@@ -116,3 +116,4 @@ design chose its major boundaries.
 - [0038 — Select an Event bridge foundation before the live hierarchy](decisions/0038-select-an-event-bridge-foundation.md)
 - [0039 — Compose a static Event hierarchy over semantic v6](decisions/0039-compose-a-static-event-hierarchy-over-semantic-v6.md)
 - [0040 — Bound a generated hierarchy scale diagnostic](decisions/0040-bound-generated-hierarchy-scale-diagnostic.md)
+- [0041 — Harden the local Event agent for customer operation](decisions/0041-customer-operable-event-service.md)

@@ -189,12 +189,20 @@ execution. The IDs below are stable planning labels, not atomic requirement IDs.
 | **P2-3** | **P2 — complete and integrate capabilities** | Freeze and validate the adopter surface. | P0 binding choices and a stakeholder-ratified usability target; stable applicable P1 lifecycle/security contracts; and applicable P2-1 policy plus P2-2 status/resource decisions. Samples, status probes, and exploratory studies may advance earlier without closing the target. | For the complete-MVP adopter outcome, the selected-node C ABI and selected first-class bindings expose Event, State, Record, Blob, and required status without transport or cryptographic internals. Independent developers complete the minimal sample within the ratified usability target. A narrower evaluation profile may ship an explicitly named subset without claiming this track complete. |
 | **P3-1** | **P3 — close a production candidate** | Close the complete-MVP production profile. | Every applicable complete-MVP capability exit; every baseline, MVP, and release trace row marked as a [final-stack invariant](../evaluations/0005/requirements-notes.md#final_stack_invariant); and every production-blocking external gate, unless a separately reviewed requirements disposition changes applicability. | An independently specification-built implementation passes the applicable conformance suite; independent cryptographic review and hostile-peer campaigns pass; the profile-specific FIPS/validated-module disposition and a reviewed `DM-8-05` disposition or technical alternative are recorded; full-graph SBOM/license admission, supported and reproducible packages, deprecation policy, representative physical/resource acceptance, and signed release authorization are complete for the exact production profile. |
 
-### Immediate post-hierarchy implementation order
+### Active post-hierarchy implementation lanes
 
-Until a later reviewed roadmap change replaces this queue, a new implementation
-session must take these increments in order. Increasing the fixed Docker tree
+The two bridge increments below remain ordered within the bridge lane, but they
+are not a global serialization point for customer-readiness work. The first
+customer MVP is single-scope and Event-only, uses exact manually admitted peers,
+and permits at most one customer-controlled pinned connectivity relay. It does
+not include multi-scope forwarding, dynamic bridge administration, or bridge
+route computation.
+
+The customer-operable Event service, deployment artifacts, protected
+provisioning, and release-gate work may therefore proceed in parallel under
+their own claim and acceptance boundaries. Increasing the fixed Docker tree
 beyond the [bounded hierarchy scale diagnostic](../quickstart/hierarchy-scale.md)
-is explicitly not the next action.
+remains explicitly outside the next bridge-lane action.
 
 1. **Next — bounded dynamic semantic-v6 Event-bridge configuration.** Add one
    privileged in-process operation that atomically replaces the complete bridge
@@ -240,6 +248,10 @@ is explicitly not the next action.
    This second increment does not establish all-class difference proportionality,
    complete `DM-5.2-18`, dynamic membership, a topology larger than the current
    diagnostic, target-resource fitness, production capacity, or release credit.
+
+The two numbered bridge increments above must remain in order relative to each
+other. They do not block the single-scope customer-operable Event-service
+increment.
 
 `P1-1` through `P1-4` are parallel lanes after `P0-1`. A lane may merge
 coherent intermediate increments without satisfying its entire exit criterion

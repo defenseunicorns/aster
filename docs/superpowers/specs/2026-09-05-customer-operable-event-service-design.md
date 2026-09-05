@@ -23,6 +23,11 @@ provisioning owners. It does not produce packages, container images,
 Kubernetes manifests, Zarf or UDS artifacts, or concrete TPM, HSM, Vault, or
 SecretStore providers.
 
+The first customer MVP is single-scope and Event-only. It uses exact manually
+admitted peers and permits at most one customer-controlled pinned connectivity
+relay. Multi-scope forwarding, Event bridges, and dynamic bridge
+administration remain a separate later capability lane.
+
 ## Goals
 
 1. Provide a strict, stable, versioned service configuration.
@@ -40,6 +45,7 @@ SecretStore providers.
 
 - State, Record, or Blob application RPCs.
 - Dynamic routing or transport selection through the application API.
+- Multi-scope forwarding, Event bridges, and dynamic bridge administration.
 - A remotely exposed application listener.
 - A second durable Event authority or service-owned journal.
 - Systemd units, Linux packages, container images, Kubernetes manifests,
@@ -122,18 +128,20 @@ is the sole input to the liveness and readiness handlers.
 
 ### `CredentialSource` boundary
 
-Consumes client and mission credential references supplied through the
-provisioning contract. The Event-service work implements secure consumption
-and client-token reload, not external credential custody. The mission
-credential configuration type is supplied by the provisioning workstream and
-is not redefined here.
+Consumes the existing provider-neutral `ProvisioningSecretRef` through exactly
+one `ProvisioningSecretLoader` supplied by the customer binary. Stable JSON
+points to an owner-only file containing the canonical serialized reference;
+the JSON document never contains its opaque bytes. Startup passes the decoded
+reference to `NodeConfig::open_secret_ref`. The Event-service work implements
+reference-file validation and client-token reload, not an additional reference
+type, protected-provider backend, or external credential custody.
 
 The business request path remains:
 
 ```text
 client
-  -> bearer authentication
-  -> protocol and resource bounds
+  -> bounded headers and pre-body bearer authentication
+  -> bounded body, protocol, and resource validation
   -> EventService
   -> SelectedEventHandle
   -> the running node's sole durable Event authority
@@ -199,8 +207,9 @@ ambiguous alternatives, and unsupported versions are errors.
 Existing individual CLI flags remain an alpha compatibility surface during
 migration. `--config` cannot be combined with those flags. The supported
 profile also provides `--check-config`, which performs syntax, semantic,
-cross-field, path, permission, and credential-reference validation without
-opening state or binding network sockets.
+cross-field, path, permission, and canonical credential-reference file
+validation without opening state, invoking a protected-provider backend, or
+binding network sockets. Provider availability is a startup-readiness check.
 
 ### Configuration domains
 
@@ -211,8 +220,10 @@ The version-one document contains these domains:
 - `health`: loopback health-listener address;
 - `mesh`: mesh bind address, bounded synchronization interval, exact manually
   admitted peer records, and at most one customer-controlled pinned relay;
-- `credentials`: an owner-only client-token file reference plus the
-  provisioning workstream's versioned mission credential reference; and
+- `credentials`: an owner-only client-token file path plus an owner-only file
+  containing one canonical `ProvisioningSecretRef`;
+- `storage`: required aggregate `max_items` and `max_payload_bytes` values that
+  map directly to `StoreLimits`; and
 - `limits`: optional values that may tighten, but never raise, compiled safety
   ceilings and the bounded shutdown grace period.
 
@@ -230,6 +241,8 @@ The supported Event profile does not include State or Record interests,
 automatic LAN discovery, public/default relay selection, or
 application-visible transport configuration. Existing feature-gated
 evaluation flags remain outside the supported configuration schema.
+The current unprotected mission-file CLI remains a development and migration
+surface only and cannot be combined with the supported configuration.
 
 All syntax and cross-field validation completes before state mutation or mesh
 network creation. Config diagnostics identify the public field and rule but do
@@ -260,11 +273,31 @@ mission-control contracts and is not implemented as config reload.
 - Authentication comparison remains constant time for equal-length values.
 - Unix token loading requires an effective-user-owned regular file with no
   group or other permissions and refuses a final symlink.
+- The mission-reference file follows the same ownership, permission,
+  regular-file, final-symlink, and size checks. Its bounded contents are
+  redacted from errors and logs and zeroized after the selected
+  `ProvisioningSecretLoader` consumes them.
 - Credentials are never accepted inline through JSON or CLI arguments.
 - Health responses are the only unauthenticated surface and reveal only an
   HTTP status code.
 - Plaintext application and health listeners remain loopback-only. Remote
   exposure is unsupported.
+
+### Supported local isolation profile
+
+The customer profile combines loopback TCP with a dedicated network namespace
+containing only the agent and its intended trusted application. It permits no
+unrelated process or sidecar and no Service, host port, ingress, or remote
+tunnel that exposes either listener. An unisolated loopback deployment remains
+development-only.
+
+The Event-service implementation owns authentication before request-body read
+or protobuf decode, plus node-global bounds on unauthenticated connections,
+header bytes, and authentication time. Bearer authentication remains required
+as defense in depth inside the namespace. The deployment owner supplies and
+tests namespace and token-file isolation; the security and release owners
+qualify the combined profile. Unix-domain sockets and mTLS remain possible
+later profiles rather than MVP requirements.
 
 ## Event operation semantics
 
@@ -309,6 +342,28 @@ and scan limit. `GetStatus` remains an authenticated bounded snapshot; it does
 not change readiness semantics or expose transport control.
 
 ## Resource and backpressure contract
+
+### Durable storage quota
+
+The supported configuration requires aggregate logical `storage.max_items` and
+`storage.max_payload_bytes` limits and maps them directly to the existing
+`StoreLimits`. The global Event custody quota is derived with
+`CustodyQuota::for_store_limits`; the MVP does not add per-scope, bridge, or
+Blob-depot quotas.
+
+Validation rejects capacities that cannot preserve the existing control,
+tombstone, and emergency reserves while accepting at least one maximum-sized
+Event. Safe capacity failure returns a sanitized `ResourceExhausted`; the
+service never silently raises the configured limit. Existing deterministic
+pressure, retirement, and protected-row rules remain authoritative. The
+current 10,000-item and 64 MiB defaults may be used as evaluation examples,
+not as production sizing guidance.
+
+These are logical payload and item limits. They do not bound redb or filesystem
+overhead, process RSS, or the complete cross-class lifecycle; those remain
+separate acceptance gates.
+
+### RPC and process resources
 
 The existing server bounds become documented supported-profile hard ceilings:
 
@@ -402,6 +457,10 @@ and never reaches `Ready`.
 - strict JSON version, unknown-field, duplicate-field, cross-field, and bounds
   validation;
 - validation ordering before state and network effects;
+- canonical `ProvisioningSecretRef` file validation without protected-backend
+  invocation;
+- `StoreLimits` mapping, derived custody quota, reserve preservation, and
+  minimum useful capacity validation;
 - lifecycle state transitions and health status mapping;
 - token reload success, old-token rejection, failed-reload retention, and
   zeroizing ownership;
@@ -411,6 +470,9 @@ and never reaches `Ready`.
 ### In-process integration tests
 
 - authenticated and unauthenticated unary and streaming calls;
+- rejection of an unauthenticated request before body read or protobuf decode,
+  under node-global unauthenticated-connection, header, and authentication-time
+  bounds;
 - health behavior throughout startup, ready, drain, and failure states;
 - request, response, deadline, page, connection, concurrency, and streaming
   backpressure;
@@ -429,6 +491,8 @@ and never reaches `Ready`.
 - terminate with `SIGTERM` during bounded unary and streaming activity and
   prove deterministic draining;
 - rotate the client token with `SIGHUP` and prove atomic authorization change;
+- refuse non-loopback listener configuration and document that unisolated
+  loopback operation is outside the customer profile;
 - inject canary secrets, paths, payloads, topics, scopes, and peer coordinates
   and prove they never appear in public errors or logs; and
 - use at least one generated non-Rust client for authenticated unary and
@@ -455,7 +519,11 @@ The Event-service workstream owns:
 - polling, streaming, acknowledgement, deletion, and redelivery semantics;
 - the public error reason and retryability catalog;
 - the black-box acceptance-suite contract; and
-- a clear supported/unsupported boundary.
+- a clear supported/unsupported boundary;
+- a customer-operability ADR that supersedes only the applicable alpha
+  follow-on statements in Decision 0030; and
+- an implementation-time quickstart update after the documented runtime
+  behavior exists, so the quickstart remains executable and accurate.
 
 ## Cross-workstream handoffs
 
@@ -465,14 +533,19 @@ The deployment owner consumes the binary contract: config path, credential
 references, loopback listeners, health semantics, signals, exit codes,
 state-directory ownership, and the black-box acceptance suite. That owner
 produces and qualifies service-manager units, images, packages, manifests,
-multi-architecture builds, SBOMs, signatures, and upgrade/rollback assets.
+multi-architecture builds, SBOMs, signatures, and upgrade/rollback assets. The
+supported customer profile also requires that owner to isolate the agent and
+intended trusted application in a dedicated network namespace and prove that
+neither listener is externally exposed.
 
 ### Provisioning and secret custody
 
-The provisioning owner supplies the versioned mission credential-reference
-type and concrete protected providers. The Event service consumes that type,
-validates the reference before state/network effects, and reports only
-sanitized provider failures. It does not implement or claim external custody.
+The provisioning owner supplies a concrete protected `ProvisioningSecretLoader`
+backend and its lifecycle. The Event service consumes the existing
+`ProvisioningSecretRef`, validates its owner-only reference file before
+state/network effects, invokes the selected loader during startup, and reports
+only sanitized provider failures. It does not implement or claim external
+custody.
 The current unprotected-reference adapter may remain available only for
 development and migration. Customer-readiness acceptance requires the
 provisioning owner's protected provider and does not silently promote that
@@ -480,13 +553,18 @@ adapter into the supported customer profile.
 
 ## Traceability and claim boundary
 
+The Event service is an active customer-readiness lane independent of the
+ordered bridge lane. It claims neither multi-scope forwarding nor bridge
+configuration, routing, or acceptance evidence.
+
 The implementation is expected to strengthen the mechanism and current-code
 evidence for `DM-7-09`, `DM-7-10`, `DM-7-11`, `DM-7-14`, `DM-7-15`,
 `DM-7-16`, `DM-7-17`, and `DM-7-18`. This design document alone changes no
 requirement status and is not acceptance evidence.
 
-Completion of this work establishes a customer-operable Event-service runtime
-within its declared loopback, Event-only boundary. Production packaging,
-protected provisioning, representative deployment acceptance, physical and
-mixed-implementation network evidence, and release authorization remain
-separate gates.
+Completion of this work establishes the runtime portion of a customer-operable
+Event service within its isolated-loopback, single-scope, Event-only boundary.
+It does not by itself close the roadmap's complete customer-readiness row.
+Protected-provider delivery, qualified isolated deployment, service-manager
+artifacts, representative acceptance, packaging, physical and mixed-network
+evidence, and release authorization remain separate gates.
