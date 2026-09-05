@@ -10,6 +10,8 @@
 pub mod config;
 pub mod credentials;
 pub mod error;
+pub mod health;
+pub mod lifecycle;
 mod service;
 
 pub use credentials::ClientToken;

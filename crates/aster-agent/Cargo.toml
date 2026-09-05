@@ -19,12 +19,19 @@ aster-iroh = { path = "../aster-iroh" }
 aster-node = { path = "../aster-node" }
 aster-redb-store = { path = "../aster-redb-store" }
 buffa.workspace = true
+bytes.workspace = true
 connectrpc = { workspace = true, features = ["json"] }
 futures.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 subtle.workspace = true
 tokio.workspace = true
+tower.workspace = true
+tower-service.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(unix)'.dependencies]
