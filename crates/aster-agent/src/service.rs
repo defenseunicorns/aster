@@ -803,7 +803,13 @@ mod tests {
             let server = tokio::spawn(agent.serve(node.selected_events(), token, shutdown_rx));
             let base_uri = format!("http://{address}");
 
-            for protocol in [Protocol::Connect, Protocol::GrpcWeb] {
+            for (protocol, expected_type_url) in [
+                (
+                    Protocol::Connect,
+                    <api::PublicErrorDetail as buffa::MessageName>::FULL_NAME,
+                ),
+                (Protocol::GrpcWeb, api::PublicErrorDetail::TYPE_URL),
+            ] {
                 let client = api::AsterApplicationServiceClient::new(
                     HttpClient::plaintext(),
                     ClientConfig::new(base_uri.parse().expect("client URI"))
@@ -824,7 +830,7 @@ mod tests {
                     .expect_err("malformed topic must fail");
                 assert_public_detail(
                     &error,
-                    api::PublicErrorDetail::TYPE_URL,
+                    expected_type_url,
                     ErrorCode::InvalidArgument,
                     api::PublicErrorReason::MalformedInput,
                     "publish_event",
