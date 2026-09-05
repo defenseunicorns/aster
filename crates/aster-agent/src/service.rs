@@ -685,6 +685,7 @@ mod tests {
 
     fn assert_public_detail(
         error: &ConnectError,
+        expected_type_url: &str,
         code: ErrorCode,
         reason: api::PublicErrorReason,
         operation: &str,
@@ -693,10 +694,7 @@ mod tests {
         assert_eq!(error.code, code);
         assert_eq!(error.details.len(), 1);
         let detail = &error.details[0];
-        assert_eq!(
-            detail.type_url,
-            "aster.application.v1alpha1.PublicErrorDetail"
-        );
+        assert_eq!(detail.type_url, expected_type_url);
         assert!(detail.debug.is_none());
         let wire = decode_base64(detail.value.as_deref().expect("encoded detail"));
         let decoded =
@@ -714,6 +712,7 @@ mod tests {
             .expect_err("non-canonical topic");
         assert_public_detail(
             &topic_error,
+            "aster.application.v1alpha1.PublicErrorDetail",
             ErrorCode::InvalidArgument,
             api::PublicErrorReason::MalformedInput,
             "publish_event",
@@ -726,6 +725,7 @@ mod tests {
                 .expect_err("unsupported priority");
         assert_public_detail(
             &priority_error,
+            "aster.application.v1alpha1.PublicErrorDetail",
             ErrorCode::InvalidArgument,
             api::PublicErrorReason::UnsupportedValue,
             "publish_event",
@@ -736,6 +736,7 @@ mod tests {
             .expect_err("short identifier");
         assert_public_detail(
             &identifier_error,
+            "aster.application.v1alpha1.PublicErrorDetail",
             ErrorCode::InvalidArgument,
             api::PublicErrorReason::MalformedInput,
             "acknowledge_event",
@@ -758,6 +759,7 @@ mod tests {
         .expect_err("response budget must include protobuf framing");
         assert_public_detail(
             &error,
+            "aster.application.v1alpha1.PublicErrorDetail",
             ErrorCode::ResourceExhausted,
             api::PublicErrorReason::ResourceExhaustion,
             "query_events",
@@ -822,6 +824,7 @@ mod tests {
                     .expect_err("malformed topic must fail");
                 assert_public_detail(
                     &error,
+                    api::PublicErrorDetail::TYPE_URL,
                     ErrorCode::InvalidArgument,
                     api::PublicErrorReason::MalformedInput,
                     "publish_event",
@@ -855,6 +858,7 @@ mod tests {
                 .expect_err("malformed topic must fail");
             assert_public_detail(
                 &error,
+                api::PublicErrorDetail::TYPE_URL,
                 ErrorCode::InvalidArgument,
                 api::PublicErrorReason::MalformedInput,
                 "publish_event",
