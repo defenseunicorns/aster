@@ -18,7 +18,7 @@ pub use error::{PublicOperation, connect_application_error, public_error};
 use std::time::Duration;
 
 use aster_node::application::SelectedEventHandle;
-use connectrpc::{ConnectError, RequestContext};
+use connectrpc::{ConnectError, ErrorCode, RequestContext};
 
 use service::AsterConnectService;
 
@@ -53,8 +53,12 @@ impl BearerAuth {
         {
             Ok(())
         } else {
-            Err(ConnectError::unauthenticated(
-                "valid local client authentication is required",
+            Err(public_error(
+                ErrorCode::Unauthenticated,
+                api::PublicErrorReason::AuthenticationFailed,
+                PublicOperation::Unspecified,
+                false,
+                None,
             ))
         }
     }
@@ -149,7 +153,85 @@ async fn shutdown_requested(mut shutdown: tokio::sync::watch::Receiver<bool>) {
 
 #[cfg(test)]
 mod tests {
+    use buffa::{Message as _, MessageName as _};
+    use connectrpc::ErrorCode;
+
     use super::*;
+
+    fn decode_base64(value: &str) -> Vec<u8> {
+        fn sextet(byte: u8) -> u8 {
+            match byte {
+                b'A'..=b'Z' => byte - b'A',
+                b'a'..=b'z' => byte - b'a' + 26,
+                b'0'..=b'9' => byte - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => panic!("invalid base64 fixture"),
+            }
+        }
+
+        let mut decoded = Vec::new();
+        for chunk in value.as_bytes().chunks(4) {
+            let a = sextet(chunk[0]);
+            let b = sextet(chunk[1]);
+            decoded.push((a << 2) | (b >> 4));
+            if chunk.len() > 2 && chunk[2] != b'=' {
+                let c = sextet(chunk[2]);
+                decoded.push((b << 4) | (c >> 2));
+                if chunk.len() > 3 && chunk[3] != b'=' {
+                    decoded.push((c << 6) | sextet(chunk[3]));
+                }
+            }
+        }
+        decoded
+    }
+
+    fn assert_authentication_failure(error: &ConnectError) {
+        assert_eq!(error.code, ErrorCode::Unauthenticated);
+        assert_eq!(error.message.as_deref(), Some("authentication failed"));
+        assert_eq!(error.details.len(), 1);
+        let detail = &error.details[0];
+        assert_eq!(detail.type_url, api::PublicErrorDetail::FULL_NAME);
+        assert!(detail.debug.is_none());
+        let wire = decode_base64(detail.value.as_deref().expect("encoded detail"));
+        let detail = api::PublicErrorDetail::decode_from_slice(&wire)
+            .expect("decodable public authentication detail");
+        assert_eq!(detail.reason, api::PublicErrorReason::AuthenticationFailed);
+        assert_eq!(detail.operation, "unspecified");
+        assert!(!detail.retryable);
+        assert_eq!(detail.retry_delay_ms, None);
+    }
+
+    #[test]
+    fn missing_and_invalid_bearer_credentials_are_indistinguishable_and_sanitized() {
+        const INVALID_CREDENTIAL_CANARY: &str = "Bearer invalid-credential-canary-0123456789abcdef";
+        let auth = BearerAuth {
+            token: ClientToken::from_bytes(b"0123456789abcdef-._~ABCDEFGHIJKL".to_vec())
+                .expect("valid token"),
+        };
+
+        let missing = auth
+            .authorize(&RequestContext::new(Default::default()))
+            .expect_err("missing bearer credential must fail");
+        let mut invalid_context = RequestContext::new(Default::default());
+        invalid_context.headers_mut().insert(
+            "authorization",
+            INVALID_CREDENTIAL_CANARY
+                .parse()
+                .expect("valid authorization header fixture"),
+        );
+        let invalid = auth
+            .authorize(&invalid_context)
+            .expect_err("invalid bearer credential must fail");
+
+        assert_authentication_failure(&missing);
+        assert_authentication_failure(&invalid);
+        assert_eq!(
+            serde_json::to_value(&missing).expect("serializable missing-credential error"),
+            serde_json::to_value(&invalid).expect("serializable invalid-credential error")
+        );
+        assert!(!format!("{invalid:?}").contains(INVALID_CREDENTIAL_CANARY));
+    }
 
     #[test]
     fn plaintext_listener_rejects_non_loopback_before_binding() {
