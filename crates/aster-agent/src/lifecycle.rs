@@ -9,6 +9,8 @@ use std::{
     },
 };
 
+use tokio::sync::watch;
+
 /// The lifecycle phase of one agent process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -109,14 +111,17 @@ impl Error for LifecycleError {}
 pub struct ServiceStatus {
     state: Arc<AtomicU8>,
     failure: Arc<Mutex<Option<FailureReason>>>,
+    changes: Arc<watch::Sender<LifecycleState>>,
 }
 
 impl ServiceStatus {
     /// Creates the initial status for a process that has not completed startup.
     pub fn starting() -> Self {
+        let (changes, _) = watch::channel(LifecycleState::Starting);
         Self {
             state: Arc::new(AtomicU8::new(LifecycleState::Starting as u8)),
             failure: Arc::new(Mutex::new(None)),
+            changes: Arc::new(changes),
         }
     }
 
@@ -171,6 +176,7 @@ impl ServiceStatus {
                 requested: LifecycleState::Failed,
             })?;
         *failure = Some(reason);
+        let _ = self.changes.send(LifecycleState::Failed);
         Ok(())
     }
 
@@ -190,35 +196,43 @@ impl ServiceStatus {
         }
     }
 
-    fn transition_without_failure(&self, next: LifecycleState) -> Result<(), LifecycleError> {
-        let current = self.state();
-        if !current.permits(next) {
-            return Err(LifecycleError {
-                current,
-                requested: next,
-            });
-        }
-        if current == next {
-            return Ok(());
-        }
+    pub(crate) fn subscribe(&self) -> watch::Receiver<LifecycleState> {
+        self.changes.subscribe()
+    }
 
-        self.state
-            .compare_exchange(
+    fn transition_without_failure(&self, next: LifecycleState) -> Result<(), LifecycleError> {
+        let mut current = self.state();
+        loop {
+            if !current.permits(next) {
+                return Err(LifecycleError {
+                    current,
+                    requested: next,
+                });
+            }
+            if current == next {
+                return Ok(());
+            }
+
+            match self.state.compare_exchange(
                 current as u8,
                 next as u8,
                 Ordering::AcqRel,
                 Ordering::Acquire,
-            )
-            .map_err(|observed| LifecycleError {
-                current: LifecycleState::from_u8(observed),
-                requested: next,
-            })?;
-        Ok(())
+            ) {
+                Ok(_) => {
+                    let _ = self.changes.send(next);
+                    return Ok(());
+                }
+                Err(observed) => current = LifecycleState::from_u8(observed),
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+
     use super::*;
 
     fn assert_health(state: LifecycleState, live: u16, ready: u16) {
@@ -277,5 +291,86 @@ mod tests {
             .expect("starting may fail");
         assert_eq!(status.state(), LifecycleState::Failed);
         assert_eq!(status.failure_reason(), Some(FailureReason::Startup));
+    }
+
+    #[test]
+    fn every_declared_transition_pair_has_its_declared_result() {
+        let states = [
+            LifecycleState::Starting,
+            LifecycleState::Ready,
+            LifecycleState::Draining,
+            LifecycleState::Stopped,
+            LifecycleState::Failed,
+        ];
+        for current in states {
+            for next in states {
+                let status = status_at(current);
+                let expected = matches!(
+                    (current, next),
+                    (
+                        LifecycleState::Starting,
+                        LifecycleState::Ready | LifecycleState::Failed
+                    ) | (
+                        LifecycleState::Ready,
+                        LifecycleState::Draining | LifecycleState::Failed
+                    ) | (
+                        LifecycleState::Draining,
+                        LifecycleState::Stopped | LifecycleState::Failed
+                    ) | (LifecycleState::Stopped, LifecycleState::Stopped)
+                        | (LifecycleState::Failed, LifecycleState::Failed)
+                );
+                assert_eq!(
+                    status.transition(next).is_ok(),
+                    expected,
+                    "{current:?} -> {next:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_terminal_self_observation_succeeds() {
+        let status = status_at(LifecycleState::Draining);
+        let barrier = Arc::new(Barrier::new(33));
+        let mut workers = Vec::new();
+        for _ in 0..32 {
+            let status = status.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                status.transition(LifecycleState::Stopped)
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker
+                .join()
+                .expect("worker does not panic")
+                .expect("terminal transition or self-observation");
+        }
+        assert_eq!(status.state(), LifecycleState::Stopped);
+    }
+
+    fn status_at(state: LifecycleState) -> ServiceStatus {
+        let status = ServiceStatus::starting();
+        match state {
+            LifecycleState::Starting => {}
+            LifecycleState::Ready => status.transition(LifecycleState::Ready).expect("ready"),
+            LifecycleState::Draining => {
+                status.transition(LifecycleState::Ready).expect("ready");
+                status
+                    .transition(LifecycleState::Draining)
+                    .expect("draining");
+            }
+            LifecycleState::Stopped => {
+                status.transition(LifecycleState::Ready).expect("ready");
+                status
+                    .transition(LifecycleState::Draining)
+                    .expect("draining");
+                status.transition(LifecycleState::Stopped).expect("stopped");
+            }
+            LifecycleState::Failed => status.transition(LifecycleState::Failed).expect("failed"),
+        }
+        status
     }
 }
