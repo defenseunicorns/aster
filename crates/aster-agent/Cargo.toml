@@ -14,7 +14,10 @@ server = ["connectrpc/server"]
 client = ["connectrpc/client"]
 
 [dependencies]
+aster-mesh = { package = "aster-core", path = "../aster-core", default-features = false, features = ["reference-session"] }
+aster-iroh = { path = "../aster-iroh" }
 aster-node = { path = "../aster-node" }
+aster-redb-store = { path = "../aster-redb-store" }
 buffa.workspace = true
 connectrpc = { workspace = true, features = ["json"] }
 futures.workspace = true

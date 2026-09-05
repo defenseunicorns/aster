@@ -275,7 +275,10 @@ dependencies = [
 name = "aster-agent"
 version = "0.1.0"
 dependencies = [
+ "aster-core",
+ "aster-iroh",
  "aster-node",
+ "aster-redb-store",
  "buffa",
  "connectrpc",
  "connectrpc-build",

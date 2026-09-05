@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod config;
+
 use std::{collections::VecDeque, io::Read as _, path::Path, sync::Arc, time::Duration};
 
 use aster_node::application::{

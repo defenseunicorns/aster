@@ -1,6 +1,6 @@
 use std::{env, net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
 
-use aster_agent::{BoundAgent, ClientToken};
+use aster_agent::{BoundAgent, ClientToken, config::check_config};
 use aster_node::application::{Scope, Topic};
 use aster_node::mission::UnprotectedReferenceMission;
 use aster_node::{
@@ -11,6 +11,35 @@ use aster_node::{
 use aster_node::{MissionNearbyPeer, SelectedForwardingConfig, start_node_with_forwarding};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+enum Invocation {
+    CheckConfig(PathBuf),
+    CustomerConfig(PathBuf),
+    LegacyDevelopment(Arguments),
+}
+
+impl Invocation {
+    fn parse(mut arguments: Arguments) -> Result<Self, BoxError> {
+        let config = arguments.optional("--config")?;
+        let check_config = arguments.optional("--check-config")?;
+        match (config, check_config) {
+            (Some(_), Some(_)) => Err("--config cannot be combined with --check-config".into()),
+            (Some(path), None) => {
+                if !arguments.values.is_empty() {
+                    return Err("--config cannot be combined with legacy flags".into());
+                }
+                Ok(Self::CustomerConfig(PathBuf::from(path)))
+            }
+            (None, Some(path)) => {
+                if !arguments.values.is_empty() {
+                    return Err("--check-config cannot be combined with legacy flags".into());
+                }
+                Ok(Self::CheckConfig(PathBuf::from(path)))
+            }
+            (None, None) => Ok(Self::LegacyDevelopment(arguments)),
+        }
+    }
+}
 
 fn main() -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -33,12 +62,20 @@ fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), BoxError> {
-    let mut arguments = Arguments::new(env::args().skip(1));
-    if arguments.take_flag("--help") || arguments.take_flag("-h") {
-        print_help();
-        return Ok(());
+    match Invocation::parse(Arguments::new(env::args().skip(1)))? {
+        Invocation::CheckConfig(path) => check_config(&path).map_err(Into::into),
+        Invocation::CustomerConfig(_path) => Err("protected provider required".into()),
+        Invocation::LegacyDevelopment(mut arguments) => {
+            if arguments.take_flag("--help") || arguments.take_flag("-h") {
+                print_help();
+                return Ok(());
+            }
+            run_legacy(arguments).await
+        }
     }
+}
 
+async fn run_legacy(mut arguments: Arguments) -> Result<(), BoxError> {
     let state = arguments.required_path("--state")?;
     let mesh_bind: SocketAddr = arguments.required("--mesh-bind")?.parse()?;
     let listen: SocketAddr = arguments
@@ -298,6 +335,36 @@ mod tests {
         assert!(HELP.contains("takes no peer identity or address"));
         assert!(HELP.contains("cannot be combined with --peer or\n--nearby-peer"));
         assert!(HELP.contains("authenticates it and current mission authorization succeeds"));
+    }
+
+    #[test]
+    fn customer_configuration_modes_are_exclusive_with_legacy_flags() {
+        let check = Invocation::parse(Arguments::new(
+            ["--check-config", "/etc/aster-agent.json"]
+                .into_iter()
+                .map(str::to_owned),
+        ))
+        .expect("check-config invocation");
+        assert!(matches!(check, Invocation::CheckConfig(_)));
+
+        let result = Invocation::parse(Arguments::new(
+            [
+                "--config",
+                "/etc/aster-agent.json",
+                "--state",
+                "/var/lib/aster",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        ));
+        let error = match result {
+            Ok(_) => panic!("legacy flags must not mix with customer config"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "--config cannot be combined with legacy flags"
+        );
     }
 
     #[cfg(feature = "nearby-discovery")]
