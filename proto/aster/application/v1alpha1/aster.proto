@@ -2,6 +2,28 @@ syntax = "proto3";
 
 package aster.application.v1alpha1;
 
+enum PublicErrorReason {
+  PUBLIC_ERROR_REASON_UNSPECIFIED = 0;
+  PUBLIC_ERROR_REASON_MALFORMED_INPUT = 1;
+  PUBLIC_ERROR_REASON_UNSUPPORTED_VALUE = 2;
+  PUBLIC_ERROR_REASON_OPERATION_KEY_CONFLICT = 3;
+  PUBLIC_ERROR_REASON_MISSING_DURABLE_OBJECT = 4;
+  PUBLIC_ERROR_REASON_FAILED_PRECONDITION = 5;
+  PUBLIC_ERROR_REASON_DEADLINE = 6;
+  PUBLIC_ERROR_REASON_RESOURCE_EXHAUSTION = 7;
+  PUBLIC_ERROR_REASON_DRAINING = 8;
+  PUBLIC_ERROR_REASON_STATE_UNAVAILABLE = 9;
+  PUBLIC_ERROR_REASON_AUTHENTICATION_FAILED = 10;
+  PUBLIC_ERROR_REASON_INTERNAL = 11;
+}
+
+message PublicErrorDetail {
+  PublicErrorReason reason = 1;
+  string operation = 2;
+  bool retryable = 3;
+  optional uint32 retry_delay_ms = 4;
+}
+
 // AsterApplicationService is the process-local, high-level application API.
 //
 // The alpha surface exposes only the live Event and status operations backed
