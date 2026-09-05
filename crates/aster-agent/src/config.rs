@@ -18,7 +18,7 @@ use aster_redb_store::{
 };
 use serde::Deserialize;
 
-use crate::MAX_AGENT_MESSAGE_BYTES;
+use crate::{MAX_AGENT_MESSAGE_BYTES, credentials::load_startup_credentials};
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 const MAX_CONFIGURED_PEERS: usize = 256;
@@ -37,6 +37,7 @@ pub enum ConfigReason {
     DistinctListenersRequired,
     DuplicatePeerCarrier,
     DuplicatePeerMission,
+    CredentialBoundary,
     FileAccess,
     InvalidMissionLoadId,
     InvalidPeer,
@@ -61,6 +62,7 @@ impl ConfigReason {
             Self::DistinctListenersRequired => "configuration listeners must be distinct",
             Self::DuplicatePeerCarrier => "configuration contains a duplicate peer carrier",
             Self::DuplicatePeerMission => "configuration contains a duplicate peer mission",
+            Self::CredentialBoundary => "credential file boundary is invalid",
             Self::FileAccess => "configuration file cannot be read",
             Self::InvalidMissionLoadId => "configuration mission load id is invalid",
             Self::InvalidPeer => "configuration peer is invalid",
@@ -323,7 +325,10 @@ pub fn load_and_validate_config(path: &Path) -> Result<ValidatedAgentConfig, Con
 }
 
 pub fn check_config(path: &Path) -> Result<(), ConfigError> {
-    load_and_validate_config(path).map(|_| ())
+    let config = load_and_validate_config(path)?;
+    load_startup_credentials(config.credential_paths())
+        .map_err(|_| ConfigError::new(ConfigReason::CredentialBoundary))?;
+    Ok(())
 }
 
 fn classify_json_error(error: serde_json::Error) -> ConfigError {

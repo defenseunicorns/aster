@@ -8,8 +8,11 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod credentials;
 
-use std::{collections::VecDeque, io::Read as _, path::Path, sync::Arc, time::Duration};
+pub use credentials::ClientToken;
+
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use aster_node::application::{
     ApplicationError, ApplicationErrorKind, AuthenticatedPeerStatus,
@@ -23,8 +26,6 @@ use aster_node::application::{
 use connectrpc::{
     ConnectError, ErrorCode, RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream,
 };
-use subtle::ConstantTimeEq as _;
-use zeroize::Zeroizing;
 
 /// Generated, repository-owned application protocol.
 pub mod proto {
@@ -44,108 +45,6 @@ pub const MAX_AGENT_RESPONSE_PROTO_BYTES: u32 = 2 * 1024 * 1024;
 pub const MIN_STREAM_BACKOFF_MS: u32 = 100;
 /// Maximum accepted delay following any delivered or caught-up streaming poll.
 pub const MAX_STREAM_BACKOFF_MS: u32 = 60_000;
-
-const MIN_CLIENT_TOKEN_BYTES: usize = 32;
-const MAX_CLIENT_TOKEN_BYTES: usize = 256;
-const BEARER_PREFIX: &[u8] = b"Bearer ";
-
-/// Owner-provisioned credential required on every application RPC.
-///
-/// The credential is retained in zeroizing storage and compared in constant
-/// time. Clones share the same allocation rather than duplicating the secret.
-#[derive(Clone)]
-pub struct ClientToken(Arc<Zeroizing<Vec<u8>>>);
-
-impl ClientToken {
-    /// Validates a URL-safe token and prepares its exact Authorization value.
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, std::io::Error> {
-        let bytes = Zeroizing::new(bytes);
-        if !(MIN_CLIENT_TOKEN_BYTES..=MAX_CLIENT_TOKEN_BYTES).contains(&bytes.len()) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "client token must contain 32 through 256 bytes",
-            ));
-        }
-        if !bytes
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-._~".contains(byte))
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "client token must contain only URL-safe ASCII characters",
-            ));
-        }
-
-        let mut authorization =
-            Zeroizing::new(Vec::with_capacity(BEARER_PREFIX.len() + bytes.len()));
-        authorization.extend_from_slice(BEARER_PREFIX);
-        authorization.extend_from_slice(&bytes);
-        Ok(Self(Arc::new(authorization)))
-    }
-
-    /// Loads a regular, owner-only file without following a final symlink.
-    #[cfg(unix)]
-    pub fn load(path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
-        use std::os::unix::{
-            fs::MetadataExt as _, fs::OpenOptionsExt as _, fs::PermissionsExt as _,
-        };
-
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(path)?;
-        let metadata = file.metadata()?;
-        if !metadata.file_type().is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "client token must be a regular file",
-            ));
-        }
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "client token file must not grant group or other permissions",
-            ));
-        }
-        if metadata.uid() != rustix::process::geteuid().as_raw() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "client token file must be owned by the effective process user",
-            ));
-        }
-
-        let mut bytes = Zeroizing::new(Vec::new());
-        file.take((MAX_CLIENT_TOKEN_BYTES + 2) as u64)
-            .read_to_end(&mut bytes)?;
-        while matches!(bytes.last(), Some(b'\n' | b'\r')) {
-            bytes.pop();
-        }
-        if bytes.len() > MAX_CLIENT_TOKEN_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "client token is too long",
-            ));
-        }
-        Self::from_bytes(std::mem::take(&mut *bytes))
-    }
-
-    /// Token-file loading is not yet supported on non-Unix targets because
-    /// the owner-only and no-symlink guarantees are platform-specific.
-    #[cfg(not(unix))]
-    pub fn load(_path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "client token loading is supported only on Unix",
-        ))
-    }
-
-    fn authorizes(&self, provided: Option<&[u8]>) -> bool {
-        let Some(provided) = provided else {
-            return false;
-        };
-        provided.len() == self.0.len() && self.0.as_slice().ct_eq(provided).into()
-    }
-}
 
 #[derive(Clone)]
 struct BearerAuth {
