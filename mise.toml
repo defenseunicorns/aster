@@ -70,6 +70,29 @@ run = [
 description = "Run bounded sanitizer-instrumented decoder fuzz campaigns"
 run = "sh ./tools/run-fuzz-smoke.sh"
 
+[tasks.agent-process-smoke]
+description = "Exercise bounded customer-agent crash, restart, reload, and drain behavior"
+run = '''
+set -eu
+cargo build --locked -p aster-agent --bin aster-agent-acceptance-fixture --features client,acceptance-test-provider
+task_root="$(mktemp -d /tmp/aster-agent-process-smoke.XXXXXX)"
+cleanup() {
+  case "$task_root" in
+    /tmp/aster-agent-process-smoke.*) rm -rf -- "$task_root" ;;
+    *) return 1 ;;
+  esac
+}
+trap cleanup EXIT HUP INT TERM
+chmod 700 "$task_root"
+fixture="target/debug/aster-agent-acceptance-fixture"
+"$fixture" prepare --root "$task_root"
+python3 tools/check-aster-agent-process.py \
+  --agent "$fixture" \
+  --config "$task_root/agent.json" \
+  --client "$fixture" \
+  --timeout-seconds 30
+'''
+
 [tasks.playground]
 description = "Launch a bounded interactive real-process Event message playground"
 run = "sh ./tools/aster-mesh-playground.sh"

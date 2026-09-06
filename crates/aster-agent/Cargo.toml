@@ -12,6 +12,12 @@ default = ["server"]
 nearby-discovery = ["aster-node/nearby-discovery"]
 server = ["connectrpc/server"]
 client = ["connectrpc/client"]
+acceptance-test-provider = []
+
+[[bin]]
+name = "aster-agent-acceptance-fixture"
+path = "src/bin/aster-agent-acceptance-fixture.rs"
+required-features = ["client", "acceptance-test-provider"]
 
 [dependencies]
 aster-mesh = { package = "aster-core", path = "../aster-core", default-features = false, features = ["reference-session"] }
