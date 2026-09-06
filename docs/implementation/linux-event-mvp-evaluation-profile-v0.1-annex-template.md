@@ -1,0 +1,375 @@
+#
+
+# Linux Event MVP Evaluation Profile v0.1 candidate-annex schema
+
+- Schema version: `0.1-proposed`
+- Profile ID: `aster-linux-event-mvp-evaluation-v0.1`
+- Status: provisional and revisionable; never qualification evidence by itself
+- Freeze gate: OS/artifact, integration/device, deterministic-gate, security,
+  dependency/legal, and release owners approve the schema interfaces
+
+A candidate cannot qualify before this schema is reviewed and frozen and G2,
+G3, G4, and G5 pass in order. A completed annex contains concrete immutable
+identifiers, digests, results, and approvals for every applicable required
+field. An omitted, unfilled, ambiguous, mutable, or unsigned required field
+makes that annex non-qualifying.
+
+No secret, credential, private key, bearer token, unsanitized customer identity,
+or mission plaintext enters this schema or a repository copy of an annex.
+Completed customer annexes may require controlled storage; any public copy must
+be sanitized without removing facts required to substantiate its public claim.
+
+## Completion conventions
+
+- `Required` means every completed base-qualification annex supplies the field.
+  `Conditional` means the stated condition decides whether the field is supplied;
+  it never permits silent omission.
+- `<...>` marks a value to be completed. Placeholder text is not a value.
+- Unless a row states otherwise, `digest` means lowercase, 64-character SHA-256
+  over immutable bytes, written as `sha256:<hex>`. An immutable record reference
+  is a stable content-addressed location plus that digest.
+- A result uses exactly `pass`, `fail`, or `not-run`. A decision uses exactly
+  `issue`, `refuse`, or `defer`. A warning, target date, scheduled run, or
+  incomplete review is never `pass`.
+- An owner is the named accountable role. A producer may populate a field, but
+  the owner reviews it and the release owner verifies every digest before issue.
+- Rejection means the annex cannot support an `issue` decision. A completed
+  `refuse` or `defer` annex preserves the failure or missing-gate facts and its
+  immutable receipts.
+- Times use RFC 3339 UTC. Durations use integer milliseconds or seconds as named.
+  Sizes and counts use decimal integers in the units stated by the field.
+
+## 1. Profile, candidate, and decision identity
+
+| Field | Applicability | Format | Owner | Rejection rule |
+|---|---|---|---|---|
+| Schema identity | Required | Reviewed schema version and `sha256:<hex>`; starts from `0.1-proposed` but a candidate uses only its later frozen revision | Profile + integration | Reject if the schema is still proposed/unfrozen, mutable, or its digest does not verify |
+| Profile identity | Required | Exact ID `aster-linux-event-mvp-evaluation-v0.1`, profile version `0.1`, and immutable profile digest | Profile owner | Reject any different, missing, or mutable identity |
+| Candidate identity | Required | Unique sanitized candidate ID and candidate-annex revision | Release owner | Reject reuse across different source, artifacts, provider, configuration, or environments |
+| Decision checkpoint | Required | Exact date `2026-09-13` and RFC 3339 UTC review time | Release owner | Reject if the date is treated as approval or if the review time is absent |
+| Final outcome | Required | Exactly one of `issue`, `refuse`, or `defer`, with a concise reason and exact G3 artifact-set digest | Release owner | Reject an `issue` unless every required gate passed in order; reject an absent, ambiguous, or unsigned outcome |
+| Claim and non-claims | Required | Immutable text identifying the time-bounded, non-production Linux/Event v0.1 claim and its exclusions | Profile + release | Reject if it broadens the profile, claims production, or describes implementation or component evidence as qualification |
+
+## 2. Source, inputs, configuration, harness, and deterministic gate
+
+| Field | Applicability | Format | Owner | Rejection rule |
+|---|---|---|---|---|
+| Source commit | Required | Full 40-character lowercase Git object ID | Deterministic-gate owner | Reject abbreviated, missing, mutable, or different source across dependent gates without a new candidate |
+| Dependency lock | Required | Lockfile format/version, path, byte size, and `sha256:<hex>` | Dependency/license + deterministic-gate | Reject an unlocked build, an unverifiable digest, or dependency drift |
+| Toolchain | Required | Exact compiler/build-tool versions and immutable toolchain-manifest digest | Deterministic-gate owner | Reject floating versions, incomplete tool identity, or drift between build and replay |
+| Sanitized strict configuration | Required | Configuration schema/version, immutable bundle reference, byte size, and `sha256:<hex>`; no secrets | Profile + integration | Reject plaintext secrets, omitted effective values, mutable references, or any profile deviation |
+| Qualification harness | Required | Version or full source commit plus harness/configuration digest | Integration + deterministic-gate | Reject an unversioned harness or a harness/config mismatch between dependent gates |
+| Clean locked checkout | Required | `pass`/`fail`, RFC 3339 UTC, command digest, receipt reference, and receipt digest | Deterministic-gate owner | Reject unless `pass` proves a clean locked checkout for the full source commit |
+| Deterministic gate | Required | Exact `mise run check` result, command/environment digest, receipt reference, and receipt digest | Deterministic-gate owner | Reject unless the exact final source passes deterministically; a retry without retained failure disposition is insufficient |
+| Event/Go process gates | Required | Results and immutable receipts for Event-service process acceptance and checked-in Go generation/black-box acceptance | Event-service + API + deterministic-gate | Reject a missing/failing result or a claim that Go is an independent server implementation |
+| Generic and profile validation | Required | Results and immutable receipts for side-effect-free generic validation and v0.1 deviation rejection | Integration + profile | Reject side effects, acceptance of a tested profile deviation, or conflation of broader generic values with v0.1 |
+
+Signed Git metadata is not a v0.1 qualification field. The full source commit
+is required, but this schema does not silently promote Git signature state into
+a gate.
+
+## 3. Architecture artifacts and procedures
+
+Record one row for each architecture. Architecture names and Debian package
+architectures remain paired exactly as shown.
+
+| Architecture | Applicability | `.deb` file and exact byte size | Package digest | Provider-composed stripped executable size/digest | Authentication method and verification result/receipt | Package manifest digest | SBOM digest | notices digest | provenance digest | Owner | Rejection rule |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `x86_64` / `amd64` | Required | `<immutable name>` / `<decimal bytes>` | `<sha256:hex>` | `<decimal bytes>` / `<sha256:hex>` | `<exact detached-signature or signed-repository method>`; `<pass/fail>`; `<receipt + digest>` | `<sha256:hex>` | `<sha256:hex>` | `<sha256:hex>` | `<sha256:hex>` | Deployment/release owner | Reject absence, wrong architecture, size/digest mismatch, failed authentication, non-native package, missing inventory, or a package not built from G2 |
+| `aarch64` / `arm64` | Required | `<immutable name>` / `<decimal bytes>` | `<sha256:hex>` | `<decimal bytes>` / `<sha256:hex>` | `<exact detached-signature or signed-repository method>`; `<pass/fail>`; `<receipt + digest>` | `<sha256:hex>` | `<sha256:hex>` | `<sha256:hex>` | `<sha256:hex>` | Deployment/release owner | Reject absence, wrong architecture, size/digest mismatch, failed authentication, non-native package, missing inventory, or a package not built from G2 |
+
+| Procedure field | Applicability | Format | Owner | Rejection rule |
+|---|---|---|---|---|
+| Install/start/health procedure | Required | Immutable procedure reference, version, and digest; exact command sequence contains no secret | Deployment/OS owner | Reject if missing, mutable, secret-bearing, or not exercised by retained target receipts |
+| Controlled restart/upgrade/permitted rollback procedure | Required | Immutable procedure reference, version, and digest; rollback is exact qualified-artifact reinstall against unchanged current state | Deployment/OS + release | Reject downgrade, snapshot restore, unknown state provenance, or any different rollback meaning |
+| Uninstall/state-preservation procedure | Required | Immutable procedure reference, version, and digest, plus result receipt | Deployment/OS owner | Reject if uninstall/state behavior is absent, unverifiable, or differs by architecture without an annexed distinction |
+| Packaged supporting material | Required | Digests for hardened `systemd` unit, strict example config, Rust client source/build instructions, generated Go client/acceptance source, profile, annex, evidence index, limitations, and escalation procedure | Deployment/release owner | Reject a missing required artifact, bundled credential/mission data/state/test secret, or digest mismatch |
+
+## 4. Protected provider and lifecycle
+
+| Field | Applicability | Format | Owner | Rejection rule |
+|---|---|---|---|---|
+| Protected provider identity | Required | Exact implementation name, version, source/build identity, supported architectures, trust/storage boundary, and immutable contract digest | Security + deployment | Reject an unapproved provider, an incomplete boundary, an unprotected fixture/engineering adapter, or provider drift |
+| Administration artifact | Required | Exact immutable artifact identity, version, digest, and sanitized command-set digest | Security + deployment | Reject a mutable/missing artifact or a command set that exposes mission secret bytes |
+| Install protected reference | Required | `pass`/`fail`, exact procedure digest, receipt reference, and receipt digest | Security + deployment + integration | Reject unless a protected node/mission reference is installed without repository or ordinary-config secret material |
+| Startup load | Required | `pass`/`fail`, load-operation identifier digest, receipt reference, and receipt digest | Security + integration | Reject plaintext exposure, fallback to plaintext parsing, extra provider loads, or failure to reach the expected readiness state |
+| Bearer rotation | Required | `pass`/`fail` for atomic `SIGHUP` reload, receipt reference, and digest | Event-service + security + integration | Reject non-atomic reload, process restart substituted for this case, or disclosure of either bearer value |
+| Provider/reference rotation | Required | `pass`/`fail` for controlled restart, receipt reference, and digest | Security + deployment + integration | Reject live mutation, stale reference/provider use, or a different artifact/config candidate |
+| Backup/recovery | Required | `pass`/`fail` using the provider's protected procedure, receipt reference, and digest | Security + deployment + integration | Reject ordinary-file plaintext backup, unbound restore, unknown state provenance, or unverifiable recovery |
+| Revoke/rekey | Required | `pass`/`fail`; exact stopped-node administration procedure digest; new roster/key-generation identifier digest; receipt reference/digest | Security + integration | Reject live-membership claims, retained removed-node authentication, omission of explicit rekey behavior, or secret disclosure |
+| Logical destroy/fail-closed startup | Required | `pass`/`fail`; provider destroy receipt digest and subsequent startup-failure receipt digest | Security + deployment + integration | Reject if provider-backed logical destruction is not followed by fail-closed startup, or if physical erasure is inferred |
+
+## 5. Sanitized mission and policy identity
+
+| Field | Applicability | Format | Owner | Rejection rule |
+|---|---|---|---|---|
+| Mission authority identifier | Required | Sanitized stable identifier or one-way commitment; no identity-bearing customer text | Security owner | Reject absence, ambiguity, unsanitized identity, or reuse as relay trust authority |
+| Offline mission-root identifier | Required | Sanitized certificate/key identifier or public-material digest only | Security owner | Reject private material, missing offline-root identity, or more than one root for the profile |
+| Delegated mission-signer identifier | Required | Sanitized signer identifier/public-material digest and delegation-record digest | Security owner | Reject private material, absent delegation, or more than one signer for the profile |
+| Node roster identity set | Required | Digest of the exact sanitized distinct-node roster plus count | Security + integration | Reject duplicate identities, roster drift, or disagreement with participant inventories |
+| Scope and topic identifiers | Required | Sanitized identifiers or commitments for exactly one scope and one topic per scenario | Security + profile | Reject unsanitized customer identity, more than one of either in a scenario, or inventory/config mismatch |
+| Protocol/profile/suite | Required | Semantic protocol `6`, Aster security profile `0x0001`, hybrid suite `0x0001`, unordered profile-ID rule, and no-fallback result | Security + integration | Reject any different negotiated value, fallback, partial hybrid composition, or pre-inventory mismatch acceptance |
+| Mission-policy identity | Required | Immutable authenticated policy digest, generation identifier, and exact permitted profile/suite pair | Security owner | Reject mutable/unsigned policy, rollback, or policy that permits another profile/suite |
+| Mission versus relay authority separation | Required | Signed statement and receipt digest that mission root/signer authority is independent of optional relay DER TLS trust roots | Security + release | Reject conflation of carrier authentication with mission membership, scope/topic access, Event acceptance, or application authority |
+
+## 6. Conditional pinned relay
+
+Exactly one of the two rows below is completed. No private trust material is
+ever recorded. DER trust-root certificates are public trust material; only
+their exact public certificate digests belong here.
+
+| Field | Applicability | Format | Owner | Rejection rule |
+|---|---|---|---|---|
+| Pinned relay used | Conditional: required when any relay claim is made | Exact sanitized relay ID/origin commitment, `direct_preferred`, customer-control attestation, explicit DER trust-root certificate digests, relay configuration digest, relay placement, loss/recovery receipt references and digests | Integration/physical-carrier + security | Reject WebPKI, `relay_only`, public/default fallback, hosted lookup, more than one relay, TLS bypass, private trust material, or missing relay-specific retained acceptance |
+| Relay not used | Conditional: required when no relay claim is made | Exact signed statement `relay not used`, signer role/identity, RFC 3339 UTC, statement digest | Integration + release | Reject silence about relay use, an unsigned statement, or any relay result/claim elsewhere in the annex |
+
+The relay remains carrier infrastructure, not an Aster durable store,
+application authority, Aster bridge, or payload-blind custody node.
+
+## 7. Participant inventories for the reusable base
+
+The base annex contains three separate inventories and three separate receipt
+sets for the 2-, 8-, and 20-node base scenarios. The same two physical nodes
+— one `x86_64` and one `aarch64` — are participants in all three tiers. A later
+customer annex may select one already-qualified architecture or tier only after
+the reusable base has qualified both architectures and all three tiers.
+
+### 7.1 Two-node inventory and receipt set
+
+| Field/group | Applicability | Format | Owner | Rejection rule |
+|---|---|---|---|---|
+| Inventory identity | Required | Scenario ID, inventory digest, exactly 2 participant rows, 2 physical/0 VM | Integration/device owner | Reject any count/shape mismatch or an inventory shared ambiguously with another tier |
+| Physical `x86_64` row | Required | Sanitized node ID, physical status, `x86_64`, device SKU, Ubuntu Server 24.04 release, exact Canonical kernel package/build, local `ext4`, CPU/RAM/state allocation, peer role, relay placement, network conditions | Integration/physical-carrier owner | Reject a VM, missing target fact, non-profile allocation, or failure to exchange Events with the physical `aarch64` node |
+| Physical `aarch64` row | Required | Sanitized node ID, physical status, `aarch64`, device SKU, Ubuntu Server 24.04 release, exact Canonical kernel package/build, local `ext4`, CPU/RAM/state allocation, peer role, relay placement, network conditions | Integration/physical-carrier owner | Reject a VM, missing target fact, non-profile allocation, or failure to exchange Events with the physical `x86_64` node |
+| Two-node receipt set | Required | Immutable index/digest of every applicable workload, lifecycle, resource, direct, and conditional-relay receipt for this exact inventory | Integration/device + release | Reject missing receipts, mutable index, digest mismatch, or results from a different inventory/environment |
+
+### 7.2 Eight-node inventory and receipt set
+
+| Field/group | Applicability | Format | Owner | Rejection rule |
+|---|---|---|---|---|
+| Inventory identity | Required | Scenario ID, inventory digest, exactly 8 participant rows, 2 physical/6 isolated VMs | Integration/device owner | Reject any count/shape mismatch or substitution of 8-VM/8-physical evidence |
+| Reused physical rows | Required | Exact two node IDs from 7.1, unchanged target facts, and explicit reuse statement | Integration/physical-carrier owner | Reject different physical nodes, architecture loss, or a claim of eight physical devices |
+| Six VM rows | Required | Per-VM sanitized ID, virtual status, architecture, Ubuntu Server 24.04 release, exact kernel package/build, local `ext4`, vCPU/RAM/state allocation, host ID, peer role, relay placement, and network conditions | Integration/device owner | Reject fewer/more than six rows, hidden co-tenancy, non-profile allocation, or an unrecorded virtual architecture |
+| VM allocation/oversubscription | Required | Per-host physical CPU/RAM/storage/network capacity, aggregate assigned VM resources, oversubscription ratios, scheduling limits, and shared-network effects | Integration/device owner | Reject absent allocation facts, unbounded oversubscription, or presentation as physical-device evidence |
+| Eight-node receipt set | Required | Immutable index/digest of every applicable workload, lifecycle, resource, direct, and conditional-relay receipt for this exact inventory | Integration/device + release | Reject missing receipts, mutable index, digest mismatch, or results from a different inventory/environment |
+
+### 7.3 Twenty-node inventory and receipt set
+
+| Field/group | Applicability | Format | Owner | Rejection rule |
+|---|---|---|---|---|
+| Inventory identity | Required | Scenario ID, inventory digest, exactly 20 participant rows, 2 physical/18 isolated VMs | Integration/device owner | Reject any count/shape mismatch or substitution of 20-VM/20-physical evidence |
+| Reused physical rows | Required | Exact two node IDs from 7.1 and 7.2, unchanged target facts, and explicit reuse statement | Integration/physical-carrier owner | Reject different physical nodes, architecture loss, or a claim of twenty physical devices |
+| Eighteen VM rows | Required | Per-VM sanitized ID, virtual status, architecture, Ubuntu Server 24.04 release, exact kernel package/build, local `ext4`, vCPU/RAM/state allocation, host ID, peer role, relay placement, and network conditions | Integration/device owner | Reject fewer/more than eighteen rows, hidden co-tenancy, non-profile allocation, or an unrecorded virtual architecture |
+| VM allocation/oversubscription | Required | Per-host physical CPU/RAM/storage/network capacity, aggregate assigned VM resources, oversubscription ratios, scheduling limits, and shared-network effects | Integration/device owner | Reject absent allocation facts, unbounded oversubscription, or presentation as physical-device evidence |
+| Twenty-node receipt set | Required | Immutable index/digest of every applicable workload, lifecycle, resource, direct, and conditional-relay receipt for this exact inventory | Integration/device + release | Reject missing receipts, mutable index, digest mismatch, or results from a different inventory/environment |
+
+## 8. Topology, configuration, emission, and harness limits
+
+| Field/group | Applicability | Format | Owner | Rejection rule |
+|---|---|---|---|---|
+| Scenario authority/content shape | Required per scenario | Exactly one mission authority, one scope, one topic, and one durable application subscription for the scenario; record sanitized IDs and configuration digest | Profile + integration | Reject zero/multiple values, one-subscription-per-node reinterpretation, or mismatch with mission identity fields |
+| Manual peers | Required per node | Zero to 19 exact operator-provided carrier-address/peer-identity bindings, serialized in canonical order with digest | Integration/physical-carrier | Reject more than 19, an arbitrary address replacement, an identity-free address, or a binding different from the run |
+| Discovery | Required | Exact value `off` plus effective-configuration receipt | Integration owner | Reject automatic discovery or missing effective-state proof |
+| Carrier paths | Required | Direct IP enabled; optional pinned relay state consistent with section 6; exact network-condition record digest | Integration/physical-carrier | Reject an unapproved carrier, public fallback, universal NAT claim, or unrecorded condition |
+| Store limits | Required per node | `storage.max_items = 10_000`; `storage.max_payload_bytes = 67_108_864`; initial free local state at least 256 MiB; effective-status receipt | Lifecycle/capacity + integration | Reject any larger value, missing effective proof, insufficient free space, or description as Event-only/physical-file limits |
+| Application connection limit | Required per node | `limits.max_connections = 1`, explicitly total application connections | Event-service + integration | Reject a larger value or reinterpretation as a per-client/identity limit |
+| In-flight application operations | Required per node | Maximum 8 node-global in-flight operations | Event-service + integration | Reject a larger value or per-connection accounting |
+| Emission mode | Required per node/run | Configured/effective `normal` or `receive_only`, startup timestamp, controlled-restart receipt for any change | Event-service + node + integration | Reject another mode, live mutation, configured/effective mismatch, or a radio-silence/zero-byte claim |
+| Local application clients | Required per node/run | Maximum one harness client | Integration owner | Reject more than one or promotion to a general runtime identity limit |
+| Page/scan limits | Required per run | Query page 16; gap page 16; delivery page 16; delivery scan 128; gap scan 128 | Integration + Event-service | Reject any deviation or the incorrect use of a 1,024-row delivery limit |
+| Unacknowledged deliveries | Required per node/run | Maximum 256 simultaneously unacknowledged deliveries | Integration + Event-service | Reject a larger or unmeasured maximum |
+| Payload boundary | Required per applicable run | Plaintext Event payloads 0 through 65,536 bytes | Integration owner | Reject a larger payload claim or characterization as an independently enforced server ceiling |
+| Operation boundary | Required per state-directory lifetime | Maximum 1,024 distinct accepted publish-operation keys; warning no later than 512; keys 1–256 bytes; exact retries add zero mappings | Lifecycle/capacity + integration | Reject new publication beyond 1,024, warning after 512, key reuse for changed intent, directory replacement as recovery, or claim of a generic store admission limit |
+| Mission timing | Required per soak | At most 48 continuous hours: exactly 24-hour disconnected publication followed by no more than 24 hours for reconnection/convergence/query/delivery/evidence | Integration owner | Reject a shorter substitute for a failed soak, publication beyond 24 hours, a reset calendar/state directory, or timing drift |
+
+## 9. Six-row workload matrix and thirteen acceptance conditions
+
+Each workload row records `pass`/`fail`/`not-run`, exact start/end times,
+inventory/configuration/artifact digests, actual counts and bounds, network
+conditions, and immutable receipt references/digests. The integration owner
+owns every row; the release owner rejects an absent or failing required row,
+any different workload, any receipt mismatch, or a summary without its receipt.
+The relay portion of applicable rows is conditional on section 6; direct
+coverage remains required.
+
+| Workload | Applicability | Format: nodes/payload/rate | Purpose and mandatory boundary | Owner | Rejection rule |
+|---|---|---|---|---|---|
+| API boundary | Required | 2 nodes; 0, 4 KiB, and 64 KiB; one exact Event at each boundary | Encoding, durable acceptance, transfer, query, delivery, and acknowledgement | Integration owner | Reject a missing payload boundary, more/fewer Events, changed node count, or unsupported receipt |
+| Small topology | Required | 2 nodes; 4 KiB; 10 Events total at 1 Event/s | Direct and conditional pinned-relay recovery | Integration/physical-carrier owner | Reject per-node reinterpretation, changed count/rate, missing direct coverage, or a missing conditional-relay disposition |
+| Intermediate topology | Required | 8 nodes; 4 KiB; 10 Events/node at 1 Event/s | Concurrent progress and bounded status | Integration/device owner | Reject changed count/rate, inventory mismatch, or missing concurrent-progress/bounded-status receipt |
+| Maximum topology | Required | 20 nodes; 4 KiB; 10 Events/node at 1 Event/s | Maximum peer and burst bracket | Integration/device owner | Reject changed count/rate, inventory mismatch, or a result beyond the declared maximum bracket |
+| Offline soak | Required for each of 2, 8, and 20 nodes | 2, 8, and 20 nodes separately; 4 KiB; 10 Events/hour/node for 24 hours | Disconnected publication, restart, later convergence, gaps, and capacity/resource behavior | Integration/device + Event-service owner | Reject a missing tier, shortened/restarted window, changed rate/payload, state replacement, or missing convergence/gap/resource receipt |
+| Capacity-warning probe | Required | 2 nodes; 4 KiB; 512 distinct local operations plus one exact retry | Audited operation usage, warning no later than 50%, and retry without growth | Lifecycle/capacity + integration owner | Reject a missing/late warning, retry growth, changed operation count, or hard-cap saturation substituted for this probe |
+
+The 64-KiB boundary is a payload boundary and bounded burst, not a sustained
+20-node soak. Every run starts from a fresh zero-workload state directory while
+retaining provisioning controls, and records final logical and physical
+headroom.
+
+For each acceptance row, record `pass`/`fail`/`not-run`, the exact claim,
+applicable workload/inventory IDs, producer, environment class, receipt
+reference, and receipt digest. The named owner reviews the row. Reject an
+`issue` if any row is absent, `fail`, `not-run`, based on changed inputs, or
+unsupported by its immutable receipt.
+
+| Acceptance condition | Applicability | Format / exact required result | Owner | Additional rejection rule |
+|---:|---|---|---|---|
+| 1 | Required | Clean locked source reproduces both packages and their SBOM, notices, provenance, and checksums through the approved build path | Deterministic-gate + deployment/release | Reject any non-reproducible or unbound output |
+| 2 | Required | `mise run check` passes deterministically; Event-service process acceptance and checked-in Go generation checks pass for the exact artifacts | Deterministic-gate + Event-service/API | Reject flaky/unretained reruns or different artifacts |
+| 3 | Required | Generic configuration validation has no state, provider-load, or listener side effects; the annex validator rejects every tested v0.1 deviation | Integration + profile | Reject side effects or silent promotion of broader generic values |
+| 4 | Required | Protected install/load, bearer rotation, provider/reference rotation, backup/recovery, revoke/rekey, and logical destroy pass without secret disclosure | Security + deployment + integration | Reject any missing lifecycle operation or privacy violation |
+| 5 | Required | Both architectures pass install, readiness, normal stop, forced process loss, same-version restart, upgrade, permitted rollback, and uninstall/state preservation on declared targets; tier inventories retain the approved physical/VM shape | Deployment/OS + integration/device | Reject missing architecture/tier, changed target, or VM evidence cited as physical evidence |
+| 6 | Required | Rust publishes/consumes through the normative API; Go performs the same black-box wire/API recovery path against the Rust server | API + Event-service + integration | Reject calling Go an independent server or omitting either client |
+| 7 | Required; relay subclaim conditional | The exact 2-, 8-, and 20-node workload matrix passes in the retained environment; optional relay includes relay-loss/direct-path recovery, or the annex explicitly says relay not used | Integration/physical-carrier | Reject generic loss/latency/bandwidth brackets or silent relay omission |
+| 8 | Required | Twenty-four-hour disconnected publication, intervening restart, later authenticated convergence, exact gaps, at-least-once redelivery, acknowledgement, and peerless reopen retain expected data | Integration + Event-service | Reject a shortened substitute, data loss, missing gap/replay evidence, or changed state |
+| 9 | Required | `receive_only` passes both carrier-identity orderings without identity manipulation; initiates no contact, discloses no local Event/control inventory, accepts inbound Events, exposes effective mode, and records mandatory response traffic as non-silence | Event-service + node + integration/physical-carrier | Reject one ordering, favorable regenerated identities, local disclosure/initiation, failure to ingest, or radio-silence wording |
+| 10 | Required | Operation/storage headroom, exact retry, changed-intent conflict, implementation-cap saturation, crash/reopen, and warning behavior are retained; post-retirement `ExpiredOrRetired` remains component-only evidence | Lifecycle/capacity + Event-service + integration | Reject black-box retirement claims, mapping reuse/deletion, or hard-cap evidence used to expand the supported workload |
+| 11 | Required | RSS, CPU, executable size, startup, stop, state growth, and energy are measured per architecture; every thresholded target passes and energy has no pass/fail claim | Integration/device + profile/release | Reject missing target measurements, threshold failure, or an invented energy threshold |
+| 12 | Required | Packet/log/error inspection finds no forbidden plaintext or credentials within the stated metadata budget | Security + integration/physical-carrier | Reject a secret/plaintext finding or a claim broader than the inspected surfaces |
+| 13 | Required | Release owner verifies every artifact/evidence digest, open-gate disposition, exact dependency graph, and annex before the signed evaluation decision | Release owner | Reject missing verification, an open evaluation-blocking row, or an unsigned decision |
+
+## 10. Evidence classification and claim isolation
+
+| Field/group | Applicability | Format | Owner | Rejection rule |
+|---|---|---|---|---|
+| Profile-qualification evidence | Required | Separate immutable index of black-box results against the exact packaged G3 artifacts and declared target/environment | Integration + release | Reject component/same-host evidence substituted for package, physical, provider, or release qualification |
+| Component evidence | Required when cited; otherwise signed `not cited` statement | Separate immutable index with exact component claim/non-claims and environment | Component owner + release | Reject presentation as black-box profile qualification or omission of environment/non-claims |
+| Post-payload-retirement behavior | Required as a classification statement | Exact statement: existing `ExpiredOrRetired` behavior is component evidence only; v0.1 has no black-box retirement trigger | Lifecycle/capacity + Event-service | Reject a black-box retirement claim or an inference of finite TTL/Event-content deletion |
+| Isolated engineering evidence | Required when cited; otherwise signed `not cited` statement | Separate immutable index with exact engineering claim/non-claims and environment | Engineering producer + lifecycle/capacity | Reject presentation as qualification or unsupported extrapolation |
+| Operation-map hard-cap saturation | Required as a classification statement | Exact statement: 4,096-row/512-KiB hard-cap saturation is isolated engineering evidence (or uses a test-only lower cap on the production transaction path) and does not expand the 1,024-operation workload claim | Lifecycle/capacity + release | Reject inclusion in the ordinary workload, capacity expansion, reclamation claim, or missing isolation |
+
+Same-host software tests, virtual/network-namespace tests, physical-device
+observations, generated-client checks, and independently implemented server
+evidence are distinct environment classes. One class never silently inherits
+the claims of another.
+
+## 11. Approved resource and capacity measurements
+
+Record the measured value, unit, method/procedure digest, architecture,
+workload/inventory ID, start/end state, result, receipt reference, and receipt
+digest for every row. Integration/device owns collection; the named co-owner
+reviews the result. Reject missing/unverifiable measurements, threshold failure,
+environment drift, or any changed target presented as v0.1.
+
+| Measurement | Applicability | Format / v0.1 threshold or treatment | Co-owner | Additional rejection rule |
+|---|---|---|---|---|
+| Stripped deployed executable | Required per architecture | No more than 16 MiB | Deployment/release | Reject non-provider-composed or nondeployed executable measurement |
+| Steady-state RSS | Required per architecture/scenario after declared stabilization | No more than 64 MiB | Profile/release | Reject absent stabilization definition or threshold failure |
+| Peak RSS | Required per architecture/scenario | No more than 128 MiB | Profile/release | Reject incomplete scenario observation or threshold failure |
+| Idle CPU | Required per architecture | No more than 5% of one core with no active contact or client request | Profile/release | Reject busy conditions labeled idle or threshold failure |
+| Readiness | Required per architecture for start/restart | Within 10 seconds | Deployment/OS | Reject readiness after threshold or detail-bearing unauthenticated health proof |
+| Graceful stop | Required per architecture | Within 30 seconds | Deployment/OS | Reject stop after threshold or loss of required durable state |
+| Initial state free space | Required per node/scenario | At least 256 MiB | Integration/device | Reject lower space or missing physical/filesystem measurement |
+| State growth/final free space | Required per node/scenario | Measure physical database/filesystem growth and final free space; no added threshold beyond profile admission/headroom | Lifecycle/capacity + profile | Reject omission, plaintext-only arithmetic used as byte-fit evidence, or invented threshold |
+| Logical item use | Required per node/scenario | Measured against 10,000 aggregate items and the 5,840 ordinary-slot budget; maximum-soak projection is 5,040 ordinary items with 800 projected slots remaining | Lifecycle/capacity | Reject Event-only accounting, omitted control/reserve rows, or projection substituted for audited composition |
+| Logical byte use | Required per node/scenario | Measured against 67,108,864 aggregate logical bytes and 50,266,112 ordinary logical bytes after reserves | Lifecycle/capacity | Reject physical amplification conflation or unsupported byte-fit claim |
+| Operation-map rows/bytes | Required per node/scenario | Actual rows/bytes; hard ceilings 4,096 rows/512 KiB; profile boundary 1,024 distinct operations | Lifecycle/capacity | Reject unaudited counts, hard-cap/profile-boundary conflation, or workload beyond 1,024 |
+| Operation headroom/warning | Required per node/scenario | Remaining profile headroom; actionable warning no later than 512 operations | Lifecycle/capacity | Reject negative/missing headroom, late warning, or a warning treated as pass |
+| Physical-target energy | Required for each physical `x86_64` and `aarch64` target | Measured and reported with method/environment; no v0.1 pass/fail threshold | Integration/physical-carrier + profile | Reject omission or assignment of a qualification threshold |
+
+Network/block-I/O metrics, extra runtime fingerprints, fleet fields, and SLOs
+are not v0.1 qualification fields. They may appear only in a clearly separate
+informational appendix that is outside the annex decision and cannot fail or
+broaden this profile.
+
+## 12. Immutable receipt index
+
+Create one row per retained receipt. Summaries and aggregate tables never
+replace this index.
+
+| Field | Applicability | Format | Owner | Rejection rule |
+|---|---|---|---|---|
+| Receipt identity and digest | Required per receipt | Unique sanitized receipt ID, immutable reference, byte size, media type, and `sha256:<hex>` | Receipt producer | Reject a mutable/missing reference, digest/size mismatch, or duplicate identity |
+| Producer | Required per receipt | Sanitized producer identity, accountable role, producer tool/version digest, and RFC 3339 production time | Receipt producer + relevant gate owner | Reject an unknown producer, missing role, or mutable/unversioned producer |
+| Environment class | Required per receipt | Exactly one primary class: `same-host-software`, `virtual-or-network-namespace`, `physical-device`, or `independent-server`; add exact environment/inventory digest | Integration + release | Reject ambiguous class, unrecorded virtualization, or physical/independent overclaim |
+| Exact claim | Required per receipt | Bounded declarative claim tied to exact artifact/config/provider/inventory/workload IDs | Relevant gate owner | Reject a claim broader than recorded observations or detached from the exact candidate |
+| Explicit non-claims | Required per receipt | Nonempty list of material exclusions, including inapplicable physical, independent, package, provider, or release claims | Relevant gate owner + release | Reject absent non-claims or silent inheritance from another evidence class |
+| Verification/replay | Required per receipt | Exact verification command/procedure digest, result, and any controlled-storage dependency | Deterministic-gate + release | Reject if the receipt cannot be verified, required raw custody is unavailable, or secrets would enter the repository |
+
+## 13. G1-G6 dependency and exit matrix
+
+Each row records the gate status, owners, predecessor exit digests, immutable
+exit-artifact references/digests, reviewed time, and signature/approval record.
+The release owner rejects an `issue` if a required digest is absent, a gate is
+not `pass`, an input changed, or the serial dependency was bypassed.
+
+| Gate | Applicability | Dependency | Format / required exit | Primary owner | Rejection rule |
+|---|---|---|---|---|---|
+| G1 — Event baseline | Required antecedent record | None | Accepted Event-service baseline plus frozen emission/capacity contract; immutable exit digests | Event-service + node + lifecycle/capacity | Reject an unaccepted baseline or an unfrozen contract; G2 cannot start |
+| G2 — Source/API freeze | Required | G1 pass | ReceiveOnly and capacity behavior merged; focused tests pass; one source/API commit and exit digest frozen | Event-service + node + deterministic-gate | Reject source/API drift or failed/missing focused tests; G3 cannot start |
+| G3 — Artifact freeze | Required | G2 pass | Reproducibly built and signed provider-composed packages for both architectures from G2; exact artifact-set and exit digests | Deployment + security + release | Reject either architecture, nonreproducibility, failed authentication, or any source other than G2; G4/G5 cannot use another artifact |
+| G4 — Focused target tests | Required | G3 pass | Install, lifecycle, Rust/Go API, ReceiveOnly, direct and conditional-relay scenarios pass using unchanged G3 artifacts; exit digests | Integration/physical-carrier + security | Reject any failed/missing required case or artifact drift; G5 qualification cannot substitute for G4 |
+| G5 — Workload qualification | Required | G3 and G4 pass | 2-/8-/20-node and 24-hour scenarios pass from G3 with distinct signed inventories and immutable exit digests | Integration/device + physical-carrier | Reject a missing tier, altered artifact/environment, ambiguous participant, shortened soak, or missing receipt |
+| G6 — Disposition | Required | G1–G5 pass in order for `issue` | Receipt review, deterministic-gate rerun, and signed `issue`/`refuse`/`defer` decision over the exact G3 artifact set and completed-annex digest | Release owner with all final roles | Reject issue if any prior gate is absent/failing, any evaluation blocker remains, a digest changed, or the decision is unsigned |
+
+## 14. Exact `DM-8-05` proposal and three approvals
+
+The proposal is evaluation-only, adds no general license allowlist, and does not
+close the formal production requirement.
+
+| Field | Applicability | Format | Owner | Rejection rule |
+|---|---|---|---|---|
+| Proposal identity | Required | Immutable reference and exact digest of `dm-8-05-linux-event-v0.1-disposition.md` | Dependency/license + release | Reject a mutable/missing proposal or digest mismatch |
+| Exact coordinates | Required | `webpki-root-certs` `1.0.9` / `b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b` / `CDLA-Permissive-2.0`; `webpki-roots` `1.0.9` / `7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a` / `CDLA-Permissive-2.0` | Dependency/license owner | Reject package, version, source, checksum, reachability, dependency-graph, license, SBOM, or notice drift |
+| Dependency approval | Required | Reviewer identity, dependency/license role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate set, proposal digest, signed approval-record reference/digest | Dependency/license owner | Reject a missing/refusing/unsigned record or one that does not bind every exact tuple and proposal digest |
+| Legal approval | Required | Reviewer identity, legal role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate set, proposal digest, signed approval-record reference/digest | Legal/compliance owner | Reject a missing/refusing/unsigned record or one that does not bind every exact tuple and proposal digest |
+| Release approval | Required | Reviewer identity, release role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate set, proposal digest, signed approval-record reference/digest | Release owner | Reject a missing/refusing/unsigned record or one that does not bind every exact tuple and proposal digest |
+| Production limitation | Required | Signed statement that `DM-8-05` remains formally open and production-blocking after any evaluation approval | Dependency/license + legal + release | Reject any production authorization, general allowlist, WebPKI/public-relay authorization, or claim that the requirement is closed |
+
+## 15. Final role approvals and completed-annex signature
+
+Each approval binds the frozen schema version/digest, completed annex digest,
+candidate ID, exact G3 artifact-set digest, decision, role, reviewer identity,
+and RFC 3339 UTC. Every approval is required for `issue`; for `refuse` or
+`defer`, record the approvals obtained and the exact missing/refusing roles.
+
+| Approval | Applicability | Format | Owner | Rejection rule |
+|---|---|---|---|---|
+| Profile/product | Required for issue | Signed immutable approval record and digest | Profile/product owner | Reject issue if absent, refusing, unsigned, or bound to a different annex/schema/artifact set |
+| Security | Required for issue | Signed immutable approval record and digest | Security owner | Reject issue if absent, refusing, unsigned, or bound to a different annex/schema/artifact set |
+| Deployment/OS and artifact | Required for issue | Signed immutable approval record and digest | Deployment/OS/artifact owner | Reject issue if absent, refusing, unsigned, or bound to a different annex/schema/artifact set |
+| Integration/device/physical carrier | Required for issue | Signed immutable approval record and digest | Integration/device/physical-carrier owner | Reject issue if absent, refusing, unsigned, or bound to a different annex/schema/artifact set |
+| Event-service/API/runtime | Required for issue | Signed immutable approval record and digest | Event-service/API/runtime owner | Reject issue if absent, refusing, unsigned, or bound to a different annex/schema/artifact set |
+| Deterministic gate | Required for issue | Signed immutable approval record and digest | Deterministic-gate owner | Reject issue if absent, refusing, unsigned, or bound to a different annex/schema/artifact set |
+| Dependency/license | Required for issue | Signed immutable approval record and digest | Dependency/license owner | Reject issue if absent, refusing, unsigned, or bound to a different annex/schema/artifact set |
+| Legal/compliance | Required for issue | Signed immutable approval record and digest | Legal/compliance owner | Reject issue if absent, refusing, unsigned, or bound to a different annex/schema/artifact set |
+| Release decision | Required | Signed immutable `issue`/`refuse`/`defer` record over the completed-annex digest and exact G3 artifact-set digest | Release owner | Reject an unsigned, ambiguous, or mismatched final decision; issue is forbidden unless all other required approvals and gates pass |
+
+The completed annex digest is computed only after every applicable field and
+receipt reference is final. No signature may stand in for a missing fact,
+receipt, gate, or approval.
+
+## Annex rejection rules
+
+Reject an annex as support for qualification if:
+
+- a required value is absent, mutable, ambiguous, or unverifiable;
+- a digest, artifact-authentication, approval, or signature check fails;
+- source, artifacts, configuration, provider, or test environment differs
+  across dependent gates without a new candidate;
+- either architecture or any base tier is missing;
+- topology, workload, limit, or timing differs from the profile;
+- an evaluation-blocking register row remains open;
+- a summary lacks its immutable receipt;
+- component or engineering evidence is presented as black-box qualification;
+- a warning or the 2026-09-13 checkpoint is treated as a pass; or
+- a secret, credential, private key, bearer token, mission plaintext, private
+  trust material, or unsanitized customer identity is embedded.
+
+A rejected `issue` claim may still be preserved as a signed `refuse` or `defer`
+decision with the exact failures and receipts. It does not become qualification
+evidence.
+
+## Schema and annex lifecycle
+
+After owner review, schema freeze gets a reviewed version and digest. Changing a
+frozen required field or evidence boundary creates a new schema revision and
+invalidates incomplete candidate annexes; it never rewrites an issued annex.
+
+An issued annex, its v0.1 claim, and receipt bundle are immutable. An editorial
+correction that changes no boundary produces v0.1.1. Any changed target,
+behavior, gate, or evidence boundary produces v0.2, retains the prior annex for
+audit, and requires a new candidate decision. Deleting or replacing a state
+directory, restarting the mission calendar, or changing source, artifact,
+provider, configuration, or environment never repairs an incomplete or failed
+candidate.
