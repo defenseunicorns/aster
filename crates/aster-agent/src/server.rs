@@ -353,6 +353,25 @@ fn first_authentication_deadline(
     admitted_at + timeout
 }
 
+async fn drive_connection<F>(
+    connection: F,
+    connection_auth: ConnectionAuthState,
+    first_authentication_deadline: tokio::time::Instant,
+) where
+    F: Future,
+{
+    tokio::pin!(connection);
+    let first_authentication = tokio::time::sleep_until(first_authentication_deadline);
+    tokio::pin!(first_authentication);
+    tokio::select! {
+        _ = connection.as_mut() => {}
+        () = connection_auth.authenticated() => {
+            let _ = connection.as_mut().await;
+        }
+        () = first_authentication.as_mut() => {}
+    }
+}
+
 /// A response body that owns an in-flight permit until the complete body has
 /// been consumed or the caller cancels by dropping it.
 pub struct PermitBody<B> {
@@ -495,21 +514,15 @@ impl BoundAgent {
                             .http2()
                             .max_header_list_size(limits.max_header_bytes() as u32)
                             .max_concurrent_streams(APPLICATION_HTTP2_STREAMS);
-                        let connection = watcher.watch(builder.serve_connection(
-                            TokioIo::new(stream),
-                            TowerToHyperService::new(gate),
-                        ));
-                        tokio::pin!(connection);
-                        let first_authentication =
-                            tokio::time::sleep_until(first_authentication_deadline);
-                        tokio::pin!(first_authentication);
-                        tokio::select! {
-                            _ = connection.as_mut() => {}
-                            () = connection_auth.authenticated() => {
-                                let _ = connection.as_mut().await;
-                            }
-                            () = first_authentication.as_mut() => {}
-                        }
+                        drive_connection(
+                            watcher.watch(builder.serve_connection(
+                                TokioIo::new(stream),
+                                TowerToHyperService::new(gate),
+                            )),
+                            connection_auth,
+                            first_authentication_deadline,
+                        )
+                        .await;
                     });
                 }
                 Some(_) = connections.join_next() => {}
@@ -1058,11 +1071,23 @@ mod tests {
             "task scheduling must consume the connection's authentication budget"
         );
 
-        let expiry = tokio::spawn(tokio::time::sleep_until(deadline));
+        let connection = tokio::spawn(drive_connection(
+            std::future::pending::<()>(),
+            ConnectionAuthState::detached(),
+            deadline,
+        ));
         tokio::task::yield_now().await;
-        assert!(!expiry.is_finished());
-        tokio::time::advance(Duration::from_secs(1)).await;
-        expiry.await.expect("deadline task joins");
+        assert!(!connection.is_finished());
+        tokio::time::advance(Duration::from_millis(999)).await;
+        tokio::task::yield_now().await;
+        assert!(!connection.is_finished());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            connection.is_finished(),
+            "the production driver must close at the admission-derived deadline"
+        );
+        connection.await.expect("connection driver joins");
     }
 
     #[tokio::test]
