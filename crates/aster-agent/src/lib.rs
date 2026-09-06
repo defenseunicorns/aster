@@ -12,17 +12,14 @@ pub mod credentials;
 pub mod error;
 pub mod health;
 pub mod lifecycle;
+#[cfg(feature = "server")]
+pub mod server;
 mod service;
 
 pub use credentials::ClientToken;
 pub use error::{PublicOperation, connect_application_error, public_error};
 
-use std::time::Duration;
-
 use aster_node::application::SelectedEventHandle;
-use connectrpc::{ConnectError, ErrorCode, RequestContext};
-
-use service::AsterConnectService;
 
 /// Generated, repository-owned application protocol.
 pub mod proto {
@@ -42,56 +39,12 @@ pub const MIN_STREAM_BACKOFF_MS: u32 = 100;
 /// Maximum accepted delay following any delivered or caught-up streaming poll.
 pub const MAX_STREAM_BACKOFF_MS: u32 = 60_000;
 
-#[derive(Clone)]
-struct BearerAuth {
-    token: ClientToken,
-}
-
-impl BearerAuth {
-    fn authorize(&self, ctx: &RequestContext) -> Result<(), ConnectError> {
-        if self
-            .token
-            .authorizes(ctx.header("authorization").map(|value| value.as_bytes()))
-        {
-            Ok(())
-        } else {
-            Err(public_error(
-                ErrorCode::Unauthenticated,
-                api::PublicErrorReason::AuthenticationFailed,
-                PublicOperation::Unspecified,
-                false,
-                None,
-            ))
-        }
-    }
-}
-
-#[connectrpc::async_trait]
-impl connectrpc::Interceptor for BearerAuth {
-    async fn intercept_unary(
-        &self,
-        request: connectrpc::interceptor::UnaryRequest,
-        next: connectrpc::Next<'_>,
-    ) -> Result<connectrpc::interceptor::UnaryResponse, ConnectError> {
-        self.authorize(&request.ctx)?;
-        next.run(request).await
-    }
-
-    async fn intercept_streaming(
-        &self,
-        request: connectrpc::interceptor::StreamRequest,
-        inbound: connectrpc::PayloadStream,
-        next: connectrpc::NextStream<'_>,
-    ) -> Result<connectrpc::interceptor::StreamResponse, ConnectError> {
-        self.authorize(&request.ctx)?;
-        next.run(request, inbound).await
-    }
-}
-
-/// A loopback-bound ConnectRPC listener that has not begun serving.
+/// Compatibility entry point for the existing development CLI. Its serving
+/// path delegates to the bounded pre-body server; Task 6 replaces this adapter
+/// with the customer runtime supervisor.
 #[cfg(feature = "server")]
 pub struct BoundAgent {
-    server: connectrpc::BoundServer,
+    server: server::BoundAgent,
 }
 
 #[cfg(feature = "server")]
@@ -104,13 +57,13 @@ impl BoundAgent {
             return Err("the plaintext Aster agent may bind only to a loopback address".into());
         }
         Ok(Self {
-            server: connectrpc::Server::bind(address).await?,
+            server: server::BoundAgent::bind(address).await?,
         })
     }
 
     /// Returns the exact address selected by the operating system.
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
-        self.server.local_addr()
+        self.server.local_addr().map_err(std::io::Error::other)
     }
 
     /// Serves until shutdown, closing active streams before transport drain.
@@ -118,122 +71,41 @@ impl BoundAgent {
         self,
         events: SelectedEventHandle,
         token: ClientToken,
-        shutdown: tokio::sync::watch::Receiver<bool>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let router = AsterConnectService::new(events, shutdown.clone()).router();
-        let limits = connectrpc::Limits::default()
-            .with_max_request_body_size(MAX_AGENT_MESSAGE_BYTES)
-            .with_max_message_size(MAX_AGENT_MESSAGE_BYTES)
-            .with_element_memory_limit(MAX_AGENT_ELEMENT_MEMORY_BYTES);
-        let deadline = connectrpc::DeadlinePolicy::new()
-            .with_min(Duration::from_millis(10))
-            .with_max(Duration::from_secs(30))
-            .with_default_timeout(Duration::from_secs(10));
-        let service = connectrpc::ConnectRpcService::new(router)
-            .with_limits(limits)
-            .with_deadline_policy(deadline)
-            .with_interceptor(BearerAuth { token });
-        self.server
-            .with_max_concurrent_streams(32)
-            .with_max_connection_idle(Duration::from_secs(60))
-            .with_max_connection_age(Duration::from_secs(30 * 60))
-            .with_max_connection_age_grace(Duration::from_secs(5))
-            .with_http2_keepalive_interval(Duration::from_secs(30))
-            .with_http2_keepalive_timeout(Duration::from_secs(10))
-            .serve_with_service_and_shutdown(service, shutdown_requested(shutdown))
-            .await
-    }
-}
-
-async fn shutdown_requested(mut shutdown: tokio::sync::watch::Receiver<bool>) {
-    while !*shutdown.borrow() {
-        if shutdown.changed().await.is_err() {
-            return;
-        }
+        let service = service::application_service(events, shutdown.clone());
+        let status = lifecycle::ServiceStatus::starting();
+        status.transition(lifecycle::LifecycleState::Ready)?;
+        let reloadable = credentials::ReloadableClientToken::new(token);
+        let (stop_send, stop_receive) = tokio::sync::watch::channel(server::ServerStop::Run);
+        let stop_status = status.clone();
+        let stop_task = tokio::spawn(async move {
+            while !*shutdown.borrow() {
+                if shutdown.changed().await.is_err() {
+                    break;
+                }
+            }
+            let _ = stop_status.transition(lifecycle::LifecycleState::Draining);
+            let _ = stop_send.send(server::ServerStop::Drain);
+        });
+        let result = self
+            .server
+            .serve(
+                service,
+                reloadable,
+                status,
+                config::AgentLimits::default(),
+                stop_receive,
+            )
+            .await;
+        stop_task.abort();
+        result.map_err(Into::into)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use buffa::{Message as _, MessageName as _};
-    use connectrpc::ErrorCode;
-
     use super::*;
-
-    fn decode_base64(value: &str) -> Vec<u8> {
-        fn sextet(byte: u8) -> u8 {
-            match byte {
-                b'A'..=b'Z' => byte - b'A',
-                b'a'..=b'z' => byte - b'a' + 26,
-                b'0'..=b'9' => byte - b'0' + 52,
-                b'+' => 62,
-                b'/' => 63,
-                _ => panic!("invalid base64 fixture"),
-            }
-        }
-
-        let mut decoded = Vec::new();
-        for chunk in value.as_bytes().chunks(4) {
-            let a = sextet(chunk[0]);
-            let b = sextet(chunk[1]);
-            decoded.push((a << 2) | (b >> 4));
-            if chunk.len() > 2 && chunk[2] != b'=' {
-                let c = sextet(chunk[2]);
-                decoded.push((b << 4) | (c >> 2));
-                if chunk.len() > 3 && chunk[3] != b'=' {
-                    decoded.push((c << 6) | sextet(chunk[3]));
-                }
-            }
-        }
-        decoded
-    }
-
-    fn assert_authentication_failure(error: &ConnectError) {
-        assert_eq!(error.code, ErrorCode::Unauthenticated);
-        assert_eq!(error.message.as_deref(), Some("authentication failed"));
-        assert_eq!(error.details.len(), 1);
-        let detail = &error.details[0];
-        assert_eq!(detail.type_url, api::PublicErrorDetail::FULL_NAME);
-        assert!(detail.debug.is_none());
-        let wire = decode_base64(detail.value.as_deref().expect("encoded detail"));
-        let detail = api::PublicErrorDetail::decode_from_slice(&wire)
-            .expect("decodable public authentication detail");
-        assert_eq!(detail.reason, api::PublicErrorReason::AuthenticationFailed);
-        assert_eq!(detail.operation, "unspecified");
-        assert!(!detail.retryable);
-        assert_eq!(detail.retry_delay_ms, None);
-    }
-
-    #[test]
-    fn missing_and_invalid_bearer_credentials_are_indistinguishable_and_sanitized() {
-        const INVALID_CREDENTIAL_CANARY: &str = "Bearer invalid-credential-canary-0123456789abcdef";
-        let auth = BearerAuth {
-            token: ClientToken::from_bytes(b"0123456789abcdef-._~ABCDEFGHIJKL".to_vec())
-                .expect("valid token"),
-        };
-
-        let missing = auth
-            .authorize(&RequestContext::new(Default::default()))
-            .expect_err("missing bearer credential must fail");
-        let mut invalid_context = RequestContext::new(Default::default());
-        invalid_context.headers_mut().insert(
-            "authorization",
-            INVALID_CREDENTIAL_CANARY
-                .parse()
-                .expect("valid authorization header fixture"),
-        );
-        let invalid = auth
-            .authorize(&invalid_context)
-            .expect_err("invalid bearer credential must fail");
-
-        assert_authentication_failure(&missing);
-        assert_authentication_failure(&invalid);
-        assert_eq!(
-            serde_json::to_value(&missing).expect("serializable missing-credential error"),
-            serde_json::to_value(&invalid).expect("serializable invalid-credential error")
-        );
-        assert!(!format!("{invalid:?}").contains(INVALID_CREDENTIAL_CANARY));
-    }
 
     #[test]
     fn plaintext_listener_rejects_non_loopback_before_binding() {

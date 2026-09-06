@@ -19,6 +19,8 @@ use crate::{
 
 use api::AsterApplicationServiceExt as _;
 
+const APPLICATION_SERVICE_NAME: &str = api::ASTER_APPLICATION_SERVICE_SERVICE_NAME;
+
 /// High-level ConnectRPC service backed by the running node's sole authority.
 #[derive(Clone)]
 pub(crate) struct AsterConnectService {
@@ -39,6 +41,100 @@ impl AsterConnectService {
     pub(crate) fn router(self) -> connectrpc::Router {
         Arc::new(self).register(connectrpc::Router::new())
     }
+}
+
+pub(crate) fn application_service(
+    events: SelectedEventHandle,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> connectrpc::ConnectRpcService<connectrpc::Router> {
+    configured_service(AsterConnectService::new(events, shutdown).router())
+}
+
+pub(crate) fn configured_service(
+    router: connectrpc::Router,
+) -> connectrpc::ConnectRpcService<connectrpc::Router> {
+    let limits = connectrpc::Limits::default()
+        .with_max_request_body_size(crate::MAX_AGENT_MESSAGE_BYTES)
+        .with_max_message_size(crate::MAX_AGENT_MESSAGE_BYTES)
+        .with_element_memory_limit(crate::MAX_AGENT_ELEMENT_MEMORY_BYTES);
+    let deadline = connectrpc::DeadlinePolicy::new()
+        .with_min(Duration::from_millis(10))
+        .with_max(Duration::from_secs(30))
+        .with_default_timeout(Duration::from_secs(10));
+    connectrpc::ConnectRpcService::new(router)
+        .with_limits(limits)
+        .with_deadline_policy(deadline)
+}
+
+fn rejection_handler<Req, Res>() -> impl connectrpc::BidiStreamingHandler<Req, Res, Item = Res>
+where
+    Req: buffa::Message + connectrpc::codec::JsonDeserialize + Send + 'static,
+    Res: buffa::Message + connectrpc::codec::JsonSerialize + Send + 'static,
+{
+    connectrpc::bidi_streaming_handler_fn(|_ctx, _requests: connectrpc::ServiceStream<Req>| async {
+        Err::<connectrpc::Response<connectrpc::ServiceStream<Res>>, _>(ConnectError::internal(
+            "request rejected",
+        ))
+    })
+}
+
+/// Builds shape-compatible rejection routes. Every route is deliberately
+/// registered as bidirectional streaming so gRPC and gRPC-Web can reach the
+/// first interceptor with an empty replacement body; that interceptor always
+/// rejects before this fallback handler can run.
+pub(crate) fn rejection_router() -> connectrpc::Router {
+    connectrpc::Router::new()
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "GetStatus",
+            rejection_handler::<api::GetStatusRequest, api::GetStatusResponse>(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "PublishEvent",
+            rejection_handler::<api::PublishEventRequest, api::PublishEventResponse>(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "QueryEvents",
+            rejection_handler::<api::QueryEventsRequest, api::QueryEventsResponse>(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "CreateEventSubscription",
+            rejection_handler::<
+                api::CreateEventSubscriptionRequest,
+                api::CreateEventSubscriptionResponse,
+            >(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "PollEvents",
+            rejection_handler::<api::PollEventsRequest, api::PollEventsResponse>(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "StreamEvents",
+            rejection_handler::<api::StreamEventsRequest, api::StreamEventsResponse>(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "AcknowledgeEvent",
+            rejection_handler::<api::AcknowledgeEventRequest, api::AcknowledgeEventResponse>(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "DeleteEventSubscription",
+            rejection_handler::<
+                api::DeleteEventSubscriptionRequest,
+                api::DeleteEventSubscriptionResponse,
+            >(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "QueryEventGaps",
+            rejection_handler::<api::QueryEventGapsRequest, api::QueryEventGapsResponse>(),
+        )
 }
 
 #[allow(refining_impl_trait)]

@@ -67,6 +67,21 @@ forwarding, Event bridges, and dynamic bridge administration.
     sole-authority architecture. Add only stable sanitized public reason and
     retry-guidance details.
 
+### Direct dependency admission for pre-body serving
+
+The pre-body gate and bounded application accept loop directly admit Hyper
+1.11.0, hyper-util 0.1.20, and Tower 0.5.3, together with the helper crates
+bytes 1.12.1, http 1.5.0, http-body-util 0.1.5, Tokio 1.53.1, and tower-service
+0.3.3. Each is an MIT-licensed public crates.io dependency, and every admitted
+version was already present transitively under the pinned ConnectRPC 0.9.0
+dependency. These dependencies provide the generic Tower pre-body service
+boundary, empty replacement and permit-owning response bodies, protocol-aware
+Hyper connection serving, bounded timers and semaphores, and the Tower-to-Hyper
+adapter. The custom accept loop is necessary because the pinned ConnectRPC
+server's public serve method accepts `ConnectRpcService`, rather than a wrapped
+generic Tower service where authentication can run before the network body is
+polled or decoded.
+
 ## Ownership and acceptance
 
 The Event-service workstream owns runtime configuration, pre-body
