@@ -746,6 +746,57 @@ def wait_for_process_pair(
     raise AssertionError("unreachable process-pair state")
 
 
+def cleanup_and_capture_processes(
+    captures: CaptureLedger,
+    registry: ProcessRegistry,
+    processes: Sequence[ManagedProcess],
+    timeout_seconds: float,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    first_error: AcceptanceError | None = None
+    for process in processes:
+        try:
+            process.cleanup(max(0.01, deadline - time.monotonic()))
+        except AcceptanceError as error:
+            if first_error is None:
+                first_error = error
+    outputs: list[str] = []
+    for process in processes:
+        stdout, _ = process.stdout.snapshot()
+        stderr, _ = process.stderr.snapshot()
+        outputs.extend((stdout, stderr))
+    try:
+        captures.extend(outputs)
+    finally:
+        for process in processes:
+            registry.discard(process)
+    if first_error is not None:
+        raise first_error
+
+
+def wait_for_process_pair_captured(
+    captures: CaptureLedger,
+    registry: ProcessRegistry,
+    first: ManagedProcess,
+    second: ManagedProcess,
+    timeout_seconds: int,
+) -> tuple[int, int]:
+    result: tuple[int, int] | None = None
+    wait_error: Exception | None = None
+    try:
+        result = wait_for_process_pair(first, second, timeout_seconds)
+    except Exception as error:
+        wait_error = error
+    cleanup_and_capture_processes(
+        captures, registry, (first, second), timeout_seconds
+    )
+    if wait_error is not None:
+        raise wait_error
+    if result is None:
+        raise AssertionError("process-pair result was unavailable")
+    return result
+
+
 @dataclasses.dataclass(frozen=True)
 class ClientResult:
     return_code: int
@@ -838,13 +889,14 @@ def invoke_client(
             registry.discard(process)
     stdout, stdout_complete = process.stdout.snapshot()
     stderr, stderr_complete = process.stderr.snapshot()
+    capture_cleanup_complete = cleanup_error is None
     failed_result = ClientResult(
         return_code,
         stdout,
         stderr,
         {},
-        stdout_capture_complete=stdout_complete,
-        stderr_capture_complete=stderr_complete,
+        stdout_capture_complete=stdout_complete and capture_cleanup_complete,
+        stderr_capture_complete=stderr_complete and capture_cleanup_complete,
     )
     if attempt_error is not None or cleanup_error is not None or not failed_result.capture_complete:
         cause = attempt_error or cleanup_error
@@ -913,6 +965,8 @@ def start_active_client(
     token_file: Path,
     timeout_seconds: int,
     request: dict[str, Any],
+    *,
+    captures: CaptureLedger,
 ) -> ManagedProcess:
     phase = {"status": "unary", "stream": "stream"}.get(command, "activity")
     process = registry.spawn(
@@ -922,8 +976,9 @@ def start_active_client(
     try:
         process.wait_for_stdout_activity('"status":"active"', timeout_seconds, phase)
     except Exception:
-        process.cleanup(timeout_seconds)
-        registry.discard(process)
+        cleanup_and_capture_processes(
+            captures, registry, (process,), timeout_seconds
+        )
         raise
     return process
 
@@ -1438,16 +1493,24 @@ def run_acceptance_with_token(
     ) -> None:
         agent.signal(signal.SIGTERM)
         try:
-            agent_code, client_code = wait_for_process_pair(
-                agent, client, arguments.timeout_seconds
+            agent_code, client_code = wait_for_process_pair_captured(
+                captures,
+                registry,
+                agent,
+                client,
+                arguments.timeout_seconds,
             )
         except AcceptanceError as error:
+            agent_stdout, _ = agent.stdout.snapshot()
+            agent_stderr, _ = agent.stderr.snapshot()
+            client_stdout, _ = client.stdout.snapshot()
+            client_stderr, _ = client.stderr.snapshot()
             print(
                 sanitized_agent_diagnostic(
                     phase,
                     agent.process.poll() if agent.process.poll() is not None else -1,
-                    agent.stdout.text(),
-                    agent.stderr.text(),
+                    agent_stdout,
+                    agent_stderr,
                 ),
                 file=sys.stderr,
             )
@@ -1455,17 +1518,12 @@ def run_acceptance_with_token(
                 sanitized_client_diagnostic(
                     phase,
                     client.process.poll() if client.process.poll() is not None else -1,
-                    client.stdout.text(),
-                    client.stderr.text(),
+                    client_stdout,
+                    client_stderr,
                 ),
                 file=sys.stderr,
             )
             raise AcceptanceError(f"{phase} drain did not finish within the bound") from error
-        captures.extend((agent.combined(), client.combined()))
-        agent.cleanup(arguments.timeout_seconds)
-        client.cleanup(arguments.timeout_seconds)
-        registry.discard(agent)
-        registry.discard(client)
         client_outcome_is_expected = expected_drain_client_outcome(
             phase, client_code, client.stdout.text(), client.stderr.text()
         )
@@ -1606,6 +1664,7 @@ def run_acceptance_with_token(
                 contract.token_file,
                 arguments.timeout_seconds,
                 {"repeat_until_error": True},
+                captures=captures,
             )
             drain_with_active_client(agent, unary, "unary")
 
@@ -1624,6 +1683,7 @@ def run_acceptance_with_token(
                     "poll_backoff_ms": 100,
                     "count": 1,
                 },
+                captures=captures,
             )
             drain_with_active_client(agent, streaming, "stream")
             receipt_names.append("graceful-drain")

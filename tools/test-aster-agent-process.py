@@ -411,6 +411,32 @@ class ProcessCheckerContractTests(unittest.TestCase):
             self.assertTrue(caught.exception.result.capture_complete)
             self.assertIn("SECRET_TIMEOUT_CANARY", captures.text())
 
+    def test_cleanup_failure_marks_client_capture_incomplete(self) -> None:
+        # Break caught: cleanup can fail while a reader remains live, so a
+        # snapshot that has not observed overflow yet must not claim complete.
+        checker = load_checker()
+        process = mock.Mock()
+        process.wait.return_value = 0
+        process.cleanup.side_effect = checker.AcceptanceError(
+            "process output cleanup exceeded the bound"
+        )
+        process.stdout.snapshot.return_value = ("partial-stdout", True)
+        process.stderr.snapshot.return_value = ("partial-stderr", True)
+        registry = mock.Mock()
+        registry.spawn.return_value = process
+        with self.assertRaises(checker.ClientInvocationError) as caught:
+            checker.invoke_client(
+                registry,
+                Path("/packaged-client"),
+                "status",
+                "127.0.0.1:1",
+                Path("/client-token"),
+                1,
+            )
+        self.assertFalse(caught.exception.result.capture_complete)
+        self.assertEqual(caught.exception.result.stdout, "partial-stdout")
+        self.assertEqual(caught.exception.result.stderr, "partial-stderr")
+
     def test_client_attempt_uses_the_reload_deadline_remaining_budget(self) -> None:
         # Break caught: giving a retry the original full timeout lets an
         # attempt started near the reload deadline overrun the phase bound.
@@ -616,6 +642,7 @@ class ProcessCheckerContractTests(unittest.TestCase):
             client.chmod(0o700)
             token = root_path / "token"
             token.write_bytes(b"unused")
+            captures = checker.CaptureLedger([])
             diagnostics = io.StringIO()
             started = time.monotonic()
             with contextlib.redirect_stderr(diagnostics):
@@ -631,8 +658,10 @@ class ProcessCheckerContractTests(unittest.TestCase):
                         token,
                         2,
                         {"repeat_until_error": True},
+                        captures=captures,
                     )
             self.assertLess(time.monotonic() - started, 1.5)
+            self.assertIn("SECRET", captures.text())
             diagnostic = diagnostics.getvalue()
             self.assertIn("phase=unary", diagnostic)
             self.assertIn("exit_code=1", diagnostic)
@@ -658,6 +687,7 @@ class ProcessCheckerContractTests(unittest.TestCase):
             client.chmod(0o700)
             token = root_path / "token"
             token.write_bytes(b"unused")
+            captures = checker.CaptureLedger([])
             started = time.monotonic()
             process = checker.start_active_client(
                 checker.ProcessRegistry(),
@@ -667,6 +697,7 @@ class ProcessCheckerContractTests(unittest.TestCase):
                 token,
                 1,
                 {},
+                captures=captures,
             )
             try:
                 self.assertLess(time.monotonic() - started, 0.75)
@@ -689,6 +720,38 @@ class ProcessCheckerContractTests(unittest.TestCase):
         finally:
             first.cleanup(1)
             second.cleanup(1)
+
+    def test_failed_process_pair_retains_all_streams_before_discard(self) -> None:
+        # Break caught: paired drain timeout discarded active-client output
+        # before the acceptance-wide canary scan could inspect it.
+        checker = load_checker()
+        registry = checker.ProcessRegistry()
+        first = registry.spawn(
+            [
+                sys.executable,
+                "-c",
+                "import sys,time; print('first-out',flush=True); "
+                "print('first-err',file=sys.stderr,flush=True); time.sleep(5)",
+            ]
+        )
+        second = registry.spawn(
+            [
+                sys.executable,
+                "-c",
+                "import sys,time; print('second-out',flush=True); "
+                "print('second-err',file=sys.stderr,flush=True); time.sleep(5)",
+            ]
+        )
+        captures = checker.CaptureLedger([])
+        with self.assertRaisesRegex(
+            checker.AcceptanceError, "process pair did not exit within the bound"
+        ):
+            checker.wait_for_process_pair_captured(
+                captures, registry, first, second, 0.1
+            )
+        for marker in ("first-out", "first-err", "second-out", "second-err"):
+            self.assertIn(marker, captures.text())
+        self.assertEqual(registry._processes, [])
 
     def test_client_token_is_restored_exactly_after_failure(self) -> None:
         # Break caught: the reusable checker must not leave a caller-supplied
