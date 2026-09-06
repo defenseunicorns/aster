@@ -82,6 +82,17 @@ server's public serve method accepts `ConnectRpcService`, rather than a wrapped
 generic Tower service where authentication can run before the network body is
 polled or decoded.
 
+### Independent Go acceptance dependencies
+
+The black-box customer-process acceptance additionally admits
+`connectrpc.com/connect` 1.20.0 under Apache-2.0 and
+`google.golang.org/protobuf` 1.36.11 under BSD-3-Clause as direct dependencies
+of the isolated `conformance/agent-go` module. They are test and
+interoperability evidence only: checked-in code is generated from the local
+public schema with Buf 1.72.0 and exact-version local generator binaries. They
+do not enter the Rust runtime, customer package, deployment lane, or protocol
+authority.
+
 ## Ownership and acceptance
 
 The Event-service workstream owns runtime configuration, pre-body

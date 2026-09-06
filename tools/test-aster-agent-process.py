@@ -793,5 +793,17 @@ class ProcessCheckerContractTests(unittest.TestCase):
         self.assertLess(trap, create)
         self.assertIn('/tmp/aster-agent-process-smoke.*)', task[empty:create])
 
+    def test_smoke_uses_independent_generated_go_client(self) -> None:
+        # Break caught: reverting the smoke task to the Rust fixture as both
+        # server and client removes the independent-language wire proof.
+        mise = CHECKER_PATH.parent.parent / "mise.toml"
+        source = mise.read_text(encoding="utf-8")
+        task = source[source.index("[tasks.agent-process-smoke]") :]
+        self.assertIn(
+            'go -C conformance/agent-go build -o "$task_root/agent-smoke"', task
+        )
+        self.assertIn('--client "$task_root/agent-smoke"', task)
+        self.assertNotIn('--client "$fixture"', task)
+
 if __name__ == "__main__":
     unittest.main()
