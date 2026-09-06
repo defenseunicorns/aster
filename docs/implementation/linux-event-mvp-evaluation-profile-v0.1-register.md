@@ -35,7 +35,7 @@ and reviewed decision.
 | `P0-1-D11` | P0-1; design metadata/observability sections | Exact metadata budget and bounded authenticated status/error surface | Resolved | no | no | Production observability and exposure acceptance remain open | none |
 | `P0-1-D12` | P0-1; design artifact/acceptance sections | Exact artifact contents, thirteen acceptance conditions, G1-G6 dependency chain | Resolved | no | no | Production release remains separately gated | none |
 | `P0-1-D13` | P0-1; design `Non-goals` and claim boundary | Every excluded platform, class, carrier, topology, lifecycle, and production claim | Resolved | no | no | Excluded capabilities remain unsupported | none |
-| `P0-1-D15` | `DM-8-05`; Decision 0028 | Exact package/version evaluation-only disposition proposed; dependency, legal, and release approvals remain required | Open | yes | yes | Exact exception cannot authorize production; production resolution remains open | none |
+| `P0-1-D15` | `DM-8-05`; Decision 0028 | Exact package/version [evaluation-only disposition proposed](dm-8-05-linux-event-v0.1-disposition.md); dependency, legal, and release approvals remain required | Open | yes | yes | Exact exception cannot authorize production; production resolution remains open | none |
 
 `P0-1-D06` is owned by security plus deployment, targets 2026-09-08,
 and exits only through the reviewed exact provider/administration record.
