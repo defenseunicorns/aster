@@ -346,6 +346,13 @@ fn headers_fit<B>(request: &Request<B>, limit: usize) -> bool {
         .is_some_and(|total| total <= limit)
 }
 
+fn first_authentication_deadline(
+    admitted_at: tokio::time::Instant,
+    timeout: Duration,
+) -> tokio::time::Instant {
+    admitted_at + timeout
+}
+
 /// A response body that owns an in-flight permit until the complete body has
 /// been consumed or the caller cancels by dropping it.
 pub struct PermitBody<B> {
@@ -461,6 +468,10 @@ impl BoundAgent {
                     else {
                         continue;
                     };
+                    let first_authentication_deadline = first_authentication_deadline(
+                        tokio::time::Instant::now(),
+                        limits.first_authentication_timeout(),
+                    );
 
                     let connection_auth = ConnectionAuthState::new(unauthenticated_permit);
                     let gate = PreBodyGate::new(
@@ -472,7 +483,6 @@ impl BoundAgent {
                         limits.max_header_bytes(),
                     );
                     let watcher = graceful.watcher();
-                    let authentication_timeout = limits.first_authentication_timeout();
                     connections.spawn(async move {
                         let _total_permit = total_permit;
                         let mut builder = auto::Builder::new(TokioExecutor::new());
@@ -490,7 +500,8 @@ impl BoundAgent {
                             TowerToHyperService::new(gate),
                         ));
                         tokio::pin!(connection);
-                        let first_authentication = tokio::time::sleep(authentication_timeout);
+                        let first_authentication =
+                            tokio::time::sleep_until(first_authentication_deadline);
                         tokio::pin!(first_authentication);
                         tokio::select! {
                             _ = connection.as_mut() => {}
@@ -1032,6 +1043,26 @@ mod tests {
             unauthenticated.try_acquire_owned().is_ok(),
             "valid authentication must release the connection permit before lifecycle admission"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_authentication_deadline_is_anchored_at_connection_admission() {
+        let admitted_at = tokio::time::Instant::now();
+        let deadline = first_authentication_deadline(admitted_at, Duration::from_secs(5));
+
+        tokio::time::advance(Duration::from_secs(4)).await;
+        let connection_task_started_at = tokio::time::Instant::now();
+        assert_eq!(
+            deadline.saturating_duration_since(connection_task_started_at),
+            Duration::from_secs(1),
+            "task scheduling must consume the connection's authentication budget"
+        );
+
+        let expiry = tokio::spawn(tokio::time::sleep_until(deadline));
+        tokio::task::yield_now().await;
+        assert!(!expiry.is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        expiry.await.expect("deadline task joins");
     }
 
     #[tokio::test]
