@@ -8,6 +8,7 @@
 - Approved design date: 2026-09-06
 - Candidate decision checkpoint: 2026-09-13
 - Product class: time-bounded, non-production customer evaluation
+- Start here: [human-focused MVP coordination guide](linux-event-mvp-coordination-guide.md)
 - Governing design until adoption: [approved design](../superpowers/specs/2026-09-06-linux-event-mvp-evaluation-profile-design.md)
 - Decision register: [v0.1 register](linux-event-mvp-evaluation-profile-v0.1-register.md)
 - Candidate-annex schema: [provisional schema](linux-event-mvp-evaluation-profile-v0.1-annex-template.md)
@@ -18,6 +19,11 @@ device run, or release candidate satisfies that boundary. A candidate may
 claim the profile only after every applicable evaluation-blocking register row
 passes and one completed annex binds the exact source, artifacts, provider,
 configuration, nodes, results, receipts, and approvals.
+
+Most engineers should read the
+[coordination guide](linux-event-mvp-coordination-guide.md) first. It explains
+the outcome, workstream handoffs, G1–G6 sequence, current blockers, and
+definition of done. This document remains the exact profile authority.
 
 ## Summary
 
