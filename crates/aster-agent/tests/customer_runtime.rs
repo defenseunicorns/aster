@@ -171,11 +171,7 @@ async fn second_terminate_forces_a_blocked_graceful_drain() {
     }
     let fixture = CustomerFixture::with_shutdown_grace(5_000);
     let running = RunningFixture::start(&fixture).await;
-    let mut stalled = tokio::net::TcpStream::connect(fixture.application())
-        .await
-        .expect("open stalled application connection");
-    use tokio::io::AsyncWriteExt as _;
-    stalled.write_all(b"G").await.expect("stall HTTP header");
+    let stalled = fill_unauthenticated_admission(fixture.application()).await;
 
     running
         .signals
@@ -201,11 +197,7 @@ async fn grace_expiry_forces_a_blocked_graceful_drain() {
     }
     let fixture = CustomerFixture::with_shutdown_grace(50);
     let running = RunningFixture::start(&fixture).await;
-    let mut stalled = tokio::net::TcpStream::connect(fixture.application())
-        .await
-        .expect("open stalled application connection");
-    use tokio::io::AsyncWriteExt as _;
-    stalled.write_all(b"G").await.expect("stall HTTP header");
+    let stalled = fill_unauthenticated_admission(fixture.application()).await;
 
     running
         .signals
@@ -470,6 +462,42 @@ impl ProvisioningSecretLoader for BlockingLoader {
 
 async fn wait_until_ready(fixture: &CustomerFixture) {
     wait_for_health_status(fixture.health(), "/readyz", 200).await;
+}
+
+async fn fill_unauthenticated_admission(address: SocketAddr) -> Vec<tokio::net::TcpStream> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let limit = aster_agent::config::AgentLimits::default().max_unauthenticated_connections();
+    let mut admitted = Vec::with_capacity(limit);
+    for _ in 0..limit {
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("open admitted incomplete connection");
+        stream
+            .write_all(b"G")
+            .await
+            .expect("start incomplete request");
+        admitted.push(stream);
+    }
+
+    let mut refused = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("kernel accepts saturation probe");
+    refused
+        .write_all(b"G")
+        .await
+        .expect("write saturation probe");
+    let mut byte = [0_u8; 1];
+    match tokio::time::timeout(Duration::from_secs(1), refused.read(&mut byte))
+        .await
+        .expect("saturation probe is refused promptly")
+    {
+        Ok(0) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Ok(read) => panic!("saturation probe received {read} response bytes"),
+        Err(error) => panic!("unexpected saturation refusal: {error}"),
+    }
+    admitted
 }
 
 async fn wait_for_health_status(address: SocketAddr, path: &str, expected: u16) {
