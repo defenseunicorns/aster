@@ -23,6 +23,16 @@ use aster_mesh::{
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn customer_fixture_prepares_an_owner_only_state_directory() {
+    // Break caught: leaving state creation to the node makes its security
+    // depend on the test runner's ordinary process umask.
+    let fixture = CustomerFixture::new();
+    let metadata = fs::metadata(fixture.root.join("state")).expect("prepared state directory");
+    assert!(metadata.is_dir());
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_validates_credentials_before_binding_any_listener() {
     // Break caught: moving credential validation after listener binding exposes
@@ -56,7 +66,7 @@ async fn readiness_waits_for_protected_bootstrap_and_application_serving() {
     }
     let fixture = CustomerFixture::new();
     let config = load_and_validate_config(fixture.config_path()).expect("validated config");
-    let (entered_send, entered_receive) = std_mpsc::channel();
+    let (entered_send, mut entered_receive) = tokio::sync::mpsc::unbounded_channel();
     let (release_send, release_receive) = std_mpsc::channel();
     let (signals, receiver) = tokio::sync::mpsc::channel(4);
     let task = tokio::spawn(async move {
@@ -67,8 +77,9 @@ async fn readiness_waits_for_protected_bootstrap_and_application_serving() {
         run_customer_agent(config, &mut loader, receiver).await
     });
 
-    entered_receive
-        .recv_timeout(Duration::from_secs(2))
+    tokio::time::timeout(Duration::from_secs(2), entered_receive.recv())
+        .await
+        .expect("protected loader entry deadline")
         .expect("protected loader entered after health bind");
     assert_eq!(health_status(fixture.health(), "/livez").await, 200);
     assert_eq!(health_status(fixture.health(), "/readyz").await, 503);
@@ -295,6 +306,10 @@ impl CustomerFixture {
         fs::create_dir(&root).expect("create fixture root");
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
             .expect("protect fixture root");
+        let state = root.join("state");
+        fs::create_dir(&state).expect("create fixture state directory");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700))
+            .expect("protect fixture state directory");
 
         let token = root.join("client-token");
         fs::write(&token, b"0123456789abcdef0123456789abcdef\n").expect("write token");
@@ -316,7 +331,7 @@ impl CustomerFixture {
             &config,
             format!(
                 r#"{{"schema_version":1,"state":{{"directory":"{}"}},"application":{{"listen":"{application}"}},"health":{{"listen":"{health}"}},"mesh":{{"bind":"127.0.0.1:0","sync_interval_ms":500,"peers":[]}},"credentials":{{"client_token_file":"{}","mission_secret_ref_file":"{}","mission_load_id":"{}"}},"storage":{{"max_items":4161,"max_payload_bytes":17891328}},"limits":{{"shutdown_grace_ms":{shutdown_grace_ms}}}}}"#,
-                root.join("state").display(),
+                state.display(),
                 token.display(),
                 mission_reference.display(),
                 "11".repeat(32),
@@ -437,7 +452,7 @@ async fn finish_runtime(
 }
 
 struct BlockingLoader {
-    entered: std_mpsc::Sender<()>,
+    entered: tokio::sync::mpsc::UnboundedSender<()>,
     release: std_mpsc::Receiver<()>,
 }
 
