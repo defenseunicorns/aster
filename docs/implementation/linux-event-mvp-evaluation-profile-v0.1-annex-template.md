@@ -36,12 +36,23 @@ be sanitized without removing facts required to substantiate its public claim.
   untyped `not-run` is invalid. Actual result and receipt digests remain
   mandatory whenever execution occurred and for every result supporting
   `issue`.
-- The G3 artifact binding is exactly one of
-  `produced:sha256:<artifact-set-manifest-digest>` when artifacts exist, or
-  `not-produced:blocked-at-G<N>:sha256:<failure-or-exit-receipt-digest>` for a
-  `refuse` or `defer` decision stopped before artifact production. The latter
-  never represents `issue`, and actual artifact digests are mandatory whenever
-  any artifact exists.
+- The global G3 artifact binding is exactly one of
+  `produced:sha256:<G3-attempt-manifest-digest>` whenever any G3 output exists,
+  including a partial attempt, or
+  `not-produced:blocked-at-G<N>:sha256:<failure-or-exit-receipt-digest>`. The
+  global no-output form is valid only when no G3 output exists. The immutable
+  G3 attempt manifest enumerates every
+  required output: each architecture package and its package-authentication,
+  package-manifest, SBOM, notices, and provenance outputs, plus the dependency
+  graph and complete artifact-set manifest. Each entry is exactly
+  `produced:sha256:<actual-output-digest>` when that output exists or
+  `not-produced:blocked-at-G3:sha256:<failure-receipt-digest>` when it does not.
+  Actual digests are mandatory for every output that exists.
+- A global `produced` G3 binding is not sufficient for `issue`. Issue requires
+  every required per-output entry to be `produced`, both architecture packages
+  to be present and authenticated successfully, and the complete artifact-set
+  manifest and digest to verify. Any per-output `not-produced` entry requires
+  `refuse` or `defer`.
 - When `not-produced` is used, every artifact-specific field and every
   downstream result/receipt field is completed with the applicable exact typed
   `not-produced` or `not-run` value rather than left blank. These typed blockers
@@ -64,8 +75,9 @@ be sanitized without removing facts required to substantiate its public claim.
 | Profile identity | Required | Exact ID `aster-linux-event-mvp-evaluation-v0.1`, profile version `0.1`, and immutable profile digest | Profile owner | Reject any different, missing, or mutable identity |
 | Candidate identity | Required | Unique sanitized candidate ID and candidate-annex revision | Release owner | Reject reuse across different source, artifacts, provider, configuration, or environments |
 | Decision checkpoint | Required | Exact date `2026-09-13` and RFC 3339 UTC review time | Release owner | Reject if the date is treated as approval or if the review time is absent |
-| G3 artifact binding | Required | Exact typed `produced:sha256:<hex>` or `not-produced:blocked-at-G<N>:sha256:<hex>` value defined above | Deployment + release | Reject an untyped/missing binding, `not-produced` for issue, a missing actual artifact digest, or disagreement with any artifact/result/decision record |
-| Final outcome | Required as a detached record; excluded from the signable annex body | Exactly one signed `issue`, `refuse`, or `defer` release-decision record with a concise reason and the exact G3 artifact binding | Release owner | Reject an `issue` unless every required gate passed in order; reject an absent, ambiguous, or unsigned outcome; reject refusal/defer if missing downstream work is not represented by typed `not-run` values |
+| G3 artifact binding | Required | Exact global `produced:sha256:<G3-attempt-manifest-digest>` when any output exists, otherwise exact global `not-produced:blocked-at-G<N>:sha256:<hex>` | Deployment + release | Reject an untyped/missing binding, global `not-produced` after any output exists, a missing actual output digest, or disagreement with any artifact/result/decision record; reject issue unless every attempt-manifest output is produced |
+| Complete G3 artifact-set binding | Required for issue and whenever a complete set exists; otherwise a per-output `not-produced:blocked-at-G3:sha256:<hex>` entry in a produced attempt manifest, or the global no-output binding | Immutable complete artifact-set manifest reference/digest binding both architecture packages, successful authentication outputs, package manifests, SBOM, notices, provenance, and dependency graph | Deployment + release | Reject issue if absent, incomplete, unverifiable, or different from the attempt manifest; preserve the actual digest whenever a complete set exists |
+| Final outcome | Required as a detached record; excluded from the signable annex body | Exactly one signed `issue`, `refuse`, or `defer` release-decision record with a concise reason and the exact typed global G3 artifact binding | Release owner | Reject an `issue` unless every required gate passed in order, every G3 per-output entry is produced, both packages authenticate, and the complete artifact-set manifest verifies; reject an absent, ambiguous, or unsigned outcome; reject refusal/defer if a partial attempt or missing downstream work lacks its typed blocker |
 | Claim and non-claims | Required | Immutable text identifying the time-bounded, non-production Linux/Event v0.1 claim and its exclusions | Profile + release | Reject if it broadens the profile, claims production, or describes implementation or component evidence as qualification |
 
 ## 2. Source, inputs, configuration, harness, and deterministic gate
@@ -77,7 +89,7 @@ be sanitized without removing facts required to substantiate its public claim.
 | Toolchain | Required | Exact compiler/build-tool versions and immutable toolchain-manifest digest | Deterministic-gate owner | Reject floating versions, incomplete tool identity, or drift between build and replay |
 | Sanitized strict configuration | Required | Configuration schema/version, immutable bundle reference, byte size, and `sha256:<hex>`; no secrets | Profile + integration | Reject plaintext secrets, omitted effective values, mutable references, or any profile deviation |
 | Qualification harness | Required | Version or full source commit plus harness/configuration digest | Integration + deterministic-gate | Reject an unversioned harness or a harness/config mismatch between dependent gates |
-| G3 dependency graph and SBOM/provenance binding | Required when the G3 artifact binding is `produced`; otherwise required as a typed downstream `not-run` value | Immutable dependency-graph/SBOM/provenance manifest reference and digest that names the exact G3 artifact binding and both package digests; otherwise `not-run:blocked-at-G<N>:sha256:<hex>` | Dependency/license + deployment/release | Reject graph, package, SBOM, provenance, or G3-binding drift; reject a missing actual digest when artifacts exist |
+| G3 dependency graph and SBOM/provenance binding | Required per-output entries when the global G3 binding is `produced`; otherwise required as a typed downstream `not-run` value | Attempt-manifest entries and immutable references/digests for dependency graph, SBOM, and provenance, each tied to the global G3 binding and actual package-output digests; absent G3 output uses `not-run:blocked-at-G<N>:sha256:<hex>` | Dependency/license + deployment/release | Reject graph, package, SBOM, provenance, or G3-binding drift; reject a missing actual digest for any output that exists; reject issue if any entry is `not-produced` |
 | Clean locked checkout | Required | `pass`/`fail`, RFC 3339 UTC, command digest, receipt reference, and receipt digest | Deterministic-gate owner | Reject unless `pass` proves a clean locked checkout for the full source commit |
 | Deterministic gate | Required | Exact `mise run check` result, command/environment digest, receipt reference, and receipt digest | Deterministic-gate owner | Reject unless the exact final source passes deterministically; a retry without retained failure disposition is insufficient |
 | Event/Go process gates | Required | Results and immutable receipts for Event-service process acceptance and checked-in Go generation/black-box acceptance | Event-service + API + deterministic-gate | Reject a missing/failing result or a claim that Go is an independent server implementation |
@@ -90,12 +102,18 @@ a gate.
 ## 3. Architecture artifacts and procedures
 
 Record one row for each architecture. Architecture names and Debian package
-architectures remain paired exactly as shown.
+architectures remain paired exactly as shown. When the global G3 binding is
+`produced`, each package, authentication, package-manifest, SBOM, notices, and
+provenance cell is a G3 attempt-manifest per-output binding. It preserves
+`produced:sha256:<actual-output-digest>` for every existing output and uses
+`not-produced:blocked-at-G3:sha256:<failure-receipt-digest>` only for an absent
+output. If no G3 output exists, every row carries the exact global no-output
+binding. No partial row can support issue.
 
-| Architecture | Applicability | `.deb` file and exact byte size | Package digest | Provider-composed stripped executable size/digest | Authentication method and verification result/receipt | Package manifest digest | SBOM digest | notices digest | provenance digest | Owner | Rejection rule |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| `x86_64` / `amd64` | Required | `<immutable name>` / `<decimal bytes>` | `<sha256:hex>` | `<decimal bytes>` / `<sha256:hex>` | `<exact detached-signature or signed-repository method>`; `<pass/fail>`; `<receipt + digest>` | `<sha256:hex>` | `<sha256:hex>` | `<sha256:hex>` | `<sha256:hex>` | Deployment/release owner | Reject absence, wrong architecture, size/digest mismatch, failed authentication, non-native package, missing inventory, or a package not built from G2 |
-| `aarch64` / `arm64` | Required | `<immutable name>` / `<decimal bytes>` | `<sha256:hex>` | `<decimal bytes>` / `<sha256:hex>` | `<exact detached-signature or signed-repository method>`; `<pass/fail>`; `<receipt + digest>` | `<sha256:hex>` | `<sha256:hex>` | `<sha256:hex>` | `<sha256:hex>` | Deployment/release owner | Reject absence, wrong architecture, size/digest mismatch, failed authentication, non-native package, missing inventory, or a package not built from G2 |
+| Architecture | Applicability | `.deb` per-output binding, file, and exact byte size | Provider-composed stripped executable size/digest | Authentication per-output binding, method, and result/receipt | Package manifest binding | SBOM binding | notices binding | provenance binding | Owner | Rejection rule |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `x86_64` / `amd64` | Required | `<per-output binding>`; `<immutable name>`; `<decimal bytes>` | `<decimal bytes>` / `<sha256:hex>` when produced | `<per-output binding>`; `<exact detached-signature or signed-repository method>`; `<pass/fail>`; `<receipt + digest>` | `<per-output binding>` | `<per-output binding>` | `<per-output binding>` | `<per-output binding>` | Deployment/release owner | Reject wrong architecture, size/digest mismatch, failed/missing authentication, non-native package, output not built from G2, or any missing actual digest; reject issue for any `not-produced` entry |
+| `aarch64` / `arm64` | Required | `<per-output binding>`; `<immutable name>`; `<decimal bytes>` | `<decimal bytes>` / `<sha256:hex>` when produced | `<per-output binding>`; `<exact detached-signature or signed-repository method>`; `<pass/fail>`; `<receipt + digest>` | `<per-output binding>` | `<per-output binding>` | `<per-output binding>` | `<per-output binding>` | Deployment/release owner | Reject wrong architecture, size/digest mismatch, failed/missing authentication, non-native package, output not built from G2, or any missing actual digest; reject issue for any `not-produced` entry |
 
 | Procedure field | Applicability | Format | Owner | Rejection rule |
 |---|---|---|---|---|
@@ -326,23 +344,29 @@ not `pass`, an input changed, or the serial dependency was bypassed.
 |---|---|---|---|---|---|
 | G1 — Event baseline | Required antecedent record | None | Accepted Event-service baseline plus frozen emission/capacity contract; immutable exit digests | Event-service + node + lifecycle/capacity | Reject an unaccepted baseline or an unfrozen contract; G2 cannot start |
 | G2 — Source/API freeze | Required | G1 pass | ReceiveOnly and capacity behavior merged; focused tests pass; one source/API commit and exit digest frozen | Event-service + node + deterministic-gate | Reject source/API drift or failed/missing focused tests; G3 cannot start |
-| G3 — Artifact freeze | Required | G2 pass | Reproducibly built and signed provider-composed packages for both architectures from G2; exact artifact-set and exit digests | Deployment + security + release | Reject either architecture, nonreproducibility, failed authentication, or any source other than G2; G4/G5 cannot use another artifact |
+| G3 — Artifact freeze | Required | G2 pass | If any output exists, immutable G3 attempt manifest with every required per-output produced/not-produced binding; for pass, reproducibly built and authenticated provider-composed packages for both architectures from G2 plus complete artifact-set manifest/digest and exit digest | Deployment + security + release | Reject unmanifested partial output, a missing actual digest, either architecture absent, any per-output `not-produced`, nonreproducibility, failed authentication, incomplete artifact-set manifest, or any source other than G2; G4/G5 cannot use another artifact |
 | G4 — Focused target tests | Required | G3 pass | Install, lifecycle, Rust/Go API, ReceiveOnly, direct and conditional-relay scenarios pass using unchanged G3 artifacts; exit digests | Integration/physical-carrier + security | Reject any failed/missing required case or artifact drift; G5 qualification cannot substitute for G4 |
 | G5 — Workload qualification | Required | G3 and G4 pass | 2-/8-/20-node and 24-hour scenarios pass from G3 with distinct signed inventories and immutable exit digests | Integration/device + physical-carrier | Reject a missing tier, altered artifact/environment, ambiguous participant, shortened soak, or missing receipt |
-| G6 — Disposition | Required | G1–G5 pass in order for `issue`; refusal/defer may follow an earlier blocking gate | Receipt review, deterministic-gate rerun when reached, typed downstream `not-run` values when not reached, and detached signed `issue`/`refuse`/`defer` decision over the canonical signable-body digest, sorted detached approval-record digests, candidate ID, schema digest, and exact typed G3 artifact binding | Release owner with all final roles | Reject issue if any prior gate is absent/failing, any evaluation blocker remains, a digest changed, or the decision is unsigned; reject refusal/defer if a pre-G3 stop lacks `not-produced` or downstream omissions lack typed `not-run` bindings |
+| G6 — Disposition | Required | G1–G5 pass in order for `issue`; refusal/defer may follow an earlier blocking gate | Receipt review, deterministic-gate rerun when reached, typed downstream `not-run` values when not reached, and detached signed `issue`/`refuse`/`defer` decision over the canonical signable-body digest, sorted Section 15 candidate-approval digests, candidate ID, schema digest, and exact typed global G3 artifact binding | Release owner with all final roles | Reject issue if any prior gate is absent/failing, any evaluation blocker remains, any G3 per-output entry is not produced, either package/authentication is absent/failing, the complete artifact-set manifest is absent/invalid, a digest changed, or the decision is unsigned; reject refusal/defer if a no-output pre-G3 stop lacks global `not-produced`, a partial G3 attempt lacks actual/absent per-output bindings, or downstream omissions lack typed `not-run` bindings |
 
 ## 14. Exact `DM-8-05` proposal and three approvals
 
 The proposal is evaluation-only, adds no general license allowlist, and does not
-close the formal production requirement.
+close the formal production requirement. These are the original pre-candidate
+approvals required to close P0-1 register row `P0-1-D15` before profile
+ratification. Each binds the exact coordinates/licenses and proposal
+digest. The records are immutable prerequisite references included in the
+canonical signable candidate body; they are not replaced, re-signed against the
+candidate body, deferred to G6, or included among Section 15 detached candidate
+approvals.
 
 | Field | Applicability | Format | Owner | Rejection rule |
 |---|---|---|---|---|
 | Proposal identity | Required | Immutable reference and exact digest of `dm-8-05-linux-event-v0.1-disposition.md` | Dependency/license + release | Reject a mutable/missing proposal or digest mismatch |
 | Exact coordinates | Required | `webpki-root-certs` `1.0.9` / `b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b` / `CDLA-Permissive-2.0`; `webpki-roots` `1.0.9` / `7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a` / `CDLA-Permissive-2.0` | Dependency/license owner | Reject package, version, source, checksum, reachability, dependency-graph, license, SBOM, or notice drift |
-| Dependency approval | Required for issue; otherwise approval or typed `not-run` | Detached reviewer identity, dependency/license role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate set, proposal digest, canonical body digest, signature, and approval-record digest | Dependency/license owner | Reject issue for a missing/refusing/unsigned record or one that does not bind the body, every exact tuple, and proposal digest; reject an untyped omission |
-| Legal approval | Required for issue; otherwise approval or typed `not-run` | Detached reviewer identity, legal role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate set, proposal digest, canonical body digest, signature, and approval-record digest | Legal/compliance owner | Reject issue for a missing/refusing/unsigned record or one that does not bind the body, every exact tuple, and proposal digest; reject an untyped omission |
-| Release approval | Required for issue; otherwise approval or typed `not-run` | Detached reviewer identity, release role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate set, proposal digest, canonical body digest, signature, and approval-record digest | Release owner | Reject issue for a missing/refusing/unsigned record or one that does not bind the body, every exact tuple, and proposal digest; reject an untyped omission |
+| Dependency approval | Approval record required before profile ratification; its immutable reference/digest is required in every later candidate body | Immutable reviewer identity, dependency/license role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate/license set, proposal digest, and signed approval-record reference/digest | Dependency/license owner | Reject a missing/refusing/unsigned record, any coordinate/license/proposal mismatch, replacement/re-signing as a candidate approval, or omission of its immutable reference/digest from the signable body |
+| Legal approval | Approval record required before profile ratification; its immutable reference/digest is required in every later candidate body | Immutable reviewer identity, legal role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate/license set, proposal digest, and signed approval-record reference/digest | Legal/compliance owner | Reject a missing/refusing/unsigned record, any coordinate/license/proposal mismatch, replacement/re-signing as a candidate approval, or omission of its immutable reference/digest from the signable body |
+| Release approval | Approval record required before profile ratification; its immutable reference/digest is required in every later candidate body | Immutable reviewer identity, release role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate/license set, proposal digest, and signed approval-record reference/digest | Release owner | Reject a missing/refusing/unsigned record, any coordinate/license/proposal mismatch, replacement/re-signing as a candidate approval, or omission of its immutable reference/digest from the signable body |
 | Production limitation | Required | Signed statement that `DM-8-05` remains formally open and production-blocking after any evaluation approval | Dependency/license + legal + release | Reject any production authorization, general allowlist, WebPKI/public-relay authorization, or claim that the requirement is closed |
 
 ## 15. Final role approvals and detached signatures
@@ -351,22 +375,28 @@ The completed annex is a bundle, not a self-signing byte string:
 
 1. Canonicalize a signable annex body/manifest after every non-signature fact
    and receipt reference is final. It includes the candidate ID, frozen schema
-   digest, exact typed G3 artifact binding, facts and results from sections
-   1–14 other than the detached final outcome and specialist approval records,
-   and typed downstream `not-run` bindings. It excludes every detached
-   approval/signature record and the detached release-decision record.
-2. Compute the canonical signable-body digest. Every final role approval is a
-   detached record that signs this same body digest. For `refuse` or `defer`, a
-   role not reached is represented by a typed downstream `not-run` binding;
-   every approval actually produced retains its actual digest.
-3. Sort every detached approval-record digest from sections 14 and 15 bytewise
+   digest, exact typed global G3 artifact binding, every G3 per-output binding,
+   facts and results from sections 1–14 other than the detached final outcome,
+   the immutable Section 14 prerequisite approval references/digests, and typed
+   downstream `not-run` bindings. It excludes only Section 15 detached
+   candidate approvals/signatures and the detached release-decision record.
+2. Compute the canonical signable-body digest. Every Section 15 final role
+   approval is a distinct later candidate attestation and a detached record that
+   signs this same body digest. The Section 15 dependency, legal, and release
+   attestations do not replace the earlier Section 14 P0-1 records. For
+   `refuse` or `defer`, a candidate role not reached is represented by a typed
+   downstream `not-run` binding; every approval actually produced retains its
+   actual digest.
+3. Sort only the Section 15 detached candidate-approval record digests bytewise
    by lowercase digest. The final detached release decision signs the body
    digest, that sorted list, candidate ID, frozen schema digest, and exact typed
-   G3 artifact binding.
-4. Verify the body digest first, then every detached approval against it, then
-   the sorted approval list and final release decision. A final archival bundle
-   digest may cover the body, detached approvals, and detached release decision,
-   but is not an input to any of those signatures and grants no additional
+   global G3 artifact binding.
+4. Verify the Section 14 prerequisite records and their references in the body,
+   then the body digest, every Section 15 detached candidate approval against
+   it, the sorted Section 15 approval list, and the final release decision. A
+   final archival bundle digest may cover the body, Section 14 prerequisite
+   records, Section 15 detached approvals, and detached release decision, but is
+   not an input to any of those signatures and grants no additional
    qualification claim.
 
 Every approval is required for `issue`. For `refuse` or `defer`, record the
@@ -374,7 +404,7 @@ approvals obtained and exact typed blockers for roles not reached.
 
 | Approval | Applicability | Format | Owner | Rejection rule |
 |---|---|---|---|---|
-| Canonical signable annex body | Required | Canonicalization identifier/version, immutable body reference, byte size, and digest; excludes all detached approval/signature and release-decision records | Profile + release | Reject nondeterministic canonicalization, a digest mismatch, or inclusion of a detached record that creates a digest/signature cycle |
+| Canonical signable annex body | Required | Canonicalization identifier/version, immutable body reference, byte size, and digest; includes immutable Section 14 prerequisite approval references/digests and excludes Section 15 candidate approvals plus the release decision | Profile + release | Reject nondeterministic canonicalization, a digest mismatch, missing Section 14 references, or inclusion of a Section 15/release record that creates a digest/signature cycle |
 | Profile/product | Required for issue; otherwise approval or typed `not-run` | Detached immutable approval record that signs the body digest; record digest | Profile/product owner | Reject issue if absent, refusing, unsigned, or bound to a different body/candidate/schema/G3 binding; reject an untyped omission |
 | Security | Required for issue; otherwise approval or typed `not-run` | Detached immutable approval record that signs the body digest; record digest | Security owner | Reject issue if absent, refusing, unsigned, or bound to a different body/candidate/schema/G3 binding; reject an untyped omission |
 | Deployment/OS and artifact | Required for issue; otherwise approval or typed `not-run` | Detached immutable approval record that signs the body digest; record digest | Deployment/OS/artifact owner | Reject issue if absent, refusing, unsigned, or bound to a different body/candidate/schema/G3 binding; reject an untyped omission |
@@ -383,8 +413,8 @@ approvals obtained and exact typed blockers for roles not reached.
 | Deterministic gate | Required for issue; otherwise approval or typed `not-run` | Detached immutable approval record that signs the body digest; record digest | Deterministic-gate owner | Reject issue if absent, refusing, unsigned, or bound to a different body/candidate/schema/G3 binding; reject an untyped omission |
 | Dependency/license | Required for issue; otherwise approval or typed `not-run` | Detached immutable approval record that signs the body digest; record digest | Dependency/license owner | Reject issue if absent, refusing, unsigned, or bound to a different body/candidate/schema/G3 binding; reject an untyped omission |
 | Legal/compliance | Required for issue; otherwise approval or typed `not-run` | Detached immutable approval record that signs the body digest; record digest | Legal/compliance owner | Reject issue if absent, refusing, unsigned, or bound to a different body/candidate/schema/G3 binding; reject an untyped omission |
-| Release decision | Required | Detached signed immutable `issue`/`refuse`/`defer` record over body digest, bytewise-sorted approval-record digests, candidate ID, schema digest, and exact typed G3 artifact binding | Release owner | Reject an unsigned, ambiguous, cyclic, unsorted, or mismatched decision; issue is forbidden unless all approvals and gates pass and G3 is `produced` |
-| Archival bundle | Conditional: when an archival bundle is formed | Immutable manifest/reference and digest covering body, detached approvals, and detached release decision | Release owner | Reject if used as a signature input, substituted for verification of any contained record, or presented as an additional claim |
+| Release decision | Required | Detached signed immutable `issue`/`refuse`/`defer` record over body digest, bytewise-sorted Section 15 candidate-approval digests, candidate ID, schema digest, and exact typed global G3 artifact binding | Release owner | Reject an unsigned, ambiguous, cyclic, unsorted, or mismatched decision; issue is forbidden unless all approvals/gates pass, every G3 per-output entry is produced, both packages authenticate, and the complete artifact-set manifest verifies |
+| Archival bundle | Conditional: when an archival bundle is formed | Immutable manifest/reference and digest covering body, Section 14 prerequisite records, Section 15 detached approvals, and detached release decision | Release owner | Reject if used as a signature input, substituted for verification of any contained record, or presented as an additional claim |
 
 No signature may stand in for a missing fact, receipt, gate, approval, or typed
 blocker.
