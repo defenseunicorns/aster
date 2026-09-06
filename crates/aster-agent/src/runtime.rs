@@ -261,7 +261,12 @@ async fn drain(
     let _ = server_stop_send.send(ServerStop::Drain);
     node_monitor.abort();
 
-    let mut node_task = tokio::spawn(async move { node.shutdown().await.map(|_| ()) });
+    let (node_shutdown_send, node_shutdown_receive) = tokio::sync::oneshot::channel();
+    let mut node_shutdown_send = Some(node_shutdown_send);
+    let mut node_task = tokio::spawn(async move {
+        let _ = node_shutdown_receive.await;
+        node.shutdown().await.map(|_| ())
+    });
     let deadline = tokio::time::sleep(grace);
     tokio::pin!(deadline);
     let mut server_done = false;
@@ -295,6 +300,9 @@ async fn drain(
             result = &mut server_task, if !server_done => {
                 server_done = true;
                 failed |= !matches!(result, Ok(Ok(())));
+                if let Some(send) = node_shutdown_send.take() {
+                    let _ = send.send(());
+                }
             }
             result = &mut node_task, if !node_done => {
                 node_done = true;

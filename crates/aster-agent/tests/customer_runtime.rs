@@ -20,6 +20,7 @@ use aster_mesh::{
     ProvisioningLoadId, ProvisioningLoadReceipt, ProvisioningSecretLoader, ProvisioningSecretRef,
     ProvisioningSecretStoreError, UnprotectedProvisioning,
 };
+use buffa::Message as _;
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -209,6 +210,81 @@ async fn grace_expiry_forces_a_blocked_graceful_drain() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admitted_publish_finishes_before_node_shutdown() {
+    // Break caught: starting selected-node shutdown concurrently with HTTP
+    // drain can reject a mutating unary request that already passed the
+    // pre-body admission gate but has not finished decoding its body.
+    if !socket_access_available() {
+        return;
+    }
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let fixture = CustomerFixture::with_shutdown_grace(2_000);
+    let running = RunningFixture::start(&fixture).await;
+    let request = aster_agent::proto::aster::application::v1alpha1::PublishEventRequest {
+        operation_key: b"drain-admitted-publication".to_vec(),
+        topic: "chat.events".to_owned(),
+        scope: "mission/team/alpha".to_owned(),
+        priority: aster_agent::proto::aster::application::v1alpha1::Priority::Immediate.into(),
+        logical_key: b"drain-message".to_vec(),
+        payload: b"accepted before shutdown".to_vec(),
+        ..Default::default()
+    };
+    let body = request.encode_to_vec();
+    let mut connection = tokio::net::TcpStream::connect(fixture.application())
+        .await
+        .expect("connect admitted publish");
+    connection
+        .write_all(
+            format!(
+                "POST /aster.application.v1alpha1.AsterApplicationService/PublishEvent HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/proto\r\nConnect-Protocol-Version: 1\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                String::from_utf8_lossy(fixture.token_bytes()),
+                body.len(),
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write admitted publish headers");
+
+    // With one global in-flight slot, a rejected status probe proves the
+    // Publish headers passed the gate and its permit is held before draining.
+    wait_for_application_status(fixture.application(), fixture.token_bytes(), 429).await;
+    running
+        .signals
+        .send(AgentSignal::Terminate)
+        .await
+        .expect("begin drain");
+    wait_for_health_status(fixture.health(), "/readyz", 503).await;
+    connection
+        .write_all(&body)
+        .await
+        .expect("finish admitted publish body");
+
+    let mut response = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        connection.read_to_end(&mut response),
+    )
+    .await
+    .expect("admitted publish response deadline")
+    .expect("read admitted publish response");
+    assert_eq!(
+        http_response_status(&response),
+        200,
+        "admitted publish response: {}",
+        String::from_utf8_lossy(&response)
+    );
+    let response_body = chunked_response_body(&response);
+    let published =
+        aster_agent::proto::aster::application::v1alpha1::PublishEventResponse::decode_from_slice(
+            &response_body,
+        )
+        .expect("decode admitted publish response");
+    assert!(published.inserted);
+    assert_eq!(running.finish().await, AgentExit::Clean);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closed_signal_task_propagates_only_a_bounded_failure_reason() {
     // Break caught: losing the signal task without a terminal transition can
     // leave the process serving forever or expose an internal channel error.
@@ -322,7 +398,7 @@ impl CustomerFixture {
         fs::write(
             &config,
             format!(
-                r#"{{"schema_version":1,"state":{{"directory":"{}"}},"application":{{"listen":"{application}"}},"health":{{"listen":"{health}"}},"mesh":{{"bind":"127.0.0.1:0","sync_interval_ms":500,"peers":[]}},"credentials":{{"client_token_file":"{}","mission_secret_ref_file":"{}","mission_load_id":"{}"}},"storage":{{"max_items":4161,"max_payload_bytes":17891328}},"limits":{{"shutdown_grace_ms":{shutdown_grace_ms}}}}}"#,
+                r#"{{"schema_version":1,"state":{{"directory":"{}"}},"application":{{"listen":"{application}"}},"health":{{"listen":"{health}"}},"mesh":{{"bind":"127.0.0.1:0","sync_interval_ms":500,"peers":[]}},"credentials":{{"client_token_file":"{}","mission_secret_ref_file":"{}","mission_load_id":"{}"}},"storage":{{"max_items":10000,"max_payload_bytes":67108864}},"limits":{{"max_in_flight_requests":1,"shutdown_grace_ms":{shutdown_grace_ms}}}}}"#,
                 state.display(),
                 token.display(),
                 mission_reference.display(),
@@ -558,13 +634,44 @@ async fn http_status(address: SocketAddr, request: &[u8]) -> u16 {
         .await
         .expect("HTTP response deadline")
         .expect("read HTTP response");
-    let first = String::from_utf8_lossy(&response);
-    first
+    http_response_status(&response)
+}
+
+fn http_response_status(response: &[u8]) -> u16 {
+    String::from_utf8_lossy(response)
         .split_whitespace()
         .nth(1)
         .expect("HTTP status")
         .parse()
         .expect("numeric HTTP status")
+}
+
+fn chunked_response_body(response: &[u8]) -> Vec<u8> {
+    let body_offset = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|offset| offset + 4)
+        .expect("HTTP response body");
+    let mut encoded = &response[body_offset..];
+    let mut decoded = Vec::new();
+    loop {
+        let size_end = encoded
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .expect("chunk size terminator");
+        let size = usize::from_str_radix(
+            std::str::from_utf8(&encoded[..size_end]).expect("ASCII chunk size"),
+            16,
+        )
+        .expect("hexadecimal chunk size");
+        encoded = &encoded[size_end + 2..];
+        if size == 0 {
+            break;
+        }
+        decoded.extend_from_slice(&encoded[..size]);
+        encoded = &encoded[size + 2..];
+    }
+    decoded
 }
 
 impl Drop for CustomerFixture {
