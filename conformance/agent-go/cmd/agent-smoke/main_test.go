@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -79,12 +80,26 @@ func TestFIFOtokenIsRejectedWithoutBlocking(t *testing.T) {
 }
 
 func TestInputReadHonorsCommandContext(t *testing.T) {
-	reader, writer := io.Pipe()
-	defer writer.Close()
+	reader := newBlockingReadCloser()
+	defer reader.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	if _, err := readInput(ctx, reader); err == nil {
 		t.Fatal("blocked input outlived command context")
+	}
+	select {
+	case <-reader.exited:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("input reader goroutine survived cancellation")
+	}
+}
+
+func TestCancelledContextStopsTokenRead(t *testing.T) {
+	token := writeToken(t, 0o600)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := readToken(ctx, token); err == nil {
+		t.Fatal("cancelled token read accepted")
 	}
 }
 
@@ -101,6 +116,16 @@ func TestFixedAndOperationIdentifiersEnforceWireBounds(t *testing.T) {
 		if _, err := decodeOperationKeyHex(value); err == nil {
 			t.Fatalf("invalid operation key accepted: length=%d", len(value))
 		}
+	}
+}
+
+func TestMalformedQueryExpectationIsRejectedBeforeEvidence(t *testing.T) {
+	input := queryInput{Expected: expectedEventInput{
+		IDHex: "01", PublisherHex: strings.Repeat("02", 32), Priority: "immediate",
+		LogicalKeyHex: "01", PayloadHex: "02",
+	}}
+	if _, err := queryRequest(input); err == nil {
+		t.Fatal("malformed query expectation accepted")
 	}
 }
 
@@ -215,4 +240,25 @@ func hexOf(value []byte) string {
 		encoded[index*2+1] = alphabet[item&0x0f]
 	}
 	return string(encoded)
+}
+
+type blockingReadCloser struct {
+	closed chan struct{}
+	exited chan struct{}
+	once   sync.Once
+}
+
+func newBlockingReadCloser() *blockingReadCloser {
+	return &blockingReadCloser{closed: make(chan struct{}), exited: make(chan struct{})}
+}
+
+func (reader *blockingReadCloser) Read(_ []byte) (int, error) {
+	<-reader.closed
+	close(reader.exited)
+	return 0, io.ErrClosedPipe
+}
+
+func (reader *blockingReadCloser) Close() error {
+	reader.once.Do(func() { close(reader.closed) })
+	return nil
 }

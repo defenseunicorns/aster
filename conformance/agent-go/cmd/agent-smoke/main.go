@@ -105,14 +105,14 @@ func main() {
 	}
 }
 
-func run(args []string, input io.Reader, output io.Writer) error {
+func run(args []string, input io.ReadCloser, output io.Writer) error {
 	opts, err := parseOptions(args)
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), opts.timeout)
 	defer cancel()
-	token, err := readToken(opts.tokenFile)
+	token, err := readToken(ctx, opts.tokenFile)
 	if err != nil {
 		return err
 	}
@@ -179,17 +179,22 @@ func parseOptions(args []string) (options, error) {
 }
 
 func validateTokenFile(path string) error {
-	_, err := readToken(path)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := readToken(ctx, path)
 	return err
 }
 
-func readToken(path string) (string, error) {
+func readToken(ctx context.Context, path string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	file, err := openToken(path)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, maxTokenFileBytes+1))
+	data, err := readBounded(ctx, file, maxTokenFileBytes)
 	if err != nil || len(data) > maxTokenFileBytes {
 		return "", errors.New("invalid token file")
 	}
@@ -244,21 +249,27 @@ func decodeInput(input io.Reader, destination any) error {
 	return nil
 }
 
-func readInput(ctx context.Context, input io.Reader) ([]byte, error) {
+func readInput(ctx context.Context, input io.ReadCloser) ([]byte, error) {
+	return readBounded(ctx, input, maxInputBytes)
+}
+
+func readBounded(ctx context.Context, input io.ReadCloser, maximum int) ([]byte, error) {
 	type readResult struct {
 		data []byte
 		err  error
 	}
 	finished := make(chan readResult, 1)
 	go func() {
-		data, err := io.ReadAll(io.LimitReader(input, maxInputBytes+1))
+		data, err := io.ReadAll(io.LimitReader(input, int64(maximum)+1))
 		finished <- readResult{data: data, err: err}
 	}()
 	select {
 	case <-ctx.Done():
+		_ = input.Close()
+		<-finished
 		return nil, ctx.Err()
 	case result := <-finished:
-		if result.err != nil || len(result.data) > maxInputBytes {
+		if result.err != nil || len(result.data) > maximum {
 			return nil, errors.New("invalid input")
 		}
 		return result.data, nil
@@ -415,9 +426,11 @@ func runCommand(ctx context.Context, client applicationv1alpha1.AsterApplication
 		if err := decodeInput(input, &value); err != nil {
 			return err
 		}
-		response, err := client.QueryEvents(ctx, request(&applicationv1alpha1.QueryEventsRequest{
-			Topic: &value.Expected.Topic, Scope: &value.Expected.Scope, Limit: 2,
-		}, token))
+		query, err := queryRequest(value)
+		if err != nil {
+			return err
+		}
+		response, err := client.QueryEvents(ctx, request(query, token))
 		if err != nil {
 			return err
 		}
@@ -520,6 +533,29 @@ func runCommand(ctx context.Context, client applicationv1alpha1.AsterApplication
 	default:
 		return errors.New("invalid command")
 	}
+}
+
+func queryRequest(input queryInput) (*applicationv1alpha1.QueryEventsRequest, error) {
+	if _, err := decodeFixedHex(input.Expected.IDHex, 32); err != nil {
+		return nil, err
+	}
+	if _, err := decodeFixedHex(input.Expected.PublisherHex, 32); err != nil {
+		return nil, err
+	}
+	if _, err := decodeHex(input.Expected.LogicalKeyHex); err != nil {
+		return nil, err
+	}
+	if _, err := decodeHex(input.Expected.PayloadHex); err != nil {
+		return nil, err
+	}
+	if _, err := priority(input.Expected.Priority); err != nil {
+		return nil, err
+	}
+	return &applicationv1alpha1.QueryEventsRequest{
+		Topic: &input.Expected.Topic,
+		Scope: &input.Expected.Scope,
+		Limit: 2,
+	}, nil
 }
 
 func eventMatches(event *applicationv1alpha1.Event, expected expectedEventInput) (bool, error) {
