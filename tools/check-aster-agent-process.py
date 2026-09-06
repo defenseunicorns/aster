@@ -35,6 +35,8 @@ MIN_TIMEOUT_SECONDS = 1
 MAX_TIMEOUT_SECONDS = 120
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_CAPTURE_BYTES = 2 * 1024 * 1024
+MAX_AGGREGATE_CAPTURE_BYTES = 16 * 1024 * 1024
+MAX_AGGREGATE_CAPTURE_CHUNKS = 4_096
 MAX_TOKEN_FILE_BYTES = 258
 MAX_HEALTH_RESPONSE_BYTES = 8 * 1024
 FIXED_PUBLISH_OPERATION = b"aster-agent-process-publish-v1"
@@ -180,6 +182,44 @@ def require_sanitized(output: str, canaries: Iterable[str]) -> None:
     for canary in canaries:
         if canary and canary in output:
             raise ValueError("canary exposed in combined process output")
+
+
+class CaptureLedger:
+    """One bounded, incrementally scanned process-output ledger."""
+
+    def __init__(
+        self,
+        canaries: Iterable[str],
+        *,
+        max_bytes: int = MAX_AGGREGATE_CAPTURE_BYTES,
+    ) -> None:
+        self._chunks: list[str] = []
+        self._canaries = list(canaries)
+        self._max_bytes = max_bytes
+        self._captured_bytes = 0
+
+    def append(self, output: str) -> None:
+        self.extend((output,))
+
+    def extend(self, outputs: Iterable[str]) -> None:
+        additions = list(outputs)
+        output_bytes = sum(len(output.encode("utf-8")) for output in additions)
+        if (
+            len(self._chunks) + len(additions) > MAX_AGGREGATE_CAPTURE_CHUNKS
+            or output_bytes > self._max_bytes - self._captured_bytes
+        ):
+            raise AcceptanceError("aggregate process output exceeded the bound")
+        self._chunks.extend(additions)
+        self._captured_bytes += output_bytes
+        require_sanitized("\n".join(additions), self._canaries)
+
+    def add_canaries(self, canaries: Iterable[str]) -> None:
+        added = list(canaries)
+        require_sanitized(self.text(), added)
+        self._canaries.extend(added)
+
+    def text(self) -> str:
+        return "\n".join(self._chunks)
 
 
 def sanitized_diagnostic(
@@ -414,6 +454,13 @@ class BoundedCapture:
             self._raise_if_unavailable()
             return self._bytes.decode("utf-8", errors="replace")
 
+    def snapshot(self) -> tuple[str, bool]:
+        with self._condition:
+            return (
+                self._bytes.decode("utf-8", errors="replace"),
+                not self._failed and not self._overflow,
+            )
+
     def wait_for(self, marker: str, timeout_seconds: int) -> None:
         deadline = time.monotonic() + timeout_seconds
         encoded = marker.encode("utf-8")
@@ -566,7 +613,7 @@ class ManagedProcess:
             except ProcessLookupError:
                 pass
 
-    def wait(self, timeout_seconds: int) -> int:
+    def wait(self, timeout_seconds: float) -> int:
         deadline = time.monotonic() + timeout_seconds
         try:
             return_code = self.process.wait(timeout=timeout_seconds)
@@ -616,7 +663,7 @@ class ManagedProcess:
                 )
             time.sleep(min(0.01, remaining))
 
-    def cleanup(self, timeout_seconds: int) -> None:
+    def cleanup(self, timeout_seconds: float) -> None:
         deadline = time.monotonic() + timeout_seconds
         try:
             os.killpg(self.process.pid, signal.SIGKILL)
@@ -705,6 +752,12 @@ class ClientResult:
     stdout: str
     stderr: str
     record: dict[str, Any]
+    stdout_capture_complete: bool = True
+    stderr_capture_complete: bool = True
+
+    @property
+    def capture_complete(self) -> bool:
+        return self.stdout_capture_complete and self.stderr_capture_complete
 
 
 class ClientInvocationError(AcceptanceError):
@@ -755,20 +808,47 @@ def invoke_client(
     request: dict[str, Any] | None = None,
     *,
     expect_failure: bool | str = False,
+    attempt_timeout_seconds: float | None = None,
 ) -> ClientResult:
     encoded = json.dumps(request or {}, separators=(",", ":")).encode("utf-8")
+    attempt_budget = (
+        float(timeout_seconds)
+        if attempt_timeout_seconds is None
+        else attempt_timeout_seconds
+    )
+    attempt_deadline = time.monotonic() + attempt_budget
     process = registry.spawn(
         _client_arguments(client, command, application, token_file, timeout_seconds),
         encoded,
     )
+    attempt_error: AcceptanceError | None = None
+    cleanup_error: AcceptanceError | None = None
+    return_code = -1
     try:
-        return_code = process.wait(timeout_seconds)
-        stdout = process.stdout.text()
-        stderr = process.stderr.text()
+        try:
+            return_code = process.wait(max(0.01, attempt_deadline - time.monotonic()))
+        except AcceptanceError as error:
+            attempt_error = error
     finally:
-        process.cleanup(timeout_seconds)
-        registry.discard(process)
-    failed_result = ClientResult(return_code, stdout, stderr, {})
+        try:
+            process.cleanup(max(0.01, attempt_deadline - time.monotonic()))
+        except AcceptanceError as error:
+            cleanup_error = error
+        finally:
+            registry.discard(process)
+    stdout, stdout_complete = process.stdout.snapshot()
+    stderr, stderr_complete = process.stderr.snapshot()
+    failed_result = ClientResult(
+        return_code,
+        stdout,
+        stderr,
+        {},
+        stdout_capture_complete=stdout_complete,
+        stderr_capture_complete=stderr_complete,
+    )
+    if attempt_error is not None or cleanup_error is not None or not failed_result.capture_complete:
+        cause = attempt_error or cleanup_error
+        raise ClientInvocationError("client command did not complete", failed_result) from cause
     try:
         if expect_failure:
             if return_code == 0:
@@ -790,11 +870,11 @@ def invoke_client(
                 raise AcceptanceError("client result was invalid")
     except AcceptanceError as error:
         raise ClientInvocationError(str(error), failed_result) from error
-    return ClientResult(return_code, stdout, stderr, record)
+    return dataclasses.replace(failed_result, record=record)
 
 
 def invoke_client_captured(
-    captures: list[str],
+    captures: CaptureLedger,
     registry: ProcessRegistry,
     client: Path,
     command: str,
@@ -804,6 +884,7 @@ def invoke_client_captured(
     request: dict[str, Any] | None = None,
     *,
     expect_failure: bool | str = False,
+    attempt_timeout_seconds: float | None = None,
 ) -> ClientResult:
     try:
         result = invoke_client(
@@ -815,6 +896,7 @@ def invoke_client_captured(
             timeout_seconds,
             request,
             expect_failure=expect_failure,
+            attempt_timeout_seconds=attempt_timeout_seconds,
         )
     except ClientInvocationError as error:
         captures.extend((error.result.stdout, error.result.stderr))
@@ -1288,7 +1370,7 @@ def run_acceptance_with_token(
 ) -> list[str]:
     old_token = preserved.token
     registry = ProcessRegistry()
-    captures: list[str] = []
+    captures = CaptureLedger(_process_canaries(arguments, contract, old_token))
     receipt_names: list[str] = []
 
     def start_agent() -> ManagedProcess:
@@ -1328,6 +1410,7 @@ def run_acceptance_with_token(
         *,
         token_file: Path | None = None,
         expect_failure: bool = False,
+        attempt_timeout_seconds: float | None = None,
     ) -> ClientResult:
         try:
             result = invoke_client_captured(
@@ -1340,6 +1423,7 @@ def run_acceptance_with_token(
                 arguments.timeout_seconds,
                 request,
                 expect_failure=expect_failure,
+                attempt_timeout_seconds=attempt_timeout_seconds,
             )
         except ClientInvocationError as error:
             raise ClientInvocationError(
@@ -1408,6 +1492,7 @@ def run_acceptance_with_token(
             contract,
             arguments.timeout_seconds,
         )
+        captures.add_canaries(negative.canaries)
         captures.extend(negative.captures)
         receipt_names.extend(negative.receipts)
         with tempfile.TemporaryDirectory(prefix="aster-agent-process-") as temporary:
@@ -1493,17 +1578,21 @@ def run_acceptance_with_token(
             agent.signal(signal.SIGHUP)
             deadline = time.monotonic() + arguments.timeout_seconds
             while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AcceptanceError("rotated token was not accepted within the bound")
                 try:
-                    call("status")
+                    call("status", attempt_timeout_seconds=remaining)
                     break
                 except ClientInvocationError as error:
                     if not expected_client_failure(error.result, "unauthenticated"):
                         raise AcceptanceError(
                             "rotated token probe did not match the contract"
                         ) from error
-                    if time.monotonic() >= deadline:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
                         raise AcceptanceError("rotated token was not accepted within the bound")
-                    time.sleep(0.05)
+                    time.sleep(min(0.05, remaining))
             rejected = call("status", token_file=old_token_file, expect_failure=True)
             if rejected.record.get("code") != "unauthenticated":
                 raise AcceptanceError("old token was not rejected after reload")
@@ -1540,7 +1629,7 @@ def run_acceptance_with_token(
             receipt_names.append("graceful-drain")
 
             require_sanitized(
-                "\n".join(captures),
+                captures.text(),
                 [
                     *_process_canaries(arguments, contract, old_token),
                     *negative.canaries,

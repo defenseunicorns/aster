@@ -298,7 +298,7 @@ class ProcessCheckerContractTests(unittest.TestCase):
             token = root_path / "token"
             token.write_bytes(b"unused")
             registry = checker.ProcessRegistry()
-            captures = []
+            captures = checker.CaptureLedger([])
             try:
                 with (
                     contextlib.redirect_stderr(io.StringIO()),
@@ -333,8 +333,123 @@ class ProcessCheckerContractTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "canary exposed"):
                 checker.require_sanitized(
-                    "\n".join(captures), ["SECRET_RELOAD_CANARY"]
+                    captures.text(), ["SECRET_RELOAD_CANARY"]
                 )
+
+    def test_process_capture_ledger_enforces_one_aggregate_byte_bound(self) -> None:
+        # Break caught: per-process stream limits alone allow rapid reload
+        # retries to accumulate gigabytes in an unrestricted list.
+        checker = load_checker()
+        ledger_type = getattr(checker, "CaptureLedger", None)
+        self.assertTrue(callable(ledger_type), "aggregate capture ledger is required")
+        ledger = ledger_type([], max_bytes=5)
+        ledger.append("1234")
+        with self.assertRaisesRegex(
+            checker.AcceptanceError, "aggregate process output exceeded the bound"
+        ):
+            ledger.append("56")
+        self.assertEqual(ledger.text(), "1234")
+
+    def test_process_capture_ledger_bounds_empty_attempts(self) -> None:
+        # Break caught: a byte-only aggregate cap permits unlimited empty
+        # strings and unbounded list overhead from fast failed retries.
+        checker = load_checker()
+        ledger = checker.CaptureLedger([])
+        for _ in range(4_096):
+            ledger.append("")
+        with self.assertRaisesRegex(
+            checker.AcceptanceError, "aggregate process output exceeded the bound"
+        ):
+            ledger.append("")
+
+    def test_process_capture_ledger_retains_both_streams_before_scanning(self) -> None:
+        # Break caught: scanning stdout before retaining stderr discards the
+        # second bounded stream when the first stream exposes a canary.
+        checker = load_checker()
+        ledger = checker.CaptureLedger(["SECRET_FIRST_STREAM"])
+        with self.assertRaisesRegex(ValueError, "canary exposed"):
+            ledger.extend(("SECRET_FIRST_STREAM", "safe-second-stream"))
+        self.assertIn("safe-second-stream", ledger.text())
+
+    def test_timed_out_client_retains_partial_output_and_capture_metadata(self) -> None:
+        # Break caught: a wait or reader failure before ClientResult creation
+        # discards the attempt's already-bounded streams from security review.
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            client = root_path / "client"
+            client.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys, time\n"
+                "sys.stdin.read()\n"
+                "sys.stdout.write('SECRET_TIMEOUT_CANARY\\n')\n"
+                "sys.stdout.flush()\n"
+                "time.sleep(5)\n",
+                encoding="utf-8",
+            )
+            client.chmod(0o700)
+            token = root_path / "token"
+            token.write_bytes(b"unused")
+            registry = checker.ProcessRegistry()
+            captures = checker.CaptureLedger([])
+            try:
+                with self.assertRaises(checker.AcceptanceError) as caught:
+                    checker.invoke_client_captured(
+                        captures,
+                        registry,
+                        client,
+                        "status",
+                        "127.0.0.1:1",
+                        token,
+                        1,
+                    )
+            finally:
+                registry.cleanup_all(1)
+
+            self.assertIsInstance(caught.exception, checker.ClientInvocationError)
+            self.assertIn("SECRET_TIMEOUT_CANARY", caught.exception.result.stdout)
+            self.assertTrue(caught.exception.result.capture_complete)
+            self.assertIn("SECRET_TIMEOUT_CANARY", captures.text())
+
+    def test_client_attempt_uses_the_reload_deadline_remaining_budget(self) -> None:
+        # Break caught: giving a retry the original full timeout lets an
+        # attempt started near the reload deadline overrun the phase bound.
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            client = root_path / "client"
+            client.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys, time\n"
+                "sys.stdin.read()\n"
+                "time.sleep(0.5)\n"
+                "sys.stdout.write('{\"status\":\"ok\"}\\n')\n",
+                encoding="utf-8",
+            )
+            client.chmod(0o700)
+            token = root_path / "token"
+            token.write_bytes(b"unused")
+            registry = checker.ProcessRegistry()
+            captures = checker.CaptureLedger([])
+            started = time.monotonic()
+            try:
+                try:
+                    with self.assertRaises(checker.AcceptanceError):
+                        checker.invoke_client_captured(
+                            captures,
+                            registry,
+                            client,
+                            "status",
+                            "127.0.0.1:1",
+                            token,
+                            1,
+                            attempt_timeout_seconds=0.05,
+                        )
+                except TypeError:
+                    self.fail("client invocation must accept the remaining phase budget")
+            finally:
+                registry.cleanup_all(1)
+            self.assertLess(time.monotonic() - started, 0.25)
 
     def test_peer_canaries_include_every_direct_component(self) -> None:
         # Break caught: scanning the full peer and socket suffix still misses
