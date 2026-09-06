@@ -2,7 +2,11 @@
 
 # Linux Event MVP Evaluation Profile v0.1 design
 
-**Status:** Approved in design review; awaiting written-spec review
+**Status:** Approved in design review on 2026-09-06; implementation planning
+authorized
+
+**Implementation plan:**
+[`2026-09-06-linux-event-mvp-evaluation-profile.md`](../plans/2026-09-06-linux-event-mvp-evaluation-profile.md)
 
 **Date:** 2026-09-06
 
