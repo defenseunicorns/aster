@@ -15,6 +15,7 @@ For a shorter path based on what you are trying to accomplish, start at the
 - [Real-process Event message playground](quickstart/message-playground.md)
 - [Live mesh CLI](quickstart/mesh-cli.md)
 - [Local ConnectRPC agent](quickstart/connect-agent.md)
+- [Aster agent configuration version 1](reference/aster-agent-config-v1.md)
 - [Selected Event API](quickstart/selected-event-api.md)
 - [Selected State API](quickstart/selected-state-api.md)
 - [Selected Record API](quickstart/selected-record-api.md)

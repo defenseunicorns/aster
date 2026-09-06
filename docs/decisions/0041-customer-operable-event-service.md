@@ -91,7 +91,34 @@ of the isolated `conformance/agent-go` module. They are test and
 interoperability evidence only: checked-in code is generated from the local
 public schema with Buf 1.72.0 and exact-version local generator binaries. They
 do not enter the Rust runtime, customer package, deployment lane, or protocol
-authority.
+authority. The final admitted module pins are in
+[`conformance/agent-go/go.mod`](../../conformance/agent-go/go.mod), the local
+generation recipe is
+[`conformance/agent-go/buf.gen.yaml`](../../conformance/agent-go/buf.gen.yaml),
+and [`tools/check-agent-go-generated.sh`](../../tools/check-agent-go-generated.sh)
+reproduces and byte-compares the checked-in generated client.
+
+### Bounded process-acceptance evidence
+
+[`tools/check-aster-agent-process.py`](../../tools/check-aster-agent-process.py)
+is the packaged-process contract and
+[`conformance/agent-go/cmd/agent-smoke`](../../conformance/agent-go/cmd/agent-smoke)
+is its separately generated Go client. One bounded same-host execution emitted
+14 passing receipts: unsupported-schema and non-loopback application/health
+refusals without state/listener effects; five readiness transitions; exact
+all-field Event recovery after forced process loss; higher-attempt redelivery;
+acknowledgement persistence; token reload; exact unary and stream drain
+outcomes; and combined process/client canary absence. Exact token bytes and
+mode were restored after the run.
+
+This is bounded runtime and client evidence only. The packaged agent in that
+run was the repository's explicitly unprotected test fixture. It is not a
+customer provider, representative deployment, retained physical/mixed-network
+result, supported-target package, independent server implementation, or
+release authorization. The exact supported configuration and operational
+semantics are documented in the
+[`v1 configuration reference`](../reference/aster-agent-config-v1.md) and
+[`Event agent quickstart`](../quickstart/connect-agent.md).
 
 ## Ownership and acceptance
 
