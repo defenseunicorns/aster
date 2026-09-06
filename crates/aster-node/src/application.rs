@@ -2337,8 +2337,14 @@ mod tests {
             UnprotectedReferenceMission::persist(&mission_path, bytes)
                 .expect("persist owner-only mission"),
         );
-        SelectedEventNode::open_unprotected_reference(root.path(), &mission_path)
-            .expect("open selected Event node")
+        // Preserve the original load failure before the public API maps it to
+        // a deliberately opaque provisioning error. Keep loading inside the
+        // opener so terminal-state inspection still precedes mission access.
+        SelectedEventNode::open_with_mission(root.path(), || {
+            Ok(UnprotectedReferenceMission::load(&mission_path)
+                .expect("reload persisted test mission after dropping its owner"))
+        })
+        .expect("open selected Event node")
     }
 
     #[test]
