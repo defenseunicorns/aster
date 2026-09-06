@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Bounded black-box crash/recovery acceptance for a customer Aster agent.
 
-The checker treats its agent and protocol client as packaged executables.  It
-never provisions production credentials; the repository smoke task supplies an
-explicitly unprotected, test-only fixture binary and configuration.
+The checker treats its agent and independently supplied protocol client as
+packaged executables; it never assumes they share an implementation language.
+It never provisions production credentials; the repository smoke task supplies
+an explicitly unprotected, test-only fixture binary and configuration.
 """
 
 from __future__ import annotations

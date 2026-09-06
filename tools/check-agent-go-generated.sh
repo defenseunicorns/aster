@@ -42,6 +42,14 @@ test "$(protoc-gen-connect-go --version)" = "1.20.0" || {
   echo "ERROR agent Go generation found an unsupported ConnectRPC generator" >&2
   exit 1
 }
+test "$(awk '$1 == "connectrpc.com/connect" { print $2 }' conformance/agent-go/go.mod)" = "v1.20.0" || {
+  echo "ERROR agent Go client found an unsupported ConnectRPC module version" >&2
+  exit 1
+}
+test "$(awk '$1 == "google.golang.org/protobuf" { print $2 }' conformance/agent-go/go.mod)" = "v1.36.11" || {
+  echo "ERROR agent Go client found an unsupported protobuf-go module version" >&2
+  exit 1
+}
 
 if grep -Eq '^[[:space:]]*remote:' conformance/agent-go/buf.gen.yaml; then
   echo "ERROR agent Go generation must use local plugins only" >&2

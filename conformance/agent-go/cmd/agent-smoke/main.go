@@ -110,7 +110,13 @@ func run(args []string, input io.Reader, output io.Writer) error {
 	if err != nil {
 		return err
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), opts.timeout)
+	defer cancel()
 	token, err := readToken(opts.tokenFile)
+	if err != nil {
+		return err
+	}
+	inputBytes, err := readInput(ctx, input)
 	if err != nil {
 		return err
 	}
@@ -124,10 +130,7 @@ func run(args []string, input io.Reader, output io.Writer) error {
 		opts.baseURL,
 		connect.WithGRPC(),
 	)
-	ctx, cancel := context.WithTimeout(context.Background(), opts.timeout)
-	defer cancel()
-
-	return runCommand(ctx, client, opts.command, token, input, output)
+	return runCommand(ctx, client, opts.command, token, bytes.NewReader(inputBytes), output)
 }
 
 func parseOptions(args []string) (options, error) {
@@ -203,7 +206,7 @@ func readToken(path string) (string, error) {
 }
 
 func openToken(path string) (*os.File, error) {
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, errors.New("invalid token file")
 	}
@@ -241,12 +244,49 @@ func decodeInput(input io.Reader, destination any) error {
 	return nil
 }
 
+func readInput(ctx context.Context, input io.Reader) ([]byte, error) {
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	finished := make(chan readResult, 1)
+	go func() {
+		data, err := io.ReadAll(io.LimitReader(input, maxInputBytes+1))
+		finished <- readResult{data: data, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-finished:
+		if result.err != nil || len(result.data) > maxInputBytes {
+			return nil, errors.New("invalid input")
+		}
+		return result.data, nil
+	}
+}
+
 func decodeHex(value string) ([]byte, error) {
 	if value == "" || len(value)%2 != 0 {
 		return nil, errors.New("invalid input")
 	}
 	decoded, err := hex.DecodeString(value)
 	if err != nil {
+		return nil, errors.New("invalid input")
+	}
+	return decoded, nil
+}
+
+func decodeFixedHex(value string, size int) ([]byte, error) {
+	decoded, err := decodeHex(value)
+	if err != nil || len(decoded) != size {
+		return nil, errors.New("invalid input")
+	}
+	return decoded, nil
+}
+
+func decodeOperationKeyHex(value string) ([]byte, error) {
+	decoded, err := decodeHex(value)
+	if err != nil || len(decoded) > 256 {
 		return nil, errors.New("invalid input")
 	}
 	return decoded, nil
@@ -336,7 +376,7 @@ func runCommand(ctx context.Context, client applicationv1alpha1.AsterApplication
 		if err := decodeInput(input, &value); err != nil {
 			return err
 		}
-		operationKey, err := decodeHex(value.OperationKeyHex)
+		operationKey, err := decodeOperationKeyHex(value.OperationKeyHex)
 		if err != nil {
 			return err
 		}
@@ -394,7 +434,7 @@ func runCommand(ctx context.Context, client applicationv1alpha1.AsterApplication
 		if err := decodeInput(input, &value); err != nil {
 			return err
 		}
-		operationKey, err := decodeHex(value.OperationKeyHex)
+		operationKey, err := decodeOperationKeyHex(value.OperationKeyHex)
 		if err != nil {
 			return err
 		}
@@ -410,7 +450,7 @@ func runCommand(ctx context.Context, client applicationv1alpha1.AsterApplication
 		if err := decodeInput(input, &value); err != nil {
 			return err
 		}
-		subscriptionID, err := decodeHex(value.SubscriptionIDHex)
+		subscriptionID, err := decodeFixedHex(value.SubscriptionIDHex, 32)
 		if err != nil {
 			return err
 		}
@@ -433,7 +473,7 @@ func runCommand(ctx context.Context, client applicationv1alpha1.AsterApplication
 		if err := decodeInput(input, &value); err != nil || value.Count == 0 || value.Count > maxStreamDeliveries {
 			return errors.New("invalid input")
 		}
-		subscriptionID, err := decodeHex(value.SubscriptionIDHex)
+		subscriptionID, err := decodeFixedHex(value.SubscriptionIDHex, 32)
 		if err != nil {
 			return err
 		}
@@ -462,11 +502,11 @@ func runCommand(ctx context.Context, client applicationv1alpha1.AsterApplication
 		if err := decodeInput(input, &value); err != nil {
 			return err
 		}
-		subscriptionID, err := decodeHex(value.SubscriptionIDHex)
+		subscriptionID, err := decodeFixedHex(value.SubscriptionIDHex, 32)
 		if err != nil {
 			return err
 		}
-		eventID, err := decodeHex(value.EventIDHex)
+		eventID, err := decodeFixedHex(value.EventIDHex, 32)
 		if err != nil {
 			return err
 		}
@@ -486,11 +526,11 @@ func eventMatches(event *applicationv1alpha1.Event, expected expectedEventInput)
 	if event == nil {
 		return false, nil
 	}
-	id, err := decodeHex(expected.IDHex)
+	id, err := decodeFixedHex(expected.IDHex, 32)
 	if err != nil {
 		return false, err
 	}
-	publisher, err := decodeHex(expected.PublisherHex)
+	publisher, err := decodeFixedHex(expected.PublisherHex, 32)
 	if err != nil {
 		return false, err
 	}

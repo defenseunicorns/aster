@@ -2,10 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	applicationv1alpha1 "github.com/defenseunicorns/aster/conformance/agent-go/gen/aster/application/v1alpha1"
 	"google.golang.org/protobuf/proto"
@@ -54,6 +58,49 @@ func TestTokenValidationAcceptsOnlyBoundedOwnerOnlyRegularFile(t *testing.T) {
 	}
 	if err := validateTokenFile(link); err == nil {
 		t.Fatal("token symlink accepted")
+	}
+}
+
+func TestFIFOtokenIsRejectedWithoutBlocking(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token-fifo")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- validateTokenFile(path) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("FIFO token accepted")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("FIFO token validation blocked")
+	}
+}
+
+func TestInputReadHonorsCommandContext(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer writer.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := readInput(ctx, reader); err == nil {
+		t.Fatal("blocked input outlived command context")
+	}
+}
+
+func TestFixedAndOperationIdentifiersEnforceWireBounds(t *testing.T) {
+	if _, err := decodeFixedHex(strings.Repeat("01", 32), 32); err != nil {
+		t.Fatalf("exact identifier rejected: %v", err)
+	}
+	for _, value := range []string{strings.Repeat("01", 31), strings.Repeat("01", 33), "zz"} {
+		if _, err := decodeFixedHex(value, 32); err == nil {
+			t.Fatalf("invalid fixed identifier accepted: length=%d", len(value))
+		}
+	}
+	for _, value := range []string{"", strings.Repeat("01", 257)} {
+		if _, err := decodeOperationKeyHex(value); err == nil {
+			t.Fatalf("invalid operation key accepted: length=%d", len(value))
+		}
 	}
 }
 
