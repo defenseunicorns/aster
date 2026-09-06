@@ -43,6 +43,7 @@ understand Aster's wire format or cryptography before building an application.
 | Compose bounded discovery domains through static Event bridges | [Hierarchy MVP](../docker/hierarchy-mvp/README.md) and [hierarchy scale diagnostic](quickstart/hierarchy-scale.md) |
 | Call Aster from Connect, gRPC, or gRPC-Web | [Local ConnectRPC agent](quickstart/connect-agent.md) |
 | Use the live Event API from Rust | [Selected Event API](quickstart/selected-event-api.md) |
+| Review the proposed bounded Linux/Event customer profile | [Linux Event MVP Evaluation Profile v0.1](implementation/linux-event-mvp-evaluation-profile-v0.1.md), its [decision register](implementation/linux-event-mvp-evaluation-profile-v0.1-register.md), and the [candidate-annex schema](implementation/linux-event-mvp-evaluation-profile-v0.1-annex-template.md) |
 | Use live State, Record, or Blob from Rust | [Selected State API](quickstart/selected-state-api.md), [Selected Record API](quickstart/selected-record-api.md), or [Selected Blob API](quickstart/selected-blob-api.md) |
 | Explore current State, Record, or Blob behavior | [State](quickstart/selected-state-api.md), [Record](quickstart/selected-record-api.md), or [Blob](quickstart/selected-blob-api.md) |
 | Use the semantic API from Rust, Python, Go, or C | [Language quickstarts](quickstart/README.md) |
