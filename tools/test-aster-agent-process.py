@@ -422,9 +422,12 @@ class ProcessCheckerContractTests(unittest.TestCase):
         )
         process.stdout.snapshot.return_value = ("partial-stdout", True)
         process.stderr.snapshot.return_value = ("partial-stderr", True)
-        registry = mock.Mock()
-        registry.spawn.return_value = process
-        with self.assertRaises(checker.ClientInvocationError) as caught:
+        registry = checker.ProcessRegistry()
+        registry._processes.append(process)
+        with (
+            mock.patch.object(registry, "spawn", return_value=process),
+            self.assertRaises(checker.ClientInvocationError) as caught,
+        ):
             checker.invoke_client(
                 registry,
                 Path("/packaged-client"),
@@ -436,6 +439,10 @@ class ProcessCheckerContractTests(unittest.TestCase):
         self.assertFalse(caught.exception.result.capture_complete)
         self.assertEqual(caught.exception.result.stdout, "partial-stdout")
         self.assertEqual(caught.exception.result.stderr, "partial-stderr")
+        self.assertIn(process, registry._processes)
+        process.cleanup.side_effect = None
+        registry.cleanup_all(1)
+        self.assertEqual(registry._processes, [])
 
     def test_client_attempt_uses_the_reload_deadline_remaining_budget(self) -> None:
         # Break caught: giving a retry the original full timeout lets an
@@ -751,6 +758,36 @@ class ProcessCheckerContractTests(unittest.TestCase):
             )
         for marker in ("first-out", "first-err", "second-out", "second-err"):
             self.assertIn(marker, captures.text())
+        self.assertEqual(registry._processes, [])
+
+    def test_failed_pair_cleanup_remains_registered_for_outer_retry(self) -> None:
+        # Break caught: discarding a process whose cleanup failed prevents the
+        # acceptance-wide finally block from retrying process-group cleanup.
+        checker = load_checker()
+        first = mock.Mock()
+        second = mock.Mock()
+        first.cleanup.side_effect = checker.AcceptanceError(
+            "process output cleanup exceeded the bound"
+        )
+        first.stdout.snapshot.return_value = ("first-partial", True)
+        first.stderr.snapshot.return_value = ("first-error", True)
+        second.stdout.snapshot.return_value = ("second-complete", True)
+        second.stderr.snapshot.return_value = ("second-error", True)
+        registry = checker.ProcessRegistry()
+        registry._processes.extend((first, second))
+        captures = checker.CaptureLedger([])
+        with self.assertRaisesRegex(
+            checker.AcceptanceError, "process output cleanup exceeded the bound"
+        ):
+            checker.cleanup_and_capture_processes(
+                captures, registry, (first, second), 1
+            )
+        self.assertIn(first, registry._processes)
+        self.assertNotIn(second, registry._processes)
+        self.assertIn("first-partial", captures.text())
+        self.assertIn("second-complete", captures.text())
+        first.cleanup.side_effect = None
+        registry.cleanup_all(1)
         self.assertEqual(registry._processes, [])
 
     def test_client_token_is_restored_exactly_after_failure(self) -> None:

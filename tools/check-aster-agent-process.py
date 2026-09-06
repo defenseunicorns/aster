@@ -754,12 +754,15 @@ def cleanup_and_capture_processes(
 ) -> None:
     deadline = time.monotonic() + timeout_seconds
     first_error: AcceptanceError | None = None
+    cleaned: list[ManagedProcess] = []
     for process in processes:
         try:
             process.cleanup(max(0.01, deadline - time.monotonic()))
         except AcceptanceError as error:
             if first_error is None:
                 first_error = error
+        else:
+            cleaned.append(process)
     outputs: list[str] = []
     for process in processes:
         stdout, _ = process.stdout.snapshot()
@@ -768,7 +771,7 @@ def cleanup_and_capture_processes(
     try:
         captures.extend(outputs)
     finally:
-        for process in processes:
+        for process in cleaned:
             registry.discard(process)
     if first_error is not None:
         raise first_error
@@ -885,7 +888,7 @@ def invoke_client(
             process.cleanup(max(0.01, attempt_deadline - time.monotonic()))
         except AcceptanceError as error:
             cleanup_error = error
-        finally:
+        else:
             registry.discard(process)
     stdout, stdout_complete = process.stdout.snapshot()
     stderr, stderr_complete = process.stderr.snapshot()
