@@ -244,6 +244,15 @@ def expected_drain_client_outcome(
     return False
 
 
+def expected_client_failure(result: ClientResult, code: str) -> bool:
+    if result.return_code != 1:
+        return False
+    try:
+        return _json_record(result.stderr) == {"status": "error", "code": code}
+    except AcceptanceError:
+        return False
+
+
 def _exact_json_lines(output: str) -> list[dict[str, Any]] | None:
     records: list[dict[str, Any]] = []
     for line in output.splitlines():
@@ -698,6 +707,14 @@ class ClientResult:
     record: dict[str, Any]
 
 
+class ClientInvocationError(AcceptanceError):
+    """A fixed client failure that retains bounded streams for final scanning."""
+
+    def __init__(self, message: str, result: ClientResult) -> None:
+        super().__init__(message)
+        self.result = result
+
+
 def _client_arguments(
     client: Path,
     command: str,
@@ -737,7 +754,7 @@ def invoke_client(
     timeout_seconds: int,
     request: dict[str, Any] | None = None,
     *,
-    expect_failure: bool = False,
+    expect_failure: bool | str = False,
 ) -> ClientResult:
     encoded = json.dumps(request or {}, separators=(",", ":")).encode("utf-8")
     process = registry.spawn(
@@ -751,21 +768,59 @@ def invoke_client(
     finally:
         process.cleanup(timeout_seconds)
         registry.discard(process)
-    if expect_failure:
-        if return_code == 0:
-            raise AcceptanceError("client unexpectedly accepted rejected work")
-        record = _json_record(stderr)
-    else:
-        if return_code != 0:
-            print(
-                sanitized_diagnostic("client", return_code, stdout, stderr),
-                file=sys.stderr,
-            )
-            raise AcceptanceError("client command failed")
-        record = _json_record(stdout)
-        if record.get("status") != "ok":
-            raise AcceptanceError("client result was invalid")
+    failed_result = ClientResult(return_code, stdout, stderr, {})
+    try:
+        if expect_failure:
+            if return_code == 0:
+                raise AcceptanceError("client unexpectedly accepted rejected work")
+            record = _json_record(stderr)
+            if isinstance(expect_failure, str) and not expected_client_failure(
+                ClientResult(return_code, stdout, stderr, record), expect_failure
+            ):
+                raise AcceptanceError("client failure did not match the contract")
+        else:
+            if return_code != 0:
+                print(
+                    sanitized_diagnostic("client", return_code, stdout, stderr),
+                    file=sys.stderr,
+                )
+                raise AcceptanceError("client command failed")
+            record = _json_record(stdout)
+            if record.get("status") != "ok":
+                raise AcceptanceError("client result was invalid")
+    except AcceptanceError as error:
+        raise ClientInvocationError(str(error), failed_result) from error
     return ClientResult(return_code, stdout, stderr, record)
+
+
+def invoke_client_captured(
+    captures: list[str],
+    registry: ProcessRegistry,
+    client: Path,
+    command: str,
+    application: str,
+    token_file: Path,
+    timeout_seconds: int,
+    request: dict[str, Any] | None = None,
+    *,
+    expect_failure: bool | str = False,
+) -> ClientResult:
+    try:
+        result = invoke_client(
+            registry,
+            client,
+            command,
+            application,
+            token_file,
+            timeout_seconds,
+            request,
+            expect_failure=expect_failure,
+        )
+    except ClientInvocationError as error:
+        captures.extend((error.result.stdout, error.result.stderr))
+        raise
+    captures.extend((result.stdout, result.stderr))
+    return result
 
 
 def start_active_client(
@@ -1275,7 +1330,8 @@ def run_acceptance_with_token(
         expect_failure: bool = False,
     ) -> ClientResult:
         try:
-            result = invoke_client(
+            result = invoke_client_captured(
+                captures,
                 registry,
                 arguments.client,
                 command,
@@ -1285,9 +1341,12 @@ def run_acceptance_with_token(
                 request,
                 expect_failure=expect_failure,
             )
+        except ClientInvocationError as error:
+            raise ClientInvocationError(
+                f"client phase {command} failed", error.result
+            ) from error
         except AcceptanceError as error:
             raise AcceptanceError(f"client phase {command} failed") from error
-        captures.extend((result.stdout, result.stderr))
         return result
 
     def drain_with_active_client(
@@ -1437,7 +1496,11 @@ def run_acceptance_with_token(
                 try:
                     call("status")
                     break
-                except AcceptanceError:
+                except ClientInvocationError as error:
+                    if not expected_client_failure(error.result, "unauthenticated"):
+                        raise AcceptanceError(
+                            "rotated token probe did not match the contract"
+                        ) from error
                     if time.monotonic() >= deadline:
                         raise AcceptanceError("rotated token was not accepted within the bound")
                     time.sleep(0.05)

@@ -164,6 +164,178 @@ class ProcessCheckerContractTests(unittest.TestCase):
             ["SECRET_PATH_CANARY", "SECRET_PAYLOAD_CANARY"],
         )
 
+    def test_failed_client_invocation_retains_output_for_canary_scan(self) -> None:
+        # Break caught: raising before the caller receives a failed attempt's
+        # streams lets a later successful reload retry hide an earlier leak.
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            client = root_path / "client"
+            client.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "sys.stdin.read()\n"
+                "sys.stderr.write('{\"status\":\"error\",'"
+                "'\"code\":\"unauthenticated\"}\\n'"
+                "'SECRET_RELOAD_CANARY\\n')\n"
+                "raise SystemExit(1)\n",
+                encoding="utf-8",
+            )
+            client.chmod(0o700)
+            token = root_path / "token"
+            token.write_bytes(b"unused")
+            registry = checker.ProcessRegistry()
+            diagnostics = io.StringIO()
+            try:
+                with (
+                    contextlib.redirect_stderr(diagnostics),
+                    self.assertRaises(checker.AcceptanceError) as caught,
+                ):
+                    checker.invoke_client(
+                        registry,
+                        client,
+                        "status",
+                        "127.0.0.1:1",
+                        token,
+                        1,
+                    )
+            finally:
+                registry.cleanup_all(1)
+
+            result = getattr(caught.exception, "result", None)
+            self.assertIsNotNone(result, "failed client streams must remain available")
+            with self.assertRaisesRegex(ValueError, "canary exposed"):
+                checker.require_sanitized(
+                    result.stdout + "\n" + result.stderr,
+                    ["SECRET_RELOAD_CANARY"],
+                )
+
+    def test_expected_authentication_failure_rejects_other_client_errors(self) -> None:
+        # Break caught: treating every failed reload probe as a transient race
+        # can hide malformed, internal, or transport failures until a later
+        # successful attempt.
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            client = root_path / "client"
+            client.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "sys.stdin.read()\n"
+                "sys.stderr.write('{\"status\":\"error\",'"
+                "'\"code\":\"internal\"}\\n')\n"
+                "raise SystemExit(1)\n",
+                encoding="utf-8",
+            )
+            client.chmod(0o700)
+            token = root_path / "token"
+            token.write_bytes(b"unused")
+            registry = checker.ProcessRegistry()
+            try:
+                with self.assertRaises(checker.AcceptanceError):
+                    checker.invoke_client(
+                        registry,
+                        client,
+                        "status",
+                        "127.0.0.1:1",
+                        token,
+                        1,
+                        expect_failure="unauthenticated",
+                    )
+            finally:
+                registry.cleanup_all(1)
+
+    def test_reload_authentication_classification_uses_the_error_record(self) -> None:
+        # Break caught: coupling transient classification to otherwise captured
+        # output can skip the final canary scan instead of retaining the whole
+        # failed attempt and classifying only its fixed public result.
+        checker = load_checker()
+        transient = checker.ClientResult(
+            1,
+            "SECRET_RELOAD_CANARY\n",
+            '{"status":"error","code":"unauthenticated"}\n',
+            {},
+        )
+        self.assertTrue(
+            checker.expected_client_failure(transient, "unauthenticated")
+        )
+        internal = checker.ClientResult(
+            1,
+            "",
+            '{"status":"error","code":"internal"}\n',
+            {},
+        )
+        self.assertFalse(
+            checker.expected_client_failure(internal, "unauthenticated")
+        )
+
+    def test_reload_retry_cannot_hide_an_earlier_canary_leak(self) -> None:
+        # Break caught: retaining only the successful retry lets a transient
+        # authentication attempt disclose a credential canary without making
+        # the acceptance-wide output scan fail.
+        checker = load_checker()
+        invoke_captured = getattr(checker, "invoke_client_captured", None)
+        self.assertTrue(callable(invoke_captured), "captured invocation is required")
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            client = root_path / "client"
+            client.write_text(
+                "#!/usr/bin/env python3\n"
+                "import pathlib, sys\n"
+                "sys.stdin.read()\n"
+                "token = pathlib.Path(sys.argv[sys.argv.index('--token-file') + 1])\n"
+                "attempt = token.with_name('reload-attempt')\n"
+                "if not attempt.exists():\n"
+                "    attempt.write_text('1')\n"
+                "    sys.stdout.write('SECRET_RELOAD_CANARY\\n')\n"
+                "    sys.stderr.write('{\"status\":\"error\",'"
+                "'\"code\":\"unauthenticated\"}\\n')\n"
+                "    raise SystemExit(1)\n"
+                "sys.stdout.write('{\"status\":\"ok\"}\\n')\n",
+                encoding="utf-8",
+            )
+            client.chmod(0o700)
+            token = root_path / "token"
+            token.write_bytes(b"unused")
+            registry = checker.ProcessRegistry()
+            captures = []
+            try:
+                with (
+                    contextlib.redirect_stderr(io.StringIO()),
+                    self.assertRaises(checker.ClientInvocationError) as first,
+                ):
+                    invoke_captured(
+                        captures,
+                        registry,
+                        client,
+                        "status",
+                        "127.0.0.1:1",
+                        token,
+                        1,
+                    )
+                self.assertTrue(
+                    checker.expected_client_failure(
+                        first.exception.result, "unauthenticated"
+                    )
+                )
+                succeeded = invoke_captured(
+                    captures,
+                    registry,
+                    client,
+                    "status",
+                    "127.0.0.1:1",
+                    token,
+                    1,
+                )
+                self.assertEqual(succeeded.record, {"status": "ok"})
+            finally:
+                registry.cleanup_all(1)
+
+            with self.assertRaisesRegex(ValueError, "canary exposed"):
+                checker.require_sanitized(
+                    "\n".join(captures), ["SECRET_RELOAD_CANARY"]
+                )
+
     def test_peer_canaries_include_every_direct_component(self) -> None:
         # Break caught: scanning the full peer and socket suffix still misses
         # disclosure of the carrier identity that precedes `@`.
