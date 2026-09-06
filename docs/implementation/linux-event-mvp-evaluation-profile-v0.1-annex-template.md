@@ -28,9 +28,26 @@ be sanitized without removing facts required to substantiate its public claim.
 - Unless a row states otherwise, `digest` means lowercase, 64-character SHA-256
   over immutable bytes, written as `sha256:<hex>`. An immutable record reference
   is a stable content-addressed location plus that digest.
-- A result uses exactly `pass`, `fail`, or `not-run`. A decision uses exactly
-  `issue`, `refuse`, or `defer`. A warning, target date, scheduled run, or
-  incomplete review is never `pass`.
+- An executed result uses `pass` or `fail` and carries its actual immutable
+  receipt digest. A downstream result that did not run because an earlier gate
+  stopped the candidate uses exactly
+  `not-run:blocked-at-G<N>:sha256:<receipt-digest>`, where `G<N>` is `G1`
+  through `G6` and the digest binds the blocking failure or exit receipt. An
+  untyped `not-run` is invalid. Actual result and receipt digests remain
+  mandatory whenever execution occurred and for every result supporting
+  `issue`.
+- The G3 artifact binding is exactly one of
+  `produced:sha256:<artifact-set-manifest-digest>` when artifacts exist, or
+  `not-produced:blocked-at-G<N>:sha256:<failure-or-exit-receipt-digest>` for a
+  `refuse` or `defer` decision stopped before artifact production. The latter
+  never represents `issue`, and actual artifact digests are mandatory whenever
+  any artifact exists.
+- When `not-produced` is used, every artifact-specific field and every
+  downstream result/receipt field is completed with the applicable exact typed
+  `not-produced` or `not-run` value rather than left blank. These typed blockers
+  are valid only for a `refuse` or `defer` record.
+- A decision uses exactly `issue`, `refuse`, or `defer`. A warning, target date,
+  scheduled run, or incomplete review is never `pass`.
 - An owner is the named accountable role. A producer may populate a field, but
   the owner reviews it and the release owner verifies every digest before issue.
 - Rejection means the annex cannot support an `issue` decision. A completed
@@ -47,7 +64,8 @@ be sanitized without removing facts required to substantiate its public claim.
 | Profile identity | Required | Exact ID `aster-linux-event-mvp-evaluation-v0.1`, profile version `0.1`, and immutable profile digest | Profile owner | Reject any different, missing, or mutable identity |
 | Candidate identity | Required | Unique sanitized candidate ID and candidate-annex revision | Release owner | Reject reuse across different source, artifacts, provider, configuration, or environments |
 | Decision checkpoint | Required | Exact date `2026-09-13` and RFC 3339 UTC review time | Release owner | Reject if the date is treated as approval or if the review time is absent |
-| Final outcome | Required | Exactly one of `issue`, `refuse`, or `defer`, with a concise reason and exact G3 artifact-set digest | Release owner | Reject an `issue` unless every required gate passed in order; reject an absent, ambiguous, or unsigned outcome |
+| G3 artifact binding | Required | Exact typed `produced:sha256:<hex>` or `not-produced:blocked-at-G<N>:sha256:<hex>` value defined above | Deployment + release | Reject an untyped/missing binding, `not-produced` for issue, a missing actual artifact digest, or disagreement with any artifact/result/decision record |
+| Final outcome | Required as a detached record; excluded from the signable annex body | Exactly one signed `issue`, `refuse`, or `defer` release-decision record with a concise reason and the exact G3 artifact binding | Release owner | Reject an `issue` unless every required gate passed in order; reject an absent, ambiguous, or unsigned outcome; reject refusal/defer if missing downstream work is not represented by typed `not-run` values |
 | Claim and non-claims | Required | Immutable text identifying the time-bounded, non-production Linux/Event v0.1 claim and its exclusions | Profile + release | Reject if it broadens the profile, claims production, or describes implementation or component evidence as qualification |
 
 ## 2. Source, inputs, configuration, harness, and deterministic gate
@@ -59,6 +77,7 @@ be sanitized without removing facts required to substantiate its public claim.
 | Toolchain | Required | Exact compiler/build-tool versions and immutable toolchain-manifest digest | Deterministic-gate owner | Reject floating versions, incomplete tool identity, or drift between build and replay |
 | Sanitized strict configuration | Required | Configuration schema/version, immutable bundle reference, byte size, and `sha256:<hex>`; no secrets | Profile + integration | Reject plaintext secrets, omitted effective values, mutable references, or any profile deviation |
 | Qualification harness | Required | Version or full source commit plus harness/configuration digest | Integration + deterministic-gate | Reject an unversioned harness or a harness/config mismatch between dependent gates |
+| G3 dependency graph and SBOM/provenance binding | Required when the G3 artifact binding is `produced`; otherwise required as a typed downstream `not-run` value | Immutable dependency-graph/SBOM/provenance manifest reference and digest that names the exact G3 artifact binding and both package digests; otherwise `not-run:blocked-at-G<N>:sha256:<hex>` | Dependency/license + deployment/release | Reject graph, package, SBOM, provenance, or G3-binding drift; reject a missing actual digest when artifacts exist |
 | Clean locked checkout | Required | `pass`/`fail`, RFC 3339 UTC, command digest, receipt reference, and receipt digest | Deterministic-gate owner | Reject unless `pass` proves a clean locked checkout for the full source commit |
 | Deterministic gate | Required | Exact `mise run check` result, command/environment digest, receipt reference, and receipt digest | Deterministic-gate owner | Reject unless the exact final source passes deterministically; a retry without retained failure disposition is insufficient |
 | Event/Go process gates | Required | Results and immutable receipts for Event-service process acceptance and checked-in Go generation/black-box acceptance | Event-service + API + deterministic-gate | Reject a missing/failing result or a claim that Go is an independent server implementation |
@@ -83,7 +102,7 @@ architectures remain paired exactly as shown.
 | Install/start/health procedure | Required | Immutable procedure reference, version, and digest; exact command sequence contains no secret | Deployment/OS owner | Reject if missing, mutable, secret-bearing, or not exercised by retained target receipts |
 | Controlled restart/upgrade/permitted rollback procedure | Required | Immutable procedure reference, version, and digest; rollback is exact qualified-artifact reinstall against unchanged current state | Deployment/OS + release | Reject downgrade, snapshot restore, unknown state provenance, or any different rollback meaning |
 | Uninstall/state-preservation procedure | Required | Immutable procedure reference, version, and digest, plus result receipt | Deployment/OS owner | Reject if uninstall/state behavior is absent, unverifiable, or differs by architecture without an annexed distinction |
-| Packaged supporting material | Required | Digests for hardened `systemd` unit, strict example config, Rust client source/build instructions, generated Go client/acceptance source, profile, annex, evidence index, limitations, and escalation procedure | Deployment/release owner | Reject a missing required artifact, bundled credential/mission data/state/test secret, or digest mismatch |
+| Packaged supporting material | Required | Digests for hardened `systemd` unit, strict example config, Rust client source/build instructions, generated Go client/acceptance source, profile, frozen annex schema/blank template, evidence index, limitations, and escalation procedure | Deployment/release owner | Reject a missing required artifact, a subsequently completed candidate annex packaged before qualification, bundled credential/mission data/state/test secret, or digest mismatch |
 
 ## 4. Protected provider and lifecycle
 
@@ -184,11 +203,14 @@ the reusable base has qualified both architectures and all three tiers.
 
 ## 9. Six-row workload matrix and thirteen acceptance conditions
 
-Each workload row records `pass`/`fail`/`not-run`, exact start/end times,
+Each executed workload row records `pass`/`fail`, exact start/end times,
 inventory/configuration/artifact digests, actual counts and bounds, network
-conditions, and immutable receipt references/digests. The integration owner
-owns every row; the release owner rejects an absent or failing required row,
-any different workload, any receipt mismatch, or a summary without its receipt.
+conditions, and immutable receipt references/digests. A downstream row not
+executed for `refuse` or `defer` records its exact typed
+`not-run:blocked-at-G<N>:sha256:<receipt-digest>` value. The integration owner
+owns every row; the release owner rejects an absent or failing required row for
+`issue`, any untyped omission, any different workload, any receipt mismatch, or
+a summary without its receipt.
 The relay portion of applicable rows is conditional on section 6; direct
 coverage remains required.
 
@@ -206,11 +228,13 @@ The 64-KiB boundary is a payload boundary and bounded burst, not a sustained
 retaining provisioning controls, and records final logical and physical
 headroom.
 
-For each acceptance row, record `pass`/`fail`/`not-run`, the exact claim,
-applicable workload/inventory IDs, producer, environment class, receipt
-reference, and receipt digest. The named owner reviews the row. Reject an
-`issue` if any row is absent, `fail`, `not-run`, based on changed inputs, or
-unsupported by its immutable receipt.
+For each executed acceptance row, record `pass`/`fail`, the exact claim,
+applicable workload/inventory IDs, producer, evidence type, execution
+environment class, receipt reference, and receipt digest. A downstream row not
+executed for `refuse` or `defer` records its exact typed `not-run` value. The
+named owner reviews the row. Reject an `issue` if any row is absent, `fail`,
+typed `not-run`, based on changed inputs, or unsupported by its immutable
+receipt; reject any record containing an untyped omission.
 
 | Acceptance condition | Applicability | Format / exact required result | Owner | Additional rejection rule |
 |---:|---|---|---|---|
@@ -232,16 +256,20 @@ unsupported by its immutable receipt.
 
 | Field/group | Applicability | Format | Owner | Rejection rule |
 |---|---|---|---|---|
-| Profile-qualification evidence | Required | Separate immutable index of black-box results against the exact packaged G3 artifacts and declared target/environment | Integration + release | Reject component/same-host evidence substituted for package, physical, provider, or release qualification |
-| Component evidence | Required when cited; otherwise signed `not cited` statement | Separate immutable index with exact component claim/non-claims and environment | Component owner + release | Reject presentation as black-box profile qualification or omission of environment/non-claims |
+| Profile-qualification evidence type | Required | Exact evidence type `profile-qualification`; separate immutable index of black-box results against the exact packaged G3 artifacts and declared target/environment | Integration + release | Reject component/same-host evidence substituted for package, physical, provider, or release qualification |
+| Component evidence type | Required when cited; otherwise signed `not cited` statement | Exact evidence type `component`; separate immutable index with exact component claim/non-claims and execution environment | Component owner + release | Reject presentation as black-box profile qualification or omission of environment/non-claims |
 | Post-payload-retirement behavior | Required as a classification statement | Exact statement: existing `ExpiredOrRetired` behavior is component evidence only; v0.1 has no black-box retirement trigger | Lifecycle/capacity + Event-service | Reject a black-box retirement claim or an inference of finite TTL/Event-content deletion |
-| Isolated engineering evidence | Required when cited; otherwise signed `not cited` statement | Separate immutable index with exact engineering claim/non-claims and environment | Engineering producer + lifecycle/capacity | Reject presentation as qualification or unsupported extrapolation |
+| Isolated engineering evidence type | Required when cited; otherwise signed `not cited` statement | Exact evidence type `isolated-engineering`; separate immutable index with exact engineering claim/non-claims and execution environment | Engineering producer + lifecycle/capacity | Reject presentation as qualification or unsupported extrapolation |
 | Operation-map hard-cap saturation | Required as a classification statement | Exact statement: 4,096-row/512-KiB hard-cap saturation is isolated engineering evidence (or uses a test-only lower cap on the production transaction path) and does not expand the 1,024-operation workload claim | Lifecycle/capacity + release | Reject inclusion in the ordinary workload, capacity expansion, reclamation claim, or missing isolation |
+| Generated-client contract evidence type | Required | Exact evidence type `generated-client-contract`; immutable receipt for checked-in Go generation and Go black-box API recovery against the Rust server | API + Event-service + deterministic-gate | Reject omission, presentation as an execution environment or independent-server evidence, or a claim beyond the client/API contract |
+| Independent-server evidence type | Required when cited; otherwise signed `not cited` statement | Exact evidence type `independent-server`; immutable receipt identifying the independently authored server boundary | Conformance/security + release | Reject presentation as an environment class, substitution by generated Go client evidence, or unsupported interoperability claim |
 
-Same-host software tests, virtual/network-namespace tests, physical-device
-observations, generated-client checks, and independently implemented server
-evidence are distinct environment classes. One class never silently inherits
-the claims of another.
+Evidence type and execution environment class are independent fields. A receipt
+records exactly one evidence type and exactly one primary execution environment
+class. Environment classes are `same-host-software`, `virtual-machine`,
+`network-namespace`, and `physical-device`; generated-client checks and
+independently implemented server evidence are evidence types, not environments.
+No type or environment class silently inherits the claims of another.
 
 ## 11. Approved resource and capacity measurements
 
@@ -281,7 +309,8 @@ replace this index.
 |---|---|---|---|---|
 | Receipt identity and digest | Required per receipt | Unique sanitized receipt ID, immutable reference, byte size, media type, and `sha256:<hex>` | Receipt producer | Reject a mutable/missing reference, digest/size mismatch, or duplicate identity |
 | Producer | Required per receipt | Sanitized producer identity, accountable role, producer tool/version digest, and RFC 3339 production time | Receipt producer + relevant gate owner | Reject an unknown producer, missing role, or mutable/unversioned producer |
-| Environment class | Required per receipt | Exactly one primary class: `same-host-software`, `virtual-or-network-namespace`, `physical-device`, or `independent-server`; add exact environment/inventory digest | Integration + release | Reject ambiguous class, unrecorded virtualization, or physical/independent overclaim |
+| Evidence type | Required per receipt | Exactly one primary type: `profile-qualification`, `component`, `isolated-engineering`, `generated-client-contract`, or `independent-server` | Relevant gate owner + release | Reject an ambiguous/missing type or use of a type as an execution environment |
+| Execution environment class | Required per receipt | Exactly one primary class: `same-host-software`, `virtual-machine`, `network-namespace`, or `physical-device`; add exact environment/inventory digest | Integration + release | Reject ambiguous class, unrecorded virtualization/namespace use, or physical overclaim |
 | Exact claim | Required per receipt | Bounded declarative claim tied to exact artifact/config/provider/inventory/workload IDs | Relevant gate owner | Reject a claim broader than recorded observations or detached from the exact candidate |
 | Explicit non-claims | Required per receipt | Nonempty list of material exclusions, including inapplicable physical, independent, package, provider, or release claims | Relevant gate owner + release | Reject absent non-claims or silent inheritance from another evidence class |
 | Verification/replay | Required per receipt | Exact verification command/procedure digest, result, and any controlled-storage dependency | Deterministic-gate + release | Reject if the receipt cannot be verified, required raw custody is unavailable, or secrets would enter the repository |
@@ -300,7 +329,7 @@ not `pass`, an input changed, or the serial dependency was bypassed.
 | G3 — Artifact freeze | Required | G2 pass | Reproducibly built and signed provider-composed packages for both architectures from G2; exact artifact-set and exit digests | Deployment + security + release | Reject either architecture, nonreproducibility, failed authentication, or any source other than G2; G4/G5 cannot use another artifact |
 | G4 — Focused target tests | Required | G3 pass | Install, lifecycle, Rust/Go API, ReceiveOnly, direct and conditional-relay scenarios pass using unchanged G3 artifacts; exit digests | Integration/physical-carrier + security | Reject any failed/missing required case or artifact drift; G5 qualification cannot substitute for G4 |
 | G5 — Workload qualification | Required | G3 and G4 pass | 2-/8-/20-node and 24-hour scenarios pass from G3 with distinct signed inventories and immutable exit digests | Integration/device + physical-carrier | Reject a missing tier, altered artifact/environment, ambiguous participant, shortened soak, or missing receipt |
-| G6 — Disposition | Required | G1–G5 pass in order for `issue` | Receipt review, deterministic-gate rerun, and signed `issue`/`refuse`/`defer` decision over the exact G3 artifact set and completed-annex digest | Release owner with all final roles | Reject issue if any prior gate is absent/failing, any evaluation blocker remains, a digest changed, or the decision is unsigned |
+| G6 — Disposition | Required | G1–G5 pass in order for `issue`; refusal/defer may follow an earlier blocking gate | Receipt review, deterministic-gate rerun when reached, typed downstream `not-run` values when not reached, and detached signed `issue`/`refuse`/`defer` decision over the canonical signable-body digest, sorted detached approval-record digests, candidate ID, schema digest, and exact typed G3 artifact binding | Release owner with all final roles | Reject issue if any prior gate is absent/failing, any evaluation blocker remains, a digest changed, or the decision is unsigned; reject refusal/defer if a pre-G3 stop lacks `not-produced` or downstream omissions lack typed `not-run` bindings |
 
 ## 14. Exact `DM-8-05` proposal and three approvals
 
@@ -311,33 +340,54 @@ close the formal production requirement.
 |---|---|---|---|---|
 | Proposal identity | Required | Immutable reference and exact digest of `dm-8-05-linux-event-v0.1-disposition.md` | Dependency/license + release | Reject a mutable/missing proposal or digest mismatch |
 | Exact coordinates | Required | `webpki-root-certs` `1.0.9` / `b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b` / `CDLA-Permissive-2.0`; `webpki-roots` `1.0.9` / `7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a` / `CDLA-Permissive-2.0` | Dependency/license owner | Reject package, version, source, checksum, reachability, dependency-graph, license, SBOM, or notice drift |
-| Dependency approval | Required | Reviewer identity, dependency/license role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate set, proposal digest, signed approval-record reference/digest | Dependency/license owner | Reject a missing/refusing/unsigned record or one that does not bind every exact tuple and proposal digest |
-| Legal approval | Required | Reviewer identity, legal role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate set, proposal digest, signed approval-record reference/digest | Legal/compliance owner | Reject a missing/refusing/unsigned record or one that does not bind every exact tuple and proposal digest |
-| Release approval | Required | Reviewer identity, release role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate set, proposal digest, signed approval-record reference/digest | Release owner | Reject a missing/refusing/unsigned record or one that does not bind every exact tuple and proposal digest |
+| Dependency approval | Required for issue; otherwise approval or typed `not-run` | Detached reviewer identity, dependency/license role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate set, proposal digest, canonical body digest, signature, and approval-record digest | Dependency/license owner | Reject issue for a missing/refusing/unsigned record or one that does not bind the body, every exact tuple, and proposal digest; reject an untyped omission |
+| Legal approval | Required for issue; otherwise approval or typed `not-run` | Detached reviewer identity, legal role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate set, proposal digest, canonical body digest, signature, and approval-record digest | Legal/compliance owner | Reject issue for a missing/refusing/unsigned record or one that does not bind the body, every exact tuple, and proposal digest; reject an untyped omission |
+| Release approval | Required for issue; otherwise approval or typed `not-run` | Detached reviewer identity, release role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate set, proposal digest, canonical body digest, signature, and approval-record digest | Release owner | Reject issue for a missing/refusing/unsigned record or one that does not bind the body, every exact tuple, and proposal digest; reject an untyped omission |
 | Production limitation | Required | Signed statement that `DM-8-05` remains formally open and production-blocking after any evaluation approval | Dependency/license + legal + release | Reject any production authorization, general allowlist, WebPKI/public-relay authorization, or claim that the requirement is closed |
 
-## 15. Final role approvals and completed-annex signature
+## 15. Final role approvals and detached signatures
 
-Each approval binds the frozen schema version/digest, completed annex digest,
-candidate ID, exact G3 artifact-set digest, decision, role, reviewer identity,
-and RFC 3339 UTC. Every approval is required for `issue`; for `refuse` or
-`defer`, record the approvals obtained and the exact missing/refusing roles.
+The completed annex is a bundle, not a self-signing byte string:
+
+1. Canonicalize a signable annex body/manifest after every non-signature fact
+   and receipt reference is final. It includes the candidate ID, frozen schema
+   digest, exact typed G3 artifact binding, facts and results from sections
+   1–14 other than the detached final outcome and specialist approval records,
+   and typed downstream `not-run` bindings. It excludes every detached
+   approval/signature record and the detached release-decision record.
+2. Compute the canonical signable-body digest. Every final role approval is a
+   detached record that signs this same body digest. For `refuse` or `defer`, a
+   role not reached is represented by a typed downstream `not-run` binding;
+   every approval actually produced retains its actual digest.
+3. Sort every detached approval-record digest from sections 14 and 15 bytewise
+   by lowercase digest. The final detached release decision signs the body
+   digest, that sorted list, candidate ID, frozen schema digest, and exact typed
+   G3 artifact binding.
+4. Verify the body digest first, then every detached approval against it, then
+   the sorted approval list and final release decision. A final archival bundle
+   digest may cover the body, detached approvals, and detached release decision,
+   but is not an input to any of those signatures and grants no additional
+   qualification claim.
+
+Every approval is required for `issue`. For `refuse` or `defer`, record the
+approvals obtained and exact typed blockers for roles not reached.
 
 | Approval | Applicability | Format | Owner | Rejection rule |
 |---|---|---|---|---|
-| Profile/product | Required for issue | Signed immutable approval record and digest | Profile/product owner | Reject issue if absent, refusing, unsigned, or bound to a different annex/schema/artifact set |
-| Security | Required for issue | Signed immutable approval record and digest | Security owner | Reject issue if absent, refusing, unsigned, or bound to a different annex/schema/artifact set |
-| Deployment/OS and artifact | Required for issue | Signed immutable approval record and digest | Deployment/OS/artifact owner | Reject issue if absent, refusing, unsigned, or bound to a different annex/schema/artifact set |
-| Integration/device/physical carrier | Required for issue | Signed immutable approval record and digest | Integration/device/physical-carrier owner | Reject issue if absent, refusing, unsigned, or bound to a different annex/schema/artifact set |
-| Event-service/API/runtime | Required for issue | Signed immutable approval record and digest | Event-service/API/runtime owner | Reject issue if absent, refusing, unsigned, or bound to a different annex/schema/artifact set |
-| Deterministic gate | Required for issue | Signed immutable approval record and digest | Deterministic-gate owner | Reject issue if absent, refusing, unsigned, or bound to a different annex/schema/artifact set |
-| Dependency/license | Required for issue | Signed immutable approval record and digest | Dependency/license owner | Reject issue if absent, refusing, unsigned, or bound to a different annex/schema/artifact set |
-| Legal/compliance | Required for issue | Signed immutable approval record and digest | Legal/compliance owner | Reject issue if absent, refusing, unsigned, or bound to a different annex/schema/artifact set |
-| Release decision | Required | Signed immutable `issue`/`refuse`/`defer` record over the completed-annex digest and exact G3 artifact-set digest | Release owner | Reject an unsigned, ambiguous, or mismatched final decision; issue is forbidden unless all other required approvals and gates pass |
+| Canonical signable annex body | Required | Canonicalization identifier/version, immutable body reference, byte size, and digest; excludes all detached approval/signature and release-decision records | Profile + release | Reject nondeterministic canonicalization, a digest mismatch, or inclusion of a detached record that creates a digest/signature cycle |
+| Profile/product | Required for issue; otherwise approval or typed `not-run` | Detached immutable approval record that signs the body digest; record digest | Profile/product owner | Reject issue if absent, refusing, unsigned, or bound to a different body/candidate/schema/G3 binding; reject an untyped omission |
+| Security | Required for issue; otherwise approval or typed `not-run` | Detached immutable approval record that signs the body digest; record digest | Security owner | Reject issue if absent, refusing, unsigned, or bound to a different body/candidate/schema/G3 binding; reject an untyped omission |
+| Deployment/OS and artifact | Required for issue; otherwise approval or typed `not-run` | Detached immutable approval record that signs the body digest; record digest | Deployment/OS/artifact owner | Reject issue if absent, refusing, unsigned, or bound to a different body/candidate/schema/G3 binding; reject an untyped omission |
+| Integration/device/physical carrier | Required for issue; otherwise approval or typed `not-run` | Detached immutable approval record that signs the body digest; record digest | Integration/device/physical-carrier owner | Reject issue if absent, refusing, unsigned, or bound to a different body/candidate/schema/G3 binding; reject an untyped omission |
+| Event-service/API/runtime | Required for issue; otherwise approval or typed `not-run` | Detached immutable approval record that signs the body digest; record digest | Event-service/API/runtime owner | Reject issue if absent, refusing, unsigned, or bound to a different body/candidate/schema/G3 binding; reject an untyped omission |
+| Deterministic gate | Required for issue; otherwise approval or typed `not-run` | Detached immutable approval record that signs the body digest; record digest | Deterministic-gate owner | Reject issue if absent, refusing, unsigned, or bound to a different body/candidate/schema/G3 binding; reject an untyped omission |
+| Dependency/license | Required for issue; otherwise approval or typed `not-run` | Detached immutable approval record that signs the body digest; record digest | Dependency/license owner | Reject issue if absent, refusing, unsigned, or bound to a different body/candidate/schema/G3 binding; reject an untyped omission |
+| Legal/compliance | Required for issue; otherwise approval or typed `not-run` | Detached immutable approval record that signs the body digest; record digest | Legal/compliance owner | Reject issue if absent, refusing, unsigned, or bound to a different body/candidate/schema/G3 binding; reject an untyped omission |
+| Release decision | Required | Detached signed immutable `issue`/`refuse`/`defer` record over body digest, bytewise-sorted approval-record digests, candidate ID, schema digest, and exact typed G3 artifact binding | Release owner | Reject an unsigned, ambiguous, cyclic, unsorted, or mismatched decision; issue is forbidden unless all approvals and gates pass and G3 is `produced` |
+| Archival bundle | Conditional: when an archival bundle is formed | Immutable manifest/reference and digest covering body, detached approvals, and detached release decision | Release owner | Reject if used as a signature input, substituted for verification of any contained record, or presented as an additional claim |
 
-The completed annex digest is computed only after every applicable field and
-receipt reference is final. No signature may stand in for a missing fact,
-receipt, gate, or approval.
+No signature may stand in for a missing fact, receipt, gate, approval, or typed
+blocker.
 
 ## Annex rejection rules
 
