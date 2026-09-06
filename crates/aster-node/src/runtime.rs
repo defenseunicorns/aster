@@ -129,6 +129,111 @@ use aster_redb_store::{
     DEFAULT_MAX_TOTAL_PAYLOAD_BYTES, MAX_CONTROL_BYTES, MAX_CONTROL_ITEMS,
 };
 
+/// Operator-output policy for one selected-node runtime.
+///
+/// Existing node entry points use [`Self::Legacy`]. The customer-agent
+/// composition opts into [`Self::CustomerSafe`], which emits no node receipts
+/// so only the agent's bounded lifecycle records reach process output.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NodeOperatorOutputPolicy {
+    /// Preserve the established READY, STOP, CONTACT, and related receipts.
+    #[default]
+    Legacy,
+    /// Suppress every selected-node operator receipt and error.
+    CustomerSafe,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NodeOutputStream {
+    Stdout,
+    Stderr,
+}
+
+trait NodeOperatorOutputSink: Send + Sync {
+    fn write(&self, stream: NodeOutputStream, record: &str);
+}
+
+struct ProcessNodeOperatorOutputSink;
+
+impl NodeOperatorOutputSink for ProcessNodeOperatorOutputSink {
+    fn write(&self, stream: NodeOutputStream, record: &str) {
+        match stream {
+            NodeOutputStream::Stdout => println!("{record}"),
+            NodeOutputStream::Stderr => eprintln!("{record}"),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct NodeOperatorOutput {
+    policy: NodeOperatorOutputPolicy,
+    sink: Arc<dyn NodeOperatorOutputSink>,
+}
+
+impl NodeOperatorOutput {
+    fn process(policy: NodeOperatorOutputPolicy) -> Self {
+        Self::with_sink(policy, Arc::new(ProcessNodeOperatorOutputSink))
+    }
+
+    fn with_sink(policy: NodeOperatorOutputPolicy, sink: Arc<dyn NodeOperatorOutputSink>) -> Self {
+        Self { policy, sink }
+    }
+
+    #[cfg(test)]
+    fn stdout(&self, arguments: fmt::Arguments<'_>) {
+        self.write(NodeOutputStream::Stdout, arguments);
+    }
+
+    #[cfg(test)]
+    fn stderr(&self, arguments: fmt::Arguments<'_>) {
+        self.write(NodeOutputStream::Stderr, arguments);
+    }
+
+    fn write(&self, stream: NodeOutputStream, arguments: fmt::Arguments<'_>) {
+        if self.policy == NodeOperatorOutputPolicy::Legacy {
+            self.sink.write(stream, &arguments.to_string());
+        }
+    }
+}
+
+tokio::task_local! {
+    static NODE_OPERATOR_OUTPUT: NodeOperatorOutput;
+}
+
+fn emit_node_output(stream: NodeOutputStream, arguments: fmt::Arguments<'_>) {
+    if NODE_OPERATOR_OUTPUT
+        .try_with(|output| output.write(stream, arguments))
+        .is_err()
+    {
+        ProcessNodeOperatorOutputSink.write(stream, &arguments.to_string());
+    }
+}
+
+fn current_node_output() -> NodeOperatorOutput {
+    NODE_OPERATOR_OUTPUT
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| NodeOperatorOutput::process(NodeOperatorOutputPolicy::default()))
+}
+
+fn inherit_node_output<F>(future: F) -> impl Future<Output = F::Output>
+where
+    F: Future,
+{
+    NODE_OPERATOR_OUTPUT.scope(current_node_output(), future)
+}
+
+macro_rules! node_stdout {
+    ($($argument:tt)*) => {
+        emit_node_output(NodeOutputStream::Stdout, format_args!($($argument)*))
+    };
+}
+
+macro_rules! node_stderr {
+    ($($argument:tt)*) => {
+        emit_node_output(NodeOutputStream::Stderr, format_args!($($argument)*))
+    };
+}
+
 pub(crate) const STORE_FILE: &str = "mesh.redb";
 const MAX_CONFIGURED_PEERS: usize = MAX_MUTABLE_TRANSFER_CURSOR_PEERS;
 #[cfg(feature = "nearby-discovery")]
@@ -4280,7 +4385,7 @@ fn drive_sample_application(
                 },
             )?;
             cache_accepted_stored_event(event_route_cache, sealer, &ping)?;
-            println!(
+            node_stdout!(
                 "APPLICATION status={} kind=ping transfer_id={} semantic_id={} publisher={} source_authenticated=true ttl=none",
                 if inserted { "emitted" } else { "existing" },
                 format_transfer_id(ping.transfer_id),
@@ -4343,7 +4448,7 @@ fn drive_sample_application(
                     },
                 )?;
                 cache_accepted_stored_event(event_route_cache, sealer, &pong)?;
-                println!(
+                node_stdout!(
                     "APPLICATION status={} kind=pong transfer_id={} semantic_id={} publisher={} correlation_semantic_id={} ping_publisher={} source_authenticated=true causal_observation=verified ttl=none",
                     if inserted { "emitted" } else { "existing" },
                     format_transfer_id(pong.transfer_id),
@@ -10985,6 +11090,33 @@ pub async fn start_node_with_forwarding(
     config: NodeConfig,
     forwarding: SelectedForwardingConfig,
 ) -> Result<RunningNode, NodeError> {
+    start_node_with_forwarding_and_output_policy(
+        config,
+        forwarding,
+        NodeOperatorOutputPolicy::default(),
+    )
+    .await
+}
+
+/// Starts one selected node with an explicit operator-output policy.
+pub async fn start_node_with_forwarding_and_output_policy(
+    config: NodeConfig,
+    forwarding: SelectedForwardingConfig,
+    output_policy: NodeOperatorOutputPolicy,
+) -> Result<RunningNode, NodeError> {
+    start_node_with_forwarding_output(
+        config,
+        forwarding,
+        NodeOperatorOutput::process(output_policy),
+    )
+    .await
+}
+
+async fn start_node_with_forwarding_output(
+    config: NodeConfig,
+    forwarding: SelectedForwardingConfig,
+    output: NodeOperatorOutput,
+) -> Result<RunningNode, NodeError> {
     let identity = config.mission.identity();
     let mission_authority = config.mission.mission_authority_id();
     let (application_sender, application_receiver) = mpsc::channel(APPLICATION_COMMAND_CAPACITY);
@@ -11018,10 +11150,11 @@ pub async fn start_node_with_forwarding(
     let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
     let (ready_sender, ready_receiver) = oneshot::channel();
     let emission_policy = Arc::new(LiveEmissionPolicy::new(forwarding.emission_policy()));
-    let task = tokio::spawn(run_node_actor_with_forwarding(
+    let task = tokio::spawn(run_node_actor_with_forwarding_output(
         config,
         forwarding,
         emission_policy.clone(),
+        output,
         NodeActorChannels::new(
             application_receiver,
             application_admission.clone(),
@@ -11124,7 +11257,7 @@ async fn run_automatic_nearby_discovery(
 ) {
     let mut generation = 1u64;
     loop {
-        println!(
+        node_stdout!(
             "DISCOVERY status=open mode=nearby-auto generation={} window_seconds={}",
             generation,
             window.as_secs()
@@ -11151,7 +11284,7 @@ async fn run_automatic_nearby_discovery(
         {
             return;
         }
-        println!(
+        node_stdout!(
             "DISCOVERY status=closed mode=nearby-auto generation={} reason=window-expired window_seconds={}",
             generation,
             window.as_secs()
@@ -11179,7 +11312,7 @@ async fn run_automatic_nearby_discovery(
                 Err(error) => {
                     failures = failures.saturating_add(1);
                     let backoff = automatic_nearby_reopen_backoff(failures);
-                    eprintln!(
+                    node_stderr!(
                         "DISCOVERY status=error mode=nearby-auto stage=reopen generation={} failures={} retry_delay_ms={} error={}",
                         generation,
                         failures,
@@ -11242,13 +11375,36 @@ async fn run_node_actor(
     .await
 }
 
+#[cfg(test)]
 async fn run_node_actor_with_forwarding(
     config: NodeConfig,
     forwarding: SelectedForwardingConfig,
     emission_policy: Arc<LiveEmissionPolicy>,
     channels: NodeActorChannels,
 ) -> Result<NodeReceipt, NodeError> {
-    run_node_actor_inner(config, forwarding, emission_policy, channels).await
+    run_node_actor_with_forwarding_output(
+        config,
+        forwarding,
+        emission_policy,
+        NodeOperatorOutput::process(NodeOperatorOutputPolicy::default()),
+        channels,
+    )
+    .await
+}
+
+async fn run_node_actor_with_forwarding_output(
+    config: NodeConfig,
+    forwarding: SelectedForwardingConfig,
+    emission_policy: Arc<LiveEmissionPolicy>,
+    output: NodeOperatorOutput,
+    channels: NodeActorChannels,
+) -> Result<NodeReceipt, NodeError> {
+    NODE_OPERATOR_OUTPUT
+        .scope(
+            output,
+            run_node_actor_inner(config, forwarding, emission_policy, channels),
+        )
+        .await
 }
 
 async fn run_node_actor_inner(
@@ -11322,7 +11478,7 @@ async fn run_node_actor_inner(
         None => (None, None),
     };
     if let Some(receipt) = &bridge_initialization {
-        println!(
+        node_stdout!(
             "BRIDGE_INIT status=pass authorizations_verified={} authorizations_applied={} authorizations_existing={} local_edges={} carry_inserted={} carry_existing={} route_candidates={} routes_reverified={} routes_inactive={} active_routes={} restored_deliveries={} payload_plaintext_logged=false",
             receipt.authorizations_verified,
             receipt.authorizations_applied,
@@ -11337,7 +11493,7 @@ async fn run_node_actor_inner(
             receipt.deliveries.len(),
         );
         for delivery in &receipt.deliveries {
-            println!(
+            node_stdout!(
                 "BRIDGE_RESTORE status=pass source_id={} route_id={} wrapper_id={} active=true payload_plaintext_logged=false",
                 crate::format_item_id(delivery.source_item_id),
                 format_node_id(delivery.bridge_route_id),
@@ -11537,7 +11693,7 @@ async fn run_node_actor_inner(
     #[cfg(not(feature = "nearby-discovery"))]
     let nearby_window_seconds = 0;
     let provisioning_origin = config.provisioning_origin().receipt_label();
-    println!(
+    node_stdout!(
         "READY selected=true pid={} carrier_id={} mission_id={} mission_authority={} sockets={} state={} peers={} application={} carrier_route={} controlled_relay_url={} controlled_relay_trust={} controlled_relay_readiness={} public_relay_fallback=false hosted_discovery=false nearby_discovery={} nearby_window_seconds={} discovery_metadata={} discovery_authority={} discovery_candidate_limit={} nat_traversal=not-claimed path_observation=not-authorization mission_auth=hybrid-pq provisioning={} semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash commit_before_activate=true content_admission=capability-gated event_bridge={}",
         std::process::id(),
         local_id,
@@ -11608,13 +11764,15 @@ async fn run_node_actor_inner(
             .clone()
             .expect("automatic browser has stop control");
         let endpoint = endpoint.clone();
-        Some(tokio::spawn(run_automatic_nearby_discovery(
-            endpoint,
-            browser,
-            window,
-            ipv4_interfaces,
-            control,
-            automatic_event_sender,
+        Some(tokio::spawn(inherit_node_output(
+            run_automatic_nearby_discovery(
+                endpoint,
+                browser,
+                window,
+                ipv4_interfaces,
+                control,
+                automatic_event_sender,
+            ),
         )))
     } else {
         nearby_session.take().map(|session| {
@@ -11627,7 +11785,7 @@ async fn run_node_actor_inner(
             let initial_policy = live_policy
                 .snapshot()
                 .expect("validated live emission policy");
-            tokio::spawn(async move {
+            tokio::spawn(inherit_node_output(async move {
                 let deadline = tokio::time::Instant::now() + window;
                 let reason = loop {
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -11641,12 +11799,12 @@ async fn run_node_actor_inner(
                     }
                 };
                 session.stop();
-                println!(
+                node_stdout!(
                     "DISCOVERY status=closed mode=nearby-evaluation reason={} window_seconds={}",
                     reason,
                     window.as_secs()
                 );
-            })
+            }))
         })
     };
     #[cfg(all(test, unix))]
@@ -11674,19 +11832,20 @@ async fn run_node_actor_inner(
     }
     #[cfg(all(test, unix))]
     let mut zeroization_task = if owner_ready {
-        Some(tokio::spawn(run_local_zeroization_accept_loop(
-            zeroization_control,
-            zeroization_sender,
-            zeroization_queued,
+        Some(tokio::spawn(inherit_node_output(
+            run_local_zeroization_accept_loop(
+                zeroization_control,
+                zeroization_sender,
+                zeroization_queued,
+            ),
         )))
     } else {
         None
     };
     #[cfg(all(not(test), unix))]
     let mut zeroization_task = if owner_ready {
-        Some(tokio::spawn(run_local_zeroization_accept_loop(
-            zeroization_control,
-            zeroization_sender,
+        Some(tokio::spawn(inherit_node_output(
+            run_local_zeroization_accept_loop(zeroization_control, zeroization_sender),
         )))
     } else {
         None
@@ -11700,7 +11859,7 @@ async fn run_node_actor_inner(
     let (blob_worker_completion_sender, mut blob_worker_completion_receiver) = oneshot::channel();
     let blob_worker_task = {
         let admission = application_admission.clone();
-        tokio::spawn(async move {
+        tokio::spawn(inherit_node_output(async move {
             let result = run_selected_blob_worker(
                 blob_application,
                 blob_worker_receiver,
@@ -11709,7 +11868,7 @@ async fn run_node_actor_inner(
             )
             .await;
             let _ = blob_worker_completion_sender.send(result);
-        })
+        }))
     };
     let mut blob_worker_completion_open = true;
 
@@ -11770,7 +11929,7 @@ async fn run_node_actor_inner(
         let allowed = allowed.clone();
         #[cfg(feature = "nearby-discovery")]
         let automatic = automatic_nearby;
-        Some(tokio::spawn(async move {
+        Some(tokio::spawn(inherit_node_output(async move {
             loop {
                 #[cfg(feature = "nearby-discovery")]
                 let accepted = if automatic {
@@ -11794,7 +11953,7 @@ async fn run_node_actor_inner(
                     }
                 }
             }
-        }))
+        })))
     };
 
     #[cfg(all(test, unix))]
@@ -11844,12 +12003,12 @@ async fn run_node_actor_inner(
                                 format_receipt_field(&error.to_string())
                             );
                             if let Err(response_error) = request.respond(&response).await {
-                                eprintln!(
+                                node_stderr!(
                                     "ZEROIZE lifecycle=live preflight=failed response=failed error={}",
                                     format_receipt_field(&response_error.to_string())
                                 );
                             }
-                            eprintln!(
+                            node_stderr!(
                                 "ZEROIZE lifecycle=live preflight=failed error={} assurance=bounded-software",
                                 format_receipt_field(&error.to_string())
                             );
@@ -11857,7 +12016,7 @@ async fn run_node_actor_inner(
                     },
                     Some(Err(error)) if error.is_integrity_failure() => {
                         let error = error.into_node_error();
-                        eprintln!(
+                        node_stderr!(
                             "ZEROIZE lifecycle=live control=failed error={}",
                             format_receipt_field(&error.to_string())
                         );
@@ -11866,7 +12025,7 @@ async fn run_node_actor_inner(
                     }
                     Some(Err(error)) => {
                         let error = error.into_node_error();
-                        eprintln!(
+                        node_stderr!(
                             "ZEROIZE lifecycle=live request=denied error={}",
                             format_receipt_field(&error.to_string())
                         );
@@ -11909,13 +12068,13 @@ async fn run_node_actor_inner(
                         if !automatic_candidates.contains(&endpoint_id)
                             && automatic_candidates.len() >= MAX_AUTOMATIC_NEARBY_CANDIDATES
                         {
-                            eprintln!(
+                            node_stderr!(
                                 "DISCOVERY status=dropped mode=nearby-auto carrier_peer={} reason=candidate-limit limit={}",
                                 endpoint_id,
                                 MAX_AUTOMATIC_NEARBY_CANDIDATES
                             );
                         } else if automatic_candidates.insert(endpoint_id) {
-                            println!(
+                            node_stdout!(
                                 "DISCOVERY status=candidate mode=nearby-auto carrier_peer={} retained_candidates={} authorization=pending-mission-handshake",
                                 endpoint_id,
                                 automatic_candidates.len()
@@ -11924,7 +12083,7 @@ async fn run_node_actor_inner(
                     }
                     Some(AutomaticNearbyEvent::Expired(endpoint_id)) => {
                         if automatic_candidates.remove(&endpoint_id) {
-                            println!(
+                            node_stdout!(
                                 "DISCOVERY status=expired mode=nearby-auto carrier_peer={} retained_candidates={}",
                                 endpoint_id,
                                 automatic_candidates.len()
@@ -12094,7 +12253,7 @@ async fn run_node_actor_inner(
                     let controlled_relay = forwarding.controlled_relay.clone();
                     #[cfg(feature = "nearby-discovery")]
                     let automatic_admission = automatic_admission.clone();
-                    let task = outbound.spawn(async move {
+                    let task = outbound.spawn(inherit_node_output(async move {
                         (
                             peer,
                             sync_once_with_forwarding(
@@ -12117,7 +12276,7 @@ async fn run_node_actor_inner(
                             )
                             .await,
                         )
-                    });
+                    }));
                     outbound_tasks.insert(task.id(), peer);
                 }
             }
@@ -12164,7 +12323,7 @@ async fn run_node_actor_inner(
                         if !inbound_peers.insert(peer) {
                             connection.close();
                             receipt.contact_errors += 1;
-                            eprintln!("CONTACT direction=in carrier_peer={peer} status=error error=duplicate_concurrent_carrier_contact");
+                            node_stderr!("CONTACT direction=in carrier_peer={peer} status=error error=duplicate_concurrent_carrier_contact");
                             if yield_for_network {
                                 tokio::task::yield_now().await;
                             }
@@ -12188,7 +12347,7 @@ async fn run_node_actor_inner(
                         debug_assert!(expected_peer.is_some());
                         #[cfg(feature = "nearby-discovery")]
                         let automatic_admission = automatic_admission.clone();
-                        let task = inbound.spawn(async move {
+                        let task = inbound.spawn(inherit_node_output(async move {
                             (
                                 peer,
                                 serve_connection_with_forwarding(InboundContact {
@@ -12207,12 +12366,12 @@ async fn run_node_actor_inner(
                                 })
                                 .await,
                             )
-                        });
+                        }));
                         inbound_tasks.insert(task.id(), peer);
                     }
                     Some(Err(error)) => {
                         receipt.contact_errors += 1;
-                        eprintln!("CONTACT direction=in status=error error={}", format_receipt_field(&error.to_string()));
+                        node_stderr!("CONTACT direction=in status=error error={}", format_receipt_field(&error.to_string()));
                     }
                     None => {
                         // Disable this select arm permanently. A closed channel
@@ -12222,7 +12381,7 @@ async fn run_node_actor_inner(
                             let _ = task.await;
                         }
                         receipt.contact_errors += 1;
-                        eprintln!("CONTACT direction=in status=error error=accept_task_stopped");
+                        node_stderr!("CONTACT direction=in status=error error=accept_task_stopped");
                     }
                 }
                 if yield_for_network {
@@ -12256,7 +12415,7 @@ async fn run_node_actor_inner(
                             break;
                         }
                         receipt.contacts += 1;
-                        println!(
+                        node_stdout!(
                             "CONTACT direction=in carrier_peer={} mission_peer={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} deferred_event_lanes={} mutable_remaining={} deferred_mutable_lanes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} bridge_offered={} bridge_applied={} bridge_delivered={} bridge_remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} carrier_path={} carrier_path_transitions={} carrier_path_transitions_saturated={} path_observation=not-authorization mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash content_admission=capability-gated status={}",
                             peer,
                             format_node_id(server_receipt.mission_peer.expect("successful mission contact has peer identity")),
@@ -12302,7 +12461,7 @@ async fn run_node_actor_inner(
                             break;
                         }
                         receipt.contact_errors += 1;
-                        eprintln!("CONTACT direction=in carrier_peer={peer} status=error error={}", format_receipt_field(&error.to_string()));
+                        node_stderr!("CONTACT direction=in carrier_peer={peer} status=error error={}", format_receipt_field(&error.to_string()));
                     }
                     Some(Err(error)) => {
                         let peer = inbound_tasks.remove(&error.id());
@@ -12310,7 +12469,7 @@ async fn run_node_actor_inner(
                             inbound_peers.remove(&peer);
                         }
                         receipt.contact_errors += 1;
-                        eprintln!("CONTACT direction=in carrier_peer={} status=error error={}", peer.map_or_else(|| "unknown".into(), |peer| peer.to_string()), format_receipt_field(&format!("task failed: {error}")));
+                        node_stderr!("CONTACT direction=in carrier_peer={} status=error error={}", peer.map_or_else(|| "unknown".into(), |peer| peer.to_string()), format_receipt_field(&format!("task failed: {error}")));
                     }
                     None => {}
                 }
@@ -12345,7 +12504,7 @@ async fn run_node_actor_inner(
                             break;
                         }
                         receipt.contacts += 1;
-                        println!(
+                        node_stdout!(
                             "CONTACT direction=out carrier_peer={} mission_peer={} locator={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} deferred_event_lanes={} mutable_remaining={} deferred_mutable_lanes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} bridge_offered={} bridge_applied={} bridge_delivered={} bridge_remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} carrier_path={} carrier_path_transitions={} carrier_path_transitions_saturated={} path_observation=not-authorization mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash content_admission=capability-gated status={}",
                             peer.carrier(),
                             format_node_id(peer_receipt.mission_peer.expect("successful mission contact has peer identity")),
@@ -12395,7 +12554,7 @@ async fn run_node_actor_inner(
                         let expected_mission = peer
                             .expected_mission()
                             .map_or_else(|| "discovered".into(), format_node_id);
-                        eprintln!("CONTACT direction=out carrier_peer={} expected_mission_peer={} status=error error={}", peer.carrier(), expected_mission, format_receipt_field(&error.to_string()));
+                        node_stderr!("CONTACT direction=out carrier_peer={} expected_mission_peer={} status=error error={}", peer.carrier(), expected_mission, format_receipt_field(&error.to_string()));
                     }
                     Some(Err(error)) => {
                         let peer = outbound_tasks.remove(&error.id());
@@ -12403,7 +12562,7 @@ async fn run_node_actor_inner(
                             outbound_peers.remove(&peer.carrier());
                         }
                         receipt.contact_errors += 1;
-                        eprintln!("CONTACT direction=out carrier_peer={} status=error error={}", peer.map_or_else(|| "unknown".into(), |peer| peer.carrier().to_string()), format_receipt_field(&format!("task failed: {error}")));
+                        node_stderr!("CONTACT direction=out carrier_peer={} status=error error={}", peer.map_or_else(|| "unknown".into(), |peer| peer.carrier().to_string()), format_receipt_field(&format!("task failed: {error}")));
                     }
                     None => {}
                 }
@@ -12533,7 +12692,7 @@ async fn run_node_actor_inner(
             // accepted. A worker/contact failure discovered while quiescing
             // remains operator-visible secondary accounting, but cannot skip
             // durable erase or suppress the request's explicit response.
-            eprintln!(
+            node_stderr!(
                 "ZEROIZE status=continuing-after-quiescence-error error={}",
                 format_receipt_field(&error.to_string())
             );
@@ -12568,7 +12727,7 @@ async fn run_node_actor_inner(
                 receipt.blob_carrier_fetch_cursors = completed.preserved.blob_carrier_fetch_cursors;
                 receipt.blob_network_staging_bytes = completed.preserved.blob_network_staging_bytes;
                 request.respond("ASTER-ZEROIZE-LOCAL-OK").await?;
-                println!(
+                node_stdout!(
                     "STOP lifecycle=zeroized sync_status=terminal-lockout carrier_id={} mission_id={} contacts={} contact_errors={} direct_contacts={} relay_contacts={} unknown_path_contacts={} carrier_path_transitions={} carrier_path_transition_saturations={} path_observation=not-authorization opaque_items={} opaque_acceptance_markers={} events={} event_acceptance_markers={} route_cached_events={} controls={} applied_controls={} pending_controls={} control_highwater={} blobs={} blob_acceptance_markers={} blob_last_acceptance_marker={} blob_sealed_bytes={} blob_operations={} blob_operation_bytes={} blob_variants={} blob_finalized_variants={} blob_committed_chunks={} blob_committed_file_bytes={} blob_reserved_file_bytes={} pending_blobs={} blob_carrier_prefixes={} blob_carrier_fetch_cursors={} blob_network_staging_bytes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} mission_auth=hybrid-pq provisioning={} assurance=bounded-software physical_sanitization=not-claimed",
                     local_id,
                     format_node_id(config.mission.identity()),
@@ -12657,7 +12816,7 @@ async fn run_node_actor_inner(
     } else {
         "contacts_observed"
     };
-    println!(
+    node_stdout!(
         "STOP lifecycle=complete sync_status={} carrier_id={} mission_id={} contacts={} contact_errors={} direct_contacts={} relay_contacts={} unknown_path_contacts={} carrier_path_transitions={} carrier_path_transition_saturations={} path_observation=not-authorization opaque_items={} opaque_acceptance_markers={} events={} event_acceptance_markers={} route_cached_events={} controls={} applied_controls={} pending_controls={} control_highwater={} blobs={} blob_acceptance_markers={} blob_last_acceptance_marker={} blob_sealed_bytes={} blob_operations={} blob_operation_bytes={} blob_variants={} blob_finalized_variants={} blob_committed_chunks={} blob_committed_file_bytes={} blob_reserved_file_bytes={} pending_blobs={} blob_carrier_prefixes={} blob_carrier_fetch_cursors={} blob_network_staging_bytes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} mission_auth=hybrid-pq provisioning={} semantics=source-authenticated-event reconciliation_classes=event,state,record,blob-v5 controls_semantics=source-authenticated-flash",
         sync_status,
         local_id,
@@ -17531,7 +17690,7 @@ fn bridge_apply_disposition(
 }
 
 fn emit_bridge_delivery(status: &'static str, delivery: &SelectedEventBridgeDeliveryReceipt) {
-    println!(
+    node_stdout!(
         "BRIDGE_DELIVERY status={} source_id={} route_id={} wrapper_id={} publisher={} hops={} origin_scope={} origin_epoch={} current_scope={} current_epoch={} topic={} priority={} event_sequence={} payload_len={} payload_sha256={} payload_opened=true payload_plaintext_logged=false",
         status,
         crate::format_item_id(delivery.source_item_id),
@@ -17617,7 +17776,7 @@ async fn send_selected_event_bridge_routes(
             .bridge_offered
             .checked_add(1)
             .ok_or_else(|| NodeError::Protocol("selected Event bridge offer overflow".into()))?;
-        println!(
+        node_stdout!(
             "BRIDGE status={} source_id={} route_id={} wrapper_id={} hops={} origin_scope={} origin_epoch={} current_scope={} current_epoch={} disposition={} payload_opened=false payload_plaintext_logged=false",
             if disposition == BridgeRouteDisposition::NotSelected {
                 "not-selected"
@@ -21772,6 +21931,126 @@ mod tests {
     use super::*;
     use crate::mission::initiate_over_iroh;
     use redb::{ReadableDatabase as _, ReadableTable as _};
+
+    #[derive(Default)]
+    struct CapturedNodeOutput {
+        records: StdMutex<Vec<(NodeOutputStream, String)>>,
+    }
+
+    impl NodeOperatorOutputSink for CapturedNodeOutput {
+        fn write(&self, stream: NodeOutputStream, record: &str) {
+            self.records
+                .lock()
+                .expect("capture node output")
+                .push((stream, record.to_owned()));
+        }
+    }
+
+    impl CapturedNodeOutput {
+        fn records(&self) -> Vec<(NodeOutputStream, String)> {
+            self.records.lock().expect("read node output").clone()
+        }
+    }
+
+    fn captured_node_output(
+        policy: NodeOperatorOutputPolicy,
+    ) -> (NodeOperatorOutput, Arc<CapturedNodeOutput>) {
+        let captured = Arc::new(CapturedNodeOutput::default());
+        let output = NodeOperatorOutput::with_sink(policy, captured.clone());
+        (output, captured)
+    }
+
+    #[test]
+    fn customer_safe_output_suppresses_every_selected_node_record_class() {
+        // Break caught: allowing any selected-node receipt class through the
+        // customer policy can disclose paths, peers, providers, or errors next
+        // to the agent's fixed-field lifecycle records.
+        let (output, captured) = captured_node_output(NodeOperatorOutputPolicy::CustomerSafe);
+        for record in [
+            "READY state=/state-path-canary peer=peer-canary",
+            "STOP state=/state-path-canary peer=peer-canary",
+            "CONTACT status=error error=provider-error-canary",
+            "DISCOVERY carrier_peer=peer-canary",
+            "ZEROIZE error=provider-error-canary",
+            "APPLICATION publisher=peer-canary",
+            "BRIDGE source_id=event-canary",
+            "BRIDGE_INIT route=event-canary",
+            "BRIDGE_RESTORE route=event-canary",
+            "BRIDGE_DELIVERY route=event-canary",
+        ] {
+            output.stdout(format_args!("{record}"));
+            output.stderr(format_args!("{record}"));
+        }
+
+        assert!(captured.records().is_empty());
+    }
+
+    #[test]
+    fn legacy_output_is_the_byte_preserving_default() {
+        // Break caught: changing the default used by start_node or
+        // start_node_with_forwarding would silently break established receipt
+        // consumers even if the opt-in customer mode remained safe.
+        let (output, captured) = captured_node_output(NodeOperatorOutputPolicy::default());
+        output.stdout(format_args!("READY selected=true state=legacy-state"));
+        output.stderr(format_args!(
+            "CONTACT direction=out status=error error=legacy-error"
+        ));
+        output.stdout(format_args!("STOP lifecycle=complete contacts=0"));
+
+        assert_eq!(
+            NodeOperatorOutputPolicy::default(),
+            NodeOperatorOutputPolicy::Legacy
+        );
+        assert_eq!(
+            captured.records(),
+            vec![
+                (
+                    NodeOutputStream::Stdout,
+                    "READY selected=true state=legacy-state".to_owned(),
+                ),
+                (
+                    NodeOutputStream::Stderr,
+                    "CONTACT direction=out status=error error=legacy-error".to_owned(),
+                ),
+                (
+                    NodeOutputStream::Stdout,
+                    "STOP lifecycle=complete contacts=0".to_owned(),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn customer_safe_selected_node_start_and_stop_emit_no_legacy_receipts() {
+        // Break caught: ignoring the selected customer policy during actor
+        // startup routes READY/STOP and the state-path canary to its sink.
+        let state = root("customer-safe-state-path-canary");
+        fs::create_dir_all(&state).expect("state root");
+        #[cfg(unix)]
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700))
+            .expect("owner-only state root");
+        let (output, captured) = captured_node_output(NodeOperatorOutputPolicy::CustomerSafe);
+        let running = start_node_with_forwarding_output(
+            NodeConfig {
+                state: state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: test_mission(),
+                peers: Vec::new(),
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            SelectedForwardingConfig::default(),
+            output,
+        )
+        .await
+        .expect("start customer-safe selected node");
+        running.shutdown().await.expect("stop customer-safe node");
+
+        assert!(captured.records().is_empty());
+        fs::remove_dir_all(state).expect("cleanup customer-safe state");
+    }
 
     #[test]
     fn injected_custody_clock_clones_share_one_identity_and_tick_source() {

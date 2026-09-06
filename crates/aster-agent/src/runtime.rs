@@ -3,7 +3,10 @@
 use std::{error::Error, fmt, path::PathBuf, time::Duration};
 
 use aster_mesh::ProvisioningSecretLoader;
-use aster_node::{NodeBootstrapErrorKind, NodeError, RunningNode, start_node_with_forwarding};
+use aster_node::{
+    NodeBootstrapErrorKind, NodeError, NodeOperatorOutputPolicy, RunningNode,
+    start_node_with_forwarding_and_output_policy,
+};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
@@ -97,7 +100,13 @@ where
             return Err(AgentRuntimeError::Bootstrap(error.kind()));
         }
     };
-    let node = match start_node_with_forwarding(node_config, forwarding).await {
+    let node = match start_node_with_forwarding_and_output_policy(
+        node_config,
+        forwarding,
+        customer_node_output_policy(),
+    )
+    .await
+    {
         Ok(node) => node,
         Err(error) => {
             let kind = classify_node_startup(&error);
@@ -219,6 +228,10 @@ where
             Ok(AgentExit::Failed(FailureReason::Runtime))
         }
     }
+}
+
+const fn customer_node_output_policy() -> NodeOperatorOutputPolicy {
+    NodeOperatorOutputPolicy::CustomerSafe
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -442,6 +455,56 @@ const fn lifecycle_state_name(state: LifecycleState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn customer_output_boundary_selects_silent_node_and_fixed_agent_records() {
+        // Break caught: starting the selected node in legacy mode mixes raw
+        // node receipts with the agent lifecycle allowlist even when the JSON
+        // serializer itself remains bounded.
+        assert_eq!(
+            customer_node_output_policy(),
+            aster_node::NodeOperatorOutputPolicy::CustomerSafe
+        );
+        let combined = [
+            lifecycle_json(LifecycleState::Starting, "startup", "started", false, 0),
+            lifecycle_json(
+                LifecycleState::Failed,
+                "fatal_transition",
+                "runtime",
+                false,
+                500,
+            ),
+        ]
+        .join("\n");
+        for canary in [
+            "config-canary",
+            "error-canary",
+            "event-canary",
+            "peer-canary",
+            "provider-canary",
+            "/path-canary",
+        ] {
+            assert!(!combined.contains(canary));
+        }
+        for line in combined.lines() {
+            let record: serde_json::Value = serde_json::from_str(line).expect("lifecycle JSON");
+            let object = record.as_object().expect("JSON object");
+            assert_eq!(object.len(), 8);
+            for field in object.keys() {
+                assert!(matches!(
+                    field.as_str(),
+                    "timestamp"
+                        | "lifecycle_state"
+                        | "operation"
+                        | "reason"
+                        | "retryable"
+                        | "response_code"
+                        | "latency_bucket"
+                        | "correlation_id"
+                ));
+            }
+        }
+    }
 
     #[test]
     fn lifecycle_records_have_only_fixed_public_fields_and_values() {
