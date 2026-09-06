@@ -2,14 +2,19 @@
 
 use std::{
     fs,
+    net::SocketAddr,
     os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    sync::mpsc as std_mpsc,
+    time::Duration,
 };
 
 use aster_agent::{
     config::{check_config, load_and_validate_config},
     credentials::{load_startup_credentials, open_node_config},
+    lifecycle::FailureReason,
+    runtime::{AgentExit, AgentRuntimeError, AgentSignal, run_customer_agent},
 };
 use aster_mesh::{
     ProvisioningLoadId, ProvisioningLoadReceipt, ProvisioningSecretLoader, ProvisioningSecretRef,
@@ -17,6 +22,205 @@ use aster_mesh::{
 };
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_validates_credentials_before_binding_any_listener() {
+    // Break caught: moving credential validation after listener binding exposes
+    // health or application sockets for an invalid startup configuration.
+    let fixture = CustomerFixture::new();
+    fixture.write_token(b"invalid");
+    let config = load_and_validate_config(fixture.config_path()).expect("validated config");
+    let (_signals, receiver) = tokio::sync::mpsc::channel(4);
+    let mut loader = RecordingLoader::new();
+
+    let result = run_customer_agent(config, &mut loader, receiver).await;
+    assert_eq!(
+        result,
+        Err(AgentRuntimeError::Credential(
+            aster_agent::credentials::CredentialReason::InvalidToken,
+        ))
+    );
+    assert_eq!(loader.calls(), 0);
+    if socket_access_available() {
+        std::net::TcpListener::bind(fixture.application()).expect("application was never bound");
+        std::net::TcpListener::bind(fixture.health()).expect("health was never bound");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readiness_waits_for_protected_bootstrap_and_application_serving() {
+    // Break caught: declaring Ready from health bind or peer-independent node
+    // construction before the application listener can accept operations.
+    if !socket_access_available() {
+        return;
+    }
+    let fixture = CustomerFixture::new();
+    let config = load_and_validate_config(fixture.config_path()).expect("validated config");
+    let (entered_send, entered_receive) = std_mpsc::channel();
+    let (release_send, release_receive) = std_mpsc::channel();
+    let (signals, receiver) = tokio::sync::mpsc::channel(4);
+    let task = tokio::spawn(async move {
+        let mut loader = BlockingLoader {
+            entered: entered_send,
+            release: release_receive,
+        };
+        run_customer_agent(config, &mut loader, receiver).await
+    });
+
+    entered_receive
+        .recv_timeout(Duration::from_secs(2))
+        .expect("protected loader entered after health bind");
+    assert_eq!(health_status(fixture.health(), "/livez").await, 200);
+    assert_eq!(health_status(fixture.health(), "/readyz").await, 503);
+    release_send.send(()).expect("release protected bootstrap");
+    wait_until_ready(&fixture).await;
+    assert_eq!(
+        application_status(fixture.application(), fixture.token_bytes()).await,
+        200
+    );
+
+    signals
+        .send(AgentSignal::Terminate)
+        .await
+        .expect("request clean stop");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("clean stop deadline")
+            .expect("runtime task joins")
+            .expect("runtime result"),
+        AgentExit::Clean
+    );
+    assert!(
+        tokio::net::TcpStream::connect(fixture.health())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_hangup_keeps_the_old_token_and_readiness() {
+    // Break caught: destructive or non-atomic reload revokes the working token
+    // or drops readiness when the replacement file is invalid.
+    if !socket_access_available() {
+        return;
+    }
+    let fixture = CustomerFixture::new();
+    let running = RunningFixture::start(&fixture).await;
+
+    fixture.write_token(b"invalid");
+    running
+        .signals
+        .send(AgentSignal::Hangup)
+        .await
+        .expect("request failed reload");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        application_status(fixture.application(), fixture.token_bytes()).await,
+        200
+    );
+    assert_eq!(health_status(fixture.health(), "/readyz").await, 200);
+    running.stop_clean().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn successful_hangup_reloads_only_the_client_token_atomically() {
+    // Break caught: reload reopens mission material or exposes a window where
+    // neither the old nor fully validated replacement token authorizes.
+    if !socket_access_available() {
+        return;
+    }
+    let fixture = CustomerFixture::new();
+    let old_token = fixture.token_bytes().to_vec();
+    let running = RunningFixture::start(&fixture).await;
+    fixture.write_reference(b"invalid-reference-canary");
+    let replacement = b"replacement-client-token-00000001";
+    fixture.write_token(replacement);
+
+    running
+        .signals
+        .send(AgentSignal::Hangup)
+        .await
+        .expect("request token reload");
+    wait_for_application_status(fixture.application(), replacement, 200).await;
+    assert_eq!(
+        application_status(fixture.application(), &old_token).await,
+        401
+    );
+    assert_eq!(health_status(fixture.health(), "/readyz").await, 200);
+    running.stop_clean().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_terminate_forces_a_blocked_graceful_drain() {
+    // Break caught: ignoring the second termination signal can strand an
+    // operator behind an in-flight connection until the whole grace expires.
+    if !socket_access_available() {
+        return;
+    }
+    let fixture = CustomerFixture::with_shutdown_grace(5_000);
+    let running = RunningFixture::start(&fixture).await;
+    let mut stalled = tokio::net::TcpStream::connect(fixture.application())
+        .await
+        .expect("open stalled application connection");
+    use tokio::io::AsyncWriteExt as _;
+    stalled.write_all(b"G").await.expect("stall HTTP header");
+
+    running
+        .signals
+        .send(AgentSignal::Terminate)
+        .await
+        .expect("begin drain");
+    wait_for_health_status(fixture.health(), "/readyz", 503).await;
+    running
+        .signals
+        .send(AgentSignal::Terminate)
+        .await
+        .expect("force drain");
+    assert_eq!(running.finish().await, AgentExit::Forced);
+    drop(stalled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grace_expiry_forces_a_blocked_graceful_drain() {
+    // Break caught: waiting indefinitely for a stalled connection violates the
+    // configured process shutdown bound.
+    if !socket_access_available() {
+        return;
+    }
+    let fixture = CustomerFixture::with_shutdown_grace(50);
+    let running = RunningFixture::start(&fixture).await;
+    let mut stalled = tokio::net::TcpStream::connect(fixture.application())
+        .await
+        .expect("open stalled application connection");
+    use tokio::io::AsyncWriteExt as _;
+    stalled.write_all(b"G").await.expect("stall HTTP header");
+
+    running
+        .signals
+        .send(AgentSignal::Terminate)
+        .await
+        .expect("begin drain");
+    assert_eq!(running.finish().await, AgentExit::Forced);
+    drop(stalled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closed_signal_task_propagates_only_a_bounded_failure_reason() {
+    // Break caught: losing the signal task without a terminal transition can
+    // leave the process serving forever or expose an internal channel error.
+    if !socket_access_available() {
+        return;
+    }
+    let fixture = CustomerFixture::new();
+    let running = RunningFixture::start(&fixture).await;
+    let RunningFixture { signals, task } = running;
+    drop(signals);
+    assert_eq!(
+        finish_runtime(task).await,
+        AgentExit::Failed(FailureReason::Runtime)
+    );
+}
 
 #[test]
 fn config_check_validates_files_without_a_provider_and_bootstrap_uses_exact_reference() {
@@ -66,15 +270,26 @@ fn bootstrap_failure_redacts_the_provider_reference() {
 struct CustomerFixture {
     root: PathBuf,
     config: PathBuf,
+    token: PathBuf,
     mission_reference: PathBuf,
     reference: ProvisioningSecretRef,
+    application: SocketAddr,
+    health: SocketAddr,
 }
 
 impl CustomerFixture {
     fn new() -> Self {
+        Self::with_shutdown_grace(1_000)
+    }
+
+    fn with_shutdown_grace(shutdown_grace_ms: u64) -> Self {
         let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "aster-agent-customer-runtime-{}-{sequence}",
+            "aster-agent-customer-runtime-{}-{nonce}-{sequence}",
             std::process::id()
         ));
         fs::create_dir(&root).expect("create fixture root");
@@ -93,11 +308,14 @@ impl CustomerFixture {
         fs::set_permissions(&mission_reference, fs::Permissions::from_mode(0o600))
             .expect("protect reference");
 
+        let application = unused_address();
+        let health = unused_address();
+        assert_ne!(application, health);
         let config = root.join("agent.json");
         fs::write(
             &config,
             format!(
-                r#"{{"schema_version":1,"state":{{"directory":"{}"}},"application":{{"listen":"127.0.0.1:8181"}},"health":{{"listen":"127.0.0.1:8182"}},"mesh":{{"bind":"127.0.0.1:0","sync_interval_ms":500,"peers":[]}},"credentials":{{"client_token_file":"{}","mission_secret_ref_file":"{}","mission_load_id":"{}"}},"storage":{{"max_items":4161,"max_payload_bytes":17891328}}}}"#,
+                r#"{{"schema_version":1,"state":{{"directory":"{}"}},"application":{{"listen":"{application}"}},"health":{{"listen":"{health}"}},"mesh":{{"bind":"127.0.0.1:0","sync_interval_ms":500,"peers":[]}},"credentials":{{"client_token_file":"{}","mission_secret_ref_file":"{}","mission_load_id":"{}"}},"storage":{{"max_items":4161,"max_payload_bytes":17891328}},"limits":{{"shutdown_grace_ms":{shutdown_grace_ms}}}}}"#,
                 root.join("state").display(),
                 token.display(),
                 mission_reference.display(),
@@ -109,8 +327,11 @@ impl CustomerFixture {
         Self {
             root,
             config,
+            token,
             mission_reference,
             reference,
+            application,
+            health,
         }
     }
 
@@ -122,10 +343,185 @@ impl CustomerFixture {
         self.reference.clone()
     }
 
+    fn application(&self) -> SocketAddr {
+        self.application
+    }
+
+    fn health(&self) -> SocketAddr {
+        self.health
+    }
+
+    fn token_bytes(&self) -> &[u8] {
+        b"0123456789abcdef0123456789abcdef"
+    }
+
+    fn write_token(&self, token: &[u8]) {
+        fs::write(&self.token, token).expect("replace token");
+        fs::set_permissions(&self.token, fs::Permissions::from_mode(0o600))
+            .expect("protect replacement token");
+    }
+
+    fn write_reference(&self, reference: &[u8]) {
+        fs::write(&self.mission_reference, reference).expect("replace mission reference");
+        fs::set_permissions(&self.mission_reference, fs::Permissions::from_mode(0o600))
+            .expect("protect replacement mission reference");
+    }
+
     fn chmod_reference(&self, mode: u32) {
         fs::set_permissions(&self.mission_reference, fs::Permissions::from_mode(mode))
             .expect("change reference permissions");
     }
+}
+
+fn unused_address() -> SocketAddr {
+    static NEXT_PORT: AtomicU64 = AtomicU64::new(40_000);
+    match std::net::TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener.local_addr().expect("test address"),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            let port = NEXT_PORT.fetch_add(1, Ordering::Relaxed) as u16;
+            SocketAddr::from(([127, 0, 0, 1], port))
+        }
+        Err(error) => panic!("reserve test address: {error}"),
+    }
+}
+
+fn socket_access_available() -> bool {
+    match std::net::TcpListener::bind("127.0.0.1:0") {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("SKIP live customer runtime: loopback sockets denied by sandbox");
+            false
+        }
+        Err(error) => panic!("probe loopback socket access: {error}"),
+    }
+}
+
+struct RunningFixture {
+    signals: tokio::sync::mpsc::Sender<AgentSignal>,
+    task: tokio::task::JoinHandle<Result<AgentExit, AgentRuntimeError>>,
+}
+
+impl RunningFixture {
+    async fn start(fixture: &CustomerFixture) -> Self {
+        let config = load_and_validate_config(fixture.config_path()).expect("validated config");
+        let (signals, receiver) = tokio::sync::mpsc::channel(4);
+        let task = tokio::spawn(async move {
+            let mut loader = RecordingLoader::new();
+            run_customer_agent(config, &mut loader, receiver).await
+        });
+        wait_until_ready(fixture).await;
+        Self { signals, task }
+    }
+
+    async fn stop_clean(self) {
+        self.signals
+            .send(AgentSignal::Terminate)
+            .await
+            .expect("request clean stop");
+        assert_eq!(self.finish().await, AgentExit::Clean);
+    }
+
+    async fn finish(self) -> AgentExit {
+        finish_runtime(self.task).await
+    }
+}
+
+async fn finish_runtime(
+    task: tokio::task::JoinHandle<Result<AgentExit, AgentRuntimeError>>,
+) -> AgentExit {
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("runtime completion deadline")
+        .expect("runtime task joins")
+        .expect("runtime result")
+}
+
+struct BlockingLoader {
+    entered: std_mpsc::Sender<()>,
+    release: std_mpsc::Receiver<()>,
+}
+
+impl ProvisioningSecretLoader for BlockingLoader {
+    fn load(
+        &mut self,
+        operation: ProvisioningLoadId,
+        reference: &ProvisioningSecretRef,
+    ) -> Result<ProvisioningLoadReceipt, ProvisioningSecretStoreError> {
+        self.entered.send(()).expect("announce loader entry");
+        self.release.recv().expect("wait for loader release");
+        test_load_receipt(operation, reference)
+    }
+}
+
+async fn wait_until_ready(fixture: &CustomerFixture) {
+    wait_for_health_status(fixture.health(), "/readyz", 200).await;
+}
+
+async fn wait_for_health_status(address: SocketAddr, path: &str, expected: u16) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("health endpoint did not reach {expected}");
+        }
+        if health_status(address, path).await == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_application_status(address: SocketAddr, token: &[u8], expected: u16) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("application endpoint did not reach {expected}");
+        }
+        if application_status(address, token).await == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn health_status(address: SocketAddr, path: &str) -> u16 {
+    http_status(
+        address,
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await
+}
+
+async fn application_status(address: SocketAddr, token: &[u8]) -> u16 {
+    http_status(
+        address,
+        format!(
+            "POST /aster.application.v1alpha1.AsterApplicationService/GetStatus HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/proto\r\nConnect-Protocol-Version: 1\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            String::from_utf8_lossy(token),
+        )
+        .as_bytes(),
+    )
+    .await
+}
+
+async fn http_status(address: SocketAddr, request: &[u8]) -> u16 {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let Ok(mut stream) = tokio::net::TcpStream::connect(address).await else {
+        return 0;
+    };
+    stream.write_all(request).await.expect("write HTTP request");
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+        .await
+        .expect("HTTP response deadline")
+        .expect("read HTTP response");
+    let first = String::from_utf8_lossy(&response);
+    first
+        .split_whitespace()
+        .nth(1)
+        .expect("HTTP status")
+        .parse()
+        .expect("numeric HTTP status")
 }
 
 impl Drop for CustomerFixture {
@@ -171,15 +567,21 @@ impl ProvisioningSecretLoader for RecordingLoader {
         self.calls += 1;
         self.operation = Some(operation);
         self.reference = Some(reference.clone());
-        let bundle =
-            include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle");
-        Ok(ProvisioningLoadReceipt::new(
-            operation,
-            reference.clone(),
-            UnprotectedProvisioning::new(bundle.to_vec())
-                .expect("bounded disposable public test provisioning"),
-        ))
+        test_load_receipt(operation, reference)
     }
+}
+
+fn test_load_receipt(
+    operation: ProvisioningLoadId,
+    reference: &ProvisioningSecretRef,
+) -> Result<ProvisioningLoadReceipt, ProvisioningSecretStoreError> {
+    let bundle = include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle");
+    Ok(ProvisioningLoadReceipt::new(
+        operation,
+        reference.clone(),
+        UnprotectedProvisioning::new(bundle.to_vec())
+            .expect("bounded disposable public test provisioning"),
+    ))
 }
 
 struct RejectingLoader;

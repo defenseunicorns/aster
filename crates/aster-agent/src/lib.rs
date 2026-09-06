@@ -13,6 +13,8 @@ pub mod error;
 pub mod health;
 pub mod lifecycle;
 #[cfg(feature = "server")]
+pub mod runtime;
+#[cfg(feature = "server")]
 pub mod server;
 mod service;
 

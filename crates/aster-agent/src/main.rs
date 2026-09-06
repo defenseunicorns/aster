@@ -1,6 +1,10 @@
 use std::{env, net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
 
-use aster_agent::{BoundAgent, ClientToken, config::check_config};
+use aster_agent::{
+    BoundAgent, ClientToken,
+    config::check_config,
+    runtime::{AgentExit, AgentSignal},
+};
 use aster_node::application::{Scope, Topic};
 use aster_node::mission::UnprotectedReferenceMission;
 use aster_node::{
@@ -53,7 +57,8 @@ fn main() -> ExitCode {
         }
     };
     match runtime.block_on(run()) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(Some(exit)) => ExitCode::from(agent_exit_code(exit)),
+        Ok(None) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("ERROR {error}");
             ExitCode::FAILURE
@@ -61,17 +66,29 @@ fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<(), BoxError> {
+async fn run() -> Result<Option<AgentExit>, BoxError> {
     match Invocation::parse(Arguments::new(env::args().skip(1)))? {
-        Invocation::CheckConfig(path) => check_config(&path).map_err(Into::into),
+        Invocation::CheckConfig(path) => {
+            check_config(&path)?;
+            Ok(None)
+        }
         Invocation::CustomerConfig(_path) => Err("protected provider required".into()),
         Invocation::LegacyDevelopment(mut arguments) => {
             if arguments.take_flag("--help") || arguments.take_flag("-h") {
                 print_help();
-                return Ok(());
+                return Ok(None);
             }
-            run_legacy(arguments).await
+            run_legacy(arguments).await?;
+            Ok(None)
         }
+    }
+}
+
+fn agent_exit_code(exit: AgentExit) -> u8 {
+    match exit {
+        AgentExit::Clean => 0,
+        AgentExit::Failed(_) => 1,
+        AgentExit::Forced => 2,
     }
 }
 
@@ -159,9 +176,14 @@ async fn run_legacy(mut arguments: Arguments) -> Result<(), BoxError> {
     );
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut signals = translated_signals()?;
     let signal = tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        let _ = shutdown_tx.send(true);
+        while let Some(signal) = signals.recv().await {
+            if signal == AgentSignal::Terminate {
+                let _ = shutdown_tx.send(true);
+                return;
+            }
+        }
     });
     let server_result = agent.serve(events, client_token, shutdown_rx).await;
     signal.abort();
@@ -169,6 +191,43 @@ async fn run_legacy(mut arguments: Arguments) -> Result<(), BoxError> {
     server_result?;
     node_result?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn translated_signals() -> Result<tokio::sync::mpsc::Receiver<AgentSignal>, BoxError> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut hangup = signal(SignalKind::hangup())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(async move {
+        loop {
+            let translated = tokio::select! {
+                received = hangup.recv() => received.map(|()| AgentSignal::Hangup),
+                received = interrupt.recv() => received.map(|()| AgentSignal::Terminate),
+                received = terminate.recv() => received.map(|()| AgentSignal::Terminate),
+            };
+            let Some(translated) = translated else {
+                return;
+            };
+            if sender.send(translated).await.is_err() {
+                return;
+            }
+        }
+    });
+    Ok(receiver)
+}
+
+#[cfg(not(unix))]
+fn translated_signals() -> Result<tokio::sync::mpsc::Receiver<AgentSignal>, BoxError> {
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = sender.send(AgentSignal::Terminate).await;
+        }
+    });
+    Ok(receiver)
 }
 
 fn parse_source_interest(value: &str, class: &str) -> Result<SourceInterestSelector, BoxError> {
@@ -365,6 +424,18 @@ mod tests {
             error.to_string(),
             "--config cannot be combined with legacy flags"
         );
+    }
+
+    #[test]
+    fn forced_customer_shutdown_has_a_distinct_non_success_exit_code() {
+        assert_eq!(agent_exit_code(aster_agent::runtime::AgentExit::Clean), 0);
+        assert_eq!(
+            agent_exit_code(aster_agent::runtime::AgentExit::Failed(
+                aster_agent::lifecycle::FailureReason::Runtime,
+            )),
+            1
+        );
+        assert_eq!(agent_exit_code(aster_agent::runtime::AgentExit::Forced), 2);
     }
 
     #[cfg(feature = "nearby-discovery")]
