@@ -75,14 +75,16 @@ description = "Exercise bounded customer-agent crash, restart, reload, and drain
 run = '''
 set -eu
 cargo build --locked -p aster-agent --bin aster-agent-acceptance-fixture --features client,acceptance-test-provider
-task_root="$(mktemp -d /tmp/aster-agent-process-smoke.XXXXXX)"
+task_root=""
 cleanup() {
   case "$task_root" in
-    /tmp/aster-agent-process-smoke.*) rm -rf -- "$task_root" ;;
+    "") return 0 ;;
+    /tmp/aster-agent-process-smoke.*) rm -rf -- "$task_root"; task_root="" ;;
     *) return 1 ;;
   esac
 }
 trap cleanup EXIT HUP INT TERM
+task_root="$(mktemp -d /tmp/aster-agent-process-smoke.XXXXXX)"
 chmod 700 "$task_root"
 fixture="target/debug/aster-agent-acceptance-fixture"
 "$fixture" prepare --root "$task_root"

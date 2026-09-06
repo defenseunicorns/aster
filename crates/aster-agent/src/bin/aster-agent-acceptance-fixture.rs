@@ -15,7 +15,7 @@ use std::{
 };
 
 use aster_agent::{
-    config::load_and_validate_config,
+    config::{check_config, load_and_validate_config},
     proto::aster::application::v1alpha1 as api,
     runtime::{AgentExit, AgentSignal, run_customer_agent},
 };
@@ -42,6 +42,12 @@ fn main() -> ExitCode {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
     if arguments
         .first()
+        .is_some_and(|argument| argument == "--check-config")
+    {
+        return run_config_check_process(&arguments);
+    }
+    if arguments
+        .first()
         .is_some_and(|argument| argument == "--config")
     {
         return run_agent_process(&arguments);
@@ -64,6 +70,23 @@ fn main() -> ExitCode {
         };
     }
     run_client_process(&arguments)
+}
+
+fn run_config_check_process(arguments: &[String]) -> ExitCode {
+    match check_config_arguments(arguments) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(()) => {
+            eprintln!("ERROR configuration check failed");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn check_config_arguments(arguments: &[String]) -> Result<(), ()> {
+    if arguments.len() != 2 || arguments[0] != "--check-config" {
+        return Err(());
+    }
+    check_config(Path::new(&arguments[1])).map_err(|_| ())
 }
 
 fn run_agent_process(arguments: &[String]) -> ExitCode {
@@ -520,6 +543,7 @@ async fn client_publish(client: &Client) -> Result<(), FixtureError> {
         "status": "ok",
         "event_id_hex": encode_hex(&response.id),
         "publisher_id_hex": encode_hex(&response.publisher),
+        "publisher_counter": response.publisher_counter,
         "event_sequence": response.event_sequence,
         "acceptance_marker": response.acceptance_marker,
         "inserted": response.inserted
@@ -529,32 +553,76 @@ async fn client_publish(client: &Client) -> Result<(), FixtureError> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct QueryInput {
+    expected: ExpectedEventInput,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpectedEventInput {
+    id_hex: String,
+    publisher_hex: String,
+    publisher_counter: u64,
+    event_sequence: u64,
     topic: String,
     scope: String,
-    limit: u32,
+    priority: String,
+    logical_key_hex: String,
+    payload_hex: String,
+    tombstone: bool,
+    acceptance_marker: u64,
 }
 
 async fn client_query(client: &Client) -> Result<(), FixtureError> {
     let input: QueryInput = read_client_input()?;
     let response = client
         .query_events(api::QueryEventsRequest {
-            topic: Some(input.topic),
-            scope: Some(input.scope),
-            limit: input.limit,
+            topic: Some(input.expected.topic.clone()),
+            scope: Some(input.expected.scope.clone()),
+            limit: 2,
             ..Default::default()
         })
         .await?
         .into_owned();
-    let event_ids = response
-        .events
-        .iter()
-        .map(|event| encode_hex(&event.id))
-        .collect::<Vec<_>>();
-    print_json(json!({
+    let exact_match =
+        response.events.len() == 1 && event_exactly_matches(&response.events[0], &input.expected)?;
+    print_json(query_evidence(
+        exact_match,
+        response.events.len(),
+        response.has_more,
+    ))
+}
+
+fn event_exactly_matches(
+    event: &api::Event,
+    expected: &ExpectedEventInput,
+) -> Result<bool, FixtureError> {
+    let priority = match expected.priority.as_str() {
+        "routine" => api::Priority::Routine,
+        "priority" => api::Priority::Priority,
+        "immediate" => api::Priority::Immediate,
+        "flash" => api::Priority::Flash,
+        _ => return Err(FixtureError::Local),
+    };
+    Ok(event.id == decode_hex(&expected.id_hex)?
+        && event.publisher == decode_hex(&expected.publisher_hex)?
+        && event.publisher_counter == expected.publisher_counter
+        && event.event_sequence == expected.event_sequence
+        && event.topic == expected.topic
+        && event.scope == expected.scope
+        && event.priority == priority
+        && event.logical_key == decode_hex(&expected.logical_key_hex)?
+        && event.payload == decode_hex(&expected.payload_hex)?
+        && event.tombstone == expected.tombstone
+        && event.acceptance_marker == expected.acceptance_marker)
+}
+
+fn query_evidence(exact_match: bool, count: usize, has_more: bool) -> serde_json::Value {
+    json!({
         "status": "ok",
-        "event_ids_hex": event_ids,
-        "has_more": response.has_more
-    }))
+        "exact_match": exact_match,
+        "count": count,
+        "has_more": has_more,
+    })
 }
 
 #[derive(Deserialize)]
@@ -771,6 +839,39 @@ fn read_owner_only_token(_path: &Path) -> Result<Vec<u8>, FixtureError> {
 mod tests {
     use super::*;
 
+    fn representative_event() -> api::Event {
+        api::Event {
+            id: vec![1; 32],
+            publisher: vec![2; 32],
+            publisher_counter: 3,
+            event_sequence: 4,
+            topic: "SECRET_TOPIC_CANARY".to_owned(),
+            scope: "SECRET_SCOPE_CANARY".to_owned(),
+            priority: api::Priority::Immediate.into(),
+            logical_key: b"SECRET_LOGICAL_KEY_CANARY".to_vec(),
+            payload: b"SECRET_PAYLOAD_CANARY".to_vec(),
+            tombstone: false,
+            acceptance_marker: 5,
+            ..Default::default()
+        }
+    }
+
+    fn representative_expected_event() -> ExpectedEventInput {
+        ExpectedEventInput {
+            id_hex: encode_hex(&[1; 32]),
+            publisher_hex: encode_hex(&[2; 32]),
+            publisher_counter: 3,
+            event_sequence: 4,
+            topic: "SECRET_TOPIC_CANARY".to_owned(),
+            scope: "SECRET_SCOPE_CANARY".to_owned(),
+            priority: "immediate".to_owned(),
+            logical_key_hex: encode_hex(b"SECRET_LOGICAL_KEY_CANARY"),
+            payload_hex: encode_hex(b"SECRET_PAYLOAD_CANARY"),
+            tombstone: false,
+            acceptance_marker: 5,
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn runtime_is_entered_before_signal_registration() {
@@ -801,5 +902,92 @@ mod tests {
         assert_eq!(TEST_STORAGE_MAX_ITEMS, 10_000);
         assert_eq!(TEST_STORAGE_MAX_PAYLOAD_BYTES, 64 * 1024 * 1024);
         assert_eq!(TEST_SHUTDOWN_GRACE_MS, 10_000);
+    }
+
+    #[test]
+    fn config_check_mode_uses_validation_without_creating_state() {
+        let root = env::temp_dir().join(format!(
+            "aster-agent-acceptance-config-check-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).expect("test root");
+        let config = root.join("invalid.json");
+        let state = root.join("state");
+        fs::write(&config, b"{}").expect("invalid config");
+
+        assert!(
+            check_config_arguments(&[
+                "--check-config".to_owned(),
+                config.to_string_lossy().into_owned(),
+            ])
+            .is_err()
+        );
+        assert!(!state.exists());
+        fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn recovered_event_match_is_sensitive_to_every_exposed_field() {
+        let event = representative_event();
+        let expected = representative_expected_event();
+        assert!(event_exactly_matches(&event, &expected).expect("exact event"));
+
+        let mut mutations = Vec::new();
+        let mut changed = event.clone();
+        changed.id[0] ^= 1;
+        mutations.push(changed);
+        let mut changed = event.clone();
+        changed.publisher[0] ^= 1;
+        mutations.push(changed);
+        let mut changed = event.clone();
+        changed.publisher_counter += 1;
+        mutations.push(changed);
+        let mut changed = event.clone();
+        changed.event_sequence += 1;
+        mutations.push(changed);
+        let mut changed = event.clone();
+        changed.topic.push('x');
+        mutations.push(changed);
+        let mut changed = event.clone();
+        changed.scope.push('x');
+        mutations.push(changed);
+        let mut changed = event.clone();
+        changed.priority = api::Priority::Flash.into();
+        mutations.push(changed);
+        let mut changed = event.clone();
+        changed.logical_key[0] ^= 1;
+        mutations.push(changed);
+        let mut changed = event.clone();
+        changed.payload[0] ^= 1;
+        mutations.push(changed);
+        let mut changed = event.clone();
+        changed.tombstone = true;
+        mutations.push(changed);
+        let mut changed = event;
+        changed.acceptance_marker += 1;
+        mutations.push(changed);
+
+        assert_eq!(mutations.len(), 11);
+        for mutation in mutations {
+            assert!(!event_exactly_matches(&mutation, &expected).expect("mutated event"));
+        }
+    }
+
+    #[test]
+    fn query_evidence_never_contains_expected_event_values() {
+        let output = serde_json::to_string(&query_evidence(true, 1, false))
+            .expect("bounded equality evidence");
+        for canary in [
+            "SECRET_TOPIC_CANARY",
+            "SECRET_SCOPE_CANARY",
+            "SECRET_PAYLOAD_CANARY",
+        ] {
+            assert!(!output.contains(canary));
+        }
+        assert_eq!(
+            output,
+            r#"{"count":1,"exact_match":true,"has_more":false,"status":"ok"}"#
+        );
     }
 }

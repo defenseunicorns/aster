@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import inspect
 import io
 import json
 import subprocess
@@ -56,6 +57,18 @@ class ProcessCheckerContractTests(unittest.TestCase):
         result = run_checker("--timeout-seconds", "1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("agent, config, and client paths are required", result.stderr)
+
+        result = run_checker(
+            "--agent",
+            "/tmp/SECRET_AGENT_PATH",
+            "--config",
+            "/tmp/SECRET_CONFIG_PATH",
+            "--client",
+            "/tmp/SECRET_CLIENT_PATH",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid process checker arguments", result.stderr)
+        self.assertNotIn("SECRET_", result.stdout + result.stderr)
 
     def test_path_validation_never_echoes_a_rejected_input(self) -> None:
         # Break caught: including caller-controlled paths in validation errors
@@ -151,6 +164,23 @@ class ProcessCheckerContractTests(unittest.TestCase):
             ["SECRET_PATH_CANARY", "SECRET_PAYLOAD_CANARY"],
         )
 
+    def test_peer_canaries_include_every_direct_component(self) -> None:
+        # Break caught: scanning the full peer and socket suffix still misses
+        # disclosure of the carrier identity that precedes `@`.
+        checker = load_checker()
+        self.assertEqual(
+            checker._peer_canaries(
+                "SECRET_CARRIER_ID@127.0.0.1:41999=SECRET_MISSION_ID"
+            ),
+            (
+                "SECRET_CARRIER_ID@127.0.0.1:41999=SECRET_MISSION_ID",
+                "SECRET_CARRIER_ID@127.0.0.1:41999",
+                "SECRET_CARRIER_ID",
+                "127.0.0.1:41999",
+                "SECRET_MISSION_ID",
+            ),
+        )
+
     def test_failure_diagnostic_reports_counts_without_echoing_output(self) -> None:
         # Break caught: making a failed child observable by forwarding its raw
         # output could disclose the very canaries this checker protects.
@@ -225,6 +255,61 @@ class ProcessCheckerContractTests(unittest.TestCase):
             process.cleanup(1)
         kill_group.assert_called_once_with(process.process.pid, checker.signal.SIGKILL)
 
+    def test_spawn_is_registered_before_pending_signal_delivery(self) -> None:
+        # Break caught: an external signal between Popen and live-list append
+        # could unwind cleanup while the new detached group was still unknown.
+        checker = load_checker()
+        registry = checker.ProcessRegistry()
+        process = mock.Mock()
+        mask_events = []
+
+        def signal_mask(how, signals):
+            mask_events.append(how)
+            if how == checker.signal.SIG_SETMASK:
+                self.assertIn(process, registry._processes)
+                raise checker.CheckerInterrupted("pending checker signal")
+            self.assertEqual(
+                set(signals),
+                {checker.signal.SIGTERM, checker.signal.SIGHUP, checker.signal.SIGINT},
+            )
+            return frozenset()
+
+        with (
+            mock.patch.object(checker, "ManagedProcess", return_value=process),
+            mock.patch.object(
+                checker.signal, "pthread_sigmask", side_effect=signal_mask
+            ),
+            self.assertRaisesRegex(checker.CheckerInterrupted, "pending checker signal"),
+        ):
+            registry.spawn(["packaged-agent"])
+
+        registry.cleanup_all(1)
+        process.cleanup.assert_called_once_with(1)
+        self.assertEqual(
+            mask_events, [checker.signal.SIG_BLOCK, checker.signal.SIG_SETMASK]
+        )
+
+    def test_all_checker_subprocesses_use_the_signal_safe_registry(self) -> None:
+        # Break caught: routing only long-lived agents through the registry
+        # leaves short-lived clients and config checks exposed to the same race.
+        checker = load_checker()
+        source = inspect.getsource(checker)
+        self.assertEqual(source.count("ManagedProcess("), 1)
+
+    def test_registered_child_does_not_retain_the_checker_signal_mask(self) -> None:
+        # Break caught: masking the parent around Popen also masks the child;
+        # the spawned process must unblock before exec so drain signals work.
+        checker = load_checker()
+        registry = checker.ProcessRegistry()
+        process = registry.spawn(
+            [sys.executable, "-c", "import time; time.sleep(5)"]
+        )
+        try:
+            process.signal(checker.signal.SIGTERM)
+            self.assertEqual(process.wait(1), -checker.signal.SIGTERM)
+        finally:
+            registry.cleanup_all(1)
+
     def test_active_client_exit_fails_early_with_fixed_phase_context(self) -> None:
         # Break caught: waiting only on stdout hides an already-exited client
         # for the full timeout and gives no clue whether unary or stream setup
@@ -252,6 +337,7 @@ class ProcessCheckerContractTests(unittest.TestCase):
                     "client phase unary exited before activity",
                 ):
                     checker.start_active_client(
+                        checker.ProcessRegistry(),
                         client,
                         "status",
                         "127.0.0.1:1",
@@ -287,6 +373,7 @@ class ProcessCheckerContractTests(unittest.TestCase):
             token.write_bytes(b"unused")
             started = time.monotonic()
             process = checker.start_active_client(
+                checker.ProcessRegistry(),
                 client,
                 "stream",
                 "127.0.0.1:1",
@@ -492,8 +579,9 @@ class ProcessCheckerContractTests(unittest.TestCase):
             agent = root_path / "agent"
             agent.write_text(
                 "#!/bin/sh\n"
-                "echo 'ERROR unprotected test fixture configuration failed' >&2\n"
-                "exit 1\n",
+                "test \"$1\" = '--check-config' || exit 99\n"
+                "echo 'PACKAGED_AGENT status=config-rejected' >&2\n"
+                "exit 7\n",
                 encoding="utf-8",
             )
             agent.chmod(0o700)
@@ -542,14 +630,168 @@ class ProcessCheckerContractTests(unittest.TestCase):
                 side_effect=guarded_addresses,
             ):
                 result = checker.run_negative_startup_checks(
-                    agent, config, contract, 1
+                    checker.ProcessRegistry(), agent, config, contract, 1
                 )
             self.assertEqual(
                 result.receipts,
-                ("invalid-config-no-side-effects", "non-loopback-refusal"),
+                (
+                    "invalid-config-no-side-effects",
+                    "non-loopback-application-refusal",
+                    "non-loopback-health-refusal",
+                ),
             )
-            self.assertEqual(len(result.captures), 2)
+            self.assertEqual(len(result.captures), 3)
             self.assertGreaterEqual(len(result.canaries), 4)
+
+    def test_negative_check_rejects_transient_state_creation_and_removal(self) -> None:
+        # Break caught: checking only final path absence allows a packaged
+        # validator to create and then erase state before returning failure.
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            agent = root_path / "agent"
+            agent.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                "document = json.loads(pathlib.Path(sys.argv[2]).read_text())\n"
+                "state = pathlib.Path(document['state']['directory'])\n"
+                "state.mkdir()\n"
+                "state.rmdir()\n"
+                "sys.stderr.write('PACKAGED_AGENT status=config-rejected\\n')\n"
+                "raise SystemExit(7)\n",
+                encoding="utf-8",
+            )
+            agent.chmod(0o700)
+            config = root_path / "agent.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "state": {"directory": str(root_path / "unused-state")},
+                        "application": {"listen": "127.0.0.1:20001"},
+                        "health": {"listen": "127.0.0.1:20002"},
+                        "mesh": {"bind": "127.0.0.1:0", "peers": []},
+                        "credentials": {
+                            "client_token_file": str(root_path / "token"),
+                            "mission_secret_ref_file": str(root_path / "reference"),
+                            "mission_load_id": "11" * 32,
+                        },
+                        "storage": {
+                            "max_items": 10_000,
+                            "max_payload_bytes": 64 * 1024 * 1024,
+                        },
+                        "limits": {"shutdown_grace_ms": 10_000},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            contract = checker.ConfigContract(
+                "127.0.0.1:20001",
+                "127.0.0.1:20002",
+                root_path / "unused-state",
+                root_path / "token",
+                root_path / "reference",
+                (),
+            )
+
+            @contextlib.contextmanager
+            def guarded_addresses():
+                yield checker.GuardedAddresses(
+                    application="127.0.0.1:21001",
+                    health="127.0.0.1:21002",
+                    mesh="127.0.0.1:21003",
+                )
+
+            with (
+                mock.patch.object(
+                    checker,
+                    "guarded_loopback_addresses",
+                    side_effect=guarded_addresses,
+                ),
+                self.assertRaisesRegex(
+                    checker.AcceptanceError, "invalid configuration mutated state"
+                ),
+            ):
+                checker.run_negative_startup_checks(
+                    checker.ProcessRegistry(), agent, config, contract, 1
+                )
+
+    def test_exact_recovery_request_and_evidence_cover_every_event_field(self) -> None:
+        # Break caught: matching only an Event ID cannot prove the recovered
+        # durable value retained all of its caller-visible fields.
+        checker = load_checker()
+        request = checker._publish_request()
+        receipt = {
+            "event_id_hex": "01" * 32,
+            "publisher_id_hex": "02" * 32,
+            "publisher_counter": 3,
+            "event_sequence": 4,
+            "acceptance_marker": 5,
+        }
+        expected = checker._expected_recovered_event(receipt, request)
+        self.assertEqual(
+            expected,
+            {
+                "id_hex": "01" * 32,
+                "publisher_hex": "02" * 32,
+                "publisher_counter": 3,
+                "event_sequence": 4,
+                "topic": checker.CANARY_TOPIC,
+                "scope": checker.CANARY_SCOPE,
+                "priority": "immediate",
+                "logical_key_hex": checker.CANARY_LOGICAL_KEY.hex(),
+                "payload_hex": checker.CANARY_PAYLOAD.hex(),
+                "tombstone": False,
+                "acceptance_marker": 5,
+            },
+        )
+        checker.require_exact_recovery_evidence(
+            {"status": "ok", "exact_match": True, "count": 1, "has_more": False}
+        )
+        for key, value in (
+            ("exact_match", False),
+            ("count", 2),
+            ("has_more", True),
+        ):
+            evidence = {
+                "status": "ok",
+                "exact_match": True,
+                "count": 1,
+                "has_more": False,
+            }
+            evidence[key] = value
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(
+                    checker.AcceptanceError, "recovered publication was not exact"
+                ):
+                    checker.require_exact_recovery_evidence(evidence)
+
+    def test_operation_key_conflict_requires_exact_public_aborted_code(self) -> None:
+        # Break caught: accepting any client error permits auth, capacity, or
+        # transport failures to masquerade as operation-key conflict proof.
+        checker = load_checker()
+        checker.require_operation_key_conflict({"status": "error", "code": "aborted"})
+        for code in ("internal", "unavailable", None):
+            with self.subTest(code=code):
+                with self.assertRaisesRegex(
+                    checker.AcceptanceError, "operation-key conflict was not rejected"
+                ):
+                    checker.require_operation_key_conflict(
+                        {"status": "error", "code": code}
+                    )
+
+    def test_smoke_trap_precedes_temporary_directory_creation(self) -> None:
+        # Break caught: creating the root before installing the trap leaves a
+        # signal window that can strand sensitive temporary fixture files.
+        mise = CHECKER_PATH.parent.parent / "mise.toml"
+        source = mise.read_text(encoding="utf-8")
+        task = source[source.index("[tasks.agent-process-smoke]") :]
+        empty = task.index('task_root=""')
+        trap = task.index("trap cleanup EXIT HUP INT TERM")
+        create = task.index("task_root=\"$(mktemp -d")
+        self.assertLess(empty, trap)
+        self.assertLess(trap, create)
+        self.assertIn('/tmp/aster-agent-process-smoke.*)', task[empty:create])
 
 if __name__ == "__main__":
     unittest.main()

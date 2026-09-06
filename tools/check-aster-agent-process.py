@@ -122,12 +122,24 @@ class GuardedAddresses:
     mesh: str
 
 
+@dataclasses.dataclass(frozen=True)
+class DirectorySnapshot:
+    device: int
+    inode: int
+    mode: int
+    links: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+    entries: tuple[str, ...]
+
+
 def parse_arguments(argv: Sequence[str]) -> Arguments:
     parser = QuietArgumentParser(add_help=True)
     parser.add_argument("--agent")
     parser.add_argument("--config")
     parser.add_argument("--client")
-    parser.add_argument("--timeout-seconds", default="30")
+    parser.add_argument("--timeout-seconds", required=True)
     namespace = parser.parse_args(argv)
     try:
         timeout_seconds = int(namespace.timeout_seconds, 10)
@@ -410,17 +422,91 @@ class BoundedCapture:
             return encoded in self._bytes
 
 
+class SignalSafePopen(subprocess.Popen[bytes]):
+    """Popen whose posix_spawn atomically restores the child's signal mask."""
+
+    def __init__(self, arguments: Sequence[str], child_signal_mask: Iterable[int], **kwargs: Any):
+        self._child_signal_mask = tuple(child_signal_mask)
+        self._used_signal_safe_spawn = False
+        super().__init__(list(arguments), **kwargs)
+        if not self._used_signal_safe_spawn:
+            try:
+                self.kill()
+            finally:
+                self.wait()
+            raise OSError("signal-safe process creation is unavailable")
+
+    def _posix_spawn(
+        self,
+        args: list[str],
+        executable: str,
+        env: dict[str, str],
+        restore_signals: bool,
+        close_fds: bool,
+        p2cread: int,
+        p2cwrite: int,
+        c2pread: int,
+        c2pwrite: int,
+        errread: int,
+        errwrite: int,
+    ) -> None:
+        spawn_options: dict[str, Any] = {
+            "setsid": True,
+            "setsigmask": self._child_signal_mask,
+        }
+        if restore_signals:
+            spawn_options["setsigdef"] = [
+                process_signal
+                for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ")
+                if (process_signal := getattr(signal, name, None)) is not None
+            ]
+        file_actions: list[tuple[int, ...]] = []
+        for descriptor in (p2cwrite, c2pread, errread):
+            if descriptor != -1:
+                file_actions.append((os.POSIX_SPAWN_CLOSE, descriptor))
+        for descriptor, target in (
+            (p2cread, 0),
+            (c2pwrite, 1),
+            (errwrite, 2),
+        ):
+            if descriptor != -1:
+                file_actions.append((os.POSIX_SPAWN_DUP2, descriptor, target))
+        if close_fds:
+            file_actions.append((os.POSIX_SPAWN_CLOSEFROM, 3))
+        if file_actions:
+            spawn_options["file_actions"] = file_actions
+        self.pid = os.posix_spawn(executable, args, env, **spawn_options)
+        self._child_created = True
+        self._used_signal_safe_spawn = True
+        self._close_pipe_fds(
+            p2cread,
+            p2cwrite,
+            c2pread,
+            c2pwrite,
+            errread,
+            errwrite,
+        )
+
+
 class ManagedProcess:
-    def __init__(self, arguments: Sequence[str], input_bytes: bytes | None = None) -> None:
+    def __init__(
+        self,
+        arguments: Sequence[str],
+        input_bytes: bytes | None = None,
+        child_signal_mask: Iterable[int] = (),
+    ) -> None:
         self.stdout = BoundedCapture()
         self.stderr = BoundedCapture()
+        if not arguments:
+            raise AcceptanceError("process could not be started")
+        normalized_arguments = [os.path.abspath(arguments[0]), *arguments[1:]]
         try:
-            self.process = subprocess.Popen(
-                list(arguments),
+            self.process = SignalSafePopen(
+                normalized_arguments,
+                child_signal_mask,
                 stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                start_new_session=True,
             )
         except OSError as error:
             raise AcceptanceError("process could not be started") from error
@@ -546,6 +632,42 @@ class ManagedProcess:
         return self.stdout.text() + "\n" + self.stderr.text()
 
 
+class ProcessRegistry:
+    """Own every isolated child before checker signals can be delivered."""
+
+    def __init__(self) -> None:
+        self._processes: list[ManagedProcess] = []
+
+    def spawn(
+        self, arguments: Sequence[str], input_bytes: bytes | None = None
+    ) -> ManagedProcess:
+        blocked = {signal.SIGTERM, signal.SIGHUP, signal.SIGINT}
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+        try:
+            process = ManagedProcess(arguments, input_bytes, previous)
+            self._processes.append(process)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        return process
+
+    def discard(self, process: ManagedProcess) -> None:
+        if process in self._processes:
+            self._processes.remove(process)
+
+    def cleanup_all(self, timeout_seconds: int) -> None:
+        first_error: AcceptanceError | None = None
+        for process in reversed(tuple(self._processes)):
+            try:
+                process.cleanup(timeout_seconds)
+            except AcceptanceError as error:
+                if first_error is None:
+                    first_error = error
+            else:
+                self.discard(process)
+        if first_error is not None:
+            raise first_error
+
+
 def wait_for_process_pair(
     first: ManagedProcess, second: ManagedProcess, timeout_seconds: int
 ) -> tuple[int, int]:
@@ -606,6 +728,7 @@ def _json_record(output: str) -> dict[str, Any]:
 
 
 def invoke_client(
+    registry: ProcessRegistry,
     client: Path,
     command: str,
     application: str,
@@ -616,7 +739,7 @@ def invoke_client(
     expect_failure: bool = False,
 ) -> ClientResult:
     encoded = json.dumps(request or {}, separators=(",", ":")).encode("utf-8")
-    process = ManagedProcess(
+    process = registry.spawn(
         _client_arguments(client, command, application, token_file, timeout_seconds),
         encoded,
     )
@@ -626,6 +749,7 @@ def invoke_client(
         stderr = process.stderr.text()
     finally:
         process.cleanup(timeout_seconds)
+        registry.discard(process)
     if expect_failure:
         if return_code == 0:
             raise AcceptanceError("client unexpectedly accepted rejected work")
@@ -644,6 +768,7 @@ def invoke_client(
 
 
 def start_active_client(
+    registry: ProcessRegistry,
     client: Path,
     command: str,
     application: str,
@@ -652,7 +777,7 @@ def start_active_client(
     request: dict[str, Any],
 ) -> ManagedProcess:
     phase = {"status": "unary", "stream": "stream"}.get(command, "activity")
-    process = ManagedProcess(
+    process = registry.spawn(
         _client_arguments(client, command, application, token_file, timeout_seconds),
         json.dumps(request, separators=(",", ":")).encode("utf-8"),
     )
@@ -660,6 +785,7 @@ def start_active_client(
         process.wait_for_stdout_activity('"status":"active"', timeout_seconds, phase)
     except Exception:
         process.cleanup(timeout_seconds)
+        registry.discard(process)
         raise
     return process
 
@@ -876,10 +1002,31 @@ def _write_private_json(path: Path, document: dict[str, Any]) -> None:
         raise AcceptanceError("negative configuration could not be prepared") from error
 
 
+def _directory_snapshot(path: Path) -> DirectorySnapshot:
+    try:
+        metadata = path.stat()
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise AcceptanceError("negative state guard is invalid")
+        entries = tuple(sorted(entry.name for entry in path.iterdir()))
+    except OSError as error:
+        raise AcceptanceError("negative state guard is unavailable") from error
+    return DirectorySnapshot(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        mode=metadata.st_mode,
+        links=metadata.st_nlink,
+        size=metadata.st_size,
+        modified_ns=metadata.st_mtime_ns,
+        changed_ns=metadata.st_ctime_ns,
+        entries=entries,
+    )
+
+
 def run_negative_startup_checks(
+    registry: ProcessRegistry,
     agent: Path,
     config_path: Path,
-    contract: ConfigContract,
+    _contract: ConfigContract,
     timeout_seconds: int,
 ) -> NegativeStartupResult:
     original = _load_config_document(config_path)
@@ -892,44 +1039,54 @@ def run_negative_startup_checks(
         with guarded_loopback_addresses() as guarded:
             canaries.extend((guarded.application, guarded.health, guarded.mesh))
             cases = (
-                ("invalid-config-no-side-effects", True),
-                ("non-loopback-refusal", False),
+                ("invalid-config-no-side-effects", "schema"),
+                ("non-loopback-application-refusal", "application"),
+                ("non-loopback-health-refusal", "health"),
             )
-            for receipt, invalid_schema in cases:
-                state = root / f"SECRET_PATH_CANARY-{receipt}-state"
+            for receipt, invalid_kind in cases:
+                state_parent = root / f"state-parent-{receipt}"
+                state_parent.mkdir(mode=0o700)
+                state = state_parent / "SECRET_PATH_CANARY-state"
                 negative_config = root / f"SECRET_PATH_CANARY-{receipt}-config.json"
                 document = copy.deepcopy(original)
                 document["state"]["directory"] = str(state)
                 document["application"]["listen"] = guarded.application
                 document["health"]["listen"] = guarded.health
                 document["mesh"]["bind"] = guarded.mesh
-                if invalid_schema:
+                if invalid_kind == "schema":
                     document["schema_version"] = 2
-                else:
+                elif invalid_kind == "application":
                     _, application_port = _address_parts(guarded.application)
                     document["application"]["listen"] = f"192.0.2.1:{application_port}"
+                else:
+                    _, health_port = _address_parts(guarded.health)
+                    document["health"]["listen"] = f"192.0.2.1:{health_port}"
                 _write_private_json(negative_config, document)
                 canaries.extend((str(state), str(negative_config)))
-                if not invalid_schema:
-                    canaries.append(document["application"]["listen"])
+                if invalid_kind in {"application", "health"}:
+                    canaries.append(document[invalid_kind]["listen"])
 
-                process = ManagedProcess([str(agent), "--config", str(negative_config)])
+                before = _directory_snapshot(state_parent)
+                process = registry.spawn(
+                    [str(agent), "--check-config", str(negative_config)]
+                )
                 try:
                     code = process.wait(timeout_seconds)
                     stdout = process.stdout.text()
                     stderr = process.stderr.text()
                     if code == 0:
                         raise AcceptanceError("invalid configuration was accepted")
-                    if stdout.splitlines() != [] or stderr.splitlines() != [
-                        "ERROR unprotected test fixture configuration failed"
-                    ]:
-                        raise AcceptanceError(
-                            "invalid configuration crossed the validation boundary"
-                        )
-                    if state.exists():
+                    require_sanitized(
+                        stdout + "\n" + stderr,
+                        (str(state), str(negative_config), document[invalid_kind].get("listen", ""))
+                        if invalid_kind in {"application", "health"}
+                        else (str(state), str(negative_config)),
+                    )
+                    if _directory_snapshot(state_parent) != before:
                         raise AcceptanceError("invalid configuration mutated state")
                 finally:
                     process.cleanup(timeout_seconds)
+                    registry.discard(process)
                 captures.append(stdout + "\n" + stderr)
                 receipts.append(receipt)
     return NegativeStartupResult(
@@ -975,13 +1132,18 @@ def _process_canaries(
     if reference_path is not None:
         canaries.append(reference_path)
     for peer in contract.peers:
-        canaries.append(peer)
-        carrier, separator, mission = peer.partition("=")
-        if separator:
-            canaries.extend((carrier, mission))
-            if "@" in carrier:
-                canaries.append(carrier.rsplit("@", 1)[1])
+        canaries.extend(_peer_canaries(peer))
     return canaries
+
+
+def _peer_canaries(peer: str) -> tuple[str, ...]:
+    carrier, separator, mission = peer.partition("=")
+    if not separator:
+        return (peer,)
+    identity, address_separator, socket_address = carrier.rpartition("@")
+    if not address_separator:
+        return (peer, carrier, mission)
+    return (peer, carrier, identity, socket_address, mission)
 
 
 def _publish_request(payload: bytes = CANARY_PAYLOAD) -> dict[str, Any]:
@@ -993,6 +1155,60 @@ def _publish_request(payload: bytes = CANARY_PAYLOAD) -> dict[str, Any]:
         "logical_key_hex": CANARY_LOGICAL_KEY.hex(),
         "payload_hex": payload.hex(),
     }
+
+
+def _expected_recovered_event(
+    receipt: dict[str, Any], request: dict[str, Any]
+) -> dict[str, Any]:
+    event_id = receipt.get("event_id_hex")
+    publisher = receipt.get("publisher_id_hex")
+    publisher_counter = receipt.get("publisher_counter")
+    event_sequence = receipt.get("event_sequence")
+    acceptance_marker = receipt.get("acceptance_marker")
+    if (
+        not isinstance(event_id, str)
+        or len(event_id) != 64
+        or not isinstance(publisher, str)
+        or len(publisher) != 64
+        or not isinstance(publisher_counter, int)
+        or isinstance(publisher_counter, bool)
+        or publisher_counter < 1
+        or not isinstance(event_sequence, int)
+        or isinstance(event_sequence, bool)
+        or event_sequence < 1
+        or not isinstance(acceptance_marker, int)
+        or isinstance(acceptance_marker, bool)
+        or acceptance_marker < 1
+    ):
+        raise AcceptanceError("publish receipt was invalid")
+    return {
+        "id_hex": event_id,
+        "publisher_hex": publisher,
+        "publisher_counter": publisher_counter,
+        "event_sequence": event_sequence,
+        "topic": request["topic"],
+        "scope": request["scope"],
+        "priority": request["priority"],
+        "logical_key_hex": request["logical_key_hex"],
+        "payload_hex": request["payload_hex"],
+        "tombstone": False,
+        "acceptance_marker": acceptance_marker,
+    }
+
+
+def require_exact_recovery_evidence(record: dict[str, Any]) -> None:
+    if record != {
+        "status": "ok",
+        "exact_match": True,
+        "count": 1,
+        "has_more": False,
+    }:
+        raise AcceptanceError("recovered publication was not exact")
+
+
+def require_operation_key_conflict(record: dict[str, Any]) -> None:
+    if record != {"status": "error", "code": "aborted"}:
+        raise AcceptanceError("operation-key conflict was not rejected")
 
 
 def run_acceptance(arguments: Arguments) -> None:
@@ -1015,19 +1231,14 @@ def run_acceptance_with_token(
     preserved: PreservedClientToken,
 ) -> list[str]:
     old_token = preserved.token
-    negative = run_negative_startup_checks(
-        arguments.agent,
-        arguments.config,
-        contract,
-        arguments.timeout_seconds,
-    )
-    captures = list(negative.captures)
-    live: list[ManagedProcess] = []
-    receipt_names = list(negative.receipts)
+    registry = ProcessRegistry()
+    captures: list[str] = []
+    receipt_names: list[str] = []
 
     def start_agent() -> ManagedProcess:
-        agent = ManagedProcess([str(arguments.agent), "--config", str(arguments.config)])
-        live.append(agent)
+        agent = registry.spawn(
+            [str(arguments.agent), "--config", str(arguments.config)]
+        )
         try:
             wait_for_readiness(agent, contract.health, arguments.timeout_seconds)
         except AcceptanceError:
@@ -1051,7 +1262,7 @@ def run_acceptance_with_token(
         code = agent.wait(arguments.timeout_seconds)
         captures.append(agent.combined())
         agent.cleanup(arguments.timeout_seconds)
-        live.remove(agent)
+        registry.discard(agent)
         if code != expected_code:
             raise AcceptanceError("agent exit status did not match the contract")
 
@@ -1064,6 +1275,7 @@ def run_acceptance_with_token(
     ) -> ClientResult:
         try:
             result = invoke_client(
+                registry,
                 arguments.client,
                 command,
                 contract.application,
@@ -1108,8 +1320,8 @@ def run_acceptance_with_token(
         captures.extend((agent.combined(), client.combined()))
         agent.cleanup(arguments.timeout_seconds)
         client.cleanup(arguments.timeout_seconds)
-        live.remove(agent)
-        live.remove(client)
+        registry.discard(agent)
+        registry.discard(client)
         client_outcome_is_expected = expected_drain_client_outcome(
             phase, client_code, client.stdout.text(), client.stderr.text()
         )
@@ -1129,6 +1341,15 @@ def run_acceptance_with_token(
             raise AcceptanceError(f"{phase} drain outcome did not match the contract")
 
     try:
+        negative = run_negative_startup_checks(
+            registry,
+            arguments.agent,
+            arguments.config,
+            contract,
+            arguments.timeout_seconds,
+        )
+        captures.extend(negative.captures)
+        receipt_names.extend(negative.receipts)
         with tempfile.TemporaryDirectory(prefix="aster-agent-process-") as temporary:
             temporary_path = Path(temporary)
             temporary_path.chmod(0o700)
@@ -1137,26 +1358,24 @@ def run_acceptance_with_token(
             old_token_file.chmod(0o600)
 
             agent = start_agent()
-            published = call("publish", _publish_request()).record
-            event_id = published.get("event_id_hex")
-            if not isinstance(event_id, str) or len(event_id) != 64:
-                raise AcceptanceError("publish receipt was invalid")
+            publish_request = _publish_request()
+            published = call("publish", publish_request).record
+            expected_event = _expected_recovered_event(published, publish_request)
+            event_id = expected_event["id_hex"]
             stop_agent(agent, signal.SIGKILL, -signal.SIGKILL)
 
             agent = start_agent()
             queried = call(
                 "query",
-                {"topic": CANARY_TOPIC, "scope": CANARY_SCOPE, "limit": 8},
+                {"expected": expected_event},
             ).record
-            if queried.get("event_ids_hex") != [event_id]:
-                raise AcceptanceError("recovered publication did not match the receipt")
+            require_exact_recovery_evidence(queried)
             conflict = call(
                 "publish",
                 _publish_request(CANARY_PAYLOAD + b"-changed"),
                 expect_failure=True,
             )
-            if conflict.record.get("status") != "error":
-                raise AcceptanceError("operation-key conflict was not rejected")
+            require_operation_key_conflict(conflict.record)
             subscription = call(
                 "subscribe",
                 {
@@ -1227,6 +1446,7 @@ def run_acceptance_with_token(
             receipt_names.append("token-reload")
 
             unary = start_active_client(
+                registry,
                 arguments.client,
                 "status",
                 contract.application,
@@ -1234,11 +1454,11 @@ def run_acceptance_with_token(
                 arguments.timeout_seconds,
                 {"repeat_until_error": True},
             )
-            live.append(unary)
             drain_with_active_client(agent, unary, "unary")
 
             agent = start_agent()
             streaming = start_active_client(
+                registry,
                 arguments.client,
                 "stream",
                 contract.application,
@@ -1252,7 +1472,6 @@ def run_acceptance_with_token(
                     "count": 1,
                 },
             )
-            live.append(streaming)
             drain_with_active_client(agent, streaming, "stream")
             receipt_names.append("graceful-drain")
 
@@ -1265,8 +1484,7 @@ def run_acceptance_with_token(
             )
             receipt_names.append("canary-absence")
     finally:
-        for process in reversed(live):
-            process.cleanup(arguments.timeout_seconds)
+        registry.cleanup_all(arguments.timeout_seconds)
 
     return receipt_names
 
