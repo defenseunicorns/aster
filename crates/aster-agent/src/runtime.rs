@@ -88,6 +88,7 @@ where
     let (health_stop_send, health_stop_receive) = tokio::sync::watch::channel(false);
     let mut health_task = tokio::spawn(health.serve(status.clone(), health_stop_receive));
     emit_lifecycle(LifecycleState::Starting, "startup", "started", false, 0);
+    tokio::task::yield_now().await;
 
     let node_config = match open_node_config(&config, &credentials, loader) {
         Ok(node_config) => node_config,
