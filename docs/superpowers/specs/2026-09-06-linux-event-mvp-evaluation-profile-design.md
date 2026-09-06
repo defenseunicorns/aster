@@ -585,7 +585,7 @@ that workstream's implementation.
 ## Acceptance and retained evidence
 
 The following are non-waivable gates for any v0.1 evaluation authorization.
-The 2026-09-13 meeting is a go/refuse/defer checkpoint; reaching the date does
+The 2026-09-13 meeting is an issue/refuse/defer checkpoint; reaching the date does
 not authorize a candidate. An unpassed gate against the exact final artifacts
 causes refusal or deferral.
 

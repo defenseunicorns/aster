@@ -656,7 +656,9 @@ owner, and its rejection rule. Include:
 13. G1-G6 matrix with dependencies and immutable exit-artifact digests.
 14. Exact DM-8-05 proposal digest and separate dependency, legal, and release
     approval records.
-15. Final role approvals and signature over the completed annex digest.
+15. Detached final role approvals that each sign the canonical signable-body
+    digest; the separate detached release decision signs and binds that body
+    digest plus the sorted approval-record digests.
 
 Do not add informational measurements as qualification gates unless the
 profile requires them. In particular, signed Git metadata, network/block-I/O
