@@ -255,7 +255,7 @@ Run:
 ```bash
 test -f crates/aster-agent/src/event_service.rs
 test ! -e crates/aster-agent/src/service.rs
-rg -n "crate::service|service::application_service|mod service|src/service\.rs" \
+rg -n "crate::service|(^|[^[:alnum:]_])service::application_service|mod service|src/service\.rs" \
   crates/aster-agent docs/superpowers/plans/2026-09-06-customer-operable-event-service.md
 CARGO_TARGET_DIR=/home/andrii/code/aster/target \
   cargo test --locked -p aster-agent --no-run
@@ -263,7 +263,8 @@ CARGO_TARGET_DIR=/home/andrii/code/aster/target \
   cargo test --locked -p aster-agent --all-features --no-run
 ```
 
-Expected: both file assertions and both Cargo commands exit `0`; `rg` prints no stale module or exact source-path reference.
+Expected: both file assertions and both Cargo commands exit `0`; `rg` exits `1`
+and prints no stale module or exact source-path reference.
 
 - [ ] **Step 7: Run focused behavior tests**
 
