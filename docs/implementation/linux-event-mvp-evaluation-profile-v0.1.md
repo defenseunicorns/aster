@@ -282,6 +282,19 @@ mission secret bytes. Plaintext credentials in arguments, environment values,
 logs, package layers, ordinary configuration, or application responses are
 prohibited.
 
+The proposed exact v0.1 provider is
+[`aster-systemd-credential-store/v1`](../superpowers/specs/2026-09-07-systemd-credential-provider-design.md),
+using Ubuntu 24.04 `systemd-creds` and `LoadCredentialEncrypted=` from the
+systemd 255.4 line with explicit host-key protection, the fixed credential name
+`aster-provisioning.bundle`, a statically composed runtime loader, and the
+root-operated `aster-credential-admin` administration artifact. TPM2 and all
+automatic or fallback provider selection are excluded. The proposed provider
+record has SHA-256
+`0aec8d59c8a0dbb00c36e47c06a08e52654d08cc727e246318de2a28f17097c6`.
+It becomes part of the accepted profile only when security and deployment
+owners approve that exact record and Decision 0042 ratifies the profile;
+provider implementation and qualification remain later candidate gates.
+
 The provider and operating procedure must demonstrate:
 
 1. installation of a protected node/mission reference;

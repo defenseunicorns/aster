@@ -107,8 +107,10 @@ fail, or a typed reason the work was not run.
 The profile is still **Proposed**. Two definition decisions must close before
 Decision 0042 can ratify it:
 
-- **D06 — protected provider:** security and deployment must approve the exact
-  provider, version, trust boundary, administration artifact, and
+- **D06 — protected provider:** the
+  [exact systemd credential proposal](../superpowers/specs/2026-09-07-systemd-credential-provider-design.md)
+  is ready; security and deployment must each approve its fixed digest,
+  provider version, trust boundary, administration artifact, limitations, and
   seven-operation lifecycle contract.
 - **D15 — `DM-8-05` evaluation disposition:** dependency, legal, and release
   owners must separately approve the exact dependency coordinates and the

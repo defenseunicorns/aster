@@ -27,7 +27,7 @@ and reviewed decision.
 | `P0-1-D03` | P0-1; `DM-14-17..18` | Exact 2/8/20 participant shape, manual peers, one scope/topic/subscription per scenario, discovery off | Resolved | no | no | Broader topology and scale remain outside v0.1 | none |
 | `P0-1-D04` | P0-1; `DM-14-07..09`, `DM-14-19`; Decision 0030 | Exact local API/lifecycle methods, Rust reference client, generated-Go qualification client | Resolved | no | no | Production bindings and independent interoperability remain open | none |
 | `P0-1-D05` | P0-1; Decision 0033; security-profile disposition | Semantic v6, profile/suite `0x0001`, unordered IDs, no fallback, non-FIPS | Resolved | no | no | Production security and FIPS paths remain separately gated | none |
-| `P0-1-D06` | P0-1; design `Protected provisioning boundary` | Protected-loader and seven-operation contract fixed; exact provider selection and administration artifact remain required | Open | yes | yes | Blocks evaluation and production until the exact provider boundary is approved | none |
+| `P0-1-D06` | P0-1; [proposed exact provider record](../superpowers/specs/2026-09-07-systemd-credential-provider-design.md) (`sha256:0aec8d59c8a0dbb00c36e47c06a08e52654d08cc727e246318de2a28f17097c6`) | `aster-systemd-credential-store/v1`; Ubuntu 24.04 systemd 255.4 credential interface; explicit host-key protection; statically composed loader; root-operated `aster-credential-admin`; seven-operation lifecycle; security and deployment approvals remain required | Open | yes | yes | Blocks evaluation and production until the exact provider boundary is approved | none |
 | `P0-1-D07` | P0-1; design `Emission modes` | Restart-selected Normal/ReceiveOnly, non-initiation/non-disclosure, both identity orderings, no radio-silence claim | Resolved | no | no | No physical-silence or production emission claim | none |
 | `P0-1-D08` | P0-1; P1-1 follow-on boundary | 1,024-key workload, 512 warning, hard caps/status/error; lifecycle/reclamation excluded | Resolved | no | no | Operation-mapping lifecycle remains production-blocking | none |
 | `P0-1-D09` | P0-1; `DM-14-03..06`, `DM-14-12..18` | Exact capacity/workload/resource matrix and provisional byte-fit gate | Resolved | no | no | No production sizing or capacity claim | none |
@@ -38,7 +38,10 @@ and reviewed decision.
 | `P0-1-D15` | `DM-8-05`; Decision 0028 | Exact package/version [evaluation-only disposition proposed](dm-8-05-linux-event-v0.1-disposition.md); dependency, legal, and release approvals remain required | Open | yes | yes | Exact exception cannot authorize production; production resolution remains open | none |
 
 `P0-1-D06` is owned by security plus deployment, targets 2026-09-08,
-and exits only through the reviewed exact provider/administration record.
+and exits only when both roles approve the linked exact
+provider/administration record and its digest. The existence of the proposal
+and the profile/product owner's working-session design approval do not
+substitute for either role approval.
 `P0-1-D15` is owned by dependency, legal, and release roles, targets
 2026-09-08, and exits only when all three approval records bind the exact
 proposal and dependency coordinates.
@@ -83,7 +86,7 @@ block v0.1 except where the evaluation-blocking cell says otherwise.
 
 | ID | Gate | Owner | Target | Status | Evaluation blocking | Production blocking | Exit | Evidence effect |
 |---|---|---|---:|---|:---:|:---:|---|:---:|
-| `P0-1-E01` | Select exact protected provider and administration artifact | Security + deployment | 2026-09-08 | Open | yes | yes | Provider contract, version, trust boundary, and lifecycle procedure are accepted | none |
+| `P0-1-E01` | Approve the [exact protected provider and administration record](../superpowers/specs/2026-09-07-systemd-credential-provider-design.md) | Security + deployment | 2026-09-08 | Open | yes | yes | Both roles accept the provider contract, version, trust boundary, administration artifact, lifecycle procedure, limitations, acceptance plan, and exact record digest | none |
 | `P0-1-E02` | Freeze signed qualification annex and exact physical/virtual topology | Profile + integration | 2026-09-08 | Open | yes | yes | Annex names every node's physical/virtual status, architecture, device SKU, Ubuntu/kernel build, filesystem, relay placement, and network conditions | none |
 | `P0-1-E03` | Merge/review candidate Event service | Event-service owner | 2026-09-09 | Open | yes | yes | Accepted commit passes clean gate and process suite | none |
 | `P0-1-E04` | Add restart-selected `receive_only` config/status | Event-service + node owner | 2026-09-10 | Open | yes | yes | Both-ordering acceptance passes | none |

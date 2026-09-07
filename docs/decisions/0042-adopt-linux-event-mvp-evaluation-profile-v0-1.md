@@ -67,9 +67,11 @@ the implementation, artifacts, devices, or receipts already satisfy it. The
 approved design nevertheless makes two decisions part of the claim boundary
 and therefore prerequisites to ratification:
 
-- `P0-1-D06` remains Open until security and deployment owners select and
-  review the exact protected provider and administration artifact against the
-  fixed seven-operation lifecycle contract.
+- `P0-1-D06` remains Open until security and deployment owners approve the
+  [proposed exact systemd credential provider and administration record](../superpowers/specs/2026-09-07-systemd-credential-provider-design.md),
+  including its fixed digest, trust boundary, limitations, and seven-operation
+  lifecycle contract. The approved working-session design does not substitute
+  for either role approval.
 - `P0-1-D15` remains Open until dependency, legal, and release owners each
   record approval of the exact evaluation-only DM-8-05 proposal and dependency
   coordinates.
