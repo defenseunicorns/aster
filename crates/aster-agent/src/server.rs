@@ -568,8 +568,10 @@ mod tests {
 
     use buffa::{Message as _, MessageName as _};
     use bytes::Bytes;
+    use connectrpc::{ConnectRpcService, ErrorCode, Router};
+    #[cfg(feature = "client")]
     use connectrpc::{
-        ConnectError, ConnectRpcService, ErrorCode, Protocol, Router,
+        ConnectError, Protocol,
         client::{ClientConfig, ServiceTransport},
     };
     use http::{Request, StatusCode, header::CONTENT_TYPE};
@@ -690,6 +692,7 @@ mod tests {
         assert_eq!(detail.reason, reason);
     }
 
+    #[cfg(feature = "client")]
     fn assert_authentication_error(error: &ConnectError, expected_type_url: &str, procedure: &str) {
         assert_eq!(error.code, ErrorCode::Unauthenticated);
         assert_eq!(error.message.as_deref(), Some("authentication failed"));
@@ -711,6 +714,7 @@ mod tests {
         assert_eq!(detail.retry_delay_ms, None);
     }
 
+    #[cfg(feature = "client")]
     fn unauthenticated_client(
         protocol: Protocol,
     ) -> api::AsterApplicationServiceClient<ServiceTransport<PreBodyGate<ConnectRpcService<Router>>>>
@@ -730,6 +734,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "client")]
     async fn assert_every_procedure_rejected(
         client: &api::AsterApplicationServiceClient<
             ServiceTransport<PreBodyGate<ConnectRpcService<Router>>>,
@@ -1090,6 +1095,7 @@ mod tests {
         connection.await.expect("connection driver joins");
     }
 
+    #[cfg(feature = "client")]
     #[tokio::test]
     async fn every_event_procedure_preserves_structured_authentication_across_protocols() {
         for (protocol, expected_type_url) in [
