@@ -387,8 +387,8 @@ One candidate annex records:
 
 Package or provider drift creates a new G3 candidate and invalidates dependent
 G4/G5 evidence. A future provider-contract change, or a final-review
-requirement to support Debian, requires a redesigned and versioned D06 decision
-rather than silent compatibility.
+requirement to support Debian or a generic Debian-family target, requires a
+redesigned and versioned D06 decision rather than silent compatibility.
 
 ## Ownership and sequencing
 

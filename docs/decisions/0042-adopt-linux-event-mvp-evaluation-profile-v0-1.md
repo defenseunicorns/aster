@@ -70,8 +70,9 @@ claim boundary and therefore a prerequisite to ratification:
 - `P0-1-D06` is resolved for the profile definition by the
   [approved initial systemd credential provider design](../superpowers/specs/2026-09-07-systemd-credential-provider-design.md).
   Security and deployment approvals remain mandatory candidate gate E01. If
-  final review requires Debian support, D06 reopens and the provider must be
-  redesigned and versioned before the affected profile or candidate proceeds.
+  final review requires Debian or generic Debian-family support, D06 reopens
+  and the provider must be redesigned and versioned before the affected
+  profile or candidate proceeds.
 - `P0-1-D15` remains Open until dependency, legal, and release owners each
   record approval of the exact evaluation-only DM-8-05 proposal and dependency
   coordinates.

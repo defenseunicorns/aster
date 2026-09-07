@@ -126,6 +126,9 @@ binding. No partial row can support issue.
 
 | Field | Applicability | Format | Owner | Rejection rule |
 |---|---|---|---|---|
+| Approved initial D06 profile design | Required | Immutable reference and SHA-256 digest of `2026-09-07-systemd-credential-provider-design.md`; provider contract `aster-systemd-credential-store/v1`; Ubuntu-only scope | Profile/product owner | Reject a missing/mutable record, digest or contract mismatch, a claim that profile approval closes E01, or an unreviewed Debian/generic Debian-family claim |
+| E01 Security approval | Required before G3 can pass or a candidate can issue | Immutable reviewer identity, Security role, `approve`/`refuse`, RFC 3339 UTC, exact D06 design digest, provider contract/version, trust boundary, limitations, acceptance plan, and signed approval-record reference/digest | Security owner | Reject a missing/refusing/unsigned approval, design/provider mismatch, omitted limitation, approval after the bound G3 artifact was produced, or a Debian/generic Debian-family requirement that has not reopened D06 for redesign |
+| E01 Deployment approval | Required before G3 can pass or a candidate can issue | Immutable reviewer identity, Deployment role, `approve`/`refuse`, RFC 3339 UTC, exact D06 design digest, administration artifact/contract, package/runtime boundary, lifecycle procedure, limitations, acceptance plan, and signed approval-record reference/digest | Deployment owner | Reject a missing/refusing/unsigned approval, design/provider/package mismatch, omitted limitation, approval after the bound G3 artifact was produced, or a Debian/generic Debian-family requirement that has not reopened D06 for redesign |
 | Protected provider identity | Required | Exact implementation name, version, source/build identity, supported architectures, trust/storage boundary, and immutable contract digest | Security + deployment | Reject an unapproved provider, an incomplete boundary, an unprotected fixture/engineering adapter, or provider drift |
 | Administration artifact | Required | Exact immutable artifact identity, version, digest, and sanitized command-set digest | Security + deployment | Reject a mutable/missing artifact or a command set that exposes mission secret bytes |
 | Install protected reference | Required | `pass`/`fail`, exact procedure digest, receipt reference, and receipt digest | Security + deployment + integration | Reject unless a protected node/mission reference is installed without repository or ordinary-config secret material |
@@ -377,8 +380,9 @@ The completed annex is a bundle, not a self-signing byte string:
    and receipt reference is final. It includes the candidate ID, frozen schema
    digest, exact typed global G3 artifact binding, every G3 per-output binding,
    facts and results from sections 1–14 other than the detached final outcome,
-   the immutable Section 14 prerequisite approval references/digests, and typed
-   downstream `not-run` bindings. It excludes only Section 15 detached
+   the immutable Section 4 E01 and Section 14 prerequisite approval
+   references/digests, and typed downstream `not-run` bindings. It excludes
+   only Section 15 detached
    candidate approvals/signatures and the detached release-decision record.
 2. Compute the canonical signable-body digest. Every Section 15 final role
    approval is a distinct later candidate attestation and a detached record that
@@ -391,20 +395,20 @@ The completed annex is a bundle, not a self-signing byte string:
    by lowercase digest. The final detached release decision signs the body
    digest, that sorted list, candidate ID, frozen schema digest, and exact typed
    global G3 artifact binding.
-4. Verify the Section 14 prerequisite records and their references in the body,
-   then the body digest, every Section 15 detached candidate approval against
-   it, the sorted Section 15 approval list, and the final release decision. A
-   final archival bundle digest may cover the body, Section 14 prerequisite
-   records, Section 15 detached approvals, and detached release decision, but is
-   not an input to any of those signatures and grants no additional
-   qualification claim.
+4. Verify the Section 4 E01 and Section 14 prerequisite records and their
+   references in the body, then the body digest, every Section 15 detached
+   candidate approval against it, the sorted Section 15 approval list, and the
+   final release decision. A final archival bundle digest may cover the body,
+   Section 4 E01 records, Section 14 prerequisite records, Section 15 detached
+   approvals, and detached release decision, but is not an input to any of
+   those signatures and grants no additional qualification claim.
 
 Every approval is required for `issue`. For `refuse` or `defer`, record the
 approvals obtained and exact typed blockers for roles not reached.
 
 | Approval | Applicability | Format | Owner | Rejection rule |
 |---|---|---|---|---|
-| Canonical signable annex body | Required | Canonicalization identifier/version, immutable body reference, byte size, and digest; includes immutable Section 14 prerequisite approval references/digests and excludes Section 15 candidate approvals plus the release decision | Profile + release | Reject nondeterministic canonicalization, a digest mismatch, missing Section 14 references, or inclusion of a Section 15/release record that creates a digest/signature cycle |
+| Canonical signable annex body | Required | Canonicalization identifier/version, immutable body reference, byte size, and digest; includes immutable Section 4 E01 and Section 14 prerequisite approval references/digests and excludes Section 15 candidate approvals plus the release decision | Profile + release | Reject nondeterministic canonicalization, a digest mismatch, missing Section 4 E01 or Section 14 references, or inclusion of a Section 15/release record that creates a digest/signature cycle |
 | Profile/product | Required for issue; otherwise approval or typed `not-run` | Detached immutable approval record that signs the body digest; record digest | Profile/product owner | Reject issue if absent, refusing, unsigned, or bound to a different body/candidate/schema/G3 binding; reject an untyped omission |
 | Security | Required for issue; otherwise approval or typed `not-run` | Detached immutable approval record that signs the body digest; record digest | Security owner | Reject issue if absent, refusing, unsigned, or bound to a different body/candidate/schema/G3 binding; reject an untyped omission |
 | Deployment/OS and artifact | Required for issue; otherwise approval or typed `not-run` | Detached immutable approval record that signs the body digest; record digest | Deployment/OS/artifact owner | Reject issue if absent, refusing, unsigned, or bound to a different body/candidate/schema/G3 binding; reject an untyped omission |
@@ -414,7 +418,7 @@ approvals obtained and exact typed blockers for roles not reached.
 | Dependency/license | Required for issue; otherwise approval or typed `not-run` | Detached immutable approval record that signs the body digest; record digest | Dependency/license owner | Reject issue if absent, refusing, unsigned, or bound to a different body/candidate/schema/G3 binding; reject an untyped omission |
 | Legal/compliance | Required for issue; otherwise approval or typed `not-run` | Detached immutable approval record that signs the body digest; record digest | Legal/compliance owner | Reject issue if absent, refusing, unsigned, or bound to a different body/candidate/schema/G3 binding; reject an untyped omission |
 | Release decision | Required | Detached signed immutable `issue`/`refuse`/`defer` record over body digest, bytewise-sorted Section 15 candidate-approval digests, candidate ID, schema digest, and exact typed global G3 artifact binding | Release owner | Reject an unsigned, ambiguous, cyclic, unsorted, or mismatched decision; issue is forbidden unless all approvals/gates pass, every G3 per-output entry is produced, both packages authenticate, and the complete artifact-set manifest verifies |
-| Archival bundle | Conditional: when an archival bundle is formed | Immutable manifest/reference and digest covering body, Section 14 prerequisite records, Section 15 detached approvals, and detached release decision | Release owner | Reject if used as a signature input, substituted for verification of any contained record, or presented as an additional claim |
+| Archival bundle | Conditional: when an archival bundle is formed | Immutable manifest/reference and digest covering body, Section 4 E01 records, Section 14 prerequisite records, Section 15 detached approvals, and detached release decision | Release owner | Reject if used as a signature input, substituted for verification of any contained record, or presented as an additional claim |
 
 No signature may stand in for a missing fact, receipt, gate, approval, or typed
 blocker.

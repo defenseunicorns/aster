@@ -1021,8 +1021,8 @@ preconditions passed.
 
 Use `.github/pull_request_template.md`. State one of these exact outcomes:
 
-- if Task 6 did not run: `P0-1 ratification package is proposed; D06/D15 remain
-  open and P0-1 is not closed`;
+- if Task 6 did not run: `P0-1 ratification package is proposed; D06 is
+  resolved for the profile, D15 remains open, and P0-1 is not closed`;
 - if Task 6 ran: `P0-1 is closed only as a reviewed reusable claim boundary;
   no candidate is authorized`.
 
@@ -1037,9 +1037,10 @@ In both cases state:
   not duplicated;
 - verification lists exact successful commands and manual link/table review.
 
-When Task 6 did not run, identify the missing D06/D15 records precisely. Call
-out the provisional 800-slot margin/byte-fit projection and September 13
-issue/refuse/defer semantics in risks.
+When Task 6 did not run, identify the missing D15 records precisely. Keep E01
+security/deployment approvals explicit as candidate blockers, not P0-1
+blockers. Call out the provisional 800-slot margin/byte-fit projection and
+September 13 issue/refuse/defer semantics in risks.
 
 ### Step 3: Request remaining role review without changing external state
 

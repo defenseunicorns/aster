@@ -110,7 +110,8 @@ Decision 0042 can ratify it:
 - **D06 — protected provider:** resolved for the profile by the
   [approved initial systemd credential design](../superpowers/specs/2026-09-07-systemd-credential-provider-design.md).
   Security and deployment approvals remain candidate gate E01. A final-review
-  requirement for Debian support reopens D06 and requires provider redesign.
+  requirement for Debian or generic Debian-family support reopens D06 and
+  requires provider redesign.
 - **D15 — `DM-8-05` evaluation disposition:** dependency, legal, and release
   owners must separately approve the exact dependency coordinates and the
   evaluation-only limitation.

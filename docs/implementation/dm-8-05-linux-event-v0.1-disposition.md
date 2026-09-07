@@ -4,7 +4,7 @@
 
 - Requirement: `DM-8-05`
 - Profile: [`aster-linux-event-mvp-evaluation-v0.1`](linux-event-mvp-evaluation-profile-v0.1.md)
-- Status: proposed for exact-candidate approval; this document records no specialist approval
+- Status: proposed for pre-candidate profile approval; this document records no specialist approval
 - Evaluation effect: blocking until dependency, legal, and release owners approve
 - Production effect: remains blocking after evaluation approval
 - General allowlist effect: none

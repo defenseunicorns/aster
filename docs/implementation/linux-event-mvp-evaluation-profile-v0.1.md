@@ -290,7 +290,7 @@ systemd 255.4 line with explicit host-key protection, the fixed credential name
 root-operated `aster-credential-admin` administration artifact. TPM2 and all
 automatic or fallback provider selection are excluded. The provider-design
 record has SHA-256
-`484001169c8b1acc597240b181bf425bcec036a1949e9caaa9655d580140f776`.
+`078c35f0046c62a7415d4e8c843f198f97da898da8b8b17eebeaa98de3e2a781`.
 D06 is resolved for the profile definition. Security and deployment approvals
 of that exact record remain mandatory candidate gate E01; provider
 implementation and qualification remain later gates.
