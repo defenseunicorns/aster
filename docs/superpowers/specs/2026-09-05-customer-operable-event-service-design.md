@@ -2,7 +2,7 @@
 
 # Customer-operable Event service design
 
-**Status:** Approved in design review; awaiting written-spec review
+**Status:** Approved in design review; component boundary clarified 2026-09-07
 
 **Date:** 2026-09-05
 
@@ -12,11 +12,17 @@
 
 ## Summary
 
-Harden the existing loopback ConnectRPC `aster-agent` into a customer-operable
-Event-service runtime. The service remains a thin authenticated and bounded
-adapter over the running node's `SelectedEventHandle`. It does not introduce a
-second database, journal, reconciliation engine, transport selector, or mesh
-wire format.
+Harden the existing loopback ConnectRPC `aster-agent` as one customer-operable
+component. Its Event service is a statically selected internal module and
+remains a thin authenticated and bounded adapter over the running node's
+`SelectedEventHandle`. “Event service” does not name a second daemon, binary,
+database, journal, reconciliation engine, transport selector, or mesh wire
+format.
+
+The crate keeps process facilities such as bounded serving, lifecycle, health,
+signals, and credential access separate from the Event RPC adapter. That
+separation permits later reuse without introducing a generic runtime service
+selector or plugin framework before another selected data-type module exists.
 
 This work defines runtime behavior and the contract consumed by deployment and
 provisioning owners. It does not produce packages, container images,
@@ -48,6 +54,9 @@ administration remain a separate later capability lane.
 - Multi-scope forwarding, Event bridges, and dynamic bridge administration.
 - A remotely exposed application listener.
 - A second durable Event authority or service-owned journal.
+- A second Event-service executable or separately deployed Event daemon.
+- A generic runtime module selector, plugin ABI, or simultaneous application
+  composition for Event, State, Record, and Blob.
 - Systemd units, Linux packages, container images, Kubernetes manifests,
   Helm, Zarf, UDS, SBOMs, signatures, or upgrade packaging.
 - Implementation of mission credential custody, TPM, HSM, Vault, or another
@@ -80,27 +89,58 @@ independent client evidence.
 ### 1. Incrementally harden `aster-agent` — selected
 
 Retain the current binary, protocol package, and `SelectedEventHandle` data
-path. Extract configuration and lifecycle responsibilities into focused units,
-then add health, shutdown, reload, failure-detail, and black-box acceptance
-behavior.
+path. Keep the Event RPC adapter in an explicitly named `event_service` module.
+Extract process configuration, serving, credential access, lifecycle, and
+health responsibilities into focused units, then add shutdown, reload,
+failure-detail, and black-box acceptance behavior.
 
 This is the smallest change that addresses the capability without creating a
 new authority or destabilizing the selected node.
 
-### 2. Extract a generic daemon framework
+### 2. Add a generic multi-service runner or plugin framework
 
-Create a reusable daemon layer intended for future State, Record, and Blob
-services. This could reduce later duplication but introduces abstractions with
-no second live service consumer today. It is deferred until another selected
-service needs the same boundary.
+Select application modules dynamically or define a plugin ABI intended for
+future State, Record, and Blob services. This introduces runtime configuration,
+compatibility, and qualification surfaces with no second live service consumer
+today. It is deferred until another selected service needs that boundary.
 
-### 3. Build a replacement Event service
+This does not prohibit focused process modules from being reused. It prohibits
+claiming a generic runtime composition contract before one exists.
 
-Create a new service process and migrate operations from `aster-agent`. This
-duplicates already-working authentication, bounds, and Event adaptation while
-increasing migration and recovery risk. It is rejected for the MVP.
+### 3. Build a separate Event-service executable
 
-## Architecture
+Create another service process and migrate or wrap operations from
+`aster-agent`. This creates two executable identities for one selected customer
+capability and risks duplicating already-working authentication, bounds, and
+Event adaptation. It is rejected for the MVP.
+
+## Component boundary
+
+```mermaid
+flowchart LR
+    Client["Rust or Go client"] -->|"ConnectRPC"| Agent
+    Systemd["systemd"] -->|"start, health, signals"| Agent
+    Provider["protected provider"] -->|"ProvisioningSecretLoader"| Agent
+
+    subgraph Agent["single deployed aster-agent component"]
+        Process["process facilities<br/>config · credentials · server<br/>health · lifecycle · runtime"]
+        Event["event_service module<br/>Event RPC validation and mapping"]
+        Process --> Event
+    end
+
+    Event --> Handle["SelectedEventHandle"]
+    Handle --> Node["aster-node sole durable authority"]
+    Node --> Store["existing store"]
+    Node --> Mesh["existing authenticated mesh"]
+```
+
+`aster-agent` is the only service executable. The protected-provider library
+is statically composed into that executable, and the provider administration
+tool remains a separate operator artifact rather than another Event service.
+The acceptance fixture is test-only and is never a qualifying customer
+component.
+
+## Internal architecture
 
 The customer-operable runtime has five responsibilities:
 
@@ -117,9 +157,12 @@ and shutdown deadline.
 
 ### `EventService`
 
-Implements the repository-owned `aster.application.v1alpha1` RPC surface. It
-performs authentication, request validation, and response-bound enforcement,
-then delegates to `SelectedEventHandle`.
+The `event_service` module implements the repository-owned
+`aster.application.v1alpha1` RPC surface. It performs Event request validation,
+Event-to-protobuf mapping, and response-bound enforcement, then delegates to
+`SelectedEventHandle`. Process-wide authentication and connection admission
+remain in the bounded serving facilities rather than becoming Event-domain
+logic.
 
 ### `ServiceStatus`
 

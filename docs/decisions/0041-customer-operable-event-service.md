@@ -29,8 +29,14 @@ forwarding, Event bridges, and dynamic bridge administration.
 
 ## Decision
 
-1. Incrementally harden `aster-agent`. Do not add another daemon, database,
-   journal, reconciliation engine, mesh protocol, or durable Event authority.
+1. Incrementally harden the single deployable `aster-agent` component. Its
+   customer Event service is an internal module over `SelectedEventHandle`, not
+   a second daemon or executable. Keep process facilities such as bounded
+   serving, lifecycle, health, signals, and credential access separate from
+   the Event RPC adapter so later selected data types can reuse them without
+   adding a generic runtime-selection or plugin framework in this MVP. Do not
+   add another database, journal, reconciliation engine, mesh protocol, or
+   durable Event authority.
 2. Add strict version-one JSON configuration and a side-effect-free
    `--check-config` mode. Reject unknown or duplicate fields, mixed legacy
    flags, State or Record interests, automatic LAN discovery, public/default
@@ -122,13 +128,14 @@ semantics are documented in the
 
 ## Ownership and acceptance
 
-The Event-service workstream owns runtime configuration, pre-body
-authentication, lifecycle, health, token reload, public errors, and black-box
-process acceptance. The provisioning workstream owns concrete protected-loader
-backends and credential lifecycle. The deployment workstream owns
-service-manager artifacts, namespace and token-file isolation,
-multi-architecture execution, packaging, and deployment acceptance. Security
-and release owners qualify the combined customer profile.
+The Event-service workstream owns the Event module and its selected
+`aster-agent` composition: runtime configuration, pre-body authentication,
+lifecycle, health, token reload, public errors, and black-box process
+acceptance. The provisioning workstream owns concrete protected-loader backends
+and credential lifecycle. The deployment workstream owns service-manager
+artifacts, namespace and token-file isolation, multi-architecture execution,
+packaging, and deployment acceptance. Security and release owners qualify the
+combined customer profile.
 
 The application quickstart is updated only after the runtime behavior exists,
 so its commands continue to describe executable repository behavior.
@@ -137,6 +144,12 @@ so its commands continue to describe executable repository behavior.
 
 - The ordered bridge increments remain their own capability lane and do not
   block this single-scope Event-service work.
+- `aster-agent` remains the only deployed service component. “Event service”
+  names its selected internal application module and customer capability, not
+  another process or independently persistent service.
+- Focused process modules are reusable implementation units, but this decision
+  does not promise runtime service selection, a plugin ABI, or simultaneous
+  Event/State/Record/Blob application modules.
 - Health endpoints disclose lifecycle status only and carry no mesh authority.
 - Loopback TCP plus bearer authentication alone is not a supported customer
   deployment; namespace isolation is mandatory for this profile.
