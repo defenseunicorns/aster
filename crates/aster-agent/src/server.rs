@@ -568,12 +568,12 @@ mod tests {
 
     use buffa::{Message as _, MessageName as _};
     use bytes::Bytes;
-    use connectrpc::{ConnectRpcService, ErrorCode, Router};
     #[cfg(feature = "client")]
     use connectrpc::{
         ConnectError, Protocol,
         client::{ClientConfig, ServiceTransport},
     };
+    use connectrpc::{ConnectRpcService, ErrorCode, Router};
     use http::{Request, StatusCode, header::CONTENT_TYPE};
     use http_body_util::{BodyExt as _, Full};
     use hyper::body::{Body, Frame};
