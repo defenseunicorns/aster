@@ -231,8 +231,9 @@ impl PreBodyGate<ConnectRpcService<Router>> {
         connection_auth: ConnectionAuthState,
         max_header_bytes: usize,
     ) -> Self {
-        let rejected = crate::service::configured_service(crate::service::rejection_router())
-            .with_interceptor(RejectionInterceptor);
+        let rejected =
+            crate::event_service::configured_service(crate::event_service::rejection_router())
+                .with_interceptor(RejectionInterceptor);
         Self {
             accepted,
             rejected,

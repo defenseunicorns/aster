@@ -1,22 +1,23 @@
-//! Process-local ConnectRPC application boundary for a running Aster node.
+//! Process-local application agent for a running Aster node.
 //!
-//! The service is intentionally narrower than the durable data model. Only
-//! operations backed by the live selected-Event handle are exposed. In
-//! particular, this crate never opens the node's store and never exposes
-//! transport, reconciliation, cryptographic, sealed, or provisioning details.
+//! The crate contains focused process facilities for bounded serving,
+//! credentials, health, lifecycle, and supervision. The selected customer MVP
+//! statically composes one crate-private Event application module over
+//! `SelectedEventHandle`; it does not provide runtime module selection, a
+//! plugin ABI, another durable authority, or a second service executable.
 
 #![forbid(unsafe_code)]
 
 pub mod config;
 pub mod credentials;
 pub mod error;
+mod event_service;
 pub mod health;
 pub mod lifecycle;
 #[cfg(feature = "server")]
 pub mod runtime;
 #[cfg(feature = "server")]
 pub mod server;
-mod service;
 
 pub use credentials::ClientToken;
 pub use error::{PublicOperation, connect_application_error, public_error};
@@ -41,9 +42,8 @@ pub const MIN_STREAM_BACKOFF_MS: u32 = 100;
 /// Maximum accepted delay following any delivered or caught-up streaming poll.
 pub const MAX_STREAM_BACKOFF_MS: u32 = 60_000;
 
-/// Compatibility entry point for the existing development CLI. Its serving
-/// path delegates to the bounded pre-body server; Task 6 replaces this adapter
-/// with the customer runtime supervisor.
+/// Development/migration compatibility entry point that delegates to the same
+/// bounded server and crate-private Event module as the customer runtime.
 #[cfg(feature = "server")]
 pub struct BoundAgent {
     server: server::BoundAgent,
@@ -75,7 +75,7 @@ impl BoundAgent {
         token: ClientToken,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let service = service::application_service(events, shutdown.clone());
+        let service = event_service::application_service(events, shutdown.clone());
         let status = lifecycle::ServiceStatus::starting();
         status.transition(lifecycle::LifecycleState::Ready)?;
         let reloadable = credentials::ReloadableClientToken::new(token);

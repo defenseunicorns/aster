@@ -12,6 +12,11 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-05-customer-operable-event-service-design.md`
 
+> **Boundary clarification (2026-09-07):** The implemented `service.rs` was
+> subsequently named `event_service.rs` to make clear that Event service is an
+> internal module of the single `aster-agent` component. No second executable,
+> durable authority, runtime selector, or plugin framework was introduced.
+
 ## Global Constraints
 
 - Every project communication and new project document is labeled ``; do not access any OPI source named by `CONTRIBUTING.md`.
@@ -35,7 +40,7 @@
 - `crates/aster-agent/src/lifecycle.rs` — legal lifecycle transitions, detail-free health decisions, drain admission, and signal events.
 - `crates/aster-agent/src/health.rs` — loopback health listener and exact `/livez` and `/readyz` HTTP behavior.
 - `crates/aster-agent/src/server.rs` — bounded Hyper accept loop and Tower pre-body authentication/admission gate around ConnectRPC.
-- `crates/aster-agent/src/service.rs` — the existing Event RPC adapter, response bounds, streaming poll loop, and application error conversion.
+- `crates/aster-agent/src/event_service.rs` — the existing Event RPC adapter, response bounds, streaming poll loop, and application error conversion.
 - `crates/aster-agent/src/runtime.rs` — protected-loader node bootstrap, listener ordering, supervisor, token reload, drain, and shutdown deadline.
 - `crates/aster-agent/src/lib.rs` — module declarations and the small supported public surface.
 - `crates/aster-agent/src/main.rs` — strict mode selection, `--check-config`, legacy development mode, Unix signal translation, and sanitized exit handling.
@@ -263,12 +268,12 @@ git commit -m "feat(agent): consume protected provisioning references"
 
 **Files:**
 - Create: `crates/aster-agent/src/error.rs`
-- Create: `crates/aster-agent/src/service.rs`
+- Create: `crates/aster-agent/src/event_service.rs`
 - Modify: `crates/aster-agent/src/lib.rs`
 - Modify: `proto/aster/application/v1alpha1/aster.proto`
 - Modify: `proto/aster/application/v1alpha1/aster.fds.bin`
 - Test: `crates/aster-agent/src/error.rs`
-- Test: `crates/aster-agent/src/service.rs`
+- Test: `crates/aster-agent/src/event_service.rs`
 
 **Interfaces:**
 - Consumes: `ApplicationError::{kind,operation}` and `ConnectError::with_detail`.
@@ -360,7 +365,7 @@ Expected: PASS with the existing Event semantics unchanged and error-detail deco
 - [ ] **Step 6: Commit the public failure contract**
 
 ```bash
-git add crates/aster-agent/src/error.rs crates/aster-agent/src/service.rs crates/aster-agent/src/lib.rs proto/aster/application/v1alpha1/aster.proto proto/aster/application/v1alpha1/aster.fds.bin
+git add crates/aster-agent/src/error.rs crates/aster-agent/src/event_service.rs crates/aster-agent/src/lib.rs proto/aster/application/v1alpha1/aster.proto proto/aster/application/v1alpha1/aster.fds.bin
 git commit -m "feat(agent): add sanitized public error details"
 ```
 
@@ -460,7 +465,7 @@ git commit -m "feat(agent): add lifecycle health contract"
 
 **Files:**
 - Create: `crates/aster-agent/src/server.rs`
-- Modify: `crates/aster-agent/src/service.rs`
+- Modify: `crates/aster-agent/src/event_service.rs`
 - Modify: `crates/aster-agent/src/lib.rs`
 - Modify: `crates/aster-agent/tests/real_node_connect.rs`
 - Modify: `docs/decisions/0041-customer-operable-event-service.md`
@@ -543,7 +548,7 @@ Add Hyper 1.11.0, hyper-util 0.1.20, Tower 0.5.3, and their direct helper crates
 - [ ] **Step 7: Commit the authenticated server**
 
 ```bash
-git add crates/aster-agent/src/server.rs crates/aster-agent/src/service.rs crates/aster-agent/src/lib.rs crates/aster-agent/tests/real_node_connect.rs docs/decisions/0041-customer-operable-event-service.md
+git add crates/aster-agent/src/server.rs crates/aster-agent/src/event_service.rs crates/aster-agent/src/lib.rs crates/aster-agent/tests/real_node_connect.rs docs/decisions/0041-customer-operable-event-service.md
 git commit -m "feat(agent): authenticate before request bodies"
 ```
 
@@ -553,7 +558,7 @@ git commit -m "feat(agent): authenticate before request bodies"
 - Create: `crates/aster-agent/src/runtime.rs`
 - Modify: `crates/aster-agent/src/main.rs`
 - Modify: `crates/aster-agent/src/lib.rs`
-- Modify: `crates/aster-agent/src/service.rs`
+- Modify: `crates/aster-agent/src/event_service.rs`
 - Modify: `crates/aster-agent/tests/customer_runtime.rs`
 - Test: `crates/aster-agent/src/runtime.rs`
 - Test: `crates/aster-agent/tests/customer_runtime.rs`
@@ -636,7 +641,7 @@ Expected: PASS for startup ordering, offline readiness, reload atomicity, drain 
 - [ ] **Step 7: Commit the supervisor**
 
 ```bash
-git add crates/aster-agent/src/runtime.rs crates/aster-agent/src/main.rs crates/aster-agent/src/lib.rs crates/aster-agent/src/service.rs crates/aster-agent/tests/customer_runtime.rs
+git add crates/aster-agent/src/runtime.rs crates/aster-agent/src/main.rs crates/aster-agent/src/lib.rs crates/aster-agent/src/event_service.rs crates/aster-agent/tests/customer_runtime.rs
 git commit -m "feat(agent): supervise reload drain and recovery"
 ```
 

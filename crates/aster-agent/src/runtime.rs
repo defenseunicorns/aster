@@ -12,10 +12,10 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use crate::{
     config::{ConfigReason, ValidatedAgentConfig},
     credentials::{CredentialReason, load_startup_credentials, open_node_config},
+    event_service::application_service,
     health::BoundHealth,
     lifecycle::{FailureReason, LifecycleState, ServiceStatus},
     server::{BoundAgent, ServerStop},
-    service::application_service,
 };
 
 const NODE_FAILURE_CHECK_INTERVAL: Duration = Duration::from_millis(100);
