@@ -52,9 +52,10 @@ blocker below is resolved. The package has four distinct roles:
    profile or atomic requirements trace.
 3. The
    [DM-8-05 disposition](../implementation/dm-8-05-linux-event-v0.1-disposition.md)
-   is an unsigned evaluation-only proposal for two exact dependency tuples. It
-   records no dependency, legal, or release approval and grants no production
-   or general-license authority.
+   (`sha256:a6fe15f39fb553f87bc1224fe7f266e7c906d451d8140402d3bc1620011bfa53`)
+   is an unsigned evaluation-only proposal for two exact dependency tuples.
+   Dependency, Legal, and Release decisions are each Pending. It grants no
+   production or general-license authority.
 4. The
    [candidate-annex schema](../implementation/linux-event-mvp-evaluation-profile-v0.1-annex-template.md)
    is provisional and revisionable. It describes how a later exact candidate
@@ -74,8 +75,9 @@ claim boundary and therefore a prerequisite to ratification:
   and the provider must be redesigned and versioned before the affected
   profile or candidate proceeds.
 - `P0-1-D15` remains Open until dependency, legal, and release owners each
-  record approval of the exact evaluation-only DM-8-05 proposal and dependency
-  coordinates.
+  record approval of the exact evaluation-only DM-8-05 proposal digest and
+  dependency coordinates. Existing lockfile, dependency-policy, and notice
+  entries do not substitute for those approvals.
 
 Until D15 closes through its reviewed exit records, this decision and the
 profile remain Proposed and the

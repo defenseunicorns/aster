@@ -65,7 +65,7 @@ or soak results from a locally rebuilt package cannot qualify the G3 candidate.
 | **OS, packaging, and artifacts** | Prepare locked build inputs, package recipes, `systemd`/namespace setup, SBOM, notice, provenance, signing, and reproduction procedures | Both architecture packages and one artifact manifest for G3 | Final packages must be built from G2 and include the selected provider |
 | **Integration and real devices** | Prepare the harness, target inventory, network conditions, and receipt collection | G4 focused results and G5 workload/resource results against G3 | Qualification starts only after G3; G5 also requires G4 |
 | **Security and deployment** | Review the selected protected-provider design and prepare package integration | E01 role approvals before candidate qualification, then provider lifecycle acceptance in G3/G4 | Provider choice must be stable before final artifacts; any required Debian support reopens D06 for redesign |
-| **Dependency, legal, and release** | Review the exact evaluation-only `DM-8-05` dependency disposition | Three approval records closing D15 before profile ratification | The approved dependency coordinates must match the candidate graph |
+| **Dependency, legal, and release** | Review the [exact evaluation-only `DM-8-05` dependency disposition](dm-8-05-linux-event-v0.1-disposition.md); all three decisions are Pending | Three separate immutable approval records closing D15 before profile ratification | Every approval binds the same disposition digest and exact tuples; the approved coordinates must match the candidate graph |
 | **Profile/product owner** | Keep the boundary, owners, dates, and customer exclusions explicit; prepare the candidate annex | Ratified profile plus one complete annex linking every handoff | Collects evidence from all lanes; does not replace their approvals |
 
 The profile work is therefore an integration map, not a competing engineering
@@ -112,9 +112,11 @@ Decision 0042 can ratify it:
   Security and deployment approvals remain candidate gate E01. A final-review
   requirement for Debian or generic Debian-family support reopens D06 and
   requires provider redesign.
-- **D15 — `DM-8-05` evaluation disposition:** dependency, legal, and release
-  owners must separately approve the exact dependency coordinates and the
-  evaluation-only limitation.
+- **D15 — `DM-8-05` evaluation disposition:** the
+  [exact proposal](dm-8-05-linux-event-v0.1-disposition.md) is ready at
+  `sha256:a6fe15f39fb553f87bc1224fe7f266e7c906d451d8140402d3bc1620011bfa53`.
+  Dependency, Legal, and Release approvals are each **Pending** and must
+  separately bind the exact dependency tuples and evaluation-only limitation.
 
 D15 is the remaining profile-ratification blocker. E01 and G1–G6 are separate
 candidate-delivery gates and remain required after the profile is ratified.

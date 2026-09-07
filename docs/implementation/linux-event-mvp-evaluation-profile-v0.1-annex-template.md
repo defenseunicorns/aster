@@ -365,12 +365,17 @@ approvals.
 
 | Field | Applicability | Format | Owner | Rejection rule |
 |---|---|---|---|---|
-| Proposal identity | Required | Immutable reference and exact digest of `dm-8-05-linux-event-v0.1-disposition.md` | Dependency/license + release | Reject a mutable/missing proposal or digest mismatch |
+| Proposal identity | Required | `dm-8-05-linux-event-v0.1-disposition.md`; `sha256:a6fe15f39fb553f87bc1224fe7f266e7c906d451d8140402d3bc1620011bfa53` | Dependency/license + release | Reject a mutable/missing proposal or digest mismatch |
 | Exact coordinates | Required | `webpki-root-certs` `1.0.9` / `b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b` / `CDLA-Permissive-2.0`; `webpki-roots` `1.0.9` / `7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a` / `CDLA-Permissive-2.0` | Dependency/license owner | Reject package, version, source, checksum, reachability, dependency-graph, license, SBOM, or notice drift |
 | Dependency approval | Approval record required before profile ratification; its immutable reference/digest is required in every later candidate body | Immutable reviewer identity, dependency/license role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate/license set, proposal digest, and signed approval-record reference/digest | Dependency/license owner | Reject a missing/refusing/unsigned record, any coordinate/license/proposal mismatch, replacement/re-signing as a candidate approval, or omission of its immutable reference/digest from the signable body |
 | Legal approval | Approval record required before profile ratification; its immutable reference/digest is required in every later candidate body | Immutable reviewer identity, legal role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate/license set, proposal digest, and signed approval-record reference/digest | Legal/compliance owner | Reject a missing/refusing/unsigned record, any coordinate/license/proposal mismatch, replacement/re-signing as a candidate approval, or omission of its immutable reference/digest from the signable body |
 | Release approval | Approval record required before profile ratification; its immutable reference/digest is required in every later candidate body | Immutable reviewer identity, release role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate/license set, proposal digest, and signed approval-record reference/digest | Release owner | Reject a missing/refusing/unsigned record, any coordinate/license/proposal mismatch, replacement/re-signing as a candidate approval, or omission of its immutable reference/digest from the signable body |
 | Production limitation | Required | Signed statement that `DM-8-05` remains formally open and production-blocking after any evaluation approval | Dependency/license + legal + release | Reject any production authorization, general allowlist, WebPKI/public-relay authorization, or claim that the requirement is closed |
+
+Initial approval-request status is **Pending** for Dependency, Legal, and
+Release. Repository lockfile, dependency-policy, notice, SBOM, or passing-gate
+facts cannot populate any approval row; each requires its separate immutable
+role record.
 
 ## 15. Final role approvals and detached signatures
 
