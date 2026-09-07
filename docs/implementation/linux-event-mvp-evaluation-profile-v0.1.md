@@ -282,18 +282,23 @@ mission secret bytes. Plaintext credentials in arguments, environment values,
 logs, package layers, ordinary configuration, or application responses are
 prohibited.
 
-The proposed exact v0.1 provider is
+The exact initial v0.1 provider design is
 [`aster-systemd-credential-store/v1`](../superpowers/specs/2026-09-07-systemd-credential-provider-design.md),
 using Ubuntu 24.04 `systemd-creds` and `LoadCredentialEncrypted=` from the
 systemd 255.4 line with explicit host-key protection, the fixed credential name
 `aster-provisioning.bundle`, a statically composed runtime loader, and the
 root-operated `aster-credential-admin` administration artifact. TPM2 and all
-automatic or fallback provider selection are excluded. The proposed provider
+automatic or fallback provider selection are excluded. The provider-design
 record has SHA-256
-`0aec8d59c8a0dbb00c36e47c06a08e52654d08cc727e246318de2a28f17097c6`.
-It becomes part of the accepted profile only when security and deployment
-owners approve that exact record and Decision 0042 ratifies the profile;
-provider implementation and qualification remain later candidate gates.
+`484001169c8b1acc597240b181bf425bcec036a1949e9caaa9655d580140f776`.
+D06 is resolved for the profile definition. Security and deployment approvals
+of that exact record remain mandatory candidate gate E01; provider
+implementation and qualification remain later gates.
+
+This provider selection makes no Debian support claim. If final review requires
+Debian or generic Debian-family support, D06 must be reopened and the provider
+redesigned and versioned against the exact additional platform boundary before
+the affected profile or candidate can proceed.
 
 The provider and operating procedure must demonstrate:
 

@@ -64,7 +64,7 @@ or soak results from a locally rebuilt package cannot qualify the G3 candidate.
 | **Rust and deterministic release gate** | Remove flaky outcomes; make clean-checkout results repeatable; prepare exact gate reporting | Passing deterministic checks bound to G2, then a rerun bound to G6 | Uses the exact source commit selected at G2 |
 | **OS, packaging, and artifacts** | Prepare locked build inputs, package recipes, `systemd`/namespace setup, SBOM, notice, provenance, signing, and reproduction procedures | Both architecture packages and one artifact manifest for G3 | Final packages must be built from G2 and include the selected provider |
 | **Integration and real devices** | Prepare the harness, target inventory, network conditions, and receipt collection | G4 focused results and G5 workload/resource results against G3 | Qualification starts only after G3; G5 also requires G4 |
-| **Security and deployment** | Resolve the exact protected-provider choice and lifecycle procedure; prepare package integration | Closed D06 record before profile ratification, then provider lifecycle acceptance in G3/G4 | Provider choice must be stable before final artifacts |
+| **Security and deployment** | Review the selected protected-provider design and prepare package integration | E01 role approvals before candidate qualification, then provider lifecycle acceptance in G3/G4 | Provider choice must be stable before final artifacts; any required Debian support reopens D06 for redesign |
 | **Dependency, legal, and release** | Review the exact evaluation-only `DM-8-05` dependency disposition | Three approval records closing D15 before profile ratification | The approved dependency coordinates must match the candidate graph |
 | **Profile/product owner** | Keep the boundary, owners, dates, and customer exclusions explicit; prepare the candidate annex | Ratified profile plus one complete annex linking every handoff | Collects evidence from all lanes; does not replace their approvals |
 
@@ -102,22 +102,21 @@ fail, or a typed reason the work was not run.
 - Preparation work and unrelated component evidence remain useful, but cannot
   be presented as qualification of the changed candidate.
 
-## Current blockers
+## Current decision state
 
-The profile is still **Proposed**. Two definition decisions must close before
+The profile is still **Proposed**. One definition decision remains before
 Decision 0042 can ratify it:
 
-- **D06 — protected provider:** the
-  [exact systemd credential proposal](../superpowers/specs/2026-09-07-systemd-credential-provider-design.md)
-  is ready; security and deployment must each approve its fixed digest,
-  provider version, trust boundary, administration artifact, limitations, and
-  seven-operation lifecycle contract.
+- **D06 — protected provider:** resolved for the profile by the
+  [approved initial systemd credential design](../superpowers/specs/2026-09-07-systemd-credential-provider-design.md).
+  Security and deployment approvals remain candidate gate E01. A final-review
+  requirement for Debian support reopens D06 and requires provider redesign.
 - **D15 — `DM-8-05` evaluation disposition:** dependency, legal, and release
   owners must separately approve the exact dependency coordinates and the
   evaluation-only limitation.
 
-These are profile-ratification blockers. G1–G6 are separate candidate-delivery
-gates and remain required after the profile is ratified.
+D15 is the remaining profile-ratification blocker. E01 and G1–G6 are separate
+candidate-delivery gates and remain required after the profile is ratified.
 
 ## Working rules for the team
 
@@ -137,7 +136,7 @@ gates and remain required after the profile is ratified.
 
 | Date | Coordinated result |
 |---:|---|
-| **2026-09-08** | D06's provider record and all three approving D15 records accepted; profile can then be ratified |
+| **2026-09-08** | All three approving D15 records accepted; profile can then be ratified. Security/deployment E01 review of the D06 design remains required for candidate qualification |
 | **2026-09-09** | G1 Event baseline and ReceiveOnly/capacity contract frozen |
 | **2026-09-10** | G2 source/API frozen; G3 packages produced only from that source |
 | **2026-09-11** | G4 passes and all required G5 24-hour scenarios start |
@@ -152,7 +151,8 @@ or `defer`; the calendar cannot turn it into `issue`.
 
 The exact candidate is ready to issue only when:
 
-- D06 and D15 are closed and Decision 0042 has ratified the profile;
+- D06 is resolved for the profile, D15 is closed, and Decision 0042 has
+  ratified the profile;
 - G1 through G5 passed in order against one traceable source and artifact set;
 - both architectures and all three node tiers passed;
 - Rust and Go, restart-selected ReceiveOnly, protected-provider lifecycle,

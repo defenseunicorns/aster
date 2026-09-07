@@ -7,19 +7,29 @@
 
 **Goal:** Publish the approved boundary as a proposed, reusable Linux Event MVP
 Evaluation Profile v0.1 ratification package. Close roadmap action P0-1 only
-after the exact protected provider and all three DM-8-05 specialist approvals
-are recorded and the conditional authority-switch task is explicitly
-authorized. This plan does not authorize a customer candidate; candidate
-authorization still requires every applicable evaluation gate and a completed
-signed annex for the exact artifacts under review.
+after all three DM-8-05 specialist approvals are recorded and the conditional
+authority-switch task is explicitly authorized. The initial exact protected
+provider design is resolved for P0-1 under the scope amendment below; its role
+approvals remain a candidate gate. This plan does not authorize a customer
+candidate; candidate authorization still requires every applicable evaluation
+gate and a completed signed annex for the exact artifacts under review.
 
 **Architecture:** Create one proposed profile, one mutable decision/gate
 register, one unsigned DM-8-05 evaluation-disposition proposal, one provisional
 per-candidate annex schema, and one Proposed adoption ADR. The approved design
-remains the governing boundary while D06 or D15 is open. Only a later
-conditional commit may close those rows, accept the profile/ADR, and freeze the
-design as historical. Runtime, artifact, provider, device, and release work
-remains in its existing lane.
+remains the governing boundary while D15 is open. Only a later conditional
+commit may close D15, accept the profile/ADR, and freeze the design as
+historical. Runtime, artifact, provider, device, and release work remains in
+its existing lane.
+
+**2026-09-07 scope amendment:** The profile owner approved the Ubuntu systemd
+credential provider as the initial D06 profile design. D06 is therefore
+resolved for P0-1, while security and deployment approvals remain mandatory at
+candidate gate E01. D15 remains a P0-1 ratification blocker. If final review
+requires Debian or generic Debian-family support, reopen D06 and replace the
+Ubuntu-specific selection with a redesigned, versioned provider boundary
+before ratification or candidate qualification, as applicable. The historical
+task text below records the stricter pre-amendment sequence.
 
 **Tech Stack:** Markdown, Git, the repository requirement-integrity checker,
 and existing `mise` verification tasks.
@@ -43,9 +53,10 @@ and existing `mise` verification tasks.
   new target, then replace every baseline comparison in this plan with that
   exact commit before editing a deliverable. Never validate against an obsolete
   baseline.
-- Preserve the approved design body from commit `ade675a`. The conditional
-  authority-switch task changes only its status/authority pointer after the
-  approved ratification prerequisites exist.
+- Preserve the approved design body from commit `ade675a` except for the
+  approved D06 scope amendment and its explicit Debian-redesign trigger. The
+  conditional authority-switch task changes only its status/authority pointer
+  after the approved ratification prerequisites exist.
 - Do not edit these active parallel-work paths:
   - `crates/aster-agent/**`
   - `crates/aster-node/src/lib.rs`
@@ -85,9 +96,9 @@ and existing `mise` verification tasks.
 | Production | Existing requirements/evidence plus a future production profile | v0.1 grants no production authority |
 
 Implementation, artifact, device, and release-test gates do not block defining
-the profile. The approved design does, however, make the exact protected
-provider selection and the three recorded DM-8-05 approvals P0-1 ratification
-conditions. The plan must not reclassify them as candidate-only gates.
+the profile. The initial exact protected-provider design resolves D06 for
+P0-1; security and deployment approvals remain candidate gate E01. The three
+recorded DM-8-05 approvals remain P0-1 ratification conditions.
 
 ## Task 0: Confirm the stacked execution base
 
@@ -868,37 +879,39 @@ here while D06 or D15 is open is an expected outcome, not a failed execution.
 
 Inspect, without editing status, for all three prerequisite sets:
 
-1. D06: a reviewed exact provider record names implementation/version,
-   source/build identity, supported architectures, storage/root-of-trust
-   behavior, seven lifecycle operations, failure behavior, administration
-   artifact, and the reviewed conformance/acceptance plan. Actual packaged
-   lifecycle results remain a later candidate-qualification gate.
+1. D06: confirm the approved initial provider-design digest remains exact and
+   final review has not required Debian or generic Debian-family support. D06
+   is resolved for P0-1; security and deployment approvals remain candidate
+   gate E01, and actual packaged lifecycle results remain later qualification
+   gates.
 2. D15: dependency, legal, and release approvals each identify the reviewer,
    role, decision, date, the exact two package/version/checksum/license tuples,
    and the reviewed disposition digest.
-3. Profile/product, security, deployment/OS, integration/device, Rust/runtime,
-   dependency, legal, and release roles each record approval or no-objection to
-   the Tasks 1–5 interface boundary. This review approves the reusable profile
-   definition only; it does not authorize a candidate.
+3. Profile/product and the remaining required P0-1 roles record approval or
+   no-objection to the Tasks 1–5 interface boundary. Security and deployment
+   provider approval is retained at E01 and does not block the profile
+   definition. This review approves the reusable profile definition only; it
+   does not authorize a candidate.
 
 Present the complete Tasks 1–5 delta and all three exit sets to the user/profile
 decision owner and request explicit authorization to mark Decision 0042
 Accepted and close P0-1. Interface review may refine the provisional annex
 schema but may not silently change the profile boundary.
 
-If either D06/D15 exit set, any required role review, or explicit ratification
-authorization is absent, stop here, report the exact missing record, and leave
-the ADR/profile Proposed, D06/D15 Open, and the approved design authoritative.
-Do not infer approval from a date, passing checks, or the existence of unsigned
-text.
+If the D15 exit set, another required P0-1 role review, or explicit
+ratification authorization is absent, stop here, report the exact missing
+record, and leave the ADR/profile Proposed, D15 Open, and the approved design
+authoritative. If final review requires Debian support, reopen D06 and stop for
+provider redesign. Do not infer approval from a date, passing checks, or the
+existence of unsigned text.
 
 ### Step 2: Record the reviewed exits
 
 Only after Step 1 passes:
 
-- link D06 to the immutable exact provider record; set it `Resolved`, with P0
-  blocker `no`, while retaining any still-applicable implementation/candidate
-  gates;
+- verify D06 remains linked to the immutable approved initial provider record,
+  `Resolved`, with P0 blocker `no`, while E01 and all applicable
+  implementation/candidate gates remain open;
 - link D15 to all three immutable approval records; set it `Resolved`, with P0
   blocker `no`;
 - update the DM-8-05 proposal status to evaluation disposition approved by the

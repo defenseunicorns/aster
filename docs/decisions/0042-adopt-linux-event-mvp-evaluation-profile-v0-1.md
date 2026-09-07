@@ -2,7 +2,7 @@
 
 # Decision 0042: Adopt the Linux Event MVP Evaluation Profile v0.1
 
-- Status: Proposed; ratification blocked by register rows `P0-1-D06` and `P0-1-D15`
+- Status: Proposed; ratification blocked by register row `P0-1-D15`
 - Proposed: 2026-09-06
 - Proposed authority: [Linux Event MVP Evaluation Profile v0.1](../implementation/linux-event-mvp-evaluation-profile-v0.1.md)
 - Register: [P0-1 decision and gate register](../implementation/linux-event-mvp-evaluation-profile-v0.1-register.md)
@@ -40,8 +40,8 @@ require durable operation keys that cannot be silently deleted or reused.
 
 Adopt the proposed
 [Linux Event MVP Evaluation Profile v0.1](../implementation/linux-event-mvp-evaluation-profile-v0.1.md)
-as the reusable P0-1 claim boundary only after the two ratification blockers
-below are resolved. The package has four distinct roles:
+as the reusable P0-1 claim boundary only after the remaining ratification
+blocker below is resolved. The package has four distinct roles:
 
 1. The proposed profile defines the bounded application, platform, topology,
    security, workload, resource, lifecycle, artifact, and evidence contract.
@@ -64,20 +64,20 @@ below are resolved. The package has four distinct roles:
 Implementation and retained-evidence gates do not by themselves block P0-1.
 P0-1 defines what a candidate would have to satisfy; it does not assert that
 the implementation, artifacts, devices, or receipts already satisfy it. The
-approved design nevertheless makes two decisions part of the claim boundary
-and therefore prerequisites to ratification:
+approved design nevertheless makes exact dependency disposition part of the
+claim boundary and therefore a prerequisite to ratification:
 
-- `P0-1-D06` remains Open until security and deployment owners approve the
-  [proposed exact systemd credential provider and administration record](../superpowers/specs/2026-09-07-systemd-credential-provider-design.md),
-  including its fixed digest, trust boundary, limitations, and seven-operation
-  lifecycle contract. The approved working-session design does not substitute
-  for either role approval.
+- `P0-1-D06` is resolved for the profile definition by the
+  [approved initial systemd credential provider design](../superpowers/specs/2026-09-07-systemd-credential-provider-design.md).
+  Security and deployment approvals remain mandatory candidate gate E01. If
+  final review requires Debian support, D06 reopens and the provider must be
+  redesigned and versioned before the affected profile or candidate proceeds.
 - `P0-1-D15` remains Open until dependency, legal, and release owners each
   record approval of the exact evaluation-only DM-8-05 proposal and dependency
   coordinates.
 
-Until both rows close through their reviewed exit records, this decision and
-the profile remain Proposed and the
+Until D15 closes through its reviewed exit records, this decision and the
+profile remain Proposed and the
 [approved design](../superpowers/specs/2026-09-06-linux-event-mvp-evaluation-profile-design.md)
 remains authoritative.
 
@@ -111,8 +111,9 @@ remain owned by their separate workstreams and gates.
 
 - Reviewers receive one bounded profile instead of inferring readiness from a
   count of requirements or mechanisms.
-- D06 and D15 remain visible ratification blockers rather than being deferred
-  to candidate qualification.
+- D06 is resolved for profile definition while its security/deployment reviews
+  remain visible candidate gate E01; D15 remains the profile-ratification
+  blocker.
 - G1-G6 and every other evaluation gate remain mandatory after P0-1 closes.
 - State, Record, Blob, BTLE, dynamic routing, broader scale, production use,
   and all other profile exclusions remain unsupported by this proposal.

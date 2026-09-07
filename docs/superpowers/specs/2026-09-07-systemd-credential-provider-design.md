@@ -3,16 +3,17 @@
 # Ubuntu systemd credential provider design
 
 - Design date: 2026-09-07
-- Design status: approved in working session; pending written review
+- Design status: approved as the initial P0-1 profile design; candidate role
+  approvals remain required
 - Profile: `aster-linux-event-mvp-evaluation-v0.1`
 - Register row: `P0-1-D06`
 - Evidence effect: none
 
 This design selects an Ubuntu-native protected provisioning boundary for the
-Linux Event MVP evaluation. It does not close D06, approve an implementation,
-or qualify an artifact. D06 remains Open until security and deployment owners
-accept the exact provider and administration record. G3 and G4 later bind and
-qualify the implemented provider in the exact packages.
+Linux Event MVP evaluation. It resolves D06 for the P0-1 profile definition; it
+does not approve an implementation or qualify an artifact. Security and
+deployment approvals remain required by candidate gate E01, and G3/G4 later
+bind and qualify the implemented provider in the exact packages.
 
 ## Outcome
 
@@ -40,6 +41,13 @@ annex rather than represented as floating `latest` versions.
 TPM2 is deliberately outside this evaluation design. The provider must never
 use `auto`, `tpm2`, `host+tpm2`, `auto-initrd`, or unauthenticated
 `tpm2-absent` selection.
+
+This selection is Ubuntu-specific. If final profile review requires Debian or
+a generic Debian-family support claim, this D06 resolution is no longer
+sufficient: D06 must be reopened and the provider redesigned and versioned
+against the exact additional operating-system, service-manager, credential,
+storage, packaging, and lifecycle boundary. The presence of systemd on a
+Debian target is not portability evidence.
 
 ## Existing mechanisms and reuse
 
@@ -362,9 +370,10 @@ Ubuntu `x86_64` and `aarch64` targets. Evidence must distinguish those classes.
 ## Version and artifact binding
 
 D06 selects the systemd 255.4 credential interface on Ubuntu 24.04 and Aster
-provider contract v1. The D06 approval record binds this design digest and the
-accepted upstream/provider identity. It does not treat Ubuntu security updates
-as implicitly qualified.
+provider contract v1. The profile record binds this design digest. Candidate
+gate E01 separately binds the security/deployment approvals and accepted
+upstream/provider identity. It does not treat Ubuntu security updates as
+implicitly qualified.
 
 One candidate annex records:
 
@@ -377,14 +386,15 @@ One candidate annex records:
 - the exact commands and receipts for every lifecycle and negative test.
 
 Package or provider drift creates a new G3 candidate and invalidates dependent
-G4/G5 evidence. A future provider-contract change requires a new versioned D06
-decision rather than silent compatibility.
+G4/G5 evidence. A future provider-contract change, or a final-review
+requirement to support Debian, requires a redesigned and versioned D06 decision
+rather than silent compatibility.
 
 ## Ownership and sequencing
 
-- Security and deployment owners approve the D06 provider identity, trust
-  boundary, administration artifact, recovery scope, limitations, and
-  acceptance plan.
+- Security and deployment owners approve the candidate provider identity,
+  trust boundary, administration artifact, recovery scope, limitations, and
+  acceptance plan at E01.
 - The provisioning implementation owner builds the loader, administration
   binary, ledger, and tests behind the accepted core contracts.
 - The OS/artifact owner composes the exact provider and unit into both G3
@@ -394,10 +404,10 @@ decision rather than silent compatibility.
 - The release owner verifies all immutable identities, receipts, and
   limitations before G6.
 
-The provider implementation may proceed after the D06 design is accepted, but
-D06 closes only through the reviewed security/deployment decision record. The
-implementation does not by itself close D06, E09, G3, G4, or any production
-requirement.
+The initial design resolves D06 for the profile definition. The provider
+implementation may proceed only in its separate delivery lane. It does not by
+itself close E01, E09, G3, G4, or any production requirement, and no candidate
+may qualify without the required security/deployment approvals.
 
 ## Alternatives not selected
 
