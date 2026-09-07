@@ -697,6 +697,9 @@ struct StreamInput {
     scan_limit: u32,
     poll_backoff_ms: u32,
     count: u32,
+    expected: Option<ExpectedEventInput>,
+    #[serde(default)]
+    after_attempt: u64,
 }
 
 async fn client_stream(client: &Client) -> Result<(), FixtureError> {
@@ -715,11 +718,34 @@ async fn client_stream(client: &Client) -> Result<(), FixtureError> {
         .await?;
     print_json(json!({"status": "active", "activity": "stream"}))?;
     let mut delivered = 0_u32;
+    let mut attempt = 0_u64;
     while delivered < input.count {
         match stream.message().await? {
-            Some(_) => delivered += 1,
+            Some(message) => {
+                let message = message.to_owned_message();
+                let event = message.event.as_option().ok_or(FixtureError::Local)?;
+                if message.attempt == 0 {
+                    return Err(FixtureError::Local);
+                }
+                if let Some(expected) = &input.expected
+                    && (!event_exactly_matches(event, expected)?
+                        || message.attempt <= input.after_attempt)
+                {
+                    return Err(FixtureError::Local);
+                }
+                attempt = message.attempt;
+                delivered += 1;
+            }
             None => break,
         }
+    }
+    if input.expected.is_some() {
+        if delivered != input.count {
+            return Err(FixtureError::Local);
+        }
+        return print_json(
+            json!({"status":"ok", "delivered":delivered, "exact_match":true, "attempt":attempt}),
+        );
     }
     print_json(json!({"status": "ok", "delivered": delivered}))
 }

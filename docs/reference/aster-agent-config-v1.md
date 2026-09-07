@@ -98,6 +98,13 @@ response, RPC deadlines of 10 ms through 30 seconds (10-second default), 32
 HTTP/2 streams per connection, and streaming poll backoff of 100 through
 60,000 ms. Event query, delivery, and scan pages are each `1..=1024`.
 
+RPC deadlines also bound established response streams. An authenticated
+connection with no active response closes after 60 seconds idle. At 30 minutes
+of connection age, new requests receive `Unavailable`; existing responses have
+at most 30 seconds of additional grace before closure. HTTP/2 keepalive runs
+every 30 seconds with a 20-second acknowledgement timeout. These compiled
+connection limits cannot be relaxed through version-one configuration.
+
 ## Relay
 
 When `mesh.relay` is present, all three scalar fields are required and
@@ -139,7 +146,8 @@ error; clients must back off or request a smaller valid page.
 ## Credential files
 
 On Unix, both credential files are opened with no final-symlink following and
-close-on-exec. Each must be a regular file owned by the process's effective
+close-on-exec and nonblocking open, so a FIFO cannot block validation or token
+reload before descriptor-type checks. Each must be a regular file owned by the process's effective
 user, with no permission bits outside owner read/write (`0600` or stricter),
 and its complete metadata must remain stable across the bounded read.
 Non-Unix secure credential loading currently fails closed.

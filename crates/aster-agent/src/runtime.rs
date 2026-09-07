@@ -5,7 +5,7 @@ use std::{error::Error, fmt, path::PathBuf, time::Duration};
 use aster_mesh::ProvisioningSecretLoader;
 use aster_node::{
     NodeBootstrapErrorKind, NodeError, NodeOperatorOutputPolicy, RunningNode,
-    start_node_with_forwarding_and_output_policy,
+    start_supervised_node_with_forwarding_and_output_policy,
 };
 use tokio::{sync::mpsc, task::JoinHandle};
 
@@ -100,7 +100,7 @@ where
             return Err(AgentRuntimeError::Bootstrap(error.kind()));
         }
     };
-    let node = match start_node_with_forwarding_and_output_policy(
+    let node = match start_supervised_node_with_forwarding_and_output_policy(
         node_config,
         forwarding,
         customer_node_output_policy(),

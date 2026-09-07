@@ -246,7 +246,7 @@ fn read_owner_only_bounded(
 
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|error| {
             if error.raw_os_error() == Some(libc::ELOOP) {

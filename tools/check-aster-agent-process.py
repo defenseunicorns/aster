@@ -1619,6 +1619,26 @@ def run_acceptance_with_token(
                 or deliveries[0]["attempt"] <= first_attempt
             ):
                 raise AcceptanceError("delivery attempt did not increase after restart")
+            streamed = call(
+                "stream",
+                {
+                    "subscription_id_hex": subscription_id,
+                    "delivery_limit": 1,
+                    "scan_limit": 8,
+                    "poll_backoff_ms": 100,
+                    "count": 1,
+                    "expected": expected_event,
+                    "after_attempt": deliveries[0]["attempt"],
+                },
+            ).record
+            if (
+                streamed.get("delivered") != 1
+                or streamed.get("exact_match") is not True
+                or not isinstance(streamed.get("attempt"), int)
+                or streamed["attempt"] <= deliveries[0]["attempt"]
+            ):
+                raise AcceptanceError("stream delivery did not match publication and attempt")
+            receipt_names.append("stream-delivery")
             call(
                 "ack",
                 {"subscription_id_hex": subscription_id, "event_id_hex": event_id},

@@ -232,6 +232,11 @@ standard Connect code. Production paths currently omit `retry_delay_ms`, so a
 client must use its own bounded backoff when `retryable` is true and no delay
 is supplied.
 
+Framework decoding and protocol failures retain standard error codes with a
+fixed sanitized message; raw decoder diagnostics are not part of the public
+contract. Rejected requests retain only their protocol framing choice before
+authentication failure encoding.
+
 With the generated Go client, decode typed details rather than parsing the
 human message:
 
@@ -309,3 +314,10 @@ authorization are still open and owned outside this Event-service increment.
 The black-box checker in `tools/check-aster-agent-process.py` is the executable
 contract those owners run against their artifacts; its repository fixture does
 not satisfy those gates.
+
+The checker includes a nonempty streaming phase: the generated client compares
+every exposed Event field against the retained publication and verifies that
+the delivery attempt increased. Its receipt contains only the match result,
+delivery count, and attempt. Scanning that sanitized client receipt alone does
+not establish wire-error redaction; the server wire regressions inspect raw
+error bodies and trailers separately.

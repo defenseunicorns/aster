@@ -60,7 +60,8 @@ pub(crate) fn configured_service(
     let deadline = connectrpc::DeadlinePolicy::new()
         .with_min(Duration::from_millis(10))
         .with_max(Duration::from_secs(30))
-        .with_default_timeout(Duration::from_secs(10));
+        .with_default_timeout(Duration::from_secs(10))
+        .with_enforce_on_streams(true);
     connectrpc::ConnectRpcService::new(router)
         .with_limits(limits)
         .with_deadline_policy(deadline)
@@ -718,7 +719,9 @@ mod tests {
     use aster_node::{MutableSourceInterests, NodeApplication, NodeConfig, start_node};
 
     use super::*;
-    use crate::{BoundAgent, ClientToken, api, error::PublicOperation};
+    #[cfg(all(feature = "client", feature = "server"))]
+    use crate::{BoundAgent, ClientToken};
+    use crate::{api, error::PublicOperation};
 
     #[cfg(all(feature = "client", feature = "server"))]
     const TEST_TOKEN: &[u8] = b"public-error-protocol-test-token";

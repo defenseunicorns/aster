@@ -81,11 +81,13 @@ type pollInput struct {
 }
 
 type streamInput struct {
-	SubscriptionIDHex string `json:"subscription_id_hex"`
-	DeliveryLimit     uint32 `json:"delivery_limit"`
-	ScanLimit         uint32 `json:"scan_limit"`
-	PollBackoffMS     uint32 `json:"poll_backoff_ms"`
-	Count             uint32 `json:"count"`
+	SubscriptionIDHex string              `json:"subscription_id_hex"`
+	DeliveryLimit     uint32              `json:"delivery_limit"`
+	ScanLimit         uint32              `json:"scan_limit"`
+	PollBackoffMS     uint32              `json:"poll_backoff_ms"`
+	Count             uint32              `json:"count"`
+	Expected          *expectedEventInput `json:"expected,omitempty"`
+	AfterAttempt      uint64              `json:"after_attempt,omitempty"`
 }
 
 type ackInput struct {
@@ -500,14 +502,29 @@ func runCommand(ctx context.Context, client applicationv1alpha1.AsterApplication
 			return err
 		}
 		var delivered uint32
+		var attempt uint64
+		defer stream.Close()
 		for delivered < value.Count && stream.Receive() {
-			if stream.Msg() == nil {
+			if stream.Msg() == nil || stream.Msg().Event == nil || stream.Msg().Attempt == 0 {
 				return errors.New("invalid response")
 			}
+			if value.Expected != nil {
+				matched, err := eventMatches(stream.Msg().Event, *value.Expected)
+				if err != nil || !matched || stream.Msg().Attempt <= value.AfterAttempt {
+					return errors.New("invalid stream evidence")
+				}
+			}
+			attempt = stream.Msg().Attempt
 			delivered++
 		}
 		if err := stream.Err(); err != nil {
 			return err
+		}
+		if value.Expected != nil {
+			if delivered != value.Count {
+				return errors.New("incomplete stream evidence")
+			}
+			return writeResult(output, result{"status": "ok", "delivered": delivered, "exact_match": true, "attempt": attempt})
 		}
 		return writeResult(output, result{"status": "ok", "delivered": delivered})
 	case "ack":

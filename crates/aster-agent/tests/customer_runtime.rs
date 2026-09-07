@@ -237,7 +237,7 @@ async fn admitted_publish_finishes_before_node_shutdown() {
     connection
         .write_all(
             format!(
-                "POST /aster.application.v1alpha1.AsterApplicationService/PublishEvent HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/proto\r\nConnect-Protocol-Version: 1\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "POST /aster.application.v1alpha1.AsterApplicationService/PublishEvent HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/proto\r\nConnect-Protocol-Version: 1\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
                 String::from_utf8_lossy(fixture.token_bytes()),
                 body.len(),
             )
@@ -245,6 +245,19 @@ async fn admitted_publish_finishes_before_node_shutdown() {
         )
         .await
         .expect("write admitted publish headers");
+
+    // Wait for body polling before issuing a competing one-slot status probe.
+    // Otherwise that probe can win admission and reject the publish itself.
+    let mut interim = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !interim.ends_with(b"\r\n\r\n") {
+            interim.push(connection.read_u8().await.expect("continue response byte"));
+            assert!(interim.len() <= 1024);
+        }
+    })
+    .await
+    .expect("continue response deadline");
+    assert!(interim.starts_with(b"HTTP/1.1 100"));
 
     // With one global in-flight slot, a rejected status probe proves the
     // Publish headers passed the gate and its permit is held before draining.

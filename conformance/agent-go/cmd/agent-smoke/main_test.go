@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,9 +14,83 @@ import (
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
+
 	applicationv1alpha1 "github.com/defenseunicorns/aster/conformance/agent-go/gen/aster/application/v1alpha1"
 	"google.golang.org/protobuf/proto"
 )
+
+type deliveryServer struct {
+	applicationv1alpha1.UnimplementedAsterApplicationServiceHandler
+	event   *applicationv1alpha1.Event
+	attempt uint64
+}
+
+func (s deliveryServer) StreamEvents(_ context.Context, _ *connect.Request[applicationv1alpha1.StreamEventsRequest], stream *connect.ServerStream[applicationv1alpha1.StreamEventsResponse]) error {
+	return stream.Send(&applicationv1alpha1.StreamEventsResponse{Event: s.event, Attempt: s.attempt})
+}
+
+func TestStreamEvidenceRequiresExactEventAndIncreasingAttempt(t *testing.T) {
+	// Break caught: counting a nonnil stream response can credit the wrong Event
+	// or stale attempt without validating any of the delivered content.
+	expected := expectedEventInput{
+		IDHex: strings.Repeat("01", 32), PublisherHex: strings.Repeat("02", 32),
+		PublisherCounter: 3, EventSequence: 4, Topic: "SECRET_TOPIC_CANARY",
+		Scope: "SECRET_SCOPE_CANARY", Priority: "immediate", LogicalKeyHex: "03",
+		PayloadHex: "04", AcceptanceMarker: 5,
+	}
+	event := &applicationv1alpha1.Event{
+		Id: bytes.Repeat([]byte{1}, 32), Publisher: bytes.Repeat([]byte{2}, 32),
+		PublisherCounter: 3, EventSequence: 4, Topic: expected.Topic, Scope: expected.Scope,
+		Priority: applicationv1alpha1.Priority_PRIORITY_IMMEDIATE, LogicalKey: []byte{3},
+		Payload: []byte{4}, AcceptanceMarker: 5,
+	}
+	for _, scenario := range []string{"exact", "wrong-payload", "stale-attempt", "missing-event"} {
+		t.Run(scenario, func(t *testing.T) {
+			message := proto.Clone(event).(*applicationv1alpha1.Event)
+			attempt := uint64(3)
+			switch scenario {
+			case "wrong-payload":
+				message.Payload = []byte{9}
+			case "stale-attempt":
+				attempt = 2
+			case "missing-event":
+				message = nil
+			}
+			_, handler := applicationv1alpha1.NewAsterApplicationServiceHandler(deliveryServer{event: message, attempt: attempt})
+			server := httptest.NewServer(handler)
+			defer server.Close()
+			client := applicationv1alpha1.NewAsterApplicationServiceClient(server.Client(), server.URL)
+			input, err := json.Marshal(map[string]any{
+				"subscription_id_hex": strings.Repeat("05", 32), "delivery_limit": 1,
+				"scan_limit": 8, "poll_backoff_ms": 100, "count": 1,
+				"expected": expected, "after_attempt": 2,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var output bytes.Buffer
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			err = runCommand(ctx, client, "stream", "test-token", bytes.NewReader(input), &output)
+			if scenario != "exact" {
+				if err == nil {
+					t.Fatal("invalid stream evidence accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("exact stream failed: %v", err)
+			}
+			if !strings.Contains(output.String(), `"exact_match":true`) || !strings.Contains(output.String(), `"attempt":3`) {
+				t.Fatalf("missing stream verification receipt: %s", output.String())
+			}
+			if strings.Contains(output.String(), "SECRET_") {
+				t.Fatal("stream receipt exposed Event content")
+			}
+		})
+	}
+}
 
 func writeToken(t *testing.T, mode os.FileMode) string {
 	t.Helper()

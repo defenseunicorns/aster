@@ -44,6 +44,9 @@ use crate::{
 const APPLICATION_HEADER_DEADLINE: Duration = Duration::from_secs(5);
 const APPLICATION_TRANSPORT_BUFFER_BYTES: usize = 16 * 1024;
 const APPLICATION_HTTP2_STREAMS: u32 = 32;
+const APPLICATION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const APPLICATION_MAX_CONNECTION_AGE: Duration = Duration::from_secs(30 * 60);
+const APPLICATION_CONNECTION_AGE_GRACE: Duration = Duration::from_secs(30);
 
 /// One application-listener control state. Task 6 owns signal translation and
 /// bounded supervisor ordering around these states.
@@ -86,6 +89,28 @@ struct ConnectionAuthInner {
     authenticated: AtomicBool,
     unauthenticated: Mutex<Option<OwnedSemaphorePermit>>,
     changed: watch::Sender<bool>,
+    admitted_at: tokio::time::Instant,
+    retiring: AtomicBool,
+    activity: watch::Sender<ConnectionActivity>,
+}
+
+#[derive(Clone, Copy)]
+struct ConnectionActivity {
+    active: usize,
+    idle_since: tokio::time::Instant,
+}
+
+struct ActiveRequest(ConnectionAuthState);
+
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        self.0.inner.activity.send_modify(|activity| {
+            activity.active -= 1;
+            if activity.active == 0 {
+                activity.idle_since = tokio::time::Instant::now();
+            }
+        });
+    }
 }
 
 impl ConnectionAuthState {
@@ -100,13 +125,28 @@ impl ConnectionAuthState {
 
     fn with_permit(unauthenticated: Option<OwnedSemaphorePermit>) -> Self {
         let (changed, _) = watch::channel(false);
+        let admitted_at = tokio::time::Instant::now();
+        let (activity, _) = watch::channel(ConnectionActivity {
+            active: 0,
+            idle_since: admitted_at,
+        });
         Self {
             inner: Arc::new(ConnectionAuthInner {
                 authenticated: AtomicBool::new(false),
                 unauthenticated: Mutex::new(unauthenticated),
                 changed,
+                admitted_at,
+                retiring: AtomicBool::new(false),
+                activity,
             }),
         }
+    }
+
+    fn begin_request(&self) -> ActiveRequest {
+        self.inner
+            .activity
+            .send_modify(|activity| activity.active += 1);
+        ActiveRequest(self.clone())
     }
 
     fn mark_authenticated(&self) {
@@ -278,7 +318,13 @@ where
             self.connection_auth.mark_authenticated();
             match self.status.state() {
                 LifecycleState::Ready => {
-                    if !headers_fit(&request, self.max_header_bytes) {
+                    if self.connection_auth.inner.retiring.load(Ordering::Acquire)
+                        || tokio::time::Instant::now()
+                            >= self.connection_auth.inner.admitted_at
+                                + APPLICATION_MAX_CONNECTION_AGE
+                    {
+                        Admission::Rejected(GateRejection::StateUnavailable)
+                    } else if !headers_fit(&request, self.max_header_bytes) {
                         Admission::Rejected(GateRejection::ResourceExhaustion)
                     } else {
                         match self.in_flight.clone().try_acquire_owned() {
@@ -295,18 +341,48 @@ where
         };
         let mut accepted = self.accepted.clone();
         let mut rejected = self.rejected.clone();
+        let active_request = matches!(admission, Admission::Accepted(_))
+            .then(|| self.connection_auth.begin_request());
 
         Box::pin(async move {
             match admission {
                 Admission::Accepted(permit) => {
-                    let response = <S as Service<Request<B>>>::call(&mut accepted, request).await?;
-                    Ok(response.map(|body| PermitBody::new(body, permit)))
+                    let mut response =
+                        <S as Service<Request<B>>>::call(&mut accepted, request).await?;
+                    let errors = crate::wire_error::WireErrors::for_response(&mut response);
+                    Ok(response.map(|body| {
+                        let mut body = PermitBody::new(body, permit);
+                        body.errors = errors;
+                        body.active_request = active_request;
+                        body
+                    }))
                 }
                 Admission::Rejected(rejection) => {
-                    let native_grpc = connectrpc::Protocol::detect(request.headers())
+                    let protocol = connectrpc::Protocol::detect(request.headers());
+                    let native_grpc = protocol
+                        .as_ref()
                         .is_some_and(|protocol| protocol.protocol == connectrpc::Protocol::Grpc);
                     let (mut parts, body) = request.into_parts();
                     drop(body);
+                    // Retain only the response framing choice. No rejected
+                    // URI, query, compression, deadline, or protocol metadata
+                    // may reach the framework's request validation paths.
+                    let content_type = match protocol {
+                        Some(p) if p.protocol == connectrpc::Protocol::Grpc => "application/grpc",
+                        Some(p) if p.protocol == connectrpc::Protocol::GrpcWeb => {
+                            "application/grpc-web+proto"
+                        }
+                        Some(p) if p.is_streaming => "application/connect+proto",
+                        _ => "application/proto",
+                    };
+                    parts.headers.clear();
+                    parts.headers.insert(
+                        http::header::CONTENT_TYPE,
+                        http::HeaderValue::from_static(content_type),
+                    );
+                    parts.uri = http::Uri::from_static(
+                        "/aster.application.v1alpha1.AsterApplicationService/GetStatus",
+                    );
                     parts.method = Method::POST;
                     parts.extensions.insert(rejection);
                     let replacement = Request::from_parts(parts, Empty::<Bytes>::new());
@@ -364,12 +440,33 @@ async fn drive_connection<F>(
     tokio::pin!(connection);
     let first_authentication = tokio::time::sleep_until(first_authentication_deadline);
     tokio::pin!(first_authentication);
-    tokio::select! {
-        _ = connection.as_mut() => {}
-        () = connection_auth.authenticated() => {
-            let _ = connection.as_mut().await;
+    let mut activity = connection_auth.inner.activity.subscribe();
+    let maximum_age = connection_auth.inner.admitted_at + APPLICATION_MAX_CONNECTION_AGE;
+    let mut authenticated = false;
+    let mut retiring = false;
+    loop {
+        let snapshot = *activity.borrow_and_update();
+        tokio::select! {
+            _ = connection.as_mut() => break,
+            () = connection_auth.authenticated(), if !authenticated => authenticated = true,
+            () = first_authentication.as_mut(), if !authenticated => break,
+            _ = activity.changed() => {},
+            () = tokio::time::sleep_until(snapshot.idle_since + APPLICATION_IDLE_TIMEOUT),
+                if authenticated && snapshot.active == 0 => {
+                    // Admission can change activity while the connection is
+                    // polled in this same select. Never retire accepted work
+                    // on an obsolete idle snapshot.
+                    let current = *activity.borrow();
+                    if current.active == 0 && current.idle_since + APPLICATION_IDLE_TIMEOUT <= tokio::time::Instant::now() {
+                        break;
+                    }
+                },
+            () = tokio::time::sleep_until(maximum_age), if !retiring => {
+                retiring = true;
+                connection_auth.inner.retiring.store(true, Ordering::Release);
+            },
+            () = tokio::time::sleep_until(maximum_age + APPLICATION_CONNECTION_AGE_GRACE) => break,
         }
-        () = first_authentication.as_mut() => {}
     }
 }
 
@@ -378,6 +475,8 @@ async fn drive_connection<F>(
 pub struct PermitBody<B> {
     inner: B,
     permit: Option<OwnedSemaphorePermit>,
+    errors: crate::wire_error::WireErrors,
+    active_request: Option<ActiveRequest>,
 }
 
 impl<B> PermitBody<B> {
@@ -385,6 +484,8 @@ impl<B> PermitBody<B> {
         Self {
             inner,
             permit: Some(permit),
+            errors: Default::default(),
+            active_request: None,
         }
     }
 
@@ -392,13 +493,15 @@ impl<B> PermitBody<B> {
         Self {
             inner,
             permit: None,
+            errors: Default::default(),
+            active_request: None,
         }
     }
 }
 
 impl<B> Body for PermitBody<B>
 where
-    B: Body + Unpin,
+    B: Body<Data = Bytes> + Unpin,
 {
     type Data = B::Data;
     type Error = B::Error;
@@ -411,8 +514,9 @@ where
         let result = Pin::new(&mut this.inner).poll_frame(cx);
         if matches!(result, Poll::Ready(None)) || this.inner.is_end_stream() {
             this.permit.take();
+            this.active_request.take();
         }
-        result
+        result.map(|frame| frame.map(|frame| frame.map(|frame| this.errors.frame(frame))))
     }
 
     fn is_end_stream(&self) -> bool {
@@ -513,6 +617,9 @@ impl BoundAgent {
                             .max_buf_size(APPLICATION_TRANSPORT_BUFFER_BYTES);
                         builder
                             .http2()
+                            .timer(TokioTimer::new())
+                            .keep_alive_interval(Some(Duration::from_secs(30)))
+                            .keep_alive_timeout(Duration::from_secs(20))
                             .max_header_list_size(limits.max_header_bytes() as u32)
                             .max_concurrent_streams(APPLICATION_HTTP2_STREAMS);
                         drive_connection(
@@ -567,7 +674,9 @@ mod tests {
         time::Duration,
     };
 
-    use buffa::{Message as _, MessageName as _};
+    use buffa::Message as _;
+    #[cfg(feature = "client")]
+    use buffa::MessageName as _;
     use bytes::Bytes;
     #[cfg(feature = "client")]
     use connectrpc::{
@@ -825,6 +934,277 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_protocol_metadata_cannot_override_authentication_or_echo_values() {
+        // Break caught: compression/protocol parsing before the rejection
+        // interceptor can replace authentication with a reflected input error.
+        for content_type in [
+            "application/proto",
+            "application/connect+json",
+            "application/grpc",
+            "application/grpc-web",
+        ] {
+            let response = PreBodyGate::new(
+                ConnectRpcService::new(Router::new()),
+                token(),
+                ready(),
+                Arc::new(Semaphore::new(1)),
+                ConnectionAuthState::detached(),
+                16 * 1024,
+            )
+            .oneshot(
+                Request::post("/SECRET_URI_CANARY?encoding=SECRET_QUERY_CANARY")
+                    .header(CONTENT_TYPE, content_type)
+                    .header("grpc-encoding", "SECRET_COMPRESSION_CANARY")
+                    .header("content-encoding", "SECRET_COMPRESSION_CANARY")
+                    .header("connect-protocol-version", "SECRET_VERSION_CANARY")
+                    .body(PanicOnPollBody)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            let headers = format!("{:?}", response.headers());
+            let body = response.into_body().collect().await.unwrap();
+            let trailers = format!("{:?}", body.trailers());
+            let bytes = body.to_bytes();
+            let wire = format!("{headers}{trailers}{}", String::from_utf8_lossy(&bytes));
+            assert!(
+                !wire.contains("SECRET_"),
+                "request value escaped on {content_type}: {wire}"
+            );
+            assert!(
+                wire.contains("authentication") || wire.contains("authentication%20failed"),
+                "authentication contract lost: {wire}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn framework_failures_are_sanitized_on_the_wire() {
+        use connectrpc::handler_fn;
+        for (content_type, header, value, path, body) in [
+            (
+                "application/grpc+json",
+                "grpc-encoding",
+                "identity",
+                "PublishEvent",
+                br#"{"priority":"SECRET_PRIORITY_CANARY"}"#.as_slice(),
+            ),
+            (
+                "application/grpc-web+json",
+                "grpc-encoding",
+                "identity",
+                "PublishEvent",
+                br#"{"priority":"SECRET_PRIORITY_CANARY"}"#.as_slice(),
+            ),
+            (
+                "application/json",
+                "connect-protocol-version",
+                "1",
+                "PublishEvent",
+                br#"{"priority":"SECRET_PRIORITY_CANARY"}"#.as_slice(),
+            ),
+            (
+                "application/grpc",
+                "grpc-encoding",
+                "SECRET_COMPRESSION_CANARY",
+                "PublishEvent",
+                b"".as_slice(),
+            ),
+            (
+                "application/grpc-web",
+                "grpc-encoding",
+                "SECRET_COMPRESSION_CANARY",
+                "PublishEvent",
+                b"".as_slice(),
+            ),
+            (
+                "application/connect+json",
+                "connect-content-encoding",
+                "SECRET_COMPRESSION_CANARY",
+                "StreamEvents",
+                b"".as_slice(),
+            ),
+            (
+                "application/proto",
+                "connect-protocol-version",
+                "SECRET_VERSION_CANARY",
+                "SECRET_PATH_CANARY",
+                b"".as_slice(),
+            ),
+        ] {
+            let body = if content_type.ends_with("+json") && !body.is_empty() {
+                let mut framed = vec![0];
+                framed.extend_from_slice(&(body.len() as u32).to_be_bytes());
+                framed.extend_from_slice(body);
+                Bytes::from(framed)
+            } else {
+                Bytes::copy_from_slice(body)
+            };
+            let router = Router::new().route(
+                api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
+                "PublishEvent",
+                handler_fn(|_ctx, _request: api::PublishEventRequest| async {
+                    Ok(connectrpc::Response::new(
+                        api::PublishEventResponse::default(),
+                    ))
+                }),
+            );
+            let response = PreBodyGate::new(
+                crate::event_service::configured_service(router),
+                token(),
+                ready(),
+                Arc::new(Semaphore::new(1)),
+                ConnectionAuthState::detached(),
+                16 * 1024,
+            )
+            .oneshot(
+                Request::post(format!(
+                    "/aster.application.v1alpha1.AsterApplicationService/{path}"
+                ))
+                .header(CONTENT_TYPE, content_type)
+                .header(header, value)
+                .header(
+                    http::header::AUTHORIZATION,
+                    format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+                )
+                .body(Full::new(body))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            let headers = format!("{:?}", response.headers());
+            let collected = response.into_body().collect().await.unwrap();
+            let trailers = format!("{:?}", collected.trailers());
+            let bytes = collected.to_bytes();
+            let wire = format!("{headers}{trailers}{}", String::from_utf8_lossy(&bytes));
+            assert!(
+                !wire.contains("SECRET_"),
+                "framework reflected input on {content_type}: {wire}"
+            );
+            assert!(
+                !wire.contains("failed to decode") && !wire.contains("unknown variant"),
+                "raw framework diagnostic escaped: {wire}"
+            );
+            assert!(
+                !wire.contains("grpc-status-details-bin"),
+                "raw framework Status must not survive sanitization"
+            );
+        }
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn stream_error_sanitization_preserves_large_event_payloads_across_protocols() {
+        for protocol in [Protocol::Connect, Protocol::Grpc, Protocol::GrpcWeb] {
+            let payload = b"\x80\x00\x00\x00\x01SECRET_EVENT_PAYLOAD".repeat(4096);
+            let expected = payload.clone();
+            let router = Router::new().route_server_stream(
+                api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
+                "StreamEvents",
+                connectrpc::streaming_handler_fn(
+                    move |_ctx, _request: api::StreamEventsRequest| {
+                        let payload = payload.clone();
+                        async move {
+                            Ok(connectrpc::Response::new(Box::pin(futures::stream::iter([
+                                Ok(api::StreamEventsResponse {
+                                    event: Some(api::Event {
+                                        payload,
+                                        ..Default::default()
+                                    })
+                                    .into(),
+                                    attempt: 2,
+                                    ..Default::default()
+                                }),
+                                Err(ConnectError::internal("SECRET_FRAMEWORK_CANARY")),
+                            ]))
+                                as connectrpc::ServiceStream<api::StreamEventsResponse>))
+                        }
+                    },
+                ),
+            );
+            let client = api::AsterApplicationServiceClient::new(
+                ServiceTransport::new(PreBodyGate::new(
+                    crate::event_service::configured_service(router),
+                    token(),
+                    ready(),
+                    Arc::new(Semaphore::new(1)),
+                    ConnectionAuthState::detached(),
+                    16 * 1024,
+                )),
+                ClientConfig::new("http://localhost".parse().unwrap())
+                    .with_protocol(protocol)
+                    .with_default_header(
+                        http::header::AUTHORIZATION,
+                        format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+                    ),
+            );
+            let mut stream = client
+                .stream_events(api::StreamEventsRequest::default())
+                .await
+                .unwrap();
+            let message = stream.message().await.unwrap().unwrap().to_owned_message();
+            assert_eq!(message.event.as_option().unwrap().payload, expected);
+            assert_eq!(message.attempt, 2);
+            let error = stream.message().await.unwrap_err();
+            assert_eq!(error.code, ErrorCode::Internal);
+            assert_eq!(error.message.as_deref(), Some("request failed"));
+            assert!(error.details.is_empty());
+        }
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test(start_paused = true)]
+    async fn established_stream_obeys_server_deadline_and_returns_capacity() {
+        // Break caught: a server-clamped deadline that stops only establishment
+        // leaves an idle stream's global in-flight slot occupied indefinitely.
+        let router = Router::new().route_server_stream(
+            api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
+            "StreamEvents",
+            connectrpc::streaming_handler_fn(|_ctx, _request: api::StreamEventsRequest| async {
+                Ok(connectrpc::Response::new(
+                    Box::pin(futures::stream::pending::<
+                        Result<api::StreamEventsResponse, ConnectError>,
+                    >())
+                        as connectrpc::ServiceStream<api::StreamEventsResponse>,
+                ))
+            }),
+        );
+        let permits = Arc::new(Semaphore::new(1));
+        let client = api::AsterApplicationServiceClient::new(
+            ServiceTransport::new(PreBodyGate::new(
+                crate::event_service::configured_service(router),
+                token(),
+                ready(),
+                permits.clone(),
+                ConnectionAuthState::detached(),
+                16 * 1024,
+            )),
+            ClientConfig::new("http://localhost".parse().unwrap())
+                .with_default_timeout(Duration::from_secs(120))
+                .with_default_header(
+                    http::header::AUTHORIZATION,
+                    format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+                ),
+        );
+        let mut stream = client
+            .stream_events(api::StreamEventsRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(permits.available_permits(), 0);
+        let result = tokio::time::timeout(Duration::from_secs(31), stream.message()).await;
+        assert!(
+            result.is_ok(),
+            "stream exceeded the server's 30-second deadline"
+        );
+        assert_eq!(
+            result.unwrap().unwrap_err().code,
+            ErrorCode::DeadlineExceeded
+        );
+        drop(stream);
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
     async fn draining_request_is_rejected_without_polling_body() {
         let status = ready();
         status
@@ -1062,6 +1442,88 @@ mod tests {
             unauthenticated.try_acquire_owned().is_ok(),
             "valid authentication must release the connection permit before lifecycle admission"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn authenticated_idle_connection_returns_total_capacity() {
+        // Break caught: authenticated idle connections retain every total slot.
+        let total = Arc::new(Semaphore::new(1));
+        let permit = total.clone().try_acquire_owned().unwrap();
+        let state = ConnectionAuthState::detached();
+        state.mark_authenticated();
+        let driver = tokio::spawn(drive_connection(
+            async move {
+                let _permit = permit;
+                std::future::pending::<()>().await;
+            },
+            state,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            driver.is_finished(),
+            "authenticated idle connection never expired"
+        );
+        driver.await.unwrap();
+        assert_eq!(total.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_connection_expires_after_maximum_age_and_returns_capacity() {
+        // Break caught: recurring requests can otherwise retain a total slot forever.
+        let total = Arc::new(Semaphore::new(1));
+        let permit = total.clone().try_acquire_owned().unwrap();
+        let state = ConnectionAuthState::detached();
+        state.mark_authenticated();
+        let gate = PreBodyGate::new(
+            ConnectRpcService::new(Router::new()),
+            token(),
+            ready(),
+            Arc::new(Semaphore::new(1)),
+            state.clone(),
+            16 * 1024,
+        );
+        let driver = tokio::spawn(drive_connection(
+            async move {
+                let _permit = permit;
+                std::future::pending::<()>().await;
+            },
+            state,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        ));
+        for _ in 0..36 {
+            let response = gate
+                .clone()
+                .oneshot(
+                    Request::post("/aster.application.v1alpha1.AsterApplicationService/GetStatus")
+                        .header(CONTENT_TYPE, "application/proto")
+                        .header(
+                            http::header::AUTHORIZATION,
+                            format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+                        )
+                        .body(Empty::<Bytes>::new())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            response.into_body().collect().await.unwrap();
+            tokio::time::advance(Duration::from_secs(50)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                !driver.is_finished(),
+                "active connection closed before its age bound"
+            );
+        }
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            driver.is_finished(),
+            "connection survived maximum age plus grace"
+        );
+        driver.await.unwrap();
+        assert_eq!(total.available_permits(), 1);
     }
 
     #[tokio::test(start_paused = true)]

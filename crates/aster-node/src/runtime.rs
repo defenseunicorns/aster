@@ -11117,6 +11117,34 @@ async fn start_node_with_forwarding_output(
     forwarding: SelectedForwardingConfig,
     output: NodeOperatorOutput,
 ) -> Result<RunningNode, NodeError> {
+    start_node_with_shutdown_ownership(config, forwarding, output, true).await
+}
+
+/// Starts a node whose shutdown is owned by its embedding supervisor.
+///
+/// Unlike standalone startup, this node does not consume process SIGINT.
+/// The supervisor drains its admitted work before calling `RunningNode::shutdown`.
+/// An explicitly configured `run_for` deadline still applies.
+pub async fn start_supervised_node_with_forwarding_and_output_policy(
+    config: NodeConfig,
+    forwarding: SelectedForwardingConfig,
+    output_policy: NodeOperatorOutputPolicy,
+) -> Result<RunningNode, NodeError> {
+    start_node_with_shutdown_ownership(
+        config,
+        forwarding,
+        NodeOperatorOutput::process(output_policy),
+        false,
+    )
+    .await
+}
+
+async fn start_node_with_shutdown_ownership(
+    config: NodeConfig,
+    forwarding: SelectedForwardingConfig,
+    output: NodeOperatorOutput,
+    handle_sigint: bool,
+) -> Result<RunningNode, NodeError> {
     let identity = config.mission.identity();
     let mission_authority = config.mission.mission_authority_id();
     let (application_sender, application_receiver) = mpsc::channel(APPLICATION_COMMAND_CAPACITY);
@@ -11150,18 +11178,20 @@ async fn start_node_with_forwarding_output(
     let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
     let (ready_sender, ready_receiver) = oneshot::channel();
     let emission_policy = Arc::new(LiveEmissionPolicy::new(forwarding.emission_policy()));
+    let mut channels = NodeActorChannels::new(
+        application_receiver,
+        application_admission.clone(),
+        control_receiver,
+        shutdown_receiver,
+        ready_sender,
+    );
+    channels.handle_sigint = handle_sigint;
     let task = tokio::spawn(run_node_actor_with_forwarding_output(
         config,
         forwarding,
         emission_policy.clone(),
         output,
-        NodeActorChannels::new(
-            application_receiver,
-            application_admission.clone(),
-            control_receiver,
-            shutdown_receiver,
-            ready_sender,
-        ),
+        channels,
     ));
     let ready = match ready_receiver.await {
         Ok(ready) => ready,
@@ -11216,6 +11246,7 @@ struct RunNodeActorTestControl {
 }
 
 struct NodeActorChannels {
+    handle_sigint: bool,
     application_receiver: mpsc::Receiver<SelectedApplicationCommand>,
     application_admission: Arc<AtomicBool>,
     control_receiver: mpsc::Receiver<SelectedControlCommand>,
@@ -11339,6 +11370,7 @@ impl NodeActorChannels {
     ) -> Self {
         Self {
             application_receiver,
+            handle_sigint: true,
             application_admission,
             control_receiver,
             shutdown_receiver,
@@ -11414,6 +11446,7 @@ async fn run_node_actor_inner(
     channels: NodeActorChannels,
 ) -> Result<NodeReceipt, NodeError> {
     let NodeActorChannels {
+        handle_sigint,
         mut application_receiver,
         application_admission,
         mut control_receiver,
@@ -11877,8 +11910,10 @@ async fn run_node_actor_inner(
     let stop = async move {
         if let Some(deadline) = stop_deadline {
             sleep(deadline.saturating_duration_since(Instant::now())).await;
-        } else {
+        } else if handle_sigint {
             let _ = tokio::signal::ctrl_c().await;
+        } else {
+            std::future::pending::<()>().await;
         }
     };
     tokio::pin!(stop);

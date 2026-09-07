@@ -18,6 +18,8 @@ pub mod lifecycle;
 pub mod runtime;
 #[cfg(feature = "server")]
 pub mod server;
+#[cfg(feature = "server")]
+mod wire_error;
 
 pub use credentials::ClientToken;
 pub use error::{PublicOperation, connect_application_error, public_error};

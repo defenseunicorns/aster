@@ -72,6 +72,27 @@ impl api::PublicErrorReason {
     }
 }
 
+/// Recognizes only the closed message vocabulary emitted by this module.
+#[cfg(feature = "server")]
+pub(crate) fn is_public_error_message(message: &str) -> bool {
+    use api::PublicErrorReason as R;
+    [
+        R::MalformedInput,
+        R::UnsupportedValue,
+        R::OperationKeyConflict,
+        R::MissingDurableObject,
+        R::FailedPrecondition,
+        R::Deadline,
+        R::ResourceExhaustion,
+        R::Draining,
+        R::StateUnavailable,
+        R::AuthenticationFailed,
+        R::Internal,
+    ]
+    .iter()
+    .any(|reason| message == reason.public_message())
+}
+
 /// Creates one bounded public error without retaining caller-provided text.
 pub fn public_error(
     code: ErrorCode,
