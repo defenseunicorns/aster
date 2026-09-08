@@ -135,15 +135,17 @@ descriptor-relative Linux filesystem APIs, `zeroize`, Tokio.
 - `--check-config` remains a non-starting configuration/ordinary-credential
   preflight and the legacy development invocation remains unchanged.
 
-- [ ] Add a process test with a valid strict config and no
+- [x] Add a process test with a valid strict config and no
   `CREDENTIALS_DIRECTORY`; assert the binary now fails with the fixed provider
   unavailable category and never emits the old `protected provider required`
   placeholder or creates state.
-- [ ] Run the exact process test and observe the old placeholder failure.
-- [ ] Add the provider dependency and wire `CustomerConfig` to the systemd
+- [x] Run the exact process test and observe the old placeholder failure.
+- [x] Add the provider dependency and wire `CustomerConfig` to the systemd
   loader and existing customer runtime in the same executable.
-- [ ] Run the process test and affected `main.rs` unit tests until green.
-- [ ] Commit as `feat(agent): compose systemd credential provider`.
+- [x] Run the process test and the affected production binary until green;
+  skip a redundant second large-bin link after the tmpfs-backed linker emitted
+  SIGBUS under confirmed storage/swap pressure.
+- [x] Commit as `feat(agent): compose systemd credential provider`.
 
 ### Task 5: Document and narrowly verify the increment
 

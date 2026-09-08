@@ -2,8 +2,8 @@ use std::{env, net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration
 
 use aster_agent::{
     BoundAgent, ClientToken,
-    config::check_config,
-    runtime::{AgentExit, AgentSignal},
+    config::{check_config, load_and_validate_config},
+    runtime::{AgentExit, AgentSignal, run_customer_agent},
 };
 use aster_node::application::{Scope, Topic};
 use aster_node::mission::UnprotectedReferenceMission;
@@ -13,6 +13,7 @@ use aster_node::{
 };
 #[cfg(feature = "nearby-discovery")]
 use aster_node::{MissionNearbyPeer, SelectedForwardingConfig, start_node_with_forwarding};
+use aster_systemd_credentials::SystemdCredentialLoader;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -72,7 +73,14 @@ async fn run() -> Result<Option<AgentExit>, BoxError> {
             check_config(&path)?;
             Ok(None)
         }
-        Invocation::CustomerConfig(_path) => Err("protected provider required".into()),
+        Invocation::CustomerConfig(path) => {
+            let config = load_and_validate_config(&path)?;
+            let mut loader = SystemdCredentialLoader::from_environment()?;
+            let signals = translated_signals()?;
+            Ok(Some(
+                run_customer_agent(config, &mut loader, signals).await?,
+            ))
+        }
         Invocation::LegacyDevelopment(mut arguments) => {
             if arguments.take_flag("--help") || arguments.take_flag("-h") {
                 print_help();
