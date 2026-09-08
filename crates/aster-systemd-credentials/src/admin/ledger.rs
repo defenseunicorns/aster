@@ -2,6 +2,7 @@ use crate::provider_generation;
 use aster_mesh::{
     ProvisioningInstallId, ProvisioningLoadId, ProvisioningSecretRef, ProvisioningSecretStoreError,
 };
+use zeroize::Zeroizing;
 
 const LEDGER_MAGIC: &[u8; 8] = b"ASTRSDL1";
 const LEDGER_VERSION: u16 = 1;
@@ -30,7 +31,7 @@ pub(super) enum Retry {
 }
 
 pub(super) fn encode_record(record: &InstallRecord) -> Vec<u8> {
-    let reference = record.secret_ref.to_bytes();
+    let reference = Zeroizing::new(record.secret_ref.to_bytes());
     let reference_len =
         u32::try_from(reference.len()).expect("bounded provisioning reference fits in u32");
     let mut encoded = Vec::with_capacity(LEDGER_HEADER_BYTES + reference.len());

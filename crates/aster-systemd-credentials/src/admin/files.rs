@@ -6,6 +6,7 @@ use std::{
     io::{Read as _, Write as _},
     path::{Component, Path},
 };
+use zeroize::Zeroizing;
 
 const MANIFEST_MAGIC: &[u8; 8] = b"ASTRSDM1";
 const MANIFEST_VERSION: u16 = 1;
@@ -23,6 +24,54 @@ pub(super) const LEDGER_FILE: &str = "ledger";
 pub(super) const LEDGER_NEXT_FILE: &str = "ledger.next";
 pub(super) const LOCK_FILE: &str = "lock";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FaultPoint {
+    StageCiphertextSynced,
+    StageReferenceSynced,
+    StageManifestSynced,
+    StageDirectorySynced,
+    StageParentSynced,
+    IntentFileSynced,
+    IntentRenamed,
+    IntentParentSynced,
+    ActiveRenamed,
+    ActiveParentSynced,
+    CompleteFileSynced,
+    CompleteRenamed,
+    CompleteParentSynced,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LedgerWrite {
+    Intent,
+    Complete,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct FaultInjector {
+    point: Option<FaultPoint>,
+}
+
+impl FaultInjector {
+    pub(super) const fn disabled() -> Self {
+        Self { point: None }
+    }
+
+    #[cfg(test)]
+    pub(super) const fn at(point: FaultPoint) -> Self {
+        Self { point: Some(point) }
+    }
+
+    fn hit(&mut self, point: FaultPoint) -> Result<(), ProvisioningSecretStoreError> {
+        if self.point == Some(point) {
+            self.point = None;
+            Err(ProvisioningSecretStoreError::Unavailable)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct GenerationManifest {
     pub(super) generation: u64,
@@ -32,7 +81,7 @@ pub(super) struct GenerationManifest {
 }
 
 pub(super) fn encode_manifest(manifest: &GenerationManifest) -> Vec<u8> {
-    let reference = manifest.secret_ref.to_bytes();
+    let reference = Zeroizing::new(manifest.secret_ref.to_bytes());
     let reference_len =
         u32::try_from(reference.len()).expect("bounded provisioning reference fits in u32");
     let mut encoded = Vec::with_capacity(MANIFEST_HEADER_BYTES + reference.len());
@@ -197,7 +246,7 @@ pub(super) fn read_optional_file(
     directory: &OwnedFd,
     name: &str,
     maximum: usize,
-) -> Result<Option<Vec<u8>>, ProvisioningSecretStoreError> {
+) -> Result<Option<Zeroizing<Vec<u8>>>, ProvisioningSecretStoreError> {
     let descriptor = match rustix::fs::openat(
         directory,
         name,
@@ -218,7 +267,7 @@ pub(super) fn read_optional_file(
     if size > maximum {
         return Err(ProvisioningSecretStoreError::TooLarge);
     }
-    let mut bytes = Vec::with_capacity(size);
+    let mut bytes = Zeroizing::new(Vec::with_capacity(size));
     File::from(descriptor)
         .take((maximum + 1) as u64)
         .read_to_end(&mut bytes)
@@ -231,7 +280,7 @@ pub(super) fn read_optional_file(
 
 pub(super) fn read_ledger(
     ledger_root: &OwnedFd,
-) -> Result<Option<Vec<u8>>, ProvisioningSecretStoreError> {
+) -> Result<Option<Zeroizing<Vec<u8>>>, ProvisioningSecretStoreError> {
     read_optional_file(
         ledger_root,
         LEDGER_FILE,
@@ -242,12 +291,26 @@ pub(super) fn read_ledger(
 pub(super) fn write_ledger_atomically(
     ledger_root: &OwnedFd,
     bytes: &[u8],
+    write: LedgerWrite,
+    faults: &mut FaultInjector,
 ) -> Result<(), ProvisioningSecretStoreError> {
     remove_optional_file(ledger_root, LEDGER_NEXT_FILE)?;
     write_new_file(ledger_root, LEDGER_NEXT_FILE, bytes)?;
+    faults.hit(match write {
+        LedgerWrite::Intent => FaultPoint::IntentFileSynced,
+        LedgerWrite::Complete => FaultPoint::CompleteFileSynced,
+    })?;
     rustix::fs::renameat(ledger_root, LEDGER_NEXT_FILE, ledger_root, LEDGER_FILE)
         .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
-    sync_directory(ledger_root)
+    faults.hit(match write {
+        LedgerWrite::Intent => FaultPoint::IntentRenamed,
+        LedgerWrite::Complete => FaultPoint::CompleteRenamed,
+    })?;
+    sync_directory(ledger_root)?;
+    faults.hit(match write {
+        LedgerWrite::Intent => FaultPoint::IntentParentSynced,
+        LedgerWrite::Complete => FaultPoint::CompleteParentSynced,
+    })
 }
 
 pub(super) fn write_staged_generation(
@@ -255,19 +318,26 @@ pub(super) fn write_staged_generation(
     ciphertext: &[u8],
     reference: &[u8],
     manifest: &[u8],
+    faults: &mut FaultInjector,
 ) -> Result<(), ProvisioningSecretStoreError> {
     rustix::fs::mkdirat(provisioning_root, STAGED_DIRECTORY, rustix::fs::Mode::RWXU)
         .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
     let staged = open_child_directory(provisioning_root, STAGED_DIRECTORY)?;
     write_new_file(&staged, CIPHERTEXT_FILE, ciphertext)?;
+    faults.hit(FaultPoint::StageCiphertextSynced)?;
     write_new_file(&staged, REFERENCE_FILE, reference)?;
+    faults.hit(FaultPoint::StageReferenceSynced)?;
     write_new_file(&staged, MANIFEST_FILE, manifest)?;
+    faults.hit(FaultPoint::StageManifestSynced)?;
     sync_directory(&staged)?;
-    sync_directory(provisioning_root)
+    faults.hit(FaultPoint::StageDirectorySynced)?;
+    sync_directory(provisioning_root)?;
+    faults.hit(FaultPoint::StageParentSynced)
 }
 
 pub(super) fn promote_staged_generation(
     provisioning_root: &OwnedFd,
+    faults: &mut FaultInjector,
 ) -> Result<(), ProvisioningSecretStoreError> {
     rustix::fs::renameat(
         provisioning_root,
@@ -276,7 +346,9 @@ pub(super) fn promote_staged_generation(
         ACTIVE_DIRECTORY,
     )
     .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
-    sync_directory(provisioning_root)
+    faults.hit(FaultPoint::ActiveRenamed)?;
+    sync_directory(provisioning_root)?;
+    faults.hit(FaultPoint::ActiveParentSynced)
 }
 
 pub(super) fn remove_staged_generation(
@@ -337,7 +409,8 @@ pub(super) fn generation_matches(
         aster_mesh::MAX_PROVISIONING_SECRET_REF_BYTES,
     )?
     .ok_or(ProvisioningSecretStoreError::Rejected)?;
-    if reference != expected.secret_ref.to_bytes() {
+    let expected_reference = Zeroizing::new(expected.secret_ref.to_bytes());
+    if reference.as_slice() != expected_reference.as_slice() {
         return Ok(false);
     }
     let ciphertext = read_optional_file(

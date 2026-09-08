@@ -204,7 +204,9 @@ name = "aster-systemd-credentials"
 version = "0.1.0"
 dependencies = [
  "aster-core",
+ "getrandom 0.4.3",
  "rustix",
+ "sha2",
  "zeroize",
 ]
 

@@ -10,6 +10,21 @@ use aster_mesh::{
 use aster_systemd_credentials::admin::SystemdCredentialAdmin;
 #[cfg(target_os = "linux")]
 use std::{env, io::Read as _, process::ExitCode};
+#[cfg(target_os = "linux")]
+use zeroize::Zeroize as _;
+
+#[cfg(all(test, target_os = "linux"))]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Default)]
+struct SecretDropObserver {
+    zeroized: AtomicBool,
+    allocation_stable: AtomicBool,
+}
 
 #[cfg(target_os = "linux")]
 struct Invocation {
@@ -89,23 +104,92 @@ fn decode_nibble(value: u8) -> Result<u8, ProvisioningSecretStoreError> {
 
 #[cfg(target_os = "linux")]
 fn read_secret(
-    mut input: impl std::io::Read,
+    input: impl std::io::Read,
 ) -> Result<UnprotectedProvisioning, ProvisioningSecretStoreError> {
-    let mut bytes = Vec::new();
+    #[cfg(test)]
+    {
+        read_secret_inner(input, None)
+    }
+    #[cfg(not(test))]
+    {
+        read_secret_inner(input)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn read_secret_with_observer(
+    input: impl std::io::Read,
+    observer: Arc<SecretDropObserver>,
+) -> Result<UnprotectedProvisioning, ProvisioningSecretStoreError> {
+    read_secret_inner(input, Some(observer))
+}
+
+#[cfg(target_os = "linux")]
+fn read_secret_inner(
+    mut input: impl std::io::Read,
+    #[cfg(test)] observer: Option<Arc<SecretDropObserver>>,
+) -> Result<UnprotectedProvisioning, ProvisioningSecretStoreError> {
+    #[cfg(test)]
+    let mut buffer = SecretInputBuffer::new(observer);
+    #[cfg(not(test))]
+    let mut buffer = SecretInputBuffer::new();
     input
         .by_ref()
         .take((MAX_UNPROTECTED_PROVISIONING_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
+        .read_to_end(&mut buffer.bytes)
         .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
-    if bytes.len() > MAX_UNPROTECTED_PROVISIONING_BYTES {
+    if buffer.bytes.len() > MAX_UNPROTECTED_PROVISIONING_BYTES {
         return Err(ProvisioningSecretStoreError::TooLarge);
     }
-    UnprotectedProvisioning::new(bytes).map_err(|error| match error {
+    UnprotectedProvisioning::new(buffer.take()).map_err(|error| match error {
         ProvisioningProtectionError::TooLarge => ProvisioningSecretStoreError::TooLarge,
         ProvisioningProtectionError::Unavailable => ProvisioningSecretStoreError::Unavailable,
         ProvisioningProtectionError::Rejected => ProvisioningSecretStoreError::Rejected,
         _ => ProvisioningSecretStoreError::Rejected,
     })
+}
+
+#[cfg(target_os = "linux")]
+struct SecretInputBuffer {
+    bytes: Vec<u8>,
+    #[cfg(test)]
+    observer: Option<Arc<SecretDropObserver>>,
+}
+
+#[cfg(target_os = "linux")]
+impl SecretInputBuffer {
+    fn new(#[cfg(test)] observer: Option<Arc<SecretDropObserver>>) -> Self {
+        Self {
+            bytes: Vec::with_capacity(MAX_UNPROTECTED_PROVISIONING_BYTES + 1),
+            #[cfg(test)]
+            observer,
+        }
+    }
+
+    fn take(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SecretInputBuffer {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        let contained_plaintext = !self.bytes.is_empty();
+        self.bytes.as_mut_slice().zeroize();
+        #[cfg(test)]
+        if let Some(observer) = &self.observer {
+            observer.zeroized.store(
+                contained_plaintext && self.bytes.iter().all(|byte| *byte == 0),
+                Ordering::SeqCst,
+            );
+            observer.allocation_stable.store(
+                self.bytes.capacity() == MAX_UNPROTECTED_PROVISIONING_BYTES + 1,
+                Ordering::SeqCst,
+            );
+        }
+        self.bytes.clear();
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -142,12 +226,15 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::FAILURE
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{Invocation, read_secret};
+    use super::{Invocation, SecretDropObserver, read_secret, read_secret_with_observer};
     use aster_mesh::{MAX_UNPROTECTED_PROVISIONING_BYTES, ProvisioningSecretStoreError};
-    use std::io::Cursor;
     use std::os::unix::ffi::OsStringExt as _;
+    use std::{
+        io::{self, Cursor, Read},
+        sync::{Arc, atomic::Ordering},
+    };
 
     fn valid_arguments() -> Vec<String> {
         vec![
@@ -224,5 +311,59 @@ mod tests {
             .err()
             .expect("non-UTF-8 argument must fail");
         assert_eq!(error, ProvisioningSecretStoreError::Rejected);
+    }
+
+    #[test]
+    fn partial_and_oversized_stdin_are_zeroized_on_failure() {
+        // Break caught: returning early from a failed or oversized stdin read
+        // must not drop a plaintext allocation without first overwriting it.
+        let partial_observer = Arc::new(SecretDropObserver::default());
+        assert_eq!(
+            read_secret_with_observer(
+                PartialFailure::new(b"partial-secret"),
+                Arc::clone(&partial_observer),
+            )
+            .expect_err("partial read failure"),
+            ProvisioningSecretStoreError::Unavailable
+        );
+        assert!(partial_observer.zeroized.load(Ordering::SeqCst));
+        assert!(partial_observer.allocation_stable.load(Ordering::SeqCst));
+
+        let oversized_observer = Arc::new(SecretDropObserver::default());
+        assert_eq!(
+            read_secret_with_observer(
+                Cursor::new(vec![0x5a; MAX_UNPROTECTED_PROVISIONING_BYTES + 1]),
+                Arc::clone(&oversized_observer),
+            )
+            .expect_err("oversized read"),
+            ProvisioningSecretStoreError::TooLarge
+        );
+        assert!(oversized_observer.zeroized.load(Ordering::SeqCst));
+        assert!(oversized_observer.allocation_stable.load(Ordering::SeqCst));
+    }
+
+    struct PartialFailure {
+        bytes: &'static [u8],
+        delivered: bool,
+    }
+
+    impl PartialFailure {
+        const fn new(bytes: &'static [u8]) -> Self {
+            Self {
+                bytes,
+                delivered: false,
+            }
+        }
+    }
+
+    impl Read for PartialFailure {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.delivered {
+                return Err(io::Error::other("injected read failure"));
+            }
+            self.delivered = true;
+            output[..self.bytes.len()].copy_from_slice(self.bytes);
+            Ok(self.bytes.len())
+        }
     }
 }

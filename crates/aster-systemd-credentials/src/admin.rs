@@ -8,11 +8,13 @@ use aster_mesh::{
     ProvisioningLoadId, ProvisioningSecretStoreError, UnprotectedProvisioning,
 };
 use encrypt::SystemdCredsEncryptor;
+#[cfg(test)]
+use files::FaultPoint;
 use files::{
-    ACTIVE_DIRECTORY, GenerationManifest, STAGED_DIRECTORY, child_directory_exists,
-    generation_matches, open_namespace_lock, open_secure_root, promote_staged_generation,
-    read_generation_manifest, read_ledger, remove_staged_generation, write_ledger_atomically,
-    write_staged_generation,
+    ACTIVE_DIRECTORY, FaultInjector, GenerationManifest, LedgerWrite, STAGED_DIRECTORY,
+    child_directory_exists, generation_matches, open_namespace_lock, open_secure_root,
+    promote_staged_generation, read_generation_manifest, read_ledger, remove_staged_generation,
+    write_ledger_atomically, write_staged_generation,
 };
 use ledger::{InstallPhase, InstallRecord, Retry, classify_retry, decode_record, encode_record};
 use rustix::fd::OwnedFd;
@@ -20,6 +22,7 @@ use sha2::{Digest as _, Sha256};
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 const PROVISIONING_ROOT: &str = "/etc/aster/provisioning";
 const LEDGER_ROOT: &str = "/var/lib/aster/provisioning-systemd";
@@ -31,6 +34,7 @@ pub struct SystemdCredentialAdmin {
     ledger_root: OwnedFd,
     _namespace_lock: OwnedFd,
     encryptor: SystemdCredsEncryptor,
+    faults: FaultInjector,
 }
 
 impl SystemdCredentialAdmin {
@@ -44,6 +48,7 @@ impl SystemdCredentialAdmin {
             Path::new(LEDGER_ROOT),
             true,
             SystemdCredsEncryptor::new(),
+            FaultInjector::disabled(),
         )
     }
 
@@ -58,6 +63,23 @@ impl SystemdCredentialAdmin {
             ledger_root,
             false,
             SystemdCredsEncryptor::at(PathBuf::from(program)),
+            FaultInjector::disabled(),
+        )
+    }
+
+    #[cfg(test)]
+    fn open_for_test_with_fault(
+        provisioning_root: &Path,
+        ledger_root: &Path,
+        program: &Path,
+        point: FaultPoint,
+    ) -> Result<Self, ProvisioningSecretStoreError> {
+        Self::open_paths(
+            provisioning_root,
+            ledger_root,
+            false,
+            SystemdCredsEncryptor::at(PathBuf::from(program)),
+            FaultInjector::at(point),
         )
     }
 
@@ -66,6 +88,7 @@ impl SystemdCredentialAdmin {
         ledger_path: &Path,
         require_ext4: bool,
         encryptor: SystemdCredsEncryptor,
+        faults: FaultInjector,
     ) -> Result<Self, ProvisioningSecretStoreError> {
         let provisioning_root = open_secure_root(provisioning_path, require_ext4)?;
         let ledger_root = open_secure_root(ledger_path, require_ext4)?;
@@ -75,6 +98,7 @@ impl SystemdCredentialAdmin {
             ledger_root,
             _namespace_lock: namespace_lock,
             encryptor,
+            faults,
         };
         admin.reconcile_namespace()?;
         Ok(admin)
@@ -109,14 +133,14 @@ impl SystemdCredentialAdmin {
         let active = generation_match(&self.provisioning_root, ACTIVE_DIRECTORY, &manifest)?;
         match reconcile_action(Some(record.phase), staged, active)? {
             ReconcileAction::PromoteStage => {
-                promote_staged_generation(&self.provisioning_root)?;
-                complete_record(&self.ledger_root, record)?;
+                promote_staged_generation(&self.provisioning_root, &mut self.faults)?;
+                complete_record(&self.ledger_root, record, &mut self.faults)?;
             }
             ReconcileAction::CompleteActive => {
                 if staged == GenerationMatch::Exact {
                     remove_staged_generation(&self.provisioning_root)?;
                 }
-                complete_record(&self.ledger_root, record)?;
+                complete_record(&self.ledger_root, record, &mut self.faults)?;
             }
             ReconcileAction::Existing => {}
             ReconcileAction::Fresh | ReconcileAction::DiscardOrphanStage => {
@@ -161,10 +185,10 @@ impl SystemdCredentialAdmin {
         }
 
         let generation = 1;
-        let mut reference_id = [0_u8; PROVIDER_REFERENCE_ID_BYTES];
-        getrandom::fill(&mut reference_id)
+        let mut reference_id = Zeroizing::new([0_u8; PROVIDER_REFERENCE_ID_BYTES]);
+        getrandom::fill(&mut *reference_id)
             .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
-        let secret_ref = provisioning_secret_ref(generation, reference_id)?;
+        let secret_ref = provisioning_secret_ref(generation, *reference_id)?;
         let envelope = encode_credential_envelope(&secret_ref, load, &plaintext)?;
         let envelope_commitment = digest(&envelope);
         let ciphertext = self.encryptor.encrypt(envelope)?;
@@ -185,19 +209,34 @@ impl SystemdCredentialAdmin {
             ciphertext_digest,
         };
 
+        let encoded_manifest = Zeroizing::new(files::encode_manifest(&manifest));
+        let encoded_reference = Zeroizing::new(secret_ref.to_bytes());
         write_staged_generation(
             &self.provisioning_root,
             &ciphertext,
-            &secret_ref.to_bytes(),
-            &files::encode_manifest(&manifest),
+            &encoded_reference,
+            &encoded_manifest,
+            &mut self.faults,
         )?;
-        write_ledger_atomically(&self.ledger_root, &encode_record(&intent))?;
-        promote_staged_generation(&self.provisioning_root)?;
+        let encoded_intent = Zeroizing::new(encode_record(&intent));
+        write_ledger_atomically(
+            &self.ledger_root,
+            &encoded_intent,
+            LedgerWrite::Intent,
+            &mut self.faults,
+        )?;
+        promote_staged_generation(&self.provisioning_root, &mut self.faults)?;
         let complete = InstallRecord {
             phase: InstallPhase::Complete,
             ..intent
         };
-        write_ledger_atomically(&self.ledger_root, &encode_record(&complete))?;
+        let encoded_complete = Zeroizing::new(encode_record(&complete));
+        write_ledger_atomically(
+            &self.ledger_root,
+            &encoded_complete,
+            LedgerWrite::Complete,
+            &mut self.faults,
+        )?;
         Ok(ProvisioningInstallReceipt::installed(operation, secret_ref))
     }
 }
@@ -229,12 +268,14 @@ fn generation_match(
 fn complete_record(
     ledger_root: &OwnedFd,
     record: InstallRecord,
+    faults: &mut FaultInjector,
 ) -> Result<(), ProvisioningSecretStoreError> {
     let complete = InstallRecord {
         phase: InstallPhase::Complete,
         ..record
     };
-    write_ledger_atomically(ledger_root, &encode_record(&complete))
+    let encoded = Zeroizing::new(encode_record(&complete));
+    write_ledger_atomically(ledger_root, &encoded, LedgerWrite::Complete, faults)
 }
 
 pub(super) fn digest(bytes: &[u8]) -> [u8; 32] {
@@ -283,11 +324,21 @@ fn reconcile_action(
     }
 }
 
+/// Exercises the durable administration record decoders for hostile-input testing.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_decode_admin_records(encoded: &[u8]) -> (bool, bool) {
+    (
+        ledger::decode_record(encoded).is_ok(),
+        files::decode_manifest(encoded).is_ok(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{GenerationMatch, ReconcileAction, SystemdCredentialAdmin, reconcile_action};
     use crate::admin::{
-        files::decode_manifest,
+        files::{FaultPoint, decode_manifest},
         ledger::{InstallPhase, decode_record, encode_record},
     };
     use aster_mesh::{
@@ -564,6 +615,144 @@ mod tests {
     }
 
     #[test]
+    fn every_install_durability_boundary_recovers_from_the_actual_interruption() {
+        // Break caught: recovery tests assembled from an already successful
+        // install do not prove what the real syscall sequence leaves behind.
+        let cases = [
+            (
+                FaultPoint::StageCiphertextSynced,
+                None,
+                None,
+                true,
+                false,
+                2,
+            ),
+            (FaultPoint::StageReferenceSynced, None, None, true, false, 2),
+            (FaultPoint::StageManifestSynced, None, None, true, false, 2),
+            (FaultPoint::StageDirectorySynced, None, None, true, false, 2),
+            (FaultPoint::StageParentSynced, None, None, true, false, 2),
+            (
+                FaultPoint::IntentFileSynced,
+                None,
+                Some(InstallPhase::Intent),
+                true,
+                false,
+                2,
+            ),
+            (
+                FaultPoint::IntentRenamed,
+                Some(InstallPhase::Intent),
+                None,
+                true,
+                false,
+                1,
+            ),
+            (
+                FaultPoint::IntentParentSynced,
+                Some(InstallPhase::Intent),
+                None,
+                true,
+                false,
+                1,
+            ),
+            (
+                FaultPoint::ActiveRenamed,
+                Some(InstallPhase::Intent),
+                None,
+                false,
+                true,
+                1,
+            ),
+            (
+                FaultPoint::ActiveParentSynced,
+                Some(InstallPhase::Intent),
+                None,
+                false,
+                true,
+                1,
+            ),
+            (
+                FaultPoint::CompleteFileSynced,
+                Some(InstallPhase::Intent),
+                Some(InstallPhase::Complete),
+                false,
+                true,
+                1,
+            ),
+            (
+                FaultPoint::CompleteRenamed,
+                Some(InstallPhase::Complete),
+                None,
+                false,
+                true,
+                1,
+            ),
+            (
+                FaultPoint::CompleteParentSynced,
+                Some(InstallPhase::Complete),
+                None,
+                false,
+                true,
+                1,
+            ),
+        ];
+
+        for (point, committed_phase, pending_phase, has_staged, has_active, expected_encryptions) in
+            cases
+        {
+            let fixture = AdminFixture::new();
+            let mut interrupted = fixture
+                .admin_with_fault(point)
+                .expect("open fault-injected admin");
+            assert_eq!(
+                interrupted
+                    .install(INSTALL, LOAD, fixture.bundle())
+                    .expect_err("injected durability failure"),
+                ProvisioningSecretStoreError::Unavailable,
+                "fault point {point:?}"
+            );
+            drop(interrupted);
+
+            assert_eq!(
+                fixture.optional_ledger_phase("ledger"),
+                committed_phase,
+                "committed ledger phase at {point:?}"
+            );
+            assert_eq!(
+                fixture.optional_ledger_phase("ledger.next"),
+                pending_phase,
+                "pending ledger phase at {point:?}"
+            );
+            assert_eq!(
+                fixture.provisioning.join("staged").exists(),
+                has_staged,
+                "staged generation at {point:?}"
+            );
+            assert_eq!(
+                fixture.provisioning.join("active").exists(),
+                has_active,
+                "active generation at {point:?}"
+            );
+
+            let replay = fixture
+                .admin()
+                .expect("reconcile interrupted install")
+                .install(INSTALL, LOAD, fixture.bundle())
+                .expect("retry interrupted install");
+            let expected_disposition = if committed_phase.is_some() {
+                ProvisioningInstallDisposition::Existing
+            } else {
+                ProvisioningInstallDisposition::Installed
+            };
+            assert_eq!(replay.disposition(), expected_disposition, "{point:?}");
+            assert_eq!(fixture.ledger_phase(), InstallPhase::Complete, "{point:?}");
+            assert!(fixture.provisioning.join("active").is_dir(), "{point:?}");
+            assert!(!fixture.provisioning.join("staged").exists(), "{point:?}");
+            assert_eq!(fixture.encrypt_calls(), expected_encryptions, "{point:?}");
+        }
+    }
+
+    #[test]
     fn unsafe_roots_and_lock_are_rejected_before_encryption() {
         // Break caught: following a root or lock symlink lets another pathname
         // redirect the supposedly fixed provider namespace.
@@ -664,6 +853,18 @@ mod tests {
             SystemdCredentialAdmin::open_for_test(&self.provisioning, &self.ledger, &self.program)
         }
 
+        fn admin_with_fault(
+            &self,
+            point: FaultPoint,
+        ) -> Result<SystemdCredentialAdmin, ProvisioningSecretStoreError> {
+            SystemdCredentialAdmin::open_for_test_with_fault(
+                &self.provisioning,
+                &self.ledger,
+                &self.program,
+                point,
+            )
+        }
+
         fn bundle(&self) -> UnprotectedProvisioning {
             UnprotectedProvisioning::new(
                 include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle")
@@ -695,6 +896,15 @@ mod tests {
             decode_record(&fs::read(self.ledger.join("ledger")).expect("read fixture ledger phase"))
                 .expect("decode fixture ledger phase")
                 .phase
+        }
+
+        fn optional_ledger_phase(&self, name: &str) -> Option<InstallPhase> {
+            let path = self.ledger.join(name);
+            path.exists().then(|| {
+                decode_record(&fs::read(path).expect("read optional fixture ledger"))
+                    .expect("decode optional fixture ledger")
+                    .phase
+            })
         }
     }
 

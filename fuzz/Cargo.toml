@@ -66,6 +66,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "systemd_admin_record_decode"
+path = "fuzz_targets/systemd_admin_record_decode.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 
 [patch.crates-io]
