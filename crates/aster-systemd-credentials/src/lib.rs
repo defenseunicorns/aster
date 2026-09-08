@@ -2,7 +2,8 @@
 
 #![forbid(unsafe_code)]
 
-mod admin;
+#[cfg(target_os = "linux")]
+pub mod admin;
 
 use aster_mesh::{
     MAX_UNPROTECTED_PROVISIONING_BYTES, ProfileProvisioningBundle, ProvisioningLoadId,

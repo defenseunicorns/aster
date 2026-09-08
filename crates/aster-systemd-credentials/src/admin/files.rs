@@ -1,0 +1,478 @@
+use crate::provider_generation;
+use aster_mesh::{ProvisioningLoadId, ProvisioningSecretRef, ProvisioningSecretStoreError};
+use rustix::fd::OwnedFd;
+use std::{
+    fs::File,
+    io::{Read as _, Write as _},
+    path::{Component, Path},
+};
+
+const MANIFEST_MAGIC: &[u8; 8] = b"ASTRSDM1";
+const MANIFEST_VERSION: u16 = 1;
+const MANIFEST_HEADER_BYTES: usize = 8 + 2 + 2 + 8 + 32 + 32 + 4;
+const MAX_MANIFEST_BYTES: usize =
+    MANIFEST_HEADER_BYTES + aster_mesh::MAX_PROVISIONING_SECRET_REF_BYTES;
+const EXT4_SUPER_MAGIC: i64 = 0xef53;
+
+pub(super) const ACTIVE_DIRECTORY: &str = "active";
+pub(super) const STAGED_DIRECTORY: &str = "staged";
+pub(super) const CIPHERTEXT_FILE: &str = "credential.cred";
+pub(super) const REFERENCE_FILE: &str = "reference";
+pub(super) const MANIFEST_FILE: &str = "manifest";
+pub(super) const LEDGER_FILE: &str = "ledger";
+pub(super) const LEDGER_NEXT_FILE: &str = "ledger.next";
+pub(super) const LOCK_FILE: &str = "lock";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct GenerationManifest {
+    pub(super) generation: u64,
+    pub(super) load: ProvisioningLoadId,
+    pub(super) secret_ref: ProvisioningSecretRef,
+    pub(super) ciphertext_digest: [u8; 32],
+}
+
+pub(super) fn encode_manifest(manifest: &GenerationManifest) -> Vec<u8> {
+    let reference = manifest.secret_ref.to_bytes();
+    let reference_len =
+        u32::try_from(reference.len()).expect("bounded provisioning reference fits in u32");
+    let mut encoded = Vec::with_capacity(MANIFEST_HEADER_BYTES + reference.len());
+    encoded.extend_from_slice(MANIFEST_MAGIC);
+    encoded.extend_from_slice(&MANIFEST_VERSION.to_be_bytes());
+    encoded.extend_from_slice(&0_u16.to_be_bytes());
+    encoded.extend_from_slice(&manifest.generation.to_be_bytes());
+    encoded.extend_from_slice(manifest.load.as_bytes());
+    encoded.extend_from_slice(&manifest.ciphertext_digest);
+    encoded.extend_from_slice(&reference_len.to_be_bytes());
+    encoded.extend_from_slice(&reference);
+    encoded
+}
+
+pub(super) fn decode_manifest(
+    encoded: &[u8],
+) -> Result<GenerationManifest, ProvisioningSecretStoreError> {
+    if encoded.len() < MANIFEST_HEADER_BYTES
+        || &encoded[..8] != MANIFEST_MAGIC
+        || read_u16(&encoded[8..10])? != MANIFEST_VERSION
+        || read_u16(&encoded[10..12])? != 0
+    {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    let generation = read_u64(&encoded[12..20])?;
+    if generation == 0 {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    let load = ProvisioningLoadId::new(read_array(&encoded[20..52])?);
+    let ciphertext_digest = read_array(&encoded[52..84])?;
+    let reference_len = usize::try_from(read_u32(&encoded[84..88])?)
+        .map_err(|_| ProvisioningSecretStoreError::Rejected)?;
+    if MANIFEST_HEADER_BYTES.checked_add(reference_len) != Some(encoded.len()) {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    let secret_ref = ProvisioningSecretRef::from_bytes(&encoded[MANIFEST_HEADER_BYTES..])
+        .map_err(|_| ProvisioningSecretStoreError::Rejected)?;
+    if provider_generation(&secret_ref).map_err(|_| ProvisioningSecretStoreError::Rejected)?
+        != generation
+    {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    Ok(GenerationManifest {
+        generation,
+        load,
+        secret_ref,
+        ciphertext_digest,
+    })
+}
+
+fn read_array<const N: usize>(bytes: &[u8]) -> Result<[u8; N], ProvisioningSecretStoreError> {
+    bytes
+        .try_into()
+        .map_err(|_| ProvisioningSecretStoreError::Rejected)
+}
+
+fn read_u16(bytes: &[u8]) -> Result<u16, ProvisioningSecretStoreError> {
+    read_array(bytes).map(u16::from_be_bytes)
+}
+
+fn read_u32(bytes: &[u8]) -> Result<u32, ProvisioningSecretStoreError> {
+    read_array(bytes).map(u32::from_be_bytes)
+}
+
+fn read_u64(bytes: &[u8]) -> Result<u64, ProvisioningSecretStoreError> {
+    read_array(bytes).map(u64::from_be_bytes)
+}
+
+pub(super) fn open_secure_root(
+    path: &Path,
+    require_ext4: bool,
+) -> Result<OwnedFd, ProvisioningSecretStoreError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    let directory = rustix::fs::openat2(
+        rustix::fs::CWD,
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+        rustix::fs::ResolveFlags::NO_SYMLINKS | rustix::fs::ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|error| {
+        if error == rustix::io::Errno::NOENT {
+            ProvisioningSecretStoreError::Unavailable
+        } else {
+            ProvisioningSecretStoreError::Rejected
+        }
+    })?;
+    validate_directory(&directory, require_ext4)?;
+    Ok(directory)
+}
+
+fn validate_directory(
+    directory: &OwnedFd,
+    require_ext4: bool,
+) -> Result<(), ProvisioningSecretStoreError> {
+    let stat =
+        rustix::fs::fstat(directory).map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory
+        || stat.st_uid != rustix::process::geteuid().as_raw()
+        || stat.st_mode & 0o7777 != 0o700
+    {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    if require_ext4 {
+        let filesystem = rustix::fs::fstatfs(directory)
+            .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+        if filesystem.f_type as i64 != EXT4_SUPER_MAGIC {
+            return Err(ProvisioningSecretStoreError::Rejected);
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn open_namespace_lock(
+    ledger_root: &OwnedFd,
+) -> Result<OwnedFd, ProvisioningSecretStoreError> {
+    let lock = rustix::fs::openat(
+        ledger_root,
+        LOCK_FILE,
+        rustix::fs::OFlags::RDWR
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )
+    .map_err(|error| {
+        if error == rustix::io::Errno::LOOP {
+            ProvisioningSecretStoreError::Rejected
+        } else {
+            ProvisioningSecretStoreError::Unavailable
+        }
+    })?;
+    validate_regular(&lock, 0o600)?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    Ok(lock)
+}
+
+fn validate_regular(descriptor: &OwnedFd, mode: u32) -> Result<(), ProvisioningSecretStoreError> {
+    let stat =
+        rustix::fs::fstat(descriptor).map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile
+        || stat.st_uid != rustix::process::geteuid().as_raw()
+        || stat.st_mode & 0o7777 != mode
+        || stat.st_nlink != 1
+    {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    Ok(())
+}
+
+pub(super) fn read_optional_file(
+    directory: &OwnedFd,
+    name: &str,
+    maximum: usize,
+) -> Result<Option<Vec<u8>>, ProvisioningSecretStoreError> {
+    let descriptor = match rustix::fs::openat(
+        directory,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(_) => return Err(ProvisioningSecretStoreError::Unavailable),
+    };
+    validate_regular(&descriptor, 0o600)?;
+    let stat =
+        rustix::fs::fstat(&descriptor).map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    let size = usize::try_from(stat.st_size).map_err(|_| ProvisioningSecretStoreError::TooLarge)?;
+    if size > maximum {
+        return Err(ProvisioningSecretStoreError::TooLarge);
+    }
+    let mut bytes = Vec::with_capacity(size);
+    File::from(descriptor)
+        .take((maximum + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    if bytes.len() > maximum {
+        return Err(ProvisioningSecretStoreError::TooLarge);
+    }
+    Ok(Some(bytes))
+}
+
+pub(super) fn read_ledger(
+    ledger_root: &OwnedFd,
+) -> Result<Option<Vec<u8>>, ProvisioningSecretStoreError> {
+    read_optional_file(
+        ledger_root,
+        LEDGER_FILE,
+        152 + aster_mesh::MAX_PROVISIONING_SECRET_REF_BYTES,
+    )
+}
+
+pub(super) fn write_ledger_atomically(
+    ledger_root: &OwnedFd,
+    bytes: &[u8],
+) -> Result<(), ProvisioningSecretStoreError> {
+    remove_optional_file(ledger_root, LEDGER_NEXT_FILE)?;
+    write_new_file(ledger_root, LEDGER_NEXT_FILE, bytes)?;
+    rustix::fs::renameat(ledger_root, LEDGER_NEXT_FILE, ledger_root, LEDGER_FILE)
+        .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    sync_directory(ledger_root)
+}
+
+pub(super) fn write_staged_generation(
+    provisioning_root: &OwnedFd,
+    ciphertext: &[u8],
+    reference: &[u8],
+    manifest: &[u8],
+) -> Result<(), ProvisioningSecretStoreError> {
+    rustix::fs::mkdirat(provisioning_root, STAGED_DIRECTORY, rustix::fs::Mode::RWXU)
+        .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    let staged = open_child_directory(provisioning_root, STAGED_DIRECTORY)?;
+    write_new_file(&staged, CIPHERTEXT_FILE, ciphertext)?;
+    write_new_file(&staged, REFERENCE_FILE, reference)?;
+    write_new_file(&staged, MANIFEST_FILE, manifest)?;
+    sync_directory(&staged)?;
+    sync_directory(provisioning_root)
+}
+
+pub(super) fn promote_staged_generation(
+    provisioning_root: &OwnedFd,
+) -> Result<(), ProvisioningSecretStoreError> {
+    rustix::fs::renameat(
+        provisioning_root,
+        STAGED_DIRECTORY,
+        provisioning_root,
+        ACTIVE_DIRECTORY,
+    )
+    .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    sync_directory(provisioning_root)
+}
+
+pub(super) fn remove_staged_generation(
+    provisioning_root: &OwnedFd,
+) -> Result<(), ProvisioningSecretStoreError> {
+    let Some(staged) = open_optional_child_directory(provisioning_root, STAGED_DIRECTORY)? else {
+        return Ok(());
+    };
+    for name in [CIPHERTEXT_FILE, REFERENCE_FILE, MANIFEST_FILE] {
+        remove_optional_file(&staged, name)?;
+    }
+    drop(staged);
+    rustix::fs::unlinkat(
+        provisioning_root,
+        STAGED_DIRECTORY,
+        rustix::fs::AtFlags::REMOVEDIR,
+    )
+    .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    sync_directory(provisioning_root)
+}
+
+pub(super) fn read_generation_manifest(
+    provisioning_root: &OwnedFd,
+    name: &str,
+) -> Result<Option<GenerationManifest>, ProvisioningSecretStoreError> {
+    let directory = match open_optional_child_directory(provisioning_root, name)? {
+        Some(directory) => directory,
+        None => return Ok(None),
+    };
+    let manifest = read_optional_file(&directory, MANIFEST_FILE, MAX_MANIFEST_BYTES)?
+        .ok_or(ProvisioningSecretStoreError::Rejected)?;
+    decode_manifest(&manifest).map(Some)
+}
+
+pub(super) fn child_directory_exists(
+    provisioning_root: &OwnedFd,
+    name: &str,
+) -> Result<bool, ProvisioningSecretStoreError> {
+    open_optional_child_directory(provisioning_root, name).map(|directory| directory.is_some())
+}
+
+pub(super) fn generation_matches(
+    provisioning_root: &OwnedFd,
+    name: &str,
+    expected: &GenerationManifest,
+) -> Result<bool, ProvisioningSecretStoreError> {
+    let Some(directory) = open_optional_child_directory(provisioning_root, name)? else {
+        return Ok(false);
+    };
+    let manifest = read_optional_file(&directory, MANIFEST_FILE, MAX_MANIFEST_BYTES)?
+        .ok_or(ProvisioningSecretStoreError::Rejected)?;
+    if decode_manifest(&manifest)? != *expected {
+        return Ok(false);
+    }
+    let reference = read_optional_file(
+        &directory,
+        REFERENCE_FILE,
+        aster_mesh::MAX_PROVISIONING_SECRET_REF_BYTES,
+    )?
+    .ok_or(ProvisioningSecretStoreError::Rejected)?;
+    if reference != expected.secret_ref.to_bytes() {
+        return Ok(false);
+    }
+    let ciphertext = read_optional_file(
+        &directory,
+        CIPHERTEXT_FILE,
+        aster_mesh::MAX_PROTECTED_PROVISIONING_BYTES,
+    )?
+    .ok_or(ProvisioningSecretStoreError::Rejected)?;
+    Ok(crate::admin::digest(&ciphertext) == expected.ciphertext_digest)
+}
+
+fn open_child_directory(
+    parent: &OwnedFd,
+    name: &str,
+) -> Result<OwnedFd, ProvisioningSecretStoreError> {
+    let directory = rustix::fs::openat(
+        parent,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    validate_directory(&directory, false)?;
+    Ok(directory)
+}
+
+fn open_optional_child_directory(
+    parent: &OwnedFd,
+    name: &str,
+) -> Result<Option<OwnedFd>, ProvisioningSecretStoreError> {
+    match rustix::fs::openat(
+        parent,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(directory) => {
+            validate_directory(&directory, false)?;
+            Ok(Some(directory))
+        }
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(_) => Err(ProvisioningSecretStoreError::Unavailable),
+    }
+}
+
+fn write_new_file(
+    directory: &OwnedFd,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), ProvisioningSecretStoreError> {
+    let descriptor = rustix::fs::openat(
+        directory,
+        name,
+        rustix::fs::OFlags::WRONLY
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::EXCL
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )
+    .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    validate_regular(&descriptor, 0o600)?;
+    let mut file = File::from(descriptor);
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|_| ProvisioningSecretStoreError::Unavailable)
+}
+
+fn remove_optional_file(
+    directory: &OwnedFd,
+    name: &str,
+) -> Result<(), ProvisioningSecretStoreError> {
+    match rustix::fs::unlinkat(directory, name, rustix::fs::AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+        Err(_) => Err(ProvisioningSecretStoreError::Unavailable),
+    }
+}
+
+fn sync_directory(directory: &OwnedFd) -> Result<(), ProvisioningSecretStoreError> {
+    rustix::fs::fsync(directory).map_err(|_| ProvisioningSecretStoreError::Unavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GenerationManifest, decode_manifest, encode_manifest};
+    use crate::{PROVIDER_REFERENCE_ID_BYTES, provisioning_secret_ref};
+    use aster_mesh::{ProvisioningLoadId, ProvisioningSecretStoreError};
+
+    fn fixture_manifest() -> GenerationManifest {
+        GenerationManifest {
+            generation: 1,
+            load: ProvisioningLoadId::new([0x22; 32]),
+            secret_ref: provisioning_secret_ref(1, [0x33; PROVIDER_REFERENCE_ID_BYTES])
+                .expect("fixture reference"),
+            ciphertext_digest: [0x55; 32],
+        }
+    }
+
+    #[test]
+    fn manifest_round_trip_preserves_runtime_generation_binding() {
+        // Break caught: losing the load, reference, generation, or ciphertext
+        // digest would let reconciliation activate an unrelated stage.
+        let manifest = fixture_manifest();
+        let encoded = encode_manifest(&manifest);
+        assert_eq!(&encoded[..8], b"ASTRSDM1");
+        assert_eq!(
+            decode_manifest(&encoded).expect("canonical manifest"),
+            manifest
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_extensions_and_cross_generation_reference() {
+        // Break caught: accepting trailing state or a reference from another
+        // generation makes an apparently exact stage ambiguous.
+        let manifest = fixture_manifest();
+        let mut trailing = encode_manifest(&manifest);
+        trailing.push(0);
+        assert_eq!(
+            decode_manifest(&trailing).expect_err("trailing manifest byte"),
+            ProvisioningSecretStoreError::Rejected
+        );
+
+        let mut mismatched = manifest;
+        mismatched.secret_ref = provisioning_secret_ref(2, [0x33; PROVIDER_REFERENCE_ID_BYTES])
+            .expect("second generation reference");
+        assert_eq!(
+            decode_manifest(&encode_manifest(&mismatched)).expect_err("cross-generation manifest"),
+            ProvisioningSecretStoreError::Rejected
+        );
+    }
+}

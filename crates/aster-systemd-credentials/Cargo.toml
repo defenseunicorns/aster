@@ -12,7 +12,9 @@ fuzzing = []
 
 [dependencies]
 aster-core = { version = "=0.1.0", path = "../aster-core", default-features = false, features = ["reference-session"] }
+getrandom.workspace = true
 rustix.workspace = true
+sha2.workspace = true
 zeroize.workspace = true
 
 [lints]

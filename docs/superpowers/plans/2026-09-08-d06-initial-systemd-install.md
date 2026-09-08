@@ -35,7 +35,7 @@
 - Consumes: `ProvisioningInstallId`, `ProvisioningLoadId`, `ProvisioningSecretRef`, and `provisioning_secret_ref(generation, reference_id)`.
 - Produces: private `InstallRecord`, `InstallPhase::{Intent, Complete}`, `encode_record`, `decode_record`, and `classify_retry` used by the filesystem transaction.
 
-- [ ] **Step 1: Write failing canonical-ledger and retry tests**
+- [x] **Step 1: Write failing canonical-ledger and retry tests**
 
 ```rust
 #[test]
@@ -52,13 +52,13 @@ fn exact_retry_is_existing_and_changed_input_conflicts() {
 }
 ```
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run: `CARGO_TARGET_DIR=/home/andrii/code/aster/target/d06-systemd-credentials CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo test -p aster-systemd-credentials admin::ledger::tests --lib`
 
 Expected: compilation fails because the ledger module and types do not exist.
 
-- [ ] **Step 3: Implement the bounded canonical record**
+- [x] **Step 3: Implement the bounded canonical record**
 
 ```rust
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,13 +78,13 @@ struct InstallRecord {
 
 Encode and decode a fixed-magic, version-1, length-delimited record. Reject zero generation, unknown phase/version, reserved bytes, noncanonical references, trailing bytes, and records whose reference generation differs from `generation`. `classify_retry` returns `Existing` only for the exact install/load/commitment tuple and `OperationConflict` otherwise.
 
-- [ ] **Step 4: Run focused tests and verify GREEN**
+- [x] **Step 4: Run focused tests and verify GREEN**
 
 Run: `CARGO_TARGET_DIR=/home/andrii/code/aster/target/d06-systemd-credentials CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo test -p aster-systemd-credentials admin::ledger::tests --lib`
 
 Expected: all ledger tests pass.
 
-- [ ] **Step 5: Commit the ledger model**
+- [x] **Step 5: Commit the ledger model**
 
 ```bash
 git add crates/aster-systemd-credentials/Cargo.toml crates/aster-systemd-credentials/src/lib.rs crates/aster-systemd-credentials/src/admin.rs crates/aster-systemd-credentials/src/admin/ledger.rs
@@ -102,7 +102,7 @@ git commit -m "feat(credentials): define durable install ledger"
 - Consumes: Task 1 ledger codec and the existing `encode_credential_envelope`.
 - Produces: `SystemdCredentialAdmin::open()`, `SystemdCredentialAdmin::install(operation, load, plaintext)`, and an internal bounded `CredentialEncryptor` seam.
 
-- [ ] **Step 1: Write failing install/reopen/fault tests**
+- [x] **Step 1: Write failing install/reopen/fault tests**
 
 ```rust
 #[test]
@@ -142,13 +142,13 @@ active generation is completed without a second encryption. An intent whose
 stage and active generation both mismatch is rejected and retained for manual
 inspection; it is never silently discarded or overwritten.
 
-- [ ] **Step 2: Run the focused install tests and verify RED**
+- [x] **Step 2: Run the focused install tests and verify RED**
 
 Run: `CARGO_TARGET_DIR=/home/andrii/code/aster/target/d06-systemd-credentials CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo test -p aster-systemd-credentials admin::tests --lib`
 
 Expected: compilation fails because `SystemdCredentialAdmin` and transaction types do not exist.
 
-- [ ] **Step 3: Implement minimal staged transaction and recovery**
+- [x] **Step 3: Implement minimal staged transaction and recovery**
 
 ```rust
 pub struct SystemdCredentialAdmin {
@@ -195,7 +195,7 @@ Command::new("/usr/bin/systemd-creds")
 
 Pipe the zeroizing envelope to stdin, capture at most `MAX_PROTECTED_PROVISIONING_BYTES + 1` bytes from stdout, discard stderr, and map all child/process failures to fixed store categories.
 
-- [ ] **Step 4: Run focused install tests and verify GREEN**
+- [x] **Step 4: Run focused install tests and verify GREEN**
 
 Run: `CARGO_TARGET_DIR=/home/andrii/code/aster/target/d06-systemd-credentials CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo test -p aster-systemd-credentials admin::tests --lib`
 
