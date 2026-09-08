@@ -40,6 +40,7 @@ pub(super) enum FaultPoint {
     IntentFileSynced,
     IntentRenamed,
     IntentParentSynced,
+    IntentParentReplayed,
     ActiveRenamed,
     ActiveParentSynced,
     ActiveExchanged,

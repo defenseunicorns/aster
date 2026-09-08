@@ -182,6 +182,7 @@ impl SystemdCredentialAdmin {
                 }
                 if publish_pending_intent {
                     lifecycle::publish_pending_lifecycle_intent(
+                        &self.provisioning_root,
                         &self.ledger_root,
                         &selected,
                         &mut self.faults,
@@ -203,7 +204,12 @@ impl SystemdCredentialAdmin {
             .as_ref()
             .is_some_and(|intent| intent.kind != LifecycleIntentKind::Install)
         {
-            let completed = lifecycle::completed_from_intent(&ledger)?;
+            let completed = lifecycle::validate_lifecycle_phase(&self.provisioning_root, &ledger)?;
+            lifecycle::sync_intent_parent_before_mutation(
+                &self.ledger_root,
+                &ledger,
+                &mut self.faults,
+            )?;
             return lifecycle::reconcile_lifecycle(
                 &self.provisioning_root,
                 &self.ledger_root,
@@ -212,6 +218,11 @@ impl SystemdCredentialAdmin {
                 &mut self.faults,
             );
         }
+        lifecycle::sync_intent_parent_before_mutation(
+            &self.ledger_root,
+            &ledger,
+            &mut self.faults,
+        )?;
         let phase = if ledger.intent.is_some() {
             LedgerPhase::Intent
         } else {

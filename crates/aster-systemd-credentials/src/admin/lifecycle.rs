@@ -71,10 +71,12 @@ pub(super) fn commit_lifecycle_intent(
 }
 
 pub(super) fn publish_pending_lifecycle_intent(
+    provisioning_root: &OwnedFd,
     ledger_root: &OwnedFd,
     ledger: &ProviderLedger,
     faults: &mut FaultInjector,
 ) -> Result<(), ProvisioningSecretStoreError> {
+    let _ = validate_lifecycle_phase(provisioning_root, ledger)?;
     let intent = ledger
         .intent
         .as_ref()
@@ -85,6 +87,42 @@ pub(super) fn publish_pending_lifecycle_intent(
         return Err(ProvisioningSecretStoreError::Rejected);
     }
     publish_pending_ledger(ledger_root, &encoded, faults)
+}
+
+/// Validates that an intent's semantic completion and current filesystem phase
+/// are exact without changing either namespace.
+pub(super) fn validate_lifecycle_phase(
+    provisioning_root: &OwnedFd,
+    ledger: &ProviderLedger,
+) -> Result<ProviderLedger, ProvisioningSecretStoreError> {
+    let intent = ledger
+        .intent
+        .as_ref()
+        .ok_or(ProvisioningSecretStoreError::Rejected)?;
+    if intent.kind == LifecycleIntentKind::Install {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    let completed = completed_from_intent(ledger)?;
+    let target = target_manifest(&completed, intent)?;
+    let source = source_manifest(ledger, intent)?;
+    let slots =
+        inspect_generation_slots(provisioning_root, ledger, intent, &target, source.as_ref())?;
+    let _ = lifecycle_step(intent.kind, slots)?;
+    Ok(completed)
+}
+
+/// Replays the ledger-root durability prerequisite before any provisioning
+/// namespace mutation resumes from a persisted intent.
+pub(super) fn sync_intent_parent_before_mutation(
+    ledger_root: &OwnedFd,
+    ledger: &ProviderLedger,
+    faults: &mut FaultInjector,
+) -> Result<(), ProvisioningSecretStoreError> {
+    if ledger.intent.is_none() {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    sync_directory(ledger_root)?;
+    faults.hit(FaultPoint::IntentParentReplayed)
 }
 
 pub(super) fn reconcile_lifecycle(
@@ -2172,6 +2210,75 @@ mod tests {
     }
 
     #[test]
+    fn invalid_pending_recover_semantics_preserve_both_ledger_files() {
+        // Break caught: promoting a canonical pending Recover intent before
+        // checking its exact persisted BackupBinding destroys the durable
+        // predecessor/pending evidence even though completion is impossible.
+        let fixture = AdminLifecycleFixture::new();
+        let target = generation_record(2, 0x41, GenerationState::Active, b"exact");
+        let (mut intent_ledger, mut completed) = recovery_ledgers(&target);
+        bind_fixture_host(&mut intent_ledger, &mut completed, fixture.host_identity);
+        intent_ledger
+            .intent
+            .as_mut()
+            .expect("Recover intent")
+            .backup_operation = Some([0x99; 32]);
+        let mut predecessor = intent_ledger.clone();
+        predecessor.intent = None;
+        fixture.write_generation(ACTIVE_DIRECTORY, &target, b"corrupt");
+        fixture.write_generation(STAGED_DIRECTORY, &target, b"exact");
+        fixture.write_ledger(predecessor);
+        fixture.write_pending_ledger(&intent_ledger);
+        let before = fixture.namespace_bytes();
+
+        assert_eq!(
+            fixture
+                .admin()
+                .expect_err("pending Recover with unbound backup operation"),
+            ProvisioningSecretStoreError::Rejected,
+        );
+        assert_eq!(fixture.namespace_bytes(), before);
+    }
+
+    #[test]
+    fn invalid_pending_filesystem_phases_preserve_both_ledger_files() {
+        // Break caught: a pending intent must not become current until every
+        // on-disk slot is an exact allowed lifecycle phase; partial,
+        // mismatched, and unbound stages retain both ledger snapshots.
+        for scenario in ["mismatched", "partial", "unbound"] {
+            let fixture = AdminLifecycleFixture::new();
+            let source = generation_record(1, 0x31, GenerationState::Active, b"old");
+            let target = generation_record(2, 0x41, GenerationState::Active, b"new");
+            let (mut intent_ledger, mut completed) = rotate_ledgers(&source, &target);
+            bind_fixture_host(&mut intent_ledger, &mut completed, fixture.host_identity);
+            fixture.write_generation(ACTIVE_DIRECTORY, &source, b"old");
+            match scenario {
+                "mismatched" => fixture.write_generation(STAGED_DIRECTORY, &target, b"corrupt"),
+                "partial" => fixture.write_partial_stage(),
+                "unbound" => {
+                    let wrong = generation_record(3, 0x51, GenerationState::Active, b"wrong");
+                    fixture.write_generation(STAGED_DIRECTORY, &wrong, b"wrong");
+                }
+                _ => unreachable!(),
+            }
+            let mut predecessor = intent_ledger.clone();
+            predecessor.intent = None;
+            fixture.write_ledger(predecessor);
+            fixture.write_pending_ledger(&intent_ledger);
+            let before = fixture.namespace_bytes();
+
+            assert_eq!(
+                fixture
+                    .admin()
+                    .expect_err("invalid pending filesystem phase"),
+                ProvisioningSecretStoreError::Rejected,
+                "scenario {scenario}",
+            );
+            assert_eq!(fixture.namespace_bytes(), before, "scenario {scenario}");
+        }
+    }
+
+    #[test]
     fn pending_intent_is_published_before_mutation_and_survives_two_interruptions() {
         // Break caught: reconciling directly from ledger.next can switch the
         // provisioning namespace and then leave only the predecessor ledger
@@ -2269,6 +2376,50 @@ mod tests {
             );
             assert_eq!(read_fixture_ledger(&fixture), completed);
         }
+    }
+
+    #[test]
+    fn current_intent_replays_ledger_parent_sync_before_provisioning_mutation() {
+        // Break caught: after IntentRenamed, a crash can leave the exact intent
+        // current without a durable ledger-parent rename; the next admin must
+        // replay that fsync before touching Active or staged.
+        let fixture = AdminLifecycleFixture::new();
+        let source = generation_record(1, 0x31, GenerationState::Active, b"old");
+        let target = generation_record(2, 0x41, GenerationState::Active, b"new");
+        let (mut intent_ledger, mut completed) = rotate_ledgers(&source, &target);
+        bind_fixture_host(&mut intent_ledger, &mut completed, fixture.host_identity);
+        fixture.write_generation(ACTIVE_DIRECTORY, &source, b"old");
+        fixture.write_generation(STAGED_DIRECTORY, &target, b"new");
+        let mut predecessor = intent_ledger.clone();
+        predecessor.intent = None;
+        fixture.write_ledger(predecessor);
+        fixture.write_pending_ledger(&intent_ledger);
+        let before_provisioning = provisioning_bytes(&fixture.provisioning);
+
+        assert_eq!(
+            fixture
+                .admin_with_fault(FaultPoint::IntentRenamed)
+                .expect_err("interrupt after intent rename"),
+            ProvisioningSecretStoreError::Unavailable,
+        );
+        assert_eq!(read_fixture_ledger(&fixture), intent_ledger);
+        assert!(!fixture.ledger.join("ledger.next").exists());
+        assert_eq!(
+            provisioning_bytes(&fixture.provisioning),
+            before_provisioning,
+        );
+        let after_rename = fixture.namespace_bytes();
+
+        assert_eq!(
+            fixture
+                .admin_with_fault(FaultPoint::IntentParentReplayed)
+                .expect_err("interrupt after replayed ledger-parent sync"),
+            ProvisioningSecretStoreError::Unavailable,
+        );
+        assert_eq!(fixture.namespace_bytes(), after_rename);
+
+        drop(fixture.admin().expect("later fresh admin converges"));
+        assert_eq!(read_fixture_ledger(&fixture), completed);
     }
 
     #[test]
@@ -2729,6 +2880,17 @@ mod tests {
                 .expect("protect lifecycle fixture ledger");
         }
 
+        fn write_pending_ledger(&self, ledger: &ProviderLedger) {
+            let path = self.ledger.join("ledger.next");
+            fs::write(
+                &path,
+                encode_ledger(ledger).expect("encode pending lifecycle fixture ledger"),
+            )
+            .expect("write pending lifecycle fixture ledger");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .expect("protect pending lifecycle fixture ledger");
+        }
+
         fn write_generation(&self, slot: &str, record: &GenerationRecord, ciphertext: &[u8]) {
             let directory = self.provisioning.join(slot);
             fs::create_dir(&directory).expect("create generation slot");
@@ -2751,6 +2913,17 @@ mod tests {
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
                     .expect("protect generation file");
             }
+        }
+
+        fn write_partial_stage(&self) {
+            let staged = self.provisioning.join(STAGED_DIRECTORY);
+            fs::create_dir(&staged).expect("create partial lifecycle stage");
+            fs::set_permissions(&staged, fs::Permissions::from_mode(0o700))
+                .expect("protect partial lifecycle stage");
+            let ciphertext = staged.join("credential.cred");
+            fs::write(&ciphertext, b"partial").expect("write partial lifecycle ciphertext");
+            fs::set_permissions(ciphertext, fs::Permissions::from_mode(0o600))
+                .expect("protect partial lifecycle ciphertext");
         }
 
         fn write_tombstone_slot(&self, slot: &str, record: &GenerationRecord) {
