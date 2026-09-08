@@ -1,9 +1,11 @@
 # Aster systemd credential provider
 
-This first-party crate is the Ubuntu-specific runtime half of provider
-contract `aster-systemd-credential-store/v1`. It is statically composed into
-the single `aster-agent` customer executable; it is not a service, plugin, or
-runtime-selectable backend.
+This first-party crate implements the Ubuntu-specific runtime loader and the
+root administration lane for provider contract
+`aster-systemd-credential-store/v1`. The loader is statically composed into
+the single `aster-agent` customer executable; the administration binary is a
+separate stopped-host tool, not a service, plugin, or runtime-selectable
+backend.
 
 The loader consumes exactly one systemd service credential named
 `aster-provisioning.bundle`. PID 1 supplies the absolute credential directory
@@ -35,17 +37,40 @@ envelope, parser detail, or plaintext.
 
 ## Current implementation boundary
 
-This increment supplies only the runtime codec and loader. It does not yet
-supply `aster-credential-admin`, the persistent operation ledger, encrypted
-install or rotation, same-host backup/recovery, logical destruction,
-crash-reconciliation, a hardened systemd unit, Ubuntu packages, or physical
-device evidence. There is no age, plaintext-file, TPM2, or alternate-provider
-fallback.
+The administration lane now supplies the initial-install subset of
+`aster-credential-admin`. The package-owned directories
+`/etc/aster/provisioning` and `/var/lib/aster/provisioning-systemd` must already
+exist as root-owned mode-`0700` directories on local `ext4`. The command:
+
+```text
+aster-credential-admin install \
+  --operation <64-lowercase-hex> \
+  --load-operation <64-lowercase-hex> < provisioning.bundle
+```
+
+accepts the canonical bundle only on standard input, invokes exactly
+`/usr/bin/systemd-creds encrypt --with-key=host
+--name=aster-provisioning.bundle - -`, and installs generation one through a
+synchronized staging directory and a versioned intent/completion ledger. An
+exact retry returns `existing` without invoking the provider again. A changed
+load operation or plaintext commitment conflicts. On restart, an exact staged
+intent is promoted and an exact active intent is completed; mismatched state
+is retained and rejected. The command prints only the sanitized `installed` or
+`existing` disposition. The opaque reference is retained in the owner-only
+active generation for the agent configuration lane.
+
+This increment does not yet supply mission/reference rotation, same-host
+backup/recovery, logical destruction, revoke/rekey orchestration, a hardened
+systemd unit, Ubuntu packages, frozen `systemd-creds` executable identity, or
+qualifying physical-device evidence. There is no age, plaintext-file, TPM2, or
+alternate-provider fallback.
 
 The selected profile is Ubuntu 24.04 with the systemd 255.4 credential
 interface and explicit host-key protection in the later administration lane.
 Debian or generic Debian-family support requires reopening and versioning the
-D06 design; this crate makes no such compatibility claim.
+D06 design; this crate makes no such compatibility claim. Runs on CM4/Debian
+13 development nodes may be used only as explicitly non-qualifying
+compatibility checks.
 
 Run the focused provider checks with:
 
@@ -56,4 +81,3 @@ CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=1 cargo test -p aster-systemd-credentials
 The exact design is
 `docs/superpowers/specs/2026-09-07-systemd-credential-provider-design.md` on
 the `feature/p0-1-linux-event-mvp-profile` branch.
-

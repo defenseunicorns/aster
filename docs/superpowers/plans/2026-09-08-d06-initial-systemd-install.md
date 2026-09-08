@@ -201,7 +201,7 @@ Run: `CARGO_TARGET_DIR=/home/andrii/code/aster/target/d06-systemd-credentials CA
 
 Expected: all transaction, retry, safety, and fault tests pass.
 
-- [ ] **Step 5: Commit the initial install transaction**
+- [x] **Step 5: Commit the initial install transaction**
 
 ```bash
 git add crates/aster-systemd-credentials/src/admin.rs crates/aster-systemd-credentials/src/admin/files.rs crates/aster-systemd-credentials/src/admin/encrypt.rs
@@ -219,7 +219,7 @@ git commit -m "feat(credentials): install systemd credential atomically"
 - Consumes: `SystemdCredentialAdmin::open` and `install`.
 - Produces: `aster-credential-admin install --operation <64 lowercase hex> --load-operation <64 lowercase hex>`, reading the bundle only from stdin.
 
-- [ ] **Step 1: Write failing parser/output tests**
+- [x] **Step 1: Write failing parser/output tests**
 
 ```rust
 #[test]
@@ -234,13 +234,13 @@ fn parser_rejects_secret_paths_and_unknown_arguments() {
 }
 ```
 
-- [ ] **Step 2: Run the binary tests and verify RED**
+- [x] **Step 2: Run the binary tests and verify RED**
 
 Run: `CARGO_TARGET_DIR=/home/andrii/code/aster/target/d06-systemd-credentials CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 cargo test -p aster-systemd-credentials --bin aster-credential-admin`
 
 Expected: the binary target or parser does not exist.
 
-- [ ] **Step 3: Implement the minimal root-only command**
+- [x] **Step 3: Implement the minimal root-only command**
 
 ```rust
 fn main() -> ExitCode {
@@ -253,7 +253,7 @@ fn main() -> ExitCode {
 
 Reject non-root execution before reading stdin, accept no environment configuration or input pathname, read at most `MAX_UNPROTECTED_PROVISIONING_BYTES + 1`, and print only `installed` or `existing`. Keep opaque reference material out of this first command's stdout until its supported owner-only handoff format is implemented.
 
-- [ ] **Step 4: Run focused crate and CLI verification**
+- [x] **Step 4: Run focused crate and CLI verification**
 
 Run:
 
@@ -269,7 +269,15 @@ Expected: all focused tests pass, Clippy reports no warnings, and formatting is 
 
 Build the aarch64 artifact through the reproducible-artifact lane, install only a non-production fixture on one CM4/Debian 13 development node, and record the run explicitly as `development-compatibility-only`. Confirm `systemd-creds` accepts the exact fixed command, the encrypted file contains no plaintext canary, the runtime credential appears only during service activation, and an exact retry performs no second encryption. Do not attach this result to G4 or claim Ubuntu/Debian qualification.
 
-- [ ] **Step 6: Commit the command and documentation**
+Compatibility preflight on 2026-09-08 initialized the previously absent systemd
+host key on `rpi4-1`, `rpi4-2`, and `rpi4-3`, then passed the exact
+`--with-key=host`/fixed-name in-memory encrypt/decrypt round trip on systemd
+257.13. Systemd reported that the host key is not on encrypted media. This is
+environment feedback only: no Aster artifact was installed, and this step
+remains incomplete until the reproducible aarch64 artifact runs the complete
+command/runtime/retry checks.
+
+- [x] **Step 6: Commit the command and documentation**
 
 ```bash
 git add crates/aster-systemd-credentials/Cargo.toml crates/aster-systemd-credentials/src/bin/aster-credential-admin.rs crates/aster-systemd-credentials/README.md
