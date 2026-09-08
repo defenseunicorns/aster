@@ -276,6 +276,7 @@ fn prepare_fixture(arguments: &[String]) -> Result<(), ()> {
         "mesh": {
             "bind": "127.0.0.1:0",
             "sync_interval_ms": 500,
+            "emission_policy": "normal",
             "peers": [peer]
         },
         "credentials": {

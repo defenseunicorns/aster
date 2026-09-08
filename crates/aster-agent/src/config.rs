@@ -11,7 +11,10 @@ use std::{
 
 use aster_iroh::{PinnedRelay, RelayUrl};
 use aster_mesh::ProvisioningLoadId;
-use aster_node::{MissionExpectedPeer, NodeConfigOptions, SelectedForwardingConfig, StoreLimits};
+use aster_node::{
+    EventEmissionPolicy, MissionExpectedPeer, NodeConfigOptions, SelectedForwardingConfig,
+    StoreLimits,
+};
 use aster_redb_store::{
     CUSTODY_EMERGENCY_BYTE_RESERVE, CUSTODY_EMERGENCY_ITEM_RESERVE, CustodyQuota,
     MAX_CONTROL_BYTES, MAX_CONTROL_ITEMS,
@@ -40,6 +43,7 @@ pub enum ConfigReason {
     CredentialBoundary,
     FileAccess,
     InvalidMissionLoadId,
+    InvalidEmissionPolicy,
     InvalidPeer,
     InvalidRelay,
     InvalidStorage,
@@ -65,6 +69,7 @@ impl ConfigReason {
             Self::CredentialBoundary => "credential file boundary is invalid",
             Self::FileAccess => "configuration file cannot be read",
             Self::InvalidMissionLoadId => "configuration mission load id is invalid",
+            Self::InvalidEmissionPolicy => "configuration emission policy is invalid",
             Self::InvalidPeer => "configuration peer is invalid",
             Self::InvalidRelay => "configuration relay is invalid",
             Self::InvalidStorage => "configuration storage limits are invalid",
@@ -205,6 +210,10 @@ impl ValidatedAgentConfig {
         self.forwarding.clone()
     }
 
+    pub const fn emission_policy(&self) -> EventEmissionPolicy {
+        self.forwarding.emission_policy()
+    }
+
     pub fn credential_paths(&self) -> &CredentialPaths {
         &self.credentials
     }
@@ -257,9 +266,38 @@ struct RawListener {
 struct RawMesh {
     bind: SocketAddr,
     sync_interval_ms: u64,
+    emission_policy: RawEmissionPolicy,
     peers: Vec<String>,
     #[serde(default)]
     relay: Option<RawRelay>,
+}
+
+#[derive(Clone, Copy)]
+enum RawEmissionPolicy {
+    Normal,
+    ReceiveOnly,
+}
+
+impl<'de> Deserialize<'de> for RawEmissionPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "normal" => Ok(Self::Normal),
+            "receive_only" => Ok(Self::ReceiveOnly),
+            _ => Err(serde::de::Error::custom("invalid emission policy")),
+        }
+    }
+}
+
+impl From<RawEmissionPolicy> for EventEmissionPolicy {
+    fn from(policy: RawEmissionPolicy) -> Self {
+        match policy {
+            RawEmissionPolicy::Normal => Self::Normal,
+            RawEmissionPolicy::ReceiveOnly => Self::ReceiveOnly,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -333,7 +371,9 @@ pub fn check_config(path: &Path) -> Result<(), ConfigError> {
 
 fn classify_json_error(error: serde_json::Error) -> ConfigError {
     let message = error.to_string();
-    let reason = if message.starts_with("unknown field") {
+    let reason = if message.starts_with("invalid emission policy") {
+        ConfigReason::InvalidEmissionPolicy
+    } else if message.starts_with("unknown field") {
         ConfigReason::UnknownField
     } else if message.starts_with("duplicate field") {
         ConfigReason::DuplicateField
@@ -355,7 +395,8 @@ fn validate(raw: RawAgentConfig) -> Result<ValidatedAgentConfig, ConfigError> {
     validate_listeners(raw.application.listen, raw.health.listen)?;
     let sync_interval = validate_sync_interval(raw.mesh.sync_interval_ms)?;
     let peers = validate_peers(raw.mesh.peers)?;
-    let forwarding = validate_forwarding(raw.storage, raw.mesh.relay)?;
+    let forwarding =
+        validate_forwarding(raw.storage, raw.mesh.emission_policy.into(), raw.mesh.relay)?;
     let credentials = CredentialPaths {
         client_token_file: raw.credentials.client_token_file,
         mission_secret_ref_file: raw.credentials.mission_secret_ref_file,
@@ -463,6 +504,7 @@ fn validate_peers(raw_peers: Vec<String>) -> Result<Vec<MissionExpectedPeer>, Co
 
 fn validate_forwarding(
     raw_storage: RawStorage,
+    emission_policy: EventEmissionPolicy,
     raw_relay: Option<RawRelay>,
 ) -> Result<SelectedForwardingConfig, ConfigError> {
     let limits = StoreLimits::new(raw_storage.max_items, raw_storage.max_payload_bytes)
@@ -476,7 +518,9 @@ fn validate_forwarding(
     }
     CustodyQuota::for_store_limits(limits)
         .map_err(|_| ConfigError::new(ConfigReason::StorageTooSmall))?;
-    let forwarding = SelectedForwardingConfig::default().with_store_limits(limits);
+    let forwarding = SelectedForwardingConfig::default()
+        .with_emission_policy(emission_policy)
+        .with_store_limits(limits);
     let Some(raw_relay) = raw_relay else {
         return Ok(forwarding);
     };
@@ -594,6 +638,7 @@ mod tests {
         time::Duration,
     };
 
+    use aster_node::EventEmissionPolicy;
     use aster_redb_store::{
         CUSTODY_EMERGENCY_BYTE_RESERVE, CUSTODY_EMERGENCY_ITEM_RESERVE, MAX_CONTROL_BYTES,
         MAX_CONTROL_ITEMS,
@@ -636,6 +681,41 @@ mod tests {
             17_891_328
         );
         let _options = config.node_options();
+    }
+
+    #[test]
+    fn v1_requires_exact_emission_policy() {
+        let normal =
+            validate_json(config_with_storage(4_161, 17_891_328)).expect("normal emission policy");
+        assert_eq!(normal.emission_policy(), EventEmissionPolicy::Normal);
+        assert_eq!(
+            normal.forwarding().emission_policy(),
+            EventEmissionPolicy::Normal
+        );
+
+        let receive_only = validate_json(replace_value(
+            config_with_storage(4_161, 17_891_328),
+            "\"emission_policy\":\"normal\"",
+            "\"emission_policy\":\"receive_only\"",
+        ))
+        .expect("receive-only emission policy");
+        assert_eq!(
+            receive_only.emission_policy(),
+            EventEmissionPolicy::ReceiveOnly
+        );
+        assert_eq!(
+            receive_only.forwarding().emission_policy(),
+            EventEmissionPolicy::ReceiveOnly
+        );
+
+        assert_reason(
+            replace_value(
+                config_with_storage(4_161, 17_891_328),
+                "\"emission_policy\":\"normal\"",
+                "\"emission_policy\":\"transmit_nothing\"",
+            ),
+            ConfigReason::InvalidEmissionPolicy,
+        );
     }
 
     #[test]
@@ -860,7 +940,7 @@ mod tests {
 
     fn config_with_storage(max_items: u64, max_payload_bytes: u64) -> String {
         format!(
-            r#"{{"schema_version":1,"state":{{"directory":"/var/lib/aster-agent"}},"application":{{"listen":"127.0.0.1:8181"}},"health":{{"listen":"127.0.0.1:8182"}},"mesh":{{"bind":"127.0.0.1:8183","sync_interval_ms":500,"peers":[]}},"credentials":{{"client_token_file":"/run/aster-agent/client-token","mission_secret_ref_file":"/run/aster-agent/mission-ref","mission_load_id":"1111111111111111111111111111111111111111111111111111111111111111"}},"storage":{{"max_items":{max_items},"max_payload_bytes":{max_payload_bytes}}}}}"#
+            r#"{{"schema_version":1,"state":{{"directory":"/var/lib/aster-agent"}},"application":{{"listen":"127.0.0.1:8181"}},"health":{{"listen":"127.0.0.1:8182"}},"mesh":{{"bind":"127.0.0.1:8183","sync_interval_ms":500,"emission_policy":"normal","peers":[]}},"credentials":{{"client_token_file":"/run/aster-agent/client-token","mission_secret_ref_file":"/run/aster-agent/mission-ref","mission_load_id":"1111111111111111111111111111111111111111111111111111111111111111"}},"storage":{{"max_items":{max_items},"max_payload_bytes":{max_payload_bytes}}}}}"#
         )
     }
 

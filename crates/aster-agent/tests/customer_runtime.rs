@@ -111,6 +111,25 @@ async fn readiness_waits_for_protected_bootstrap_and_application_serving() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receive_only_starts_ready_and_accepts_local_publication() {
+    // Break caught: parsing receive_only without wiring it through customer
+    // startup can either fail readiness or accidentally disable the local API.
+    if !socket_access_available() {
+        return;
+    }
+    let fixture = CustomerFixture::new();
+    fixture.set_emission_policy("receive_only");
+    let running = RunningFixture::start(&fixture).await;
+
+    assert_eq!(
+        publish_event_status(fixture.application(), fixture.token_bytes()).await,
+        200
+    );
+    assert_eq!(health_status(fixture.health(), "/readyz").await, 200);
+    running.stop_clean().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_hangup_keeps_the_old_token_and_readiness() {
     // Break caught: destructive or non-atomic reload revokes the working token
     // or drops readiness when the replacement file is invalid.
@@ -411,7 +430,7 @@ impl CustomerFixture {
         fs::write(
             &config,
             format!(
-                r#"{{"schema_version":1,"state":{{"directory":"{}"}},"application":{{"listen":"{application}"}},"health":{{"listen":"{health}"}},"mesh":{{"bind":"127.0.0.1:0","sync_interval_ms":500,"peers":[]}},"credentials":{{"client_token_file":"{}","mission_secret_ref_file":"{}","mission_load_id":"{}"}},"storage":{{"max_items":10000,"max_payload_bytes":67108864}},"limits":{{"max_in_flight_requests":1,"shutdown_grace_ms":{shutdown_grace_ms}}}}}"#,
+                r#"{{"schema_version":1,"state":{{"directory":"{}"}},"application":{{"listen":"{application}"}},"health":{{"listen":"{health}"}},"mesh":{{"bind":"127.0.0.1:0","sync_interval_ms":500,"emission_policy":"normal","peers":[]}},"credentials":{{"client_token_file":"{}","mission_secret_ref_file":"{}","mission_load_id":"{}"}},"storage":{{"max_items":10000,"max_payload_bytes":67108864}},"limits":{{"max_in_flight_requests":1,"shutdown_grace_ms":{shutdown_grace_ms}}}}}"#,
                 state.display(),
                 token.display(),
                 mission_reference.display(),
@@ -461,6 +480,18 @@ impl CustomerFixture {
         fs::write(&self.mission_reference, reference).expect("replace mission reference");
         fs::set_permissions(&self.mission_reference, fs::Permissions::from_mode(0o600))
             .expect("protect replacement mission reference");
+    }
+
+    fn set_emission_policy(&self, policy: &str) {
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&self.config).expect("read customer config"))
+                .expect("parse customer config");
+        config["mesh"]["emission_policy"] = policy.into();
+        fs::write(
+            &self.config,
+            serde_json::to_vec(&config).expect("encode customer config"),
+        )
+        .expect("write customer config");
     }
 
     fn chmod_reference(&self, mode: u32) {
@@ -629,6 +660,29 @@ async fn application_status(address: SocketAddr, token: &[u8]) -> u16 {
         format!(
             "POST /aster.application.v1alpha1.AsterApplicationService/GetStatus HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/proto\r\nConnect-Protocol-Version: 1\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             String::from_utf8_lossy(token),
+        )
+        .as_bytes(),
+    )
+    .await
+}
+
+async fn publish_event_status(address: SocketAddr, token: &[u8]) -> u16 {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "operationKey": "cmVjZWl2ZS1vbmx5LWxvY2FsLXB1YmxpY2F0aW9u",
+        "topic": "chat.events",
+        "scope": "mission/team/alpha",
+        "priority": "PRIORITY_IMMEDIATE",
+        "logicalKey": "cmVjZWl2ZS1vbmx5LWxvY2FsLWtleQ==",
+        "payload": "YWNjZXB0ZWQgd2l0aG91dCBvdXRib3VuZCBlbWlzc2lvbg=="
+    }))
+    .expect("encode publication request");
+    http_status(
+        address,
+        format!(
+            "POST /aster.application.v1alpha1.AsterApplicationService/PublishEvent HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            String::from_utf8_lossy(token),
+            body.len(),
+            String::from_utf8_lossy(&body),
         )
         .as_bytes(),
     )
