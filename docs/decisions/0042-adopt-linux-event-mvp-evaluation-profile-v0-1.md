@@ -68,7 +68,9 @@ the implementation, artifacts, devices, or receipts already satisfy it. The
 approved design nevertheless makes exact dependency disposition part of the
 claim boundary and therefore a prerequisite to ratification:
 
-- `P0-1-D06` is resolved for the profile definition by the
+- `P0-1-D06` is resolved for the profile definition. Internal approval of the
+  exact provider selection and bound digest was recorded on 2026-09-08 against
+  the
   [approved initial systemd credential provider design](../superpowers/specs/2026-09-07-systemd-credential-provider-design.md).
   Security and deployment approvals remain mandatory candidate gate E01. If
   final review requires Debian or generic Debian-family support, D06 reopens

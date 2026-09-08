@@ -291,9 +291,11 @@ root-operated `aster-credential-admin` administration artifact. TPM2 and all
 automatic or fallback provider selection are excluded. The provider-design
 record has SHA-256
 `078c35f0046c62a7415d4e8c843f198f97da898da8b8b17eebeaa98de3e2a781`.
-D06 is resolved for the profile definition. Security and deployment approvals
-of that exact record remain mandatory candidate gate E01; provider
-implementation and qualification remain later gates.
+Internal approval of this exact provider selection and bound design digest was
+recorded for the profile definition on 2026-09-08. D06 is resolved for the
+profile definition. Security and deployment approvals of that exact record
+remain mandatory candidate gate E01; provider implementation and qualification
+remain later gates.
 
 This provider selection makes no Debian support claim. If final review requires
 Debian or generic Debian-family support, D06 must be reopened and the provider

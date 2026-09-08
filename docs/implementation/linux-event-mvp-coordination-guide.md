@@ -104,10 +104,12 @@ fail, or a typed reason the work was not run.
 
 ## Current decision state
 
-The profile is still **Proposed**. One definition decision remains before
-Decision 0042 can ratify it:
+The profile is still **Proposed**. D15 is the one definition decision remaining
+before Decision 0042 can ratify it:
 
-- **D06 — protected provider:** resolved for the profile by the
+- **D06 — protected provider:** the exact provider selection and bound design
+  digest were approved internally for the profile definition on 2026-09-08.
+  D06 is resolved by the
   [approved initial systemd credential design](../superpowers/specs/2026-09-07-systemd-credential-provider-design.md).
   Security and deployment approvals remain candidate gate E01. A final-review
   requirement for Debian or generic Debian-family support reopens D06 and
