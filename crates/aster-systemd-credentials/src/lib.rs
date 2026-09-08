@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+mod admin;
+
 use aster_mesh::{
     MAX_UNPROTECTED_PROVISIONING_BYTES, ProfileProvisioningBundle, ProvisioningLoadId,
     ProvisioningLoadReceipt, ProvisioningSecretLoader, ProvisioningSecretRef,
