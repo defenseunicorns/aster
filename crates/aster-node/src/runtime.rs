@@ -2283,6 +2283,8 @@ fn account_blob_receipt(total: &mut NodeReceipt, contact: &PeerReceipt) -> Resul
 
 /// Owned lifecycle for one running selected-stack node actor.
 pub struct RunningNode {
+    #[cfg(test)]
+    bound_sockets: Vec<SocketAddr>,
     selected_events: SelectedEventHandle,
     selected_state: SelectedStateHandle,
     selected_records: SelectedRecordHandle,
@@ -11045,8 +11047,11 @@ pub async fn start_node_with_forwarding(
             };
         }
     };
+    #[cfg(not(test))]
     let _bound_sockets = ready.bound_sockets;
     Ok(RunningNode {
+        #[cfg(test)]
+        bound_sockets: ready.bound_sockets,
         selected_events,
         selected_state,
         selected_records,
@@ -28648,6 +28653,49 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup Blob rekey actor state");
     }
 
+    // The higher identity only accepts contacts. Its configured peer address is
+    // not dialed; only the lower identity needs the responder's real address.
+    // Both endpoints own their OS-selected ports continuously from bind through
+    // shutdown. start_node returns only after the actor's readiness handoff.
+    async fn start_test_pair(
+        mut left: NodeConfig,
+        mut right: NodeConfig,
+        left_id: aster_iroh::EndpointId,
+        right_id: aster_iroh::EndpointId,
+    ) -> (RunningNode, RunningNode) {
+        assert_ne!(left_id, right_id);
+        assert_eq!(left.peers.len(), 1);
+        assert_eq!(right.peers.len(), 1);
+        left.bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        right.bind = left.bind;
+        let left_is_responder = left_id > right_id;
+        let (mut responder, mut initiator) = if left_is_responder {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        responder.peers[0].carrier.address = SocketAddr::from(([127, 0, 0, 1], 9));
+        let responder = start_node(responder).await.expect("responder readiness");
+        let address = responder
+            .bound_sockets
+            .iter()
+            .copied()
+            .find(SocketAddr::is_ipv4)
+            .expect("responder IPv4 socket");
+        assert_ne!(address.port(), 0);
+        assert!(
+            UdpSocket::bind(address).is_err(),
+            "ready responder must retain its port"
+        );
+        initiator.peers[0].carrier.address = address;
+        let initiator = start_node(initiator).await.expect("initiator readiness");
+        if left_is_responder {
+            (responder, initiator)
+        } else {
+            (initiator, responder)
+        }
+    }
+
     #[tokio::test]
     async fn live_selected_blob_converges_over_direct_iroh_and_restarts_peerless() {
         use crate::application::{ApplicationErrorKind, BlobReadPageRequest, BlobReadRequest};
@@ -28707,11 +28755,8 @@ mod tests {
             .await
             .expect("stop peerless direct-Iroh Blob source");
 
-        let source_socket = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve source port");
-        let receiver_socket = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve receiver port");
-        let source_address = source_socket.local_addr().expect("source address");
-        let receiver_address = receiver_socket.local_addr().expect("receiver address");
-        drop((source_socket, receiver_socket));
+        let source_address = SocketAddr::from(([127, 0, 0, 1], 0));
+        let receiver_address = source_address;
         let interests =
             MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
                 topic.clone(),
@@ -28756,23 +28801,13 @@ mod tests {
             published.publisher_counter,
             *published.id.as_bytes(),
         );
-        let (source_running, receiver_running) = if source_carrier > receiver_carrier {
-            let source = start_node(source_config)
-                .await
-                .expect("start direct-Iroh source responder");
-            let receiver = start_node(receiver_config)
-                .await
-                .expect("start direct-Iroh receiver initiator");
-            (source, receiver)
-        } else {
-            let receiver = start_node(receiver_config)
-                .await
-                .expect("start direct-Iroh receiver responder");
-            let source = start_node(source_config)
-                .await
-                .expect("start direct-Iroh source initiator");
-            (source, receiver)
-        };
+        let (source_running, receiver_running) = start_test_pair(
+            source_config,
+            receiver_config,
+            source_carrier,
+            receiver_carrier,
+        )
+        .await;
         let receiver_blobs = receiver_running.selected_blobs();
         let read = BlobReadRequest {
             id: published.id,
@@ -29384,11 +29419,8 @@ mod tests {
             0
         );
 
-        let left_port = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve left mutable port");
-        let right_port = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve right mutable port");
-        let left_address = left_port.local_addr().expect("left mutable address");
-        let right_address = right_port.local_addr().expect("right mutable address");
-        drop((left_port, right_port));
+        let left_address = SocketAddr::from(([127, 0, 0, 1], 0));
+        let right_address = left_address;
         let interests = MutableSourceInterests::new(
             vec![SourceInterestSelector::new(
                 topic.clone(),
@@ -29433,26 +29465,8 @@ mod tests {
             run_for: None,
             application: NodeApplication::Relay,
         };
-        // The lower carrier identity is the sole initiator. Start the higher
-        // identity first so no expected startup absence becomes a failed
-        // authenticated-contact attempt.
-        let (left_running, right_running) = if left_carrier > right_carrier {
-            let left = start_node(left_config)
-                .await
-                .expect("restart connected left responder");
-            let right = start_node(right_config)
-                .await
-                .expect("restart connected right initiator");
-            (left, right)
-        } else {
-            let right = start_node(right_config)
-                .await
-                .expect("restart connected right responder");
-            let left = start_node(left_config)
-                .await
-                .expect("restart connected left initiator");
-            (left, right)
-        };
+        let (left_running, right_running) =
+            start_test_pair(left_config, right_config, left_carrier, right_carrier).await;
         let left_state_handle = left_running.selected_state();
         let right_state_handle = right_running.selected_state();
         let left_records = left_running.selected_records();
@@ -32439,13 +32453,8 @@ mod tests {
                 },
                 fault,
             );
-            let source_socket =
-                UdpSocket::bind(("127.0.0.1", 0)).expect("reserve contact-fatal source port");
-            let receiver_socket =
-                UdpSocket::bind(("127.0.0.1", 0)).expect("reserve contact-fatal receiver port");
-            let source_address = source_socket.local_addr().expect("source address");
-            let receiver_address = receiver_socket.local_addr().expect("receiver address");
-            drop((source_socket, receiver_socket));
+            let source_address = SocketAddr::from(([127, 0, 0, 1], 0));
+            let receiver_address = source_address;
             let interests =
                 MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
                     topic.clone(),
@@ -32484,23 +32493,13 @@ mod tests {
                 run_for: None,
                 application: NodeApplication::Relay,
             };
-            let (source_running, receiver_running) = if source_carrier > receiver_carrier {
-                let source = start_node(source_config)
-                    .await
-                    .expect("start contact-fatal source responder");
-                let receiver = start_node(receiver_config)
-                    .await
-                    .expect("start contact-fatal receiver initiator");
-                (source, receiver)
-            } else {
-                let receiver = start_node(receiver_config)
-                    .await
-                    .expect("start contact-fatal receiver responder");
-                let source = start_node(source_config)
-                    .await
-                    .expect("start contact-fatal source initiator");
-                (source, receiver)
-            };
+            let (source_running, receiver_running) = start_test_pair(
+                source_config,
+                receiver_config,
+                source_carrier,
+                receiver_carrier,
+            )
+            .await;
             let (faulted, peer) = if target_is_source {
                 (source_running, receiver_running)
             } else {
