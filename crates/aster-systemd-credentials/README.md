@@ -1,11 +1,26 @@
-# Aster systemd credential provider
+# Aster Raspberry Pi systemd credential provider
 
-This first-party crate implements the Ubuntu-specific runtime loader and the
-root administration lane for provider contract
-`aster-systemd-credential-store/v1`. The loader is statically composed into
+This first-party crate implements the Raspberry Pi runtime loader and the root
+administration lane for provider contract
+`aster-systemd-credential-store/v2`. The loader is statically composed into
 the single `aster-agent` customer executable; the administration binary is a
 separate stopped-host tool, not a service, plugin, or runtime-selectable
 backend.
+
+The exact v2 profile is:
+
+```text
+provider = aster-systemd-credential-store/v2
+image = Raspberry Pi reference 2026-06-18
+distribution = Debian GNU/Linux 13 (trixie)
+hardware = Raspberry Pi Compute Module 4 Rev 1.1
+architecture = aarch64
+kernel = 6.18.39+rpt-rpi-v8
+systemd = 257.13-1~deb13u1
+credential executable = /usr/bin/systemd-creds
+filesystem = ext4
+TPM2 = excluded
+```
 
 The loader consumes exactly one systemd service credential named
 `aster-provisioning.bundle`. PID 1 supplies the absolute credential directory
@@ -23,7 +38,7 @@ Before returning provisioning plaintext, the loader:
   mode `0400`;
 - requires Linux `ramfs`, matching systemd's `secure` classification, and
   rejects `tmpfs` or another filesystem as `weak`;
-- reads at most the exact v1 provider-envelope bound once and rechecks file
+- reads at most the exact v2 provider-envelope bound once and rechecks file
   metadata after the read;
 - verifies the provider version, reserved fields, generation, canonical Aster
   reference, load-operation ID, exact lengths, and canonical `ASTRPB03` inner
@@ -59,18 +74,17 @@ is retained and rejected. The command prints only the sanitized `installed` or
 `existing` disposition. The opaque reference is retained in the owner-only
 active generation for the agent configuration lane.
 
-This increment does not yet supply mission/reference rotation, same-host
-backup/recovery, logical destruction, revoke/rekey orchestration, a hardened
-systemd unit, Ubuntu packages, frozen `systemd-creds` executable identity, or
-qualifying physical-device evidence. There is no age, plaintext-file, TPM2, or
-alternate-provider fallback.
+The current code implements runtime load and crash-recoverable generation-one
+install only. Rotation, backup/recovery, revoke/rekey, logical destruction, a
+hardened unit, package/executable freeze, and two-node G4 qualification remain
+open. There is no age, plaintext-file, TPM2, or alternate-provider fallback.
+This increment does not close E01 or E09 and does not claim G3, G4, or
+production completion.
 
-The selected profile is Ubuntu 24.04 with the systemd 255.4 credential
-interface and explicit host-key protection in the later administration lane.
-Debian or generic Debian-family support requires reopening and versioning the
-D06 design; this crate makes no such compatibility claim. Runs on CM4/Debian
-13 development nodes may be used only as explicitly non-qualifying
-compatibility checks.
+The [approved v2 design](../../docs/superpowers/specs/2026-09-08-raspberry-pi-systemd-credential-provider-v2-design.md)
+on `main` defines this exact evaluation profile. Persistent v1 state is
+deliberately rejected rather than migrated; the historical v1 design does not
+qualify this v2 provider.
 
 Run the focused provider checks with:
 
@@ -78,6 +92,4 @@ Run the focused provider checks with:
 CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=1 cargo test -p aster-systemd-credentials
 ```
 
-The exact design is
-`docs/superpowers/specs/2026-09-07-systemd-credential-provider-design.md` on
-the `feature/p0-1-linux-event-mvp-profile` branch.
+The exact design is the approved v2 design on `main` linked above.

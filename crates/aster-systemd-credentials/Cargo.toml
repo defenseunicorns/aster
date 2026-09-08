@@ -1,6 +1,6 @@
 [package]
 name = "aster-systemd-credentials"
-description = "Ubuntu systemd credential store provider for Aster provisioning"
+description = "Raspberry Pi systemd credential store provider for Aster provisioning"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

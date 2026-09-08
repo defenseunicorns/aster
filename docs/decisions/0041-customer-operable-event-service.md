@@ -84,8 +84,12 @@ forwarding, Event bridges, and dynamic bridge administration.
     workload boundary of 256 and implementation hard ceiling of 262,144.
     Dedicated Event-operation hard-cap refusal is a distinct non-retryable
     public reason. No online operation-map reclamation is introduced.
-13. In the Ubuntu evaluation composition, statically link the first-party
-    `aster-systemd-credentials` runtime loader into the same `aster-agent`
+13. In the Raspberry Pi reference 2026-06-18 evaluation composition (Debian
+    GNU/Linux 13 (trixie), Raspberry Pi Compute Module 4 Rev 1.1, `aarch64`,
+    kernel `6.18.39+rpt-rpi-v8`, systemd `257.13-1~deb13u1`, local `ext4`, and
+    TPM2 excluded), statically link the first-party
+    `aster-systemd-credentials` runtime loader for provider contract
+    `aster-systemd-credential-store/v2` into the same `aster-agent`
     executable. `--config` selects only that loader. It opens the fixed
     `aster-provisioning.bundle` systemd service credential through
     `CREDENTIALS_DIRECTORY`, requires systemd's `secure` boundary (single-link
@@ -150,7 +154,7 @@ semantics are documented in the
 ### D06 runtime-loader increment
 
 The stacked D06 implementation adds provider contract
-`aster-systemd-credential-store/v1` in
+`aster-systemd-credential-store/v2` in
 [`aster-systemd-credentials`](../../crates/aster-systemd-credentials/README.md).
 Its canonical provider reference and zeroizing envelope bind one nonzero
 generation, exact Aster secret reference, exact load-operation identifier, and
@@ -159,12 +163,13 @@ the systemd loader directly; missing, weak, insecure, changed, oversized, or
 mismatched credentials fail through fixed sanitized categories before the
 node can create state or bind health/application listeners.
 
-This is the runtime-loader increment only. The root administration binary,
-durable operation ledger, install/rotation/backup/recovery/destruction
-lifecycle, crash reconciliation, hardened unit, packages, candidate identity,
-and physical-target evidence remain in later D06/G3/G4 work. In particular,
-this increment does not approve the provider candidate, close E01, qualify a
-package, or establish Debian support.
+This is the runtime-load plus crash-recoverable generation-one-install
+increment only. Rotation, backup/recovery, revoke/rekey, logical destruction,
+the hardened unit, package/executable freeze, and two-node G4 qualification
+remain open. In particular, this increment does not approve the provider
+candidate, close E01 or E09, qualify G3 or G4, or establish production
+completion. Persistent v1 provider state is deliberately rejected rather than
+migrated.
 
 ## Ownership and acceptance
 
