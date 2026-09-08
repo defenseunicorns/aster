@@ -1,5 +1,6 @@
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
+use aster_node::EventEmissionPolicy;
 use aster_node::application::{
     AuthenticatedPeerStatus, ContactSyncStatus as NodeContactSyncStatus, EventAcknowledgement,
     EventDelivery as NodeEventDelivery, EventGap as NodeEventGap, EventGapQuery, EventId,
@@ -7,6 +8,9 @@ use aster_node::application::{
     EventSubscriptionId, EventSubscriptionRequest, EventSyncStatus as NodeEventSyncStatus,
     EventUnsubscribe, PeerAuthorization as NodePeerAuthorization, Priority as NodePriority, Scope,
     SelectedEventHandle, SelectedEventStatus, Topic,
+};
+use aster_redb_store::{
+    MAX_EVENT_OPERATION_BYTES, MAX_EVENT_OPERATIONS, MAX_EVENT_PENDING_DELIVERIES,
 };
 use connectrpc::{
     ConnectError, ErrorCode, RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream,
@@ -20,11 +24,15 @@ use crate::{
 use api::AsterApplicationServiceExt as _;
 
 const APPLICATION_SERVICE_NAME: &str = api::ASTER_APPLICATION_SERVICE_SERVICE_NAME;
+const PROFILE_EVENT_OPERATION_WARNING: u64 = 512;
+const PROFILE_EVENT_OPERATION_BOUNDARY: u64 = 1_024;
+const PROFILE_EVENT_PENDING_DELIVERY_BOUNDARY: u64 = 256;
 
 /// High-level ConnectRPC service backed by the running node's sole authority.
 #[derive(Clone)]
 pub(crate) struct AsterConnectService {
     events: SelectedEventHandle,
+    configured_emission_policy: EventEmissionPolicy,
     shutdown: tokio::sync::watch::Receiver<bool>,
 }
 
@@ -32,9 +40,14 @@ impl AsterConnectService {
     /// Creates a service over one live Event handle.
     pub(crate) fn new(
         events: SelectedEventHandle,
+        configured_emission_policy: EventEmissionPolicy,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
-        Self { events, shutdown }
+        Self {
+            events,
+            configured_emission_policy,
+            shutdown,
+        }
     }
 
     /// Builds the protocol router without exposing node internals.
@@ -45,9 +58,12 @@ impl AsterConnectService {
 
 pub(crate) fn application_service(
     events: SelectedEventHandle,
+    configured_emission_policy: EventEmissionPolicy,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> connectrpc::ConnectRpcService<connectrpc::Router> {
-    configured_service(AsterConnectService::new(events, shutdown).router())
+    configured_service(
+        AsterConnectService::new(events, configured_emission_policy, shutdown).router(),
+    )
 }
 
 pub(crate) fn configured_service(
@@ -154,6 +170,7 @@ impl api::AsterApplicationService for AsterConnectService {
             status_response(
                 self.events.identity(),
                 self.events.mission_authority(),
+                self.configured_emission_policy,
                 status,
             ),
             PublicOperation::GetStatus,
@@ -548,8 +565,11 @@ fn gap_message(gap: NodeEventGap) -> api::EventGap {
 fn status_response(
     identity: [u8; 32],
     mission_authority: [u8; 32],
+    configured_emission_policy: EventEmissionPolicy,
     status: SelectedEventStatus,
 ) -> api::GetStatusResponse {
+    let profile_remaining =
+        PROFILE_EVENT_OPERATION_BOUNDARY.saturating_sub(status.event_operations);
     api::GetStatusResponse {
         identity: identity.to_vec(),
         mission_authority: mission_authority.to_vec(),
@@ -557,7 +577,45 @@ fn status_response(
         authenticated_contacts: status.authenticated_contacts,
         failed_contact_attempts: status.failed_contact_attempts,
         peers: status.peers.into_iter().map(peer_status_message).collect(),
+        configured_emission_mode: emission_mode_message(configured_emission_policy).into(),
+        effective_emission_mode: emission_mode_message(status.emission_policy).into(),
+        store_capacity: api::StoreCapacityStatus {
+            items: status.store_usage.items,
+            item_limit: status.store_limits.max_items(),
+            payload_bytes: status.store_usage.payload_bytes,
+            payload_byte_limit: status.store_limits.max_total_payload_bytes(),
+            ..Default::default()
+        }
+        .into(),
+        publish_operation_capacity: api::PublishOperationCapacityStatus {
+            rows: status.event_operations,
+            bytes: status.event_operation_bytes,
+            row_hard_limit: MAX_EVENT_OPERATIONS,
+            byte_hard_limit: MAX_EVENT_OPERATION_BYTES,
+            profile_boundary: PROFILE_EVENT_OPERATION_BOUNDARY,
+            profile_remaining,
+            profile_warning: status.event_operations >= PROFILE_EVENT_OPERATION_WARNING,
+            profile_exhausted: status.event_operations >= PROFILE_EVENT_OPERATION_BOUNDARY,
+            ..Default::default()
+        }
+        .into(),
+        delivery_capacity: api::DeliveryCapacityStatus {
+            pending: status.pending_deliveries,
+            profile_boundary: PROFILE_EVENT_PENDING_DELIVERY_BOUNDARY,
+            profile_saturated: status.pending_deliveries >= PROFILE_EVENT_PENDING_DELIVERY_BOUNDARY,
+            hard_limit: MAX_EVENT_PENDING_DELIVERIES,
+            ..Default::default()
+        }
+        .into(),
         ..Default::default()
+    }
+}
+
+fn emission_mode_message(policy: EventEmissionPolicy) -> api::EmissionMode {
+    match policy {
+        EventEmissionPolicy::Normal => api::EmissionMode::Normal,
+        EventEmissionPolicy::ReceiveOnly => api::EmissionMode::ReceiveOnly,
+        EventEmissionPolicy::AtLeast(_) => api::EmissionMode::Unspecified,
     }
 }
 
@@ -717,6 +775,7 @@ mod tests {
     use aster_node::mission::UnprotectedReferenceMission;
     #[cfg(all(feature = "client", feature = "server"))]
     use aster_node::{MutableSourceInterests, NodeApplication, NodeConfig, start_node};
+    use aster_redb_store::{AggregateStoreUsage, StoreLimits};
 
     use super::*;
     #[cfg(all(feature = "client", feature = "server"))]
@@ -863,6 +922,67 @@ mod tests {
             api::PublicErrorReason::ResourceExhaustion,
             "query_events",
             true,
+        );
+    }
+
+    #[test]
+    fn status_reports_configured_effective_mode_and_capacity_headroom() {
+        let response = status_response(
+            [0x11; 32],
+            [0x22; 32],
+            EventEmissionPolicy::Normal,
+            SelectedEventStatus {
+                sync: NodeEventSyncStatus::Offline,
+                authenticated_contacts: 0,
+                failed_contact_attempts: 0,
+                peers: Vec::new(),
+                emission_policy: EventEmissionPolicy::ReceiveOnly,
+                store_usage: AggregateStoreUsage::default(),
+                store_limits: StoreLimits::new(10_000, 64 * 1024 * 1024).expect("limits"),
+                event_operations: 0,
+                event_operation_bytes: 0,
+                pending_deliveries: 0,
+            },
+        );
+
+        assert_eq!(response.configured_emission_mode, api::EmissionMode::Normal);
+        assert_eq!(
+            response.effective_emission_mode,
+            api::EmissionMode::ReceiveOnly
+        );
+        assert_eq!(
+            response.store_capacity.as_option(),
+            Some(&api::StoreCapacityStatus {
+                items: 0,
+                item_limit: 10_000,
+                payload_bytes: 0,
+                payload_byte_limit: 64 * 1024 * 1024,
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            response.publish_operation_capacity.as_option(),
+            Some(&api::PublishOperationCapacityStatus {
+                rows: 0,
+                bytes: 0,
+                row_hard_limit: 4_096,
+                byte_hard_limit: 524_288,
+                profile_boundary: 1_024,
+                profile_remaining: 1_024,
+                profile_warning: false,
+                profile_exhausted: false,
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            response.delivery_capacity.as_option(),
+            Some(&api::DeliveryCapacityStatus {
+                pending: 0,
+                profile_boundary: 256,
+                profile_saturated: false,
+                hard_limit: 262_144,
+                ..Default::default()
+            })
         );
     }
 

@@ -61,6 +61,42 @@ message GetStatusResponse {
   uint64 authenticated_contacts = 4;
   uint64 failed_contact_attempts = 5;
   repeated PeerStatus peers = 6;
+  EmissionMode configured_emission_mode = 7;
+  EmissionMode effective_emission_mode = 8;
+  StoreCapacityStatus store_capacity = 9;
+  PublishOperationCapacityStatus publish_operation_capacity = 10;
+  DeliveryCapacityStatus delivery_capacity = 11;
+}
+
+enum EmissionMode {
+  EMISSION_MODE_UNSPECIFIED = 0;
+  EMISSION_MODE_NORMAL = 1;
+  EMISSION_MODE_RECEIVE_ONLY = 2;
+}
+
+message StoreCapacityStatus {
+  uint64 items = 1;
+  uint64 item_limit = 2;
+  uint64 payload_bytes = 3;
+  uint64 payload_byte_limit = 4;
+}
+
+message PublishOperationCapacityStatus {
+  uint64 rows = 1;
+  uint64 bytes = 2;
+  uint64 row_hard_limit = 3;
+  uint64 byte_hard_limit = 4;
+  uint64 profile_boundary = 5;
+  uint64 profile_remaining = 6;
+  bool profile_warning = 7;
+  bool profile_exhausted = 8;
+}
+
+message DeliveryCapacityStatus {
+  uint64 pending = 1;
+  uint64 profile_boundary = 2;
+  bool profile_saturated = 3;
+  uint64 hard_limit = 4;
 }
 
 message PeerStatus {

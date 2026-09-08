@@ -82,6 +82,7 @@ where
     let application_address = config.application();
     let health_address = config.health();
     let forwarding = config.forwarding();
+    let configured_emission_policy = config.emission_policy();
     let limits = *config.limits();
 
     let health = BoundHealth::bind(health_address)
@@ -127,7 +128,7 @@ where
     let monitored_events = events.clone();
     let (stream_stop_send, stream_stop_receive) = tokio::sync::watch::channel(false);
     let (server_stop_send, server_stop_receive) = tokio::sync::watch::channel(ServerStop::Run);
-    let service = application_service(events, stream_stop_receive);
+    let service = application_service(events, configured_emission_policy, stream_stop_receive);
     let mut server_task = tokio::spawn(application.serve(
         service,
         credentials.token.clone(),

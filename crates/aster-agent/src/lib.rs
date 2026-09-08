@@ -77,7 +77,11 @@ impl BoundAgent {
         token: ClientToken,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let service = event_service::application_service(events, shutdown.clone());
+        let service = event_service::application_service(
+            events,
+            aster_node::EventEmissionPolicy::Normal,
+            shutdown.clone(),
+        );
         let status = lifecycle::ServiceStatus::starting();
         status.transition(lifecycle::LifecycleState::Ready)?;
         let reloadable = credentials::ReloadableClientToken::new(token);
