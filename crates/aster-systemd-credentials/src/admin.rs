@@ -2,6 +2,9 @@ mod encrypt;
 mod files;
 mod ledger;
 
+#[cfg(test)]
+pub(super) static TEST_PROCESS_SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use crate::{PROVIDER_REFERENCE_ID_BYTES, encode_credential_envelope, provisioning_secret_ref};
 use aster_mesh::{
     ProfileProvisioningBundle, ProvisioningInstallId, ProvisioningInstallReceipt,
@@ -349,7 +352,10 @@ mod tests {
         fs,
         os::unix::fs::{PermissionsExt as _, symlink},
         path::{Path, PathBuf},
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            MutexGuard,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
     const INSTALL: ProvisioningInstallId = ProvisioningInstallId::new([0x11; 32]);
@@ -806,6 +812,7 @@ mod tests {
     }
 
     struct AdminFixture {
+        _process_spawn_lock: MutexGuard<'static, ()>,
         root: PathBuf,
         provisioning: PathBuf,
         ledger: PathBuf,
@@ -815,6 +822,9 @@ mod tests {
 
     impl AdminFixture {
         fn new() -> Self {
+            let process_spawn_lock = super::TEST_PROCESS_SPAWN_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let serial = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
             let root = std::env::temp_dir().join(format!(
                 "aster-systemd-admin-test-{}-{serial}",
@@ -841,6 +851,7 @@ mod tests {
             fs::set_permissions(&program, fs::Permissions::from_mode(0o700))
                 .expect("make fake encryptor executable");
             Self {
+                _process_spawn_lock: process_spawn_lock,
                 root,
                 provisioning,
                 ledger,

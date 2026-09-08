@@ -86,7 +86,7 @@ impl SystemdCredsEncryptor {
 
 #[cfg(test)]
 mod tests {
-    use super::SystemdCredsEncryptor;
+    use super::{super::TEST_PROCESS_SPAWN_LOCK, SystemdCredsEncryptor};
     use aster_mesh::ProvisioningSecretStoreError;
     use std::{
         fs,
@@ -102,6 +102,9 @@ mod tests {
     fn encryptor_pipes_input_through_the_fixed_host_key_command() {
         // Break caught: adding a secret argument/path, omitting host-only key
         // selection, or changing the credential name fails in the executable.
+        let _process_spawn_lock = TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let fixture = EncryptFixture::new(
             "test \"$#\" = 5\n\
              test \"$1\" = encrypt\n\
@@ -123,6 +126,9 @@ mod tests {
     fn encryptor_rejects_failure_and_oversized_output() {
         // Break caught: accepting a failed child or buffering provider output
         // past the public protected-artifact bound weakens the admin boundary.
+        let _process_spawn_lock = TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let failed = EncryptFixture::new("exit 9");
         assert_eq!(
             SystemdCredsEncryptor::at(failed.program.clone())
