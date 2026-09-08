@@ -33,6 +33,53 @@ reuses the same database without another fetch for the fuzz lockfile. Its
 vulnerability result therefore reflects the RustSec database available when
 the workflow ran, rather than a permanently reproducible snapshot.
 
+## Network reliability under contention
+
+Run the bounded loopback diagnostic from the repository root:
+
+```sh
+python3 tools/test-network-contention.py --rounds 3 --cpu-workers 4 \
+  --test-threads 4 --output /tmp/aster-network-contention-run
+```
+
+The output directory must be new. The runner builds the locked, offline,
+all-feature node and Iroh library tests before starting CPU load. Each round
+runs the complete Iroh suite concurrently with the selected Blob convergence,
+State/Record convergence and resolution, Blob contact-fault, and progress
+watchdog tests. Each binary also runs its selected tests in parallel. The
+runner retains all output, commands, source identity, load settings and exit
+codes in the output directory; it stops on failure rather than retrying to a
+pass. CPU workers and test process groups are cleaned up on exit. A round has
+an independent outer deadline, including if a test stops responding.
+
+These tests keep exact data and zero-contact-error assertions. Blob waiting
+tracks committed carrier prefixes. State/Record waiting counts each expected
+version once per node; duplicate queries or oscillating observations cannot
+reset its stall timer. Both also retain absolute deadlines. This is functional
+reliability evidence under a declared synthetic CPU load, not a performance
+benchmark, packet-loss test, target-hardware qualification, or hosted-CI result.
+
+Selected in-process node pairs bind their actual responder to port zero and
+use its readiness-reported address to start the initiator. The responder owns
+its socket throughout; the fixture does not reserve, release and reacquire a
+port. The higher-identity responder needs only the peer's authenticated identity
+for inbound contacts; its unused outbound address is never dialed. This reuses
+the existing startup handoff without adding a public lifecycle API. The separate
+CLI/process fixtures still have explicit topology/restart port requirements
+and their existing per-binary serialization; this change does not claim to
+eliminate every fixed-port fixture.
+
+The rejected-request test checks both that a rejected local authorization never
+invokes the payload writer and that a subsequent authorized exchange completes.
+The receiver checks bytes incrementally. An observation timeout is a failure,
+not evidence that no payload was sent.
+
+Before removing the Linux lane's global serialization, require a parallel full
+workspace pass with its prerequisite fixes and repeat the contention diagnostic
+on Linux. Investigate remaining errors before weakening zero-error assertions
+or increasing carrier deadlines. Preserve narrow isolation where an individual
+fixture still requires exclusive resources.
+
 ## Selected composition coverage
 
 `aster-profile`, `aster-redb-store`, `aster-negentropy`, `aster-iroh`, and
