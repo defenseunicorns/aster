@@ -87,17 +87,17 @@ descriptor-relative Linux filesystem APIs, `zeroize`, Tokio.
 - Uses Linux `openat2`/`openat`, `fstat`, and `fstatfs` through safe `rustix`
   APIs; it does not concatenate a credential pathname.
 
-- [ ] Add tests naming the production failures for missing/non-absolute or
+- [x] Add tests naming the production failures for missing/non-absolute or
   traversing credential directories, final symlinks, non-regular files,
   multiple links, wrong owner/mode, changed metadata, oversized data, and
   non-`ramfs` filesystem classification.
-- [ ] Add a loader-contract test with a controlled credential source proving
+- [x] Add a loader-contract test with a controlled credential source proving
   the exact successful operation/reference echo and zeroizing plaintext.
-- [ ] Run only the new loader tests and observe the expected missing behavior.
-- [ ] Implement the minimum descriptor-relative source, security policy,
+- [x] Run only the new loader tests and observe the expected missing behavior.
+- [x] Implement the minimum descriptor-relative source, security policy,
   bounded read, and loader mapping. Recheck security metadata after reading.
-- [ ] Run all `aster-systemd-credentials` tests until green.
-- [ ] Commit as `feat(credentials): load secure systemd credential`.
+- [x] Run all `aster-systemd-credentials` tests until green.
+- [x] Commit as `feat(credentials): load secure systemd credential`.
 
 ### Task 3: Enforce protected bootstrap before any listener
 
