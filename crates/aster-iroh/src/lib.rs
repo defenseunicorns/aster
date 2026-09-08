@@ -1757,6 +1757,19 @@ impl PathWitness {
     }
 }
 
+// Keep authorization and the first payload submission in one testable seam.
+// The write closure is never invoked if authorization fails.
+async fn checked_write<F, W, Fut, T, E>(before_write: F, write: W) -> Result<T, E>
+where
+    F: FnOnce() -> Result<T, E>,
+    W: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), E>>,
+{
+    let checked = before_write()?;
+    write().await?;
+    Ok(checked)
+}
+
 /// Authenticated, bounded opaque exchange channel.
 #[derive(Clone)]
 pub struct Connection {
@@ -1949,10 +1962,12 @@ impl Connection {
                 .open_bi()
                 .await
                 .map_err(|error| E::from(CarrierError::Transport(error.to_string())))?;
-            let checked = before_write()?;
-            send.write_all(request)
-                .await
-                .map_err(|error| E::from(CarrierError::Transport(error.to_string())))?;
+            let checked = checked_write(before_write, || async {
+                send.write_all(request)
+                    .await
+                    .map_err(|error| E::from(CarrierError::Transport(error.to_string())))
+            })
+            .await?;
             send.finish()
                 .map_err(|error| E::from(CarrierError::Transport(error.to_string())))?;
             let response = receive
@@ -3127,6 +3142,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_check_never_invokes_payload_submission() {
+        let invoked = std::cell::Cell::new(false);
+        let rejected = checked_write(
+            || Err::<(), _>("rejected"),
+            || {
+                invoked.set(true);
+                async { Ok(()) }
+            },
+        )
+        .await;
+        assert_eq!(rejected, Err("rejected"));
+        assert!(!invoked.get());
+        // Positive control: the same seam really invokes the writer and
+        // propagates its failure after successful authorization.
+        let failed = checked_write(
+            || Ok("authorized"),
+            || {
+                invoked.set(true);
+                async { Err("write failed") }
+            },
+        )
+        .await;
+        assert!(invoked.get());
+        assert_eq!(failed, Err("write failed"));
+    }
+
+    #[tokio::test]
     async fn carrier_adjacent_check_failure_writes_no_application_bytes() {
         #[derive(Debug)]
         enum CheckedError {
@@ -3141,7 +3183,7 @@ mod tests {
         }
 
         let mut config = EndpointConfig::direct("127.0.0.1:0".parse().expect("address"));
-        config.exchange_timeout = Duration::from_secs(1);
+        config.exchange_timeout = Duration::from_secs(10);
         let server = Endpoint::bind(SecretKey::generate(), config)
             .await
             .expect("server");
@@ -3153,19 +3195,53 @@ mod tests {
             let server = server.clone();
             async move {
                 let connection = server.accept(&allowed).await.expect("accept");
-                // Opening a QUIC stream does not authorize an application
-                // byte. A rejected post-open check may leave no peer-visible
-                // stream at all, or a reset/empty stream, but never payload.
-                if let Ok(Ok((_send, mut receive))) =
-                    timeout(Duration::from_millis(250), connection.inner.accept_bi()).await
-                {
-                    let received =
-                        timeout(Duration::from_millis(250), receive.read_to_end(64)).await;
-                    assert!(
-                        !matches!(received, Ok(Ok(bytes)) if !bytes.is_empty()),
-                        "rejected request escaped"
-                    );
-                }
+                // A subsequent successful request is the observation fence.
+                // Read incrementally: read_to_end could discard already-read
+                // payload when a later reset or timeout occurs.
+                timeout(Duration::from_secs(10), async {
+                    loop {
+                        let (mut send, mut receive) =
+                            connection.inner.accept_bi().await.expect("fence stream");
+                        let mut observed = Vec::new();
+                        let mut buffer = [0; 64];
+                        loop {
+                            match receive.read(&mut buffer).await {
+                                Ok(Some(count)) => {
+                                    observed.extend_from_slice(&buffer[..count]);
+                                    assert!(
+                                        b"authorized-fence".starts_with(&observed),
+                                        "rejected payload escaped: {observed:?}"
+                                    );
+                                }
+                                Ok(None) => break,
+                                Err(error) if observed.is_empty() => {
+                                    assert!(
+                                        matches!(error, iroh::endpoint::ReadError::Reset(_)),
+                                        "unexpected receive failure: {error}"
+                                    );
+                                    break;
+                                }
+                                Err(error) => {
+                                    panic!("incomplete observation: {error}; bytes={observed:?}")
+                                }
+                            }
+                        }
+                        if observed.is_empty() {
+                            continue;
+                        }
+                        assert_eq!(observed, b"authorized-fence");
+                        send.write_all(b"observed").await.expect("fence response");
+                        send.finish().expect("finish fence response");
+                        assert_eq!(send.stopped().await.expect("fence consumed"), None);
+                        break;
+                    }
+                })
+                .await
+                .expect("rejected-request observation must complete");
+                connection
+                    .finish_as_responder()
+                    .await
+                    .expect("responder completion");
             }
         });
         let connection = client
@@ -3185,6 +3261,17 @@ mod tests {
             .await;
         assert!(matches!(result, Err(CheckedError::Rejected)));
         assert!(callback_ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            connection
+                .request(b"authorized-fence")
+                .await
+                .expect("fence request"),
+            b"observed"
+        );
+        connection
+            .finish_as_initiator()
+            .await
+            .expect("initiator completion");
         server_task.await.expect("server task");
         client.close().await;
         server.close().await;
