@@ -266,30 +266,9 @@ impl SystemdCredentialAdmin {
 
         if let Some(encoded) = read_ledger(&self.ledger_root)? {
             let ledger = decode_ledger(&encoded)?;
-            let record = ledger
-                .generations
-                .iter()
-                .find(|record| record.install == operation)
-                .ok_or(ProvisioningSecretStoreError::OperationConflict)?;
-            let envelope = encode_credential_envelope(&record.secret_ref, load, &plaintext)?;
-            let envelope_commitment = digest(&envelope);
-            if record.load != load || record.envelope_commitment != envelope_commitment {
-                return Err(ProvisioningSecretStoreError::OperationConflict);
-            }
-            if record.state == GenerationState::Destroyed {
-                return Err(ProvisioningSecretStoreError::Destroyed);
-            }
-            if record.state != GenerationState::Active {
-                return Err(ProvisioningSecretStoreError::Rejected);
-            }
-            let manifest = manifest_from_record(record);
-            if !generation_matches(&self.provisioning_root, ACTIVE_DIRECTORY, &manifest)? {
-                return Err(ProvisioningSecretStoreError::Rejected);
-            }
-            return Ok(ProvisioningInstallReceipt::existing(
-                operation,
-                record.secret_ref.clone(),
-            ));
+            return self
+                .classify_existing_install_operation(&ledger, operation, load, &plaintext)?
+                .ok_or(ProvisioningSecretStoreError::OperationConflict);
         }
 
         if read_generation_manifest(&self.provisioning_root, ACTIVE_DIRECTORY)?.is_some()
@@ -375,29 +354,10 @@ impl SystemdCredentialAdmin {
         }
         lifecycle::validate_completed_generations(&self.provisioning_root, &ledger)?;
 
-        if let Some(record) = ledger
-            .generations
-            .iter()
-            .find(|record| record.install == operation)
+        if let Some(receipt) =
+            self.classify_existing_install_operation(&ledger, operation, load, &plaintext)?
         {
-            let envelope = encode_credential_envelope(&record.secret_ref, load, &plaintext)?;
-            if record.load != load || record.envelope_commitment != digest(&envelope) {
-                return Err(ProvisioningSecretStoreError::OperationConflict);
-            }
-            let slot = match record.state {
-                GenerationState::Active => ACTIVE_DIRECTORY,
-                GenerationState::Previous => files::PREVIOUS_DIRECTORY,
-                GenerationState::Destroyed => {
-                    return Err(ProvisioningSecretStoreError::Destroyed);
-                }
-            };
-            if !generation_matches(&self.provisioning_root, slot, &manifest_from_record(record))? {
-                return Err(ProvisioningSecretStoreError::Rejected);
-            }
-            return Ok(ProvisioningInstallReceipt::existing(
-                operation,
-                record.secret_ref.clone(),
-            ));
+            return Ok(receipt);
         }
 
         if ledger
@@ -418,6 +378,17 @@ impl SystemdCredentialAdmin {
             .checked_add(1)
             .ok_or(ProvisioningSecretStoreError::Rejected)?;
         let source_ref = source.secret_ref.clone();
+        let capacity_reference =
+            provisioning_secret_ref(generation, [0; PROVIDER_REFERENCE_ID_BYTES])?;
+        let _ = rotation_snapshots(
+            ledger.clone(),
+            operation,
+            load,
+            source_ref.clone(),
+            capacity_reference,
+            [0; 32],
+            [0; 32],
+        )?;
 
         let mut reference_id = Zeroizing::new([0_u8; PROVIDER_REFERENCE_ID_BYTES]);
         getrandom::fill(&mut *reference_id)
@@ -434,22 +405,15 @@ impl SystemdCredentialAdmin {
             ciphertext_digest,
             content: GenerationContent::Credential,
         };
-        let pre_mutation_ledger_revision = digest(&encode_ledger(&ledger)?);
-        let mut intent_ledger = ledger;
-        intent_ledger.intent = Some(LifecycleIntent {
-            kind: LifecycleIntentKind::Rotate,
-            operation: *operation.as_bytes(),
-            backup_operation: None,
-            load: Some(load),
-            target_ref: secret_ref.clone(),
-            target_generation: generation,
-            source_ref: Some(source_ref),
-            envelope_commitment: Some(envelope_commitment),
-            expected_ciphertext_digest: Some(ciphertext_digest),
-            expected_artifact_digest: None,
-            pre_mutation_ledger_revision,
-        });
-        let completed = lifecycle::completed_from_intent(&intent_ledger)?;
+        let (intent_ledger, completed) = rotation_snapshots(
+            ledger,
+            operation,
+            load,
+            source_ref,
+            secret_ref.clone(),
+            envelope_commitment,
+            ciphertext_digest,
+        )?;
         let encoded_manifest = Zeroizing::new(files::encode_manifest(&manifest));
         let encoded_reference = Zeroizing::new(secret_ref.to_bytes());
         write_staged_generation(
@@ -469,6 +433,74 @@ impl SystemdCredentialAdmin {
         )?;
         Ok(ProvisioningInstallReceipt::installed(operation, secret_ref))
     }
+
+    fn classify_existing_install_operation(
+        &self,
+        ledger: &ProviderLedger,
+        operation: ProvisioningInstallId,
+        load: ProvisioningLoadId,
+        plaintext: &UnprotectedProvisioning,
+    ) -> Result<Option<ProvisioningInstallReceipt>, ProvisioningSecretStoreError> {
+        let Some(record) = ledger
+            .generations
+            .iter()
+            .find(|record| record.install == operation)
+        else {
+            return Ok(None);
+        };
+        let envelope = encode_credential_envelope(&record.secret_ref, load, plaintext)?;
+        if record.load != load || record.envelope_commitment != digest(&envelope) {
+            return Err(ProvisioningSecretStoreError::OperationConflict);
+        }
+        let slot = match record.state {
+            GenerationState::Active => ACTIVE_DIRECTORY,
+            GenerationState::Previous => files::PREVIOUS_DIRECTORY,
+            GenerationState::Destroyed => return Err(ProvisioningSecretStoreError::Destroyed),
+        };
+        if !generation_matches(&self.provisioning_root, slot, &manifest_from_record(record))? {
+            return Err(ProvisioningSecretStoreError::Rejected);
+        }
+        Ok(Some(ProvisioningInstallReceipt::existing(
+            operation,
+            record.secret_ref.clone(),
+        )))
+    }
+}
+
+fn rotation_snapshots(
+    mut ledger: ProviderLedger,
+    operation: ProvisioningInstallId,
+    load: ProvisioningLoadId,
+    source_ref: aster_mesh::ProvisioningSecretRef,
+    target_ref: aster_mesh::ProvisioningSecretRef,
+    envelope_commitment: [u8; 32],
+    ciphertext_digest: [u8; 32],
+) -> Result<(ProviderLedger, ProviderLedger), ProvisioningSecretStoreError> {
+    let target_generation = crate::provider_generation(&target_ref)?;
+    let pre_mutation_ledger_revision = digest(&encode_ledger(&ledger)?);
+    ledger.intent = Some(LifecycleIntent {
+        kind: LifecycleIntentKind::Rotate,
+        operation: *operation.as_bytes(),
+        backup_operation: None,
+        load: Some(load),
+        target_ref,
+        target_generation,
+        source_ref: Some(source_ref),
+        envelope_commitment: Some(envelope_commitment),
+        expected_ciphertext_digest: Some(ciphertext_digest),
+        expected_artifact_digest: None,
+        pre_mutation_ledger_revision,
+    });
+    let encoded_intent = encode_ledger(&ledger)?;
+    if decode_ledger(&encoded_intent)? != ledger {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    let completed = lifecycle::completed_from_intent(&ledger)?;
+    let encoded_completed = encode_ledger(&completed)?;
+    if decode_ledger(&encoded_completed)? != completed {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    Ok((ledger, completed))
 }
 
 fn manifest_from_record(record: &GenerationRecord) -> GenerationManifest {

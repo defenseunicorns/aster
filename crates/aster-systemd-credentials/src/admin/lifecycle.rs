@@ -992,7 +992,8 @@ pub(super) fn lifecycle_step(
 mod tests {
     use super::{
         CLEANUP_DIRECTORY, CleanupSlotIdentity, GenerationSlots, LifecycleStep, SlotIdentity,
-        commit_lifecycle_intent, lifecycle_step, reconcile_lifecycle, select_lifecycle_ledger,
+        commit_lifecycle_intent, completed_from_intent, lifecycle_step, reconcile_lifecycle,
+        select_lifecycle_ledger,
     };
     use super::{
         exchange_staged_with_active, exchange_staged_with_previous, write_staged_tombstone,
@@ -1006,15 +1007,18 @@ mod tests {
         },
         ledger::{
             BackupBinding, DestroyBinding, DestroyBindingOutcome, GenerationRecord,
-            GenerationState, LifecycleIntent, LifecycleIntentKind, ProviderLedger, RecoveryBinding,
-            decode_ledger, encode_ledger,
+            GenerationState, LifecycleIntent, LifecycleIntentKind, MAX_LEDGER_BYTES,
+            ProviderLedger, RecoveryBinding, decode_ledger, encode_ledger,
         },
     };
-    use crate::{PROVIDER_REFERENCE_ID_BYTES, provider_generation, provisioning_secret_ref};
+    use crate::{
+        PROVIDER_REFERENCE_ID_BYTES, SystemdCredentialLoader, provider_generation,
+        provisioning_secret_ref,
+    };
     use aster_mesh::{
         ProvisioningAccess, ProvisioningDestroyId, ProvisioningInstallDisposition,
-        ProvisioningInstallId, ProvisioningLoadId, ProvisioningSecretStoreError,
-        ReferenceProvisioner, Scope, Topic, UnprotectedProvisioning,
+        ProvisioningInstallId, ProvisioningLoadId, ProvisioningSecretLoader,
+        ProvisioningSecretStoreError, ReferenceProvisioner, Scope, Topic, UnprotectedProvisioning,
     };
     use std::{
         fs,
@@ -1022,6 +1026,7 @@ mod tests {
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
     };
+    use zeroize::Zeroizing;
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -2272,6 +2277,105 @@ mod tests {
     }
 
     #[test]
+    fn rotation_and_install_share_previous_and_destroyed_operation_retry_classification() {
+        // Break caught: install and rotate are two entry points to the same
+        // permanent install-operation binding. Once rotation parks I1 as
+        // Previous, its exact install retry must remain Existing; only its
+        // later tombstone changes that classification to Destroyed.
+        let fixture = AdminLifecycleFixture::new();
+        let install_operation = ProvisioningInstallId::new([0x11; 32]);
+        let install_load = ProvisioningLoadId::new([0x22; 32]);
+        let installed = fixture
+            .admin()
+            .unwrap()
+            .install(install_operation, install_load, fixture.bundle())
+            .expect("initial install");
+        fixture
+            .admin()
+            .unwrap()
+            .rotate(
+                ProvisioningInstallId::new([0x7a; 32]),
+                ProvisioningLoadId::new([0x7b; 32]),
+                fixture.bundle(),
+            )
+            .expect("park initial install as Previous");
+
+        let retry = fixture
+            .admin()
+            .unwrap()
+            .install(install_operation, install_load, fixture.bundle())
+            .expect("exact Previous install retry");
+        assert_eq!(
+            retry.disposition(),
+            ProvisioningInstallDisposition::Existing
+        );
+        assert_eq!(retry.secret_ref(), installed.secret_ref());
+        assert_eq!(
+            fixture
+                .admin()
+                .unwrap()
+                .install(
+                    install_operation,
+                    ProvisioningLoadId::new([0x7c; 32]),
+                    fixture.bundle(),
+                )
+                .expect_err("changed Previous install retry"),
+            ProvisioningSecretStoreError::OperationConflict,
+        );
+        assert_eq!(
+            fixture
+                .admin()
+                .unwrap()
+                .install(install_operation, install_load, fixture.alternate_bundle(),)
+                .expect_err("changed Previous plaintext"),
+            ProvisioningSecretStoreError::OperationConflict,
+        );
+        assert_eq!(fixture.encrypt_calls(), 2);
+
+        let mut ledger = read_fixture_ledger(&fixture);
+        let previous = ledger
+            .generations
+            .iter_mut()
+            .find(|record| record.install == install_operation)
+            .expect("Previous operation record");
+        let destroyed_ref = previous.secret_ref.clone();
+        let destroyed_generation = previous.generation;
+        previous.state = GenerationState::Destroyed;
+        previous.ciphertext_digest = [0; 32];
+        ledger.destroys.push(DestroyBinding {
+            operation: ProvisioningDestroyId::new([0x7f; 32]),
+            secret_ref: destroyed_ref,
+            generation: destroyed_generation,
+            outcome: DestroyBindingOutcome::Destroyed,
+        });
+        fs::remove_dir_all(fixture.provisioning.join(PREVIOUS_DIRECTORY))
+            .expect("model completed Previous tombstone cleanup");
+        fixture.write_ledger(ledger);
+
+        assert_eq!(
+            fixture
+                .admin()
+                .unwrap()
+                .install(install_operation, install_load, fixture.bundle())
+                .expect_err("exact tombstoned install retry"),
+            ProvisioningSecretStoreError::Destroyed,
+        );
+        assert_eq!(
+            fixture
+                .admin()
+                .unwrap()
+                .install(
+                    install_operation,
+                    ProvisioningLoadId::new([0x7c; 32]),
+                    fixture.bundle(),
+                )
+                .expect_err("changed tombstoned install retry"),
+            ProvisioningSecretStoreError::OperationConflict,
+        );
+        assert_eq!(fixture.encrypt_calls(), 2);
+    }
+
+    #[test]
     fn rotation_rejects_invalid_plaintext_previous_and_generation_exhaustion_before_encryption() {
         // Break caught: plaintext validation, the single-Previous gate, and
         // checked generation allocation must all precede reference creation,
@@ -2517,6 +2621,8 @@ mod tests {
             assert!(fixture.provisioning.join(STAGED_DIRECTORY).is_dir());
             assert!(!fixture.provisioning.join(PREVIOUS_DIRECTORY).exists());
             assert_eq!(fixture.encrypt_calls(), 2, "fault {point:?}");
+            let source = read_fixture_ledger(&fixture).generations[0].clone();
+            fixture.assert_active_runtime_loads(source.load, &source.secret_ref, fixture.bundle());
             let stranded = fixture.namespace_bytes();
 
             assert_eq!(
@@ -2528,6 +2634,68 @@ mod tests {
             );
             assert_eq!(fixture.namespace_bytes(), stranded, "fault {point:?}");
         }
+    }
+
+    #[test]
+    fn rotation_preflights_oversized_intent_before_encryption_or_staging() {
+        // Break caught: a completed snapshot can fit under MAX_LEDGER_BYTES
+        // while its larger Rotate intent does not. Discovering this only at
+        // intent commit strands an unbound, already-encrypted stage.
+        let fixture = AdminLifecycleFixture::new();
+        fixture.install_once();
+        let operation = ProvisioningInstallId::new([0x7d; 32]);
+        let load = ProvisioningLoadId::new([0x7e; 32]);
+        let mut predecessor = read_fixture_ledger(&fixture);
+        let (intent, completed) = loop {
+            let candidate = capacity_rotation_ledgers(&predecessor, operation, load);
+            if encode_ledger(&candidate.1).is_ok()
+                && encode_ledger(&candidate.0) == Err(ProvisioningSecretStoreError::TooLarge)
+            {
+                break candidate;
+            }
+            let index = u64::try_from(predecessor.backups.len() + 1).unwrap();
+            let mut backup_operation = [0_u8; 32];
+            backup_operation[24..].copy_from_slice(&index.to_be_bytes());
+            predecessor.backups.push(BackupBinding {
+                operation: backup_operation,
+                secret_ref: predecessor.generations[0].secret_ref.clone(),
+                generation: predecessor.generations[0].generation,
+                artifact_digest: crate::admin::digest(&index.to_be_bytes()),
+            });
+        };
+        assert!(
+            encode_ledger(&predecessor).unwrap().len() > MAX_LEDGER_BYTES - 1024,
+            "capacity fixture must exercise the ledger ceiling",
+        );
+        assert!(encode_ledger(&completed).unwrap().len() <= MAX_LEDGER_BYTES);
+        assert_eq!(
+            encode_ledger(&intent).expect_err("intent must exceed ledger bound"),
+            ProvisioningSecretStoreError::TooLarge,
+        );
+        fixture.write_ledger(predecessor);
+        let before = fixture.namespace_bytes();
+        let mut admin = fixture.admin().expect("open near-capacity ledger");
+
+        assert_eq!(
+            admin
+                .rotate(operation, load, fixture.bundle())
+                .expect_err("oversized Rotate intent"),
+            ProvisioningSecretStoreError::TooLarge,
+        );
+        assert!(fixture.namespace_bytes() == before);
+        assert_eq!(fixture.encrypt_calls(), 1);
+        let retry = admin
+            .install(
+                ProvisioningInstallId::new([0x11; 32]),
+                ProvisioningLoadId::new([0x22; 32]),
+                fixture.bundle(),
+            )
+            .expect("same admin remains usable");
+        assert_eq!(
+            retry.disposition(),
+            ProvisioningInstallDisposition::Existing
+        );
+        assert!(fixture.namespace_bytes() == before);
     }
 
     #[test]
@@ -3281,6 +3449,27 @@ mod tests {
                 .expect("fixture install");
         }
 
+        fn assert_active_runtime_loads(
+            &self,
+            operation: ProvisioningLoadId,
+            secret_ref: &aster_mesh::ProvisioningSecretRef,
+            expected: UnprotectedProvisioning,
+        ) {
+            let ciphertext = fs::read(self.provisioning.join("active/credential.cred"))
+                .expect("read active test ciphertext");
+            let envelope = ciphertext
+                .strip_prefix(b"cipher:")
+                .expect("test provider ciphertext contains exact envelope");
+            let mut loader =
+                SystemdCredentialLoader::from_test_envelope(Zeroizing::new(envelope.to_vec()));
+            let receipt = loader
+                .load(operation, secret_ref)
+                .expect("production runtime loader accepts retained Active envelope");
+            assert_eq!(receipt.operation(), operation);
+            assert_eq!(receipt.secret_ref(), secret_ref);
+            assert_eq!(receipt.plaintext().expose(), expected.expose());
+        }
+
         fn write_ledger(&self, ledger: ProviderLedger) {
             let path = self.ledger.join("ledger");
             fs::write(
@@ -3537,6 +3726,38 @@ mod tests {
             destroys: vec![],
         };
         (intent_ledger, completed)
+    }
+
+    fn capacity_rotation_ledgers(
+        predecessor: &ProviderLedger,
+        operation: ProvisioningInstallId,
+        load: ProvisioningLoadId,
+    ) -> (ProviderLedger, ProviderLedger) {
+        let source = predecessor
+            .generations
+            .iter()
+            .find(|record| record.state == GenerationState::Active)
+            .expect("capacity Active generation");
+        let generation = source.generation.checked_add(1).unwrap();
+        let mut intent = predecessor.clone();
+        intent.intent = Some(LifecycleIntent {
+            kind: LifecycleIntentKind::Rotate,
+            operation: *operation.as_bytes(),
+            backup_operation: None,
+            load: Some(load),
+            target_ref: provisioning_secret_ref(generation, [0xf1; PROVIDER_REFERENCE_ID_BYTES])
+                .expect("capacity target reference"),
+            target_generation: generation,
+            source_ref: Some(source.secret_ref.clone()),
+            envelope_commitment: Some([0xf2; 32]),
+            expected_ciphertext_digest: Some([0xf3; 32]),
+            expected_artifact_digest: None,
+            pre_mutation_ledger_revision: crate::admin::digest(
+                &encode_ledger(predecessor).expect("bounded capacity predecessor"),
+            ),
+        });
+        let completed = completed_from_intent(&intent).expect("bounded capacity completion");
+        (intent, completed)
     }
 
     fn recovery_ledgers(target: &GenerationRecord) -> (ProviderLedger, ProviderLedger) {
