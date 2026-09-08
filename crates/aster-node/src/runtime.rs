@@ -26784,6 +26784,7 @@ mod tests {
             SelectedForwardingConfig::default(),
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             NodeActorChannels {
+                handle_sigint: true,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 control_receiver,
@@ -26919,6 +26920,7 @@ mod tests {
             SelectedForwardingConfig::default(),
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             NodeActorChannels {
+                handle_sigint: true,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 control_receiver,
@@ -31042,6 +31044,7 @@ mod tests {
             forwarding,
             emission_policy,
             NodeActorChannels {
+                handle_sigint: true,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 control_receiver,
