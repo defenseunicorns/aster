@@ -104,6 +104,8 @@ pub enum ApplicationErrorKind {
     Conflict,
     /// The operation remains durably bound after its finite payload was retired.
     ExpiredOrRetired,
+    /// The durable Event idempotency map reached its dedicated hard ceiling.
+    OperationCapacity,
     ResourceLimit,
     StateUnavailable,
     Integrity,
@@ -150,6 +152,7 @@ impl fmt::Display for ApplicationError {
             ApplicationErrorKind::ExpiredOrRetired => {
                 "idempotent publication expired or was retired"
             }
+            ApplicationErrorKind::OperationCapacity => "durable Event operation capacity exhausted",
             ApplicationErrorKind::ResourceLimit => "selected data resource limit reached",
             ApplicationErrorKind::StateUnavailable => "selected application state is unavailable",
             ApplicationErrorKind::Integrity => "selected data integrity check failed",
@@ -1916,9 +1919,11 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::StateSubscriptionConflict
         | StoreError::RecordSubscriptionConflict
         | StoreError::BlobSubscriptionConflict => ApplicationErrorKind::Conflict,
+        StoreError::EventOperationLimitExceeded { .. }
+        | StoreError::EventOperationByteLimitExceeded { .. } => {
+            ApplicationErrorKind::OperationCapacity
+        }
         StoreError::ItemLimitExceeded { .. }
-        | StoreError::EventOperationLimitExceeded { .. }
-        | StoreError::EventOperationByteLimitExceeded { .. }
         | StoreError::StateProjectionLimitExceeded { .. }
         | StoreError::StateCausalFrontierLimitExceeded { .. }
         | StoreError::StateOperationLimitExceeded { .. }
@@ -2129,6 +2134,33 @@ mod tests {
                 "test integrity"
             )),
             ApplicationErrorKind::Integrity
+        );
+    }
+
+    #[test]
+    fn event_operation_capacity_has_a_distinct_application_kind() {
+        for error in [
+            StoreError::EventOperationLimitExceeded {
+                current: 4_096,
+                limit: 4_096,
+            },
+            StoreError::EventOperationByteLimitExceeded {
+                current: 524_200,
+                incoming: 100,
+                limit: 524_288,
+            },
+        ] {
+            assert_eq!(
+                store_error_kind(&error),
+                ApplicationErrorKind::OperationCapacity
+            );
+        }
+        assert_eq!(
+            store_error_kind(&StoreError::ItemLimitExceeded {
+                current: 10_000,
+                limit: 10_000,
+            }),
+            ApplicationErrorKind::ResourceLimit
         );
     }
 

@@ -64,6 +64,7 @@ impl api::PublicErrorReason {
             Self::FailedPrecondition => "operation precondition is not satisfied",
             Self::Deadline => "operation deadline exceeded",
             Self::ResourceExhaustion => "resource limit reached",
+            Self::OperationCapacityExhausted => "durable operation capacity exhausted",
             Self::Draining => "service is draining",
             Self::StateUnavailable => "service state is unavailable",
             Self::AuthenticationFailed => "authentication failed",
@@ -84,6 +85,7 @@ pub(crate) fn is_public_error_message(message: &str) -> bool {
         R::FailedPrecondition,
         R::Deadline,
         R::ResourceExhaustion,
+        R::OperationCapacityExhausted,
         R::Draining,
         R::StateUnavailable,
         R::AuthenticationFailed,
@@ -165,6 +167,11 @@ fn application_error_mapping(kind: ApplicationErrorKind, operation: &str) -> Pub
             ErrorCode::ResourceExhausted,
             api::PublicErrorReason::ResourceExhaustion,
             true,
+        ),
+        ApplicationErrorKind::OperationCapacity => (
+            ErrorCode::ResourceExhausted,
+            api::PublicErrorReason::OperationCapacityExhausted,
+            false,
         ),
         ApplicationErrorKind::StateUnavailable => (
             ErrorCode::Unavailable,
@@ -330,6 +337,12 @@ mod tests {
                 ErrorCode::ResourceExhausted,
                 api::PublicErrorReason::ResourceExhaustion,
                 true,
+            ),
+            (
+                ApplicationErrorKind::OperationCapacity,
+                ErrorCode::ResourceExhausted,
+                api::PublicErrorReason::OperationCapacityExhausted,
+                false,
             ),
             (
                 ApplicationErrorKind::StateUnavailable,
