@@ -13,10 +13,16 @@ fn reference() -> Vec<u8> {
 
 fn valid_ledger() -> Vec<u8> {
     let reference = reference();
-    let mut encoded = Vec::with_capacity(152 + reference.len());
+    let mut encoded = Vec::with_capacity(204 + reference.len());
     encoded.extend_from_slice(b"ASTRSDL1");
     encoded.extend_from_slice(&2_u16.to_be_bytes());
-    encoded.extend_from_slice(&[2, 0]);
+    encoded.extend_from_slice(&[0, 0]);
+    encoded.extend_from_slice(&[0xa0; 32]);
+    encoded.extend_from_slice(&1_u32.to_be_bytes());
+    encoded.extend_from_slice(&0_u32.to_be_bytes());
+    encoded.extend_from_slice(&0_u32.to_be_bytes());
+    encoded.extend_from_slice(&0_u32.to_be_bytes());
+    encoded.extend_from_slice(&[1, 0, 0, 0]);
     encoded.extend_from_slice(&1_u64.to_be_bytes());
     encoded.extend_from_slice(&[0x11; 32]);
     encoded.extend_from_slice(&[0x22; 32]);

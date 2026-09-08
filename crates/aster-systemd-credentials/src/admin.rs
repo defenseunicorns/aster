@@ -16,10 +16,14 @@ use files::FaultPoint;
 use files::{
     ACTIVE_DIRECTORY, FaultInjector, GenerationManifest, LedgerWrite, STAGED_DIRECTORY,
     child_directory_exists, generation_matches, open_namespace_lock, open_secure_root,
-    promote_staged_generation, read_generation_manifest, read_ledger, remove_staged_generation,
-    sync_recovered_active_parent, write_ledger_atomically, write_staged_generation,
+    promote_staged_generation, read_generation_manifest, read_host_key_identity, read_ledger,
+    remove_staged_generation, sync_recovered_active_parent, write_ledger_atomically,
+    write_staged_generation,
 };
-use ledger::{InstallPhase, InstallRecord, Retry, classify_retry, decode_record, encode_record};
+use ledger::{
+    GenerationRecord, GenerationState, LifecycleIntent, LifecycleIntentKind, ProviderLedger,
+    decode_ledger, encode_ledger,
+};
 use rustix::fd::OwnedFd;
 use sha2::{Digest as _, Sha256};
 use std::path::Path;
@@ -29,12 +33,14 @@ use zeroize::Zeroizing;
 
 const PROVISIONING_ROOT: &str = "/etc/aster/provisioning";
 const LEDGER_ROOT: &str = "/var/lib/aster/provisioning-systemd";
+const HOST_KEY_PATH: &str = "/var/lib/systemd/credential.secret";
 
 /// Root-operated administration capability for the selected systemd provider.
 #[derive(Debug)]
 pub struct SystemdCredentialAdmin {
     provisioning_root: OwnedFd,
     ledger_root: OwnedFd,
+    host_key_identity: [u8; 32],
     _namespace_lock: OwnedFd,
     encryptor: SystemdCredsEncryptor,
     faults: FaultInjector,
@@ -49,6 +55,7 @@ impl SystemdCredentialAdmin {
         Self::open_paths(
             Path::new(PROVISIONING_ROOT),
             Path::new(LEDGER_ROOT),
+            Path::new(HOST_KEY_PATH),
             true,
             SystemdCredsEncryptor::new(),
             FaultInjector::disabled(),
@@ -59,11 +66,13 @@ impl SystemdCredentialAdmin {
     fn open_for_test(
         provisioning_root: &Path,
         ledger_root: &Path,
+        host_key_path: &Path,
         program: &Path,
     ) -> Result<Self, ProvisioningSecretStoreError> {
         Self::open_paths(
             provisioning_root,
             ledger_root,
+            host_key_path,
             false,
             SystemdCredsEncryptor::at(PathBuf::from(program)),
             FaultInjector::disabled(),
@@ -74,12 +83,14 @@ impl SystemdCredentialAdmin {
     fn open_for_test_with_fault(
         provisioning_root: &Path,
         ledger_root: &Path,
+        host_key_path: &Path,
         program: &Path,
         point: FaultPoint,
     ) -> Result<Self, ProvisioningSecretStoreError> {
         Self::open_paths(
             provisioning_root,
             ledger_root,
+            host_key_path,
             false,
             SystemdCredsEncryptor::at(PathBuf::from(program)),
             FaultInjector::at(point),
@@ -89,6 +100,7 @@ impl SystemdCredentialAdmin {
     fn open_paths(
         provisioning_path: &Path,
         ledger_path: &Path,
+        host_key_path: &Path,
         require_ext4: bool,
         encryptor: SystemdCredsEncryptor,
         faults: FaultInjector,
@@ -96,9 +108,11 @@ impl SystemdCredentialAdmin {
         let provisioning_root = open_secure_root(provisioning_path, require_ext4)?;
         let ledger_root = open_secure_root(ledger_path, require_ext4)?;
         let namespace_lock = open_namespace_lock(&ledger_root)?;
+        let host_key_identity = read_host_key_identity(host_key_path)?;
         let mut admin = Self {
             provisioning_root,
             ledger_root,
+            host_key_identity,
             _namespace_lock: namespace_lock,
             encryptor,
             faults,
@@ -130,14 +144,22 @@ impl SystemdCredentialAdmin {
             return Ok(());
         };
 
-        let record = decode_record(&encoded)?;
-        let manifest = manifest_from_record(&record);
+        let ledger = decode_ledger(&encoded)?;
+        if ledger.host_key_identity != self.host_key_identity {
+            return Err(ProvisioningSecretStoreError::Rejected);
+        }
+        let phase = if ledger.intent.is_some() {
+            LedgerPhase::Intent
+        } else {
+            LedgerPhase::Complete
+        };
+        let manifest = manifest_from_ledger(&ledger)?;
         let staged = generation_match(&self.provisioning_root, STAGED_DIRECTORY, &manifest)?;
         let active = generation_match(&self.provisioning_root, ACTIVE_DIRECTORY, &manifest)?;
-        match reconcile_action(Some(record.phase), staged, active)? {
+        match reconcile_action(Some(phase), staged, active)? {
             ReconcileAction::PromoteStage => {
                 promote_staged_generation(&self.provisioning_root, &mut self.faults)?;
-                complete_record(&self.ledger_root, record, &mut self.faults)?;
+                complete_ledger(&self.ledger_root, ledger, &mut self.faults)?;
             }
             ReconcileAction::CompleteActive => {
                 // The active rename may have reached this separate filesystem
@@ -147,7 +169,7 @@ impl SystemdCredentialAdmin {
                 if staged == GenerationMatch::Exact {
                     remove_staged_generation(&self.provisioning_root)?;
                 }
-                complete_record(&self.ledger_root, record, &mut self.faults)?;
+                complete_ledger(&self.ledger_root, ledger, &mut self.faults)?;
             }
             ReconcileAction::Existing => {}
             ReconcileAction::Fresh | ReconcileAction::DiscardOrphanStage => {
@@ -168,21 +190,31 @@ impl SystemdCredentialAdmin {
             .map_err(|_| ProvisioningSecretStoreError::Rejected)?;
 
         if let Some(encoded) = read_ledger(&self.ledger_root)? {
-            let record = decode_record(&encoded)?;
+            let ledger = decode_ledger(&encoded)?;
+            let record = ledger
+                .generations
+                .iter()
+                .find(|record| record.install == operation)
+                .ok_or(ProvisioningSecretStoreError::OperationConflict)?;
             let envelope = encode_credential_envelope(&record.secret_ref, load, &plaintext)?;
             let envelope_commitment = digest(&envelope);
-            match classify_retry(&record, operation, load, envelope_commitment)? {
-                Retry::Existing => {
-                    let manifest = manifest_from_record(&record);
-                    if !generation_matches(&self.provisioning_root, ACTIVE_DIRECTORY, &manifest)? {
-                        return Err(ProvisioningSecretStoreError::Rejected);
-                    }
-                    return Ok(ProvisioningInstallReceipt::existing(
-                        operation,
-                        record.secret_ref,
-                    ));
-                }
+            if record.load != load || record.envelope_commitment != envelope_commitment {
+                return Err(ProvisioningSecretStoreError::OperationConflict);
             }
+            if record.state == GenerationState::Destroyed {
+                return Err(ProvisioningSecretStoreError::Destroyed);
+            }
+            if record.state != GenerationState::Active {
+                return Err(ProvisioningSecretStoreError::Rejected);
+            }
+            let manifest = manifest_from_record(record);
+            if !generation_matches(&self.provisioning_root, ACTIVE_DIRECTORY, &manifest)? {
+                return Err(ProvisioningSecretStoreError::Rejected);
+            }
+            return Ok(ProvisioningInstallReceipt::existing(
+                operation,
+                record.secret_ref.clone(),
+            ));
         }
 
         if read_generation_manifest(&self.provisioning_root, ACTIVE_DIRECTORY)?.is_some()
@@ -206,14 +238,25 @@ impl SystemdCredentialAdmin {
             secret_ref: secret_ref.clone(),
             ciphertext_digest,
         };
-        let intent = InstallRecord {
-            phase: InstallPhase::Intent,
-            install: operation,
-            load,
-            secret_ref: secret_ref.clone(),
-            generation,
-            envelope_commitment,
-            ciphertext_digest,
+        let intent = LifecycleIntent {
+            kind: LifecycleIntentKind::Install,
+            operation: *operation.as_bytes(),
+            load: Some(load),
+            target_ref: secret_ref.clone(),
+            target_generation: generation,
+            source_ref: None,
+            envelope_commitment: Some(envelope_commitment),
+            expected_ciphertext_digest: Some(ciphertext_digest),
+            expected_artifact_digest: None,
+            pre_mutation_ledger_revision: [0; 32],
+        };
+        let ledger = ProviderLedger {
+            host_key_identity: self.host_key_identity,
+            intent: Some(intent),
+            generations: Vec::new(),
+            backups: Vec::new(),
+            recoveries: Vec::new(),
+            destroys: Vec::new(),
         };
 
         let encoded_manifest = Zeroizing::new(files::encode_manifest(&manifest));
@@ -225,7 +268,7 @@ impl SystemdCredentialAdmin {
             &encoded_manifest,
             &mut self.faults,
         )?;
-        let encoded_intent = Zeroizing::new(encode_record(&intent));
+        let encoded_intent = Zeroizing::new(encode_ledger(&ledger)?);
         write_ledger_atomically(
             &self.ledger_root,
             &encoded_intent,
@@ -233,28 +276,47 @@ impl SystemdCredentialAdmin {
             &mut self.faults,
         )?;
         promote_staged_generation(&self.provisioning_root, &mut self.faults)?;
-        let complete = InstallRecord {
-            phase: InstallPhase::Complete,
-            ..intent
-        };
-        let encoded_complete = Zeroizing::new(encode_record(&complete));
-        write_ledger_atomically(
-            &self.ledger_root,
-            &encoded_complete,
-            LedgerWrite::Complete,
-            &mut self.faults,
-        )?;
+        complete_ledger(&self.ledger_root, ledger, &mut self.faults)?;
         Ok(ProvisioningInstallReceipt::installed(operation, secret_ref))
     }
 }
 
-fn manifest_from_record(record: &InstallRecord) -> GenerationManifest {
+fn manifest_from_record(record: &GenerationRecord) -> GenerationManifest {
     GenerationManifest {
         generation: record.generation,
         load: record.load,
         secret_ref: record.secret_ref.clone(),
         ciphertext_digest: record.ciphertext_digest,
     }
+}
+
+fn manifest_from_ledger(
+    ledger: &ProviderLedger,
+) -> Result<GenerationManifest, ProvisioningSecretStoreError> {
+    if let Some(intent) = &ledger.intent {
+        if intent.kind != LifecycleIntentKind::Install {
+            return Err(ProvisioningSecretStoreError::Rejected);
+        }
+        return Ok(GenerationManifest {
+            generation: intent.target_generation,
+            load: intent.load.ok_or(ProvisioningSecretStoreError::Rejected)?,
+            secret_ref: intent.target_ref.clone(),
+            ciphertext_digest: intent
+                .expected_ciphertext_digest
+                .ok_or(ProvisioningSecretStoreError::Rejected)?,
+        });
+    }
+    let mut active = ledger
+        .generations
+        .iter()
+        .filter(|record| record.state == GenerationState::Active);
+    let record = active
+        .next()
+        .ok_or(ProvisioningSecretStoreError::Rejected)?;
+    if active.next().is_some() {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    Ok(manifest_from_record(record))
 }
 
 fn generation_match(
@@ -272,16 +334,33 @@ fn generation_match(
     }
 }
 
-fn complete_record(
+fn complete_ledger(
     ledger_root: &OwnedFd,
-    record: InstallRecord,
+    mut ledger: ProviderLedger,
     faults: &mut FaultInjector,
 ) -> Result<(), ProvisioningSecretStoreError> {
-    let complete = InstallRecord {
-        phase: InstallPhase::Complete,
-        ..record
+    let intent = ledger
+        .intent
+        .take()
+        .ok_or(ProvisioningSecretStoreError::Rejected)?;
+    if intent.kind != LifecycleIntentKind::Install || !ledger.generations.is_empty() {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    let record = GenerationRecord {
+        install: ProvisioningInstallId::new(intent.operation),
+        load: intent.load.ok_or(ProvisioningSecretStoreError::Rejected)?,
+        secret_ref: intent.target_ref,
+        generation: intent.target_generation,
+        envelope_commitment: intent
+            .envelope_commitment
+            .ok_or(ProvisioningSecretStoreError::Rejected)?,
+        ciphertext_digest: intent
+            .expected_ciphertext_digest
+            .ok_or(ProvisioningSecretStoreError::Rejected)?,
+        state: GenerationState::Active,
     };
-    let encoded = Zeroizing::new(encode_record(&complete));
+    ledger.generations.push(record);
+    let encoded = Zeroizing::new(encode_ledger(&ledger)?);
     write_ledger_atomically(ledger_root, &encoded, LedgerWrite::Complete, faults)
 }
 
@@ -298,6 +377,12 @@ enum GenerationMatch {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LedgerPhase {
+    Intent,
+    Complete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReconcileAction {
     Fresh,
     DiscardOrphanStage,
@@ -307,7 +392,7 @@ enum ReconcileAction {
 }
 
 fn reconcile_action(
-    phase: Option<InstallPhase>,
+    phase: Option<LedgerPhase>,
     staged: GenerationMatch,
     active: GenerationMatch,
 ) -> Result<ReconcileAction, ProvisioningSecretStoreError> {
@@ -316,15 +401,15 @@ fn reconcile_action(
         (None, GenerationMatch::Unbound, GenerationMatch::Absent) => {
             Ok(ReconcileAction::DiscardOrphanStage)
         }
-        (Some(InstallPhase::Intent), GenerationMatch::Exact, GenerationMatch::Absent) => {
+        (Some(LedgerPhase::Intent), GenerationMatch::Exact, GenerationMatch::Absent) => {
             Ok(ReconcileAction::PromoteStage)
         }
         (
-            Some(InstallPhase::Intent),
+            Some(LedgerPhase::Intent),
             GenerationMatch::Absent | GenerationMatch::Exact,
             GenerationMatch::Exact,
         ) => Ok(ReconcileAction::CompleteActive),
-        (Some(InstallPhase::Complete), GenerationMatch::Absent, GenerationMatch::Exact) => {
+        (Some(LedgerPhase::Complete), GenerationMatch::Absent, GenerationMatch::Exact) => {
             Ok(ReconcileAction::Existing)
         }
         _ => Err(ProvisioningSecretStoreError::Rejected),
@@ -336,17 +421,21 @@ fn reconcile_action(
 #[doc(hidden)]
 pub fn fuzz_decode_admin_records(encoded: &[u8]) -> (bool, bool) {
     (
-        ledger::decode_record(encoded).is_ok(),
+        ledger::decode_ledger(encoded).is_ok(),
         files::decode_manifest(encoded).is_ok(),
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{GenerationMatch, ReconcileAction, SystemdCredentialAdmin, reconcile_action};
+    use super::{
+        GenerationMatch, LedgerPhase, ReconcileAction, SystemdCredentialAdmin, reconcile_action,
+    };
     use crate::admin::{
         files::{FaultPoint, decode_manifest},
-        ledger::{InstallPhase, decode_record, encode_record},
+        ledger::{
+            GenerationState, LifecycleIntent, LifecycleIntentKind, decode_ledger, encode_ledger,
+        },
     };
     use aster_mesh::{
         ProvisioningInstallDisposition, ProvisioningInstallId, ProvisioningLoadId,
@@ -364,6 +453,11 @@ mod tests {
 
     const INSTALL: ProvisioningInstallId = ProvisioningInstallId::new([0x11; 32]);
     const LOAD: ProvisioningLoadId = ProvisioningLoadId::new([0x22; 32]);
+    const HOST_ID: [u8; 32] = [
+        0x60, 0xbf, 0x07, 0xc4, 0x88, 0xaa, 0xd1, 0x8f, 0xda, 0x33, 0x9d, 0xf0, 0x7e, 0x4f, 0xbc,
+        0x47, 0xb4, 0xf0, 0x0b, 0xe7, 0x17, 0x11, 0x93, 0x6f, 0x18, 0xd0, 0x4d, 0x35, 0x2a, 0xd0,
+        0x18, 0x90,
+    ];
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
@@ -372,7 +466,7 @@ mod tests {
         // partial or unrelated credential after a crash.
         assert_eq!(
             reconcile_action(
-                Some(InstallPhase::Intent),
+                Some(LedgerPhase::Intent),
                 GenerationMatch::Exact,
                 GenerationMatch::Absent
             )
@@ -381,7 +475,7 @@ mod tests {
         );
         assert_eq!(
             reconcile_action(
-                Some(InstallPhase::Intent),
+                Some(LedgerPhase::Intent),
                 GenerationMatch::Absent,
                 GenerationMatch::Exact
             )
@@ -390,7 +484,7 @@ mod tests {
         );
         assert_eq!(
             reconcile_action(
-                Some(InstallPhase::Complete),
+                Some(LedgerPhase::Complete),
                 GenerationMatch::Absent,
                 GenerationMatch::Exact
             )
@@ -416,7 +510,7 @@ mod tests {
         );
         for state in [GenerationMatch::Unbound, GenerationMatch::Mismatch] {
             assert_eq!(
-                reconcile_action(Some(InstallPhase::Intent), state, GenerationMatch::Absent)
+                reconcile_action(Some(LedgerPhase::Intent), state, GenerationMatch::Absent)
                     .expect_err("mismatched intent"),
                 ProvisioningSecretStoreError::Rejected
             );
@@ -448,6 +542,17 @@ mod tests {
         assert_eq!(manifest.secret_ref, *receipt.secret_ref());
         assert_eq!(manifest.generation, 1);
         assert_eq!(manifest.load, LOAD);
+        let ledger =
+            decode_ledger(&fs::read(fixture.ledger.join("ledger")).expect("read lifecycle ledger"))
+                .expect("canonical lifecycle ledger");
+        assert_eq!(ledger.host_key_identity, HOST_ID);
+        assert!(ledger.intent.is_none());
+        assert_eq!(ledger.generations.len(), 1);
+        assert_eq!(ledger.generations[0].state, GenerationState::Active);
+        assert_eq!(ledger.generations[0].secret_ref, *receipt.secret_ref());
+        assert!(ledger.backups.is_empty());
+        assert!(ledger.recoveries.is_empty());
+        assert!(ledger.destroys.is_empty());
         assert_eq!(fixture.encrypt_calls(), 1);
         assert!(!fixture.provisioning.join("staged").exists());
     }
@@ -527,7 +632,7 @@ mod tests {
         // completion must not force re-encryption or strand a valid install.
         let fixture = AdminFixture::new();
         fixture.install_once();
-        fixture.set_ledger_phase(InstallPhase::Intent);
+        fixture.set_ledger_phase(LedgerPhase::Intent);
 
         let replay = fixture
             .admin()
@@ -538,7 +643,7 @@ mod tests {
             replay.disposition(),
             ProvisioningInstallDisposition::Existing
         );
-        assert_eq!(fixture.ledger_phase(), InstallPhase::Complete);
+        assert_eq!(fixture.ledger_phase(), LedgerPhase::Complete);
         assert_eq!(fixture.encrypt_calls(), 1);
     }
 
@@ -549,7 +654,7 @@ mod tests {
         // disappears after a crash, including when the two roots differ.
         let fixture = AdminFixture::new();
         fixture.install_once();
-        fixture.set_ledger_phase(InstallPhase::Intent);
+        fixture.set_ledger_phase(LedgerPhase::Intent);
 
         assert_eq!(
             fixture
@@ -557,7 +662,7 @@ mod tests {
                 .expect_err("recovered active parent sync failure"),
             ProvisioningSecretStoreError::Unavailable
         );
-        assert_eq!(fixture.ledger_phase(), InstallPhase::Intent);
+        assert_eq!(fixture.ledger_phase(), LedgerPhase::Intent);
         assert!(fixture.provisioning.join("active").is_dir());
         assert!(!fixture.ledger.join("ledger.next").exists());
     }
@@ -568,7 +673,7 @@ mod tests {
         // must promote the exact staged ciphertext rather than regenerate it.
         let fixture = AdminFixture::new();
         fixture.install_once();
-        fixture.set_ledger_phase(InstallPhase::Intent);
+        fixture.set_ledger_phase(LedgerPhase::Intent);
         fs::rename(
             fixture.provisioning.join("active"),
             fixture.provisioning.join("staged"),
@@ -586,7 +691,7 @@ mod tests {
         );
         assert!(fixture.provisioning.join("active").is_dir());
         assert!(!fixture.provisioning.join("staged").exists());
-        assert_eq!(fixture.ledger_phase(), InstallPhase::Complete);
+        assert_eq!(fixture.ledger_phase(), LedgerPhase::Complete);
         assert_eq!(fixture.encrypt_calls(), 1);
     }
 
@@ -664,14 +769,14 @@ mod tests {
             (
                 FaultPoint::IntentFileSynced,
                 None,
-                Some(InstallPhase::Intent),
+                Some(LedgerPhase::Intent),
                 true,
                 false,
                 2,
             ),
             (
                 FaultPoint::IntentRenamed,
-                Some(InstallPhase::Intent),
+                Some(LedgerPhase::Intent),
                 None,
                 true,
                 false,
@@ -679,7 +784,7 @@ mod tests {
             ),
             (
                 FaultPoint::IntentParentSynced,
-                Some(InstallPhase::Intent),
+                Some(LedgerPhase::Intent),
                 None,
                 true,
                 false,
@@ -687,7 +792,7 @@ mod tests {
             ),
             (
                 FaultPoint::ActiveRenamed,
-                Some(InstallPhase::Intent),
+                Some(LedgerPhase::Intent),
                 None,
                 false,
                 true,
@@ -695,7 +800,7 @@ mod tests {
             ),
             (
                 FaultPoint::ActiveParentSynced,
-                Some(InstallPhase::Intent),
+                Some(LedgerPhase::Intent),
                 None,
                 false,
                 true,
@@ -703,15 +808,15 @@ mod tests {
             ),
             (
                 FaultPoint::CompleteFileSynced,
-                Some(InstallPhase::Intent),
-                Some(InstallPhase::Complete),
+                Some(LedgerPhase::Intent),
+                Some(LedgerPhase::Complete),
                 false,
                 true,
                 1,
             ),
             (
                 FaultPoint::CompleteRenamed,
-                Some(InstallPhase::Complete),
+                Some(LedgerPhase::Complete),
                 None,
                 false,
                 true,
@@ -719,7 +824,7 @@ mod tests {
             ),
             (
                 FaultPoint::CompleteParentSynced,
-                Some(InstallPhase::Complete),
+                Some(LedgerPhase::Complete),
                 None,
                 false,
                 true,
@@ -775,7 +880,7 @@ mod tests {
                 ProvisioningInstallDisposition::Installed
             };
             assert_eq!(replay.disposition(), expected_disposition, "{point:?}");
-            assert_eq!(fixture.ledger_phase(), InstallPhase::Complete, "{point:?}");
+            assert_eq!(fixture.ledger_phase(), LedgerPhase::Complete, "{point:?}");
             assert!(fixture.provisioning.join("active").is_dir(), "{point:?}");
             assert!(!fixture.provisioning.join("staged").exists(), "{point:?}");
             assert_eq!(fixture.encrypt_calls(), expected_encryptions, "{point:?}");
@@ -790,8 +895,13 @@ mod tests {
         let linked = fixture.root.join("linked-provisioning");
         symlink(&fixture.provisioning, &linked).expect("create root symlink");
         assert_eq!(
-            SystemdCredentialAdmin::open_for_test(&linked, &fixture.ledger, &fixture.program)
-                .expect_err("symlinked root"),
+            SystemdCredentialAdmin::open_for_test(
+                &linked,
+                &fixture.ledger,
+                &fixture.host_key,
+                &fixture.program,
+            )
+            .expect_err("symlinked root"),
             ProvisioningSecretStoreError::Rejected
         );
 
@@ -815,12 +925,39 @@ mod tests {
     }
 
     #[test]
+    fn existing_ledger_rejects_a_changed_host_key_identity() {
+        // Break caught: accepting an intact ledger under another systemd host
+        // key could let later recovery reach provider decrypt on the wrong host.
+        let fixture = AdminFixture::new();
+        fixture.install_once();
+        fs::write(&fixture.host_key, [0x6b; 32]).expect("replace host-key fixture");
+        assert_eq!(
+            fixture.admin().expect_err("changed host key"),
+            ProvisioningSecretStoreError::Rejected
+        );
+        assert_eq!(fixture.encrypt_calls(), 1);
+    }
+
+    #[test]
+    fn missing_host_key_is_unavailable_before_install() {
+        // Break caught: treating a missing identity as an empty/default key
+        // would create a ledger that cannot prove same-host recovery.
+        let fixture = AdminFixture::new();
+        fs::remove_file(&fixture.host_key).expect("remove host-key fixture");
+        assert_eq!(
+            fixture.admin().expect_err("missing host key"),
+            ProvisioningSecretStoreError::Unavailable
+        );
+        assert_eq!(fixture.encrypt_calls(), 0);
+    }
+
+    #[test]
     fn mismatched_intent_is_rejected_and_retained() {
         // Break caught: completing or deleting a mismatched crash record hides
         // corruption and may bind the ledger to changed ciphertext.
         let fixture = AdminFixture::new();
         fixture.install_once();
-        fixture.set_ledger_phase(InstallPhase::Intent);
+        fixture.set_ledger_phase(LedgerPhase::Intent);
         let ciphertext = fixture.provisioning.join("active/credential.cred");
         let mut changed = fs::read(&ciphertext).expect("read ciphertext fixture");
         changed[0] ^= 1;
@@ -830,7 +967,7 @@ mod tests {
             fixture.admin().expect_err("mismatched active generation"),
             ProvisioningSecretStoreError::Rejected
         );
-        assert_eq!(fixture.ledger_phase(), InstallPhase::Intent);
+        assert_eq!(fixture.ledger_phase(), LedgerPhase::Intent);
         assert_eq!(fs::read(ciphertext).expect("retained ciphertext"), changed);
         assert_eq!(fixture.encrypt_calls(), 1);
     }
@@ -840,6 +977,7 @@ mod tests {
         root: PathBuf,
         provisioning: PathBuf,
         ledger: PathBuf,
+        host_key: PathBuf,
         program: PathBuf,
         calls: PathBuf,
     }
@@ -862,6 +1000,10 @@ mod tests {
                 .expect("protect provisioning root");
             fs::set_permissions(&ledger, fs::Permissions::from_mode(0o700))
                 .expect("protect ledger root");
+            let host_key = root.join("credential.secret");
+            fs::write(&host_key, [0x5a; 32]).expect("write host-key fixture");
+            fs::set_permissions(&host_key, fs::Permissions::from_mode(0o600))
+                .expect("protect host-key fixture");
             let calls = root.join("encrypt.calls");
             let program = root.join("systemd-creds-test");
             fs::write(
@@ -879,13 +1021,19 @@ mod tests {
                 root,
                 provisioning,
                 ledger,
+                host_key,
                 program,
                 calls,
             }
         }
 
         fn admin(&self) -> Result<SystemdCredentialAdmin, ProvisioningSecretStoreError> {
-            SystemdCredentialAdmin::open_for_test(&self.provisioning, &self.ledger, &self.program)
+            SystemdCredentialAdmin::open_for_test(
+                &self.provisioning,
+                &self.ledger,
+                &self.host_key,
+                &self.program,
+            )
         }
 
         fn admin_with_fault(
@@ -895,6 +1043,7 @@ mod tests {
             SystemdCredentialAdmin::open_for_test_with_fault(
                 &self.provisioning,
                 &self.ledger,
+                &self.host_key,
                 &self.program,
                 point,
             )
@@ -919,26 +1068,70 @@ mod tests {
                 .expect("fixture install");
         }
 
-        fn set_ledger_phase(&self, phase: InstallPhase) {
+        fn set_ledger_phase(&self, phase: LedgerPhase) {
             let path = self.ledger.join("ledger");
-            let mut record = decode_record(&fs::read(&path).expect("read fixture ledger"))
+            let mut ledger = decode_ledger(&fs::read(&path).expect("read fixture ledger"))
                 .expect("decode fixture ledger");
-            record.phase = phase;
-            fs::write(path, encode_record(&record)).expect("write fixture ledger");
+            match phase {
+                LedgerPhase::Intent if ledger.intent.is_none() => {
+                    let record = ledger.generations.remove(0);
+                    ledger.intent = Some(LifecycleIntent {
+                        kind: LifecycleIntentKind::Install,
+                        operation: *record.install.as_bytes(),
+                        load: Some(record.load),
+                        target_ref: record.secret_ref,
+                        target_generation: record.generation,
+                        source_ref: None,
+                        envelope_commitment: Some(record.envelope_commitment),
+                        expected_ciphertext_digest: Some(record.ciphertext_digest),
+                        expected_artifact_digest: None,
+                        pre_mutation_ledger_revision: [0; 32],
+                    });
+                }
+                LedgerPhase::Complete if ledger.intent.is_some() => {
+                    let intent = ledger.intent.take().expect("fixture intent");
+                    ledger.generations.push(super::GenerationRecord {
+                        install: ProvisioningInstallId::new(intent.operation),
+                        load: intent.load.expect("fixture load"),
+                        secret_ref: intent.target_ref,
+                        generation: intent.target_generation,
+                        envelope_commitment: intent
+                            .envelope_commitment
+                            .expect("fixture commitment"),
+                        ciphertext_digest: intent
+                            .expected_ciphertext_digest
+                            .expect("fixture ciphertext digest"),
+                        state: GenerationState::Active,
+                    });
+                }
+                _ => {}
+            }
+            fs::write(path, encode_ledger(&ledger).expect("encode fixture ledger"))
+                .expect("write fixture ledger");
         }
 
-        fn ledger_phase(&self) -> InstallPhase {
-            decode_record(&fs::read(self.ledger.join("ledger")).expect("read fixture ledger phase"))
-                .expect("decode fixture ledger phase")
-                .phase
+        fn ledger_phase(&self) -> LedgerPhase {
+            let ledger = decode_ledger(
+                &fs::read(self.ledger.join("ledger")).expect("read fixture ledger phase"),
+            )
+            .expect("decode fixture ledger phase");
+            if ledger.intent.is_some() {
+                LedgerPhase::Intent
+            } else {
+                LedgerPhase::Complete
+            }
         }
 
-        fn optional_ledger_phase(&self, name: &str) -> Option<InstallPhase> {
+        fn optional_ledger_phase(&self, name: &str) -> Option<LedgerPhase> {
             let path = self.ledger.join(name);
             path.exists().then(|| {
-                decode_record(&fs::read(path).expect("read optional fixture ledger"))
-                    .expect("decode optional fixture ledger")
-                    .phase
+                let ledger = decode_ledger(&fs::read(path).expect("read optional fixture ledger"))
+                    .expect("decode optional fixture ledger");
+                if ledger.intent.is_some() {
+                    LedgerPhase::Intent
+                } else {
+                    LedgerPhase::Complete
+                }
             })
         }
     }

@@ -13,6 +13,7 @@ const MANIFEST_VERSION: u16 = 2;
 const MANIFEST_HEADER_BYTES: usize = 8 + 2 + 2 + 8 + 32 + 32 + 4;
 const MAX_MANIFEST_BYTES: usize =
     MANIFEST_HEADER_BYTES + aster_mesh::MAX_PROVISIONING_SECRET_REF_BYTES;
+const MAX_HOST_KEY_BYTES: usize = 64 * 1024;
 const EXT4_SUPER_MAGIC: i64 = 0xef53;
 
 pub(super) const ACTIVE_DIRECTORY: &str = "active";
@@ -243,6 +244,83 @@ fn validate_regular(descriptor: &OwnedFd, mode: u32) -> Result<(), ProvisioningS
     Ok(())
 }
 
+pub(super) fn read_host_key_identity(
+    path: &Path,
+) -> Result<[u8; 32], ProvisioningSecretStoreError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    let parent = path
+        .parent()
+        .ok_or(ProvisioningSecretStoreError::Rejected)?;
+    let name = path
+        .file_name()
+        .ok_or(ProvisioningSecretStoreError::Rejected)?;
+    let directory = rustix::fs::openat2(
+        rustix::fs::CWD,
+        parent,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+        rustix::fs::ResolveFlags::NO_SYMLINKS | rustix::fs::ResolveFlags::NO_MAGICLINKS,
+    )
+    .map_err(|error| match error {
+        rustix::io::Errno::NOENT | rustix::io::Errno::ACCESS => {
+            ProvisioningSecretStoreError::Unavailable
+        }
+        _ => ProvisioningSecretStoreError::Rejected,
+    })?;
+    let descriptor = rustix::fs::openat(
+        &directory,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|error| match error {
+        rustix::io::Errno::LOOP => ProvisioningSecretStoreError::Rejected,
+        _ => ProvisioningSecretStoreError::Unavailable,
+    })?;
+    let stat =
+        rustix::fs::fstat(&descriptor).map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile
+        || stat.st_uid != rustix::process::geteuid().as_raw()
+        || stat.st_mode & 0o077 != 0
+        || stat.st_nlink != 1
+    {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    let size = usize::try_from(stat.st_size).map_err(|_| ProvisioningSecretStoreError::TooLarge)?;
+    if size == 0 || size > MAX_HOST_KEY_BYTES {
+        return Err(if size == 0 {
+            ProvisioningSecretStoreError::Rejected
+        } else {
+            ProvisioningSecretStoreError::TooLarge
+        });
+    }
+    let mut key = Zeroizing::new(Vec::with_capacity(size));
+    File::from(descriptor)
+        .take((MAX_HOST_KEY_BYTES + 1) as u64)
+        .read_to_end(&mut key)
+        .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    if key.is_empty() || key.len() > MAX_HOST_KEY_BYTES {
+        return Err(if key.is_empty() {
+            ProvisioningSecretStoreError::Rejected
+        } else {
+            ProvisioningSecretStoreError::TooLarge
+        });
+    }
+    Ok(crate::admin::digest(&key))
+}
+
 pub(super) fn read_optional_file(
     directory: &OwnedFd,
     name: &str,
@@ -282,11 +360,7 @@ pub(super) fn read_optional_file(
 pub(super) fn read_ledger(
     ledger_root: &OwnedFd,
 ) -> Result<Option<Zeroizing<Vec<u8>>>, ProvisioningSecretStoreError> {
-    read_optional_file(
-        ledger_root,
-        LEDGER_FILE,
-        152 + aster_mesh::MAX_PROVISIONING_SECRET_REF_BYTES,
-    )
+    read_optional_file(ledger_root, LEDGER_FILE, super::ledger::MAX_LEDGER_BYTES)
 }
 
 pub(super) fn write_ledger_atomically(
@@ -510,9 +584,16 @@ fn sync_directory(directory: &OwnedFd) -> Result<(), ProvisioningSecretStoreErro
 
 #[cfg(test)]
 mod tests {
-    use super::{GenerationManifest, decode_manifest, encode_manifest};
+    use super::{GenerationManifest, decode_manifest, encode_manifest, read_host_key_identity};
     use crate::{PROVIDER_REFERENCE_ID_BYTES, provisioning_secret_ref};
     use aster_mesh::{ProvisioningLoadId, ProvisioningSecretStoreError};
+    use std::{
+        fs,
+        os::unix::fs::{PermissionsExt as _, symlink},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static NEXT_HOST_KEY_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
     fn fixture_manifest() -> GenerationManifest {
         GenerationManifest {
@@ -563,6 +644,53 @@ mod tests {
         assert_eq!(
             decode_manifest(&encode_manifest(&mismatched)).expect_err("cross-generation manifest"),
             ProvisioningSecretStoreError::Rejected
+        );
+    }
+
+    #[test]
+    fn host_key_identity_hashes_only_a_secure_bounded_regular_file() {
+        // Break caught: reading by path without descriptor-relative no-follow
+        // and metadata checks could bind the ledger to attacker-selected key
+        // bytes or retain those bytes outside zeroizing memory.
+        let serial = NEXT_HOST_KEY_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "aster-systemd-host-key-test-{}-{serial}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).expect("create host-key fixture root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("protect host-key fixture root");
+        let key = root.join("credential.secret");
+        fs::write(&key, [0x5a; 32]).expect("write host-key fixture");
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600))
+            .expect("protect host-key fixture");
+        assert_eq!(
+            read_host_key_identity(&key).expect("secure host-key identity"),
+            [
+                0x60, 0xbf, 0x07, 0xc4, 0x88, 0xaa, 0xd1, 0x8f, 0xda, 0x33, 0x9d, 0xf0, 0x7e, 0x4f,
+                0xbc, 0x47, 0xb4, 0xf0, 0x0b, 0xe7, 0x17, 0x11, 0x93, 0x6f, 0x18, 0xd0, 0x4d, 0x35,
+                0x2a, 0xd0, 0x18, 0x90,
+            ]
+        );
+
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o640))
+            .expect("broaden host-key fixture");
+        assert_eq!(
+            read_host_key_identity(&key).expect_err("group-readable host key"),
+            ProvisioningSecretStoreError::Rejected
+        );
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600))
+            .expect("restore host-key fixture");
+        let link = root.join("credential-link");
+        symlink(&key, &link).expect("create host-key symlink");
+        assert_eq!(
+            read_host_key_identity(&link).expect_err("symlinked host key"),
+            ProvisioningSecretStoreError::Rejected
+        );
+        fs::remove_dir_all(&root).expect("remove host-key fixture");
+        assert_eq!(
+            read_host_key_identity(&key).expect_err("missing host key"),
+            ProvisioningSecretStoreError::Unavailable
         );
     }
 }
