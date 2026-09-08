@@ -71,6 +71,16 @@ reset its stall timer. Both also retain absolute deadlines. This is functional
 reliability evidence under a declared synthetic CPU load, not a performance
 benchmark, packet-loss test, target-hardware qualification, or hosted-CI result.
 
+Blob convergence, State/Record convergence, and Record-resolution waiting each
+allow 30 seconds without new durable progress, using the production
+`CONTACT_DEADLINE` directly. Each absolute cap remains 60 seconds. This aligns
+the budget lengths; the watchdog and contact timers start independently, so it
+is not a guarantee of contact completion.
+Resolution probes also check for contact errors and report authenticated-contact
+counts against the pre-wait baseline. Contact counts do not extend the watchdog;
+only newly observed expected versions do. Carrier deadlines and exact projection
+assertions are unchanged.
+
 Selected in-process node pairs bind their actual responder to port zero and
 use its readiness-reported address to start the initiator. The responder owns
 its socket throughout; the fixture does not reserve, release and reacquire a
@@ -96,7 +106,14 @@ Local validation on 2026-09-08:
 |---|---|
 | Contention diagnostic, network code `34699e8` | macOS ARM64, 18 logical CPUs, four CPU-load workers, four test threads per binary: three rounds passed; 102 Iroh and 33 selected node/progress test executions. |
 | Contention diagnostic, network code `a0b7154` | Linux ARM64 container, two CPUs, two CPU-load workers, four test threads per binary: three rounds passed; 102 Iroh and 33 selected node/progress test executions. |
+| Complete `mise run check` with prerequisites and descriptor wrapper | Passed in an isolated full clone at `b746307`: formatting, policy/trace checks, Clippy, Rust workspace, real application smokes, conformance, Python bindings, all 202 lab tests, and Go bindings. |
 | Parallel Linux workspace with prerequisites and descriptor wrapper | 1,226 passed, seven existing ignored tests. Rust 1.97.1, default test parallelism, owner-only creation mask, test/dev debug info disabled. The approximately 2-GB VM required one build job and the pinned Rust image's bundled LLVM linker; these build settings did not serialize tests. |
+
+For the complete local gate, use a full clone: the signed-source lab checks
+require a real `.git` directory and reject linked worktree metadata. When
+sharing `CARGO_TARGET_DIR`, also make the built FFI library available at the
+checkout's expected `target/debug` path for the Python and Go binding checks.
+The validation clone used an owner-only creation mask (`umask 077`).
 
 The network branch must integrate after the existing
 `fix/mission-lock-lifetime` (`cc98ae7`), `fix/binding-semantic-version`

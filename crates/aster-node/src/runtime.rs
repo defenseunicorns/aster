@@ -28821,26 +28821,42 @@ mod tests {
         // A committed range resets the stall timer; contacts and duplicate
         // ranges do not. The absolute cap never moves, even under trickle progress.
         let receiver_status = receiver_running.selected_events();
-        progress.wait(CONTACT_DEADLINE, Duration::from_secs(120), || async {
-            match receiver_blobs.read_page(BlobReadPageRequest {
-                blob: read.clone(), offset: 0, max_bytes: 1,
-            }).await {
-                Ok(page) => {
-                    assert_eq!(page.as_bytes(), &bytes[..1]);
-                    Ok(None)
+        progress
+            .wait(CONTACT_DEADLINE, Duration::from_secs(60), || async {
+                match receiver_blobs
+                    .read_page(BlobReadPageRequest {
+                        blob: read.clone(),
+                        offset: 0,
+                        max_bytes: 1,
+                    })
+                    .await
+                {
+                    Ok(page) => {
+                        assert_eq!(page.as_bytes(), &bytes[..1]);
+                        Ok(None)
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            ApplicationErrorKind::RequestRejected
+                                | ApplicationErrorKind::UnauthorizedOrRevoked
+                                | ApplicationErrorKind::PolicyUnsettled
+                        ) =>
+                    {
+                        let status = receiver_status
+                            .status()
+                            .await
+                            .map_err(|error| format!("contact status: {error:?}"))?;
+                        Ok(Some(format!(
+                            "read={error:?}; authenticated_contacts={}; failed_contact_attempts={}",
+                            status.authenticated_contacts, status.failed_contact_attempts
+                        )))
+                    }
+                    Err(error) => Err(format!("Blob read: {error:?}")),
                 }
-                Err(error) if matches!(error.kind(),
-                    ApplicationErrorKind::RequestRejected
-                    | ApplicationErrorKind::UnauthorizedOrRevoked
-                    | ApplicationErrorKind::PolicyUnsettled) => {
-                    let status = receiver_status.status().await
-                        .map_err(|error| format!("contact status: {error:?}"))?;
-                    Ok(Some(format!("read={error:?}; authenticated_contacts={}; failed_contact_attempts={}",
-                        status.authenticated_contacts, status.failed_contact_attempts)))
-                }
-                Err(error) => Err(format!("Blob read: {error:?}")),
-            }
-        }).await.unwrap_or_else(|error| panic!("direct-Iroh Blob convergence: {error}"));
+            })
+            .await
+            .unwrap_or_else(|error| panic!("direct-Iroh Blob convergence: {error}"));
         progress.assert_carriers_complete();
         assert_eq!(
             read_live_blob_pages(&receiver_blobs, read.clone()).await,
@@ -29491,7 +29507,7 @@ mod tests {
         };
 
         let (left_record_projection, right_record_projection) =
-            convergence_test::wait("live State/Record convergence", CONTACT_DEADLINE, Duration::from_secs(120), || async {
+            convergence_test::wait("live State/Record convergence", CONTACT_DEADLINE, Duration::from_secs(60), || async {
                     let left_state_projection = left_state_handle
                         .query(state_query.clone())
                         .await
@@ -29667,7 +29683,7 @@ mod tests {
             // Match the production contact budget instead of declaring a stall
             // after only 20 seconds without a newly committed version.
             CONTACT_DEADLINE,
-            Duration::from_secs(120),
+            Duration::from_secs(60),
             || async {
                 let left = left_records
                     .query(record_query.clone())
