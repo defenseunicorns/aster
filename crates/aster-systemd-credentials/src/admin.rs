@@ -41,7 +41,7 @@ pub struct SystemdCredentialAdmin {
 }
 
 impl SystemdCredentialAdmin {
-    /// Opens the fixed Ubuntu provider namespace and acquires its exclusive lock.
+    /// Opens the fixed Raspberry Pi provider namespace and acquires its exclusive lock.
     pub fn open() -> Result<Self, ProvisioningSecretStoreError> {
         if !rustix::process::geteuid().is_root() {
             return Err(ProvisioningSecretStoreError::Unavailable);

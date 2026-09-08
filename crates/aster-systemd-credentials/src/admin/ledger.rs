@@ -5,7 +5,7 @@ use aster_mesh::{
 use zeroize::Zeroizing;
 
 const LEDGER_MAGIC: &[u8; 8] = b"ASTRSDL1";
-const LEDGER_VERSION: u16 = 1;
+const LEDGER_VERSION: u16 = 2;
 const LEDGER_HEADER_BYTES: usize = 8 + 2 + 1 + 1 + 8 + 32 + 32 + 32 + 32 + 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -206,7 +206,7 @@ mod tests {
         let record = fixture_record(InstallPhase::Complete);
         let canonical = encode_record(&record);
         assert_eq!(&canonical[..8], b"ASTRSDL1");
-        assert_eq!(&canonical[8..10], &1_u16.to_be_bytes());
+        assert_eq!(&canonical[8..10], &2_u16.to_be_bytes());
         assert_eq!(canonical[10], 2);
         assert_eq!(canonical[11], 0);
         assert_eq!(&canonical[12..20], &1_u64.to_be_bytes());
@@ -215,9 +215,9 @@ mod tests {
         let mut wrong_magic = canonical.clone();
         wrong_magic[0] ^= 1;
         cases.push(wrong_magic);
-        let mut wrong_version = canonical.clone();
-        wrong_version[9] = 2;
-        cases.push(wrong_version);
+        let mut v1_version = canonical.clone();
+        v1_version[8..10].copy_from_slice(&1_u16.to_be_bytes());
+        cases.push(v1_version);
         let mut wrong_phase = canonical.clone();
         wrong_phase[10] = 3;
         cases.push(wrong_phase);

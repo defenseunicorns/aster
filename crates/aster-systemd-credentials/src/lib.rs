@@ -1,4 +1,4 @@
-//! Ubuntu systemd credential store provider for Aster provisioning.
+//! Raspberry Pi systemd credential store provider for Aster provisioning.
 
 #![forbid(unsafe_code)]
 
@@ -22,16 +22,16 @@ use std::{
 };
 
 /// Stable identity of the selected D06 provider contract.
-pub const PROVIDER_CONTRACT: &str = "aster-systemd-credential-store/v1";
+pub const PROVIDER_CONTRACT: &str = "aster-systemd-credential-store/v2";
 
 /// Fixed systemd service credential consumed by the Aster agent.
 pub const CREDENTIAL_NAME: &str = "aster-provisioning.bundle";
 
-/// Exact size of the random identity in a v1 provider reference.
+/// Exact size of the random identity in a v2 provider reference.
 pub const PROVIDER_REFERENCE_ID_BYTES: usize = 32;
 
 const PROVIDER_REFERENCE_MAGIC: &[u8; 8] = b"ASTRSDRF";
-const PROVIDER_REFERENCE_VERSION: u16 = 1;
+const PROVIDER_REFERENCE_VERSION: u16 = 2;
 const PROVIDER_REFERENCE_HEADER_BYTES: usize = 8 + 2 + 2 + 8;
 const PROVIDER_REFERENCE_OPAQUE_BYTES: usize =
     PROVIDER_REFERENCE_HEADER_BYTES + PROVIDER_REFERENCE_ID_BYTES;
@@ -40,10 +40,10 @@ const PROVIDER_SECRET_REF_BYTES: usize =
     ASTER_REFERENCE_HEADER_BYTES + PROVIDER_REFERENCE_OPAQUE_BYTES;
 
 const CREDENTIAL_ENVELOPE_MAGIC: &[u8; 8] = b"ASTRSDCE";
-const CREDENTIAL_ENVELOPE_VERSION: u16 = 1;
+const CREDENTIAL_ENVELOPE_VERSION: u16 = 2;
 const CREDENTIAL_ENVELOPE_HEADER_BYTES: usize = 8 + 2 + 2 + 8 + 32 + 4 + 4;
 
-/// Maximum exact v1 provider-envelope size accepted from systemd.
+/// Maximum exact v2 provider-envelope size accepted from systemd.
 pub const MAX_CREDENTIAL_ENVELOPE_BYTES: usize = CREDENTIAL_ENVELOPE_HEADER_BYTES
     + PROVIDER_SECRET_REF_BYTES
     + MAX_UNPROTECTED_PROVISIONING_BYTES;
@@ -108,7 +108,7 @@ enum CredentialSource {
     Test(Option<Zeroizing<Vec<u8>>>),
 }
 
-/// Runtime loader for the selected Ubuntu systemd service credential.
+/// Runtime loader for the selected Raspberry Pi systemd service credential.
 ///
 /// Construction and loading retain only open descriptors and fixed error
 /// categories. The credential path, envelope, reference, operation identity,
@@ -429,8 +429,10 @@ fn decode_credential_envelope(
     )
     .map_err(|_| ProvisioningSecretStoreError::Rejected)?;
     if &envelope_ref != expected_ref
-        || provider_generation(&envelope_ref)? != generation
-        || provider_generation(expected_ref)? != generation
+        || provider_generation(&envelope_ref).map_err(|_| ProvisioningSecretStoreError::Rejected)?
+            != generation
+        || provider_generation(expected_ref).map_err(|_| ProvisioningSecretStoreError::Rejected)?
+            != generation
     {
         return Err(ProvisioningSecretStoreError::Rejected);
     }
@@ -511,8 +513,8 @@ mod tests {
     };
 
     use aster_mesh::{
-        ProvisioningLoadId, ProvisioningSecretLoader, ProvisioningSecretStoreError,
-        UnprotectedProvisioning,
+        ProvisioningLoadId, ProvisioningSecretLoader, ProvisioningSecretRef,
+        ProvisioningSecretStoreError, UnprotectedProvisioning,
     };
     use zeroize::Zeroizing;
 
@@ -531,11 +533,11 @@ mod tests {
     fn envelope_round_trip_is_canonical_and_exact() {
         // Break caught: changing the provider reference/envelope layout or
         // failing to echo the exact operation/reference would make installed
-        // ciphertext incompatible with the selected v1 provider contract.
+        // ciphertext incompatible with the selected v2 provider contract.
         let secret_ref = provisioning_secret_ref(GENERATION, [0x5a; PROVIDER_REFERENCE_ID_BYTES])
             .expect("valid provider reference");
         let mut expected_opaque = b"ASTRSDRF".to_vec();
-        expected_opaque.extend_from_slice(&1_u16.to_be_bytes());
+        expected_opaque.extend_from_slice(&2_u16.to_be_bytes());
         expected_opaque.extend_from_slice(&0_u16.to_be_bytes());
         expected_opaque.extend_from_slice(&GENERATION.to_be_bytes());
         expected_opaque.extend_from_slice(&[0x5a; PROVIDER_REFERENCE_ID_BYTES]);
@@ -548,7 +550,7 @@ mod tests {
             .expect("encode provider envelope");
 
         assert_eq!(&encoded[..8], b"ASTRSDCE");
-        assert_eq!(&encoded[8..10], &1_u16.to_be_bytes());
+        assert_eq!(&encoded[8..10], &2_u16.to_be_bytes());
         assert_eq!(&encoded[10..12], &0_u16.to_be_bytes());
         assert_eq!(&encoded[12..20], &GENERATION.to_be_bytes());
         assert_eq!(&encoded[20..52], OPERATION.as_bytes());
@@ -590,9 +592,9 @@ mod tests {
         wrong_magic[0] ^= 1;
         cases.push(("wrong magic", wrong_magic, OPERATION, &secret_ref));
 
-        let mut wrong_version = canonical.clone();
-        wrong_version[9] = 2;
-        cases.push(("wrong version", wrong_version, OPERATION, &secret_ref));
+        let mut v1_envelope = canonical.clone();
+        v1_envelope[8..10].copy_from_slice(&1_u16.to_be_bytes());
+        cases.push(("v1 envelope version", v1_envelope, OPERATION, &secret_ref));
 
         let mut reserved = canonical.clone();
         reserved[11] = 1;
@@ -622,6 +624,19 @@ mod tests {
             malformed_reference,
             OPERATION,
             &secret_ref,
+        ));
+
+        let mut v1_reference = canonical.clone();
+        v1_reference[82..84].copy_from_slice(&1_u16.to_be_bytes());
+        let mut v1_expected_ref = secret_ref.to_bytes();
+        v1_expected_ref[22..24].copy_from_slice(&1_u16.to_be_bytes());
+        let v1_expected_ref = ProvisioningSecretRef::from_bytes(&v1_expected_ref)
+            .expect("bounded v1 provider reference");
+        cases.push((
+            "v1 provider reference version",
+            v1_reference,
+            OPERATION,
+            &v1_expected_ref,
         ));
 
         let mut wrong_reference_length = canonical.clone();

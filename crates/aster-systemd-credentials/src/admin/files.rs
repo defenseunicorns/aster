@@ -9,7 +9,7 @@ use std::{
 use zeroize::Zeroizing;
 
 const MANIFEST_MAGIC: &[u8; 8] = b"ASTRSDM1";
-const MANIFEST_VERSION: u16 = 1;
+const MANIFEST_VERSION: u16 = 2;
 const MANIFEST_HEADER_BYTES: usize = 8 + 2 + 2 + 8 + 32 + 32 + 4;
 const MAX_MANIFEST_BYTES: usize =
     MANIFEST_HEADER_BYTES + aster_mesh::MAX_PROVISIONING_SECRET_REF_BYTES;
@@ -522,6 +522,7 @@ mod tests {
         let manifest = fixture_manifest();
         let encoded = encode_manifest(&manifest);
         assert_eq!(&encoded[..8], b"ASTRSDM1");
+        assert_eq!(&encoded[8..10], &2_u16.to_be_bytes());
         assert_eq!(
             decode_manifest(&encoded).expect("canonical manifest"),
             manifest
@@ -537,6 +538,13 @@ mod tests {
         trailing.push(0);
         assert_eq!(
             decode_manifest(&trailing).expect_err("trailing manifest byte"),
+            ProvisioningSecretStoreError::Rejected
+        );
+
+        let mut v1_version = encode_manifest(&manifest);
+        v1_version[8..10].copy_from_slice(&1_u16.to_be_bytes());
+        assert_eq!(
+            decode_manifest(&v1_version).expect_err("v1 manifest version"),
             ProvisioningSecretStoreError::Rejected
         );
 
