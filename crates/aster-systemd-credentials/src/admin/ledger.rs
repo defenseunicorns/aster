@@ -576,10 +576,10 @@ fn validate_reference_generation(
 #[cfg(test)]
 mod tests {
     use super::{
-        BackupBinding, DESTROY_FIXED_BYTES, DestroyBinding, DestroyBindingOutcome,
-        GENERATION_FIXED_BYTES, GenerationRecord, GenerationState, LEDGER_HEADER_BYTES,
-        LifecycleIntent, LifecycleIntentKind, MAX_LEDGER_BYTES, ProviderLedger, RecoveryBinding,
-        decode_ledger, encode_ledger,
+        BackupBinding, DestroyBinding, DestroyBindingOutcome, GENERATION_FIXED_BYTES,
+        GenerationRecord, GenerationState, LEDGER_HEADER_BYTES, LifecycleIntent,
+        LifecycleIntentKind, MAX_LEDGER_BYTES, ProviderLedger, RecoveryBinding, decode_ledger,
+        encode_ledger,
     };
     use crate::{PROVIDER_REFERENCE_ID_BYTES, provisioning_secret_ref};
     use aster_mesh::{
@@ -723,18 +723,49 @@ mod tests {
         extension.push(0);
         let mut invalid_state = canonical;
         invalid_state[60] = 9;
-        let mut invalid_intent_kind = vec![0_u8; 61];
-        invalid_intent_kind[..8].copy_from_slice(b"ASTRSDL1");
-        invalid_intent_kind[8..10].copy_from_slice(&2_u16.to_be_bytes());
-        invalid_intent_kind[10] = 1;
-        invalid_intent_kind[12..44].copy_from_slice(&[0xa0; 32]);
-        invalid_intent_kind[60] = 9;
-        let mut invalid_destroy_outcome = vec![0_u8; 60 + DESTROY_FIXED_BYTES];
-        invalid_destroy_outcome[..8].copy_from_slice(b"ASTRSDL1");
-        invalid_destroy_outcome[8..10].copy_from_slice(&2_u16.to_be_bytes());
-        invalid_destroy_outcome[12..44].copy_from_slice(&[0xa0; 32]);
-        invalid_destroy_outcome[56..60].copy_from_slice(&1_u32.to_be_bytes());
-        invalid_destroy_outcome[60] = 9;
+        let mut intent_ledger = fixture_ledger();
+        intent_ledger.intent = Some(LifecycleIntent {
+            kind: LifecycleIntentKind::Rotate,
+            operation: [0x60; 32],
+            load: Some(ProvisioningLoadId::new([0x61; 32])),
+            target_ref: provisioning_secret_ref(3, [0x62; 32]).expect("target reference"),
+            target_generation: 3,
+            source_ref: Some(intent_ledger.generations[0].secret_ref.clone()),
+            envelope_commitment: Some([0x63; 32]),
+            expected_ciphertext_digest: Some([0x64; 32]),
+            expected_artifact_digest: None,
+            pre_mutation_ledger_revision: [0x65; 32],
+        });
+        let mut invalid_intent_kind =
+            encode_ledger(&intent_ledger).expect("valid intent ledger fixture");
+        assert_eq!(
+            decode_ledger(&invalid_intent_kind).expect("complete valid intent fixture"),
+            intent_ledger
+        );
+        let intent_offset = LEDGER_HEADER_BYTES
+            + GENERATION_FIXED_BYTES
+            + intent_ledger.generations[0].secret_ref.to_bytes().len();
+        invalid_intent_kind[intent_offset] = 9;
+
+        let mut destroy_ledger = fixture_ledger();
+        destroy_ledger.generations[0].state = GenerationState::Destroyed;
+        destroy_ledger.generations[0].ciphertext_digest = [0; 32];
+        destroy_ledger.destroys.push(DestroyBinding {
+            operation: ProvisioningDestroyId::new([0x73; 32]),
+            secret_ref: destroy_ledger.generations[0].secret_ref.clone(),
+            generation: destroy_ledger.generations[0].generation,
+            outcome: DestroyBindingOutcome::Destroyed,
+        });
+        let mut invalid_destroy_outcome =
+            encode_ledger(&destroy_ledger).expect("valid destroy ledger fixture");
+        assert_eq!(
+            decode_ledger(&invalid_destroy_outcome).expect("complete valid destroy fixture"),
+            destroy_ledger
+        );
+        let destroy_offset = LEDGER_HEADER_BYTES
+            + GENERATION_FIXED_BYTES
+            + destroy_ledger.generations[0].secret_ref.to_bytes().len();
+        invalid_destroy_outcome[destroy_offset] = 9;
         for encoded in [
             install_only_v2,
             extension,

@@ -294,9 +294,7 @@ fn manifest_from_ledger(
     ledger: &ProviderLedger,
 ) -> Result<GenerationManifest, ProvisioningSecretStoreError> {
     if let Some(intent) = &ledger.intent {
-        if intent.kind != LifecycleIntentKind::Install {
-            return Err(ProvisioningSecretStoreError::Rejected);
-        }
+        validate_install_intent(ledger, intent)?;
         return Ok(GenerationManifest {
             generation: intent.target_generation,
             load: intent.load.ok_or(ProvisioningSecretStoreError::Rejected)?,
@@ -317,6 +315,28 @@ fn manifest_from_ledger(
         return Err(ProvisioningSecretStoreError::Rejected);
     }
     Ok(manifest_from_record(record))
+}
+
+fn validate_install_intent(
+    ledger: &ProviderLedger,
+    intent: &LifecycleIntent,
+) -> Result<(), ProvisioningSecretStoreError> {
+    if intent.kind != LifecycleIntentKind::Install
+        || intent.target_generation != 1
+        || intent.load.is_none()
+        || intent.source_ref.is_some()
+        || intent.envelope_commitment.is_none()
+        || intent.expected_ciphertext_digest.is_none()
+        || intent.expected_artifact_digest.is_some()
+        || intent.pre_mutation_ledger_revision != [0; 32]
+        || !ledger.generations.is_empty()
+        || !ledger.backups.is_empty()
+        || !ledger.recoveries.is_empty()
+        || !ledger.destroys.is_empty()
+    {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    Ok(())
 }
 
 fn generation_match(
@@ -341,11 +361,13 @@ fn complete_ledger(
 ) -> Result<(), ProvisioningSecretStoreError> {
     let intent = ledger
         .intent
+        .as_ref()
+        .ok_or(ProvisioningSecretStoreError::Rejected)?;
+    validate_install_intent(&ledger, intent)?;
+    let intent = ledger
+        .intent
         .take()
         .ok_or(ProvisioningSecretStoreError::Rejected)?;
-    if intent.kind != LifecycleIntentKind::Install || !ledger.generations.is_empty() {
-        return Err(ProvisioningSecretStoreError::Rejected);
-    }
     let record = GenerationRecord {
         install: ProvisioningInstallId::new(intent.operation),
         load: intent.load.ok_or(ProvisioningSecretStoreError::Rejected)?,
@@ -434,9 +456,11 @@ mod tests {
     use crate::admin::{
         files::{FaultPoint, decode_manifest},
         ledger::{
-            GenerationState, LifecycleIntent, LifecycleIntentKind, decode_ledger, encode_ledger,
+            GenerationRecord, GenerationState, LifecycleIntent, LifecycleIntentKind, decode_ledger,
+            encode_ledger,
         },
     };
+    use crate::provisioning_secret_ref;
     use aster_mesh::{
         ProvisioningInstallDisposition, ProvisioningInstallId, ProvisioningLoadId,
         ProvisioningSecretStoreError, UnprotectedProvisioning,
@@ -693,6 +717,82 @@ mod tests {
         assert!(!fixture.provisioning.join("staged").exists());
         assert_eq!(fixture.ledger_phase(), LedgerPhase::Complete);
         assert_eq!(fixture.encrypt_calls(), 1);
+    }
+
+    #[test]
+    fn malformed_install_intent_preserves_duplicate_staged_generation() {
+        // Break caught: validating the envelope commitment only after
+        // reconciliation lets a malformed intent delete an exact staged copy
+        // before the ledger is rejected.
+        let fixture = AdminFixture::new();
+        fixture.install_once();
+        fixture.set_ledger_phase(LedgerPhase::Intent);
+        fixture.copy_active_to_staged();
+        let ledger_path = fixture.ledger.join("ledger");
+        let mut ledger = decode_ledger(&fs::read(&ledger_path).expect("read fixture ledger"))
+            .expect("decode fixture ledger");
+        ledger
+            .intent
+            .as_mut()
+            .expect("fixture intent")
+            .envelope_commitment = None;
+        let ledger_before = encode_ledger(&ledger).expect("encode malformed fixture ledger");
+        fs::write(&ledger_path, &ledger_before).expect("write malformed fixture ledger");
+        let active_before = fixture.generation_bytes("active");
+        let staged_before = fixture.generation_bytes("staged");
+
+        assert_eq!(
+            fixture.admin().expect_err("missing envelope commitment"),
+            ProvisioningSecretStoreError::Rejected
+        );
+        assert_eq!(
+            fs::read(&ledger_path).expect("retained ledger"),
+            ledger_before
+        );
+        assert_eq!(fixture.generation_bytes("active"), active_before);
+        assert_eq!(fixture.generation_bytes("staged"), staged_before);
+    }
+
+    #[test]
+    fn install_intent_with_retained_generation_preserves_staged_generation() {
+        // Break caught: checking the empty-generation prerequisite only after
+        // promotion can move staged ciphertext into Active before rejecting a
+        // contradictory Install intent.
+        let fixture = AdminFixture::new();
+        fixture.install_once();
+        fixture.set_ledger_phase(LedgerPhase::Intent);
+        fs::rename(
+            fixture.provisioning.join("active"),
+            fixture.provisioning.join("staged"),
+        )
+        .expect("simulate pre-rename crash");
+        let ledger_path = fixture.ledger.join("ledger");
+        let mut ledger = decode_ledger(&fs::read(&ledger_path).expect("read fixture ledger"))
+            .expect("decode fixture ledger");
+        ledger.generations.push(GenerationRecord {
+            install: ProvisioningInstallId::new([0x91; 32]),
+            load: ProvisioningLoadId::new([0x92; 32]),
+            secret_ref: provisioning_secret_ref(9, [0x93; 32])
+                .expect("unexpected retained reference"),
+            generation: 9,
+            envelope_commitment: [0x94; 32],
+            ciphertext_digest: [0; 32],
+            state: GenerationState::Destroyed,
+        });
+        let ledger_before = encode_ledger(&ledger).expect("encode contradictory fixture ledger");
+        fs::write(&ledger_path, &ledger_before).expect("write contradictory fixture ledger");
+        let staged_before = fixture.generation_bytes("staged");
+
+        assert_eq!(
+            fixture.admin().expect_err("unexpected retained generation"),
+            ProvisioningSecretStoreError::Rejected
+        );
+        assert_eq!(
+            fs::read(&ledger_path).expect("retained ledger"),
+            ledger_before
+        );
+        assert!(!fixture.provisioning.join("active").exists());
+        assert_eq!(fixture.generation_bytes("staged"), staged_before);
     }
 
     #[test]
@@ -1066,6 +1166,35 @@ mod tests {
                 .expect("fixture admin")
                 .install(INSTALL, LOAD, self.bundle())
                 .expect("fixture install");
+        }
+
+        fn copy_active_to_staged(&self) {
+            let staged = self.provisioning.join("staged");
+            fs::create_dir(&staged).expect("create staged fixture");
+            fs::set_permissions(&staged, fs::Permissions::from_mode(0o700))
+                .expect("protect staged fixture");
+            for name in ["credential.cred", "reference", "manifest"] {
+                fs::copy(
+                    self.provisioning.join("active").join(name),
+                    staged.join(name),
+                )
+                .expect("copy staged fixture file");
+                fs::set_permissions(staged.join(name), fs::Permissions::from_mode(0o600))
+                    .expect("protect staged fixture file");
+            }
+        }
+
+        fn generation_bytes(&self, name: &str) -> Vec<(String, Vec<u8>)> {
+            ["credential.cred", "reference", "manifest"]
+                .into_iter()
+                .map(|file| {
+                    (
+                        file.to_owned(),
+                        fs::read(self.provisioning.join(name).join(file))
+                            .expect("read generation fixture file"),
+                    )
+                })
+                .collect()
         }
 
         fn set_ledger_phase(&self, phase: LedgerPhase) {
