@@ -92,6 +92,9 @@ use zeroize::Zeroize as _;
 #[cfg(test)]
 #[path = "runtime/blob_progress_test.rs"]
 mod blob_progress_test;
+#[cfg(test)]
+#[path = "runtime/convergence_test.rs"]
+mod convergence_test;
 
 #[cfg(feature = "nearby-discovery")]
 use crate::mission::{initiate_discovered_over_iroh_metered, respond_discovered_over_iroh_metered};
@@ -21791,6 +21794,7 @@ mod tests {
     use std::sync::{Barrier, mpsc as std_mpsc};
 
     use super::*;
+    use crate::application::{RecordProjection, StateProjection};
     use crate::mission::initiate_over_iroh;
     use redb::{ReadableDatabase as _, ReadableTable as _};
 
@@ -29487,8 +29491,7 @@ mod tests {
         };
 
         let (left_record_projection, right_record_projection) =
-            timeout(Duration::from_secs(20), async {
-                loop {
+            convergence_test::wait("live State/Record convergence", CONTACT_DEADLINE, Duration::from_secs(120), || async {
                     let left_state_projection = left_state_handle
                         .query(state_query.clone())
                         .await
@@ -29528,14 +29531,27 @@ mod tests {
                         .is_some_and(|(left, right)| {
                             left.siblings == right.siblings && left.siblings.len() == 2
                         });
-                    if state_converged && records_converged {
-                        break (left_record_projection, right_record_projection);
-                    }
-                    sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .expect("live State and Record projections converge");
+                    let has_state = |projection: &StateProjection, id| {
+                        projection.current.iter().chain(&projection.recoverable).any(|item| item.id == id)
+                    };
+                    let has_record = |projection: &RecordProjection, id| {
+                        projection.current.iter().chain(&projection.concurrent).chain(&projection.superseded)
+                            .any(|item| item.id == id)
+                    };
+                    let milestones = [
+                        has_state(&left_state_projection, left_state_publication.id),
+                        has_state(&left_state_projection, right_state_publication.id),
+                        has_state(&right_state_projection, left_state_publication.id),
+                        has_state(&right_state_projection, right_state_publication.id),
+                        has_record(&left_record_projection, left_record_publication.id),
+                        has_record(&left_record_projection, right_record_publication.id),
+                        has_record(&right_record_projection, left_record_publication.id),
+                        has_record(&right_record_projection, right_record_publication.id),
+                    ];
+                    let detail = format!("state_converged={state_converged}; records_converged={records_converged}; versions={milestones:?}");
+                    (milestones, (state_converged && records_converged).then_some(
+                        (left_record_projection, right_record_projection)), detail)
+            }).await;
         timeout(Duration::from_secs(20), async {
             loop {
                 let left = left_status
@@ -29646,8 +29662,13 @@ mod tests {
             .expect("right contact baseline")
             .authenticated_contacts;
 
-        timeout(Duration::from_secs(20), async {
-            loop {
+        convergence_test::wait(
+            "live Record resolution",
+            // Match the production contact budget instead of declaring a stall
+            // after only 20 seconds without a newly committed version.
+            CONTACT_DEADLINE,
+            Duration::from_secs(120),
+            || async {
                 let left = left_records
                     .query(record_query.clone())
                     .await
@@ -29656,7 +29677,11 @@ mod tests {
                     .query(record_query.clone())
                     .await
                     .expect("right resolved Record query");
-                if left
+                let left_contact = left_status.status().await.expect("left resolution status");
+                let right_contact = right_status.status().await.expect("right resolution status");
+                assert_eq!(left_contact.failed_contact_attempts, 0);
+                assert_eq!(right_contact.failed_contact_attempts, 0);
+                let complete = left
                     .current
                     .as_ref()
                     .is_some_and(|item| item.id == resolved.id)
@@ -29667,15 +29692,41 @@ mod tests {
                     && left.conflict.is_none()
                     && right.conflict.is_none()
                     && left.superseded.len() == 2
-                    && right.superseded.len() == 2
-                {
-                    break;
-                }
-                sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("live Record resolution converges");
+                    && right.superseded.len() == 2;
+                let milestones = [
+                    left.current
+                        .as_ref()
+                        .is_some_and(|item| item.id == resolved.id),
+                    right
+                        .current
+                        .as_ref()
+                        .is_some_and(|item| item.id == resolved.id),
+                    left.superseded
+                        .iter()
+                        .any(|item| item.id == left_record_publication.id),
+                    left.superseded
+                        .iter()
+                        .any(|item| item.id == right_record_publication.id),
+                    right
+                        .superseded
+                        .iter()
+                        .any(|item| item.id == left_record_publication.id),
+                    right
+                        .superseded
+                        .iter()
+                        .any(|item| item.id == right_record_publication.id),
+                ];
+                (
+                    milestones,
+                    complete.then_some(()),
+                    format!(
+                        "resolved_versions={milestones:?}; exact_projection={complete}; authenticated_contacts=[{}, {}]; contact_baseline=[{left_contact_baseline}, {right_contact_baseline}]",
+                        left_contact.authenticated_contacts, right_contact.authenticated_contacts,
+                    ),
+                )
+            },
+        )
+        .await;
 
         timeout(Duration::from_secs(20), async {
             loop {
