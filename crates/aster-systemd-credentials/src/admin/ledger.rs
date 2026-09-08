@@ -19,11 +19,13 @@ const INTENT_OPTION_SOURCE: u8 = 1 << 1;
 const INTENT_OPTION_ENVELOPE: u8 = 1 << 2;
 const INTENT_OPTION_CIPHERTEXT: u8 = 1 << 3;
 const INTENT_OPTION_ARTIFACT: u8 = 1 << 4;
+const INTENT_OPTION_BACKUP_OPERATION: u8 = 1 << 5;
 const INTENT_OPTION_MASK: u8 = INTENT_OPTION_LOAD
     | INTENT_OPTION_SOURCE
     | INTENT_OPTION_ENVELOPE
     | INTENT_OPTION_CIPHERTEXT
-    | INTENT_OPTION_ARTIFACT;
+    | INTENT_OPTION_ARTIFACT
+    | INTENT_OPTION_BACKUP_OPERATION;
 
 pub(super) const MAX_LEDGER_BYTES: usize = 64 * 1024;
 
@@ -59,6 +61,7 @@ pub(super) enum GenerationState {
 pub(super) struct LifecycleIntent {
     pub(super) kind: LifecycleIntentKind,
     pub(super) operation: [u8; 32],
+    pub(super) backup_operation: Option<[u8; 32]>,
     pub(super) load: Option<ProvisioningLoadId>,
     pub(super) target_ref: ProvisioningSecretRef,
     pub(super) target_generation: u64,
@@ -245,7 +248,8 @@ fn encode_intent(
         | (u8::from(intent.source_ref.is_some()) * INTENT_OPTION_SOURCE)
         | (u8::from(intent.envelope_commitment.is_some()) * INTENT_OPTION_ENVELOPE)
         | (u8::from(intent.expected_ciphertext_digest.is_some()) * INTENT_OPTION_CIPHERTEXT)
-        | (u8::from(intent.expected_artifact_digest.is_some()) * INTENT_OPTION_ARTIFACT);
+        | (u8::from(intent.expected_artifact_digest.is_some()) * INTENT_OPTION_ARTIFACT)
+        | (u8::from(intent.backup_operation.is_some()) * INTENT_OPTION_BACKUP_OPERATION);
     append(encoded, &[intent.kind as u8, options, 0, 0])?;
     append(encoded, &intent.operation)?;
     append(encoded, &intent.target_generation.to_be_bytes())?;
@@ -265,6 +269,9 @@ fn encode_intent(
     }
     if let Some(digest) = intent.expected_artifact_digest {
         append(encoded, &digest)?;
+    }
+    if let Some(operation) = intent.backup_operation {
+        append(encoded, &operation)?;
     }
     Ok(())
 }
@@ -453,9 +460,13 @@ impl<'a> Decoder<'a> {
         let expected_artifact_digest = (options & INTENT_OPTION_ARTIFACT != 0)
             .then(|| self.array())
             .transpose()?;
+        let backup_operation = (options & INTENT_OPTION_BACKUP_OPERATION != 0)
+            .then(|| self.array())
+            .transpose()?;
         Ok(LifecycleIntent {
             kind,
             operation,
+            backup_operation,
             load,
             target_ref,
             target_generation,
@@ -523,6 +534,9 @@ fn validate_ledger(ledger: &ProviderLedger) -> Result<(), ProvisioningSecretStor
         }
     }
     if let Some(intent) = &ledger.intent {
+        if (intent.kind == LifecycleIntentKind::Recover) != intent.backup_operation.is_some() {
+            return Err(ProvisioningSecretStoreError::Rejected);
+        }
         validate_reference_generation(&intent.target_ref, intent.target_generation)?;
         if let Some(source) = &intent.source_ref {
             provider_generation(source).map_err(|_| ProvisioningSecretStoreError::Rejected)?;
@@ -663,6 +677,7 @@ mod tests {
         ledger.intent = Some(LifecycleIntent {
             kind: LifecycleIntentKind::Rotate,
             operation: [0x60; 32],
+            backup_operation: None,
             load: Some(ProvisioningLoadId::new([0x61; 32])),
             target_ref: provisioning_secret_ref(3, [0x62; 32]).expect("target reference"),
             target_generation: 3,
@@ -700,6 +715,61 @@ mod tests {
     }
 
     #[test]
+    fn recover_intent_canonically_requires_the_authenticated_backup_operation() {
+        // Break caught: without the already-authenticated backup operation in
+        // the durable intent, a fresh reconciler cannot reconstruct the exact
+        // RecoveryBinding and must either invent identity or strand intent.
+        let mut ledger = fixture_ledger();
+        let target = ledger.generations[0].clone();
+        ledger.backups.push(BackupBinding {
+            operation: [0x70; 32],
+            secret_ref: target.secret_ref.clone(),
+            generation: target.generation,
+            artifact_digest: [0x72; 32],
+        });
+        ledger.intent = Some(LifecycleIntent {
+            kind: LifecycleIntentKind::Recover,
+            operation: [0x71; 32],
+            backup_operation: Some([0x70; 32]),
+            load: Some(target.load),
+            target_ref: target.secret_ref,
+            target_generation: target.generation,
+            source_ref: None,
+            envelope_commitment: None,
+            expected_ciphertext_digest: Some(target.ciphertext_digest),
+            expected_artifact_digest: Some([0x72; 32]),
+            pre_mutation_ledger_revision: [0x73; 32],
+        });
+
+        let encoded = encode_ledger(&ledger).expect("encode Recover intent");
+        assert_eq!(
+            decode_ledger(&encoded).expect("decode Recover intent"),
+            ledger
+        );
+
+        let mut missing = ledger.clone();
+        missing
+            .intent
+            .as_mut()
+            .expect("Recover intent")
+            .backup_operation = None;
+        assert_eq!(
+            decode_ledger(&encode_ledger(&missing).expect("encode missing backup operation"))
+                .expect_err("Recover without backup operation"),
+            ProvisioningSecretStoreError::Rejected,
+        );
+
+        let mut forbidden = ledger;
+        let intent = forbidden.intent.as_mut().expect("Recover intent");
+        intent.kind = LifecycleIntentKind::Rotate;
+        assert_eq!(
+            decode_ledger(&encode_ledger(&forbidden).expect("encode forbidden backup operation"))
+                .expect_err("non-Recover backup operation"),
+            ProvisioningSecretStoreError::Rejected,
+        );
+    }
+
+    #[test]
     fn lifecycle_ledger_rejects_install_only_v2_extensions_and_invalid_enums() {
         // Break caught: accepting the draft install-only v2 layout, extension
         // bytes, or an unknown state would make one version noncanonical.
@@ -727,6 +797,7 @@ mod tests {
         intent_ledger.intent = Some(LifecycleIntent {
             kind: LifecycleIntentKind::Rotate,
             operation: [0x60; 32],
+            backup_operation: None,
             load: Some(ProvisioningLoadId::new([0x61; 32])),
             target_ref: provisioning_secret_ref(3, [0x62; 32]).expect("target reference"),
             target_generation: 3,

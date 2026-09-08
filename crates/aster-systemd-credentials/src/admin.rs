@@ -19,8 +19,8 @@ use files::{
     ACTIVE_DIRECTORY, FaultInjector, GenerationContent, GenerationManifest, LedgerWrite,
     STAGED_DIRECTORY, child_directory_exists, generation_matches, open_namespace_lock,
     open_secure_root, promote_staged_generation, read_generation_manifest, read_host_key_identity,
-    read_ledger, remove_staged_generation, sync_recovered_active_parent, write_ledger_atomically,
-    write_staged_generation,
+    read_ledger, read_pending_ledger, remove_staged_generation, sync_recovered_active_parent,
+    write_ledger_atomically, write_staged_generation,
 };
 use ledger::{
     GenerationRecord, GenerationState, LifecycleIntent, LifecycleIntentKind, ProviderLedger,
@@ -124,7 +124,20 @@ impl SystemdCredentialAdmin {
     }
 
     fn reconcile_namespace(&mut self) -> Result<(), ProvisioningSecretStoreError> {
-        let Some(encoded) = read_ledger(&self.ledger_root)? else {
+        let current = read_ledger(&self.ledger_root)?;
+        let pending = read_pending_ledger(&self.ledger_root)?;
+        if current.is_none() {
+            if let Some(encoded) = &pending {
+                let pending = decode_ledger(encoded)?;
+                if pending.host_key_identity != self.host_key_identity
+                    || pending
+                        .intent
+                        .as_ref()
+                        .is_none_or(|intent| intent.kind != LifecycleIntentKind::Install)
+                {
+                    return Err(ProvisioningSecretStoreError::Rejected);
+                }
+            }
             let staged = child_directory_exists(&self.provisioning_root, STAGED_DIRECTORY)?;
             let active = child_directory_exists(&self.provisioning_root, ACTIVE_DIRECTORY)?;
             let action = reconcile_action(
@@ -144,15 +157,45 @@ impl SystemdCredentialAdmin {
                 remove_staged_generation(&self.provisioning_root)?;
             }
             return Ok(());
-        };
+        }
 
-        let ledger = decode_ledger(&encoded)?;
+        let pending = pending
+            .as_ref()
+            .map(|encoded| decode_ledger(encoded))
+            .transpose()?;
+        if pending
+            .as_ref()
+            .is_some_and(|ledger| ledger.host_key_identity != self.host_key_identity)
+        {
+            return Err(ProvisioningSecretStoreError::Rejected);
+        }
+        let ledger = match current {
+            Some(encoded) => {
+                let current = decode_ledger(&encoded)?;
+                lifecycle::select_lifecycle_ledger(current, pending)?
+            }
+            None => return Err(ProvisioningSecretStoreError::Rejected),
+        };
         if ledger.host_key_identity != self.host_key_identity {
             return Err(ProvisioningSecretStoreError::Rejected);
         }
         if ledger.intent.is_none() {
             lifecycle::validate_completed_generations(&self.provisioning_root, &ledger)?;
             return Ok(());
+        }
+        if ledger
+            .intent
+            .as_ref()
+            .is_some_and(|intent| intent.kind != LifecycleIntentKind::Install)
+        {
+            let completed = lifecycle::completed_from_intent(&ledger)?;
+            return lifecycle::reconcile_lifecycle(
+                &self.provisioning_root,
+                &self.ledger_root,
+                ledger,
+                &completed,
+                &mut self.faults,
+            );
         }
         let phase = if ledger.intent.is_some() {
             LedgerPhase::Intent
@@ -248,6 +291,7 @@ impl SystemdCredentialAdmin {
         let intent = LifecycleIntent {
             kind: LifecycleIntentKind::Install,
             operation: *operation.as_bytes(),
+            backup_operation: None,
             load: Some(load),
             target_ref: secret_ref.clone(),
             target_generation: generation,
@@ -1220,6 +1264,7 @@ mod tests {
                     ledger.intent = Some(LifecycleIntent {
                         kind: LifecycleIntentKind::Install,
                         operation: *record.install.as_bytes(),
+                        backup_operation: None,
                         load: Some(record.load),
                         target_ref: record.secret_ref,
                         target_generation: record.generation,

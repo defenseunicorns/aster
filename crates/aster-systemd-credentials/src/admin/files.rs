@@ -45,6 +45,14 @@ pub(super) enum FaultPoint {
     ActiveExchanged,
     PreviousExchanged,
     PreviousRenamed,
+    CleanupGenerationRenamed,
+    CleanupParentSynced,
+    CleanupContentDeleted,
+    CleanupReferenceDeleted,
+    CleanupManifestDeleted,
+    CleanupContentsDeleted,
+    CleanupDirectoryDeleted,
+    CleanupRemovalParentSynced,
     ReplacedGenerationDeleted,
     ProvisioningParentSynced,
     RecoveredActiveParentSyncFailed,
@@ -393,6 +401,16 @@ pub(super) fn read_ledger(
     read_optional_file(ledger_root, LEDGER_FILE, super::ledger::MAX_LEDGER_BYTES)
 }
 
+pub(super) fn read_pending_ledger(
+    ledger_root: &OwnedFd,
+) -> Result<Option<Zeroizing<Vec<u8>>>, ProvisioningSecretStoreError> {
+    read_optional_file(
+        ledger_root,
+        LEDGER_NEXT_FILE,
+        super::ledger::MAX_LEDGER_BYTES,
+    )
+}
+
 pub(super) fn write_ledger_atomically(
     ledger_root: &OwnedFd,
     bytes: &[u8],
@@ -674,7 +692,7 @@ pub(super) fn write_new_file(
         .map_err(|_| ProvisioningSecretStoreError::Unavailable)
 }
 
-fn remove_optional_file(
+pub(super) fn remove_optional_file(
     directory: &OwnedFd,
     name: &str,
 ) -> Result<(), ProvisioningSecretStoreError> {

@@ -1,9 +1,10 @@
 use super::files::{
     ACTIVE_DIRECTORY, CIPHERTEXT_FILE, FaultInjector, FaultPoint, GenerationContent,
     GenerationManifest, LedgerWrite, MANIFEST_FILE, PREVIOUS_DIRECTORY, REFERENCE_FILE,
-    STAGED_DIRECTORY, TOMBSTONE_FILE, child_directory_exists, directory_has_exact_entries,
-    encode_manifest, generation_identity_matches, generation_matches, open_child_directory,
-    promote_staged_generation, sync_directory, write_ledger_atomically, write_new_file,
+    STAGED_DIRECTORY, TOMBSTONE_FILE, child_directory_exists, decode_manifest,
+    directory_has_exact_entries, encode_manifest, generation_identity_matches, generation_matches,
+    open_child_directory, promote_staged_generation, read_optional_file, remove_optional_file,
+    sync_directory, write_ledger_atomically, write_new_file,
 };
 use super::ledger::{
     GenerationRecord, GenerationState, LifecycleIntent, LifecycleIntentKind, ProviderLedger,
@@ -11,7 +12,10 @@ use super::ledger::{
 };
 use aster_mesh::ProvisioningSecretStoreError;
 use rustix::fd::OwnedFd;
+use std::collections::BTreeSet;
 use zeroize::Zeroizing;
+
+const CLEANUP_DIRECTORY: &str = "cleanup";
 
 pub(super) fn select_lifecycle_ledger(
     current: ProviderLedger,
@@ -20,7 +24,17 @@ pub(super) fn select_lifecycle_ledger(
     let Some(pending) = pending else {
         return Ok(current);
     };
+    if current
+        .intent
+        .as_ref()
+        .is_some_and(|intent| intent.kind == LifecycleIntentKind::Install)
+    {
+        return Ok(current);
+    }
     if current.intent.is_some() {
+        if pending != completed_from_intent(&current)? {
+            return Err(ProvisioningSecretStoreError::Rejected);
+        }
         return Ok(current);
     }
     let intent = pending
@@ -46,6 +60,9 @@ pub(super) fn commit_lifecycle_intent(
         .as_ref()
         .ok_or(ProvisioningSecretStoreError::Rejected)?;
     validate_intent_revision(ledger, intent)?;
+    if intent.kind != LifecycleIntentKind::Install {
+        let _ = completed_from_intent(ledger)?;
+    }
     let encoded = Zeroizing::new(encode_ledger(ledger)?);
     if decode_ledger(&encoded)? != *ledger {
         return Err(ProvisioningSecretStoreError::Rejected);
@@ -65,12 +82,14 @@ pub(super) fn reconcile_lifecycle(
         .as_ref()
         .ok_or(ProvisioningSecretStoreError::Rejected)?;
     validate_intent_revision(&ledger, intent)?;
-    validate_completed_snapshot(&ledger, completed, intent)?;
+    validate_completed_snapshot(&ledger, completed)?;
     let target = target_manifest(completed, intent)?;
     let source = source_manifest(&ledger, intent)?;
+    resume_bound_cleanup(provisioning_root, intent, &target, source.as_ref(), faults)?;
 
     for _ in 0..4 {
-        let slots = inspect_generation_slots(provisioning_root, intent, &target, source.as_ref())?;
+        let slots =
+            inspect_generation_slots(provisioning_root, &ledger, intent, &target, source.as_ref())?;
         match lifecycle_step(intent.kind, slots)? {
             LifecycleStep::ExchangeStagedWithActive => {
                 exchange_staged_with_active(provisioning_root, faults)?;
@@ -93,9 +112,19 @@ pub(super) fn reconcile_lifecycle(
             LifecycleStep::PromoteStagedToActive => {
                 promote_staged_generation(provisioning_root, faults)?;
             }
-            step @ (LifecycleStep::RemoveSourceStage | LifecycleStep::RemoveReplacedStage) => {
-                remove_bound_staged_generation(
+            LifecycleStep::RemovePreviousTombstone => {
+                move_bound_generation_to_cleanup(
                     provisioning_root,
+                    PREVIOUS_DIRECTORY,
+                    &target,
+                    true,
+                    faults,
+                )?;
+            }
+            step @ (LifecycleStep::RemoveSourceStage | LifecycleStep::RemoveReplacedStage) => {
+                move_bound_generation_to_cleanup(
+                    provisioning_root,
+                    STAGED_DIRECTORY,
                     source
                         .as_ref()
                         .ok_or(ProvisioningSecretStoreError::Rejected)?,
@@ -136,177 +165,150 @@ fn validate_intent_revision(
 fn validate_completed_snapshot(
     ledger: &ProviderLedger,
     completed: &ProviderLedger,
-    intent: &LifecycleIntent,
 ) -> Result<(), ProvisioningSecretStoreError> {
     if completed.intent.is_some() || completed.host_key_identity != ledger.host_key_identity {
         return Err(ProvisioningSecretStoreError::Rejected);
     }
     let encoded = encode_ledger(completed)?;
-    if decode_ledger(&encoded)? != *completed {
+    if decode_ledger(&encoded)? != *completed || completed_from_intent(ledger)? != *completed {
         return Err(ProvisioningSecretStoreError::Rejected);
     }
+    Ok(())
+}
+
+pub(super) fn completed_from_intent(
+    ledger: &ProviderLedger,
+) -> Result<ProviderLedger, ProvisioningSecretStoreError> {
+    let intent = ledger
+        .intent
+        .as_ref()
+        .ok_or(ProvisioningSecretStoreError::Rejected)?;
+    validate_intent_revision(ledger, intent)?;
+    let mut completed = ledger.clone();
+    completed.intent = None;
     match intent.kind {
-        LifecycleIntentKind::Rotate => validate_rotate_completion(ledger, completed, intent)?,
-        LifecycleIntentKind::Recover => validate_recovery_completion(ledger, completed, intent)?,
+        LifecycleIntentKind::Rotate => {
+            let source_ref = intent
+                .source_ref
+                .as_ref()
+                .ok_or(ProvisioningSecretStoreError::Rejected)?;
+            let source_index = ledger
+                .generations
+                .iter()
+                .position(|record| {
+                    record.secret_ref == *source_ref && record.state == GenerationState::Active
+                })
+                .ok_or(ProvisioningSecretStoreError::Rejected)?;
+            let source = &ledger.generations[source_index];
+            if ledger
+                .generations
+                .iter()
+                .any(|record| record.state == GenerationState::Previous)
+                || intent.backup_operation.is_some()
+                || intent.load.is_none()
+                || intent.envelope_commitment.is_none()
+                || intent.expected_ciphertext_digest.is_none()
+                || intent.expected_artifact_digest.is_some()
+                || intent.target_generation
+                    != source
+                        .generation
+                        .checked_add(1)
+                        .ok_or(ProvisioningSecretStoreError::Rejected)?
+            {
+                return Err(ProvisioningSecretStoreError::Rejected);
+            }
+            completed.generations[source_index].state = GenerationState::Previous;
+            completed.generations.push(GenerationRecord {
+                install: aster_mesh::ProvisioningInstallId::new(intent.operation),
+                load: intent.load.ok_or(ProvisioningSecretStoreError::Rejected)?,
+                secret_ref: intent.target_ref.clone(),
+                generation: intent.target_generation,
+                envelope_commitment: intent
+                    .envelope_commitment
+                    .ok_or(ProvisioningSecretStoreError::Rejected)?,
+                ciphertext_digest: intent
+                    .expected_ciphertext_digest
+                    .ok_or(ProvisioningSecretStoreError::Rejected)?,
+                state: GenerationState::Active,
+            });
+        }
+        LifecycleIntentKind::Recover => {
+            let target = ledger
+                .generations
+                .iter()
+                .find(|record| {
+                    record.secret_ref == intent.target_ref
+                        && record.generation == intent.target_generation
+                        && record.state == GenerationState::Active
+                })
+                .ok_or(ProvisioningSecretStoreError::Rejected)?;
+            let backup_operation = intent
+                .backup_operation
+                .ok_or(ProvisioningSecretStoreError::Rejected)?;
+            let artifact_digest = intent
+                .expected_artifact_digest
+                .ok_or(ProvisioningSecretStoreError::Rejected)?;
+            if intent.load != Some(target.load)
+                || intent.source_ref.is_some()
+                || intent.envelope_commitment.is_some()
+                || intent.expected_ciphertext_digest != Some(target.ciphertext_digest)
+                || !ledger.backups.iter().any(|binding| {
+                    binding.operation == backup_operation
+                        && binding.secret_ref == intent.target_ref
+                        && binding.generation == intent.target_generation
+                        && binding.artifact_digest == artifact_digest
+                })
+            {
+                return Err(ProvisioningSecretStoreError::Rejected);
+            }
+            completed.recoveries.push(super::ledger::RecoveryBinding {
+                operation: intent.operation,
+                backup_operation,
+                secret_ref: intent.target_ref.clone(),
+                generation: intent.target_generation,
+                artifact_digest,
+            });
+        }
         LifecycleIntentKind::DestroyActive | LifecycleIntentKind::DestroyPrevious => {
-            validate_destroy_completion(ledger, completed, intent)?;
+            let expected_state = if intent.kind == LifecycleIntentKind::DestroyActive {
+                GenerationState::Active
+            } else {
+                GenerationState::Previous
+            };
+            let source_index = ledger
+                .generations
+                .iter()
+                .position(|record| {
+                    record.secret_ref == intent.target_ref
+                        && record.generation == intent.target_generation
+                        && record.state == expected_state
+                })
+                .ok_or(ProvisioningSecretStoreError::Rejected)?;
+            if intent.backup_operation.is_some()
+                || intent.load.is_some()
+                || intent.source_ref.is_some()
+                || intent.envelope_commitment.is_some()
+                || intent.expected_ciphertext_digest.is_some()
+                || intent.expected_artifact_digest.is_some()
+            {
+                return Err(ProvisioningSecretStoreError::Rejected);
+            }
+            completed.generations[source_index].state = GenerationState::Destroyed;
+            completed.generations[source_index].ciphertext_digest = [0; 32];
+            completed.destroys.push(super::ledger::DestroyBinding {
+                operation: aster_mesh::ProvisioningDestroyId::new(intent.operation),
+                secret_ref: intent.target_ref.clone(),
+                generation: intent.target_generation,
+                outcome: super::ledger::DestroyBindingOutcome::Destroyed,
+            });
         }
         LifecycleIntentKind::Install => return Err(ProvisioningSecretStoreError::Rejected),
     }
-    Ok(())
-}
-
-fn validate_recovery_completion(
-    ledger: &ProviderLedger,
-    completed: &ProviderLedger,
-    intent: &LifecycleIntent,
-) -> Result<(), ProvisioningSecretStoreError> {
-    let target = ledger
-        .generations
-        .iter()
-        .find(|record| {
-            record.secret_ref == intent.target_ref
-                && record.generation == intent.target_generation
-                && record.state == GenerationState::Active
-        })
-        .ok_or(ProvisioningSecretStoreError::Rejected)?;
-    if intent.load != Some(target.load)
-        || intent.source_ref.is_some()
-        || intent.envelope_commitment.is_some()
-        || intent.expected_ciphertext_digest != Some(target.ciphertext_digest)
-        || intent.expected_artifact_digest.is_none()
-        || completed.generations != ledger.generations
-        || completed.backups != ledger.backups
-        || completed.destroys != ledger.destroys
-        || completed.recoveries.len() != ledger.recoveries.len() + 1
-        || completed.recoveries[..ledger.recoveries.len()] != ledger.recoveries
-    {
+    let encoded = encode_ledger(&completed)?;
+    if decode_ledger(&encoded)? != completed {
         return Err(ProvisioningSecretStoreError::Rejected);
     }
-    let binding = completed
-        .recoveries
-        .last()
-        .ok_or(ProvisioningSecretStoreError::Rejected)?;
-    if binding.operation != intent.operation
-        || binding.secret_ref != intent.target_ref
-        || binding.generation != intent.target_generation
-        || Some(binding.artifact_digest) != intent.expected_artifact_digest
-    {
-        return Err(ProvisioningSecretStoreError::Rejected);
-    }
-    Ok(())
-}
-
-fn validate_destroy_completion(
-    ledger: &ProviderLedger,
-    completed: &ProviderLedger,
-    intent: &LifecycleIntent,
-) -> Result<(), ProvisioningSecretStoreError> {
-    let expected_state = if intent.kind == LifecycleIntentKind::DestroyActive {
-        GenerationState::Active
-    } else {
-        GenerationState::Previous
-    };
-    let source = ledger
-        .generations
-        .iter()
-        .find(|record| {
-            record.secret_ref == intent.target_ref
-                && record.generation == intent.target_generation
-                && record.state == expected_state
-        })
-        .ok_or(ProvisioningSecretStoreError::Rejected)?;
-    let completed_target = completed
-        .generations
-        .iter()
-        .find(|record| record.secret_ref == intent.target_ref)
-        .ok_or(ProvisioningSecretStoreError::Rejected)?;
-    let mut expected_target = source.clone();
-    expected_target.state = GenerationState::Destroyed;
-    expected_target.ciphertext_digest = [0; 32];
-    let unchanged = ledger
-        .generations
-        .iter()
-        .filter(|record| record.secret_ref != intent.target_ref)
-        .all(|record| completed.generations.contains(record));
-    if completed_target != &expected_target
-        || !unchanged
-        || completed.generations.len() != ledger.generations.len()
-        || intent.load.is_some()
-        || intent.source_ref.is_some()
-        || intent.envelope_commitment.is_some()
-        || intent.expected_ciphertext_digest.is_some()
-        || intent.expected_artifact_digest.is_some()
-        || completed.backups != ledger.backups
-        || completed.recoveries != ledger.recoveries
-        || completed.destroys.len() != ledger.destroys.len() + 1
-        || completed.destroys[..ledger.destroys.len()] != ledger.destroys
-    {
-        return Err(ProvisioningSecretStoreError::Rejected);
-    }
-    let binding = completed
-        .destroys
-        .last()
-        .ok_or(ProvisioningSecretStoreError::Rejected)?;
-    if binding.operation.as_bytes() != &intent.operation
-        || binding.secret_ref != intent.target_ref
-        || binding.generation != intent.target_generation
-        || binding.outcome != super::ledger::DestroyBindingOutcome::Destroyed
-    {
-        return Err(ProvisioningSecretStoreError::Rejected);
-    }
-    Ok(())
-}
-
-fn validate_rotate_completion(
-    ledger: &ProviderLedger,
-    completed: &ProviderLedger,
-    intent: &LifecycleIntent,
-) -> Result<(), ProvisioningSecretStoreError> {
-    let source_ref = intent
-        .source_ref
-        .as_ref()
-        .ok_or(ProvisioningSecretStoreError::Rejected)?;
-    let source = ledger
-        .generations
-        .iter()
-        .find(|record| record.secret_ref == *source_ref && record.state == GenerationState::Active)
-        .ok_or(ProvisioningSecretStoreError::Rejected)?;
-    let completed_source = completed
-        .generations
-        .iter()
-        .find(|record| record.secret_ref == *source_ref)
-        .ok_or(ProvisioningSecretStoreError::Rejected)?;
-    let target = completed
-        .generations
-        .iter()
-        .find(|record| {
-            record.secret_ref == intent.target_ref
-                && record.generation == intent.target_generation
-                && record.state == GenerationState::Active
-        })
-        .ok_or(ProvisioningSecretStoreError::Rejected)?;
-    let mut expected_source = source.clone();
-    expected_source.state = GenerationState::Previous;
-    if completed_source != &expected_source
-        || intent.operation != *target.install.as_bytes()
-        || intent.load != Some(target.load)
-        || intent.envelope_commitment != Some(target.envelope_commitment)
-        || intent.expected_ciphertext_digest != Some(target.ciphertext_digest)
-        || intent.expected_artifact_digest.is_some()
-        || intent.target_generation
-            != source
-                .generation
-                .checked_add(1)
-                .ok_or(ProvisioningSecretStoreError::Rejected)?
-        || ledger.backups != completed.backups
-        || ledger.recoveries != completed.recoveries
-        || ledger.destroys != completed.destroys
-        || completed.generations.len() != ledger.generations.len() + 1
-    {
-        return Err(ProvisioningSecretStoreError::Rejected);
-    }
-    Ok(())
+    Ok(completed)
 }
 
 fn target_manifest(
@@ -362,21 +364,63 @@ fn manifest_from_record(record: &GenerationRecord) -> GenerationManifest {
 
 fn inspect_generation_slots(
     provisioning_root: &OwnedFd,
+    ledger: &ProviderLedger,
     intent: &LifecycleIntent,
     target: &GenerationManifest,
     source: Option<&GenerationManifest>,
 ) -> Result<GenerationSlots, ProvisioningSecretStoreError> {
     Ok(GenerationSlots {
-        active: inspect_slot(provisioning_root, ACTIVE_DIRECTORY, intent, target, source)?,
+        active: inspect_slot(
+            provisioning_root,
+            ACTIVE_DIRECTORY,
+            intent,
+            target,
+            source,
+            retained_manifest(ledger, intent, GenerationState::Active).as_ref(),
+        )?,
         previous: inspect_slot(
             provisioning_root,
             PREVIOUS_DIRECTORY,
             intent,
             target,
             source,
+            retained_manifest(ledger, intent, GenerationState::Previous).as_ref(),
         )?,
-        staged: inspect_slot(provisioning_root, STAGED_DIRECTORY, intent, target, source)?,
+        staged: inspect_slot(
+            provisioning_root,
+            STAGED_DIRECTORY,
+            intent,
+            target,
+            source,
+            None,
+        )?,
     })
+}
+
+fn retained_manifest(
+    ledger: &ProviderLedger,
+    intent: &LifecycleIntent,
+    state: GenerationState,
+) -> Option<GenerationManifest> {
+    let retained = matches!(
+        (intent.kind, state),
+        (
+            LifecycleIntentKind::DestroyPrevious,
+            GenerationState::Active
+        ) | (
+            LifecycleIntentKind::Recover | LifecycleIntentKind::DestroyActive,
+            GenerationState::Previous
+        )
+    );
+    retained
+        .then(|| {
+            ledger
+                .generations
+                .iter()
+                .find(|record| record.state == state)
+                .map(manifest_from_record)
+        })
+        .flatten()
 }
 
 fn inspect_slot(
@@ -385,6 +429,7 @@ fn inspect_slot(
     intent: &LifecycleIntent,
     target: &GenerationManifest,
     source: Option<&GenerationManifest>,
+    retained: Option<&GenerationManifest>,
 ) -> Result<SlotIdentity, ProvisioningSecretStoreError> {
     if !child_directory_exists(provisioning_root, slot)? {
         return Ok(SlotIdentity::Absent);
@@ -401,6 +446,11 @@ fn inspect_slot(
     {
         return Ok(SlotIdentity::Source);
     }
+    if let Some(retained) = retained
+        && generation_matches(provisioning_root, slot, retained)?
+    {
+        return Ok(SlotIdentity::Retained);
+    }
     if intent.kind == LifecycleIntentKind::Recover
         && generation_identity_matches(provisioning_root, slot, target)?
     {
@@ -409,41 +459,168 @@ fn inspect_slot(
     Ok(SlotIdentity::Unbound)
 }
 
-fn remove_bound_staged_generation(
+fn move_bound_generation_to_cleanup(
     provisioning_root: &OwnedFd,
+    slot: &str,
     expected: &GenerationManifest,
     require_digest: bool,
     faults: &mut FaultInjector,
 ) -> Result<(), ProvisioningSecretStoreError> {
     let matches = if require_digest {
-        generation_matches(provisioning_root, STAGED_DIRECTORY, expected)?
+        generation_matches(provisioning_root, slot, expected)?
     } else {
-        generation_identity_matches(provisioning_root, STAGED_DIRECTORY, expected)?
+        generation_identity_matches(provisioning_root, slot, expected)?
     };
-    if !matches {
+    if !matches || child_directory_exists(provisioning_root, CLEANUP_DIRECTORY)? {
         return Err(ProvisioningSecretStoreError::Rejected);
     }
-    let staged = open_child_directory(provisioning_root, STAGED_DIRECTORY)?;
-    let entries = match expected.content {
+    rustix::fs::renameat(
+        provisioning_root,
+        slot,
+        provisioning_root,
+        CLEANUP_DIRECTORY,
+    )
+    .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    faults.hit(FaultPoint::CleanupGenerationRenamed)?;
+    sync_directory(provisioning_root)?;
+    faults.hit(FaultPoint::CleanupParentSynced)?;
+    delete_bound_cleanup(provisioning_root, expected, require_digest, faults)
+}
+
+fn resume_bound_cleanup(
+    provisioning_root: &OwnedFd,
+    intent: &LifecycleIntent,
+    target: &GenerationManifest,
+    source: Option<&GenerationManifest>,
+    faults: &mut FaultInjector,
+) -> Result<(), ProvisioningSecretStoreError> {
+    if !child_directory_exists(provisioning_root, CLEANUP_DIRECTORY)? {
+        return Ok(());
+    }
+    let cleanup = open_child_directory(provisioning_root, CLEANUP_DIRECTORY)?;
+    let manifest = read_optional_file(&cleanup, MANIFEST_FILE, 64 * 1024)?;
+    if manifest.is_none() {
+        if !directory_has_exact_entries(&cleanup, &[])? {
+            return Err(ProvisioningSecretStoreError::Rejected);
+        }
+        drop(cleanup);
+        return delete_empty_cleanup(provisioning_root, faults);
+    }
+    drop(cleanup);
+    let manifest = decode_manifest(
+        manifest
+            .as_ref()
+            .ok_or(ProvisioningSecretStoreError::Rejected)?,
+    )?;
+    let (expected, require_digest, origin) = if manifest == *target
+        && intent.kind == LifecycleIntentKind::DestroyPrevious
+        && target.content == GenerationContent::Tombstone
+    {
+        (target, true, PREVIOUS_DIRECTORY)
+    } else if let Some(source) = source.filter(|source| manifest == **source) {
+        (
+            source,
+            intent.kind != LifecycleIntentKind::Recover,
+            STAGED_DIRECTORY,
+        )
+    } else {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    };
+    if child_directory_exists(provisioning_root, origin)? {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    delete_bound_cleanup(provisioning_root, expected, require_digest, faults)
+}
+
+fn delete_bound_cleanup(
+    provisioning_root: &OwnedFd,
+    expected: &GenerationManifest,
+    require_digest: bool,
+    faults: &mut FaultInjector,
+) -> Result<(), ProvisioningSecretStoreError> {
+    let cleanup = open_child_directory(provisioning_root, CLEANUP_DIRECTORY)?;
+    let expected_names = match expected.content {
         GenerationContent::Credential => [CIPHERTEXT_FILE, REFERENCE_FILE, MANIFEST_FILE],
         GenerationContent::Tombstone => [TOMBSTONE_FILE, REFERENCE_FILE, MANIFEST_FILE],
     };
-    if !directory_has_exact_entries(&staged, &entries)? {
+    let mut entries = BTreeSet::new();
+    let mut reader = rustix::fs::Dir::read_from(&cleanup)
+        .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    while let Some(entry) = reader.read() {
+        let entry = entry.map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+        let name = entry.file_name().to_bytes();
+        if name != b"." && name != b".." {
+            entries.insert(name.to_vec());
+        }
+    }
+    if !entries.iter().all(|name| {
+        expected_names
+            .iter()
+            .any(|expected| name == expected.as_bytes())
+    }) || !entries.contains(MANIFEST_FILE.as_bytes())
+    {
         return Err(ProvisioningSecretStoreError::Rejected);
     }
-    for name in entries {
-        rustix::fs::unlinkat(&staged, name, rustix::fs::AtFlags::empty())
-            .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    let manifest = read_optional_file(&cleanup, MANIFEST_FILE, 64 * 1024)?
+        .ok_or(ProvisioningSecretStoreError::Rejected)?;
+    if decode_manifest(&manifest)? != *expected {
+        return Err(ProvisioningSecretStoreError::Rejected);
     }
-    drop(staged);
+    if let Some(reference) = read_optional_file(
+        &cleanup,
+        REFERENCE_FILE,
+        aster_mesh::MAX_PROVISIONING_SECRET_REF_BYTES,
+    )? && reference.as_slice() != expected.secret_ref.to_bytes()
+    {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    let content_name = match expected.content {
+        GenerationContent::Credential => CIPHERTEXT_FILE,
+        GenerationContent::Tombstone => TOMBSTONE_FILE,
+    };
+    if let Some(content) = read_optional_file(
+        &cleanup,
+        content_name,
+        aster_mesh::MAX_PROTECTED_PROVISIONING_BYTES,
+    )? && require_digest
+    {
+        match expected.content {
+            GenerationContent::Credential
+                if super::digest(&content) != expected.ciphertext_digest =>
+            {
+                return Err(ProvisioningSecretStoreError::Rejected);
+            }
+            GenerationContent::Tombstone if !content.is_empty() => {
+                return Err(ProvisioningSecretStoreError::Rejected);
+            }
+            _ => {}
+        }
+    }
+    remove_optional_file(&cleanup, content_name)?;
+    faults.hit(FaultPoint::CleanupContentDeleted)?;
+    remove_optional_file(&cleanup, REFERENCE_FILE)?;
+    faults.hit(FaultPoint::CleanupReferenceDeleted)?;
+    remove_optional_file(&cleanup, MANIFEST_FILE)?;
+    faults.hit(FaultPoint::CleanupManifestDeleted)?;
+    faults.hit(FaultPoint::CleanupContentsDeleted)?;
+    drop(cleanup);
+    delete_empty_cleanup(provisioning_root, faults)
+}
+
+fn delete_empty_cleanup(
+    provisioning_root: &OwnedFd,
+    faults: &mut FaultInjector,
+) -> Result<(), ProvisioningSecretStoreError> {
     rustix::fs::unlinkat(
         provisioning_root,
-        STAGED_DIRECTORY,
+        CLEANUP_DIRECTORY,
         rustix::fs::AtFlags::REMOVEDIR,
     )
     .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    faults.hit(FaultPoint::CleanupDirectoryDeleted)?;
     faults.hit(FaultPoint::ReplacedGenerationDeleted)?;
     sync_directory(provisioning_root)?;
+    faults.hit(FaultPoint::CleanupRemovalParentSynced)?;
     faults.hit(FaultPoint::ProvisioningParentSynced)
 }
 
@@ -600,6 +777,7 @@ pub(super) enum SlotIdentity {
     Target,
     Tombstone,
     Replaced,
+    Retained,
     Mismatch,
     Partial,
     Duplicate,
@@ -614,6 +792,7 @@ pub(super) enum LifecycleStep {
     PromoteStagedToActive,
     RemoveSourceStage,
     RemoveReplacedStage,
+    RemovePreviousTombstone,
     Complete,
 }
 
@@ -624,24 +803,25 @@ pub(super) fn lifecycle_step(
     use LifecycleIntentKind::{DestroyActive, DestroyPrevious, Recover, Rotate};
     use LifecycleStep::{
         Complete, ExchangeStagedWithActive, ExchangeStagedWithPrevious, ParkStagedAsPrevious,
-        PromoteStagedToActive, RemoveReplacedStage, RemoveSourceStage,
+        PromoteStagedToActive, RemovePreviousTombstone, RemoveReplacedStage, RemoveSourceStage,
     };
-    use SlotIdentity::{Absent, Replaced, Source, Target, Tombstone};
+    use SlotIdentity::{Absent, Replaced, Retained, Source, Target, Tombstone};
 
     let step = match (kind, slots.active, slots.previous, slots.staged) {
         (Rotate, Source, Absent, Target) => ExchangeStagedWithActive,
         (Rotate, Target, Absent, Source) => ParkStagedAsPrevious,
         (Rotate, Target, Source, Absent) => Complete,
-        (Recover, Absent, Absent, Target) => PromoteStagedToActive,
-        (Recover, Replaced, Absent, Target) => ExchangeStagedWithActive,
-        (Recover, Target, Absent, Replaced) => RemoveReplacedStage,
-        (Recover, Target, Absent, Absent) => Complete,
-        (DestroyActive, Source, Absent, Tombstone) => ExchangeStagedWithActive,
-        (DestroyActive, Tombstone, Absent, Source) => RemoveSourceStage,
-        (DestroyActive, Tombstone, Absent, Absent) => Complete,
-        (DestroyPrevious, Absent, Source, Tombstone) => ExchangeStagedWithPrevious,
-        (DestroyPrevious, Absent, Tombstone, Source) => RemoveSourceStage,
-        (DestroyPrevious, Absent, Tombstone, Absent) => Complete,
+        (Recover, Absent, Absent | Retained, Target) => PromoteStagedToActive,
+        (Recover, Replaced, Absent | Retained, Target) => ExchangeStagedWithActive,
+        (Recover, Target, Absent | Retained, Replaced) => RemoveReplacedStage,
+        (Recover, Target, Absent | Retained, Absent) => Complete,
+        (DestroyActive, Source, Absent | Retained, Tombstone) => ExchangeStagedWithActive,
+        (DestroyActive, Tombstone, Absent | Retained, Source) => RemoveSourceStage,
+        (DestroyActive, Tombstone, Absent | Retained, Absent) => Complete,
+        (DestroyPrevious, Absent | Retained, Source, Tombstone) => ExchangeStagedWithPrevious,
+        (DestroyPrevious, Absent | Retained, Tombstone, Source) => RemoveSourceStage,
+        (DestroyPrevious, Absent | Retained, Tombstone, Absent) => RemovePreviousTombstone,
+        (DestroyPrevious, Absent | Retained, Absent, Absent) => Complete,
         _ => return Err(ProvisioningSecretStoreError::Rejected),
     };
     Ok(step)
@@ -650,8 +830,8 @@ pub(super) fn lifecycle_step(
 #[cfg(test)]
 mod tests {
     use super::{
-        GenerationSlots, LifecycleStep, SlotIdentity, commit_lifecycle_intent, lifecycle_step,
-        reconcile_lifecycle, select_lifecycle_ledger,
+        CLEANUP_DIRECTORY, GenerationSlots, LifecycleStep, SlotIdentity, commit_lifecycle_intent,
+        lifecycle_step, reconcile_lifecycle, select_lifecycle_ledger,
     };
     use super::{
         exchange_staged_with_active, exchange_staged_with_previous, write_staged_tombstone,
@@ -720,7 +900,7 @@ mod tests {
                 LifecycleIntentKind::Recover,
                 slots(
                     SlotIdentity::Absent,
-                    SlotIdentity::Absent,
+                    SlotIdentity::Retained,
                     SlotIdentity::Target,
                 ),
                 LifecycleStep::PromoteStagedToActive,
@@ -729,7 +909,7 @@ mod tests {
                 LifecycleIntentKind::Recover,
                 slots(
                     SlotIdentity::Replaced,
-                    SlotIdentity::Absent,
+                    SlotIdentity::Retained,
                     SlotIdentity::Target,
                 ),
                 LifecycleStep::ExchangeStagedWithActive,
@@ -738,7 +918,7 @@ mod tests {
                 LifecycleIntentKind::Recover,
                 slots(
                     SlotIdentity::Target,
-                    SlotIdentity::Absent,
+                    SlotIdentity::Retained,
                     SlotIdentity::Replaced,
                 ),
                 LifecycleStep::RemoveReplacedStage,
@@ -747,7 +927,7 @@ mod tests {
                 LifecycleIntentKind::Recover,
                 slots(
                     SlotIdentity::Target,
-                    SlotIdentity::Absent,
+                    SlotIdentity::Retained,
                     SlotIdentity::Absent,
                 ),
                 LifecycleStep::Complete,
@@ -756,7 +936,7 @@ mod tests {
                 LifecycleIntentKind::DestroyActive,
                 slots(
                     SlotIdentity::Source,
-                    SlotIdentity::Absent,
+                    SlotIdentity::Retained,
                     SlotIdentity::Tombstone,
                 ),
                 LifecycleStep::ExchangeStagedWithActive,
@@ -765,7 +945,7 @@ mod tests {
                 LifecycleIntentKind::DestroyActive,
                 slots(
                     SlotIdentity::Tombstone,
-                    SlotIdentity::Absent,
+                    SlotIdentity::Retained,
                     SlotIdentity::Source,
                 ),
                 LifecycleStep::RemoveSourceStage,
@@ -774,7 +954,7 @@ mod tests {
                 LifecycleIntentKind::DestroyActive,
                 slots(
                     SlotIdentity::Tombstone,
-                    SlotIdentity::Absent,
+                    SlotIdentity::Retained,
                     SlotIdentity::Absent,
                 ),
                 LifecycleStep::Complete,
@@ -782,7 +962,7 @@ mod tests {
             (
                 LifecycleIntentKind::DestroyPrevious,
                 slots(
-                    SlotIdentity::Absent,
+                    SlotIdentity::Retained,
                     SlotIdentity::Source,
                     SlotIdentity::Tombstone,
                 ),
@@ -791,7 +971,7 @@ mod tests {
             (
                 LifecycleIntentKind::DestroyPrevious,
                 slots(
-                    SlotIdentity::Absent,
+                    SlotIdentity::Retained,
                     SlotIdentity::Tombstone,
                     SlotIdentity::Source,
                 ),
@@ -800,8 +980,17 @@ mod tests {
             (
                 LifecycleIntentKind::DestroyPrevious,
                 slots(
-                    SlotIdentity::Absent,
+                    SlotIdentity::Retained,
                     SlotIdentity::Tombstone,
+                    SlotIdentity::Absent,
+                ),
+                LifecycleStep::RemovePreviousTombstone,
+            ),
+            (
+                LifecycleIntentKind::DestroyPrevious,
+                slots(
+                    SlotIdentity::Retained,
+                    SlotIdentity::Absent,
                     SlotIdentity::Absent,
                 ),
                 LifecycleStep::Complete,
@@ -815,6 +1004,22 @@ mod tests {
                 "intent {kind:?} with slots {slots:?}",
             );
         }
+    }
+
+    #[test]
+    fn intent_ledger_selects_only_its_exact_pending_completion() {
+        // Break caught: blindly ignoring ledger.next once ledger contains an
+        // intent can overwrite a valid but contradictory pending snapshot.
+        let source = generation_record(1, 0x31, GenerationState::Active, b"old");
+        let target = generation_record(2, 0x41, GenerationState::Active, b"new");
+        let (intent_ledger, mut completed) = rotate_ledgers(&source, &target);
+        completed.generations[0].envelope_commitment = [0xee; 32];
+
+        assert_eq!(
+            select_lifecycle_ledger(intent_ledger, Some(completed))
+                .expect_err("contradictory pending completion"),
+            ProvisioningSecretStoreError::Rejected,
+        );
     }
 
     #[test]
@@ -1142,6 +1347,111 @@ mod tests {
     }
 
     #[test]
+    fn recover_intent_commit_requires_an_exact_persisted_backup_binding() {
+        // Break caught: presence of backup_operation alone is not enough to
+        // persist a resumable Recover intent; it must identify the exact
+        // ledger binding already authenticated by Task 4.
+        let fixture = ReconcileFixture::new();
+        let target = generation_record(2, 0x41, GenerationState::Active, b"exact");
+        let (mut intent_ledger, _) = recovery_ledgers(&target);
+        intent_ledger
+            .intent
+            .as_mut()
+            .expect("Recover intent")
+            .backup_operation = Some([0x99; 32]);
+        fixture.write_ledger_without_intent(&intent_ledger);
+        let before = fs::read(fixture.ledger.join("ledger")).expect("read predecessor ledger");
+
+        assert_eq!(
+            commit_lifecycle_intent(
+                &fixture.ledger_fd,
+                &intent_ledger,
+                &mut FaultInjector::disabled(),
+            )
+            .expect_err("unbound Recover backup operation"),
+            ProvisioningSecretStoreError::Rejected,
+        );
+        assert_eq!(
+            fs::read(fixture.ledger.join("ledger")).expect("retained predecessor ledger"),
+            before,
+        );
+        assert!(!fixture.ledger.join("ledger.next").exists());
+    }
+
+    #[test]
+    fn completion_preserves_the_exact_generation_collection_except_declared_transition() {
+        // Break caught: validating only source/target records lets a caller
+        // rewrite unrelated destroyed history, and set-style comparison lets
+        // destroy silently reorder canonical generation history.
+        {
+            let fixture = ReconcileFixture::new();
+            let source = generation_record(2, 0x31, GenerationState::Active, b"old");
+            let target = generation_record(3, 0x41, GenerationState::Active, b"new");
+            let mut historical =
+                generation_record(1, 0x21, GenerationState::Destroyed, b"discarded");
+            historical.ciphertext_digest = [0; 32];
+            let (mut intent_ledger, mut completed) = rotate_ledgers(&source, &target);
+            add_retained_generation(&mut intent_ledger, &mut completed, historical.clone());
+            completed
+                .generations
+                .iter_mut()
+                .find(|record| record.secret_ref == historical.secret_ref)
+                .expect("completed historical generation")
+                .envelope_commitment = [0xee; 32];
+            fixture.write_generation(ACTIVE_DIRECTORY, &target, b"new");
+            let mut previous = source;
+            previous.state = GenerationState::Previous;
+            fixture.write_generation(PREVIOUS_DIRECTORY, &previous, b"old");
+            fixture.write_ledger(&intent_ledger);
+            let before = fixture.namespace_bytes();
+
+            assert_eq!(
+                reconcile_lifecycle(
+                    &fixture.provisioning_fd,
+                    &fixture.ledger_fd,
+                    intent_ledger,
+                    &completed,
+                    &mut FaultInjector::disabled(),
+                )
+                .expect_err("mutated unrelated history"),
+                ProvisioningSecretStoreError::Rejected,
+            );
+            assert_eq!(fixture.namespace_bytes(), before);
+        }
+
+        {
+            let fixture = ReconcileFixture::new();
+            let active = generation_record(1, 0x31, GenerationState::Active, b"current");
+            let previous = generation_record(2, 0x41, GenerationState::Previous, b"old");
+            let (mut intent_ledger, mut completed) = destroy_ledgers(&active);
+            add_retained_generation(&mut intent_ledger, &mut completed, previous.clone());
+            completed.generations.swap(0, 1);
+            fixture.write_tombstone(&completed.generations[1]);
+            fs::rename(
+                fixture.provisioning.join(STAGED_DIRECTORY),
+                fixture.provisioning.join(ACTIVE_DIRECTORY),
+            )
+            .expect("install active tombstone fixture");
+            fixture.write_generation(PREVIOUS_DIRECTORY, &previous, b"old");
+            fixture.write_ledger(&intent_ledger);
+            let before = fixture.namespace_bytes();
+
+            assert_eq!(
+                reconcile_lifecycle(
+                    &fixture.provisioning_fd,
+                    &fixture.ledger_fd,
+                    intent_ledger,
+                    &completed,
+                    &mut FaultInjector::disabled(),
+                )
+                .expect_err("reordered canonical generation history"),
+                ProvisioningSecretStoreError::Rejected,
+            );
+            assert_eq!(fixture.namespace_bytes(), before);
+        }
+    }
+
+    #[test]
     fn destroy_reconciliation_exchanges_tombstone_and_removes_only_exact_source() {
         // Break caught: completing destruction before removal can leave the
         // exact target ciphertext in a provider generation slot.
@@ -1171,15 +1481,154 @@ mod tests {
             assert_eq!(fixture.read_ledger(), completed);
             let tombstone_slot = fixture.provisioning.join(source_slot);
             assert!(!tombstone_slot.join("credential.cred").exists());
-            assert!(tombstone_slot.join(TOMBSTONE_FILE).is_file());
+            if state == GenerationState::Active {
+                assert!(tombstone_slot.join(TOMBSTONE_FILE).is_file());
+            } else {
+                assert!(!tombstone_slot.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn destroy_previous_preserves_active_and_leaves_destroyed_generation_ledger_only() {
+        // Break caught: requiring Active to be absent makes the normal
+        // Active+Previous state impossible to reconcile, while retaining the
+        // Previous tombstone directory permanently blocks the next rotation.
+        let fixture = ReconcileFixture::new();
+        let previous = generation_record(1, 0x31, GenerationState::Previous, b"old");
+        let active = generation_record(2, 0x41, GenerationState::Active, b"current");
+        let (mut intent_ledger, mut completed) = destroy_ledgers(&previous);
+        intent_ledger.generations.push(active.clone());
+        let mut predecessor = intent_ledger.clone();
+        predecessor.intent = None;
+        intent_ledger
+            .intent
+            .as_mut()
+            .expect("destroy intent")
+            .pre_mutation_ledger_revision = crate::admin::digest(
+            &encode_ledger(&predecessor).expect("encode composed destroy predecessor"),
+        );
+        completed.generations.push(active.clone());
+
+        fixture.write_generation(ACTIVE_DIRECTORY, &active, b"current");
+        fixture.write_generation(PREVIOUS_DIRECTORY, &previous, b"old");
+        fixture.write_tombstone(&completed.generations[0]);
+        fixture.write_ledger(&intent_ledger);
+
+        reconcile_lifecycle(
+            &fixture.provisioning_fd,
+            &fixture.ledger_fd,
+            intent_ledger,
+            &completed,
+            &mut FaultInjector::disabled(),
+        )
+        .expect("destroy exact Previous beside retained Active");
+
+        assert!(fixture.generation_matches(ACTIVE_DIRECTORY, &active));
+        assert!(!fixture.provisioning.join(PREVIOUS_DIRECTORY).exists());
+        assert!(!fixture.provisioning.join(STAGED_DIRECTORY).exists());
+        assert_eq!(fixture.read_ledger(), completed);
+
+        let target = generation_record(3, 0x51, GenerationState::Active, b"next");
+        let mut rotate_intent = completed.clone();
+        rotate_intent.intent = Some(LifecycleIntent {
+            kind: LifecycleIntentKind::Rotate,
+            operation: *target.install.as_bytes(),
+            backup_operation: None,
+            load: Some(target.load),
+            target_ref: target.secret_ref.clone(),
+            target_generation: target.generation,
+            source_ref: Some(active.secret_ref.clone()),
+            envelope_commitment: Some(target.envelope_commitment),
+            expected_ciphertext_digest: Some(target.ciphertext_digest),
+            expected_artifact_digest: None,
+            pre_mutation_ledger_revision: crate::admin::digest(
+                &encode_ledger(&completed).expect("encode post-destroy ledger"),
+            ),
+        });
+        let mut rotated = completed.clone();
+        rotated
+            .generations
+            .iter_mut()
+            .find(|record| record.secret_ref == active.secret_ref)
+            .expect("retained Active")
+            .state = GenerationState::Previous;
+        rotated.generations.push(target.clone());
+        fixture.write_generation(STAGED_DIRECTORY, &target, b"next");
+        fixture.write_ledger(&rotate_intent);
+
+        reconcile_lifecycle(
+            &fixture.provisioning_fd,
+            &fixture.ledger_fd,
+            rotate_intent,
+            &rotated,
+            &mut FaultInjector::disabled(),
+        )
+        .expect("rotate after Previous destruction is ledger-only");
+        assert!(fixture.generation_matches(ACTIVE_DIRECTORY, &target));
+        let mut current_as_previous = active;
+        current_as_previous.state = GenerationState::Previous;
+        assert!(fixture.generation_matches(PREVIOUS_DIRECTORY, &current_as_previous));
+        assert_eq!(fixture.read_ledger(), rotated);
+    }
+
+    #[test]
+    fn recover_and_destroy_active_preserve_an_exact_unrelated_previous() {
+        // Break caught: reconciliation must classify an unrelated retained
+        // Previous from the decoded ledger, not reject or modify it merely
+        // because the target operation acts on Active.
+        {
+            let fixture = ReconcileFixture::new();
+            let previous = generation_record(1, 0x31, GenerationState::Previous, b"old");
+            let active = generation_record(2, 0x41, GenerationState::Active, b"exact");
+            let (mut intent_ledger, mut completed) = recovery_ledgers(&active);
+            add_retained_generation(&mut intent_ledger, &mut completed, previous.clone());
+            fixture.write_generation(ACTIVE_DIRECTORY, &active, b"corrupt");
+            fixture.write_generation(PREVIOUS_DIRECTORY, &previous, b"old");
+            fixture.write_generation(STAGED_DIRECTORY, &active, b"exact");
+            fixture.write_ledger(&intent_ledger);
+
+            reconcile_lifecycle(
+                &fixture.provisioning_fd,
+                &fixture.ledger_fd,
+                intent_ledger,
+                &completed,
+                &mut FaultInjector::disabled(),
+            )
+            .expect("recover Active beside retained Previous");
+            assert!(fixture.generation_matches(ACTIVE_DIRECTORY, &active));
+            assert!(fixture.generation_matches(PREVIOUS_DIRECTORY, &previous));
+        }
+
+        {
+            let fixture = ReconcileFixture::new();
+            let active = generation_record(1, 0x31, GenerationState::Active, b"current");
+            let previous = generation_record(2, 0x41, GenerationState::Previous, b"old");
+            let (mut intent_ledger, mut completed) = destroy_ledgers(&active);
+            add_retained_generation(&mut intent_ledger, &mut completed, previous.clone());
+            fixture.write_generation(ACTIVE_DIRECTORY, &active, b"current");
+            fixture.write_generation(PREVIOUS_DIRECTORY, &previous, b"old");
+            fixture.write_tombstone(&completed.generations[0]);
+            fixture.write_ledger(&intent_ledger);
+
+            reconcile_lifecycle(
+                &fixture.provisioning_fd,
+                &fixture.ledger_fd,
+                intent_ledger,
+                &completed,
+                &mut FaultInjector::disabled(),
+            )
+            .expect("destroy Active beside retained Previous");
+            assert!(fixture.generation_matches(ACTIVE_DIRECTORY, &completed.generations[0]));
+            assert!(fixture.generation_matches(PREVIOUS_DIRECTORY, &previous));
         }
     }
 
     #[test]
     fn lifecycle_fault_boundaries_reopen_to_one_exact_completed_rotation() {
         // Break caught: a failure after an exchange, park, parent sync, or
-        // ledger write must be resumable from the exact persisted intent and
-        // must never select or reconstruct a generation.
+        // ledger write must be resumable by a fresh admin from the exact
+        // persisted intent and must never select or regenerate a generation.
         for point in [
             FaultPoint::IntentFileSynced,
             FaultPoint::IntentRenamed,
@@ -1191,13 +1640,19 @@ mod tests {
             FaultPoint::CompleteRenamed,
             FaultPoint::CompleteParentSynced,
         ] {
-            let fixture = ReconcileFixture::new();
+            let fixture = AdminLifecycleFixture::new();
             let source = generation_record(1, 0x31, GenerationState::Active, b"old");
             let target = generation_record(2, 0x41, GenerationState::Active, b"new");
-            let (intent_ledger, completed) = rotate_ledgers(&source, &target);
+            let (mut intent_ledger, mut completed) = rotate_ledgers(&source, &target);
+            bind_fixture_host(&mut intent_ledger, &mut completed, fixture.host_identity);
             fixture.write_generation(ACTIVE_DIRECTORY, &source, b"old");
             fixture.write_generation(STAGED_DIRECTORY, &target, b"new");
-            fixture.write_ledger_without_intent(&intent_ledger);
+            let mut predecessor = intent_ledger.clone();
+            predecessor.intent = None;
+            fixture.write_ledger(predecessor);
+            let provisioning_fd =
+                open_secure_root(&fixture.provisioning, false).expect("open provisioning fixture");
+            let ledger_fd = open_secure_root(&fixture.ledger, false).expect("open ledger fixture");
 
             if matches!(
                 point,
@@ -1207,7 +1662,7 @@ mod tests {
             ) {
                 assert_eq!(
                     commit_lifecycle_intent(
-                        &fixture.ledger_fd,
+                        &ledger_fd,
                         &intent_ledger,
                         &mut FaultInjector::at(point),
                     )
@@ -1216,11 +1671,11 @@ mod tests {
                     "fault {point:?}",
                 );
             } else {
-                fixture.write_ledger(&intent_ledger);
+                fixture.write_ledger(intent_ledger.clone());
                 assert_eq!(
                     reconcile_lifecycle(
-                        &fixture.provisioning_fd,
-                        &fixture.ledger_fd,
+                        &provisioning_fd,
+                        &ledger_fd,
                         intent_ledger.clone(),
                         &completed,
                         &mut FaultInjector::at(point),
@@ -1230,25 +1685,161 @@ mod tests {
                     "fault {point:?}",
                 );
             }
+            drop(provisioning_fd);
+            drop(ledger_fd);
 
-            let persisted = fixture.read_reconciliation_ledger();
-            if persisted.intent.is_some() {
-                let (provisioning_fd, ledger_fd) = fixture.reopen();
-                reconcile_lifecycle(
-                    &provisioning_fd,
-                    &ledger_fd,
-                    persisted,
-                    &completed,
-                    &mut FaultInjector::disabled(),
-                )
-                .expect("reconcile from fresh descriptors");
-            }
-            assert_eq!(fixture.read_ledger(), completed, "fault {point:?}");
-            assert!(fixture.generation_matches(ACTIVE_DIRECTORY, &target));
+            drop(fixture.admin().expect("fresh admin resumes exact Rotate"));
+            assert_eq!(
+                decode_ledger(&fs::read(fixture.ledger.join("ledger")).expect("read final ledger"))
+                    .expect("decode final ledger"),
+                completed,
+                "fault {point:?}",
+            );
+            let provisioning_fd =
+                open_secure_root(&fixture.provisioning, false).expect("reopen provisioning");
+            assert!(
+                generation_matches(&provisioning_fd, ACTIVE_DIRECTORY, &manifest_for(&target),)
+                    .expect("exact Active")
+            );
             let mut previous = source;
             previous.state = GenerationState::Previous;
-            assert!(fixture.generation_matches(PREVIOUS_DIRECTORY, &previous));
+            assert!(
+                generation_matches(
+                    &provisioning_fd,
+                    PREVIOUS_DIRECTORY,
+                    &manifest_for(&previous),
+                )
+                .expect("exact Previous")
+            );
             assert!(!fixture.provisioning.join(STAGED_DIRECTORY).exists());
+        }
+    }
+
+    #[test]
+    fn fresh_admin_selects_pending_rotate_intent_and_derives_exact_completion() {
+        // Break caught: an intent synced into ledger.next before rename is a
+        // real persisted operation state; ignoring it or routing every intent
+        // through install-only recovery strands an exact staged rotation.
+        let fixture = AdminLifecycleFixture::new();
+        let source = generation_record(1, 0x31, GenerationState::Active, b"old");
+        let target = generation_record(2, 0x41, GenerationState::Active, b"new");
+        let (mut intent_ledger, mut completed) = rotate_ledgers(&source, &target);
+        bind_fixture_host(&mut intent_ledger, &mut completed, fixture.host_identity);
+        fixture.write_generation(ACTIVE_DIRECTORY, &source, b"old");
+        fixture.write_generation(STAGED_DIRECTORY, &target, b"new");
+        let mut predecessor = intent_ledger.clone();
+        predecessor.intent = None;
+        fixture.write_ledger(predecessor);
+        let ledger_fd = open_secure_root(&fixture.ledger, false).expect("open ledger fixture");
+
+        assert_eq!(
+            commit_lifecycle_intent(
+                &ledger_fd,
+                &intent_ledger,
+                &mut FaultInjector::at(FaultPoint::IntentFileSynced),
+            )
+            .expect_err("interrupt exact pending intent"),
+            ProvisioningSecretStoreError::Unavailable,
+        );
+        drop(ledger_fd);
+
+        drop(
+            fixture
+                .admin()
+                .expect("fresh admin reconciles pending Rotate"),
+        );
+        assert_eq!(
+            decode_ledger(&fs::read(fixture.ledger.join("ledger")).expect("read final ledger"))
+                .expect("decode final ledger"),
+            completed,
+        );
+        assert!(!fixture.ledger.join("ledger.next").exists());
+    }
+
+    #[test]
+    fn fresh_admin_resumes_recover_and_both_destroy_kinds_from_persisted_intent() {
+        // Break caught: fresh-open dispatch that handles only Rotate still
+        // strands authenticated Recover and composed destroy states after a
+        // real filesystem boundary.
+        {
+            let fixture = AdminLifecycleFixture::new();
+            let previous = generation_record(1, 0x31, GenerationState::Previous, b"old");
+            let target = generation_record(2, 0x41, GenerationState::Active, b"exact");
+            let (mut intent_ledger, mut completed) = recovery_ledgers(&target);
+            add_retained_generation(&mut intent_ledger, &mut completed, previous.clone());
+            bind_fixture_host(&mut intent_ledger, &mut completed, fixture.host_identity);
+            fixture.write_generation(ACTIVE_DIRECTORY, &target, b"corrupt");
+            fixture.write_generation(PREVIOUS_DIRECTORY, &previous, b"old");
+            fixture.write_generation(STAGED_DIRECTORY, &target, b"exact");
+            fixture.write_ledger(intent_ledger.clone());
+            interrupt_reconciliation(
+                &fixture,
+                intent_ledger,
+                &completed,
+                FaultPoint::ActiveExchanged,
+            );
+
+            drop(fixture.admin().expect("fresh admin resumes Recover"));
+            assert_eq!(read_fixture_ledger(&fixture), completed);
+            let provisioning_fd = open_secure_root(&fixture.provisioning, false)
+                .expect("reopen recovery provisioning");
+            assert!(
+                generation_matches(
+                    &provisioning_fd,
+                    PREVIOUS_DIRECTORY,
+                    &manifest_for(&previous),
+                )
+                .expect("retained recovery Previous")
+            );
+        }
+
+        {
+            let fixture = AdminLifecycleFixture::new();
+            let active = generation_record(1, 0x31, GenerationState::Active, b"current");
+            let previous = generation_record(2, 0x41, GenerationState::Previous, b"old");
+            let (mut intent_ledger, mut completed) = destroy_ledgers(&active);
+            add_retained_generation(&mut intent_ledger, &mut completed, previous.clone());
+            bind_fixture_host(&mut intent_ledger, &mut completed, fixture.host_identity);
+            fixture.write_generation(ACTIVE_DIRECTORY, &active, b"current");
+            fixture.write_generation(PREVIOUS_DIRECTORY, &previous, b"old");
+            fixture.write_tombstone_slot(STAGED_DIRECTORY, &completed.generations[0]);
+            fixture.write_ledger(intent_ledger.clone());
+            interrupt_reconciliation(
+                &fixture,
+                intent_ledger,
+                &completed,
+                FaultPoint::CleanupContentDeleted,
+            );
+
+            drop(fixture.admin().expect("fresh admin resumes DestroyActive"));
+            assert_eq!(read_fixture_ledger(&fixture), completed);
+        }
+
+        {
+            let fixture = AdminLifecycleFixture::new();
+            let previous = generation_record(1, 0x31, GenerationState::Previous, b"old");
+            let active = generation_record(2, 0x41, GenerationState::Active, b"current");
+            let (mut intent_ledger, mut completed) = destroy_ledgers(&previous);
+            add_retained_generation(&mut intent_ledger, &mut completed, active.clone());
+            bind_fixture_host(&mut intent_ledger, &mut completed, fixture.host_identity);
+            fixture.write_generation(ACTIVE_DIRECTORY, &active, b"current");
+            fixture.write_generation(PREVIOUS_DIRECTORY, &previous, b"old");
+            fixture.write_tombstone_slot(STAGED_DIRECTORY, &completed.generations[0]);
+            fixture.write_ledger(intent_ledger.clone());
+            interrupt_reconciliation(
+                &fixture,
+                intent_ledger,
+                &completed,
+                FaultPoint::PreviousExchanged,
+            );
+
+            drop(
+                fixture
+                    .admin()
+                    .expect("fresh admin resumes DestroyPrevious"),
+            );
+            assert_eq!(read_fixture_ledger(&fixture), completed);
+            assert!(!fixture.provisioning.join(PREVIOUS_DIRECTORY).exists());
         }
     }
 
@@ -1257,14 +1848,18 @@ mod tests {
         // Break caught: the three non-rotation durability boundaries must
         // retain enough exact intent-bound state for a fresh reconciler.
         {
-            let fixture = ReconcileFixture::new();
+            let fixture = AdminLifecycleFixture::new();
             let source = generation_record(1, 0x31, GenerationState::Active, b"secret");
-            let (intent_ledger, completed) = destroy_ledgers(&source);
+            let (mut intent_ledger, mut completed) = destroy_ledgers(&source);
+            bind_fixture_host(&mut intent_ledger, &mut completed, fixture.host_identity);
             fixture.write_generation(ACTIVE_DIRECTORY, &source, b"secret");
+            fixture.write_ledger(intent_ledger);
+            let provisioning_fd = open_secure_root(&fixture.provisioning, false)
+                .expect("open tombstone provisioning fixture");
             let tombstone = manifest_for(&completed.generations[0]);
             assert_eq!(
                 write_staged_tombstone(
-                    &fixture.provisioning_fd,
+                    &provisioning_fd,
                     &tombstone,
                     &mut FaultInjector::at(FaultPoint::StagedTombstoneSynced),
                 )
@@ -1272,7 +1867,7 @@ mod tests {
                 ProvisioningSecretStoreError::Unavailable
             );
             assert!(
-                generation_matches(&fixture.provisioning_fd, STAGED_DIRECTORY, &tombstone)
+                generation_matches(&provisioning_fd, STAGED_DIRECTORY, &tombstone)
                     .expect("exact interrupted tombstone")
             );
             assert!(
@@ -1282,17 +1877,13 @@ mod tests {
                     .join("credential.cred")
                     .exists()
             );
-            fixture.write_ledger(&intent_ledger);
-            let (provisioning_fd, ledger_fd) = fixture.reopen();
-            reconcile_lifecycle(
-                &provisioning_fd,
-                &ledger_fd,
-                fixture.read_ledger(),
-                &completed,
-                &mut FaultInjector::disabled(),
-            )
-            .expect("reopen interrupted tombstone preparation");
-            assert_eq!(fixture.read_ledger(), completed);
+            drop(provisioning_fd);
+            drop(
+                fixture
+                    .admin()
+                    .expect("fresh admin resumes tombstone preparation"),
+            );
+            assert_eq!(read_fixture_ledger(&fixture), completed);
         }
 
         {
@@ -1355,6 +1946,48 @@ mod tests {
             )
             .expect("reopen replaced deletion");
             assert_eq!(fixture.read_ledger(), completed);
+        }
+    }
+
+    #[test]
+    fn cleanup_faults_never_leave_a_partial_provider_slot_and_resume_only_bound_work() {
+        // Break caught: unlinking staged files in place can strand a partial
+        // provider slot that no exact intent state can safely authorize for a
+        // later deletion.
+        for point in [
+            FaultPoint::CleanupGenerationRenamed,
+            FaultPoint::CleanupParentSynced,
+            FaultPoint::CleanupContentDeleted,
+            FaultPoint::CleanupReferenceDeleted,
+            FaultPoint::CleanupManifestDeleted,
+            FaultPoint::CleanupContentsDeleted,
+            FaultPoint::CleanupDirectoryDeleted,
+            FaultPoint::ReplacedGenerationDeleted,
+            FaultPoint::CleanupRemovalParentSynced,
+        ] {
+            let fixture = AdminLifecycleFixture::new();
+            let target = generation_record(2, 0x41, GenerationState::Active, b"exact");
+            let (mut intent_ledger, mut completed) = recovery_ledgers(&target);
+            bind_fixture_host(&mut intent_ledger, &mut completed, fixture.host_identity);
+            fixture.write_generation(ACTIVE_DIRECTORY, &target, b"corrupt");
+            fixture.write_generation(STAGED_DIRECTORY, &target, b"exact");
+            fixture.write_ledger(intent_ledger.clone());
+            interrupt_reconciliation(&fixture, intent_ledger, &completed, point);
+            assert!(!fixture.provisioning.join(STAGED_DIRECTORY).exists());
+
+            drop(
+                fixture
+                    .admin()
+                    .expect("fresh admin resumes exact bound cleanup"),
+            );
+            assert_eq!(read_fixture_ledger(&fixture), completed, "fault {point:?}");
+            let provisioning_fd = open_secure_root(&fixture.provisioning, false)
+                .expect("reopen cleanup provisioning");
+            assert!(
+                generation_matches(&provisioning_fd, ACTIVE_DIRECTORY, &manifest_for(&target),)
+                    .expect("exact recovered Active")
+            );
+            assert!(!fixture.provisioning.join(CLEANUP_DIRECTORY).exists());
         }
     }
 
@@ -1699,6 +2332,7 @@ mod tests {
         intent_ledger.intent = Some(LifecycleIntent {
             kind: LifecycleIntentKind::Rotate,
             operation: *target.install.as_bytes(),
+            backup_operation: None,
             load: Some(target.load),
             target_ref: target.secret_ref.clone(),
             target_generation: target.generation,
@@ -1741,6 +2375,7 @@ mod tests {
         intent_ledger.intent = Some(LifecycleIntent {
             kind: LifecycleIntentKind::Recover,
             operation: [0x71; 32],
+            backup_operation: Some([0x70; 32]),
             load: Some(target.load),
             target_ref: target.secret_ref.clone(),
             target_generation: target.generation,
@@ -1780,6 +2415,7 @@ mod tests {
                 LifecycleIntentKind::DestroyPrevious
             },
             operation: [0x81; 32],
+            backup_operation: None,
             load: None,
             target_ref: source.secret_ref.clone(),
             target_generation: source.generation,
@@ -1808,6 +2444,70 @@ mod tests {
             }],
         };
         (intent_ledger, completed)
+    }
+
+    fn add_retained_generation(
+        intent_ledger: &mut ProviderLedger,
+        completed: &mut ProviderLedger,
+        retained: GenerationRecord,
+    ) {
+        intent_ledger.generations.push(retained.clone());
+        let mut predecessor = intent_ledger.clone();
+        predecessor.intent = None;
+        intent_ledger
+            .intent
+            .as_mut()
+            .expect("lifecycle intent")
+            .pre_mutation_ledger_revision = crate::admin::digest(
+            &encode_ledger(&predecessor).expect("encode composed predecessor"),
+        );
+        completed.generations.push(retained);
+    }
+
+    fn bind_fixture_host(
+        intent_ledger: &mut ProviderLedger,
+        completed: &mut ProviderLedger,
+        host_key_identity: [u8; 32],
+    ) {
+        intent_ledger.host_key_identity = host_key_identity;
+        completed.host_key_identity = host_key_identity;
+        let mut predecessor = intent_ledger.clone();
+        predecessor.intent = None;
+        intent_ledger
+            .intent
+            .as_mut()
+            .expect("lifecycle intent")
+            .pre_mutation_ledger_revision = crate::admin::digest(
+            &encode_ledger(&predecessor).expect("encode host-bound predecessor"),
+        );
+    }
+
+    fn interrupt_reconciliation(
+        fixture: &AdminLifecycleFixture,
+        intent_ledger: ProviderLedger,
+        completed: &ProviderLedger,
+        point: FaultPoint,
+    ) {
+        let provisioning_fd =
+            open_secure_root(&fixture.provisioning, false).expect("open provisioning fixture");
+        let ledger_fd = open_secure_root(&fixture.ledger, false).expect("open ledger fixture");
+        assert_eq!(
+            reconcile_lifecycle(
+                &provisioning_fd,
+                &ledger_fd,
+                intent_ledger,
+                completed,
+                &mut FaultInjector::at(point),
+            )
+            .expect_err("interrupt reconciliation fixture"),
+            ProvisioningSecretStoreError::Unavailable,
+            "fault {point:?}",
+        );
+    }
+
+    fn read_fixture_ledger(fixture: &AdminLifecycleFixture) -> ProviderLedger {
+        decode_ledger(&fs::read(fixture.ledger.join("ledger")).expect("read fixture ledger"))
+            .expect("decode fixture ledger")
     }
 
     fn generation_record(
