@@ -6,6 +6,7 @@
 - Proposed: 2026-09-06
 - Accepted: 2026-09-08
 - Authority: [Linux Event MVP Evaluation Profile v0.1](../implementation/linux-event-mvp-evaluation-profile-v0.1.md)
+- Amendment: [Raspberry Pi Linux Event MVP profile amendment](../superpowers/specs/2026-09-08-raspberry-pi-linux-event-mvp-profile-amendment-design.md)
 - Register: [P0-1 decision and gate register](../implementation/linux-event-mvp-evaluation-profile-v0.1-register.md)
 - Roadmap action: `P0-1 — define the claim boundary`
 
@@ -25,10 +26,22 @@ most complete live application and offline-first exchange path. It is Linux-
 only so the operating system, service manager, filesystem, package form, and
 resource measurements can be exact. It is explicitly non-production and
 time-bounded because protected provisioning, supported artifacts, physical
-target evidence, and release authorization remain open. Its 2-, 8-, and
-20-node tiers include the largest bounded topology proposed for this
-evaluation while requiring the exact physical/virtual composition and avoiding
-a broader scale claim.
+target evidence, and release authorization remain open.
+
+The accepted pre-merge profile now selects the exact Raspberry Pi reference
+2026-06-18, Debian GNU/Linux 13 `trixie`, `6.18.39+rpt-rpi-v8`, systemd
+`257.13-1~deb13u1`, local `ext4`, physical Raspberry Pi Compute Module 4 Rev
+1.1, and `aarch64` boundary recorded by the 2026-09-08 amendment. The rationale
+for that narrower fast path is:
+
+- two physical `aarch64` CM4 nodes minimize time to physical qualification;
+- the third device is support capacity, not evidence for a broader tier;
+- one `arm64` artifact is required;
+- `x86_64`, Ubuntu, VMs, and 8-/20-node scale are deferred without changing
+  atomic requirement status;
+- D06 is resolved for profile definition by the exact v2 design and digest;
+  and
+- E01, G1–G6, final candidate approvals, and production gates remain open.
 
 The profile also needs explicit constrained-operation and lifetime-capacity
 boundaries. Restart-selected ReceiveOnly is included so inbound synchronization
@@ -75,11 +88,11 @@ claim boundary:
 - `P0-1-D06` is resolved for the profile definition. Internal approval of the
   exact provider selection and bound digest was recorded on 2026-09-08 against
   the
-  [approved initial systemd credential provider design](../superpowers/specs/2026-09-07-systemd-credential-provider-design.md).
-  Security and deployment approvals remain mandatory candidate gate E01. If
-  final review requires Debian or generic Debian-family support, D06 reopens
-  and the provider must be redesigned and versioned before the affected
-  profile or candidate proceeds.
+  [approved Raspberry Pi systemd credential provider v2 design](../superpowers/specs/2026-09-08-raspberry-pi-systemd-credential-provider-v2-design.md)
+  at
+  `sha256:30c5dfe71a203fcdd69dd330f9b5c68eeaee5032b624ee41912aa4723a9f853f`.
+  Security and deployment approvals of that exact design and digest remain
+  mandatory candidate gate E01.
 - `P0-1-D15` is resolved. Dependency/license, Legal/compliance, and Release
   approval of the exact evaluation-only disposition and bound digest was
   recorded on 2026-09-08. The approval is limited to the exact dependency
@@ -87,9 +100,11 @@ claim boundary:
   production `DM-8-05`.
 
 With D06 and D15 resolved for profile definition, this decision accepts the
-profile. The
+profile as amended. The
 [approved design](../superpowers/specs/2026-09-06-linux-event-mvp-evaluation-profile-design.md)
-remains its historical design authority.
+remains its historical design authority; the 2026-09-08 amendment supersedes
+its conflicting platform, architecture, topology, artifact, D06, and
+acceptance selections for the unmerged v0.1 profile.
 
 ## Candidate and production boundary
 
@@ -122,8 +137,13 @@ remain owned by their separate workstreams and gates.
 - Reviewers receive one bounded profile instead of inferring readiness from a
   count of requirements or mechanisms.
 - D06 and D15 are resolved for profile definition. D06 security/deployment
-  reviews remain visible candidate gate E01; all other candidate gates and
-  final approvals remain required.
+  reviews of the exact v2 design and digest remain visible candidate gate E01;
+  all other candidate gates and final approvals remain required.
 - G1-G6 and every other evaluation gate remain mandatory after P0-1 closes.
-- State, Record, Blob, BTLE, dynamic routing, broader scale, production use,
-  and all other profile exclusions remain unsupported by this decision.
+- One reproducible `arm64` artifact and focused qualification on exactly two
+  mandatory physical CM4 nodes replace the earlier dual-architecture and
+  2/8/20-node selections for this pre-merge profile; the optional third CM4 is
+  declared support capacity only.
+- Ubuntu, `x86_64`, VMs, 8-/20-node scale, State, Record, Blob, BTLE, dynamic
+  routing, production use, and all other profile exclusions remain unsupported
+  by this decision.
