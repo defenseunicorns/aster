@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+fuzzing = []
+
 [dependencies]
 aster-core = { version = "=0.1.0", path = "../aster-core", default-features = false, features = ["reference-session"] }
 rustix.workspace = true

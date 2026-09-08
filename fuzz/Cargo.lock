@@ -144,6 +144,7 @@ dependencies = [
  "aster-node",
  "aster-profile",
  "aster-redb-store",
+ "aster-systemd-credentials",
  "libfuzzer-sys",
 ]
 
@@ -196,6 +197,15 @@ dependencies = [
  "redb",
  "rustix",
  "sha2",
+]
+
+[[package]]
+name = "aster-systemd-credentials"
+version = "0.1.0"
+dependencies = [
+ "aster-core",
+ "rustix",
+ "zeroize",
 ]
 
 [[package]]

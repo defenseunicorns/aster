@@ -14,6 +14,7 @@ aster-negentropy = { path = "../crates/aster-negentropy" }
 aster-node = { path = "../crates/aster-node", features = ["fuzzing"] }
 aster-profile = { path = "../crates/aster-profile" }
 aster-redb-store = { path = "../crates/aster-redb-store" }
+aster-systemd-credentials = { path = "../crates/aster-systemd-credentials", features = ["fuzzing"] }
 libfuzzer-sys = "=0.4.13"
 
 [[bin]]
@@ -54,6 +55,13 @@ bench = false
 [[bin]]
 name = "classical_profile_decode"
 path = "fuzz_targets/classical_profile_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "systemd_credential_decode"
+path = "fuzz_targets/systemd_credential_decode.rs"
 test = false
 doc = false
 bench = false

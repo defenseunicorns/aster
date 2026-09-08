@@ -1154,7 +1154,7 @@ impl NodeConfig {
         .map_err(|_| {
             NodeBootstrapError::new(operation, NodeBootstrapErrorKind::InvalidConfiguration)
         })?;
-        ensure_state_accepts_normal_operation(&state).map_err(|_| {
+        let state_preflight = inspect_state_for_normal_operation(&state).map_err(|_| {
             NodeBootstrapError::new(operation, NodeBootstrapErrorKind::StateUnavailable)
         })?;
         let mission = load_mission()
@@ -1163,6 +1163,9 @@ impl NodeConfig {
         let config = options.into_config(state, mission);
         validate_node_config(&config).map_err(|_| {
             NodeBootstrapError::new(operation, NodeBootstrapErrorKind::InvalidConfiguration)
+        })?;
+        complete_state_preflight(&config.state, state_preflight).map_err(|_| {
+            NodeBootstrapError::new(operation, NodeBootstrapErrorKind::StateUnavailable)
         })?;
         Ok(config)
     }
@@ -3220,6 +3223,50 @@ fn store_receipt_from_inspection(inspection: StoreInspection) -> StoreReceipt {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NormalOperationStatePreflight {
+    Accepted,
+    RecoveryRequired,
+}
+
+/// Inspects state before a protected provider is invoked, without writing.
+///
+/// An inspectable terminal state is rejected immediately. If redb reports that
+/// writer recovery is required, recovery is deferred until after the protected
+/// provider has validated its input, so provider failure cannot mutate state.
+fn inspect_state_for_normal_operation(
+    state: &Path,
+) -> Result<NormalOperationStatePreflight, NodeError> {
+    let store_path = state.join(STORE_FILE);
+    if !store_path.try_exists()? {
+        return Ok(NormalOperationStatePreflight::Accepted);
+    }
+    match Store::inspect_zeroization_state(&store_path) {
+        Ok(status) if status.state().is_terminal() => {
+            Err(StoreError::StoreZeroized(status.state()).into())
+        }
+        Ok(_) => Ok(NormalOperationStatePreflight::Accepted),
+        Err(error) if error.is_read_only_repair_required() => {
+            Ok(NormalOperationStatePreflight::RecoveryRequired)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn complete_state_preflight(
+    state: &Path,
+    preflight: NormalOperationStatePreflight,
+) -> Result<(), NodeError> {
+    if matches!(preflight, NormalOperationStatePreflight::Accepted) {
+        return Ok(());
+    }
+    let status = Store::recover_zeroization_state(state.join(STORE_FILE))?;
+    if status.state().is_terminal() {
+        return Err(StoreError::StoreZeroized(status.state()).into());
+    }
+    Ok(())
+}
+
 /// Rejects a durably terminal state before a CLI loads or creates credentials.
 ///
 /// Read-only inspection is used normally. Only redb's exact `RepairAborted`
@@ -3228,21 +3275,8 @@ fn store_receipt_from_inspection(inspection: StoreInspection) -> StoreReceipt {
 /// state is still rejected before the caller loads mission artifacts, creates a
 /// carrier identity, or binds sockets.
 pub fn ensure_state_accepts_normal_operation(state: &Path) -> Result<(), NodeError> {
-    let store_path = state.join(STORE_FILE);
-    if !store_path.try_exists()? {
-        return Ok(());
-    }
-    let status = match Store::inspect_zeroization_state(&store_path) {
-        Ok(status) => status,
-        Err(error) if error.is_read_only_repair_required() => {
-            Store::recover_zeroization_state(&store_path)?
-        }
-        Err(error) => return Err(error.into()),
-    };
-    if status.state().is_terminal() {
-        return Err(StoreError::StoreZeroized(status.state()).into());
-    }
-    Ok(())
+    let preflight = inspect_state_for_normal_operation(state)?;
+    complete_state_preflight(state, preflight)
 }
 
 /// Resolves a caller path against one previously captured absolute cwd without

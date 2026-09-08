@@ -114,6 +114,8 @@ descriptor-relative Linux filesystem APIs, `zeroize`, Tokio.
   remain unbound until protected bootstrap completes.
 - [x] Add/retain a rejecting-loader assertion proving no state directory and no
   listener exists after protected bootstrap failure.
+- [x] Add an interrupted-store regression proving provider rejection precedes
+  writer recovery and leaves repair-required state byte-for-byte unchanged.
 - [x] Run those exact customer-runtime tests and observe failure because the
   health listener currently binds before `open_node_config`.
 - [x] Move protected bootstrap ahead of health binding without broadening
@@ -168,7 +170,10 @@ descriptor-relative Linux filesystem APIs, `zeroize`, Tokio.
 - [x] Run `cargo fmt --all -- --check`, `cargo clippy -p
   aster-systemd-credentials --all-targets -- -D warnings`, and
   `git diff --check`.
+- [x] Add a structured hostile-input target for the exact D06 envelope decoder
+  and run the repository-required `mise run fuzz-smoke` gate.
 - [x] Do not run `mise run check` during iteration. Before a substantive code
   handoff, decide with the owner whether the full gate belongs here or in the
   deterministic release-gate lane already in progress.
-- [ ] Request focused code review; do not claim G3/G4 or close D06 overall.
+- [x] Request focused code review; address its bootstrap-ordering and fuzz-smoke
+  findings; do not claim G3/G4 or close D06 overall.

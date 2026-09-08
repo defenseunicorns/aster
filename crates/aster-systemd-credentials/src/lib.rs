@@ -443,6 +443,22 @@ fn decode_credential_envelope(
     ))
 }
 
+/// Exercises the exact production envelope decoder for hostile-input testing.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_decode_credential_envelope(
+    encoded: &[u8],
+    expected_operation: ProvisioningLoadId,
+    expected_ref: &ProvisioningSecretRef,
+) -> bool {
+    decode_credential_envelope(
+        Zeroizing::new(encoded.to_vec()),
+        expected_operation,
+        expected_ref,
+    )
+    .is_ok()
+}
+
 fn provider_generation(
     secret_ref: &ProvisioningSecretRef,
 ) -> Result<u64, ProvisioningSecretStoreError> {
