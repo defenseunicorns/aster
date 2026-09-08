@@ -52,6 +52,18 @@ codes in the output directory; it stops on failure rather than retrying to a
 pass. CPU workers and test process groups are cleaned up on exit. A round has
 an independent outer deadline, including if a test stops responding.
 
+The full workspace test commands in `mise run check` and the macOS CI lane use
+`tools/with-test-resources.sh`. The 256-pair relay fixture alone owns 1,024
+socket descriptors, before its listener/runtime files and neighboring tests.
+The wrapper raises only the child process's soft open-file limit to at least
+4,096, preserves a larger existing limit, and fails clearly if the hard limit
+cannot support it. It does not reduce test capacity or change the host's hard
+limit. For a direct workspace run, use:
+
+```sh
+sh tools/with-test-resources.sh cargo test --locked --workspace --all-features
+```
+
 These tests keep exact data and zero-contact-error assertions. Blob waiting
 tracks committed carrier prefixes. State/Record waiting counts each expected
 version once per node; duplicate queries or oscillating observations cannot

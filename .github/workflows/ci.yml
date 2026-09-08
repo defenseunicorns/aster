@@ -87,7 +87,7 @@ jobs:
       - name: Run workspace tests offline
         env:
           CARGO_NET_OFFLINE: "true"
-        run: cargo +1.97.1 test --locked --workspace --all-features
+        run: sh tools/with-test-resources.sh cargo +1.97.1 test --locked --workspace --all-features
 
       - name: Run live tour presenter tests
         run: python3 tools/test_aster_tour_ui.py

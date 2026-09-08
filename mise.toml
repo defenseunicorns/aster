@@ -42,7 +42,7 @@ run = [
   "sh ./tools/check-dependency-exception-scope.sh",
   "sh ./tools/test-dependency-exception-scope.sh",
   "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings",
-  "cargo test --locked --workspace --all-features",
+  "sh tools/with-test-resources.sh cargo test --locked --workspace --all-features",
   "sh tools/test-aster-mesh-playground-real.sh",
   "sh tools/test-aster-hello-real.sh",
   "cargo build --locked -p aster-ffi",
