@@ -1,6 +1,8 @@
 mod encrypt;
 mod files;
 mod ledger;
+#[allow(dead_code)] // Shared lifecycle primitives are consumed by Tasks 3-5.
+mod lifecycle;
 
 #[cfg(test)]
 pub(super) static TEST_PROCESS_SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -14,10 +16,10 @@ use encrypt::SystemdCredsEncryptor;
 #[cfg(test)]
 use files::FaultPoint;
 use files::{
-    ACTIVE_DIRECTORY, FaultInjector, GenerationManifest, LedgerWrite, STAGED_DIRECTORY,
-    child_directory_exists, generation_matches, open_namespace_lock, open_secure_root,
-    promote_staged_generation, read_generation_manifest, read_host_key_identity, read_ledger,
-    remove_staged_generation, sync_recovered_active_parent, write_ledger_atomically,
+    ACTIVE_DIRECTORY, FaultInjector, GenerationContent, GenerationManifest, LedgerWrite,
+    STAGED_DIRECTORY, child_directory_exists, generation_matches, open_namespace_lock,
+    open_secure_root, promote_staged_generation, read_generation_manifest, read_host_key_identity,
+    read_ledger, remove_staged_generation, sync_recovered_active_parent, write_ledger_atomically,
     write_staged_generation,
 };
 use ledger::{
@@ -148,6 +150,10 @@ impl SystemdCredentialAdmin {
         if ledger.host_key_identity != self.host_key_identity {
             return Err(ProvisioningSecretStoreError::Rejected);
         }
+        if ledger.intent.is_none() {
+            lifecycle::validate_completed_generations(&self.provisioning_root, &ledger)?;
+            return Ok(());
+        }
         let phase = if ledger.intent.is_some() {
             LedgerPhase::Intent
         } else {
@@ -237,6 +243,7 @@ impl SystemdCredentialAdmin {
             load,
             secret_ref: secret_ref.clone(),
             ciphertext_digest,
+            content: GenerationContent::Credential,
         };
         let intent = LifecycleIntent {
             kind: LifecycleIntentKind::Install,
@@ -287,6 +294,11 @@ fn manifest_from_record(record: &GenerationRecord) -> GenerationManifest {
         load: record.load,
         secret_ref: record.secret_ref.clone(),
         ciphertext_digest: record.ciphertext_digest,
+        content: if record.state == GenerationState::Destroyed {
+            GenerationContent::Tombstone
+        } else {
+            GenerationContent::Credential
+        },
     }
 }
 
@@ -302,6 +314,7 @@ fn manifest_from_ledger(
             ciphertext_digest: intent
                 .expected_ciphertext_digest
                 .ok_or(ProvisioningSecretStoreError::Rejected)?,
+            content: GenerationContent::Credential,
         });
     }
     let mut active = ledger

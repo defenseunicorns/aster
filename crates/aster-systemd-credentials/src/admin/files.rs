@@ -2,6 +2,7 @@ use crate::provider_generation;
 use aster_mesh::{ProvisioningLoadId, ProvisioningSecretRef, ProvisioningSecretStoreError};
 use rustix::fd::OwnedFd;
 use std::{
+    collections::BTreeSet,
     fs::File,
     io::{Read as _, Write as _},
     path::{Component, Path},
@@ -17,14 +18,17 @@ const MAX_HOST_KEY_BYTES: usize = 64 * 1024;
 const EXT4_SUPER_MAGIC: i64 = 0xef53;
 
 pub(super) const ACTIVE_DIRECTORY: &str = "active";
+pub(super) const PREVIOUS_DIRECTORY: &str = "previous";
 pub(super) const STAGED_DIRECTORY: &str = "staged";
 pub(super) const CIPHERTEXT_FILE: &str = "credential.cred";
 pub(super) const REFERENCE_FILE: &str = "reference";
 pub(super) const MANIFEST_FILE: &str = "manifest";
+pub(super) const TOMBSTONE_FILE: &str = "tombstone";
 pub(super) const LEDGER_FILE: &str = "ledger";
 pub(super) const LEDGER_NEXT_FILE: &str = "ledger.next";
 pub(super) const LOCK_FILE: &str = "lock";
 
+#[allow(dead_code)] // Later lifecycle operations select the task-specific points.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FaultPoint {
     StageCiphertextSynced,
@@ -32,11 +36,17 @@ pub(super) enum FaultPoint {
     StageManifestSynced,
     StageDirectorySynced,
     StageParentSynced,
+    StagedTombstoneSynced,
     IntentFileSynced,
     IntentRenamed,
     IntentParentSynced,
     ActiveRenamed,
     ActiveParentSynced,
+    ActiveExchanged,
+    PreviousExchanged,
+    PreviousRenamed,
+    ReplacedGenerationDeleted,
+    ProvisioningParentSynced,
     RecoveredActiveParentSyncFailed,
     CompleteFileSynced,
     CompleteRenamed,
@@ -64,7 +74,7 @@ impl FaultInjector {
         Self { point: Some(point) }
     }
 
-    fn hit(&mut self, point: FaultPoint) -> Result<(), ProvisioningSecretStoreError> {
+    pub(super) fn hit(&mut self, point: FaultPoint) -> Result<(), ProvisioningSecretStoreError> {
         if self.point == Some(point) {
             self.point = None;
             Err(ProvisioningSecretStoreError::Unavailable)
@@ -80,6 +90,13 @@ pub(super) struct GenerationManifest {
     pub(super) load: ProvisioningLoadId,
     pub(super) secret_ref: ProvisioningSecretRef,
     pub(super) ciphertext_digest: [u8; 32],
+    pub(super) content: GenerationContent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum GenerationContent {
+    Credential,
+    Tombstone,
 }
 
 pub(super) fn encode_manifest(manifest: &GenerationManifest) -> Vec<u8> {
@@ -89,7 +106,11 @@ pub(super) fn encode_manifest(manifest: &GenerationManifest) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(MANIFEST_HEADER_BYTES + reference.len());
     encoded.extend_from_slice(MANIFEST_MAGIC);
     encoded.extend_from_slice(&MANIFEST_VERSION.to_be_bytes());
-    encoded.extend_from_slice(&0_u16.to_be_bytes());
+    encoded.push(match manifest.content {
+        GenerationContent::Credential => 0,
+        GenerationContent::Tombstone => 1,
+    });
+    encoded.push(0);
     encoded.extend_from_slice(&manifest.generation.to_be_bytes());
     encoded.extend_from_slice(manifest.load.as_bytes());
     encoded.extend_from_slice(&manifest.ciphertext_digest);
@@ -104,10 +125,15 @@ pub(super) fn decode_manifest(
     if encoded.len() < MANIFEST_HEADER_BYTES
         || &encoded[..8] != MANIFEST_MAGIC
         || read_u16(&encoded[8..10])? != MANIFEST_VERSION
-        || read_u16(&encoded[10..12])? != 0
+        || encoded[11] != 0
     {
         return Err(ProvisioningSecretStoreError::Rejected);
     }
+    let content = match encoded[10] {
+        0 => GenerationContent::Credential,
+        1 => GenerationContent::Tombstone,
+        _ => return Err(ProvisioningSecretStoreError::Rejected),
+    };
     let generation = read_u64(&encoded[12..20])?;
     if generation == 0 {
         return Err(ProvisioningSecretStoreError::Rejected);
@@ -126,11 +152,15 @@ pub(super) fn decode_manifest(
     {
         return Err(ProvisioningSecretStoreError::Rejected);
     }
+    if content == GenerationContent::Tombstone && ciphertext_digest != [0; 32] {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
     Ok(GenerationManifest {
         generation,
         load,
         secret_ref,
         ciphertext_digest,
+        content,
     })
 }
 
@@ -478,6 +508,45 @@ pub(super) fn generation_matches(
     name: &str,
     expected: &GenerationManifest,
 ) -> Result<bool, ProvisioningSecretStoreError> {
+    if !generation_identity_matches(provisioning_root, name, expected)? {
+        return Ok(false);
+    }
+    let Some(directory) = open_optional_child_directory(provisioning_root, name)? else {
+        return Ok(false);
+    };
+    match expected.content {
+        GenerationContent::Credential => {
+            if read_optional_file(&directory, TOMBSTONE_FILE, 0)?.is_some() {
+                return Ok(false);
+            }
+            let ciphertext = read_optional_file(
+                &directory,
+                CIPHERTEXT_FILE,
+                aster_mesh::MAX_PROTECTED_PROVISIONING_BYTES,
+            )?
+            .ok_or(ProvisioningSecretStoreError::Rejected)?;
+            Ok(crate::admin::digest(&ciphertext) == expected.ciphertext_digest)
+        }
+        GenerationContent::Tombstone => {
+            if read_optional_file(
+                &directory,
+                CIPHERTEXT_FILE,
+                aster_mesh::MAX_PROTECTED_PROVISIONING_BYTES,
+            )?
+            .is_some()
+            {
+                return Ok(false);
+            }
+            Ok(read_optional_file(&directory, TOMBSTONE_FILE, 0)?.is_some())
+        }
+    }
+}
+
+pub(super) fn generation_identity_matches(
+    provisioning_root: &OwnedFd,
+    name: &str,
+    expected: &GenerationManifest,
+) -> Result<bool, ProvisioningSecretStoreError> {
     let Some(directory) = open_optional_child_directory(provisioning_root, name)? else {
         return Ok(false);
     };
@@ -496,16 +565,53 @@ pub(super) fn generation_matches(
     if reference.as_slice() != expected_reference.as_slice() {
         return Ok(false);
     }
-    let ciphertext = read_optional_file(
-        &directory,
-        CIPHERTEXT_FILE,
-        aster_mesh::MAX_PROTECTED_PROVISIONING_BYTES,
-    )?
-    .ok_or(ProvisioningSecretStoreError::Rejected)?;
-    Ok(crate::admin::digest(&ciphertext) == expected.ciphertext_digest)
+    let expected_entries = match expected.content {
+        GenerationContent::Credential => [CIPHERTEXT_FILE, REFERENCE_FILE, MANIFEST_FILE],
+        GenerationContent::Tombstone => [TOMBSTONE_FILE, REFERENCE_FILE, MANIFEST_FILE],
+    };
+    if !directory_has_exact_entries(&directory, &expected_entries)? {
+        return Ok(false);
+    }
+    match expected.content {
+        GenerationContent::Credential => Ok(read_optional_file(
+            &directory,
+            CIPHERTEXT_FILE,
+            aster_mesh::MAX_PROTECTED_PROVISIONING_BYTES,
+        )?
+        .is_some()
+            && read_optional_file(&directory, TOMBSTONE_FILE, 0)?.is_none()),
+        GenerationContent::Tombstone => Ok(read_optional_file(
+            &directory,
+            CIPHERTEXT_FILE,
+            aster_mesh::MAX_PROTECTED_PROVISIONING_BYTES,
+        )?
+        .is_none()
+            && read_optional_file(&directory, TOMBSTONE_FILE, 0)?.is_some()),
+    }
 }
 
-fn open_child_directory(
+pub(super) fn directory_has_exact_entries(
+    directory: &OwnedFd,
+    expected: &[&str],
+) -> Result<bool, ProvisioningSecretStoreError> {
+    let mut entries = BTreeSet::new();
+    let mut reader = rustix::fs::Dir::read_from(directory)
+        .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    while let Some(entry) = reader.read() {
+        let entry = entry.map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+        let name = entry.file_name().to_bytes();
+        if name != b"." && name != b".." {
+            entries.insert(name.to_vec());
+        }
+    }
+    let expected = expected
+        .iter()
+        .map(|name| name.as_bytes().to_vec())
+        .collect::<BTreeSet<_>>();
+    Ok(entries == expected)
+}
+
+pub(super) fn open_child_directory(
     parent: &OwnedFd,
     name: &str,
 ) -> Result<OwnedFd, ProvisioningSecretStoreError> {
@@ -545,7 +651,7 @@ fn open_optional_child_directory(
     }
 }
 
-fn write_new_file(
+pub(super) fn write_new_file(
     directory: &OwnedFd,
     name: &str,
     bytes: &[u8],
@@ -578,7 +684,7 @@ fn remove_optional_file(
     }
 }
 
-fn sync_directory(directory: &OwnedFd) -> Result<(), ProvisioningSecretStoreError> {
+pub(super) fn sync_directory(directory: &OwnedFd) -> Result<(), ProvisioningSecretStoreError> {
     rustix::fs::fsync(directory).map_err(|_| ProvisioningSecretStoreError::Unavailable)
 }
 
@@ -602,6 +708,7 @@ mod tests {
             secret_ref: provisioning_secret_ref(1, [0x33; PROVIDER_REFERENCE_ID_BYTES])
                 .expect("fixture reference"),
             ciphertext_digest: [0x55; 32],
+            content: super::GenerationContent::Credential,
         }
     }
 
