@@ -35,6 +35,7 @@ credential or provisioning reference.
   },
   "mesh": {
     "bind": "0.0.0.0:8183",
+    "emission_policy": "normal",
     "sync_interval_ms": 500,
     "peers": []
   },
@@ -76,6 +77,7 @@ Unsigned integer fields use their JSON integer representation.
 | `application.listen` | socket address | none | IPv4 or IPv6 loopback only. Must differ from `health.listen`. Plaintext Connect/gRPC/gRPC-Web. |
 | `health.listen` | socket address | none | IPv4 or IPv6 loopback only. Must differ from `application.listen`. Plaintext HTTP health only. |
 | `mesh.bind` | socket address | none | Valid IP socket address for the selected mesh carrier. It is not an application listener. |
+| `mesh.emission_policy` | string enum | none | `normal` or `receive_only`. The selection is applied at startup and changes require restart. Receive-only accepts authenticated inbound work but initiates no contacts and discloses no local Event/control inventory or objects; it is not physical radio silence. |
 | `mesh.sync_interval_ms` | integer | none | `1..=60000`. |
 | `mesh.peers` | array of strings | none | `0..=256` exact manual peers. Each is `CARRIER_ID@IP:PORT=MISSION_NODE_ID_HEX64`. Carrier identities must be unique and mission identities must be unique; distinct peers may share a socket address. |
 | `mesh.relay` | object or `null` | omitted/`null` | At most one controlled relay. See Relay below. |
@@ -143,6 +145,21 @@ has no per-scope, bridge, or Blob-depot quota field and never raises a limit
 automatically. Saturation returns the sanitized public resource-exhaustion
 error; clients must back off or request a smaller valid page.
 
+The durable Event publish-operation map has a separate implementation ceiling
+of 4,096 rows and 524,288 bytes. For this evaluation profile, treat 512 rows as
+the operator warning point and stop new publication work at 1,024 rows pending
+review; the profile does not delete or reclaim operation mappings online.
+Authenticated `GetStatus` reports the exact row/byte use, hard ceilings,
+profile boundary and remaining headroom. Reaching either implementation hard
+ceiling returns `PUBLIC_ERROR_REASON_OPERATION_CAPACITY_EXHAUSTED`, which is
+terminal for the attempted new operation and must not be retried with a new
+operation key.
+
+The profile workload boundary for unacknowledged Event deliveries is 256,
+while the implementation hard ceiling remains 262,144. `GetStatus` reports
+both the current pending count and these boundaries. Operators should stop new
+workload and drain/acknowledge deliveries when profile saturation is reported.
+
 ## Credential files
 
 On Unix, both credential files are opened with no final-symlink following and
@@ -160,8 +177,8 @@ deployment owner must provide the directory ownership and isolation boundary.
 
 `SIGHUP` rereads only `client_token_file`. A completely validated replacement
 atomically becomes active; a failed reload retains the previous token and
-readiness. Mission reference, load ID, peers, relay, storage, and limits change
-only through restart.
+readiness. Emission policy, mission reference, load ID, peers, relay, storage,
+and limits change only through restart.
 
 ## Validation and diagnostics
 
@@ -189,6 +206,7 @@ of these fixed configuration reasons (the stock CLI prefixes it with `ERROR`):
 - `configuration contains a duplicate peer mission`
 - `credential file boundary is invalid`
 - `configuration file cannot be read`
+- `configuration emission policy is invalid`
 - `configuration mission load id is invalid`
 - `configuration peer is invalid`
 - `configuration relay is invalid`

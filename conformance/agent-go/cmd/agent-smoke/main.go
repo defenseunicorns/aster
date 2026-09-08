@@ -21,11 +21,19 @@ import (
 )
 
 const (
-	maxInputBytes       = 1024 * 1024
-	maxOutputBytes      = 2 * 1024 * 1024
-	maxTokenFileBytes   = 257
-	maxTimeoutSeconds   = 30
-	maxStreamDeliveries = 32
+	maxInputBytes        = 1024 * 1024
+	maxOutputBytes       = 2 * 1024 * 1024
+	maxTokenFileBytes    = 257
+	maxTimeoutSeconds    = 30
+	maxStreamDeliveries  = 32
+	profileStoreItems    = 10_000
+	profileStoreBytes    = 64 * 1024 * 1024
+	operationHardRows    = 4_096
+	operationHardBytes   = 512 * 1024
+	operationWarnRows    = 512
+	operationProfileRows = 1_024
+	deliveryProfileRows  = 256
+	deliveryHardRows     = 262_144
 )
 
 type options struct {
@@ -362,6 +370,73 @@ func resultFixture() result {
 	return result{"status": "ok"}
 }
 
+func emissionMode(value applicationv1alpha1.EmissionMode) (string, error) {
+	switch value {
+	case applicationv1alpha1.EmissionMode_EMISSION_MODE_NORMAL:
+		return "normal", nil
+	case applicationv1alpha1.EmissionMode_EMISSION_MODE_RECEIVE_ONLY:
+		return "receive_only", nil
+	default:
+		return "", errors.New("invalid status response")
+	}
+}
+
+func statusEvidence(message *applicationv1alpha1.GetStatusResponse) (result, error) {
+	if message == nil {
+		return nil, errors.New("invalid status response")
+	}
+	configured, err := emissionMode(message.ConfiguredEmissionMode)
+	if err != nil {
+		return nil, err
+	}
+	effective, err := emissionMode(message.EffectiveEmissionMode)
+	if err != nil {
+		return nil, err
+	}
+	store := message.StoreCapacity
+	operations := message.PublishOperationCapacity
+	deliveries := message.DeliveryCapacity
+	if store == nil || operations == nil || deliveries == nil {
+		return nil, errors.New("invalid status response")
+	}
+	if store.ItemLimit != profileStoreItems || store.PayloadByteLimit != profileStoreBytes ||
+		store.Items > store.ItemLimit || store.PayloadBytes > store.PayloadByteLimit {
+		return nil, errors.New("invalid status response")
+	}
+	remaining := uint64(0)
+	if operations.Rows < operationProfileRows {
+		remaining = operationProfileRows - operations.Rows
+	}
+	if operations.RowHardLimit != operationHardRows || operations.ByteHardLimit != operationHardBytes ||
+		operations.ProfileBoundary != operationProfileRows || operations.ProfileRemaining != remaining ||
+		operations.ProfileWarning != (operations.Rows >= operationWarnRows) ||
+		operations.ProfileExhausted != (operations.Rows >= operationProfileRows) ||
+		operations.Rows > operations.RowHardLimit || operations.Bytes > operations.ByteHardLimit {
+		return nil, errors.New("invalid status response")
+	}
+	if deliveries.ProfileBoundary != deliveryProfileRows || deliveries.HardLimit != deliveryHardRows ||
+		deliveries.ProfileSaturated != (deliveries.Pending >= deliveryProfileRows) ||
+		deliveries.Pending > deliveries.HardLimit {
+		return nil, errors.New("invalid status response")
+	}
+	return result{
+		"status":                      "ok",
+		"configured_emission_mode":    configured,
+		"effective_emission_mode":     effective,
+		"store_items":                 store.Items,
+		"store_item_limit":            store.ItemLimit,
+		"store_payload_bytes":         store.PayloadBytes,
+		"store_payload_byte_limit":    store.PayloadByteLimit,
+		"operation_rows":              operations.Rows,
+		"operation_bytes":             operations.Bytes,
+		"operation_profile_remaining": operations.ProfileRemaining,
+		"operation_profile_warning":   operations.ProfileWarning,
+		"operation_profile_exhausted": operations.ProfileExhausted,
+		"pending_deliveries":          deliveries.Pending,
+		"delivery_profile_saturated":  deliveries.ProfileSaturated,
+	}, nil
+}
+
 func runCommand(ctx context.Context, client applicationv1alpha1.AsterApplicationServiceClient, command, token string, input io.Reader, output io.Writer) error {
 	switch command {
 	case "status":
@@ -369,17 +444,26 @@ func runCommand(ctx context.Context, client applicationv1alpha1.AsterApplication
 		if err := decodeInput(input, &value); err != nil {
 			return err
 		}
-		if _, err := client.GetStatus(ctx, request(&applicationv1alpha1.GetStatusRequest{}, token)); err != nil {
+		response, err := client.GetStatus(ctx, request(&applicationv1alpha1.GetStatusRequest{}, token))
+		if err != nil {
+			return err
+		}
+		receipt, err := statusEvidence(response.Msg)
+		if err != nil {
 			return err
 		}
 		if !value.RepeatUntilError {
-			return writeResult(output, result{"status": "ok"})
+			return writeResult(output, receipt)
 		}
 		if err := writeResult(output, result{"status": "active", "activity": "unary"}); err != nil {
 			return err
 		}
 		for {
-			if _, err := client.GetStatus(ctx, request(&applicationv1alpha1.GetStatusRequest{}, token)); err != nil {
+			response, err := client.GetStatus(ctx, request(&applicationv1alpha1.GetStatusRequest{}, token))
+			if err != nil {
+				return err
+			}
+			if _, err := statusEvidence(response.Msg); err != nil {
 				return err
 			}
 			time.Sleep(time.Millisecond)

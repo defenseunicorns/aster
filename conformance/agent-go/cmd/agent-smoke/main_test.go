@@ -308,6 +308,48 @@ func TestResultEncodingIsBounded(t *testing.T) {
 	}
 }
 
+func TestStatusEvidenceRequiresProfileCapacityContract(t *testing.T) {
+	valid := &applicationv1alpha1.GetStatusResponse{
+		ConfiguredEmissionMode: applicationv1alpha1.EmissionMode_EMISSION_MODE_NORMAL,
+		EffectiveEmissionMode:  applicationv1alpha1.EmissionMode_EMISSION_MODE_RECEIVE_ONLY,
+		StoreCapacity: &applicationv1alpha1.StoreCapacityStatus{
+			Items: 0, ItemLimit: 10_000, PayloadBytes: 0, PayloadByteLimit: 64 * 1024 * 1024,
+		},
+		PublishOperationCapacity: &applicationv1alpha1.PublishOperationCapacityStatus{
+			Rows: 0, Bytes: 0, RowHardLimit: 4_096, ByteHardLimit: 524_288,
+			ProfileBoundary: 1_024, ProfileRemaining: 1_024,
+		},
+		DeliveryCapacity: &applicationv1alpha1.DeliveryCapacityStatus{
+			Pending: 0, ProfileBoundary: 256, HardLimit: 262_144,
+		},
+	}
+	receipt, err := statusEvidence(valid)
+	if err != nil {
+		t.Fatalf("valid profile status rejected: %v", err)
+	}
+	if receipt["configured_emission_mode"] != "normal" || receipt["effective_emission_mode"] != "receive_only" {
+		t.Fatalf("emission modes not retained in receipt: %#v", receipt)
+	}
+
+	for name, mutate := range map[string]func(*applicationv1alpha1.GetStatusResponse){
+		"missing-store": func(status *applicationv1alpha1.GetStatusResponse) { status.StoreCapacity = nil },
+		"wrong-operation-boundary": func(status *applicationv1alpha1.GetStatusResponse) {
+			status.PublishOperationCapacity.ProfileBoundary = 2_048
+		},
+		"wrong-delivery-hard-limit": func(status *applicationv1alpha1.GetStatusResponse) {
+			status.DeliveryCapacity.HardLimit = 1
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := proto.Clone(valid).(*applicationv1alpha1.GetStatusResponse)
+			mutate(changed)
+			if _, err := statusEvidence(changed); err == nil {
+				t.Fatal("invalid profile status accepted")
+			}
+		})
+	}
+}
+
 func hexOf(value []byte) string {
 	const alphabet = "0123456789abcdef"
 	encoded := make([]byte, len(value)*2)

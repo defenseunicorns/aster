@@ -36,6 +36,12 @@ const MAX_CLIENT_TIMEOUT_SECONDS: u64 = 120;
 const TEST_STORAGE_MAX_ITEMS: u32 = 10_000;
 const TEST_STORAGE_MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 const TEST_SHUTDOWN_GRACE_MS: u64 = 10_000;
+const EVENT_OPERATION_HARD_ROWS: u64 = 4_096;
+const EVENT_OPERATION_HARD_BYTES: u64 = 512 * 1024;
+const EVENT_OPERATION_WARNING_ROWS: u64 = 512;
+const EVENT_OPERATION_PROFILE_ROWS: u64 = 1_024;
+const EVENT_DELIVERY_PROFILE_ROWS: u64 = 256;
+const EVENT_DELIVERY_HARD_ROWS: u64 = 262_144;
 const INITIAL_TOKEN: &[u8] = b"SECRET_TOKEN_CANARY_0123456789ABCDEF";
 
 fn main() -> ExitCode {
@@ -496,16 +502,93 @@ struct StatusInput {
 
 async fn client_status(client: &Client) -> Result<(), FixtureError> {
     let input: StatusInput = read_client_input()?;
-    client.get_status(api::GetStatusRequest::default()).await?;
+    let response = client
+        .get_status(api::GetStatusRequest::default())
+        .await?
+        .into_owned();
+    let evidence = status_evidence(&response)?;
     if !input.repeat_until_error {
-        print_json(json!({"status": "ok"}))?;
+        print_json(evidence)?;
         return Ok(());
     }
     print_json(json!({"status": "active", "activity": "unary"}))?;
     loop {
-        client.get_status(api::GetStatusRequest::default()).await?;
+        let response = client
+            .get_status(api::GetStatusRequest::default())
+            .await?
+            .into_owned();
+        status_evidence(&response)?;
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
+}
+
+fn emission_mode_name(
+    value: buffa::EnumValue<api::EmissionMode>,
+) -> Result<&'static str, FixtureError> {
+    match value.as_known() {
+        Some(api::EmissionMode::Normal) => Ok("normal"),
+        Some(api::EmissionMode::ReceiveOnly) => Ok("receive_only"),
+        Some(api::EmissionMode::Unspecified) | None => Err(FixtureError::Local),
+    }
+}
+
+fn status_evidence(response: &api::GetStatusResponse) -> Result<serde_json::Value, FixtureError> {
+    let configured = emission_mode_name(response.configured_emission_mode)?;
+    let effective = emission_mode_name(response.effective_emission_mode)?;
+    let store = response
+        .store_capacity
+        .as_option()
+        .ok_or(FixtureError::Local)?;
+    let operations = response
+        .publish_operation_capacity
+        .as_option()
+        .ok_or(FixtureError::Local)?;
+    let deliveries = response
+        .delivery_capacity
+        .as_option()
+        .ok_or(FixtureError::Local)?;
+    if store.item_limit != u64::from(TEST_STORAGE_MAX_ITEMS)
+        || store.payload_byte_limit != TEST_STORAGE_MAX_PAYLOAD_BYTES
+        || store.items > store.item_limit
+        || store.payload_bytes > store.payload_byte_limit
+    {
+        return Err(FixtureError::Local);
+    }
+    let remaining = EVENT_OPERATION_PROFILE_ROWS.saturating_sub(operations.rows);
+    if operations.row_hard_limit != EVENT_OPERATION_HARD_ROWS
+        || operations.byte_hard_limit != EVENT_OPERATION_HARD_BYTES
+        || operations.profile_boundary != EVENT_OPERATION_PROFILE_ROWS
+        || operations.profile_remaining != remaining
+        || operations.profile_warning != (operations.rows >= EVENT_OPERATION_WARNING_ROWS)
+        || operations.profile_exhausted != (operations.rows >= EVENT_OPERATION_PROFILE_ROWS)
+        || operations.rows > operations.row_hard_limit
+        || operations.bytes > operations.byte_hard_limit
+    {
+        return Err(FixtureError::Local);
+    }
+    if deliveries.profile_boundary != EVENT_DELIVERY_PROFILE_ROWS
+        || deliveries.hard_limit != EVENT_DELIVERY_HARD_ROWS
+        || deliveries.profile_saturated != (deliveries.pending >= EVENT_DELIVERY_PROFILE_ROWS)
+        || deliveries.pending > deliveries.hard_limit
+    {
+        return Err(FixtureError::Local);
+    }
+    Ok(json!({
+        "status": "ok",
+        "configured_emission_mode": configured,
+        "effective_emission_mode": effective,
+        "store_items": store.items,
+        "store_item_limit": store.item_limit,
+        "store_payload_bytes": store.payload_bytes,
+        "store_payload_byte_limit": store.payload_byte_limit,
+        "operation_rows": operations.rows,
+        "operation_bytes": operations.bytes,
+        "operation_profile_remaining": operations.profile_remaining,
+        "operation_profile_warning": operations.profile_warning,
+        "operation_profile_exhausted": operations.profile_exhausted,
+        "pending_deliveries": deliveries.pending,
+        "delivery_profile_saturated": deliveries.profile_saturated,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -929,6 +1012,46 @@ mod tests {
         assert_eq!(TEST_STORAGE_MAX_ITEMS, 10_000);
         assert_eq!(TEST_STORAGE_MAX_PAYLOAD_BYTES, 64 * 1024 * 1024);
         assert_eq!(TEST_SHUTDOWN_GRACE_MS, 10_000);
+    }
+
+    #[test]
+    fn status_evidence_requires_profile_modes_and_capacity_contract() {
+        let valid = api::GetStatusResponse {
+            configured_emission_mode: api::EmissionMode::Normal.into(),
+            effective_emission_mode: api::EmissionMode::ReceiveOnly.into(),
+            store_capacity: api::StoreCapacityStatus {
+                item_limit: 10_000,
+                payload_byte_limit: 64 * 1024 * 1024,
+                ..Default::default()
+            }
+            .into(),
+            publish_operation_capacity: api::PublishOperationCapacityStatus {
+                row_hard_limit: 4_096,
+                byte_hard_limit: 524_288,
+                profile_boundary: 1_024,
+                profile_remaining: 1_024,
+                ..Default::default()
+            }
+            .into(),
+            delivery_capacity: api::DeliveryCapacityStatus {
+                profile_boundary: 256,
+                hard_limit: 262_144,
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        };
+
+        let evidence = status_evidence(&valid).expect("valid profile status");
+        assert_eq!(evidence["configured_emission_mode"], "normal");
+        assert_eq!(evidence["effective_emission_mode"], "receive_only");
+
+        let mut invalid = valid;
+        invalid
+            .publish_operation_capacity
+            .get_or_insert_default()
+            .profile_boundary = 2_048;
+        assert!(status_evidence(&invalid).is_err());
     }
 
     #[test]

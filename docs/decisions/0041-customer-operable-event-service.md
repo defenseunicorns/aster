@@ -72,6 +72,18 @@ forwarding, Event bridges, and dynamic bridge administration.
     semantics, redelivery rules, hard bounds, generated-client surface, and
     sole-authority architecture. Add only stable sanitized public reason and
     retry-guidance details.
+11. Require restart-selected `normal` or `receive_only` Event emission. In
+    receive-only mode the node remains locally ready and accepts authenticated
+    inbound work, but initiates no contacts and discloses no local Event or
+    control inventory/objects. This is zero transfer of locally held selected
+    objects, not physical radio silence.
+12. Extend authenticated status with configured/effective mode and audited
+    aggregate-store, Event-operation, and pending-delivery capacity. Retain
+    hard operation ceilings of 4,096 rows/524,288 bytes, with profile warning
+    at 512 and profile stop boundary at 1,024; retain the delivery profile
+    workload boundary of 256 and implementation hard ceiling of 262,144.
+    Dedicated Event-operation hard-cap refusal is a distinct non-retryable
+    public reason. No online operation-map reclamation is introduced.
 
 ### Direct dependency admission for pre-body serving
 
@@ -155,6 +167,9 @@ so its commands continue to describe executable repository behavior.
   deployment; namespace isolation is mandatory for this profile.
 - Logical item and payload limits do not claim total disk, redb overhead,
   process RSS, or complete cross-class lifecycle bounds.
+- Capacity status is an operator coordination surface, not automatic profile
+  enforcement: the harness/operator stops work at the lower profile boundaries
+  while the implementation hard ceilings remain fail-closed safeguards.
 - This decision authorizes implementation. It does not close protected
   provisioning, deployment, physical-network, mixed-implementation,
   packaging, security-review, or release gates.

@@ -80,10 +80,30 @@ authority and application listener accept work; it does not require a peer,
 carrier connectivity, a recent contact, an empty queue, or convergence.
 Offline-first publication is ready behavior.
 
+`GetStatus` also returns the configured and effective emission mode, aggregate
+logical store use/limits, durable publish-operation rows/bytes and headroom,
+and pending-delivery pressure. For this profile, the operation warning begins
+at 512 rows and the workload stops at 1,024 rows; pending-delivery workload
+saturates at 256. These profile boundaries are lower than the implementation
+hard ceilings and are intended to trigger operator action before refusal.
+
 Only `GET` with no body is accepted. Unknown paths return `404`, other methods
 return `405`, and responses contain no node, mission, peer, path, queue, or
 failure detail. Use authenticated `GetStatus` when an application needs its
 bounded synchronization snapshot.
+
+## Select normal or receive-only operation
+
+Set required `mesh.emission_policy` to `normal` or `receive_only` before
+startup. Changing it requires process restart. Receive-only keeps local health
+and authenticated application APIs ready and continues to accept authenticated
+inbound mesh work. It does not initiate contacts or disclose local Event or
+control inventory/objects.
+
+Receive-only is a zero-transfer mode for locally held application/control
+objects, not physical radio silence: the carrier may still receive traffic and
+the protocol may emit mandatory acknowledgements or other transport responses.
+Use deployment/network controls when a customer requires actual radio silence.
 
 ## Exercise the repository development path
 
@@ -196,6 +216,13 @@ page/scan request. For durable-storage pressure, wait for operator-controlled
 retirement/capacity recovery rather than silently increasing the configured
 limit or changing the operation key.
 
+`ResourceExhausted` with
+`PUBLIC_ERROR_REASON_OPERATION_CAPACITY_EXHAUSTED` is different: the durable
+idempotency map reached its dedicated row or byte hard ceiling. It is
+non-retryable and carries no retry delay. Stop new publication, preserve the
+original operation key, and escalate to the operator; creating another key
+only consumes more capacity and changes the application effect identity.
+
 `Unavailable` with `PUBLIC_ERROR_REASON_DRAINING` or
 `PUBLIC_ERROR_REASON_STATE_UNAVAILABLE` is retryable only after `/readyz`
 returns `200`. Authentication failures require credential refresh.
@@ -220,6 +247,7 @@ request values or internal chains.
 | `PUBLIC_ERROR_REASON_MISSING_DURABLE_OBJECT` | `NotFound` | no | The named subscription/Event is unavailable or retired. |
 | `PUBLIC_ERROR_REASON_FAILED_PRECONDITION` | `PermissionDenied`, `Unavailable`, or `FailedPrecondition` | no | Resolve authorization, policy, or provisioning state before retrying. |
 | `PUBLIC_ERROR_REASON_RESOURCE_EXHAUSTION` | `ResourceExhausted` | yes | Back off, reduce a valid page, or wait for capacity recovery. |
+| `PUBLIC_ERROR_REASON_OPERATION_CAPACITY_EXHAUSTED` | `ResourceExhausted` | no | Stop new publication and escalate; do not replace the operation key. |
 | `PUBLIC_ERROR_REASON_DRAINING` | `Unavailable` | yes | Wait for a Ready process. |
 | `PUBLIC_ERROR_REASON_STATE_UNAVAILABLE` | `Unavailable` | yes | Wait for a Ready process. |
 | `PUBLIC_ERROR_REASON_AUTHENTICATION_FAILED` | `Unauthenticated` | no | Refresh credentials; do not repeat the same failed authorization. |
@@ -274,7 +302,8 @@ kill -HUP "$ASTER_AGENT_PID"
 
 Only the bearer token reloads. A valid replacement becomes active atomically
 and the old token is rejected; a failed reload retains the old token and Ready
-state. Mission reference, peers, relay, storage, and limits require restart.
+state. Emission policy, mission reference, peers, relay, storage, and limits
+require restart.
 
 Start bounded draining with either signal:
 
