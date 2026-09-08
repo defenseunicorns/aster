@@ -10,6 +10,7 @@
 - Product class: time-bounded, non-production customer evaluation
 - Start here: [human-focused MVP coordination guide](linux-event-mvp-coordination-guide.md)
 - Historical design authority: [approved design](../superpowers/specs/2026-09-06-linux-event-mvp-evaluation-profile-design.md)
+- Amendment authority: [approved Raspberry Pi profile amendment](../superpowers/specs/2026-09-08-raspberry-pi-linux-event-mvp-profile-amendment-design.md), which supersedes conflicting platform, architecture, topology, artifact, D06, and acceptance text in the historical design
 - Decision register: [v0.1 register](linux-event-mvp-evaluation-profile-v0.1-register.md)
 - Candidate-annex schema: [provisional schema](linux-event-mvp-evaluation-profile-v0.1-annex-template.md)
 
@@ -29,11 +30,12 @@ definition of done. This document remains the exact profile authority.
 
 This profile defines the first reusable Aster customer-evaluation profile as a
 deliberately narrow Linux, single-scope, Event-only product slice. The profile
-supports durable offline-first Event exchange among 2, 8, or 20 manually
-configured nodes over approved IP paths, optionally using one customer-controlled
-pinned connectivity relay. It fixes the application, security, operating,
-capacity, resource, lifecycle, artifact, and evidence boundaries needed to
-decide whether an exact build is suitable for a customer evaluation.
+supports durable offline-first Event exchange between exactly two manually
+configured physical CM4 nodes over approved IP paths, optionally using one
+customer-controlled pinned connectivity relay. It fixes the application,
+security, operating, capacity, resource, lifecycle, artifact, and evidence
+boundaries needed to decide whether an exact build is suitable for a customer
+evaluation.
 
 This is a time-bounded, non-production evaluation profile. It is not the
 complete MVP target in `data-mesh-requirements.md`, production authorization,
@@ -90,22 +92,22 @@ claim records that exact name plus:
 - package, SBOM, notice, and provenance digests;
 - the protected-provider implementation and version;
 - the complete sanitized configuration digest;
-- the exact Ubuntu, kernel, architecture, filesystem, and device identity;
+- exact Raspberry Pi reference image, Debian identity, kernel, systemd package,
+  architecture, filesystem, and CM4 identity;
+- exactly two mandatory physical aarch64 CM4 participants;
+- a third CM4 only as declared support capacity;
+- no reusable claim for another OS, image, architecture, device family, VM,
+  container, or node tier;
 - enabled direct and controlled-relay paths;
 - the acceptance-harness version; and
 - the retained receipt bundle and release decision.
 
-A customer annex may reduce node count, remove relay use, reduce payload or
-queue limits, select only one listed architecture, tighten resource limits, or
-disable an optional behavior. It may not add a platform, carrier, data class,
-API, security profile, topology, or lifecycle behavior; weaken authentication,
-rollback, isolation, or evidence gates; increase a bound; or convert an
-exclusion into support. An expansion requires a new versioned base profile.
-
-The reusable base must first qualify both architectures and all three node
-tiers. Only after that qualification may a customer annex deploy one qualified
-architecture or a lower qualified node tier. An annex cannot be used to issue
-the reusable base when an architecture or tier never passed.
+A customer annex may remove relay use, reduce payload or queue limits, tighten
+resource limits, or disable an optional behavior. It may not reduce the two
+mandatory CM4 participants, add a platform, carrier, data class, API, security
+profile, topology, or lifecycle behavior; weaken authentication, rollback,
+isolation, or evidence gates; increase a bound; or convert an exclusion into
+support. An expansion requires a new versioned base profile.
 
 After a claim is issued, v0.1 and its receipt bundle are immutable. An editorial
 correction that changes no boundary produces v0.1.1. Any changed target,
@@ -139,19 +141,18 @@ restarting the calendar does not reset a state directory's operation count.
 
 ## Supported platform and deployment
 
-| Dimension | v0.1 boundary |
+| Dimension | Required value |
 |---|---|
-| Device tier | Tier 2 Linux |
-| Operating system | Ubuntu Server 24.04 LTS |
-| Kernel | The exact Canonical-supported Ubuntu 24.04 kernel package/build named in the signed qualification annex; no blanket claim covers later kernels |
-| Architectures | `x86_64` and `aarch64` |
-| Init/service manager | `systemd` |
-| State filesystem | Local `ext4` |
-| CPU available to agent | At least one core |
-| Deployment memory | At least 1 GiB |
-| Free state capacity at start | At least 256 MiB |
-| Packaging | Native `.deb` for each architecture, authenticated by the exact detached-signature or signed-repository method named in the annex |
-| Application isolation | Dedicated network namespace shared only by the agent and its intended trusted application |
+| Operating system | Raspberry Pi reference image `2026-06-18`, identifying as Debian GNU/Linux 13 `trixie` |
+| Kernel | Exact `6.18.39+rpt-rpi-v8` build, revalidated and frozen in the candidate annex |
+| Architecture | `aarch64` only |
+| Hardware | Physical Raspberry Pi Compute Module 4 Rev 1.1 |
+| Service manager | systemd `257.13-1~deb13u1` |
+| Package | Native `arm64` `.deb` |
+| Filesystem | Local `ext4` state |
+
+The candidate annex must confirm the exact image identity
+`Raspberry Pi reference 2026-06-18` on both mandatory devices.
 
 The artifact runs as a dedicated unprivileged service identity. Application and
 health listeners remain loopback-only inside the dedicated namespace. The
@@ -159,17 +160,19 @@ deployment exposes no Service, host port, ingress, remote tunnel, or unrelated
 same-namespace sidecar. Bearer authentication remains mandatory inside the
 namespace.
 
-Containers, Kubernetes, Helm, Zarf, UDS, network filesystems, other Linux
-distributions, macOS, Windows, Android, iOS, and MCU targets do not qualify
-v0.1. A container image produced by a broader artifact workstream is not a
-v0.1 artifact.
+Ubuntu Server 24.04, `x86_64`, Raspberry Pi Compute Module 5, VMs, containers,
+Kubernetes, Helm, Zarf, UDS, network filesystems, other Linux distributions,
+macOS, Windows, Android, iOS, and MCU targets do not qualify v0.1. The 8- and
+20-node tiers are also non-goals. A container image produced by a broader
+artifact workstream is not a v0.1 artifact.
 
 ## Topology and carriers
 
 - One mission authority, one scope, one topic, and one durable application
   subscription are active in a qualification scenario. This is not one
   subscription per node.
-- Supported node-count tiers are exactly 2, 8, and 20.
+- The mandatory qualification topology contains exactly two physical CM4
+  nodes.
 - A node has no more than 19 exact manually configured peers.
 - Direct IP uses exact operator-provided carrier address and peer identity
   bindings. Automatic discovery is disabled.
@@ -191,18 +194,17 @@ multipath behavior, or continuous connectivity.
 
 The reusable base uses this participant shape:
 
-| Tier | Physical nodes | Isolated Ubuntu 24.04 virtual nodes | Required architecture evidence |
-|---:|---:|---:|---|
-| 2 | 2 | 0 | One physical `x86_64` and one physical `aarch64` node exchange Events |
-| 8 | 2 | 6 | Both qualified physical architectures remain participants; the annex records every virtual architecture |
-| 20 | 2 | 18 | Both qualified physical architectures remain participants; the annex records every virtual architecture |
+| Required topology | Physical CM4 nodes | Required exchange |
+|---|---:|---|
+| Two-node base | 2 | Both CM4 nodes run the unchanged G3 artifact and exchange Events directly |
 
-Every virtual node receives the profile CPU, memory, and local-ext4 allocation;
-host oversubscription and shared-network effects are recorded. The signed annex
-names every device/VM, architecture, Ubuntu and kernel package build,
-filesystem, peer role, relay placement, and network condition. The 8/20-node
-results are mixed physical/virtual evidence, never 8- or 20-device physical
-evidence.
+The third CM4 is an optional declared spare, failure, recovery, or relay
+participant and support capacity, not a third required participant. If it
+sends, receives, stores, or relays candidate traffic, the annex records it in
+the inventory with its exact role and reruns every affected scenario. Replacing
+either mandatory node is an inventory change and likewise requires every
+affected scenario to be rerun. Results involving the third CM4 do not widen the
+required two-node claim.
 
 ## Emission modes
 
@@ -282,25 +284,28 @@ mission secret bytes. Plaintext credentials in arguments, environment values,
 logs, package layers, ordinary configuration, or application responses are
 prohibited.
 
-The exact initial v0.1 provider design is
-[`aster-systemd-credential-store/v1`](../superpowers/specs/2026-09-07-systemd-credential-provider-design.md),
-using Ubuntu 24.04 `systemd-creds` and `LoadCredentialEncrypted=` from the
-systemd 255.4 line with explicit host-key protection, the fixed credential name
-`aster-provisioning.bundle`, a statically composed runtime loader, and the
-root-operated `aster-credential-admin` administration artifact. TPM2 and all
-automatic or fallback provider selection are excluded. The provider-design
-record has SHA-256
-`078c35f0046c62a7415d4e8c843f198f97da898da8b8b17eebeaa98de3e2a781`.
+The exact initial v0.1 provider binding is:
+
+- provider = `aster-systemd-credential-store/v2`
+- design = [`docs/superpowers/specs/2026-09-08-raspberry-pi-systemd-credential-provider-v2-design.md`](../superpowers/specs/2026-09-08-raspberry-pi-systemd-credential-provider-v2-design.md)
+- design_digest = `sha256:30c5dfe71a203fcdd69dd330f9b5c68eeaee5032b624ee41912aa4723a9f853f`
+- systemd = `257.13-1~deb13u1`
+
+The provider uses `systemd-creds` and `LoadCredentialEncrypted=` with explicit
+host-key protection, the fixed credential name `aster-provisioning.bundle`, a
+statically composed runtime loader, and the root-operated
+`aster-credential-admin` administration artifact. TPM2 and all automatic or
+fallback provider selection are excluded.
 Internal approval of this exact provider selection and bound design digest was
 recorded for the profile definition on 2026-09-08. D06 is resolved for the
 profile definition. Security and deployment approvals of that exact record
 remain mandatory candidate gate E01; provider implementation and qualification
 remain later gates.
 
-This provider selection makes no Debian support claim. If final review requires
-Debian or generic Debian-family support, D06 must be reopened and the provider
-redesigned and versioned against the exact additional platform boundary before
-the affected profile or candidate can proceed.
+This provider selection makes no generic Debian or Debian-family support claim.
+If final review requires another platform, D06 must be reopened and the
+provider redesigned and versioned against the exact additional platform
+boundary before the affected profile or candidate can proceed.
 
 The provider and operating procedure must demonstrate:
 
@@ -413,9 +418,9 @@ guidance.
 A full crash-safe generation/retirement lifecycle belongs to `P1-1`. TTL, LRU,
 FIFO, or deletion of a bare mapping is prohibited because a delayed retry could
 otherwise create a second Event. The decision is reopened after the first
-retained physical workload on both architectures and before approving a profile
-revision above 1,024 distinct operations, any `P2-2` workload bracket, or any
-production profile, whichever occurs first.
+retained physical workload on both mandatory CM4 nodes and before approving a
+profile revision above 1,024 distinct operations, any `P2-2` workload bracket,
+or any production profile, whichever occurs first.
 
 The review records distinct accepted operations, key-length distribution,
 logical operation bytes, database/filesystem growth, reopen time, RSS, CPU,
@@ -464,17 +469,16 @@ The qualification dimensions are not an unconstrained Cartesian product:
 | Scenario | Nodes | Payload | Rate/duration | Purpose |
 |---|---:|---:|---|---|
 | API boundary | 2 | 0, 4 KiB, and 64 KiB | One exact Event at each boundary | Encoding, durable acceptance, transfer, query, delivery, and acknowledgement |
-| Small topology | 2 | 4 KiB | 10 Events at 1 Event/s | Direct and optional pinned-relay recovery |
-| Intermediate topology | 8 | 4 KiB | 10 Events/node at 1 Event/s | Concurrent progress and bounded status |
-| Maximum topology | 20 | 4 KiB | 10 Events/node at 1 Event/s | Maximum peer and burst bracket |
-| Offline soak | 2, 8, and 20 | 4 KiB | 10 Events/hour/node for 24 hours | Disconnected publication, restart, later convergence, gaps, and capacity/resource behavior |
+| Two-node topology | 2 | 4 KiB | 10 Events at 1 Event/s | Direct and optional pinned-relay recovery |
+| Offline soak | 2 | 4 KiB | 10 Events/hour/node for 24 hours | Disconnected publication, restart, later convergence, gaps, and capacity/resource behavior |
 | Capacity-warning probe | 2 | 4 KiB | 512 distinct local operations plus one exact retry | Audited operation usage, 50% warning, and retry-without-growth |
 
 The 64-KiB profile boundary is tested as a payload boundary and bounded burst;
-it is not sustained at 10 Events/hour across 20 nodes for 24 hours. Every run
-starts from a fresh zero-workload state directory, retains controls created by
-provisioning, and records final logical and physical headroom. Admission or
-convergence past a stated limit is not part of the successful profile.
+it is not sustained at 10 Events/hour during the 24-hour soak. Every run starts
+from a fresh zero-workload state directory, retains controls created by
+provisioning, and records final logical and physical headroom on both mandatory
+CM4 nodes. Admission or convergence past a stated limit is not part of the
+successful profile.
 
 The agent's compiled request/message ceiling is 1 MiB, but v0.1 makes no 1-MiB
 plaintext payload claim because protobuf and protected-envelope overhead also
@@ -488,16 +492,16 @@ profile boundary.
 
 After control and emergency reserves, the configured store provides 5,840
 ordinary aggregate item slots and 50,266,112 ordinary logical bytes. The
-maximum soak projects 5,040 ordinary aggregate items per converged node: 4,800
-Events plus 240 local publish-operation mappings. That leaves 800 item slots
+two-node soak projects 720 ordinary aggregate items per converged node: 480
+Events plus 240 local publish-operation mappings. That leaves 5,120 item slots
 before other aggregate-counted rows. Byte fit remains provisional until the
 receipts record exact protected source-object bytes and physical database
 growth; plaintext payload arithmetic alone is not evidence of fit.
 
 ## Resource and lifecycle targets
 
-The following apply to the provider-composed agent on each declared
-architecture under the workload matrix:
+The following apply to the provider-composed agent on each participating
+physical CM4 node under the workload matrix:
 
 | Measure | v0.1 target |
 |---|---:|
@@ -511,9 +515,9 @@ architecture under the workload matrix:
 | Free local state space at start | at least 256 MiB |
 
 
-Energy is measured and retained for each physical target but v0.1 sets no pass/
-fail threshold. A changed target creates a new profile version; a test result
-does not silently redefine v0.1.
+Energy is measured and retained for each participating physical CM4 node but
+v0.1 sets no pass/fail threshold. A changed target creates a new profile
+version; a test result does not silently redefine v0.1.
 
 Startup fails closed before readiness for invalid configuration, credentials,
 provider state, mission policy/profile mismatch, or inconsistent durable state.
@@ -561,7 +565,7 @@ is not inferred from these minimum fields.
 
 ## Artifact and installation contract
 
-Each architecture-specific candidate contains:
+The one native `arm64` candidate contains:
 
 - one provider-composed, stripped `aster-agent` executable in a native `.deb`
   package with the annexed artifact-authentication method;
@@ -590,8 +594,8 @@ The 2026-09-13 meeting is an issue/refuse/defer checkpoint; reaching the date
 does not authorize a candidate. An unpassed gate against the exact final
 artifacts causes refusal or deferral.
 
-1. A clean, locked source checkout reproduces both packages and their SBOM,
-   notices, provenance, and checksums through the approved build path.
+1. A clean, locked source checkout reproduces the one `arm64` package and its
+   SBOM, notices, provenance, and checksums through the approved build path.
 2. `mise run check` passes deterministically from that clean checkout. The
    Event-service process acceptance and checked-in Go generation checks pass
    for the exact artifacts.
@@ -603,20 +607,16 @@ artifacts causes refusal or deferral.
 4. Protected install/load, bearer rotation, provider/reference rotation,
    backup/recovery, revoke/rekey, and logical destroy follow the lifecycle
    contract without secret disclosure.
-5. Both architectures pass install, readiness, normal stop, forced process
-   loss, same-version restart, upgrade, permitted rollback, and uninstall/state
-   preservation scenarios on declared Ubuntu 24.04 targets. The two-node tier
-   uses one physical `x86_64` and one physical `aarch64` device. The 8- and
-   20-node tiers retain those two physical endpoints and may use isolated
-   Ubuntu 24.04 virtual participants for the remaining nodes. Every virtual
-   allocation and oversubscription assumption is recorded and cannot be cited
-   as physical-device evidence.
+5. Both mandatory CM4 devices and the one `arm64` artifact pass install,
+   readiness, normal stop, forced process loss, same-version restart, upgrade,
+   permitted rollback, and uninstall/state preservation scenarios in the exact
+   declared profile environment.
 6. Rust publishes and consumes through the normative API. Go performs the same
    black-box wire/API recovery path against the Rust server.
-7. The 2-, 8-, and 20-node workload matrix passes with the exact environment
-   retained. v0.1 defines no generic loss/latency/bandwidth acceptance bracket.
-   Optional controlled-relay claims include relay-loss and direct-path
-   recovery; direct-only annexes omit the relay claim explicitly.
+7. The two-node workload passes with the exact environment retained. v0.1
+   defines no generic loss/latency/bandwidth acceptance bracket. Optional
+   controlled-relay claims include relay-loss and direct-path recovery;
+   direct-only annexes omit the relay claim explicitly.
 8. Twenty-four-hour disconnected publication, intervening restart, later
    authenticated convergence, exact gap reporting, at-least-once redelivery,
    acknowledgement, and peerless reopen retain the expected data.
@@ -633,8 +633,8 @@ artifacts causes refusal or deferral.
     black-box retirement trigger because its API exposes neither finite TTL nor
     Event-content deletion.
 11. RSS, CPU, executable size, startup, stop, state growth, and energy are
-    measured on each architecture. Every thresholded target passes; energy is
-    reported without a pass/fail claim.
+    measured on each participating physical CM4 node. Every thresholded target
+    passes; energy is reported without a pass/fail claim.
 12. Packet/log/error inspection finds no forbidden plaintext or credentials
     within the stated metadata budget.
 13. The release owner verifies every artifact/evidence digest, open-gate
@@ -658,13 +658,13 @@ parallel:
 2. **G2 — Source/API freeze:** merge ReceiveOnly and capacity behavior, pass
    focused tests, and freeze one source/API commit.
 3. **G3 — Artifact freeze:** reproducibly build and sign protected-provider-
-   composed packages for both architectures from G2.
+   composed one native `arm64` package from G2.
 4. **G4 — Focused target tests:** pass install, lifecycle, Rust/Go API,
-   ReceiveOnly, and direct/optional-relay scenarios using the unchanged G3
-   artifacts.
-5. **G5 — Workload qualification:** run the 2/8/20-node and 24-hour scenarios
-   from G3. Scenarios may run concurrently only when the signed hardware/
-   virtual inventory distinguishes every participant.
+   ReceiveOnly, and direct/optional-relay scenarios on both mandatory CM4
+   devices using the unchanged G3 artifact.
+5. **G5 — Workload qualification:** run the two-node workload and 24-hour
+   disconnected/reconnection scenario using the unchanged G3 artifact and a
+   frozen device/network inventory.
 6. **G6 — Disposition:** review receipts and rerun deterministic gates, then
    issue, refuse, or defer the exact G3 artifact set.
 
@@ -672,9 +672,9 @@ parallel:
 
 - Evaluators receive one precise Linux/Event product slice rather than a broad
   claim based on unrelated mechanisms.
-- The maximum soak projects 5,040 ordinary items against 5,840 available
-  ordinary slots. Its 800-slot margin and byte fit remain qualification gates,
-  not production sizing evidence.
+- The two-node soak projects 720 ordinary items against 5,840 available
+  ordinary slots. Its 5,120-slot margin and byte fit remain qualification
+  gates, not production sizing evidence.
 - The 1,024-operation lifetime boundary is safe for maximum legal operation
   keys and leaves margin over the 240-operation offline workload, but it is not
   a production lifetime or reclamation solution.
