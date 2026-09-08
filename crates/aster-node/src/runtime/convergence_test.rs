@@ -118,7 +118,7 @@ mod tests {
             "hung",
             Duration::from_millis(20),
             Duration::from_secs(10),
-            || std::future::pending(),
+            std::future::pending,
         )
         .await;
     }
@@ -130,7 +130,7 @@ mod tests {
             "hung",
             Duration::from_secs(10),
             Duration::from_millis(20),
-            || std::future::pending(),
+            std::future::pending,
         )
         .await;
     }
