@@ -356,6 +356,119 @@ impl SystemdCredentialAdmin {
         complete_ledger(&self.ledger_root, ledger, &mut self.faults)?;
         Ok(ProvisioningInstallReceipt::installed(operation, secret_ref))
     }
+
+    /// Rotates the active provider generation while retaining its predecessor.
+    pub fn rotate(
+        &mut self,
+        operation: ProvisioningInstallId,
+        load: ProvisioningLoadId,
+        plaintext: UnprotectedProvisioning,
+    ) -> Result<ProvisioningInstallReceipt, ProvisioningSecretStoreError> {
+        ProfileProvisioningBundle::from_bytes(plaintext.expose())
+            .map_err(|_| ProvisioningSecretStoreError::Rejected)?;
+
+        let encoded =
+            read_ledger(&self.ledger_root)?.ok_or(ProvisioningSecretStoreError::Rejected)?;
+        let ledger = decode_ledger(&encoded)?;
+        if ledger.host_key_identity != self.host_key_identity || ledger.intent.is_some() {
+            return Err(ProvisioningSecretStoreError::Rejected);
+        }
+        lifecycle::validate_completed_generations(&self.provisioning_root, &ledger)?;
+
+        if let Some(record) = ledger
+            .generations
+            .iter()
+            .find(|record| record.install == operation)
+        {
+            let envelope = encode_credential_envelope(&record.secret_ref, load, &plaintext)?;
+            if record.load != load || record.envelope_commitment != digest(&envelope) {
+                return Err(ProvisioningSecretStoreError::OperationConflict);
+            }
+            let slot = match record.state {
+                GenerationState::Active => ACTIVE_DIRECTORY,
+                GenerationState::Previous => files::PREVIOUS_DIRECTORY,
+                GenerationState::Destroyed => {
+                    return Err(ProvisioningSecretStoreError::Destroyed);
+                }
+            };
+            if !generation_matches(&self.provisioning_root, slot, &manifest_from_record(record))? {
+                return Err(ProvisioningSecretStoreError::Rejected);
+            }
+            return Ok(ProvisioningInstallReceipt::existing(
+                operation,
+                record.secret_ref.clone(),
+            ));
+        }
+
+        if ledger
+            .generations
+            .iter()
+            .any(|record| record.state == GenerationState::Previous)
+            || child_directory_exists(&self.provisioning_root, files::PREVIOUS_DIRECTORY)?
+        {
+            return Err(ProvisioningSecretStoreError::Rejected);
+        }
+        let source = ledger
+            .generations
+            .iter()
+            .find(|record| record.state == GenerationState::Active)
+            .ok_or(ProvisioningSecretStoreError::Rejected)?;
+        let generation = source
+            .generation
+            .checked_add(1)
+            .ok_or(ProvisioningSecretStoreError::Rejected)?;
+        let source_ref = source.secret_ref.clone();
+
+        let mut reference_id = Zeroizing::new([0_u8; PROVIDER_REFERENCE_ID_BYTES]);
+        getrandom::fill(&mut *reference_id)
+            .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+        let secret_ref = provisioning_secret_ref(generation, *reference_id)?;
+        let envelope = encode_credential_envelope(&secret_ref, load, &plaintext)?;
+        let envelope_commitment = digest(&envelope);
+        let ciphertext = self.encryptor.encrypt(envelope)?;
+        let ciphertext_digest = digest(&ciphertext);
+        let manifest = GenerationManifest {
+            generation,
+            load,
+            secret_ref: secret_ref.clone(),
+            ciphertext_digest,
+            content: GenerationContent::Credential,
+        };
+        let pre_mutation_ledger_revision = digest(&encode_ledger(&ledger)?);
+        let mut intent_ledger = ledger;
+        intent_ledger.intent = Some(LifecycleIntent {
+            kind: LifecycleIntentKind::Rotate,
+            operation: *operation.as_bytes(),
+            backup_operation: None,
+            load: Some(load),
+            target_ref: secret_ref.clone(),
+            target_generation: generation,
+            source_ref: Some(source_ref),
+            envelope_commitment: Some(envelope_commitment),
+            expected_ciphertext_digest: Some(ciphertext_digest),
+            expected_artifact_digest: None,
+            pre_mutation_ledger_revision,
+        });
+        let completed = lifecycle::completed_from_intent(&intent_ledger)?;
+        let encoded_manifest = Zeroizing::new(files::encode_manifest(&manifest));
+        let encoded_reference = Zeroizing::new(secret_ref.to_bytes());
+        write_staged_generation(
+            &self.provisioning_root,
+            &ciphertext,
+            &encoded_reference,
+            &encoded_manifest,
+            &mut self.faults,
+        )?;
+        lifecycle::commit_lifecycle_intent(&self.ledger_root, &intent_ledger, &mut self.faults)?;
+        lifecycle::reconcile_lifecycle(
+            &self.provisioning_root,
+            &self.ledger_root,
+            intent_ledger,
+            &completed,
+            &mut self.faults,
+        )?;
+        Ok(ProvisioningInstallReceipt::installed(operation, secret_ref))
+    }
 }
 
 fn manifest_from_record(record: &GenerationRecord) -> GenerationManifest {

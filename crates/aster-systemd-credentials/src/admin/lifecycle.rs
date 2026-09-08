@@ -1010,10 +1010,11 @@ mod tests {
             decode_ledger, encode_ledger,
         },
     };
-    use crate::{PROVIDER_REFERENCE_ID_BYTES, provisioning_secret_ref};
+    use crate::{PROVIDER_REFERENCE_ID_BYTES, provider_generation, provisioning_secret_ref};
     use aster_mesh::{
-        ProvisioningDestroyId, ProvisioningInstallId, ProvisioningLoadId,
-        ProvisioningSecretStoreError,
+        ProvisioningAccess, ProvisioningDestroyId, ProvisioningInstallDisposition,
+        ProvisioningInstallId, ProvisioningLoadId, ProvisioningSecretStoreError,
+        ReferenceProvisioner, Scope, Topic, UnprotectedProvisioning,
     };
     use std::{
         fs,
@@ -2169,6 +2170,367 @@ mod tests {
     }
 
     #[test]
+    fn rotation_commits_one_new_active_generation_and_retains_the_exact_previous() {
+        // Break caught: a public rotation path that bypasses the shared
+        // reconciler can publish a receipt without the exact Active/Previous
+        // filesystem and ledger transition.
+        let fixture = AdminLifecycleFixture::new();
+        fixture.install_once();
+        let predecessor = read_fixture_ledger(&fixture);
+        let source = predecessor.generations[0].clone();
+        let source_ciphertext = fs::read(fixture.provisioning.join("active/credential.cred"))
+            .expect("read source ciphertext");
+        let operation = ProvisioningInstallId::new([0x61; 32]);
+        let load = ProvisioningLoadId::new([0x62; 32]);
+
+        let receipt = fixture
+            .admin()
+            .expect("open rotation admin")
+            .rotate(operation, load, fixture.bundle())
+            .expect("rotate provider generation");
+
+        assert_eq!(
+            receipt.disposition(),
+            ProvisioningInstallDisposition::Installed
+        );
+        assert_eq!(provider_generation(receipt.secret_ref()).unwrap(), 2);
+        let completed = read_fixture_ledger(&fixture);
+        assert!(completed.intent.is_none());
+        assert_eq!(completed.generations.len(), 2);
+        let previous = &completed.generations[0];
+        let active = &completed.generations[1];
+        assert_eq!(previous.secret_ref, source.secret_ref);
+        assert_eq!(previous.state, GenerationState::Previous);
+        assert_eq!(active.install, operation);
+        assert_eq!(active.load, load);
+        assert_eq!(active.secret_ref, *receipt.secret_ref());
+        assert_eq!(active.state, GenerationState::Active);
+        assert_eq!(
+            fs::read(fixture.provisioning.join("previous/credential.cred"))
+                .expect("read retained previous ciphertext"),
+            source_ciphertext
+        );
+        let provisioning = open_secure_root(&fixture.provisioning, false).unwrap();
+        assert!(
+            generation_matches(&provisioning, ACTIVE_DIRECTORY, &manifest_for(active)).unwrap()
+        );
+        assert!(
+            generation_matches(&provisioning, PREVIOUS_DIRECTORY, &manifest_for(previous)).unwrap()
+        );
+        assert!(!fixture.provisioning.join(STAGED_DIRECTORY).exists());
+        assert_eq!(fixture.encrypt_calls(), 2);
+    }
+
+    #[test]
+    fn rotation_exact_retry_is_existing_without_encryption_and_changed_inputs_conflict() {
+        // Break caught: retrying through the encryptor or comparing only the
+        // operation/load rather than the canonical provider envelope breaks
+        // permanent operation binding.
+        let fixture = AdminLifecycleFixture::new();
+        fixture.install_once();
+        let operation = ProvisioningInstallId::new([0x63; 32]);
+        let load = ProvisioningLoadId::new([0x64; 32]);
+        let installed = fixture
+            .admin()
+            .unwrap()
+            .rotate(operation, load, fixture.bundle())
+            .expect("initial rotation");
+
+        let replay = fixture
+            .admin()
+            .unwrap()
+            .rotate(operation, load, fixture.bundle())
+            .expect("exact rotation retry");
+        assert_eq!(
+            replay.disposition(),
+            ProvisioningInstallDisposition::Existing
+        );
+        assert_eq!(replay.secret_ref(), installed.secret_ref());
+        assert_eq!(fixture.encrypt_calls(), 2);
+
+        assert_eq!(
+            fixture
+                .admin()
+                .unwrap()
+                .rotate(
+                    operation,
+                    ProvisioningLoadId::new([0x65; 32]),
+                    fixture.bundle(),
+                )
+                .expect_err("changed rotation load"),
+            ProvisioningSecretStoreError::OperationConflict
+        );
+        assert_eq!(
+            fixture
+                .admin()
+                .unwrap()
+                .rotate(operation, load, fixture.alternate_bundle())
+                .expect_err("changed rotation plaintext"),
+            ProvisioningSecretStoreError::OperationConflict
+        );
+        assert_eq!(fixture.encrypt_calls(), 2);
+    }
+
+    #[test]
+    fn rotation_rejects_invalid_plaintext_previous_and_generation_exhaustion_before_encryption() {
+        // Break caught: plaintext validation, the single-Previous gate, and
+        // checked generation allocation must all precede reference creation,
+        // staging, or provider invocation.
+        let fixture = AdminLifecycleFixture::new();
+        fixture.install_once();
+        let operation = ProvisioningInstallId::new([0x66; 32]);
+        let load = ProvisioningLoadId::new([0x67; 32]);
+        let before = fixture.namespace_bytes();
+        assert_eq!(
+            fixture
+                .admin()
+                .unwrap()
+                .rotate(
+                    operation,
+                    load,
+                    UnprotectedProvisioning::new(b"not-a-canonical-bundle".to_vec()).unwrap(),
+                )
+                .expect_err("invalid rotation plaintext"),
+            ProvisioningSecretStoreError::Rejected
+        );
+        assert_eq!(fixture.namespace_bytes(), before);
+        assert_eq!(fixture.encrypt_calls(), 1);
+
+        fixture
+            .admin()
+            .unwrap()
+            .rotate(operation, load, fixture.bundle())
+            .expect("first rotation");
+        let before_second = fixture.namespace_bytes();
+        assert_eq!(
+            fixture
+                .admin()
+                .unwrap()
+                .rotate(
+                    ProvisioningInstallId::new([0x68; 32]),
+                    ProvisioningLoadId::new([0x69; 32]),
+                    fixture.bundle(),
+                )
+                .expect_err("second rotation while Previous is retained"),
+            ProvisioningSecretStoreError::Rejected
+        );
+        assert_eq!(fixture.namespace_bytes(), before_second);
+        assert_eq!(fixture.encrypt_calls(), 2);
+
+        let exhausted = AdminLifecycleFixture::new();
+        let record = generation_record(u64::MAX, 0x71, GenerationState::Active, b"max");
+        exhausted.write_generation(ACTIVE_DIRECTORY, &record, b"max");
+        exhausted.write_ledger(ProviderLedger {
+            host_key_identity: exhausted.host_identity,
+            intent: None,
+            generations: vec![record],
+            backups: vec![],
+            recoveries: vec![],
+            destroys: vec![],
+        });
+        let exhausted_before = exhausted.namespace_bytes();
+        assert_eq!(
+            exhausted
+                .admin()
+                .unwrap()
+                .rotate(
+                    ProvisioningInstallId::new([0x78; 32]),
+                    ProvisioningLoadId::new([0x73; 32]),
+                    exhausted.bundle(),
+                )
+                .expect_err("generation overflow"),
+            ProvisioningSecretStoreError::Rejected
+        );
+        assert_eq!(exhausted.namespace_bytes(), exhausted_before);
+        assert_eq!(exhausted.encrypt_calls(), 0);
+    }
+
+    #[test]
+    fn rotation_mismatched_or_v1_state_never_becomes_active() {
+        // Break caught: rotation must not use a v1 ledger or manifest and must
+        // not promote a mismatched durable generation as a fallback.
+        for corrupt in ["ledger", "manifest"] {
+            let fixture = AdminLifecycleFixture::new();
+            fixture.install_once();
+            let path = if corrupt == "ledger" {
+                fixture.ledger.join("ledger")
+            } else {
+                fixture.provisioning.join("active/manifest")
+            };
+            let mut bytes = fs::read(&path).expect("read versioned state");
+            bytes[9] = 1;
+            fs::write(&path, bytes).expect("write v1 state");
+            let before = fixture.namespace_bytes();
+
+            assert_eq!(
+                fixture.admin().expect_err("v1 state must fail closed"),
+                ProvisioningSecretStoreError::Rejected,
+                "corrupt {corrupt}",
+            );
+            assert_eq!(fixture.namespace_bytes(), before, "corrupt {corrupt}");
+            assert_eq!(fixture.encrypt_calls(), 1, "corrupt {corrupt}");
+        }
+
+        let fixture = AdminLifecycleFixture::new();
+        fixture.install_once();
+        let active_before = generation_bytes(&fixture.provisioning, ACTIVE_DIRECTORY);
+        assert_eq!(
+            fixture
+                .admin_with_fault(FaultPoint::IntentFileSynced)
+                .unwrap()
+                .rotate(
+                    ProvisioningInstallId::new([0x6a; 32]),
+                    ProvisioningLoadId::new([0x6b; 32]),
+                    fixture.bundle(),
+                )
+                .expect_err("leave pending Rotate intent"),
+            ProvisioningSecretStoreError::Unavailable,
+        );
+        fs::write(
+            fixture.provisioning.join("staged/credential.cred"),
+            b"mismatched ciphertext",
+        )
+        .expect("corrupt staged ciphertext");
+        let before_reopen = fixture.namespace_bytes();
+        assert_eq!(
+            fixture
+                .admin()
+                .expect_err("mismatched staged generation must not activate"),
+            ProvisioningSecretStoreError::Rejected,
+        );
+        assert_eq!(fixture.namespace_bytes(), before_reopen);
+        assert_eq!(
+            generation_bytes(&fixture.provisioning, ACTIVE_DIRECTORY),
+            active_before,
+        );
+        assert!(!fixture.provisioning.join(PREVIOUS_DIRECTORY).exists());
+        assert_eq!(fixture.encrypt_calls(), 2);
+    }
+
+    #[test]
+    fn rotation_intent_and_namespace_faults_reopen_without_reencryption_or_fallback() {
+        // Break caught: every persisted Rotate phase must be completed by the
+        // shared fresh-admin reconciler using the exact ciphertext generated
+        // once, never by restoring the old Active generation.
+        for point in [
+            FaultPoint::IntentFileSynced,
+            FaultPoint::IntentRenamed,
+            FaultPoint::IntentParentSynced,
+            FaultPoint::ActiveExchanged,
+            FaultPoint::ProvisioningParentSynced,
+            FaultPoint::PreviousRenamed,
+            FaultPoint::CompleteFileSynced,
+            FaultPoint::CompleteRenamed,
+            FaultPoint::CompleteParentSynced,
+        ] {
+            let fixture = AdminLifecycleFixture::new();
+            fixture.install_once();
+            let source = read_fixture_ledger(&fixture).generations[0].clone();
+            let operation = ProvisioningInstallId::new([0x74; 32]);
+            let load = ProvisioningLoadId::new([0x75; 32]);
+
+            assert_eq!(
+                fixture
+                    .admin_with_fault(point)
+                    .unwrap()
+                    .rotate(operation, load, fixture.bundle())
+                    .expect_err("injected public rotation fault"),
+                ProvisioningSecretStoreError::Unavailable,
+                "fault {point:?}",
+            );
+            assert_eq!(fixture.encrypt_calls(), 2, "fault {point:?}");
+
+            drop(fixture.admin().expect("fresh admin converges rotation"));
+            let completed = read_fixture_ledger(&fixture);
+            let previous = completed
+                .generations
+                .iter()
+                .find(|record| record.secret_ref == source.secret_ref)
+                .expect("retained source generation");
+            let active = completed
+                .generations
+                .iter()
+                .find(|record| record.install == operation)
+                .expect("committed target generation");
+            assert_eq!(previous.state, GenerationState::Previous, "{point:?}");
+            assert_eq!(active.state, GenerationState::Active, "{point:?}");
+            assert_eq!(active.generation, 2, "{point:?}");
+            assert!(!fixture.provisioning.join(STAGED_DIRECTORY).exists());
+            assert_eq!(fixture.encrypt_calls(), 2, "fault {point:?}");
+
+            let replay = fixture
+                .admin()
+                .unwrap()
+                .rotate(operation, load, fixture.bundle())
+                .expect("exact retry after recovery");
+            assert_eq!(
+                replay.disposition(),
+                ProvisioningInstallDisposition::Existing,
+                "{point:?}",
+            );
+            assert_eq!(replay.secret_ref(), &active.secret_ref);
+            assert_eq!(fixture.encrypt_calls(), 2, "fault {point:?}");
+        }
+    }
+
+    #[test]
+    fn rotation_pre_intent_stage_faults_preserve_old_active_and_fail_closed_on_reopen() {
+        // Break caught: before a Rotate intent is durable there is no trusted
+        // operation binding that authorizes a fresh admin to activate or
+        // delete staged bytes. The committed old generation remains the only
+        // runtime generation and the unbound stage is retained as evidence.
+        for point in [
+            FaultPoint::StageCiphertextSynced,
+            FaultPoint::StageReferenceSynced,
+            FaultPoint::StageManifestSynced,
+            FaultPoint::StageDirectorySynced,
+            FaultPoint::StageParentSynced,
+        ] {
+            let fixture = AdminLifecycleFixture::new();
+            fixture.install_once();
+            let ledger_before = fs::read(fixture.ledger.join("ledger")).unwrap();
+            let active_before = generation_bytes(&fixture.provisioning, ACTIVE_DIRECTORY);
+
+            assert_eq!(
+                fixture
+                    .admin_with_fault(point)
+                    .unwrap()
+                    .rotate(
+                        ProvisioningInstallId::new([0x76; 32]),
+                        ProvisioningLoadId::new([0x77; 32]),
+                        fixture.bundle(),
+                    )
+                    .expect_err("injected pre-intent stage fault"),
+                ProvisioningSecretStoreError::Unavailable,
+                "fault {point:?}",
+            );
+            assert_eq!(
+                fs::read(fixture.ledger.join("ledger")).unwrap(),
+                ledger_before,
+                "fault {point:?}",
+            );
+            assert_eq!(
+                generation_bytes(&fixture.provisioning, ACTIVE_DIRECTORY),
+                active_before,
+                "fault {point:?}",
+            );
+            assert!(fixture.provisioning.join(STAGED_DIRECTORY).is_dir());
+            assert!(!fixture.provisioning.join(PREVIOUS_DIRECTORY).exists());
+            assert_eq!(fixture.encrypt_calls(), 2, "fault {point:?}");
+            let stranded = fixture.namespace_bytes();
+
+            assert_eq!(
+                fixture
+                    .admin()
+                    .expect_err("unbound stage requires operator remediation"),
+                ProvisioningSecretStoreError::Rejected,
+                "fault {point:?}",
+            );
+            assert_eq!(fixture.namespace_bytes(), stranded, "fault {point:?}");
+        }
+    }
+
+    #[test]
     fn fresh_admin_selects_pending_rotate_intent_and_derives_exact_completion() {
         // Break caught: an intent synced into ledger.next before rename is a
         // real persisted operation state; ignoring it or routing every intent
@@ -2806,6 +3168,7 @@ mod tests {
         ledger: PathBuf,
         host_key: PathBuf,
         program: PathBuf,
+        calls: PathBuf,
         host_identity: [u8; 32],
     }
 
@@ -2829,8 +3192,16 @@ mod tests {
             fs::set_permissions(&host_key, fs::Permissions::from_mode(0o600))
                 .expect("protect host-key fixture");
             let host_identity = crate::admin::digest(&[0x5a; 32]);
-            let program = path.join("unused-systemd-creds");
-            fs::write(&program, "#!/bin/sh\nexit 99\n").expect("write unused provider fixture");
+            let calls = path.join("encrypt.calls");
+            let program = path.join("systemd-creds-test");
+            fs::write(
+                &program,
+                format!(
+                    "#!/bin/sh\ntest \"$#\" = 5 || exit 91\nprintf x >> {}\nprintf cipher:\nexec cat\n",
+                    calls.display()
+                ),
+            )
+            .expect("write provider fixture");
             fs::set_permissions(&program, fs::Permissions::from_mode(0o700))
                 .expect("make provider fixture executable");
             Self {
@@ -2839,6 +3210,7 @@ mod tests {
                 ledger,
                 host_key,
                 program,
+                calls,
                 host_identity,
             }
         }
@@ -2867,6 +3239,46 @@ mod tests {
 
         fn namespace_bytes(&self) -> Vec<(String, Vec<u8>)> {
             namespace_bytes(&self.provisioning, &self.ledger)
+        }
+
+        fn bundle(&self) -> UnprotectedProvisioning {
+            UnprotectedProvisioning::new(
+                include_bytes!("../../../../bindings/testdata/non-production-provisioning.bundle")
+                    .to_vec(),
+            )
+            .expect("canonical fixture bundle")
+        }
+
+        fn alternate_bundle(&self) -> UnprotectedProvisioning {
+            let mut authority =
+                ReferenceProvisioner::from_seed([0xb6; 32]).expect("alternate provisioner");
+            let access = ProvisioningAccess::member(
+                Scope::new("mission/team/rotation").expect("alternate scope"),
+                vec![0, 1],
+                vec![Topic::new("rotation.events").expect("alternate topic")],
+            )
+            .expect("alternate access");
+            let bundle = authority
+                .issue_node(7, &[access])
+                .expect("issue alternate bundle")
+                .to_bytes()
+                .expect("encode alternate bundle");
+            UnprotectedProvisioning::new(bundle).expect("bounded alternate bundle")
+        }
+
+        fn encrypt_calls(&self) -> usize {
+            fs::read(&self.calls).map_or(0, |calls| calls.len())
+        }
+
+        fn install_once(&self) {
+            self.admin()
+                .expect("fixture install admin")
+                .install(
+                    ProvisioningInstallId::new([0x11; 32]),
+                    ProvisioningLoadId::new([0x22; 32]),
+                    self.bundle(),
+                )
+                .expect("fixture install");
         }
 
         fn write_ledger(&self, ledger: ProviderLedger) {
@@ -3378,6 +3790,13 @@ mod tests {
             }
         }
         bytes
+    }
+
+    fn generation_bytes(provisioning: &Path, slot: &str) -> Vec<(String, Vec<u8>)> {
+        provisioning_bytes(provisioning)
+            .into_iter()
+            .filter(|(name, _)| name.starts_with(&format!("{slot}/")))
+            .collect()
     }
 
     fn manifest_for(record: &GenerationRecord) -> GenerationManifest {
