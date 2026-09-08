@@ -352,30 +352,30 @@ not `pass`, an input changed, or the serial dependency was bypassed.
 | G5 — Workload qualification | Required | G3 and G4 pass | 2-/8-/20-node and 24-hour scenarios pass from G3 with distinct signed inventories and immutable exit digests | Integration/device + physical-carrier | Reject a missing tier, altered artifact/environment, ambiguous participant, shortened soak, or missing receipt |
 | G6 — Disposition | Required | G1–G5 pass in order for `issue`; refusal/defer may follow an earlier blocking gate | Receipt review, deterministic-gate rerun when reached, typed downstream `not-run` values when not reached, and detached signed `issue`/`refuse`/`defer` decision over the canonical signable-body digest, sorted Section 15 candidate-approval digests, candidate ID, schema digest, and exact typed global G3 artifact binding | Release owner with all final roles | Reject issue if any prior gate is absent/failing, any evaluation blocker remains, any G3 per-output entry is not produced, either package/authentication is absent/failing, the complete artifact-set manifest is absent/invalid, a digest changed, or the decision is unsigned; reject refusal/defer if a no-output pre-G3 stop lacks global `not-produced`, a partial G3 attempt lacks actual/absent per-output bindings, or downstream omissions lack typed `not-run` bindings |
 
-## 14. Exact `DM-8-05` proposal and three approvals
+## 14. Exact `DM-8-05` proposal and approvals
 
 The proposal is evaluation-only, adds no general license allowlist, and does not
-close the formal production requirement. These are the original pre-candidate
-approvals required to close P0-1 register row `P0-1-D15` before profile
-ratification. Each binds the exact coordinates/licenses and proposal
-digest. The records are immutable prerequisite references included in the
-canonical signable candidate body; they are not replaced, re-signed against the
-candidate body, deferred to G6, or included among Section 15 detached candidate
-approvals.
+close the formal production requirement. Dependency/license, Legal/compliance,
+and Release approval closes P0-1 register row `P0-1-D15`. The consolidated
+repository record binds all three reported internal role outcomes to the exact
+coordinates/licenses and proposal digest. Its committed reference and digest
+are included in the canonical signable candidate body; the record is not
+replaced, re-signed against the candidate body, deferred to G6, or included
+among Section 15 detached candidate approvals.
 
 | Field | Applicability | Format | Owner | Rejection rule |
 |---|---|---|---|---|
 | Proposal identity | Required | `dm-8-05-linux-event-v0.1-disposition.md`; `sha256:a6fe15f39fb553f87bc1224fe7f266e7c906d451d8140402d3bc1620011bfa53` | Dependency/license + release | Reject a mutable/missing proposal or digest mismatch |
 | Exact coordinates | Required | `webpki-root-certs` `1.0.9` / `b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b` / `CDLA-Permissive-2.0`; `webpki-roots` `1.0.9` / `7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a` / `CDLA-Permissive-2.0` | Dependency/license owner | Reject package, version, source, checksum, reachability, dependency-graph, license, SBOM, or notice drift |
-| Dependency approval | Approval record required before profile ratification; its immutable reference/digest is required in every later candidate body | Immutable reviewer identity, dependency/license role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate/license set, proposal digest, and signed approval-record reference/digest | Dependency/license owner | Reject a missing/refusing/unsigned record, any coordinate/license/proposal mismatch, replacement/re-signing as a candidate approval, or omission of its immutable reference/digest from the signable body |
-| Legal approval | Approval record required before profile ratification; its immutable reference/digest is required in every later candidate body | Immutable reviewer identity, legal role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate/license set, proposal digest, and signed approval-record reference/digest | Legal/compliance owner | Reject a missing/refusing/unsigned record, any coordinate/license/proposal mismatch, replacement/re-signing as a candidate approval, or omission of its immutable reference/digest from the signable body |
-| Release approval | Approval record required before profile ratification; its immutable reference/digest is required in every later candidate body | Immutable reviewer identity, release role, `approve`/`refuse`, RFC 3339 UTC, exact coordinate/license set, proposal digest, and signed approval-record reference/digest | Release owner | Reject a missing/refusing/unsigned record, any coordinate/license/proposal mismatch, replacement/re-signing as a candidate approval, or omission of its immutable reference/digest from the signable body |
+| Dependency approval | Approved 2026-09-08 | [Consolidated internal role-approval record](dm-8-05-linux-event-v0.1-role-approvals.md), `sha256:4edda9457c78d0c1d177590c1583691071e708ccbbace078cc15a82dd9bcac85`, bound to the proposal digest and exact tuples | Dependency/license owner | Reject a missing record, coordinate/license/proposal mismatch, or omission of its committed reference/digest from the signable body |
+| Legal approval | Approved 2026-09-08 | [Consolidated internal role-approval record](dm-8-05-linux-event-v0.1-role-approvals.md), `sha256:4edda9457c78d0c1d177590c1583691071e708ccbbace078cc15a82dd9bcac85`, bound to the proposal digest and exact tuples | Legal/compliance owner | Reject a missing record, coordinate/license/proposal mismatch, widened scope, or omission of its committed reference/digest from the signable body |
+| Release approval | Approved 2026-09-08 | [Consolidated internal role-approval record](dm-8-05-linux-event-v0.1-role-approvals.md), `sha256:4edda9457c78d0c1d177590c1583691071e708ccbbace078cc15a82dd9bcac85`, bound to the proposal digest and exact tuples | Release owner | Reject a missing record, coordinate/license/proposal mismatch, candidate/production authorization claim, or omission of its committed reference/digest from the signable body |
 | Production limitation | Required | Signed statement that `DM-8-05` remains formally open and production-blocking after any evaluation approval | Dependency/license + legal + release | Reject any production authorization, general allowlist, WebPKI/public-relay authorization, or claim that the requirement is closed |
 
-Initial approval-request status is **Pending** for Dependency, Legal, and
-Release. Repository lockfile, dependency-policy, notice, SBOM, or passing-gate
-facts cannot populate any approval row; each requires its separate immutable
-role record.
+Dependency/license, Legal/compliance, and Release status is **Approved**.
+Repository lockfile, dependency-policy, notice, SBOM, or passing-gate facts do
+not replace the committed approval record. Any mismatch in the later candidate
+graph invalidates the bounded approval for that candidate.
 
 ## 15. Final role approvals and detached signatures
 

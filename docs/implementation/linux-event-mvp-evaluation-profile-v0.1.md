@@ -3,13 +3,13 @@
 # Linux Event MVP Evaluation Profile v0.1
 
 - Profile ID: `aster-linux-event-mvp-evaluation-v0.1`
-- Status: Proposed; becomes normative when Decision 0042 is accepted
+- Status: Accepted by Decision 0042 on 2026-09-08
 - Profile version: `0.1`
 - Approved design date: 2026-09-06
 - Candidate decision checkpoint: 2026-09-13
 - Product class: time-bounded, non-production customer evaluation
 - Start here: [human-focused MVP coordination guide](linux-event-mvp-coordination-guide.md)
-- Governing design until adoption: [approved design](../superpowers/specs/2026-09-06-linux-event-mvp-evaluation-profile-design.md)
+- Historical design authority: [approved design](../superpowers/specs/2026-09-06-linux-event-mvp-evaluation-profile-design.md)
 - Decision register: [v0.1 register](linux-event-mvp-evaluation-profile-v0.1-register.md)
 - Candidate-annex schema: [provisional schema](linux-event-mvp-evaluation-profile-v0.1-annex-template.md)
 

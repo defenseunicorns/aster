@@ -35,7 +35,7 @@ and reviewed decision.
 | `P0-1-D11` | P0-1; design metadata/observability sections | Exact metadata budget and bounded authenticated status/error surface | Resolved | no | no | Production observability and exposure acceptance remain open | none |
 | `P0-1-D12` | P0-1; design artifact/acceptance sections | Exact artifact contents, thirteen acceptance conditions, G1-G6 dependency chain | Resolved | no | no | Production release remains separately gated | none |
 | `P0-1-D13` | P0-1; design `Non-goals` and claim boundary | Every excluded platform, class, carrier, topology, lifecycle, and production claim | Resolved | no | no | Excluded capabilities remain unsupported | none |
-| `P0-1-D15` | `DM-8-05`; Decision 0028; [proposed exact evaluation disposition](dm-8-05-linux-event-v0.1-disposition.md) (`sha256:a6fe15f39fb553f87bc1224fe7f266e7c906d451d8140402d3bc1620011bfa53`) | Exact `webpki-root-certs`/`webpki-roots` 1.0.9 tuples only; evaluation-only; no general allowlist or production resolution; Dependency, Legal, and Release approvals are Pending | Open | yes | yes | Exact exception cannot authorize production; production resolution remains open | none |
+| `P0-1-D15` | `DM-8-05`; Decision 0028; [exact evaluation disposition](dm-8-05-linux-event-v0.1-disposition.md) (`sha256:a6fe15f39fb553f87bc1224fe7f266e7c906d451d8140402d3bc1620011bfa53`); [internal role approvals](dm-8-05-linux-event-v0.1-role-approvals.md) (`sha256:4edda9457c78d0c1d177590c1583691071e708ccbbace078cc15a82dd9bcac85`) | Exact `webpki-root-certs`/`webpki-roots` 1.0.9 tuples only; Dependency/license, Legal/compliance, and Release approved; evaluation-only; no general allowlist, candidate release authorization, or production resolution | Resolved | no | no | Exact exception cannot authorize production; production resolution remains open | none |
 
 Internal approval of the exact D06 provider selection and bound design digest
 was recorded for the profile definition on 2026-09-08. `P0-1-D06` is resolved
@@ -45,11 +45,12 @@ required at `P0-1-E01`; it blocks candidate qualification, not profile
 definition. If final review requires Debian or generic Debian-family support,
 reopen D06 and replace this selection with a redesigned, versioned provider
 boundary before the affected profile or candidate proceeds.
-`P0-1-D15` is owned by dependency, legal, and release roles, targets
-2026-09-08, and exits only when all three separate approval records bind the
-exact proposal digest and dependency coordinates. Dependency, Legal, and
-Release are each currently **Pending**; repository policy, lockfile, and notice
-entries are review inputs and do not count as approvals.
+Dependency/license, Legal/compliance, and Release approval of the exact D15
+evaluation-only disposition and bound digest was recorded on 2026-09-08.
+`P0-1-D15` is therefore resolved for P0-1 and is not a candidate blocker. The
+later annex must bind the committed approval record and exact candidate graph.
+Any tuple, graph, SBOM, notice, or reachability drift reopens D15 for the
+affected profile or candidate. Production `DM-8-05` remains open and blocking.
 
 ## DM-14 dispositions
 
@@ -134,7 +135,7 @@ The dates below are aggressive earliest targets, not authority to skip a gate:
 | Date | Delivery | Primary owner | Exit signal |
 |---:|---|---|---|
 | 2026-09-07 | Review written v0.1 design and prepare the profile/decision register | Profile/architecture | Review comments resolved; no evidence statuses moved |
-| 2026-09-08 | Obtain Dependency, Legal, and Release approval of the exact `DM-8-05` evaluation disposition, then accept P0-1 | Dependency/license, legal, release, profile owner | All three immutable approval records bind the proposed disposition digest and exact tuples; Decision 0042 is explicitly ratified |
+| 2026-09-08 | Record Dependency/license, Legal/compliance, and Release approval of the exact `DM-8-05` evaluation disposition and accept P0-1 | Dependency/license, legal, release, profile owner | All three role decisions bind the disposition digest and exact tuples; Decision 0042 is accepted without candidate or production authorization |
 | 2026-09-09 | Complete Event-service review and freeze ReceiveOnly/capacity follow-up contract | Event service, node, lifecycle/capacity | G1 passes |
 | 2026-09-10 | Complete G2, then produce the G3 packages if the source/API commit is frozen | Event service, node, deployment, security | G2 and G3 pass; otherwise later gates do not start |
 | 2026-09-11 | Run G4 and start every required 24-hour G5 soak no later than this date | Integration/physical carrier, security | G4 passes and each soak starts from a recorded clean boundary |
