@@ -25,13 +25,13 @@ use aster_mesh::{
 };
 pub use aster_mesh::{NodeId, Priority, Scope, Topic};
 use aster_redb_store::{
-    BlobStoreError, ControlPolicySnapshot, ControlTransferId, CustodyObjectKey, CustodyStoreError,
-    EventDeliveryAck as StoreEventDeliveryAck, EventGapScanPlan, EventOperationKey,
-    EventQueryFilter, EventReplicationPolicySnapshot, EventSemanticId,
-    EventSubscriptionId as StoreEventSubscriptionId, EventSubscriptionKey, EventSubscriptionMode,
-    EventSubscriptionPollSelection, EventSubscriptionRemoveOutcome, EventSubscriptionSpec,
-    MAX_EVENT_PAGE, MAX_EVENT_POLL_DELIVERIES, MAX_EVENT_SUBSCRIPTION_SCAN, Store, StoreError,
-    StoredEvent,
+    AggregateStoreUsage, BlobStoreError, ControlPolicySnapshot, ControlTransferId,
+    CustodyObjectKey, CustodyStoreError, EventDeliveryAck as StoreEventDeliveryAck,
+    EventGapScanPlan, EventOperationKey, EventQueryFilter, EventReplicationPolicySnapshot,
+    EventSemanticId, EventSubscriptionId as StoreEventSubscriptionId, EventSubscriptionKey,
+    EventSubscriptionMode, EventSubscriptionPollSelection, EventSubscriptionRemoveOutcome,
+    EventSubscriptionSpec, MAX_EVENT_PAGE, MAX_EVENT_POLL_DELIVERIES, MAX_EVENT_SUBSCRIPTION_SCAN,
+    Store, StoreError, StoreLimits, StoredEvent,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -40,11 +40,11 @@ use crate::{
     mission::UnprotectedReferenceMission,
     runtime::{
         AuthenticatedEventRouteCache, EVENT_OPERATION_CONFLICT, EVENT_OPERATION_RETIRED,
-        NodeCustodyClock, STORE_FILE, SelectedEventPublish, StartupEventVerification,
-        absolute_path_from, absolute_state_path, cache_accepted_stored_event,
-        drive_custody_maintenance, ensure_principal_active, ensure_state_accepts_normal_operation,
-        event_is_inactive, migrate_legacy_event_operation_witnesses,
-        open_startup_event_verifier_and_cache,
+        EventEmissionPolicy, NodeCustodyClock, STORE_FILE, SelectedEventPublish,
+        StartupEventVerification, absolute_path_from, absolute_state_path,
+        cache_accepted_stored_event, drive_custody_maintenance, ensure_principal_active,
+        ensure_state_accepts_normal_operation, event_is_inactive,
+        migrate_legacy_event_operation_witnesses, open_startup_event_verifier_and_cache,
         prune_authenticated_event_route_cache_to_sender_projection, publish_selected_event_once,
         refresh_application_policy, verify_content_stored_claim, verify_stored_claim,
     },
@@ -569,6 +569,12 @@ pub struct SelectedEventStatus {
     pub authenticated_contacts: u64,
     pub failed_contact_attempts: u64,
     pub peers: Vec<AuthenticatedPeerStatus>,
+    pub emission_policy: EventEmissionPolicy,
+    pub store_usage: AggregateStoreUsage,
+    pub store_limits: StoreLimits,
+    pub event_operations: u64,
+    pub event_operation_bytes: u64,
+    pub pending_deliveries: u64,
 }
 
 /// Cloneable live application handle backed by the running node's sole authority.

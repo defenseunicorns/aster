@@ -2737,7 +2737,12 @@ impl SelectedEventStatusTracker {
         store: &Store,
         current: &EventReplicationPolicySnapshot,
         failed_contact_attempts: usize,
+        emission_policy: EventEmissionPolicy,
     ) -> Result<SelectedEventStatus, NodeError> {
+        let store_usage = store.aggregate_usage()?;
+        let store_limits = store.limits();
+        let event_stats = store.event_stats()?;
+        let subscription_stats = store.event_subscription_stats()?;
         let current_policy = ContactEventPolicy::capture(current);
         let mut peers = Vec::with_capacity(self.authenticated.len());
         let mut authenticated_contacts = 0u64;
@@ -2805,6 +2810,12 @@ impl SelectedEventStatusTracker {
             authenticated_contacts,
             failed_contact_attempts,
             peers,
+            emission_policy,
+            store_usage,
+            store_limits,
+            event_operations: event_stats.operations,
+            event_operation_bytes: event_stats.operation_bytes,
+            pending_deliveries: subscription_stats.pending_deliveries,
         })
     }
 }
@@ -10719,6 +10730,7 @@ fn configured_runtime_peers(
 fn execute_selected_event_command(
     application: &mut SelectedEventNode,
     store: &Store,
+    emission_policy: &LiveEmissionPolicy,
     status: &SelectedEventStatusTracker,
     receipt: &NodeReceipt,
     command: SelectedEventCommand,
@@ -10765,8 +10777,11 @@ fn execute_selected_event_command(
         }
         SelectedEventCommand::Status { response } => {
             let result = application.runtime_policy_for_status().and_then(|current| {
+                let emission = emission_policy
+                    .snapshot()
+                    .map_err(|error| runtime_application_error("status", error))?;
                 status
-                    .snapshot(store, &current, receipt.contact_errors)
+                    .snapshot(store, &current, receipt.contact_errors, emission.policy)
                     .map_err(|error| runtime_application_error("status", error))
             });
             let _ = response.send(result);
@@ -10928,13 +10943,21 @@ fn execute_selected_application_command(
     records: &mut SelectedRecordNode,
     blobs: &mpsc::Sender<SelectedBlobCommand>,
     store: &Store,
+    emission_policy: &LiveEmissionPolicy,
     status: &SelectedEventStatusTracker,
     receipt: &NodeReceipt,
     command: SelectedApplicationCommand,
 ) {
     match command {
         SelectedApplicationCommand::Event(command) => {
-            execute_selected_event_command(events, store, status, receipt, command);
+            execute_selected_event_command(
+                events,
+                store,
+                emission_policy,
+                status,
+                receipt,
+                command,
+            );
         }
         SelectedApplicationCommand::State(command) => {
             execute_selected_state_command(state, command);
@@ -12334,6 +12357,7 @@ async fn run_node_actor_inner(
                     &mut record_application,
                     &blob_worker_sender,
                     &store,
+                    &emission_policy,
                     &selected_event_status,
                     &receipt,
                     command,
@@ -12635,6 +12659,7 @@ async fn run_node_actor_inner(
                     &mut record_application,
                     &blob_worker_sender,
                     &store,
+                    &emission_policy,
                     &selected_event_status,
                     &receipt,
                     command,
@@ -22238,16 +22263,23 @@ mod tests {
             .expect("initial status policy");
 
         let offline = SelectedEventStatusTracker::new(BTreeSet::new(), false)
-            .snapshot(&store, &initial, 0)
+            .snapshot(&store, &initial, 0, EventEmissionPolicy::ReceiveOnly)
             .expect("offline status");
         assert_eq!(offline.sync, EventSyncStatus::Offline);
+        assert_eq!(offline.emission_policy, EventEmissionPolicy::ReceiveOnly);
+        assert_eq!(offline.store_usage.items, 0);
+        assert_eq!(offline.store_usage.payload_bytes, 0);
+        assert_eq!(offline.store_limits, store.limits());
+        assert_eq!(offline.event_operations, 0);
+        assert_eq!(offline.event_operation_bytes, 0);
+        assert_eq!(offline.pending_deliveries, 0);
         assert_eq!(offline.authenticated_contacts, 0);
         assert_eq!(offline.failed_contact_attempts, 0);
         assert!(offline.peers.is_empty());
 
         let mut tracker = SelectedEventStatusTracker::new(BTreeSet::from([peer]), false);
         let awaiting = tracker
-            .snapshot(&store, &initial, 7)
+            .snapshot(&store, &initial, 7, EventEmissionPolicy::Normal)
             .expect("awaiting status");
         assert_eq!(awaiting.sync, EventSyncStatus::AwaitingAuthenticatedContact);
         assert_eq!(awaiting.authenticated_contacts, 0);
@@ -22265,7 +22297,7 @@ mod tests {
             })
             .expect("partial authenticated contact");
         let work_remained = tracker
-            .snapshot(&store, &initial, 7)
+            .snapshot(&store, &initial, 7, EventEmissionPolicy::Normal)
             .expect("partial-contact status");
         assert_eq!(work_remained.sync, EventSyncStatus::WorkRemained);
         assert_eq!(work_remained.authenticated_contacts, 1);
@@ -22298,7 +22330,7 @@ mod tests {
             .event_replication_policy_snapshot()
             .expect("changed status policy");
         let policy_changed = tracker
-            .snapshot(&store, &changed, 7)
+            .snapshot(&store, &changed, 7, EventEmissionPolicy::Normal)
             .expect("policy-changed status");
         assert_eq!(
             policy_changed.sync,
@@ -22324,7 +22356,7 @@ mod tests {
             })
             .expect("fresh completed authenticated contact");
         let complete = tracker
-            .snapshot(&store, &changed, 7)
+            .snapshot(&store, &changed, 7, EventEmissionPolicy::Normal)
             .expect("fresh complete status");
         assert_eq!(complete.sync, EventSyncStatus::LastContactComplete);
         assert_eq!(complete.authenticated_contacts, 2);
@@ -22344,7 +22376,7 @@ mod tests {
             .event_replication_policy_snapshot()
             .expect("revoked status policy");
         let revoked = tracker
-            .snapshot(&store, &revoked_policy, 7)
+            .snapshot(&store, &revoked_policy, 7, EventEmissionPolicy::Normal)
             .expect("revoked-peer status");
         assert_eq!(revoked.sync, EventSyncStatus::NoActiveConfiguredPeers);
         assert_eq!(revoked.authenticated_contacts, 2);
@@ -22487,7 +22519,7 @@ mod tests {
             },
         );
         let aggregate = tracker
-            .snapshot(&store, &current, usize::MAX)
+            .snapshot(&store, &current, usize::MAX, EventEmissionPolicy::Normal)
             .expect_err("aggregate authenticated contact overflow must fail");
         assert!(matches!(
             aggregate,
