@@ -110,16 +110,16 @@ descriptor-relative Linux filesystem APIs, `zeroize`, Tokio.
   before binding health or application listeners and before opening state.
 - Startup still invokes the loader exactly once.
 
-- [ ] Change the existing blocked-loader test to prove both listener addresses
+- [x] Change the existing blocked-loader test to prove both listener addresses
   remain unbound until protected bootstrap completes.
-- [ ] Add/retain a rejecting-loader assertion proving no state directory and no
+- [x] Add/retain a rejecting-loader assertion proving no state directory and no
   listener exists after protected bootstrap failure.
-- [ ] Run those exact customer-runtime tests and observe failure because the
+- [x] Run those exact customer-runtime tests and observe failure because the
   health listener currently binds before `open_node_config`.
-- [ ] Move protected bootstrap ahead of health binding without broadening
+- [x] Move protected bootstrap ahead of health binding without broadening
   failure output or changing ready-state semantics.
-- [ ] Run the two focused customer-runtime tests until green.
-- [ ] Commit as `fix(agent): bootstrap before opening listeners`.
+- [x] Run the two focused customer-runtime tests until green.
+- [x] Commit as `fix(agent): bootstrap before opening listeners`.
 
 ### Task 4: Statically compose the provider into `aster-agent --config`
 

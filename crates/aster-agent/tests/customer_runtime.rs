@@ -59,12 +59,10 @@ async fn startup_validates_credentials_before_binding_any_listener() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn readiness_waits_for_protected_bootstrap_and_application_serving() {
-    // Break caught: declaring Ready from health bind or peer-independent node
-    // construction before the application listener can accept operations.
-    if !socket_access_available() {
-        return;
-    }
+async fn protected_bootstrap_finishes_before_any_listener_is_bound() {
+    // Break caught: binding even the health listener before the protected
+    // bundle is authenticated violates D06's fail-before-side-effects boundary.
+    let sockets_available = socket_access_available();
     let fixture = CustomerFixture::new();
     let config = load_and_validate_config(fixture.config_path()).expect("validated config");
     let (entered_send, mut entered_receive) = tokio::sync::mpsc::unbounded_channel();
@@ -81,10 +79,22 @@ async fn readiness_waits_for_protected_bootstrap_and_application_serving() {
     tokio::time::timeout(Duration::from_secs(2), entered_receive.recv())
         .await
         .expect("protected loader entry deadline")
-        .expect("protected loader entered after health bind");
-    assert_eq!(health_status(fixture.health(), "/livez").await, 200);
-    assert_eq!(health_status(fixture.health(), "/readyz").await, 503);
+        .expect("protected loader entered before listener bind");
+    if sockets_available {
+        let application_probe = std::net::TcpListener::bind(fixture.application())
+            .expect("application remains unbound");
+        let health_probe =
+            std::net::TcpListener::bind(fixture.health()).expect("health remains unbound");
+        drop((application_probe, health_probe));
+    }
     release_send.send(()).expect("release protected bootstrap");
+    if !sockets_available {
+        assert_eq!(
+            task.await.expect("runtime task joins"),
+            Err(AgentRuntimeError::Listener(FailureReason::Startup))
+        );
+        return;
+    }
     wait_until_ready(&fixture).await;
     assert_eq!(
         application_status(fixture.application(), fixture.token_bytes()).await,
@@ -107,6 +117,35 @@ async fn readiness_waits_for_protected_bootstrap_and_application_serving() {
         tokio::net::TcpStream::connect(fixture.health())
             .await
             .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejected_protected_bootstrap_leaves_no_listener_or_state_side_effect() {
+    // Break caught: recovering from a rejected provider only after opening
+    // listeners or durable node state exposes a partially started service.
+    let sockets_available = socket_access_available();
+    let fixture = CustomerFixture::new();
+    let config = load_and_validate_config(fixture.config_path()).expect("validated config");
+    let (_signals, receiver) = tokio::sync::mpsc::channel(4);
+    let mut loader = RejectingLoader;
+
+    assert_eq!(
+        run_customer_agent(config, &mut loader, receiver).await,
+        Err(AgentRuntimeError::Bootstrap(
+            aster_node::NodeBootstrapErrorKind::Rejected,
+        ))
+    );
+    if sockets_available {
+        std::net::TcpListener::bind(fixture.application()).expect("application was never bound");
+        std::net::TcpListener::bind(fixture.health()).expect("health was never bound");
+    }
+    assert!(
+        fs::read_dir(fixture.root.join("state"))
+            .expect("inspect state directory")
+            .next()
+            .is_none(),
+        "protected bootstrap failure must not create durable state"
     );
 }
 

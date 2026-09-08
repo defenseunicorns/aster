@@ -84,6 +84,8 @@ where
     let forwarding = config.forwarding();
     let configured_emission_policy = config.emission_policy();
     let limits = *config.limits();
+    let node_config = open_node_config(&config, &credentials, loader)
+        .map_err(|error| AgentRuntimeError::Bootstrap(error.kind()))?;
 
     let health = BoundHealth::bind(health_address)
         .await
@@ -94,13 +96,6 @@ where
     emit_lifecycle(LifecycleState::Starting, "startup", "started", false, 0);
     tokio::task::yield_now().await;
 
-    let node_config = match open_node_config(&config, &credentials, loader) {
-        Ok(node_config) => node_config,
-        Err(error) => {
-            fail_startup(&status, &health_stop_send, &mut health_task).await;
-            return Err(AgentRuntimeError::Bootstrap(error.kind()));
-        }
-    };
     let node = match start_supervised_node_with_forwarding_and_output_policy(
         node_config,
         forwarding,
