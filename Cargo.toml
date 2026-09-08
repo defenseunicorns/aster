@@ -15,6 +15,7 @@ members = [
   "crates/aster-conformance",
   "crates/aster-lab",
   "crates/aster-provisioning-age",
+  "crates/aster-systemd-credentials",
   "crates/aster-libp2p-provider",
 ]
 exclude = [

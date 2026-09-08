@@ -61,19 +61,19 @@ descriptor-relative Linux filesystem APIs, `zeroize`, Tokio.
   plaintext.
 - Returns only `ProvisioningSecretStoreError` categories.
 
-- [ ] Add literal-fixture tests for canonical provider-reference and envelope
+- [x] Add literal-fixture tests for canonical provider-reference and envelope
   round trips through the public Aster contracts.
-- [ ] Add one table-driven rejection test covering wrong magic/version,
+- [x] Add one table-driven rejection test covering wrong magic/version,
   nonzero reserved fields, zero generation, noncanonical reference,
   reference/generation/operation mismatch, empty/oversized inner plaintext,
   trailing bytes, and integer-length disagreement.
-- [ ] Run `cargo test -p aster-systemd-credentials envelope -- --nocapture` and
+- [x] Run `cargo test -p aster-systemd-credentials envelope -- --nocapture` and
   observe failure because the crate/API does not exist.
-- [ ] Add the crate to the workspace and implement the minimum bounded codec;
+- [x] Add the crate to the workspace and implement the minimum bounded codec;
   own transient buffers with `Zeroizing` and construct
   `UnprotectedProvisioning` only after every outer check passes.
-- [ ] Run the same focused provider tests until green.
-- [ ] Commit as `feat(credentials): define systemd provider envelope`.
+- [x] Run the same focused provider tests until green.
+- [x] Commit as `feat(credentials): define systemd provider envelope`.
 
 ### Task 2: Implement the secure systemd credential source and loader
 
@@ -170,4 +170,3 @@ descriptor-relative Linux filesystem APIs, `zeroize`, Tokio.
   handoff, decide with the owner whether the full gate belongs here or in the
   deterministic release-gate lane already in progress.
 - [ ] Request focused code review; do not claim G3/G4 or close D06 overall.
-

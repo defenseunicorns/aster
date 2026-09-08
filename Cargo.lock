@@ -457,6 +457,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-systemd-credentials"
+version = "0.1.0"
+dependencies = [
+ "aster-core",
+ "rustix",
+ "zeroize",
+]
+
+[[package]]
 name = "async-io"
 version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
