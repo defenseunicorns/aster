@@ -36,6 +36,7 @@ pub(super) enum FaultPoint {
     IntentParentSynced,
     ActiveRenamed,
     ActiveParentSynced,
+    RecoveredActiveParentSyncFailed,
     CompleteFileSynced,
     CompleteRenamed,
     CompleteParentSynced,
@@ -349,6 +350,14 @@ pub(super) fn promote_staged_generation(
     faults.hit(FaultPoint::ActiveRenamed)?;
     sync_directory(provisioning_root)?;
     faults.hit(FaultPoint::ActiveParentSynced)
+}
+
+pub(super) fn sync_recovered_active_parent(
+    provisioning_root: &OwnedFd,
+    faults: &mut FaultInjector,
+) -> Result<(), ProvisioningSecretStoreError> {
+    faults.hit(FaultPoint::RecoveredActiveParentSyncFailed)?;
+    sync_directory(provisioning_root)
 }
 
 pub(super) fn remove_staged_generation(

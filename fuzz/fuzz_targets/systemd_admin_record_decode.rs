@@ -15,7 +15,7 @@ fn valid_ledger() -> Vec<u8> {
     let reference = reference();
     let mut encoded = Vec::with_capacity(152 + reference.len());
     encoded.extend_from_slice(b"ASTRSDL1");
-    encoded.extend_from_slice(&1_u16.to_be_bytes());
+    encoded.extend_from_slice(&2_u16.to_be_bytes());
     encoded.extend_from_slice(&[2, 0]);
     encoded.extend_from_slice(&1_u64.to_be_bytes());
     encoded.extend_from_slice(&[0x11; 32]);
@@ -31,7 +31,7 @@ fn valid_manifest() -> Vec<u8> {
     let reference = reference();
     let mut encoded = Vec::with_capacity(88 + reference.len());
     encoded.extend_from_slice(b"ASTRSDM1");
-    encoded.extend_from_slice(&1_u16.to_be_bytes());
+    encoded.extend_from_slice(&2_u16.to_be_bytes());
     encoded.extend_from_slice(&0_u16.to_be_bytes());
     encoded.extend_from_slice(&1_u64.to_be_bytes());
     encoded.extend_from_slice(&[0x22; 32]);
@@ -58,6 +58,16 @@ fn mutate(mut candidate: Vec<u8>, input: &[u8]) -> Vec<u8> {
 }
 
 fuzz_target!(|input: &[u8]| {
+    assert_eq!(
+        fuzz_decode_admin_records(&valid_ledger()),
+        (true, false),
+        "canonical ledger fixture must reach only the ledger decoder"
+    );
+    assert_eq!(
+        fuzz_decode_admin_records(&valid_manifest()),
+        (false, true),
+        "canonical manifest fixture must reach only the manifest decoder"
+    );
     black_box(fuzz_decode_admin_records(input));
     black_box(fuzz_decode_admin_records(&mutate(valid_ledger(), input)));
     black_box(fuzz_decode_admin_records(&mutate(valid_manifest(), input)));

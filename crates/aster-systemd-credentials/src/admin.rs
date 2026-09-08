@@ -17,7 +17,7 @@ use files::{
     ACTIVE_DIRECTORY, FaultInjector, GenerationManifest, LedgerWrite, STAGED_DIRECTORY,
     child_directory_exists, generation_matches, open_namespace_lock, open_secure_root,
     promote_staged_generation, read_generation_manifest, read_ledger, remove_staged_generation,
-    write_ledger_atomically, write_staged_generation,
+    sync_recovered_active_parent, write_ledger_atomically, write_staged_generation,
 };
 use ledger::{InstallPhase, InstallRecord, Retry, classify_retry, decode_record, encode_record};
 use rustix::fd::OwnedFd;
@@ -140,6 +140,10 @@ impl SystemdCredentialAdmin {
                 complete_record(&self.ledger_root, record, &mut self.faults)?;
             }
             ReconcileAction::CompleteActive => {
+                // The active rename may have reached this separate filesystem
+                // without its parent fsync. Make it durable before committing
+                // the operation in the ledger filesystem.
+                sync_recovered_active_parent(&self.provisioning_root, &mut self.faults)?;
                 if staged == GenerationMatch::Exact {
                     remove_staged_generation(&self.provisioning_root)?;
                 }
@@ -536,6 +540,26 @@ mod tests {
         );
         assert_eq!(fixture.ledger_phase(), InstallPhase::Complete);
         assert_eq!(fixture.encrypt_calls(), 1);
+    }
+
+    #[test]
+    fn recovered_active_intent_stays_pending_when_parent_sync_fails() {
+        // Break caught: completing the ledger before the recovered active
+        // rename is durable can expose a committed operation whose generation
+        // disappears after a crash, including when the two roots differ.
+        let fixture = AdminFixture::new();
+        fixture.install_once();
+        fixture.set_ledger_phase(InstallPhase::Intent);
+
+        assert_eq!(
+            fixture
+                .admin_with_fault(FaultPoint::RecoveredActiveParentSyncFailed)
+                .expect_err("recovered active parent sync failure"),
+            ProvisioningSecretStoreError::Unavailable
+        );
+        assert_eq!(fixture.ledger_phase(), InstallPhase::Intent);
+        assert!(fixture.provisioning.join("active").is_dir());
+        assert!(!fixture.ledger.join("ledger.next").exists());
     }
 
     #[test]
