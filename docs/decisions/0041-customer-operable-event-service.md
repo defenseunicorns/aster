@@ -86,8 +86,9 @@ forwarding, Event bridges, and dynamic bridge administration.
     public reason. No online operation-map reclamation is introduced.
 13. In the Raspberry Pi reference 2026-06-18 evaluation composition (Debian
     GNU/Linux 13 (trixie), Raspberry Pi Compute Module 4 Rev 1.1, `aarch64`,
-    kernel `6.18.39+rpt-rpi-v8`, systemd `257.13-1~deb13u1`, local `ext4`, and
-    TPM2 excluded), statically link the first-party
+    kernel `6.18.39+rpt-rpi-v8`, systemd `257.13-1~deb13u1`, credential
+    executable `/usr/bin/systemd-creds`, local `ext4`, and TPM2 excluded),
+    statically link the first-party
     `aster-systemd-credentials` runtime loader for provider contract
     `aster-systemd-credential-store/v2` into the same `aster-agent`
     executable. `--config` selects only that loader. It opens the fixed
