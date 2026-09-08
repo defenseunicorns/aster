@@ -172,7 +172,22 @@ impl SystemdCredentialAdmin {
         let ledger = match current {
             Some(encoded) => {
                 let current = decode_ledger(&encoded)?;
-                lifecycle::select_lifecycle_ledger(current, pending)?
+                let publish_pending_intent = current.intent.is_none()
+                    && pending
+                        .as_ref()
+                        .is_some_and(|ledger| ledger.intent.is_some());
+                let selected = lifecycle::select_lifecycle_ledger(current, pending)?;
+                if selected.host_key_identity != self.host_key_identity {
+                    return Err(ProvisioningSecretStoreError::Rejected);
+                }
+                if publish_pending_intent {
+                    lifecycle::publish_pending_lifecycle_intent(
+                        &self.ledger_root,
+                        &selected,
+                        &mut self.faults,
+                    )?;
+                }
+                selected
             }
             None => return Err(ProvisioningSecretStoreError::Rejected),
         };

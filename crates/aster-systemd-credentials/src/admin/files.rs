@@ -411,6 +411,23 @@ pub(super) fn read_pending_ledger(
     )
 }
 
+pub(super) fn publish_pending_ledger(
+    ledger_root: &OwnedFd,
+    expected: &[u8],
+    faults: &mut FaultInjector,
+) -> Result<(), ProvisioningSecretStoreError> {
+    let pending =
+        read_pending_ledger(ledger_root)?.ok_or(ProvisioningSecretStoreError::Rejected)?;
+    if pending.as_slice() != expected {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    rustix::fs::renameat(ledger_root, LEDGER_NEXT_FILE, ledger_root, LEDGER_FILE)
+        .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    faults.hit(FaultPoint::IntentRenamed)?;
+    sync_directory(ledger_root)?;
+    faults.hit(FaultPoint::IntentParentSynced)
+}
+
 pub(super) fn write_ledger_atomically(
     ledger_root: &OwnedFd,
     bytes: &[u8],
