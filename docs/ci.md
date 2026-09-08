@@ -86,11 +86,33 @@ invokes the payload writer and that a subsequent authorized exchange completes.
 The receiver checks bytes incrementally. An observation timeout is a failure,
 not evidence that no payload was sent.
 
-Before removing the Linux lane's global serialization, require a parallel full
-workspace pass with its prerequisite fixes and repeat the contention diagnostic
-on Linux. Investigate remaining errors before weakening zero-error assertions
-or increasing carrier deadlines. Preserve narrow isolation where an individual
-fixture still requires exclusive resources.
+The Linux quality lane now uses default test parallelism. Narrow isolation in
+individual process fixtures remains. Investigate errors before weakening
+zero-error assertions or increasing carrier deadlines.
+
+Local validation on 2026-09-08:
+
+| Run | Environment and result |
+|---|---|
+| Contention diagnostic, network code `34699e8` | macOS ARM64, 18 logical CPUs, four CPU-load workers, four test threads per binary: three rounds passed; 102 Iroh and 33 selected node/progress test executions. |
+| Contention diagnostic, network code `a0b7154` | Linux ARM64 container, two CPUs, two CPU-load workers, four test threads per binary: three rounds passed; 102 Iroh and 33 selected node/progress test executions. |
+| Parallel Linux workspace with prerequisites and descriptor wrapper | 1,226 passed, seven existing ignored tests. Rust 1.97.1, default test parallelism, owner-only creation mask, test/dev debug info disabled. The approximately 2-GB VM required one build job and the pinned Rust image's bundled LLVM linker; these build settings did not serialize tests. |
+
+The network branch must integrate after the existing
+`fix/mission-lock-lifetime` (`cc98ae7`), `fix/binding-semantic-version`
+(`422cd89`), and `fix/ci-secure-umask` (`25a7ccf`) fixes. They remain separate
+changes. The combined validation checkout applies them to network code
+`a0b7154`, plus descriptor-budget change `e13a030`. Without the lock fix, a
+parallel macOS run reached 258 passing node tests and two provisioning failures;
+with it, all 262 node tests passed. The ordinary relay deadlines and
+zero-contact-error assertions remain intact.
+
+The Linux image was the repository's existing pinned Rust image,
+`rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97`.
+These are local workstation/container observations, not hosted Actions results
+or new product-requirements acceptance evidence. Raw attempts, including the
+low-descriptor-limit failure and linker-memory failures, were retained with the
+implementation task; successful retries followed specific environment fixes.
 
 ## Selected composition coverage
 

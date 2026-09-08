@@ -30,14 +30,12 @@ jobs:
   quality:
     name: quality
     runs-on: ubuntu-24.04
-    # The single-threaded workspace suite now regularly exceeds 30 minutes on
-    # hosted runners. Keep every quality gate intact and leave enough headroom
-    # for runner variance instead of cancelling an otherwise healthy run.
+    # Keep headroom for the complete quality gate and hosted-runner variance.
+    # Workspace tests use default parallelism with an explicit descriptor budget.
     timeout-minutes: 45
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      RUST_TEST_THREADS: "1"
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
