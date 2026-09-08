@@ -84,6 +84,15 @@ forwarding, Event bridges, and dynamic bridge administration.
     workload boundary of 256 and implementation hard ceiling of 262,144.
     Dedicated Event-operation hard-cap refusal is a distinct non-retryable
     public reason. No online operation-map reclamation is introduced.
+13. In the Ubuntu evaluation composition, statically link the first-party
+    `aster-systemd-credentials` runtime loader into the same `aster-agent`
+    executable. `--config` selects only that loader. It opens the fixed
+    `aster-provisioning.bundle` systemd service credential through
+    `CREDENTIALS_DIRECTORY`, requires systemd's `secure` boundary (single-link
+    regular file, effective service owner, exact `0400`, Linux `ramfs`),
+    validates the provider envelope and canonical inner bundle, and completes
+    protected bootstrap before state or either listener is opened. It invokes
+    no credential CLI and has no runtime provider or plaintext fallback.
 
 ### Direct dependency admission for pre-body serving
 
@@ -138,6 +147,25 @@ semantics are documented in the
 [`v1 configuration reference`](../reference/aster-agent-config-v1.md) and
 [`Event agent quickstart`](../quickstart/connect-agent.md).
 
+### D06 runtime-loader increment
+
+The stacked D06 implementation adds provider contract
+`aster-systemd-credential-store/v1` in
+[`aster-systemd-credentials`](../../crates/aster-systemd-credentials/README.md).
+Its canonical provider reference and zeroizing envelope bind one nonzero
+generation, exact Aster secret reference, exact load-operation identifier, and
+one validated `ASTRPB03` bundle. The production customer invocation constructs
+the systemd loader directly; missing, weak, insecure, changed, oversized, or
+mismatched credentials fail through fixed sanitized categories before the
+node can create state or bind health/application listeners.
+
+This is the runtime-loader increment only. The root administration binary,
+durable operation ledger, install/rotation/backup/recovery/destruction
+lifecycle, crash reconciliation, hardened unit, packages, candidate identity,
+and physical-target evidence remain in later D06/G3/G4 work. In particular,
+this increment does not approve the provider candidate, close E01, qualify a
+package, or establish Debian support.
+
 ## Ownership and acceptance
 
 The Event-service workstream owns the Event module and its selected
@@ -171,5 +199,5 @@ so its commands continue to describe executable repository behavior.
   enforcement: the harness/operator stops work at the lower profile boundaries
   while the implementation hard ceilings remain fail-closed safeguards.
 - This decision authorizes implementation. It does not close protected
-  provisioning, deployment, physical-network, mixed-implementation,
-  packaging, security-review, or release gates.
+  provisioning lifecycle, deployment, physical-network,
+  mixed-implementation, packaging, security-review, or release gates.

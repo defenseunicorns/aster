@@ -166,6 +166,17 @@ impl SystemdCredentialLoader {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+impl ProvisioningSecretLoader for SystemdCredentialLoader {
+    fn load(
+        &mut self,
+        _operation: ProvisioningLoadId,
+        _secret_ref: &ProvisioningSecretRef,
+    ) -> Result<ProvisioningLoadReceipt, ProvisioningSecretStoreError> {
+        Err(ProvisioningSecretStoreError::Unavailable)
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl ProvisioningSecretLoader for SystemdCredentialLoader {
     fn load(
@@ -471,7 +482,7 @@ fn read_u64(bytes: &[u8]) -> Result<u64, ProvisioningSecretStoreError> {
         .map_err(|_| ProvisioningSecretStoreError::Rejected)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::{
         fs,

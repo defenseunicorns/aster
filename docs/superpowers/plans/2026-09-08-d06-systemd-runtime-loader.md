@@ -158,17 +158,17 @@ descriptor-relative Linux filesystem APIs, `zeroize`, Tokio.
   D06 admin/ledger/lifecycle/package/device work.
 - Makes no requirements-status or profile-qualification change.
 
-- [ ] Document the fixed credential name, provider identity, environment and
+- [x] Document the fixed credential name, provider identity, environment and
   filesystem requirements, static composition, sanitized failures, and all
   non-claims.
-- [ ] Update Decision 0041 only to replace the runtime provider placeholder
+- [x] Update Decision 0041 only to replace the runtime provider placeholder
   with the exact implemented boundary and retain its stacked-branch status.
-- [ ] Run `cargo test -p aster-systemd-credentials` plus only the affected
+- [x] Run `cargo test -p aster-systemd-credentials` plus only the affected
   `aster-agent` runtime/binary tests.
-- [ ] Run `cargo fmt --all -- --check`, `cargo clippy -p
+- [x] Run `cargo fmt --all -- --check`, `cargo clippy -p
   aster-systemd-credentials --all-targets -- -D warnings`, and
   `git diff --check`.
-- [ ] Do not run `mise run check` during iteration. Before a substantive code
+- [x] Do not run `mise run check` during iteration. Before a substantive code
   handoff, decide with the owner whether the full gate belongs here or in the
   deterministic release-gate lane already in progress.
 - [ ] Request focused code review; do not claim G3/G4 or close D06 overall.
