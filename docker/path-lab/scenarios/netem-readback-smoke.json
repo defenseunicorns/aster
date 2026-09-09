@@ -1,0 +1,23 @@
+{
+  "schema": "aster-path-lab-scenario/v1",
+  "id": "netem-readback-smoke",
+  "seed": 104729,
+  "timeline": [
+    {
+      "at_ms": 0,
+      "action": "set_netem",
+      "node": "wan",
+      "interface": "eth2",
+      "delay_ms": 40,
+      "jitter_ms": 5,
+      "loss_percent": 1,
+      "rate_kbit": 100000
+    },
+    {
+      "at_ms": 250,
+      "action": "reset_netem",
+      "node": "wan",
+      "interface": "eth2"
+    }
+  ]
+}
