@@ -1,0 +1,58 @@
+[
+  {
+    "id": {
+      "purl": "pkg:cargo/netlink-packet-core@0.8.2?download_url=file://../../third-party/netlink-packet-core-0.8.2-aster"
+    },
+    "set": {
+      "pedigree": {
+        "ancestors": [
+          {
+            "type": "library",
+            "name": "netlink-packet-core",
+            "version": "0.8.2",
+            "purl": "pkg:cargo/netlink-packet-core@0.8.2",
+            "hashes": [
+              {
+                "alg": "SHA-256",
+                "content": "b897d7bd4f0af82e68d40d0344cf37e97f9c97ddf74a098de3e4da05e96ca395"
+              }
+            ],
+            "licenses": [
+              {
+                "license": {
+                  "id": "MIT"
+                }
+              }
+            ],
+            "description": "Original crates.io crate archive. Upstream VCS revision recorded by ASTER-PATCH.md: 571d8bb5fa1dbaa875e8aede3f214c87f70b955b."
+          }
+        ],
+        "patches": [
+          {
+            "type": "unofficial",
+            "diff": {
+              "text": {
+                "contentType": "text/plain",
+                "content": "--- a/Cargo.toml\n+++ b/Cargo.toml\n@@ -43,7 +43,8 @@\n path = \"examples/rtnetlink.rs\"\n \n [dependencies.paste]\n-version = \"1\"\n+package = \"pastey\"\n+version = \"=0.2.2\"\n \n [dev-dependencies.netlink-packet-route]\n version = \"0.13.0\"\n"
+              }
+            }
+          }
+        ],
+        "notes": "Current /build/aster source snapshot. Cargo.toml aliases paste to pastey exactly 0.2.2. Retained Rust source files match ASTER-UPSTREAM.sha256. Upstream .github/workflows/clippy-rustfmt.yml, .github/workflows/license.yml, .github/workflows/main.yml and Cargo.lock are omitted as documented by the repository checker. ASTER-PATCH.md and ASTER-UPSTREAM.sha256 are added receipts. Additionally, Cargo.toml.orig is absent from this chroot snapshot although the repository checker requires it; full checker fails on that missing file. This snapshot hash identifies the current source files and is not an attestation that they are unchanged since the executable build."
+      },
+      "externalReferences": [
+        {
+          "type": "distribution",
+          "url": "netlink-packet-core-0.8.2-aster.tar",
+          "comment": "Exact current local source snapshot; archive distributed alongside this SBOM. SHA-256 covers the tar bytes. GNU tar: --sort=name --format=ustar --mtime=@0 --owner=0 --group=0 --numeric-owner.",
+          "hashes": [
+            {
+              "alg": "SHA-256",
+              "content": "bb5df952e94d0635397c492710fbe887dab55dc478c4f5b5c8753f05015bc612"
+            }
+          ]
+        }
+      ]
+    }
+  }
+]

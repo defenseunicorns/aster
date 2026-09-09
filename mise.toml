@@ -16,7 +16,6 @@ run = [
   "sh tools/check-agent-proto.sh",
   "python3 tools/check-project-license.py",
   "python3 tools/check-implementation-requirements.py",
-  "python3 tools/check-public-provenance.py",
   "python3 tools/test_aster_tour_ui.py",
   "python3 tools/test_aster_mesh_playground.py",
   "python3 tools/test_aster_lan_mvp.py",

@@ -57,8 +57,8 @@ For a shorter path based on what you are trying to accomplish, start at the
 - [Reconciliation FOSS bake-off](reconciliation-bakeoff.md)
 - [Requirements-first FOSS evaluation record](evaluations/0005/README.md)
 - [Selected FOSS reference-stack validation](evaluations/0006/README.md)
-- [Public development provenance record](provenance/independent-development-record.md)
-- [Public source register](provenance/public-source-register.csv)
+- [Executable SBOM workflow](release/sbom/README.md)
+- [Executable SBOM observation — 2026-09-08](release/sbom/2026-09-08-observation.md)
 
 ## Proposals and results
 
