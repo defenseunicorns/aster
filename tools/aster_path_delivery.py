@@ -393,33 +393,44 @@ def _execute_scenario(
     with tempfile.TemporaryDirectory(prefix="aster-path-delivery-") as directory:
         isolated_topology = Path(directory) / "topology.delivery.clab.yml"
         destroy: list[str] = []
+        primary_error: ExecutionError | OSError | None = None
+        primary_stage = "topology-copy"
+        event_id = ""
+        observed: dict[str, object] = {}
         try:
             isolated_topology.write_bytes(topology.read_bytes())
             deploy = [clab, "deploy", "--topo", str(isolated_topology)]
             destroy = [clab, "destroy", "--topo", str(isolated_topology), "--cleanup"]
             deployed = True
+            primary_stage = "lab-deploy"
             run(deploy, 240)
             provisioner = f"clab-{LAB}-provisioner"
+            primary_stage = "provisioner-wait"
             if run([docker_exe, "wait", provisioner], 90).strip() != b"0":
                 raise ExecutionError("isolated provisioner failed")
+            primary_stage = "provisioner-remove"
             run([docker_exe, "rm", provisioner], 30)
+            primary_stage = "wan-configure"
             run([
                 docker_exe, "exec", f"clab-{LAB}-wan",
                 "/usr/local/libexec/aster/delivery-wan.py", "configure",
             ], 30)
             for node in ("node-a", "node-b"):
+                primary_stage = f"{node}-network"
                 run([
                     docker_exe, "run", "--rm", "--network",
                     f"container:clab-{LAB}-{node}", "--cap-drop", "ALL",
                     "--cap-add", "NET_ADMIN", "aster-path-delivery:local",
                     "/usr/local/libexec/aster/delivery-network-init.py", node,
                 ], 30)
+                primary_stage = f"{node}-agent"
                 run([
                     docker_exe, "exec", "--detach", "--user", "10001:10001",
                     f"clab-{LAB}-{node}",
                     "/usr/local/libexec/aster/delivery-agent.py", node,
                 ], 30)
             for node in ("node-a", "node-b"):
+                primary_stage = f"{node}-readiness"
                 deadline = time.monotonic() + 60
                 status_argv = [
                     docker_exe, "exec", "--user", "10001:10001",
@@ -436,53 +447,80 @@ def _execute_scenario(
                     if time.monotonic() >= deadline:
                         raise ExecutionError("agent readiness timed out")
                     time.sleep(0.25)
+            primary_stage = "event-subscribe"
             run(_event_exec(docker_exe, "node-b", "subscribe", plan), 30)
 
             netem_attempted = True
+            primary_stage = "netem-set"
             run([
                 clab, "tools", "netem", "set", "--node", str(FIXED_NETEM["node"]),
                 "--interface", "eth2", "--delay", "40ms", "--jitter", "5ms",
                 "--loss", "1.0", "--rate", "100000",
             ], 30)
+            primary_stage = "netem-readback"
             readback = run([
                 clab, "tools", "netem", "show", "--node", str(FIXED_NETEM["node"]),
                 "--format", "json",
             ], 30)
             observed = _validate_netem(readback)
+            primary_stage = "event-publish"
             event_id = _canonical_event_id(run(_event_exec(docker_exe, "node-a", "publish", plan), 30))
+            primary_stage = "event-wait"
             event = _strict_json(
                 run(_event_exec(docker_exe, "node-b", "wait", plan, event_id), 60),
                 "Event observation",
             )
+            primary_stage = "event-verify"
             expected_key = base64.b64encode(str(plan["logical_key"]).encode()).decode()
             expected_payload = base64.b64encode(str(plan["payload"]).encode()).decode()
             if not isinstance(event, dict) or event.get("id") != event_id or event.get("logicalKey") != expected_key or event.get("payload") != expected_payload:
                 raise ExecutionError("exact Event observation mismatch")
+        except (ExecutionError, OSError) as error:
+            primary_error = error
         finally:
-            cleanup_error: ExecutionError | None = None
+            cleanup_stages: list[str] = []
+            cleanup_errors: list[ExecutionError] = []
             if netem_attempted:
                 try:
                     run([
                         clab, "tools", "netem", "reset", "--node", str(FIXED_NETEM["node"]),
                         "--interface", "eth2",
                     ], 30)
-                except ExecutionError:
-                    cleanup_error = ExecutionError("path-delivery cleanup failed")
+                except ExecutionError as error:
+                    cleanup_stages.append("netem-reset")
+                    cleanup_errors.append(error)
             if deployed:
                 try:
                     run(destroy, 180)
-                except ExecutionError:
-                    cleanup_error = ExecutionError("path-delivery cleanup failed")
+                except ExecutionError as error:
+                    cleanup_stages.append("lab-destroy")
+                    cleanup_errors.append(error)
             try:
                 remaining = _strict_json(run(inspect, 30), "post-cleanup lab inspection")
                 if not _lab_is_absent(remaining):
-                    cleanup_error = ExecutionError("path-delivery cleanup verification failed")
-            except ExecutionError:
-                cleanup_error = ExecutionError("path-delivery cleanup verification failed")
+                    cleanup_stages.append("post-cleanup-inspect")
+                    cleanup_errors.append(ExecutionError("post-cleanup lab remains"))
+            except ExecutionError as error:
+                cleanup_stages.append("post-cleanup-inspect")
+                cleanup_errors.append(error)
             if (Path(directory) / f"clab-{LAB}").exists():
-                cleanup_error = ExecutionError("credential-bearing lab directory remains")
-            if cleanup_error is not None:
-                raise cleanup_error
+                cleanup_stages.append("credential-directory")
+                cleanup_errors.append(ExecutionError("credential-bearing lab directory remains"))
+            if cleanup_stages:
+                fields = []
+                if primary_error is not None:
+                    fields.append(f"primary={primary_stage}")
+                fields.append(f"cleanup={','.join(cleanup_stages)}")
+                cause: BaseException | None = primary_error
+                for cleanup_error in cleanup_errors:
+                    if cause is not None:
+                        cleanup_error.__cause__ = cause
+                        cleanup_error.__suppress_context__ = True
+                    cause = cleanup_error
+                raise ExecutionError(f"path-delivery failed: {' '.join(fields)}") from cause
+
+        if primary_error is not None:
+            raise ExecutionError(f"path-delivery failed: primary={primary_stage}") from primary_error
 
     return {
         "schema": RECEIPT_SCHEMA,

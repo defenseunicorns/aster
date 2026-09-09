@@ -206,6 +206,53 @@ class PathDeliveryControllerTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
 
+    def test_execution_reports_primary_and_cleanup_stage_without_inner_output(self) -> None:
+        scenario = {
+            "schema": "aster-path-delivery-scenario/v1",
+            "id": "event-delivery-netem",
+            "seed": 104729,
+            "operation_key": "one",
+            "logical_key": "key",
+            "payload": "payload",
+        }
+
+        def run(argv: list[str], timeout: float) -> bytes:
+            del timeout
+            if argv[1:5] == ["inspect", "--all", "--format", "json"]:
+                return b"{}"
+            if argv[1] == "deploy":
+                raise MODULE.ExecutionError("raw-primary-output")
+            if argv[1] == "destroy":
+                raise MODULE.ExecutionError("raw-cleanup-output")
+            return b""
+
+        with tempfile.TemporaryDirectory() as directory:
+            topology = Path(directory) / "topology.delivery.clab.yml"
+            topology.write_text("name: aster-path-delivery\n", encoding="utf-8")
+            with self.assertRaises(MODULE.ExecutionError) as raised:
+                MODULE.execute_scenario(
+                    json.dumps(scenario).encode(),
+                    containerlab=Path("/usr/local/bin/containerlab"),
+                    docker=Path("/usr/local/bin/docker"),
+                    topology=topology,
+                    run=run,
+                    lock_path=Path(directory) / "aster-path-delivery.lock",
+                )
+
+        message = str(raised.exception)
+        self.assertEqual(
+            message,
+            "path-delivery failed: primary=lab-deploy cleanup=lab-destroy",
+        )
+        self.assertNotIn("raw-primary-output", message)
+        self.assertNotIn("raw-cleanup-output", message)
+        causes = []
+        cause = raised.exception.__cause__
+        while cause is not None:
+            causes.append(str(cause))
+            cause = cause.__cause__
+        self.assertEqual(causes, ["raw-cleanup-output", "raw-primary-output"])
+
     def test_execution_delivers_exact_event_and_reports_bounded_oracles(self) -> None:
         scenario = {
             "schema": "aster-path-delivery-scenario/v1",
