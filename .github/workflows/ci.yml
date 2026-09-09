@@ -260,8 +260,6 @@ jobs:
 
       - name: Install pinned SBOM tools
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y libicu-dev pkg-config
           cargo install --locked --version 0.5.9 cargo-cyclonedx --root "$RUNNER_TEMP/sbom-cargo"
           python3 -m venv "$RUNNER_TEMP/sbom-python"
           "$RUNNER_TEMP/sbom-python/bin/pip" install 'cyclonedx-editor-validator==0.34.0'
