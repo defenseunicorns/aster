@@ -1401,10 +1401,7 @@ a maintainer reviews the upstream release and the resulting dependency changes.
 For the separate release-build/SBOM lane, provision its pinned tools and fetch
 locked dependencies, then run `mise run sbom`. See the
 [artifact workflow](release/sbom/README.md#automated-build-and-artifact) for
-prerequisites, output layout and inventory qualifications. Its orchestration
-regression tests run in `mise run check` and can also be invoked directly with
-`python3 tools/test_sbom_workflow.py`.
-
+prerequisites, output layout and inventory qualifications.
 
 Install the repository toolchain and run the primary gate:
 

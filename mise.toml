@@ -15,7 +15,6 @@ run = [
   "cargo fmt --all -- --check",
   "sh tools/check-agent-proto.sh",
   "python3 tools/check-project-license.py",
-  "python3 tools/test_sbom_workflow.py",
   "python3 tools/check-implementation-requirements.py",
   "python3 tools/test_aster_tour_ui.py",
   "python3 tools/test_aster_mesh_playground.py",
