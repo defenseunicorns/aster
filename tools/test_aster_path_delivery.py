@@ -436,6 +436,18 @@ class PathDeliveryControllerTests(unittest.TestCase):
         workflow = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn("path-delivery-smoke:", workflow)
         self.assertIn("- path-delivery-smoke", workflow)
+        dockerignore = (root / ".dockerignore").read_text(encoding="utf-8")
+        for required_context_path in (
+            "!proto/",
+            "!proto/**",
+            "!tools/",
+            "!tools/aster_lan_mvp.py",
+            "!docker/",
+            "!docker/path-lab/",
+            "!docker/path-lab/Dockerfile.delivery",
+            "!docker/path-lab/delivery-*.py",
+        ):
+            self.assertIn(required_context_path, dockerignore)
         readme = (root / "docker/path-lab/README.md").read_text(encoding="utf-8")
         self.assertIn("one-host container limitation", readme)
         self.assertIn("does not claim recovery", readme)
