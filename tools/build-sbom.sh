@@ -30,21 +30,20 @@ mkdir -p "$stage/source" "$stage/bundle"
 git archive "$revision" | tar -xf - -C "$stage/source"
 bundle="$stage/bundle"
 cd "$stage/source"
-sha256sum Cargo.lock > "$bundle/Cargo.lock.sha256"
+sha256sum Cargo.lock > "$stage/Cargo.lock.sha256"
 python3 tools/check-netlink-packet-core-patch.py
 
 cargo build --frozen --release --target "$target" \
-    -p aster-node -p aster-agent --bin aster --bin aster-agent \
-    2>&1 | tee "$out/build.log"
+    -p aster-node -p aster-agent --bin aster --bin aster-agent
 cargo cyclonedx --format json --spec-version 1.5 --describe binaries \
-    --target "$target" 2>&1 | tee "$out/generate.log"
-sha256sum -c "$bundle/Cargo.lock.sha256"
+    --target "$target"
+sha256sum -c "$stage/Cargo.lock.sha256"
 
 cp crates/aster-node/aster_bin.cdx.json "$bundle/aster.cdx.json"
 cp crates/aster-agent/aster-agent_bin.cdx.json "$bundle/aster-agent.cdx.json"
 for name in aster aster-agent; do
     cp "$CARGO_TARGET_DIR/$target/release/$name" "$bundle/$name"
-    "$bundle/$name" --help > "$out/$name.help.txt"
+    "$bundle/$name" --help
     cdx-ev validate "$bundle/$name.cdx.json" --schema-type default
 done
 
@@ -65,12 +64,7 @@ for name in ("aster", "aster-agent"):
         raise SystemExit(f"{name}: dependency license declarations are missing")
 PY
 
-# Preserve current vendored source and its existing patch receipts, not a dated set-list.
-tar --sort=name --format=ustar --mtime=@0 --owner=0 --group=0 --numeric-owner \
-    -cf "$bundle/netlink-packet-core-0.8.2-aster.tar" \
-    -C third-party netlink-packet-core-0.8.2-aster
-cp Cargo.lock LICENSE "$bundle/"
-cp "$out/build.log" "$out/generate.log" "$out/aster.help.txt" "$out/aster-agent.help.txt" "$bundle/"
+cp LICENSE "$bundle/"
 {
     printf '\ncommit=%s\ntarget=%s\nprofile=release\nfeatures=package defaults\n' "$revision" "$target"
     rustc -Vv
@@ -78,24 +72,6 @@ cp "$out/build.log" "$out/generate.log" "$out/aster.help.txt" "$out/aster-agent.
     cargo cyclonedx --version
     cdx-ev --version
 } > "$bundle/BUILD.txt"
-cat > "$bundle/SCOPE.txt" <<'EOF'
-
-
-These CycloneDX 1.5 files are unmodified cargo-cyclonedx output, including
-manifest-declared licenses. The inventory is overinclusive: workspace feature
-unification may include unused dependencies such as SQLite. Component presence
-does not prove inclusion in either executable. Vulnerability findings require
-artifact-specific triage; no blanket advisory exception is granted.
-
-The application source came from the commit recorded in BUILD.txt. SHA256SUMS
-binds these files as a bundle; it is not signed provenance or proof of
-reproducible builds. This is a CI build, not a release authorization.
-
-The netlink source archive contains the actual vendored snapshot, ASTER-PATCH.md
-and upstream hash receipt. This workflow does not apply the historical pedigree
-set-list or add that archive's pedigree/hash to the generated SBOM components.
-Full native/Rust-std coverage, license notices and release packaging remain open.
-EOF
 cd "$bundle"
 sha256sum ./* > SHA256SUMS
 sha256sum -c SHA256SUMS

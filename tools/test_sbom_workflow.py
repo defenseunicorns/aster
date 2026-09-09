@@ -83,14 +83,13 @@ if [ "${FAIL_MODE:-}" = validator ]; then echo "forced validator failure" >&2; e
         return subprocess.run(["bash", str(ROOT / "tools/build-sbom.sh")], cwd=self.repo,
                               env=dict(self.env, FAIL_MODE=mode), text=True, capture_output=True)
 
-    def test_bundle_contains_executables_sboms_and_current_patch_source(self):
+    def test_bundle_contains_only_deliverable_files(self):
         result = self.run_workflow()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         with tarfile.open(self.output) as bundle:
-            names = {m.name.removeprefix("./") for m in bundle.getmembers()}
-            self.assertTrue({"aster", "aster-agent", "aster.cdx.json", "aster-agent.cdx.json",
-                             "SHA256SUMS", "BUILD.txt", "SCOPE.txt", "LICENSE",
-                             "netlink-packet-core-0.8.2-aster.tar"} <= names)
+            names = {m.name.removeprefix("./") for m in bundle.getmembers() if m.isfile()}
+            self.assertEqual(names, {"aster", "aster-agent", "aster.cdx.json", "aster-agent.cdx.json",
+                                     "SHA256SUMS", "BUILD.txt", "LICENSE"})
             self.assertTrue(bundle.getmember("./aster").mode & 0o111)
             destination = Path(self.temp.name) / "unpacked"
             bundle.extractall(destination, filter="data")

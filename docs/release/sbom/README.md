@@ -29,17 +29,16 @@ The result is `target/sbom/aster-linux-x86_64.tar`, containing:
 
 - executables `aster` and `aster-agent`;
 - SBOMs `aster.cdx.json` and `aster-agent.cdx.json` from cargo-cyclonedx;
-- `SHA256SUMS`, Cargo.lock and its checksum, and `BUILD.txt` with the source
-  commit, compiler, Cargo, generator, validator, target and profile;
-- build/generation logs, `--help` smoke outputs, project LICENSE and SCOPE.txt;
-- the current vendored netlink source archive, including its patch explanation
-  and upstream hash receipt. Historical pedigree edits are not applied.
+- `SHA256SUMS` and `BUILD.txt` with the source commit, compiler, Cargo,
+  generator, validator, target and profile;
+- project `LICENSE`.
 
 The script requires both schema-valid documents with the expected application
 roots and nonempty dependency license declarations. Build, generation, lockfile
 drift, smoke or validation failure stops it and removes any previous output
-bundle. Build/generation logs remain under `target/sbom/` for diagnosis. The
-archive preserves executable permissions and its files have relative checksums.
+bundle. Build, generation and `--help` output goes to the CI log or local
+terminal. The archive preserves executable permissions and its files have
+relative checksums.
 After extracting it, run `sha256sum -c SHA256SUMS`.
 
 CI runs this same task in its separate required `sbom` job on Ubuntu 24.04.
@@ -49,9 +48,8 @@ commit and are CI results, not signed releases. No automatic release publishing
 or requirement-status change is implied.
 
 The commands below remain available as the manual equivalent and historical
-pedigree-editing reference. The automated bundle preserves patch provenance as
-sidecar source evidence; it does not add pedigree or executable hashes inside
-the generated CycloneDX documents. Python validator transitive dependencies
+pedigree-editing reference. The generated CycloneDX documents do not include
+patch pedigree or executable hashes. Python validator transitive dependencies
 and runner system packages are not fully locked by this workflow.
 
 ## SBOM generator
