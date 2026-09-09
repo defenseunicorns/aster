@@ -191,6 +191,7 @@ impl SystemdCredentialAdmin {
         let current = read_ledger(&self.ledger_root)?;
         let pending = read_pending_ledger(&self.ledger_root)?;
         if current.is_none() {
+            validate_initial_namespace(&self.provisioning_root, &[STAGED_DIRECTORY])?;
             if recovery {
                 return Err(ProvisioningSecretStoreError::Rejected);
             }
@@ -317,10 +318,9 @@ impl SystemdCredentialAdmin {
                 &mut self.faults,
             );
         }
-        lifecycle::sync_intent_parent_before_mutation(
-            &self.ledger_root,
-            &ledger,
-            &mut self.faults,
+        validate_initial_namespace(
+            &self.provisioning_root,
+            &[STAGED_DIRECTORY, ACTIVE_DIRECTORY],
         )?;
         let phase = if ledger.intent.is_some() {
             LedgerPhase::Intent
@@ -330,7 +330,13 @@ impl SystemdCredentialAdmin {
         let manifest = manifest_from_ledger(&ledger)?;
         let staged = generation_match(&self.provisioning_root, STAGED_DIRECTORY, &manifest)?;
         let active = generation_match(&self.provisioning_root, ACTIVE_DIRECTORY, &manifest)?;
-        match reconcile_action(Some(phase), staged, active)? {
+        let action = reconcile_action(Some(phase), staged, active)?;
+        lifecycle::sync_intent_parent_before_mutation(
+            &self.ledger_root,
+            &ledger,
+            &mut self.faults,
+        )?;
+        match action {
             ReconcileAction::PromoteStage => {
                 promote_staged_generation(&self.provisioning_root, &mut self.faults)?;
                 complete_ledger(&self.ledger_root, ledger, &mut self.faults)?;
@@ -340,9 +346,6 @@ impl SystemdCredentialAdmin {
                 // without its parent fsync. Make it durable before committing
                 // the operation in the ledger filesystem.
                 sync_recovered_active_parent(&self.provisioning_root, &mut self.faults)?;
-                if staged == GenerationMatch::Exact {
-                    remove_staged_generation(&self.provisioning_root)?;
-                }
                 complete_ledger(&self.ledger_root, ledger, &mut self.faults)?;
             }
             ReconcileAction::Existing => {}
@@ -369,11 +372,7 @@ impl SystemdCredentialAdmin {
                 .ok_or(ProvisioningSecretStoreError::OperationConflict);
         }
 
-        if read_generation_manifest(&self.provisioning_root, ACTIVE_DIRECTORY)?.is_some()
-            || read_generation_manifest(&self.provisioning_root, STAGED_DIRECTORY)?.is_some()
-        {
-            return Err(ProvisioningSecretStoreError::Rejected);
-        }
+        validate_initial_namespace(&self.provisioning_root, &[])?;
 
         let generation = 1;
         let mut reference_id = Zeroizing::new([0_u8; PROVIDER_REFERENCE_ID_BYTES]);
@@ -877,11 +876,25 @@ fn generation_match(
     }
 }
 
-fn complete_ledger(
-    ledger_root: &OwnedFd,
-    mut ledger: ProviderLedger,
-    faults: &mut FaultInjector,
+fn validate_initial_namespace(
+    provisioning_root: &OwnedFd,
+    allowed: &[&str],
 ) -> Result<(), ProvisioningSecretStoreError> {
+    let mut present = Vec::new();
+    for name in allowed {
+        if child_directory_exists(provisioning_root, name)? {
+            present.push(*name);
+        }
+    }
+    if !files::directory_has_exact_entries(provisioning_root, &present)? {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    Ok(())
+}
+
+fn completed_install_ledger(
+    mut ledger: ProviderLedger,
+) -> Result<ProviderLedger, ProvisioningSecretStoreError> {
     let intent = ledger
         .intent
         .as_ref()
@@ -905,7 +918,21 @@ fn complete_ledger(
         state: GenerationState::Active,
     };
     ledger.generations.push(record);
-    let encoded = Zeroizing::new(encode_ledger(&ledger)?);
+    Ok(ledger)
+}
+
+fn complete_ledger(
+    ledger_root: &OwnedFd,
+    ledger: ProviderLedger,
+    faults: &mut FaultInjector,
+) -> Result<(), ProvisioningSecretStoreError> {
+    let encoded = Zeroizing::new(encode_ledger(&completed_install_ledger(ledger)?)?);
+    if let Some(pending) = read_pending_ledger(ledger_root)? {
+        if pending != encoded {
+            return Err(ProvisioningSecretStoreError::Rejected);
+        }
+        return files::publish_pending_ledger(ledger_root, &encoded, faults);
+    }
     write_ledger_atomically(ledger_root, &encoded, LedgerWrite::Complete, faults)
 }
 
@@ -949,11 +976,9 @@ fn reconcile_action(
         (Some(LedgerPhase::Intent), GenerationMatch::Exact, GenerationMatch::Absent) => {
             Ok(ReconcileAction::PromoteStage)
         }
-        (
-            Some(LedgerPhase::Intent),
-            GenerationMatch::Absent | GenerationMatch::Exact,
-            GenerationMatch::Exact,
-        ) => Ok(ReconcileAction::CompleteActive),
+        (Some(LedgerPhase::Intent), GenerationMatch::Absent, GenerationMatch::Exact) => {
+            Ok(ReconcileAction::CompleteActive)
+        }
         (Some(LedgerPhase::Complete), GenerationMatch::Absent, GenerationMatch::Exact) => {
             Ok(ReconcileAction::Existing)
         }

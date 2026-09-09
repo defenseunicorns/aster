@@ -540,6 +540,27 @@ pub(super) fn remove_staged_generation(
     let Some(staged) = open_optional_child_directory(provisioning_root, STAGED_DIRECTORY)? else {
         return Ok(());
     };
+    // A pre-intent install stage may be partial, but every existing entry
+    // must be a bounded, secure file from that stage before any unlink.
+    let mut present = Vec::new();
+    for (name, maximum) in [
+        (
+            CIPHERTEXT_FILE,
+            aster_mesh::MAX_PROTECTED_PROVISIONING_BYTES,
+        ),
+        (
+            REFERENCE_FILE,
+            aster_mesh::MAX_PROVISIONING_SECRET_REF_BYTES,
+        ),
+        (MANIFEST_FILE, MAX_MANIFEST_BYTES),
+    ] {
+        if read_optional_file(&staged, name, maximum)?.is_some() {
+            present.push(name);
+        }
+    }
+    if !directory_has_exact_entries(&staged, &present)? {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
     for name in [CIPHERTEXT_FILE, REFERENCE_FILE, MANIFEST_FILE] {
         remove_optional_file(&staged, name)?;
     }
