@@ -558,6 +558,12 @@ fn encode_reference(reference: &ProvisioningSecretRef) -> Zeroizing<String> {
 }
 
 #[cfg(target_os = "linux")]
+/// Writes directly to the caller's output transports. Parser, input, and
+/// provider failures occur before this function and therefore emit no stdout.
+/// Once a write starts, output is nontransactional: a later write, flush, or
+/// broken-pipe failure returns `Unavailable`, and the nonzero invocation's
+/// partial or complete stdout must be discarded. Backup status is deliberately
+/// written only after its artifact bytes have successfully flushed.
 fn write_success(
     outcome: CommandOutcome,
     stdout: &mut impl std::io::Write,
@@ -648,6 +654,9 @@ const fn destroy_disposition(disposition: ProvisioningDestroyDisposition) -> &'s
 }
 
 #[cfg(target_os = "linux")]
+/// Runs one invocation and returns a process status. A nonzero status always
+/// invalidates stdout, including any prefix written before an output transport
+/// failure; stdout is guaranteed empty only for failures before output starts.
 fn execute_with<A, R, O, E, F>(
     arguments: A,
     input: R,
@@ -714,7 +723,7 @@ mod tests {
     use std::os::unix::ffi::OsStringExt as _;
     use std::{
         fs,
-        io::{self, Cursor, Read},
+        io::{self, Cursor, Read, Write},
         path::PathBuf,
         process::Command as ProcessCommand,
         sync::{Arc, atomic::Ordering},
@@ -1047,6 +1056,171 @@ mod tests {
         .expect("render backup success");
         assert_eq!(stdout, artifact);
         assert_eq!(stderr, b"BACKUP disposition=available generation=7\n");
+    }
+
+    #[test]
+    fn partial_backup_stdout_write_returns_unavailable_and_a_binary_prefix() {
+        // Break caught: treating a short artifact write as success could emit a
+        // corrupt backup followed by a misleading success status.
+        let artifact = backup_output_fixture();
+        let mut stdout = FailingWriter::after(5, io::ErrorKind::Other);
+        let mut stderr = Vec::new();
+        assert_eq!(
+            super::write_success(backup_outcome(), &mut stdout, &mut stderr)
+                .expect_err("partial stdout write"),
+            ProvisioningSecretStoreError::Unavailable
+        );
+        assert_eq!(stdout.bytes, artifact[..5]);
+        assert!(stderr.is_empty());
+
+        let (status, stdout, stderr) =
+            execute_backup_with_writers(FailingWriter::after(5, io::ErrorKind::Other), Vec::new());
+        assert_eq!(status, 1);
+        assert_eq!(stdout.bytes, artifact[..5]);
+        assert_eq!(stderr, b"ERROR provisioning secret store is unavailable\n");
+    }
+
+    #[test]
+    fn backup_stdout_flush_failure_returns_unavailable_after_the_full_artifact() {
+        // Break caught: reporting success before stdout flush can bless an
+        // artifact whose final transport operation failed.
+        let artifact = backup_output_fixture();
+        let mut stdout = FailingWriter::on_flush();
+        let mut stderr = Vec::new();
+        assert_eq!(
+            super::write_success(backup_outcome(), &mut stdout, &mut stderr)
+                .expect_err("stdout flush failure"),
+            ProvisioningSecretStoreError::Unavailable
+        );
+        assert_eq!(stdout.bytes, artifact);
+        assert!(stderr.is_empty());
+
+        let (status, stdout, stderr) =
+            execute_backup_with_writers(FailingWriter::on_flush(), Vec::new());
+        assert_eq!(status, 1);
+        assert_eq!(stdout.bytes, artifact);
+        assert_eq!(stderr, b"ERROR provisioning secret store is unavailable\n");
+    }
+
+    #[test]
+    fn backup_stderr_status_failure_returns_unavailable_after_artifact_flush() {
+        // Break caught: moving the status write before the artifact flush can
+        // claim availability while stdout is incomplete.
+        let artifact = backup_output_fixture();
+        let mut stdout = Vec::new();
+        let mut stderr = FailingWriter::after(7, io::ErrorKind::Other);
+        assert_eq!(
+            super::write_success(backup_outcome(), &mut stdout, &mut stderr)
+                .expect_err("stderr status failure"),
+            ProvisioningSecretStoreError::Unavailable
+        );
+        assert_eq!(stdout, artifact);
+        assert_eq!(stderr.bytes, b"BACKUP ");
+
+        let (status, stdout, stderr) =
+            execute_backup_with_writers(Vec::new(), FailingWriter::after(7, io::ErrorKind::Other));
+        assert_eq!(status, 1);
+        assert_eq!(stdout, artifact);
+        assert_eq!(stderr.bytes, b"BACKUP ");
+    }
+
+    #[test]
+    fn backup_broken_pipe_returns_unavailable_without_status_or_stdout_text() {
+        // Break caught: a broken output pipe must produce a nonzero result and
+        // must never redirect the textual backup status into stdout.
+        let mut stdout = FailingWriter::after(0, io::ErrorKind::BrokenPipe);
+        let mut stderr = Vec::new();
+        assert_eq!(
+            super::write_success(backup_outcome(), &mut stdout, &mut stderr)
+                .expect_err("broken stdout pipe"),
+            ProvisioningSecretStoreError::Unavailable
+        );
+        assert!(stdout.bytes.is_empty());
+        assert!(stderr.is_empty());
+
+        let (status, stdout, stderr) = execute_backup_with_writers(
+            FailingWriter::after(0, io::ErrorKind::BrokenPipe),
+            Vec::new(),
+        );
+        assert_eq!(status, 1);
+        assert!(stdout.bytes.is_empty());
+        assert_eq!(stderr, b"ERROR provisioning secret store is unavailable\n");
+    }
+
+    fn backup_output_fixture() -> Vec<u8> {
+        vec![0x00, 0xff, b'A', b'S', b'T', b'R', 0x01, b'\n', 0x80]
+    }
+
+    fn backup_outcome() -> CommandOutcome {
+        CommandOutcome::Backup {
+            generation: 9,
+            artifact: Zeroizing::new(backup_output_fixture()),
+        }
+    }
+
+    fn execute_backup_with_writers<O: Write, E: Write>(
+        mut stdout: O,
+        mut stderr: E,
+    ) -> (i32, O, E) {
+        let status = execute_with(
+            operation_arguments("backup"),
+            Cursor::new(Vec::<u8>::new()),
+            &mut stdout,
+            &mut stderr,
+            |mode, prepared| {
+                assert_eq!(mode, OpenMode::Normal);
+                assert!(matches!(prepared, PreparedCommand::Backup { .. }));
+                Ok(backup_outcome())
+            },
+        );
+        (status, stdout, stderr)
+    }
+
+    struct FailingWriter {
+        bytes: Vec<u8>,
+        remaining: usize,
+        error_kind: io::ErrorKind,
+        flush_fails: bool,
+    }
+
+    impl FailingWriter {
+        fn after(remaining: usize, error_kind: io::ErrorKind) -> Self {
+            Self {
+                bytes: Vec::new(),
+                remaining,
+                error_kind,
+                flush_fails: false,
+            }
+        }
+
+        fn on_flush() -> Self {
+            Self {
+                bytes: Vec::new(),
+                remaining: usize::MAX,
+                error_kind: io::ErrorKind::Other,
+                flush_fails: true,
+            }
+        }
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::from(self.error_kind));
+            }
+            let written = input.len().min(self.remaining);
+            self.bytes.extend_from_slice(&input[..written]);
+            self.remaining -= written;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.flush_fails {
+                Err(io::Error::from(self.error_kind))
+            } else {
+                Ok(())
+            }
+        }
     }
 
     #[test]
