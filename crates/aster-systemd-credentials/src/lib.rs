@@ -89,7 +89,7 @@ impl CredentialFileMetadata {
                 == rustix::fs::FileType::RegularFile,
             owner: stat.st_uid,
             mode: stat.st_mode & 0o7777,
-            links: stat.st_nlink,
+            links: u64::from(stat.st_nlink),
             device: stat.st_dev,
             inode: stat.st_ino,
             size: stat.st_size,
