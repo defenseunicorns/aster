@@ -86,3 +86,9 @@ RSS observations. These are small-run observations, not sizing evidence.
 - ZeroTier control sessions experienced intermittent high latency and SSH
   disconnects. Retried commands were bound by retained inputs and receipts;
   this is a test-harness reliability finding, not evidence of product data loss.
+- The carrier `identity.key` and Event `mesh.redb` share the configured state
+  directory. A whole-directory test reset regenerates carrier identities and
+  invalidates exact peer pins. Repeatable qualification must either preserve
+  `identity.key` while resetting only `mesh.redb`, or rerun initialization and
+  regenerate every affected peer pin. The final uncontaminated run used the
+  former procedure.
