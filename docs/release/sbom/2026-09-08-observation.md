@@ -2,6 +2,13 @@
 
 
 
+**Scope qualification added 2026-09-09:** these are historical evaluation
+artifacts. Their cargo-cyclonedx inventories include SQLite packages due to
+workspace feature unification; they are accepted as overinclusive inventories,
+not exact binary-composition evidence. The current [selected workflow](README.md)
+uses cargo-cyclonedx with an ordinary stable build. It does not require this
+observation's cargo-auditable setup or change the recorded artifact hashes.
+
 This records the accepted, bounded experiment behind the [workflow](README.md).
 It is not a fresh build of the MR base revision, release approval, or an
 attestation of source-to-binary identity. The build source revision and complete
@@ -35,7 +42,7 @@ Grant was researched but not installed or run.
 
 ## Retained artifact identities
 
-SHA-256 values for the accepted artifacts:
+SHA-256 values for the retained evaluation artifacts:
 
 | File | SHA-256 |
 |---|---|

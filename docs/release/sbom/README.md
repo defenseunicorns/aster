@@ -11,19 +11,43 @@ reproducible builds, provenance, signing, or release authorization. The
 [requirements status](../../implementation/requirements-status.md) retain
 their existing claim boundaries.
 
+## Selected approach
+
+Use **cargo-cyclonedx 0.5.9** to produce one CycloneDX 1.5 JSON document for
+`aster` and one for `aster-agent`, including declared licenses and dependency
+relationships. Keep the shared Cargo.lock unchanged.
+
+Accept the generator's **overinclusive Cargo dependency inventory** for this
+increment. Workspace feature unification can include packages that the selected
+executable build does not use. In the evaluated documents, `rusqlite` and
+`libsqlite3-sys` are present even though the selected node/agent compilation
+uses `aster-core` with `reference-session` and its redb storage path. Keep those
+entries rather than manually filtering the generated graph. SBOM component
+presence is not proof that its code is linked into the executable.
+
+Distribute this scope qualification with the SBOMs. Vulnerability findings for
+possibly unused components require artifact-specific triage; this is not a
+blanket exception for SQLite advisories. Recheck the build configuration when
+sources or features change. Other workspace consumers do use SQLite.
+
+The selected workflow uses stable Rust, ordinary `cargo build`, and an
+unmodified cargo-cyclonedx. Nightly precursor support and local generator or
+cargo-auditable patches are outside this workflow. Embedded `.dep-v0` metadata
+is not required to generate these CycloneDX documents.
+
 ## Scope and tools
 
 The evaluation target is Ubuntu 24.04 amd64, using Rust/Cargo 1.97.1 and
 `x86_64-unknown-linux-gnu`. This is an agreed build target, not a general
-platform-support claim. The observed host was Ubuntu 26.04; builds stayed in
-the Ubuntu 24.04 chroot. See the [dated observation](2026-09-08-observation.md).
+platform-support claim. The historical evaluation ran in an Ubuntu 24.04
+chroot on an Ubuntu 26.04 host and used cargo-auditable for its binaries. The stable plain-build commands
+below describe the selected workflow; they do not change the identities of
+those historical artifacts. See the [dated observation](2026-09-08-observation.md).
 
 | Tool | Evaluated version | Role |
 |---|---|---|
-| [cargo-auditable](https://github.com/rust-secure-code/cargo-auditable) | 0.7.5 | Embed dependency metadata in each executable |
 | [cargo-cyclonedx](https://github.com/CycloneDX/cyclonedx-rust-cargo) | 0.5.9 | Generate Cargo component/license/dependency SBOMs |
 | [CycloneDX Editor/Validator](https://github.com/Festo-se/cyclonedx-editor-validator) | 0.34.0 | Apply explicit pedigree data and validate CycloneDX schemas |
-| [cargo-audit](https://github.com/rustsec/rustsec/tree/main/cargo-audit) | Not retained in the observed run | Audit the executable's embedded data; record the version on future runs |
 
 Keep build tools in build-environment/provenance records, rather than adding
 them automatically to the delivered application's components. Installation is
@@ -37,7 +61,6 @@ Evaluated Cargo tool installation commands, inside the chroot as `builder`:
 ```bash
 . "$HOME/.cargo/env"
 export RUSTUP_TOOLCHAIN=1.97.1
-cargo install --locked --version 0.7.5 cargo-auditable
 cargo install --locked --version 0.5.9 cargo-cyclonedx
 ```
 
@@ -69,28 +92,26 @@ export RUSTUP_TOOLCHAIN=1.97.1
 cd /build/aster
 set -euo pipefail
 mkdir -p /build/logs /build/sbom
-export CARGO_TARGET_DIR=/build/target-auditable
+export CARGO_TARGET_DIR=/build/target-sbom
 export CARGO_INCREMENTAL=0
 
-cargo auditable build --frozen --release \
+cargo build --frozen --release \
     --target x86_64-unknown-linux-gnu \
     -p aster-node -p aster-agent \
     --bin aster --bin aster-agent \
-    2>&1 | tee /build/logs/auditable-build.log
+    2>&1 | tee /build/logs/build.log
 
 for name in aster aster-agent; do
     binary="$CARGO_TARGET_DIR/x86_64-unknown-linux-gnu/release/$name"
     sha256sum "$binary"
-    readelf -SW "$binary" | grep -F '.dep-v0'
     "$binary" --help
 done
 ```
 
 Default features are intentional. Do not add `--all-features` or enable
 `nearby-discovery`. Explicit `--bin` options avoid unrelated/demo executables.
-The release profile strips symbols; `.dep-v0` survived in the observed run.
-Section presence and `--help` are metadata/smoke checks, not node functional
-tests or proof of bit-for-bit reproducibility.
+Record the binary SHA-256 values with the generated documents. `--help` is a
+smoke check, not a node functional test or proof of bit-for-bit reproducibility.
 
 ## Generate a Cargo SBOM for each executable
 
@@ -190,31 +211,29 @@ archive beside the edited SBOMs. In the evaluated editor invocation,
 This limitation is retained in the observation. For future set-lists include
 all references that must survive; do not assume array append behavior.
 
-## Audit the correct binaries
+## Deliver and interpret the SBOMs
 
-Use explicit paths; `/build/aster/target/...` can contain older, non-auditable
-binaries. With an operator-provisioned `cargo-audit` supporting `bin`:
+Retain each executable, its corresponding CycloneDX document, checksums,
+source revision/local-change record, Cargo.lock hash, tool versions, and build
+and generation logs together. Include the inventory qualification above and
+any source archive referenced by patch pedigree. Do not relabel a previous
+build's checksums or SBOM as belonging to a fresh build.
 
-```bash
-cargo audit --version
-cargo audit bin \
-    /build/target-auditable/x86_64-unknown-linux-gnu/release/aster \
-    /build/target-auditable/x86_64-unknown-linux-gnu/release/aster-agent
-```
-
-This may update RustSec and the crates.io index. Use approved network access;
-record the advisory-db revision, time, audit version, output and exit status.
-Do not reuse a past "no advisories reported" result as current assurance.
-`yanked` warnings do not by themselves establish a vulnerability.
+License fields contain the declarations from each package's manifest. A full
+license-notice bundle and review of native/toolchain licenses remain separate
+release work. Use the [historical observation](2026-09-08-observation.md) only
+for its dated results, including its optional binary-audit experiment; it is
+not a current vulnerability scan.
 
 ## Remaining release work
 
 - Build-only crates/procedural macros can appear as `required`. Presence in
-  the Cargo SBOM is not proof their code is shipped. Stable auditable metadata
-  also has Cargo-metadata limitations; it is not a post-LTO inventory.
+  the Cargo SBOM is not proof their code is shipped. The accepted overinclusive
+  inventory is not a post-LTO analysis of binary composition.
 - Separately establish coverage of statically included Rust standard-library
   and native code. A `*-sys` crate version is not its native-library version.
-  No SQLite defect or inclusion in these executables was established here.
+  The listed SQLite crates must not be treated as evidence of native SQLite
+  linkage in these selected executables.
 - External system glibc is outside these unpackaged executable inventories;
   record runtime requirements separately. A concrete runtime-container SBOM
   includes installed system packages and their exact versions.
