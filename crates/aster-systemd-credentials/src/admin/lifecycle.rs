@@ -502,9 +502,45 @@ fn retained_manifest(
                 .generations
                 .iter()
                 .find(|record| record.state == state)
+                .or_else(|| {
+                    // Once Active is destroyed its latest generation remains
+                    // the exact Active tombstone while Previous is removed.
+                    // Historical ledger-only tombstones are never candidates.
+                    if intent.kind != LifecycleIntentKind::DestroyPrevious
+                        || state != GenerationState::Active
+                    {
+                        return None;
+                    }
+                    ledger
+                        .generations
+                        .iter()
+                        .max_by_key(|record| record.generation)
+                        .filter(|record| record.state == GenerationState::Destroyed)
+                })
                 .map(manifest_from_record)
         })
         .flatten()
+}
+
+pub(super) fn validate_retained_before_staging(
+    provisioning_root: &OwnedFd,
+    ledger: &ProviderLedger,
+) -> Result<(), ProvisioningSecretStoreError> {
+    let intent = ledger
+        .intent
+        .as_ref()
+        .ok_or(ProvisioningSecretStoreError::Rejected)?;
+    for (slot, state) in [
+        (ACTIVE_DIRECTORY, GenerationState::Active),
+        (PREVIOUS_DIRECTORY, GenerationState::Previous),
+    ] {
+        if let Some(manifest) = retained_manifest(ledger, intent, state)
+            && !generation_matches(provisioning_root, slot, &manifest)?
+        {
+            return Err(ProvisioningSecretStoreError::Rejected);
+        }
+    }
+    Ok(())
 }
 
 fn inspect_slot(
@@ -861,7 +897,9 @@ pub(super) fn write_staged_tombstone(
     let reference = Zeroizing::new(manifest.secret_ref.to_bytes());
     let encoded_manifest = Zeroizing::new(encode_manifest(manifest));
     write_new_file(&staged, REFERENCE_FILE, &reference)?;
+    faults.hit(FaultPoint::StageReferenceSynced)?;
     write_new_file(&staged, MANIFEST_FILE, &encoded_manifest)?;
+    faults.hit(FaultPoint::StageManifestSynced)?;
     write_new_file(&staged, TOMBSTONE_FILE, &[])?;
     faults.hit(FaultPoint::StagedTombstoneSynced)?;
     sync_directory(&staged)?;
@@ -1075,6 +1113,1224 @@ mod tests {
     use zeroize::Zeroizing;
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn destroy_public_active_and_previous_commit_exact_tombstones_and_retry_bindings() {
+        // Break caught: the public destroy capability acknowledges before exact
+        // source removal, drops its operation binding, or destroys the other slot.
+        use aster_mesh::{ProvisioningDestroyDisposition, ProvisioningSecretDestroyer};
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for previous in [false, true] {
+            let fixture = AdminLifecycleFixture::new();
+            fixture.install_once();
+            fixture
+                .admin()
+                .unwrap()
+                .rotate(
+                    ProvisioningInstallId::new([0x61; 32]),
+                    ProvisioningLoadId::new([0x62; 32]),
+                    fixture.alternate_bundle(),
+                )
+                .unwrap();
+            let before = read_fixture_ledger(&fixture);
+            let index = usize::from(!previous);
+            let target = &before.generations[index];
+            let retained = &before.generations[1 - index];
+            let slot = if previous { "previous" } else { "active" };
+            let other_slot = if previous { "active" } else { "previous" };
+            let ciphertext =
+                fs::read(fixture.provisioning.join(slot).join("credential.cred")).unwrap();
+            let other = fs::read(
+                fixture
+                    .provisioning
+                    .join(other_slot)
+                    .join("credential.cred"),
+            )
+            .unwrap();
+            let operation = ProvisioningDestroyId::new([0x81; 32]);
+            let receipt = ProvisioningSecretDestroyer::destroy(
+                &mut fixture.admin().unwrap(),
+                operation,
+                &target.secret_ref,
+            )
+            .unwrap();
+            assert_eq!(
+                receipt.disposition(),
+                ProvisioningDestroyDisposition::Destroyed
+            );
+            assert_eq!(receipt.operation(), operation);
+            assert_eq!(receipt.secret_ref(), &target.secret_ref);
+            assert!(!receipt.claims_physical_media_erasure());
+            assert!(
+                !provisioning_bytes(&fixture.provisioning)
+                    .iter()
+                    .any(|(_, bytes)| bytes == &ciphertext)
+            );
+            assert_eq!(
+                fs::read(
+                    fixture
+                        .provisioning
+                        .join(other_slot)
+                        .join("credential.cred")
+                )
+                .unwrap(),
+                other
+            );
+            assert!(!fixture.provisioning.join("previous").exists() || !previous);
+            if !previous {
+                assert!(fixture.provisioning.join("active/tombstone").is_file());
+                assert!(!fixture.provisioning.join("active/credential.cred").exists());
+            }
+            let after = read_fixture_ledger(&fixture);
+            assert!(after.intent.is_none());
+            assert_eq!(after.generations[index].state, GenerationState::Destroyed);
+            assert_eq!(after.generations[index].ciphertext_digest, [0; 32]);
+            assert_eq!(&after.generations[1 - index], retained);
+            assert_eq!(after.destroys.len(), 1);
+            assert_eq!(
+                fixture
+                    .admin()
+                    .unwrap()
+                    .destroy(operation, &target.secret_ref)
+                    .unwrap()
+                    .disposition(),
+                ProvisioningDestroyDisposition::AlreadyDestroyed
+            );
+            assert_eq!(
+                fixture
+                    .admin()
+                    .unwrap()
+                    .destroy(operation, &retained.secret_ref)
+                    .unwrap_err(),
+                ProvisioningSecretStoreError::OperationConflict
+            );
+            assert_eq!(
+                fixture
+                    .admin()
+                    .unwrap()
+                    .destroy(ProvisioningDestroyId::new([0x82; 32]), &target.secret_ref)
+                    .unwrap()
+                    .disposition(),
+                ProvisioningDestroyDisposition::AlreadyDestroyed
+            );
+            assert_eq!(read_fixture_ledger(&fixture).destroys.len(), 2);
+            assert_eq!(fixture.encrypt_calls(), 2);
+            if previous {
+                let next = fixture
+                    .admin()
+                    .unwrap()
+                    .rotate(
+                        ProvisioningInstallId::new([0x71; 32]),
+                        ProvisioningLoadId::new([0x72; 32]),
+                        fixture.bundle(),
+                    )
+                    .unwrap();
+                assert_eq!(provider_generation(next.secret_ref()).unwrap(), 3);
+            }
+        }
+    }
+
+    #[test]
+    fn destroy_unknown_reference_permanently_binds_not_found_without_a_tombstone() {
+        // Break caught: an unknown reference is acknowledged as destroyed or a
+        // retry reuses its operation for a different, live reference.
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fixture = AdminLifecycleFixture::new();
+        fixture.install_once();
+        let before = read_fixture_ledger(&fixture);
+        let namespace = provisioning_bytes(&fixture.provisioning);
+        let unknown = provisioning_secret_ref(4, [0xe1; PROVIDER_REFERENCE_ID_BYTES]).unwrap();
+        let operation = ProvisioningDestroyId::new([0x81; 32]);
+        for _ in 0..2 {
+            assert_eq!(
+                fixture
+                    .admin()
+                    .unwrap()
+                    .destroy(operation, &unknown)
+                    .unwrap_err(),
+                ProvisioningSecretStoreError::NotFound
+            );
+        }
+        let after = read_fixture_ledger(&fixture);
+        assert_eq!(after.generations, before.generations);
+        assert_eq!(
+            after.destroys,
+            vec![DestroyBinding {
+                operation,
+                secret_ref: unknown,
+                generation: 4,
+                outcome: DestroyBindingOutcome::NotFound
+            }]
+        );
+        assert_eq!(
+            fixture
+                .admin()
+                .unwrap()
+                .destroy(operation, &before.generations[0].secret_ref)
+                .unwrap_err(),
+            ProvisioningSecretStoreError::OperationConflict
+        );
+        assert_eq!(provisioning_bytes(&fixture.provisioning), namespace);
+    }
+
+    #[test]
+    fn destroy_exact_retry_replays_completed_ledger_parent_sync_before_outcome() {
+        // Break caught: CompleteRenamed can leave a completed ledger visible
+        // without a durable rename; exact retry must synchronize before output.
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for unknown in [false, true] {
+            let fixture = AdminLifecycleFixture::new();
+            fixture.install_once();
+            let target = if unknown {
+                provisioning_secret_ref(4, [0xe1; PROVIDER_REFERENCE_ID_BYTES]).unwrap()
+            } else {
+                read_fixture_ledger(&fixture).generations[0]
+                    .secret_ref
+                    .clone()
+            };
+            let operation = ProvisioningDestroyId::new([0x81; 32]);
+            assert_eq!(
+                fixture
+                    .admin_with_fault(FaultPoint::CompleteRenamed)
+                    .unwrap()
+                    .destroy(operation, &target)
+                    .unwrap_err(),
+                ProvisioningSecretStoreError::Unavailable
+            );
+            let before = fixture.namespace_bytes();
+            assert_eq!(
+                fixture
+                    .admin_with_fault(FaultPoint::CompletedLedgerParentSynced)
+                    .and_then(|mut admin| admin.destroy(operation, &target))
+                    .unwrap_err(),
+                ProvisioningSecretStoreError::Unavailable
+            );
+            assert_eq!(fixture.namespace_bytes(), before);
+            let result = fixture.admin().unwrap().destroy(operation, &target);
+            if unknown {
+                assert_eq!(result.unwrap_err(), ProvisioningSecretStoreError::NotFound);
+            } else {
+                assert_eq!(
+                    result.unwrap().disposition(),
+                    aster_mesh::ProvisioningDestroyDisposition::AlreadyDestroyed
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn completed_open_replays_ledger_parent_before_install_backup_or_destroyed_outcomes() {
+        // Break caught: a visible completed rename is treated as a durable
+        // install/backup/tombstone operation before its ledger parent is synced.
+        use crate::admin::BackupOperationId;
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for case in 0..3 {
+            let fixture = AdminLifecycleFixture::new();
+            let install = ProvisioningInstallId::new([0x11; 32]);
+            let load = ProvisioningLoadId::new([0x22; 32]);
+            if case == 0 {
+                assert_eq!(
+                    fixture
+                        .admin_with_fault(FaultPoint::CompleteRenamed)
+                        .unwrap()
+                        .install(install, load, fixture.bundle())
+                        .unwrap_err(),
+                    ProvisioningSecretStoreError::Unavailable
+                );
+            } else {
+                fixture.install_once();
+            }
+            if case == 1 {
+                assert_eq!(
+                    fixture
+                        .admin_with_fault(FaultPoint::CompleteRenamed)
+                        .unwrap()
+                        .backup(BackupOperationId::new([0x91; 32]))
+                        .unwrap_err(),
+                    ProvisioningSecretStoreError::Unavailable
+                );
+            }
+            if case == 2 {
+                let target = read_fixture_ledger(&fixture).generations[0]
+                    .secret_ref
+                    .clone();
+                assert_eq!(
+                    fixture
+                        .admin_with_fault(FaultPoint::CompleteRenamed)
+                        .unwrap()
+                        .destroy(ProvisioningDestroyId::new([0x81; 32]), &target)
+                        .unwrap_err(),
+                    ProvisioningSecretStoreError::Unavailable
+                );
+            }
+            let before = fixture.namespace_bytes();
+            let result = fixture
+                .admin_with_fault(FaultPoint::CompletedLedgerParentSynced)
+                .and_then(|mut admin| {
+                    if case == 1 {
+                        admin.backup(BackupOperationId::new([0x91; 32])).map(|_| ())
+                    } else {
+                        admin.install(install, load, fixture.bundle()).map(|_| ())
+                    }
+                });
+            assert_eq!(
+                result.unwrap_err(),
+                ProvisioningSecretStoreError::Unavailable,
+                "{case}"
+            );
+            assert_eq!(fixture.namespace_bytes(), before);
+            let mut admin = fixture.admin().unwrap();
+            if case == 1 {
+                admin.backup(BackupOperationId::new([0x91; 32])).unwrap();
+            } else if case == 2 {
+                assert_eq!(
+                    admin.install(install, load, fixture.bundle()).unwrap_err(),
+                    ProvisioningSecretStoreError::Destroyed
+                );
+            } else {
+                assert_eq!(
+                    admin
+                        .install(install, load, fixture.bundle())
+                        .unwrap()
+                        .disposition(),
+                    ProvisioningInstallDisposition::Existing
+                );
+            }
+            assert_eq!(fixture.encrypt_calls(), 1);
+        }
+    }
+
+    #[test]
+    fn completed_same_admin_retry_replays_parent_before_all_existing_outcomes() {
+        // Break caught: keeping an admin after CompleteRenamed can bypass the
+        // fresh-open durability replay and expose an unsynchronized operation.
+        use crate::admin::{BackupOperationId, RecoveryOperationId};
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for case in 0..6 {
+            let fixture = AdminLifecycleFixture::new();
+            if case != 0 {
+                fixture.install_once();
+            }
+            let backup = if case == 4 {
+                Some(
+                    fixture
+                        .admin()
+                        .unwrap()
+                        .backup(BackupOperationId::new([0x91; 32]))
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let target = if case == 2 {
+                read_fixture_ledger(&fixture).generations[0]
+                    .secret_ref
+                    .clone()
+            } else {
+                provisioning_secret_ref(4, [0xe1; PROVIDER_REFERENCE_ID_BYTES]).unwrap()
+            };
+            let mut admin = fixture
+                .admin_with_fault(FaultPoint::CompleteRenamed)
+                .unwrap();
+            let invoke =
+                |admin: &mut SystemdCredentialAdmin| -> Result<(), ProvisioningSecretStoreError> {
+                    match case {
+                        0 => admin
+                            .install(
+                                ProvisioningInstallId::new([0x11; 32]),
+                                ProvisioningLoadId::new([0x22; 32]),
+                                fixture.bundle(),
+                            )
+                            .map(|_| ()),
+                        1 => admin.backup(BackupOperationId::new([0x91; 32])).map(|_| ()),
+                        2 | 3 => admin
+                            .destroy(ProvisioningDestroyId::new([0x81; 32]), &target)
+                            .map(|_| ()),
+                        4 => admin
+                            .recover(
+                                RecoveryOperationId::new([0x92; 32]),
+                                backup.as_ref().unwrap().artifact(),
+                            )
+                            .map(|_| ()),
+                        5 => admin
+                            .rotate(
+                                ProvisioningInstallId::new([0x61; 32]),
+                                ProvisioningLoadId::new([0x62; 32]),
+                                fixture.bundle(),
+                            )
+                            .map(|_| ()),
+                        _ => unreachable!(),
+                    }
+                };
+            assert_eq!(
+                invoke(&mut admin).unwrap_err(),
+                ProvisioningSecretStoreError::Unavailable
+            );
+            let before = fixture.namespace_bytes();
+            admin.faults = FaultInjector::at(FaultPoint::CompletedLedgerParentSynced);
+            assert_eq!(
+                invoke(&mut admin).unwrap_err(),
+                ProvisioningSecretStoreError::Unavailable,
+                "{case}"
+            );
+            assert_eq!(fixture.namespace_bytes(), before);
+            let retry = invoke(&mut admin);
+            if case == 3 {
+                assert_eq!(retry.unwrap_err(), ProvisioningSecretStoreError::NotFound);
+            } else {
+                retry.unwrap();
+            }
+            assert_eq!(fixture.namespace_bytes(), before);
+            assert_eq!(fixture.encrypt_calls(), if case == 5 { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn destroy_ledger_only_completion_crashes_reopen_to_exact_bound_outcome() {
+        // Break caught: a NotFound/AlreadyDestroyed binding is lost at pending
+        // publication or replaced by a second write from the interrupted admin.
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for destroyed in [false, true] {
+            for point in [
+                FaultPoint::CompleteFileSynced,
+                FaultPoint::CompleteRenamed,
+                FaultPoint::CompleteParentSynced,
+            ] {
+                let fixture = AdminLifecycleFixture::new();
+                fixture.install_once();
+                let target = if destroyed {
+                    let target = read_fixture_ledger(&fixture).generations[0]
+                        .secret_ref
+                        .clone();
+                    fixture
+                        .admin()
+                        .unwrap()
+                        .destroy(ProvisioningDestroyId::new([0x80; 32]), &target)
+                        .unwrap();
+                    target
+                } else {
+                    provisioning_secret_ref(4, [0xe1; PROVIDER_REFERENCE_ID_BYTES]).unwrap()
+                };
+                let operation = ProvisioningDestroyId::new([0x81; 32]);
+                let namespace = provisioning_bytes(&fixture.provisioning);
+                let mut admin = fixture.admin_with_fault(point).unwrap();
+                assert_eq!(
+                    admin.destroy(operation, &target).unwrap_err(),
+                    ProvisioningSecretStoreError::Unavailable,
+                    "{point:?}"
+                );
+                if point == FaultPoint::CompleteFileSynced {
+                    assert_eq!(
+                        admin
+                            .destroy(ProvisioningDestroyId::new([0x82; 32]), &target)
+                            .unwrap_err(),
+                        ProvisioningSecretStoreError::Rejected
+                    );
+                }
+                drop(admin);
+                let mut fresh = fixture.admin().unwrap();
+                let result = fresh.destroy(operation, &target);
+                if destroyed {
+                    assert_eq!(
+                        result.unwrap().disposition(),
+                        aster_mesh::ProvisioningDestroyDisposition::AlreadyDestroyed
+                    );
+                } else {
+                    assert_eq!(result.unwrap_err(), ProvisioningSecretStoreError::NotFound);
+                }
+                assert_eq!(
+                    read_fixture_ledger(&fixture).destroys.len(),
+                    if destroyed { 2 } else { 1 }
+                );
+                assert!(!fixture.ledger.join("ledger.next").exists());
+                assert_eq!(provisioning_bytes(&fixture.provisioning), namespace);
+            }
+        }
+    }
+
+    #[test]
+    fn destroy_pending_completion_replays_file_durability_before_publication() {
+        // Break caught: a fully written but unsynced ledger-only destroy binding
+        // can be published without replaying its own file synchronization.
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for destroyed in [false, true] {
+            for point in [
+                FaultPoint::PendingLedgerFileSyncFailed,
+                FaultPoint::PendingLedgerFileSynced,
+                FaultPoint::IntentRenamed,
+                FaultPoint::IntentParentSynced,
+            ] {
+                let fixture = AdminLifecycleFixture::new();
+                fixture.install_once();
+                let target = if destroyed {
+                    let target = read_fixture_ledger(&fixture).generations[0]
+                        .secret_ref
+                        .clone();
+                    fixture
+                        .admin()
+                        .unwrap()
+                        .destroy(ProvisioningDestroyId::new([0x80; 32]), &target)
+                        .unwrap();
+                    target
+                } else {
+                    provisioning_secret_ref(4, [0xe1; PROVIDER_REFERENCE_ID_BYTES]).unwrap()
+                };
+                let predecessor = read_fixture_ledger(&fixture);
+                let mut pending = predecessor.clone();
+                let operation = ProvisioningDestroyId::new([0x81; 32]);
+                pending.destroys.push(DestroyBinding {
+                    operation,
+                    secret_ref: target.clone(),
+                    generation: provider_generation(&target).unwrap(),
+                    outcome: if destroyed {
+                        DestroyBindingOutcome::Destroyed
+                    } else {
+                        DestroyBindingOutcome::NotFound
+                    },
+                });
+                // Fixture write deliberately has no file or parent fsync.
+                fixture.write_pending_ledger(&pending);
+                let before = fixture.namespace_bytes();
+                assert_eq!(
+                    fixture.admin_with_fault(point).unwrap_err(),
+                    ProvisioningSecretStoreError::Unavailable,
+                    "{point:?}"
+                );
+                if matches!(
+                    point,
+                    FaultPoint::PendingLedgerFileSyncFailed | FaultPoint::PendingLedgerFileSynced
+                ) {
+                    assert_eq!(fixture.namespace_bytes(), before);
+                    assert_eq!(read_fixture_ledger(&fixture), predecessor);
+                    // A second interruption cannot consume or rewrite the pending binding.
+                    assert_eq!(
+                        fixture.admin_with_fault(point).unwrap_err(),
+                        ProvisioningSecretStoreError::Unavailable
+                    );
+                    assert_eq!(fixture.namespace_bytes(), before);
+                } else {
+                    assert_eq!(read_fixture_ledger(&fixture), pending);
+                }
+                let mut admin = fixture.admin().unwrap();
+                if destroyed {
+                    admin.destroy(operation, &target).unwrap();
+                } else {
+                    assert_eq!(
+                        admin.destroy(operation, &target).unwrap_err(),
+                        ProvisioningSecretStoreError::NotFound
+                    );
+                }
+                assert_eq!(read_fixture_ledger(&fixture), pending);
+                assert!(!fixture.ledger.join("ledger.next").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn destroy_pending_completion_rejects_unbound_or_rewritten_state_without_mutation() {
+        // Break caught: treating any DestroyBinding append as authority can
+        // destroy a live generation, rewrite unrelated history, or skip slots.
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for case in 0..8 {
+            let fixture = AdminLifecycleFixture::new();
+            fixture.install_once();
+            let predecessor = read_fixture_ledger(&fixture);
+            let mut pending = predecessor.clone();
+            pending.destroys.push(DestroyBinding {
+                operation: ProvisioningDestroyId::new([0x81; 32]),
+                secret_ref: provisioning_secret_ref(4, [0xe1; PROVIDER_REFERENCE_ID_BYTES])
+                    .unwrap(),
+                generation: 4,
+                outcome: DestroyBindingOutcome::NotFound,
+            });
+            match case {
+                0 => {
+                    let mut extra = pending.destroys[0].clone();
+                    extra.operation = ProvisioningDestroyId::new([0x82; 32]);
+                    pending.destroys.push(extra);
+                }
+                1 => pending.generations[0].envelope_commitment[0] ^= 1,
+                2 => pending.host_key_identity[0] ^= 1,
+                3 => {
+                    pending.generations[0].state = GenerationState::Destroyed;
+                    pending.generations[0].ciphertext_digest = [0; 32];
+                    pending.destroys[0].secret_ref = pending.generations[0].secret_ref.clone();
+                    pending.destroys[0].generation = 1;
+                    pending.destroys[0].outcome = DestroyBindingOutcome::Destroyed;
+                }
+                4..=7 => {}
+                _ => unreachable!(),
+            }
+            fixture.write_pending_ledger(&pending);
+            if case == 4 {
+                let path = fixture.ledger.join("ledger.next");
+                let mut bytes = fs::read(&path).unwrap();
+                bytes.push(0);
+                fs::write(path, bytes).unwrap();
+            }
+            if case == 5 {
+                // Corrupt a retained slot; valid pending metadata cannot hide it.
+                fs::write(
+                    fixture.provisioning.join("active/credential.cred"),
+                    b"corrupt",
+                )
+                .unwrap();
+            }
+            if case == 6 || case == 7 {
+                let path = fixture.ledger.join("ledger.next");
+                let mut bytes = fs::read(&path).unwrap();
+                // The appended destroy is the final record. Change its outcome
+                // or reference generation without repairing any other binding.
+                let destroy_start = encode_ledger(&predecessor).unwrap().len();
+                if case == 6 {
+                    bytes[destroy_start] = 1;
+                } else {
+                    bytes[destroy_start + 43] ^= 1;
+                }
+                fs::write(path, bytes).unwrap();
+            }
+            let before = fixture.namespace_bytes();
+            assert_eq!(
+                fixture.admin().unwrap_err(),
+                ProvisioningSecretStoreError::Rejected,
+                "{case}"
+            );
+            assert_eq!(fixture.namespace_bytes(), before);
+        }
+    }
+
+    #[test]
+    fn destroy_pre_intent_tombstone_faults_preserve_old_runtime_and_unbound_evidence() {
+        // Break caught: an unsafely unbound tombstone can activate, be silently
+        // deleted, or lack an injectable reference/manifest durability boundary.
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for previous in [false, true] {
+            for point in [
+                FaultPoint::StageReferenceSynced,
+                FaultPoint::StageManifestSynced,
+                FaultPoint::StagedTombstoneSynced,
+                FaultPoint::StageDirectorySynced,
+                FaultPoint::StageParentSynced,
+            ] {
+                let fixture = AdminLifecycleFixture::new();
+                fixture.install_once();
+                if previous {
+                    fixture
+                        .admin()
+                        .unwrap()
+                        .rotate(
+                            ProvisioningInstallId::new([0x61; 32]),
+                            ProvisioningLoadId::new([0x62; 32]),
+                            fixture.bundle(),
+                        )
+                        .unwrap();
+                }
+                let before = read_fixture_ledger(&fixture);
+                let target = &before.generations[0];
+                let active = before.generations.last().unwrap();
+                let active_bytes =
+                    fs::read(fixture.provisioning.join("active/credential.cred")).unwrap();
+                assert_eq!(
+                    fixture
+                        .admin_with_fault(point)
+                        .unwrap()
+                        .destroy(ProvisioningDestroyId::new([0x81; 32]), &target.secret_ref)
+                        .unwrap_err(),
+                    ProvisioningSecretStoreError::Unavailable,
+                    "{point:?}"
+                );
+                assert_eq!(read_fixture_ledger(&fixture), before);
+                assert_eq!(
+                    fs::read(fixture.provisioning.join("active/credential.cred")).unwrap(),
+                    active_bytes
+                );
+                let interrupted = fixture.namespace_bytes();
+                assert_eq!(
+                    fixture.admin().unwrap_err(),
+                    ProvisioningSecretStoreError::Rejected
+                );
+                assert_eq!(fixture.namespace_bytes(), interrupted);
+                fixture.assert_active_runtime_loads(
+                    active.load,
+                    &active.secret_ref,
+                    fixture.bundle(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn destroy_public_crashes_reopen_at_every_intent_exchange_cleanup_and_completion_boundary() {
+        // Break caught: public intent construction or receipt ordering differs
+        // from the synthetic engine and leaves a credential behind on restart.
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for previous in [false, true] {
+            for point in [
+                FaultPoint::IntentFileSynced,
+                FaultPoint::IntentRenamed,
+                FaultPoint::IntentParentSynced,
+                if previous {
+                    FaultPoint::PreviousExchanged
+                } else {
+                    FaultPoint::ActiveExchanged
+                },
+                FaultPoint::CleanupGenerationRenamed,
+                FaultPoint::CleanupParentSynced,
+                FaultPoint::CleanupContentDeleted,
+                FaultPoint::CleanupReferenceDeleted,
+                FaultPoint::CleanupManifestDeleted,
+                FaultPoint::CleanupContentsDeleted,
+                FaultPoint::CleanupDirectoryDeleted,
+                FaultPoint::CleanupRemovalParentSynced,
+                FaultPoint::ReplacedGenerationDeleted,
+                FaultPoint::ProvisioningParentSynced,
+                FaultPoint::CompleteFileSynced,
+                FaultPoint::CompleteRenamed,
+                FaultPoint::CompleteParentSynced,
+            ] {
+                let fixture = AdminLifecycleFixture::new();
+                fixture.install_once();
+                fixture
+                    .admin()
+                    .unwrap()
+                    .rotate(
+                        ProvisioningInstallId::new([0x61; 32]),
+                        ProvisioningLoadId::new([0x62; 32]),
+                        fixture.bundle(),
+                    )
+                    .unwrap();
+                let before = read_fixture_ledger(&fixture);
+                let index = usize::from(!previous);
+                let target = &before.generations[index];
+                let target_slot = if previous { "previous" } else { "active" };
+                let retained_slot = if previous { "active" } else { "previous" };
+                let ciphertext = fs::read(
+                    fixture
+                        .provisioning
+                        .join(target_slot)
+                        .join("credential.cred"),
+                )
+                .unwrap();
+                let retained = fs::read(
+                    fixture
+                        .provisioning
+                        .join(retained_slot)
+                        .join("credential.cred"),
+                )
+                .unwrap();
+                let operation = ProvisioningDestroyId::new([0x81; 32]);
+                assert_eq!(
+                    fixture
+                        .admin_with_fault(point)
+                        .unwrap()
+                        .destroy(operation, &target.secret_ref)
+                        .unwrap_err(),
+                    ProvisioningSecretStoreError::Unavailable,
+                    "{previous}/{point:?}"
+                );
+                let interrupted = read_fixture_ledger(&fixture);
+                if point == FaultPoint::IntentFileSynced {
+                    assert_eq!(interrupted, before);
+                } else if matches!(
+                    point,
+                    FaultPoint::CompleteRenamed | FaultPoint::CompleteParentSynced
+                ) {
+                    assert!(interrupted.intent.is_none());
+                    assert_eq!(
+                        interrupted.generations[index].state,
+                        GenerationState::Destroyed
+                    );
+                } else {
+                    assert!(interrupted.intent.is_some(), "{point:?}");
+                }
+                let mut admin = fixture
+                    .admin()
+                    .unwrap_or_else(|error| panic!("reopen {previous}/{point:?}: {error:?}"));
+                let receipt = admin.destroy(operation, &target.secret_ref).unwrap();
+                assert_eq!(
+                    receipt.disposition(),
+                    aster_mesh::ProvisioningDestroyDisposition::AlreadyDestroyed
+                );
+                assert_eq!(receipt.secret_ref(), &target.secret_ref);
+                assert!(
+                    !provisioning_bytes(&fixture.provisioning)
+                        .iter()
+                        .any(|(_, bytes)| bytes == &ciphertext)
+                );
+                assert_eq!(
+                    fs::read(
+                        fixture
+                            .provisioning
+                            .join(retained_slot)
+                            .join("credential.cred")
+                    )
+                    .unwrap(),
+                    retained
+                );
+                assert!(!fixture.provisioning.join("staged").exists());
+                assert!(!fixture.provisioning.join("cleanup").exists());
+                assert!(!fixture.ledger.join("ledger.next").exists());
+                assert_eq!(read_fixture_ledger(&fixture).destroys.len(), 1);
+                if previous {
+                    assert!(!fixture.provisioning.join("previous").exists());
+                } else {
+                    assert!(fixture.provisioning.join("active/tombstone").is_file());
+                }
+                assert_eq!(fixture.encrypt_calls(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn destroy_repeated_pending_intent_and_stage_replay_crashes_converge() {
+        // Break caught: a pending destroy intent advances the filesystem before
+        // durable publication or loses identity across a second interruption.
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for previous in [false, true] {
+            for point in [
+                FaultPoint::PendingLedgerFileSyncFailed,
+                FaultPoint::PendingLedgerFileSynced,
+                FaultPoint::IntentRenamed,
+                FaultPoint::IntentParentSynced,
+                FaultPoint::IntentParentReplayed,
+                FaultPoint::StageDirectorySynced,
+                FaultPoint::StageParentSynced,
+                FaultPoint::CompleteFileSynced,
+            ] {
+                let fixture = AdminLifecycleFixture::new();
+                fixture.install_once();
+                if previous {
+                    fixture
+                        .admin()
+                        .unwrap()
+                        .rotate(
+                            ProvisioningInstallId::new([0x61; 32]),
+                            ProvisioningLoadId::new([0x62; 32]),
+                            fixture.bundle(),
+                        )
+                        .unwrap();
+                }
+                let target = read_fixture_ledger(&fixture).generations[0]
+                    .secret_ref
+                    .clone();
+                let operation = ProvisioningDestroyId::new([0x81; 32]);
+                assert_eq!(
+                    fixture
+                        .admin_with_fault(FaultPoint::IntentFileSynced)
+                        .unwrap()
+                        .destroy(operation, &target)
+                        .unwrap_err(),
+                    ProvisioningSecretStoreError::Unavailable
+                );
+                let provisioning = provisioning_bytes(&fixture.provisioning);
+                assert_eq!(
+                    fixture.admin_with_fault(point).unwrap_err(),
+                    ProvisioningSecretStoreError::Unavailable,
+                    "{point:?}"
+                );
+                if point != FaultPoint::CompleteFileSynced {
+                    assert_eq!(provisioning_bytes(&fixture.provisioning), provisioning);
+                }
+                assert_eq!(
+                    fixture
+                        .admin_with_fault(FaultPoint::IntentParentReplayed)
+                        .unwrap_err(),
+                    ProvisioningSecretStoreError::Unavailable
+                );
+                let mut admin = fixture.admin().unwrap();
+                assert_eq!(
+                    admin.destroy(operation, &target).unwrap().disposition(),
+                    aster_mesh::ProvisioningDestroyDisposition::AlreadyDestroyed
+                );
+                assert_eq!(read_fixture_ledger(&fixture).destroys.len(), 1);
+                assert!(!fixture.provisioning.join("staged").exists());
+                assert!(!fixture.provisioning.join("cleanup").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn destroy_previous_tombstone_cleanup_survives_each_second_cleanup_boundary() {
+        // Break caught: the Previous tombstone's second cleanup is not covered
+        // by the first (credential) cleanup's identical fault point names.
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for point in [
+            FaultPoint::CleanupGenerationRenamed,
+            FaultPoint::CleanupParentSynced,
+            FaultPoint::CleanupContentDeleted,
+            FaultPoint::CleanupReferenceDeleted,
+            FaultPoint::CleanupManifestDeleted,
+            FaultPoint::CleanupContentsDeleted,
+            FaultPoint::CleanupDirectoryDeleted,
+            FaultPoint::ReplacedGenerationDeleted,
+            FaultPoint::CleanupRemovalParentSynced,
+            FaultPoint::ProvisioningParentSynced,
+        ] {
+            let fixture = AdminLifecycleFixture::new();
+            fixture.install_once();
+            fixture
+                .admin()
+                .unwrap()
+                .rotate(
+                    ProvisioningInstallId::new([0x61; 32]),
+                    ProvisioningLoadId::new([0x62; 32]),
+                    fixture.bundle(),
+                )
+                .unwrap();
+            let target = read_fixture_ledger(&fixture).generations[0]
+                .secret_ref
+                .clone();
+            let operation = ProvisioningDestroyId::new([0x81; 32]);
+            assert_eq!(
+                fixture
+                    .admin_with_fault(FaultPoint::ReplacedGenerationDeleted)
+                    .unwrap()
+                    .destroy(operation, &target)
+                    .unwrap_err(),
+                ProvisioningSecretStoreError::Unavailable
+            );
+            assert!(!fixture.provisioning.join("cleanup").exists());
+            assert!(fixture.provisioning.join("previous/tombstone").exists());
+            let active = fs::read(fixture.provisioning.join("active/credential.cred")).unwrap();
+            assert_eq!(
+                fixture.admin_with_fault(point).unwrap_err(),
+                ProvisioningSecretStoreError::Unavailable,
+                "{point:?}"
+            );
+            assert_eq!(
+                fixture
+                    .admin_with_fault(FaultPoint::IntentParentReplayed)
+                    .unwrap_err(),
+                ProvisioningSecretStoreError::Unavailable
+            );
+            let mut admin = fixture.admin().unwrap();
+            admin.destroy(operation, &target).unwrap();
+            assert!(!fixture.provisioning.join("previous").exists());
+            assert!(!fixture.provisioning.join("cleanup").exists());
+            assert_eq!(
+                fs::read(fixture.provisioning.join("active/credential.cred")).unwrap(),
+                active
+            );
+            assert_eq!(read_fixture_ledger(&fixture).destroys.len(), 1);
+        }
+    }
+
+    #[test]
+    fn destroy_capacity_and_missing_ledger_fail_before_namespace_mutation() {
+        // Break caught: deterministic ledger exhaustion leaves an unbound stage,
+        // or an absent ledger is treated as proof that a reference never existed.
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let empty = AdminLifecycleFixture::new();
+        let unknown = provisioning_secret_ref(4, [0xe1; PROVIDER_REFERENCE_ID_BYTES]).unwrap();
+        let mut admin = empty.admin().unwrap();
+        let before = empty.namespace_bytes();
+        assert_eq!(
+            admin
+                .destroy(ProvisioningDestroyId::new([0x81; 32]), &unknown)
+                .unwrap_err(),
+            ProvisioningSecretStoreError::Rejected
+        );
+        assert_eq!(empty.namespace_bytes(), before);
+        for previous in [false, true] {
+            let fixture = AdminLifecycleFixture::new();
+            fixture.install_once();
+            if previous {
+                fixture
+                    .admin()
+                    .unwrap()
+                    .rotate(
+                        ProvisioningInstallId::new([0x61; 32]),
+                        ProvisioningLoadId::new([0x62; 32]),
+                        fixture.bundle(),
+                    )
+                    .unwrap();
+            }
+            let mut ledger = read_fixture_ledger(&fixture);
+            let target = ledger.generations[0].secret_ref.clone();
+            for id in 1_u64..1000 {
+                let mut operation = [0; 32];
+                operation[..8].copy_from_slice(&id.to_be_bytes());
+                ledger.destroys.push(DestroyBinding {
+                    operation: ProvisioningDestroyId::new(operation),
+                    secret_ref: unknown.clone(),
+                    generation: 4,
+                    outcome: DestroyBindingOutcome::NotFound,
+                });
+                if encode_ledger(&ledger).is_err() {
+                    ledger.destroys.pop();
+                    break;
+                }
+            }
+            assert!(encode_ledger(&ledger).unwrap().len() > MAX_LEDGER_BYTES - 256);
+            fixture.write_ledger(ledger);
+            let before = fixture.namespace_bytes();
+            let mut admin = fixture.admin().unwrap();
+            assert_eq!(
+                admin
+                    .destroy(ProvisioningDestroyId::new([0x81; 32]), &target)
+                    .unwrap_err(),
+                ProvisioningSecretStoreError::TooLarge
+            );
+            assert_eq!(fixture.namespace_bytes(), before);
+            assert_eq!(fixture.encrypt_calls(), if previous { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn destroy_public_tombstone_cannot_be_resurrected_by_any_lifecycle_entry() {
+        // Break caught: real destruction differs from a synthetic ledger edit,
+        // so install/rotate/backup/recover or the runtime may reuse old material.
+        use crate::admin::{BackupOperationId, RecoveryOperationId};
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for previous in [false, true] {
+            let fixture = AdminLifecycleFixture::new();
+            fixture.install_once();
+            let backup = fixture
+                .admin()
+                .unwrap()
+                .backup(BackupOperationId::new([0x91; 32]))
+                .unwrap();
+            let target = read_fixture_ledger(&fixture).generations[0].clone();
+            if previous {
+                fixture
+                    .admin()
+                    .unwrap()
+                    .rotate(
+                        ProvisioningInstallId::new([0x61; 32]),
+                        ProvisioningLoadId::new([0x62; 32]),
+                        fixture.bundle(),
+                    )
+                    .unwrap();
+            }
+            fixture
+                .admin()
+                .unwrap()
+                .destroy(ProvisioningDestroyId::new([0x81; 32]), &target.secret_ref)
+                .unwrap();
+            let before = fixture.namespace_bytes();
+            let mut admin = fixture.admin().unwrap();
+            assert_eq!(
+                admin
+                    .install(target.install, target.load, fixture.bundle())
+                    .unwrap_err(),
+                ProvisioningSecretStoreError::Destroyed
+            );
+            assert_eq!(
+                admin
+                    .rotate(target.install, target.load, fixture.bundle())
+                    .unwrap_err(),
+                ProvisioningSecretStoreError::Destroyed
+            );
+            assert_eq!(
+                admin
+                    .backup(BackupOperationId::new([0x91; 32]))
+                    .unwrap_err(),
+                ProvisioningSecretStoreError::Destroyed
+            );
+            assert_eq!(
+                admin
+                    .recover(RecoveryOperationId::new([0x92; 32]), backup.artifact())
+                    .unwrap_err(),
+                ProvisioningSecretStoreError::Destroyed
+            );
+            if previous {
+                let bytes = fs::read(fixture.provisioning.join("active/credential.cred")).unwrap();
+                let mut loader = SystemdCredentialLoader::from_test_envelope(Zeroizing::new(
+                    bytes.strip_prefix(b"cipher:").unwrap().to_vec(),
+                ));
+                assert!(loader.load(target.load, &target.secret_ref).is_err());
+            } else {
+                let mut loader = SystemdCredentialLoader::from_directory_for_test(
+                    &fixture.provisioning.join("active"),
+                )
+                .unwrap();
+                assert!(loader.load(target.load, &target.secret_ref).is_err());
+                assert!(!fixture.provisioning.join("active/credential.cred").exists());
+            }
+            assert_eq!(fixture.namespace_bytes(), before);
+            assert_eq!(fixture.encrypt_calls(), if previous { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn destroy_previous_after_active_preserves_the_exact_active_tombstone() {
+        // Break caught: retained-slot inspection recognizes only live Active,
+        // stranding an intent when Previous is destroyed after Active.
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for point in [
+            None,
+            Some(FaultPoint::IntentFileSynced),
+            Some(FaultPoint::PreviousExchanged),
+            Some(FaultPoint::CleanupContentDeleted),
+        ] {
+            let fixture = AdminLifecycleFixture::new();
+            fixture.install_once();
+            fixture
+                .admin()
+                .unwrap()
+                .rotate(
+                    ProvisioningInstallId::new([0x61; 32]),
+                    ProvisioningLoadId::new([0x62; 32]),
+                    fixture.bundle(),
+                )
+                .unwrap();
+            let ledger = read_fixture_ledger(&fixture);
+            fixture
+                .admin()
+                .unwrap()
+                .destroy(
+                    ProvisioningDestroyId::new([0x81; 32]),
+                    &ledger.generations[1].secret_ref,
+                )
+                .unwrap();
+            let tombstone = fs::read(fixture.provisioning.join("active/manifest")).unwrap();
+            let operation = ProvisioningDestroyId::new([0x82; 32]);
+            if let Some(point) = point {
+                assert_eq!(
+                    fixture
+                        .admin_with_fault(point)
+                        .unwrap()
+                        .destroy(operation, &ledger.generations[0].secret_ref)
+                        .unwrap_err(),
+                    ProvisioningSecretStoreError::Unavailable
+                );
+                assert_eq!(
+                    fixture
+                        .admin_with_fault(FaultPoint::IntentParentReplayed)
+                        .unwrap_err(),
+                    ProvisioningSecretStoreError::Unavailable
+                );
+            }
+            fixture
+                .admin()
+                .unwrap()
+                .destroy(operation, &ledger.generations[0].secret_ref)
+                .unwrap();
+            drop(fixture.admin().unwrap());
+            assert_eq!(
+                fs::read(fixture.provisioning.join("active/manifest")).unwrap(),
+                tombstone
+            );
+            assert!(!fixture.provisioning.join("previous").exists());
+            assert!(
+                read_fixture_ledger(&fixture)
+                    .generations
+                    .iter()
+                    .all(|record| record.state == GenerationState::Destroyed)
+            );
+        }
+    }
+
+    #[test]
+    fn destroy_previous_rejects_missing_or_wrong_retained_active_tombstone_before_staging() {
+        // Break caught: completed slot validation permits ledger-only Destroyed
+        // history, but destroying Previous must retain the latest Active tombstone.
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for case in 0..4 {
+            let fixture = AdminLifecycleFixture::new();
+            fixture.install_once();
+            fixture
+                .admin()
+                .unwrap()
+                .rotate(
+                    ProvisioningInstallId::new([0x61; 32]),
+                    ProvisioningLoadId::new([0x62; 32]),
+                    fixture.bundle(),
+                )
+                .unwrap();
+            let original = read_fixture_ledger(&fixture);
+            fixture
+                .admin()
+                .unwrap()
+                .destroy(
+                    ProvisioningDestroyId::new([0x80; 32]),
+                    &original.generations[0].secret_ref,
+                )
+                .unwrap();
+            fixture
+                .admin()
+                .unwrap()
+                .rotate(
+                    ProvisioningInstallId::new([0x71; 32]),
+                    ProvisioningLoadId::new([0x72; 32]),
+                    fixture.bundle(),
+                )
+                .unwrap();
+            let ledger = read_fixture_ledger(&fixture);
+            fixture
+                .admin()
+                .unwrap()
+                .destroy(
+                    ProvisioningDestroyId::new([0x81; 32]),
+                    &ledger.generations[2].secret_ref,
+                )
+                .unwrap();
+            let mut admin = fixture.admin().unwrap();
+            match case {
+                0 => fs::remove_dir_all(fixture.provisioning.join("active")).unwrap(),
+                1 => {
+                    fs::remove_dir_all(fixture.provisioning.join("active")).unwrap();
+                    fixture.write_tombstone_slot("active", &ledger.generations[0]);
+                }
+                2 => {
+                    let path = fixture.provisioning.join("active/credential.cred");
+                    fs::write(&path, b"unexpected credential").unwrap();
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                3 => fixture
+                    .write_tombstone_slot("staged", &read_fixture_ledger(&fixture).generations[2]),
+                _ => unreachable!(),
+            }
+            let before = fixture.namespace_bytes();
+            assert_eq!(
+                admin
+                    .destroy(
+                        ProvisioningDestroyId::new([0x82; 32]),
+                        &ledger.generations[1].secret_ref
+                    )
+                    .unwrap_err(),
+                ProvisioningSecretStoreError::Rejected,
+                "{case}"
+            );
+            assert_eq!(
+                fixture.namespace_bytes(),
+                before,
+                "must reject before staging: {case}"
+            );
+        }
+    }
 
     #[test]
     fn intent_tables_select_only_the_next_exact_filesystem_step() {

@@ -15,8 +15,10 @@ pub(super) static TEST_PROCESS_SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mut
 
 use crate::{PROVIDER_REFERENCE_ID_BYTES, encode_credential_envelope, provisioning_secret_ref};
 use aster_mesh::{
-    ProfileProvisioningBundle, ProvisioningInstallId, ProvisioningInstallReceipt,
-    ProvisioningLoadId, ProvisioningSecretStoreError, UnprotectedProvisioning,
+    ProfileProvisioningBundle, ProvisioningDestroyId, ProvisioningDestroyReceipt,
+    ProvisioningInstallId, ProvisioningInstallReceipt, ProvisioningLoadId,
+    ProvisioningSecretDestroyer, ProvisioningSecretRef, ProvisioningSecretStoreError,
+    UnprotectedProvisioning,
 };
 use encrypt::SystemdCredsEncryptor;
 #[cfg(test)]
@@ -29,8 +31,8 @@ use files::{
     write_ledger_atomically, write_staged_generation,
 };
 use ledger::{
-    GenerationRecord, GenerationState, LifecycleIntent, LifecycleIntentKind, ProviderLedger,
-    decode_ledger, encode_ledger,
+    DestroyBinding, DestroyBindingOutcome, GenerationRecord, GenerationState, LifecycleIntent,
+    LifecycleIntentKind, ProviderLedger, decode_ledger, encode_ledger,
 };
 use rustix::fd::OwnedFd;
 use sha2::{Digest as _, Sha256};
@@ -244,7 +246,15 @@ impl SystemdCredentialAdmin {
                     && let Some(pending) = &pending
                     && pending.intent.is_none()
                 {
-                    backup::validate_pending_backup(&self.provisioning_root, &current, pending)?;
+                    if pending.destroys.len() != current.destroys.len() {
+                        validate_pending_destroy(&self.provisioning_root, &current, pending)?;
+                    } else {
+                        backup::validate_pending_backup(
+                            &self.provisioning_root,
+                            &current,
+                            pending,
+                        )?;
+                    }
                     files::publish_pending_ledger(
                         &self.ledger_root,
                         &Zeroizing::new(encode_ledger(pending)?),
@@ -282,6 +292,10 @@ impl SystemdCredentialAdmin {
             } else {
                 lifecycle::validate_completed_generations(&self.provisioning_root, &ledger)?;
             }
+            // A completed ledger may be visible after an interrupted rename
+            // whose parent sync never ran. Replay it before exposing any
+            // existing operation outcome from this newly opened capability.
+            self.sync_completed_ledger_parent()?;
             return Ok(());
         }
         if ledger
@@ -349,12 +363,7 @@ impl SystemdCredentialAdmin {
         ProfileProvisioningBundle::from_bytes(plaintext.expose())
             .map_err(|_| ProvisioningSecretStoreError::Rejected)?;
 
-        if let Some(encoded) = read_ledger(&self.ledger_root)? {
-            let ledger = decode_ledger(&encoded)?;
-            if ledger.host_key_identity != self.host_key_identity || ledger.intent.is_some() {
-                return Err(ProvisioningSecretStoreError::Rejected);
-            }
-            lifecycle::validate_completed_generations(&self.provisioning_root, &ledger)?;
+        if let Some(ledger) = self.read_completed_ledger(false)? {
             return self
                 .classify_existing_install_operation(&ledger, operation, load, &plaintext)?
                 .ok_or(ProvisioningSecretStoreError::OperationConflict);
@@ -435,14 +444,9 @@ impl SystemdCredentialAdmin {
         ProfileProvisioningBundle::from_bytes(plaintext.expose())
             .map_err(|_| ProvisioningSecretStoreError::Rejected)?;
 
-        self.require_no_pending_ledger()?;
-        let encoded =
-            read_ledger(&self.ledger_root)?.ok_or(ProvisioningSecretStoreError::Rejected)?;
-        let ledger = decode_ledger(&encoded)?;
-        if ledger.host_key_identity != self.host_key_identity || ledger.intent.is_some() {
-            return Err(ProvisioningSecretStoreError::Rejected);
-        }
-        lifecycle::validate_completed_generations(&self.provisioning_root, &ledger)?;
+        let ledger = self
+            .read_completed_ledger(false)?
+            .ok_or(ProvisioningSecretStoreError::Rejected)?;
 
         if let Some(receipt) =
             self.classify_existing_install_operation(&ledger, operation, load, &plaintext)?
@@ -524,6 +528,140 @@ impl SystemdCredentialAdmin {
         Ok(ProvisioningInstallReceipt::installed(operation, secret_ref))
     }
 
+    /// Logically destroys one exact Active or Previous provider reference.
+    /// The operator must first stop and confirm termination of the service.
+    /// Receipts assert durable logical destruction only, never physical erasure.
+    pub fn destroy(
+        &mut self,
+        operation: ProvisioningDestroyId,
+        secret_ref: &ProvisioningSecretRef,
+    ) -> Result<ProvisioningDestroyReceipt, ProvisioningSecretStoreError> {
+        let mut ledger = self
+            .read_completed_ledger(false)?
+            .ok_or(ProvisioningSecretStoreError::Rejected)?;
+        if let Some(binding) = ledger
+            .destroys
+            .iter()
+            .find(|binding| binding.operation == operation)
+        {
+            if binding.secret_ref != *secret_ref {
+                return Err(ProvisioningSecretStoreError::OperationConflict);
+            }
+            return destroy_retry_receipt(binding);
+        }
+        let generation = crate::provider_generation(secret_ref)?;
+        let target = ledger
+            .generations
+            .iter()
+            .find(|record| record.secret_ref == *secret_ref);
+        let kind = match target.map(|record| record.state) {
+            Some(GenerationState::Active) => LifecycleIntentKind::DestroyActive,
+            Some(GenerationState::Previous) => LifecycleIntentKind::DestroyPrevious,
+            state => {
+                let binding = DestroyBinding {
+                    operation,
+                    secret_ref: secret_ref.clone(),
+                    generation,
+                    outcome: if state == Some(GenerationState::Destroyed) {
+                        DestroyBindingOutcome::Destroyed
+                    } else {
+                        DestroyBindingOutcome::NotFound
+                    },
+                };
+                ledger.destroys.push(binding.clone());
+                let completed = Zeroizing::new(encode_ledger(&ledger)?);
+                if decode_ledger(&completed)? != ledger {
+                    return Err(ProvisioningSecretStoreError::Rejected);
+                }
+                write_ledger_atomically(
+                    &self.ledger_root,
+                    &completed,
+                    LedgerWrite::Complete,
+                    &mut self.faults,
+                )?;
+                return destroy_retry_receipt(&binding);
+            }
+        };
+        let pre_mutation_ledger_revision = digest(&encode_ledger(&ledger)?);
+        ledger.intent = Some(LifecycleIntent {
+            kind,
+            operation: *operation.as_bytes(),
+            backup_operation: None,
+            load: None,
+            target_ref: secret_ref.clone(),
+            target_generation: generation,
+            source_ref: None,
+            envelope_commitment: None,
+            expected_ciphertext_digest: None,
+            expected_artifact_digest: None,
+            pre_mutation_ledger_revision,
+        });
+        // Both canonical snapshots must fit and validate before any stage exists.
+        if decode_ledger(&encode_ledger(&ledger)?)? != ledger {
+            return Err(ProvisioningSecretStoreError::Rejected);
+        }
+        let completed = lifecycle::completed_from_intent(&ledger)?;
+        let tombstone = completed
+            .generations
+            .iter()
+            .find(|record| record.secret_ref == *secret_ref)
+            .ok_or(ProvisioningSecretStoreError::Rejected)?;
+        lifecycle::validate_retained_before_staging(&self.provisioning_root, &ledger)?;
+        lifecycle::write_staged_tombstone(
+            &self.provisioning_root,
+            &manifest_from_record(tombstone),
+            &mut self.faults,
+        )?;
+        lifecycle::commit_lifecycle_intent(&self.ledger_root, &ledger, &mut self.faults)?;
+        lifecycle::reconcile_lifecycle(
+            &self.provisioning_root,
+            &self.ledger_root,
+            ledger,
+            &completed,
+            &mut self.faults,
+        )?;
+        Ok(ProvisioningDestroyReceipt::destroyed(
+            operation,
+            secret_ref.clone(),
+        ))
+    }
+
+    fn sync_completed_ledger_parent(&mut self) -> Result<(), ProvisioningSecretStoreError> {
+        files::sync_directory(&self.ledger_root)?;
+        self.faults
+            .hit(files::FaultPoint::CompletedLedgerParentSynced)
+    }
+
+    /// Revalidates and makes the selected completed ledger durable even when
+    /// this same capability previously returned an error after its rename.
+    fn read_completed_ledger(
+        &mut self,
+        recovery: bool,
+    ) -> Result<Option<ProviderLedger>, ProvisioningSecretStoreError> {
+        let Some(encoded) = read_ledger(&self.ledger_root)? else {
+            // Initial install retains its accepted orphan-stage restart path;
+            // there is no completed operation to classify in this namespace.
+            return Ok(None);
+        };
+        self.require_no_pending_ledger()?;
+        let ledger = decode_ledger(&encoded)?;
+        if ledger.host_key_identity != self.host_key_identity || ledger.intent.is_some() {
+            return Err(ProvisioningSecretStoreError::Rejected);
+        }
+        if recovery
+            && ledger
+                .generations
+                .iter()
+                .any(|record| record.state == GenerationState::Active)
+        {
+            lifecycle::validate_recovery_generations(&self.provisioning_root, &ledger)?;
+        } else {
+            lifecycle::validate_completed_generations(&self.provisioning_root, &ledger)?;
+        }
+        self.sync_completed_ledger_parent()?;
+        Ok(Some(ledger))
+    }
+
     fn require_no_pending_ledger(&self) -> Result<(), ProvisioningSecretStoreError> {
         // An interrupted write must be reconciled by a fresh open before this
         // instance can overwrite the pending operation with another mutation.
@@ -563,6 +701,64 @@ impl SystemdCredentialAdmin {
             operation,
             record.secret_ref.clone(),
         )))
+    }
+}
+
+impl ProvisioningSecretDestroyer for SystemdCredentialAdmin {
+    fn destroy(
+        &mut self,
+        operation: ProvisioningDestroyId,
+        secret_ref: &ProvisioningSecretRef,
+    ) -> Result<ProvisioningDestroyReceipt, ProvisioningSecretStoreError> {
+        Self::destroy(self, operation, secret_ref)
+    }
+}
+
+fn destroy_retry_receipt(
+    binding: &DestroyBinding,
+) -> Result<ProvisioningDestroyReceipt, ProvisioningSecretStoreError> {
+    match binding.outcome {
+        DestroyBindingOutcome::Destroyed => Ok(ProvisioningDestroyReceipt::already_destroyed(
+            binding.operation,
+            binding.secret_ref.clone(),
+        )),
+        DestroyBindingOutcome::NotFound => Err(ProvisioningSecretStoreError::NotFound),
+    }
+}
+
+fn validate_pending_destroy(
+    provisioning_root: &OwnedFd,
+    current: &ProviderLedger,
+    pending: &ProviderLedger,
+) -> Result<(), ProvisioningSecretStoreError> {
+    if current.intent.is_some()
+        || pending.intent.is_some()
+        || pending.destroys.len() != current.destroys.len() + 1
+    {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    let mut predecessor = pending.clone();
+    let binding = predecessor
+        .destroys
+        .pop()
+        .ok_or(ProvisioningSecretStoreError::Rejected)?;
+    if predecessor != *current {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    lifecycle::validate_completed_generations(provisioning_root, current)?;
+    let record = current
+        .generations
+        .iter()
+        .find(|record| record.secret_ref == binding.secret_ref);
+    match (binding.outcome, record) {
+        (DestroyBindingOutcome::NotFound, None) => Ok(()),
+        (DestroyBindingOutcome::Destroyed, Some(record))
+            if record.state == GenerationState::Destroyed
+                && record.generation == binding.generation =>
+        {
+            Ok(())
+        }
+        _ => Err(ProvisioningSecretStoreError::Rejected),
     }
 }
 

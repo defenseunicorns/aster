@@ -62,6 +62,7 @@ pub(super) enum FaultPoint {
     CompleteFileSynced,
     CompleteRenamed,
     CompleteParentSynced,
+    CompletedLedgerParentSynced,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

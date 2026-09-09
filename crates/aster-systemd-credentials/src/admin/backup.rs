@@ -184,16 +184,10 @@ impl super::SystemdCredentialAdmin {
         use super::{
             files,
             ledger::{BackupBinding, GenerationState, decode_ledger, encode_ledger},
-            lifecycle,
         };
-        self.require_no_pending_ledger()?;
-        let encoded =
-            files::read_ledger(&self.ledger_root)?.ok_or(ProvisioningSecretStoreError::Rejected)?;
-        let mut ledger = decode_ledger(&encoded)?;
-        if ledger.host_key_identity != self.host_key_identity || ledger.intent.is_some() {
-            return Err(ProvisioningSecretStoreError::Rejected);
-        }
-        lifecycle::validate_completed_generations(&self.provisioning_root, &ledger)?;
+        let mut ledger = self
+            .read_completed_ledger(false)?
+            .ok_or(ProvisioningSecretStoreError::Rejected)?;
         let binding = ledger
             .backups
             .iter()
@@ -234,8 +228,6 @@ impl super::SystemdCredentialAdmin {
             if binding.artifact_digest != artifact_digest {
                 return Err(ProvisioningSecretStoreError::OperationConflict);
             }
-            // A previous attempt may have stopped after rename and before parent sync.
-            files::sync_directory(&self.ledger_root)?;
         } else {
             ledger.backups.push(BackupBinding {
                 operation: *operation.as_bytes(),
@@ -372,14 +364,10 @@ impl super::SystemdCredentialAdmin {
         };
         let decoded = decode_backup(artifact.as_bytes())?;
         let artifact_digest = digest(artifact.as_bytes());
-        self.require_no_pending_ledger()?;
-        let encoded =
-            files::read_ledger(&self.ledger_root)?.ok_or(ProvisioningSecretStoreError::Rejected)?;
-        let mut ledger = decode_ledger(&encoded)?;
-        if ledger.intent.is_some()
-            || ledger.host_key_identity != self.host_key_identity
-            || decoded.host_key_identity != self.host_key_identity
-        {
+        let mut ledger = self
+            .read_completed_ledger(true)?
+            .ok_or(ProvisioningSecretStoreError::Rejected)?;
+        if decoded.host_key_identity != self.host_key_identity {
             return Err(ProvisioningSecretStoreError::Rejected);
         }
         let existing = ledger
@@ -435,10 +423,9 @@ impl super::SystemdCredentialAdmin {
                 return Err(ProvisioningSecretStoreError::Rejected);
             }
             files::sync_directory(&self.provisioning_root)?;
-            files::sync_directory(&self.ledger_root)?;
             return Ok(receipt);
         }
-        let pre_mutation_ledger_revision = digest(&encoded);
+        let pre_mutation_ledger_revision = digest(&encode_ledger(&ledger)?);
         ledger.intent = Some(LifecycleIntent {
             kind: LifecycleIntentKind::Recover,
             operation: *operation.as_bytes(),
