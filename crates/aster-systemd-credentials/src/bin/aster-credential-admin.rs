@@ -2,16 +2,24 @@
 
 #[cfg(target_os = "linux")]
 use aster_mesh::{
-    MAX_UNPROTECTED_PROVISIONING_BYTES, ProvisioningInstallDisposition, ProvisioningInstallId,
-    ProvisioningLoadId, ProvisioningProtectionError, ProvisioningSecretStoreError,
-    UnprotectedProvisioning,
+    MAX_PROVISIONING_SECRET_REF_BYTES, MAX_UNPROTECTED_PROVISIONING_BYTES,
+    ProvisioningDestroyDisposition, ProvisioningDestroyId, ProvisioningInstallDisposition,
+    ProvisioningInstallId, ProvisioningLoadId, ProvisioningProtectionError, ProvisioningSecretRef,
+    ProvisioningSecretStoreError, UnprotectedProvisioning,
 };
 #[cfg(target_os = "linux")]
-use aster_systemd_credentials::admin::SystemdCredentialAdmin;
+use aster_systemd_credentials::{
+    PROVIDER_REFERENCE_ID_BYTES,
+    admin::{
+        BackupOperationId, MAX_BACKUP_ARTIFACT_BYTES, ProtectedBackupArtifact, RecoveryDisposition,
+        RecoveryOperationId, SystemdCredentialAdmin,
+    },
+    provisioning_secret_ref,
+};
 #[cfg(target_os = "linux")]
 use std::{env, io::Read as _, process::ExitCode};
 #[cfg(target_os = "linux")]
-use zeroize::Zeroize as _;
+use zeroize::{Zeroize as _, Zeroizing};
 
 #[cfg(all(test, target_os = "linux"))]
 use std::sync::{
@@ -26,14 +34,38 @@ struct SecretDropObserver {
     allocation_stable: AtomicBool,
 }
 
-#[cfg(target_os = "linux")]
-struct Invocation {
-    install: ProvisioningInstallId,
-    load: ProvisioningLoadId,
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Default)]
+struct ArtifactDropObserver {
+    zeroized: AtomicBool,
+    allocation_stable: AtomicBool,
 }
 
 #[cfg(target_os = "linux")]
-impl Invocation {
+#[derive(Debug)]
+enum Command {
+    Install {
+        operation: ProvisioningInstallId,
+        load: ProvisioningLoadId,
+    },
+    Rotate {
+        operation: ProvisioningInstallId,
+        load: ProvisioningLoadId,
+    },
+    Backup {
+        operation: BackupOperationId,
+    },
+    Recover {
+        operation: RecoveryOperationId,
+    },
+    Destroy {
+        operation: ProvisioningDestroyId,
+        reference: ProvisioningSecretRef,
+    },
+}
+
+#[cfg(target_os = "linux")]
+impl Command {
     fn parse_os(
         arguments: impl IntoIterator<Item = std::ffi::OsString>,
     ) -> Result<Self, ProvisioningSecretStoreError> {
@@ -52,27 +84,52 @@ impl Invocation {
         arguments: impl IntoIterator<Item = String>,
     ) -> Result<Self, ProvisioningSecretStoreError> {
         let arguments = arguments.into_iter().collect::<Vec<_>>();
-        if arguments.len() != 5
-            || arguments[0] != "install"
-            || arguments[1] != "--operation"
-            || arguments[3] != "--load-operation"
-        {
-            return Err(ProvisioningSecretStoreError::Rejected);
+        match arguments.as_slice() {
+            [command, operation_flag, operation, load_flag, load]
+                if (command == "install" || command == "rotate")
+                    && operation_flag == "--operation"
+                    && load_flag == "--load-operation" =>
+            {
+                let operation = ProvisioningInstallId::new(parse_operation_id(operation)?);
+                let load = ProvisioningLoadId::new(parse_operation_id(load)?);
+                if command == "install" {
+                    Ok(Self::Install { operation, load })
+                } else {
+                    Ok(Self::Rotate { operation, load })
+                }
+            }
+            [command, operation_flag, operation]
+                if (command == "backup" || command == "recover")
+                    && operation_flag == "--operation" =>
+            {
+                let operation = parse_operation_id(operation)?;
+                if command == "backup" {
+                    Ok(Self::Backup {
+                        operation: BackupOperationId::new(operation),
+                    })
+                } else {
+                    Ok(Self::Recover {
+                        operation: RecoveryOperationId::new(operation),
+                    })
+                }
+            }
+            [
+                command,
+                operation_flag,
+                operation,
+                reference_flag,
+                reference,
+            ] if command == "destroy"
+                && operation_flag == "--operation"
+                && reference_flag == "--reference" =>
+            {
+                Ok(Self::Destroy {
+                    operation: ProvisioningDestroyId::new(parse_operation_id(operation)?),
+                    reference: parse_reference(reference)?,
+                })
+            }
+            _ => Err(ProvisioningSecretStoreError::Rejected),
         }
-        Ok(Self {
-            install: ProvisioningInstallId::new(parse_operation_id(&arguments[2])?),
-            load: ProvisioningLoadId::new(parse_operation_id(&arguments[4])?),
-        })
-    }
-
-    #[cfg(test)]
-    const fn install_bytes(&self) -> [u8; 32] {
-        *self.install.as_bytes()
-    }
-
-    #[cfg(test)]
-    const fn load_bytes(&self) -> [u8; 32] {
-        *self.load.as_bytes()
     }
 }
 
@@ -100,6 +157,59 @@ fn decode_nibble(value: u8) -> Result<u8, ProvisioningSecretStoreError> {
         b'a'..=b'f' => Ok(value - b'a' + 10),
         _ => Err(ProvisioningSecretStoreError::Rejected),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_reference(value: &str) -> Result<ProvisioningSecretRef, ProvisioningSecretStoreError> {
+    let bytes = value.as_bytes();
+    if bytes.len() > MAX_PROVISIONING_SECRET_REF_BYTES.saturating_mul(2) {
+        return Err(ProvisioningSecretStoreError::TooLarge);
+    }
+    if bytes.is_empty()
+        || !bytes.len().is_multiple_of(2)
+        || bytes
+            .iter()
+            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(byte))
+    {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    let mut decoded = Zeroizing::new(Vec::with_capacity(bytes.len() / 2));
+    for pair in bytes.chunks_exact(2) {
+        decoded.push(decode_nibble(pair[0])? << 4 | decode_nibble(pair[1])?);
+    }
+    let reference = ProvisioningSecretRef::from_bytes(&decoded)?;
+    let _ = provider_reference_generation(&reference)?;
+    Ok(reference)
+}
+
+#[cfg(target_os = "linux")]
+fn provider_reference_generation(
+    reference: &ProvisioningSecretRef,
+) -> Result<u64, ProvisioningSecretStoreError> {
+    const PROVIDER_REFERENCE_BYTES: usize = 8 + 2 + 2 + 8 + PROVIDER_REFERENCE_ID_BYTES;
+    let opaque = reference.expose_opaque();
+    if opaque.len() != PROVIDER_REFERENCE_BYTES
+        || &opaque[..8] != b"ASTRSDRF"
+        || &opaque[8..10] != 2_u16.to_be_bytes().as_slice()
+        || &opaque[10..12] != 0_u16.to_be_bytes().as_slice()
+    {
+        return Err(ProvisioningSecretStoreError::InvalidReference);
+    }
+    let generation = u64::from_be_bytes(
+        opaque[12..20]
+            .try_into()
+            .map_err(|_| ProvisioningSecretStoreError::InvalidReference)?,
+    );
+    if generation == 0 {
+        return Err(ProvisioningSecretStoreError::InvalidReference);
+    }
+    let reference_id: [u8; PROVIDER_REFERENCE_ID_BYTES] = opaque[20..]
+        .try_into()
+        .map_err(|_| ProvisioningSecretStoreError::InvalidReference)?;
+    if provisioning_secret_ref(generation, reference_id)? != *reference {
+        return Err(ProvisioningSecretStoreError::InvalidReference);
+    }
+    Ok(generation)
 }
 
 #[cfg(target_os = "linux")]
@@ -193,31 +303,390 @@ impl Drop for SecretInputBuffer {
 }
 
 #[cfg(target_os = "linux")]
-fn run() -> Result<ProvisioningInstallDisposition, ProvisioningSecretStoreError> {
-    let invocation = Invocation::parse_os(env::args_os().skip(1))?;
-    let mut admin = SystemdCredentialAdmin::open()?;
-    let plaintext = read_secret(std::io::stdin().lock())?;
-    admin
-        .install(invocation.install, invocation.load, plaintext)
-        .map(|receipt| receipt.disposition())
+fn read_protected_artifact(
+    input: impl std::io::Read,
+) -> Result<ProtectedBackupArtifact, ProvisioningSecretStoreError> {
+    #[cfg(test)]
+    {
+        read_protected_artifact_inner(input, None)
+    }
+    #[cfg(not(test))]
+    {
+        read_protected_artifact_inner(input)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn read_protected_artifact_with_observer(
+    input: impl std::io::Read,
+    observer: Arc<ArtifactDropObserver>,
+) -> Result<ProtectedBackupArtifact, ProvisioningSecretStoreError> {
+    read_protected_artifact_inner(input, Some(observer))
+}
+
+#[cfg(target_os = "linux")]
+fn read_protected_artifact_inner(
+    mut input: impl std::io::Read,
+    #[cfg(test)] observer: Option<Arc<ArtifactDropObserver>>,
+) -> Result<ProtectedBackupArtifact, ProvisioningSecretStoreError> {
+    #[cfg(test)]
+    let mut buffer = ProtectedArtifactInputBuffer::new(observer);
+    #[cfg(not(test))]
+    let mut buffer = ProtectedArtifactInputBuffer::new();
+    input
+        .by_ref()
+        .take((MAX_BACKUP_ARTIFACT_BYTES + 1) as u64)
+        .read_to_end(&mut buffer.bytes)
+        .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    if buffer.bytes.len() > MAX_BACKUP_ARTIFACT_BYTES {
+        return Err(ProvisioningSecretStoreError::TooLarge);
+    }
+    ProtectedBackupArtifact::from_bytes(&buffer.bytes)
+}
+
+#[cfg(target_os = "linux")]
+struct ProtectedArtifactInputBuffer {
+    bytes: Vec<u8>,
+    #[cfg(test)]
+    observer: Option<Arc<ArtifactDropObserver>>,
+}
+
+#[cfg(target_os = "linux")]
+impl ProtectedArtifactInputBuffer {
+    fn new(#[cfg(test)] observer: Option<Arc<ArtifactDropObserver>>) -> Self {
+        Self {
+            bytes: Vec::with_capacity(MAX_BACKUP_ARTIFACT_BYTES + 1),
+            #[cfg(test)]
+            observer,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ProtectedArtifactInputBuffer {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        let contained_artifact = !self.bytes.is_empty();
+        self.bytes.as_mut_slice().zeroize();
+        #[cfg(test)]
+        if let Some(observer) = &self.observer {
+            observer.zeroized.store(
+                contained_artifact && self.bytes.iter().all(|byte| *byte == 0),
+                Ordering::SeqCst,
+            );
+            observer.allocation_stable.store(
+                self.bytes.capacity() == MAX_BACKUP_ARTIFACT_BYTES + 1,
+                Ordering::SeqCst,
+            );
+        }
+        self.bytes.clear();
+    }
+}
+
+#[cfg(target_os = "linux")]
+enum PreparedCommand {
+    Install {
+        operation: ProvisioningInstallId,
+        load: ProvisioningLoadId,
+        plaintext: UnprotectedProvisioning,
+    },
+    Rotate {
+        operation: ProvisioningInstallId,
+        load: ProvisioningLoadId,
+        plaintext: UnprotectedProvisioning,
+    },
+    Backup {
+        operation: BackupOperationId,
+    },
+    Recover {
+        operation: RecoveryOperationId,
+        artifact: ProtectedBackupArtifact,
+    },
+    Destroy {
+        operation: ProvisioningDestroyId,
+        reference: ProvisioningSecretRef,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpenMode {
+    Normal,
+    Recovery,
+}
+
+#[cfg(target_os = "linux")]
+enum CommandOutcome {
+    Install {
+        disposition: ProvisioningInstallDisposition,
+        generation: u64,
+        reference: ProvisioningSecretRef,
+    },
+    Rotate {
+        disposition: ProvisioningInstallDisposition,
+        generation: u64,
+        reference: ProvisioningSecretRef,
+    },
+    Backup {
+        generation: u64,
+        artifact: Zeroizing<Vec<u8>>,
+    },
+    Recover {
+        disposition: RecoveryDisposition,
+        generation: u64,
+    },
+    Destroy(ProvisioningDestroyDisposition),
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_command(
+    command: Command,
+    input: impl std::io::Read,
+) -> Result<(OpenMode, PreparedCommand), ProvisioningSecretStoreError> {
+    match command {
+        Command::Install { operation, load } => Ok((
+            OpenMode::Normal,
+            PreparedCommand::Install {
+                operation,
+                load,
+                plaintext: read_secret(input)?,
+            },
+        )),
+        Command::Rotate { operation, load } => Ok((
+            OpenMode::Normal,
+            PreparedCommand::Rotate {
+                operation,
+                load,
+                plaintext: read_secret(input)?,
+            },
+        )),
+        Command::Backup { operation } => {
+            Ok((OpenMode::Normal, PreparedCommand::Backup { operation }))
+        }
+        Command::Recover { operation } => Ok((
+            OpenMode::Recovery,
+            PreparedCommand::Recover {
+                operation,
+                artifact: read_protected_artifact(input)?,
+            },
+        )),
+        Command::Destroy {
+            operation,
+            reference,
+        } => Ok((
+            OpenMode::Normal,
+            PreparedCommand::Destroy {
+                operation,
+                reference,
+            },
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_and_execute(
+    mode: OpenMode,
+    command: PreparedCommand,
+) -> Result<CommandOutcome, ProvisioningSecretStoreError> {
+    let mut admin = match mode {
+        OpenMode::Normal => SystemdCredentialAdmin::open()?,
+        OpenMode::Recovery => SystemdCredentialAdmin::open_for_recovery()?,
+    };
+    match command {
+        PreparedCommand::Install {
+            operation,
+            load,
+            plaintext,
+        } if mode == OpenMode::Normal => {
+            let receipt = admin.install(operation, load, plaintext)?;
+            Ok(CommandOutcome::Install {
+                disposition: receipt.disposition(),
+                generation: provider_reference_generation(receipt.secret_ref())?,
+                reference: receipt.into_secret_ref(),
+            })
+        }
+        PreparedCommand::Rotate {
+            operation,
+            load,
+            plaintext,
+        } if mode == OpenMode::Normal => {
+            let receipt = admin.rotate(operation, load, plaintext)?;
+            Ok(CommandOutcome::Rotate {
+                disposition: receipt.disposition(),
+                generation: provider_reference_generation(receipt.secret_ref())?,
+                reference: receipt.into_secret_ref(),
+            })
+        }
+        PreparedCommand::Backup { operation } if mode == OpenMode::Normal => {
+            let receipt = admin.backup(operation)?;
+            Ok(CommandOutcome::Backup {
+                generation: receipt.generation(),
+                artifact: Zeroizing::new(receipt.artifact().as_bytes().to_vec()),
+            })
+        }
+        PreparedCommand::Recover {
+            operation,
+            artifact,
+        } if mode == OpenMode::Recovery => {
+            let receipt = admin.recover(operation, &artifact)?;
+            Ok(CommandOutcome::Recover {
+                disposition: receipt.disposition(),
+                generation: receipt.generation(),
+            })
+        }
+        PreparedCommand::Destroy {
+            operation,
+            reference,
+        } if mode == OpenMode::Normal => {
+            let receipt = admin.destroy(operation, &reference)?;
+            Ok(CommandOutcome::Destroy(receipt.disposition()))
+        }
+        _ => Err(ProvisioningSecretStoreError::Rejected),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn encode_reference(reference: &ProvisioningSecretRef) -> Zeroizing<String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = Zeroizing::new(reference.to_bytes());
+    let mut encoded = Zeroizing::new(String::with_capacity(bytes.len() * 2));
+    for &byte in bytes.iter() {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+#[cfg(target_os = "linux")]
+fn write_success(
+    outcome: CommandOutcome,
+    stdout: &mut impl std::io::Write,
+    stderr: &mut impl std::io::Write,
+) -> Result<(), ProvisioningSecretStoreError> {
+    let unavailable = |_| ProvisioningSecretStoreError::Unavailable;
+    match outcome {
+        CommandOutcome::Install {
+            disposition,
+            generation,
+            reference,
+        } => {
+            let reference = encode_reference(&reference);
+            writeln!(
+                stdout,
+                "INSTALL disposition={} generation={generation} reference={}",
+                install_disposition(disposition),
+                reference.as_str()
+            )
+            .map_err(unavailable)
+        }
+        CommandOutcome::Rotate {
+            disposition,
+            generation,
+            reference,
+        } => {
+            let reference = encode_reference(&reference);
+            writeln!(
+                stdout,
+                "ROTATE disposition={} generation={generation} reference={}",
+                install_disposition(disposition),
+                reference.as_str()
+            )
+            .map_err(unavailable)
+        }
+        CommandOutcome::Backup {
+            generation,
+            artifact,
+        } => {
+            stdout.write_all(&artifact).map_err(unavailable)?;
+            stdout.flush().map_err(unavailable)?;
+            writeln!(
+                stderr,
+                "BACKUP disposition=available generation={generation}"
+            )
+            .map_err(unavailable)
+        }
+        CommandOutcome::Recover {
+            disposition,
+            generation,
+        } => writeln!(
+            stdout,
+            "RECOVER disposition={} generation={generation}",
+            recovery_disposition(disposition)
+        )
+        .map_err(unavailable),
+        CommandOutcome::Destroy(disposition) => writeln!(
+            stdout,
+            "DESTROY disposition={}",
+            destroy_disposition(disposition)
+        )
+        .map_err(unavailable),
+    }
+}
+
+#[cfg(target_os = "linux")]
+const fn install_disposition(disposition: ProvisioningInstallDisposition) -> &'static str {
+    match disposition {
+        ProvisioningInstallDisposition::Installed => "installed",
+        ProvisioningInstallDisposition::Existing => "existing",
+    }
+}
+
+#[cfg(target_os = "linux")]
+const fn recovery_disposition(disposition: RecoveryDisposition) -> &'static str {
+    match disposition {
+        RecoveryDisposition::Restored => "restored",
+        RecoveryDisposition::Existing => "existing",
+    }
+}
+
+#[cfg(target_os = "linux")]
+const fn destroy_disposition(disposition: ProvisioningDestroyDisposition) -> &'static str {
+    match disposition {
+        ProvisioningDestroyDisposition::Destroyed => "destroyed",
+        ProvisioningDestroyDisposition::AlreadyDestroyed => "already-destroyed",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn execute_with<A, R, O, E, F>(
+    arguments: A,
+    input: R,
+    stdout: &mut O,
+    stderr: &mut E,
+    execute: F,
+) -> i32
+where
+    A: IntoIterator,
+    A::Item: Into<std::ffi::OsString>,
+    R: std::io::Read,
+    O: std::io::Write,
+    E: std::io::Write,
+    F: FnOnce(OpenMode, PreparedCommand) -> Result<CommandOutcome, ProvisioningSecretStoreError>,
+{
+    let result = Command::parse_os(arguments.into_iter().map(Into::into))
+        .and_then(|command| prepare_command(command, input))
+        .and_then(|(mode, command)| execute(mode, command))
+        .and_then(|outcome| write_success(outcome, stdout, stderr));
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            let _ = writeln!(stderr, "ERROR {error}");
+            1
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn main() -> ExitCode {
-    match run() {
-        Ok(ProvisioningInstallDisposition::Installed) => {
-            println!("INSTALL disposition=installed");
-            ExitCode::SUCCESS
-        }
-        Ok(ProvisioningInstallDisposition::Existing) => {
-            println!("INSTALL disposition=existing");
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            eprintln!("ERROR {error}");
-            ExitCode::FAILURE
-        }
-    }
+    let mut stdout = std::io::stdout().lock();
+    let mut stderr = std::io::stderr().lock();
+    ExitCode::from(execute_with(
+        env::args_os().skip(1),
+        std::io::stdin().lock(),
+        &mut stdout,
+        &mut stderr,
+        open_and_execute,
+    ) as u8)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -228,57 +697,191 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{Invocation, SecretDropObserver, read_secret, read_secret_with_observer};
-    use aster_mesh::{MAX_UNPROTECTED_PROVISIONING_BYTES, ProvisioningSecretStoreError};
+    use super::{
+        ArtifactDropObserver, Command, CommandOutcome, OpenMode, PreparedCommand,
+        SecretDropObserver, execute_with, read_protected_artifact,
+        read_protected_artifact_with_observer, read_secret, read_secret_with_observer,
+    };
+    use aster_mesh::{
+        MAX_PROVISIONING_SECRET_REF_BYTES, MAX_UNPROTECTED_PROVISIONING_BYTES,
+        ProvisioningDestroyDisposition, ProvisioningInstallDisposition,
+        ProvisioningSecretStoreError,
+    };
+    use aster_systemd_credentials::{
+        admin::{MAX_BACKUP_ARTIFACT_BYTES, RecoveryDisposition},
+        provisioning_secret_ref,
+    };
     use std::os::unix::ffi::OsStringExt as _;
     use std::{
+        fs,
         io::{self, Cursor, Read},
+        path::PathBuf,
+        process::Command as ProcessCommand,
         sync::{Arc, atomic::Ordering},
     };
+    use zeroize::Zeroizing;
 
-    fn valid_arguments() -> Vec<String> {
+    const OPERATION: [u8; 32] = [0x11; 32];
+    const LOAD_OPERATION: [u8; 32] = [0x22; 32];
+
+    fn install_arguments(command: &str) -> Vec<String> {
         vec![
-            "install".to_owned(),
+            command.to_owned(),
             "--operation".to_owned(),
-            "11".repeat(32),
+            hex(&OPERATION),
             "--load-operation".to_owned(),
-            "22".repeat(32),
+            hex(&LOAD_OPERATION),
         ]
     }
 
-    #[test]
-    fn install_parser_accepts_only_two_exact_lowercase_operation_ids() {
-        // Break caught: ambiguous or noncanonical identifiers could bind a
-        // retry differently across administrators or parser versions.
-        let invocation = Invocation::parse(valid_arguments()).expect("exact install invocation");
-        assert_eq!(invocation.install_bytes(), [0x11; 32]);
-        assert_eq!(invocation.load_bytes(), [0x22; 32]);
+    fn operation_arguments(command: &str) -> Vec<String> {
+        vec![
+            command.to_owned(),
+            "--operation".to_owned(),
+            hex(&OPERATION),
+        ]
+    }
 
+    fn reference() -> aster_mesh::ProvisioningSecretRef {
+        provisioning_secret_ref(7, [0xab; 32]).expect("canonical provider reference")
+    }
+
+    fn destroy_arguments() -> Vec<String> {
+        let mut arguments = operation_arguments("destroy");
+        arguments.extend(["--reference".to_owned(), hex(&reference().to_bytes())]);
+        arguments
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+            encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+        }
+        encoded
+    }
+
+    #[test]
+    fn parser_accepts_only_the_five_exact_command_shapes() {
+        // Break caught: collapsing commands into one flexible argument bag can
+        // dispatch an operation with missing, reordered, or unrelated fields.
+        for command_name in ["install", "rotate"] {
+            match Command::parse(install_arguments(command_name)).expect("install-like command") {
+                Command::Install { operation, load } if command_name == "install" => {
+                    assert_eq!(operation.as_bytes(), &OPERATION);
+                    assert_eq!(load.as_bytes(), &LOAD_OPERATION);
+                }
+                Command::Rotate { operation, load } if command_name == "rotate" => {
+                    assert_eq!(operation.as_bytes(), &OPERATION);
+                    assert_eq!(load.as_bytes(), &LOAD_OPERATION);
+                }
+                _ => panic!("wrong install-like command variant"),
+            }
+        }
+        assert!(matches!(
+            Command::parse(operation_arguments("backup")).expect("backup command"),
+            Command::Backup { operation } if operation.as_bytes() == &OPERATION
+        ));
+        assert!(matches!(
+            Command::parse(operation_arguments("recover")).expect("recover command"),
+            Command::Recover { operation } if operation.as_bytes() == &OPERATION
+        ));
+        assert!(matches!(
+            Command::parse(destroy_arguments()).expect("destroy command"),
+            Command::Destroy { operation, reference: parsed }
+                if operation.as_bytes() == &OPERATION && parsed == reference()
+        ));
+    }
+
+    #[test]
+    fn parser_rejects_noncanonical_ids_and_references() {
+        // Break caught: case-folding or accepting an arbitrary opaque Aster
+        // reference makes durable operation/reference binding ambiguous.
         for replacement in ["11".to_owned(), "AA".repeat(32), "gg".repeat(32)] {
-            let mut arguments = valid_arguments();
+            let mut arguments = install_arguments("install");
             arguments[2] = replacement;
-            assert!(Invocation::parse(arguments).is_err());
+            assert_eq!(
+                Command::parse(arguments).expect_err("noncanonical operation"),
+                ProvisioningSecretStoreError::Rejected
+            );
+        }
+
+        let canonical = hex(&reference().to_bytes());
+        let mut uppercase = destroy_arguments();
+        uppercase[4] = canonical.to_uppercase();
+        assert!(Command::parse(uppercase).is_err());
+
+        let mut odd = destroy_arguments();
+        odd[4].pop();
+        assert!(Command::parse(odd).is_err());
+
+        let mut too_large = destroy_arguments();
+        too_large[4] = "aa".repeat(MAX_PROVISIONING_SECRET_REF_BYTES + 1);
+        assert_eq!(
+            Command::parse(too_large).expect_err("oversized reference"),
+            ProvisioningSecretStoreError::TooLarge
+        );
+
+        let arbitrary = aster_mesh::ProvisioningSecretRef::from_opaque(b"not-provider-v2".to_vec())
+            .expect("bounded arbitrary reference");
+        let mut non_provider = destroy_arguments();
+        non_provider[4] = hex(&arbitrary.to_bytes());
+        assert_eq!(
+            Command::parse(non_provider).expect_err("non-provider reference"),
+            ProvisioningSecretStoreError::InvalidReference
+        );
+    }
+
+    #[test]
+    fn parser_rejects_duplicates_unknown_arguments_reordering_and_secret_sources() {
+        // Break caught: flexible flag parsing can admit secret paths,
+        // environment sources, duplicates, or order-dependent interpretation.
+        let mut cases = vec![
+            Vec::new(),
+            vec!["INSTALL".to_owned()],
+            vec![
+                "install".to_owned(),
+                "--input".to_owned(),
+                "/tmp/bundle".to_owned(),
+            ],
+            vec![
+                "recover".to_owned(),
+                "--input-env".to_owned(),
+                "SECRET".to_owned(),
+            ],
+        ];
+        let mut unknown = install_arguments("install");
+        unknown.push("--verbose".to_owned());
+        cases.push(unknown);
+        let mut reordered = install_arguments("rotate");
+        reordered.swap(1, 3);
+        cases.push(reordered);
+        let mut duplicate = operation_arguments("backup");
+        duplicate.extend(["--operation".to_owned(), hex(&OPERATION)]);
+        cases.push(duplicate);
+        let mut destroy_reordered = destroy_arguments();
+        destroy_reordered.swap(1, 3);
+        destroy_reordered.swap(2, 4);
+        cases.push(destroy_reordered);
+
+        for arguments in cases {
+            assert_eq!(
+                Command::parse(arguments).expect_err("invalid exact grammar"),
+                ProvisioningSecretStoreError::Rejected
+            );
         }
     }
 
     #[test]
-    fn parser_rejects_secret_paths_unknown_arguments_and_reordering() {
-        // Break caught: accepting an input pathname or flexible trailing
-        // arguments creates an unsupported plaintext or ambiguity surface.
-        assert!(
-            Invocation::parse(vec![
-                "install".to_owned(),
-                "--input".to_owned(),
-                "/tmp/bundle".to_owned(),
-            ])
-            .is_err()
+    fn non_utf8_arguments_are_rejected_without_a_panic() {
+        // Break caught: `env::args` panics on non-UTF-8 input before the
+        // command can return its fixed sanitized rejection category.
+        let arguments = vec![std::ffi::OsString::from_vec(vec![0xff])];
+        assert_eq!(
+            Command::parse_os(arguments).expect_err("non-UTF-8 argument"),
+            ProvisioningSecretStoreError::Rejected
         );
-        let mut unknown = valid_arguments();
-        unknown.push("--verbose".to_owned());
-        assert!(Invocation::parse(unknown).is_err());
-        let mut reordered = valid_arguments();
-        reordered.swap(1, 3);
-        assert!(Invocation::parse(reordered).is_err());
     }
 
     #[test]
@@ -303,14 +906,43 @@ mod tests {
     }
 
     #[test]
-    fn non_utf8_arguments_are_rejected_without_a_panic() {
-        // Break caught: `env::args` panics on non-UTF-8 input before the
-        // command can return its fixed sanitized rejection category.
-        let arguments = vec![std::ffi::OsString::from_vec(vec![0xff])];
-        let error = Invocation::parse_os(arguments)
-            .err()
-            .expect("non-UTF-8 argument must fail");
-        assert_eq!(error, ProvisioningSecretStoreError::Rejected);
+    fn recovery_artifact_reader_has_its_own_bound_and_zeroizing_buffer() {
+        // Break caught: reusing the plaintext bound or plaintext buffer for a
+        // protected artifact can truncate valid backup data or mix lifetimes.
+        assert_eq!(
+            read_protected_artifact(Cursor::new(Vec::<u8>::new()))
+                .expect_err("missing protected artifact"),
+            ProvisioningSecretStoreError::Rejected
+        );
+        assert_eq!(
+            read_protected_artifact(Cursor::new(vec![0; MAX_BACKUP_ARTIFACT_BYTES + 1]))
+                .expect_err("oversized protected artifact"),
+            ProvisioningSecretStoreError::TooLarge
+        );
+
+        let partial_observer = Arc::new(ArtifactDropObserver::default());
+        assert_eq!(
+            read_protected_artifact_with_observer(
+                PartialFailure::new(b"partial-protected-artifact"),
+                Arc::clone(&partial_observer),
+            )
+            .expect_err("partial protected-artifact read failure"),
+            ProvisioningSecretStoreError::Unavailable
+        );
+        assert!(partial_observer.zeroized.load(Ordering::SeqCst));
+        assert!(partial_observer.allocation_stable.load(Ordering::SeqCst));
+
+        let oversized_observer = Arc::new(ArtifactDropObserver::default());
+        assert_eq!(
+            read_protected_artifact_with_observer(
+                Cursor::new(vec![0x5a; MAX_BACKUP_ARTIFACT_BYTES + 1]),
+                Arc::clone(&oversized_observer),
+            )
+            .expect_err("oversized protected-artifact read"),
+            ProvisioningSecretStoreError::TooLarge
+        );
+        assert!(oversized_observer.zeroized.load(Ordering::SeqCst));
+        assert!(oversized_observer.allocation_stable.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -340,6 +972,350 @@ mod tests {
         );
         assert!(oversized_observer.zeroized.load(Ordering::SeqCst));
         assert!(oversized_observer.allocation_stable.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn exact_success_schema_exposes_only_each_commands_allowed_fields() {
+        // Break caught: status rendering can leak operation IDs or references
+        // on commands whose schema deliberately excludes them.
+        let reference = reference();
+        let reference_hex = hex(&reference.to_bytes());
+        let cases = [
+            (
+                CommandOutcome::Install {
+                    disposition: ProvisioningInstallDisposition::Installed,
+                    generation: 7,
+                    reference: reference.clone(),
+                },
+                format!("INSTALL disposition=installed generation=7 reference={reference_hex}\n"),
+            ),
+            (
+                CommandOutcome::Rotate {
+                    disposition: ProvisioningInstallDisposition::Existing,
+                    generation: 7,
+                    reference,
+                },
+                format!("ROTATE disposition=existing generation=7 reference={reference_hex}\n"),
+            ),
+            (
+                CommandOutcome::Recover {
+                    disposition: RecoveryDisposition::Restored,
+                    generation: 7,
+                },
+                "RECOVER disposition=restored generation=7\n".to_owned(),
+            ),
+            (
+                CommandOutcome::Recover {
+                    disposition: RecoveryDisposition::Existing,
+                    generation: 7,
+                },
+                "RECOVER disposition=existing generation=7\n".to_owned(),
+            ),
+            (
+                CommandOutcome::Destroy(ProvisioningDestroyDisposition::Destroyed),
+                "DESTROY disposition=destroyed\n".to_owned(),
+            ),
+            (
+                CommandOutcome::Destroy(ProvisioningDestroyDisposition::AlreadyDestroyed),
+                "DESTROY disposition=already-destroyed\n".to_owned(),
+            ),
+        ];
+        for (outcome, expected_stdout) in cases {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            super::write_success(outcome, &mut stdout, &mut stderr).expect("render success");
+            assert_eq!(stdout, expected_stdout.as_bytes());
+            assert!(stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn backup_success_keeps_stdout_binary_and_uses_one_neutral_stderr_line() {
+        // Break caught: writing status text to stdout corrupts a redirected
+        // protected artifact, while claiming creation misstates exact retries.
+        let artifact = b"\0ASTRSDB1\nnot-status-text\xff".to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        super::write_success(
+            CommandOutcome::Backup {
+                generation: 7,
+                artifact: Zeroizing::new(artifact.clone()),
+            },
+            &mut stdout,
+            &mut stderr,
+        )
+        .expect("render backup success");
+        assert_eq!(stdout, artifact);
+        assert_eq!(stderr, b"BACKUP disposition=available generation=7\n");
+    }
+
+    #[test]
+    fn process_boundary_orders_validation_and_sanitizes_provider_failures_and_backup_output() {
+        // Break caught: refactoring main can open the provider before complete
+        // validation, expose backend detail, or mix backup status into stdout.
+        for scenario in [
+            "secret-path-before-open",
+            "secret-env-before-open",
+            "missing-install-before-open",
+            "oversized-install-before-open",
+            "missing-recover-before-open",
+            "oversized-recover-before-open",
+            "provider-unavailable",
+            "provider-rejected",
+            "provider-invalid-reference",
+            "provider-too-large",
+            "provider-operation-conflict",
+            "provider-not-found",
+            "provider-destroyed",
+            "backup-success",
+        ] {
+            let root = ProcessFixture::new(scenario);
+            let output = ProcessCommand::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "tests::cli_process_worker",
+                    "--nocapture",
+                    "--quiet",
+                    "--test-threads=1",
+                ])
+                .env("ASTER_ADMIN_CLI_PROCESS_SCENARIO", scenario)
+                .env("ASTER_ADMIN_CLI_PROCESS_STDOUT", root.stdout())
+                .env("ASTER_ADMIN_CLI_PROCESS_STDERR", root.stderr())
+                .output()
+                .expect("run CLI process worker");
+            assert!(
+                output.status.success(),
+                "worker failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = fs::read(root.stdout()).expect("read captured CLI stdout");
+            let stderr = fs::read(root.stderr()).expect("read captured CLI stderr");
+            if scenario == "backup-success" {
+                assert_eq!(stdout, b"\0protected\nartifact\xff");
+                assert_eq!(stderr, b"BACKUP disposition=available generation=9\n");
+            } else {
+                assert!(stdout.is_empty());
+                assert_eq!(stderr, expected_process_error(scenario));
+            }
+        }
+    }
+
+    fn expected_process_error(scenario: &str) -> &'static [u8] {
+        match scenario {
+            "secret-path-before-open"
+            | "secret-env-before-open"
+            | "missing-install-before-open"
+            | "missing-recover-before-open"
+            | "provider-rejected" => b"ERROR provisioning secret store rejected the request\n",
+            "oversized-install-before-open"
+            | "oversized-recover-before-open"
+            | "provider-too-large" => b"ERROR provisioning secret value exceeds its size limit\n",
+            "provider-unavailable" => b"ERROR provisioning secret store is unavailable\n",
+            "provider-invalid-reference" => b"ERROR provisioning secret reference is invalid\n",
+            "provider-operation-conflict" => {
+                b"ERROR provisioning secret operation conflicts with its durable record\n"
+            }
+            "provider-not-found" => b"ERROR provisioning secret reference was not found\n",
+            "provider-destroyed" => {
+                b"ERROR provisioning secret store reports the secret destroyed\n"
+            }
+            _ => panic!("scenario does not produce an error"),
+        }
+    }
+
+    #[test]
+    fn cli_process_worker() {
+        let Some(scenario) = std::env::var_os("ASTER_ADMIN_CLI_PROCESS_SCENARIO") else {
+            return;
+        };
+        let scenario = scenario.into_string().expect("UTF-8 scenario");
+        let stdout_path =
+            std::env::var_os("ASTER_ADMIN_CLI_PROCESS_STDOUT").expect("stdout capture path");
+        let stderr_path =
+            std::env::var_os("ASTER_ADMIN_CLI_PROCESS_STDERR").expect("stderr capture path");
+        let mut stdout = fs::File::create(stdout_path).expect("create stdout capture");
+        let mut stderr = fs::File::create(stderr_path).expect("create stderr capture");
+        let (arguments, input) = match scenario.as_str() {
+            "secret-path-before-open" => (
+                vec![
+                    "install".to_owned(),
+                    "--input".to_owned(),
+                    "/tmp/secret".to_owned(),
+                ],
+                Vec::new(),
+            ),
+            "secret-env-before-open" => (
+                vec![
+                    "rotate".to_owned(),
+                    "--input-env".to_owned(),
+                    "ASTER_SECRET".to_owned(),
+                ],
+                Vec::new(),
+            ),
+            "missing-install-before-open" => (install_arguments("install"), Vec::new()),
+            "oversized-install-before-open" => (
+                install_arguments("install"),
+                vec![0; MAX_UNPROTECTED_PROVISIONING_BYTES + 1],
+            ),
+            "missing-recover-before-open" => (operation_arguments("recover"), Vec::new()),
+            "oversized-recover-before-open" => (
+                operation_arguments("recover"),
+                vec![0; MAX_BACKUP_ARTIFACT_BYTES + 1],
+            ),
+            "provider-unavailable"
+            | "provider-rejected"
+            | "provider-invalid-reference"
+            | "provider-too-large"
+            | "provider-operation-conflict"
+            | "provider-not-found"
+            | "provider-destroyed"
+            | "backup-success" => (operation_arguments("backup"), Vec::new()),
+            _ => panic!("unknown process scenario"),
+        };
+        let mut called = false;
+        let status = execute_with(
+            arguments,
+            Cursor::new(input),
+            &mut stdout,
+            &mut stderr,
+            |mode, prepared| {
+                called = true;
+                assert_eq!(mode, OpenMode::Normal);
+                assert!(matches!(prepared, PreparedCommand::Backup { .. }));
+                match scenario.as_str() {
+                    "provider-unavailable" => Err(ProvisioningSecretStoreError::Unavailable),
+                    "provider-rejected" => Err(ProvisioningSecretStoreError::Rejected),
+                    "provider-invalid-reference" => {
+                        Err(ProvisioningSecretStoreError::InvalidReference)
+                    }
+                    "provider-too-large" => Err(ProvisioningSecretStoreError::TooLarge),
+                    "provider-operation-conflict" => {
+                        Err(ProvisioningSecretStoreError::OperationConflict)
+                    }
+                    "provider-not-found" => Err(ProvisioningSecretStoreError::NotFound),
+                    "provider-destroyed" => Err(ProvisioningSecretStoreError::Destroyed),
+                    "backup-success" => Ok(CommandOutcome::Backup {
+                        generation: 9,
+                        artifact: Zeroizing::new(b"\0protected\nartifact\xff".to_vec()),
+                    }),
+                    _ => Err(ProvisioningSecretStoreError::Unavailable),
+                }
+            },
+        );
+        assert_eq!(
+            called,
+            scenario.starts_with("provider-") || scenario == "backup-success"
+        );
+        assert_eq!(
+            status,
+            if called && scenario == "backup-success" {
+                0
+            } else {
+                1
+            }
+        );
+    }
+
+    #[test]
+    fn recover_prepares_artifact_before_requesting_the_recovery_open_mode() {
+        // Break caught: opening through the ordinary constructor or before
+        // bounded artifact validation prevents the supported repair path.
+        let mut opened = false;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = execute_with(
+            operation_arguments("recover"),
+            Cursor::new(canonical_backup_artifact()),
+            &mut stdout,
+            &mut stderr,
+            |mode, prepared| {
+                opened = true;
+                assert_eq!(mode, OpenMode::Recovery);
+                assert!(matches!(prepared, PreparedCommand::Recover { .. }));
+                Ok(CommandOutcome::Recover {
+                    disposition: RecoveryDisposition::Existing,
+                    generation: 7,
+                })
+            },
+        );
+        assert_eq!(status, 0);
+        assert!(opened);
+        assert_eq!(stdout, b"RECOVER disposition=existing generation=7\n");
+        assert!(stderr.is_empty());
+
+        opened = false;
+        stdout.clear();
+        let status = execute_with(
+            operation_arguments("recover"),
+            Cursor::new(Vec::<u8>::new()),
+            &mut stdout,
+            &mut stderr,
+            |_, _| {
+                opened = true;
+                Err(ProvisioningSecretStoreError::Unavailable)
+            },
+        );
+        assert_eq!(status, 1);
+        assert!(!opened);
+    }
+
+    fn canonical_backup_artifact() -> Vec<u8> {
+        use sha2::{Digest as _, Sha256};
+
+        let reference = reference().to_bytes();
+        let ciphertext = b"protected-fixture";
+        let ciphertext_digest: [u8; 32] = Sha256::digest(ciphertext).into();
+        let mut manifest = Vec::new();
+        manifest.extend_from_slice(b"ASTRSDM1\x00\x02\x00\x00");
+        manifest.extend_from_slice(&7_u64.to_be_bytes());
+        manifest.extend_from_slice(&LOAD_OPERATION);
+        manifest.extend_from_slice(&ciphertext_digest);
+        manifest.extend_from_slice(&(reference.len() as u32).to_be_bytes());
+        manifest.extend_from_slice(&reference);
+        let manifest_digest: [u8; 32] = Sha256::digest(&manifest).into();
+
+        let mut artifact = Vec::new();
+        artifact.extend_from_slice(b"ASTRSDB1\x00\x02\x00\x00");
+        artifact.extend_from_slice(&OPERATION);
+        artifact.extend_from_slice(&[0xa0; 32]);
+        artifact.extend_from_slice(&7_u64.to_be_bytes());
+        artifact.extend_from_slice(&LOAD_OPERATION);
+        artifact.extend_from_slice(&(reference.len() as u32).to_be_bytes());
+        artifact.extend_from_slice(&reference);
+        artifact.extend_from_slice(&manifest_digest);
+        artifact.extend_from_slice(&ciphertext_digest);
+        artifact.extend_from_slice(&(ciphertext.len() as u32).to_be_bytes());
+        artifact.extend_from_slice(ciphertext);
+        artifact
+    }
+
+    struct ProcessFixture {
+        root: PathBuf,
+    }
+
+    impl ProcessFixture {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("aster-admin-cli-{label}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir(&root).expect("create process fixture");
+            Self { root }
+        }
+
+        fn stdout(&self) -> PathBuf {
+            self.root.join("stdout")
+        }
+
+        fn stderr(&self) -> PathBuf {
+            self.root.join("stderr")
+        }
+    }
+
+    impl Drop for ProcessFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
 
     struct PartialFailure {
