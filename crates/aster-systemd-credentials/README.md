@@ -52,34 +52,54 @@ envelope, parser detail, or plaintext.
 
 ## Current implementation boundary
 
-The administration lane now supplies the initial-install subset of
-`aster-credential-admin`. The package-owned directories
+The administration lane now supplies the complete code-level
+`aster-credential-admin` lifecycle. The package-owned directories
 `/etc/aster/provisioning` and `/var/lib/aster/provisioning-systemd` must already
 exist as root-owned mode-`0700` directories on local `ext4`. The command:
 
 ```text
-aster-credential-admin install \
-  --operation <64-lowercase-hex> \
-  --load-operation <64-lowercase-hex> < provisioning.bundle
+aster-credential-admin install --operation HEX64 --load-operation HEX64 < ASTRPB03
+aster-credential-admin rotate --operation HEX64 --load-operation HEX64 < ASTRPB03
+aster-credential-admin backup --operation HEX64 > protected-backup.bin
+aster-credential-admin recover --operation HEX64 < protected-backup.bin
+aster-credential-admin destroy --operation HEX64 --reference HEX
 ```
 
-accepts the canonical bundle only on standard input, invokes exactly
-`/usr/bin/systemd-creds encrypt --with-key=host
---name=aster-provisioning.bundle - -`, and installs generation one through a
-synchronized staging directory and a versioned intent/completion ledger. An
-exact retry returns `existing` without invoking the provider again. A changed
-load operation or plaintext commitment conflicts. On restart, an exact staged
-intent is promoted and an exact active intent is completed; mismatched state
-is retained and rejected. The command prints only the sanitized `installed` or
-`existing` disposition. The opaque reference is retained in the owner-only
-active generation for the agent configuration lane.
+Install and rotate accept a canonical bundle only on standard input and invoke
+exactly `/usr/bin/systemd-creds encrypt --with-key=host
+--name=aster-provisioning.bundle - -`. Rotation atomically makes one new
+generation Active and retains one exact Previous generation until the operator
+proves new-generation readiness and destroys it. Backup emits a host-bound
+protected binary artifact; recovery can repair only the intact ledger's exact
+current generation on the same host with the unchanged systemd host key.
+Destroy commits a durable logical tombstone and never claims physical erasure.
+All operations bind to the versioned lifecycle ledger; generation mutations
+use intent-driven reconciliation, and ambiguous state is rejected without
+fallback.
 
-The current code implements runtime load and crash-recoverable generation-one
-install only. Rotation, backup/recovery, revoke/rekey, logical destruction, a
-hardened unit, package/executable freeze, and two-node G4 qualification remain
-open. There is no age, plaintext-file, TPM2, or alternate-provider fallback.
-This increment does not close E01 or E09 and does not claim G3, G4, or
-production completion.
+Install and rotate stdout is exactly
+`{INSTALL|ROTATE} disposition={installed|existing} generation=N reference=HEX`.
+Recover stdout is exactly
+`RECOVER disposition={restored|existing} generation=N`; destroy stdout is
+exactly `DESTROY disposition={destroyed|already-destroyed}`. Backup writes only
+artifact bytes to stdout and writes
+`BACKUP disposition=available generation=N` to stderr. A nonzero exit
+invalidates all stdout, including a partial or complete prefix left by an
+output-transport failure. Operation IDs are permanent bindings: retain the
+exact ID and authorized input for retry, and never reuse an ID with changed
+input.
+
+The complete human-first sequence, including required stopped-service state,
+safe backup redirection, bearer-token SIGHUP composition, mission/provider
+rotation, same-host recovery, revoke/rekey composition, destruction, and
+pre-intent staged-evidence escalation, is the
+[Raspberry Pi provider v2 operations procedure](../../docs/implementation/raspberry-pi-provider-v2-operations.md).
+
+The current code makes this lifecycle executable but does not qualify it. E01,
+packaged E09 qualification, the hardened unit and native package integration,
+G3/G4, protected authority issuance, cross-host recovery, snapshot rollback,
+physical erasure, production, and general-platform support remain open. There
+is no age, plaintext-file, TPM2, or alternate-provider fallback.
 
 The [approved v2 design](../../docs/superpowers/specs/2026-09-08-raspberry-pi-systemd-credential-provider-v2-design.md)
 on `main` defines this exact evaluation profile. Persistent v1 state is

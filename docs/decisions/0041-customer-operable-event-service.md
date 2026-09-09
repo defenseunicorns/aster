@@ -152,7 +152,7 @@ semantics are documented in the
 [`v1 configuration reference`](../reference/aster-agent-config-v1.md) and
 [`Event agent quickstart`](../quickstart/connect-agent.md).
 
-### D06 runtime-loader increment
+### D06 provider-lifecycle increment
 
 The stacked D06 implementation adds provider contract
 `aster-systemd-credential-store/v2` in
@@ -164,13 +164,23 @@ the systemd loader directly; missing, weak, insecure, changed, oversized, or
 mismatched credentials fail through fixed sanitized categories before the
 node can create state or bind health/application listeners.
 
-This is the runtime-load plus crash-recoverable generation-one-install
-increment only. Rotation, backup/recovery, revoke/rekey, logical destruction,
-the hardened unit, package/executable freeze, and two-node G4 qualification
-remain open. In particular, this increment does not approve the provider
-candidate, close E01 or E09, qualify G3 or G4, or establish production
-completion. Persistent v1 provider state is deliberately rejected rather than
-migrated.
+The stacked implementation now includes the complete code-level provider
+lifecycle: crash-recoverable install, atomic mission/provider rotation with one
+retained Previous generation, host-bound backup, same-host current-generation
+recovery through a narrow recovery open, and durable logical destruction. The
+root administration CLI exposes five exact, operation-bound commands with
+sanitized text output and a binary-only backup stdout. The
+[operator procedure](../implementation/raspberry-pi-provider-v2-operations.md)
+composes those commands with the existing Event-agent bearer-token SIGHUP
+reload and stopped-authority revoke/rekey workflow to describe all seven
+operations without duplicating either authority.
+
+Code completion makes the lifecycle executable; it does not qualify the
+provider candidate. E01, packaged E09 qualification, the hardened unit and
+native package integration, G3/G4, protected authority issuance, cross-host
+recovery, snapshot rollback, physical erasure, production, and
+general-platform support remain open. Persistent v1 provider state is
+deliberately rejected rather than migrated.
 
 ## Ownership and acceptance
 
