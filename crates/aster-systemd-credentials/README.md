@@ -95,11 +95,18 @@ rotation, same-host recovery, revoke/rekey composition, destruction, and
 pre-intent staged-evidence escalation, is the
 [Raspberry Pi provider v2 operations procedure](../../docs/implementation/raspberry-pi-provider-v2-operations.md).
 
-The current code makes this lifecycle executable but does not qualify it. E01,
-packaged E09 qualification, the hardened unit and native package integration,
-G3/G4, protected authority issuance, cross-host recovery, snapshot rollback,
-physical erasure, production, and general-platform support remain open. There
-is no age, plaintext-file, TPM2, or alternate-provider fallback.
+The five provider lifecycle CLI commands are executable but the Event-agent
+integration is not yet executable end to end or qualified. The provider's
+`active/reference` stays root-only; the future package must atomically populate
+a separate mode-`0600`, final-service-UID-owned reference handoff from
+successful INSTALL/ROTATE output. Agent configuration checks and runtime must
+run as that final service UID, while the administration CLI remains root-only.
+E01, packaged E09 qualification, the exact handoff path and ownership setup,
+service UID, hardened unit/control values, readiness check, native package
+integration, G3/G4, protected authority issuance, cross-host recovery,
+snapshot rollback, physical erasure, production, and general-platform support
+remain open. There is no age, plaintext-file, TPM2, or alternate-provider
+fallback.
 
 The [approved v2 design](../../docs/superpowers/specs/2026-09-08-raspberry-pi-systemd-credential-provider-v2-design.md)
 on `main` defines this exact evaluation profile. Persistent v1 state is

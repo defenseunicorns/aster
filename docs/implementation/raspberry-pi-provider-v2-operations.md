@@ -4,16 +4,16 @@
 
 - Profile: `aster-linux-event-mvp-evaluation-v0.1`
 - Provider: `aster-systemd-credential-store/v2`
-- Status: code-level operator procedure; package and target qualification open
+- Status: provider-CLI procedure; end-to-end package integration blocked
 
-This procedure coordinates the seven provider and Event-agent operations that
-exist in the current source tree. The five `aster-credential-admin` command
-forms below are exact and executable. The repository does not yet contain the
-hardened systemd unit or native package, so the package-owned unit name,
-installed executable paths, configuration path, and readiness address are not
-invented here. The G3 candidate annex must supply those values and the exact
-stop, start, termination-confirmation, and readiness commands before this can
-be used as a packaged qualification procedure.
+This procedure describes the intended seven provider and Event-agent
+operations. The five `aster-credential-admin` command forms below are exact and
+executable. End-to-end agent integration is blocked and unqualified: the
+repository does not yet contain the hardened systemd unit or native package.
+The G3 candidate annex must supply the package-owned service UID, provider-
+reference handoff path and ownership setup, installed executable and
+configuration paths, unit and control values, and exact stop, start,
+termination-confirmation, and readiness commands. None is invented here.
 
 This is an evaluation-only procedure for the exact Raspberry Pi reference
 2026-06-18 / Debian 13 / CM4 Rev 1.1 / `aarch64` / kernel
@@ -37,14 +37,29 @@ local ext4 before the first operation:
 /var/lib/aster/provisioning-systemd
 ```
 
-The service integration must use `LoadCredentialEncrypted=` for
-`/etc/aster/provisioning/active/credential.cred`, name the runtime credential
-exactly `aster-provisioning.bundle`, and configure the agent's
-`mission_secret_ref_file` as
-`/etc/aster/provisioning/active/reference`. The configured
-`mission_load_id` must equal the load-operation ID used for the Active
-generation. These are package-integration requirements, not artifacts shipped
-by the current crate.
+The service integration must use `LoadCredentialEncrypted=` for the provider-
+internal `/etc/aster/provisioning/active/credential.cred` and name the runtime
+credential exactly `aster-provisioning.bundle`. The sibling provider-internal
+`/etc/aster/provisioning/active/reference` remains root-only state and **must
+not** be configured as the unprivileged Event agent's
+`mission_secret_ref_file`.
+
+Instead, the deployment/package owns a separate service-readable reference
+handoff file. After a successful INSTALL or ROTATE, trusted package logic must
+parse the exact complete `reference=HEX` success field, decode that canonical
+hex to the serialized `ProvisioningSecretRef` bytes expected by the agent, and
+atomically replace the handoff file. The file must be owned exactly by the
+final service UID with mode `0600`. No shell extraction command or handoff path
+is specified because both belong to the not-yet-frozen package annex. The
+agent's `mission_secret_ref_file` must name that handoff file, and its
+configured `mission_load_id` must equal the load-operation ID used for the
+Active generation.
+
+Run the root administration CLI only as root. Run `aster-agent --check-config`
+and the agent runtime as the final service UID, not root: agent credential-file
+validation requires the bearer-token and reference handoff files to be owned
+by its own effective UID. The bearer-token file is likewise owned exactly by
+the final service UID with mode `0600`.
 
 For every new semantic provider operation, the authorized operator system
 allocates a fresh 32-byte operation ID, renders it as exactly 64 lowercase hex
@@ -125,9 +140,14 @@ ERROR provisioning secret store reports the secret destroyed
    generation and reference. Retain the returned opaque reference in the
    authorized root-only operation record: it is the exact future rotation or
    destruction input. Do not copy it into general logs.
-4. Confirm that the package configuration points to the fixed Active reference
-   path and contains this generation's exact load-operation ID. The repository
-   configuration checker is side-effect-free:
+4. Through the package-owned trusted handoff, atomically populate the separate
+   service-readable reference file from the exact successful `reference=HEX`
+   field. Its owner must be the final service UID and its mode must be `0600`;
+   do not expose or directly configure the root-only provider reference file.
+   Confirm that the package configuration points to the handoff file and
+   contains this generation's exact load-operation ID.
+5. As the final service UID, not root, run the side-effect-free repository
+   configuration checker:
 
    ```sh
    aster-agent --check-config "$ASTER_AGENT_CONFIG"
@@ -138,7 +158,9 @@ ERROR provisioning secret store reports the secret destroyed
 
 ## 2. Load the Active reference at startup
 
-1. Use the deployment-owned start procedure. PID 1 must authenticate and
+1. Use the deployment-owned start procedure. The runtime must execute as the
+   same final service UID that owns the reference handoff and bearer-token
+   files. PID 1 must authenticate and
    decrypt the encrypted credential before launching the unprivileged agent.
    The loader checks the exact reference, load operation, generation, runtime
    file security, provider envelope, and canonical inner bundle once, before
@@ -154,10 +176,10 @@ This is the only operation performed while the Event agent remains running.
 Use the configured bearer-token path and the atomic owner-only replacement
 procedure in the [Event agent quickstart](../quickstart/connect-agent.md#reload-and-stop)
 and [configuration reference](../reference/aster-agent-config-v1.md#credential-files).
-Create the replacement in the same protected directory, preserve the service
-owner and mode `0600` or stricter, and atomically rename the completely written
-regular file over the configured path. Never put token bytes in arguments,
-environment values, logs, or command output.
+Create the replacement in the same protected directory, set its owner exactly
+to the final service UID and its mode exactly to `0600`, and atomically rename
+the completely written regular file over the configured path. Never put token
+bytes in arguments, environment values, logs, or command output.
 
 Send `SIGHUP` to the exact running agent process:
 
@@ -199,11 +221,14 @@ The repository does not issue that mission material.
    made the new generation Active and parked the exact prior generation as
    Previous; it has not restarted the service or destroyed Previous. A second
    rotation is rejected while Previous remains.
-3. Atomically install the already prepared deployment configuration with
-   `mission_load_id` equal to `NEW_LOAD_OPERATION`, retaining the fixed Active
-   reference path. Run the side-effect-free `--check-config` command shown in
-   operation 1. Configuration replacement is deployment-owned until the
-   hardened package exists.
+3. Through the package-owned trusted handoff, atomically replace the separate
+   service-readable reference file from the exact successful `reference=HEX`
+   field, owned by the final service UID at mode `0600`. Atomically install the
+   already prepared configuration with `mission_load_id` equal to
+   `NEW_LOAD_OPERATION` and `mission_secret_ref_file` naming that handoff, not
+   the root-only provider-internal Active reference. Run the `--check-config`
+   command from operation 1 as the final service UID. Handoff and configuration
+   replacement remain blocked on the hardened package annex.
 4. Start the service and require the deployment readiness check to pass on the
    new generation. Never fall back to Previous after the new generation has
    committed.
@@ -322,26 +347,30 @@ The coordinated operation is:
    remains external to the repository.
 3. Use the linked stopped-authority workflow to commit the revocation and
    recipient-filtered scope rekey, then on each still-stopped retained node
-   perform operation 4 with that node's fresh provider operation IDs and exact
-   replacement bundle. Revocation and rekey remain separate, idempotent
-   authority operations; this is not an automatic or atomic
-   revoke-plus-rekey mechanism.
+   perform **only operation 4 steps 1–3** with that node's fresh provider
+   operation IDs and exact replacement bundle. Every retained node remains
+   stopped at this coordinated checkpoint. Revocation and rekey remain
+   separate, idempotent authority operations; this is not an automatic or
+   atomic revoke-plus-rekey mechanism.
 4. If the removed node is under administrator control, keep it stopped and
    use operation 7 to destroy each known live local provider reference, using
    a fresh destroy operation ID per exact reference. If it is not under
    control, make no local-erasure claim.
-5. Restart retained nodes only after their authority and provider changes are
-   complete. Require readiness on the new generation, then complete each
-   retained node's post-readiness Previous destruction from operation 4.
+5. Only after every retained node has reached that stopped checkpoint and the
+   removed controlled node has completed step 4, perform **operation 4 steps
+   4–6 exactly once** on each retained node: start and require new-generation
+   readiness, stop and destroy Previous, then start and require readiness
+   again.
 6. Through the authority workflow's authenticated acceptance path, verify that
    retained nodes accept the new generation and subsequent authentication with
    the removed credential is rejected. Provider destruction is not a
    substitute for this mission-authentication check.
 
-The current source-tree authority mechanisms and provider lifecycle make this
-composition executable with authorized inputs. Protected issuance, packaged
-coordination, physical-node execution, and the exact rejection receipt remain
-E09/G4 work.
+The authority mechanisms and provider CLI pieces are executable with
+authorized inputs. Their end-to-end Event-agent composition remains blocked on
+the package handoff, identity, service-control, readiness, and protected-
+issuance gaps above. Physical-node execution and the exact rejection receipt
+remain E09/G4 work.
 
 ## Adjacent Event-agent ReceiveOnly behavior
 
@@ -424,13 +453,15 @@ remaining package/runbook action.
 
 ## Qualification and non-claims
 
-Completing the code and this procedure makes the five provider commands and
-seven-operation composition executable at source level. It does not qualify a
-candidate. All of the following remain open:
+The five provider CLI commands are executable at source level. The complete
+seven-operation Event-agent composition is not yet executable end to end and
+does not qualify a candidate. All of the following remain open:
 
 - Security and Deployment approval at E01;
 - packaged lifecycle qualification at E09;
-- a hardened systemd unit and native package integration;
+- a hardened systemd unit and native package integration, including the exact
+  service UID, service-readable reference handoff path/ownership setup, unit
+  and control values, and readiness check;
 - G3 package, executable, unit, source, SBOM, notice, and provenance freeze;
 - G4 lifecycle and negative acceptance on both mandatory physical CM4 nodes;
 - protected mission/registry issuance and operator authorization;

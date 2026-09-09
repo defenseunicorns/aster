@@ -175,12 +175,18 @@ composes those commands with the existing Event-agent bearer-token SIGHUP
 reload and stopped-authority revoke/rekey workflow to describe all seven
 operations without duplicating either authority.
 
-Code completion makes the lifecycle executable; it does not qualify the
-provider candidate. E01, packaged E09 qualification, the hardened unit and
-native package integration, G3/G4, protected authority issuance, cross-host
-recovery, snapshot rollback, physical erasure, production, and
-general-platform support remain open. Persistent v1 provider state is
-deliberately rejected rather than migrated.
+The five provider lifecycle CLI commands are executable, but code completion
+does not make the Event-agent integration executable end to end or qualify the
+provider candidate. The provider-internal Active reference remains root-only;
+the future package must atomically hand successful INSTALL/ROTATE output to a
+separate mode-`0600`, final-service-UID-owned reference file. Configuration
+checking and runtime validation run as that final service UID, while provider
+administration remains root-only. E01, packaged E09 qualification, the exact
+handoff path and ownership setup, service UID, hardened unit/control values,
+readiness check, native package integration, G3/G4, protected authority
+issuance, cross-host recovery, snapshot rollback, physical erasure,
+production, and general-platform support remain open. Persistent v1 provider
+state is deliberately rejected rather than migrated.
 
 ## Ownership and acceptance
 
