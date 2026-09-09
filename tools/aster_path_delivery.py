@@ -429,11 +429,15 @@ def _execute_scenario(
             primary_stage = "lab-deploy"
             run(deploy, 240)
             provisioner = f"clab-{LAB}-provisioner"
-            primary_stage = "provisioner-wait"
-            if run([docker_exe, "wait", provisioner], 90).strip() != b"0":
-                raise ExecutionError("isolated provisioner failed")
+            primary_stage = "provisioner-run"
+            run([
+                docker_exe,
+                "exec",
+                provisioner,
+                "/usr/local/libexec/aster/delivery-provision.py",
+            ], 90)
             primary_stage = "provisioner-remove"
-            run([docker_exe, "rm", provisioner], 30)
+            run([docker_exe, "rm", "--force", provisioner], 30)
             primary_stage = "wan-configure"
             run([
                 docker_exe, "exec", f"clab-{LAB}-wan",

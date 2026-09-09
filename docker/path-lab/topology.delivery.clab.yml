@@ -11,7 +11,7 @@ topology:
     provisioner:
       network-mode: none
       restart-policy: "no"
-      cmd: /usr/local/libexec/aster/delivery-provision.py
+      cmd: sleep infinity
       binds:
         - __clabDir__:/lab
       cap-drop:

@@ -465,6 +465,24 @@ class PathDeliveryControllerTests(unittest.TestCase):
         self.assertTrue(
             all(call[1:4] == ["exec", "--user", "10001:10001"] for call in application_helpers)
         )
+        provision_calls = [
+            call
+            for call in calls
+            if call[-1:] == ["/usr/local/libexec/aster/delivery-provision.py"]
+        ]
+        self.assertEqual(len(provision_calls), 1)
+        self.assertEqual(
+            provision_calls[0][1:3],
+            ["exec", "clab-aster-path-delivery-provisioner"],
+        )
+        provision_index = calls.index(provision_calls[0])
+        remove_index = next(
+            index
+            for index, call in enumerate(calls)
+            if call[1:4] == ["rm", "--force", "clab-aster-path-delivery-provisioner"]
+        )
+        self.assertLess(provision_index, remove_index)
+        self.assertFalse(any(call[1:2] == ["wait"] for call in calls))
         self.assertEqual(calls[-1][1], "inspect")
 
     def test_readiness_and_cleanup_shapes_fail_closed(self) -> None:
@@ -491,6 +509,9 @@ class PathDeliveryControllerTests(unittest.TestCase):
         self.assertEqual(topology.count("__clabNodeDir__:/clab"), 2)
         self.assertIn("network-mode: none", topology)
         self.assertIn('restart-policy: "no"', topology)
+        provisioner = topology.split("    provisioner:\n", 1)[1].split("    node-a:\n", 1)[0]
+        self.assertIn("cmd: sleep infinity", provisioner)
+        self.assertNotIn("delivery-provision.py", provisioner)
         self.assertIn("net.ipv4.ip_forward: 1", topology)
         self.assertEqual(topology.count("cap-drop:\n        - ALL"), 4)
         self.assertEqual(topology.count("cap-add:\n        - NET_ADMIN"), 1)
