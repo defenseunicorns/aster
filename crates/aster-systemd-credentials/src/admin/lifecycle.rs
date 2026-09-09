@@ -3481,6 +3481,83 @@ mod tests {
     }
 
     #[test]
+    fn backup_pending_publication_replays_file_sync_before_rename_and_output() {
+        // Break caught: a complete ledger.next left before its original file sync
+        // is renamed and acknowledged without durable binding-file contents.
+        use crate::admin::{BackupOperationId, backup::encode_backup};
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for point in [
+            FaultPoint::PendingLedgerFileSyncFailed,
+            FaultPoint::PendingLedgerFileSynced,
+            FaultPoint::IntentRenamed,
+            FaultPoint::IntentParentSynced,
+        ] {
+            let fixture = AdminLifecycleFixture::new();
+            fixture.install_once();
+            let predecessor = read_fixture_ledger(&fixture);
+            let record = &predecessor.generations[0];
+            let operation = BackupOperationId::new([0x91; 32]);
+            let ciphertext = fs::read(fixture.provisioning.join("active/credential.cred")).unwrap();
+            let artifact = encode_backup(
+                operation,
+                fixture.host_identity,
+                &manifest_for(record),
+                &ciphertext,
+            )
+            .unwrap();
+            let mut pending = predecessor.clone();
+            pending.backups.push(BackupBinding {
+                operation: *operation.as_bytes(),
+                secret_ref: record.secret_ref.clone(),
+                generation: record.generation,
+                artifact_digest: crate::admin::digest(artifact.as_bytes()),
+            });
+            // Explicit pre-file-sync crash fixture: write_pending_ledger uses
+            // fs::write and never syncs either file or parent directory.
+            fixture.write_pending_ledger(&pending);
+            let before = fixture.namespace_bytes();
+            let before_provisioning = provisioning_bytes(&fixture.provisioning);
+            let result = fixture
+                .admin_with_fault(point)
+                .and_then(|mut admin| admin.backup(operation));
+            assert_eq!(
+                result.unwrap_err(),
+                ProvisioningSecretStoreError::Unavailable,
+                "{point:?}"
+            );
+            if matches!(
+                point,
+                FaultPoint::PendingLedgerFileSyncFailed | FaultPoint::PendingLedgerFileSynced
+            ) {
+                assert_eq!(
+                    fixture.namespace_bytes(),
+                    before,
+                    "no rename before file sync at {point:?}"
+                );
+                assert_eq!(read_fixture_ledger(&fixture), predecessor);
+                assert_eq!(
+                    decode_ledger(&fs::read(fixture.ledger.join("ledger.next")).unwrap()).unwrap(),
+                    pending
+                );
+            } else {
+                assert_eq!(read_fixture_ledger(&fixture), pending);
+                assert!(!fixture.ledger.join("ledger.next").exists());
+            }
+            assert_eq!(
+                provisioning_bytes(&fixture.provisioning),
+                before_provisioning
+            );
+            let receipt = fixture.admin().unwrap().backup(operation).unwrap();
+            assert_eq!(receipt.artifact().as_bytes(), artifact.as_bytes());
+            assert_eq!(read_fixture_ledger(&fixture), pending);
+            assert!(!fixture.ledger.join("ledger.next").exists());
+            assert_eq!(fixture.encrypt_calls(), 1);
+        }
+    }
+
+    #[test]
     fn backup_pending_completion_rejects_changed_or_unbound_snapshots_without_mutation() {
         // Break caught: publishing an arbitrary completed ledger.next rewrites trusted history.
         use crate::admin::BackupOperationId;

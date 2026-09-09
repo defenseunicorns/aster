@@ -41,6 +41,8 @@ pub(super) enum FaultPoint {
     IntentRenamed,
     IntentParentSynced,
     IntentParentReplayed,
+    PendingLedgerFileSyncFailed,
+    PendingLedgerFileSynced,
     ActiveRenamed,
     ActiveParentSynced,
     ActiveExchanged,
@@ -417,11 +419,42 @@ pub(super) fn publish_pending_ledger(
     expected: &[u8],
     faults: &mut FaultInjector,
 ) -> Result<(), ProvisioningSecretStoreError> {
-    let pending =
-        read_pending_ledger(ledger_root)?.ok_or(ProvisioningSecretStoreError::Rejected)?;
+    // Read and synchronize the same secure descriptor: ledger.next may contain
+    // complete bytes from a write interrupted before its original file sync.
+    let descriptor = rustix::fs::openat(
+        ledger_root,
+        LEDGER_NEXT_FILE,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|_| ProvisioningSecretStoreError::Rejected)?;
+    validate_regular(&descriptor, 0o600)?;
+    let stat =
+        rustix::fs::fstat(&descriptor).map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    let size = usize::try_from(stat.st_size).map_err(|_| ProvisioningSecretStoreError::TooLarge)?;
+    let maximum = super::ledger::MAX_LEDGER_BYTES;
+    if size > maximum {
+        return Err(ProvisioningSecretStoreError::TooLarge);
+    }
+    let file = File::from(descriptor);
+    let mut pending = Zeroizing::new(Vec::with_capacity(size));
+    (&file)
+        .take((maximum + 1) as u64)
+        .read_to_end(&mut pending)
+        .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    if pending.len() > maximum {
+        return Err(ProvisioningSecretStoreError::TooLarge);
+    }
     if pending.as_slice() != expected {
         return Err(ProvisioningSecretStoreError::Rejected);
     }
+    faults.hit(FaultPoint::PendingLedgerFileSyncFailed)?;
+    file.sync_all()
+        .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
+    faults.hit(FaultPoint::PendingLedgerFileSynced)?;
     rustix::fs::renameat(ledger_root, LEDGER_NEXT_FILE, ledger_root, LEDGER_FILE)
         .map_err(|_| ProvisioningSecretStoreError::Unavailable)?;
     faults.hit(FaultPoint::IntentRenamed)?;
