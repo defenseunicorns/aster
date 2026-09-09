@@ -15,6 +15,7 @@ run = [
   "cargo fmt --all -- --check",
   "sh tools/check-agent-proto.sh",
   "python3 tools/check-project-license.py",
+  "python3 tools/test_sbom_workflow.py",
   "python3 tools/check-implementation-requirements.py",
   "python3 tools/test_aster_tour_ui.py",
   "python3 tools/test_aster_mesh_playground.py",
@@ -154,3 +155,7 @@ run = "sh ./tools/age-reference/check.sh"
 [tasks.age-reference-audit]
 description = "Audit the Go age oracle with exact govulncheck v1.6.0"
 run = "sh ./tools/age-reference/audit.sh"
+
+[tasks.sbom]
+description = "Build Linux release binaries and their CycloneDX SBOM artifact bundle"
+run = "bash tools/build-sbom.sh"

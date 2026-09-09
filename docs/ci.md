@@ -24,6 +24,7 @@ single stable check name **`CI / required`**.
 | `dependency policy` | `ubuntu-24.04` | Enforces the retained-libp2p-oracle boundary, applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
 | `age reference interoperability` | `ubuntu-24.04` | Installs exact `govulncheck` v1.6.0, runs `mise run age-reference-audit`, then runs `mise run age-reference-interop`: the Go oracle's reachable vulnerability and compiled-module license gates must pass before exact reference Go `filippo.io/age` v1.3.1 and the Rust provider exchange classic-X25519 artifacts in both directions, compare recovered plaintext, and agree on the recipient. |
 | `bounded fuzz smoke` | `ubuntu-24.04` | Runs five fixed 10,000-case hostile-input campaigns with the pinned nightly toolchain and `cargo-fuzz`: semantic wire decode, fragment decode, reference-envelope inspection, selected mechanics-frame decode, and selected Negentropy state-machine/bounds exercise. |
+| `Linux release build and SBOM` | `ubuntu-24.04` | Runs `mise run sbom`: builds the two selected Linux release executables from the checked-out commit, generates and validates their CycloneDX SBOMs, checks Cargo.lock stability, and retains a tar bundle with checksums and scope/provenance notes for 14 days. |
 | `required` | `ubuntu-24.04` | Fails unless every validation lane completed successfully; this is the branch-protection check. |
 
 The Rust dependency downloads happen before Cargo validation is switched to
@@ -1363,7 +1364,9 @@ The workflow is safe to run for pull requests from forks:
 - Its only workflow permission is read-only repository contents.
 - It runs exclusively on GitHub-hosted, fixed-version runner labels.
 - It does not receive secrets, persist checkout credentials, execute
-  submodules, upload artifacts, or use shared Actions caches.
+  submodules, or use shared Actions caches. The SBOM job uploads only its
+  completed build tar; it does not upload the workspace or secrets. PR artifacts
+  are untrusted CI outputs until reviewed and are not automatically released.
 - Every third-party action is pinned to a full commit SHA.
 - Concurrency cancels superseded runs for the same pull request or ref, and
   every job has a timeout.
@@ -1373,7 +1376,10 @@ The action and tool pins are:
 | Component | Pin |
 | --- | --- |
 | `actions/checkout` | `3d3c42e5aac5ba805825da76410c181273ba90b1` (`v7.0.1`) |
-| `jdx/mise-action` | `3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518` (`v4.2.5`) |
+| `jdx/mise-action` | `c2a87611a18de5b3828c5652fe268e992400cb5c` (`v4.3.0`) |
+| `actions/upload-artifact` | `ea165f8d65b6e75b540449e92b4886f43607fa02` (`v4.6.2`) |
+| cargo-cyclonedx | `0.5.9` |
+| CycloneDX Editor/Validator | `0.34.0` |
 | mise | `2026.4.28` |
 | Rust | `1.97.1` |
 | Minimum supported Rust | `1.91.0` |
@@ -1393,6 +1399,14 @@ manual reviewed update. An update remains untrusted until these checks pass and
 a maintainer reviews the upstream release and the resulting dependency changes.
 
 ## Running checks locally
+
+For the separate release-build/SBOM lane, provision its pinned tools and fetch
+locked dependencies, then run `mise run sbom`. See the
+[artifact workflow](release/sbom/README.md#automated-build-and-artifact) for
+prerequisites, output layout and inventory qualifications. Its orchestration
+regression tests run in `mise run check` and can also be invoked directly with
+`python3 tools/test_sbom_workflow.py`.
+
 
 Install the repository toolchain and run the primary gate:
 

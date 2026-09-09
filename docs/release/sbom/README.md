@@ -11,6 +11,48 @@ reproducible builds, provenance, signing, or release authorization. The
 [requirements status](../../implementation/requirements-status.md) retain
 their existing claim boundaries.
 
+## Automated build and artifact
+
+Run `mise run sbom` from a checkout with committed tracked changes. It uses
+Rust 1.97.1, cargo-cyclonedx 0.5.9 and cdx-ev 0.34.0 from PATH. Provision the
+pinned tools as described below, then run `cargo fetch --locked` once with
+approved network access. The task itself runs offline and installs nothing.
+
+The task builds a Git archive of HEAD, excluding untracked local files. It
+refuses modified tracked files so BUILD.txt can identify the committed source.
+Generator outputs stay in that temporary snapshot. The release target is
+`x86_64-unknown-linux-gnu`, with package-default features for `aster-node` and
+`aster-agent`. Existing `CARGO_TARGET_DIR` is honored; the default is
+`target/sbom-build`.
+
+The result is `target/sbom/aster-linux-x86_64.tar`, containing:
+
+- `aster`, `aster-agent`, and the two unmodified CycloneDX JSON documents;
+- `SHA256SUMS`, Cargo.lock and its checksum, and `BUILD.txt` with the source
+  commit, compiler, Cargo, generator, validator, target and profile;
+- build/generation logs, `--help` smoke outputs, project LICENSE and SCOPE.txt;
+- the current vendored netlink source archive, including its patch explanation
+  and upstream hash receipt. Historical pedigree edits are not applied.
+
+The script requires both schema-valid documents with the expected application
+roots and nonempty dependency license declarations. Build, generation, lockfile
+drift, smoke or validation failure stops it and removes any previous output
+bundle. Build/generation logs remain under `target/sbom/` for diagnosis. The
+archive preserves executable permissions and its files have relative checksums.
+After extracting it, run `sha256sum -c SHA256SUMS`.
+
+CI runs this same task in its separate required `sbom` job on Ubuntu 24.04.
+It uploads only the completed tar as an Actions artifact, retained for 14 days
+(subject to repository policy). PR artifacts describe the checked-out test
+commit and are CI results, not signed releases. No automatic release publishing
+or requirement-status change is implied.
+
+The commands below remain available as the manual equivalent and historical
+pedigree-editing reference. The automated bundle preserves patch provenance as
+sidecar source evidence; it does not add pedigree or executable hashes inside
+the generated CycloneDX documents. Python validator transitive dependencies
+and runner system packages are not fully locked by this workflow.
+
 ## Selected approach
 
 Use **cargo-cyclonedx 0.5.9** to produce one CycloneDX 1.5 JSON document for
