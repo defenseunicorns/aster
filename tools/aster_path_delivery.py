@@ -296,6 +296,26 @@ def _lab_is_absent(document: object) -> bool:
     return isinstance(document, dict) and LAB not in document
 
 
+def _prepare_bind_sources(topology_directory: Path) -> Path:
+    lab_directory = topology_directory / f"clab-{LAB}"
+    paths = (
+        lab_directory,
+        lab_directory / "node-a",
+        lab_directory / "node-b",
+    )
+    for path in paths:
+        path.mkdir(mode=0o700)
+        metadata = path.lstat()
+        if (
+            path.is_symlink()
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise ExecutionError("path-delivery bind source is not trusted")
+    return lab_directory
+
+
 def _validate_netem(raw: bytes) -> dict[str, object]:
     document = _strict_json(raw, "netem read-back")
     records = document.get(FIXED_NETEM["node"]) if isinstance(document, dict) else None
@@ -378,6 +398,8 @@ def _execute_scenario(
 ) -> dict[str, object]:
     """Execute while the caller holds exclusive ownership of the fixed lab."""
 
+    if os.environ.get("CLAB_LABDIR_BASE"):
+        raise ExecutionError("CLAB_LABDIR_BASE must be unset for path-delivery execution")
     plan = compile_scenario(raw)
     clab = str(containerlab)
     docker_exe = str(docker)
@@ -399,6 +421,8 @@ def _execute_scenario(
         observed: dict[str, object] = {}
         try:
             isolated_topology.write_bytes(topology.read_bytes())
+            primary_stage = "bind-source-prepare"
+            _prepare_bind_sources(Path(directory))
             deploy = [clab, "deploy", "--topo", str(isolated_topology)]
             destroy = [clab, "destroy", "--topo", str(isolated_topology), "--cleanup"]
             deployed = True

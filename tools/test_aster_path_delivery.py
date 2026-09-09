@@ -242,7 +242,7 @@ class PathDeliveryControllerTests(unittest.TestCase):
         message = str(raised.exception)
         self.assertEqual(
             message,
-            "path-delivery failed: primary=lab-deploy cleanup=lab-destroy",
+            "path-delivery failed: primary=lab-deploy cleanup=lab-destroy,credential-directory",
         )
         self.assertNotIn("raw-primary-output", message)
         self.assertNotIn("raw-cleanup-output", message)
@@ -251,7 +251,108 @@ class PathDeliveryControllerTests(unittest.TestCase):
         while cause is not None:
             causes.append(str(cause))
             cause = cause.__cause__
-        self.assertEqual(causes, ["raw-cleanup-output", "raw-primary-output"])
+        self.assertEqual(
+            causes,
+            [
+                "credential-bearing lab directory remains",
+                "raw-cleanup-output",
+                "raw-primary-output",
+            ],
+        )
+
+    def test_execution_precreates_owner_only_bind_sources_before_deploy(self) -> None:
+        scenario = {
+            "schema": "aster-path-delivery-scenario/v1",
+            "id": "event-delivery-netem",
+            "seed": 104729,
+            "operation_key": "one",
+            "logical_key": "key",
+            "payload": "payload",
+        }
+        observed: list[tuple[bool, bool, int, int]] = []
+        lab_directory: Path | None = None
+
+        def run(argv: list[str], timeout: float) -> bytes:
+            nonlocal lab_directory
+            del timeout
+            if argv[1:5] == ["inspect", "--all", "--format", "json"]:
+                return b"{}"
+            if argv[1] == "deploy":
+                topology = Path(argv[argv.index("--topo") + 1])
+                lab_directory = topology.parent / f"clab-{MODULE.LAB}"
+                for path in (
+                    lab_directory,
+                    lab_directory / "node-a",
+                    lab_directory / "node-b",
+                ):
+                    metadata = path.lstat() if path.exists() else None
+                    observed.append(
+                        (
+                            path.exists(),
+                            path.is_dir() and not path.is_symlink(),
+                            MODULE.stat.S_IMODE(metadata.st_mode) if metadata else -1,
+                            metadata.st_uid if metadata else -1,
+                        )
+                    )
+                raise MODULE.ExecutionError("stop after bind inspection")
+            if argv[1] == "destroy" and lab_directory is not None:
+                MODULE.shutil.rmtree(lab_directory, ignore_errors=True)
+            return b""
+
+        with tempfile.TemporaryDirectory() as directory:
+            topology = Path(directory) / "topology.delivery.clab.yml"
+            topology.write_text("name: aster-path-delivery\n", encoding="utf-8")
+            with self.assertRaisesRegex(MODULE.ExecutionError, "primary=lab-deploy"):
+                MODULE.execute_scenario(
+                    json.dumps(scenario).encode(),
+                    containerlab=Path("/usr/local/bin/containerlab"),
+                    docker=Path("/usr/local/bin/docker"),
+                    topology=topology,
+                    run=run,
+                    lock_path=Path(directory) / "aster-path-delivery.lock",
+                )
+
+        self.assertEqual(
+            observed,
+            [(True, True, 0o700, MODULE.os.geteuid())] * 3,
+        )
+
+    def test_execution_rejects_an_external_containerlab_lab_directory_base(self) -> None:
+        scenario = {
+            "schema": "aster-path-delivery-scenario/v1",
+            "id": "event-delivery-netem",
+            "seed": 104729,
+            "operation_key": "one",
+            "logical_key": "key",
+            "payload": "payload",
+        }
+        calls: list[list[str]] = []
+
+        def run(argv: list[str], timeout: float) -> bytes:
+            del timeout
+            calls.append(argv)
+            return b"{}"
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.dict(
+                MODULE.os.environ,
+                {"CLAB_LABDIR_BASE": "/tmp/external-lab-base"},
+            ),
+            self.assertRaisesRegex(MODULE.ExecutionError, "CLAB_LABDIR_BASE"),
+        ):
+            topology = Path(directory) / "topology.delivery.clab.yml"
+            topology.write_text("name: aster-path-delivery\n", encoding="utf-8")
+            MODULE.execute_scenario(
+                json.dumps(scenario).encode(),
+                containerlab=Path("/usr/local/bin/containerlab"),
+                docker=Path("/usr/local/bin/docker"),
+                topology=topology,
+                run=run,
+                lock_path=Path(directory) / "aster-path-delivery.lock",
+            )
+
+        self.assertEqual(calls, [])
 
     def test_execution_delivers_exact_event_and_reports_bounded_oracles(self) -> None:
         scenario = {
@@ -312,6 +413,12 @@ class PathDeliveryControllerTests(unittest.TestCase):
                 ).encode()
             if argv[1:3] == ["wait", "clab-aster-path-delivery-provisioner"]:
                 return b"0\n"
+            if argv[1] == "destroy":
+                topology = Path(argv[argv.index("--topo") + 1])
+                MODULE.shutil.rmtree(
+                    topology.parent / f"clab-{MODULE.LAB}",
+                    ignore_errors=True,
+                )
             return b""
 
         with tempfile.TemporaryDirectory() as directory:
