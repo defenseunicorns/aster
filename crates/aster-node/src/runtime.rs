@@ -84,7 +84,7 @@ use tokio::{
 };
 use tokio::{
     sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, mpsc, oneshot},
-    task::{Id as TaskId, JoinHandle, JoinSet},
+    task::{AbortHandle, Id as TaskId, JoinHandle, JoinSet},
     time::{MissedTickBehavior, sleep, timeout},
 };
 use zeroize::Zeroize as _;
@@ -251,6 +251,10 @@ const AUTOMATIC_NEARBY_REOPEN_MIN_BACKOFF: Duration = Duration::from_millis(250)
 const AUTOMATIC_NEARBY_REOPEN_MAX_BACKOFF: Duration = Duration::from_secs(4);
 const MAX_INBOUND_CONTACTS: usize = 16;
 const MAX_OUTBOUND_CONTACTS: usize = 16;
+// Preserve single-sided contact in the normal case, but do not let carrier-ID
+// ordering permanently hide a ReceiveOnly peer from a permitted initiator.
+const MIN_NON_PREFERRED_CONTACT_FALLBACK_DELAY: Duration = Duration::from_secs(1);
+const NON_PREFERRED_CONTACT_FALLBACK_INTERVALS: u32 = 3;
 const APPLICATION_COMMAND_CAPACITY: usize = 32;
 const BLOB_WORKER_CAPACITY: usize = 1;
 const CONTROL_COMMAND_CAPACITY: usize = 1;
@@ -429,6 +433,36 @@ const LOCAL_ZEROIZATION_REQUEST_MAGIC: &[u8] = b"ASTER-ZEROIZE-LOCAL-V1\0";
 const MAX_LOCAL_ZEROIZATION_PATH_BYTES: usize = 8 * 1024;
 #[cfg(unix)]
 const MAX_LOCAL_ZEROIZATION_RESPONSE_BYTES: usize = 8 * 1024;
+
+fn contact_initiation_is_due(
+    local: EndpointId,
+    peer: EndpointId,
+    last_peer_activity: Instant,
+    now: Instant,
+    fallback_delay: Duration,
+) -> bool {
+    local < peer || now.saturating_duration_since(last_peer_activity) >= fallback_delay
+}
+
+fn non_preferred_contact_fallback_delay(sync_interval: Duration) -> Duration {
+    sync_interval
+        .saturating_mul(NON_PREFERRED_CONTACT_FALLBACK_INTERVALS)
+        .max(MIN_NON_PREFERRED_CONTACT_FALLBACK_DELAY)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InboundContactCollision {
+    KeepPreferredOutbound,
+    YieldFallbackOutbound,
+}
+
+fn inbound_contact_collision(local: EndpointId, peer: EndpointId) -> InboundContactCollision {
+    if local < peer {
+        InboundContactCollision::KeepPreferredOutbound
+    } else {
+        InboundContactCollision::YieldFallbackOutbound
+    }
+}
 
 fn selected_reconciliation_limits() -> Result<ReconciliationLimits, NodeError> {
     Ok(ReconciliationLimits::new(
@@ -11965,6 +11999,14 @@ async fn run_node_actor_inner(
         JoinSet::new();
     let mut outbound_peers = BTreeSet::new();
     let mut outbound_tasks = BTreeMap::<TaskId, ContactPeer>::new();
+    let mut outbound_abort_handles = BTreeMap::<EndpointId, (TaskId, AbortHandle)>::new();
+    let mut collision_aborted_outbound = BTreeSet::<TaskId>::new();
+    let non_preferred_fallback_delay = non_preferred_contact_fallback_delay(config.sync_interval);
+    let contact_election_started = Instant::now();
+    let mut peer_contact_activity = configured_peers
+        .iter()
+        .map(|peer| (peer.carrier, contact_election_started))
+        .collect::<BTreeMap<_, _>>();
     let mut automatic_candidates = BTreeSet::<EndpointId>::new();
     let mut automatic_events_open = automatic_nearby;
     let mut next_outbound_peer = 0usize;
@@ -12141,6 +12183,7 @@ async fn run_node_actor_inner(
                     }
                     Some(AutomaticNearbyEvent::Expired(endpoint_id)) => {
                         if automatic_candidates.remove(&endpoint_id) {
+                            peer_contact_activity.remove(&endpoint_id);
                             node_stdout!(
                                 "DISCOVERY status=expired mode=nearby-auto carrier_peer={} retained_candidates={}",
                                 endpoint_id,
@@ -12150,10 +12193,12 @@ async fn run_node_actor_inner(
                     }
                     Some(AutomaticNearbyEvent::WindowClosed) => {
                         automatic_candidates.clear();
+                        peer_contact_activity.clear();
                     }
                     None => {
                         automatic_events_open = false;
                         automatic_candidates.clear();
+                        peer_contact_activity.clear();
                     }
                 }
                 // A biased, continuously ready discovery stream gets at most
@@ -12289,16 +12334,33 @@ async fn run_node_actor_inner(
                 }
                 let start = next_outbound_peer % peer_count;
                 next_outbound_peer = (start + 1) % peer_count;
+                let election_now = Instant::now();
                 for offset in 0..peer_count {
                     if outbound.len() >= MAX_OUTBOUND_CONTACTS {
                         break;
                     }
                     let peer = contact_peers[(start + offset) % peer_count];
-                    // Exactly one endpoint initiates each configured edge. This avoids
-                    // symmetric connect/accept deadlocks without assigning topology meaning.
-                    if local_id >= peer.carrier() || !outbound_peers.insert(peer.carrier()) {
+                    let peer_id = peer.carrier();
+                    let last_activity = peer_contact_activity
+                        .entry(peer_id)
+                        .or_insert(election_now);
+                    // The lower identity initiates immediately. The higher identity
+                    // becomes eligible only after a bounded quiet period, which keeps
+                    // the normal case single-sided while allowing a normal peer to
+                    // reach a lower-identity ReceiveOnly peer.
+                    if inbound_peers.contains(&peer_id)
+                        || !contact_initiation_is_due(
+                            local_id,
+                            peer_id,
+                            *last_activity,
+                            election_now,
+                            non_preferred_fallback_delay,
+                        )
+                        || !outbound_peers.insert(peer_id)
+                    {
                         continue;
                     }
+                    *last_activity = election_now;
                     let store = store.clone();
                     let endpoint = endpoint.clone();
                     let policy_lock = policy_lock.clone();
@@ -12335,7 +12397,9 @@ async fn run_node_actor_inner(
                             .await,
                         )
                     }));
-                    outbound_tasks.insert(task.id(), peer);
+                    let task_id = task.id();
+                    outbound_tasks.insert(task_id, peer);
+                    outbound_abort_handles.insert(peer_id, (task_id, task));
                 }
             }
             lease = acquire_application_policy_lease(
@@ -12379,7 +12443,12 @@ async fn run_node_actor_inner(
                 match accepted {
                     Some(Ok(connection)) => {
                         let peer = connection.remote_id();
-                        if !inbound_peers.insert(peer) {
+                        if peer_contact_activity.contains_key(&peer)
+                            || automatic_candidates.contains(&peer)
+                        {
+                            peer_contact_activity.insert(peer, Instant::now());
+                        }
+                        if inbound_peers.contains(&peer) {
                             connection.close();
                             receipt.contact_errors += 1;
                             node_stderr!("CONTACT direction=in carrier_peer={peer} status=error error=duplicate_concurrent_carrier_contact");
@@ -12388,6 +12457,28 @@ async fn run_node_actor_inner(
                             }
                             continue;
                         }
+                        if let Some((task, abort)) = outbound_abort_handles
+                            .get(&peer)
+                            .map(|(task, abort)| (*task, abort.clone()))
+                        {
+                            match inbound_contact_collision(local_id, peer) {
+                                InboundContactCollision::KeepPreferredOutbound => {
+                                    connection.close();
+                                    println!("CONTACT direction=in carrier_peer={peer} status=collision-resolved resolution=keep-preferred-outbound");
+                                    if yield_for_network {
+                                        tokio::task::yield_now().await;
+                                    }
+                                    continue;
+                                }
+                                InboundContactCollision::YieldFallbackOutbound => {
+                                    collision_aborted_outbound.insert(task);
+                                    abort.abort();
+                                    println!("CONTACT direction=out carrier_peer={peer} status=collision-resolved resolution=yield-fallback-to-preferred-inbound");
+                                }
+                            }
+                        }
+                        let inserted = inbound_peers.insert(peer);
+                        debug_assert!(inserted, "duplicate inbound peer was rejected above");
                         let store = store.clone();
                         let policy_lock = policy_lock.clone();
                         let emission_policy = emission_policy.clone();
@@ -12457,6 +12548,9 @@ async fn run_node_actor_inner(
                     Some(Ok((task, (peer, Ok(server_receipt))))) => {
                         inbound_tasks.remove(&task);
                         inbound_peers.remove(&peer);
+                        if let Some(last_activity) = peer_contact_activity.get_mut(&peer) {
+                            *last_activity = Instant::now();
+                        }
                         if let Err(error) = selected_event_status.record(&server_receipt) {
                             fatal_error = Some(error);
                             break;
@@ -12515,6 +12609,9 @@ async fn run_node_actor_inner(
                     Some(Ok((task, (peer, Err(error))))) => {
                         inbound_tasks.remove(&task);
                         inbound_peers.remove(&peer);
+                        if let Some(last_activity) = peer_contact_activity.get_mut(&peer) {
+                            *last_activity = Instant::now();
+                        }
                         if actor_fatal_contact_error(&error, config.mission.identity()) {
                             fatal_error = Some(error);
                             break;
@@ -12526,6 +12623,9 @@ async fn run_node_actor_inner(
                         let peer = inbound_tasks.remove(&error.id());
                         if let Some(peer) = peer {
                             inbound_peers.remove(&peer);
+                            if let Some(last_activity) = peer_contact_activity.get_mut(&peer) {
+                                *last_activity = Instant::now();
+                            }
                         }
                         receipt.contact_errors += 1;
                         node_stderr!("CONTACT direction=in carrier_peer={} status=error error={}", peer.map_or_else(|| "unknown".into(), |peer| peer.to_string()), format_receipt_field(&format!("task failed: {error}")));
@@ -12546,6 +12646,11 @@ async fn run_node_actor_inner(
                     Some(Ok((task, (peer, Ok(peer_receipt))))) => {
                         outbound_tasks.remove(&task);
                         outbound_peers.remove(&peer.carrier());
+                        outbound_abort_handles.remove(&peer.carrier());
+                        collision_aborted_outbound.remove(&task);
+                        if let Some(last_activity) = peer_contact_activity.get_mut(&peer.carrier()) {
+                            *last_activity = Instant::now();
+                        }
                         if let Err(error) = selected_event_status.record(&peer_receipt) {
                             fatal_error = Some(error);
                             break;
@@ -12605,6 +12710,11 @@ async fn run_node_actor_inner(
                     Some(Ok((task, (peer, Err(error))))) => {
                         outbound_tasks.remove(&task);
                         outbound_peers.remove(&peer.carrier());
+                        outbound_abort_handles.remove(&peer.carrier());
+                        collision_aborted_outbound.remove(&task);
+                        if let Some(last_activity) = peer_contact_activity.get_mut(&peer.carrier()) {
+                            *last_activity = Instant::now();
+                        }
                         if actor_fatal_contact_error(&error, config.mission.identity()) {
                             fatal_error = Some(error);
                             break;
@@ -12616,9 +12726,18 @@ async fn run_node_actor_inner(
                         node_stderr!("CONTACT direction=out carrier_peer={} expected_mission_peer={} status=error error={}", peer.carrier(), expected_mission, format_receipt_field(&error.to_string()));
                     }
                     Some(Err(error)) => {
-                        let peer = outbound_tasks.remove(&error.id());
+                        let task = error.id();
+                        let collision_aborted = collision_aborted_outbound.remove(&task);
+                        let peer = outbound_tasks.remove(&task);
                         if let Some(peer) = peer {
                             outbound_peers.remove(&peer.carrier());
+                            outbound_abort_handles.remove(&peer.carrier());
+                            if let Some(last_activity) = peer_contact_activity.get_mut(&peer.carrier()) {
+                                *last_activity = Instant::now();
+                            }
+                        }
+                        if collision_aborted {
+                            continue;
                         }
                         receipt.contact_errors += 1;
                         node_stderr!("CONTACT direction=out carrier_peer={} status=error error={}", peer.map_or_else(|| "unknown".into(), |peer| peer.carrier().to_string()), format_receipt_field(&format!("task failed: {error}")));
@@ -22113,6 +22232,61 @@ mod tests {
     }
 
     #[test]
+    fn contact_election_prefers_lower_identity_then_bounds_higher_fallback() {
+        let first = expected_peer(901, 29_901).carrier.id;
+        let second = expected_peer(902, 29_902).carrier.id;
+        let (lower, higher) = if first < second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let started = Instant::now();
+        let fallback_delay = non_preferred_contact_fallback_delay(Duration::from_secs(5));
+        assert_eq!(fallback_delay, Duration::from_secs(15));
+        assert_eq!(
+            non_preferred_contact_fallback_delay(Duration::from_millis(20)),
+            MIN_NON_PREFERRED_CONTACT_FALLBACK_DELAY,
+        );
+        let just_before_fallback = started
+            .checked_add(fallback_delay - Duration::from_nanos(1))
+            .expect("bounded fallback instant");
+        let fallback = started
+            .checked_add(fallback_delay)
+            .expect("fallback instant");
+
+        assert!(contact_initiation_is_due(
+            lower,
+            higher,
+            started,
+            started,
+            fallback_delay,
+        ));
+        assert!(!contact_initiation_is_due(
+            higher,
+            lower,
+            started,
+            just_before_fallback,
+            fallback_delay,
+        ));
+        assert!(contact_initiation_is_due(
+            higher,
+            lower,
+            started,
+            fallback,
+            fallback_delay,
+        ));
+        assert_eq!(
+            inbound_contact_collision(lower, higher),
+            InboundContactCollision::KeepPreferredOutbound,
+        );
+        assert_eq!(
+            inbound_contact_collision(higher, lower),
+            InboundContactCollision::YieldFallbackOutbound,
+        );
+        assert!(!EventEmissionPolicy::ReceiveOnly.permits_contact_initiation());
+    }
+
+    #[test]
     fn injected_custody_clock_clones_share_one_identity_and_tick_source() {
         let clock = NodeCustodyClock::injected([0x81; 16], 41, 1);
         let clone = clock.clone();
@@ -28218,6 +28392,177 @@ mod tests {
             ApplicationErrorKind::StateUnavailable
         );
         fs::remove_dir_all(state).expect("cleanup live actor state");
+    }
+
+    #[tokio::test]
+    async fn higher_normal_peer_delivers_to_lower_receive_only_peer() {
+        use crate::application::{EventPollRequest, EventPublishRequest, EventSubscriptionRequest};
+
+        let test_root = root("higher-normal-to-lower-receive-only");
+        let first_state = test_root.join("first");
+        let second_state = test_root.join("second");
+        fs::create_dir_all(&test_root).expect("contact-election test root");
+        let first_carrier = {
+            let identity =
+                NodeIdentity::load_or_create(&first_state).expect("first carrier identity");
+            let id = identity.id();
+            drop(identity);
+            id
+        };
+        let second_carrier = {
+            let identity =
+                NodeIdentity::load_or_create(&second_state).expect("second carrier identity");
+            let id = identity.id();
+            drop(identity);
+            id
+        };
+        #[cfg(unix)]
+        for state in [&first_state, &second_state] {
+            fs::set_permissions(state, fs::Permissions::from_mode(0o700))
+                .expect("owner-only contact-election state");
+        }
+        let mut missions = issue_missions(2);
+        let first_mission = missions.remove(0);
+        let second_mission = missions.remove(0);
+        let (
+            lower_state,
+            lower_carrier,
+            lower_mission,
+            higher_state,
+            higher_carrier,
+            higher_mission,
+        ) = if first_carrier < second_carrier {
+            (
+                first_state,
+                first_carrier,
+                first_mission,
+                second_state,
+                second_carrier,
+                second_mission,
+            )
+        } else {
+            (
+                second_state,
+                second_carrier,
+                second_mission,
+                first_state,
+                first_carrier,
+                first_mission,
+            )
+        };
+        let lower_socket = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve lower port");
+        let higher_socket = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve higher port");
+        let lower_address = lower_socket.local_addr().expect("lower address");
+        let higher_address = higher_socket.local_addr().expect("higher address");
+        drop((lower_socket, higher_socket));
+        let lower_config = NodeConfig {
+            state: lower_state,
+            bind: lower_address,
+            mission: lower_mission.credentials.clone(),
+            peers: vec![MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: higher_carrier,
+                    address: higher_address,
+                },
+                mission: higher_mission.identity,
+            }],
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(20),
+            run_for: None,
+            application: NodeApplication::Relay,
+        };
+        let higher_config = NodeConfig {
+            state: higher_state,
+            bind: higher_address,
+            mission: higher_mission.credentials,
+            peers: vec![MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: lower_carrier,
+                    address: lower_address,
+                },
+                mission: lower_mission.identity,
+            }],
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(20),
+            run_for: None,
+            application: NodeApplication::Relay,
+        };
+        let receive_only = SelectedForwardingConfig::default()
+            .with_emission_policy(EventEmissionPolicy::ReceiveOnly);
+        let lower = start_node_with_forwarding(lower_config, receive_only)
+            .await
+            .expect("start lower ReceiveOnly peer");
+        let lower_events = lower.selected_events();
+        let topic = Topic::new("opaque").expect("topic");
+        let scope = Scope::new("test/runtime-contact").expect("scope");
+        let subscription = lower_events
+            .subscribe(EventSubscriptionRequest {
+                operation_key: b"higher-normal-to-lower-receive-only".to_vec(),
+                topic: topic.clone(),
+                scope: scope.clone(),
+                include_descendant_scopes: false,
+            })
+            .await
+            .expect("subscribe lower ReceiveOnly peer");
+        let higher = start_node(higher_config)
+            .await
+            .expect("start higher normal peer");
+        let higher_events = higher.selected_events();
+        let published = higher_events
+            .publish(EventPublishRequest {
+                operation_key: b"higher-normal-publication".to_vec(),
+                predecessor: None,
+                topic,
+                scope,
+                priority: Priority::Priority,
+                logical_key: b"contact-election".to_vec(),
+                payload: b"higher normal peer must fall back to initiation".to_vec(),
+                tombstone: false,
+            })
+            .await
+            .expect("publish on higher normal peer");
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let page = lower_events
+                    .poll(EventPollRequest {
+                        subscription: subscription.id,
+                        delivery_limit: 8,
+                        scan_limit: 8,
+                    })
+                    .await
+                    .expect("poll lower ReceiveOnly peer");
+                if page
+                    .deliveries
+                    .iter()
+                    .any(|delivery| delivery.event.id == published.id)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("higher normal peer must initiate after the preferred peer stays silent");
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let lower_status = lower_events.status().await.expect("lower contact status");
+                let higher_status = higher_events.status().await.expect("higher contact status");
+                if lower_status.authenticated_contacts > 0
+                    && higher_status.authenticated_contacts > 0
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fallback contact must complete on both peers");
+
+        let (lower_receipt, higher_receipt) = tokio::join!(lower.shutdown(), higher.shutdown());
+        assert!(lower_receipt.expect("lower shutdown").contacts > 0);
+        assert!(higher_receipt.expect("higher shutdown").contacts > 0);
+        fs::remove_dir_all(test_root).expect("contact-election cleanup");
     }
 
     #[tokio::test]
