@@ -204,6 +204,26 @@ provisioning remain open work.
 | **Security profiles** | Stock runtime profile `0x0001` retains hybrid-PQ source/control, mission handshake, and Aster records. Additive profile `0x0002` exposes a provisioned P-256 semantic-v1 Event/control and exporter-bound two-node Iroh path without a second Aster application record. | Stock runtime/CLI selection, authenticated offers or general negotiation, complete classical data/lifecycle coverage, snapshot-resistant rollback, retained capture/resource evidence, independent interoperability, and release authorization |
 | **Operations** | Manually admitted direct addresses, an operator-pinned controlled relay, default-off Iroh-compatible mDNS evaluation modes for exact rostered peers or mission-authorized `--discover-lan` contacts in repeated maximum-30-second windows, explicit bounded IPv4 interface selection for multi-homed discovery, bounded one-host software namespace-NAT acceptance, reference mission provisioning, and bounded same-UID Unix software zeroization | Protected operational provisioning, physically qualified/hostile-bounded production discovery, representative/physical NAT, public/default relay selection, BTLE platform integration, physical sanitization, and release authorization |
 
+## Customer-readiness priorities
+
+The shortest supportable path to customer use is a deliberately narrow Linux
+and Event-only product profile. It should promise durable transfer across
+intermittently available approved IP paths, not seamless multipath networking
+or real-time streaming. Work should proceed in this order:
+
+| Priority | Task | Minimum completion evidence |
+|---|---|---|
+| **P0** | Freeze and document the first supported profile | One versioned profile covering Linux, Event, bounded payloads and node counts, manually admitted direct peers, one customer-controlled pinned relay, explicit quotas, and disabled automatic LAN discovery; unsupported State, Record, Blob, public-relay, automatic-discovery, and dynamic-routing behavior is rejected or clearly marked preview |
+| **P0** | Make the release gate deterministic | The pinned `mise run check` passes from a clean checkout; network integration tests remain reliable under loaded CI; the secure file-creation umask is established by the runner; every language binding reports semantic version 6; future-incompatible dependencies are removed or dispositioned |
+| **P0** | Produce reproducible deployable artifacts | Signed Linux packages and container images build from locked, reviewed inputs through an approved package proxy or vendored offline dependencies; enterprise CA installation is supported without disabling TLS verification; SBOM, provenance, license notices, checksums, upgrade, rollback, and uninstall procedures ship with each release |
+| **P0** | Replace reference provisioning with an operational secret boundary | Node and mission material can be installed, rotated, revoked, backed up, restored, and destroyed through an approved protected provider; plaintext credentials are never required in arguments, logs, images, or ordinary configuration files |
+| **P0** | Establish a customer-operable Event service | The loopback ConnectRPC agent has stable configuration, health/readiness endpoints, bounded publish/query/subscription behavior, documented acknowledgement and retry semantics, service-manager integration, graceful shutdown, crash recovery, and actionable sanitized errors |
+| **P1** | Qualify unstable direct and relay paths | Retained tests cover packet loss, latency, reordering, bandwidth limits, NAT rebinding, address replacement, interface loss, long outages, process termination, relay loss, and recovery; they prove no unauthorized disclosure, no accepted-data loss, bounded resource use, and eventual delivery after an approved path returns |
+| **P1** | Add controlled IP multi-network switching | A bounded supervisor observes interface and route changes, refreshes approved endpoint candidates, reauthenticates every new contact, prefers usable direct paths, falls back only to the pinned relay, retries direct paths after backoff, and exposes every path transition without transferring authorization between interfaces |
+| **P1** | Ship production observability and capacity controls | Operators can monitor queued items and bytes, oldest pending age, last authenticated contact, direct/relay selection, retry deadlines, path transitions, storage pressure, rejected work, and saturation; alerts and sizing guidance are validated at the supported node and payload limits |
+| **P1** | Harden controlled-relay operations | The relay has documented certificate rotation, peer allowlisting, quotas, denial-of-service bounds, health checks, log redaction, backup-free recovery, upgrade procedures, and an availability model appropriate to the first customer deployments |
+| **P2** | Expand beyond the Event MVP only after field evidence | State, Record, Blob, dynamic hierarchy, automatic discovery, and additional carriers each receive an explicit API, lifecycle, relay, recovery, resource, physical-network, and mixed-implementation acceptance gate before entering the supported profile |
+
 The [capability roadmap](docs/implementation/capability-roadmap.md) is the
 planning and merge-review view. The
 [requirements status](docs/implementation/requirements-status.md) remains the
