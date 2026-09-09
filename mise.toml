@@ -27,6 +27,8 @@ run = [
   "python3 tools/test_aster_hierarchy_scale_compose.py",
   "python3 tools/test_aster_path_lab.py",
   "python3 tools/aster_path_lab.py docker/path-lab/scenarios/netem-readback-smoke.json",
+  "python3 tools/test_aster_path_delivery.py",
+  "python3 tools/aster_path_delivery.py docker/path-lab/scenarios/event-delivery-netem.json",
   "sh -n docker/lan-scale/init-state.sh",
   "sh -n docker/hierarchy-mvp/demo-node-entrypoint.sh",
   "python3 tools/test-selected-n32-receipt.py",
@@ -148,6 +150,14 @@ run = "python3 tools/aster_path_lab.py docker/path-lab/scenarios/netem-readback-
 [tasks.path-lab-smoke]
 description = "Execute the bounded Containerlab netem read-back smoke on Linux"
 run = "python3 tools/aster_path_lab.py docker/path-lab/scenarios/netem-readback-smoke.json --execute"
+
+[tasks.path-delivery-plan]
+description = "Validate the fixed real-Event path-delivery scenario"
+run = "python3 tools/aster_path_delivery.py docker/path-lab/scenarios/event-delivery-netem.json"
+
+[tasks.path-delivery-smoke]
+description = "Execute one real Event through the routed Containerlab impairment on Linux"
+run = "python3 tools/aster_path_delivery.py docker/path-lab/scenarios/event-delivery-netem.json --execute"
 
 [tasks.tour]
 description = "Run the fastest two-node causal Ping/Pong capability tour"

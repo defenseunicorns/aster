@@ -151,6 +151,48 @@ jobs:
             --execute \
             --containerlab "$RUNNER_TEMP/containerlab"
 
+  path-delivery-smoke:
+    name: path-lab real Event delivery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Install exact-pinned Containerlab
+        env:
+          CONTAINERLAB_SHA256: f90d36d58bb6c4afd3b3a4dca006b81594c6d16f7a04be0184b03f44291085a2
+          CONTAINERLAB_URL: https://github.com/srl-labs/containerlab/releases/download/v0.79.0/containerlab_0.79.0_linux_amd64.tar.gz
+        run: |
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            "$CONTAINERLAB_URL" \
+            --output "$RUNNER_TEMP/containerlab.tar.gz"
+          printf '%s  %s\n' "$CONTAINERLAB_SHA256" \
+            "$RUNNER_TEMP/containerlab.tar.gz" | sha256sum --check --strict
+          tar --extract --gzip --file "$RUNNER_TEMP/containerlab.tar.gz" \
+            --directory "$RUNNER_TEMP" containerlab
+          chmod 0755 "$RUNNER_TEMP/containerlab"
+          "$RUNNER_TEMP/containerlab" version --short
+
+      - name: Build the real-Event delivery image
+        run: |
+          docker pull rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97
+          docker build --pull=false \
+            --file docker/path-lab/Dockerfile.delivery \
+            --tag aster-path-delivery:local .
+
+      - name: Execute the bounded real-Event scenario
+        run: |
+          sudo python3 tools/aster_path_delivery.py \
+            docker/path-lab/scenarios/event-delivery-netem.json \
+            --execute \
+            --containerlab "$RUNNER_TEMP/containerlab" \
+            --docker "$(command -v docker)"
+
   macos-tests:
     name: macOS tests
     runs-on: macos-14
@@ -331,6 +373,7 @@ jobs:
     needs:
       - quality
       - path-lab-smoke
+      - path-delivery-smoke
       - macos-tests
       - msrv
       - age-reference-interop
@@ -345,6 +388,7 @@ jobs:
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
           PATH_LAB_RESULT: ${{ needs.path-lab-smoke.result }}
+          PATH_DELIVERY_RESULT: ${{ needs.path-delivery-smoke.result }}
           MACOS_RESULT: ${{ needs.macos-tests.result }}
           MSRV_RESULT: ${{ needs.msrv.result }}
           AGE_INTEROP_RESULT: ${{ needs.age-reference-interop.result }}
@@ -355,6 +399,7 @@ jobs:
           for result in \
             "$QUALITY_RESULT" \
             "$PATH_LAB_RESULT" \
+            "$PATH_DELIVERY_RESULT" \
             "$MACOS_RESULT" \
             "$MSRV_RESULT" \
             "$AGE_INTEROP_RESULT" \

@@ -1,0 +1,43 @@
+# Copyright 2026 Defense Unicorns, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+name: aster-path-delivery
+
+topology:
+  defaults:
+    kind: linux
+    image: aster-path-delivery:local
+  nodes:
+    provisioner:
+      network-mode: none
+      restart-policy: "no"
+      cmd: /usr/local/libexec/aster/delivery-provision.py
+      binds:
+        - __clabDir__:/lab
+      cap-drop:
+        - ALL
+      cap-add:
+        - CHOWN
+    node-a:
+      cmd: sleep infinity
+      binds:
+        - __clabNodeDir__:/clab
+      cap-drop:
+        - ALL
+    wan:
+      cmd: sleep infinity
+      sysctls:
+        net.ipv4.ip_forward: 1
+      cap-drop:
+        - ALL
+      cap-add:
+        - NET_ADMIN
+    node-b:
+      cmd: sleep infinity
+      binds:
+        - __clabNodeDir__:/clab
+      cap-drop:
+        - ALL
+  links:
+    - endpoints: ["node-a:eth1", "wan:eth1"]
+    - endpoints: ["wan:eth2", "node-b:eth1"]
