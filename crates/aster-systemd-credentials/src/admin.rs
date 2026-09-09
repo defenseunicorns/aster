@@ -1,8 +1,14 @@
+mod backup;
 mod encrypt;
 mod files;
 mod ledger;
 #[allow(dead_code)] // Shared lifecycle primitives are consumed by Tasks 3-5.
 mod lifecycle;
+
+pub use backup::{
+    BackupOperationId, BackupReceipt, MAX_BACKUP_ARTIFACT_BYTES, ProtectedBackupArtifact,
+    RecoveryDisposition, RecoveryOperationId, RecoveryReceipt,
+};
 
 #[cfg(test)]
 pub(super) static TEST_PROCESS_SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -49,6 +55,23 @@ pub struct SystemdCredentialAdmin {
 }
 
 impl SystemdCredentialAdmin {
+    /// Opens the fixed namespace for same-host repair with an intact ledger.
+    /// Only missing Active or corrupt ciphertext with exact current-generation
+    /// metadata is tolerated. Other operations still require complete slots.
+    pub fn open_for_recovery() -> Result<Self, ProvisioningSecretStoreError> {
+        if !rustix::process::geteuid().is_root() {
+            return Err(ProvisioningSecretStoreError::Unavailable);
+        }
+        Self::open_paths_for_recovery(
+            Path::new(PROVISIONING_ROOT),
+            Path::new(LEDGER_ROOT),
+            Path::new(HOST_KEY_PATH),
+            true,
+            SystemdCredsEncryptor::new(),
+            FaultInjector::disabled(),
+        )
+    }
+
     /// Opens the fixed Raspberry Pi provider namespace and acquires its exclusive lock.
     pub fn open() -> Result<Self, ProvisioningSecretStoreError> {
         if !rustix::process::geteuid().is_root() {
@@ -107,6 +130,45 @@ impl SystemdCredentialAdmin {
         encryptor: SystemdCredsEncryptor,
         faults: FaultInjector,
     ) -> Result<Self, ProvisioningSecretStoreError> {
+        Self::open_paths_with_mode(
+            provisioning_path,
+            ledger_path,
+            host_key_path,
+            require_ext4,
+            encryptor,
+            faults,
+            false,
+        )
+    }
+
+    fn open_paths_for_recovery(
+        provisioning_path: &Path,
+        ledger_path: &Path,
+        host_key_path: &Path,
+        require_ext4: bool,
+        encryptor: SystemdCredsEncryptor,
+        faults: FaultInjector,
+    ) -> Result<Self, ProvisioningSecretStoreError> {
+        Self::open_paths_with_mode(
+            provisioning_path,
+            ledger_path,
+            host_key_path,
+            require_ext4,
+            encryptor,
+            faults,
+            true,
+        )
+    }
+
+    fn open_paths_with_mode(
+        provisioning_path: &Path,
+        ledger_path: &Path,
+        host_key_path: &Path,
+        require_ext4: bool,
+        encryptor: SystemdCredsEncryptor,
+        faults: FaultInjector,
+        recovery: bool,
+    ) -> Result<Self, ProvisioningSecretStoreError> {
         let provisioning_root = open_secure_root(provisioning_path, require_ext4)?;
         let ledger_root = open_secure_root(ledger_path, require_ext4)?;
         let namespace_lock = open_namespace_lock(&ledger_root)?;
@@ -119,14 +181,17 @@ impl SystemdCredentialAdmin {
             encryptor,
             faults,
         };
-        admin.reconcile_namespace()?;
+        admin.reconcile_namespace(recovery)?;
         Ok(admin)
     }
 
-    fn reconcile_namespace(&mut self) -> Result<(), ProvisioningSecretStoreError> {
+    fn reconcile_namespace(&mut self, recovery: bool) -> Result<(), ProvisioningSecretStoreError> {
         let current = read_ledger(&self.ledger_root)?;
         let pending = read_pending_ledger(&self.ledger_root)?;
         if current.is_none() {
+            if recovery {
+                return Err(ProvisioningSecretStoreError::Rejected);
+            }
             if let Some(encoded) = &pending {
                 let pending = decode_ledger(encoded)?;
                 if pending.host_key_identity != self.host_key_identity
@@ -172,6 +237,22 @@ impl SystemdCredentialAdmin {
         let ledger = match current {
             Some(encoded) => {
                 let current = decode_ledger(&encoded)?;
+                if current.host_key_identity != self.host_key_identity {
+                    return Err(ProvisioningSecretStoreError::Rejected);
+                }
+                if current.intent.is_none()
+                    && let Some(pending) = &pending
+                    && pending.intent.is_none()
+                {
+                    backup::validate_pending_backup(&self.provisioning_root, &current, pending)?;
+                    files::publish_pending_ledger(
+                        &self.ledger_root,
+                        &Zeroizing::new(encode_ledger(pending)?),
+                        &mut self.faults,
+                    )?;
+                    lifecycle::validate_completed_generations(&self.provisioning_root, pending)?;
+                    return Ok(());
+                }
                 let publish_pending_intent = current.intent.is_none()
                     && pending
                         .as_ref()
@@ -196,7 +277,11 @@ impl SystemdCredentialAdmin {
             return Err(ProvisioningSecretStoreError::Rejected);
         }
         if ledger.intent.is_none() {
-            lifecycle::validate_completed_generations(&self.provisioning_root, &ledger)?;
+            if recovery {
+                lifecycle::validate_recovery_generations(&self.provisioning_root, &ledger)?;
+            } else {
+                lifecycle::validate_completed_generations(&self.provisioning_root, &ledger)?;
+            }
             return Ok(());
         }
         if ledger
@@ -266,6 +351,10 @@ impl SystemdCredentialAdmin {
 
         if let Some(encoded) = read_ledger(&self.ledger_root)? {
             let ledger = decode_ledger(&encoded)?;
+            if ledger.host_key_identity != self.host_key_identity || ledger.intent.is_some() {
+                return Err(ProvisioningSecretStoreError::Rejected);
+            }
+            lifecycle::validate_completed_generations(&self.provisioning_root, &ledger)?;
             return self
                 .classify_existing_install_operation(&ledger, operation, load, &plaintext)?
                 .ok_or(ProvisioningSecretStoreError::OperationConflict);
@@ -346,6 +435,7 @@ impl SystemdCredentialAdmin {
         ProfileProvisioningBundle::from_bytes(plaintext.expose())
             .map_err(|_| ProvisioningSecretStoreError::Rejected)?;
 
+        self.require_no_pending_ledger()?;
         let encoded =
             read_ledger(&self.ledger_root)?.ok_or(ProvisioningSecretStoreError::Rejected)?;
         let ledger = decode_ledger(&encoded)?;
@@ -432,6 +522,15 @@ impl SystemdCredentialAdmin {
             &mut self.faults,
         )?;
         Ok(ProvisioningInstallReceipt::installed(operation, secret_ref))
+    }
+
+    fn require_no_pending_ledger(&self) -> Result<(), ProvisioningSecretStoreError> {
+        // An interrupted write must be reconciled by a fresh open before this
+        // instance can overwrite the pending operation with another mutation.
+        if read_pending_ledger(&self.ledger_root)?.is_some() {
+            return Err(ProvisioningSecretStoreError::Rejected);
+        }
+        Ok(())
     }
 
     fn classify_existing_install_operation(

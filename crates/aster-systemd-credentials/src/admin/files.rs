@@ -578,6 +578,29 @@ pub(super) fn generation_matches(
     }
 }
 
+pub(super) fn read_exact_generation_ciphertext(
+    provisioning_root: &OwnedFd,
+    name: &str,
+    expected: &GenerationManifest,
+) -> Result<Zeroizing<Vec<u8>>, ProvisioningSecretStoreError> {
+    if expected.content != GenerationContent::Credential
+        || !generation_identity_matches(provisioning_root, name, expected)?
+    {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    let directory = open_child_directory(provisioning_root, name)?;
+    let ciphertext = read_optional_file(
+        &directory,
+        CIPHERTEXT_FILE,
+        aster_mesh::MAX_PROTECTED_PROVISIONING_BYTES,
+    )?
+    .ok_or(ProvisioningSecretStoreError::Rejected)?;
+    if super::digest(&ciphertext) != expected.ciphertext_digest {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    Ok(ciphertext)
+}
+
 pub(super) fn generation_identity_matches(
     provisioning_root: &OwnedFd,
     name: &str,

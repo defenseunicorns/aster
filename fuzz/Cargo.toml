@@ -73,6 +73,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "systemd_backup_decode"
+path = "fuzz_targets/systemd_backup_decode.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 
 [patch.crates-io]

@@ -761,6 +761,52 @@ pub(super) fn validate_completed_generations(
     Ok(())
 }
 
+/// Recovery defers only the current Active ciphertext integrity check. All
+/// metadata, retained slots, and absence of transaction debris remain required.
+pub(super) fn validate_recovery_generations(
+    provisioning_root: &OwnedFd,
+    ledger: &ProviderLedger,
+) -> Result<(), ProvisioningSecretStoreError> {
+    if ledger.intent.is_some() {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    let active = ledger
+        .generations
+        .iter()
+        .find(|record| record.state == GenerationState::Active)
+        .ok_or(ProvisioningSecretStoreError::Rejected)?;
+    if child_directory_exists(provisioning_root, ACTIVE_DIRECTORY)?
+        && !generation_identity_matches(
+            provisioning_root,
+            ACTIVE_DIRECTORY,
+            &manifest_from_record(active),
+        )?
+    {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    let previous = ledger
+        .generations
+        .iter()
+        .find(|record| record.state == GenerationState::Previous);
+    if let Some(previous) = previous {
+        if !generation_matches(
+            provisioning_root,
+            PREVIOUS_DIRECTORY,
+            &manifest_from_record(previous),
+        )? {
+            return Err(ProvisioningSecretStoreError::Rejected);
+        }
+    } else if child_directory_exists(provisioning_root, PREVIOUS_DIRECTORY)? {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    if child_directory_exists(provisioning_root, STAGED_DIRECTORY)?
+        || child_directory_exists(provisioning_root, CLEANUP_DIRECTORY)?
+    {
+        return Err(ProvisioningSecretStoreError::Rejected);
+    }
+    Ok(())
+}
+
 fn validate_completed_slot(
     provisioning_root: &OwnedFd,
     slot: &str,
@@ -3330,6 +3376,749 @@ mod tests {
         }
     }
 
+    #[test]
+    fn backup_binds_before_output_and_retries_the_original_active_or_previous_bytes() {
+        // Break caught: a retry selecting the new Active silently changes the backup binding.
+        use crate::admin::{BackupOperationId, backup::decode_backup};
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fixture = AdminLifecycleFixture::new();
+        fixture.install_once();
+        let operation = BackupOperationId::new([0x91; 32]);
+        let receipt = fixture.admin().unwrap().backup(operation).unwrap();
+        let bytes = receipt.artifact().as_bytes().to_vec();
+        let decoded = decode_backup(&bytes).unwrap();
+        assert_eq!(
+            decoded.ciphertext,
+            fs::read(fixture.provisioning.join("active/credential.cred")).unwrap()
+        );
+        let ledger = decode_ledger(&fs::read(fixture.ledger.join("ledger")).unwrap()).unwrap();
+        assert_eq!(ledger.backups.len(), 1);
+        assert_eq!(ledger.backups[0].operation, [0x91; 32]);
+        assert_eq!(
+            ledger.backups[0].artifact_digest,
+            crate::admin::digest(&bytes)
+        );
+        assert_eq!(receipt.operation(), operation);
+        assert_eq!(receipt.secret_ref(), &decoded.manifest.secret_ref);
+        assert_eq!(receipt.generation(), 1);
+        fixture
+            .admin()
+            .unwrap()
+            .rotate(
+                ProvisioningInstallId::new([0x92; 32]),
+                ProvisioningLoadId::new([0x93; 32]),
+                fixture.bundle(),
+            )
+            .unwrap();
+        assert_eq!(
+            fixture
+                .admin()
+                .unwrap()
+                .backup(operation)
+                .unwrap()
+                .artifact()
+                .as_bytes(),
+            bytes
+        );
+        let next = fixture
+            .admin()
+            .unwrap()
+            .backup(BackupOperationId::new([0x94; 32]))
+            .unwrap();
+        assert_eq!(next.generation(), 2);
+        assert_ne!(next.artifact().as_bytes(), bytes);
+        assert_eq!(fixture.encrypt_calls(), 2);
+
+        let mut ledger = decode_ledger(&fs::read(fixture.ledger.join("ledger")).unwrap()).unwrap();
+        ledger.backups[0].artifact_digest[0] ^= 1;
+        fixture.write_ledger(ledger);
+        let before = fixture.namespace_bytes();
+        assert_eq!(
+            fixture.admin().unwrap().backup(operation).unwrap_err(),
+            ProvisioningSecretStoreError::OperationConflict
+        );
+        assert_eq!(fixture.namespace_bytes(), before);
+    }
+
+    #[test]
+    fn backup_commit_faults_reopen_to_exact_identical_output() {
+        // Break caught: a ledger-only backup completion pending at crash strands administration.
+        use crate::admin::BackupOperationId;
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for point in [
+            FaultPoint::CompleteFileSynced,
+            FaultPoint::CompleteRenamed,
+            FaultPoint::CompleteParentSynced,
+        ] {
+            let fixture = AdminLifecycleFixture::new();
+            fixture.install_once();
+            assert_eq!(
+                fixture
+                    .admin_with_fault(point)
+                    .unwrap()
+                    .backup(BackupOperationId::new([0x91; 32]))
+                    .unwrap_err(),
+                ProvisioningSecretStoreError::Unavailable
+            );
+            let receipt = fixture
+                .admin()
+                .unwrap()
+                .backup(BackupOperationId::new([0x91; 32]))
+                .unwrap();
+            let ledger = decode_ledger(&fs::read(fixture.ledger.join("ledger")).unwrap()).unwrap();
+            assert_eq!(ledger.backups.len(), 1, "{point:?}");
+            assert_eq!(
+                ledger.backups[0].artifact_digest,
+                crate::admin::digest(receipt.artifact().as_bytes())
+            );
+            assert!(!fixture.ledger.join("ledger.next").exists());
+            assert_eq!(fixture.encrypt_calls(), 1);
+        }
+    }
+
+    #[test]
+    fn backup_pending_completion_rejects_changed_or_unbound_snapshots_without_mutation() {
+        // Break caught: publishing an arbitrary completed ledger.next rewrites trusted history.
+        use crate::admin::BackupOperationId;
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for case in 0..5 {
+            let fixture = AdminLifecycleFixture::new();
+            fixture.install_once();
+            let _ = fixture
+                .admin_with_fault(FaultPoint::CompleteFileSynced)
+                .unwrap()
+                .backup(BackupOperationId::new([0x91; 32]));
+            let mut pending =
+                decode_ledger(&fs::read(fixture.ledger.join("ledger.next")).unwrap()).unwrap();
+            match case {
+                0 => pending.backups[0].artifact_digest[0] ^= 1,
+                1 => {
+                    let mut second = pending.backups[0].clone();
+                    second.operation = [0x92; 32];
+                    pending.backups.push(second);
+                }
+                2 => pending.generations[0].envelope_commitment[0] ^= 1,
+                3 => pending.backups[0].operation = [0x93; 32],
+                4 => pending.host_key_identity[0] ^= 1,
+                _ => unreachable!(),
+            }
+            fixture.write_pending_ledger(&pending);
+            let before = fixture.namespace_bytes();
+            assert_eq!(
+                fixture.admin().unwrap_err(),
+                ProvisioningSecretStoreError::Rejected,
+                "{case}"
+            );
+            assert_eq!(fixture.namespace_bytes(), before);
+        }
+    }
+
+    #[test]
+    fn recovery_restores_only_exact_current_missing_or_corrupt_active_and_retries_existing() {
+        // Break caught: recovery cannot be reached after a process restart or re-encrypts the backup.
+        use crate::admin::{BackupOperationId, RecoveryDisposition, RecoveryOperationId};
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for corrupt in [false, true] {
+            let fixture = AdminLifecycleFixture::new();
+            fixture.install_once();
+            let backup = fixture
+                .admin()
+                .unwrap()
+                .backup(BackupOperationId::new([0x91; 32]))
+                .unwrap();
+            let active_before = namespace_bytes(&fixture.provisioning, &fixture.ledger)
+                .into_iter()
+                .filter(|(name, _)| name.starts_with("active/"))
+                .collect::<Vec<_>>();
+            assert_eq!(active_before.len(), 3);
+            if corrupt {
+                fs::write(
+                    fixture.provisioning.join("active/credential.cred"),
+                    b"corrupt ciphertext",
+                )
+                .unwrap();
+            } else {
+                fs::remove_dir_all(fixture.provisioning.join("active")).unwrap();
+            }
+            assert_eq!(
+                fixture.admin().unwrap_err(),
+                ProvisioningSecretStoreError::Rejected
+            );
+            let operation = RecoveryOperationId::new([0x92; 32]);
+            let receipt = fixture
+                .recovery_admin(None)
+                .unwrap()
+                .recover(operation, backup.artifact())
+                .unwrap();
+            assert_eq!(receipt.disposition(), RecoveryDisposition::Restored);
+            assert_eq!(receipt.operation(), operation);
+            assert_eq!(receipt.secret_ref(), backup.secret_ref());
+            assert_eq!(receipt.generation(), 1);
+            let retry = fixture
+                .admin()
+                .unwrap()
+                .recover(operation, backup.artifact())
+                .unwrap();
+            assert_eq!(retry.disposition(), RecoveryDisposition::Existing);
+            let active_after = namespace_bytes(&fixture.provisioning, &fixture.ledger)
+                .into_iter()
+                .filter(|(name, _)| name.starts_with("active/"))
+                .collect::<Vec<_>>();
+            assert_eq!(active_after, active_before);
+            assert!(!fixture.provisioning.join("staged").exists());
+            assert!(!fixture.provisioning.join("cleanup").exists());
+            assert_eq!(fixture.encrypt_calls(), 1);
+        }
+    }
+
+    #[test]
+    fn recovery_open_and_other_operations_preserve_every_unrelated_namespace_defect() {
+        // Break caught: relaxing open for recovery also permits install/rotation or unrelated bad slots.
+        use crate::admin::BackupOperationId;
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for defect in 0..8 {
+            let fixture = AdminLifecycleFixture::new();
+            fixture.install_once();
+            if defect == 6 {
+                fixture
+                    .admin()
+                    .unwrap()
+                    .rotate(
+                        ProvisioningInstallId::new([0x94; 32]),
+                        ProvisioningLoadId::new([0x95; 32]),
+                        fixture.bundle(),
+                    )
+                    .unwrap();
+                fs::remove_dir_all(fixture.provisioning.join("previous")).unwrap();
+            }
+            if defect == 0 {
+                fs::remove_dir_all(fixture.provisioning.join("active")).unwrap();
+                let mut admin = fixture.recovery_admin(None).unwrap();
+                let before = fixture.namespace_bytes();
+                assert_eq!(
+                    admin
+                        .install(
+                            ProvisioningInstallId::new([0x11; 32]),
+                            ProvisioningLoadId::new([0x22; 32]),
+                            fixture.bundle()
+                        )
+                        .unwrap_err(),
+                    ProvisioningSecretStoreError::Rejected
+                );
+                assert_eq!(
+                    admin
+                        .rotate(
+                            ProvisioningInstallId::new([0x94; 32]),
+                            ProvisioningLoadId::new([0x95; 32]),
+                            fixture.bundle()
+                        )
+                        .unwrap_err(),
+                    ProvisioningSecretStoreError::Rejected
+                );
+                assert_eq!(
+                    admin
+                        .backup(BackupOperationId::new([0x91; 32]))
+                        .unwrap_err(),
+                    ProvisioningSecretStoreError::Rejected
+                );
+                assert_eq!(fixture.namespace_bytes(), before);
+                continue;
+            }
+            match defect {
+                1 => fs::remove_file(fixture.provisioning.join("active/reference")).unwrap(),
+                2 => fs::write(fixture.provisioning.join("active/extra"), b"unbound").unwrap(),
+                3..=5 => {
+                    let name = ["staged", "cleanup", "previous"][defect - 3];
+                    fs::create_dir(fixture.provisioning.join(name)).unwrap();
+                    fs::set_permissions(
+                        fixture.provisioning.join(name),
+                        fs::Permissions::from_mode(0o700),
+                    )
+                    .unwrap();
+                }
+                6 => {}
+                7 => fs::write(
+                    fixture.provisioning.join("active/manifest"),
+                    b"corrupt manifest",
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            }
+            let before = fixture.namespace_bytes();
+            assert_eq!(
+                fixture.recovery_admin(None).unwrap_err(),
+                ProvisioningSecretStoreError::Rejected,
+                "defect {defect}"
+            );
+            assert_eq!(fixture.namespace_bytes(), before);
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_wrong_host_backup_binding_digest_and_history_without_mutation() {
+        // Break caught: trusting a merely well-formed artifact permits rollback or new unrecorded backups.
+        use crate::admin::{BackupOperationId, ProtectedBackupArtifact, RecoveryOperationId};
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for case in 0..7 {
+            let fixture = AdminLifecycleFixture::new();
+            fixture.install_once();
+            let backup = fixture
+                .admin()
+                .unwrap()
+                .backup(BackupOperationId::new([0x91; 32]))
+                .unwrap();
+            let mut bytes = backup.artifact().as_bytes().to_vec();
+            match case {
+                0 => bytes[44] ^= 1,
+                1 => bytes[12] ^= 1,
+                2 => {
+                    let mut ledger =
+                        decode_ledger(&fs::read(fixture.ledger.join("ledger")).unwrap()).unwrap();
+                    ledger.backups[0].artifact_digest[0] ^= 1;
+                    fixture.write_ledger(ledger);
+                }
+                3 => fs::remove_file(fixture.ledger.join("ledger")).unwrap(),
+                4 => {
+                    fixture
+                        .admin()
+                        .unwrap()
+                        .rotate(
+                            ProvisioningInstallId::new([0x94; 32]),
+                            ProvisioningLoadId::new([0x95; 32]),
+                            fixture.bundle(),
+                        )
+                        .unwrap();
+                }
+                5 => fs::write(&fixture.host_key, [0x6b; 32]).unwrap(),
+                6 => {
+                    let mut ledger =
+                        decode_ledger(&fs::read(fixture.ledger.join("ledger")).unwrap()).unwrap();
+                    ledger.generations[0].state = GenerationState::Destroyed;
+                    ledger.generations[0].ciphertext_digest = [0; 32];
+                    fixture.write_ledger(ledger);
+                    fs::remove_dir_all(fixture.provisioning.join("active")).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let artifact = ProtectedBackupArtifact::from_bytes(&bytes).unwrap();
+            let before = fixture.namespace_bytes();
+            let result = fixture.recovery_admin(None).and_then(|mut admin| {
+                admin.recover(RecoveryOperationId::new([0x92; 32]), &artifact)
+            });
+            assert!(result.is_err(), "case {case}");
+            assert_eq!(fixture.namespace_bytes(), before, "case {case}");
+            assert_eq!(fixture.encrypt_calls(), if case == 4 { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn recovery_public_faults_resume_through_fresh_admin_and_every_cleanup_boundary() {
+        // Break caught: only synthetic engine tests miss unpersisted public recovery bindings.
+        use crate::admin::{BackupOperationId, RecoveryDisposition, RecoveryOperationId};
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let common = [
+            FaultPoint::IntentFileSynced,
+            FaultPoint::IntentRenamed,
+            FaultPoint::IntentParentSynced,
+            FaultPoint::ProvisioningParentSynced,
+            FaultPoint::CompleteFileSynced,
+            FaultPoint::CompleteRenamed,
+            FaultPoint::CompleteParentSynced,
+        ];
+        let cleanup = [
+            FaultPoint::ActiveExchanged,
+            FaultPoint::CleanupGenerationRenamed,
+            FaultPoint::CleanupParentSynced,
+            FaultPoint::CleanupContentDeleted,
+            FaultPoint::CleanupReferenceDeleted,
+            FaultPoint::CleanupManifestDeleted,
+            FaultPoint::CleanupContentsDeleted,
+            FaultPoint::CleanupDirectoryDeleted,
+            FaultPoint::CleanupRemovalParentSynced,
+            FaultPoint::ReplacedGenerationDeleted,
+        ];
+        for corrupt in [false, true] {
+            let points = common.into_iter().chain(if corrupt {
+                cleanup.to_vec()
+            } else {
+                vec![FaultPoint::ActiveRenamed, FaultPoint::ActiveParentSynced]
+            });
+            for point in points {
+                let fixture = AdminLifecycleFixture::new();
+                fixture.install_once();
+                let backup = fixture
+                    .admin()
+                    .unwrap()
+                    .backup(BackupOperationId::new([0x91; 32]))
+                    .unwrap();
+                if corrupt {
+                    fs::write(
+                        fixture.provisioning.join("active/credential.cred"),
+                        b"corrupt ciphertext",
+                    )
+                    .unwrap();
+                } else {
+                    fs::remove_dir_all(fixture.provisioning.join("active")).unwrap();
+                }
+                let operation = RecoveryOperationId::new([0x92; 32]);
+                assert_eq!(
+                    fixture
+                        .recovery_admin(Some(point))
+                        .unwrap()
+                        .recover(operation, backup.artifact())
+                        .unwrap_err(),
+                    ProvisioningSecretStoreError::Unavailable,
+                    "{point:?}"
+                );
+                let receipt = fixture
+                    .admin()
+                    .unwrap()
+                    .recover(operation, backup.artifact())
+                    .unwrap();
+                assert_eq!(
+                    receipt.disposition(),
+                    RecoveryDisposition::Existing,
+                    "{point:?}"
+                );
+                let ledger =
+                    decode_ledger(&fs::read(fixture.ledger.join("ledger")).unwrap()).unwrap();
+                assert!(ledger.intent.is_none());
+                assert_eq!(ledger.recoveries.len(), 1);
+                assert_eq!(ledger.recoveries[0].backup_operation, [0x91; 32]);
+                assert!(!fixture.provisioning.join("cleanup").exists());
+                assert!(!fixture.provisioning.join("staged").exists());
+                assert_eq!(fixture.encrypt_calls(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_pre_intent_faults_preserve_unbound_stage_for_operator_remediation() {
+        // Break caught: recovery auto-deletes or activates ciphertext before a bound intent exists.
+        use crate::admin::{BackupOperationId, RecoveryOperationId};
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for point in [
+            FaultPoint::StageCiphertextSynced,
+            FaultPoint::StageReferenceSynced,
+            FaultPoint::StageManifestSynced,
+            FaultPoint::StageDirectorySynced,
+            FaultPoint::StageParentSynced,
+        ] {
+            let fixture = AdminLifecycleFixture::new();
+            fixture.install_once();
+            let backup = fixture
+                .admin()
+                .unwrap()
+                .backup(BackupOperationId::new([0x91; 32]))
+                .unwrap();
+            fs::write(
+                fixture.provisioning.join("active/credential.cred"),
+                b"corrupt ciphertext",
+            )
+            .unwrap();
+            let ledger_before = fs::read(fixture.ledger.join("ledger")).unwrap();
+            assert_eq!(
+                fixture
+                    .recovery_admin(Some(point))
+                    .unwrap()
+                    .recover(RecoveryOperationId::new([0x92; 32]), backup.artifact())
+                    .unwrap_err(),
+                ProvisioningSecretStoreError::Unavailable
+            );
+            let before = fixture.namespace_bytes();
+            assert_eq!(
+                fixture.admin().unwrap_err(),
+                ProvisioningSecretStoreError::Rejected
+            );
+            assert_eq!(
+                fixture.recovery_admin(None).unwrap_err(),
+                ProvisioningSecretStoreError::Rejected
+            );
+            assert_eq!(fixture.namespace_bytes(), before);
+            assert_eq!(
+                fs::read(fixture.ledger.join("ledger")).unwrap(),
+                ledger_before
+            );
+            assert_eq!(
+                fs::read(fixture.provisioning.join("active/credential.cred")).unwrap(),
+                b"corrupt ciphertext"
+            );
+            assert_eq!(fixture.encrypt_calls(), 1);
+        }
+    }
+
+    #[test]
+    fn recovery_retry_conflicts_on_another_valid_backup_and_rejects_later_damage() {
+        // Break caught: an existing operation accepts different valid input or silently repairs twice.
+        use crate::admin::{BackupOperationId, RecoveryDisposition, RecoveryOperationId};
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fixture = AdminLifecycleFixture::new();
+        fixture.install_once();
+        let first = fixture
+            .admin()
+            .unwrap()
+            .backup(BackupOperationId::new([0x91; 32]))
+            .unwrap();
+        let second = fixture
+            .admin()
+            .unwrap()
+            .backup(BackupOperationId::new([0x93; 32]))
+            .unwrap();
+        let operation = RecoveryOperationId::new([0x92; 32]);
+        assert_eq!(
+            fixture
+                .admin()
+                .unwrap()
+                .recover(operation, first.artifact())
+                .unwrap()
+                .disposition(),
+            RecoveryDisposition::Existing
+        );
+        let before = fixture.namespace_bytes();
+        assert_eq!(
+            fixture
+                .admin()
+                .unwrap()
+                .recover(operation, second.artifact())
+                .unwrap_err(),
+            ProvisioningSecretStoreError::OperationConflict
+        );
+        assert_eq!(fixture.namespace_bytes(), before);
+        fs::remove_dir_all(fixture.provisioning.join("active")).unwrap();
+        let before = fixture.namespace_bytes();
+        assert_eq!(
+            fixture
+                .recovery_admin(None)
+                .unwrap()
+                .recover(operation, first.artifact())
+                .unwrap_err(),
+            ProvisioningSecretStoreError::Rejected
+        );
+        assert_eq!(fixture.namespace_bytes(), before);
+    }
+
+    #[test]
+    fn recovery_and_backup_preflight_capacity_without_staging_or_namespace_mutation() {
+        // Break caught: deterministic ledger exhaustion strands unbound recovery ciphertext.
+        use crate::admin::{BackupOperationId, RecoveryOperationId};
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fixture = AdminLifecycleFixture::new();
+        fixture.install_once();
+        let backup = fixture
+            .admin()
+            .unwrap()
+            .backup(BackupOperationId::new([0x91; 32]))
+            .unwrap();
+        let mut ledger = read_fixture_ledger(&fixture);
+        loop {
+            let index = u64::try_from(ledger.backups.len() + 1).unwrap();
+            let mut operation = [0; 32];
+            operation[24..].copy_from_slice(&index.to_be_bytes());
+            ledger.backups.push(BackupBinding {
+                operation,
+                secret_ref: ledger.generations[0].secret_ref.clone(),
+                generation: 1,
+                artifact_digest: [0; 32],
+            });
+            if encode_ledger(&ledger).is_err() {
+                ledger.backups.pop();
+                break;
+            }
+        }
+        fixture.write_ledger(ledger);
+        let before = fixture.namespace_bytes();
+        assert_eq!(
+            fixture
+                .admin()
+                .unwrap()
+                .backup(BackupOperationId::new([0x93; 32]))
+                .unwrap_err(),
+            ProvisioningSecretStoreError::TooLarge
+        );
+        assert_eq!(fixture.namespace_bytes(), before);
+        fs::remove_dir_all(fixture.provisioning.join("active")).unwrap();
+        let before = fixture.namespace_bytes();
+        assert_eq!(
+            fixture
+                .recovery_admin(None)
+                .unwrap()
+                .recover(RecoveryOperationId::new([0x92; 32]), backup.artifact())
+                .unwrap_err(),
+            ProvisioningSecretStoreError::TooLarge
+        );
+        assert_eq!(fixture.namespace_bytes(), before);
+        assert_eq!(fixture.encrypt_calls(), 1);
+    }
+
+    #[test]
+    fn backup_exact_tombstone_returns_destroyed_and_recovery_never_resurrects_it() {
+        // Break caught: live backup bytes survive in the provider or can restore a tombstoned reference.
+        use crate::admin::{BackupOperationId, RecoveryOperationId};
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fixture = AdminLifecycleFixture::new();
+        fixture.install_once();
+        let operation = BackupOperationId::new([0x91; 32]);
+        let backup = fixture.admin().unwrap().backup(operation).unwrap();
+        let mut ledger = read_fixture_ledger(&fixture);
+        ledger.generations[0].state = GenerationState::Destroyed;
+        ledger.generations[0].ciphertext_digest = [0; 32];
+        fs::remove_dir_all(fixture.provisioning.join("active")).unwrap();
+        fixture.write_tombstone_slot("active", &ledger.generations[0]);
+        fixture.write_ledger(ledger);
+        let before = fixture.namespace_bytes();
+        assert_eq!(
+            fixture.admin().unwrap().backup(operation).unwrap_err(),
+            ProvisioningSecretStoreError::Destroyed
+        );
+        assert_eq!(
+            fixture
+                .admin()
+                .unwrap()
+                .recover(RecoveryOperationId::new([0x92; 32]), backup.artifact())
+                .unwrap_err(),
+            ProvisioningSecretStoreError::Destroyed
+        );
+        assert_eq!(fixture.namespace_bytes(), before);
+    }
+
+    #[test]
+    fn recovery_repairs_current_generation_two_and_preserves_exact_previous() {
+        // Break caught: recovery drops Previous or restores an older backup into the active slot.
+        use crate::admin::{BackupOperationId, RecoveryDisposition, RecoveryOperationId};
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fixture = AdminLifecycleFixture::new();
+        fixture.install_once();
+        let old = fixture
+            .admin()
+            .unwrap()
+            .backup(BackupOperationId::new([0x90; 32]))
+            .unwrap();
+        fixture
+            .admin()
+            .unwrap()
+            .rotate(
+                ProvisioningInstallId::new([0x94; 32]),
+                ProvisioningLoadId::new([0x95; 32]),
+                fixture.bundle(),
+            )
+            .unwrap();
+        let backup = fixture
+            .admin()
+            .unwrap()
+            .backup(BackupOperationId::new([0x91; 32]))
+            .unwrap();
+        let previous = fixture
+            .namespace_bytes()
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("previous/"))
+            .collect::<Vec<_>>();
+        assert_eq!(previous.len(), 3);
+        fs::write(
+            fixture.provisioning.join("active/credential.cred"),
+            b"corrupt current",
+        )
+        .unwrap();
+        let before = fixture.namespace_bytes();
+        assert_eq!(
+            fixture
+                .recovery_admin(None)
+                .unwrap()
+                .recover(RecoveryOperationId::new([0x92; 32]), old.artifact())
+                .unwrap_err(),
+            ProvisioningSecretStoreError::Rejected
+        );
+        assert_eq!(fixture.namespace_bytes(), before);
+        let receipt = fixture
+            .recovery_admin(None)
+            .unwrap()
+            .recover(RecoveryOperationId::new([0x92; 32]), backup.artifact())
+            .unwrap();
+        assert_eq!(receipt.disposition(), RecoveryDisposition::Restored);
+        assert_eq!(receipt.generation(), 2);
+        assert_eq!(
+            fixture
+                .namespace_bytes()
+                .into_iter()
+                .filter(|(name, _)| name.starts_with("previous/"))
+                .collect::<Vec<_>>(),
+            previous
+        );
+        fixture.assert_active_runtime_loads(
+            ProvisioningLoadId::new([0x95; 32]),
+            receipt.secret_ref(),
+            fixture.bundle(),
+        );
+        assert_eq!(fixture.encrypt_calls(), 2);
+    }
+
+    #[test]
+    fn backup_pending_commit_cannot_be_overwritten_by_another_live_admin_operation() {
+        // Break caught: retrying on the same object overwrites a durable unacknowledged backup binding.
+        use crate::admin::{BackupOperationId, RecoveryOperationId};
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for operation in 0..3 {
+            let fixture = AdminLifecycleFixture::new();
+            fixture.install_once();
+            let backup = fixture
+                .admin()
+                .unwrap()
+                .backup(BackupOperationId::new([0x90; 32]))
+                .unwrap();
+            let mut admin = fixture
+                .admin_with_fault(FaultPoint::CompleteFileSynced)
+                .unwrap();
+            assert_eq!(
+                admin
+                    .backup(BackupOperationId::new([0x91; 32]))
+                    .unwrap_err(),
+                ProvisioningSecretStoreError::Unavailable
+            );
+            let before = fixture.namespace_bytes();
+            let rejected = match operation {
+                0 => admin.backup(BackupOperationId::new([0x92; 32])).is_err(),
+                1 => admin
+                    .rotate(
+                        ProvisioningInstallId::new([0x94; 32]),
+                        ProvisioningLoadId::new([0x95; 32]),
+                        fixture.bundle(),
+                    )
+                    .is_err(),
+                2 => admin
+                    .recover(RecoveryOperationId::new([0x92; 32]), backup.artifact())
+                    .is_err(),
+                _ => unreachable!(),
+            };
+            assert!(rejected, "operation {operation}");
+            assert_eq!(fixture.namespace_bytes(), before, "operation {operation}");
+        }
+    }
+
     struct AdminLifecycleFixture {
         path: PathBuf,
         provisioning: PathBuf,
@@ -3341,6 +4130,19 @@ mod tests {
     }
 
     impl AdminLifecycleFixture {
+        fn recovery_admin(
+            &self,
+            point: Option<FaultPoint>,
+        ) -> Result<SystemdCredentialAdmin, ProvisioningSecretStoreError> {
+            SystemdCredentialAdmin::open_paths_for_recovery(
+                &self.provisioning,
+                &self.ledger,
+                &self.host_key,
+                false,
+                crate::admin::encrypt::SystemdCredsEncryptor::at(self.program.clone()),
+                point.map_or_else(FaultInjector::disabled, FaultInjector::at),
+            )
+        }
         fn new() -> Self {
             let serial = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
