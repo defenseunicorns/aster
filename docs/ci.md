@@ -24,7 +24,7 @@ single stable check name **`CI / required`**.
 | `dependency policy` | `ubuntu-24.04` | Enforces the retained-libp2p-oracle boundary, applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
 | `age reference interoperability` | `ubuntu-24.04` | Installs exact `govulncheck` v1.6.0, runs `mise run age-reference-audit`, then runs `mise run age-reference-interop`: the Go oracle's reachable vulnerability and compiled-module license gates must pass before exact reference Go `filippo.io/age` v1.3.1 and the Rust provider exchange classic-X25519 artifacts in both directions, compare recovered plaintext, and agree on the recipient. |
 | `bounded fuzz smoke` | `ubuntu-24.04` | Runs five fixed 10,000-case hostile-input campaigns with the pinned nightly toolchain and `cargo-fuzz`: semantic wire decode, fragment decode, reference-envelope inspection, selected mechanics-frame decode, and selected Negentropy state-machine/bounds exercise. |
-| `Linux release build and SBOM` | `ubuntu-24.04` | Runs `mise run sbom`: builds the two selected Linux release executables from the checked-out commit, generates and validates their CycloneDX SBOMs, checks Cargo.lock stability, and retains a tar bundle with checksums and scope/provenance notes for 14 days. |
+| `Linux release build and SBOM` | `ubuntu-24.04` | Runs `mise run sbom`: builds `aster` (package `aster-node`) and `aster-agent` (package `aster-agent`) for `x86_64-unknown-linux-gnu` in release mode from the checked-out commit, generates and validates their CycloneDX SBOMs, checks Cargo.lock stability, and retains a tar bundle with checksums and scope/provenance notes for 14 days. |
 | `required` | `ubuntu-24.04` | Fails unless every validation lane completed successfully; this is the branch-protection check. |
 
 The Rust dependency downloads happen before Cargo validation is switched to
@@ -1364,9 +1364,7 @@ The workflow is safe to run for pull requests from forks:
 - Its only workflow permission is read-only repository contents.
 - It runs exclusively on GitHub-hosted, fixed-version runner labels.
 - It does not receive secrets, persist checkout credentials, execute
-  submodules, or use shared Actions caches. The SBOM job uploads only its
-  completed build tar; it does not upload the workspace or secrets. PR artifacts
-  are untrusted CI outputs until reviewed and are not automatically released.
+  submodules, or use shared Actions caches.
 - Every third-party action is pinned to a full commit SHA.
 - Concurrency cancels superseded runs for the same pull request or ref, and
   every job has a timeout.

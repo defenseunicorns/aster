@@ -3,8 +3,8 @@
 
 
 This is the bounded SBOM increment of P0-3, **Produce reproducible deployable
-artifacts**. It documents the evaluated workflow for two unpackaged Linux
-executables: `aster` (package `aster-node`) and `aster-agent` (package
+artifacts**. It documents the evaluated workflow for the unpackaged Linux
+executables `aster` (package `aster-node`) and `aster-agent` (package
 `aster-agent`, using the node library). It does not complete packaging,
 reproducible builds, provenance, signing, or release authorization. The
 [capability roadmap](../../implementation/capability-roadmap.md) and
@@ -27,7 +27,8 @@ Generator outputs stay in that temporary snapshot. The release target is
 
 The result is `target/sbom/aster-linux-x86_64.tar`, containing:
 
-- `aster`, `aster-agent`, and the two unmodified CycloneDX JSON documents;
+- executables `aster` and `aster-agent`;
+- SBOMs `aster.cdx.json` and `aster-agent.cdx.json` from cargo-cyclonedx;
 - `SHA256SUMS`, Cargo.lock and its checksum, and `BUILD.txt` with the source
   commit, compiler, Cargo, generator, validator, target and profile;
 - build/generation logs, `--help` smoke outputs, project LICENSE and SCOPE.txt;
@@ -42,7 +43,7 @@ archive preserves executable permissions and its files have relative checksums.
 After extracting it, run `sha256sum -c SHA256SUMS`.
 
 CI runs this same task in its separate required `sbom` job on Ubuntu 24.04.
-It uploads only the completed tar as an Actions artifact, retained for 14 days
+It uploads `aster-linux-x86_64.tar` as an Actions artifact, retained for 14 days
 (subject to repository policy). PR artifacts describe the checked-out test
 commit and are CI results, not signed releases. No automatic release publishing
 or requirement-status change is implied.
@@ -53,16 +54,16 @@ sidecar source evidence; it does not add pedigree or executable hashes inside
 the generated CycloneDX documents. Python validator transitive dependencies
 and runner system packages are not fully locked by this workflow.
 
-## Selected approach
+## SBOM generator
 
 Use **cargo-cyclonedx 0.5.9** to produce one CycloneDX 1.5 JSON document for
 `aster` and one for `aster-agent`, including declared licenses and dependency
 relationships. Keep the shared Cargo.lock unchanged.
 
 Accept the generator's **overinclusive Cargo dependency inventory** for this
-increment. Workspace feature unification can include packages that the selected
-executable build does not use. In the evaluated documents, `rusqlite` and
-`libsqlite3-sys` are present even though the selected node/agent compilation
+increment. Workspace feature unification can include packages that the `aster` and
+`aster-agent` builds do not use. In the evaluated documents, `rusqlite` and
+`libsqlite3-sys` are present even though compilation of `aster` and `aster-agent`
 uses `aster-core` with `reference-session` and its redb storage path. Keep those
 entries rather than manually filtering the generated graph. SBOM component
 presence is not proof that its code is linked into the executable.
@@ -72,7 +73,7 @@ possibly unused components require artifact-specific triage; this is not a
 blanket exception for SQLite advisories. Recheck the build configuration when
 sources or features change. Other workspace consumers do use SQLite.
 
-The selected workflow uses stable Rust, ordinary `cargo build`, and an
+The workflow uses stable Rust, ordinary `cargo build`, and an
 unmodified cargo-cyclonedx. Nightly precursor support and local generator or
 cargo-auditable patches are outside this workflow. Embedded `.dep-v0` metadata
 is not required to generate these CycloneDX documents.
@@ -83,7 +84,7 @@ The evaluation target is Ubuntu 24.04 amd64, using Rust/Cargo 1.97.1 and
 `x86_64-unknown-linux-gnu`. This is an agreed build target, not a general
 platform-support claim. The historical evaluation ran in an Ubuntu 24.04
 chroot on an Ubuntu 26.04 host and used cargo-auditable for its binaries. The stable plain-build commands
-below describe the selected workflow; they do not change the identities of
+below describe the workflow; they do not change the identities of
 those historical artifacts. See the [dated observation](2026-09-08-observation.md).
 
 | Tool | Evaluated version | Role |
@@ -109,7 +110,7 @@ cargo install --locked --version 0.5.9 cargo-cyclonedx
 The editor can run on the host in an isolated Python environment, as it reads
 JSON and does not build Aster. Its Python requirement is >=3.10; PyICU may
 require Python/ICU development packages and a compiler. Provision those
-separately if needed. In an operator-selected tooling directory:
+separately if needed. In a directory for the validator:
 
 ```bash
 python3 -m venv cdx-ev
@@ -117,7 +118,7 @@ cdx-ev/bin/pip install 'cyclonedx-editor-validator==0.34.0'
 cdx-ev/bin/pip freeze > cdx-ev-requirements-observed.txt
 ```
 
-## Build the two executables
+## Build `aster` and `aster-agent`
 
 Commands below use the observed chroot layout: `builder`, sources at
 `/build/aster`, logs at `/build/logs`. On the host, prefix these paths with
@@ -157,7 +158,7 @@ smoke check, not a node functional test or proof of bit-for-bit reproducibility.
 
 ## Generate a Cargo SBOM for each executable
 
-Run from the same `/build/aster` snapshot, with the toolchain above selected:
+Run from the same `/build/aster` snapshot, using Rust/Cargo 1.97.1:
 
 ```bash
 sha256sum Cargo.lock > /build/sbom/Cargo.lock.before.sha256
@@ -181,10 +182,11 @@ generator does not expose `--locked`/`--frozen`, and the check detects a lockfil
 change after the command. Preserve the original source/lockfile snapshot.
 
 Version 0.5.9 generates documents for other workspace binaries too; retain
-only the two named outputs for this delivery. It does not expose `-p` or
+`aster.cdx.json` and `aster-agent.cdx.json` for this delivery. It does not expose `-p` or
 `--bin`. Its per-binary mode uses the owning package's Cargo graph, not an
 analysis of linked machine code. Platform/features are inputs, but exact
-agreement with the selected build units must not be inferred from them.
+agreement with the dependencies compiled for `aster` and `aster-agent` must
+not be inferred from them.
 
 Licenses are manifest declarations, not an independent license-text review.
 Registry checksums identify crate archives, not compiled library bytes.
@@ -275,7 +277,7 @@ not a current vulnerability scan.
 - Separately establish coverage of statically included Rust standard-library
   and native code. A `*-sys` crate version is not its native-library version.
   The listed SQLite crates must not be treated as evidence of native SQLite
-  linkage in these selected executables.
+  linkage in `aster` or `aster-agent`.
 - External system glibc is outside these unpackaged executable inventories;
   record runtime requirements separately. A concrete runtime-container SBOM
   includes installed system packages and their exact versions.
