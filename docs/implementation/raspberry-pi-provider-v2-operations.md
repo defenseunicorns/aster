@@ -4,12 +4,14 @@
 
 - Profile: `aster-linux-event-mvp-evaluation-v0.1`
 - Provider: `aster-systemd-credential-store/v2`
-- Status: provider-CLI procedure; end-to-end package integration blocked
+- Status: code-level integration manually validated; packaged qualification blocked
 
 This procedure describes the intended seven provider and Event-agent
-operations. The five `aster-credential-admin` command forms below are exact and
-executable. End-to-end agent integration is blocked and unqualified: the
-repository does not yet contain the hardened systemd unit or native package.
+operations. The five `aster-credential-admin` command forms and statically
+composed runtime loader are exact and executable. A 2026-09-09 engineering
+spike exercised the code-level integration on the selected physical hardware.
+Packaged qualification remains blocked and unqualified: the repository does
+not yet contain the final hardened systemd unit or native package.
 The G3 candidate annex must supply the package-owned service UID, provider-
 reference handoff path and ownership setup, installed executable and
 configuration paths, unit and control values, and exact stop, start,
@@ -54,6 +56,12 @@ is specified because both belong to the not-yet-frozen package annex. The
 agent's `mission_secret_ref_file` must name that handoff file, and its
 configured `mission_load_id` must equal the load-operation ID used for the
 Active generation.
+
+The runtime presentation must satisfy either the original service-owned
+mode-`0400` `ramfs` form or every predicate of the exact
+[systemd 257 credential-presentation amendment](../superpowers/specs/2026-09-09-systemd-257-credential-presentation-amendment.md).
+The latter is not a generic `tmpfs` fallback and remains subject to Security
+and Deployment approval at E01.
 
 Run the root administration CLI only as root. Run `aster-agent --check-config`
 and the agent runtime as the final service UID, not root: agent credential-file

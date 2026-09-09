@@ -99,6 +99,13 @@ forwarding, Event bridges, and dynamic bridge administration.
     protected bootstrap before state or either listener is opened. It invokes
     no credential CLI and has no runtime provider or plaintext fallback.
 
+    The mode-`0400`/`ramfs` description remains the original accepted
+    presentation. The exact systemd 257 profile additionally uses the narrowly
+    pinned root-owned ACL/read-only-`tmpfs`/`noswap` presentation defined in
+    the [2026-09-09 credential-presentation amendment](../superpowers/specs/2026-09-09-systemd-257-credential-presentation-amendment.md).
+    That amendment requires separate Security and Deployment approval at E01
+    and creates no generic Debian, `tmpfs`, or production support claim.
+
 ### Direct dependency admission for pre-body serving
 
 The pre-body gate and bounded application accept loop directly admit Hyper

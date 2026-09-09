@@ -28,16 +28,22 @@ through `CREDENTIALS_DIRECTORY` after authenticating and decrypting the
 `LoadCredentialEncrypted=` source. The loader never invokes `systemd-creds`
 and never searches another directory or provider.
 
-Before returning provisioning plaintext, the loader:
+Before returning provisioning plaintext, the loader accepts either the
+original systemd presentation or the exact systemd 257 profile presentation.
+It:
 
 - opens the credential directory without relative components or symlink
   traversal;
 - opens the fixed credential name relative to that directory descriptor with
   no-follow semantics;
-- requires a regular, single-link, effective-service-owned file with exact
-  mode `0400`;
-- requires Linux `ramfs`, matching systemd's `secure` classification, and
-  rejects `tmpfs` or another filesystem as `weak`;
+- accepts the original regular, single-link, effective-service-owned mode
+  `0400` file only on Linux `ramfs`;
+- on the exact non-root systemd 257 profile, accepts only the root-owned mode
+  `0440` file and root-owned mode `0550` per-service directory with exact
+  service-UID ACLs, on a read-only `nosuid,nodev,noexec,nosymfollow` `tmpfs`
+  mount whose superblock is `noswap`;
+- rejects every other path shape, owner, group, mode, ACL, filesystem, mount
+  option, or swappable `tmpfs` presentation;
 - reads at most the exact v2 provider-envelope bound once and rechecks file
   metadata after the read;
 - verifies the provider version, reserved fields, generation, canonical Aster
@@ -49,6 +55,12 @@ Before returning provisioning plaintext, the loader:
 All failures use Aster's fixed `ProvisioningSecretStoreError` categories. The
 provider does not log or retain the credential path, reference, operation ID,
 envelope, parser detail, or plaintext.
+
+The systemd 257 ACL/tmpfs boundary is defined by the
+[profile amendment](../../docs/superpowers/specs/2026-09-09-systemd-257-credential-presentation-amendment.md).
+It does not claim systemd's `secure` label, generic `tmpfs` safety, generic
+Debian support, or production qualification. Security and Deployment approval
+of the immutable amendment remains required at candidate gate E01.
 
 ## Current implementation boundary
 
@@ -95,8 +107,10 @@ rotation, same-host recovery, revoke/rekey composition, destruction, and
 pre-intent staged-evidence escalation, is the
 [Raspberry Pi provider v2 operations procedure](../../docs/implementation/raspberry-pi-provider-v2-operations.md).
 
-The five provider lifecycle CLI commands are executable but the Event-agent
-integration is not yet executable end to end or qualified. The provider's
+The five provider lifecycle CLI commands and the code-level Event-agent
+integration are executable; a three-device engineering spike has exercised
+startup and the lifecycle, but the integration is not yet packaged or
+qualified. The provider's
 `active/reference` stays root-only; the future package must atomically populate
 a separate mode-`0600`, final-service-UID-owned reference handoff from
 successful INSTALL/ROTATE output. Agent configuration checks and runtime must
