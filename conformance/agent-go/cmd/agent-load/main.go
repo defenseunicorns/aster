@@ -22,18 +22,22 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"connectrpc.com/connect"
 	api "github.com/defenseunicorns/aster/conformance/agent-go/gen/aster/application/v1alpha1"
+	"google.golang.org/protobuf/proto"
 )
 
 const maxSlots = 10_000_000
+const custodyCeiling = 262_144
 
 type options struct {
 	url, tokenFile, topic, scope, prefix, output, commit, binaryHash, configHash string
 	slots                                                                        uint64
+	sampleEvery                                                                  uint64
 	duration, interval, timeout                                                  time.Duration
 	rate                                                                         float64
 	payload, concurrency                                                         int
@@ -54,7 +58,7 @@ func parseOptions(args []string) (options, error) {
 		values[args[i]] = args[i+1]
 	}
 	allowed := map[string]bool{}
-	for _, k := range []string{"--url", "--token-file", "--count", "--duration-seconds", "--rate", "--payload-bytes", "--topic", "--scope", "--operation-prefix", "--concurrency", "--timeout-seconds", "--output", "--source-commit", "--binary-sha256", "--config-sha256"} {
+	for _, k := range []string{"--url", "--token-file", "--count", "--duration-seconds", "--rate", "--payload-bytes", "--topic", "--scope", "--operation-prefix", "--concurrency", "--timeout-seconds", "--output", "--source-commit", "--binary-sha256", "--config-sha256", "--sample-every"} {
 		allowed[k] = true
 	}
 	for k := range values {
@@ -103,6 +107,10 @@ func parseOptions(args []string) (options, error) {
 		return options{}, bad
 	}
 	o.interval = time.Duration(math.Ceil(float64(time.Second) / o.rate))
+	o.sampleEvery, err = strconv.ParseUint(values["--sample-every"], 10, 64)
+	if err != nil || o.sampleEvery > maxSlots {
+		return options{}, bad
+	}
 	number := func(key string, max uint64) (uint64, error) {
 		v, e := strconv.ParseUint(values[key], 10, 64)
 		if e != nil || v == 0 || v > max {
@@ -155,7 +163,9 @@ func operationKey(prefix string, index uint64) []byte {
 }
 
 func publishRequest(o options, index uint64, token string) *connect.Request[api.PublishEventRequest] {
-	req := connect.NewRequest(&api.PublishEventRequest{OperationKey: operationKey(o.prefix, index), Topic: o.topic, Scope: o.scope, Priority: api.Priority_PRIORITY_ROUTINE, LogicalKey: []byte("agent-load/v1"), Payload: bytes.Repeat([]byte{0x61}, o.payload)})
+	logical := append([]byte("agent-load/v1:"), make([]byte, 8)...)
+	binary.BigEndian.PutUint64(logical[len(logical)-8:], index)
+	req := connect.NewRequest(&api.PublishEventRequest{OperationKey: operationKey(o.prefix, index), Topic: o.topic, Scope: o.scope, Priority: api.Priority_PRIORITY_ROUTINE, LogicalKey: logical, Payload: bytes.Repeat([]byte{0x61}, o.payload)})
 	req.Header().Set("Authorization", "Bearer "+token)
 	return req
 }
@@ -164,6 +174,10 @@ type result struct {
 	kind, reason       string
 	terminal, inserted bool
 	elapsed            time.Duration
+	measured           bool
+	original           *api.PublishEventResponse
+	probes             probeCounts
+	probeStop          string
 }
 
 func classify(response *connect.Response[api.PublishEventResponse], err error) result {
@@ -171,7 +185,7 @@ func classify(response *connect.Response[api.PublishEventResponse], err error) r
 		if response == nil || response.Msg == nil || len(response.Msg.Id) != 32 || len(response.Msg.Publisher) != 32 || response.Msg.PublisherCounter == 0 || response.Msg.EventSequence == 0 || response.Msg.AcceptanceMarker == 0 || response.Msg.Priority != api.Priority_PRIORITY_ROUTINE {
 			return result{kind: "protocol", reason: "invalid_response", terminal: true}
 		}
-		return result{kind: "accepted", inserted: response.Msg.Inserted}
+		return result{kind: "accepted", inserted: response.Msg.Inserted, original: response.Msg}
 	}
 	var e *connect.Error
 	if errors.As(err, &e) {
@@ -205,6 +219,135 @@ func classify(response *connect.Response[api.PublishEventResponse], err error) r
 func call(ctx context.Context, client api.AsterApplicationServiceClient, o options, index uint64, token string) result {
 	response, err := client.PublishEvent(ctx, publishRequest(o, index, token))
 	return classify(response, err)
+}
+
+type probeCounts struct {
+	Scheduled  uint64 `json:"scheduled"`
+	Skipped    uint64 `json:"skipped"`
+	Attempted  uint64 `json:"attempted"`
+	Completed  uint64 `json:"completed"`
+	Exact      uint64 `json:"exact_matched"`
+	Conflict   uint64 `json:"conflict_matched"`
+	Transport  uint64 `json:"transport_indeterminate"`
+	Unexpected uint64 `json:"unexpected_result"`
+	Terminal   uint64 `json:"terminal_results"`
+}
+
+func (p *probeCounts) add(v probeCounts) {
+	p.Scheduled += v.Scheduled
+	p.Skipped += v.Skipped
+	p.Attempted += v.Attempted
+	p.Completed += v.Completed
+	p.Exact += v.Exact
+	p.Conflict += v.Conflict
+	p.Transport += v.Transport
+	p.Unexpected += v.Unexpected
+	p.Terminal += v.Terminal
+}
+
+// Fixed planned indices retain at most four original public results. Each
+// checkpoint visits these in fixed order; no raw operation keys are retained.
+func sampleIndices(n uint64) []uint64 {
+	if n == 0 {
+		return nil
+	}
+	x := n + 0x9e3779b97f4a7c15
+	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9
+	x = (x ^ (x >> 27)) * 0x94d049bb133111eb
+	x ^= x >> 31
+	var indices []uint64
+	for _, i := range []uint64{0, n / 2, n - 1, x % n} {
+		found := false
+		for _, j := range indices {
+			found = found || i == j
+		}
+		if !found {
+			indices = append(indices, i)
+		}
+	}
+	return indices
+}
+
+// Probes execute sequentially inside the same bounded worker as the triggering
+// new publication. They cannot add in-flight workers or a pending work queue.
+// The registry contains at most four result objects and each snapshot at most
+// eight requests. Checkpoints are triggered by completed planned slot indices,
+// not by the number of accepted load publications.
+func publicWork(o options, c clock, client api.AsterApplicationServiceClient, token string) func(context.Context, uint64) result {
+	start := c.Now()
+	indices := sampleIndices(o.slots)
+	var mu sync.Mutex
+	originals := make(map[uint64]*api.PublishEventResponse)
+	return func(ctx context.Context, index uint64) result {
+		began := c.Now()
+		v := call(ctx, client, o, index, token)
+		v.elapsed = c.Now().Sub(began)
+		v.measured = true
+		if o.sampleEvery == 0 || v.kind != "accepted" || !v.inserted {
+			return v
+		}
+		mu.Lock()
+		for _, i := range indices {
+			if i == index {
+				originals[i] = proto.Clone(v.original).(*api.PublishEventResponse)
+			}
+		}
+		snapshot := make(map[uint64]*api.PublishEventResponse)
+		if (index+1)%o.sampleEvery == 0 || index+1 == o.slots {
+			for i, original := range originals {
+				snapshot[i] = original
+			}
+		}
+		mu.Unlock()
+		v.probes.Scheduled = uint64(2 * len(snapshot))
+		for _, i := range indices {
+			original, ok := snapshot[i]
+			if !ok {
+				continue
+			}
+			for _, changed := range []bool{false, true} {
+				if ctx.Err() != nil || (o.duration > 0 && c.Now().Sub(start) >= o.duration) {
+					v.probes.Skipped = v.probes.Scheduled - v.probes.Attempted
+					if ctx.Err() != nil {
+						v.probeStop = "probe_deadline_or_cancelled"
+					} else {
+						v.probeStop = "duration_elapsed"
+					}
+					return v
+				}
+				req := publishRequest(o, i, token)
+				if changed {
+					req.Msg.Payload[0] ^= 1
+				}
+				v.probes.Attempted++
+				response, err := client.PublishEvent(ctx, req)
+				observed := classify(response, err)
+				v.probes.Completed++
+				if changed && observed.kind == "rejected" && observed.reason == "operation_key_conflict" {
+					v.probes.Conflict++
+					continue
+				}
+				if !changed && observed.kind == "accepted" {
+					expected := proto.Clone(original).(*api.PublishEventResponse)
+					expected.Inserted = false
+					if proto.Equal(expected, observed.original) {
+						v.probes.Exact++
+						continue
+					}
+				}
+				if observed.kind == "transport" {
+					v.probes.Transport++
+				} else {
+					v.probes.Unexpected++
+				}
+				v.probes.Terminal++
+				v.probeStop = "probe_mismatch"
+				v.probes.Skipped = v.probes.Scheduled - v.probes.Attempted
+				return v
+			}
+		}
+		return v
+	}
 }
 
 // One-millisecond upper-edge histogram, with a final >30,999ms overflow bucket.
@@ -295,18 +438,21 @@ type counts struct {
 	Terminal    uint64 `json:"terminal_results"`
 }
 type workloadConfig struct {
-	Slots        uint64  `json:"planned_slots"`
-	DurationNS   int64   `json:"requested_duration_ns"`
-	Rate         float64 `json:"offered_per_second"`
-	IntervalNS   int64   `json:"pacing_interval_ns"`
-	Payload      int     `json:"payload_bytes"`
-	Concurrency  int     `json:"concurrency"`
-	TimeoutNS    int64   `json:"attempt_timeout_ns"`
-	EndpointHash string  `json:"endpoint_sha256"`
-	TopicHash    string  `json:"topic_sha256"`
-	ScopeHash    string  `json:"scope_sha256"`
-	PrefixHash   string  `json:"operation_prefix_sha256"`
-	KeyAlgorithm string  `json:"operation_key_algorithm"`
+	Slots          uint64  `json:"planned_slots"`
+	DurationNS     int64   `json:"requested_duration_ns"`
+	Rate           float64 `json:"offered_per_second"`
+	IntervalNS     int64   `json:"pacing_interval_ns"`
+	Payload        int     `json:"payload_bytes"`
+	Concurrency    int     `json:"concurrency"`
+	TimeoutNS      int64   `json:"attempt_timeout_ns"`
+	EndpointHash   string  `json:"endpoint_sha256"`
+	TopicHash      string  `json:"topic_sha256"`
+	ScopeHash      string  `json:"scope_sha256"`
+	PrefixHash     string  `json:"operation_prefix_sha256"`
+	KeyAlgorithm   string  `json:"operation_key_algorithm"`
+	SampleEvery    uint64  `json:"sample_every_planned_slots_zero_disabled"`
+	SampleRule     string  `json:"sample_rule"`
+	CustodyCeiling uint64  `json:"unique_event_custody_ceiling"`
 }
 type receipt struct {
 	Schema            string         `json:"schema"`
@@ -322,6 +468,7 @@ type receipt struct {
 	DurationNS        int64          `json:"elapsed_ns"`
 	StopReason        string         `json:"stop_reason"`
 	Counts            counts         `json:"counts"`
+	Probes            probeCounts    `json:"probes"`
 	PeakInflight      int            `json:"peak_inflight"`
 	LatencyRule       string         `json:"latency_rule"`
 	P50               uint64         `json:"p50_ms"`
@@ -331,9 +478,11 @@ type receipt struct {
 }
 
 func execute(ctx context.Context, o options, c clock, publish func(context.Context, uint64) result) receipt {
+	ctx, stopWorkers := context.WithCancel(ctx)
+	defer stopWorkers()
 	start := c.Now()
-	r := receipt{Schema: "aster-agent-load/v1", Claim: "public-connect-workload-observation", SourceCommit: o.commit, BinarySHA256: o.binaryHash, AgentConfigSHA256: o.configHash, Started: start.UTC().Format(time.RFC3339Nano), StopReason: "schedule_complete", LatencyRule: "all completed attempts; nearest rank ceil(p*N/100); 1ms upper edges; >30999ms overflow returns 31000 sentinel; zero for no samples"}
-	r.Config = workloadConfig{o.slots, int64(o.duration), o.rate, int64(o.interval), o.payload, o.concurrency, int64(o.timeout), digest([]byte(o.url)), digest([]byte(o.topic)), digest([]byte(o.scope)), digest([]byte(o.prefix)), "sha256:aster/agent-load/key/v1:u16be-prefix-length:prefix:u64be-index"}
+	r := receipt{Schema: "aster-agent-load/v1", Claim: "public-connect-workload-observation", SourceCommit: o.commit, BinarySHA256: o.binaryHash, AgentConfigSHA256: o.configHash, Started: start.UTC().Format(time.RFC3339Nano), StopReason: "schedule_complete", LatencyRule: "completed new-load attempts only, excludes probes; nearest rank ceil(p*N/100); 1ms upper edges; >30999ms overflow returns 31000 sentinel; zero for no samples"}
+	r.Config = workloadConfig{o.slots, int64(o.duration), o.rate, int64(o.interval), o.payload, o.concurrency, int64(o.timeout), digest([]byte(o.url)), digest([]byte(o.topic)), digest([]byte(o.scope)), digest([]byte(o.prefix)), "sha256:aster/agent-load/key/v1:u16be-prefix-length:prefix:u64be-index", o.sampleEvery, "fixed first/middle/last/splitmix64(count); at most 4 original results; exact then changed; zero disables; final slot also samples; worker timeout includes probes", custodyCeiling}
 	encoded, _ := json.Marshal(r.Config)
 	r.ConfigSHA256 = digest(encoded)
 	p := pacer{interval: o.interval, limit: o.slots}
@@ -341,9 +490,24 @@ func execute(ctx context.Context, o options, c clock, publish func(context.Conte
 	completed := make(chan result, o.concurrency)
 	inflight := 0
 	stopped := false
+	if o.slots > custodyCeiling {
+		stopped = true
+		r.StopReason = "custody_ceiling"
+	}
 	account := func(v result) {
 		inflight--
+		if v.kind == "not_dispatched" {
+			r.Counts.Attempted--
+			r.Counts.Skipped++
+			stopped = true
+			r.StopReason = v.reason
+			stopWorkers()
+			r.Counts.Skipped += p.limit - p.scheduled
+			p.scheduled = p.limit
+			return
+		}
 		r.Counts.Completed++
+		r.Probes.add(v.probes)
 		h.add(v.elapsed)
 		switch v.kind {
 		case "accepted":
@@ -365,7 +529,13 @@ func execute(ctx context.Context, o options, c clock, publish func(context.Conte
 			if !stopped {
 				stopped = true
 				r.StopReason = v.reason
+				stopWorkers()
 			}
+		}
+		if v.probeStop != "" && !stopped {
+			stopped = true
+			r.StopReason = v.probeStop
+			stopWorkers()
 		}
 	}
 	for {
@@ -391,6 +561,14 @@ func execute(ctx context.Context, o options, c clock, publish func(context.Conte
 			continue
 		}
 		elapsed := c.Now().Sub(start)
+		if o.duration > 0 && elapsed >= o.duration {
+			r.Counts.Skipped += p.limit - p.scheduled
+			p.scheduled = p.limit
+			stopped = true
+			r.StopReason = "duration_elapsed"
+			stopWorkers()
+			continue
+		}
 		index, skipped, due := p.take(elapsed)
 		r.Counts.Skipped += skipped
 		if due {
@@ -403,11 +581,17 @@ func execute(ctx context.Context, o options, c clock, publish func(context.Conte
 					r.PeakInflight = inflight
 				}
 				go func(i uint64) {
+					if o.duration > 0 && c.Now().Sub(start) >= o.duration {
+						completed <- result{kind: "not_dispatched", reason: "duration_elapsed"}
+						return
+					}
 					attemptCtx, cancel := context.WithTimeout(ctx, o.timeout)
 					defer cancel()
 					began := c.Now()
 					v := publish(attemptCtx, i)
-					v.elapsed = c.Now().Sub(began)
+					if !v.measured {
+						v.elapsed = c.Now().Sub(began)
+					}
 					completed <- v
 				}(index)
 			}
@@ -472,8 +656,31 @@ func readToken(path string) (string, error) {
 }
 
 type atomicOutput struct {
-	file *os.File
-	path string
+	file      *os.File
+	path      string
+	directory os.FileInfo
+}
+
+// The pathname algorithm is safe only when no other UID can replace an
+// ancestor. The sole writable-root exception is root-owned sticky /tmp.
+func trustedAncestors(path string) error {
+	for current := path; ; current = filepath.Dir(current) {
+		info, err := os.Lstat(current)
+		if err != nil || !info.IsDir() {
+			return errors.New("unsafe output ancestor")
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || (stat.Uid != 0 && stat.Uid != uint32(os.Geteuid())) {
+			return errors.New("unsafe output ancestor")
+		}
+		stickyTmp := current == "/tmp" && stat.Uid == 0 && info.Mode()&os.ModeSticky != 0
+		if info.Mode().Perm()&0022 != 0 && !stickyTmp {
+			return errors.New("unsafe output ancestor")
+		}
+		if current == "/" {
+			return nil
+		}
+	}
 }
 
 func prepareOutput(path string) (*atomicOutput, error) {
@@ -484,6 +691,9 @@ func prepareOutput(path string) (*atomicOutput, error) {
 	parent := filepath.Dir(path)
 	resolved, err := filepath.EvalSymlinks(parent)
 	if err != nil || resolved != parent {
+		return nil, bad
+	}
+	if trustedAncestors(parent) != nil {
 		return nil, bad
 	}
 	info, err := os.Lstat(parent)
@@ -501,18 +711,43 @@ func prepareOutput(path string) (*atomicOutput, error) {
 	if err != nil {
 		return nil, bad
 	}
-	return &atomicOutput{f, path}, nil
+	return &atomicOutput{file: f, path: path, directory: info}, nil
 }
-func (o *atomicOutput) abort() { _ = o.file.Close(); _ = os.Remove(o.file.Name()) }
+func (o *atomicOutput) validStage() bool {
+	parent := filepath.Dir(o.path)
+	info, err := os.Lstat(parent)
+	if err != nil || !os.SameFile(info, o.directory) || trustedAncestors(parent) != nil {
+		return false
+	}
+	opened, err := o.file.Stat()
+	if err != nil {
+		return false
+	}
+	named, err := os.Lstat(o.file.Name())
+	if err != nil || !os.SameFile(opened, named) || !named.Mode().IsRegular() || named.Mode().Perm() != 0600 {
+		return false
+	}
+	stat, ok := named.Sys().(*syscall.Stat_t)
+	return ok && stat.Uid == uint32(os.Geteuid()) && stat.Nlink == 1
+}
+func (o *atomicOutput) abort() {
+	if o.validStage() {
+		_ = os.Remove(o.file.Name())
+	}
+	_ = o.file.Close()
+}
 func (o *atomicOutput) finish(data []byte) error {
 	bad := errors.New("output commit failed")
+	if !o.validStage() {
+		return bad
+	}
 	if n, err := o.file.Write(data); err != nil || n != len(data) {
 		return bad
 	}
 	if o.file.Sync() != nil {
 		return bad
 	}
-	if o.file.Close() != nil {
+	if !o.validStage() {
 		return bad
 	}
 	// link is atomic and fails if a destination appeared since preflight.
@@ -552,7 +787,7 @@ func run(args []string) error {
 	transport := &http.Transport{Protocols: protocols, MaxConnsPerHost: 1}
 	defer transport.CloseIdleConnections()
 	client := api.NewAsterApplicationServiceClient(&http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, o.url, connect.WithGRPC(), connect.WithReadMaxBytes(1<<20))
-	r := execute(ctx, o, realClock{}, func(ctx context.Context, i uint64) result { return call(ctx, client, o, i, token) })
+	r := execute(ctx, o, realClock{}, publicWork(o, realClock{}, client, token))
 	encoded, err := json.Marshal(r)
 	if err != nil {
 		return errors.New("receipt encoding failed")

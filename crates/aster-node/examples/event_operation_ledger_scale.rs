@@ -7,8 +7,10 @@
 //! --scope, --operation-prefix, --source-commit, --binary-sha256,
 //! --config-sha256. Modes: small (requires --count 1..10000),
 //! small-byte-capacity (requires --count 1..10000; durable byte-edge fixture),
-//! million-retired (1,010,000 records / 10,000 reserve), candidate-capacity
-//! (default 1,000,000 records / 10,000 reserve; 990,000 ordinary operations).
+//! The requested million-retired and candidate-capacity modes are disabled:
+//! they retain a feasibility-failure receipt before state creation because
+//! custody authority stops at 262,144 unique Events and this API cannot bind
+//! aliases. Their requested limit identities remain separate in receipts.
 
 use aster_node::{
     MutableSourceInterests, NodeApplication, NodeConfig, NodeOperatorOutputPolicy, RunningNode,
@@ -39,8 +41,68 @@ use tokio::time::{sleep, timeout};
 type Failure = Box<dyn Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Failure>;
 
+fn unique_event_feasible(count: u64) -> bool {
+    count <= aster_redb_store::MAX_CUSTODY_RETIREMENTS
+}
+
+#[derive(Debug)]
+struct ObservedFailure {
+    phase: &'static str,
+    reason: &'static str,
+}
+impl std::fmt::Display for ObservedFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.phase, self.reason)
+    }
+}
+impl Error for ObservedFailure {}
+
+fn safe_reason(error: &Failure) -> &'static str {
+    if let Some(e) = error.downcast_ref::<ObservedFailure>() {
+        return e.reason;
+    }
+    if let Some(e) = error.downcast_ref::<aster_node::application::ApplicationError>() {
+        return match e.kind() {
+            ApplicationErrorKind::OperationCapacity => "operation_capacity",
+            ApplicationErrorKind::ResourceLimit => "resource_limit",
+            ApplicationErrorKind::StateUnavailable => "state_unavailable",
+            ApplicationErrorKind::Integrity => "integrity",
+            ApplicationErrorKind::RequestRejected => "request_rejected",
+            ApplicationErrorKind::UnauthorizedOrRevoked => "unauthorized_or_revoked",
+            ApplicationErrorKind::Conflict => "operation_conflict",
+            ApplicationErrorKind::ExpiredOrRetired => "expired_or_retired",
+            ApplicationErrorKind::InvalidRequest => "invalid_request",
+            ApplicationErrorKind::PolicyUnsettled => "policy_unsettled",
+            ApplicationErrorKind::Provisioning => "provisioning",
+            _ => "unknown_application_error",
+        };
+    }
+    if error.is::<std::io::Error>() {
+        return "io";
+    }
+    "state_unavailable"
+}
+
 fn require(ok: bool, reason: &'static str) -> Result<()> {
-    if ok { Ok(()) } else { Err(reason.into()) }
+    if ok {
+        return Ok(());
+    }
+    let reason = match reason {
+        "exact retry changed durable result"
+        | "exact replay changed original result"
+        | "new operation replayed" => "unexpected_replay",
+        "changed intent did not conflict" => "unexpected_conflict",
+        "ordinary boundary not reached" | "first new key did not reject at capacity" => {
+            "capacity_boundary"
+        }
+        "operation audit failed" => "integrity",
+        _ => "invariant",
+    };
+    Err(ObservedFailure {
+        phase: "validation",
+        reason,
+    }
+    .into())
 }
 
 #[derive(Clone)]
@@ -251,7 +313,7 @@ fn lifetime(o: &Options) -> Result<EventPublishOptions> {
     })
 }
 
-// At most four indices and one request/result are retained. SplitMix's integer
+// At most four indices and four original results are retained. SplitMix's integer
 // mixing is for reproducible sampling only, not randomness or cryptography.
 fn samples(n: u64) -> Vec<u64> {
     if n == 0 {
@@ -269,9 +331,12 @@ fn samples(n: u64) -> Vec<u64> {
 
 #[derive(Default)]
 struct Receipt {
+    originals: BTreeMap<u64, aster_node::application::EventPublishResult>,
     started_ms: u128,
     ended_ms: u128,
     elapsed_ms: u128,
+    startup_ms: u128,
+    shutdown_ms: u128,
     created: u64,
     retired: u64,
     exact_active: u64,
@@ -289,6 +354,7 @@ struct Receipt {
     status_samples: u64,
     status_max_us: u128,
     failure: &'static str,
+    phase: &'static str,
 }
 
 impl Receipt {
@@ -316,8 +382,8 @@ impl Receipt {
                 "{{\"schema\":\"aster-event-operation-ledger-scale/v1\",\"claim\":\"selected-rust-node-mechanism-observation\",\"qualification\":false,",
                 "\"customer_api_retention\":\"unavailable_public_rpc_has_no_ttl\",\"provisioning\":\"unprotected_clean_team_fixture\",",
                 "\"alias_64_65\":\"unavailable_selected_api_has_no_alias_binding\",\"key_algorithm\":\"sha256:aster/ledger-scale/key/v1:u16be-prefix-length:prefix:u64be-index\",",
-                "\"sampling\":\"unique_early_middle_late_splitmix64_index_per_checkpoint\",\"source_commit_supplied\":\"{}\",\"binary_sha256_supplied\":\"{}\",\"config_sha256_supplied\":\"{}\",",
-                "\"workload\":{},\"workload_sha256\":\"{}\",\"started_unix_ms\":{},\"ended_unix_ms\":{},\"elapsed_ms\":{},\"failure\":\"{}\",",
+                "\"sampling\":\"at_most_four_original_results_at_planned_early_middle_late_splitmix64_indices\",\"custody_unique_event_ceiling\":262144,\"long_unique_event_lifetimes\":\"blocked_7d_at_1hz_and_2d_at_5hz\",\"source_commit_supplied\":\"{}\",\"binary_sha256_supplied\":\"{}\",\"config_sha256_supplied\":\"{}\",",
+                "\"workload\":{},\"workload_sha256\":\"{}\",\"started_unix_ms\":{},\"ended_unix_ms\":{},\"elapsed_ms\":{},\"startup_ms\":{},\"shutdown_ms\":{},\"failure\":\"{}\",\"failure_phase\":\"{}\",\"request_disposition\":\"{}\",\"ledger_counts_observation\":\"last_successful_status\",",
                 "\"created_ordinary\":{},\"retired_ordinary\":{},\"exact_active_probes\":{},\"exact_retired_probes\":{},\"exact_full_result_matches\":{},\"changed_intent_conflicts\":{},\"first_new_key_rejections\":{},\"emergency_tombstones_accepted\":{},",
                 "\"records_total\":{},\"records_active\":{},\"records_retired\":{},\"reverse_rows\":{},\"logical_bytes\":{},",
                 "\"clean_restart\":{},\"restart_ms\":{},\"offline_audit_complete\":{},\"audit_ms\":{},\"audit_scanned\":{},\"status_samples\":{},\"status_max_us\":{}}}\n"
@@ -330,7 +396,17 @@ impl Receipt {
             self.started_ms,
             self.ended_ms,
             self.elapsed_ms,
+            self.startup_ms,
+            self.shutdown_ms,
             self.failure,
+            self.phase,
+            if self.phase == "feasibility" {
+                "not_started_feasibility_blocked"
+            } else if self.failure == "none" {
+                "observation_completed"
+            } else {
+                "observation_failed"
+            },
             self.created,
             self.retired,
             self.exact_active,
@@ -384,22 +460,23 @@ async fn probe(
         .event_operation_capacity
         .stats
         .records_total;
-    for i in samples(n) {
+    for (i, original) in r.originals.clone().into_iter().filter(|(i, _)| *i < n) {
         match events
             .publish_with_options(publication(o, i, false), lifetime(o)?)
             .await
         {
             Ok(value) => {
                 require(
-                    !retired && !value.inserted,
+                    !retired && same_publication(&original, &value),
                     "exact retry changed durable result",
                 )?;
                 r.exact_active += 1;
+                r.exact_result_matches += 1;
             }
-            Err(e) if e.kind() == ApplicationErrorKind::ExpiredOrRetired => {
+            Err(e) if o.workload.finite && e.kind() == ApplicationErrorKind::ExpiredOrRetired => {
                 r.exact_retired += 1;
             }
-            Err(_) => return Err("unexpected exact retry result".into()),
+            Err(e) => return Err(e.into()),
         }
         let changed = events
             .publish_with_options(changed_publication(o, i), lifetime(o)?)
@@ -426,7 +503,12 @@ async fn start(o: &Options) -> Result<RunningNode> {
         NodeConfig {
             state: o.state.clone(),
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-            mission: UnprotectedReferenceMission::load(&o.mission)?,
+            mission: UnprotectedReferenceMission::load(&o.mission).map_err(|_| {
+                ObservedFailure {
+                    phase: "startup",
+                    reason: "provisioning",
+                }
+            })?,
             peers: Vec::new(),
             mutable_interests: MutableSourceInterests::default(),
             sync_interval: Duration::from_secs(300),
@@ -449,13 +531,19 @@ async fn exercise(events: &SelectedEventHandle, o: &Options, r: &mut Receipt) ->
             == 0,
         "state is not fresh",
     )?;
+    let selected = samples(o.workload.ordinary);
     for i in 0..o.workload.ordinary {
+        r.phase = "publication";
         let published = events
             .publish_with_options(publication(o, i, false), lifetime(o)?)
             .await?;
         require(published.inserted, "new operation replayed")?;
         r.created += 1;
+        if selected.contains(&i) {
+            r.originals.insert(i, published.clone());
+        }
         if r.created.is_multiple_of(o.sample_every) || r.created == o.workload.ordinary {
+            r.phase = "probe";
             match events
                 .publish_with_options(publication(o, i, false), lifetime(o)?)
                 .await
@@ -467,14 +555,17 @@ async fn exercise(events: &SelectedEventHandle, o: &Options, r: &mut Receipt) ->
                     )?;
                     r.exact_result_matches += 1;
                 }
-                Err(e) if e.kind() == ApplicationErrorKind::ExpiredOrRetired => {
+                Err(e)
+                    if o.workload.finite && e.kind() == ApplicationErrorKind::ExpiredOrRetired =>
+                {
                     r.exact_retired += 1;
                 }
-                Err(_) => return Err("unexpected immediate exact retry result".into()),
+                Err(e) => return Err(e.into()),
             }
             probe(events, o, r.created, r, false).await?;
         }
     }
+    r.phase = "capacity";
     require(
         sample_status(events, r)
             .await?
@@ -500,6 +591,7 @@ async fn exercise(events: &SelectedEventHandle, o: &Options, r: &mut Receipt) ->
     )?;
     r.emergency_accepted = 1;
     if o.workload.finite {
+        r.phase = "retirement";
         loop {
             let stats = sample_status(events, r)
                 .await?
@@ -511,6 +603,7 @@ async fn exercise(events: &SelectedEventHandle, o: &Options, r: &mut Receipt) ->
             sleep(Duration::from_millis(10)).await;
         }
     }
+    r.phase = "probe";
     probe(events, o, r.created, r, o.workload.finite).await?;
     require(
         r.final_stats.records_total == r.created + 1,
@@ -523,66 +616,127 @@ fn unix_ms() -> Result<u128> {
 }
 
 async fn run_workload(o: &Options) -> Result<Receipt> {
-    // All source work uses the selected API; only the public offline audit
-    // entrypoint runs after dropping the node and its handle.
-    fs::DirBuilder::new().mode(0o700).create(&o.state)?;
     let began = Instant::now();
+    let wall_start = unix_ms();
     let mut r = Receipt {
-        started_ms: unix_ms()?,
+        started_ms: wall_start.as_ref().copied().unwrap_or(0),
         failure: "none",
+        phase: "preflight",
         ..Default::default()
     };
-    let running = start(o).await?;
+    if wall_start.is_err() {
+        r.phase = "clock";
+        r.failure = "wall_clock_unavailable";
+        return finish_observation(r, began);
+    }
+    // Do not create state or load provisioning for a known impossible run.
+    if !unique_event_feasible(o.workload.ordinary) {
+        r.phase = "feasibility";
+        r.failure = "custody_ceiling_alias_unavailable";
+        return finish_observation(r, began);
+    }
+    let preflight = (|| -> Result<()> {
+        private_directory(o.state.parent().ok_or("invalid state")?)?;
+        if !fs::symlink_metadata(&o.state).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Err(ObservedFailure {
+                phase: "preflight",
+                reason: "state_exists",
+            }
+            .into());
+        }
+        fs::DirBuilder::new().mode(0o700).create(&o.state)?;
+        Ok(())
+    })();
+    if let Err(e) = preflight {
+        r.failure = safe_reason(&e);
+        return finish_observation(r, began);
+    }
+    r.phase = "startup";
+    let startup = Instant::now();
+    let started = start(o).await;
+    r.startup_ms = startup.elapsed().as_millis();
+    let running = match started {
+        Ok(node) => node,
+        Err(e) => {
+            r.failure = safe_reason(&e);
+            return finish_observation(r, began);
+        }
+    };
     let events = running.selected_events();
     match timeout(o.deadline, exercise(&events, o, &mut r)).await {
         Ok(Ok(())) => {}
-        Ok(Err(_)) => r.failure = "workload_boundary_failed",
+        Ok(Err(e)) => r.failure = safe_reason(&e),
         Err(_) => r.failure = "workload_deadline",
     }
     drop(events);
-    if running.shutdown().await.is_err() {
-        r.failure = "shutdown_failed";
+    let shutdown = Instant::now();
+    if let Err(e) = running.shutdown().await {
+        r.phase = "shutdown";
+        r.failure = safe_reason(&e.into());
     }
+    r.shutdown_ms = shutdown.elapsed().as_millis();
     if r.failure == "none" {
+        r.phase = "restart";
         let restart = Instant::now();
         match start(o).await {
             Ok(reopened) => {
                 r.restart_ms = restart.elapsed().as_millis();
+                r.phase = "restart_probe";
                 let events = reopened.selected_events();
-                if timeout(
+                match timeout(
                     Duration::from_secs(30),
                     probe(&events, o, r.created, &mut r, o.workload.finite),
                 )
                 .await
-                .is_ok_and(|v| v.is_ok())
                 {
-                    r.restarted = true;
-                } else {
-                    r.failure = "restart_probe_failed";
+                    Ok(Ok(())) => r.restarted = true,
+                    Ok(Err(e)) => r.failure = safe_reason(&e),
+                    Err(_) => r.failure = "deadline",
                 }
                 drop(events);
                 if reopened.shutdown().await.is_err() {
-                    r.failure = "restart_shutdown_failed";
+                    r.phase = "restart_shutdown";
+                    r.failure = "state_unavailable";
                 }
             }
-            Err(_) => r.failure = "restart_failed",
+            Err(e) => {
+                r.restart_ms = restart.elapsed().as_millis();
+                r.failure = safe_reason(&e);
+            }
         }
     }
     if r.failure == "none" {
+        r.phase = "offline_audit";
         let audit = Instant::now();
         match audit_store_event_operations(&o.state) {
             Ok(p) => {
                 r.audit_scanned = p.scanned;
                 r.audit_complete = p.scanned == p.total;
                 if !r.audit_complete {
-                    r.failure = "audit_incomplete";
+                    r.failure = "integrity";
                 }
             }
-            Err(_) => r.failure = "offline_audit_failed",
+            Err(_) => r.failure = "integrity",
         };
         r.audit_ms = audit.elapsed().as_millis();
     }
-    r.ended_ms = unix_ms()?;
+    if r.failure == "none" {
+        r.phase = "complete";
+    }
+    finish_observation(r, began)
+}
+
+fn finish_observation(mut r: Receipt, began: Instant) -> Result<Receipt> {
+    match unix_ms() {
+        Ok(value) => r.ended_ms = value,
+        Err(_) => {
+            if r.failure == "none" {
+                r.phase = "clock";
+                r.failure = "wall_clock_unavailable";
+            }
+        }
+    }
     r.elapsed_ms = began.elapsed().as_millis();
     Ok(r)
 }
@@ -591,6 +745,7 @@ struct AtomicOutput {
     file: File,
     temporary: PathBuf,
     destination: PathBuf,
+    directory: fs::Metadata,
 }
 impl AtomicOutput {
     fn prepare(path: &Path) -> Result<Self> {
@@ -612,11 +767,34 @@ impl AtomicOutput {
             file,
             temporary,
             destination: path.to_path_buf(),
+            directory: fs::symlink_metadata(parent)?,
         })
     }
+    fn valid_stage(&self) -> Result<()> {
+        let parent = self.destination.parent().ok_or("invalid output")?;
+        private_directory(parent)?;
+        let directory = fs::symlink_metadata(parent)?;
+        require(
+            directory.dev() == self.directory.dev() && directory.ino() == self.directory.ino(),
+            "output directory changed",
+        )?;
+        let opened = self.file.metadata()?;
+        let named = fs::symlink_metadata(&self.temporary)?;
+        require(
+            named.is_file()
+                && named.mode() & 0o777 == 0o600
+                && named.uid() == rustix::process::geteuid().as_raw()
+                && named.nlink() == 1
+                && opened.dev() == named.dev()
+                && opened.ino() == named.ino(),
+            "output staging changed",
+        )
+    }
     fn finish(&mut self, bytes: &[u8]) -> Result<()> {
+        self.valid_stage()?;
         self.file.write_all(bytes)?;
         self.file.sync_all()?;
+        self.valid_stage()?;
         fs::hard_link(&self.temporary, &self.destination)?;
         fs::remove_file(&self.temporary)?;
         File::open(self.destination.parent().ok_or("invalid output")?)?.sync_all()?;
@@ -625,7 +803,9 @@ impl AtomicOutput {
 }
 impl Drop for AtomicOutput {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.temporary);
+        if self.valid_stage().is_ok() {
+            let _ = fs::remove_file(&self.temporary);
+        }
     }
 }
 fn private_directory(path: &Path) -> Result<()> {
@@ -634,6 +814,17 @@ fn private_directory(path: &Path) -> Result<()> {
         "directory must be canonical",
     )?;
     let m = fs::symlink_metadata(path)?;
+    for ancestor in path.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)?;
+        let sticky_tmp =
+            ancestor == Path::new("/tmp") && metadata.uid() == 0 && metadata.mode() & 0o1000 != 0;
+        require(
+            metadata.is_dir()
+                && (metadata.uid() == 0 || metadata.uid() == rustix::process::geteuid().as_raw())
+                && (metadata.mode() & 0o022 == 0 || sticky_tmp),
+            "unsafe writable directory ancestor",
+        )?;
+    }
     // rustix's safe wrapper provides the process uid without unsafe code.
     require(
         m.is_dir() && m.mode() & 0o077 == 0 && m.uid() == rustix::process::geteuid().as_raw(),
@@ -642,24 +833,47 @@ fn private_directory(path: &Path) -> Result<()> {
 }
 
 async fn run(args: &[String]) -> Result<()> {
-    let o = options(args)?;
-    let mut output = AtomicOutput::prepare(&o.output)?;
-    // State must be a new child of an owned private directory, not a reused
-    // mission or runtime directory. The runtime owns creation and locking.
-    private_directory(o.state.parent().ok_or("invalid state")?)?;
-    require(
-        fs::symlink_metadata(&o.state).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
-        "state already exists",
-    )?;
+    let o = options(args).map_err(|_| ObservedFailure {
+        phase: "arguments",
+        reason: "invalid_arguments",
+    })?;
+    let mut output = AtomicOutput::prepare(&o.output).map_err(|_| ObservedFailure {
+        phase: "output",
+        reason: "invalid_output",
+    })?;
     let receipt = run_workload(&o).await?;
-    output.finish(receipt.json(&o).as_bytes())?;
-    require(receipt.failure == "none", "workload failed")
+    persist_receipt(&mut output, &receipt, &o)?;
+    if receipt.failure != "none" {
+        return Err(ObservedFailure {
+            phase: receipt.phase,
+            reason: receipt.failure,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn persist_receipt(output: &mut AtomicOutput, receipt: &Receipt, o: &Options) -> Result<()> {
+    output.finish(receipt.json(o).as_bytes()).map_err(|_| {
+        ObservedFailure {
+            phase: "output",
+            reason: "output_commit_failed",
+        }
+        .into()
+    })
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
-    if run(&env::args().skip(1).collect::<Vec<_>>()).await.is_err() {
-        eprintln!("{{\"status\":\"error\",\"reason\":\"scale_failed\"}}");
+    if let Err(error) = run(&env::args().skip(1).collect::<Vec<_>>()).await {
+        let phase = error
+            .downcast_ref::<ObservedFailure>()
+            .map_or("observation", |e| e.phase);
+        eprintln!(
+            "{{\"status\":\"error\",\"phase\":\"{}\",\"reason\":\"{}\"}}",
+            phase,
+            safe_reason(&error)
+        );
         std::process::exit(1);
     }
 }
@@ -667,6 +881,175 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_receipt_write_error_is_safe_typed_and_never_partial() {
+        let root = TestRoot::new();
+        let o = fixture_options(&root.0);
+        let mut output = AtomicOutput::prepare(&o.output).unwrap();
+        output.file = File::open(&output.temporary).unwrap();
+        let r = Receipt {
+            failure: "provisioning",
+            phase: "startup",
+            ..Default::default()
+        };
+        let error = persist_receipt(&mut output, &r, &o).unwrap_err();
+        let safe = error.downcast_ref::<ObservedFailure>().unwrap();
+        assert_eq!(safe.phase, "output");
+        assert_eq!(safe.reason, "output_commit_failed");
+        assert!(!o.output.exists());
+        assert!(!error.to_string().contains(root.0.to_str().unwrap()));
+    }
+
+    #[test]
+    fn unique_event_lifetime_feasibility_rejects_custody_ceiling() {
+        assert!(unique_event_feasible(262_144));
+        for count in [262_145, 604_800, 864_000, 990_000, 1_000_000] {
+            assert!(!unique_event_feasible(count));
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_failure_and_large_mode_blocker_have_atomic_receipts() {
+        for mode in ["small", "candidate-capacity", "million-retired"] {
+            let root = TestRoot::new();
+            let mut o = fixture_options(&root.0);
+            if mode != "small" {
+                o.workload = Workload::new(mode, None).unwrap();
+            }
+            assert!(run(&cli_args(&o)).await.is_err());
+            let receipt = fs::read_to_string(&o.output).expect("failure receipt missing");
+            assert!(receipt.contains("\"qualification\":false"));
+            if mode == "small" {
+                assert!(receipt.contains("\"failure_phase\":\"startup\""));
+                assert!(receipt.contains("\"failure\":\"provisioning\""));
+            } else {
+                assert!(receipt.contains("\"failure\":\"custody_ceiling_alias_unavailable\""));
+                assert!(!o.state.exists());
+            }
+            assert!(!receipt.contains(o.mission.to_str().unwrap()));
+        }
+    }
+
+    #[tokio::test]
+    async fn workload_failure_receipt_distinguishes_policy_rejection() {
+        let root = TestRoot::new();
+        let mut o = fixture_options(&root.0);
+        provision(&o);
+        o.topic = Topic::new("unprovisioned.topic").unwrap();
+        assert!(run(&cli_args(&o)).await.is_err());
+        let receipt = fs::read_to_string(&o.output).unwrap();
+        assert!(receipt.contains("\"failure_phase\":\"publication\""));
+        assert!(receipt.contains("\"failure\":\"request_rejected\""));
+    }
+
+    #[tokio::test]
+    async fn older_active_probe_rejects_changed_original_result() {
+        let root = TestRoot::new();
+        let mut o = fixture_options(&root.0);
+        o.workload = Workload::new("small-byte-capacity", Some(4)).unwrap();
+        provision(&o);
+        fs::DirBuilder::new().mode(0o700).create(&o.state).unwrap();
+        let running = start(&o).await.unwrap();
+        let events = running.selected_events();
+        let mut original = events.publish(publication(&o, 0, false)).await.unwrap();
+        original.acceptance_marker += 1;
+        let mut r = Receipt::default();
+        r.originals.insert(0, original);
+        let result = probe(&events, &o, 1, &mut r, false).await;
+        drop(events);
+        running.shutdown().await.unwrap();
+        assert!(
+            result.is_err(),
+            "older active replay accepted a changed marker"
+        );
+    }
+
+    fn cli_args(o: &Options) -> Vec<String> {
+        let pairs = [
+            ("--state", o.state.to_str().unwrap().to_owned()),
+            ("--mission-bundle", o.mission.to_str().unwrap().to_owned()),
+            ("--output", o.output.to_str().unwrap().to_owned()),
+            ("--mode", o.workload.mode.into()),
+            ("--ttl-ms", o.ttl_ms.to_string()),
+            ("--payload-bytes", o.payload_bytes.to_string()),
+            ("--sample-every", o.sample_every.to_string()),
+            ("--deadline-seconds", o.deadline.as_secs().to_string()),
+            ("--topic", o.topic.as_str().into()),
+            ("--scope", o.scope.as_str().into()),
+            ("--operation-prefix", o.prefix.clone()),
+            ("--source-commit", o.commit.clone()),
+            ("--binary-sha256", o.binary_hash.clone()),
+            ("--config-sha256", o.config_hash.clone()),
+        ];
+        let mut args = pairs
+            .into_iter()
+            .flat_map(|(k, v)| [k.into(), v])
+            .collect::<Vec<_>>();
+        if o.workload.mode.starts_with("small") {
+            args.extend(["--count".into(), o.workload.ordinary.to_string()]);
+        }
+        args
+    }
+
+    #[tokio::test]
+    async fn selected_api_same_intent_new_keys_create_distinct_events_not_aliases() {
+        let root = TestRoot::new();
+        let mut o = fixture_options(&root.0);
+        o.ttl_ms = 60_000;
+        o.workload.limits = EventOperationLimits::new(512, 201_326_592, 2).unwrap();
+        provision(&o);
+        fs::DirBuilder::new().mode(0o700).create(&o.state).unwrap();
+        let running = start(&o).await.unwrap();
+        let events = running.selected_events();
+        let first = events
+            .publish_with_options(publication(&o, 0, false), lifetime(&o).unwrap())
+            .await
+            .unwrap();
+        let second = events
+            .publish_with_options(publication(&o, 1, false), lifetime(&o).unwrap())
+            .await
+            .unwrap();
+        let status = events.status().await.unwrap();
+        drop(events);
+        running.shutdown().await.unwrap();
+        assert!(first.inserted && second.inserted);
+        assert!(first.id != second.id);
+        assert_eq!(status.event_operation_capacity.stats.records_total, 2);
+    }
+
+    #[test]
+    fn output_rejects_writable_ancestor() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = TestRoot::new();
+        let child = root.0.join("private");
+        fs::DirBuilder::new().mode(0o700).create(&child).unwrap();
+        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(AtomicOutput::prepare(&child.join("receipt.json")).is_err());
+    }
+
+    #[test]
+    fn output_rejects_staging_substitution() {
+        let root = TestRoot::new();
+        let destination = root.0.join("receipt.json");
+        let mut out = AtomicOutput::prepare(&destination).unwrap();
+        fs::rename(&out.temporary, root.0.join("old.tmp")).unwrap();
+        std::os::unix::fs::symlink("target", &out.temporary).unwrap();
+        assert!(out.finish(b"{}").is_err());
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn output_rejects_swapped_parent_directory() {
+        let root = TestRoot::new();
+        let child = root.0.join("private");
+        fs::DirBuilder::new().mode(0o700).create(&child).unwrap();
+        let mut out = AtomicOutput::prepare(&child.join("receipt.json")).unwrap();
+        fs::rename(&child, root.0.join("old")).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&child).unwrap();
+        fs::write(&out.temporary, b"substitution").unwrap();
+        assert!(out.finish(b"{}").is_err());
+    }
 
     #[test]
     fn replay_evidence_requires_every_original_result_field() {
