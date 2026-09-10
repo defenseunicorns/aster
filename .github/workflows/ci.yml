@@ -241,7 +241,7 @@ jobs:
         run: sh ./tools/run-fuzz-smoke.sh
 
   sbom:
-    name: Linux release build and SBOM
+    name: "Build: Linux x86_64"
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
