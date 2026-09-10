@@ -33,6 +33,122 @@ reuses the same database without another fetch for the fuzz lockfile. Its
 vulnerability result therefore reflects the RustSec database available when
 the workflow ran, rather than a permanently reproducible snapshot.
 
+## Network reliability under contention
+
+Run the bounded loopback diagnostic from the repository root:
+
+```sh
+python3 tools/test-network-contention.py --rounds 3 --cpu-workers 4 \
+  --test-threads 4 --output /tmp/aster-network-contention-run
+```
+
+The output directory must be new. The runner builds the locked, offline,
+all-feature node and Iroh library tests before starting CPU load. Each round
+runs the complete Iroh suite concurrently with the selected Blob convergence,
+State/Record convergence and resolution, Blob contact-fault, and progress
+watchdog tests. Each binary also runs its selected tests in parallel. The
+runner retains all output, commands, source identity, load settings and exit
+codes in the output directory; it stops on failure rather than retrying to a
+pass. CPU workers and test process groups are cleaned up on exit. A round has
+an independent outer deadline, including if a test stops responding.
+
+The full workspace test commands in `mise run check` and the macOS CI lane use
+`tools/with-test-resources.sh`. The 256-pair relay fixture alone owns 1,024
+socket descriptors, before its listener/runtime files and neighboring tests.
+The wrapper raises only the child process's soft open-file limit to at least
+4,096, preserves a larger existing limit, and fails clearly if the hard limit
+cannot support it. It does not reduce test capacity or change the host's hard
+limit. For a direct workspace run, use:
+
+```sh
+sh tools/with-test-resources.sh cargo test --locked --workspace --all-features
+```
+
+These tests keep exact data and zero-contact-error assertions. Blob waiting
+tracks committed carrier prefixes. State/Record waiting counts each expected
+version once per node; duplicate queries or oscillating observations cannot
+reset its stall timer. Both also retain absolute deadlines. This is functional
+reliability evidence under a declared synthetic CPU load, not a performance
+benchmark, packet-loss test, target-hardware qualification, or hosted-CI result.
+
+Blob convergence, State/Record convergence, and Record-resolution waiting each
+allow 30 seconds without new durable progress, using the production
+`CONTACT_DEADLINE` directly. Each absolute cap remains 60 seconds. This aligns
+the budget lengths; the watchdog and contact timers start independently, so it
+is not a guarantee of contact completion.
+Resolution probes also check for contact errors and report authenticated-contact
+counts against the pre-wait baseline. Contact counts do not extend the watchdog;
+only newly observed expected versions do. Carrier deadlines and exact projection
+assertions are unchanged.
+
+Selected in-process node pairs bind their actual responder to port zero and
+use its readiness-reported address to start the initiator. The responder owns
+its socket throughout; the fixture does not reserve, release and reacquire a
+port. The higher-identity responder needs only the peer's authenticated identity
+for inbound contacts; its unused outbound address is never dialed. This reuses
+the existing startup handoff without adding a public lifecycle API. The separate
+CLI/process fixtures still have explicit topology/restart port requirements
+and their existing per-binary serialization; this change does not claim to
+eliminate every fixed-port fixture.
+
+The rejected-request test checks both that a rejected local authorization never
+invokes the payload writer and that a subsequent authorized exchange completes.
+The receiver checks bytes incrementally. An observation timeout is a failure,
+not evidence that no payload was sent.
+
+The Linux quality lane now uses default test parallelism. Narrow isolation in
+individual process fixtures remains. Investigate errors before weakening
+zero-error assertions or increasing carrier deadlines.
+
+Historical local validation on 2026-09-08:
+
+| Run | Environment and result |
+|---|---|
+| Contention diagnostic, network code `34699e8` | macOS ARM64, 18 logical CPUs, four CPU-load workers, four test threads per binary: three rounds passed; 102 Iroh and 33 selected node/progress test executions. |
+| Contention diagnostic, network code `a0b7154` | Linux ARM64 container, two CPUs, two CPU-load workers, four test threads per binary: three rounds passed; 102 Iroh and 33 selected node/progress test executions. |
+| Complete `mise run check` with the then-staged integration set and descriptor wrapper | Passed in an isolated full clone at `b746307`: formatting, policy/trace checks, Clippy, Rust workspace, real application smokes, conformance, Python bindings, all 202 lab tests, and Go bindings. |
+| Parallel Linux workspace with the then-staged integration set and descriptor wrapper | 1,226 passed, seven existing ignored tests. Rust 1.97.1, default test parallelism, owner-only creation mask, test/dev debug info disabled. The approximately 2-GB VM required one build job and the pinned Rust image's bundled LLVM linker; these build settings did not serialize tests. |
+
+For the complete local gate, use a full clone: the signed-source lab checks
+require a real `.git` directory and reject linked worktree metadata. When
+sharing `CARGO_TARGET_DIR`, also make the built FFI library available at the
+checkout's expected `target/debug` path for the Python and Go binding checks.
+The validation clone used an owner-only creation mask (`umask 077`).
+
+The binding semantic-version and secure-umask fixes are now part of `main`.
+The 2026-09-08 combined validation checkout also contained an experimental
+mission-lock change while investigating two provisioning failures. That
+historical composition is not a prerequisite for this network branch, and the
+mission-lock change remains separately paused for ownership-contract review.
+
+On 2026-09-10 this branch was composed with `main` at merge commit `31b7b24`
+without the mission-lock change. Focused validation through the owner-only CI
+shell passed the direct-Iroh Blob convergence/restart test in 11.5 seconds and
+the State/Record convergence/resolution test in 28.6 seconds. Five Blob-progress
+watchdog tests, three mutable-convergence watchdog tests, and both
+authorization-before-write tests also passed. Formatting, descriptor-wrapper
+syntax and behavior, and contention-runner parsing passed.
+
+The first composed hosted run exposed a test-fixture race under parallel load:
+the elected responder's production fallback timer could expire while the
+preferred initiator was still completing its authenticated handshake. The
+resulting intentional collision resolution recorded the aborted redundant
+handshake as a failed contact. The shared direct-contact test helper now keeps
+only its elected responder passive beyond both convergence phases; production
+election, fallback timing, and zero-contact-error assertions are unchanged.
+After that fixture change, the exact failed State/Record test passed, the
+direct-Iroh Blob test passed in 11.7 seconds, and one four-worker/four-thread
+contention round covering all three shared-helper scenarios plus the watchdog
+suites passed in 31.8 seconds. This focused result does not replace the required
+hosted CI run on the updated branch.
+
+The Linux image was the repository's existing pinned Rust image,
+`rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97`.
+These are local workstation/container observations, not hosted Actions results
+or new product-requirements acceptance evidence. Raw attempts, including the
+low-descriptor-limit failure and linker-memory failures, were retained with the
+implementation task; successful retries followed specific environment fixes.
+
 ## Selected composition coverage
 
 `aster-profile`, `aster-redb-store`, `aster-negentropy`, `aster-iroh`, and

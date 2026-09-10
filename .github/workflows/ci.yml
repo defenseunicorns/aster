@@ -19,7 +19,8 @@ concurrency:
 
 defaults:
   run:
-    shell: bash
+    # Repository run steps require checkout before this wrapper is available.
+    shell: bash .github/scripts/ci-shell.sh {0}
 
 env:
   CARGO_INCREMENTAL: "0"
@@ -30,14 +31,12 @@ jobs:
   quality:
     name: quality
     runs-on: ubuntu-24.04
-    # The single-threaded workspace suite now regularly exceeds 30 minutes on
-    # hosted runners. Keep every quality gate intact and leave enough headroom
-    # for runner variance instead of cancelling an otherwise healthy run.
+    # Keep headroom for the complete quality gate and hosted-runner variance.
+    # Workspace tests use default parallelism with an explicit descriptor budget.
     timeout-minutes: 45
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      RUST_TEST_THREADS: "1"
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -87,7 +86,7 @@ jobs:
       - name: Run workspace tests offline
         env:
           CARGO_NET_OFFLINE: "true"
-        run: cargo +1.97.1 test --locked --workspace --all-features
+        run: sh tools/with-test-resources.sh cargo +1.97.1 test --locked --workspace --all-features
 
       - name: Run live tour presenter tests
         run: python3 tools/test_aster_tour_ui.py
@@ -254,6 +253,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Require every validation lane
+        # This aggregation job does not check out the repository.
+        shell: bash
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
           MACOS_RESULT: ${{ needs.macos-tests.result }}
@@ -262,6 +263,7 @@ jobs:
           POLICY_RESULT: ${{ needs.dependency-policy.result }}
           FUZZ_RESULT: ${{ needs.fuzz-smoke.result }}
         run: |
+          umask 077
           for result in \
             "$QUALITY_RESULT" \
             "$MACOS_RESULT" \

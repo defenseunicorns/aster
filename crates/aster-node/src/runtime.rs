@@ -89,6 +89,13 @@ use tokio::{
 };
 use zeroize::Zeroize as _;
 
+#[cfg(test)]
+#[path = "runtime/blob_progress_test.rs"]
+mod blob_progress_test;
+#[cfg(test)]
+#[path = "runtime/convergence_test.rs"]
+mod convergence_test;
+
 #[cfg(feature = "nearby-discovery")]
 use crate::mission::{initiate_discovered_over_iroh_metered, respond_discovered_over_iroh_metered};
 use crate::{
@@ -2421,6 +2428,8 @@ fn account_blob_receipt(total: &mut NodeReceipt, contact: &PeerReceipt) -> Resul
 
 /// Owned lifecycle for one running selected-stack node actor.
 pub struct RunningNode {
+    #[cfg(test)]
+    bound_sockets: Vec<SocketAddr>,
     selected_events: SelectedEventHandle,
     selected_state: SelectedStateHandle,
     selected_records: SelectedRecordHandle,
@@ -11295,8 +11304,11 @@ async fn start_node_with_shutdown_ownership(
             };
         }
     };
+    #[cfg(not(test))]
     let _bound_sockets = ready.bound_sockets;
     Ok(RunningNode {
+        #[cfg(test)]
+        bound_sockets: ready.bound_sockets,
         selected_events,
         selected_state,
         selected_records,
@@ -16613,6 +16625,10 @@ fn selected_pending_blob_contact_work(
             ));
         }
     };
+    #[cfg(test)]
+    for status in &carriers {
+        blob_progress_test::record(verifier.identity(), &blob, *status);
+    }
     Ok(Some(PendingBlobContactWork {
         source: projection.transfer_id,
         blob,
@@ -16879,6 +16895,14 @@ async fn sync_blob_carrier_lane(
                         (0, BlobRangeApplyDisposition::Duplicate)
                     }
                     Ok(BlobCarrierAppendOutcome::Appended(status)) => {
+                        // Observe the committed prefix before completion can
+                        // retire its staging row. This is test-only telemetry.
+                        #[cfg(test)]
+                        blob_progress_test::record(
+                            verifier.identity(),
+                            &selected.as_ref().expect("selected Blob work").blob,
+                            status,
+                        );
                         receipt.blob_bytes_fetched = receipt
                             .blob_bytes_fetched
                             .checked_add(bytes.len())
@@ -22142,6 +22166,7 @@ mod tests {
     use std::sync::{Barrier, mpsc as std_mpsc};
 
     use super::*;
+    use crate::application::{RecordProjection, StateProjection};
     use crate::mission::initiate_over_iroh;
     use redb::{ReadableDatabase as _, ReadableTable as _};
 
@@ -29359,6 +29384,59 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup Blob rekey actor state");
     }
 
+    // The higher identity only accepts contacts. Its configured peer address is
+    // not dialed; only the lower identity needs the responder's real address.
+    // Both endpoints own their OS-selected ports continuously from bind through
+    // shutdown. start_node returns only after the actor's readiness handoff.
+    async fn start_test_pair(
+        mut left: NodeConfig,
+        mut right: NodeConfig,
+        left_id: aster_iroh::EndpointId,
+        right_id: aster_iroh::EndpointId,
+    ) -> (RunningNode, RunningNode) {
+        assert_ne!(left_id, right_id);
+        assert_eq!(left.peers.len(), 1);
+        assert_eq!(right.peers.len(), 1);
+        left.bind = SocketAddr::from(([127, 0, 0, 1], 0));
+        right.bind = left.bind;
+        let left_is_responder = left_id > right_id;
+        let (mut responder, mut initiator) = if left_is_responder {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        // Keep this test's elected responder passive through both 60-second
+        // convergence phases. Under loaded parallel CI, the one-second
+        // production fallback can otherwise start a second contact while the
+        // preferred initiator is still completing its authenticated handshake.
+        responder.sync_interval = Duration::from_secs(120);
+        assert!(
+            non_preferred_contact_fallback_delay(responder.sync_interval)
+                > Duration::from_secs(120),
+            "test responder fallback must outlive both convergence phases"
+        );
+        responder.peers[0].carrier.address = SocketAddr::from(([127, 0, 0, 1], 9));
+        let responder = start_node(responder).await.expect("responder readiness");
+        let address = responder
+            .bound_sockets
+            .iter()
+            .copied()
+            .find(SocketAddr::is_ipv4)
+            .expect("responder IPv4 socket");
+        assert_ne!(address.port(), 0);
+        assert!(
+            UdpSocket::bind(address).is_err(),
+            "ready responder must retain its port"
+        );
+        initiator.peers[0].carrier.address = address;
+        let initiator = start_node(initiator).await.expect("initiator readiness");
+        if left_is_responder {
+            (responder, initiator)
+        } else {
+            (initiator, responder)
+        }
+    }
+
     #[tokio::test]
     async fn live_selected_blob_converges_over_direct_iroh_and_restarts_peerless() {
         use crate::application::{ApplicationErrorKind, BlobReadPageRequest, BlobReadRequest};
@@ -29418,11 +29496,8 @@ mod tests {
             .await
             .expect("stop peerless direct-Iroh Blob source");
 
-        let source_socket = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve source port");
-        let receiver_socket = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve receiver port");
-        let source_address = source_socket.local_addr().expect("source address");
-        let receiver_address = receiver_socket.local_addr().expect("receiver address");
-        drop((source_socket, receiver_socket));
+        let source_address = SocketAddr::from(([127, 0, 0, 1], 0));
+        let receiver_address = source_address;
         let interests =
             MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
                 topic.clone(),
@@ -29461,31 +29536,30 @@ mod tests {
             run_for: None,
             application: NodeApplication::Relay,
         };
-        let (source_running, receiver_running) = if source_carrier > receiver_carrier {
-            let source = start_node(source_config)
-                .await
-                .expect("start direct-Iroh source responder");
-            let receiver = start_node(receiver_config)
-                .await
-                .expect("start direct-Iroh receiver initiator");
-            (source, receiver)
-        } else {
-            let receiver = start_node(receiver_config)
-                .await
-                .expect("start direct-Iroh receiver responder");
-            let source = start_node(source_config)
-                .await
-                .expect("start direct-Iroh source initiator");
-            (source, receiver)
-        };
+        let progress = blob_progress_test::Observer::install(
+            receiver_mission.identity,
+            published.publisher,
+            published.publisher_counter,
+            *published.id.as_bytes(),
+        );
+        let (source_running, receiver_running) = start_test_pair(
+            source_config,
+            receiver_config,
+            source_carrier,
+            receiver_carrier,
+        )
+        .await;
         let receiver_blobs = receiver_running.selected_blobs();
         let read = BlobReadRequest {
             id: published.id,
             topic: topic.clone(),
             scope: scope.clone(),
         };
-        timeout(Duration::from_secs(20), async {
-            loop {
+        // A committed range resets the stall timer; contacts and duplicate
+        // ranges do not. The absolute cap never moves, even under trickle progress.
+        let receiver_status = receiver_running.selected_events();
+        progress
+            .wait(CONTACT_DEADLINE, Duration::from_secs(60), || async {
                 match receiver_blobs
                     .read_page(BlobReadPageRequest {
                         blob: read.clone(),
@@ -29496,7 +29570,7 @@ mod tests {
                 {
                     Ok(page) => {
                         assert_eq!(page.as_bytes(), &bytes[..1]);
-                        break;
+                        Ok(None)
                     }
                     Err(error)
                         if matches!(
@@ -29506,14 +29580,21 @@ mod tests {
                                 | ApplicationErrorKind::PolicyUnsettled
                         ) =>
                     {
-                        sleep(Duration::from_millis(20)).await;
+                        let status = receiver_status
+                            .status()
+                            .await
+                            .map_err(|error| format!("contact status: {error:?}"))?;
+                        Ok(Some(format!(
+                            "read={error:?}; authenticated_contacts={}; failed_contact_attempts={}",
+                            status.authenticated_contacts, status.failed_contact_attempts
+                        )))
                     }
-                    Err(error) => panic!("direct-Iroh Blob read failed unexpectedly: {error}"),
+                    Err(error) => Err(format!("Blob read: {error:?}")),
                 }
-            }
-        })
-        .await
-        .expect("direct-Iroh Blob convergence deadline");
+            })
+            .await
+            .unwrap_or_else(|error| panic!("direct-Iroh Blob convergence: {error}"));
+        progress.assert_carriers_complete();
         assert_eq!(
             read_live_blob_pages(&receiver_blobs, read.clone()).await,
             bytes
@@ -30095,11 +30176,8 @@ mod tests {
             0
         );
 
-        let left_port = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve left mutable port");
-        let right_port = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve right mutable port");
-        let left_address = left_port.local_addr().expect("left mutable address");
-        let right_address = right_port.local_addr().expect("right mutable address");
-        drop((left_port, right_port));
+        let left_address = SocketAddr::from(([127, 0, 0, 1], 0));
+        let right_address = left_address;
         let interests = MutableSourceInterests::new(
             vec![SourceInterestSelector::new(
                 topic.clone(),
@@ -30144,26 +30222,8 @@ mod tests {
             run_for: None,
             application: NodeApplication::Relay,
         };
-        // The lower carrier identity is the sole initiator. Start the higher
-        // identity first so no expected startup absence becomes a failed
-        // authenticated-contact attempt.
-        let (left_running, right_running) = if left_carrier > right_carrier {
-            let left = start_node(left_config)
-                .await
-                .expect("restart connected left responder");
-            let right = start_node(right_config)
-                .await
-                .expect("restart connected right initiator");
-            (left, right)
-        } else {
-            let right = start_node(right_config)
-                .await
-                .expect("restart connected right responder");
-            let left = start_node(left_config)
-                .await
-                .expect("restart connected left initiator");
-            (left, right)
-        };
+        let (left_running, right_running) =
+            start_test_pair(left_config, right_config, left_carrier, right_carrier).await;
         let left_state_handle = left_running.selected_state();
         let right_state_handle = right_running.selected_state();
         let left_records = left_running.selected_records();
@@ -30184,8 +30244,7 @@ mod tests {
         };
 
         let (left_record_projection, right_record_projection) =
-            timeout(Duration::from_secs(20), async {
-                loop {
+            convergence_test::wait("live State/Record convergence", CONTACT_DEADLINE, Duration::from_secs(60), || async {
                     let left_state_projection = left_state_handle
                         .query(state_query.clone())
                         .await
@@ -30225,14 +30284,27 @@ mod tests {
                         .is_some_and(|(left, right)| {
                             left.siblings == right.siblings && left.siblings.len() == 2
                         });
-                    if state_converged && records_converged {
-                        break (left_record_projection, right_record_projection);
-                    }
-                    sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .expect("live State and Record projections converge");
+                    let has_state = |projection: &StateProjection, id| {
+                        projection.current.iter().chain(&projection.recoverable).any(|item| item.id == id)
+                    };
+                    let has_record = |projection: &RecordProjection, id| {
+                        projection.current.iter().chain(&projection.concurrent).chain(&projection.superseded)
+                            .any(|item| item.id == id)
+                    };
+                    let milestones = [
+                        has_state(&left_state_projection, left_state_publication.id),
+                        has_state(&left_state_projection, right_state_publication.id),
+                        has_state(&right_state_projection, left_state_publication.id),
+                        has_state(&right_state_projection, right_state_publication.id),
+                        has_record(&left_record_projection, left_record_publication.id),
+                        has_record(&left_record_projection, right_record_publication.id),
+                        has_record(&right_record_projection, left_record_publication.id),
+                        has_record(&right_record_projection, right_record_publication.id),
+                    ];
+                    let detail = format!("state_converged={state_converged}; records_converged={records_converged}; versions={milestones:?}");
+                    (milestones, (state_converged && records_converged).then_some(
+                        (left_record_projection, right_record_projection)), detail)
+            }).await;
         timeout(Duration::from_secs(20), async {
             loop {
                 let left = left_status
@@ -30343,8 +30415,13 @@ mod tests {
             .expect("right contact baseline")
             .authenticated_contacts;
 
-        timeout(Duration::from_secs(20), async {
-            loop {
+        convergence_test::wait(
+            "live Record resolution",
+            // Match the production contact budget instead of declaring a stall
+            // after only 20 seconds without a newly committed version.
+            CONTACT_DEADLINE,
+            Duration::from_secs(60),
+            || async {
                 let left = left_records
                     .query(record_query.clone())
                     .await
@@ -30353,7 +30430,11 @@ mod tests {
                     .query(record_query.clone())
                     .await
                     .expect("right resolved Record query");
-                if left
+                let left_contact = left_status.status().await.expect("left resolution status");
+                let right_contact = right_status.status().await.expect("right resolution status");
+                assert_eq!(left_contact.failed_contact_attempts, 0);
+                assert_eq!(right_contact.failed_contact_attempts, 0);
+                let complete = left
                     .current
                     .as_ref()
                     .is_some_and(|item| item.id == resolved.id)
@@ -30364,15 +30445,41 @@ mod tests {
                     && left.conflict.is_none()
                     && right.conflict.is_none()
                     && left.superseded.len() == 2
-                    && right.superseded.len() == 2
-                {
-                    break;
-                }
-                sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("live Record resolution converges");
+                    && right.superseded.len() == 2;
+                let milestones = [
+                    left.current
+                        .as_ref()
+                        .is_some_and(|item| item.id == resolved.id),
+                    right
+                        .current
+                        .as_ref()
+                        .is_some_and(|item| item.id == resolved.id),
+                    left.superseded
+                        .iter()
+                        .any(|item| item.id == left_record_publication.id),
+                    left.superseded
+                        .iter()
+                        .any(|item| item.id == right_record_publication.id),
+                    right
+                        .superseded
+                        .iter()
+                        .any(|item| item.id == left_record_publication.id),
+                    right
+                        .superseded
+                        .iter()
+                        .any(|item| item.id == right_record_publication.id),
+                ];
+                (
+                    milestones,
+                    complete.then_some(()),
+                    format!(
+                        "resolved_versions={milestones:?}; exact_projection={complete}; authenticated_contacts=[{}, {}]; contact_baseline=[{left_contact_baseline}, {right_contact_baseline}]",
+                        left_contact.authenticated_contacts, right_contact.authenticated_contacts,
+                    ),
+                )
+            },
+        )
+        .await;
 
         timeout(Duration::from_secs(20), async {
             loop {
@@ -33151,13 +33258,8 @@ mod tests {
                 },
                 fault,
             );
-            let source_socket =
-                UdpSocket::bind(("127.0.0.1", 0)).expect("reserve contact-fatal source port");
-            let receiver_socket =
-                UdpSocket::bind(("127.0.0.1", 0)).expect("reserve contact-fatal receiver port");
-            let source_address = source_socket.local_addr().expect("source address");
-            let receiver_address = receiver_socket.local_addr().expect("receiver address");
-            drop((source_socket, receiver_socket));
+            let source_address = SocketAddr::from(([127, 0, 0, 1], 0));
+            let receiver_address = source_address;
             let interests =
                 MutableSourceInterests::default().with_blob(vec![SourceInterestSelector::new(
                     topic.clone(),
@@ -33196,23 +33298,13 @@ mod tests {
                 run_for: None,
                 application: NodeApplication::Relay,
             };
-            let (source_running, receiver_running) = if source_carrier > receiver_carrier {
-                let source = start_node(source_config)
-                    .await
-                    .expect("start contact-fatal source responder");
-                let receiver = start_node(receiver_config)
-                    .await
-                    .expect("start contact-fatal receiver initiator");
-                (source, receiver)
-            } else {
-                let receiver = start_node(receiver_config)
-                    .await
-                    .expect("start contact-fatal receiver responder");
-                let source = start_node(source_config)
-                    .await
-                    .expect("start contact-fatal source initiator");
-                (source, receiver)
-            };
+            let (source_running, receiver_running) = start_test_pair(
+                source_config,
+                receiver_config,
+                source_carrier,
+                receiver_carrier,
+            )
+            .await;
             let (faulted, peer) = if target_is_source {
                 (source_running, receiver_running)
             } else {
