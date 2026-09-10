@@ -36,8 +36,8 @@ const MAX_CLIENT_TIMEOUT_SECONDS: u64 = 120;
 const TEST_STORAGE_MAX_ITEMS: u32 = 10_000;
 const TEST_STORAGE_MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 const TEST_SHUTDOWN_GRACE_MS: u64 = 10_000;
-const EVENT_OPERATION_HARD_ROWS: u64 = 4_096;
-const EVENT_OPERATION_HARD_BYTES: u64 = 512 * 1024;
+const EVENT_OPERATION_HARD_ROWS: u64 = 1_000_000;
+const EVENT_OPERATION_HARD_BYTES: u64 = 201_326_592;
 const EVENT_OPERATION_WARNING_ROWS: u64 = 512;
 const EVENT_OPERATION_PROFILE_ROWS: u64 = 1_024;
 const EVENT_DELIVERY_PROFILE_ROWS: u64 = 256;
@@ -566,11 +566,10 @@ fn status_evidence(response: &api::GetStatusResponse) -> Result<serde_json::Valu
         || operations.profile_remaining != remaining
         || operations.profile_warning != (operations.rows >= EVENT_OPERATION_WARNING_ROWS)
         || operations.profile_exhausted != (operations.rows >= EVENT_OPERATION_PROFILE_ROWS)
-        || operations.rows > operations.row_hard_limit
-        || operations.bytes > operations.byte_hard_limit
     {
         return Err(FixtureError::Local);
     }
+    let (warning, audit) = operation_health(operations)?;
     if deliveries.profile_boundary != EVENT_DELIVERY_PROFILE_ROWS
         || deliveries.hard_limit != EVENT_DELIVERY_HARD_ROWS
         || deliveries.profile_saturated != (deliveries.pending >= EVENT_DELIVERY_PROFILE_ROWS)
@@ -591,9 +590,78 @@ fn status_evidence(response: &api::GetStatusResponse) -> Result<serde_json::Valu
         "operation_profile_remaining": operations.profile_remaining,
         "operation_profile_warning": operations.profile_warning,
         "operation_profile_exhausted": operations.profile_exhausted,
+        "operation_active_rows": operations.active_rows,
+        "operation_retired_rows": operations.retired_rows,
+        "operation_reverse_rows": operations.reverse_rows,
+        "operation_ordinary_remaining": operations.ordinary_remaining,
+        "operation_emergency_remaining": operations.emergency_remaining,
+        "operation_rolling_accept_rate": operations.rolling_accept_rate,
+        "operation_estimated_seconds_to_exhaustion": operations.estimated_seconds_to_exhaustion,
+        "operation_warning_state": warning,
+        "operation_audit_state": audit,
+        "operation_audit_scanned": operations.audit.as_option().ok_or(FixtureError::Local)?.scanned,
+        "operation_audit_total": operations.audit.as_option().ok_or(FixtureError::Local)?.total,
         "pending_deliveries": deliveries.pending,
         "delivery_profile_saturated": deliveries.profile_saturated,
     }))
+}
+
+fn operation_health(
+    operations: &api::PublishOperationCapacityStatus,
+) -> Result<(&'static str, &'static str), FixtureError> {
+    use aster_node::application::{EventOperationCapacity, EventOperationCapacityWarning};
+    use aster_redb_store::{EventOperationLimits, EventOperationStats};
+    if operations.active_rows.checked_add(operations.retired_rows) != Some(operations.rows)
+        || operations.reverse_rows != operations.active_rows
+        || u128::from(operations.bytes)
+            != u128::from(operations.active_rows) * 162 + u128::from(operations.retired_rows) * 67
+    {
+        return Err(FixtureError::Local);
+    }
+    let capacity = EventOperationCapacity::new(
+        EventOperationStats {
+            records_total: operations.rows,
+            records_active: operations.active_rows,
+            records_retired: operations.retired_rows,
+            reverse_rows: operations.reverse_rows,
+            logical_bytes: operations.bytes,
+        },
+        EventOperationLimits::DEFAULT,
+    );
+    let (expected_warning, warning) = match capacity.warning {
+        EventOperationCapacityWarning::Ok => (api::OperationCapacityWarning::Ok, "ok"),
+        EventOperationCapacityWarning::Warning => {
+            (api::OperationCapacityWarning::Warning, "warning")
+        }
+        EventOperationCapacityWarning::Critical => {
+            (api::OperationCapacityWarning::Critical, "critical")
+        }
+        EventOperationCapacityWarning::Exhausted => {
+            (api::OperationCapacityWarning::Exhausted, "exhausted")
+        }
+    };
+    if operations.ordinary_remaining != capacity.ordinary_remaining
+        || operations.emergency_remaining != capacity.emergency_remaining
+        || operations.warning_state != expected_warning
+        || !operations.rolling_accept_rate.is_finite()
+        || operations.rolling_accept_rate < 0.0
+        || ((operations.rolling_accept_rate == 0.0 || capacity.ordinary_remaining == 0)
+            && operations.estimated_seconds_to_exhaustion != 0)
+    {
+        return Err(FixtureError::Local);
+    }
+    let audit = operations.audit.as_option().ok_or(FixtureError::Local)?;
+    if audit.scanned > audit.total {
+        return Err(FixtureError::Local);
+    }
+    let audit_name = match audit.state.as_known() {
+        Some(api::OperationLedgerAudit::Pending) if audit.scanned == 0 => "pending",
+        Some(api::OperationLedgerAudit::Running) => "running",
+        Some(api::OperationLedgerAudit::Complete) if audit.scanned == audit.total => "complete",
+        Some(api::OperationLedgerAudit::Failed) => "failed",
+        _ => return Err(FixtureError::Local),
+    };
+    Ok((warning, audit_name))
 }
 
 #[derive(Deserialize)]
@@ -1031,10 +1099,18 @@ mod tests {
             }
             .into(),
             publish_operation_capacity: api::PublishOperationCapacityStatus {
-                row_hard_limit: 4_096,
-                byte_hard_limit: 524_288,
+                row_hard_limit: 1_000_000,
+                byte_hard_limit: 201_326_592,
                 profile_boundary: 1_024,
                 profile_remaining: 1_024,
+                ordinary_remaining: 990_000,
+                emergency_remaining: 10_000,
+                warning_state: api::OperationCapacityWarning::Ok.into(),
+                audit: api::OperationLedgerAuditStatus {
+                    state: api::OperationLedgerAudit::Pending.into(),
+                    ..Default::default()
+                }
+                .into(),
                 ..Default::default()
             }
             .into(),
@@ -1050,6 +1126,8 @@ mod tests {
         let evidence = status_evidence(&valid).expect("valid profile status");
         assert_eq!(evidence["configured_emission_mode"], "normal");
         assert_eq!(evidence["effective_emission_mode"], "receive_only");
+        assert_eq!(evidence["operation_ordinary_remaining"], 990_000);
+        assert_eq!(evidence["operation_audit_state"], "pending");
 
         let mut invalid = valid;
         invalid

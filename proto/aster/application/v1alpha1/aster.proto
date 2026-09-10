@@ -90,6 +90,37 @@ message PublishOperationCapacityStatus {
   uint64 profile_remaining = 6;
   bool profile_warning = 7;
   bool profile_exhausted = 8;
+  uint64 active_rows = 9;
+  uint64 retired_rows = 10;
+  uint64 reverse_rows = 11;
+  uint64 ordinary_remaining = 12;
+  uint64 emergency_remaining = 13;
+  double rolling_accept_rate = 14;
+  uint64 estimated_seconds_to_exhaustion = 15;
+  OperationCapacityWarning warning_state = 16;
+  OperationLedgerAuditStatus audit = 17;
+}
+
+enum OperationCapacityWarning {
+  OPERATION_CAPACITY_WARNING_UNSPECIFIED = 0;
+  OPERATION_CAPACITY_WARNING_OK = 1;
+  OPERATION_CAPACITY_WARNING_WARNING = 2;
+  OPERATION_CAPACITY_WARNING_CRITICAL = 3;
+  OPERATION_CAPACITY_WARNING_EXHAUSTED = 4;
+}
+
+enum OperationLedgerAudit {
+  OPERATION_LEDGER_AUDIT_UNSPECIFIED = 0;
+  OPERATION_LEDGER_AUDIT_PENDING = 1;
+  OPERATION_LEDGER_AUDIT_RUNNING = 2;
+  OPERATION_LEDGER_AUDIT_COMPLETE = 3;
+  OPERATION_LEDGER_AUDIT_FAILED = 4;
+}
+
+message OperationLedgerAuditStatus {
+  OperationLedgerAudit state = 1;
+  uint64 scanned = 2;
+  uint64 total = 3;
 }
 
 message DeliveryCapacityStatus {

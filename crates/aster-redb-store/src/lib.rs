@@ -2940,16 +2940,6 @@ pub struct EventStoreStats {
     pub route_cached_bytes: u64,
     /// Exact permanent Event operation ledger accounting.
     pub operation_stats: EventOperationStats,
-    /// Deprecated compatibility mirror of the authoritative operation row count.
-    ///
-    /// Before legacy migration this continues to report legacy rows. Once v3 is
-    /// authoritative it mirrors [`Self::operation_stats.records_total`].
-    pub operations: u64,
-    /// Deprecated compatibility mirror of authoritative operation logical bytes.
-    ///
-    /// Before legacy migration this continues to report legacy encoded bytes.
-    /// Once v3 is authoritative it mirrors [`Self::operation_stats.logical_bytes`].
-    pub operation_bytes: u64,
 }
 
 /// Consistent counts for the mission-bound semantic State namespace.
@@ -9384,11 +9374,6 @@ impl Store {
         }
         let operation_stats = event_operation::inspect_event_operation_accounting_read(&read)?;
         let legacy_operations = operations.len()?;
-        let (operations, operation_bytes) = if legacy_operations == 0 {
-            (operation_stats.records_total, operation_stats.logical_bytes)
-        } else {
-            (legacy_operations, legacy_operation_bytes)
-        };
         let stats = EventStoreStats {
             events: live_events,
             retiring_events,
@@ -9399,8 +9384,6 @@ impl Store {
             retiring_route_cached,
             route_cached_bytes,
             operation_stats,
-            operations,
-            operation_bytes,
         };
         for (field, durable, reconstructed) in [
             (
@@ -22439,16 +22422,6 @@ fn inspect_semantic_readable(
         retiring_route_cached: 0,
         route_cached_bytes: route_bytes,
         operation_stats,
-        operations: if operation_count == 0 {
-            operation_stats.records_total
-        } else {
-            operation_count
-        },
-        operation_bytes: if operation_count == 0 {
-            operation_stats.logical_bytes
-        } else {
-            operation_bytes
-        },
     };
     for (field, reconstructed) in [
         (SEMANTIC_ITEM_COUNT, stats.events),
@@ -27662,8 +27635,8 @@ mod tests {
             usage.payload_bytes, stats.total_sealed_bytes,
             "the operation ledger has dedicated logical-byte accounting"
         );
-        assert_eq!(stats.operations, 3);
-        assert_eq!(stats.operation_bytes, 486);
+        assert_eq!(stats.operation_stats.records_total, 3);
+        assert_eq!(stats.operation_stats.logical_bytes, 486);
         assert!(usage.items <= reopened.limits().max_items());
         assert!(usage.payload_bytes <= reopened.limits().max_total_payload_bytes());
     }
@@ -37559,7 +37532,14 @@ mod tests {
             ),
             Err(StoreError::EventOperationConflict)
         ));
-        assert_eq!(store.event_stats().expect("stats").operations, 1);
+        assert_eq!(
+            store
+                .event_stats()
+                .expect("stats")
+                .operation_stats
+                .records_total,
+            1
+        );
     }
 
     #[test]

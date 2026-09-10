@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -28,8 +29,9 @@ const (
 	maxStreamDeliveries  = 32
 	profileStoreItems    = 10_000
 	profileStoreBytes    = 64 * 1024 * 1024
-	operationHardRows    = 4_096
-	operationHardBytes   = 512 * 1024
+	operationHardRows    = 1_000_000
+	operationHardBytes   = 201_326_592
+	operationReserveRows = 10_000
 	operationWarnRows    = 512
 	operationProfileRows = 1_024
 	deliveryProfileRows  = 256
@@ -410,9 +412,12 @@ func statusEvidence(message *applicationv1alpha1.GetStatusResponse) (result, err
 	if operations.RowHardLimit != operationHardRows || operations.ByteHardLimit != operationHardBytes ||
 		operations.ProfileBoundary != operationProfileRows || operations.ProfileRemaining != remaining ||
 		operations.ProfileWarning != (operations.Rows >= operationWarnRows) ||
-		operations.ProfileExhausted != (operations.Rows >= operationProfileRows) ||
-		operations.Rows > operations.RowHardLimit || operations.Bytes > operations.ByteHardLimit {
+		operations.ProfileExhausted != (operations.Rows >= operationProfileRows) {
 		return nil, errors.New("invalid status response")
+	}
+	warning, audit, err := operationHealth(operations)
+	if err != nil {
+		return nil, err
 	}
 	if deliveries.ProfileBoundary != deliveryProfileRows || deliveries.HardLimit != deliveryHardRows ||
 		deliveries.ProfileSaturated != (deliveries.Pending >= deliveryProfileRows) ||
@@ -420,21 +425,96 @@ func statusEvidence(message *applicationv1alpha1.GetStatusResponse) (result, err
 		return nil, errors.New("invalid status response")
 	}
 	return result{
-		"status":                      "ok",
-		"configured_emission_mode":    configured,
-		"effective_emission_mode":     effective,
-		"store_items":                 store.Items,
-		"store_item_limit":            store.ItemLimit,
-		"store_payload_bytes":         store.PayloadBytes,
-		"store_payload_byte_limit":    store.PayloadByteLimit,
-		"operation_rows":              operations.Rows,
-		"operation_bytes":             operations.Bytes,
-		"operation_profile_remaining": operations.ProfileRemaining,
-		"operation_profile_warning":   operations.ProfileWarning,
-		"operation_profile_exhausted": operations.ProfileExhausted,
-		"pending_deliveries":          deliveries.Pending,
-		"delivery_profile_saturated":  deliveries.ProfileSaturated,
+		"status":                                    "ok",
+		"configured_emission_mode":                  configured,
+		"effective_emission_mode":                   effective,
+		"store_items":                               store.Items,
+		"store_item_limit":                          store.ItemLimit,
+		"store_payload_bytes":                       store.PayloadBytes,
+		"store_payload_byte_limit":                  store.PayloadByteLimit,
+		"operation_rows":                            operations.Rows,
+		"operation_bytes":                           operations.Bytes,
+		"operation_profile_remaining":               operations.ProfileRemaining,
+		"operation_profile_warning":                 operations.ProfileWarning,
+		"operation_profile_exhausted":               operations.ProfileExhausted,
+		"operation_active_rows":                     operations.ActiveRows,
+		"operation_retired_rows":                    operations.RetiredRows,
+		"operation_reverse_rows":                    operations.ReverseRows,
+		"operation_ordinary_remaining":              operations.OrdinaryRemaining,
+		"operation_emergency_remaining":             operations.EmergencyRemaining,
+		"operation_rolling_accept_rate":             operations.RollingAcceptRate,
+		"operation_estimated_seconds_to_exhaustion": operations.EstimatedSecondsToExhaustion,
+		"operation_warning_state":                   warning,
+		"operation_audit_state":                     audit,
+		"operation_audit_scanned":                   operations.Audit.Scanned,
+		"operation_audit_total":                     operations.Audit.Total,
+		"pending_deliveries":                        deliveries.Pending,
+		"delivery_profile_saturated":                deliveries.ProfileSaturated,
 	}, nil
+}
+
+func saturatingSub(limit, used uint64) uint64 {
+	if used >= limit {
+		return 0
+	}
+	return limit - used
+}
+
+// This fixture uses the explicit candidate defaults; approved profile fields
+// remain the independent 1,024-row view checked above.
+func operationHealth(operations *applicationv1alpha1.PublishOperationCapacityStatus) (string, string, error) {
+	invalid := errors.New("invalid status response")
+	if operations.ActiveRows > operations.Rows || operations.RetiredRows != operations.Rows-operations.ActiveRows ||
+		operations.ReverseRows != operations.ActiveRows || operations.ActiveRows > math.MaxUint64/162 ||
+		operations.RetiredRows > (math.MaxUint64-operations.ActiveRows*162)/67 ||
+		operations.Bytes != operations.ActiveRows*162+operations.RetiredRows*67 {
+		return "", "", invalid
+	}
+	ordinaryRecords := uint64(operationHardRows - operationReserveRows)
+	ordinaryBytes := uint64(operationHardBytes - operationReserveRows*162)
+	ordinary := min(saturatingSub(ordinaryRecords, operations.Rows), saturatingSub(ordinaryBytes, operations.Bytes)/162)
+	total := min(saturatingSub(operationHardRows, operations.Rows), saturatingSub(operationHardBytes, operations.Bytes)/162)
+	if operations.OrdinaryRemaining != ordinary || operations.EmergencyRemaining != saturatingSub(total, ordinary) {
+		return "", "", invalid
+	}
+	warning := applicationv1alpha1.OperationCapacityWarning_OPERATION_CAPACITY_WARNING_OK
+	warningName := "ok"
+	// Compare against ceil(limit * percent / 100); fixed fixture limits fit.
+	if ordinary == 0 {
+		warning, warningName = applicationv1alpha1.OperationCapacityWarning_OPERATION_CAPACITY_WARNING_EXHAUSTED, "exhausted"
+	} else if operations.Rows >= (ordinaryRecords*90+99)/100 || operations.Bytes >= (ordinaryBytes*90+99)/100 {
+		warning, warningName = applicationv1alpha1.OperationCapacityWarning_OPERATION_CAPACITY_WARNING_CRITICAL, "critical"
+	} else if operations.Rows >= (ordinaryRecords*70+99)/100 || operations.Bytes >= (ordinaryBytes*70+99)/100 {
+		warning, warningName = applicationv1alpha1.OperationCapacityWarning_OPERATION_CAPACITY_WARNING_WARNING, "warning"
+	}
+	if operations.WarningState != warning || math.IsNaN(operations.RollingAcceptRate) || math.IsInf(operations.RollingAcceptRate, 0) || operations.RollingAcceptRate < 0 ||
+		((operations.RollingAcceptRate == 0 || ordinary == 0) && operations.EstimatedSecondsToExhaustion != 0) {
+		return "", "", invalid
+	}
+	audit := operations.Audit
+	if audit == nil || audit.Scanned > audit.Total {
+		return "", "", invalid
+	}
+	var auditName string
+	switch audit.State {
+	case applicationv1alpha1.OperationLedgerAudit_OPERATION_LEDGER_AUDIT_PENDING:
+		if audit.Scanned != 0 {
+			return "", "", invalid
+		}
+		auditName = "pending"
+	case applicationv1alpha1.OperationLedgerAudit_OPERATION_LEDGER_AUDIT_RUNNING:
+		auditName = "running"
+	case applicationv1alpha1.OperationLedgerAudit_OPERATION_LEDGER_AUDIT_COMPLETE:
+		if audit.Scanned != audit.Total {
+			return "", "", invalid
+		}
+		auditName = "complete"
+	case applicationv1alpha1.OperationLedgerAudit_OPERATION_LEDGER_AUDIT_FAILED:
+		auditName = "failed"
+	default:
+		return "", "", invalid
+	}
+	return warningName, auditName, nil
 }
 
 func runCommand(ctx context.Context, client applicationv1alpha1.AsterApplicationServiceClient, command, token string, input io.Reader, output io.Writer) error {

@@ -73,6 +73,12 @@ pub struct EventOperationAuditProgress {
 }
 
 impl crate::Store {
+    /// Reads permanent ledger counters and cardinalities without traversing
+    /// retained Events or decoding every operation. Complete audit is separate.
+    pub fn event_operation_stats(&self) -> Result<EventOperationStats, StoreError> {
+        inspect_event_operation_accounting_read(&self.database.begin_read()?)
+    }
+
     /// Audits every v3 operation and reverse row using ONE consistent read
     /// snapshot. Concurrent commits belong to the next run. Callbacks occur
     /// initially and after at most `min(page_size, 1024)` traversal rows, without
@@ -1770,7 +1776,9 @@ mod tests {
         let stats = store.event_stats().expect("Event stats");
         assert_eq!(stats.operation_stats.records_total, 1);
         assert_eq!(stats.operation_stats.logical_bytes, 162);
-        assert_eq!(stats.operations, 1);
-        assert_eq!(stats.operation_bytes, 162);
+        assert_eq!(
+            store.event_operation_stats().expect("dedicated stats"),
+            stats.operation_stats
+        );
     }
 }

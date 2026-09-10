@@ -321,8 +321,11 @@ func TestStatusEvidenceRequiresProfileCapacityContract(t *testing.T) {
 			Items: 0, ItemLimit: 10_000, PayloadBytes: 0, PayloadByteLimit: 64 * 1024 * 1024,
 		},
 		PublishOperationCapacity: &applicationv1alpha1.PublishOperationCapacityStatus{
-			Rows: 0, Bytes: 0, RowHardLimit: 4_096, ByteHardLimit: 524_288,
+			Rows: 0, Bytes: 0, RowHardLimit: 1_000_000, ByteHardLimit: 201_326_592,
 			ProfileBoundary: 1_024, ProfileRemaining: 1_024,
+			OrdinaryRemaining: 990_000, EmergencyRemaining: 10_000,
+			WarningState: applicationv1alpha1.OperationCapacityWarning_OPERATION_CAPACITY_WARNING_OK,
+			Audit:        &applicationv1alpha1.OperationLedgerAuditStatus{State: applicationv1alpha1.OperationLedgerAudit_OPERATION_LEDGER_AUDIT_PENDING},
 		},
 		DeliveryCapacity: &applicationv1alpha1.DeliveryCapacityStatus{
 			Pending: 0, ProfileBoundary: 256, HardLimit: 262_144,
@@ -335,6 +338,9 @@ func TestStatusEvidenceRequiresProfileCapacityContract(t *testing.T) {
 	if receipt["configured_emission_mode"] != "normal" || receipt["effective_emission_mode"] != "receive_only" {
 		t.Fatalf("emission modes not retained in receipt: %#v", receipt)
 	}
+	if receipt["operation_ordinary_remaining"] != uint64(990_000) || receipt["operation_audit_state"] != "pending" {
+		t.Fatalf("ledger health missing from receipt: %#v", receipt)
+	}
 
 	for name, mutate := range map[string]func(*applicationv1alpha1.GetStatusResponse){
 		"missing-store": func(status *applicationv1alpha1.GetStatusResponse) { status.StoreCapacity = nil },
@@ -344,6 +350,21 @@ func TestStatusEvidenceRequiresProfileCapacityContract(t *testing.T) {
 		"wrong-delivery-hard-limit": func(status *applicationv1alpha1.GetStatusResponse) {
 			status.DeliveryCapacity.HardLimit = 1
 		},
+		"missing-audit":      func(status *applicationv1alpha1.GetStatusResponse) { status.PublishOperationCapacity.Audit = nil },
+		"wrong-active-count": func(status *applicationv1alpha1.GetStatusResponse) { status.PublishOperationCapacity.ActiveRows = 1 },
+		"wrong-headroom": func(status *applicationv1alpha1.GetStatusResponse) {
+			status.PublishOperationCapacity.OrdinaryRemaining++
+		},
+		"wrong-warning": func(status *applicationv1alpha1.GetStatusResponse) {
+			status.PublishOperationCapacity.WarningState = applicationv1alpha1.OperationCapacityWarning_OPERATION_CAPACITY_WARNING_CRITICAL
+		},
+		"unknown-audit": func(status *applicationv1alpha1.GetStatusResponse) { status.PublishOperationCapacity.Audit.State = 99 },
+		"negative-rate": func(status *applicationv1alpha1.GetStatusResponse) {
+			status.PublishOperationCapacity.RollingAcceptRate = -1
+		},
+		"estimate-without-rate": func(status *applicationv1alpha1.GetStatusResponse) {
+			status.PublishOperationCapacity.EstimatedSecondsToExhaustion = 1
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			changed := proto.Clone(valid).(*applicationv1alpha1.GetStatusResponse)
@@ -352,6 +373,26 @@ func TestStatusEvidenceRequiresProfileCapacityContract(t *testing.T) {
 				t.Fatal("invalid profile status accepted")
 			}
 		})
+	}
+	for _, state := range []applicationv1alpha1.OperationLedgerAudit{
+		applicationv1alpha1.OperationLedgerAudit_OPERATION_LEDGER_AUDIT_RUNNING,
+		applicationv1alpha1.OperationLedgerAudit_OPERATION_LEDGER_AUDIT_COMPLETE,
+		applicationv1alpha1.OperationLedgerAudit_OPERATION_LEDGER_AUDIT_FAILED,
+	} {
+		changed := proto.Clone(valid).(*applicationv1alpha1.GetStatusResponse)
+		operations := changed.PublishOperationCapacity
+		operations.Rows, operations.ActiveRows, operations.RetiredRows, operations.ReverseRows = 1_024, 24, 1_000, 24
+		operations.Bytes, operations.OrdinaryRemaining = 70_888, 988_976
+		operations.ProfileRemaining, operations.ProfileWarning, operations.ProfileExhausted = 0, true, true
+		operations.RollingAcceptRate, operations.EstimatedSecondsToExhaustion = 2, 494_488
+		operations.Audit = &applicationv1alpha1.OperationLedgerAuditStatus{State: state, Scanned: 1_048, Total: 1_048}
+		receipt, err := statusEvidence(changed)
+		if err != nil {
+			t.Fatalf("mixed ledger/audit state %v rejected: %v", state, err)
+		}
+		if receipt["operation_active_rows"] != uint64(24) || receipt["operation_retired_rows"] != uint64(1_000) || receipt["operation_rolling_accept_rate"] != float64(2) || receipt["operation_estimated_seconds_to_exhaustion"] != uint64(494_488) {
+			t.Fatalf("ledger observation lost: %#v", receipt)
+		}
 	}
 }
 

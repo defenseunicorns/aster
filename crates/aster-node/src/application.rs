@@ -33,7 +33,9 @@ use aster_redb_store::{
     EventSubscriptionSpec, MAX_EVENT_PAGE, MAX_EVENT_POLL_DELIVERIES, MAX_EVENT_SUBSCRIPTION_SCAN,
     Store, StoreError, StoreLimits, StoredEvent,
 };
-pub use aster_redb_store::{EventOperationAuditState, EventOperationAuditStatus};
+pub use aster_redb_store::{
+    EventOperationAuditState, EventOperationAuditStatus, EventOperationLimits, EventOperationStats,
+};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
@@ -52,6 +54,9 @@ use crate::{
 };
 
 mod blob;
+#[cfg(test)]
+#[path = "application/operation_capacity_test.rs"]
+mod operation_capacity_test;
 mod record;
 mod state;
 pub(crate) use blob::SelectedBlobCommand;
@@ -566,11 +571,72 @@ pub enum EventSyncStatus {
     PolicyChangedSinceContact,
 }
 
+/// Occupancy-only warning against the configured ordinary operation limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventOperationCapacityWarning {
+    Ok,
+    Warning,
+    Critical,
+    Exhausted,
+}
+
+/// Candidate ledger headroom, independent of the approved evaluation profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventOperationCapacity {
+    pub stats: EventOperationStats,
+    pub limits: EventOperationLimits,
+    pub ordinary_remaining: u64,
+    pub emergency_remaining: u64,
+    pub warning: EventOperationCapacityWarning,
+}
+
+impl EventOperationCapacity {
+    pub fn new(stats: EventOperationStats, limits: EventOperationLimits) -> Self {
+        const ACTIVE_BYTES: u64 = 162;
+        // EventOperationLimits construction checked both reserve arithmetic
+        // and subtraction. Retained usage may exceed a lower reopened limit.
+        let ordinary_records = limits.ordinary_record_limit();
+        let ordinary_bytes = limits.max_logical_bytes() - limits.emergency_byte_reserve();
+        let ordinary_remaining = ordinary_records
+            .saturating_sub(stats.records_total)
+            .min(ordinary_bytes.saturating_sub(stats.logical_bytes) / ACTIVE_BYTES);
+        let total_remaining = limits
+            .max_records()
+            .saturating_sub(stats.records_total)
+            .min(
+                limits
+                    .max_logical_bytes()
+                    .saturating_sub(stats.logical_bytes)
+                    / ACTIVE_BYTES,
+            );
+        let at_percent = |percent: u128| {
+            u128::from(stats.records_total) * 100 >= u128::from(ordinary_records) * percent
+                || u128::from(stats.logical_bytes) * 100 >= u128::from(ordinary_bytes) * percent
+        };
+        let warning = if ordinary_remaining == 0 {
+            EventOperationCapacityWarning::Exhausted
+        } else if at_percent(90) {
+            EventOperationCapacityWarning::Critical
+        } else if at_percent(70) {
+            EventOperationCapacityWarning::Warning
+        } else {
+            EventOperationCapacityWarning::Ok
+        };
+        Self {
+            stats,
+            limits,
+            ordinary_remaining,
+            emergency_remaining: total_remaining.saturating_sub(ordinary_remaining),
+            warning,
+        }
+    }
+}
+
 /// Sanitized live selected-Event status snapshot. When the operation audit is
 /// `Failed`, store usage, operation counts/bytes, and pending deliveries are
 /// the last successfully read figures, not current or trusted capacity. Peer,
 /// synchronization, emission, and audit observations remain actor-current.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SelectedEventStatus {
     /// One background audit; traversal counts include ledger and reverse rows.
     pub event_operation_audit: EventOperationAuditStatus,
@@ -581,8 +647,11 @@ pub struct SelectedEventStatus {
     pub emission_policy: EventEmissionPolicy,
     pub store_usage: AggregateStoreUsage,
     pub store_limits: StoreLimits,
-    pub event_operations: u64,
-    pub event_operation_bytes: u64,
+    pub event_operation_capacity: EventOperationCapacity,
+    /// New permanent records committed in the preceding monotonic 60 seconds / 60.
+    pub event_operation_rolling_accept_rate: f64,
+    /// Ceiling of remaining / rate, saturated to u64; zero without observations.
+    pub event_operation_estimated_seconds_to_exhaustion: u64,
     pub pending_deliveries: u64,
 }
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet, VecDeque, btree_map::Entry},
     error::Error,
     fmt,
     fs::{self, File},
@@ -102,11 +102,11 @@ use crate::mission::{initiate_discovered_over_iroh_metered, respond_discovered_o
 use crate::{
     NodeIdentity,
     application::{
-        AuthenticatedPeerStatus, ContactSyncStatus, EventSyncStatus, PeerAuthorization,
-        SelectedApplicationCommand, SelectedBlobCommand, SelectedBlobHandle, SelectedBlobNode,
-        SelectedEventCommand, SelectedEventHandle, SelectedEventNode, SelectedEventStatus,
-        SelectedRecordCommand, SelectedRecordHandle, SelectedRecordNode, SelectedStateCommand,
-        SelectedStateHandle, SelectedStateNode, runtime_application_error,
+        AuthenticatedPeerStatus, ContactSyncStatus, EventOperationCapacity, EventSyncStatus,
+        PeerAuthorization, SelectedApplicationCommand, SelectedBlobCommand, SelectedBlobHandle,
+        SelectedBlobNode, SelectedEventCommand, SelectedEventHandle, SelectedEventNode,
+        SelectedEventStatus, SelectedRecordCommand, SelectedRecordHandle, SelectedRecordNode,
+        SelectedStateCommand, SelectedStateHandle, SelectedStateNode, runtime_application_error,
     },
     bridge_runtime::{
         SelectedEventBridgeApplyDisposition, SelectedEventBridgeConfig,
@@ -2637,10 +2637,56 @@ fn node_actor_join_error(error: tokio::task::JoinError) -> NodeError {
 #[derive(Default)]
 struct SelectedEventStatusTracker {
     operation_audit: EventOperationAuditStatus,
+    operation_rate: EventOperationAcceptRate,
     last_store_metrics: std::cell::Cell<Option<SelectedEventStoreMetrics>>,
     configured_peers: BTreeSet<NodeId>,
     authenticated: BTreeMap<NodeId, AuthenticatedContactObservation>,
     automatic_nearby: bool,
+}
+
+/// Actor-local observations only: restart starts an empty fixed 60-second
+/// window. Entries at exactly now - 60 seconds have expired. Publication prunes
+/// old entries; allocation can retain the peak window size until actor restart.
+/// Retries add no entries, keys, fingerprints, or Event contents.
+#[derive(Default)]
+struct EventOperationAcceptRate {
+    commits: VecDeque<(tokio::time::Instant, u64)>,
+}
+
+impl EventOperationAcceptRate {
+    const WINDOW_SECONDS: u64 = 60;
+
+    fn record(&mut self, now: tokio::time::Instant, count: u64) {
+        while self.commits.front().is_some_and(|(at, _)| {
+            now.saturating_duration_since(*at) >= Duration::from_secs(Self::WINDOW_SECONDS)
+        }) {
+            self.commits.pop_front();
+        }
+        if count != 0 {
+            self.commits.push_back((now, count));
+        }
+    }
+
+    fn snapshot(&self, now: tokio::time::Instant, remaining: u64) -> (f64, u64) {
+        let count = self
+            .commits
+            .iter()
+            .filter(|(at, _)| {
+                *at <= now && now.duration_since(*at) < Duration::from_secs(Self::WINDOW_SECONDS)
+            })
+            .fold(0u64, |total, (_, count)| total.saturating_add(*count));
+        if count == 0 {
+            return (0.0, 0);
+        }
+        // Compute ceil(remaining * 60 / count) in integers: no float rounding
+        // at whole-second boundaries, and no overflow before saturation.
+        let seconds =
+            (u128::from(remaining) * u128::from(Self::WINDOW_SECONDS)).div_ceil(u128::from(count));
+        (
+            count as f64 / Self::WINDOW_SECONDS as f64,
+            u64::try_from(seconds).unwrap_or(u64::MAX),
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2768,10 +2814,27 @@ impl SelectedEventStatusTracker {
         Self {
             configured_peers,
             operation_audit: EventOperationAuditStatus::default(),
+            operation_rate: EventOperationAcceptRate::default(),
             last_store_metrics: std::cell::Cell::new(None),
             authenticated: BTreeMap::new(),
             automatic_nearby,
         }
+    }
+
+    fn observe_operation_commit<T>(&mut self, store: &Store, commit: impl FnOnce() -> T) -> T {
+        // Only the selected actor publishes local operation keys. Retirement
+        // preserves the permanent count. Read failures/ambiguous deltas cannot
+        // alter the caller's result, especially after a successful commit.
+        let before = store.event_operation_stats().ok();
+        let result = commit();
+        let after = store.event_operation_stats().ok();
+        if let (Some(before), Some(after)) = (before, after)
+            && let Some(count) = after.records_total.checked_sub(before.records_total)
+        {
+            self.operation_rate
+                .record(tokio::time::Instant::now(), count);
+        }
+        result
     }
 
     fn record(&mut self, contact: &CompletedPeerContact) -> Result<(), NodeError> {
@@ -2815,6 +2878,13 @@ impl SelectedEventStatusTracker {
         let store_usage = metrics.usage;
         let store_limits = store.limits();
         let event_stats = metrics.events;
+        let event_operation_capacity =
+            EventOperationCapacity::new(event_stats.operation_stats, store.operation_limits());
+        let (event_operation_rolling_accept_rate, event_operation_estimated_seconds_to_exhaustion) =
+            self.operation_rate.snapshot(
+                tokio::time::Instant::now(),
+                event_operation_capacity.ordinary_remaining,
+            );
         let current_policy = ContactEventPolicy::capture(current);
         let mut peers = Vec::with_capacity(self.authenticated.len());
         let mut authenticated_contacts = 0u64;
@@ -2886,8 +2956,9 @@ impl SelectedEventStatusTracker {
             emission_policy,
             store_usage,
             store_limits,
-            event_operations: event_stats.operations,
-            event_operation_bytes: event_stats.operation_bytes,
+            event_operation_capacity,
+            event_operation_rolling_accept_rate,
+            event_operation_estimated_seconds_to_exhaustion,
             pending_deliveries: metrics.pending_deliveries,
         })
     }
@@ -4330,7 +4401,11 @@ fn drive_sample_application(
     context: SampleApplicationContext<'_>,
     cursor: &mut u64,
     initial_receipt_emitted: &mut bool,
+    status: &mut SelectedEventStatusTracker,
 ) -> Result<(), NodeError> {
+    if matches!(role, NodeApplication::Relay) {
+        return Ok(());
+    }
     let SampleApplicationContext {
         store,
         policy,
@@ -4338,7 +4413,7 @@ fn drive_sample_application(
         custody_clock,
         event_route_cache,
     } = context;
-    match role {
+    status.observe_operation_commit(store, || match role {
         NodeApplication::Relay => Ok(()),
         NodeApplication::PingEmitter | NodeApplication::EpochTwoPingEmitter => {
             if matches!(role, NodeApplication::EpochTwoPingEmitter)
@@ -4439,7 +4514,7 @@ fn drive_sample_application(
             }
             Ok(())
         }
-    }
+    })
 }
 
 pub(crate) fn verify_stored_claim(
@@ -10699,7 +10774,7 @@ fn execute_selected_event_command(
     application: &mut SelectedEventNode,
     store: &Store,
     emission_policy: &LiveEmissionPolicy,
-    status: &SelectedEventStatusTracker,
+    status: &mut SelectedEventStatusTracker,
     receipt: &NodeReceipt,
     command: SelectedEventCommand,
 ) {
@@ -10712,7 +10787,9 @@ fn execute_selected_event_command(
             let result = if status.operation_audit.state == EventOperationAuditState::Failed {
                 Err(crate::application::actor_unavailable("publish"))
             } else {
-                application.publish_with_options(request, options)
+                status.observe_operation_commit(store, || {
+                    application.publish_with_options(request, options)
+                })
             };
             let _ = response.send(result);
         }
@@ -10916,7 +10993,7 @@ fn execute_selected_application_command(
     blobs: &mpsc::Sender<SelectedBlobCommand>,
     store: &Store,
     emission_policy: &LiveEmissionPolicy,
-    status: &SelectedEventStatusTracker,
+    status: &mut SelectedEventStatusTracker,
     receipt: &NodeReceipt,
     command: SelectedApplicationCommand,
 ) {
@@ -12339,6 +12416,7 @@ async fn run_node_actor_inner(
                         },
                         &mut application_cursor,
                         &mut initial_application_receipt_emitted,
+                        &mut selected_event_status,
                     )
                 {
                     fatal_error = Some(error);
@@ -12472,7 +12550,7 @@ async fn run_node_actor_inner(
                     &blob_worker_sender,
                     &store,
                     &emission_policy,
-                    &selected_event_status,
+                    &mut selected_event_status,
                     &receipt,
                     command,
                 );
@@ -12829,7 +12907,7 @@ async fn run_node_actor_inner(
                     &blob_worker_sender,
                     &store,
                     &emission_policy,
-                    &selected_event_status,
+                    &mut selected_event_status,
                     &receipt,
                     command,
                 );
@@ -22159,6 +22237,7 @@ fn validate_port_block(base: u16, count: usize) -> Result<(), NodeError> {
 
 #[cfg(test)]
 mod tests {
+    mod operation_rate_test;
     use std::sync::{Barrier, mpsc as std_mpsc};
 
     use super::*;
@@ -22531,8 +22610,8 @@ mod tests {
         assert_eq!(offline.store_usage.items, 0);
         assert_eq!(offline.store_usage.payload_bytes, 0);
         assert_eq!(offline.store_limits, store.limits());
-        assert_eq!(offline.event_operations, 0);
-        assert_eq!(offline.event_operation_bytes, 0);
+        assert_eq!(offline.event_operation_capacity.stats.records_total, 0);
+        assert_eq!(offline.event_operation_capacity.stats.logical_bytes, 0);
         assert_eq!(offline.pending_deliveries, 0);
         assert_eq!(offline.authenticated_contacts, 0);
         assert_eq!(offline.failed_contact_attempts, 0);
@@ -28303,19 +28382,32 @@ mod tests {
         let running =
             wait_operation_audit_status(&selected, EventOperationAuditState::Running, 2).await;
         assert_eq!(running.total, 5);
+        let before_publish = selected.status().await.unwrap();
+        assert_eq!(before_publish.event_operation_rolling_accept_rate, 0.0);
+        let request = EventPublishRequest {
+            operation_key: b"after-audit-snapshot".to_vec(),
+            predecessor: None,
+            topic: Topic::new("opaque").unwrap(),
+            scope: Scope::new("test/runtime").unwrap(),
+            priority: Priority::Routine,
+            logical_key: b"audit".to_vec(),
+            payload: b"one".to_vec(),
+            tombstone: false,
+        };
         selected
-            .publish(EventPublishRequest {
-                operation_key: b"after-audit-snapshot".to_vec(),
-                predecessor: None,
-                topic: Topic::new("opaque").unwrap(),
-                scope: Scope::new("test/runtime").unwrap(),
-                priority: Priority::Routine,
-                logical_key: b"audit".to_vec(),
-                payload: b"one".to_vec(),
-                tombstone: false,
-            })
+            .publish(request.clone())
             .await
             .expect("publication while audit runs");
+        selected.publish(request).await.expect("exact active retry");
+        let after_publish = selected.status().await.unwrap();
+        assert_eq!(
+            after_publish.event_operation_rolling_accept_rate,
+            1.0 / 60.0
+        );
+        assert_eq!(
+            after_publish.event_operation_estimated_seconds_to_exhaustion,
+            59_399_640
+        );
         assert_eq!(
             selected
                 .query(EventQuery::default())
@@ -28339,6 +28431,14 @@ mod tests {
         let restarted =
             wait_operation_audit_status(&selected, EventOperationAuditState::Complete, 7).await;
         assert_eq!(restarted.total, 7);
+        assert_eq!(
+            selected
+                .status()
+                .await
+                .unwrap()
+                .event_operation_rolling_accept_rate,
+            0.0
+        );
         shutdown.send(()).await.unwrap();
         actor.await.unwrap().unwrap();
 
@@ -28398,7 +28498,10 @@ mod tests {
             .expect("counter failure must not hide status");
         assert_eq!(after.store_usage, before.store_usage);
         assert_eq!(
-            (after.event_operations, after.event_operation_bytes),
+            (
+                after.event_operation_capacity.stats.records_total,
+                after.event_operation_capacity.stats.logical_bytes
+            ),
             (5, 335)
         );
         shutdown.send(()).await.unwrap();
@@ -28590,7 +28693,7 @@ mod tests {
         );
         let inspection = Store::inspect_existing(state.join(STORE_FILE)).unwrap();
         assert_eq!(inspection.event_stats.events, 0);
-        assert_eq!(inspection.event_stats.operations, 5);
+        assert_eq!(inspection.event_stats.operation_stats.records_total, 5);
         fs::remove_dir_all(state).unwrap();
     }
 
