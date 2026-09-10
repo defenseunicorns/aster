@@ -156,7 +156,7 @@ description = "Validate the fixed real-Event path-delivery scenario"
 run = "python3 tools/aster_path_delivery.py docker/path-lab/scenarios/event-delivery-netem.json"
 
 [tasks.path-delivery-smoke]
-description = "Execute one real Event through the routed Containerlab impairment on Linux"
+description = "Execute one real Event through isolated Docker segments and WAN netem on Linux"
 run = "python3 tools/aster_path_delivery.py docker/path-lab/scenarios/event-delivery-netem.json --execute"
 
 [tasks.tour]

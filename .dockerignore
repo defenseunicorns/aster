@@ -16,6 +16,7 @@
 !proto/**
 !tools/
 !tools/aster_lan_mvp.py
+!tools/aster_path_delivery.py
 !docker/
 !docker/path-lab/
 !docker/path-lab/Dockerfile.delivery

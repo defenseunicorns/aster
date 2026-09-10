@@ -163,20 +163,12 @@ jobs:
           persist-credentials: false
           submodules: false
 
-      - name: Install exact-pinned Containerlab
-        env:
-          CONTAINERLAB_SHA256: f90d36d58bb6c4afd3b3a4dca006b81594c6d16f7a04be0184b03f44291085a2
-          CONTAINERLAB_URL: https://github.com/srl-labs/containerlab/releases/download/v0.79.0/containerlab_0.79.0_linux_amd64.tar.gz
+      - name: Validate delivery controller contracts
         run: |
-          curl --fail --location --proto '=https' --tlsv1.2 \
-            "$CONTAINERLAB_URL" \
-            --output "$RUNNER_TEMP/containerlab.tar.gz"
-          printf '%s  %s\n' "$CONTAINERLAB_SHA256" \
-            "$RUNNER_TEMP/containerlab.tar.gz" | sha256sum --check --strict
-          tar --extract --gzip --file "$RUNNER_TEMP/containerlab.tar.gz" \
-            --directory "$RUNNER_TEMP" containerlab
-          chmod 0755 "$RUNNER_TEMP/containerlab"
-          "$RUNNER_TEMP/containerlab" version --short
+          python3 tools/test_aster_path_delivery.py
+          python3 tools/aster_path_delivery.py docker/path-lab/scenarios/event-delivery-netem.json
+          docker version --format '{{.Server.Version}}'
+          uname -r
 
       - name: Build the real-Event delivery image
         run: |
@@ -190,7 +182,6 @@ jobs:
           sudo python3 tools/aster_path_delivery.py \
             docker/path-lab/scenarios/event-delivery-netem.json \
             --execute \
-            --containerlab "$RUNNER_TEMP/containerlab" \
             --docker "$(command -v docker)"
 
   macos-tests:

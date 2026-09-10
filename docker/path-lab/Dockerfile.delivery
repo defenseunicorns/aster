@@ -22,6 +22,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /work/target/release/aster /usr/local/bin/aster
 COPY --from=build /work/target/release/aster-agent /usr/local/bin/aster-agent
+COPY tools/aster_path_delivery.py /usr/local/libexec/aster/aster_path_delivery.py
 COPY tools/aster_lan_mvp.py /usr/local/libexec/aster/aster_lan_mvp.py
 COPY docker/path-lab/delivery-provision.py /usr/local/libexec/aster/delivery-provision.py
 COPY docker/path-lab/delivery-network-init.py /usr/local/libexec/aster/delivery-network-init.py
@@ -31,4 +32,5 @@ COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/licenses/aster/
 RUN chmod 0755 /usr/local/bin/aster /usr/local/bin/aster-agent \
     /usr/local/libexec/aster/*.py
 WORKDIR /opt/aster
-CMD ["sleep", "infinity"]
+USER 10001:10001
+CMD ["sleep", "600"]

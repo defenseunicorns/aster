@@ -6,10 +6,10 @@
 from __future__ import annotations
 
 import os
+from itertools import islice
 from pathlib import Path
 import re
 import selectors
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -42,7 +42,7 @@ def create_state_targets(lab: Path) -> list[Path]:
 
 
 def copy_state(source: Path, target: Path) -> None:
-    items = list(source.iterdir())
+    items = list(islice(source.iterdir(), 3))
     if {item.name for item in items} != STATE_FILES:
         raise ValueError("state source must contain only regular files")
     for item in items:
@@ -51,7 +51,13 @@ def copy_state(source: Path, target: Path) -> None:
         destination = target / item.name
         if destination.exists() or destination.is_symlink():
             raise ValueError("endpoint state path exists")
-        shutil.copy2(item, destination)
+        with item.open("rb") as handle:
+            raw = handle.read(65537)
+        if not raw or len(raw) > 65536:
+            raise ValueError("credential exceeds byte bound")
+        descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(raw)
 
 
 def run_initializer(argv: list[str], timeout: float) -> bytes:
@@ -95,13 +101,19 @@ def run_initializer(argv: list[str], timeout: float) -> bytes:
         return bytes(raw_stdout)
     except ValueError:
         if process is not None and process.poll() is None:
-            process.kill()
-            process.wait()
+            try:
+                process.kill()
+                process.wait(timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                pass
         raise
     except (OSError, subprocess.SubprocessError) as error:
         if process is not None and process.poll() is None:
-            process.kill()
-            process.wait()
+            try:
+                process.kill()
+                process.wait(timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                pass
         raise ValueError("initializer output failed") from error
     finally:
         if process is not None:
@@ -137,6 +149,16 @@ def parse_nodes(raw: bytes) -> list[tuple[str, str]]:
     return [nodes[0], nodes[1]]
 
 
+def handoff(target: Path) -> None:
+    os.chmod(target, 0o700)
+    for item in target.iterdir():
+        os.chmod(item, 0o600)
+        os.chown(item, 10001, 10001)
+    os.chown(target, 10001, 10001)
+    os.chmod(target.parent, 0o700)
+    os.chown(target.parent, 10001, 10001)
+
+
 def main() -> int:
     try:
         set_owner_only_umask()
@@ -170,11 +192,7 @@ def main() -> int:
                 f"{identities[0][0]}@10.77.1.2:4433={identities[0][1]}\n", encoding="ascii"
             )
             for target in targets:
-                os.chmod(target, 0o700)
-                for item in target.iterdir():
-                    os.chmod(item, 0o600)
-                    os.chown(item, 10001, 10001)
-                os.chown(target, 10001, 10001)
+                handoff(target)
         print("PROVISION status=pass nodes=2 network=none state=owner-only")
         return 0
     except (OSError, ValueError, subprocess.SubprocessError):
