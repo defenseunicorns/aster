@@ -98,6 +98,11 @@ func writeToken(t *testing.T, mode os.FileMode) string {
 	if err := os.WriteFile(path, []byte("test-token-0123456789abcdefghijkl\n"), mode); err != nil {
 		t.Fatal(err)
 	}
+	// os.WriteFile applies the process umask. Force the requested fixture mode so
+	// permission-rejection tests remain meaningful under a restrictive CI umask.
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
 	return path
 }
 
