@@ -3376,6 +3376,16 @@ pub enum StoreError {
     },
     /// An Event operation key was replayed with another canonical public intent.
     EventOperationConflict,
+    /// Legacy operations lack a durable mission binding required for migration.
+    EventOperationMigrationMissingMissionBinding,
+    /// A legacy operation lacks the authenticated intent needed for migration.
+    EventOperationMigrationMissingAuthenticatedIntent,
+    /// Distinct legacy raw keys produced the same mission-bound fingerprint.
+    EventOperationMigrationFingerprintCollision,
+    /// A legacy Event exceeds the destination's bounded operation alias count.
+    EventOperationMigrationAliasOverflow,
+    /// The complete migration image exceeds the configured destination limits.
+    EventOperationMigrationDestinationCapacity,
     /// The dedicated durable Event operation row cap was reached.
     EventOperationLimitExceeded { current: u64, limit: u64 },
     /// Retaining another Event operation would exceed its dedicated byte cap.
@@ -3831,6 +3841,21 @@ impl fmt::Display for StoreError {
             ),
             Self::EventOperationConflict => {
                 formatter.write_str("Event operation retry differs from its durable public intent")
+            }
+            Self::EventOperationMigrationMissingMissionBinding => {
+                formatter.write_str("Event operation migration lacks a mission binding")
+            }
+            Self::EventOperationMigrationMissingAuthenticatedIntent => {
+                formatter.write_str("Event operation migration lacks authenticated intent")
+            }
+            Self::EventOperationMigrationFingerprintCollision => {
+                formatter.write_str("Event operation migration fingerprint collision")
+            }
+            Self::EventOperationMigrationAliasOverflow => {
+                formatter.write_str("Event operation migration exceeds the alias limit")
+            }
+            Self::EventOperationMigrationDestinationCapacity => {
+                formatter.write_str("Event operation migration exceeds destination capacity")
             }
             Self::EventOperationLimitExceeded { current, limit } => write!(
                 formatter,
@@ -5580,7 +5605,14 @@ impl Store {
         // additive Blob migration. A foreign/pre-marker physical root blocks
         // migration while this exact writer transaction can still roll back.
         blob::depot::prepare_depot_owner_token_write(&write, &path)?;
+        let operation_migration =
+            event_operation::stage_legacy_event_operations_write(&write, operation_limits)?;
+        // Audit all retained metadata, predecessor relations, witnesses and
+        // legacy accounting before replacing any legacy row.
         let blob_stats = audit_semantic_tables(&write, limits)?;
+        if let Some(migration) = &operation_migration {
+            migration.apply(&write)?;
+        }
         let operation_stats = event_operation::audit_event_operation_accounting_write(&write)?;
         let blob_depot_owner_token = blob::depot::depot_owner_token_write(&write)?;
         blob::depot::bind_depot_owner_write(
@@ -5629,6 +5661,12 @@ impl Store {
             ));
         }
         custody::audit_custody_tables_write(&write, limits, mission_authority)?;
+        #[cfg(test)]
+        if operation_migration.is_some() && event_operation::MIGRATION_TEST_FAULT.get() == 2 {
+            return Err(StoreError::SemanticInvariant(
+                "injected Event operation migration abort",
+            ));
+        }
         write.commit()?;
 
         // Persist the database-specific owner token before installing its
@@ -15861,6 +15899,11 @@ fn inspect_mission_binding_read_only(path: &Path) -> Result<Option<NodeId>, Stor
         None
     };
     if binding.is_none() {
+        if table_names.contains(EVENT_OPERATIONS.name())
+            && read.open_table(EVENT_OPERATIONS)?.len()? != 0
+        {
+            return Err(StoreError::EventOperationMigrationMissingMissionBinding);
+        }
         let semantic_rows = if table_names.contains(EVENTS.name()) {
             read.open_table(EVENTS)?.len()?
         } else {
@@ -23221,6 +23264,7 @@ fn parse_id(table: &'static str, bytes: &[u8]) -> Result<ItemId, StoreError> {
 
 #[cfg(test)]
 mod tests {
+    mod event_operation_migration;
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};

@@ -1,5 +1,10 @@
 use crate::{
-    CustodyRetirementReason, EventTransferId, MAX_EVENT_OPERATION_KEY_BYTES, METADATA, StoreError,
+    CustodyRetirementReason, EVENT_OPERATION_COUNT, EVENT_OPERATION_TOTAL_BYTES,
+    EVENT_OPERATION_WITNESSES, EVENT_OPERATIONS, EVENT_TOMBSTONE_OPERATION_COUNT,
+    EVENT_TOMBSTONE_OPERATION_TOTAL_BYTES, EVENTS, EventTransferId, MAX_EVENT_OPERATION_KEY_BYTES,
+    MAX_EVENT_OPERATIONS, METADATA, StoreError, custody, decode_event_metadata,
+    decode_operation_record, event_operation_intent_digest, event_operation_intent_from_header,
+    event_operation_witness_write, read_mission_binding,
 };
 use redb::{
     MultimapTableHandle, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
@@ -152,6 +157,11 @@ impl EventOperationLimits {
 }
 
 pub(crate) type EventOperationFingerprint = [u8; 32];
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static MIGRATION_TEST_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EventOperationLedgerRecord {
@@ -528,9 +538,9 @@ fn audit_event_operation_cardinalities(
     Ok(())
 }
 
-pub(crate) fn audit_event_operation_accounting_write(
+fn existing_event_operation_stats_write(
     write: &redb::WriteTransaction,
-) -> Result<EventOperationStats, StoreError> {
+) -> Result<Option<EventOperationStats>, StoreError> {
     if write.list_multimap_tables()?.any(|table| {
         table.name() == EVENT_OPERATION_LEDGER_V3.name()
             || table.name() == ACTIVE_OPERATION_BY_EVENT_V1.name()
@@ -548,15 +558,7 @@ pub(crate) fn audit_event_operation_accounting_write(
     let metadata = write.open_table(METADATA)?;
     let stats = read_event_operation_stats(&metadata)?;
     match (ledger_present, reverse_present, stats) {
-        (false, false, None) => {
-            drop(metadata);
-            write.open_table(EVENT_OPERATION_LEDGER_V3)?;
-            write.open_table(ACTIVE_OPERATION_BY_EVENT_V1)?;
-            let mut metadata = write.open_table(METADATA)?;
-            let stats = EventOperationStats::default();
-            write_event_operation_stats(&mut metadata, stats)?;
-            Ok(stats)
-        }
+        (false, false, None) => Ok(None),
         (true, true, Some(stats)) => {
             drop(metadata);
             audit_event_operation_cardinalities(
@@ -564,11 +566,175 @@ pub(crate) fn audit_event_operation_accounting_write(
                 write.open_table(EVENT_OPERATION_LEDGER_V3)?.len()?,
                 write.open_table(ACTIVE_OPERATION_BY_EVENT_V1)?.len()?,
             )?;
-            Ok(stats)
+            Ok(Some(stats))
         }
         _ => Err(StoreError::SemanticInvariant(
             "Event operation ledger schema group is incomplete",
         )),
+    }
+}
+
+pub(crate) fn audit_event_operation_accounting_write(
+    write: &redb::WriteTransaction,
+) -> Result<EventOperationStats, StoreError> {
+    if let Some(stats) = existing_event_operation_stats_write(write)? {
+        return Ok(stats);
+    }
+    write.open_table(EVENT_OPERATION_LEDGER_V3)?;
+    write.open_table(ACTIVE_OPERATION_BY_EVENT_V1)?;
+    let stats = EventOperationStats::default();
+    write_event_operation_stats(&mut write.open_table(METADATA)?, stats)?;
+    Ok(stats)
+}
+
+/// A bounded image prepared while the legacy rows are still authoritative.
+/// The caller must audit the complete legacy semantic image before applying it
+/// in the same writer transaction. No raw application key is retained here.
+pub(crate) struct LegacyEventOperationMigration {
+    records: std::collections::BTreeMap<EventOperationFingerprint, EventOperationLedgerRecord>,
+    stats: EventOperationStats,
+}
+
+pub(crate) fn stage_legacy_event_operations_write(
+    write: &redb::WriteTransaction,
+    limits: EventOperationLimits,
+) -> Result<Option<LegacyEventOperationMigration>, StoreError> {
+    // Inspect before initialization: any partial v3 group must fail closed.
+    let existing = existing_event_operation_stats_write(write)?;
+    let operations = write.open_table(EVENT_OPERATIONS)?;
+    let witnesses = write.open_table(EVENT_OPERATION_WITNESSES)?;
+    if existing.is_some() {
+        if operations.len()? != 0 || witnesses.len()? != 0 {
+            return Err(StoreError::SemanticInvariant(
+                "Event operation ledger coexists with legacy rows",
+            ));
+        }
+        return Ok(None);
+    }
+    let count = operations.len()?;
+    if count > MAX_EVENT_OPERATIONS || witnesses.len()? > count {
+        return Err(StoreError::SemanticInvariant(
+            "Event operation or witness table exceeds its bounded cardinality",
+        ));
+    }
+    drop(witnesses);
+    if count == 0 {
+        return Ok(None);
+    }
+    // A caller-supplied mission cannot authenticate an unbound legacy image.
+    let mission = read_mission_binding(write)?
+        .ok_or(StoreError::EventOperationMigrationMissingMissionBinding)?;
+    let events = write.open_table(EVENTS)?;
+    let mut records = std::collections::BTreeMap::new();
+    let mut aliases = std::collections::BTreeMap::<EventTransferId, u64>::new();
+    let mut stats = EventOperationStats::default();
+    for row in operations.iter()? {
+        let (key, value) = row?;
+        let operation = EventOperationKey::new(key.value().to_vec())?;
+        let legacy = decode_operation_record(value.value())?;
+        let metadata = events
+            .get(legacy.transfer_id.as_bytes().as_slice())?
+            .map(|value| decode_event_metadata(value.value()))
+            .transpose()?
+            .ok_or(StoreError::EventOperationMigrationMissingAuthenticatedIntent)?;
+        let intent_digest = if legacy.legacy_unbound {
+            let payload_digest = event_operation_witness_write(write, legacy.transfer_id)?
+                .ok_or(StoreError::EventOperationMigrationMissingAuthenticatedIntent)?;
+            let intent = event_operation_intent_from_header(&metadata.header, payload_digest);
+            event_operation_intent_digest(&intent, legacy.predecessor)?
+        } else {
+            // The full legacy audit checks this against retained accepted
+            // metadata and the stored predecessor before any v3 row is written.
+            legacy.intent_digest
+        };
+        let aliases = aliases.entry(legacy.transfer_id).or_default();
+        *aliases += 1; // At most MAX_EVENT_OPERATIONS rows have been admitted.
+        if *aliases > MAX_EVENT_OPERATION_ALIASES {
+            return Err(StoreError::EventOperationMigrationAliasOverflow);
+        }
+        let record = match custody::retired_event_receipt_write(write, legacy.transfer_id)? {
+            Some((semantic_id, _, reason)) => {
+                if semantic_id != metadata.semantic_id {
+                    return Err(StoreError::SemanticInvariant(
+                        "Event operation retirement differs from accepted metadata",
+                    ));
+                }
+                stats.records_retired += 1;
+                EventOperationLedgerRecord::Retired {
+                    intent_digest,
+                    reason,
+                }
+            }
+            None => {
+                stats.records_active += 1;
+                EventOperationLedgerRecord::Active {
+                    intent_digest,
+                    transfer_id: legacy.transfer_id,
+                }
+            }
+        };
+        let fingerprint = event_operation_fingerprint(&mission, &operation);
+        #[cfg(test)]
+        let fingerprint = if MIGRATION_TEST_FAULT.get() == 1 {
+            [0; 32]
+        } else {
+            fingerprint
+        };
+        // redb's raw-key map already guarantees distinct input keys; even
+        // aliases with identical intent must not silently merge on collision.
+        if records.insert(fingerprint, record).is_some() {
+            return Err(StoreError::EventOperationMigrationFingerprintCollision);
+        }
+    }
+    stats.records_total = count;
+    stats.reverse_rows = stats.records_active;
+    stats.logical_bytes = checked_event_operation_logical_bytes(
+        stats.records_active,
+        stats.records_retired,
+        stats.reverse_rows,
+    )?;
+    validate_event_operation_stats(stats)?;
+    // Migration preserves already accepted work, including emergency records;
+    // the destination's hard limits, rather than its ordinary reserve, apply.
+    if stats.records_total > limits.max_records()
+        || stats.logical_bytes > limits.max_logical_bytes()
+    {
+        return Err(StoreError::EventOperationMigrationDestinationCapacity);
+    }
+    Ok(Some(LegacyEventOperationMigration { records, stats }))
+}
+
+impl LegacyEventOperationMigration {
+    pub(crate) fn apply(&self, write: &redb::WriteTransaction) -> Result<(), StoreError> {
+        let mut ledger = write.open_table(EVENT_OPERATION_LEDGER_V3)?;
+        let mut reverse = write.open_table(ACTIVE_OPERATION_BY_EVENT_V1)?;
+        for (&fingerprint, &record) in &self.records {
+            let encoded = encode_event_operation_ledger_record(record);
+            ledger.insert(fingerprint.as_slice(), encoded.as_slice())?;
+            if let EventOperationLedgerRecord::Active { transfer_id, .. } = record {
+                let key = encode_active_operation_by_event_key(transfer_id, fingerprint);
+                reverse.insert(key.as_slice(), &[][..])?;
+            }
+        }
+        drop((ledger, reverse));
+        let mut metadata = write.open_table(METADATA)?;
+        write_event_operation_stats(&mut metadata, self.stats)?;
+        // Remove the legacy ordinary/quota contribution in this same commit.
+        for field in [
+            EVENT_OPERATION_COUNT,
+            EVENT_OPERATION_TOTAL_BYTES,
+            EVENT_TOMBSTONE_OPERATION_COUNT,
+            EVENT_TOMBSTONE_OPERATION_TOTAL_BYTES,
+        ] {
+            metadata.insert(field, 0)?;
+        }
+        drop(metadata);
+        // Retain empty tables for the legacy source-compatible read surfaces.
+        write.delete_table(EVENT_OPERATIONS)?;
+        write.delete_table(EVENT_OPERATION_WITNESSES)?;
+        write.open_table(EVENT_OPERATIONS)?;
+        write.open_table(EVENT_OPERATION_WITNESSES)?;
+        Ok(())
     }
 }
 
