@@ -46,19 +46,20 @@ fn legacy_fixture(
     let mut services = event_services(0x79);
     let store = Store::open_for_mission(&file.0, services.authority).expect("fixture store");
     let transfer = accept_local_finite_event(&store, &mut services, 1, b"payload", 10_000, SAMPLE);
+    let stored = store.get_event(transfer).expect("read").expect("Event");
+    let intent = event_publication_intent(&stored.header, b"payload");
     let write = store
         .database
         .begin_write()
         .expect("released fixture transaction");
     remove_v3(&write);
-    let mut row = write
-        .open_table(EVENT_OPERATIONS)
-        .expect("operations")
-        .get(&[b'f', 1][..])
-        .expect("operation")
-        .expect("published row")
-        .value()
-        .to_vec();
+    let mut row = encode_operation_record(OperationRecord {
+        transfer_id: transfer,
+        predecessor: None,
+        payload_digest: intent.payload_digest,
+        intent_digest: event_operation_intent_digest(&intent, None).expect("intent"),
+        legacy_unbound: false,
+    });
     if witnessed_v1 {
         row.truncate(34);
         row[0] = 1;
@@ -114,7 +115,7 @@ struct LegacySnapshot {
     all_tables: Vec<(String, LogicalRows)>,
 }
 
-fn snapshot_table(read: &redb::ReadTransaction, name: &str) -> LogicalRows {
+pub(super) fn snapshot_table(read: &redb::ReadTransaction, name: &str) -> LogicalRows {
     // Capture every logical key/value, including unrelated schema and custody
     // indexes, without relying on physical page placement after rollback.
     macro_rules! try_table {
@@ -577,6 +578,41 @@ fn migration_distinguishes_lease_withheld_retained_events_from_retirement_receip
     assert_eq!(report.retired, vec![CustodyObjectKey::event(retired)]);
     let write = store.database.begin_write().expect("fixture write");
     remove_v3(&write);
+    for (suffix, transfer, payload) in [
+        (1, active, &b"active"[..]),
+        (2, withheld, &b"withheld"[..]),
+        (3, retired, &b"retired"[..]),
+    ] {
+        let metadata = write
+            .open_table(EVENTS)
+            .expect("events")
+            .get(transfer.as_bytes().as_slice())
+            .expect("row")
+            .expect("metadata")
+            .value()
+            .to_vec();
+        let header = decode_event_metadata(&metadata).expect("header").header;
+        let intent = event_publication_intent(&header, payload);
+        let row = encode_operation_record(OperationRecord {
+            transfer_id: transfer,
+            predecessor: None,
+            payload_digest: intent.payload_digest,
+            intent_digest: event_operation_intent_digest(&intent, None).expect("intent"),
+            legacy_unbound: false,
+        });
+        write
+            .open_table(EVENT_OPERATIONS)
+            .expect("operations")
+            .insert(&[b'f', suffix][..], row.as_slice())
+            .expect("released operation");
+    }
+    {
+        let mut metadata = write.open_table(METADATA).expect("metadata");
+        metadata.insert(EVENT_OPERATION_COUNT, 3).expect("count");
+        metadata
+            .insert(EVENT_OPERATION_TOTAL_BYTES, 300)
+            .expect("bytes");
+    }
     write.commit().expect("released fixture");
     drop(store);
     assert_migrated(&file, services.authority, 2, 1, 391);
@@ -621,8 +657,27 @@ fn migration_witnessed_v1_retains_the_authenticated_predecessor_in_its_digest() 
         .expect("accepted predecessor")
         .semantic_id;
     let second = accept_local_finite_event(&store, &mut services, 2, b"payload", 10_000, SAMPLE);
+    let first_stored = store.get_event(first).expect("Event").expect("first");
+    let stored = store.get_event(second).expect("Event").expect("reaction");
+    let event = content_event(&mut services.reader, &stored.sealed);
+    event
+        .verify_exact_payload(b"payload")
+        .expect("authenticated witness payload");
+    let first_intent = event_publication_intent(&first_stored.header, b"payload");
     let write = store.database.begin_write().expect("write");
     remove_v3(&write);
+    let first_record = encode_operation_record(OperationRecord {
+        transfer_id: first,
+        predecessor: None,
+        payload_digest: first_intent.payload_digest,
+        intent_digest: event_operation_intent_digest(&first_intent, None).expect("intent"),
+        legacy_unbound: false,
+    });
+    write
+        .open_table(EVENT_OPERATIONS)
+        .expect("operations")
+        .insert(&[b'f', 1][..], first_record.as_slice())
+        .expect("v2 first operation");
     let mut legacy = vec![1];
     legacy.extend_from_slice(second.as_bytes());
     legacy.push(1);
@@ -631,32 +686,21 @@ fn migration_witnessed_v1_retains_the_authenticated_predecessor_in_its_digest() 
         .open_table(EVENT_OPERATIONS)
         .expect("operations")
         .insert(&[b'f', 2][..], legacy.as_slice())
-        .expect("legacy row");
+        .expect("v1 reaction");
+    let witness = encode_event_operation_witness(first_intent.payload_digest);
     write
-        .open_table(METADATA)
-        .expect("metadata")
-        .insert(EVENT_OPERATION_TOTAL_BYTES, 168)
-        .expect("100-byte v2 plus 68-byte v1");
-    write.commit().expect("v1 fixture");
-    // Establish the witness through the released capability-checking API.
-    let stored = store
-        .get_event(second)
-        .expect("Event")
-        .expect("retained reaction");
-    let event = content_event(&mut services.reader, &stored.sealed);
-    let intent = event_publication_intent(event.header(), b"payload");
-    let key = EventOperationKey::new(vec![b'f', 2]).expect("key");
-    let request =
-        EventOperationRequest::new(&key, &intent, b"payload", Some(predecessor)).expect("request");
-    store
-        .bind_legacy_event_operation_intent_with_policy(
-            &store.control_policy_snapshot().expect("policy"),
-            &request,
-            &event,
-            &stored.sealed,
-        )
-        .expect("bind authenticated witness")
-        .expect("bound reaction");
+        .open_table(EVENT_OPERATION_WITNESSES)
+        .expect("witnesses")
+        .insert(second.as_bytes().as_slice(), witness.as_slice())
+        .expect("authenticated witness");
+    {
+        let mut metadata = write.open_table(METADATA).expect("metadata");
+        metadata.insert(EVENT_OPERATION_COUNT, 2).expect("count");
+        metadata
+            .insert(EVENT_OPERATION_TOTAL_BYTES, 168)
+            .expect("bytes");
+    }
+    write.commit().expect("released fixture");
     let expected =
         expected_fixture_intent(event.header().stamp.dot.publisher, 2, Some(predecessor));
     drop(store);
@@ -745,7 +789,9 @@ fn migration_missing_physical_depot_marker_preserves_the_complete_legacy_image()
     let file = TestFile(root.0.join("store.redb"));
     let mut services = event_services(0x7c);
     let store = Store::open_for_mission(&file.0, services.authority).expect("store");
-    accept_local_finite_event(&store, &mut services, 1, b"payload", 10_000, SAMPLE);
+    let transfer = accept_local_finite_event(&store, &mut services, 1, b"payload", 10_000, SAMPLE);
+    let stored = store.get_event(transfer).expect("read").expect("Event");
+    let intent = event_publication_intent(&stored.header, b"payload");
     drop(store.blob_depot().expect("establish physical owner marker"));
     let write = store.database.begin_write().expect("released fixture");
     // Exercise the durable-token fast path that precedes physical validation.
@@ -754,6 +800,25 @@ fn migration_missing_physical_depot_marker_preserves_the_complete_legacy_image()
         [0; 32]
     );
     remove_v3(&write);
+    let legacy = encode_operation_record(OperationRecord {
+        transfer_id: transfer,
+        predecessor: None,
+        payload_digest: intent.payload_digest,
+        intent_digest: event_operation_intent_digest(&intent, None).expect("intent"),
+        legacy_unbound: false,
+    });
+    write
+        .open_table(EVENT_OPERATIONS)
+        .expect("operations")
+        .insert(&[b'f', 1][..], legacy.as_slice())
+        .expect("released row");
+    {
+        let mut metadata = write.open_table(METADATA).expect("metadata");
+        metadata.insert(EVENT_OPERATION_COUNT, 1).expect("count");
+        metadata
+            .insert(EVENT_OPERATION_TOTAL_BYTES, 100)
+            .expect("bytes");
+    }
     write.commit().expect("commit released legacy image");
     drop(store);
     let marker = root.0.join("blob-depot-v1/.aster-store-owner-v1");
@@ -824,6 +889,31 @@ fn migration_clears_nonzero_legacy_tombstone_operation_counters() {
         .begin_write()
         .expect("released tombstone fixture");
     remove_v3(&write);
+    let row = encode_operation_record(OperationRecord {
+        transfer_id: transfer,
+        predecessor: None,
+        payload_digest: intent.payload_digest,
+        intent_digest: event_operation_intent_digest(&intent, None).expect("intent"),
+        legacy_unbound: false,
+    });
+    write
+        .open_table(EVENT_OPERATIONS)
+        .expect("operations")
+        .insert(operation.as_bytes(), row.as_slice())
+        .expect("released tombstone row");
+    {
+        let mut metadata = write.open_table(METADATA).expect("metadata");
+        metadata.insert(EVENT_OPERATION_COUNT, 1).expect("count");
+        metadata
+            .insert(EVENT_OPERATION_TOTAL_BYTES, 100)
+            .expect("bytes");
+        metadata
+            .insert(EVENT_TOMBSTONE_OPERATION_COUNT, 1)
+            .expect("tombstone count");
+        metadata
+            .insert(EVENT_TOMBSTONE_OPERATION_TOTAL_BYTES, 100)
+            .expect("tombstone bytes");
+    }
     {
         let metadata = write.open_table(METADATA).expect("metadata");
         assert_eq!(

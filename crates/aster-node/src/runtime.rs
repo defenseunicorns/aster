@@ -3968,130 +3968,6 @@ pub(crate) struct SelectedEventPublish<'a> {
     pub tombstone: bool,
 }
 
-/// Proactively binds every retained pre-intent Event operation to a freshly
-/// verified plaintext witness before custody maintenance can collect bytes.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct LegacyEventWitnessMigration {
-    pub operation_rows_scanned: usize,
-    pub transfers_verified: usize,
-}
-
-fn try_open_legacy_event_witness(
-    sealer: &mut ReferenceEnvelopeSealer,
-    stored: &StoredEvent,
-) -> Result<Option<(ContentVerifiedEventEnvelope, Vec<u8>)>, NodeError> {
-    let Ok(route) = sealer.verify_event(&stored.sealed) else {
-        return Ok(None);
-    };
-    verify_stored_claim(
-        &route,
-        stored.transfer_id,
-        stored.semantic_id,
-        &stored.header,
-    )?;
-    let verification = match sealer.verify_event_content(route, &stored.sealed) {
-        Ok(verification) => verification,
-        Err(_) => return Ok(None),
-    };
-    let EventContentVerification::ContentVerified { event, payload } = verification else {
-        return Ok(None);
-    };
-    verify_content_stored_claim(&event, stored)?;
-    Ok(Some((event, payload)))
-}
-
-pub(crate) fn migrate_legacy_event_operation_witnesses(
-    store: &Store,
-    policy: &ControlPolicySnapshot,
-    sealer: &mut ReferenceEnvelopeSealer,
-    historical_sealer: &mut ReferenceEnvelopeSealer,
-) -> Result<LegacyEventWitnessMigration, NodeError> {
-    if sealer.identity() != historical_sealer.identity()
-        || sealer.mission_authority_id() != historical_sealer.mission_authority_id()
-    {
-        return Err(NodeError::Protocol(
-            "legacy Event migration verifiers belong to different missions".into(),
-        ));
-    }
-    let mut after = None;
-    let mut recovered_transfers = BTreeSet::new();
-    let mut report = LegacyEventWitnessMigration::default();
-    loop {
-        let page = store.unbound_legacy_event_operations_with_policy(
-            policy,
-            after.as_ref(),
-            MAX_EVENT_PAGE,
-        )?;
-        if page.is_empty() {
-            return Ok(report);
-        }
-        for recovery in page {
-            report.operation_rows_scanned = report
-                .operation_rows_scanned
-                .checked_add(1)
-                .ok_or_else(|| NodeError::Protocol("legacy recovery count overflow".into()))?;
-            after = Some(recovery.operation().clone());
-            let stored = recovery.event();
-            if !recovered_transfers.insert(stored.transfer_id) {
-                continue;
-            }
-            report.transfers_verified = report
-                .transfers_verified
-                .checked_add(1)
-                .ok_or_else(|| NodeError::Protocol("legacy recovery count overflow".into()))?;
-            let opened = match try_open_legacy_event_witness(sealer, stored)? {
-                Some(opened) => Some(opened),
-                None => try_open_legacy_event_witness(historical_sealer, stored)?,
-            };
-            let (event, payload) = opened.ok_or_else(|| {
-                NodeError::Protocol(
-                    "legacy Event operation recovery lacks exact historical content authorization"
-                        .into(),
-                )
-            })?;
-            let intent = EventPublicationIntent::new(
-                EventPublicationSpec::new(
-                    stored.header.stamp.dot.publisher,
-                    stored.header.topic.clone(),
-                    stored.header.scope.clone(),
-                    stored.header.priority,
-                    stored.header.logical_key.clone(),
-                    stored.header.tombstone,
-                    stored.header.ttl_ms,
-                )?,
-                &payload,
-            )?;
-            let request = EventOperationRequest::new(
-                recovery.operation(),
-                &intent,
-                &payload,
-                recovery.predecessor(),
-            )?;
-            let resolution = store.bind_legacy_event_operation_intent_with_policy(
-                policy,
-                &request,
-                &event,
-                &stored.sealed,
-            )?;
-            let exact = match resolution {
-                Some(EventOperationResolution::Live(resolved)) => {
-                    resolved.transfer_id == stored.transfer_id
-                }
-                Some(EventOperationResolution::Withheld { transfer_id, .. })
-                | Some(EventOperationResolution::Retired { transfer_id, .. }) => {
-                    transfer_id == stored.transfer_id
-                }
-                None => false,
-            };
-            if !exact {
-                return Err(NodeError::Protocol(
-                    "legacy Event operation changed during proactive recovery".into(),
-                ));
-            }
-        }
-    }
-}
-
 fn verify_existing_event_publication(
     sealer: &mut ReferenceEnvelopeSealer,
     stored: &StoredEvent,
@@ -4184,55 +4060,15 @@ pub(crate) fn publish_selected_event_once(
         payload,
     )?;
     let operation_request = EventOperationRequest::new(operation, &intent, payload, predecessor)?;
-    let existing_prebind = if let Some(existing) = store.event_operation_resolution(operation)? {
-        match existing {
-            EventOperationResolution::Live(stored) => {
-                let verified =
-                    verify_existing_event_publication(sealer, &stored, &intent, payload)?;
-                Some((stored, verified))
-            }
-            EventOperationResolution::Retired { .. } => {
-                // A bound-v2 retired operation still needs the store's private
-                // intent digest comparison below to distinguish exact replay
-                // from changed-key reuse without resurrecting retired bytes.
-                None
-            }
-            EventOperationResolution::Withheld { .. } => {
-                // Marked retirement is already non-authoritative to the
-                // application. The atomic commit below still compares the
-                // private request digest without reopening withheld bytes.
-                None
-            }
+    match store.event_operation_resolution_for_request(&operation_request) {
+        Ok(Some(EventOperationResolution::Live(stored))) => {
+            verify_existing_event_publication(sealer, &stored, &intent, payload)?;
         }
-    } else {
-        None
-    };
-    if let Some((stored, original)) = existing_prebind.as_ref() {
-        match store.bind_legacy_event_operation_intent_with_policy(
-            policy,
-            &operation_request,
-            original,
-            &stored.sealed,
-        ) {
-            Ok(Some(EventOperationResolution::Live(resolved))) if resolved == *stored => {}
-            Ok(Some(
-                EventOperationResolution::Withheld { .. }
-                | EventOperationResolution::Retired { .. },
-            )) => {}
-            Ok(Some(EventOperationResolution::Live(_))) | Ok(None) => {
-                return Err(NodeError::Protocol(
-                    "durable Event operation changed during intent preflight".into(),
-                ));
-            }
-            Err(StoreError::EventOperationConflict | StoreError::OperationPredecessorMismatch) => {
-                return Err(NodeError::Protocol(EVENT_OPERATION_CONFLICT.into()));
-            }
-            Err(error) => return Err(error.into()),
+        Ok(_) => {}
+        Err(StoreError::EventOperationConflict | StoreError::OperationPredecessorMismatch) => {
+            return Err(NodeError::Protocol(EVENT_OPERATION_CONFLICT.into()));
         }
-        // This housekeeping-only witness is bound to the freshly verified
-        // original transfer and plaintext before a fresh reservation. The
-        // publication still proceeds through current-epoch sealing and the
-        // atomic commit below, which independently enforces current authority.
+        Err(error) => return Err(error.into()),
     }
     let key_epoch = store
         .active_scope_epoch(scope)?
@@ -4316,7 +4152,8 @@ pub(crate) fn publish_selected_event_once(
                         semantic_id,
                         ..
                     } => (transfer_id, semantic_id, false),
-                    EventOnceOutcome::Retired { .. } => {
+                    EventOnceOutcome::Retired { .. }
+                    | EventOnceOutcome::RetiredOperation { .. } => {
                         return Err(NodeError::Protocol(EVENT_OPERATION_RETIRED.into()));
                     }
                 };
@@ -4375,6 +4212,9 @@ pub(crate) fn publish_selected_event_once(
             }
             Err(StoreError::ReservationChanged) => continue,
             Err(StoreError::Custody(CustodyStoreError::PolicyChanged)) => continue,
+            Err(StoreError::Custody(CustodyStoreError::AlreadyRetired)) => {
+                return Err(NodeError::Protocol(EVENT_OPERATION_RETIRED.into()));
+            }
             Err(StoreError::EventOperationConflict | StoreError::OperationPredecessorMismatch) => {
                 return Err(NodeError::Protocol(EVENT_OPERATION_CONFLICT.into()));
             }
@@ -7785,7 +7625,7 @@ pub(crate) fn prewarm_authenticated_event_route_cache(
 }
 
 /// Opens one verifier and proves every retained custody Event source before
-/// startup is allowed to mutate quotas, operation witnesses, or custody rows.
+/// startup is allowed to mutate quotas or custody rows.
 ///
 /// The pre-control pass preserves default-key rows. Blob sources are then
 /// authenticated incrementally after each exact durable scope-key transition,
@@ -11640,12 +11480,12 @@ async fn run_node_actor_inner(
     }
     let policy_lock = Arc::new(RwLock::new(()));
     // Prove every retained Event/route source across both the pre-control and
-    // final replayed key views before quota replacement, witness migration, or
+    // final replayed key views before quota replacement or
     // custody maintenance can mutate/delete durable Event state. This also
     // remains before persisted carrier identity or socket creation.
     let StartupEventVerification {
-        verifier: mut application_sealer,
-        historical_verifier: mut historical_application_sealer,
+        verifier: application_sealer,
+        historical_verifier: historical_application_sealer,
         cache: event_route_cache,
         policy: startup_policy,
     } = open_startup_event_verifier_and_cache(&store, &config.mission)?;
@@ -11654,12 +11494,6 @@ async fn run_node_actor_inner(
     store.reconcile_blob_carrier_fetch_cursor_peers(&configured_cursor_peers)?;
     let application_control_head = store.control_head()?;
     ensure_principal_active(&store, application_sealer.identity())?;
-    migrate_legacy_event_operation_witnesses(
-        &store,
-        &startup_policy,
-        &mut application_sealer,
-        &mut historical_application_sealer,
-    )?;
     // Each live facade owns a stateful sealer. They share one mission-bound
     // store and startup-authenticated route cache, but never alias provider
     // state across application operations.
@@ -13120,19 +12954,9 @@ async fn sync_once_with_policy(
     let emission_policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
     let snapshot = emission_policy.snapshot()?;
     let StartupEventVerification {
-        verifier: mut cache_verifier,
-        mut historical_verifier,
         cache: event_route_cache,
-        policy: cache_policy,
+        ..
     } = open_startup_event_verifier_and_cache(&store, &mission)?;
-    migrate_legacy_event_operation_witnesses(
-        &store,
-        &cache_policy,
-        &mut cache_verifier,
-        &mut historical_verifier,
-    )?;
-    drop(historical_verifier);
-    drop(cache_verifier);
     let custody_clock = NodeCustodyClock::open(mission.identity())?;
     sync_once_with_forwarding(
         endpoint,
@@ -18499,19 +18323,9 @@ async fn serve_connection(
     mutable_interests: MutableSourceInterests,
 ) -> Result<CompletedPeerContact, NodeError> {
     let StartupEventVerification {
-        verifier: mut cache_verifier,
-        mut historical_verifier,
         cache: event_route_cache,
-        policy: cache_policy,
+        ..
     } = open_startup_event_verifier_and_cache(&store, &credentials)?;
-    migrate_legacy_event_operation_witnesses(
-        &store,
-        &cache_policy,
-        &mut cache_verifier,
-        &mut historical_verifier,
-    )?;
-    drop(historical_verifier);
-    drop(cache_verifier);
     let custody_clock = NodeCustodyClock::open(credentials.identity())?;
     serve_connection_with_forwarding(InboundContact {
         store,
@@ -24280,11 +24094,6 @@ mod tests {
 
     #[tokio::test]
     async fn same_epoch_rekey_restart_withholds_historical_lineage_and_contact_continues() {
-        const EVENT_OPERATIONS: redb::TableDefinition<&[u8], &[u8]> =
-            redb::TableDefinition::new("aster.event-operations.v1");
-        const METADATA: redb::TableDefinition<&str, u64> =
-            redb::TableDefinition::new("aster.metadata.v1");
-        const EVENT_OPERATION_TOTAL_BYTES: &str = "semantic_event_operation_total_bytes";
         const HISTORICAL_OPERATION: &[u8] = b"same-epoch/historical";
         let services = control_test_services([0x84; 32]);
         let source_state = root("same-epoch-lineage-source");
@@ -24321,46 +24130,6 @@ mod tests {
         drop(source_verifier);
         drop(source_store);
 
-        // Recreate the pre-intent v1 operation row while leaving the exact
-        // historical Event representation live and witnessless.
-        let database = redb::Database::open(&source_path).expect("open legacy source fixture");
-        let write = database.begin_write().expect("begin legacy source fixture");
-        let removed_operation_bytes = {
-            let mut operations = write.open_table(EVENT_OPERATIONS).expect("operations");
-            let current = operations
-                .get(HISTORICAL_OPERATION)
-                .expect("read historical operation")
-                .expect("historical operation row")
-                .value()
-                .to_vec();
-            assert_eq!(current[0], 2);
-            assert_eq!(current[33], 0);
-            let mut legacy = Vec::with_capacity(34);
-            legacy.push(1);
-            legacy.extend_from_slice(&current[1..34]);
-            operations
-                .insert(HISTORICAL_OPERATION, legacy.as_slice())
-                .expect("install historical v1 operation");
-            u64::try_from(current.len() - legacy.len()).expect("fixture delta fits u64")
-        };
-        {
-            let mut metadata = write.open_table(METADATA).expect("metadata");
-            let operation_bytes = metadata
-                .get(EVENT_OPERATION_TOTAL_BYTES)
-                .expect("read operation accounting")
-                .expect("operation accounting")
-                .value();
-            metadata
-                .insert(
-                    EVENT_OPERATION_TOTAL_BYTES,
-                    operation_bytes
-                        .checked_sub(removed_operation_bytes)
-                        .expect("legacy operation is smaller"),
-                )
-                .expect("adjust operation accounting");
-        }
-        write.commit().expect("commit historical v1 fixture");
-        drop(database);
         let source_store =
             Store::open_for_mission(&source_path, services.member.mission_authority_id())
                 .expect("reopen source before rekey");
@@ -24466,15 +24235,13 @@ mod tests {
         assert_eq!(source_receipt.remaining, 0);
         assert_eq!(receiver_receipt.fetched, 1);
         assert_eq!(receiver_receipt.inserted, 1);
-        let source_policy = source_store
-            .control_policy_snapshot()
-            .expect("source policy after historical migration");
         assert!(
             source_store
-                .unbound_legacy_event_operations_with_policy(&source_policy, None, MAX_EVENT_PAGE,)
-                .expect("historical legacy recovery scan")
-                .is_empty(),
-            "startup must bind the old-lineage v1 plaintext witness before maintenance"
+                .event_operation_resolution(
+                    &EventOperationKey::new(HISTORICAL_OPERATION.to_vec()).expect("operation key"),
+                )
+                .expect("retained operation")
+                .is_some()
         );
         assert!(
             receiver_store
@@ -34568,20 +34335,9 @@ mod tests {
         store: &Store,
         mission: &UnprotectedReferenceMission,
     ) -> Arc<AuthenticatedEventRouteCache> {
-        let StartupEventVerification {
-            verifier: mut cache_verifier,
-            mut historical_verifier,
-            cache,
-            policy,
-        } = open_startup_event_verifier_and_cache(store, mission)
-            .expect("prewarm Event route cache");
-        migrate_legacy_event_operation_witnesses(
-            store,
-            &policy,
-            &mut cache_verifier,
-            &mut historical_verifier,
-        )
-        .expect("migrate legacy Event operation witnesses");
+        let StartupEventVerification { cache, .. } =
+            open_startup_event_verifier_and_cache(store, mission)
+                .expect("prewarm Event route cache");
         cache
     }
 

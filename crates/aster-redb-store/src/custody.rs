@@ -2714,24 +2714,6 @@ fn selected_tombstone_usage_read(
     })
 }
 
-pub(crate) fn require_event_tombstone_operation_capacity_write(
-    write: &redb::WriteTransaction,
-    limits: StoreLimits,
-    incoming_bytes: u64,
-) -> Result<(), StoreError> {
-    let (max_items, max_bytes) = custody_tombstone_allowance(limits);
-    require_quota_capacity(
-        selected_tombstone_usage_write(write)?,
-        &CustodyQuota {
-            scope: None,
-            max_items,
-            max_bytes,
-        },
-        1,
-        incoming_bytes,
-    )
-}
-
 fn check_admission_capacity(
     write: &redb::WriteTransaction,
     admission: &CustodyAdmission,

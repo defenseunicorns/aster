@@ -11,10 +11,8 @@ use redb::{
 };
 use sha2::{Digest, Sha256};
 
-#[allow(dead_code)] // Used by the ledger authority introduced in the following lifecycle slice.
 pub(crate) const EVENT_OPERATION_LEDGER_V3: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.event-operation-ledger.v3");
-#[allow(dead_code)] // Used by the ledger authority introduced in the following lifecycle slice.
 pub(crate) const ACTIVE_OPERATION_BY_EVENT_V1: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.active-operation-by-event.v1");
 
@@ -34,7 +32,6 @@ const EVENT_OPERATION_ACCOUNTING_FIELDS: [&str; 5] = [
 ];
 
 pub(crate) const EVENT_OPERATION_ACTIVE_LOGICAL_BYTES: u64 = 98;
-#[allow(dead_code)] // Used by checked ledger accounting in the following lifecycle slice.
 pub(crate) const EVENT_OPERATION_RETIRED_LOGICAL_BYTES: u64 = 67;
 pub(crate) const ACTIVE_OPERATION_BY_EVENT_LOGICAL_BYTES: u64 = 64;
 const EVENT_OPERATION_EMERGENCY_RECORD_LOGICAL_BYTES: u64 =
@@ -67,7 +64,7 @@ pub struct EventOperationStats {
 
 /// A bounded, application-defined idempotency key for one local Event operation.
 ///
-/// The key is durable and maps to exactly one accepted source Event. A caller
+/// Its mission-bound fingerprint permanently names one publication intent. A caller
 /// should namespace the bytes by application and operation kind. Reactive work
 /// can append the authenticated predecessor's semantic item identifier.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -85,7 +82,7 @@ impl EventOperationKey {
         Ok(Self(bytes))
     }
 
-    /// Returns the exact durable key bytes.
+    /// Returns the exact caller-provided key bytes; durable records store only a fingerprint.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -369,6 +366,15 @@ pub(crate) fn checked_admit_event_operation_record(
     limits: EventOperationLimits,
     emergency: bool,
 ) -> Result<EventOperationStats, StoreError> {
+    checked_admit_event_operation_record_kind(current, limits, emergency, false)
+}
+
+fn checked_admit_event_operation_record_kind(
+    current: EventOperationStats,
+    limits: EventOperationLimits,
+    emergency: bool,
+    retired: bool,
+) -> Result<EventOperationStats, StoreError> {
     validate_event_operation_stats(current)?;
     let record_limit = if emergency {
         limits.max_records()
@@ -394,14 +400,19 @@ pub(crate) fn checked_admit_event_operation_record(
             .checked_sub(limits.emergency_byte_reserve())
             .ok_or(StoreError::PayloadByteAccountingOverflow)?
     };
+    let incoming = if retired {
+        EVENT_OPERATION_RETIRED_LOGICAL_BYTES
+    } else {
+        EVENT_OPERATION_EMERGENCY_RECORD_LOGICAL_BYTES
+    };
     let next_bytes = current
         .logical_bytes
-        .checked_add(EVENT_OPERATION_EMERGENCY_RECORD_LOGICAL_BYTES)
+        .checked_add(incoming)
         .ok_or(StoreError::PayloadByteAccountingOverflow)?;
     if next_bytes > byte_limit {
         return Err(StoreError::EventOperationByteLimitExceeded {
             current: current.logical_bytes,
-            incoming: EVENT_OPERATION_EMERGENCY_RECORD_LOGICAL_BYTES,
+            incoming,
             limit: byte_limit,
         });
     }
@@ -410,12 +421,15 @@ pub(crate) fn checked_admit_event_operation_record(
         records_total: next_total,
         records_active: current
             .records_active
-            .checked_add(1)
+            .checked_add(u64::from(!retired))
             .ok_or(StoreError::ItemCountAccountingOverflow)?,
-        records_retired: current.records_retired,
+        records_retired: current
+            .records_retired
+            .checked_add(u64::from(retired))
+            .ok_or(StoreError::ItemCountAccountingOverflow)?,
         reverse_rows: current
             .reverse_rows
-            .checked_add(1)
+            .checked_add(u64::from(!retired))
             .ok_or(StoreError::ItemCountAccountingOverflow)?,
         logical_bytes: next_bytes,
     };
@@ -457,6 +471,93 @@ pub(crate) fn checked_retire_event_operation_records(
     };
     validate_event_operation_stats(next)?;
     Ok(next)
+}
+
+/// Adds one previously unseen operation and its bounded reverse edge in the
+/// caller's Event transaction. No ordinary Event-storage quota is charged.
+pub(crate) fn admit_active_event_operation_write(
+    write: &redb::WriteTransaction,
+    authority: &[u8; 32],
+    operation: &EventOperationKey,
+    intent_digest: [u8; 32],
+    transfer_id: EventTransferId,
+    limits: EventOperationLimits,
+    emergency: bool,
+) -> Result<(), StoreError> {
+    let fingerprint = event_operation_fingerprint(authority, operation);
+    let mut ledger = write.open_table(EVENT_OPERATION_LEDGER_V3)?;
+    if ledger.get(fingerprint.as_slice())?.is_some() {
+        return Err(StoreError::SemanticInvariant(
+            "Event operation appeared during admission",
+        ));
+    }
+    let mut reverse = write.open_table(ACTIVE_OPERATION_BY_EVENT_V1)?;
+    let lower = encode_active_operation_by_event_key(transfer_id, [0; 32]);
+    let upper = encode_active_operation_by_event_key(transfer_id, [u8::MAX; 32]);
+    let mut aliases = 0u64;
+    for row in reverse.range(lower.as_slice()..=upper.as_slice())? {
+        let (key, value) = row?;
+        decode_active_operation_by_event_key(key.value())?;
+        if !value.value().is_empty() {
+            return Err(StoreError::SemanticInvariant(
+                "Event operation reverse value is not empty",
+            ));
+        }
+        aliases += 1;
+        if aliases >= MAX_EVENT_OPERATION_ALIASES {
+            return Err(StoreError::EventOperationLimitExceeded {
+                current: aliases,
+                limit: MAX_EVENT_OPERATION_ALIASES,
+            });
+        }
+    }
+    let mut metadata = write.open_table(METADATA)?;
+    let current = read_event_operation_stats(&metadata)?.ok_or(StoreError::SemanticInvariant(
+        "Event operation accounting is missing during publication",
+    ))?;
+    let next = checked_admit_event_operation_record(current, limits, emergency)?;
+    let encoded = encode_event_operation_ledger_record(EventOperationLedgerRecord::Active {
+        intent_digest,
+        transfer_id,
+    });
+    ledger.insert(fingerprint.as_slice(), encoded.as_slice())?;
+    let key = encode_active_operation_by_event_key(transfer_id, fingerprint);
+    if reverse.insert(key.as_slice(), &[][..])?.is_some() {
+        return Err(StoreError::SemanticInvariant(
+            "Event operation reverse edge already exists",
+        ));
+    }
+    write_event_operation_stats(&mut metadata, next)
+}
+
+/// Fences a previously unseen key replaying an already-retired Event. This is
+/// ordinary publication admission and adds no Event pointer or reverse edge.
+pub(crate) fn admit_retired_event_operation_write(
+    write: &redb::WriteTransaction,
+    authority: &[u8; 32],
+    operation: &EventOperationKey,
+    intent_digest: [u8; 32],
+    reason: CustodyRetirementReason,
+    limits: EventOperationLimits,
+) -> Result<(), StoreError> {
+    let fingerprint = event_operation_fingerprint(authority, operation);
+    let mut ledger = write.open_table(EVENT_OPERATION_LEDGER_V3)?;
+    if ledger.get(fingerprint.as_slice())?.is_some() {
+        return Err(StoreError::SemanticInvariant(
+            "Event operation appeared during retired admission",
+        ));
+    }
+    let mut metadata = write.open_table(METADATA)?;
+    let current = read_event_operation_stats(&metadata)?.ok_or(StoreError::SemanticInvariant(
+        "Event operation accounting is missing during publication",
+    ))?;
+    let next = checked_admit_event_operation_record_kind(current, limits, false, true)?;
+    let encoded = encode_event_operation_ledger_record(EventOperationLedgerRecord::Retired {
+        intent_digest,
+        reason,
+    });
+    ledger.insert(fingerprint.as_slice(), encoded.as_slice())?;
+    write_event_operation_stats(&mut metadata, next)
 }
 
 fn read_event_operation_stats<T>(metadata: &T) -> Result<Option<EventOperationStats>, StoreError>
@@ -601,6 +702,14 @@ pub(crate) fn stage_legacy_event_operations_write(
 ) -> Result<Option<LegacyEventOperationMigration>, StoreError> {
     // Inspect before initialization: any partial v3 group must fail closed.
     let existing = existing_event_operation_stats_write(write)?;
+    if write
+        .list_multimap_tables()?
+        .any(|table| table.name() == EVENT_OPERATION_WITNESSES.name())
+    {
+        return Err(StoreError::SemanticInvariant(
+            "Event operation-witness index has the wrong table kind",
+        ));
+    }
     let operations = write.open_table(EVENT_OPERATIONS)?;
     let witnesses = write.open_table(EVENT_OPERATION_WITNESSES)?;
     if existing.is_some() {
