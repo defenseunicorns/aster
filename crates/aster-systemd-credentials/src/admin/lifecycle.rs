@@ -3055,6 +3055,9 @@ mod tests {
 
     #[test]
     fn completed_ledger_open_validates_exact_active_and_previous_identities() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: validating only that Active exists lets a corrupt or
         // substituted retained Previous generation pass ordinary open.
         let fixture = AdminLifecycleFixture::new();
@@ -3089,6 +3092,9 @@ mod tests {
 
     #[test]
     fn completed_ledger_rejects_a_duplicate_destroyed_generation_without_deletion() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: validating each retained slot independently could
         // accept two filesystem copies for one destroyed ledger identity.
         let fixture = AdminLifecycleFixture::new();
@@ -3733,6 +3739,9 @@ mod tests {
 
     #[test]
     fn completed_open_rejects_every_cleanup_directory_without_mutation() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: cleanup is never part of a completed ledger snapshot;
         // even an empty, partial, bound, or unrelated cleanup must remain as
         // evidence and make ordinary open fail closed.
@@ -3785,6 +3794,9 @@ mod tests {
 
     #[test]
     fn lifecycle_fault_boundaries_reopen_to_one_exact_completed_rotation() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: a failure after an exchange, park, parent sync, or
         // ledger write must be resumable by a fresh admin from the exact
         // persisted intent and must never select or regenerate a generation.
@@ -3876,6 +3888,9 @@ mod tests {
 
     #[test]
     fn rotation_commits_one_new_active_generation_and_retains_the_exact_previous() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: a public rotation path that bypasses the shared
         // reconciler can publish a receipt without the exact Active/Previous
         // filesystem and ledger transition.
@@ -3928,6 +3943,9 @@ mod tests {
 
     #[test]
     fn rotation_exact_retry_is_existing_without_encryption_and_changed_inputs_conflict() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: retrying through the encryptor or comparing only the
         // operation/load rather than the canonical provider envelope breaks
         // permanent operation binding.
@@ -3978,6 +3996,9 @@ mod tests {
 
     #[test]
     fn rotation_and_install_share_previous_and_destroyed_operation_retry_classification() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: install and rotate are two entry points to the same
         // permanent install-operation binding. Once rotation parks I1 as
         // Previous, its exact install retry must remain Existing; only its
@@ -4077,6 +4098,9 @@ mod tests {
 
     #[test]
     fn rotation_rejects_invalid_plaintext_previous_and_generation_exhaustion_before_encryption() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: plaintext validation, the single-Previous gate, and
         // checked generation allocation must all precede reference creation,
         // staging, or provider invocation.
@@ -4151,6 +4175,9 @@ mod tests {
 
     #[test]
     fn rotation_mismatched_or_v1_state_never_becomes_active() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: rotation must not use a v1 ledger or manifest and must
         // not promote a mismatched durable generation as a fallback.
         for corrupt in ["ledger", "manifest"] {
@@ -4213,6 +4240,9 @@ mod tests {
 
     #[test]
     fn rotation_intent_and_namespace_faults_reopen_without_reencryption_or_fallback() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: every persisted Rotate phase must be completed by the
         // shared fresh-admin reconciler using the exact ciphertext generated
         // once, never by restoring the old Active generation.
@@ -4279,6 +4309,9 @@ mod tests {
 
     #[test]
     fn rotation_pre_intent_stage_faults_preserve_old_active_and_fail_closed_on_reopen() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: before a Rotate intent is durable there is no trusted
         // operation binding that authorizes a fresh admin to activate or
         // delete staged bytes. The committed old generation remains the only
@@ -4338,6 +4371,9 @@ mod tests {
 
     #[test]
     fn rotation_preflights_oversized_intent_before_encryption_or_staging() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: a completed snapshot can fit under MAX_LEDGER_BYTES
         // while its larger Rotate intent does not. Discovering this only at
         // intent commit strands an unbound, already-encrypted stage.
@@ -4400,6 +4436,9 @@ mod tests {
 
     #[test]
     fn fresh_admin_selects_pending_rotate_intent_and_derives_exact_completion() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: an intent synced into ledger.next before rename is a
         // real persisted operation state; ignoring it or routing every intent
         // through install-only recovery strands an exact staged rotation.
@@ -4441,6 +4480,9 @@ mod tests {
 
     #[test]
     fn invalid_pending_recover_semantics_preserve_both_ledger_files() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: promoting a canonical pending Recover intent before
         // checking its exact persisted BackupBinding destroys the durable
         // predecessor/pending evidence even though completion is impossible.
@@ -4472,6 +4514,9 @@ mod tests {
 
     #[test]
     fn invalid_pending_filesystem_phases_preserve_both_ledger_files() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: a pending intent must not become current until every
         // on-disk slot is an exact allowed lifecycle phase; partial,
         // mismatched, and unbound stages retain both ledger snapshots.
@@ -4510,6 +4555,9 @@ mod tests {
 
     #[test]
     fn pending_intent_is_published_before_mutation_and_survives_two_interruptions() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: reconciling directly from ledger.next can switch the
         // provisioning namespace and then leave only the predecessor ledger
         // when completion publication is interrupted.
@@ -4557,6 +4605,9 @@ mod tests {
 
     #[test]
     fn pending_intent_publication_faults_before_provisioning_mutation() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: publication faults must occur while the exact Active
         // and staged generations are still untouched, with the intent either
         // retained as pending or atomically installed as current.
@@ -4610,6 +4661,9 @@ mod tests {
 
     #[test]
     fn current_intent_replays_ledger_parent_sync_before_provisioning_mutation() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: after IntentRenamed, a crash can leave the exact intent
         // current without a durable ledger-parent rename; the next admin must
         // replay that fsync before touching Active or staged.
@@ -4654,6 +4708,9 @@ mod tests {
 
     #[test]
     fn fresh_admin_resumes_recover_and_both_destroy_kinds_from_persisted_intent() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: fresh-open dispatch that handles only Rotate still
         // strands authenticated Recover and composed destroy states after a
         // real filesystem boundary.
@@ -4741,6 +4798,9 @@ mod tests {
 
     #[test]
     fn tombstone_previous_exchange_and_replaced_deletion_faults_reopen_exactly() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: the three non-rotation durability boundaries must
         // retain enough exact intent-bound state for a fresh reconciler.
         {
@@ -4847,6 +4907,9 @@ mod tests {
 
     #[test]
     fn resumed_tombstone_syncs_its_directory_before_exchange() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: an exact tombstone whose file writes completed but
         // directory fsync did not must not be exchanged into Active until a
         // fresh admin replays both staged-directory and parent durability.
@@ -4888,6 +4951,9 @@ mod tests {
 
     #[test]
     fn resumed_cleanup_syncs_rename_parent_before_any_unlink() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: after a cleanup rename interruption, deleting its
         // files before replaying the provisioning-parent fsync can lose both
         // the origin name and cleanup binding across a crash.
@@ -4925,6 +4991,9 @@ mod tests {
 
     #[test]
     fn cleanup_faults_never_leave_a_partial_provider_slot_and_resume_only_bound_work() {
+        let _guard = crate::admin::TEST_PROCESS_SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break caught: unlinking staged files in place can strand a partial
         // provider slot that no exact intent state can safely authorize for a
         // later deletion.
