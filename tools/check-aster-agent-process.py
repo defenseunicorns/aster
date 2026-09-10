@@ -19,6 +19,7 @@ import json
 import os
 import select
 import signal
+import shutil
 import socket
 import stat
 import subprocess
@@ -28,7 +29,7 @@ import threading
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
 
 MIN_TIMEOUT_SECONDS = 1
@@ -724,6 +725,44 @@ class ProcessRegistry:
         if first_error is not None:
             raise first_error
 
+    @contextlib.contextmanager
+    def private_directory(self, captures: CaptureLedger, timeout_seconds: int) -> Iterator[str]:
+        # No automatic finalizer: unresolved owned processes must keep their state.
+        directory = Path(tempfile.mkdtemp(prefix="aster-agent-process-"))
+        try:
+            yield str(directory)
+        finally:
+            primary_error = sys.exc_info()[1]
+            pending = tuple(self._processes)
+            cleanup_error = None
+            try:
+                self.cleanup_all(timeout_seconds)
+            except BaseException as error:
+                cleanup_error = error
+            try:
+                for process in pending:
+                    captures.append(process.combined())
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+            try:
+                if self._processes:
+                    _write_private_json(directory / "process-recovery.json", {
+                        "status": "cleanup-unconfirmed",
+                        "owned_pids": [p.process.pid for p in self._processes],
+                        "warning": "Verify process identity before manual recovery; PIDs may be reused.",
+                    })
+                    print("DIAGNOSTIC private_fixture=retained recovery=process-recovery.json", file=sys.stderr)
+                else:
+                    shutil.rmtree(directory)
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+            if cleanup_error is not None:
+                if primary_error is None:
+                    raise cleanup_error
+                print("DIAGNOSTIC private_fixture_cleanup=failed", file=sys.stderr)
+
 
 def wait_for_process_pair(
     first: ManagedProcess, second: ManagedProcess, timeout_seconds: int
@@ -808,6 +847,7 @@ class ClientResult:
     record: dict[str, Any]
     stdout_capture_complete: bool = True
     stderr_capture_complete: bool = True
+    pid: int = 0
 
     @property
     def capture_complete(self) -> bool:
@@ -900,6 +940,7 @@ def invoke_client(
         {},
         stdout_capture_complete=stdout_complete and capture_cleanup_complete,
         stderr_capture_complete=stderr_complete and capture_cleanup_complete,
+        pid=process.process.pid,
     )
     if attempt_error is not None or cleanup_error is not None or not failed_result.capture_complete:
         cause = attempt_error or cleanup_error
@@ -1407,6 +1448,69 @@ def require_operation_key_conflict(record: dict[str, Any]) -> None:
         raise AcceptanceError("operation-key conflict was not rejected")
 
 
+def run_client_only_recovery(agent: ManagedProcess, call: Any) -> dict[str, Any]:
+    """Reap client one before starting client two on the same live agent.
+
+    The existing call boundary waits, joins bounded captures and reaps each
+    client. Process identity comes from Popen, not just client-supplied JSON.
+    No server restart or subscription deletion/recreation occurs here.
+    """
+    process = agent.process
+    agent_pid = process.pid
+
+    def require_live_agent() -> None:
+        if agent.process is not process or process.pid != agent_pid or process.poll() is not None:
+            raise AcceptanceError("client recovery agent was replaced or stopped")
+
+    def require_client(result: ClientResult) -> dict[str, Any]:
+        record = result.record
+        if (result.return_code != 0 or not result.capture_complete
+                or type(result.pid) is not int or result.pid <= 0 or result.pid == agent_pid
+                or record.get("status") != "ok"
+                or type(record.get("client_pid")) is not int
+                or record["client_pid"] != result.pid):
+            raise AcceptanceError("client recovery process receipt was invalid")
+        return record
+
+    require_live_agent()
+    publication = _publish_request()
+    first_result = call("recovery-begin", {
+        "publish": publication,
+        "subscription_operation_key_hex": b"aster-agent-client-only-subscribe-v1".hex(),
+    })
+    require_live_agent()
+    first = require_client(first_result)
+    if (type(first.get("attempt")) is not int or first["attempt"] != 1
+            or first.get("exact_match") is not True or first.get("retry_same_effect") is not True
+            or first.get("first_inserted") is not True or first.get("retry_inserted") is not False):
+        raise AcceptanceError("client recovery first delivery or retry was invalid")
+    subscription_id = first.get("subscription_id_hex")
+    if (not isinstance(subscription_id, str) or len(subscription_id) != 64
+            or any(c not in "0123456789abcdef" for c in subscription_id)):
+        raise AcceptanceError("client recovery subscription was invalid")
+    expected = _expected_recovered_event(first, publication)
+    for value in (expected["id_hex"], expected["publisher_hex"]):
+        if any(c not in "0123456789abcdef" for c in value):
+            raise AcceptanceError("client recovery identity was invalid")
+    second_result = call("recovery-resume", {"subscription_id_hex": subscription_id, "expected": expected})
+    require_live_agent()
+    second = require_client(second_result)
+    if (second_result.pid == first_result.pid
+            or second.get("subscription_id_hex") != subscription_id
+            or second.get("event_id_hex") != expected["id_hex"]
+            or type(second.get("acceptance_marker")) is not int
+            or second["acceptance_marker"] != expected["acceptance_marker"]
+            or type(second.get("attempt")) is not int or second["attempt"] != 2
+            or second.get("exact_match") is not True or second.get("acknowledged") is not True
+            or second.get("retained_query_exact") is not True
+            or type(second.get("quiet_polls")) is not int or second["quiet_polls"] < 2
+            or type(second.get("quiet_window_ms")) is not int or second["quiet_window_ms"] != 500):
+        raise AcceptanceError("client recovery completion was invalid")
+    return {"status": "pass", "agent_pid": agent_pid, "agent_restarts": 0,
+            "first_client_exit": first_result.return_code, "second_client_exit": second_result.return_code,
+            "first": first, "second": second}
+
+
 def run_acceptance(arguments: Arguments) -> None:
     require_executable(arguments.agent, "agent")
     require_executable(arguments.client, "client")
@@ -1431,22 +1535,20 @@ def run_acceptance_with_token(
     captures = CaptureLedger(_process_canaries(arguments, contract, old_token))
     receipt_names: list[str] = []
 
-    def start_agent() -> ManagedProcess:
+    def start_agent(config: Path = arguments.config) -> ManagedProcess:
         agent = registry.spawn(
-            [str(arguments.agent), "--config", str(arguments.config)]
+            [str(arguments.agent), "--config", str(config)]
         )
         try:
             wait_for_readiness(agent, contract.health, arguments.timeout_seconds)
-        except AcceptanceError:
-            print(
-                sanitized_diagnostic(
-                    "agent",
-                    agent.process.poll() if agent.process.poll() is not None else -1,
-                    agent.stdout.text(),
-                    agent.stderr.text(),
-                ),
-                file=sys.stderr,
-            )
+        except BaseException as error:
+            # The directory scope owns cleanup even if spawn was interrupted
+            # before returning this handle, or cleanup itself cannot finish.
+            if isinstance(error, AcceptanceError):
+                print(
+                    "DIAGNOSTIC agent_readiness=failed",
+                    file=sys.stderr,
+                )
             raise
         receipt_names.append("readiness")
         return agent
@@ -1454,11 +1556,27 @@ def run_acceptance_with_token(
     def stop_agent(
         agent: ManagedProcess, process_signal: signal.Signals, expected_code: int
     ) -> None:
-        agent.signal(process_signal)
-        code = agent.wait(arguments.timeout_seconds)
-        captures.append(agent.combined())
-        agent.cleanup(arguments.timeout_seconds)
-        registry.discard(agent)
+        first_error = None
+        code = None
+        try:
+            agent.signal(process_signal)
+            code = agent.wait(arguments.timeout_seconds)
+        except BaseException as error:
+            first_error = error
+        try:
+            agent.cleanup(arguments.timeout_seconds)
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+        else:
+            registry.discard(agent)
+        try:
+            captures.append(agent.combined())
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+        if first_error is not None:
+            raise first_error
         if code != expected_code:
             raise AcceptanceError("agent exit status did not match the contract")
 
@@ -1556,16 +1674,34 @@ def run_acceptance_with_token(
         captures.add_canaries(negative.canaries)
         captures.extend(negative.captures)
         receipt_names.extend(negative.receipts)
-        with tempfile.TemporaryDirectory(prefix="aster-agent-process-") as temporary:
+        with registry.private_directory(captures, arguments.timeout_seconds) as temporary:
             temporary_path = Path(temporary)
             temporary_path.chmod(0o700)
             old_token_file = temporary_path / "old-client-token"
             old_token_file.write_bytes(old_token + b"\n")
             old_token_file.chmod(0o600)
 
+            # Keep the client-only publication and ACK out of the crash store.
+            # Reuse the authorized provisioning and listeners sequentially, but
+            # give this peerless fixture its own fresh, privately owned state.
+            recovery_config = temporary_path.resolve() / "client-recovery-config.json"
+            recovery_state = temporary_path.resolve() / "client-recovery-state"
+            recovery_document = _load_config_document(arguments.config)
+            recovery_document["state"]["directory"] = str(recovery_state)
+            recovery_document["mesh"]["peers"] = []
+            _write_private_json(recovery_config, recovery_document)
+            captures.add_canaries((str(recovery_config), str(recovery_state)))
+            agent = start_agent(recovery_config)
+            # On failure the directory scope reaps all owned children before
+            # deleting any state, without replacing the original exception.
+            run_client_only_recovery(agent, call)
+            stop_agent(agent, signal.SIGTERM, 0)
+            receipt_names.append("generated-go-client-only-recovery")
             agent = start_agent()
             publish_request = _publish_request()
             published = call("publish", publish_request).record
+            if published.get("inserted") is not True:
+                raise AcceptanceError("crash-boundary publication was not newly inserted")
             expected_event = _expected_recovered_event(published, publish_request)
             event_id = expected_event["id_hex"]
             stop_agent(agent, signal.SIGKILL, -signal.SIGKILL)
@@ -1720,7 +1856,13 @@ def run_acceptance_with_token(
             )
             receipt_names.append("canary-absence")
     finally:
-        registry.cleanup_all(arguments.timeout_seconds)
+        primary_error = sys.exc_info()[1]
+        try:
+            registry.cleanup_all(arguments.timeout_seconds)
+        except BaseException:
+            if primary_error is None:
+                raise
+            print("DIAGNOSTIC registry_cleanup=failed", file=sys.stderr)
 
     return receipt_names
 

@@ -43,6 +43,277 @@ def run_checker(*arguments: str) -> subprocess.CompletedProcess[str]:
 
 
 class ProcessCheckerContractTests(unittest.TestCase):
+    def test_private_directory_cleanup_and_canary_failures_cannot_pass(self):
+        checker = load_checker()
+        for fault in (None, "cleanup", "canary"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as root:
+                registry = checker.ProcessRegistry()
+                captures = checker.CaptureLedger(["private-output-canary"])
+                process = mock.Mock()
+                process.process.pid = 12345
+                process.combined.return_value = "private-output-canary" if fault == "canary" else ""
+                def cleanup(_timeout):
+                    self.assertTrue((directory / "owned-state").exists())
+                    if fault == "cleanup":
+                        raise checker.AcceptanceError("injected cleanup failure")
+                process.cleanup.side_effect = cleanup
+                with mock.patch.object(checker.tempfile, "tempdir", root):
+                    error = None
+                    try:
+                        with registry.private_directory(captures, 2) as path:
+                            directory = Path(path)
+                            (directory / "owned-state").mkdir()
+                            registry._processes.append(process)
+                    except (checker.AcceptanceError, ValueError) as caught:
+                        error = caught
+                process.cleanup.assert_called_once_with(2)
+                self.assertEqual(directory.exists(), fault == "cleanup")
+                self.assertEqual(registry._processes, [process] if fault == "cleanup" else [])
+                if fault is None:
+                    self.assertIsNone(error)
+                else:
+                    self.assertIsInstance(error, checker.AcceptanceError if fault == "cleanup" else ValueError)
+
+    def test_private_fixture_retains_live_state_when_cleanup_fails(self):
+        for stage in ("shutdown", "readiness", "spawn-interrupt"):
+            with self.subTest(stage=stage):
+                self._exercise_retained_private_fixture(stage)
+
+    def _exercise_retained_private_fixture(self, stage):
+        checker = load_checker()
+        registry = checker.ProcessRegistry()
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            config = root / "agent.json"
+            config.write_text(json.dumps({"state": {"directory": str(root / "state")},
+                                         "mesh": {"peers": []}}))
+            arguments = checker.Arguments(Path("agent"), config, Path("client"), 2)
+            contract = checker.ConfigContract("127.0.0.1:1", "127.0.0.1:2", root / "state",
+                                              root / "token", root / "reference", ())
+            agent = mock.Mock()
+            agent.process.pid = 12345
+            agent.combined.return_value = ""
+            private = []
+            cleanup_observations = []
+            primary = (checker.CheckerInterrupted("injected startup interrupt") if stage == "spawn-interrupt"
+                       else checker.AcceptanceError("injected " + stage + " timeout"))
+            agent.wait.side_effect = primary
+            def spawn(argv):
+                path = Path(argv[-1])
+                state = Path(json.loads(path.read_text())["state"]["directory"])
+                state.mkdir()
+                private.extend((path, state))
+                registry._processes.append(agent)
+                if stage == "spawn-interrupt":
+                    raise primary
+                return agent
+            def cleanup(_timeout):
+                cleanup_observations.append(all(p.exists() for p in private))
+                raise checker.AcceptanceError("injected cleanup failure")
+            agent.cleanup.side_effect = cleanup
+            with mock.patch.object(checker, "ProcessRegistry", return_value=registry), \
+                 mock.patch.object(registry, "spawn", side_effect=spawn), \
+                 mock.patch.object(checker, "_process_canaries", return_value=[]), \
+                 mock.patch.object(checker, "run_negative_startup_checks", return_value=checker.NegativeStartupResult((), (), ())), \
+                 mock.patch.object(checker, "wait_for_readiness", side_effect=primary if stage == "readiness" else None), \
+                 mock.patch.object(checker, "run_client_only_recovery"), \
+                 mock.patch.object(checker.tempfile, "tempdir", str(root)):
+                with self.assertRaises(type(primary)) as caught:
+                    checker.run_acceptance_with_token(arguments, contract, mock.Mock(token=b"test"))
+            self.assertTrue(all(p.exists() for p in private), "live fixture state was deleted")
+            self.assertTrue(all(cleanup_observations), "cleanup ran after state deletion")
+            self.assertIs(caught.exception, primary)
+            self.assertEqual(registry._processes, [agent])
+            recovery = json.loads((private[0].parent / "process-recovery.json").read_text())
+            self.assertEqual(recovery["owned_pids"], [12345])
+
+    def test_client_recovery_does_not_prepopulate_publish_crash_store(self):
+        self._exercise_publish_crash_orchestration()
+
+    def test_publish_crash_boundary_rejects_nonfresh_receipts(self):
+        for inserted in (False, None, 1, "true", "missing"):
+            with self.subTest(inserted=inserted):
+                self._exercise_publish_crash_orchestration(inserted)
+
+    def test_client_recovery_fixture_is_reaped_on_failure(self):
+        for stage in ("readiness", "recovery", "shutdown", "recovery-shutdown", "capture", "spawn-interrupt"):
+            with self.subTest(stage=stage):
+                self._exercise_publish_crash_orchestration(failed_stage=stage)
+
+    def _exercise_publish_crash_orchestration(self, inserted_override: object = True,
+                                             failed_stage=None):
+        # Exercise the real acceptance orchestration, replacing only process I/O.
+        # A per-state operation ledger reproduces idempotent publish replay.
+        checker = load_checker()
+        class CrashBoundaryReached(Exception):
+            pass
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            config = root / "agent.json"
+            original_state = root / "original-state"
+            document = {"state": {"directory": str(original_state)}, "mesh": {"peers": ["test-peer"]}}
+            config.write_text(json.dumps(document))
+            arguments = checker.Arguments(Path("agent"), config, Path("client"), 2)
+            contract = checker.ConfigContract("127.0.0.1:1", "127.0.0.1:2", original_state,
+                                              root / "token", root / "reference", ())
+            registry = checker.ProcessRegistry()
+            registry.spawn = mock.Mock()
+            registry.discard = mock.Mock(wraps=registry.discard)
+            registry.cleanup_all = mock.Mock(wraps=registry.cleanup_all)
+            history = []
+            ledgers = {}
+            agents = []
+
+            def spawn(argv):
+                actual = json.loads(Path(argv[-1]).read_text())
+                state = Path(actual["state"]["directory"])
+                if state != original_state:
+                    self.assertFalse(state.exists())
+                    self.assertEqual(actual, {"state": {"directory": str(state)}, "mesh": {"peers": []}})
+                    self.assertEqual(Path(argv[-1]).stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(Path(argv[-1]).parent.stat().st_mode & 0o777, 0o700)
+                    state.mkdir()
+                if agents:
+                    agents[-1].cleanup.assert_called_once()
+                    registry.discard.assert_called_with(agents[-1])
+                agent = mock.Mock()
+                agent.state = state
+                agent.combined.return_value = ""
+                agent.stdout.text.return_value = ""
+                agent.stderr.text.return_value = ""
+                agent.process.poll.return_value = None
+                agent.wait.return_value = 0
+                if failed_stage in ("shutdown", "recovery-shutdown"):
+                    agent.wait.side_effect = checker.AcceptanceError("injected shutdown timeout")
+                if failed_stage == "capture":
+                    agent.combined.side_effect = ValueError("injected capture failure")
+                def cleanup(_timeout):
+                    self.assertTrue(Path(argv[-1]).is_file())
+                    if state != original_state:
+                        self.assertTrue(state.is_dir())
+                agent.cleanup.side_effect = cleanup
+                def send(process_signal):
+                    history.append(("signal", state, process_signal))
+                    if process_signal == checker.signal.SIGKILL:
+                        raise CrashBoundaryReached()
+                agent.signal.side_effect = send
+                agents.append(agent)
+                registry._processes.append(agent)
+                history.append(("start", state))
+                if failed_stage == "spawn-interrupt":
+                    raise checker.CheckerInterrupted("injected startup interrupt")
+                return agent
+
+            def recovery(agent, call):
+                self.assertIs(agent, agents[-1])
+                if failed_stage in ("recovery", "recovery-shutdown"):
+                    raise checker.AcceptanceError("injected recovery failure")
+                ledgers.setdefault(agent.state, set()).add(checker.FIXED_PUBLISH_OPERATION.hex())
+                history.append(("client-recovery", agent.state))
+
+            def invoke(_captures, _registry, _client, command, _address, _token, _timeout,
+                       request, **_kwargs):
+                self.assertEqual(command, "publish")
+                state = agents[-1].state
+                operations = ledgers.setdefault(state, set())
+                inserted = request["operation_key_hex"] not in operations
+                if inserted_override is not True:
+                    inserted = inserted_override
+                operations.add(request["operation_key_hex"])
+                history.append(("publish", state, inserted))
+                record = {"status": "ok", "inserted": inserted, "event_id_hex": "01" * 32,
+                          "publisher_id_hex": "02" * 32, "publisher_counter": 1,
+                          "event_sequence": 1, "acceptance_marker": 1}
+                if inserted_override == "missing":
+                    del record["inserted"]
+                return checker.ClientResult(0, json.dumps(record), "", record)
+
+            registry.spawn.side_effect = spawn
+            with mock.patch.object(checker, "ProcessRegistry", return_value=registry), \
+                 mock.patch.object(checker, "_process_canaries", return_value=[]), \
+                 mock.patch.object(checker, "run_negative_startup_checks", return_value=checker.NegativeStartupResult((), (), ())), \
+                 mock.patch.object(checker, "wait_for_readiness", side_effect=checker.AcceptanceError("injected readiness failure") if failed_stage == "readiness" else None), \
+                 mock.patch.object(checker, "run_client_only_recovery", side_effect=recovery), \
+                 mock.patch.object(checker, "invoke_client_captured", side_effect=invoke), \
+                 mock.patch.object(checker.time, "sleep", side_effect=AssertionError("delay at crash boundary")):
+                try:
+                    checker.run_acceptance_with_token(arguments, contract, mock.Mock(token=b"test"))
+                except (CrashBoundaryReached, checker.AcceptanceError, checker.CheckerInterrupted, ValueError) as error:
+                    outcome = error
+                else:
+                    self.fail("orchestration passed the crash boundary")
+            if failed_stage is not None:
+                expected = {"shutdown": "injected shutdown timeout", "recovery-shutdown": "injected recovery failure",
+                            "capture": "injected capture failure", "spawn-interrupt": "injected startup interrupt"}
+                self.assertEqual(str(outcome), expected.get(failed_stage, "injected " + failed_stage + " failure"))
+                self.assertEqual(len(agents), 1)
+                agents[0].cleanup.assert_called_once_with(2)
+                registry.discard.assert_called_once_with(agents[0])
+                self.assertTrue(agents[0].combined.called, "failure output was never scanned")
+                return
+            if inserted_override is True:
+                self.assertIsInstance(outcome, CrashBoundaryReached)
+                self.assertEqual(history[-2:], [("publish", original_state, True),
+                                                ("signal", original_state, checker.signal.SIGKILL)])
+            else:
+                self.assertIsInstance(outcome, checker.AcceptanceError,
+                                      "nonfresh publication reached SIGKILL")
+                self.assertEqual(str(outcome), "crash-boundary publication was not newly inserted")
+                self.assertEqual(history[-1], ("publish", original_state, inserted_override))
+            self.assertNotEqual(history[0][1], original_state)
+            self.assertEqual(len(agents), 2)
+            self.assertEqual(json.loads(config.read_text()), document)
+            self.assertEqual(registry.cleanup_all.call_args_list, [mock.call(2), mock.call(2)])
+
+    def test_client_recovery_requires_distinct_processes_and_unchanged_live_agent(self):
+        checker = load_checker()
+        run = getattr(checker, "run_client_only_recovery", None)
+        self.assertTrue(callable(run), "missing client-only recovery scenario")
+        for fault in (None, "same-pid", "receipt-pid", "dead-agent", "replaced-agent", "wrong-event", "short-window", "one-poll", "old-attempt", "bad-retry", "missing-ack", "bad-query"):
+            with self.subTest(fault=fault):
+                process = mock.Mock(pid=100)
+                process.poll.return_value = None
+                agent = mock.Mock(process=process)
+                commands = []
+                first = {"status": "ok", "client_pid": 101, "event_id_hex": "01" * 32,
+                         "publisher_id_hex": "02" * 32, "publisher_counter": 3,
+                         "event_sequence": 4, "acceptance_marker": 5,
+                         "subscription_id_hex": "03" * 32, "attempt": 1,
+                         "exact_match": True, "retry_same_effect": True,
+                         "first_inserted": True, "retry_inserted": False}
+                second = {"status": "ok", "client_pid": 102, "event_id_hex": "01" * 32,
+                          "acceptance_marker": 5, "subscription_id_hex": "03" * 32,
+                          "attempt": 2, "exact_match": True, "acknowledged": True,
+                          "quiet_polls": 11, "quiet_window_ms": 500, "retained_query_exact": True}
+                def call(command, request):
+                    commands.append(command)
+                    if command == "recovery-begin":
+                        self.assertEqual(request["publish"], checker._publish_request())
+                        self.assertNotEqual(request["subscription_operation_key_hex"], checker.FIXED_SUBSCRIBE_OPERATION.hex())
+                        if fault == "bad-retry": first["retry_inserted"] = True
+                        if fault == "dead-agent": process.poll.return_value = 0
+                        if fault == "replaced-agent": agent.process = mock.Mock(pid=100)
+                        return checker.ClientResult(0, json.dumps(first), "", first, pid=101)
+                    self.assertEqual(command, "recovery-resume")
+                    self.assertEqual(request["subscription_id_hex"], first["subscription_id_hex"])
+                    self.assertEqual(request["expected"], checker._expected_recovered_event(first, checker._publish_request()))
+                    pid = 101 if fault == "same-pid" else 102
+                    second["client_pid"] = 999 if fault == "receipt-pid" else pid
+                    if fault == "wrong-event": second["event_id_hex"] = "09" * 32
+                    if fault == "short-window": second["quiet_window_ms"] = 499
+                    if fault == "one-poll": second["quiet_polls"] = 1
+                    if fault == "old-attempt": second["attempt"] = 1
+                    if fault == "missing-ack": second["acknowledged"] = False
+                    if fault == "bad-query": second["retained_query_exact"] = False
+                    return checker.ClientResult(0, json.dumps(second), "", second, pid=pid)
+                if fault is None:
+                    receipt = run(agent, call)
+                    self.assertEqual(receipt["agent_pid"], 100)
+                    self.assertEqual(commands, ["recovery-begin", "recovery-resume"])
+                else:
+                    with self.assertRaises(checker.AcceptanceError):
+                        run(agent, call)
+
     def test_rejects_unbounded_or_missing_process_inputs(self) -> None:
         # Break caught: a zero timeout could turn deployment acceptance into an
         # unbounded wait, while argparse-first validation could hide that bug.
