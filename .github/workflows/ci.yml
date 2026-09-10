@@ -37,8 +37,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      # Runtime environment selection overrides mise.toml in nested mise calls.
-      MISE_PYTHON_VERSION: path:${{ runner.temp }}/aster-ci-python-3.13.7
+
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -46,6 +45,14 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
           submodules: false
+
+      - name: Initialize CI Python selection
+        # runner is unavailable in job env; persist the shell-resolved path
+        # for the build, mise setup action, and all later nested mise calls.
+        run: |
+          : "${RUNNER_TEMP:?CI runner scratch directory is required}"
+          : "${GITHUB_ENV:?GitHub Actions environment output is required}"
+          printf 'MISE_PYTHON_VERSION=path:%s/aster-ci-python-3.13.7\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
       - name: Build exact-source signal-safe Python
         timeout-minutes: 15

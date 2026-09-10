@@ -48,7 +48,13 @@ verification remains enabled.
 
 ## Interpreter consistency, including nested mise
 
-The job declares `MISE_PYTHON_VERSION=path:<runner.temp>/aster-ci-python-3.13.7`.
+After checkout, an initialization run step resolves `$RUNNER_TEMP` and writes
+`MISE_PYTHON_VERSION=path:<RUNNER_TEMP>/aster-ci-python-3.13.7` to `$GITHUB_ENV`
+before the build and mise setup action. GitHub's [context-availability table](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#context-availability)
+does not allow `runner` in job-level `env` (it is allowed in step-level `env`).
+The [environment-file contract](https://docs.github.com/en/actions/reference/workflow-commands-for-github-actions#setting-an-environment-variable)
+makes this selection available to all subsequent steps in the job, not to the
+initialization step itself. No step-local override replaces that selection.
 The install prefix exists before mise runs. `GITHUB_PATH` selects the same
 prefix for direct `python3` commands, but PATH is not the sole override:
 
