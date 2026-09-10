@@ -1,5 +1,9 @@
-use crate::{CustodyRetirementReason, EventTransferId, MAX_EVENT_OPERATION_KEY_BYTES, StoreError};
-use redb::TableDefinition;
+use crate::{
+    CustodyRetirementReason, EventTransferId, MAX_EVENT_OPERATION_KEY_BYTES, METADATA, StoreError,
+};
+use redb::{
+    MultimapTableHandle, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
+};
 use sha2::{Digest, Sha256};
 
 #[allow(dead_code)] // Used by the ledger authority introduced in the following lifecycle slice.
@@ -8,6 +12,21 @@ pub(crate) const EVENT_OPERATION_LEDGER_V3: TableDefinition<&[u8], &[u8]> =
 #[allow(dead_code)] // Used by the ledger authority introduced in the following lifecycle slice.
 pub(crate) const ACTIVE_OPERATION_BY_EVENT_V1: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.active-operation-by-event.v1");
+
+pub(crate) const EVENT_OPERATION_RECORDS_TOTAL: &str = "semantic_event_operation_v3_records_total";
+pub(crate) const EVENT_OPERATION_RECORDS_ACTIVE: &str =
+    "semantic_event_operation_v3_records_active";
+pub(crate) const EVENT_OPERATION_RECORDS_RETIRED: &str =
+    "semantic_event_operation_v3_records_retired";
+pub(crate) const EVENT_OPERATION_REVERSE_ROWS: &str = "semantic_event_operation_v3_reverse_rows";
+pub(crate) const EVENT_OPERATION_LOGICAL_BYTES: &str = "semantic_event_operation_v3_logical_bytes";
+const EVENT_OPERATION_ACCOUNTING_FIELDS: [&str; 5] = [
+    EVENT_OPERATION_RECORDS_TOTAL,
+    EVENT_OPERATION_RECORDS_ACTIVE,
+    EVENT_OPERATION_RECORDS_RETIRED,
+    EVENT_OPERATION_REVERSE_ROWS,
+    EVENT_OPERATION_LOGICAL_BYTES,
+];
 
 pub(crate) const EVENT_OPERATION_ACTIVE_LOGICAL_BYTES: u64 = 98;
 #[allow(dead_code)] // Used by checked ledger accounting in the following lifecycle slice.
@@ -22,6 +41,24 @@ const EVENT_OPERATION_KEY_DOMAIN: &[u8] = b"aster/event-operation-key/v1";
 
 /// Maximum distinct active operation keys that may refer to one Event.
 pub const MAX_EVENT_OPERATION_ALIASES: u64 = 64;
+
+/// Exact logical usage of the permanent mission-bound Event operation ledger.
+///
+/// Logical bytes include each ledger key and value plus active reverse-index
+/// keys. They intentionally exclude redb and filesystem amplification.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EventOperationStats {
+    /// Permanent active plus retired operation records.
+    pub records_total: u64,
+    /// Active records that still resolve to retained Events.
+    pub records_active: u64,
+    /// Permanent compact fences for retired Events.
+    pub records_retired: u64,
+    /// Active reverse-index rows; exactly one per active record.
+    pub reverse_rows: u64,
+    /// Exact fixed-size ledger plus reverse-index logical bytes.
+    pub logical_bytes: u64,
+}
 
 /// A bounded, application-defined idempotency key for one local Event operation.
 ///
@@ -283,10 +320,323 @@ pub(crate) fn checked_event_operation_logical_bytes(
         .ok_or(StoreError::PayloadByteAccountingOverflow)
 }
 
+pub(crate) fn validate_event_operation_stats(stats: EventOperationStats) -> Result<(), StoreError> {
+    let reconstructed_total = stats
+        .records_active
+        .checked_add(stats.records_retired)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    if stats.records_total != reconstructed_total {
+        return Err(StoreError::AccountingMismatch {
+            field: EVENT_OPERATION_RECORDS_TOTAL,
+            durable: stats.records_total,
+            reconstructed: reconstructed_total,
+        });
+    }
+    if stats.reverse_rows != stats.records_active {
+        return Err(StoreError::AccountingMismatch {
+            field: EVENT_OPERATION_REVERSE_ROWS,
+            durable: stats.reverse_rows,
+            reconstructed: stats.records_active,
+        });
+    }
+    let reconstructed_bytes = checked_event_operation_logical_bytes(
+        stats.records_active,
+        stats.records_retired,
+        stats.reverse_rows,
+    )?;
+    if stats.logical_bytes != reconstructed_bytes {
+        return Err(StoreError::AccountingMismatch {
+            field: EVENT_OPERATION_LOGICAL_BYTES,
+            durable: stats.logical_bytes,
+            reconstructed: reconstructed_bytes,
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn checked_admit_event_operation_record(
+    current: EventOperationStats,
+    limits: EventOperationLimits,
+    emergency: bool,
+) -> Result<EventOperationStats, StoreError> {
+    validate_event_operation_stats(current)?;
+    let record_limit = if emergency {
+        limits.max_records()
+    } else {
+        limits.ordinary_record_limit()
+    };
+    let next_total = current
+        .records_total
+        .checked_add(1)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    if next_total > record_limit {
+        return Err(StoreError::EventOperationLimitExceeded {
+            current: current.records_total,
+            limit: record_limit,
+        });
+    }
+
+    let byte_limit = if emergency {
+        limits.max_logical_bytes()
+    } else {
+        limits
+            .max_logical_bytes()
+            .checked_sub(limits.emergency_byte_reserve())
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?
+    };
+    let next_bytes = current
+        .logical_bytes
+        .checked_add(EVENT_OPERATION_EMERGENCY_RECORD_LOGICAL_BYTES)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    if next_bytes > byte_limit {
+        return Err(StoreError::EventOperationByteLimitExceeded {
+            current: current.logical_bytes,
+            incoming: EVENT_OPERATION_EMERGENCY_RECORD_LOGICAL_BYTES,
+            limit: byte_limit,
+        });
+    }
+
+    let next = EventOperationStats {
+        records_total: next_total,
+        records_active: current
+            .records_active
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?,
+        records_retired: current.records_retired,
+        reverse_rows: current
+            .reverse_rows
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?,
+        logical_bytes: next_bytes,
+    };
+    validate_event_operation_stats(next)?;
+    Ok(next)
+}
+
+pub(crate) fn checked_retire_event_operation_records(
+    current: EventOperationStats,
+    records: u64,
+) -> Result<EventOperationStats, StoreError> {
+    validate_event_operation_stats(current)?;
+    let records_active =
+        current
+            .records_active
+            .checked_sub(records)
+            .ok_or(StoreError::SemanticInvariant(
+                "Event operation active-record accounting underflow",
+            ))?;
+    let reverse_rows =
+        current
+            .reverse_rows
+            .checked_sub(records)
+            .ok_or(StoreError::SemanticInvariant(
+                "Event operation reverse-row accounting underflow",
+            ))?;
+    let records_retired = current
+        .records_retired
+        .checked_add(records)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    let logical_bytes =
+        checked_event_operation_logical_bytes(records_active, records_retired, reverse_rows)?;
+    let next = EventOperationStats {
+        records_total: current.records_total,
+        records_active,
+        records_retired,
+        reverse_rows,
+        logical_bytes,
+    };
+    validate_event_operation_stats(next)?;
+    Ok(next)
+}
+
+fn read_event_operation_stats<T>(metadata: &T) -> Result<Option<EventOperationStats>, StoreError>
+where
+    T: ReadableTable<&'static str, u64>,
+{
+    let values = [
+        metadata
+            .get(EVENT_OPERATION_RECORDS_TOTAL)?
+            .map(|value| value.value()),
+        metadata
+            .get(EVENT_OPERATION_RECORDS_ACTIVE)?
+            .map(|value| value.value()),
+        metadata
+            .get(EVENT_OPERATION_RECORDS_RETIRED)?
+            .map(|value| value.value()),
+        metadata
+            .get(EVENT_OPERATION_REVERSE_ROWS)?
+            .map(|value| value.value()),
+        metadata
+            .get(EVENT_OPERATION_LOGICAL_BYTES)?
+            .map(|value| value.value()),
+    ];
+    let present = values.iter().filter(|value| value.is_some()).count();
+    if present == 0 {
+        return Ok(None);
+    }
+    if present != values.len() {
+        let field = EVENT_OPERATION_ACCOUNTING_FIELDS
+            .into_iter()
+            .zip(values)
+            .find_map(|(field, value)| value.is_none().then_some(field))
+            .expect("partial accounting has a missing field");
+        return Err(StoreError::MissingAccountingMetadata { field });
+    }
+    let stats = EventOperationStats {
+        records_total: values[0].expect("checked total counter"),
+        records_active: values[1].expect("checked active counter"),
+        records_retired: values[2].expect("checked retired counter"),
+        reverse_rows: values[3].expect("checked reverse counter"),
+        logical_bytes: values[4].expect("checked logical byte counter"),
+    };
+    validate_event_operation_stats(stats)?;
+    Ok(Some(stats))
+}
+
+pub(crate) fn write_event_operation_stats(
+    metadata: &mut redb::Table<'_, &str, u64>,
+    stats: EventOperationStats,
+) -> Result<(), StoreError> {
+    validate_event_operation_stats(stats)?;
+    metadata.insert(EVENT_OPERATION_RECORDS_TOTAL, stats.records_total)?;
+    metadata.insert(EVENT_OPERATION_RECORDS_ACTIVE, stats.records_active)?;
+    metadata.insert(EVENT_OPERATION_RECORDS_RETIRED, stats.records_retired)?;
+    metadata.insert(EVENT_OPERATION_REVERSE_ROWS, stats.reverse_rows)?;
+    metadata.insert(EVENT_OPERATION_LOGICAL_BYTES, stats.logical_bytes)?;
+    Ok(())
+}
+
+fn audit_event_operation_cardinalities(
+    stats: EventOperationStats,
+    ledger_rows: u64,
+    reverse_rows: u64,
+) -> Result<(), StoreError> {
+    if stats.records_total != ledger_rows {
+        return Err(StoreError::AccountingMismatch {
+            field: EVENT_OPERATION_RECORDS_TOTAL,
+            durable: stats.records_total,
+            reconstructed: ledger_rows,
+        });
+    }
+    if stats.reverse_rows != reverse_rows {
+        return Err(StoreError::AccountingMismatch {
+            field: EVENT_OPERATION_REVERSE_ROWS,
+            durable: stats.reverse_rows,
+            reconstructed: reverse_rows,
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn audit_event_operation_accounting_write(
+    write: &redb::WriteTransaction,
+) -> Result<EventOperationStats, StoreError> {
+    if write.list_multimap_tables()?.any(|table| {
+        table.name() == EVENT_OPERATION_LEDGER_V3.name()
+            || table.name() == ACTIVE_OPERATION_BY_EVENT_V1.name()
+    }) {
+        return Err(StoreError::SemanticInvariant(
+            "Event operation ledger schema has the wrong table kind",
+        ));
+    }
+    let table_names = write
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let ledger_present = table_names.contains(EVENT_OPERATION_LEDGER_V3.name());
+    let reverse_present = table_names.contains(ACTIVE_OPERATION_BY_EVENT_V1.name());
+    let metadata = write.open_table(METADATA)?;
+    let stats = read_event_operation_stats(&metadata)?;
+    match (ledger_present, reverse_present, stats) {
+        (false, false, None) => {
+            drop(metadata);
+            write.open_table(EVENT_OPERATION_LEDGER_V3)?;
+            write.open_table(ACTIVE_OPERATION_BY_EVENT_V1)?;
+            let mut metadata = write.open_table(METADATA)?;
+            let stats = EventOperationStats::default();
+            write_event_operation_stats(&mut metadata, stats)?;
+            Ok(stats)
+        }
+        (true, true, Some(stats)) => {
+            drop(metadata);
+            audit_event_operation_cardinalities(
+                stats,
+                write.open_table(EVENT_OPERATION_LEDGER_V3)?.len()?,
+                write.open_table(ACTIVE_OPERATION_BY_EVENT_V1)?.len()?,
+            )?;
+            Ok(stats)
+        }
+        _ => Err(StoreError::SemanticInvariant(
+            "Event operation ledger schema group is incomplete",
+        )),
+    }
+}
+
+pub(crate) fn inspect_event_operation_accounting_read(
+    read: &redb::ReadTransaction,
+) -> Result<EventOperationStats, StoreError> {
+    if read.list_multimap_tables()?.any(|table| {
+        table.name() == EVENT_OPERATION_LEDGER_V3.name()
+            || table.name() == ACTIVE_OPERATION_BY_EVENT_V1.name()
+    }) {
+        return Err(StoreError::SemanticInvariant(
+            "Event operation ledger schema has the wrong table kind",
+        ));
+    }
+    let table_names = read
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    let ledger_present = table_names.contains(EVENT_OPERATION_LEDGER_V3.name());
+    let reverse_present = table_names.contains(ACTIVE_OPERATION_BY_EVENT_V1.name());
+    let metadata = read.open_table(METADATA)?;
+    let stats = read_event_operation_stats(&metadata)?;
+    if !ledger_present && !reverse_present && stats.is_none() {
+        return Ok(EventOperationStats::default());
+    }
+    if !ledger_present || !reverse_present || stats.is_none() {
+        return Err(StoreError::SemanticInvariant(
+            "Event operation ledger schema group is incomplete",
+        ));
+    }
+    let stats = stats.expect("complete accounting has stats");
+    audit_event_operation_cardinalities(
+        stats,
+        read.open_table(EVENT_OPERATION_LEDGER_V3)?.len()?,
+        read.open_table(ACTIVE_OPERATION_BY_EVENT_V1)?.len()?,
+    )?;
+    Ok(stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CustodyRetirementReason, EventTransferId};
+    use crate::{
+        AggregateStoreUsage, BlobDepotLimits, CustodyRetirementReason, EventStoreStats,
+        EventTransferId, Store, StoreLimits,
+    };
+    use redb::Database;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_ACCOUNTING_TEST_PATH: AtomicU64 = AtomicU64::new(0);
+
+    struct AccountingTestFile(std::path::PathBuf);
+
+    impl AccountingTestFile {
+        fn new(name: &str) -> Self {
+            let sequence = NEXT_ACCOUNTING_TEST_PATH.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "aster-event-operation-{name}-{}-{sequence}.redb",
+                std::process::id()
+            )))
+        }
+    }
+
+    impl Drop for AccountingTestFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 
     const MISSION_A: [u8; 32] = [
         0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae,
@@ -485,5 +835,237 @@ mod tests {
             424
         );
         assert!(checked_event_operation_logical_bytes(u64::MAX, 1, 1).is_err());
+    }
+
+    #[test]
+    fn mission_open_retains_explicit_operation_limits_and_reports_empty_defaults() {
+        let file = AccountingTestFile::new("empty-defaults");
+        let operation_limits =
+            EventOperationLimits::new(100, 20_000, 10).expect("valid operation limits");
+        let store = Store::open_with_limits_and_operation_limits_for_mission(
+            &file.0,
+            StoreLimits::default(),
+            BlobDepotLimits::default(),
+            operation_limits,
+            MISSION_A,
+        )
+        .expect("open with explicit operation limits");
+
+        assert_eq!(store.operation_limits(), operation_limits);
+        assert_eq!(
+            store.event_stats().expect("empty Event stats"),
+            EventStoreStats {
+                operation_stats: EventOperationStats::default(),
+                ..EventStoreStats::default()
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_custom_limits_and_counter_arithmetic_fail_closed() {
+        assert!(EventOperationLimits::new(0, 162, 1).is_err());
+        assert!(EventOperationLimits::new(2, 161, 1).is_err());
+
+        assert!(matches!(
+            validate_event_operation_stats(EventOperationStats {
+                records_total: u64::MAX,
+                records_active: u64::MAX,
+                records_retired: 1,
+                reverse_rows: u64::MAX,
+                logical_bytes: u64::MAX,
+            }),
+            Err(StoreError::ItemCountAccountingOverflow)
+        ));
+        assert!(matches!(
+            checked_retire_event_operation_records(EventOperationStats::default(), 1),
+            Err(StoreError::SemanticInvariant(
+                "Event operation active-record accounting underflow"
+            ))
+        ));
+    }
+
+    #[test]
+    fn active_increment_and_retirement_preserve_exact_ledger_invariants() {
+        let limits = EventOperationLimits::new(3, 486, 1).expect("limits");
+        let first =
+            checked_admit_event_operation_record(EventOperationStats::default(), limits, false)
+                .expect("first ordinary operation");
+        assert_eq!(
+            first,
+            EventOperationStats {
+                records_total: 1,
+                records_active: 1,
+                records_retired: 0,
+                reverse_rows: 1,
+                logical_bytes: 162,
+            }
+        );
+        let second = checked_admit_event_operation_record(first, limits, false)
+            .expect("last ordinary operation");
+        assert!(matches!(
+            checked_admit_event_operation_record(second, limits, false),
+            Err(StoreError::EventOperationLimitExceeded {
+                current: 2,
+                limit: 2,
+            })
+        ));
+        let emergency = checked_admit_event_operation_record(second, limits, true)
+            .expect("reserved emergency operation");
+        assert_eq!(emergency.records_total, 3);
+        assert_eq!(emergency.logical_bytes, 486);
+
+        let retired = checked_retire_event_operation_records(emergency, 2)
+            .expect("compact two active records");
+        assert_eq!(
+            retired,
+            EventOperationStats {
+                records_total: 3,
+                records_active: 1,
+                records_retired: 2,
+                reverse_rows: 1,
+                logical_bytes: 296,
+            }
+        );
+    }
+
+    #[test]
+    fn reopen_rejects_operation_counter_cardinality_mismatch() {
+        let file = AccountingTestFile::new("cardinality-mismatch");
+        let limits = EventOperationLimits::new(100, 20_000, 10).expect("limits");
+        {
+            let store = Store::open_with_limits_and_operation_limits_for_mission(
+                &file.0,
+                StoreLimits::default(),
+                BlobDepotLimits::default(),
+                limits,
+                MISSION_A,
+            )
+            .expect("create operation store");
+            let write = store.database.begin_write().expect("begin ledger fixture");
+            {
+                let fingerprint = [0x61; 32];
+                let transfer_id = EventTransferId::new([0x62; 32]);
+                write
+                    .open_table(EVENT_OPERATION_LEDGER_V3)
+                    .expect("ledger")
+                    .insert(
+                        fingerprint.as_slice(),
+                        encode_event_operation_ledger_record(EventOperationLedgerRecord::Active {
+                            intent_digest: [0x63; 32],
+                            transfer_id,
+                        })
+                        .as_slice(),
+                    )
+                    .expect("insert ledger row");
+                write
+                    .open_table(ACTIVE_OPERATION_BY_EVENT_V1)
+                    .expect("reverse")
+                    .insert(
+                        encode_active_operation_by_event_key(transfer_id, fingerprint).as_slice(),
+                        [].as_slice(),
+                    )
+                    .expect("insert reverse row");
+                let mut metadata = write.open_table(crate::METADATA).expect("metadata");
+                write_event_operation_stats(
+                    &mut metadata,
+                    EventOperationStats {
+                        records_total: 1,
+                        records_active: 1,
+                        records_retired: 0,
+                        reverse_rows: 1,
+                        logical_bytes: 162,
+                    },
+                )
+                .expect("write exact counters");
+            }
+            write.commit().expect("commit ledger fixture");
+        }
+
+        {
+            let database = Database::open(&file.0).expect("open raw database");
+            let write = database.begin_write().expect("begin counter corruption");
+            write
+                .open_table(crate::METADATA)
+                .expect("metadata")
+                .insert(EVENT_OPERATION_RECORDS_TOTAL, 2)
+                .expect("inflate total counter");
+            write.commit().expect("commit counter corruption");
+        }
+
+        assert!(matches!(
+            Store::open_with_limits_and_operation_limits_for_mission(
+                &file.0,
+                StoreLimits::default(),
+                BlobDepotLimits::default(),
+                limits,
+                MISSION_A,
+            ),
+            Err(StoreError::AccountingMismatch {
+                field: EVENT_OPERATION_RECORDS_TOTAL,
+                durable: 2,
+                reconstructed: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn v3_operation_rows_do_not_consume_aggregate_store_limits() {
+        let file = AccountingTestFile::new("dedicated-aggregate");
+        let store = Store::open_with_limits_and_operation_limits_for_mission(
+            &file.0,
+            StoreLimits::new(1, 1).expect("ordinary limits"),
+            BlobDepotLimits::default(),
+            EventOperationLimits::new(100, 20_000, 10).expect("operation limits"),
+            MISSION_A,
+        )
+        .expect("create operation store");
+        let write = store.database.begin_write().expect("begin ledger fixture");
+        {
+            let fingerprint = [0x71; 32];
+            let transfer_id = EventTransferId::new([0x72; 32]);
+            write
+                .open_table(EVENT_OPERATION_LEDGER_V3)
+                .expect("ledger")
+                .insert(
+                    fingerprint.as_slice(),
+                    encode_event_operation_ledger_record(EventOperationLedgerRecord::Active {
+                        intent_digest: [0x73; 32],
+                        transfer_id,
+                    })
+                    .as_slice(),
+                )
+                .expect("insert ledger row");
+            write
+                .open_table(ACTIVE_OPERATION_BY_EVENT_V1)
+                .expect("reverse")
+                .insert(
+                    encode_active_operation_by_event_key(transfer_id, fingerprint).as_slice(),
+                    [].as_slice(),
+                )
+                .expect("insert reverse row");
+            let mut metadata = write.open_table(crate::METADATA).expect("metadata");
+            write_event_operation_stats(
+                &mut metadata,
+                EventOperationStats {
+                    records_total: 1,
+                    records_active: 1,
+                    records_retired: 0,
+                    reverse_rows: 1,
+                    logical_bytes: 162,
+                },
+            )
+            .expect("write exact counters");
+        }
+        write.commit().expect("commit ledger fixture");
+
+        assert_eq!(
+            store.aggregate_usage().expect("ordinary aggregate usage"),
+            AggregateStoreUsage::default()
+        );
+        let stats = store.event_stats().expect("Event stats");
+        assert_eq!(stats.operation_stats.records_total, 1);
+        assert_eq!(stats.operation_stats.logical_bytes, 162);
+        assert_eq!(stats.operations, 1);
+        assert_eq!(stats.operation_bytes, 162);
     }
 }

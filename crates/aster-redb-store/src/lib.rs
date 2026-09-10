@@ -16,11 +16,15 @@
 //! or control namespace. Semantic mutation requires a live strong capability from
 //! `aster-core`, while persisted decoded metadata is only structurally audited.
 //! [`StoreLimits`] bound aggregate redb rows and encoded bytes across the
-//! accounted logical namespaces; selector/delivery/custody ledgers have separate
-//! caps, while accepted-dot and causal-frontier aggregate retirement remains an
-//! explicit open boundary. [`BlobDepotLimits`] separately bound durable depot import/chunk
-//! rows and redb-marked chunk-file bytes, without claiming a bound on untracked
-//! filesystem allocation.
+//! accounted logical namespaces. Permanent schema-v3 Event operations are
+//! excluded from that ordinary quota and bounded by [`EventOperationLimits`],
+//! while legacy Event-operation rows remain ordinary-accounted until atomic
+//! migration makes v3 authoritative. Both quotas remain part of deployment's
+//! total logical state-allocation calculation. Selector/delivery/custody ledgers
+//! have separate caps, while accepted-dot and causal-frontier aggregate
+//! retirement remains an explicit open boundary. [`BlobDepotLimits`] separately
+//! bound durable depot import/chunk rows and redb-marked chunk-file bytes, without
+//! claiming a bound on untracked filesystem allocation.
 
 #![forbid(unsafe_code)]
 
@@ -28,6 +32,7 @@ mod blob;
 mod blob_subscription;
 mod bridge_event;
 mod custody;
+#[allow(dead_code)] // Ledger codec/delta pieces become authoritative in Tasks 3-5.
 mod event_operation;
 mod record_subscription;
 mod state_subscription;
@@ -36,7 +41,9 @@ pub use blob::*;
 pub use blob_subscription::*;
 pub use bridge_event::*;
 pub use custody::*;
-pub use event_operation::{EventOperationKey, EventOperationLimits, MAX_EVENT_OPERATION_ALIASES};
+pub use event_operation::{
+    EventOperationKey, EventOperationLimits, EventOperationStats, MAX_EVENT_OPERATION_ALIASES,
+};
 pub use record_subscription::*;
 pub use state_subscription::*;
 
@@ -401,13 +408,16 @@ impl MutableTransferCursorMode {
 /// Validated durable admission limits for one store.
 ///
 /// Both limits count aggregate legacy opaque rows, accepted exact source-sealed
-/// Event, State, Record, and signed Blob representations, durable selected-store
-/// operation mappings, route-only cache entries, exact controls, canonical
-/// local control-publication intents, and opaque selected Event bridge
-/// authorizations, deduplicated sources, wrappers, and route metadata. Physical
-/// Blob-depot files are governed by [`BlobDepotLimits`] instead of being
-/// double-counted here. Unmarked or hostile untracked filesystem allocation and
-/// filesystem/redb overhead remain outside these logical admission claims.
+/// Event, State, Record, and signed Blob representations, durable State, Record,
+/// Blob, and not-yet-migrated legacy Event operation mappings, route-only cache
+/// entries, exact controls, canonical local control-publication intents, and
+/// opaque selected Event bridge authorizations, deduplicated sources, wrappers,
+/// and route metadata. Permanent schema-v3 Event operations are governed by
+/// [`EventOperationLimits`] instead, but remain part of deployment's total state
+/// allocation. Physical Blob-depot files are governed by [`BlobDepotLimits`]
+/// instead of being double-counted here. Unmarked or hostile untracked filesystem
+/// allocation and filesystem/redb overhead remain outside these logical
+/// admission claims.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoreLimits {
     max_items: u64,
@@ -2945,9 +2955,17 @@ pub struct EventStoreStats {
     pub retiring_route_cached: u64,
     /// Exact bytes retained in the route-only cache.
     pub route_cached_bytes: u64,
-    /// Durable idempotent Event operation mappings.
+    /// Exact permanent Event operation ledger accounting.
+    pub operation_stats: EventOperationStats,
+    /// Deprecated compatibility mirror of the authoritative operation row count.
+    ///
+    /// Before legacy migration this continues to report legacy rows. Once v3 is
+    /// authoritative it mirrors [`Self::operation_stats.records_total`].
     pub operations: u64,
-    /// Aggregate operation-key plus operation-record bytes.
+    /// Deprecated compatibility mirror of authoritative operation logical bytes.
+    ///
+    /// Before legacy migration this continues to report legacy encoded bytes.
+    /// Once v3 is authoritative it mirrors [`Self::operation_stats.logical_bytes`].
     pub operation_bytes: u64,
 }
 
@@ -4871,6 +4889,7 @@ pub struct Store {
     backing_identity: StoreBackingIdentity,
     limits: StoreLimits,
     blob_depot_limits: BlobDepotLimits,
+    operation_limits: EventOperationLimits,
     mission_authority: Option<NodeId>,
     live: AtomicBool,
     blob_depot_lock: std::sync::Mutex<()>,
@@ -5254,6 +5273,7 @@ impl Store {
             path,
             StoreLimits::default(),
             BlobDepotLimits::default(),
+            EventOperationLimits::DEFAULT,
             Some(binding.mission_authority),
             Some(expectation),
         )?;
@@ -5280,6 +5300,29 @@ impl Store {
         path: impl AsRef<Path>,
         limits: StoreLimits,
         blob_depot_limits: BlobDepotLimits,
+        mission_authority: NodeId,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_limits_and_operation_limits_for_mission(
+            path,
+            limits,
+            blob_depot_limits,
+            EventOperationLimits::DEFAULT,
+            mission_authority,
+        )
+    }
+
+    /// Opens a mission-bound store with explicit ordinary, physical Blob-depot,
+    /// and permanent Event-operation ledger limits.
+    ///
+    /// The Event-operation logical-byte limit remains part of the deployment's
+    /// total state-allocation preflight even though schema-v3 operation rows do
+    /// not consume [`StoreLimits`]. Existing legacy operation rows remain
+    /// ordinary-accounted until migration makes the v3 ledger authoritative.
+    pub fn open_with_limits_and_operation_limits_for_mission(
+        path: impl AsRef<Path>,
+        limits: StoreLimits,
+        blob_depot_limits: BlobDepotLimits,
+        operation_limits: EventOperationLimits,
         mission_authority: NodeId,
     ) -> Result<Self, StoreError> {
         let path = path.as_ref();
@@ -5309,6 +5352,7 @@ impl Store {
             path,
             limits,
             blob_depot_limits,
+            operation_limits,
             Some(mission_authority),
             None,
         )?;
@@ -5410,6 +5454,7 @@ impl Store {
             path.as_ref(),
             limits,
             BlobDepotLimits::default(),
+            EventOperationLimits::DEFAULT,
             None,
             None,
         )
@@ -5419,6 +5464,7 @@ impl Store {
         path: &Path,
         limits: StoreLimits,
         blob_depot_limits: BlobDepotLimits,
+        operation_limits: EventOperationLimits,
         expected_mission_authority: Option<NodeId>,
         expected_security_profile_policy: Option<SecurityProfilePolicyExpectation>,
     ) -> Result<Self, StoreError> {
@@ -5535,6 +5581,7 @@ impl Store {
         // migration while this exact writer transaction can still roll back.
         blob::depot::prepare_depot_owner_token_write(&write, &path)?;
         let blob_stats = audit_semantic_tables(&write, limits)?;
+        let operation_stats = event_operation::audit_event_operation_accounting_write(&write)?;
         let blob_depot_owner_token = blob::depot::depot_owner_token_write(&write)?;
         blob::depot::bind_depot_owner_write(
             &write,
@@ -5558,6 +5605,7 @@ impl Store {
                 || write.open_table(blob::BLOB_CHUNKS)?.len()? != 0
                 || write.open_table(ROUTE_CACHE)?.len()? != 0
                 || write.open_table(CONTROL_RECORDS)?.len()? != 0
+                || operation_stats.records_total != 0
                 || bridge_event_stats.aggregate_items()? != 0
                 || mutable_transfer_cursors.rows != 0)
         {
@@ -5607,6 +5655,7 @@ impl Store {
             backing_identity,
             limits,
             blob_depot_limits,
+            operation_limits,
             mission_authority,
             live: AtomicBool::new(true),
             blob_depot_lock: std::sync::Mutex::new(()),
@@ -5624,6 +5673,11 @@ impl Store {
     /// Returns the admission limits active on this handle.
     pub const fn limits(&self) -> StoreLimits {
         self.limits
+    }
+
+    /// Returns the permanent Event-operation ledger limits active on this handle.
+    pub const fn operation_limits(&self) -> EventOperationLimits {
+        self.operation_limits
     }
 
     /// Returns exact logical usage charged against this handle's aggregate
@@ -5817,6 +5871,7 @@ impl Store {
             backing_identity,
             limits: _,
             blob_depot_limits: _,
+            operation_limits: _,
             mission_authority: _,
             live: _,
             blob_depot_lock: _,
@@ -9357,12 +9412,12 @@ impl Store {
                 )
                 .ok_or(StoreError::PayloadByteAccountingOverflow)?;
         }
-        let mut operation_bytes = 0u64;
+        let mut legacy_operation_bytes = 0u64;
         for row in operations.iter()? {
             let (key, value) = row?;
             EventOperationKey::new(key.value().to_vec())?;
             decode_operation_record(value.value())?;
-            operation_bytes = operation_bytes
+            legacy_operation_bytes = legacy_operation_bytes
                 .checked_add(
                     key.value()
                         .len()
@@ -9372,6 +9427,13 @@ impl Store {
                 )
                 .ok_or(StoreError::PayloadByteAccountingOverflow)?;
         }
+        let operation_stats = event_operation::inspect_event_operation_accounting_read(&read)?;
+        let legacy_operations = operations.len()?;
+        let (operations, operation_bytes) = if legacy_operations == 0 {
+            (operation_stats.records_total, operation_stats.logical_bytes)
+        } else {
+            (legacy_operations, legacy_operation_bytes)
+        };
         let stats = EventStoreStats {
             events: live_events,
             retiring_events,
@@ -9381,7 +9443,8 @@ impl Store {
             route_cached: route_cache.len()?,
             retiring_route_cached,
             route_cached_bytes,
-            operations: operations.len()?,
+            operation_stats,
+            operations,
             operation_bytes,
         };
         for (field, durable, reconstructed) in [
@@ -9425,14 +9488,14 @@ impl Store {
                 metadata
                     .get(EVENT_OPERATION_COUNT)?
                     .map_or(0, |value| value.value()),
-                stats.operations,
+                legacy_operations,
             ),
             (
                 EVENT_OPERATION_TOTAL_BYTES,
                 metadata
                     .get(EVENT_OPERATION_TOTAL_BYTES)?
                     .map_or(0, |value| value.value()),
-                stats.operation_bytes,
+                legacy_operation_bytes,
             ),
         ] {
             if durable != reconstructed {
@@ -22013,6 +22076,7 @@ fn inspect_semantic_readable(
         .list_tables()?
         .map(|table| table.name().to_owned())
         .collect::<std::collections::BTreeSet<_>>();
+    let operation_stats = event_operation::inspect_event_operation_accounting_read(read)?;
     let acceptance_order_present = table_names.contains(EVENT_ACCEPTANCE_ORDER.name());
     let semantic_tables = [
         EVENTS.name(),
@@ -22034,7 +22098,7 @@ fn inspect_semantic_readable(
         .filter(|name| table_names.contains(**name))
         .count();
     if present == 0 {
-        if acceptance_order_present {
+        if acceptance_order_present || operation_stats != EventOperationStats::default() {
             return Err(StoreError::SemanticInvariant(
                 "mission-scoped Event schema is incomplete",
             ));
@@ -22661,6 +22725,7 @@ fn inspect_semantic_readable(
             || blob_stats.publications != 0
             || blob_stats.variants != 0
             || blob_stats.committed_chunks != 0
+            || operation_stats.records_total != 0
             || route_count != 0)
     {
         return Err(StoreError::SemanticInvariant(
@@ -22677,8 +22742,17 @@ fn inspect_semantic_readable(
         route_cached: route_count,
         retiring_route_cached: 0,
         route_cached_bytes: route_bytes,
-        operations: operation_count,
-        operation_bytes,
+        operation_stats,
+        operations: if operation_count == 0 {
+            operation_stats.records_total
+        } else {
+            operation_count
+        },
+        operation_bytes: if operation_count == 0 {
+            operation_stats.logical_bytes
+        } else {
+            operation_bytes
+        },
     };
     for (field, reconstructed) in [
         (SEMANTIC_ITEM_COUNT, stats.events),
@@ -22689,8 +22763,8 @@ fn inspect_semantic_readable(
         ),
         (ROUTE_CACHE_ITEM_COUNT, stats.route_cached),
         (ROUTE_CACHE_TOTAL_BYTES, stats.route_cached_bytes),
-        (EVENT_OPERATION_COUNT, stats.operations),
-        (EVENT_OPERATION_TOTAL_BYTES, stats.operation_bytes),
+        (EVENT_OPERATION_COUNT, operation_count),
+        (EVENT_OPERATION_TOTAL_BYTES, operation_bytes),
         (EVENT_TOMBSTONE_OPERATION_COUNT, tombstone_operation_count),
         (
             EVENT_TOMBSTONE_OPERATION_TOTAL_BYTES,
