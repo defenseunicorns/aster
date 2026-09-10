@@ -23,6 +23,7 @@ use aster_node::{
     NodeBootstrapError, NodeBootstrapErrorKind, NodeConfig, NodeConfigOptions, NodeError,
     SourceInterestSelector, start_node,
 };
+use aster_profile::ItemId;
 use aster_redb_store::{Store, ZeroizationIntent};
 
 static ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -157,6 +158,22 @@ struct RecordingSecretLoader {
     returned_operation: ProvisioningLoadId,
     returned_secret_ref: ProvisioningSecretRef,
     plaintext: Option<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct RejectingSecretLoader {
+    calls: usize,
+}
+
+impl ProvisioningSecretLoader for RejectingSecretLoader {
+    fn load(
+        &mut self,
+        _operation: ProvisioningLoadId,
+        _secret_ref: &ProvisioningSecretRef,
+    ) -> Result<ProvisioningLoadReceipt, ProvisioningSecretStoreError> {
+        self.calls += 1;
+        Err(ProvisioningSecretStoreError::Rejected)
+    }
 }
 
 impl RecordingSecretLoader {
@@ -582,6 +599,73 @@ fn terminal_state_precedes_protected_provider_and_secret_loader_without_mutation
         before,
         "terminal preflight must not mutate the selected store"
     );
+}
+
+#[test]
+fn rejected_secret_loader_precedes_repair_required_store_recovery() {
+    const CHILD_STORE_ENV: &str = "ASTER_PROTECTED_RUNTIME_REPAIR_STORE";
+    if let Some(store_path) = std::env::var_os(CHILD_STORE_ENV) {
+        let mission = UnprotectedReferenceMission::from_bytes(canonical_mission_bytes())
+            .expect("parse repair-child mission");
+        let store = Store::open_for_mission(store_path, mission.mission_authority_id())
+            .expect("open repair-child store");
+        store
+            .apply(
+                ItemId::new([0x91; 32]),
+                b"committed before abrupt protected bootstrap",
+            )
+            .expect("commit repair-child row");
+        std::process::exit(86);
+    }
+
+    let root = TestRoot::new("repair-before-rejection");
+    let state = root.path().join("selected-state");
+    fs::create_dir(&state).expect("create repair-required state root");
+    let store_path = state.join("mesh.redb");
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .arg("--exact")
+        .arg("rejected_secret_loader_precedes_repair_required_store_recovery")
+        .arg("--nocapture")
+        .arg("--test-threads=1")
+        .env(CHILD_STORE_ENV, &store_path)
+        .output()
+        .expect("run abrupt protected-runtime store child");
+    assert_eq!(
+        output.status.code(),
+        Some(86),
+        "abrupt child failed unexpectedly: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(matches!(
+        Store::inspect_zeroization_state(&store_path),
+        Err(ref error) if error.is_read_only_repair_required()
+    ));
+    let before = fs::read(&store_path).expect("read repair-required store before rejection");
+
+    let operation = ProvisioningLoadId::new([0x92; 32]);
+    let secret_ref = ProvisioningSecretRef::from_opaque(b"repair-secret-reference".to_vec())
+        .expect("repair secret reference");
+    let mut loader = RejectingSecretLoader::default();
+    let error = bootstrap_error(NodeConfig::open_secret_ref(
+        &state,
+        &secret_ref,
+        operation,
+        valid_options(),
+        &mut loader,
+    ));
+
+    assert_eq!(error.kind(), NodeBootstrapErrorKind::Rejected);
+    assert_eq!(loader.calls, 1);
+    let after = fs::read(&store_path).expect("read repair-required store after rejection");
+    assert!(
+        after == before,
+        "provider rejection must leave repair-required state byte-for-byte unchanged"
+    );
+    assert!(matches!(
+        Store::inspect_zeroization_state(&store_path),
+        Err(ref error) if error.is_read_only_repair_required()
+    ));
 }
 
 #[test]

@@ -12,8 +12,9 @@ use std::{
 use aster_agent::{BoundAgent, ClientToken, proto::aster::application::v1alpha1 as api};
 use aster_node::mission::UnprotectedReferenceMission;
 use aster_node::{MutableSourceInterests, NodeApplication, NodeConfig, start_node};
+use buffa::{Message as _, MessageName as _};
 use connectrpc::{
-    ErrorCode, Protocol,
+    ConnectError, ErrorCode, Protocol,
     client::{ClientConfig, Http2Connection, HttpClient},
 };
 
@@ -42,6 +43,51 @@ impl Drop for TestState {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+fn decode_base64(value: &str) -> Vec<u8> {
+    fn sextet(byte: u8) -> u8 {
+        match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => panic!("invalid base64 fixture"),
+        }
+    }
+
+    let mut decoded = Vec::new();
+    for chunk in value.as_bytes().chunks(4) {
+        let a = sextet(chunk[0]);
+        let b = sextet(chunk[1]);
+        decoded.push((a << 2) | (b >> 4));
+        if chunk.len() > 2 && chunk[2] != b'=' {
+            let c = sextet(chunk[2]);
+            decoded.push((b << 4) | (c >> 2));
+            if chunk.len() > 3 && chunk[3] != b'=' {
+                decoded.push((c << 6) | sextet(chunk[3]));
+            }
+        }
+    }
+    decoded
+}
+
+fn assert_authentication_error(error: &ConnectError, expected_type_url: &str) {
+    assert_eq!(error.code, ErrorCode::Unauthenticated);
+    assert_eq!(error.message.as_deref(), Some("authentication failed"));
+    assert_eq!(error.details.len(), 1);
+    let wire_detail = &error.details[0];
+    assert_eq!(wire_detail.type_url, expected_type_url);
+    assert!(wire_detail.debug.is_none());
+    let detail = api::PublicErrorDetail::decode_from_slice(&decode_base64(
+        wire_detail.value.as_deref().expect("encoded public detail"),
+    ))
+    .expect("decodable public authentication detail");
+    assert_eq!(detail.reason, api::PublicErrorReason::AuthenticationFailed);
+    assert_eq!(detail.operation, "unspecified");
+    assert!(!detail.retryable);
+    assert_eq!(detail.retry_delay_ms, None);
 }
 
 #[test]
@@ -86,7 +132,7 @@ fn connect_client_uses_the_real_live_event_authority() {
             .get_status(api::GetStatusRequest::default())
             .await
             .expect_err("missing credentials must fail");
-        assert_eq!(error.code, ErrorCode::Unauthenticated);
+        assert_authentication_error(&error, api::PublicErrorDetail::FULL_NAME);
         let mut unauthenticated_stream = unauthenticated_client
             .stream_events(api::StreamEventsRequest {
                 subscription_id: vec![0; 32],
@@ -101,14 +147,36 @@ fn connect_client_uses_the_real_live_event_authority() {
             .message()
             .await
             .expect_err("missing streaming credentials must fail");
-        assert_eq!(stream_error.code, ErrorCode::Unauthenticated);
+        assert_authentication_error(&stream_error, api::PublicErrorDetail::FULL_NAME);
 
         let base_uri = format!("http://{address}");
+        let unauthenticated_grpc_web = api::AsterApplicationServiceClient::new(
+            HttpClient::plaintext(),
+            ClientConfig::new(base_uri.parse().expect("gRPC-Web client URI"))
+                .with_protocol(Protocol::GrpcWeb),
+        );
+        let error = unauthenticated_grpc_web
+            .get_status(api::GetStatusRequest::default())
+            .await
+            .expect_err("missing gRPC-Web credentials must fail");
+        assert_authentication_error(&error, api::PublicErrorDetail::TYPE_URL);
+
         let grpc =
             Http2Connection::connect_plaintext(base_uri.parse().expect("gRPC transport URI"))
                 .await
                 .expect("connect gRPC HTTP/2 transport")
                 .shared(32);
+        let unauthenticated_grpc = api::AsterApplicationServiceClient::new(
+            grpc.clone(),
+            ClientConfig::new(base_uri.parse().expect("unauthenticated gRPC client URI"))
+                .with_protocol(Protocol::Grpc),
+        );
+        let error = unauthenticated_grpc
+            .get_status(api::GetStatusRequest::default())
+            .await
+            .expect_err("missing gRPC credentials must fail");
+        assert_authentication_error(&error, api::PublicErrorDetail::TYPE_URL);
+
         let client = api::AsterApplicationServiceClient::new(
             grpc,
             ClientConfig::new(base_uri.parse().expect("gRPC client URI"))

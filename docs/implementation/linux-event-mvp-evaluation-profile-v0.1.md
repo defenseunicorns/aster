@@ -289,6 +289,8 @@ The exact initial v0.1 provider binding is:
 - provider = `aster-systemd-credential-store/v2`
 - design = [`docs/superpowers/specs/2026-09-08-raspberry-pi-systemd-credential-provider-v2-design.md`](../superpowers/specs/2026-09-08-raspberry-pi-systemd-credential-provider-v2-design.md)
 - design_digest = `sha256:30c5dfe71a203fcdd69dd330f9b5c68eeaee5032b624ee41912aa4723a9f853f`
+- presentation_amendment = [`docs/superpowers/specs/2026-09-09-systemd-257-credential-presentation-amendment.md`](../superpowers/specs/2026-09-09-systemd-257-credential-presentation-amendment.md)
+- presentation_amendment_digest = `sha256:549ea3fd5bdfd62c01bab5a8f1adac4b84a2710ab406ea006119c9048e28d4cd`
 - systemd = `257.13-1~deb13u1`
 
 The provider uses `systemd-creds` and `LoadCredentialEncrypted=` with explicit
@@ -298,9 +300,10 @@ statically composed runtime loader, and the root-operated
 fallback provider selection are excluded.
 Internal approval of this exact provider selection and bound design digest was
 recorded for the profile definition on 2026-09-08. D06 is resolved for the
-profile definition. Security and deployment approvals of that exact record
-remain mandatory candidate gate E01; provider implementation and qualification
-remain later gates.
+profile definition. Product approval to implement and validate the exact
+systemd 257 credential-presentation amendment was recorded on 2026-09-09.
+Security and Deployment approvals of both immutable records remain mandatory
+candidate gate E01; provider qualification remains a later gate.
 
 This provider selection makes no generic Debian or Debian-family support claim.
 If final review requires another platform, D06 must be reopened and the

@@ -3723,7 +3723,7 @@ fn require_blob_apply_capacity_read(
     }
 
     let aggregate = read.open_table(METADATA)?;
-    let total = aggregate_usage(&aggregate)?;
+    let total = aggregate_usage_from_metadata(&aggregate)?;
     if total
         .items
         .checked_add(1)

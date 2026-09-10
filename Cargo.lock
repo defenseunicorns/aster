@@ -275,17 +275,28 @@ dependencies = [
 name = "aster-agent"
 version = "0.1.0"
 dependencies = [
+ "aster-core",
+ "aster-iroh",
  "aster-node",
+ "aster-redb-store",
+ "aster-systemd-credentials",
  "buffa",
+ "bytes",
  "connectrpc",
  "connectrpc-build",
  "futures",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "rustix",
  "serde",
  "serde_json",
  "subtle",
  "tokio",
+ "tower",
+ "tower-service",
  "zeroize",
 ]
 
@@ -444,6 +455,17 @@ dependencies = [
  "redb",
  "rustix",
  "sha2 0.11.0",
+]
+
+[[package]]
+name = "aster-systemd-credentials"
+version = "0.1.0"
+dependencies = [
+ "aster-core",
+ "getrandom 0.4.3",
+ "rustix",
+ "sha2 0.11.0",
+ "zeroize",
 ]
 
 [[package]]
