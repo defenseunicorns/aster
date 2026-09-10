@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -393,6 +394,59 @@ func TestStatusEvidenceRequiresProfileCapacityContract(t *testing.T) {
 		if receipt["operation_active_rows"] != uint64(24) || receipt["operation_retired_rows"] != uint64(1_000) || receipt["operation_rolling_accept_rate"] != float64(2) || receipt["operation_estimated_seconds_to_exhaustion"] != uint64(494_488) {
 			t.Fatalf("ledger observation lost: %#v", receipt)
 		}
+	}
+}
+
+func TestOperationHealthRequiresCoherentRateEstimate(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		rows     uint64
+		rate     float64
+		estimate uint64
+		valid    bool
+	}{
+		{"exact", 1_024, 2, 494_488, true},
+		{"positive-rate-zero", 1_024, 2, 0, false},
+		{"positive-rate-one", 1_024, 2, 1, false},
+		{"positive-rate-max", 1_024, 2, math.MaxUint64, false},
+		{"one-second-low", 1_024, 2, 494_487, false},
+		{"one-second-high", 1_024, 2, 494_489, false},
+		{"fraction-round-up", 1_024, 3, 329_659, true},
+		{"subsecond", 1_024, 1_977_952, 1, true},
+		{"subsecond-zero", 1_024, 1_977_952, 0, false},
+		{"quotient-overflow", 1_024, math.SmallestNonzeroFloat64, math.MaxUint64, true},
+		{"quotient-overflow-not-saturated", 1_024, math.SmallestNonzeroFloat64, math.MaxUint64 - 1, false},
+		{"maximum-rate", 1_024, math.MaxFloat64, 1, true},
+		{"zero-rate", 1_024, 0, 0, true},
+		{"zero-rate-estimate", 1_024, 0, 1, false},
+		{"negative-rate", 1_024, -1, 0, false},
+		{"nan-rate", 1_024, math.NaN(), 0, false},
+		{"infinite-rate", 1_024, math.Inf(1), 0, false},
+		{"negative-infinite-rate", 1_024, math.Inf(-1), 0, false},
+		{"non-actor-rate-below-two", 1_024, math.Nextafter(2, 0), 494_489, true},
+		// 69/60 is rounded on the wire: direct floating ceil is one too high.
+		{"actor-rate-exact-ceiling", 1_092, 69.0 / 60.0, 859_920, true},
+		{"actor-rate-float-ceiling-rejected", 1_092, 69.0 / 60.0, 859_921, false},
+		{"zero-headroom", 990_000, 2, 0, true},
+		{"zero-headroom-estimate", 990_000, 2, 1, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			operations := &applicationv1alpha1.PublishOperationCapacityStatus{
+				Rows: test.rows, ActiveRows: 24, RetiredRows: test.rows - 24, ReverseRows: 24,
+				Bytes:             3_888 + (test.rows-24)*67,
+				OrdinaryRemaining: 990_000 - test.rows, EmergencyRemaining: 10_000,
+				RollingAcceptRate: test.rate, EstimatedSecondsToExhaustion: test.estimate,
+				WarningState: applicationv1alpha1.OperationCapacityWarning_OPERATION_CAPACITY_WARNING_OK,
+				Audit:        &applicationv1alpha1.OperationLedgerAuditStatus{State: applicationv1alpha1.OperationLedgerAudit_OPERATION_LEDGER_AUDIT_PENDING},
+			}
+			if test.rows == 990_000 {
+				operations.WarningState = applicationv1alpha1.OperationCapacityWarning_OPERATION_CAPACITY_WARNING_EXHAUSTED
+			}
+			_, _, err := operationHealth(operations)
+			if (err == nil) != test.valid {
+				t.Fatalf("estimate accepted=%v; want %v", err == nil, test.valid)
+			}
+		})
 	}
 }
 

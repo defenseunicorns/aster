@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/bits"
 	"net/http"
 	"net/url"
 	"os"
@@ -487,8 +488,8 @@ func operationHealth(operations *applicationv1alpha1.PublishOperationCapacitySta
 	} else if operations.Rows >= (ordinaryRecords*70+99)/100 || operations.Bytes >= (ordinaryBytes*70+99)/100 {
 		warning, warningName = applicationv1alpha1.OperationCapacityWarning_OPERATION_CAPACITY_WARNING_WARNING, "warning"
 	}
-	if operations.WarningState != warning || math.IsNaN(operations.RollingAcceptRate) || math.IsInf(operations.RollingAcceptRate, 0) || operations.RollingAcceptRate < 0 ||
-		((operations.RollingAcceptRate == 0 || ordinary == 0) && operations.EstimatedSecondsToExhaustion != 0) {
+	estimate, validRate := operationEstimate(ordinary, operations.RollingAcceptRate)
+	if operations.WarningState != warning || !validRate || operations.EstimatedSecondsToExhaustion != estimate {
 		return "", "", invalid
 	}
 	audit := operations.Audit
@@ -515,6 +516,38 @@ func operationHealth(operations *applicationv1alpha1.PublishOperationCapacitySta
 		return "", "", invalid
 	}
 	return warningName, auditName, nil
+}
+
+func operationEstimate(remaining uint64, rate float64) (uint64, bool) {
+	if math.IsNaN(rate) || math.IsInf(rate, 0) || rate < 0 {
+		return 0, false
+	}
+	if rate == 0 || remaining == 0 {
+		return 0, true
+	}
+	// The actor emits count/60 as a double but computes its ceiling in integers.
+	// Recover exactly round-tripping counts to avoid a spurious extra second
+	// (e.g. remaining=988908, rate=69/60). No epsilon or adjacent estimate passes.
+	count := math.Round(rate * 60)
+	if count >= 1 && count < float64(math.MaxUint64) && float64(uint64(count))/60 == rate {
+		accepted := uint64(count)
+		hi, lo := bits.Mul64(remaining, 60)
+		if hi >= accepted {
+			return math.MaxUint64, true
+		}
+		seconds, remainder := bits.Div64(hi, lo, accepted)
+		if remainder != 0 && seconds != math.MaxUint64 {
+			seconds++
+		}
+		return seconds, true
+	}
+	// Other finite positive wire rates use ceil(remaining/rate). Check overflow
+	// before conversion; positive headroom below one second still reports one.
+	seconds := math.Ceil(float64(remaining) / rate)
+	if seconds >= float64(math.MaxUint64) {
+		return math.MaxUint64, true
+	}
+	return max(1, uint64(seconds)), true
 }
 
 func runCommand(ctx context.Context, client applicationv1alpha1.AsterApplicationServiceClient, command, token string, input io.Reader, output io.Writer) error {

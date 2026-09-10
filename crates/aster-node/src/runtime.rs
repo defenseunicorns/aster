@@ -2645,8 +2645,8 @@ struct SelectedEventStatusTracker {
 }
 
 /// Actor-local observations only: restart starts an empty fixed 60-second
-/// window. Entries at exactly now - 60 seconds have expired. Publication prunes
-/// old entries; allocation can retain the peak window size until actor restart.
+/// window. Entries at exactly now - 60 seconds have expired. Publication and
+/// status snapshots prune old entries; allocation can retain peak window size.
 /// Retries add no entries, keys, fingerprints, or Event contents.
 #[derive(Default)]
 struct EventOperationAcceptRate {
@@ -2657,23 +2657,26 @@ impl EventOperationAcceptRate {
     const WINDOW_SECONDS: u64 = 60;
 
     fn record(&mut self, now: tokio::time::Instant, count: u64) {
-        while self.commits.front().is_some_and(|(at, _)| {
-            now.saturating_duration_since(*at) >= Duration::from_secs(Self::WINDOW_SECONDS)
-        }) {
-            self.commits.pop_front();
-        }
+        self.prune(now);
         if count != 0 {
             self.commits.push_back((now, count));
         }
     }
 
-    fn snapshot(&self, now: tokio::time::Instant, remaining: u64) -> (f64, u64) {
+    fn prune(&mut self, now: tokio::time::Instant) {
+        while self.commits.front().is_some_and(|(at, _)| {
+            now.saturating_duration_since(*at) >= Duration::from_secs(Self::WINDOW_SECONDS)
+        }) {
+            self.commits.pop_front();
+        }
+    }
+
+    fn snapshot(&mut self, now: tokio::time::Instant, remaining: u64) -> (f64, u64) {
+        self.prune(now);
         let count = self
             .commits
             .iter()
-            .filter(|(at, _)| {
-                *at <= now && now.duration_since(*at) < Duration::from_secs(Self::WINDOW_SECONDS)
-            })
+            .filter(|(at, _)| *at <= now)
             .fold(0u64, |total, (_, count)| total.saturating_add(*count));
         if count == 0 {
             return (0.0, 0);
@@ -2868,7 +2871,7 @@ impl SelectedEventStatusTracker {
     }
 
     fn snapshot(
-        &self,
+        &mut self,
         store: &Store,
         current: &EventReplicationPolicySnapshot,
         failed_contact_attempts: usize,

@@ -245,3 +245,30 @@ fn operation_rate_counts_committed_active_alias_and_direct_retired_fences_once()
     drop(store);
     fs::remove_dir_all(state).unwrap();
 }
+
+#[test]
+fn operation_rate_snapshot_removes_expired_samples_during_quiet_period() {
+    let now = tokio::time::Instant::now();
+    let mut rate = EventOperationAcceptRate::default();
+    rate.record(now, 7);
+    rate.record(now + Duration::from_secs(30), 3);
+    assert_eq!(
+        rate.snapshot(now + Duration::from_secs(60), 2),
+        (3.0 / 60.0, 40)
+    );
+    assert_eq!(
+        rate.commits.len(),
+        1,
+        "snapshot must remove the exact 60-second-old sample"
+    );
+    assert_eq!(rate.snapshot(now + Duration::from_secs(91), 2), (0.0, 0));
+    assert!(
+        rate.commits.is_empty(),
+        "quiet status must not retain expired entries to scan again"
+    );
+    rate.record(now + Duration::from_secs(92), 4);
+    assert_eq!(
+        rate.snapshot(now + Duration::from_secs(93), 1),
+        (4.0 / 60.0, 15)
+    );
+}

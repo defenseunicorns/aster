@@ -643,10 +643,8 @@ fn operation_health(
     if operations.ordinary_remaining != capacity.ordinary_remaining
         || operations.emergency_remaining != capacity.emergency_remaining
         || operations.warning_state != expected_warning
-        || !operations.rolling_accept_rate.is_finite()
-        || operations.rolling_accept_rate < 0.0
-        || ((operations.rolling_accept_rate == 0.0 || capacity.ordinary_remaining == 0)
-            && operations.estimated_seconds_to_exhaustion != 0)
+        || operation_estimate(capacity.ordinary_remaining, operations.rolling_accept_rate)
+            != Some(operations.estimated_seconds_to_exhaustion)
     {
         return Err(FixtureError::Local);
     }
@@ -662,6 +660,31 @@ fn operation_health(
         _ => return Err(FixtureError::Local),
     };
     Ok((warning, audit_name))
+}
+
+fn operation_estimate(remaining: u64, rate: f64) -> Option<u64> {
+    if !rate.is_finite() || rate < 0.0 {
+        return None;
+    }
+    if rate == 0.0 || remaining == 0 {
+        return Some(0);
+    }
+    // The actor emits count/60 as a double but computes its ceiling in integers.
+    // Recover exactly round-tripping counts to avoid a spurious extra second
+    // (e.g. remaining=988908, rate=69/60). No epsilon or adjacent estimate passes.
+    let count = (rate * 60.0).round();
+    if count >= 1.0 && count < u64::MAX as f64 && (count as u64) as f64 / 60.0 == rate {
+        let seconds = (u128::from(remaining) * 60).div_ceil(u128::from(count as u64));
+        return Some(u64::try_from(seconds).unwrap_or(u64::MAX));
+    }
+    // Other finite positive wire rates use ceil(remaining/rate). Explicitly
+    // saturate quotient overflow, including infinity produced by division.
+    let seconds = (remaining as f64 / rate).ceil();
+    Some(if seconds >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        (seconds as u64).max(1)
+    })
 }
 
 #[derive(Deserialize)]
@@ -1135,6 +1158,91 @@ mod tests {
             .get_or_insert_default()
             .profile_boundary = 2_048;
         assert!(status_evidence(&invalid).is_err());
+    }
+
+    #[test]
+    fn operation_health_requires_coherent_rate_estimate() {
+        for (name, rows, rate, estimate, valid) in [
+            ("exact", 1_024, 2.0, 494_488, true),
+            ("positive-rate-zero", 1_024, 2.0, 0, false),
+            ("positive-rate-one", 1_024, 2.0, 1, false),
+            ("positive-rate-max", 1_024, 2.0, u64::MAX, false),
+            ("one-second-low", 1_024, 2.0, 494_487, false),
+            ("one-second-high", 1_024, 2.0, 494_489, false),
+            ("fraction-round-up", 1_024, 3.0, 329_659, true),
+            ("subsecond", 1_024, 1_977_952.0, 1, true),
+            ("subsecond-zero", 1_024, 1_977_952.0, 0, false),
+            (
+                "quotient-overflow",
+                1_024,
+                f64::from_bits(1),
+                u64::MAX,
+                true,
+            ),
+            (
+                "quotient-overflow-not-saturated",
+                1_024,
+                f64::from_bits(1),
+                u64::MAX - 1,
+                false,
+            ),
+            ("maximum-rate", 1_024, f64::MAX, 1, true),
+            ("zero-rate", 1_024, 0.0, 0, true),
+            ("zero-rate-estimate", 1_024, 0.0, 1, false),
+            ("negative-rate", 1_024, -1.0, 0, false),
+            ("nan-rate", 1_024, f64::NAN, 0, false),
+            ("infinite-rate", 1_024, f64::INFINITY, 0, false),
+            ("negative-infinite-rate", 1_024, f64::NEG_INFINITY, 0, false),
+            (
+                "non-actor-rate-below-two",
+                1_024,
+                2.0_f64.next_down(),
+                494_489,
+                true,
+            ),
+            // 69/60 is rounded on the wire: direct floating ceil is one too high.
+            (
+                "actor-rate-exact-ceiling",
+                1_092,
+                69.0 / 60.0,
+                859_920,
+                true,
+            ),
+            (
+                "actor-rate-float-ceiling-rejected",
+                1_092,
+                69.0 / 60.0,
+                859_921,
+                false,
+            ),
+            ("zero-headroom", 990_000, 2.0, 0, true),
+            ("zero-headroom-estimate", 990_000, 2.0, 1, false),
+        ] {
+            let operations = api::PublishOperationCapacityStatus {
+                rows,
+                active_rows: 24,
+                retired_rows: rows - 24,
+                reverse_rows: 24,
+                bytes: 3_888 + (rows - 24) * 67,
+                ordinary_remaining: 990_000 - rows,
+                emergency_remaining: 10_000,
+                rolling_accept_rate: rate,
+                estimated_seconds_to_exhaustion: estimate,
+                warning_state: if rows == 990_000 {
+                    api::OperationCapacityWarning::Exhausted
+                } else {
+                    api::OperationCapacityWarning::Ok
+                }
+                .into(),
+                audit: api::OperationLedgerAuditStatus {
+                    state: api::OperationLedgerAudit::Pending.into(),
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            };
+            assert_eq!(operation_health(&operations).is_ok(), valid, "{name}");
+        }
     }
 
     #[test]
