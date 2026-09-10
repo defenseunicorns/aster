@@ -720,3 +720,163 @@ fn migration_corrupt_v2_intent_and_missing_v1_metadata_preserve_all_tables() {
         );
     }
 }
+
+struct MigrationDepotRoot(PathBuf);
+
+impl MigrationDepotRoot {
+    fn new() -> Self {
+        let path = TestFile::new("migration physical depot")
+            .0
+            .with_extension("directory");
+        std::fs::create_dir(&path).expect("create isolated fixture directory");
+        Self(path)
+    }
+}
+
+impl Drop for MigrationDepotRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn migration_missing_physical_depot_marker_preserves_the_complete_legacy_image() {
+    let root = MigrationDepotRoot::new();
+    let file = TestFile(root.0.join("store.redb"));
+    let mut services = event_services(0x7c);
+    let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+    accept_local_finite_event(&store, &mut services, 1, b"payload", 10_000, SAMPLE);
+    drop(store.blob_depot().expect("establish physical owner marker"));
+    let write = store.database.begin_write().expect("released fixture");
+    // Exercise the durable-token fast path that precedes physical validation.
+    assert_ne!(
+        blob::depot::depot_owner_token_write(&write).expect("durable owner token"),
+        [0; 32]
+    );
+    remove_v3(&write);
+    write.commit().expect("commit released legacy image");
+    drop(store);
+    let marker = root.0.join("blob-depot-v1/.aster-store-owner-v1");
+    let saved_marker = root.0.join("owner-marker.saved");
+    std::fs::rename(&marker, &saved_marker).expect("withhold exact owner marker");
+    let before = legacy_snapshot(&file.0);
+    let error = Store::open_for_mission(&file.0, services.authority)
+        .err()
+        .expect("missing owner marker must reject open");
+    assert!(matches!(
+        error,
+        StoreError::Blob(BlobStoreError::DepotIntegrity(
+            "fixed Blob depot root is missing its owner marker"
+        ))
+    ));
+    assert!(
+        !marker.exists(),
+        "failed open must not repair the owner marker"
+    );
+    assert!(
+        legacy_snapshot(&file.0) == before,
+        "physical depot validation failed after committing the legacy operation migration"
+    );
+    std::fs::rename(&saved_marker, &marker).expect("restore exact fixture marker");
+    assert_migrated(&file, services.authority, 1, 0, 162);
+}
+
+#[test]
+fn migration_clears_nonzero_legacy_tombstone_operation_counters() {
+    let file = TestFile::new("migration tombstone operation");
+    let mut services = event_services(0x7d);
+    let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+    let policy = store.control_policy_snapshot().expect("policy");
+    let operation = EventOperationKey::new(vec![0x82, 1]).expect("operation key");
+    let reservation = store
+        .reserve_event_with_policy(
+            &policy,
+            services.publisher.identity(),
+            &event_topic(),
+            &event_scope(),
+        )
+        .expect("reservation");
+    let header = reservation
+        .header(Priority::Routine, b"deleted".to_vec(), None, 0, true, 1)
+        .expect("tombstone header");
+    let intent = event_publication_intent(&header, b"");
+    let request = EventOperationRequest::new(&operation, &intent, b"", None).expect("request");
+    let sealed = services
+        .publisher
+        .seal_event(&header, b"")
+        .expect("seal tombstone");
+    let event = content_event(&mut services.reader, &sealed.bytes);
+    let transfer = match store
+        .commit_reserved_event_once_with_policy(
+            &policy,
+            &request,
+            &reservation,
+            &event,
+            &sealed.bytes,
+        )
+        .expect("publish tombstone")
+    {
+        EventOnceOutcome::Inserted { transfer_id, .. } => transfer_id,
+        outcome => panic!("unexpected publication outcome: {outcome:?}"),
+    };
+    let write = store
+        .database
+        .begin_write()
+        .expect("released tombstone fixture");
+    remove_v3(&write);
+    {
+        let metadata = write.open_table(METADATA).expect("metadata");
+        assert_eq!(
+            metadata
+                .get(EVENT_TOMBSTONE_OPERATION_COUNT)
+                .expect("count")
+                .expect("counter")
+                .value(),
+            1
+        );
+        // Two raw key bytes plus the 98-byte v2 record, without a predecessor.
+        assert_eq!(
+            metadata
+                .get(EVENT_TOMBSTONE_OPERATION_TOTAL_BYTES)
+                .expect("bytes")
+                .expect("counter")
+                .value(),
+            100
+        );
+    }
+    let expected_intent = write
+        .open_table(EVENT_OPERATIONS)
+        .expect("operations")
+        .get(operation.as_bytes())
+        .expect("row")
+        .expect("tombstone operation")
+        .value()[66..98]
+        .to_vec();
+    write.commit().expect("commit released tombstone fixture");
+    drop(store);
+    assert_migrated(&file, services.authority, 1, 0, 162);
+    let reopened = Store::open_for_mission(&file.0, services.authority).expect("reopen tombstone");
+    assert!(
+        reopened
+            .get_event(transfer)
+            .expect("Event")
+            .expect("retained tombstone")
+            .header
+            .tombstone
+    );
+    let read = reopened.database.begin_read().expect("read v3");
+    let row = read
+        .open_table(EVENT_OPERATION_LEDGER_V3)
+        .expect("ledger")
+        .iter()
+        .expect("rows")
+        .next()
+        .expect("tombstone record")
+        .expect("row")
+        .1
+        .value()
+        .to_vec();
+    assert_eq!(&row[..2], &[1, 1]);
+    assert_eq!(&row[2..34], &expected_intent);
+    assert_eq!(&row[34..], transfer.as_bytes());
+}

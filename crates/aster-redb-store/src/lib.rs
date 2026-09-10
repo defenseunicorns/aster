@@ -5661,6 +5661,20 @@ impl Store {
             ));
         }
         custody::audit_custody_tables_write(&write, limits, mission_authority)?;
+        if operation_migration.is_some() {
+            // A failed physical audit must not leave a committed operation
+            // migration behind. Keep all fallible depot validation/reclaim in
+            // this same transaction for the bounded legacy conversion. The
+            // token/binding checks above forbid adopting an existing root with
+            // a newly generated owner token; this audit never creates a root.
+            blob::depot::audit_depot_write(
+                &write,
+                &path,
+                backing_identity,
+                blob_depot_owner_token,
+                blob_stats,
+            )?;
+        }
         #[cfg(test)]
         if operation_migration.is_some() && event_operation::MIGRATION_TEST_FAULT.get() == 2 {
             return Err(StoreError::SemanticInvariant(
@@ -5669,11 +5683,13 @@ impl Store {
         }
         write.commit()?;
 
-        // Persist the database-specific owner token before installing its
-        // crash-safe filesystem peer. Physical inspection and reclaim remain
-        // mission-bound effects, and the second exact writer transaction
-        // rechecks terminal and mission truth before touching the depot.
-        if let Some(authority) = mission_authority {
+        // Opens without an operation migration retain the separate physical
+        // audit after persisting their database owner token. The second exact
+        // writer transaction rechecks terminal and mission truth before depot
+        // effects. A migration already completed this audit before its commit.
+        if operation_migration.is_none()
+            && let Some(authority) = mission_authority
+        {
             let physical = database.begin_write()?;
             enforce_live_write(&physical)?;
             check_expected_mission_binding(&physical, authority)?;
