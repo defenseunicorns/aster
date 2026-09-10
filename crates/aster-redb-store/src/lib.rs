@@ -28,6 +28,7 @@ mod blob;
 mod blob_subscription;
 mod bridge_event;
 mod custody;
+mod event_operation;
 mod record_subscription;
 mod state_subscription;
 
@@ -35,6 +36,7 @@ pub use blob::*;
 pub use blob_subscription::*;
 pub use bridge_event::*;
 pub use custody::*;
+pub use event_operation::{EventOperationKey, EventOperationLimits};
 pub use record_subscription::*;
 pub use state_subscription::*;
 
@@ -1039,32 +1041,6 @@ impl ControlInventory {
                 .copied()
                 .map(ControlTransferId::reconciliation_item_id),
         )
-    }
-}
-
-/// A bounded, application-defined idempotency key for one local Event operation.
-///
-/// The key is durable and maps to exactly one accepted source Event. A caller
-/// should namespace the bytes by application and operation kind. Reactive work
-/// can append the authenticated predecessor's semantic item identifier.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct EventOperationKey(Vec<u8>);
-
-impl EventOperationKey {
-    /// Validates a nonempty bounded operation key.
-    pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, StoreError> {
-        let bytes = bytes.into();
-        if bytes.is_empty() || bytes.len() > MAX_EVENT_OPERATION_KEY_BYTES {
-            return Err(StoreError::InvalidEventOperationKey {
-                length: bytes.len(),
-            });
-        }
-        Ok(Self(bytes))
-    }
-
-    /// Returns the exact durable key bytes.
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
     }
 }
 
