@@ -361,6 +361,128 @@ func TestDurationLateWakeDoesNotDispatchAfterDeclaredEnd(t *testing.T) {
 	}
 }
 
+// Hold a worker at its pre-dispatch clock read. Once the scheduler has admitted
+// its final slot it drains without reading the clock, so the gate is unambiguous.
+type dispatchGateClock struct {
+	*manualClock
+	gateMu           sync.Mutex
+	armed            bool
+	skip             int
+	entered, release chan struct{}
+}
+
+func (c *dispatchGateClock) Now() time.Time {
+	c.gateMu.Lock()
+	block := false
+	if c.armed {
+		if c.skip > 0 {
+			c.skip--
+		} else {
+			c.armed = false
+			block = true
+		}
+	}
+	c.gateMu.Unlock()
+	if block {
+		close(c.entered)
+		<-c.release
+	}
+	return c.manualClock.Now()
+}
+
+func TestTerminalCauseSurvivesAdmittedWorkerWakingAfterDuration(t *testing.T) {
+	o, _ := parseOptions(validArgs())
+	o.duration = 6 * time.Second
+	o.interval = 2 * time.Second
+	o.slots = 3
+	o.concurrency = 3
+	c := &dispatchGateClock{manualClock: &manualClock{now: time.Unix(0, 0), waiting: make(chan *manualTimer, 10)}, entered: make(chan struct{}), release: make(chan struct{})}
+	started := make(chan uint64, 3)
+	terminal := make(chan struct{})
+	cancelled := make(chan struct{})
+	done := make(chan receipt, 1)
+	go func() {
+		done <- execute(context.Background(), o, c, func(ctx context.Context, i uint64) result {
+			started <- i
+			if i == 0 {
+				<-terminal
+				return result{kind: "rejected", reason: "state_unavailable", terminal: true, measured: true}
+			}
+			if i == 1 {
+				<-ctx.Done()
+				close(cancelled)
+				return result{kind: "transport", measured: true}
+			}
+			return result{kind: "accepted", inserted: true, measured: true}
+		})
+	}()
+	if <-started != 0 {
+		t.Fatal("first slot")
+	}
+	c.advance(<-c.waiting, 2*time.Second)
+	if <-started != 1 {
+		t.Fatal("second slot")
+	}
+	tick := <-c.waiting
+	c.gateMu.Lock()
+	c.armed = true
+	c.skip = 1
+	c.gateMu.Unlock()
+	c.advance(tick, 2*time.Second)
+	<-c.entered
+	close(terminal)
+	// Worker 1 cannot observe this cancellation until execute has accounted
+	// worker 0's terminal result and cancelled the shared execution context.
+	<-cancelled
+	c.manualClock.mu.Lock()
+	c.manualClock.now = c.manualClock.now.Add(4 * time.Second)
+	c.manualClock.mu.Unlock()
+	close(c.release)
+	r := <-done
+	if r.StopReason != "state_unavailable" || r.Counts.Terminal != 1 || r.Counts.Rejected != 1 || r.Counts.Transport != 1 || r.Counts.Attempted != 2 || r.Counts.Completed != 2 || r.Counts.Skipped != 1 || r.Counts.Scheduled != 3 || r.Counts.Unscheduled != 0 {
+		t.Fatalf("late worker replaced first terminal cause or accounting: reason=%s counts=%+v", r.StopReason, r.Counts)
+	}
+	select {
+	case <-started:
+		t.Fatal("late worker dispatched a request")
+	default:
+	}
+	if r.Counts.Scheduled+r.Counts.Unscheduled != 3 || r.Counts.Skipped+r.Counts.Attempted != r.Counts.Scheduled {
+		t.Fatal("schedule equation failed")
+	}
+}
+
+func TestLateNotDispatchedResultPreservesTerminalUnscheduledSlots(t *testing.T) {
+	o, _ := parseOptions(validArgs())
+	o.slots = 5
+	c := &manualClock{now: time.Unix(0, 0), waiting: make(chan *manualTimer, 10)}
+	started := make(chan uint64, 2)
+	terminal := make(chan struct{})
+	done := make(chan receipt, 1)
+	go func() {
+		done <- execute(context.Background(), o, c, func(ctx context.Context, i uint64) result {
+			started <- i
+			if i == 0 {
+				<-terminal
+				return result{kind: "rejected", reason: "state_unavailable", terminal: true, measured: true}
+			}
+			<-ctx.Done()
+			return result{kind: "not_dispatched", reason: "duration_elapsed", measured: true}
+		})
+	}()
+	<-started
+	c.advance(<-c.waiting, o.interval)
+	<-started
+	close(terminal)
+	r := <-done
+	if r.StopReason != "state_unavailable" || r.Counts.Terminal != 1 || r.Counts.Scheduled != 2 || r.Counts.Unscheduled != 3 || r.Counts.Skipped != 1 || r.Counts.Attempted != 1 || r.Counts.Completed != 1 {
+		t.Fatalf("drained non-dispatch changed terminal schedule: reason=%s counts=%+v", r.StopReason, r.Counts)
+	}
+	if r.Counts.Scheduled+r.Counts.Unscheduled != 5 || r.Counts.Skipped+r.Counts.Attempted != r.Counts.Scheduled {
+		t.Fatal("schedule equation failed")
+	}
+}
+
 func TestOutputRejectsUnsafeAncestorAndSubstitutedStaging(t *testing.T) {
 	root := t.TempDir()
 	_ = os.Chmod(root, 0777)

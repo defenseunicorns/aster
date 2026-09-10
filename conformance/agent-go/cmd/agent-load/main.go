@@ -499,11 +499,13 @@ func execute(ctx context.Context, o options, c clock, publish func(context.Conte
 		if v.kind == "not_dispatched" {
 			r.Counts.Attempted--
 			r.Counts.Skipped++
-			stopped = true
-			r.StopReason = v.reason
-			stopWorkers()
-			r.Counts.Skipped += p.limit - p.scheduled
-			p.scheduled = p.limit
+			if !stopped {
+				stopped = true
+				r.StopReason = v.reason
+				stopWorkers()
+				r.Counts.Skipped += p.limit - p.scheduled
+				p.scheduled = p.limit
+			}
 			return
 		}
 		r.Counts.Completed++
