@@ -100,14 +100,14 @@ The Linux quality lane now uses default test parallelism. Narrow isolation in
 individual process fixtures remains. Investigate errors before weakening
 zero-error assertions or increasing carrier deadlines.
 
-Local validation on 2026-09-08:
+Historical local validation on 2026-09-08:
 
 | Run | Environment and result |
 |---|---|
 | Contention diagnostic, network code `34699e8` | macOS ARM64, 18 logical CPUs, four CPU-load workers, four test threads per binary: three rounds passed; 102 Iroh and 33 selected node/progress test executions. |
 | Contention diagnostic, network code `a0b7154` | Linux ARM64 container, two CPUs, two CPU-load workers, four test threads per binary: three rounds passed; 102 Iroh and 33 selected node/progress test executions. |
-| Complete `mise run check` with prerequisites and descriptor wrapper | Passed in an isolated full clone at `b746307`: formatting, policy/trace checks, Clippy, Rust workspace, real application smokes, conformance, Python bindings, all 202 lab tests, and Go bindings. |
-| Parallel Linux workspace with prerequisites and descriptor wrapper | 1,226 passed, seven existing ignored tests. Rust 1.97.1, default test parallelism, owner-only creation mask, test/dev debug info disabled. The approximately 2-GB VM required one build job and the pinned Rust image's bundled LLVM linker; these build settings did not serialize tests. |
+| Complete `mise run check` with the then-staged integration set and descriptor wrapper | Passed in an isolated full clone at `b746307`: formatting, policy/trace checks, Clippy, Rust workspace, real application smokes, conformance, Python bindings, all 202 lab tests, and Go bindings. |
+| Parallel Linux workspace with the then-staged integration set and descriptor wrapper | 1,226 passed, seven existing ignored tests. Rust 1.97.1, default test parallelism, owner-only creation mask, test/dev debug info disabled. The approximately 2-GB VM required one build job and the pinned Rust image's bundled LLVM linker; these build settings did not serialize tests. |
 
 For the complete local gate, use a full clone: the signed-source lab checks
 require a real `.git` directory and reject linked worktree metadata. When
@@ -115,14 +115,21 @@ sharing `CARGO_TARGET_DIR`, also make the built FFI library available at the
 checkout's expected `target/debug` path for the Python and Go binding checks.
 The validation clone used an owner-only creation mask (`umask 077`).
 
-The network branch must integrate after the existing
-`fix/mission-lock-lifetime` (`cc98ae7`), `fix/binding-semantic-version`
-(`422cd89`), and `fix/ci-secure-umask` (`25a7ccf`) fixes. They remain separate
-changes. The combined validation checkout applies them to network code
-`a0b7154`, plus descriptor-budget change `e13a030`. Without the lock fix, a
-parallel macOS run reached 258 passing node tests and two provisioning failures;
-with it, all 262 node tests passed. The ordinary relay deadlines and
-zero-contact-error assertions remain intact.
+The binding semantic-version and secure-umask fixes are now part of `main`.
+The 2026-09-08 combined validation checkout also contained an experimental
+mission-lock change while investigating two provisioning failures. That
+historical composition is not a prerequisite for this network branch, and the
+mission-lock change remains separately paused for ownership-contract review.
+
+On 2026-09-10 this branch was composed with `main` at merge commit `28c7d26`
+without the mission-lock change. Focused validation through the owner-only CI
+shell passed the direct-Iroh Blob convergence/restart test in 11.5 seconds and
+the State/Record convergence/resolution test in 28.6 seconds. Five Blob-progress
+watchdog tests, three mutable-convergence watchdog tests, and both
+authorization-before-write tests also passed. Formatting, descriptor-wrapper
+syntax and behavior, and contention-runner parsing passed. This focused result
+does not replace the required hosted CI run on the composed branch. The
+ordinary relay deadlines and zero-contact-error assertions remain intact.
 
 The Linux image was the repository's existing pinned Rust image,
 `rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97`.
