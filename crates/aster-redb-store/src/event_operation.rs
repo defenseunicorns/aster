@@ -615,7 +615,6 @@ mod tests {
         AggregateStoreUsage, BlobDepotLimits, CustodyRetirementReason, EventStoreStats,
         EventTransferId, Store, StoreLimits,
     };
-    use redb::Database;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ACCOUNTING_TEST_PATH: AtomicU64 = AtomicU64::new(0);
@@ -928,10 +927,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reopen_rejects_operation_counter_cardinality_mismatch() {
-        let file = AccountingTestFile::new("cardinality-mismatch");
-        let limits = EventOperationLimits::new(100, 20_000, 10).expect("limits");
+    fn write_single_active_operation_fixture(
+        file: &AccountingTestFile,
+        limits: EventOperationLimits,
+        stats: EventOperationStats,
+        include_reverse_row: bool,
+    ) {
         {
             let store = Store::open_with_limits_and_operation_limits_for_mission(
                 &file.0,
@@ -957,40 +958,40 @@ mod tests {
                         .as_slice(),
                     )
                     .expect("insert ledger row");
-                write
-                    .open_table(ACTIVE_OPERATION_BY_EVENT_V1)
-                    .expect("reverse")
-                    .insert(
-                        encode_active_operation_by_event_key(transfer_id, fingerprint).as_slice(),
-                        [].as_slice(),
-                    )
-                    .expect("insert reverse row");
+                if include_reverse_row {
+                    write
+                        .open_table(ACTIVE_OPERATION_BY_EVENT_V1)
+                        .expect("reverse")
+                        .insert(
+                            encode_active_operation_by_event_key(transfer_id, fingerprint)
+                                .as_slice(),
+                            [].as_slice(),
+                        )
+                        .expect("insert reverse row");
+                }
                 let mut metadata = write.open_table(crate::METADATA).expect("metadata");
-                write_event_operation_stats(
-                    &mut metadata,
-                    EventOperationStats {
-                        records_total: 1,
-                        records_active: 1,
-                        records_retired: 0,
-                        reverse_rows: 1,
-                        logical_bytes: 162,
-                    },
-                )
-                .expect("write exact counters");
+                write_event_operation_stats(&mut metadata, stats).expect("write exact counters");
             }
             write.commit().expect("commit ledger fixture");
         }
+    }
 
-        {
-            let database = Database::open(&file.0).expect("open raw database");
-            let write = database.begin_write().expect("begin counter corruption");
-            write
-                .open_table(crate::METADATA)
-                .expect("metadata")
-                .insert(EVENT_OPERATION_RECORDS_TOTAL, 2)
-                .expect("inflate total counter");
-            write.commit().expect("commit counter corruption");
-        }
+    #[test]
+    fn reopen_rejects_ledger_cardinality_mismatch_after_counter_validation() {
+        let file = AccountingTestFile::new("ledger-cardinality-mismatch");
+        let limits = EventOperationLimits::new(100, 20_000, 10).expect("limits");
+        write_single_active_operation_fixture(
+            &file,
+            limits,
+            EventOperationStats {
+                records_total: 2,
+                records_active: 1,
+                records_retired: 1,
+                reverse_rows: 1,
+                logical_bytes: 229,
+            },
+            true,
+        );
 
         assert!(matches!(
             Store::open_with_limits_and_operation_limits_for_mission(
@@ -1004,6 +1005,39 @@ mod tests {
                 field: EVENT_OPERATION_RECORDS_TOTAL,
                 durable: 2,
                 reconstructed: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn reopen_rejects_reverse_cardinality_mismatch_after_ledger_cardinality_passes() {
+        let file = AccountingTestFile::new("reverse-cardinality-mismatch");
+        let limits = EventOperationLimits::new(100, 20_000, 10).expect("limits");
+        write_single_active_operation_fixture(
+            &file,
+            limits,
+            EventOperationStats {
+                records_total: 1,
+                records_active: 1,
+                records_retired: 0,
+                reverse_rows: 1,
+                logical_bytes: 162,
+            },
+            false,
+        );
+
+        assert!(matches!(
+            Store::open_with_limits_and_operation_limits_for_mission(
+                &file.0,
+                StoreLimits::default(),
+                BlobDepotLimits::default(),
+                limits,
+                MISSION_A,
+            ),
+            Err(StoreError::AccountingMismatch {
+                field: EVENT_OPERATION_REVERSE_ROWS,
+                durable: 1,
+                reconstructed: 0,
             })
         ));
     }
