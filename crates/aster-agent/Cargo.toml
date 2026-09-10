@@ -24,6 +24,7 @@ aster-mesh = { package = "aster-core", path = "../aster-core", default-features 
 aster-iroh = { path = "../aster-iroh" }
 aster-node = { path = "../aster-node" }
 aster-redb-store = { path = "../aster-redb-store" }
+aster-systemd-credentials = { path = "../aster-systemd-credentials" }
 buffa.workspace = true
 bytes.workspace = true
 connectrpc = { workspace = true, features = ["json"] }

@@ -27,7 +27,7 @@ and reviewed decision.
 | `P0-1-D03` | P0-1; `DM-14-17..18` | Exactly two mandatory physical CM4 participants; an optional third support node must be declared if it carries candidate traffic; 8-/20-node qualification deferred; manual peers, one scope/topic/subscription per scenario, discovery off | Resolved | no | no | Broader topology and scale remain outside v0.1 | none |
 | `P0-1-D04` | P0-1; `DM-14-07..09`, `DM-14-19`; Decision 0030 | Exact local API/lifecycle methods, Rust reference client, generated-Go qualification client | Resolved | no | no | Production bindings and independent interoperability remain open | none |
 | `P0-1-D05` | P0-1; Decision 0033; security-profile disposition | Semantic v6, profile/suite `0x0001`, unordered IDs, no fallback, non-FIPS | Resolved | no | no | Production security and FIPS paths remain separately gated | none |
-| `P0-1-D06` | P0-1; [approved Raspberry Pi provider v2 design](../superpowers/specs/2026-09-08-raspberry-pi-systemd-credential-provider-v2-design.md) (`sha256:30c5dfe71a203fcdd69dd330f9b5c68eeaee5032b624ee41912aa4723a9f853f`) | `aster-systemd-credential-store/v2`; exact Raspberry Pi reference `2026-06-18` and systemd `257.13-1~deb13u1` credential interface; explicit host-key protection; statically composed loader; root-operated `aster-credential-admin`; seven-operation lifecycle | Resolved | no | yes | Security/deployment approvals and provider qualification remain candidate and production gates | none |
+| `P0-1-D06` | P0-1; [approved Raspberry Pi provider v2 design](../superpowers/specs/2026-09-08-raspberry-pi-systemd-credential-provider-v2-design.md) (`sha256:30c5dfe71a203fcdd69dd330f9b5c68eeaee5032b624ee41912aa4723a9f853f`); [systemd 257 presentation amendment](../superpowers/specs/2026-09-09-systemd-257-credential-presentation-amendment.md) (`sha256:549ea3fd5bdfd62c01bab5a8f1adac4b84a2710ab406ea006119c9048e28d4cd`) | `aster-systemd-credential-store/v2`; exact Raspberry Pi reference `2026-06-18` and systemd `257.13-1~deb13u1` credential interface; original `0400`/`ramfs` or exact non-root ACL/read-only-`tmpfs`/`noswap` presentation; explicit host-key protection; statically composed loader; root-operated `aster-credential-admin`; seven-operation lifecycle | Resolved | no | yes | Security/deployment approval of the amendment and provider qualification remain candidate and production gates; no generic `tmpfs` or Debian claim | none |
 | `P0-1-D07` | P0-1; design `Emission modes` | Restart-selected Normal/ReceiveOnly, non-initiation/non-disclosure, both identity orderings, no radio-silence claim | Resolved | no | no | No physical-silence or production emission claim | none |
 | `P0-1-D08` | P0-1; P1-1 follow-on boundary | 1,024-key workload, 512 warning, hard caps/status/error; lifecycle/reclamation excluded | Resolved | no | no | Operation-mapping lifecycle remains production-blocking | none |
 | `P0-1-D09` | P0-1; `DM-14-03..06`, `DM-14-12..18` | Exact two-node workload/resource matrix and provisional byte-fit gate on both mandatory physical CM4 devices | Resolved | no | no | No production sizing, broader scale, or capacity claim | none |
@@ -41,10 +41,11 @@ Internal approval of the exact D06 provider selection and bound design digest
 was recorded for the profile definition on 2026-09-08. `P0-1-D06` is resolved
 for the P0-1 profile definition by the approved Raspberry Pi provider v2 design
 at `sha256:30c5dfe71a203fcdd69dd330f9b5c68eeaee5032b624ee41912aa4723a9f853f`.
-Security and deployment approval of that exact record and digest remains
-required at `P0-1-E01`; it blocks candidate qualification, not profile
-definition. Another platform requires a new reviewed provider and profile
-boundary before the affected candidate proceeds.
+Product approval to implement and validate the exact systemd 257 presentation
+amendment was recorded on 2026-09-09. Security and Deployment approval of both
+immutable records remains required at `P0-1-E01`; it blocks candidate
+qualification, not profile definition. Another platform requires a new
+reviewed provider and profile boundary before the affected candidate proceeds.
 Dependency/license, Legal/compliance, and Release approval of the exact D15
 evaluation-only disposition and bound digest was recorded on 2026-09-08.
 `P0-1-D15` is therefore resolved for P0-1 and is not a candidate blocker. The
@@ -92,7 +93,7 @@ block v0.1 except where the evaluation-blocking cell says otherwise.
 
 | ID | Gate | Owner | Target | Status | Evaluation blocking | Production blocking | Exit | Evidence effect |
 |---|---|---|---:|---|:---:|:---:|---|:---:|
-| `P0-1-E01` | Approve the [exact Raspberry Pi protected provider v2 design](../superpowers/specs/2026-09-08-raspberry-pi-systemd-credential-provider-v2-design.md) (`sha256:30c5dfe71a203fcdd69dd330f9b5c68eeaee5032b624ee41912aa4723a9f853f`) and administration record | Security + deployment | 2026-09-08 | Open | yes | yes | Both roles accept the exact provider contract, version, trust boundary, administration artifact, lifecycle procedure, limitations, acceptance plan, and design digest | none |
+| `P0-1-E01` | Approve the [exact Raspberry Pi protected provider v2 design](../superpowers/specs/2026-09-08-raspberry-pi-systemd-credential-provider-v2-design.md) (`sha256:30c5dfe71a203fcdd69dd330f9b5c68eeaee5032b624ee41912aa4723a9f853f`), [systemd 257 presentation amendment](../superpowers/specs/2026-09-09-systemd-257-credential-presentation-amendment.md) (`sha256:549ea3fd5bdfd62c01bab5a8f1adac4b84a2710ab406ea006119c9048e28d4cd`), and administration record | Security + deployment | 2026-09-09 | Open | yes | yes | Both roles accept both exact digests, provider contract/version, trust boundary, pinned ACL/mount predicates, administration artifact, lifecycle procedure, limitations, and acceptance plan | none |
 | `P0-1-E02` | Freeze signed qualification annex and exact two-CM4 inventory | Profile + integration | 2026-09-08 | Open | yes | yes | Annex names both mandatory physical CM4 nodes' exact image, Debian identity, kernel, systemd package, architecture, hardware revision, filesystem, relay placement, and network conditions; any participating third CM4 is explicitly declared with its support role | none |
 | `P0-1-E03` | Merge/review candidate Event service | Event-service owner | 2026-09-09 | Open | yes | yes | Accepted commit passes clean gate and process suite | none |
 | `P0-1-E04` | Add restart-selected `receive_only` config/status | Event-service + node owner | 2026-09-10 | Open | yes | yes | Both-ordering acceptance passes | none |

@@ -279,6 +279,7 @@ dependencies = [
  "aster-iroh",
  "aster-node",
  "aster-redb-store",
+ "aster-systemd-credentials",
  "buffa",
  "bytes",
  "connectrpc",
@@ -454,6 +455,17 @@ dependencies = [
  "redb",
  "rustix",
  "sha2 0.11.0",
+]
+
+[[package]]
+name = "aster-systemd-credentials"
+version = "0.1.0"
+dependencies = [
+ "aster-core",
+ "getrandom 0.4.3",
+ "rustix",
+ "sha2 0.11.0",
+ "zeroize",
 ]
 
 [[package]]

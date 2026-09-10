@@ -84,6 +84,27 @@ forwarding, Event bridges, and dynamic bridge administration.
     workload boundary of 256 and implementation hard ceiling of 262,144.
     Dedicated Event-operation hard-cap refusal is a distinct non-retryable
     public reason. No online operation-map reclamation is introduced.
+13. In the Raspberry Pi reference 2026-06-18 evaluation composition (Debian
+    GNU/Linux 13 (trixie), Raspberry Pi Compute Module 4 Rev 1.1, `aarch64`,
+    kernel `6.18.39+rpt-rpi-v8`, systemd `257.13-1~deb13u1`, credential
+    executable `/usr/bin/systemd-creds`, local `ext4`, and TPM2 excluded),
+    statically link the first-party
+    `aster-systemd-credentials` runtime loader for provider contract
+    `aster-systemd-credential-store/v2` into the same `aster-agent`
+    executable. `--config` selects only that loader. It opens the fixed
+    `aster-provisioning.bundle` systemd service credential through
+    `CREDENTIALS_DIRECTORY`, requires systemd's `secure` boundary (single-link
+    regular file, effective service owner, exact `0400`, Linux `ramfs`),
+    validates the provider envelope and canonical inner bundle, and completes
+    protected bootstrap before state or either listener is opened. It invokes
+    no credential CLI and has no runtime provider or plaintext fallback.
+
+    The mode-`0400`/`ramfs` description remains the original accepted
+    presentation. The exact systemd 257 profile additionally uses the narrowly
+    pinned root-owned ACL/read-only-`tmpfs`/`noswap` presentation defined in
+    the [2026-09-09 credential-presentation amendment](../superpowers/specs/2026-09-09-systemd-257-credential-presentation-amendment.md).
+    That amendment requires separate Security and Deployment approval at E01
+    and creates no generic Debian, `tmpfs`, or production support claim.
 
 ### Direct dependency admission for pre-body serving
 
@@ -138,6 +159,42 @@ semantics are documented in the
 [`v1 configuration reference`](../reference/aster-agent-config-v1.md) and
 [`Event agent quickstart`](../quickstart/connect-agent.md).
 
+### D06 provider-lifecycle increment
+
+The stacked D06 implementation adds provider contract
+`aster-systemd-credential-store/v2` in
+[`aster-systemd-credentials`](../../crates/aster-systemd-credentials/README.md).
+Its canonical provider reference and zeroizing envelope bind one nonzero
+generation, exact Aster secret reference, exact load-operation identifier, and
+one validated `ASTRPB03` bundle. The production customer invocation constructs
+the systemd loader directly; missing, weak, insecure, changed, oversized, or
+mismatched credentials fail through fixed sanitized categories before the
+node can create state or bind health/application listeners.
+
+The stacked implementation now includes the complete code-level provider
+lifecycle: crash-recoverable install, atomic mission/provider rotation with one
+retained Previous generation, host-bound backup, same-host current-generation
+recovery through a narrow recovery open, and durable logical destruction. The
+root administration CLI exposes five exact, operation-bound commands with
+sanitized text output and a binary-only backup stdout. The
+[operator procedure](../implementation/raspberry-pi-provider-v2-operations.md)
+composes those commands with the existing Event-agent bearer-token SIGHUP
+reload and stopped-authority revoke/rekey workflow to describe all seven
+operations without duplicating either authority.
+
+The five provider lifecycle CLI commands are executable, but code completion
+does not make the Event-agent integration executable end to end or qualify the
+provider candidate. The provider-internal Active reference remains root-only;
+the future package must atomically hand successful INSTALL/ROTATE output to a
+separate mode-`0600`, final-service-UID-owned reference file. Configuration
+checking and runtime validation run as that final service UID, while provider
+administration remains root-only. E01, packaged E09 qualification, the exact
+handoff path and ownership setup, service UID, hardened unit/control values,
+readiness check, native package integration, G3/G4, protected authority
+issuance, cross-host recovery, snapshot rollback, physical erasure,
+production, and general-platform support remain open. Persistent v1 provider
+state is deliberately rejected rather than migrated.
+
 ## Ownership and acceptance
 
 The Event-service workstream owns the Event module and its selected
@@ -171,5 +228,5 @@ so its commands continue to describe executable repository behavior.
   enforcement: the harness/operator stops work at the lower profile boundaries
   while the implementation hard ceilings remain fail-closed safeguards.
 - This decision authorizes implementation. It does not close protected
-  provisioning, deployment, physical-network, mixed-implementation,
-  packaging, security-review, or release gates.
+  provisioning lifecycle, deployment, physical-network,
+  mixed-implementation, packaging, security-review, or release gates.

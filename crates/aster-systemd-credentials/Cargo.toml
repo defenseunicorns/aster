@@ -1,0 +1,21 @@
+[package]
+name = "aster-systemd-credentials"
+description = "Raspberry Pi systemd credential store provider for Aster provisioning"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+fuzzing = []
+
+[dependencies]
+aster-core = { version = "=0.1.0", path = "../aster-core", default-features = false, features = ["reference-session"] }
+getrandom.workspace = true
+rustix.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

@@ -37,6 +37,18 @@ first-flight mission parsing. Its retained `B`, `E`, and `H` files are nonsecret
 mutation recipes; canonical credentials, envelopes, and handshake bytes are
 created in memory and are not retained in the corpus.
 
+`systemd_credential_decode` reaches the exact D06 provider-envelope decoder
+through a doc-hidden fuzz seam that is absent from normal provider builds. It
+tests arbitrary hostile bytes and structured mutations of a valid envelope;
+the retained `M` file is only a nonsecret mutation recipe, while the reference,
+operation identity, and non-production provisioning bytes are created in
+memory.
+
+`systemd_admin_record_decode` reaches both D06 durable-state decoders through a
+doc-hidden fuzz seam that is absent from normal provider builds. Every case
+tests arbitrary hostile bytes plus structured mutations of valid ledger and
+generation-manifest records assembled in memory from nonsecret fixed values.
+
 Each smoke campaign runs 10,000 cases with a fixed seed and a 262,144-byte
 maximum input. Retained corpora are copied to a temporary directory before each
 campaign, so libFuzzer cannot mutate the checked-in seed corpus. Targets without
