@@ -33,6 +33,18 @@ reuses the same database without another fetch for the fuzz lockfile. Its
 vulnerability result therefore reflects the RustSec database available when
 the workflow ran, rather than a permanently reproducible snapshot.
 
+## Manual Linux build
+
+Run **Actions → Build: Linux x86_64 → Run workflow**, then choose a branch.
+The workflow file must first be merged into the default branch for the button
+to appear.
+
+This independent workflow runs `mise run build` on Ubuntu 24.04 to build `aster`
+(package `aster-node`) and `aster-agent` (package `aster-agent`) for
+`x86_64-unknown-linux-gnu` in release mode. Download `aster-linux-x86_64-<commit SHA>`
+from the run's **Artifacts** section; it contains `aster-linux-x86_64.tar` and
+is retained for 14 days. The build is manual and is not part of `CI / required`.
+
 ## Network reliability under contention
 
 Run the bounded loopback diagnostic from the repository root:
@@ -1479,7 +1491,7 @@ The workflow is safe to run for pull requests from forks:
 - Its only workflow permission is read-only repository contents.
 - It runs exclusively on GitHub-hosted, fixed-version runner labels.
 - It does not receive secrets, persist checkout credentials, execute
-  submodules, upload artifacts, or use shared Actions caches.
+  submodules, or use shared Actions caches.
 - Every third-party action is pinned to a full commit SHA.
 - Concurrency cancels superseded runs for the same pull request or ref, and
   every job has a timeout.
@@ -1489,7 +1501,10 @@ The action and tool pins are:
 | Component | Pin |
 | --- | --- |
 | `actions/checkout` | `3d3c42e5aac5ba805825da76410c181273ba90b1` (`v7.0.1`) |
-| `jdx/mise-action` | `3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518` (`v4.2.5`) |
+| `jdx/mise-action` | `c2a87611a18de5b3828c5652fe268e992400cb5c` (`v4.3.0`) |
+| `actions/upload-artifact` | `ea165f8d65b6e75b540449e92b4886f43607fa02` (`v4.6.2`) |
+| cargo-cyclonedx | `0.5.9` |
+| CycloneDX Editor/Validator | `0.34.0` |
 | mise | `2026.4.28` |
 | Rust | `1.97.1` |
 | Minimum supported Rust | `1.91.0` |
@@ -1509,6 +1524,11 @@ manual reviewed update. An update remains untrusted until these checks pass and
 a maintainer reviews the upstream release and the resulting dependency changes.
 
 ## Running checks locally
+
+For the separate release-build/SBOM lane, provision its pinned tools and fetch
+locked dependencies, then run `mise run build`. See the
+[artifact workflow](release/sbom/README.md#automated-build-and-artifact) for
+prerequisites, output layout and inventory qualifications.
 
 Install the repository toolchain and run the primary gate:
 

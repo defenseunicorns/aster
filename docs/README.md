@@ -57,7 +57,7 @@ understand Aster's wire format or cryptography before building an application.
 | Implement an independent compatible profile-`0x0001` node | [Protocol](protocol.md), [wire grammar](wire.cddl), and [security objects](envelope.md) |
 | Review the additive profile-`0x0002` implementation boundary | [Classical Iroh-QUIC profile](classical-iroh-security-profile.md); complete normative byte grammar, independent vectors, and a black-box conformance lane remain open |
 | Assess progress, security policy, or production blockers | [Capability roadmap](implementation/capability-roadmap.md), [Security-profile requirements disposition](implementation/security-profile-requirements-disposition.md), [Security](security.md), [Conformance](conformance.md), and [requirements status](implementation/requirements-status.md) |
-| Review development inputs and public provenance | [Public development provenance record](provenance/independent-development-record.md) and [public source register](provenance/public-source-register.csv) |
+| Generate the two executable SBOMs | [Executable SBOM workflow](release/sbom/README.md) and [bounded observation](release/sbom/2026-09-08-observation.md) |
 | Run validation or interpret evidence | [CI](ci.md), [Conformance](conformance.md), and the [lab guide](../lab/README.md) |
 
 ## Know which kind of document you are reading
@@ -247,9 +247,6 @@ boundary; [requirements status](implementation/requirements-status.md),
 - [Source requirements](../data-mesh-requirements.md) — frozen target-state
   grounding requirements; use the [capability roadmap](implementation/capability-roadmap.md)
   for delivery planning and PR review.
-- [Public development provenance record](provenance/independent-development-record.md)
-  — review path from product intent and public inputs to decisions,
-  implementation, and retained repository history.
 
 ## Contributing
 
