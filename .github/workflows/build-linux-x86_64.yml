@@ -52,7 +52,7 @@ jobs:
       - name: Build and validate the artifact bundle offline
         env:
           CARGO_NET_OFFLINE: "true"
-        run: mise run sbom
+        run: mise run build
 
       - name: Retain binaries, SBOMs and checksums
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

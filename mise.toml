@@ -189,6 +189,6 @@ run = "sh ./tools/age-reference/check.sh"
 description = "Audit the Go age oracle with exact govulncheck v1.6.0"
 run = "sh ./tools/age-reference/audit.sh"
 
-[tasks.sbom]
-description = "Build Linux release binaries and their CycloneDX SBOM artifact bundle"
-run = "bash tools/build-sbom.sh"
+[tasks.build]
+description = "Build aster and aster-agent for Linux x86_64"
+run = "bash tools/build-linux-x86_64.sh"

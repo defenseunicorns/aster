@@ -13,7 +13,7 @@ their existing claim boundaries.
 
 ## Automated build and artifact
 
-Run `mise run sbom` from a checkout with committed tracked changes. It uses
+Run `mise run build` from a checkout with committed tracked changes. It uses
 Rust 1.97.1, cargo-cyclonedx 0.5.9 and cdx-ev 0.34.0 from PATH. Provision the
 pinned tools as described below, then run `cargo fetch --locked` once with
 approved network access. The task itself runs offline and installs nothing.

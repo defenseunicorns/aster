@@ -39,7 +39,7 @@ Run **Actions → Build: Linux x86_64 → Run workflow**, then choose a branch.
 The workflow file must first be merged into the default branch for the button
 to appear.
 
-This independent workflow runs `mise run sbom` on Ubuntu 24.04 to build `aster`
+This independent workflow runs `mise run build` on Ubuntu 24.04 to build `aster`
 (package `aster-node`) and `aster-agent` (package `aster-agent`) for
 `x86_64-unknown-linux-gnu` in release mode. Download `aster-linux-x86_64-<commit SHA>`
 from the run's **Artifacts** section; it contains `aster-linux-x86_64.tar` and
@@ -1526,7 +1526,7 @@ a maintainer reviews the upstream release and the resulting dependency changes.
 ## Running checks locally
 
 For the separate release-build/SBOM lane, provision its pinned tools and fetch
-locked dependencies, then run `mise run sbom`. See the
+locked dependencies, then run `mise run build`. See the
 [artifact workflow](release/sbom/README.md#automated-build-and-artifact) for
 prerequisites, output layout and inventory qualifications.
 
