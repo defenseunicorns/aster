@@ -671,6 +671,75 @@ class PathDeliveryControllerTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.ExecutionError, "host ip"):
                 MODULE.preflight(Path("/usr/bin/docker"))
 
+    def test_json_nesting_boundary(self):
+        # Root containers count as one; this contract must not depend on the
+        # interpreter's C decoder recursion threshold or global recursion limit.
+        for opening, closing in ((b"[", b"]"), (b'{"key":', b"}")):
+            for depth in (63, 64):
+                with self.subTest(opening=opening, depth=depth):
+                    raw = opening * depth + b"0" + closing * depth
+                    value = MODULE._strict_json(raw, "readback")
+                    for _ in range(depth):
+                        value = value[0] if opening == b"[" else value["key"]
+                    self.assertEqual(value, 0)
+            raw = opening * 65 + b"0" + closing * 65
+            with self.subTest(opening=opening), self.assertRaisesRegex(
+                    MODULE.ExecutionError, "^readback exceeds the nesting bound$"):
+                MODULE._strict_json(raw, "readback")
+            with self.subTest(opening=opening), self.assertRaisesRegex(
+                    MODULE.ScenarioError, "^scenario exceeds the nesting bound$"):
+                MODULE.compile_scenario(raw)
+
+    def test_json_nesting_ignores_strings_and_escaped_quotes(self):
+        # Odd/even backslash runs before quotes, literal brackets, UTF-8,
+        # and Unicode escapes must not hide real depth or create false depth.
+        strings = ["[{]}" * 100, '"' + "[" * 100, "\\", '\\"[{]}', "é[雪]"]
+        for text in strings:
+            for ensure_ascii in (False, True):
+                encoded = json.dumps(text, ensure_ascii=ensure_ascii).encode()
+                with self.subTest(text=text, ensure_ascii=ensure_ascii):
+                    raw = b'[{"key":' * 32 + encoded + b"}]" * 32
+                    value = MODULE._strict_json(raw, "readback")
+                    for _ in range(32):
+                        value = value[0]["key"]
+                    self.assertEqual(value, text)
+                    with self.assertRaisesRegex(MODULE.ExecutionError, "nesting bound"):
+                        MODULE._strict_json(b"[" + raw + b"]", "readback")
+        self.assertEqual(MODULE._strict_json(b'"\\u005b\\u007b\\u005d\\u007d"', "readback"), "[{]}")
+        raw = (MODULE_PATH.parents[1] / "docker/path-lab/scenarios/event-delivery-netem.json").read_bytes()
+        document = json.loads(raw)
+        document["payload"] = '[{]}\\"' * 100
+        self.assertEqual(MODULE.compile_scenario(json.dumps(document).encode())["payload"], document["payload"])
+
+    def test_json_limits_preserve_bytes_duplicates_and_nonfinite_rejection(self):
+        scenario = (MODULE_PATH.parents[1] / "docker/path-lab/scenarios/event-delivery-netem.json").read_bytes()
+        for parse, error_type, raw, maximum, label in (
+                (MODULE.compile_scenario, MODULE.ScenarioError, scenario, MODULE.MAX_SCENARIO_BYTES, "scenario"),
+                (lambda raw: MODULE._strict_json(raw, "readback"), MODULE.ExecutionError,
+                 b"{}", MODULE.MAX_OUTPUT_BYTES, "readback")):
+            with self.subTest(label=label):
+                padded = raw + b" " * (maximum - len(raw))
+                parse(padded)
+                with self.assertRaisesRegex(error_type, "byte bound"):
+                    parse(padded + b" ")
+                # Byte rejection must precede the structural scan and decoder.
+                with mock.patch.object(MODULE, "_exceeds_json_nesting", side_effect=AssertionError("must not scan")):
+                    with self.assertRaisesRegex(error_type, "byte bound"):
+                        parse(b"[" * (maximum + 1))
+                with self.assertRaisesRegex(error_type, "duplicate field") as error:
+                    parse(b'{"private-marker":0,"private-marker":1}')
+                self.assertNotIn("private-marker", str(error.exception))
+                for malformed in (b"NaN", b"Infinity", b"-Infinity", b"[}", b"]" + b"[" * 65,
+                                  b'"unterminated\\', b'"bad\\q"', b'"\xff"'):
+                    with self.subTest(malformed=malformed), self.assertRaises(error_type):
+                        parse(malformed)
+                # Deterministically exercise sanitization even on decoders whose
+                # own recursion threshold is never reached by the depth guard.
+                with mock.patch.object(MODULE.json, "loads", side_effect=RecursionError("private-marker")):
+                    with self.assertRaises(error_type) as error:
+                        parse(b"{}")
+                    self.assertNotIn("private-marker", str(error.exception))
+
     def test_recursive_input_is_sanitized(self):
         nested = b"[" * 2000 + b"0" + b"]" * 2000
         with self.assertRaises(MODULE.ScenarioError):

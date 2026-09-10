@@ -132,6 +132,12 @@ identifies this scenario; it does not seed the kernel's packet selection.
 No requirement evidence status or retained-receipt baseline moves.
 
 Scenario input must be a regular non-symlink file and is capped at 16 KiB.
+Scenario and command read-back JSON allow at most 64 nested arrays/objects,
+counting the root container as one. A non-recursive scan enforces this before
+JSON decoding, independent of the Python version's decoder recursion threshold;
+brackets inside strings (including escaped quotes/backslashes) do not count.
+Over-depth input fails with a sanitized nesting-bound error. Existing UTF-8,
+syntax, duplicate-field, and nonfinite-constant rejection remains in force.
 Command output (stdout plus stderr) is capped at 2 MiB,
 peer input at 200 bytes, PID input at 16 bytes, and each process-status read at
 8 KiB. Provisioning accepts only two generated credential files, each at most

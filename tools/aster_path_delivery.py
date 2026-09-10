@@ -31,6 +31,7 @@ PLAN_SCHEMA = "aster-path-delivery-plan/v1"
 RECEIPT_SCHEMA = "aster-path-delivery-receipt/v1"
 MAX_SCENARIO_BYTES = 16 * 1024
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
+MAX_JSON_DEPTH = 64
 FIELDS = {"schema", "id", "seed", "operation_key", "logical_key", "payload"}
 LAB = "aster-path-delivery"
 LAB_LOCK = Path("/run/lock") / LAB / "owner.lock"
@@ -303,9 +304,39 @@ def _text(value: Any, label: str, maximum: int) -> str:
     return value
 
 
+def _exceeds_json_nesting(raw: bytes) -> bool:
+    """Bound container depth before decoding, independent of Python recursion.
+
+    The caller checks bytes first. JSON syntax/UTF-8 validation stays with the
+    decoder; only ASCII structural bytes outside strings affect this bound.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for byte in raw:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 92:  # backslash
+                escaped = True
+            elif byte == 34:  # quote
+                in_string = False
+        elif byte == 34:
+            in_string = True
+        elif byte in (91, 123):  # [ {
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                return True
+        elif byte in (93, 125):  # ] }
+            depth -= 1
+    return False
+
+
 def _strict_json(raw: bytes, label: str) -> Any:
     if len(raw) > MAX_OUTPUT_BYTES:
         raise ExecutionError(f"{label} exceeds the byte bound")
+    if _exceeds_json_nesting(raw):
+        raise ExecutionError(f"{label} exceeds the nesting bound")
 
     def object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -335,6 +366,8 @@ def compile_scenario(raw: bytes) -> dict[str, object]:
 
     if len(raw) > MAX_SCENARIO_BYTES:
         raise ScenarioError("scenario exceeds the byte bound")
+    if _exceeds_json_nesting(raw):
+        raise ScenarioError("scenario exceeds the nesting bound")
 
     def object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         value: dict[str, Any] = {}
