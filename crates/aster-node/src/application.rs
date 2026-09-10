@@ -2889,10 +2889,28 @@ mod tests {
                     .kind(),
                 ApplicationErrorKind::ExpiredOrRetired,
             );
+            let mut changed_held = publication.clone();
+            changed_held.payload = b"changed-while-held".to_vec();
+            assert_eq!(
+                node.publish_with_options(changed_held, options)
+                    .expect_err("changed retry while the lease retains bytes")
+                    .kind(),
+                ApplicationErrorKind::Conflict
+            );
             node.store
                 .release_transfer_lease(lease.id)
                 .expect("release held lease");
             node.maintain_custody().expect("finalize retirement");
+            assert_eq!(
+                node.store
+                    .event_operation_resolution(&operation)
+                    .expect("compact resolution"),
+                Some(
+                    aster_redb_store::EventOperationResolution::RetiredOperation {
+                        reason: aster_redb_store::CustodyRetirementReason::Expired,
+                    }
+                )
+            );
             let retired = node.store.event_stats().expect("retired Event stats");
             assert_eq!(retired.events, 0);
             assert_eq!(retired.retiring_events, 0);

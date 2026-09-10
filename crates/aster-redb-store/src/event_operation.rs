@@ -158,6 +158,17 @@ pub(crate) type EventOperationFingerprint = [u8; 32];
 #[cfg(test)]
 thread_local! {
     pub(crate) static MIGRATION_TEST_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    pub(crate) static RETIREMENT_TEST_FAULT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn retirement_test_fault(point: u8) -> Result<(), StoreError> {
+    if RETIREMENT_TEST_FAULT.get() == point {
+        return Err(StoreError::SemanticInvariant(
+            "injected Event operation retirement failure",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -471,6 +482,108 @@ pub(crate) fn checked_retire_event_operation_records(
     };
     validate_event_operation_stats(next)?;
     Ok(next)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EventOperationRetirementDelta {
+    pub(crate) records_retired: u64,
+    pub(crate) logical_bytes_released: u64,
+}
+
+/// Compacts every alias in the final custody-retirement transaction. Validate
+/// the entire bounded prefix and its accounting before changing any row; no
+/// admission quota applies because conversion only releases logical bytes.
+pub(crate) fn retire_event_operations_write(
+    write: &redb::WriteTransaction,
+    transfer_id: EventTransferId,
+    reason: CustodyRetirementReason,
+) -> Result<EventOperationRetirementDelta, StoreError> {
+    let mut ledger = write.open_table(EVENT_OPERATION_LEDGER_V3)?;
+    let mut reverse = write.open_table(ACTIVE_OPERATION_BY_EVENT_V1)?;
+    let mut metadata = write.open_table(METADATA)?;
+    let current = read_event_operation_stats(&metadata)?.ok_or(StoreError::SemanticInvariant(
+        "Event operation accounting is missing during retirement",
+    ))?;
+    audit_event_operation_cardinalities(current, ledger.len()?, reverse.len()?)?;
+
+    // Range the complete transfer prefix, including malformed short/long keys.
+    // A fixed 64-byte lower/upper pair would silently omit such corrupt edges.
+    let mut successor = *transfer_id.as_bytes();
+    let upper = if let Some(index) = successor.iter().rposition(|byte| *byte != u8::MAX) {
+        successor[index] += 1;
+        successor[index + 1..].fill(0);
+        std::ops::Bound::Excluded(successor.as_slice())
+    } else {
+        std::ops::Bound::Unbounded
+    };
+    let mut aliases = Vec::new();
+    for row in reverse.range::<&[u8]>((
+        std::ops::Bound::Included(transfer_id.as_bytes().as_slice()),
+        upper,
+    ))? {
+        let (key, value) = row?;
+        if aliases.len() == MAX_EVENT_OPERATION_ALIASES as usize {
+            return Err(StoreError::SemanticInvariant(
+                "Event operation retirement exceeds the alias cap",
+            ));
+        }
+        let (indexed_transfer, fingerprint) = decode_active_operation_by_event_key(key.value())?;
+        if indexed_transfer != transfer_id || !value.value().is_empty() {
+            return Err(StoreError::SemanticInvariant(
+                "Event operation retirement has an invalid reverse edge",
+            ));
+        }
+        let record = ledger
+            .get(fingerprint.as_slice())?
+            .ok_or(StoreError::SemanticInvariant(
+                "Event operation reverse edge has no ledger target",
+            ))?;
+        let EventOperationLedgerRecord::Active {
+            intent_digest,
+            transfer_id: target,
+        } = decode_event_operation_ledger_record(record.value())?
+        else {
+            return Err(StoreError::SemanticInvariant(
+                "retired Event operation still has a reverse edge",
+            ));
+        };
+        if target != transfer_id {
+            return Err(StoreError::SemanticInvariant(
+                "Event operation reverse edge targets a different Event",
+            ));
+        }
+        aliases.push((fingerprint, intent_digest));
+    }
+    let records_retired = aliases.len() as u64; // Bounded above by 64.
+    let next = checked_retire_event_operation_records(current, records_retired)?;
+    let logical_bytes_released = current
+        .logical_bytes
+        .checked_sub(next.logical_bytes)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    #[cfg(test)]
+    retirement_test_fault(1)?;
+    for (fingerprint, intent_digest) in aliases {
+        let retired = encode_event_operation_ledger_record(EventOperationLedgerRecord::Retired {
+            intent_digest,
+            reason,
+        });
+        ledger.insert(fingerprint.as_slice(), retired.as_slice())?;
+        let key = encode_active_operation_by_event_key(transfer_id, fingerprint);
+        if reverse.remove(key.as_slice())?.is_none() {
+            return Err(StoreError::SemanticInvariant(
+                "Event operation reverse edge disappeared during retirement",
+            ));
+        }
+        #[cfg(test)]
+        retirement_test_fault(2)?;
+    }
+    write_event_operation_stats(&mut metadata, next)?;
+    #[cfg(test)]
+    retirement_test_fault(3)?;
+    Ok(EventOperationRetirementDelta {
+        records_retired,
+        logical_bytes_released,
+    })
 }
 
 /// Adds one previously unseen operation and its bounded reverse edge in the

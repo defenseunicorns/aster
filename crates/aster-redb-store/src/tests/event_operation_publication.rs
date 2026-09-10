@@ -233,8 +233,9 @@ fn publication_ledger_mission_fingerprint_cannot_resolve_copied_key() {
 fn publication_ledger_new_alias_to_retired_event_uses_only_compact_capacity() {
     let file = TestFile::new("retired alias capacity");
     let mut services = event_services(0x99);
-    // One retained active operation (162), one compact fence (67), reserve (162).
-    let store = open(&file, services.authority, 10, 391);
+    // Three compact fences (201) plus reserve (162); initially fits one
+    // active alias (162), which retirement compacts before new alias admission.
+    let store = open(&file, services.authority, 10, 363);
     let policy = store.control_policy_snapshot().expect("policy");
     let reservation = store
         .reserve_event_with_policy(
@@ -286,14 +287,23 @@ fn publication_ledger_new_alias_to_retired_event_uses_only_compact_capacity() {
             reason: CustodyRetirementReason::Expired
         }
     );
+    let extra = EventOperationKey::new(b"another-retired-alias".to_vec()).expect("key");
+    let extra_request =
+        EventOperationRequest::new(&extra, &intent, b"same", None).expect("request");
+    assert_eq!(
+        commit(&extra_request).expect("fill compact capacity"),
+        EventOnceOutcome::RetiredOperation {
+            reason: CustodyRetirementReason::Expired
+        }
+    );
     assert_eq!(
         stats(&store),
         EventOperationStats {
-            records_total: 2,
-            records_active: 1,
-            records_retired: 1,
-            reverse_rows: 1,
-            logical_bytes: 229
+            records_total: 3,
+            records_active: 0,
+            records_retired: 3,
+            reverse_rows: 0,
+            logical_bytes: 201
         }
     );
     let full_alias = EventOperationKey::new(b"one-too-many".to_vec()).expect("key");
@@ -302,9 +312,9 @@ fn publication_ledger_new_alias_to_retired_event_uses_only_compact_capacity() {
     assert!(matches!(
         commit(&rejected),
         Err(StoreError::EventOperationByteLimitExceeded {
-            current: 229,
+            current: 201,
             incoming: 67,
-            limit: 229
+            limit: 201
         })
     ));
     assert!(

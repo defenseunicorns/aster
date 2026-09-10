@@ -22889,6 +22889,7 @@ fn parse_id(table: &'static str, bytes: &[u8]) -> Result<ItemId, StoreError> {
 mod tests {
     mod event_operation_migration;
     mod event_operation_publication;
+    mod event_operation_retirement;
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -37697,6 +37698,19 @@ mod tests {
         assert_eq!(report.marked, vec![key]);
         assert!(report.retired.is_empty());
         assert_eq!(report.blocked_by_leases, 1);
+        assert_eq!(
+            event_operation::inspect_event_operation_accounting_read(
+                &store.database.begin_read().expect("held ledger read")
+            )
+            .expect("held ledger"),
+            EventOperationStats {
+                records_total: 1,
+                records_active: 1,
+                records_retired: 0,
+                reverse_rows: 1,
+                logical_bytes: 162,
+            }
+        );
         assert_eq!(store.get_event(transfer_id).expect("public get"), None);
         assert!(
             store
@@ -37798,9 +37812,8 @@ mod tests {
             store
                 .event_operation_resolution(&operation)
                 .expect("retired operation"),
-            Some(EventOperationResolution::Retired {
+            Some(EventOperationResolution::RetiredOperation {
                 reason: CustodyRetirementReason::Expired,
-                ..
             })
         ));
         drop(store);
