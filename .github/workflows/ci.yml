@@ -37,6 +37,8 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      # Runtime environment selection overrides mise.toml in nested mise calls.
+      MISE_PYTHON_VERSION: path:${{ runner.temp }}/aster-ci-python-3.13.7
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -45,11 +47,22 @@ jobs:
           persist-credentials: false
           submodules: false
 
+      - name: Build exact-source signal-safe Python
+        timeout-minutes: 15
+        run: bash .github/scripts/build-ci-python.sh
+
       - name: Install repository toolchain
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           version: 2026.4.28
           cache: false
+
+      - name: Verify direct and nested mise signal-safe Python
+        timeout-minutes: 2
+        run: |
+          python3 .github/scripts/test-ci-python.py
+          python3 .github/scripts/check-ci-python.py
+          mise exec -- mise run ci-python-preflight
 
       - name: Install Rust quality components
         run: rustup component add --toolchain 1.97.1 rustfmt clippy
@@ -60,10 +73,22 @@ jobs:
           cargo fetch --locked --manifest-path fuzz/Cargo.toml
           cargo fetch --locked --manifest-path conformance/evaluation-v0/runner/Cargo.toml
 
+      # Keep process acceptance on Linux with the pinned Python 3.13 toolchain;
+      # the signal-safe subprocess path requires POSIX_SPAWN_CLOSEFROM.
+      - name: Run full agent process contract suite
+        timeout-minutes: 5
+        run: python3 tools/test-aster-agent-process.py
+
       - name: Run formatting, lint, tests, bindings, and conformance
         env:
           CARGO_NET_OFFLINE: "true"
         run: mise run check
+
+      - name: Run stock agent process smoke
+        timeout-minutes: 10
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: mise run agent-process-smoke
 
   macos-tests:
     name: macOS tests
