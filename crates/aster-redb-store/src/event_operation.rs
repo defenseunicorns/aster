@@ -20,6 +20,9 @@ const EVENT_OPERATION_LEDGER_ACTIVE: u8 = 1;
 const EVENT_OPERATION_LEDGER_RETIRED: u8 = 2;
 const EVENT_OPERATION_KEY_DOMAIN: &[u8] = b"aster/event-operation-key/v1";
 
+/// Maximum distinct active operation keys that may refer to one Event.
+pub const MAX_EVENT_OPERATION_ALIASES: u64 = 64;
+
 /// A bounded, application-defined idempotency key for one local Event operation.
 ///
 /// The key is durable and maps to exactly one accepted source Event. A caller
@@ -301,6 +304,11 @@ mod tests {
     }
 
     #[test]
+    fn crate_root_exports_the_fixed_event_operation_alias_limit() {
+        assert_eq!(crate::MAX_EVENT_OPERATION_ALIASES, 64);
+    }
+
+    #[test]
     fn fingerprint_uses_the_exact_domain_mission_length_and_raw_key() {
         let fingerprint =
             event_operation_fingerprint(&MISSION_A, &operation_key(&[0x01, 0x02, 0x03]));
@@ -409,10 +417,20 @@ mod tests {
 
     #[test]
     fn ledger_decoder_rejects_each_malformed_version_state_length_and_reason() {
+        assert!(decode_event_operation_ledger_record(&[]).is_err());
+        assert!(decode_event_operation_ledger_record(&[1]).is_err());
         assert!(decode_event_operation_ledger_record(&[9, 1]).is_err());
         assert!(decode_event_operation_ledger_record(&[1, 9]).is_err());
         assert!(decode_event_operation_ledger_record(&[1, 1]).is_err());
         assert!(decode_event_operation_ledger_record(&[1, 2]).is_err());
+        let mut overlong_active = [0u8; 67];
+        overlong_active[0] = 1;
+        overlong_active[1] = 1;
+        assert!(decode_event_operation_ledger_record(&overlong_active).is_err());
+        let mut overlong_retired = [0u8; 36];
+        overlong_retired[0] = 1;
+        overlong_retired[1] = 2;
+        assert!(decode_event_operation_ledger_record(&overlong_retired).is_err());
         let mut unknown_reason = [0u8; 35];
         unknown_reason[0] = 1;
         unknown_reason[1] = 2;

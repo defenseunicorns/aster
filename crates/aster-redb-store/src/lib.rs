@@ -36,7 +36,7 @@ pub use blob::*;
 pub use blob_subscription::*;
 pub use bridge_event::*;
 pub use custody::*;
-pub use event_operation::{EventOperationKey, EventOperationLimits};
+pub use event_operation::{EventOperationKey, EventOperationLimits, MAX_EVENT_OPERATION_ALIASES};
 pub use record_subscription::*;
 pub use state_subscription::*;
 
