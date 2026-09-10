@@ -401,12 +401,14 @@ fn retirement_rejects_corrupt_edges_targets_and_counters_without_any_commit() {
             accepted.push(corruption);
             continue;
         }
+        let error = match result.unwrap_err() {
+            StoreError::EventOperationRetirementInvariant(error) => *error,
+            error => error,
+        };
         assert!(
             !matches!(
-                result,
-                Err(StoreError::SemanticInvariant(
-                    "injected Event operation retirement failure"
-                ))
+                error,
+                StoreError::SemanticInvariant("injected Event operation retirement failure")
             ),
             "{corruption} reached mutation before validation"
         );
@@ -449,11 +451,14 @@ fn retirement_faults_before_during_and_after_compaction_reopen_the_complete_befo
             missed.push(point);
             continue;
         }
+        let error = match (point, result.unwrap_err()) {
+            (1..=3, StoreError::EventOperationRetirementInvariant(error)) => *error,
+            (4, error) => error,
+            (_, error) => panic!("unexpected retirement error category: {error:?}"),
+        };
         assert!(matches!(
-            result,
-            Err(StoreError::SemanticInvariant(
-                "injected Event operation retirement failure"
-            ))
+            error,
+            StoreError::SemanticInvariant("injected Event operation retirement failure")
         ));
         assert_eq!(
             snapshot(&store.database.begin_read().expect("after error")),

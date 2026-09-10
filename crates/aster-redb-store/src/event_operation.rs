@@ -124,9 +124,9 @@ impl crate::Store {
         F: FnMut(EventOperationAuditProgress),
     {
         let path = std::path::absolute(path).map_err(StoreError::StorePath)?;
-        let before = crate::open_existing_store_backing(&path)?.identity;
+        let before = crate::open_read_only_store_backing(&path)?.identity;
         let database = redb::Builder::new().open_read_only(&path)?;
-        if before != crate::open_existing_store_backing(&path)?.identity {
+        if before != crate::open_read_only_store_backing(&path)?.identity {
             return Err(StoreError::StoreBackingInvariant(
                 "backing path changed during read-only audit",
             ));
@@ -773,6 +773,22 @@ pub(crate) fn checked_retire_event_operation_records(
 pub(crate) struct EventOperationRetirementDelta {
     pub(crate) records_retired: u64,
     pub(crate) logical_bytes_released: u64,
+}
+
+/// Only the ledger compaction boundary may label these otherwise shared
+/// logical errors as operation-specific. Storage-engine errors must propagate
+/// unchanged, even when the selected runtime has quarantined a failed audit.
+pub(crate) fn classify_retirement_invariant(error: StoreError) -> StoreError {
+    match error {
+        StoreError::SemanticInvariant(_)
+        | StoreError::AccountingMismatch { .. }
+        | StoreError::MissingAccountingMetadata { .. }
+        | StoreError::ItemCountAccountingOverflow
+        | StoreError::PayloadByteAccountingOverflow => {
+            StoreError::EventOperationRetirementInvariant(Box::new(error))
+        }
+        other => other,
+    }
 }
 
 /// Compacts every alias in the final custody-retirement transaction. Validate

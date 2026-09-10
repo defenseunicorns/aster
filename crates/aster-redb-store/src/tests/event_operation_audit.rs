@@ -62,6 +62,31 @@ fn operation_audit_bounds_pages_and_completes_all_retired_rows_after_reopen() {
 }
 
 #[test]
+#[cfg(unix)]
+fn operation_audit_offline_accepts_read_only_backing_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let file = TestFile::new("audit read-only permissions");
+    let store = open(&file, [0xa6; 32], 10, 2_000);
+    retired_rows(&store, 3);
+    drop(store);
+    let before = std::fs::read(&file.0).unwrap();
+    std::fs::set_permissions(&file.0, std::fs::Permissions::from_mode(0o400)).unwrap();
+    assert_eq!(
+        Store::audit_existing_event_operations(&file.0, 1, |_| {})
+            .expect("read-only audit")
+            .total,
+        3
+    );
+    Store::inspect_existing(&file.0).expect("the accompanying inspection is read-only too");
+    assert_eq!(std::fs::read(&file.0).unwrap(), before);
+    assert_eq!(
+        std::fs::metadata(&file.0).unwrap().permissions().mode() & 0o777,
+        0o400
+    );
+}
+
+#[test]
 fn operation_audit_holds_one_snapshot_excluding_concurrent_publication() {
     let file = TestFile::new("audit snapshot publication");
     let mut services = event_services(0xa6);
@@ -96,6 +121,94 @@ fn operation_audit_holds_one_snapshot_excluding_concurrent_publication() {
             .total,
         4
     );
+}
+
+#[test]
+fn operation_audit_rejects_65_otherwise_valid_aliases() {
+    let file = TestFile::new("audit alias overflow");
+    let mut services = event_services(0xa8);
+    let store = open(&file, services.authority, 100, 20_000);
+    publish(&store, &mut services, b"first", b"one", false).unwrap();
+    let read = store.database.begin_read().unwrap();
+    let ledger = read.open_table(EVENT_OPERATION_LEDGER_V3).unwrap();
+    let (_, value) = ledger.first().unwrap().unwrap();
+    let value = value.value().to_vec();
+    let EventOperationLedgerRecord::Active { transfer_id, .. } =
+        decode_event_operation_ledger_record(&value).unwrap()
+    else {
+        panic!("active fixture")
+    };
+    let write = store.database.begin_write().unwrap();
+    {
+        let mut ledger = write.open_table(EVENT_OPERATION_LEDGER_V3).unwrap();
+        let mut reverse = write.open_table(ACTIVE_OPERATION_BY_EVENT_V1).unwrap();
+        // The existing real publication plus 64 canonical aliases.
+        for index in 0..64u8 {
+            let fingerprint = [index; 32];
+            assert!(
+                ledger
+                    .insert(fingerprint.as_slice(), value.as_slice())
+                    .unwrap()
+                    .is_none()
+            );
+            reverse
+                .insert(
+                    encode_active_operation_by_event_key(transfer_id, fingerprint).as_slice(),
+                    [].as_slice(),
+                )
+                .unwrap();
+        }
+        write_event_operation_stats(
+            &mut write.open_table(METADATA).unwrap(),
+            EventOperationStats {
+                records_total: 65,
+                records_active: 65,
+                records_retired: 0,
+                reverse_rows: 65,
+                logical_bytes: 65 * 162,
+            },
+        )
+        .unwrap();
+    }
+    write.commit().unwrap();
+    assert!(matches!(
+        store.audit_event_operations(1, |_| {}),
+        Err(StoreError::SemanticInvariant(
+            "Event operation audit exceeds the alias limit"
+        ))
+    ));
+}
+
+#[test]
+fn operation_audit_retirement_category_does_not_wrap_backend_or_custody_errors() {
+    assert!(matches!(
+        classify_retirement_invariant(StoreError::SemanticInvariant("ledger")),
+        StoreError::EventOperationRetirementInvariant(_)
+    ));
+    assert!(matches!(
+        classify_retirement_invariant(StoreError::AccountingMismatch {
+            field: "ledger",
+            durable: 1,
+            reconstructed: 0
+        }),
+        StoreError::EventOperationRetirementInvariant(_)
+    ));
+    assert!(matches!(
+        classify_retirement_invariant(StoreError::Backend(redb::Error::Io(std::io::Error::other(
+            "storage failure"
+        )))),
+        StoreError::Backend(_)
+    ));
+    assert!(matches!(
+        classify_retirement_invariant(StoreError::Custody(CustodyStoreError::Invariant(
+            "custody failure"
+        ))),
+        StoreError::Custody(_)
+    ));
+    assert!(matches!(
+        classify_retirement_invariant(StoreError::ControlPolicyUnsettled { pending: 1 }),
+        StoreError::ControlPolicyUnsettled { .. }
+    ));
 }
 
 #[test]

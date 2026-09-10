@@ -3371,6 +3371,10 @@ pub enum StoreError {
     EventOperationMigrationDestinationCapacity,
     /// A complete operation audit was cancelled between bounded pages.
     EventOperationAuditCancelled,
+    /// A logical operation-ledger invariant blocked final Event retirement.
+    /// Backend/I/O errors and other custody or security invariants are never
+    /// wrapped in this category. The failed transaction remains uncommitted.
+    EventOperationRetirementInvariant(Box<StoreError>),
     /// The dedicated durable Event operation row cap was reached.
     EventOperationLimitExceeded { current: u64, limit: u64 },
     /// Retaining another Event operation would exceed its dedicated byte cap.
@@ -3844,6 +3848,9 @@ impl fmt::Display for StoreError {
             }
             Self::EventOperationAuditCancelled => {
                 formatter.write_str("Event operation audit cancelled before completion")
+            }
+            Self::EventOperationRetirementInvariant(error) => {
+                write!(formatter, "Event operation retirement invariant: {error}")
             }
             Self::EventOperationLimitExceeded { current, limit } => write!(
                 formatter,
@@ -4403,6 +4410,7 @@ impl Error for StoreError {
             Self::Blob(error) => Some(error),
             Self::Bridge(error) => Some(error),
             Self::Custody(error) => Some(error),
+            Self::EventOperationRetirementInvariant(error) => Some(error.as_ref()),
             Self::StorePath(error) => Some(error),
             _ => None,
         }
@@ -4963,6 +4971,7 @@ struct OpenedStoreBacking {
 fn open_store_backing_file(
     path: &Path,
     create_new: bool,
+    read_only: bool,
 ) -> Result<OpenedStoreBacking, StoreError> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -4984,7 +4993,12 @@ fn open_store_backing_file(
         rustix::fs::Mode::empty(),
     )
     .map_err(|error| StoreError::StorePath(error.into()))?;
-    let mut flags = rustix::fs::OFlags::RDWR
+    let access = if read_only {
+        rustix::fs::OFlags::RDONLY
+    } else {
+        rustix::fs::OFlags::RDWR
+    };
+    let mut flags = access
         | rustix::fs::OFlags::CLOEXEC
         | rustix::fs::OFlags::NOFOLLOW
         | rustix::fs::OFlags::NONBLOCK;
@@ -5035,9 +5049,10 @@ fn open_store_backing_file(
 fn open_store_backing_file(
     path: &Path,
     create_new: bool,
+    read_only: bool,
 ) -> Result<OpenedStoreBacking, StoreError> {
     let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create_new(create_new);
+    options.read(true).write(!read_only).create_new(create_new);
     let file = options.open(path).map_err(StoreError::StorePath)?;
     let metadata = file.metadata().map_err(StoreError::StorePath)?;
     if !metadata.is_file() {
@@ -5056,7 +5071,16 @@ fn open_store_backing_file(
 }
 
 fn open_existing_store_backing(path: &Path) -> Result<OpenedStoreBacking, StoreError> {
-    let backing = open_store_backing_file(path, false)?;
+    validate_nonempty_store_backing(open_store_backing_file(path, false, false)?)
+}
+
+fn open_read_only_store_backing(path: &Path) -> Result<OpenedStoreBacking, StoreError> {
+    validate_nonempty_store_backing(open_store_backing_file(path, false, true)?)
+}
+
+fn validate_nonempty_store_backing(
+    backing: OpenedStoreBacking,
+) -> Result<OpenedStoreBacking, StoreError> {
     if backing.length == 0 {
         return Err(StoreError::StoreBackingInvariant(
             "existing backing file is empty",
@@ -5066,15 +5090,15 @@ fn open_existing_store_backing(path: &Path) -> Result<OpenedStoreBacking, StoreE
 }
 
 fn open_or_create_store_backing(path: &Path) -> Result<OpenedStoreBacking, StoreError> {
-    let backing = match open_store_backing_file(path, false) {
+    let backing = match open_store_backing_file(path, false, false) {
         Ok(backing) => backing,
         Err(StoreError::StorePath(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            match open_store_backing_file(path, true) {
+            match open_store_backing_file(path, true, false) {
                 Ok(backing) => backing,
                 Err(StoreError::StorePath(error))
                     if error.kind() == std::io::ErrorKind::AlreadyExists =>
                 {
-                    open_store_backing_file(path, false)?
+                    open_store_backing_file(path, false, false)?
                 }
                 Err(error) => return Err(error),
             }
@@ -5401,9 +5425,9 @@ impl Store {
     /// so an absent store is never created as a side effect of inspection.
     pub fn inspect_existing(path: impl AsRef<Path>) -> Result<StoreInspection, StoreError> {
         let path = std::path::absolute(path).map_err(StoreError::StorePath)?;
-        let before = open_existing_store_backing(&path)?.identity;
+        let before = open_read_only_store_backing(&path)?.identity;
         let database = redb::Builder::new().open_read_only(&path)?;
-        let after = open_existing_store_backing(&path)?.identity;
+        let after = open_read_only_store_backing(&path)?.identity;
         if before != after {
             return Err(StoreError::StoreBackingInvariant(
                 "backing path changed during read-only inspection",

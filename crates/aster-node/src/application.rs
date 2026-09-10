@@ -26,7 +26,7 @@ use aster_mesh::{
 pub use aster_mesh::{NodeId, Priority, Scope, Topic};
 use aster_redb_store::{
     AggregateStoreUsage, BlobStoreError, ControlPolicySnapshot, ControlTransferId,
-    CustodyObjectKey, CustodyStoreError, EventDeliveryAck as StoreEventDeliveryAck,
+    CustodyObjectKey, CustodyQuota, CustodyStoreError, EventDeliveryAck as StoreEventDeliveryAck,
     EventGapScanPlan, EventOperationKey, EventQueryFilter, EventReplicationPolicySnapshot,
     EventSemanticId, EventSubscriptionId as StoreEventSubscriptionId, EventSubscriptionKey,
     EventSubscriptionMode, EventSubscriptionPollSelection, EventSubscriptionRemoveOutcome,
@@ -881,6 +881,7 @@ pub struct SelectedEventNode {
     verifier_head: Option<(u64, ControlTransferId)>,
     custody_clock: NodeCustodyClock,
     event_route_cache: Arc<AuthenticatedEventRouteCache>,
+    operation_retirement_quarantined: bool,
 }
 
 impl SelectedEventNode {
@@ -1031,6 +1032,7 @@ impl SelectedEventNode {
             verifier_head,
             custody_clock,
             event_route_cache,
+            operation_retirement_quarantined: false,
         };
         selected.current_policy("open")?;
         Ok(selected)
@@ -1051,7 +1053,22 @@ impl SelectedEventNode {
             verifier_head,
             custody_clock,
             event_route_cache,
+            operation_retirement_quarantined: false,
         }
+    }
+
+    pub(crate) fn quarantine_operation_retirement(&mut self) {
+        self.operation_retirement_quarantined = true;
+    }
+
+    pub(crate) fn maintain_runtime_custody(
+        &self,
+        scope_quotas: &[CustodyQuota],
+    ) -> Result<(), NodeError> {
+        operation_audit_maintenance_result(
+            self.operation_retirement_quarantined,
+            drive_custody_maintenance(&self.store, &self.custody_clock, scope_quotas),
+        )
     }
 
     pub(crate) fn refresh_runtime_policy(
@@ -1460,7 +1477,7 @@ impl SelectedEventNode {
     }
 
     fn maintain_custody_for(&self, operation: &'static str) -> Result<(), ApplicationError> {
-        drive_custody_maintenance(&self.store, &self.custody_clock, &[])
+        self.maintain_runtime_custody(&[])
             .map_err(|error| application_error(operation, error))
     }
 
@@ -1777,6 +1794,21 @@ fn event_sequence(stored: &StoredEvent, operation: &'static str) -> Result<u64, 
         .ok_or_else(|| ApplicationError::new(ApplicationErrorKind::Integrity, operation))
 }
 
+fn operation_audit_maintenance_result(
+    quarantined: bool,
+    result: Result<(), NodeError>,
+) -> Result<(), NodeError> {
+    match result {
+        Err(NodeError::Store(StoreError::EventOperationRetirementInvariant(_))) if quarantined => {
+            // The compaction transaction aborted. Retain the untrusted rows,
+            // without repair; reads still enforce custody TTL/authorization.
+            // Unrelated storage/security errors propagate unchanged.
+            Ok(())
+        }
+        result => result,
+    }
+}
+
 fn application_error(operation: &'static str, error: NodeError) -> ApplicationError {
     let kind = match error {
         NodeError::Configuration(_) => ApplicationErrorKind::InvalidRequest,
@@ -1987,6 +2019,7 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::AccountingMismatch { .. }
         | StoreError::MissingAccountingMetadata { .. }
         | StoreError::SemanticInvariant(_)
+        | StoreError::EventOperationRetirementInvariant(_)
         | StoreError::StateInvariant(_)
         | StoreError::RecordInvariant(_)
         | StoreError::BlobInvariant(_)
@@ -2177,6 +2210,34 @@ mod tests {
             StoreError::EventOperationMigrationFingerprintCollision,
         ] {
             assert_eq!(store_error_kind(&error), ApplicationErrorKind::Integrity);
+        }
+    }
+
+    #[test]
+    fn operation_audit_maintenance_quarantine_is_narrow_and_requires_failure() {
+        for quarantined in [false, true] {
+            let ledger_error = StoreError::EventOperationRetirementInvariant(Box::new(
+                StoreError::SemanticInvariant("ledger retirement"),
+            ));
+            assert_eq!(
+                operation_audit_maintenance_result(quarantined, Err(ledger_error.into())).is_ok(),
+                quarantined
+            );
+            for error in [
+                StoreError::Backend(redb::Error::Io(std::io::Error::other("storage"))),
+                StoreError::Custody(CustodyStoreError::Invariant("custody")),
+                StoreError::ControlPolicyUnsettled { pending: 1 },
+                StoreError::SemanticInvariant("outside ledger retirement"),
+                StoreError::AccountingMismatch {
+                    field: "outside ledger retirement",
+                    durable: 1,
+                    reconstructed: 0,
+                },
+            ] {
+                assert!(
+                    operation_audit_maintenance_result(quarantined, Err(error.into())).is_err()
+                );
+            }
         }
     }
 

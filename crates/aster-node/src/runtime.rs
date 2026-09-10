@@ -11245,6 +11245,8 @@ struct EventOperationAuditTestControl {
     page_size: usize,
     on_progress: Box<dyn FnMut(EventOperationAuditProgress) + Send>,
     completion_error: Option<StoreError>,
+    custody_clock: Option<NodeCustodyClock>,
+    terminal_publication_gate: Option<oneshot::Sender<()>>,
 }
 
 struct NodeActorChannels {
@@ -11565,6 +11567,12 @@ async fn run_node_actor_inner(
         CustodyQuota::for_store_limits(forwarding.store_limits()).map_err(StoreError::from)?;
     store.replace_custody_quotas(global_custody_quota, forwarding.scope_quotas())?;
     let custody_clock = NodeCustodyClock::open(application_sealer.identity())?;
+    #[cfg(all(test, unix))]
+    let custody_clock = test_control
+        .as_ref()
+        .and_then(|control| control.event_operation_audit.as_ref())
+        .and_then(|control| control.custody_clock.clone())
+        .unwrap_or(custody_clock);
     drive_custody_maintenance(&store, &custody_clock, forwarding.scope_quotas())?;
     prune_authenticated_event_route_cache_to_sender_projection(
         &store,
@@ -12015,6 +12023,10 @@ async fn run_node_actor_inner(
     // bounded channel provides page backpressure without retaining a full
     // ledger or placing mutable status outside this actor.
     let (audit_progress_sender, mut audit_progress_receiver) = mpsc::channel(1);
+    #[cfg(all(test, unix))]
+    let mut terminal_publication_gate = event_operation_audit_control
+        .as_mut()
+        .and_then(|control| control.terminal_publication_gate.take());
     let mut audit_task = owner_ready.then(|| {
         let store = store.clone();
         tokio::task::spawn_blocking(move || {
@@ -12140,22 +12152,17 @@ async fn run_node_actor_inner(
             }
             _ = shutdown_receiver.recv() => break,
             _ = &mut stop => break,
-            progress = audit_progress_receiver.recv(), if audit_progress_open && audit_can_progress => {
-                if let Some(progress) = progress {
-                    selected_event_status.operation_audit = EventOperationAuditStatus {
-                        state: EventOperationAuditState::Running,
-                        scanned: progress.scanned,
-                        total: progress.total,
-                    };
-                    audit_yield_required = true;
-                } else {
-                    audit_progress_open = false;
-                }
-            }
             completed = async { audit_task.as_mut().expect("guarded audit task").await },
-                if audit_task.is_some() && audit_can_progress => {
+                if audit_task.is_some() => {
                 audit_task.take();
                 audit_progress_open = false;
+                // Completion is independent of progress fairness and precedes
+                // every publication arm. Preserve the final buffered counts
+                // (at most one notification) without re-entering Running.
+                if let Ok(progress) = audit_progress_receiver.try_recv() {
+                    selected_event_status.operation_audit.scanned = progress.scanned;
+                    selected_event_status.operation_audit.total = progress.total;
+                }
                 match completed {
                     Ok(Ok(progress)) => selected_event_status.operation_audit = EventOperationAuditStatus {
                         state: EventOperationAuditState::Complete,
@@ -12165,7 +12172,35 @@ async fn run_node_actor_inner(
                     // Includes worker panic, cancellation outside shutdown,
                     // and every storage/invariant error. Never expose details
                     // or close the shared application/control admission gate.
-                    _ => selected_event_status.operation_audit.state = EventOperationAuditState::Failed,
+                    _ => {
+                        selected_event_status.operation_audit.state = EventOperationAuditState::Failed;
+                        application.quarantine_operation_retirement();
+                    }
+                }
+            }
+            progress = audit_progress_receiver.recv(), if audit_progress_open && audit_can_progress => {
+                if let Some(progress) = progress {
+                    selected_event_status.operation_audit = EventOperationAuditStatus {
+                        state: EventOperationAuditState::Running,
+                        scanned: progress.scanned,
+                        total: progress.total,
+                    };
+                    audit_yield_required = true;
+                    #[cfg(all(test, unix))]
+                    if progress.scanned == 4
+                        && let Some(reached) = terminal_publication_gate.take()
+                    {
+                        // Leave the final progress notification buffered, and
+                        // the terminal error ready, before admitting one queued
+                        // command to the next real actor select turn.
+                        while !audit_task.as_ref().unwrap().is_finished() {
+                            tokio::task::yield_now().await;
+                        }
+                        reached.send(()).unwrap();
+                        pending_application_command = application_receiver.recv().await;
+                    }
+                } else {
+                    audit_progress_open = false;
                 }
             }
             discovery = automatic_event_receiver.recv(),
@@ -12275,11 +12310,7 @@ async fn run_node_actor_inner(
                 control_yield_required = false;
                 discovery_yield_required = false;
                 application_tick_pending = false;
-                if let Err(error) = drive_custody_maintenance(
-                    &store,
-                    &custody_clock,
-                    forwarding.scope_quotas(),
-                ) {
+                if let Err(error) = application.maintain_runtime_custody(forwarding.scope_quotas()) {
                     fatal_error = Some(error);
                     break;
                 }
@@ -28474,6 +28505,185 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn operation_audit_publish_request() -> crate::application::EventPublishRequest {
+        crate::application::EventPublishRequest {
+            operation_key: b"audit-must-not-publish".to_vec(),
+            predecessor: None,
+            topic: Topic::new("opaque").unwrap(),
+            scope: Scope::new("test/runtime").unwrap(),
+            priority: Priority::Routine,
+            logical_key: b"audit".to_vec(),
+            payload: b"one".to_vec(),
+            tombstone: false,
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn operation_audit_worker_panic_closes_publication_but_keeps_actor() {
+        use crate::application::{ApplicationErrorKind, EventQuery};
+
+        let state = root("operation-audit-worker-panic");
+        seed_operation_audit_rows(&state, false);
+        let (selected, shutdown, actor) = start_operation_audit_actor(&state, |p| {
+            assert_ne!(p.scanned, 2, "injected blocking audit worker panic");
+        })
+        .await;
+        wait_operation_audit_status(&selected, EventOperationAuditState::Failed, 2).await;
+        assert_eq!(
+            selected
+                .publish(operation_audit_publish_request())
+                .await
+                .unwrap_err()
+                .kind(),
+            ApplicationErrorKind::StateUnavailable
+        );
+        assert!(
+            selected
+                .query(EventQuery::default())
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        shutdown.send(()).await.unwrap();
+        actor.await.unwrap().unwrap();
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn operation_audit_ready_failure_precedes_pending_publication() {
+        use crate::application::ApplicationErrorKind;
+
+        let state = root("operation-audit-terminal-fairness");
+        seed_operation_audit_rows(&state, false);
+        let (reached, received) = oneshot::channel();
+        let (selected, shutdown, actor) = start_operation_audit_actor_with_control(
+            &state,
+            EventOperationAuditTestControl {
+                page_size: 2,
+                on_progress: Box::new(|_| {}),
+                completion_error: Some(StoreError::SemanticInvariant("audit test failure")),
+                custody_clock: None,
+                terminal_publication_gate: Some(reached),
+            },
+        )
+        .await;
+        timeout(Duration::from_secs(5), received)
+            .await
+            .unwrap()
+            .unwrap();
+        let published = selected.publish(operation_audit_publish_request()).await;
+        shutdown.send(()).await.unwrap();
+        actor.await.unwrap().unwrap();
+        assert_eq!(
+            published
+                .expect_err("ready terminal failure must precede pending publication")
+                .kind(),
+            ApplicationErrorKind::StateUnavailable
+        );
+        let inspection = Store::inspect_existing(state.join(STORE_FILE)).unwrap();
+        assert_eq!(inspection.event_stats.events, 0);
+        assert_eq!(inspection.event_stats.operations, 5);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn operation_audit_failed_active_expiry_preserves_reads_status_and_shutdown() {
+        use crate::application::{ApplicationErrorKind, EventQuery};
+        use redb::ReadableTable;
+
+        let state = root("operation-audit-failed-active-expiry");
+        fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+        let clock_id = [0xa6; 16];
+        let clock = NodeCustodyClock::injected(clock_id, 0, 0);
+        let mission = test_mission();
+        let store = Store::open_for_mission(state.join(STORE_FILE), mission.mission_authority_id())
+            .unwrap();
+        publish_test_custody_event(
+            &store,
+            &mut open_test_sealer(&mission),
+            TestCustodyPublication {
+                operation: b"finite-audit-corrupt-active",
+                topic: &Topic::new("opaque").unwrap(),
+                scope: &Scope::new("test/runtime").unwrap(),
+                priority: Priority::Routine,
+                ttl_ms: Some(10),
+                sample: CustodySample {
+                    clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"expired-content-must-not-escape",
+                tombstone: false,
+            },
+        );
+        drop(store);
+        // Mutate only a stopped store, without any production corruption hook.
+        let db = redb::Database::open(state.join(STORE_FILE)).unwrap();
+        let write = db.begin_write().unwrap();
+        {
+            let mut ledger = write
+                .open_table(redb::TableDefinition::<&[u8], &[u8]>::new(
+                    "aster.event-operation-ledger.v3",
+                ))
+                .unwrap();
+            let (key, mut value) = {
+                let (key, value) = ledger.first().unwrap().unwrap();
+                (key.value().to_vec(), value.value().to_vec())
+            };
+            value[0] = 0xff;
+            ledger.insert(key.as_slice(), value.as_slice()).unwrap();
+        }
+        write.commit().unwrap();
+        drop(db);
+        let (selected, shutdown, actor) = start_operation_audit_actor_with_control(
+            &state,
+            EventOperationAuditTestControl {
+                page_size: 1,
+                on_progress: Box::new(|_| {}),
+                completion_error: None,
+                custody_clock: Some(clock.clone()),
+                terminal_publication_gate: None,
+            },
+        )
+        .await;
+        wait_operation_audit_status(&selected, EventOperationAuditState::Failed, 0).await;
+        clock.set_injected_tick(10).unwrap();
+        let queried = selected.query(EventQuery::default()).await;
+        // The overdue periodic pass runs before the next application command.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let status = selected.status().await;
+        let published = selected.publish(operation_audit_publish_request()).await;
+        let _ = shutdown.send(()).await;
+        let stopped = timeout(Duration::from_secs(5), actor)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            queried
+                .expect("query survives failed ledger retirement")
+                .items
+                .is_empty()
+        );
+        assert_eq!(
+            status
+                .expect("periodic expiry must not kill actor")
+                .event_operation_audit
+                .state,
+            EventOperationAuditState::Failed
+        );
+        assert_eq!(
+            published.unwrap_err().kind(),
+            ApplicationErrorKind::StateUnavailable
+        );
+        stopped.expect("shutdown survives failed ledger retirement");
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[cfg(unix)]
     async fn start_operation_audit_actor(
         state: &Path,
         on_progress: impl FnMut(aster_redb_store::EventOperationAuditProgress) + Send + 'static,
@@ -28490,6 +28700,28 @@ mod tests {
         state: &Path,
         on_progress: impl FnMut(aster_redb_store::EventOperationAuditProgress) + Send + 'static,
         completion_error: Option<StoreError>,
+    ) -> (
+        SelectedEventHandle,
+        mpsc::Sender<()>,
+        JoinHandle<Result<NodeReceipt, NodeError>>,
+    ) {
+        start_operation_audit_actor_with_control(
+            state,
+            EventOperationAuditTestControl {
+                page_size: 2,
+                on_progress: Box::new(on_progress),
+                completion_error,
+                custody_clock: None,
+                terminal_publication_gate: None,
+            },
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn start_operation_audit_actor_with_control(
+        state: &Path,
+        audit_control: EventOperationAuditTestControl,
     ) -> (
         SelectedEventHandle,
         mpsc::Sender<()>,
@@ -28538,11 +28770,7 @@ mod tests {
                     zeroization_queued,
                     blob_worker_fatal_on_shutdown: false,
                     blob_final_read_gate: None,
-                    event_operation_audit: Some(EventOperationAuditTestControl {
-                        page_size: 2,
-                        on_progress: Box::new(on_progress),
-                        completion_error,
-                    }),
+                    event_operation_audit: Some(audit_control),
                 }),
             },
         ));
