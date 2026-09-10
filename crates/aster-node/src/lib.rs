@@ -55,11 +55,13 @@ pub use runtime::{
     ControlPublicationReceipt, DemoScenario, EventEmissionPolicy,
     MAX_CUSTODY_FINALIZATION_CHARGE_MS, MissionExpectedPeer, MutableSourceInterests,
     NodeApplication, NodeBootstrapError, NodeBootstrapErrorKind, NodeConfig, NodeConfigOptions,
-    NodeError, NodeReceipt, PeerReceipt, RunningNode, SelectedForwardingConfig,
-    SoftwareZeroizationPathState, SoftwareZeroizationReceipt, SoftwareZeroizationState,
-    SourceInterestSelector, StoreReceipt, ensure_state_accepts_normal_operation,
-    format_control_transfer_id, inspect_store, put_opaque, run_demo, run_demo_scenario, run_node,
-    run_node_with_forwarding, start_node, start_node_with_forwarding, zeroize_node,
+    NodeError, NodeOperatorOutputPolicy, NodeReceipt, PeerReceipt, RunningNode,
+    SelectedForwardingConfig, SoftwareZeroizationPathState, SoftwareZeroizationReceipt,
+    SoftwareZeroizationState, SourceInterestSelector, StoreReceipt,
+    ensure_state_accepts_normal_operation, format_control_transfer_id, inspect_store, put_opaque,
+    run_demo, run_demo_scenario, run_node, run_node_with_forwarding, start_node,
+    start_node_with_forwarding, start_node_with_forwarding_and_output_policy,
+    start_supervised_node_with_forwarding_and_output_policy, zeroize_node,
 };
 #[cfg(feature = "nearby-discovery")]
 pub use runtime::{

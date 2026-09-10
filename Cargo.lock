@@ -275,17 +275,27 @@ dependencies = [
 name = "aster-agent"
 version = "0.1.0"
 dependencies = [
+ "aster-core",
+ "aster-iroh",
  "aster-node",
+ "aster-redb-store",
  "buffa",
+ "bytes",
  "connectrpc",
  "connectrpc-build",
  "futures",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "rustix",
  "serde",
  "serde_json",
  "subtle",
  "tokio",
+ "tower",
+ "tower-service",
  "zeroize",
 ]
 

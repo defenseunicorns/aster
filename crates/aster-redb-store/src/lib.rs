@@ -2939,6 +2939,16 @@ pub struct StoreStats {
     pub last_acceptance_marker: u64,
 }
 
+/// Exact logical usage charged against the aggregate store limits.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AggregateStoreUsage {
+    /// Number of logical rows charged against [`StoreLimits::max_items`].
+    pub items: u64,
+    /// Encoded payload bytes charged against
+    /// [`StoreLimits::max_total_payload_bytes`].
+    pub payload_bytes: u64,
+}
+
 /// Consistent counts for the mission-bound semantic Event namespace.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EventStoreStats {
@@ -5638,6 +5648,18 @@ impl Store {
     /// Returns the admission limits active on this handle.
     pub const fn limits(&self) -> StoreLimits {
         self.limits
+    }
+
+    /// Returns exact logical usage charged against this handle's aggregate
+    /// store limits.
+    pub fn aggregate_usage(&self) -> Result<AggregateStoreUsage, StoreError> {
+        let read = self.database.begin_read()?;
+        let metadata = read.open_table(METADATA)?;
+        let usage = aggregate_usage_from_metadata(&metadata)?;
+        Ok(AggregateStoreUsage {
+            items: usage.items,
+            payload_bytes: usage.bytes,
+        })
     }
 
     /// Returns the stable mission authority binding, when provisioned.
@@ -13276,7 +13298,7 @@ fn require_aggregate_capacity_bounds(
     incoming_items: u64,
     incoming_bytes: u64,
 ) -> Result<(), StoreError> {
-    let usage = aggregate_usage(metadata)?;
+    let usage = aggregate_usage_from_metadata(metadata)?;
     let next_items = usage
         .items
         .checked_add(incoming_items)
@@ -13342,7 +13364,7 @@ fn require_mutable_class_capacity(
     Ok(())
 }
 
-fn aggregate_usage<T>(metadata: &T) -> Result<CustodyUsage, StoreError>
+fn aggregate_usage_from_metadata<T>(metadata: &T) -> Result<CustodyUsage, StoreError>
 where
     T: redb::ReadableTable<&'static str, u64>,
 {
@@ -13403,7 +13425,7 @@ fn require_ordinary_aggregate_capacity(
 ) -> Result<(), StoreError> {
     require_aggregate_capacity(metadata, limits, incoming_items, incoming_bytes)?;
     let (item_reserve, byte_reserve) = custody::custody_emergency_reserve(limits);
-    let total = aggregate_usage(metadata)?;
+    let total = aggregate_usage_from_metadata(metadata)?;
     let control = CustodyUsage {
         items: metadata
             .get(CONTROL_ITEM_COUNT)?
@@ -24093,6 +24115,21 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_usage_reports_logical_items_and_payload_bytes() {
+        let file = TestFile::new("aggregate usage");
+        let store = Store::open(&file.0).expect("open aggregate-usage fixture");
+        store.apply(item(0x41), b"abc").expect("apply fixture item");
+
+        assert_eq!(
+            store.aggregate_usage().expect("aggregate usage"),
+            AggregateStoreUsage {
+                items: 1,
+                payload_bytes: 3,
+            }
+        );
+    }
+
+    #[test]
     fn mutable_class_capacity_uses_the_tighter_configured_limits() {
         let file = TestFile::new("mutable class configured limits");
         let store = Store::open(&file.0).expect("open capacity fixture");
@@ -27864,6 +27901,15 @@ mod tests {
         let stats = reopened.event_stats().expect("Event stats");
         assert_eq!(stats.events, 2);
         assert_eq!(stats.acceptance_markers, 2);
+        let usage = reopened.aggregate_usage().expect("aggregate usage");
+        assert_eq!(usage.items, 5, "two Events plus three operation rows");
+        assert_eq!(
+            usage.payload_bytes,
+            stats.total_sealed_bytes + stats.operation_bytes,
+            "aggregate usage includes both Event and operation bytes"
+        );
+        assert!(usage.items <= reopened.limits().max_items());
+        assert!(usage.payload_bytes <= reopened.limits().max_total_payload_bytes());
     }
 
     #[test]

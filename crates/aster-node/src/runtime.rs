@@ -84,7 +84,7 @@ use tokio::{
 };
 use tokio::{
     sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, mpsc, oneshot},
-    task::{Id as TaskId, JoinHandle, JoinSet},
+    task::{AbortHandle, Id as TaskId, JoinHandle, JoinSet},
     time::{MissedTickBehavior, sleep, timeout},
 };
 use zeroize::Zeroize as _;
@@ -129,6 +129,111 @@ use aster_redb_store::{
     DEFAULT_MAX_TOTAL_PAYLOAD_BYTES, MAX_CONTROL_BYTES, MAX_CONTROL_ITEMS,
 };
 
+/// Operator-output policy for one selected-node runtime.
+///
+/// Existing node entry points use [`Self::Legacy`]. The customer-agent
+/// composition opts into [`Self::CustomerSafe`], which emits no node receipts
+/// so only the agent's bounded lifecycle records reach process output.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NodeOperatorOutputPolicy {
+    /// Preserve the established READY, STOP, CONTACT, and related receipts.
+    #[default]
+    Legacy,
+    /// Suppress every selected-node operator receipt and error.
+    CustomerSafe,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NodeOutputStream {
+    Stdout,
+    Stderr,
+}
+
+trait NodeOperatorOutputSink: Send + Sync {
+    fn write(&self, stream: NodeOutputStream, record: &str);
+}
+
+struct ProcessNodeOperatorOutputSink;
+
+impl NodeOperatorOutputSink for ProcessNodeOperatorOutputSink {
+    fn write(&self, stream: NodeOutputStream, record: &str) {
+        match stream {
+            NodeOutputStream::Stdout => println!("{record}"),
+            NodeOutputStream::Stderr => eprintln!("{record}"),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct NodeOperatorOutput {
+    policy: NodeOperatorOutputPolicy,
+    sink: Arc<dyn NodeOperatorOutputSink>,
+}
+
+impl NodeOperatorOutput {
+    fn process(policy: NodeOperatorOutputPolicy) -> Self {
+        Self::with_sink(policy, Arc::new(ProcessNodeOperatorOutputSink))
+    }
+
+    fn with_sink(policy: NodeOperatorOutputPolicy, sink: Arc<dyn NodeOperatorOutputSink>) -> Self {
+        Self { policy, sink }
+    }
+
+    #[cfg(test)]
+    fn stdout(&self, arguments: fmt::Arguments<'_>) {
+        self.write(NodeOutputStream::Stdout, arguments);
+    }
+
+    #[cfg(test)]
+    fn stderr(&self, arguments: fmt::Arguments<'_>) {
+        self.write(NodeOutputStream::Stderr, arguments);
+    }
+
+    fn write(&self, stream: NodeOutputStream, arguments: fmt::Arguments<'_>) {
+        if self.policy == NodeOperatorOutputPolicy::Legacy {
+            self.sink.write(stream, &arguments.to_string());
+        }
+    }
+}
+
+tokio::task_local! {
+    static NODE_OPERATOR_OUTPUT: NodeOperatorOutput;
+}
+
+fn emit_node_output(stream: NodeOutputStream, arguments: fmt::Arguments<'_>) {
+    if NODE_OPERATOR_OUTPUT
+        .try_with(|output| output.write(stream, arguments))
+        .is_err()
+    {
+        ProcessNodeOperatorOutputSink.write(stream, &arguments.to_string());
+    }
+}
+
+fn current_node_output() -> NodeOperatorOutput {
+    NODE_OPERATOR_OUTPUT
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| NodeOperatorOutput::process(NodeOperatorOutputPolicy::default()))
+}
+
+fn inherit_node_output<F>(future: F) -> impl Future<Output = F::Output>
+where
+    F: Future,
+{
+    NODE_OPERATOR_OUTPUT.scope(current_node_output(), future)
+}
+
+macro_rules! node_stdout {
+    ($($argument:tt)*) => {
+        emit_node_output(NodeOutputStream::Stdout, format_args!($($argument)*))
+    };
+}
+
+macro_rules! node_stderr {
+    ($($argument:tt)*) => {
+        emit_node_output(NodeOutputStream::Stderr, format_args!($($argument)*))
+    };
+}
+
 pub(crate) const STORE_FILE: &str = "mesh.redb";
 const MAX_CONFIGURED_PEERS: usize = MAX_MUTABLE_TRANSFER_CURSOR_PEERS;
 #[cfg(feature = "nearby-discovery")]
@@ -146,6 +251,10 @@ const AUTOMATIC_NEARBY_REOPEN_MIN_BACKOFF: Duration = Duration::from_millis(250)
 const AUTOMATIC_NEARBY_REOPEN_MAX_BACKOFF: Duration = Duration::from_secs(4);
 const MAX_INBOUND_CONTACTS: usize = 16;
 const MAX_OUTBOUND_CONTACTS: usize = 16;
+// Preserve single-sided contact in the normal case, but do not let carrier-ID
+// ordering permanently hide a ReceiveOnly peer from a permitted initiator.
+const MIN_NON_PREFERRED_CONTACT_FALLBACK_DELAY: Duration = Duration::from_secs(1);
+const NON_PREFERRED_CONTACT_FALLBACK_INTERVALS: u32 = 3;
 const APPLICATION_COMMAND_CAPACITY: usize = 32;
 const BLOB_WORKER_CAPACITY: usize = 1;
 const CONTROL_COMMAND_CAPACITY: usize = 1;
@@ -324,6 +433,36 @@ const LOCAL_ZEROIZATION_REQUEST_MAGIC: &[u8] = b"ASTER-ZEROIZE-LOCAL-V1\0";
 const MAX_LOCAL_ZEROIZATION_PATH_BYTES: usize = 8 * 1024;
 #[cfg(unix)]
 const MAX_LOCAL_ZEROIZATION_RESPONSE_BYTES: usize = 8 * 1024;
+
+fn contact_initiation_is_due(
+    local: EndpointId,
+    peer: EndpointId,
+    last_peer_activity: Instant,
+    now: Instant,
+    fallback_delay: Duration,
+) -> bool {
+    local < peer || now.saturating_duration_since(last_peer_activity) >= fallback_delay
+}
+
+fn non_preferred_contact_fallback_delay(sync_interval: Duration) -> Duration {
+    sync_interval
+        .saturating_mul(NON_PREFERRED_CONTACT_FALLBACK_INTERVALS)
+        .max(MIN_NON_PREFERRED_CONTACT_FALLBACK_DELAY)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InboundContactCollision {
+    KeepPreferredOutbound,
+    YieldFallbackOutbound,
+}
+
+fn inbound_contact_collision(local: EndpointId, peer: EndpointId) -> InboundContactCollision {
+    if local < peer {
+        InboundContactCollision::KeepPreferredOutbound
+    } else {
+        InboundContactCollision::YieldFallbackOutbound
+    }
+}
 
 fn selected_reconciliation_limits() -> Result<ReconciliationLimits, NodeError> {
     Ok(ReconciliationLimits::new(
@@ -2632,7 +2771,12 @@ impl SelectedEventStatusTracker {
         store: &Store,
         current: &EventReplicationPolicySnapshot,
         failed_contact_attempts: usize,
+        emission_policy: EventEmissionPolicy,
     ) -> Result<SelectedEventStatus, NodeError> {
+        let store_usage = store.aggregate_usage()?;
+        let store_limits = store.limits();
+        let event_stats = store.event_stats()?;
+        let subscription_stats = store.event_subscription_stats()?;
         let current_policy = ContactEventPolicy::capture(current);
         let mut peers = Vec::with_capacity(self.authenticated.len());
         let mut authenticated_contacts = 0u64;
@@ -2700,6 +2844,12 @@ impl SelectedEventStatusTracker {
             authenticated_contacts,
             failed_contact_attempts,
             peers,
+            emission_policy,
+            store_usage,
+            store_limits,
+            event_operations: event_stats.operations,
+            event_operation_bytes: event_stats.operation_bytes,
+            pending_deliveries: subscription_stats.pending_deliveries,
         })
     }
 }
@@ -4280,7 +4430,7 @@ fn drive_sample_application(
                 },
             )?;
             cache_accepted_stored_event(event_route_cache, sealer, &ping)?;
-            println!(
+            node_stdout!(
                 "APPLICATION status={} kind=ping transfer_id={} semantic_id={} publisher={} source_authenticated=true ttl=none",
                 if inserted { "emitted" } else { "existing" },
                 format_transfer_id(ping.transfer_id),
@@ -4343,7 +4493,7 @@ fn drive_sample_application(
                     },
                 )?;
                 cache_accepted_stored_event(event_route_cache, sealer, &pong)?;
-                println!(
+                node_stdout!(
                     "APPLICATION status={} kind=pong transfer_id={} semantic_id={} publisher={} correlation_semantic_id={} ping_publisher={} source_authenticated=true causal_observation=verified ttl=none",
                     if inserted { "emitted" } else { "existing" },
                     format_transfer_id(pong.transfer_id),
@@ -10614,6 +10764,7 @@ fn configured_runtime_peers(
 fn execute_selected_event_command(
     application: &mut SelectedEventNode,
     store: &Store,
+    emission_policy: &LiveEmissionPolicy,
     status: &SelectedEventStatusTracker,
     receipt: &NodeReceipt,
     command: SelectedEventCommand,
@@ -10660,8 +10811,11 @@ fn execute_selected_event_command(
         }
         SelectedEventCommand::Status { response } => {
             let result = application.runtime_policy_for_status().and_then(|current| {
+                let emission = emission_policy
+                    .snapshot()
+                    .map_err(|error| runtime_application_error("status", error))?;
                 status
-                    .snapshot(store, &current, receipt.contact_errors)
+                    .snapshot(store, &current, receipt.contact_errors, emission.policy)
                     .map_err(|error| runtime_application_error("status", error))
             });
             let _ = response.send(result);
@@ -10823,13 +10977,21 @@ fn execute_selected_application_command(
     records: &mut SelectedRecordNode,
     blobs: &mpsc::Sender<SelectedBlobCommand>,
     store: &Store,
+    emission_policy: &LiveEmissionPolicy,
     status: &SelectedEventStatusTracker,
     receipt: &NodeReceipt,
     command: SelectedApplicationCommand,
 ) {
     match command {
         SelectedApplicationCommand::Event(command) => {
-            execute_selected_event_command(events, store, status, receipt, command);
+            execute_selected_event_command(
+                events,
+                store,
+                emission_policy,
+                status,
+                receipt,
+                command,
+            );
         }
         SelectedApplicationCommand::State(command) => {
             execute_selected_state_command(state, command);
@@ -10985,6 +11147,61 @@ pub async fn start_node_with_forwarding(
     config: NodeConfig,
     forwarding: SelectedForwardingConfig,
 ) -> Result<RunningNode, NodeError> {
+    start_node_with_forwarding_and_output_policy(
+        config,
+        forwarding,
+        NodeOperatorOutputPolicy::default(),
+    )
+    .await
+}
+
+/// Starts one selected node with an explicit operator-output policy.
+pub async fn start_node_with_forwarding_and_output_policy(
+    config: NodeConfig,
+    forwarding: SelectedForwardingConfig,
+    output_policy: NodeOperatorOutputPolicy,
+) -> Result<RunningNode, NodeError> {
+    start_node_with_forwarding_output(
+        config,
+        forwarding,
+        NodeOperatorOutput::process(output_policy),
+    )
+    .await
+}
+
+async fn start_node_with_forwarding_output(
+    config: NodeConfig,
+    forwarding: SelectedForwardingConfig,
+    output: NodeOperatorOutput,
+) -> Result<RunningNode, NodeError> {
+    start_node_with_shutdown_ownership(config, forwarding, output, true).await
+}
+
+/// Starts a node whose shutdown is owned by its embedding supervisor.
+///
+/// Unlike standalone startup, this node does not consume process SIGINT.
+/// The supervisor drains its admitted work before calling `RunningNode::shutdown`.
+/// An explicitly configured `run_for` deadline still applies.
+pub async fn start_supervised_node_with_forwarding_and_output_policy(
+    config: NodeConfig,
+    forwarding: SelectedForwardingConfig,
+    output_policy: NodeOperatorOutputPolicy,
+) -> Result<RunningNode, NodeError> {
+    start_node_with_shutdown_ownership(
+        config,
+        forwarding,
+        NodeOperatorOutput::process(output_policy),
+        false,
+    )
+    .await
+}
+
+async fn start_node_with_shutdown_ownership(
+    config: NodeConfig,
+    forwarding: SelectedForwardingConfig,
+    output: NodeOperatorOutput,
+    handle_sigint: bool,
+) -> Result<RunningNode, NodeError> {
     let identity = config.mission.identity();
     let mission_authority = config.mission.mission_authority_id();
     let (application_sender, application_receiver) = mpsc::channel(APPLICATION_COMMAND_CAPACITY);
@@ -11018,17 +11235,20 @@ pub async fn start_node_with_forwarding(
     let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
     let (ready_sender, ready_receiver) = oneshot::channel();
     let emission_policy = Arc::new(LiveEmissionPolicy::new(forwarding.emission_policy()));
-    let task = tokio::spawn(run_node_actor_with_forwarding(
+    let mut channels = NodeActorChannels::new(
+        application_receiver,
+        application_admission.clone(),
+        control_receiver,
+        shutdown_receiver,
+        ready_sender,
+    );
+    channels.handle_sigint = handle_sigint;
+    let task = tokio::spawn(run_node_actor_with_forwarding_output(
         config,
         forwarding,
         emission_policy.clone(),
-        NodeActorChannels::new(
-            application_receiver,
-            application_admission.clone(),
-            control_receiver,
-            shutdown_receiver,
-            ready_sender,
-        ),
+        output,
+        channels,
     ));
     let ready = match ready_receiver.await {
         Ok(ready) => ready,
@@ -11083,6 +11303,7 @@ struct RunNodeActorTestControl {
 }
 
 struct NodeActorChannels {
+    handle_sigint: bool,
     application_receiver: mpsc::Receiver<SelectedApplicationCommand>,
     application_admission: Arc<AtomicBool>,
     control_receiver: mpsc::Receiver<SelectedControlCommand>,
@@ -11124,7 +11345,7 @@ async fn run_automatic_nearby_discovery(
 ) {
     let mut generation = 1u64;
     loop {
-        println!(
+        node_stdout!(
             "DISCOVERY status=open mode=nearby-auto generation={} window_seconds={}",
             generation,
             window.as_secs()
@@ -11151,7 +11372,7 @@ async fn run_automatic_nearby_discovery(
         {
             return;
         }
-        println!(
+        node_stdout!(
             "DISCOVERY status=closed mode=nearby-auto generation={} reason=window-expired window_seconds={}",
             generation,
             window.as_secs()
@@ -11179,7 +11400,7 @@ async fn run_automatic_nearby_discovery(
                 Err(error) => {
                     failures = failures.saturating_add(1);
                     let backoff = automatic_nearby_reopen_backoff(failures);
-                    eprintln!(
+                    node_stderr!(
                         "DISCOVERY status=error mode=nearby-auto stage=reopen generation={} failures={} retry_delay_ms={} error={}",
                         generation,
                         failures,
@@ -11206,6 +11427,7 @@ impl NodeActorChannels {
     ) -> Self {
         Self {
             application_receiver,
+            handle_sigint: true,
             application_admission,
             control_receiver,
             shutdown_receiver,
@@ -11242,13 +11464,36 @@ async fn run_node_actor(
     .await
 }
 
+#[cfg(test)]
 async fn run_node_actor_with_forwarding(
     config: NodeConfig,
     forwarding: SelectedForwardingConfig,
     emission_policy: Arc<LiveEmissionPolicy>,
     channels: NodeActorChannels,
 ) -> Result<NodeReceipt, NodeError> {
-    run_node_actor_inner(config, forwarding, emission_policy, channels).await
+    run_node_actor_with_forwarding_output(
+        config,
+        forwarding,
+        emission_policy,
+        NodeOperatorOutput::process(NodeOperatorOutputPolicy::default()),
+        channels,
+    )
+    .await
+}
+
+async fn run_node_actor_with_forwarding_output(
+    config: NodeConfig,
+    forwarding: SelectedForwardingConfig,
+    emission_policy: Arc<LiveEmissionPolicy>,
+    output: NodeOperatorOutput,
+    channels: NodeActorChannels,
+) -> Result<NodeReceipt, NodeError> {
+    NODE_OPERATOR_OUTPUT
+        .scope(
+            output,
+            run_node_actor_inner(config, forwarding, emission_policy, channels),
+        )
+        .await
 }
 
 async fn run_node_actor_inner(
@@ -11258,6 +11503,7 @@ async fn run_node_actor_inner(
     channels: NodeActorChannels,
 ) -> Result<NodeReceipt, NodeError> {
     let NodeActorChannels {
+        handle_sigint,
         mut application_receiver,
         application_admission,
         mut control_receiver,
@@ -11322,7 +11568,7 @@ async fn run_node_actor_inner(
         None => (None, None),
     };
     if let Some(receipt) = &bridge_initialization {
-        println!(
+        node_stdout!(
             "BRIDGE_INIT status=pass authorizations_verified={} authorizations_applied={} authorizations_existing={} local_edges={} carry_inserted={} carry_existing={} route_candidates={} routes_reverified={} routes_inactive={} active_routes={} restored_deliveries={} payload_plaintext_logged=false",
             receipt.authorizations_verified,
             receipt.authorizations_applied,
@@ -11337,7 +11583,7 @@ async fn run_node_actor_inner(
             receipt.deliveries.len(),
         );
         for delivery in &receipt.deliveries {
-            println!(
+            node_stdout!(
                 "BRIDGE_RESTORE status=pass source_id={} route_id={} wrapper_id={} active=true payload_plaintext_logged=false",
                 crate::format_item_id(delivery.source_item_id),
                 format_node_id(delivery.bridge_route_id),
@@ -11537,7 +11783,7 @@ async fn run_node_actor_inner(
     #[cfg(not(feature = "nearby-discovery"))]
     let nearby_window_seconds = 0;
     let provisioning_origin = config.provisioning_origin().receipt_label();
-    println!(
+    node_stdout!(
         "READY selected=true pid={} carrier_id={} mission_id={} mission_authority={} sockets={} state={} peers={} application={} carrier_route={} controlled_relay_url={} controlled_relay_trust={} controlled_relay_readiness={} public_relay_fallback=false hosted_discovery=false nearby_discovery={} nearby_window_seconds={} discovery_metadata={} discovery_authority={} discovery_candidate_limit={} nat_traversal=not-claimed path_observation=not-authorization mission_auth=hybrid-pq provisioning={} semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash commit_before_activate=true content_admission=capability-gated event_bridge={}",
         std::process::id(),
         local_id,
@@ -11608,13 +11854,15 @@ async fn run_node_actor_inner(
             .clone()
             .expect("automatic browser has stop control");
         let endpoint = endpoint.clone();
-        Some(tokio::spawn(run_automatic_nearby_discovery(
-            endpoint,
-            browser,
-            window,
-            ipv4_interfaces,
-            control,
-            automatic_event_sender,
+        Some(tokio::spawn(inherit_node_output(
+            run_automatic_nearby_discovery(
+                endpoint,
+                browser,
+                window,
+                ipv4_interfaces,
+                control,
+                automatic_event_sender,
+            ),
         )))
     } else {
         nearby_session.take().map(|session| {
@@ -11627,7 +11875,7 @@ async fn run_node_actor_inner(
             let initial_policy = live_policy
                 .snapshot()
                 .expect("validated live emission policy");
-            tokio::spawn(async move {
+            tokio::spawn(inherit_node_output(async move {
                 let deadline = tokio::time::Instant::now() + window;
                 let reason = loop {
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -11641,12 +11889,12 @@ async fn run_node_actor_inner(
                     }
                 };
                 session.stop();
-                println!(
+                node_stdout!(
                     "DISCOVERY status=closed mode=nearby-evaluation reason={} window_seconds={}",
                     reason,
                     window.as_secs()
                 );
-            })
+            }))
         })
     };
     #[cfg(all(test, unix))]
@@ -11674,19 +11922,20 @@ async fn run_node_actor_inner(
     }
     #[cfg(all(test, unix))]
     let mut zeroization_task = if owner_ready {
-        Some(tokio::spawn(run_local_zeroization_accept_loop(
-            zeroization_control,
-            zeroization_sender,
-            zeroization_queued,
+        Some(tokio::spawn(inherit_node_output(
+            run_local_zeroization_accept_loop(
+                zeroization_control,
+                zeroization_sender,
+                zeroization_queued,
+            ),
         )))
     } else {
         None
     };
     #[cfg(all(not(test), unix))]
     let mut zeroization_task = if owner_ready {
-        Some(tokio::spawn(run_local_zeroization_accept_loop(
-            zeroization_control,
-            zeroization_sender,
+        Some(tokio::spawn(inherit_node_output(
+            run_local_zeroization_accept_loop(zeroization_control, zeroization_sender),
         )))
     } else {
         None
@@ -11700,7 +11949,7 @@ async fn run_node_actor_inner(
     let (blob_worker_completion_sender, mut blob_worker_completion_receiver) = oneshot::channel();
     let blob_worker_task = {
         let admission = application_admission.clone();
-        tokio::spawn(async move {
+        tokio::spawn(inherit_node_output(async move {
             let result = run_selected_blob_worker(
                 blob_application,
                 blob_worker_receiver,
@@ -11709,7 +11958,7 @@ async fn run_node_actor_inner(
             )
             .await;
             let _ = blob_worker_completion_sender.send(result);
-        })
+        }))
     };
     let mut blob_worker_completion_open = true;
 
@@ -11718,8 +11967,10 @@ async fn run_node_actor_inner(
     let stop = async move {
         if let Some(deadline) = stop_deadline {
             sleep(deadline.saturating_duration_since(Instant::now())).await;
-        } else {
+        } else if handle_sigint {
             let _ = tokio::signal::ctrl_c().await;
+        } else {
+            std::future::pending::<()>().await;
         }
     };
     tokio::pin!(stop);
@@ -11748,6 +11999,14 @@ async fn run_node_actor_inner(
         JoinSet::new();
     let mut outbound_peers = BTreeSet::new();
     let mut outbound_tasks = BTreeMap::<TaskId, ContactPeer>::new();
+    let mut outbound_abort_handles = BTreeMap::<EndpointId, (TaskId, AbortHandle)>::new();
+    let mut collision_aborted_outbound = BTreeSet::<TaskId>::new();
+    let non_preferred_fallback_delay = non_preferred_contact_fallback_delay(config.sync_interval);
+    let contact_election_started = Instant::now();
+    let mut peer_contact_activity = configured_peers
+        .iter()
+        .map(|peer| (peer.carrier, contact_election_started))
+        .collect::<BTreeMap<_, _>>();
     let mut automatic_candidates = BTreeSet::<EndpointId>::new();
     let mut automatic_events_open = automatic_nearby;
     let mut next_outbound_peer = 0usize;
@@ -11770,7 +12029,7 @@ async fn run_node_actor_inner(
         let allowed = allowed.clone();
         #[cfg(feature = "nearby-discovery")]
         let automatic = automatic_nearby;
-        Some(tokio::spawn(async move {
+        Some(tokio::spawn(inherit_node_output(async move {
             loop {
                 #[cfg(feature = "nearby-discovery")]
                 let accepted = if automatic {
@@ -11794,7 +12053,7 @@ async fn run_node_actor_inner(
                     }
                 }
             }
-        }))
+        })))
     };
 
     #[cfg(all(test, unix))]
@@ -11844,12 +12103,12 @@ async fn run_node_actor_inner(
                                 format_receipt_field(&error.to_string())
                             );
                             if let Err(response_error) = request.respond(&response).await {
-                                eprintln!(
+                                node_stderr!(
                                     "ZEROIZE lifecycle=live preflight=failed response=failed error={}",
                                     format_receipt_field(&response_error.to_string())
                                 );
                             }
-                            eprintln!(
+                            node_stderr!(
                                 "ZEROIZE lifecycle=live preflight=failed error={} assurance=bounded-software",
                                 format_receipt_field(&error.to_string())
                             );
@@ -11857,7 +12116,7 @@ async fn run_node_actor_inner(
                     },
                     Some(Err(error)) if error.is_integrity_failure() => {
                         let error = error.into_node_error();
-                        eprintln!(
+                        node_stderr!(
                             "ZEROIZE lifecycle=live control=failed error={}",
                             format_receipt_field(&error.to_string())
                         );
@@ -11866,7 +12125,7 @@ async fn run_node_actor_inner(
                     }
                     Some(Err(error)) => {
                         let error = error.into_node_error();
-                        eprintln!(
+                        node_stderr!(
                             "ZEROIZE lifecycle=live request=denied error={}",
                             format_receipt_field(&error.to_string())
                         );
@@ -11909,13 +12168,13 @@ async fn run_node_actor_inner(
                         if !automatic_candidates.contains(&endpoint_id)
                             && automatic_candidates.len() >= MAX_AUTOMATIC_NEARBY_CANDIDATES
                         {
-                            eprintln!(
+                            node_stderr!(
                                 "DISCOVERY status=dropped mode=nearby-auto carrier_peer={} reason=candidate-limit limit={}",
                                 endpoint_id,
                                 MAX_AUTOMATIC_NEARBY_CANDIDATES
                             );
                         } else if automatic_candidates.insert(endpoint_id) {
-                            println!(
+                            node_stdout!(
                                 "DISCOVERY status=candidate mode=nearby-auto carrier_peer={} retained_candidates={} authorization=pending-mission-handshake",
                                 endpoint_id,
                                 automatic_candidates.len()
@@ -11924,7 +12183,8 @@ async fn run_node_actor_inner(
                     }
                     Some(AutomaticNearbyEvent::Expired(endpoint_id)) => {
                         if automatic_candidates.remove(&endpoint_id) {
-                            println!(
+                            peer_contact_activity.remove(&endpoint_id);
+                            node_stdout!(
                                 "DISCOVERY status=expired mode=nearby-auto carrier_peer={} retained_candidates={}",
                                 endpoint_id,
                                 automatic_candidates.len()
@@ -11933,10 +12193,12 @@ async fn run_node_actor_inner(
                     }
                     Some(AutomaticNearbyEvent::WindowClosed) => {
                         automatic_candidates.clear();
+                        peer_contact_activity.clear();
                     }
                     None => {
                         automatic_events_open = false;
                         automatic_candidates.clear();
+                        peer_contact_activity.clear();
                     }
                 }
                 // A biased, continuously ready discovery stream gets at most
@@ -12072,16 +12334,33 @@ async fn run_node_actor_inner(
                 }
                 let start = next_outbound_peer % peer_count;
                 next_outbound_peer = (start + 1) % peer_count;
+                let election_now = Instant::now();
                 for offset in 0..peer_count {
                     if outbound.len() >= MAX_OUTBOUND_CONTACTS {
                         break;
                     }
                     let peer = contact_peers[(start + offset) % peer_count];
-                    // Exactly one endpoint initiates each configured edge. This avoids
-                    // symmetric connect/accept deadlocks without assigning topology meaning.
-                    if local_id >= peer.carrier() || !outbound_peers.insert(peer.carrier()) {
+                    let peer_id = peer.carrier();
+                    let last_activity = peer_contact_activity
+                        .entry(peer_id)
+                        .or_insert(election_now);
+                    // The lower identity initiates immediately. The higher identity
+                    // becomes eligible only after a bounded quiet period, which keeps
+                    // the normal case single-sided while allowing a normal peer to
+                    // reach a lower-identity ReceiveOnly peer.
+                    if inbound_peers.contains(&peer_id)
+                        || !contact_initiation_is_due(
+                            local_id,
+                            peer_id,
+                            *last_activity,
+                            election_now,
+                            non_preferred_fallback_delay,
+                        )
+                        || !outbound_peers.insert(peer_id)
+                    {
                         continue;
                     }
+                    *last_activity = election_now;
                     let store = store.clone();
                     let endpoint = endpoint.clone();
                     let policy_lock = policy_lock.clone();
@@ -12094,7 +12373,7 @@ async fn run_node_actor_inner(
                     let controlled_relay = forwarding.controlled_relay.clone();
                     #[cfg(feature = "nearby-discovery")]
                     let automatic_admission = automatic_admission.clone();
-                    let task = outbound.spawn(async move {
+                    let task = outbound.spawn(inherit_node_output(async move {
                         (
                             peer,
                             sync_once_with_forwarding(
@@ -12117,8 +12396,10 @@ async fn run_node_actor_inner(
                             )
                             .await,
                         )
-                    });
-                    outbound_tasks.insert(task.id(), peer);
+                    }));
+                    let task_id = task.id();
+                    outbound_tasks.insert(task_id, peer);
+                    outbound_abort_handles.insert(peer_id, (task_id, task));
                 }
             }
             lease = acquire_application_policy_lease(
@@ -12140,6 +12421,7 @@ async fn run_node_actor_inner(
                     &mut record_application,
                     &blob_worker_sender,
                     &store,
+                    &emission_policy,
                     &selected_event_status,
                     &receipt,
                     command,
@@ -12161,15 +12443,42 @@ async fn run_node_actor_inner(
                 match accepted {
                     Some(Ok(connection)) => {
                         let peer = connection.remote_id();
-                        if !inbound_peers.insert(peer) {
+                        if peer_contact_activity.contains_key(&peer)
+                            || automatic_candidates.contains(&peer)
+                        {
+                            peer_contact_activity.insert(peer, Instant::now());
+                        }
+                        if inbound_peers.contains(&peer) {
                             connection.close();
                             receipt.contact_errors += 1;
-                            eprintln!("CONTACT direction=in carrier_peer={peer} status=error error=duplicate_concurrent_carrier_contact");
+                            node_stderr!("CONTACT direction=in carrier_peer={peer} status=error error=duplicate_concurrent_carrier_contact");
                             if yield_for_network {
                                 tokio::task::yield_now().await;
                             }
                             continue;
                         }
+                        if let Some((task, abort)) = outbound_abort_handles
+                            .get(&peer)
+                            .map(|(task, abort)| (*task, abort.clone()))
+                        {
+                            match inbound_contact_collision(local_id, peer) {
+                                InboundContactCollision::KeepPreferredOutbound => {
+                                    connection.close();
+                                    println!("CONTACT direction=in carrier_peer={peer} status=collision-resolved resolution=keep-preferred-outbound");
+                                    if yield_for_network {
+                                        tokio::task::yield_now().await;
+                                    }
+                                    continue;
+                                }
+                                InboundContactCollision::YieldFallbackOutbound => {
+                                    collision_aborted_outbound.insert(task);
+                                    abort.abort();
+                                    println!("CONTACT direction=out carrier_peer={peer} status=collision-resolved resolution=yield-fallback-to-preferred-inbound");
+                                }
+                            }
+                        }
+                        let inserted = inbound_peers.insert(peer);
+                        debug_assert!(inserted, "duplicate inbound peer was rejected above");
                         let store = store.clone();
                         let policy_lock = policy_lock.clone();
                         let emission_policy = emission_policy.clone();
@@ -12188,7 +12497,7 @@ async fn run_node_actor_inner(
                         debug_assert!(expected_peer.is_some());
                         #[cfg(feature = "nearby-discovery")]
                         let automatic_admission = automatic_admission.clone();
-                        let task = inbound.spawn(async move {
+                        let task = inbound.spawn(inherit_node_output(async move {
                             (
                                 peer,
                                 serve_connection_with_forwarding(InboundContact {
@@ -12207,12 +12516,12 @@ async fn run_node_actor_inner(
                                 })
                                 .await,
                             )
-                        });
+                        }));
                         inbound_tasks.insert(task.id(), peer);
                     }
                     Some(Err(error)) => {
                         receipt.contact_errors += 1;
-                        eprintln!("CONTACT direction=in status=error error={}", format_receipt_field(&error.to_string()));
+                        node_stderr!("CONTACT direction=in status=error error={}", format_receipt_field(&error.to_string()));
                     }
                     None => {
                         // Disable this select arm permanently. A closed channel
@@ -12222,7 +12531,7 @@ async fn run_node_actor_inner(
                             let _ = task.await;
                         }
                         receipt.contact_errors += 1;
-                        eprintln!("CONTACT direction=in status=error error=accept_task_stopped");
+                        node_stderr!("CONTACT direction=in status=error error=accept_task_stopped");
                     }
                 }
                 if yield_for_network {
@@ -12239,6 +12548,9 @@ async fn run_node_actor_inner(
                     Some(Ok((task, (peer, Ok(server_receipt))))) => {
                         inbound_tasks.remove(&task);
                         inbound_peers.remove(&peer);
+                        if let Some(last_activity) = peer_contact_activity.get_mut(&peer) {
+                            *last_activity = Instant::now();
+                        }
                         if let Err(error) = selected_event_status.record(&server_receipt) {
                             fatal_error = Some(error);
                             break;
@@ -12256,7 +12568,7 @@ async fn run_node_actor_inner(
                             break;
                         }
                         receipt.contacts += 1;
-                        println!(
+                        node_stdout!(
                             "CONTACT direction=in carrier_peer={} mission_peer={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} deferred_event_lanes={} mutable_remaining={} deferred_mutable_lanes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} bridge_offered={} bridge_applied={} bridge_delivered={} bridge_remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} carrier_path={} carrier_path_transitions={} carrier_path_transitions_saturated={} path_observation=not-authorization mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash content_admission=capability-gated status={}",
                             peer,
                             format_node_id(server_receipt.mission_peer.expect("successful mission contact has peer identity")),
@@ -12297,20 +12609,26 @@ async fn run_node_actor_inner(
                     Some(Ok((task, (peer, Err(error))))) => {
                         inbound_tasks.remove(&task);
                         inbound_peers.remove(&peer);
+                        if let Some(last_activity) = peer_contact_activity.get_mut(&peer) {
+                            *last_activity = Instant::now();
+                        }
                         if actor_fatal_contact_error(&error, config.mission.identity()) {
                             fatal_error = Some(error);
                             break;
                         }
                         receipt.contact_errors += 1;
-                        eprintln!("CONTACT direction=in carrier_peer={peer} status=error error={}", format_receipt_field(&error.to_string()));
+                        node_stderr!("CONTACT direction=in carrier_peer={peer} status=error error={}", format_receipt_field(&error.to_string()));
                     }
                     Some(Err(error)) => {
                         let peer = inbound_tasks.remove(&error.id());
                         if let Some(peer) = peer {
                             inbound_peers.remove(&peer);
+                            if let Some(last_activity) = peer_contact_activity.get_mut(&peer) {
+                                *last_activity = Instant::now();
+                            }
                         }
                         receipt.contact_errors += 1;
-                        eprintln!("CONTACT direction=in carrier_peer={} status=error error={}", peer.map_or_else(|| "unknown".into(), |peer| peer.to_string()), format_receipt_field(&format!("task failed: {error}")));
+                        node_stderr!("CONTACT direction=in carrier_peer={} status=error error={}", peer.map_or_else(|| "unknown".into(), |peer| peer.to_string()), format_receipt_field(&format!("task failed: {error}")));
                     }
                     None => {}
                 }
@@ -12328,6 +12646,11 @@ async fn run_node_actor_inner(
                     Some(Ok((task, (peer, Ok(peer_receipt))))) => {
                         outbound_tasks.remove(&task);
                         outbound_peers.remove(&peer.carrier());
+                        outbound_abort_handles.remove(&peer.carrier());
+                        collision_aborted_outbound.remove(&task);
+                        if let Some(last_activity) = peer_contact_activity.get_mut(&peer.carrier()) {
+                            *last_activity = Instant::now();
+                        }
                         if let Err(error) = selected_event_status.record(&peer_receipt) {
                             fatal_error = Some(error);
                             break;
@@ -12345,7 +12668,7 @@ async fn run_node_actor_inner(
                             break;
                         }
                         receipt.contacts += 1;
-                        println!(
+                        node_stdout!(
                             "CONTACT direction=out carrier_peer={} mission_peer={} locator={} rounds={} control_offered={} control_fetched={} control_retained={} control_duplicates={} control_activated={} control_remaining={} offered={} fetched={} inserted={} duplicates={} remaining={} deferred_event_lanes={} mutable_remaining={} deferred_mutable_lanes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} bridge_offered={} bridge_applied={} bridge_delivered={} bridge_remaining={} handshake_frames={} handshake_bytes={} protected_frames={} protected_bytes={} carrier_path={} carrier_path_transitions={} carrier_path_transitions_saturated={} path_observation=not-authorization mission_auth=hybrid-pq semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash content_admission=capability-gated status={}",
                             peer.carrier(),
                             format_node_id(peer_receipt.mission_peer.expect("successful mission contact has peer identity")),
@@ -12387,6 +12710,11 @@ async fn run_node_actor_inner(
                     Some(Ok((task, (peer, Err(error))))) => {
                         outbound_tasks.remove(&task);
                         outbound_peers.remove(&peer.carrier());
+                        outbound_abort_handles.remove(&peer.carrier());
+                        collision_aborted_outbound.remove(&task);
+                        if let Some(last_activity) = peer_contact_activity.get_mut(&peer.carrier()) {
+                            *last_activity = Instant::now();
+                        }
                         if actor_fatal_contact_error(&error, config.mission.identity()) {
                             fatal_error = Some(error);
                             break;
@@ -12395,15 +12723,24 @@ async fn run_node_actor_inner(
                         let expected_mission = peer
                             .expected_mission()
                             .map_or_else(|| "discovered".into(), format_node_id);
-                        eprintln!("CONTACT direction=out carrier_peer={} expected_mission_peer={} status=error error={}", peer.carrier(), expected_mission, format_receipt_field(&error.to_string()));
+                        node_stderr!("CONTACT direction=out carrier_peer={} expected_mission_peer={} status=error error={}", peer.carrier(), expected_mission, format_receipt_field(&error.to_string()));
                     }
                     Some(Err(error)) => {
-                        let peer = outbound_tasks.remove(&error.id());
+                        let task = error.id();
+                        let collision_aborted = collision_aborted_outbound.remove(&task);
+                        let peer = outbound_tasks.remove(&task);
                         if let Some(peer) = peer {
                             outbound_peers.remove(&peer.carrier());
+                            outbound_abort_handles.remove(&peer.carrier());
+                            if let Some(last_activity) = peer_contact_activity.get_mut(&peer.carrier()) {
+                                *last_activity = Instant::now();
+                            }
+                        }
+                        if collision_aborted {
+                            continue;
                         }
                         receipt.contact_errors += 1;
-                        eprintln!("CONTACT direction=out carrier_peer={} status=error error={}", peer.map_or_else(|| "unknown".into(), |peer| peer.carrier().to_string()), format_receipt_field(&format!("task failed: {error}")));
+                        node_stderr!("CONTACT direction=out carrier_peer={} status=error error={}", peer.map_or_else(|| "unknown".into(), |peer| peer.carrier().to_string()), format_receipt_field(&format!("task failed: {error}")));
                     }
                     None => {}
                 }
@@ -12441,6 +12778,7 @@ async fn run_node_actor_inner(
                     &mut record_application,
                     &blob_worker_sender,
                     &store,
+                    &emission_policy,
                     &selected_event_status,
                     &receipt,
                     command,
@@ -12533,7 +12871,7 @@ async fn run_node_actor_inner(
             // accepted. A worker/contact failure discovered while quiescing
             // remains operator-visible secondary accounting, but cannot skip
             // durable erase or suppress the request's explicit response.
-            eprintln!(
+            node_stderr!(
                 "ZEROIZE status=continuing-after-quiescence-error error={}",
                 format_receipt_field(&error.to_string())
             );
@@ -12568,7 +12906,7 @@ async fn run_node_actor_inner(
                 receipt.blob_carrier_fetch_cursors = completed.preserved.blob_carrier_fetch_cursors;
                 receipt.blob_network_staging_bytes = completed.preserved.blob_network_staging_bytes;
                 request.respond("ASTER-ZEROIZE-LOCAL-OK").await?;
-                println!(
+                node_stdout!(
                     "STOP lifecycle=zeroized sync_status=terminal-lockout carrier_id={} mission_id={} contacts={} contact_errors={} direct_contacts={} relay_contacts={} unknown_path_contacts={} carrier_path_transitions={} carrier_path_transition_saturations={} path_observation=not-authorization opaque_items={} opaque_acceptance_markers={} events={} event_acceptance_markers={} route_cached_events={} controls={} applied_controls={} pending_controls={} control_highwater={} blobs={} blob_acceptance_markers={} blob_last_acceptance_marker={} blob_sealed_bytes={} blob_operations={} blob_operation_bytes={} blob_variants={} blob_finalized_variants={} blob_committed_chunks={} blob_committed_file_bytes={} blob_reserved_file_bytes={} pending_blobs={} blob_carrier_prefixes={} blob_carrier_fetch_cursors={} blob_network_staging_bytes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} mission_auth=hybrid-pq provisioning={} assurance=bounded-software physical_sanitization=not-claimed",
                     local_id,
                     format_node_id(config.mission.identity()),
@@ -12657,7 +12995,7 @@ async fn run_node_actor_inner(
     } else {
         "contacts_observed"
     };
-    println!(
+    node_stdout!(
         "STOP lifecycle=complete sync_status={} carrier_id={} mission_id={} contacts={} contact_errors={} direct_contacts={} relay_contacts={} unknown_path_contacts={} carrier_path_transitions={} carrier_path_transition_saturations={} path_observation=not-authorization opaque_items={} opaque_acceptance_markers={} events={} event_acceptance_markers={} route_cached_events={} controls={} applied_controls={} pending_controls={} control_highwater={} blobs={} blob_acceptance_markers={} blob_last_acceptance_marker={} blob_sealed_bytes={} blob_operations={} blob_operation_bytes={} blob_variants={} blob_finalized_variants={} blob_committed_chunks={} blob_committed_file_bytes={} blob_reserved_file_bytes={} pending_blobs={} blob_carrier_prefixes={} blob_carrier_fetch_cursors={} blob_network_staging_bytes={} blob_ranges_fetched={} blob_bytes_fetched={} blob_remaining={} blob_deferred={} mission_auth=hybrid-pq provisioning={} semantics=source-authenticated-event reconciliation_classes=event,state,record,blob-v5 controls_semantics=source-authenticated-flash",
         sync_status,
         local_id,
@@ -17531,7 +17869,7 @@ fn bridge_apply_disposition(
 }
 
 fn emit_bridge_delivery(status: &'static str, delivery: &SelectedEventBridgeDeliveryReceipt) {
-    println!(
+    node_stdout!(
         "BRIDGE_DELIVERY status={} source_id={} route_id={} wrapper_id={} publisher={} hops={} origin_scope={} origin_epoch={} current_scope={} current_epoch={} topic={} priority={} event_sequence={} payload_len={} payload_sha256={} payload_opened=true payload_plaintext_logged=false",
         status,
         crate::format_item_id(delivery.source_item_id),
@@ -17617,7 +17955,7 @@ async fn send_selected_event_bridge_routes(
             .bridge_offered
             .checked_add(1)
             .ok_or_else(|| NodeError::Protocol("selected Event bridge offer overflow".into()))?;
-        println!(
+        node_stdout!(
             "BRIDGE status={} source_id={} route_id={} wrapper_id={} hops={} origin_scope={} origin_epoch={} current_scope={} current_epoch={} disposition={} payload_opened=false payload_plaintext_logged=false",
             if disposition == BridgeRouteDisposition::NotSelected {
                 "not-selected"
@@ -21773,6 +22111,181 @@ mod tests {
     use crate::mission::initiate_over_iroh;
     use redb::{ReadableDatabase as _, ReadableTable as _};
 
+    #[derive(Default)]
+    struct CapturedNodeOutput {
+        records: StdMutex<Vec<(NodeOutputStream, String)>>,
+    }
+
+    impl NodeOperatorOutputSink for CapturedNodeOutput {
+        fn write(&self, stream: NodeOutputStream, record: &str) {
+            self.records
+                .lock()
+                .expect("capture node output")
+                .push((stream, record.to_owned()));
+        }
+    }
+
+    impl CapturedNodeOutput {
+        fn records(&self) -> Vec<(NodeOutputStream, String)> {
+            self.records.lock().expect("read node output").clone()
+        }
+    }
+
+    fn captured_node_output(
+        policy: NodeOperatorOutputPolicy,
+    ) -> (NodeOperatorOutput, Arc<CapturedNodeOutput>) {
+        let captured = Arc::new(CapturedNodeOutput::default());
+        let output = NodeOperatorOutput::with_sink(policy, captured.clone());
+        (output, captured)
+    }
+
+    #[test]
+    fn customer_safe_output_suppresses_every_selected_node_record_class() {
+        // Break caught: allowing any selected-node receipt class through the
+        // customer policy can disclose paths, peers, providers, or errors next
+        // to the agent's fixed-field lifecycle records.
+        let (output, captured) = captured_node_output(NodeOperatorOutputPolicy::CustomerSafe);
+        for record in [
+            "READY state=/state-path-canary peer=peer-canary",
+            "STOP state=/state-path-canary peer=peer-canary",
+            "CONTACT status=error error=provider-error-canary",
+            "DISCOVERY carrier_peer=peer-canary",
+            "ZEROIZE error=provider-error-canary",
+            "APPLICATION publisher=peer-canary",
+            "BRIDGE source_id=event-canary",
+            "BRIDGE_INIT route=event-canary",
+            "BRIDGE_RESTORE route=event-canary",
+            "BRIDGE_DELIVERY route=event-canary",
+        ] {
+            output.stdout(format_args!("{record}"));
+            output.stderr(format_args!("{record}"));
+        }
+
+        assert!(captured.records().is_empty());
+    }
+
+    #[test]
+    fn legacy_output_is_the_byte_preserving_default() {
+        // Break caught: changing the default used by start_node or
+        // start_node_with_forwarding would silently break established receipt
+        // consumers even if the opt-in customer mode remained safe.
+        let (output, captured) = captured_node_output(NodeOperatorOutputPolicy::default());
+        output.stdout(format_args!("READY selected=true state=legacy-state"));
+        output.stderr(format_args!(
+            "CONTACT direction=out status=error error=legacy-error"
+        ));
+        output.stdout(format_args!("STOP lifecycle=complete contacts=0"));
+
+        assert_eq!(
+            NodeOperatorOutputPolicy::default(),
+            NodeOperatorOutputPolicy::Legacy
+        );
+        assert_eq!(
+            captured.records(),
+            vec![
+                (
+                    NodeOutputStream::Stdout,
+                    "READY selected=true state=legacy-state".to_owned(),
+                ),
+                (
+                    NodeOutputStream::Stderr,
+                    "CONTACT direction=out status=error error=legacy-error".to_owned(),
+                ),
+                (
+                    NodeOutputStream::Stdout,
+                    "STOP lifecycle=complete contacts=0".to_owned(),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn customer_safe_selected_node_start_and_stop_emit_no_legacy_receipts() {
+        // Break caught: ignoring the selected customer policy during actor
+        // startup routes READY/STOP and the state-path canary to its sink.
+        let state = root("customer-safe-state-path-canary");
+        fs::create_dir_all(&state).expect("state root");
+        #[cfg(unix)]
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700))
+            .expect("owner-only state root");
+        let (output, captured) = captured_node_output(NodeOperatorOutputPolicy::CustomerSafe);
+        let running = start_node_with_forwarding_output(
+            NodeConfig {
+                state: state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: test_mission(),
+                peers: Vec::new(),
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            SelectedForwardingConfig::default(),
+            output,
+        )
+        .await
+        .expect("start customer-safe selected node");
+        running.shutdown().await.expect("stop customer-safe node");
+
+        assert!(captured.records().is_empty());
+        fs::remove_dir_all(state).expect("cleanup customer-safe state");
+    }
+
+    #[test]
+    fn contact_election_prefers_lower_identity_then_bounds_higher_fallback() {
+        let first = expected_peer(901, 29_901).carrier.id;
+        let second = expected_peer(902, 29_902).carrier.id;
+        let (lower, higher) = if first < second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let started = Instant::now();
+        let fallback_delay = non_preferred_contact_fallback_delay(Duration::from_secs(5));
+        assert_eq!(fallback_delay, Duration::from_secs(15));
+        assert_eq!(
+            non_preferred_contact_fallback_delay(Duration::from_millis(20)),
+            MIN_NON_PREFERRED_CONTACT_FALLBACK_DELAY,
+        );
+        let just_before_fallback = started
+            .checked_add(fallback_delay - Duration::from_nanos(1))
+            .expect("bounded fallback instant");
+        let fallback = started
+            .checked_add(fallback_delay)
+            .expect("fallback instant");
+
+        assert!(contact_initiation_is_due(
+            lower,
+            higher,
+            started,
+            started,
+            fallback_delay,
+        ));
+        assert!(!contact_initiation_is_due(
+            higher,
+            lower,
+            started,
+            just_before_fallback,
+            fallback_delay,
+        ));
+        assert!(contact_initiation_is_due(
+            higher,
+            lower,
+            started,
+            fallback,
+            fallback_delay,
+        ));
+        assert_eq!(
+            inbound_contact_collision(lower, higher),
+            InboundContactCollision::KeepPreferredOutbound,
+        );
+        assert_eq!(
+            inbound_contact_collision(higher, lower),
+            InboundContactCollision::YieldFallbackOutbound,
+        );
+        assert!(!EventEmissionPolicy::ReceiveOnly.permits_contact_initiation());
+    }
+
     #[test]
     fn injected_custody_clock_clones_share_one_identity_and_tick_source() {
         let clock = NodeCustodyClock::injected([0x81; 16], 41, 1);
@@ -21924,16 +22437,23 @@ mod tests {
             .expect("initial status policy");
 
         let offline = SelectedEventStatusTracker::new(BTreeSet::new(), false)
-            .snapshot(&store, &initial, 0)
+            .snapshot(&store, &initial, 0, EventEmissionPolicy::ReceiveOnly)
             .expect("offline status");
         assert_eq!(offline.sync, EventSyncStatus::Offline);
+        assert_eq!(offline.emission_policy, EventEmissionPolicy::ReceiveOnly);
+        assert_eq!(offline.store_usage.items, 0);
+        assert_eq!(offline.store_usage.payload_bytes, 0);
+        assert_eq!(offline.store_limits, store.limits());
+        assert_eq!(offline.event_operations, 0);
+        assert_eq!(offline.event_operation_bytes, 0);
+        assert_eq!(offline.pending_deliveries, 0);
         assert_eq!(offline.authenticated_contacts, 0);
         assert_eq!(offline.failed_contact_attempts, 0);
         assert!(offline.peers.is_empty());
 
         let mut tracker = SelectedEventStatusTracker::new(BTreeSet::from([peer]), false);
         let awaiting = tracker
-            .snapshot(&store, &initial, 7)
+            .snapshot(&store, &initial, 7, EventEmissionPolicy::Normal)
             .expect("awaiting status");
         assert_eq!(awaiting.sync, EventSyncStatus::AwaitingAuthenticatedContact);
         assert_eq!(awaiting.authenticated_contacts, 0);
@@ -21951,7 +22471,7 @@ mod tests {
             })
             .expect("partial authenticated contact");
         let work_remained = tracker
-            .snapshot(&store, &initial, 7)
+            .snapshot(&store, &initial, 7, EventEmissionPolicy::Normal)
             .expect("partial-contact status");
         assert_eq!(work_remained.sync, EventSyncStatus::WorkRemained);
         assert_eq!(work_remained.authenticated_contacts, 1);
@@ -21984,7 +22504,7 @@ mod tests {
             .event_replication_policy_snapshot()
             .expect("changed status policy");
         let policy_changed = tracker
-            .snapshot(&store, &changed, 7)
+            .snapshot(&store, &changed, 7, EventEmissionPolicy::Normal)
             .expect("policy-changed status");
         assert_eq!(
             policy_changed.sync,
@@ -22010,7 +22530,7 @@ mod tests {
             })
             .expect("fresh completed authenticated contact");
         let complete = tracker
-            .snapshot(&store, &changed, 7)
+            .snapshot(&store, &changed, 7, EventEmissionPolicy::Normal)
             .expect("fresh complete status");
         assert_eq!(complete.sync, EventSyncStatus::LastContactComplete);
         assert_eq!(complete.authenticated_contacts, 2);
@@ -22030,7 +22550,7 @@ mod tests {
             .event_replication_policy_snapshot()
             .expect("revoked status policy");
         let revoked = tracker
-            .snapshot(&store, &revoked_policy, 7)
+            .snapshot(&store, &revoked_policy, 7, EventEmissionPolicy::Normal)
             .expect("revoked-peer status");
         assert_eq!(revoked.sync, EventSyncStatus::NoActiveConfiguredPeers);
         assert_eq!(revoked.authenticated_contacts, 2);
@@ -22173,7 +22693,7 @@ mod tests {
             },
         );
         let aggregate = tracker
-            .snapshot(&store, &current, usize::MAX)
+            .snapshot(&store, &current, usize::MAX, EventEmissionPolicy::Normal)
             .expect_err("aggregate authenticated contact overflow must fail");
         assert!(matches!(
             aggregate,
@@ -26470,6 +26990,7 @@ mod tests {
             SelectedForwardingConfig::default(),
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             NodeActorChannels {
+                handle_sigint: true,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 control_receiver,
@@ -26605,6 +27126,7 @@ mod tests {
             SelectedForwardingConfig::default(),
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             NodeActorChannels {
+                handle_sigint: true,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 control_receiver,
@@ -27870,6 +28392,177 @@ mod tests {
             ApplicationErrorKind::StateUnavailable
         );
         fs::remove_dir_all(state).expect("cleanup live actor state");
+    }
+
+    #[tokio::test]
+    async fn higher_normal_peer_delivers_to_lower_receive_only_peer() {
+        use crate::application::{EventPollRequest, EventPublishRequest, EventSubscriptionRequest};
+
+        let test_root = root("higher-normal-to-lower-receive-only");
+        let first_state = test_root.join("first");
+        let second_state = test_root.join("second");
+        fs::create_dir_all(&test_root).expect("contact-election test root");
+        let first_carrier = {
+            let identity =
+                NodeIdentity::load_or_create(&first_state).expect("first carrier identity");
+            let id = identity.id();
+            drop(identity);
+            id
+        };
+        let second_carrier = {
+            let identity =
+                NodeIdentity::load_or_create(&second_state).expect("second carrier identity");
+            let id = identity.id();
+            drop(identity);
+            id
+        };
+        #[cfg(unix)]
+        for state in [&first_state, &second_state] {
+            fs::set_permissions(state, fs::Permissions::from_mode(0o700))
+                .expect("owner-only contact-election state");
+        }
+        let mut missions = issue_missions(2);
+        let first_mission = missions.remove(0);
+        let second_mission = missions.remove(0);
+        let (
+            lower_state,
+            lower_carrier,
+            lower_mission,
+            higher_state,
+            higher_carrier,
+            higher_mission,
+        ) = if first_carrier < second_carrier {
+            (
+                first_state,
+                first_carrier,
+                first_mission,
+                second_state,
+                second_carrier,
+                second_mission,
+            )
+        } else {
+            (
+                second_state,
+                second_carrier,
+                second_mission,
+                first_state,
+                first_carrier,
+                first_mission,
+            )
+        };
+        let lower_socket = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve lower port");
+        let higher_socket = UdpSocket::bind(("127.0.0.1", 0)).expect("reserve higher port");
+        let lower_address = lower_socket.local_addr().expect("lower address");
+        let higher_address = higher_socket.local_addr().expect("higher address");
+        drop((lower_socket, higher_socket));
+        let lower_config = NodeConfig {
+            state: lower_state,
+            bind: lower_address,
+            mission: lower_mission.credentials.clone(),
+            peers: vec![MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: higher_carrier,
+                    address: higher_address,
+                },
+                mission: higher_mission.identity,
+            }],
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(20),
+            run_for: None,
+            application: NodeApplication::Relay,
+        };
+        let higher_config = NodeConfig {
+            state: higher_state,
+            bind: higher_address,
+            mission: higher_mission.credentials,
+            peers: vec![MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: lower_carrier,
+                    address: lower_address,
+                },
+                mission: lower_mission.identity,
+            }],
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(20),
+            run_for: None,
+            application: NodeApplication::Relay,
+        };
+        let receive_only = SelectedForwardingConfig::default()
+            .with_emission_policy(EventEmissionPolicy::ReceiveOnly);
+        let lower = start_node_with_forwarding(lower_config, receive_only)
+            .await
+            .expect("start lower ReceiveOnly peer");
+        let lower_events = lower.selected_events();
+        let topic = Topic::new("opaque").expect("topic");
+        let scope = Scope::new("test/runtime-contact").expect("scope");
+        let subscription = lower_events
+            .subscribe(EventSubscriptionRequest {
+                operation_key: b"higher-normal-to-lower-receive-only".to_vec(),
+                topic: topic.clone(),
+                scope: scope.clone(),
+                include_descendant_scopes: false,
+            })
+            .await
+            .expect("subscribe lower ReceiveOnly peer");
+        let higher = start_node(higher_config)
+            .await
+            .expect("start higher normal peer");
+        let higher_events = higher.selected_events();
+        let published = higher_events
+            .publish(EventPublishRequest {
+                operation_key: b"higher-normal-publication".to_vec(),
+                predecessor: None,
+                topic,
+                scope,
+                priority: Priority::Priority,
+                logical_key: b"contact-election".to_vec(),
+                payload: b"higher normal peer must fall back to initiation".to_vec(),
+                tombstone: false,
+            })
+            .await
+            .expect("publish on higher normal peer");
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let page = lower_events
+                    .poll(EventPollRequest {
+                        subscription: subscription.id,
+                        delivery_limit: 8,
+                        scan_limit: 8,
+                    })
+                    .await
+                    .expect("poll lower ReceiveOnly peer");
+                if page
+                    .deliveries
+                    .iter()
+                    .any(|delivery| delivery.event.id == published.id)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("higher normal peer must initiate after the preferred peer stays silent");
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let lower_status = lower_events.status().await.expect("lower contact status");
+                let higher_status = higher_events.status().await.expect("higher contact status");
+                if lower_status.authenticated_contacts > 0
+                    && higher_status.authenticated_contacts > 0
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fallback contact must complete on both peers");
+
+        let (lower_receipt, higher_receipt) = tokio::join!(lower.shutdown(), higher.shutdown());
+        assert!(lower_receipt.expect("lower shutdown").contacts > 0);
+        assert!(higher_receipt.expect("higher shutdown").contacts > 0);
+        fs::remove_dir_all(test_root).expect("contact-election cleanup");
     }
 
     #[tokio::test]
@@ -30728,6 +31421,7 @@ mod tests {
             forwarding,
             emission_policy,
             NodeActorChannels {
+                handle_sigint: true,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 control_receiver,
