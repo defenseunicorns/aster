@@ -117,6 +117,24 @@ required.
 Do not raise limits during a candidate run. A changed limit changes the tested
 profile.
 
+## After unclean redb recovery
+
+After any unclean redb storage recovery, stop the service and confirm that no
+node process owns the state directory. Before resuming publication, run the
+complete offline operation-ledger audit on the recovered v3 store:
+
+```sh
+aster inspect --state DIR --audit-event-operations
+```
+
+Require a successful command and retain its `EVENT_OPERATION_AUDIT` receipt
+with `state=complete` and equal `scanned`/`total` counts. Counts include both
+ledger and active reverse-index rows. This complete audit is also required for
+release qualification; startup readiness and a background audit still in
+progress do not replace it. The inspection command does not repair or migrate
+the store. On failure, keep publication stopped and escalate with the sanitized
+receipt.
+
 ## Reload the application bearer token
 
 Atomically replace the owner-only configured token file, then send `SIGHUP` to

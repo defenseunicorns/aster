@@ -62,12 +62,13 @@ use aster_redb_store::{
     ControlTransferId, CustodyObjectKey, CustodyPeerApplyDisposition, CustodyPeerApplyEvidence,
     CustodyPeerSelectorRevision, CustodyPolicyRevision, CustodyPressureDemand, CustodyQuota,
     CustodyReconciliationEvidence, CustodyReconciliationSelection, CustodySendAuthorization,
-    CustodySenderProjection, CustodyStoreError, CustodyUsage, EventOnceOutcome, EventOperationKey,
-    EventOperationRequest, EventOperationResolution, EventPublicationIntent, EventPublicationSpec,
-    EventReplicationPolicySnapshot, EventSemanticId, EventSubscriptionKey, EventSubscriptionMode,
-    EventSubscriptionSpec, EventTransferId, LocalCustodyCheckpoint, MAX_BLOB_NETWORK_RANGE_BYTES,
-    MAX_BLOB_NETWORK_SOURCE_BYTES, MAX_BLOB_NETWORK_STAGING_ROWS, MAX_CUSTODY_PAGE,
-    MAX_CUSTODY_RETIREMENTS, MAX_EVENT_PAGE, MAX_MUTABLE_TRANSFER_CURSOR_PEERS,
+    CustodySenderProjection, CustodyStoreError, CustodyUsage, EventOnceOutcome,
+    EventOperationAuditProgress, EventOperationAuditState, EventOperationAuditStatus,
+    EventOperationKey, EventOperationRequest, EventOperationResolution, EventPublicationIntent,
+    EventPublicationSpec, EventReplicationPolicySnapshot, EventSemanticId, EventSubscriptionKey,
+    EventSubscriptionMode, EventSubscriptionSpec, EventTransferId, LocalCustodyCheckpoint,
+    MAX_BLOB_NETWORK_RANGE_BYTES, MAX_BLOB_NETWORK_SOURCE_BYTES, MAX_BLOB_NETWORK_STAGING_ROWS,
+    MAX_CUSTODY_PAGE, MAX_CUSTODY_RETIREMENTS, MAX_EVENT_PAGE, MAX_MUTABLE_TRANSFER_CURSOR_PEERS,
     MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS, MAX_ROUTE_CACHE_ITEMS,
     MutableTransferCursorClass, MutableTransferCursorMode, RecordSenderProjection,
     RecordTransferId, RejectedControl, RouteCacheOutcome, ScopeRekeyPublicationIntent,
@@ -2631,9 +2632,28 @@ fn node_actor_join_error(error: tokio::task::JoinError) -> NodeError {
 
 #[derive(Default)]
 struct SelectedEventStatusTracker {
+    operation_audit: EventOperationAuditStatus,
+    last_store_metrics: std::cell::Cell<Option<SelectedEventStoreMetrics>>,
     configured_peers: BTreeSet<NodeId>,
     authenticated: BTreeMap<NodeId, AuthenticatedContactObservation>,
     automatic_nearby: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SelectedEventStoreMetrics {
+    usage: aster_redb_store::AggregateStoreUsage,
+    events: aster_redb_store::EventStoreStats,
+    pending_deliveries: u64,
+}
+
+impl SelectedEventStoreMetrics {
+    fn read(store: &Store) -> Result<Self, StoreError> {
+        Ok(Self {
+            usage: store.aggregate_usage()?,
+            events: store.event_stats()?,
+            pending_deliveries: store.event_subscription_stats()?.pending_deliveries,
+        })
+    }
 }
 
 #[cfg(feature = "nearby-discovery")]
@@ -2743,6 +2763,8 @@ impl SelectedEventStatusTracker {
     fn new(configured_peers: BTreeSet<NodeId>, automatic_nearby: bool) -> Self {
         Self {
             configured_peers,
+            operation_audit: EventOperationAuditStatus::default(),
+            last_store_metrics: std::cell::Cell::new(None),
             authenticated: BTreeMap::new(),
             automatic_nearby,
         }
@@ -2785,10 +2807,10 @@ impl SelectedEventStatusTracker {
         failed_contact_attempts: usize,
         emission_policy: EventEmissionPolicy,
     ) -> Result<SelectedEventStatus, NodeError> {
-        let store_usage = store.aggregate_usage()?;
+        let metrics = self.store_metrics(store)?;
+        let store_usage = metrics.usage;
         let store_limits = store.limits();
-        let event_stats = store.event_stats()?;
-        let subscription_stats = store.event_subscription_stats()?;
+        let event_stats = metrics.events;
         let current_policy = ContactEventPolicy::capture(current);
         let mut peers = Vec::with_capacity(self.authenticated.len());
         let mut authenticated_contacts = 0u64;
@@ -2852,6 +2874,7 @@ impl SelectedEventStatusTracker {
         let failed_contact_attempts = u64::try_from(failed_contact_attempts)
             .map_err(|_| NodeError::Protocol("failed contact count exceeds u64".into()))?;
         Ok(SelectedEventStatus {
+            event_operation_audit: self.operation_audit,
             sync,
             authenticated_contacts,
             failed_contact_attempts,
@@ -2861,8 +2884,22 @@ impl SelectedEventStatusTracker {
             store_limits,
             event_operations: event_stats.operations,
             event_operation_bytes: event_stats.operation_bytes,
-            pending_deliveries: subscription_stats.pending_deliveries,
+            pending_deliveries: metrics.pending_deliveries,
         })
+    }
+
+    fn store_metrics(&self, store: &Store) -> Result<SelectedEventStoreMetrics, NodeError> {
+        if self.operation_audit.state == EventOperationAuditState::Failed {
+            // A ledger/accounting failure must not prevent observing Failed.
+            // These figures are explicitly last-known, not current authority.
+            return self
+                .last_store_metrics
+                .get()
+                .ok_or_else(|| NodeError::Protocol("no verified pre-audit store metrics".into()));
+        }
+        let metrics = SelectedEventStoreMetrics::read(store)?;
+        self.last_store_metrics.set(Some(metrics));
+        Ok(metrics)
     }
 }
 
@@ -3226,6 +3263,16 @@ pub fn put_opaque(state: &Path, id: ItemId, bytes: &[u8]) -> Result<bool, NodeEr
 pub fn inspect_store(state: &Path) -> Result<StoreReceipt, NodeError> {
     let inspection = Store::inspect_existing(state.join(STORE_FILE))?;
     Ok(store_receipt_from_inspection(inspection))
+}
+
+/// Performs the complete v3 operation audit while the node is stopped. The
+/// inspection handle never creates, migrates, or repairs a store. Failures are
+/// sanitized for the operator surface.
+pub fn audit_store_event_operations(
+    state: &Path,
+) -> Result<EventOperationAuditProgress, NodeError> {
+    Store::audit_existing_event_operations(state.join(STORE_FILE), 1_024, |_| {})
+        .map_err(|_| NodeError::Protocol("Event operation audit failed".into()))
 }
 
 fn store_receipt_from_inspection(inspection: StoreInspection) -> StoreReceipt {
@@ -10658,7 +10705,11 @@ fn execute_selected_event_command(
             options,
             response,
         } => {
-            let result = application.publish_with_options(request, options);
+            let result = if status.operation_audit.state == EventOperationAuditState::Failed {
+                Err(crate::application::actor_unavailable("publish"))
+            } else {
+                application.publish_with_options(request, options)
+            };
             let _ = response.send(result);
         }
         SelectedEventCommand::Query { query, response } => {
@@ -11181,11 +11232,19 @@ pub async fn run_node_with_forwarding(
 
 #[cfg(all(test, unix))]
 struct RunNodeActorTestControl {
+    event_operation_audit: Option<EventOperationAuditTestControl>,
     before_loop_ready: oneshot::Sender<()>,
     before_loop_release: oneshot::Receiver<()>,
     zeroization_queued: oneshot::Sender<()>,
     blob_worker_fatal_on_shutdown: bool,
     blob_final_read_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+}
+
+#[cfg(all(test, unix))]
+struct EventOperationAuditTestControl {
+    page_size: usize,
+    on_progress: Box<dyn FnMut(EventOperationAuditProgress) + Send>,
+    completion_error: Option<StoreError>,
 }
 
 struct NodeActorChannels {
@@ -11546,6 +11605,7 @@ async fn run_node_actor_inner(
         application_control_head,
         event_route_cache.clone(),
     );
+    let initial_status_metrics = SelectedEventStoreMetrics::read(&store)?;
     let identity = NodeIdentity::load_or_create(&config.state)?;
     let local_id = identity.id();
     if allowed.contains(&local_id) {
@@ -11784,6 +11844,7 @@ async fn run_node_actor_inner(
         zeroization_queued,
         blob_worker_fatal_on_shutdown,
         blob_final_read_gate,
+        mut event_operation_audit_control,
     ) = match test_control.take() {
         Some(control) => (
             Some(control.before_loop_ready),
@@ -11791,8 +11852,9 @@ async fn run_node_actor_inner(
             Some(control.zeroization_queued),
             control.blob_worker_fatal_on_shutdown,
             control.blob_final_read_gate,
+            control.event_operation_audit,
         ),
-        None => (None, None, None, false, None),
+        None => (None, None, None, false, None, None),
     };
     #[cfg(not(all(test, unix)))]
     let blob_worker_fatal_on_shutdown = false;
@@ -11859,6 +11921,9 @@ async fn run_node_actor_inner(
         configured_peers.iter().map(|peer| peer.mission).collect(),
         automatic_nearby,
     );
+    selected_event_status
+        .last_store_metrics
+        .set(Some(initial_status_metrics));
     let mut application_commands_open = true;
     let mut pending_application_command = None::<SelectedApplicationCommand>;
     let mut control_commands_open = true;
@@ -11946,8 +12011,48 @@ async fn run_node_actor_inner(
         }
     }
 
+    // Exactly one worker, created only after the readiness handoff. The
+    // bounded channel provides page backpressure without retaining a full
+    // ledger or placing mutable status outside this actor.
+    let (audit_progress_sender, mut audit_progress_receiver) = mpsc::channel(1);
+    let mut audit_task = owner_ready.then(|| {
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(all(test, unix))]
+            let page_size = event_operation_audit_control
+                .as_ref()
+                .map_or(1_024, |control| control.page_size);
+            #[cfg(not(all(test, unix)))]
+            let page_size = 1_024;
+            let result = store.audit_event_operations_cancellable(
+                page_size,
+                |progress| {
+                    let _ = audit_progress_sender.blocking_send(progress);
+                    #[cfg(all(test, unix))]
+                    if let Some(control) = event_operation_audit_control.as_mut() {
+                        (control.on_progress)(progress);
+                    }
+                },
+                || audit_progress_sender.is_closed(),
+            );
+            // Models a returned worker error through exactly the production
+            // join path. Real committed counter corruption is tested in Store.
+            #[cfg(all(test, unix))]
+            if let Some(error) = event_operation_audit_control
+                .as_mut()
+                .and_then(|control| control.completion_error.take())
+            {
+                return Err(error);
+            }
+            result
+        })
+    });
+    let mut audit_progress_open = owner_ready;
+    let mut audit_yield_required = false;
     if owner_ready {
         loop {
+            // Each audit notification yields one select turn to ordinary work.
+            let audit_can_progress = !std::mem::take(&mut audit_yield_required);
             if network_events_since_application >= NETWORK_EVENT_BUDGET
                 && pending_application_command.is_none()
                 && application_commands_open
@@ -12035,6 +12140,34 @@ async fn run_node_actor_inner(
             }
             _ = shutdown_receiver.recv() => break,
             _ = &mut stop => break,
+            progress = audit_progress_receiver.recv(), if audit_progress_open && audit_can_progress => {
+                if let Some(progress) = progress {
+                    selected_event_status.operation_audit = EventOperationAuditStatus {
+                        state: EventOperationAuditState::Running,
+                        scanned: progress.scanned,
+                        total: progress.total,
+                    };
+                    audit_yield_required = true;
+                } else {
+                    audit_progress_open = false;
+                }
+            }
+            completed = async { audit_task.as_mut().expect("guarded audit task").await },
+                if audit_task.is_some() && audit_can_progress => {
+                audit_task.take();
+                audit_progress_open = false;
+                match completed {
+                    Ok(Ok(progress)) => selected_event_status.operation_audit = EventOperationAuditStatus {
+                        state: EventOperationAuditState::Complete,
+                        scanned: progress.scanned,
+                        total: progress.total,
+                    },
+                    // Includes worker panic, cancellation outside shutdown,
+                    // and every storage/invariant error. Never expose details
+                    // or close the shared application/control admission gate.
+                    _ => selected_event_status.operation_audit.state = EventOperationAuditState::Failed,
+                }
+            }
             discovery = automatic_event_receiver.recv(),
                 if automatic_events_open && !discovery_yield_required => {
                 control_yield_required = false;
@@ -12157,7 +12290,8 @@ async fn run_node_actor_inner(
                         break;
                     }
                 };
-                if let Some(application_policy) = application_policy
+                if selected_event_status.operation_audit.state != EventOperationAuditState::Failed
+                    && let Some(application_policy) = application_policy
                     && let Err(error) = drive_sample_application(
                         config.application,
                         SampleApplicationContext {
@@ -12672,7 +12806,8 @@ async fn run_node_actor_inner(
                 }
             }
             _ = tokio::task::yield_now(),
-                if control_yield_required
+                if !audit_can_progress
+                    || control_yield_required
                     || discovery_yield_required
                     || (application_tick_pending && application_tick_yield_required) => {
                 control_yield_required = false;
@@ -12684,6 +12819,9 @@ async fn run_node_actor_inner(
     }
 
     application_admission.store(false, Ordering::Release);
+    // Closing progress unblocks blocking_send and cancels at the next bounded
+    // page checkpoint. Join before zeroization or releasing the store owner.
+    audit_progress_receiver.close();
     application_receiver.close();
     control_receiver.close();
     pending_control_lease.take();
@@ -12698,6 +12836,9 @@ async fn run_node_actor_inner(
     }
     while let Ok(command) = control_receiver.try_recv() {
         command.reject();
+    }
+    if let Some(task) = audit_task.take() {
+        let _ = task.await;
     }
     // Closing shared admission precedes both common-queue rejection above and
     // worker-queue rejection. Dropping the final worker sender lets the worker
@@ -12843,7 +12984,12 @@ async fn run_node_actor_inner(
         return Err(error);
     }
     let stats = store.stats()?;
-    let event_stats = store.event_stats()?;
+    let event_stats =
+        if selected_event_status.operation_audit.state == EventOperationAuditState::Failed {
+            selected_event_status.store_metrics(&store)?.events
+        } else {
+            store.event_stats()?
+        };
     let control_stats = store.control_stats()?;
     let blob_stats = store.blob_stats()?;
     receipt.items = stats.items;
@@ -22295,6 +22441,38 @@ mod tests {
     }
 
     #[test]
+    fn operation_audit_failed_status_retains_last_verified_metrics() {
+        let state = root("operation-audit-cached-status");
+        fs::create_dir_all(&state).unwrap();
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            test_mission().mission_authority_id(),
+        )
+        .unwrap();
+        let policy = store.event_replication_policy_snapshot().unwrap();
+        let mut tracker = SelectedEventStatusTracker::new(BTreeSet::new(), false);
+        let before = tracker
+            .snapshot(&store, &policy, 0, EventEmissionPolicy::Normal)
+            .unwrap();
+        store
+            .apply(ItemId::new([0x19; 32]), b"later opaque work")
+            .unwrap();
+        assert_eq!(store.aggregate_usage().unwrap().items, 1);
+        tracker.operation_audit.state = EventOperationAuditState::Failed;
+        let failed = tracker
+            .snapshot(&store, &policy, 3, EventEmissionPolicy::ReceiveOnly)
+            .unwrap();
+        assert_eq!(
+            failed.store_usage, before.store_usage,
+            "failed audit metrics must be last-known, not newly read authority"
+        );
+        assert_eq!(failed.failed_contact_attempts, 3);
+        assert_eq!(failed.emission_policy, EventEmissionPolicy::ReceiveOnly);
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
     fn selected_event_status_tracks_policy_work_contact_failure_and_revocation() {
         let state = root("selected-event-status-state-machine");
         fs::create_dir_all(&state).expect("status state root");
@@ -26827,6 +27005,7 @@ mod tests {
                     before_loop_release: before_loop_release_receiver,
                     zeroization_queued: zeroization_queued_sender,
                     blob_worker_fatal_on_shutdown: true,
+                    event_operation_audit: None,
                     blob_final_read_gate: None,
                 }),
             },
@@ -26967,6 +27146,7 @@ mod tests {
                         Arc::clone(&page_reached),
                         Arc::clone(&page_release),
                     )),
+                    event_operation_audit: None,
                 }),
             },
         ));
@@ -28066,6 +28246,337 @@ mod tests {
         drop(left_shutdown);
         drop(right_shutdown);
         fs::remove_dir_all(root).expect("cleanup saturated contact state");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn operation_audit_runtime_ready_progress_restart_and_cancel() {
+        use crate::application::{EventPublishRequest, EventQuery};
+        use aster_redb_store::EventOperationAuditState;
+        use std::sync::mpsc as blocking;
+
+        let state = root("operation-audit-runtime");
+        seed_operation_audit_rows(&state, false);
+        let (release, released) = blocking::channel();
+        let (selected, shutdown, actor) = start_operation_audit_actor(&state, move |p| {
+            if p.scanned == 2 {
+                released.recv().expect("release audit page");
+            }
+        })
+        .await;
+        let running =
+            wait_operation_audit_status(&selected, EventOperationAuditState::Running, 2).await;
+        assert_eq!(running.total, 5);
+        selected
+            .publish(EventPublishRequest {
+                operation_key: b"after-audit-snapshot".to_vec(),
+                predecessor: None,
+                topic: Topic::new("opaque").unwrap(),
+                scope: Scope::new("test/runtime").unwrap(),
+                priority: Priority::Routine,
+                logical_key: b"audit".to_vec(),
+                payload: b"one".to_vec(),
+                tombstone: false,
+            })
+            .await
+            .expect("publication while audit runs");
+        assert_eq!(
+            selected
+                .query(EventQuery::default())
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        release.send(()).unwrap();
+        let complete =
+            wait_operation_audit_status(&selected, EventOperationAuditState::Complete, 5).await;
+        assert_eq!(
+            complete.total, 5,
+            "post-snapshot publication belongs to next run"
+        );
+        shutdown.send(()).await.unwrap();
+        actor.await.unwrap().unwrap();
+
+        let (selected, shutdown, actor) = start_operation_audit_actor(&state, |_| {}).await;
+        let restarted =
+            wait_operation_audit_status(&selected, EventOperationAuditState::Complete, 7).await;
+        assert_eq!(restarted.total, 7);
+        shutdown.send(()).await.unwrap();
+        actor.await.unwrap().unwrap();
+
+        let (release, released) = blocking::channel();
+        let (pages, page_receiver) = blocking::channel();
+        let (selected, shutdown, actor) = start_operation_audit_actor(&state, move |p| {
+            pages.send(p.scanned).unwrap();
+            if p.scanned == 2 {
+                released.recv().unwrap();
+            }
+        })
+        .await;
+        wait_operation_audit_status(&selected, EventOperationAuditState::Running, 2).await;
+        shutdown.send(()).await.unwrap();
+        // Observe the actor's closed application admission before releasing the
+        // blocked page, so cancellation deterministically wins the next page.
+        while selected.status().await.is_ok() {
+            tokio::task::yield_now().await;
+        }
+        release.send(()).unwrap();
+        timeout(Duration::from_secs(5), actor)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(page_receiver.iter().collect::<Vec<_>>(), [0, 2]);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn operation_audit_runtime_counter_error_after_readiness_keeps_status_available() {
+        let state = root("operation-audit-counter-error");
+        seed_operation_audit_rows(&state, false);
+        let (release, released) = std::sync::mpsc::channel();
+        let (selected, shutdown, actor) = start_operation_audit_actor_with_error(
+            &state,
+            move |p| {
+                if p.scanned == 2 {
+                    released.recv().unwrap();
+                }
+            },
+            Some(StoreError::AccountingMismatch {
+                field: "synthetic-audit-counter",
+                durable: 6,
+                reconstructed: 5,
+            }),
+        )
+        .await;
+        wait_operation_audit_status(&selected, EventOperationAuditState::Running, 2).await;
+        let before = selected.status().await.unwrap();
+        release.send(()).unwrap();
+        wait_operation_audit_status(&selected, EventOperationAuditState::Failed, 5).await;
+        let after = selected
+            .status()
+            .await
+            .expect("counter failure must not hide status");
+        assert_eq!(after.store_usage, before.store_usage);
+        assert_eq!(
+            (after.event_operations, after.event_operation_bytes),
+            (5, 335)
+        );
+        shutdown.send(()).await.unwrap();
+        timeout(Duration::from_secs(5), actor)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn operation_audit_runtime_failure_closes_only_event_publication() {
+        use crate::application::{ApplicationErrorKind, EventPublishRequest, EventQuery};
+        use aster_redb_store::EventOperationAuditState;
+        let state = root("operation-audit-failure");
+        seed_operation_audit_rows(&state, true);
+        let (selected, shutdown, actor) = start_operation_audit_actor(&state, |_| {}).await;
+        let failed =
+            wait_operation_audit_status(&selected, EventOperationAuditState::Failed, 4).await;
+        assert_eq!(failed.total, 5);
+        for _ in 0..2 {
+            let error = selected
+                .publish(EventPublishRequest {
+                    operation_key: b"must-not-publish".to_vec(),
+                    predecessor: None,
+                    topic: Topic::new("opaque").unwrap(),
+                    scope: Scope::new("test/runtime").unwrap(),
+                    priority: Priority::Routine,
+                    logical_key: b"audit".to_vec(),
+                    payload: b"one".to_vec(),
+                    tombstone: false,
+                })
+                .await
+                .expect_err("publication closed");
+            assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
+            assert_eq!(
+                error.to_string(),
+                "selected application publish failed: selected application state is unavailable"
+            );
+        }
+        assert!(
+            selected
+                .query(EventQuery::default())
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        assert_eq!(
+            selected.status().await.unwrap().event_operation_audit.state,
+            EventOperationAuditState::Failed
+        );
+        shutdown.send(()).await.unwrap();
+        timeout(Duration::from_secs(5), actor)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("shutdown after audit failure");
+        assert!(
+            aster_redb_store::Store::audit_existing_event_operations(
+                state.join(STORE_FILE),
+                1,
+                |_| {}
+            )
+            .is_err(),
+            "failure did not repair or reopen the ledger"
+        );
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn seed_operation_audit_rows(state: &Path, corrupt: bool) {
+        fs::DirBuilder::new().mode(0o700).create(state).unwrap();
+        drop(
+            Store::open_for_mission(
+                state.join(STORE_FILE),
+                test_mission().mission_authority_id(),
+            )
+            .unwrap(),
+        );
+        let db = redb::Database::open(state.join(STORE_FILE)).unwrap();
+        let write = db.begin_write().unwrap();
+        let ledger = redb::TableDefinition::<&[u8], &[u8]>::new("aster.event-operation-ledger.v3");
+        for index in 0..5u8 {
+            let mut value = vec![1, 2];
+            value.extend_from_slice(&[7; 32]);
+            value.push(if corrupt && index == 4 { 0xff } else { 1 });
+            write
+                .open_table(ledger)
+                .unwrap()
+                .insert([index; 32].as_slice(), value.as_slice())
+                .unwrap();
+        }
+        let metadata = redb::TableDefinition::<&str, u64>::new("aster.metadata.v1");
+        for (key, value) in [
+            ("semantic_event_operation_v3_records_total", 5),
+            ("semantic_event_operation_v3_records_retired", 5),
+            ("semantic_event_operation_v3_logical_bytes", 335),
+        ] {
+            write
+                .open_table(metadata)
+                .unwrap()
+                .insert(key, value)
+                .unwrap();
+        }
+        write.commit().unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn start_operation_audit_actor(
+        state: &Path,
+        on_progress: impl FnMut(aster_redb_store::EventOperationAuditProgress) + Send + 'static,
+    ) -> (
+        SelectedEventHandle,
+        mpsc::Sender<()>,
+        JoinHandle<Result<NodeReceipt, NodeError>>,
+    ) {
+        start_operation_audit_actor_with_error(state, on_progress, None).await
+    }
+
+    #[cfg(unix)]
+    async fn start_operation_audit_actor_with_error(
+        state: &Path,
+        on_progress: impl FnMut(aster_redb_store::EventOperationAuditProgress) + Send + 'static,
+        completion_error: Option<StoreError>,
+    ) -> (
+        SelectedEventHandle,
+        mpsc::Sender<()>,
+        JoinHandle<Result<NodeReceipt, NodeError>>,
+    ) {
+        let mission = test_mission();
+        let admission = Arc::new(AtomicBool::new(true));
+        let (sender, receiver) = mpsc::channel(8);
+        let selected = SelectedEventHandle::new(
+            sender,
+            admission.clone(),
+            mission.identity(),
+            mission.mission_authority_id(),
+        );
+        let (_, controls) = mpsc::channel(1);
+        let (shutdown, shutdown_receiver) = mpsc::channel(1);
+        let (ready, received) = oneshot::channel();
+        let (before_loop_ready, _) = oneshot::channel();
+        let (release, before_loop_release) = oneshot::channel();
+        release.send(()).unwrap();
+        let (zeroization_queued, _) = oneshot::channel();
+        let config = NodeConfig {
+            state: state.to_path_buf(),
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission,
+            peers: Vec::new(),
+            mutable_interests: Default::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        };
+        let actor = tokio::spawn(run_node_actor_inner(
+            config,
+            SelectedForwardingConfig::default(),
+            Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+            NodeActorChannels {
+                handle_sigint: false,
+                application_receiver: receiver,
+                application_admission: admission,
+                control_receiver: controls,
+                shutdown_receiver,
+                ready,
+                test_control: Some(RunNodeActorTestControl {
+                    before_loop_ready,
+                    before_loop_release,
+                    zeroization_queued,
+                    blob_worker_fatal_on_shutdown: false,
+                    blob_final_read_gate: None,
+                    event_operation_audit: Some(EventOperationAuditTestControl {
+                        page_size: 2,
+                        on_progress: Box::new(on_progress),
+                        completion_error,
+                    }),
+                }),
+            },
+        ));
+        if timeout(Duration::from_secs(10), received)
+            .await
+            .unwrap()
+            .is_err()
+        {
+            panic!("actor stopped before readiness: {:?}", actor.await);
+        }
+        (selected, shutdown, actor)
+    }
+
+    #[cfg(unix)]
+    async fn wait_operation_audit_status(
+        selected: &SelectedEventHandle,
+        state: aster_redb_store::EventOperationAuditState,
+        scanned: u64,
+    ) -> aster_redb_store::EventOperationAuditStatus {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let status = selected
+                    .status()
+                    .await
+                    .expect("status remains available")
+                    .event_operation_audit;
+                if status.state == state && status.scanned == scanned {
+                    return status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("audit state/progress")
     }
 
     #[tokio::test]
@@ -31341,6 +31852,7 @@ mod tests {
                     zeroization_queued,
                     blob_worker_fatal_on_shutdown: false,
                     blob_final_read_gate: None,
+                    event_operation_audit: None,
                 }),
             },
         ));

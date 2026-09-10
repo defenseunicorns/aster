@@ -7,7 +7,8 @@ use crate::{
     event_operation_witness_write, read_mission_binding,
 };
 use redb::{
-    MultimapTableHandle, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
+    MultimapTableHandle, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+    TableHandle,
 };
 use sha2::{Digest, Sha256};
 
@@ -43,6 +44,290 @@ const EVENT_OPERATION_KEY_DOMAIN: &[u8] = b"aster/event-operation-key/v1";
 
 /// Maximum distinct active operation keys that may refer to one Event.
 pub const MAX_EVENT_OPERATION_ALIASES: u64 = 64;
+
+/// Lifecycle of one complete, snapshot-consistent operation ledger audit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EventOperationAuditState {
+    #[default]
+    Pending,
+    Running,
+    Complete,
+    Failed,
+}
+
+/// Sanitized actor-owned audit observation; counts include both table passes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EventOperationAuditStatus {
+    pub state: EventOperationAuditState,
+    pub scanned: u64,
+    pub total: u64,
+}
+
+/// Validated traversal rows (ledger plus reverse index) in one fixed snapshot.
+/// `total` never changes within a run. `scanned == total` is only a traversal
+/// observation: success also requires the final accounting checks to pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EventOperationAuditProgress {
+    pub scanned: u64,
+    pub total: u64,
+}
+
+impl crate::Store {
+    /// Audits every v3 operation and reverse row using ONE consistent read
+    /// snapshot. Concurrent commits belong to the next run. Callbacks occur
+    /// initially and after at most `min(page_size, 1024)` traversal rows, without
+    /// collecting a ledger-sized image. A zero page size is invalid.
+    pub fn audit_event_operations<F>(
+        &self,
+        page_size: usize,
+        on_progress: F,
+    ) -> Result<EventOperationAuditProgress, StoreError>
+    where
+        F: FnMut(EventOperationAuditProgress),
+    {
+        self.audit_event_operations_cancellable(page_size, on_progress, || false)
+    }
+
+    /// The same complete audit, with cooperative cancellation at each page
+    /// boundary. Cancellation returns `EventOperationAuditCancelled`, never a
+    /// successful partial result, and drops the snapshot before returning.
+    pub fn audit_event_operations_cancellable<F, C>(
+        &self,
+        page_size: usize,
+        on_progress: F,
+        is_cancelled: C,
+    ) -> Result<EventOperationAuditProgress, StoreError>
+    where
+        F: FnMut(EventOperationAuditProgress),
+        C: FnMut() -> bool,
+    {
+        let read = self.database.begin_read()?;
+        audit_event_operations_read(
+            &read,
+            self.operation_limits,
+            page_size,
+            on_progress,
+            is_cancelled,
+        )
+    }
+
+    /// Offline complete operation audit of an existing v3 store. This uses a
+    /// read-only redb handle and never creates, migrates, repairs, or reopens a
+    /// writer. Run the ordinary inspection separately for other schema groups.
+    /// The initial supported operation limits apply to this inspection surface.
+    pub fn audit_existing_event_operations<F>(
+        path: impl AsRef<std::path::Path>,
+        page_size: usize,
+        on_progress: F,
+    ) -> Result<EventOperationAuditProgress, StoreError>
+    where
+        F: FnMut(EventOperationAuditProgress),
+    {
+        let path = std::path::absolute(path).map_err(StoreError::StorePath)?;
+        let before = crate::open_existing_store_backing(&path)?.identity;
+        let database = redb::Builder::new().open_read_only(&path)?;
+        if before != crate::open_existing_store_backing(&path)?.identity {
+            return Err(StoreError::StoreBackingInvariant(
+                "backing path changed during read-only audit",
+            ));
+        }
+        let read = database.begin_read()?;
+        audit_event_operations_read(
+            &read,
+            EventOperationLimits::DEFAULT,
+            page_size,
+            on_progress,
+            || false,
+        )
+    }
+}
+
+fn audit_event_operations_read<F, C>(
+    read: &redb::ReadTransaction,
+    limits: EventOperationLimits,
+    page_size: usize,
+    mut on_progress: F,
+    mut is_cancelled: C,
+) -> Result<EventOperationAuditProgress, StoreError>
+where
+    F: FnMut(EventOperationAuditProgress),
+    C: FnMut() -> bool,
+{
+    if page_size == 0 {
+        return Err(StoreError::SemanticInvariant(
+            "Event operation audit page size is zero",
+        ));
+    }
+    let page_size = page_size.min(1_024) as u64;
+    if crate::read_mission_binding_read(read)?.is_none() {
+        return Err(StoreError::EventOperationMigrationMissingMissionBinding);
+    }
+    let stats = inspect_event_operation_accounting_read(read)?;
+    // Opening both tables also rejects a wholly absent v3 schema: an offline
+    // complete audit must not silently claim to have audited a legacy ledger.
+    let ledger = read.open_table(EVENT_OPERATION_LEDGER_V3)?;
+    let reverse = read.open_table(ACTIVE_OPERATION_BY_EVENT_V1)?;
+    if read.open_table(EVENT_OPERATIONS)?.len()? != 0
+        || read.open_table(EVENT_OPERATION_WITNESSES)?.len()? != 0
+    {
+        return Err(StoreError::SemanticInvariant(
+            "Event operation ledger coexists with legacy rows",
+        ));
+    }
+    if stats.records_total > limits.max_records()
+        || stats.logical_bytes > limits.max_logical_bytes()
+    {
+        return Err(StoreError::SemanticInvariant(
+            "Event operation audit exceeds configured limits",
+        ));
+    }
+    let mut progress = EventOperationAuditProgress {
+        scanned: 0,
+        total: stats
+            .records_total
+            .checked_add(stats.reverse_rows)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?,
+    };
+    let mut checkpoint = |progress| {
+        on_progress(progress);
+        if is_cancelled() {
+            Err(StoreError::EventOperationAuditCancelled)
+        } else {
+            Ok(())
+        }
+    };
+    checkpoint(progress)?;
+    let mut actual = EventOperationStats::default();
+    for row in ledger.iter()? {
+        let (key, value) = row?;
+        let fingerprint: EventOperationFingerprint = key.value().try_into().map_err(|_| {
+            StoreError::SemanticInvariant("invalid Event operation fingerprint length")
+        })?;
+        match decode_event_operation_ledger_record(value.value())? {
+            EventOperationLedgerRecord::Active { transfer_id, .. } => {
+                let key = encode_active_operation_by_event_key(transfer_id, fingerprint);
+                let edge = reverse
+                    .get(key.as_slice())?
+                    .ok_or(StoreError::SemanticInvariant(
+                        "active Event operation is missing its reverse edge",
+                    ))?;
+                if !edge.value().is_empty() {
+                    return Err(StoreError::SemanticInvariant(
+                        "Event operation reverse value is not empty",
+                    ));
+                }
+                let event = crate::load_event_from_read(read, transfer_id)?.ok_or(
+                    StoreError::SemanticInvariant(
+                        "active Event operation is missing its retained Event",
+                    ),
+                )?;
+                if event.acceptance_marker == 0
+                    || read
+                        .open_table(crate::SEMANTIC_ITEMS)?
+                        .get(event.semantic_id.as_bytes().as_slice())?
+                        .is_none_or(|value| value.value() != transfer_id.as_bytes())
+                {
+                    return Err(StoreError::SemanticInvariant(
+                        "active Event operation has an inconsistent Event relationship",
+                    ));
+                }
+                actual.records_active += 1;
+            }
+            EventOperationLedgerRecord::Retired { .. } => actual.records_retired += 1,
+        }
+        actual.records_total += 1;
+        progress.scanned += 1;
+        if progress.scanned.is_multiple_of(page_size) {
+            checkpoint(progress)?;
+        }
+    }
+    // Every reverse row must name its exact active ledger record. Together
+    // with the first pass, this proves that retired rows have NO reverse edge
+    // without either O(n²) per-retired scans or O(n) auxiliary memory.
+    let mut previous_event = None;
+    let mut aliases = 0;
+    for row in reverse.iter()? {
+        let (key, value) = row?;
+        let (transfer_id, fingerprint) = decode_active_operation_by_event_key(key.value())?;
+        if !value.value().is_empty() {
+            return Err(StoreError::SemanticInvariant(
+                "Event operation reverse value is not empty",
+            ));
+        }
+        let record = ledger
+            .get(fingerprint.as_slice())?
+            .ok_or(StoreError::SemanticInvariant(
+                "Event operation reverse target is missing",
+            ))?;
+        if !matches!(decode_event_operation_ledger_record(record.value())?, EventOperationLedgerRecord::Active { transfer_id: target, .. } if target == transfer_id)
+        {
+            return Err(StoreError::SemanticInvariant(
+                "Event operation reverse target is not the exact active record",
+            ));
+        }
+        aliases = if previous_event == Some(transfer_id) {
+            aliases + 1
+        } else {
+            1
+        };
+        previous_event = Some(transfer_id);
+        if aliases > MAX_EVENT_OPERATION_ALIASES {
+            return Err(StoreError::SemanticInvariant(
+                "Event operation audit exceeds the alias limit",
+            ));
+        }
+        actual.reverse_rows += 1;
+        progress.scanned += 1;
+        if progress.scanned.is_multiple_of(page_size) {
+            checkpoint(progress)?;
+        }
+    }
+    actual.logical_bytes = checked_event_operation_logical_bytes(
+        actual.records_active,
+        actual.records_retired,
+        actual.reverse_rows,
+    )?;
+    validate_event_operation_stats(actual)?;
+    for (field, durable, reconstructed) in [
+        (
+            EVENT_OPERATION_RECORDS_TOTAL,
+            stats.records_total,
+            actual.records_total,
+        ),
+        (
+            EVENT_OPERATION_RECORDS_ACTIVE,
+            stats.records_active,
+            actual.records_active,
+        ),
+        (
+            EVENT_OPERATION_RECORDS_RETIRED,
+            stats.records_retired,
+            actual.records_retired,
+        ),
+        (
+            EVENT_OPERATION_REVERSE_ROWS,
+            stats.reverse_rows,
+            actual.reverse_rows,
+        ),
+        (
+            EVENT_OPERATION_LOGICAL_BYTES,
+            stats.logical_bytes,
+            actual.logical_bytes,
+        ),
+    ] {
+        if durable != reconstructed {
+            return Err(StoreError::AccountingMismatch {
+                field,
+                durable,
+                reconstructed,
+            });
+        }
+    }
+    if !progress.scanned.is_multiple_of(page_size) {
+        checkpoint(progress)?;
+    }
+    Ok(progress)
+}
 
 /// Exact logical usage of the permanent mission-bound Event operation ledger.
 ///

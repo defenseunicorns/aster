@@ -140,6 +140,13 @@ fn retirement_compacts_zero_one_and_64_aliases_at_full_capacity_and_reopens() {
     // deleting shared metadata breaks these hand-derived expectations.
     for (aliases, before_bytes, after_bytes) in [(0, 0, 0), (1, 162, 67), (64, 10_368, 4_288)] {
         let (file, services, store, stored) = fixture(aliases);
+        let audit = store
+            .audit_event_operations(7, |_| {})
+            .expect("audit active aliases");
+        assert_eq!(
+            (audit.scanned, audit.total),
+            (u64::from(aliases) * 2, u64::from(aliases) * 2)
+        );
         assert_eq!(
             stats(&store),
             EventOperationStats {
@@ -202,6 +209,13 @@ fn retirement_compacts_zero_one_and_64_aliases_at_full_capacity_and_reopens() {
         drop(store);
         let reopened =
             Store::open_for_mission(&file.0, services.authority).expect("reopen retired");
+        let audit = reopened
+            .audit_event_operations(7, |_| {})
+            .expect("audit compact retired aliases");
+        assert_eq!(
+            (audit.scanned, audit.total),
+            (u64::from(aliases), u64::from(aliases))
+        );
         assert_eq!(shared_snapshot(&reopened), shared);
         assert_eq!(stats(&reopened).logical_bytes, after_bytes);
         let intent = event_publication_intent(&stored.header, b"payload");

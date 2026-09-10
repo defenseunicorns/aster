@@ -33,6 +33,7 @@ use aster_redb_store::{
     EventSubscriptionSpec, MAX_EVENT_PAGE, MAX_EVENT_POLL_DELIVERIES, MAX_EVENT_SUBSCRIPTION_SCAN,
     Store, StoreError, StoreLimits, StoredEvent,
 };
+pub use aster_redb_store::{EventOperationAuditState, EventOperationAuditStatus};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
@@ -565,9 +566,14 @@ pub enum EventSyncStatus {
     PolicyChangedSinceContact,
 }
 
-/// Sanitized live selected-Event status snapshot.
+/// Sanitized live selected-Event status snapshot. When the operation audit is
+/// `Failed`, store usage, operation counts/bytes, and pending deliveries are
+/// the last successfully read figures, not current or trusted capacity. Peer,
+/// synchronization, emission, and audit observations remain actor-current.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelectedEventStatus {
+    /// One background audit; traversal counts include ledger and reverse rows.
+    pub event_operation_audit: EventOperationAuditStatus,
     pub sync: EventSyncStatus,
     pub authenticated_contacts: u64,
     pub failed_contact_attempts: u64,
@@ -1811,6 +1817,7 @@ pub(crate) fn runtime_application_error(
 
 fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
     match error {
+        StoreError::EventOperationAuditCancelled => ApplicationErrorKind::StateUnavailable,
         StoreError::Blob(error) => blob_store_error_kind(error),
         // The bridge foundation has no selected application surface yet. Any
         // bridge-store error reaching this classifier is therefore an internal

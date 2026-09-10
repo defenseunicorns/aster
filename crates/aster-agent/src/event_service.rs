@@ -932,6 +932,7 @@ mod tests {
             [0x22; 32],
             EventEmissionPolicy::Normal,
             SelectedEventStatus {
+                event_operation_audit: Default::default(),
                 sync: NodeEventSyncStatus::Offline,
                 authenticated_contacts: 0,
                 failed_contact_attempts: 0,

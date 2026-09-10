@@ -4,7 +4,7 @@ use crate::event_operation::{
     inspect_event_operation_accounting_read,
 };
 
-fn open(file: &TestFile, authority: NodeId, records: u64, bytes: u64) -> Store {
+pub(super) fn open(file: &TestFile, authority: NodeId, records: u64, bytes: u64) -> Store {
     Store::open_with_limits_and_operation_limits_for_mission(
         &file.0,
         StoreLimits::default(),
@@ -15,7 +15,7 @@ fn open(file: &TestFile, authority: NodeId, records: u64, bytes: u64) -> Store {
     .expect("store")
 }
 
-fn publish(
+pub(super) fn publish(
     store: &Store,
     services: &mut EventServices,
     key: &[u8],

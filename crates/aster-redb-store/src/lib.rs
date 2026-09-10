@@ -42,6 +42,7 @@ pub use blob_subscription::*;
 pub use bridge_event::*;
 pub use custody::*;
 pub use event_operation::{
+    EventOperationAuditProgress, EventOperationAuditState, EventOperationAuditStatus,
     EventOperationKey, EventOperationLimits, EventOperationStats, MAX_EVENT_OPERATION_ALIASES,
 };
 pub use record_subscription::*;
@@ -3368,6 +3369,8 @@ pub enum StoreError {
     EventOperationMigrationAliasOverflow,
     /// The complete migration image exceeds the configured destination limits.
     EventOperationMigrationDestinationCapacity,
+    /// A complete operation audit was cancelled between bounded pages.
+    EventOperationAuditCancelled,
     /// The dedicated durable Event operation row cap was reached.
     EventOperationLimitExceeded { current: u64, limit: u64 },
     /// Retaining another Event operation would exceed its dedicated byte cap.
@@ -3838,6 +3841,9 @@ impl fmt::Display for StoreError {
             }
             Self::EventOperationMigrationDestinationCapacity => {
                 formatter.write_str("Event operation migration exceeds destination capacity")
+            }
+            Self::EventOperationAuditCancelled => {
+                formatter.write_str("Event operation audit cancelled before completion")
             }
             Self::EventOperationLimitExceeded { current, limit } => write!(
                 formatter,
@@ -22887,6 +22893,7 @@ fn parse_id(table: &'static str, bytes: &[u8]) -> Result<ItemId, StoreError> {
 
 #[cfg(test)]
 mod tests {
+    mod event_operation_audit;
     mod event_operation_migration;
     mod event_operation_publication;
     mod event_operation_retirement;
