@@ -62,6 +62,82 @@ fn operation_audit_bounds_pages_and_completes_all_retired_rows_after_reopen() {
 }
 
 #[test]
+fn operation_audit_accepts_retained_records_above_lower_reopen_limits() {
+    // Break caught: classifying capacity pressure as corruption disables exact
+    // existing-key classification despite a structurally valid retained ledger.
+    let file = TestFile::new("audit lower reopened quota");
+    let store = open(&file, [0xa6; 32], 10, 2_000);
+    retired_rows(&store, 6);
+    let keys = (0u8..6)
+        .map(|index| EventOperationKey::new(vec![index]).unwrap())
+        .collect::<Vec<_>>();
+    let write = store.database.begin_write().unwrap();
+    {
+        let mut ledger = write.open_table(EVENT_OPERATION_LEDGER_V3).unwrap();
+        for (index, key) in keys.iter().enumerate() {
+            let mut old = [0; 32];
+            old[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            let value = ledger
+                .remove(old.as_slice())
+                .unwrap()
+                .unwrap()
+                .value()
+                .to_vec();
+            let fingerprint = event_operation_fingerprint(&[0xa6; 32], key);
+            ledger
+                .insert(fingerprint.as_slice(), value.as_slice())
+                .unwrap();
+        }
+    }
+    write.commit().unwrap();
+    let rows = |store: &Store| {
+        store
+            .database
+            .begin_read()
+            .unwrap()
+            .open_table(EVENT_OPERATION_LEDGER_V3)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|row| {
+                let (key, value) = row.unwrap();
+                (key.value().to_vec(), value.value().to_vec())
+            })
+            .collect::<Vec<_>>()
+    };
+    let retained = rows(&store);
+    let before = store.event_stats().unwrap().operation_stats;
+    drop(store);
+    for (records, bytes) in [(5, 2_000), (10, 400)] {
+        let store = open(&file, [0xa6; 32], records, bytes);
+        assert_eq!(store.event_stats().unwrap().operation_stats, before);
+        let progress = store
+            .audit_event_operations(2, |_| {})
+            .expect("capacity is not corruption");
+        assert_eq!(progress.scanned, 6);
+        assert_eq!(progress.total, 6);
+        assert_eq!(store.event_stats().unwrap().operation_stats, before);
+        assert_eq!(
+            rows(&store),
+            retained,
+            "reopen and audit preserve exact ledger rows"
+        );
+        for key in &keys {
+            assert_eq!(
+                store.resolve_event_operation(key, Some([7; 32])).unwrap(),
+                Some(EventOperationResolution::RetiredOperation {
+                    reason: CustodyRetirementReason::Expired
+                })
+            );
+            assert!(matches!(
+                store.resolve_event_operation(key, Some([8; 32])),
+                Err(StoreError::EventOperationConflict)
+            ));
+        }
+    }
+}
+
+#[test]
 #[cfg(unix)]
 fn operation_audit_offline_accepts_read_only_backing_permissions() {
     use std::os::unix::fs::PermissionsExt;

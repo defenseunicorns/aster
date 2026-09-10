@@ -77,6 +77,8 @@ impl crate::Store {
     /// snapshot. Concurrent commits belong to the next run. Callbacks occur
     /// initially and after at most `min(page_size, 1024)` traversal rows, without
     /// collecting a ledger-sized image. A zero page size is invalid.
+    /// Admission quotas do not invalidate retained rows after a lower-limit
+    /// reopen; this audit verifies structure and accounting independently.
     pub fn audit_event_operations<F>(
         &self,
         page_size: usize,
@@ -102,19 +104,13 @@ impl crate::Store {
         C: FnMut() -> bool,
     {
         let read = self.database.begin_read()?;
-        audit_event_operations_read(
-            &read,
-            self.operation_limits,
-            page_size,
-            on_progress,
-            is_cancelled,
-        )
+        audit_event_operations_read(&read, page_size, on_progress, is_cancelled)
     }
 
     /// Offline complete operation audit of an existing v3 store. This uses a
     /// read-only redb handle and never creates, migrates, repairs, or reopens a
     /// writer. Run the ordinary inspection separately for other schema groups.
-    /// The initial supported operation limits apply to this inspection surface.
+    /// This checks integrity, not qualification against an admission quota.
     pub fn audit_existing_event_operations<F>(
         path: impl AsRef<std::path::Path>,
         page_size: usize,
@@ -132,19 +128,12 @@ impl crate::Store {
             ));
         }
         let read = database.begin_read()?;
-        audit_event_operations_read(
-            &read,
-            EventOperationLimits::DEFAULT,
-            page_size,
-            on_progress,
-            || false,
-        )
+        audit_event_operations_read(&read, page_size, on_progress, || false)
     }
 }
 
 fn audit_event_operations_read<F, C>(
     read: &redb::ReadTransaction,
-    limits: EventOperationLimits,
     page_size: usize,
     mut on_progress: F,
     mut is_cancelled: C,
@@ -172,13 +161,6 @@ where
     {
         return Err(StoreError::SemanticInvariant(
             "Event operation ledger coexists with legacy rows",
-        ));
-    }
-    if stats.records_total > limits.max_records()
-        || stats.logical_bytes > limits.max_logical_bytes()
-    {
-        return Err(StoreError::SemanticInvariant(
-            "Event operation audit exceeds configured limits",
         ));
     }
     let mut progress = EventOperationAuditProgress {

@@ -989,6 +989,11 @@ class ProcessCheckerContractTests(unittest.TestCase):
                         "storage": {
                             "max_items": 10_000,
                             "max_payload_bytes": 64 * 1024 * 1024,
+                            "operations": {
+                                "max_records": 1_000_000,
+                                "max_logical_bytes": 201_326_592,
+                                "emergency_reserve": 10_000,
+                            },
                         },
                         "limits": {"shutdown_grace_ms": 10_000},
                     }
@@ -1066,6 +1071,11 @@ class ProcessCheckerContractTests(unittest.TestCase):
                         "storage": {
                             "max_items": 10_000,
                             "max_payload_bytes": 64 * 1024 * 1024,
+                            "operations": {
+                                "max_records": 1_000_000,
+                                "max_logical_bytes": 201_326_592,
+                                "emergency_reserve": 10_000,
+                            },
                         },
                         "limits": {"shutdown_grace_ms": 10_000},
                     }

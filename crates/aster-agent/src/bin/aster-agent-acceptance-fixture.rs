@@ -292,7 +292,12 @@ fn prepare_fixture(arguments: &[String]) -> Result<(), ()> {
         },
         "storage": {
             "max_items": TEST_STORAGE_MAX_ITEMS,
-            "max_payload_bytes": TEST_STORAGE_MAX_PAYLOAD_BYTES
+            "max_payload_bytes": TEST_STORAGE_MAX_PAYLOAD_BYTES,
+            "operations": {
+                "max_records": 1_000_000,
+                "max_logical_bytes": 201_326_592,
+                "emergency_reserve": 10_000
+            }
         },
         "limits": {"shutdown_grace_ms": TEST_SHUTDOWN_GRACE_MS}
     });

@@ -64,18 +64,18 @@ use aster_redb_store::{
     CustodyReconciliationEvidence, CustodyReconciliationSelection, CustodySendAuthorization,
     CustodySenderProjection, CustodyStoreError, CustodyUsage, EventOnceOutcome,
     EventOperationAuditProgress, EventOperationAuditState, EventOperationAuditStatus,
-    EventOperationKey, EventOperationRequest, EventOperationResolution, EventPublicationIntent,
-    EventPublicationSpec, EventReplicationPolicySnapshot, EventSemanticId, EventSubscriptionKey,
-    EventSubscriptionMode, EventSubscriptionSpec, EventTransferId, LocalCustodyCheckpoint,
-    MAX_BLOB_NETWORK_RANGE_BYTES, MAX_BLOB_NETWORK_SOURCE_BYTES, MAX_BLOB_NETWORK_STAGING_ROWS,
-    MAX_CUSTODY_PAGE, MAX_CUSTODY_RETIREMENTS, MAX_EVENT_PAGE, MAX_MUTABLE_TRANSFER_CURSOR_PEERS,
-    MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS, MAX_ROUTE_CACHE_ITEMS,
-    MutableTransferCursorClass, MutableTransferCursorMode, RecordSenderProjection,
-    RecordTransferId, RejectedControl, RouteCacheOutcome, ScopeRekeyPublicationIntent,
-    StateSenderProjection, StateTransferId, Store, StoreBackingIdentity, StoreError,
-    StoreInspection, StoreLimits, StoreZeroizationState, StoredControl, StoredControlEffect,
-    StoredEvent, StoredEventTransfer, StoredRecord, StoredState, TransferLease,
-    ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
+    EventOperationKey, EventOperationLimits, EventOperationRequest, EventOperationResolution,
+    EventPublicationIntent, EventPublicationSpec, EventReplicationPolicySnapshot, EventSemanticId,
+    EventSubscriptionKey, EventSubscriptionMode, EventSubscriptionSpec, EventTransferId,
+    LocalCustodyCheckpoint, MAX_BLOB_NETWORK_RANGE_BYTES, MAX_BLOB_NETWORK_SOURCE_BYTES,
+    MAX_BLOB_NETWORK_STAGING_ROWS, MAX_CUSTODY_PAGE, MAX_CUSTODY_RETIREMENTS, MAX_EVENT_PAGE,
+    MAX_MUTABLE_TRANSFER_CURSOR_PEERS, MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS,
+    MAX_ROUTE_CACHE_ITEMS, MutableTransferCursorClass, MutableTransferCursorMode,
+    RecordSenderProjection, RecordTransferId, RejectedControl, RouteCacheOutcome,
+    ScopeRekeyPublicationIntent, StateSenderProjection, StateTransferId, Store,
+    StoreBackingIdentity, StoreError, StoreInspection, StoreLimits, StoreZeroizationState,
+    StoredControl, StoredControlEffect, StoredEvent, StoredEventTransfer, StoredRecord,
+    StoredState, TransferLease, ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
 };
 use sha2::{Digest as _, Sha256};
 #[cfg(unix)]
@@ -1320,6 +1320,7 @@ impl EventEmissionPolicy {
 pub struct SelectedForwardingConfig {
     emission_policy: EventEmissionPolicy,
     store_limits: StoreLimits,
+    operation_limits: EventOperationLimits,
     blob_depot_limits: BlobDepotLimits,
     scope_quotas: Vec<CustodyQuota>,
     event_bridge: Option<SelectedEventBridgeConfig>,
@@ -1354,6 +1355,7 @@ impl SelectedForwardingConfig {
         Self {
             emission_policy,
             store_limits,
+            operation_limits: EventOperationLimits::DEFAULT,
             blob_depot_limits: BlobDepotLimits::DEFAULT,
             scope_quotas: Vec::new(),
             event_bridge: None,
@@ -1373,6 +1375,11 @@ impl SelectedForwardingConfig {
         self.store_limits
     }
 
+    /// Returns the permanent Event-operation ledger admission limits.
+    pub const fn operation_limits(&self) -> EventOperationLimits {
+        self.operation_limits
+    }
+
     /// Returns the aggregate durable Blob-depot limits.
     pub const fn blob_depot_limits(&self) -> BlobDepotLimits {
         self.blob_depot_limits
@@ -1387,6 +1394,12 @@ impl SelectedForwardingConfig {
     /// Replaces the aggregate durable-admission limits.
     pub const fn with_store_limits(mut self, limits: StoreLimits) -> Self {
         self.store_limits = limits;
+        self
+    }
+
+    /// Replaces the permanent Event-operation ledger admission limits.
+    pub const fn with_operation_limits(mut self, limits: EventOperationLimits) -> Self {
+        self.operation_limits = limits;
         self
     }
 
@@ -1595,16 +1608,7 @@ impl SelectedForwardingConfig {
 
 impl Default for SelectedForwardingConfig {
     fn default() -> Self {
-        Self {
-            emission_policy: EventEmissionPolicy::Normal,
-            store_limits: StoreLimits::default(),
-            blob_depot_limits: BlobDepotLimits::default(),
-            scope_quotas: Vec::new(),
-            event_bridge: None,
-            controlled_relay: None,
-            #[cfg(feature = "nearby-discovery")]
-            nearby_discovery: None,
-        }
+        Self::new(EventEmissionPolicy::Normal, StoreLimits::default())
     }
 }
 
@@ -11493,10 +11497,11 @@ async fn run_node_actor_inner(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let store = Arc::new(Store::open_with_limits_and_blob_depot_limits_for_mission(
+    let store = Arc::new(Store::open_with_limits_and_operation_limits_for_mission(
         &store_path,
         forwarding.store_limits(),
         forwarding.blob_depot_limits(),
+        forwarding.operation_limits(),
         mission_authority,
     )?);
     store.require_process_exclusive_lock()?;
