@@ -12,12 +12,3 @@
 !lab/Dockerfile.selected-nat
 !lab/Dockerfile.dockerignore
 !lab/debian.sources
-!proto/
-!proto/**
-!tools/
-!tools/aster_lan_mvp.py
-!tools/aster_path_delivery.py
-!docker/
-!docker/path-lab/
-!docker/path-lab/Dockerfile.delivery
-!docker/path-lab/delivery-*.py

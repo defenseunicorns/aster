@@ -199,6 +199,21 @@ sudo python3 tools/aster_path_delivery.py \
   --execute --docker /usr/bin/docker
 ```
 
+The delivery build uses the sibling `Dockerfile.delivery.dockerignore`, not an
+expanded root `.dockerignore`. Its deny-all allowlist admits only the local
+`COPY` inputs (the Rust/proto/vendor trees, manifests, notices, Debian sources,
+two controller modules, and four named delivery helpers) plus their parent
+directories. Re-including a parent alone also re-includes descendants under
+Docker's matching rules: `lab/**`, `tools/**`, `docker/**`, and
+`docker/path-lab/**` therefore re-exclude descendants immediately after each
+parent entry, before the exact required files are re-included. The complete
+`crates`, `proto`, and `third-party` trees intentionally remain admitted; this
+is not a credential filter within those required trees. There is no wildcard
+re-inclusion of other tools, scenarios, or `delivery-*.py` files. The root and
+`lab/Dockerfile.dockerignore` retain the exact reviewed lab contract. Docker
+still sends the selected Dockerfile and ignore file as build metadata even
+though they are not admitted as copyable context inputs.
+
 The delivery CI lane runs controller contracts and the plan before building and
 executing the real image. Unit tests use an explicit fake daemon because they run
 without Linux/Docker: **they do not prove Docker or network execution**. A live
@@ -219,6 +234,47 @@ Python versions are written to
 Docker Engine and kernel versions are printed by the delivery CI job; they are
 host tooling, not falsely presented as version-pinned product dependencies.
 No live image package or host version is asserted by a plan-only run.
+
+Public Docker build-context documentation checked on 2026-09-10:
+[Docker Docs: filename and location](https://docs.docker.com/build/concepts/context/#filename-and-location)
+and [matching](https://docs.docker.com/build/concepts/context/#matching).
+These document the sibling `<Dockerfile>.dockerignore` naming rule, precedence
+over the root policy, context-root-relative patterns, and automatic transmission
+of excluded build metadata. The public documentation was retrieved directly from
+Docker Docs (the older `/build/building/context/` URL redirects to this page);
+no upstream source code or new dependency was imported into the repository.
+Public Moby [patternmatcher v0.6.0](https://github.com/moby/patternmatcher/blob/v0.6.0/patternmatcher.go)
+and [ignorefile normalization](https://github.com/moby/patternmatcher/blob/v0.6.0/ignorefile/ignorefile.go)
+were also inspected to check parent-match propagation and trailing-slash
+normalization. Source inspection is not executed matching evidence. The focused
+regression checks the exact ordered policy and an independent inventory of all
+local `COPY` sources; it does not subtract parent entries to infer exclusions,
+emulate Docker matching, or claim an executed image build.
+
+An optional credential-free context probe exercises Docker itself:
+
+```sh
+python3 tools/probe_delivery_docker_context.py --execute
+```
+
+It reads only the delivery ignore policy from the repository and generates all
+other inputs in a temporary context: required-file sentinels, nested sentinels
+in each full tree, and unrelated/hidden sentinels under the restricted parents.
+A conflicting root deny-all policy checks sibling-policy precedence. A synthetic
+`FROM scratch` / `COPY . /` build exports locally, without a base-image pull,
+container execution, or repository context copy. The complete exported path set
+(including directories) and required sentinel contents must match exactly;
+build metadata and unrelated sentinels must not be copyable. The probe uses an
+empty temporary Docker config and the fixed local Unix socket, not user contexts
+or credentials. It requires Docker with BuildKit local-export support and may
+leave synthetic build cache; it does not prune shared daemon state.
+
+Without `--execute`, a Docker CLI, or an accessible local Engine it prints
+`NOT RUN` and exits 77, never a pass. Build/export failure exits 1. Docker was
+unavailable for this local revision, so the real context probe and delivery
+image build remain **not run**; Python CLI/text-contract tests are not substitutes.
+Even a probe pass establishes only synthetic context behavior, not compilation,
+capabilities, network behavior, or real Event delivery.
 
 Public interface references checked for the veth revision (2026-09-10):
 [ip-link(8)](https://man7.org/linux/man-pages/man8/ip-link.8.html),

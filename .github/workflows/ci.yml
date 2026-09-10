@@ -170,6 +170,11 @@ jobs:
           docker version --format '{{.Server.Version}}'
           uname -r
 
+      - name: Verify isolated delivery build context
+        run: |
+          python3 tools/test_delivery_docker_context_probe.py
+          python3 tools/probe_delivery_docker_context.py --execute
+
       - name: Build the real-Event delivery image
         run: |
           docker pull rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97
