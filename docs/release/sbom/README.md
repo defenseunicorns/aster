@@ -41,10 +41,12 @@ terminal. The archive preserves executable permissions and its files have
 relative checksums.
 After extracting it, run `sha256sum -c SHA256SUMS`.
 
-CI runs this same task in its separate required `sbom` job on Ubuntu 24.04.
+The manual `Build: Linux x86_64` workflow runs this task on Ubuntu 24.04.
+Start it through **Actions → Build: Linux x86_64 → Run workflow** and choose
+a branch. The workflow must exist on the default branch for the button to
+appear. It is not part of `CI / required`.
 It uploads `aster-linux-x86_64.tar` as an Actions artifact, retained for 14 days
-(subject to repository policy). PR artifacts describe the checked-out test
-commit and are CI results, not signed releases. No automatic release publishing
+(subject to repository policy). Artifacts describe the commit built from the chosen branch. No automatic release publishing
 or requirement-status change is implied.
 
 The commands below remain available as the manual equivalent and historical

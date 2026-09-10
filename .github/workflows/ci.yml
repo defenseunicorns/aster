@@ -240,48 +240,6 @@ jobs:
           CARGO_NET_OFFLINE: "true"
         run: sh ./tools/run-fuzz-smoke.sh
 
-  sbom:
-    name: "Build: Linux x86_64"
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 1
-          persist-credentials: false
-          submodules: false
-
-      - name: Install repository toolchain
-        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
-        with:
-          version: 2026.4.28
-          cache: false
-
-      - name: Install pinned SBOM tools
-        run: |
-          cargo install --locked --version 0.5.9 cargo-cyclonedx --root "$RUNNER_TEMP/sbom-cargo"
-          python3 -m venv "$RUNNER_TEMP/sbom-python"
-          "$RUNNER_TEMP/sbom-python/bin/pip" install 'cyclonedx-editor-validator==0.34.0'
-          echo "$RUNNER_TEMP/sbom-cargo/bin" >> "$GITHUB_PATH"
-          echo "$RUNNER_TEMP/sbom-python/bin" >> "$GITHUB_PATH"
-
-      - name: Acquire locked Rust dependencies
-        run: cargo fetch --locked
-
-      - name: Build and validate the artifact bundle offline
-        env:
-          CARGO_NET_OFFLINE: "true"
-        run: mise run sbom
-
-      - name: Retain binaries, SBOMs and checksums
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: aster-linux-x86_64-${{ github.sha }}
-          path: target/sbom/aster-linux-x86_64.tar
-          if-no-files-found: error
-          retention-days: 14
-
   required:
     name: required
     if: ${{ always() }}
@@ -292,7 +250,6 @@ jobs:
       - age-reference-interop
       - dependency-policy
       - fuzz-smoke
-      - sbom
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -304,7 +261,6 @@ jobs:
           AGE_INTEROP_RESULT: ${{ needs.age-reference-interop.result }}
           POLICY_RESULT: ${{ needs.dependency-policy.result }}
           FUZZ_RESULT: ${{ needs.fuzz-smoke.result }}
-          SBOM_RESULT: ${{ needs.sbom.result }}
         run: |
           for result in \
             "$QUALITY_RESULT" \
@@ -312,8 +268,7 @@ jobs:
             "$MSRV_RESULT" \
             "$AGE_INTEROP_RESULT" \
             "$POLICY_RESULT" \
-            "$FUZZ_RESULT" \
-            "$SBOM_RESULT"
+            "$FUZZ_RESULT"
           do
             if [[ "$result" != "success" ]]; then
               printf 'A required CI lane ended with status: %s\n' "$result" >&2

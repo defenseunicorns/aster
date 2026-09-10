@@ -24,7 +24,6 @@ single stable check name **`CI / required`**.
 | `dependency policy` | `ubuntu-24.04` | Enforces the retained-libp2p-oracle boundary, applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
 | `age reference interoperability` | `ubuntu-24.04` | Installs exact `govulncheck` v1.6.0, runs `mise run age-reference-audit`, then runs `mise run age-reference-interop`: the Go oracle's reachable vulnerability and compiled-module license gates must pass before exact reference Go `filippo.io/age` v1.3.1 and the Rust provider exchange classic-X25519 artifacts in both directions, compare recovered plaintext, and agree on the recipient. |
 | `bounded fuzz smoke` | `ubuntu-24.04` | Runs five fixed 10,000-case hostile-input campaigns with the pinned nightly toolchain and `cargo-fuzz`: semantic wire decode, fragment decode, reference-envelope inspection, selected mechanics-frame decode, and selected Negentropy state-machine/bounds exercise. |
-| `Build: Linux x86_64` | `ubuntu-24.04` | Runs `mise run sbom`: builds `aster` (package `aster-node`) and `aster-agent` (package `aster-agent`) for `x86_64-unknown-linux-gnu` in release mode from the checked-out commit, generates and validates their CycloneDX SBOMs, checks Cargo.lock stability, and retains `aster-linux-x86_64.tar` with the executables, SBOMs, checksums, build metadata and LICENSE for 14 days. |
 | `required` | `ubuntu-24.04` | Fails unless every validation lane completed successfully; this is the branch-protection check. |
 
 The Rust dependency downloads happen before Cargo validation is switched to
@@ -33,6 +32,18 @@ current advisory data once, audits the root lockfile during that refresh, and
 reuses the same database without another fetch for the fuzz lockfile. Its
 vulnerability result therefore reflects the RustSec database available when
 the workflow ran, rather than a permanently reproducible snapshot.
+
+## Manual Linux build
+
+Run **Actions → Build: Linux x86_64 → Run workflow**, then choose a branch.
+The workflow file must first be merged into the default branch for the button
+to appear.
+
+This independent workflow runs `mise run sbom` on Ubuntu 24.04 to build `aster`
+(package `aster-node`) and `aster-agent` (package `aster-agent`) for
+`x86_64-unknown-linux-gnu` in release mode. Download `aster-linux-x86_64-<commit SHA>`
+from the run's **Artifacts** section; it contains `aster-linux-x86_64.tar` and
+is retained for 14 days. The build is manual and is not part of `CI / required`.
 
 ## Selected composition coverage
 
