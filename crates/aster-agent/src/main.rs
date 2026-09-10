@@ -1,6 +1,10 @@
 use std::{env, net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
 
-use aster_agent::{BoundAgent, ClientToken};
+use aster_agent::{
+    BoundAgent, ClientToken,
+    config::check_config,
+    runtime::{AgentExit, AgentSignal},
+};
 use aster_node::application::{Scope, Topic};
 use aster_node::mission::UnprotectedReferenceMission;
 use aster_node::{
@@ -11,6 +15,35 @@ use aster_node::{
 use aster_node::{MissionNearbyPeer, SelectedForwardingConfig, start_node_with_forwarding};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+enum Invocation {
+    CheckConfig(PathBuf),
+    CustomerConfig(PathBuf),
+    LegacyDevelopment(Arguments),
+}
+
+impl Invocation {
+    fn parse(mut arguments: Arguments) -> Result<Self, BoxError> {
+        let config = arguments.optional("--config")?;
+        let check_config = arguments.optional("--check-config")?;
+        match (config, check_config) {
+            (Some(_), Some(_)) => Err("--config cannot be combined with --check-config".into()),
+            (Some(path), None) => {
+                if !arguments.values.is_empty() {
+                    return Err("--config cannot be combined with legacy flags".into());
+                }
+                Ok(Self::CustomerConfig(PathBuf::from(path)))
+            }
+            (None, Some(path)) => {
+                if !arguments.values.is_empty() {
+                    return Err("--check-config cannot be combined with legacy flags".into());
+                }
+                Ok(Self::CheckConfig(PathBuf::from(path)))
+            }
+            (None, None) => Ok(Self::LegacyDevelopment(arguments)),
+        }
+    }
+}
 
 fn main() -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -24,7 +57,8 @@ fn main() -> ExitCode {
         }
     };
     match runtime.block_on(run()) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(Some(exit)) => ExitCode::from(agent_exit_code(exit)),
+        Ok(None) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("ERROR {error}");
             ExitCode::FAILURE
@@ -32,13 +66,33 @@ fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<(), BoxError> {
-    let mut arguments = Arguments::new(env::args().skip(1));
-    if arguments.take_flag("--help") || arguments.take_flag("-h") {
-        print_help();
-        return Ok(());
+async fn run() -> Result<Option<AgentExit>, BoxError> {
+    match Invocation::parse(Arguments::new(env::args().skip(1)))? {
+        Invocation::CheckConfig(path) => {
+            check_config(&path)?;
+            Ok(None)
+        }
+        Invocation::CustomerConfig(_path) => Err("protected provider required".into()),
+        Invocation::LegacyDevelopment(mut arguments) => {
+            if arguments.take_flag("--help") || arguments.take_flag("-h") {
+                print_help();
+                return Ok(None);
+            }
+            run_legacy(arguments).await?;
+            Ok(None)
+        }
     }
+}
 
+fn agent_exit_code(exit: AgentExit) -> u8 {
+    match exit {
+        AgentExit::Clean => 0,
+        AgentExit::Failed(_) => 1,
+        AgentExit::Forced => 2,
+    }
+}
+
+async fn run_legacy(mut arguments: Arguments) -> Result<(), BoxError> {
     let state = arguments.required_path("--state")?;
     let mesh_bind: SocketAddr = arguments.required("--mesh-bind")?.parse()?;
     let listen: SocketAddr = arguments
@@ -122,9 +176,14 @@ async fn run() -> Result<(), BoxError> {
     );
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut signals = translated_signals()?;
     let signal = tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        let _ = shutdown_tx.send(true);
+        while let Some(signal) = signals.recv().await {
+            if signal == AgentSignal::Terminate {
+                let _ = shutdown_tx.send(true);
+                return;
+            }
+        }
     });
     let server_result = agent.serve(events, client_token, shutdown_rx).await;
     signal.abort();
@@ -132,6 +191,43 @@ async fn run() -> Result<(), BoxError> {
     server_result?;
     node_result?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn translated_signals() -> Result<tokio::sync::mpsc::Receiver<AgentSignal>, BoxError> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut hangup = signal(SignalKind::hangup())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(async move {
+        loop {
+            let translated = tokio::select! {
+                received = hangup.recv() => received.map(|()| AgentSignal::Hangup),
+                received = interrupt.recv() => received.map(|()| AgentSignal::Terminate),
+                received = terminate.recv() => received.map(|()| AgentSignal::Terminate),
+            };
+            let Some(translated) = translated else {
+                return;
+            };
+            if sender.send(translated).await.is_err() {
+                return;
+            }
+        }
+    });
+    Ok(receiver)
+}
+
+#[cfg(not(unix))]
+fn translated_signals() -> Result<tokio::sync::mpsc::Receiver<AgentSignal>, BoxError> {
+    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = sender.send(AgentSignal::Terminate).await;
+        }
+    });
+    Ok(receiver)
 }
 
 fn parse_source_interest(value: &str, class: &str) -> Result<SourceInterestSelector, BoxError> {
@@ -298,6 +394,48 @@ mod tests {
         assert!(HELP.contains("takes no peer identity or address"));
         assert!(HELP.contains("cannot be combined with --peer or\n--nearby-peer"));
         assert!(HELP.contains("authenticates it and current mission authorization succeeds"));
+    }
+
+    #[test]
+    fn customer_configuration_modes_are_exclusive_with_legacy_flags() {
+        let check = Invocation::parse(Arguments::new(
+            ["--check-config", "/etc/aster-agent.json"]
+                .into_iter()
+                .map(str::to_owned),
+        ))
+        .expect("check-config invocation");
+        assert!(matches!(check, Invocation::CheckConfig(_)));
+
+        let result = Invocation::parse(Arguments::new(
+            [
+                "--config",
+                "/etc/aster-agent.json",
+                "--state",
+                "/var/lib/aster",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        ));
+        let error = match result {
+            Ok(_) => panic!("legacy flags must not mix with customer config"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "--config cannot be combined with legacy flags"
+        );
+    }
+
+    #[test]
+    fn forced_customer_shutdown_has_a_distinct_non_success_exit_code() {
+        assert_eq!(agent_exit_code(aster_agent::runtime::AgentExit::Clean), 0);
+        assert_eq!(
+            agent_exit_code(aster_agent::runtime::AgentExit::Failed(
+                aster_agent::lifecycle::FailureReason::Runtime,
+            )),
+            1
+        );
+        assert_eq!(agent_exit_code(aster_agent::runtime::AgentExit::Forced), 2);
     }
 
     #[cfg(feature = "nearby-discovery")]

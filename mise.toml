@@ -4,6 +4,8 @@ go = "1.26.7"
 python = "3.13.7"
 ripgrep = "15.2.0"
 buf = "1.72.0"
+"go:google.golang.org/protobuf/cmd/protoc-gen-go" = "1.36.11"
+"go:connectrpc.com/connect/cmd/protoc-gen-connect-go" = "1.20.0"
 
 [env]
 RUST_BACKTRACE = "1"
@@ -55,6 +57,9 @@ run = [
   "python3 -m unittest discover -s lab/tests",
   "test -z \"$(gofmt -l bindings/go)\"",
   "GOCACHE=/tmp/aster-mesh-go-cache go -C bindings/go test -tags aster_workspace ./...",
+  "test -z \"$(gofmt -l conformance/agent-go)\"",
+  "go -C conformance/agent-go test ./...",
+  "sh tools/check-agent-go-generated.sh",
 ]
 
 [tasks.conformance-profile-v0-r2]
@@ -69,6 +74,35 @@ run = [
 [tasks.fuzz-smoke]
 description = "Run bounded sanitizer-instrumented decoder fuzz campaigns"
 run = "sh ./tools/run-fuzz-smoke.sh"
+
+[tasks.agent-process-smoke]
+description = "Exercise bounded customer-agent crash, restart, reload, and drain behavior"
+run = '''
+set -eu
+task_root=""
+cleanup() {
+  case "$task_root" in
+    "") return 0 ;;
+    /tmp/aster-agent-process-smoke.*) rm -rf -- "$task_root"; task_root="" ;;
+    *) return 1 ;;
+  esac
+}
+trap cleanup EXIT HUP INT TERM
+task_root="$(mktemp -d /tmp/aster-agent-process-smoke.XXXXXX)"
+chmod 700 "$task_root"
+cargo build --locked -p aster-agent --bin aster-agent-acceptance-fixture --features client,acceptance-test-provider
+GOCACHE="$task_root/go-cache" go -C conformance/agent-go build -o "$task_root/agent-smoke" ./cmd/agent-smoke
+fixture="target/debug/aster-agent-acceptance-fixture"
+runtime_root="$task_root/runtime"
+mkdir "$runtime_root"
+chmod 700 "$runtime_root"
+"$fixture" prepare --root "$runtime_root"
+python3 tools/check-aster-agent-process.py \
+  --agent "$fixture" \
+  --config "$runtime_root/agent.json" \
+  --client "$task_root/agent-smoke" \
+  --timeout-seconds 30
+'''
 
 [tasks.playground]
 description = "Launch a bounded interactive real-process Event message playground"

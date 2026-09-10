@@ -19,7 +19,8 @@ concurrency:
 
 defaults:
   run:
-    shell: bash
+    # Repository run steps require checkout before this wrapper is available.
+    shell: bash .github/scripts/ci-shell.sh {0}
 
 env:
   CARGO_INCREMENTAL: "0"
@@ -252,6 +253,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Require every validation lane
+        # This aggregation job does not check out the repository.
+        shell: bash
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
           MACOS_RESULT: ${{ needs.macos-tests.result }}
@@ -260,6 +263,7 @@ jobs:
           POLICY_RESULT: ${{ needs.dependency-policy.result }}
           FUZZ_RESULT: ${{ needs.fuzz-smoke.result }}
         run: |
+          umask 077
           for result in \
             "$QUALITY_RESULT" \
             "$MACOS_RESULT" \

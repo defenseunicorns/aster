@@ -20,3 +20,4 @@
 .env.*
 !.env.example
 /coverage/
+/.worktrees/

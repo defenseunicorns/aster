@@ -1,5 +1,6 @@
 # Decision 0040: Bound a generated hierarchy scale diagnostic
 
+> ****
 
 - Status: Accepted for a bounded development diagnostic
 - Date: 2026-08-31
@@ -86,7 +87,7 @@ authorization.
   proof of scale.
 - Resource and duplicate-offer reports identify the next concrete bottleneck;
   they do not silently become product thresholds or maturity evidence.
-- The [roadmap's immediate implementation order](../implementation/capability-roadmap.md#immediate-post-hierarchy-implementation-order)
+- The [roadmap's active implementation lanes](../implementation/capability-roadmap.md#active-post-hierarchy-implementation-lanes)
   first establishes a durable generation for bounded dynamic Event-bridge
   configuration, then binds peer-specific difference reconciliation to that
   generation. Increasing this fixed tree further comes after those increments.
