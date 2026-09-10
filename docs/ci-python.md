@@ -26,6 +26,67 @@ This pins source input, **not bit-for-bit binary reproducibility**: the hosted
 Ubuntu image, compiler, libc, and development headers remain runner-provided
 inputs. Source compilation and total job timing must be qualified on actual CI.
 
+## Ubuntu build prerequisites
+
+Run [34524164653](https://github.com/edgesoftops/astertech/actions/runs/34524164653/job/103028850660)
+at `cb7a77dfda7a671a9a0997496dede24ec584d78e` completed compilation and
+installation, then failed the required import with `No module named '_bz2'`.
+Configure had reported both `bzlib.h` and `lzma.h` absent and both `_bz2` and
+`_lzma` missing. Fixing only bzip2 would leave the next required import broken.
+The other required native modules (`_ctypes`, `_hashlib`, `_sqlite3`, `_ssl`,
+and `zlib`) were detected. Configure also reported `_dbm`, `_gdbm`, `readline`,
+`_tkinter`, and `_uuid` missing; these are not in this CI interpreter's required
+import contract and this change does not add their development packages.
+
+Before configuring CPython, the quality lane explicitly installs the following
+native build inputs, using the Ubuntu 24.04 runner's configured APT repositories
+and normal signature verification. It does not add a PPA, external repository,
+pip package, or product dependency. The five-minute prerequisite step does not
+increase the existing 45-minute job or 15-minute source-build deadlines.
+
+| Ubuntu package / public source | Observed Noble revision (2026-09-10) | Build role |
+| --- | --- | --- |
+| [build-essential](https://packages.ubuntu.com/noble/build-essential) | `12.10ubuntu1` | Native compiler, libc development files, and make |
+| [pkg-config](https://packages.ubuntu.com/noble/pkg-config) | `1.8.1-2build1` | Configure library discovery |
+| [libbz2-dev](https://packages.ubuntu.com/noble/libbz2-dev) | `1.0.8-5.1ubuntu0.1` | `bzlib.h` and bzip2 link input for `bz2` |
+| [libffi-dev](https://packages.ubuntu.com/noble/libffi-dev) | `3.4.6-1build1` | `ctypes` |
+| [liblzma-dev](https://packages.ubuntu.com/noble/liblzma-dev) | `5.6.1+really5.4.5-1ubuntu0.3` | `lzma.h` and liblzma link input for `lzma` |
+| [libsqlite3-dev](https://packages.ubuntu.com/noble/libsqlite3-dev) | `3.45.1-1ubuntu2.7` | `sqlite3` |
+| [libssl-dev](https://packages.ubuntu.com/noble/libssl-dev) | `3.0.13-0ubuntu3.15` | `ssl` and OpenSSL-backed `hashlib` |
+| [zlib1g-dev](https://packages.ubuntu.com/noble/zlib1g-dev) | `1:1.3.dfsg-3.1ubuntu2.2` | `zlib` |
+
+These are observed package-page revisions, **not exact APT install pins**.
+Like the existing hosted-image compiler/libc inputs, they follow the configured
+Noble archive/security updates. The step logs actual installed package versions
+with `dpkg-query`; those run-specific direct-package versions, not this observation
+table, are the direct-package build receipt, not complete compiler/libc or
+transitive-library provenance. This deliberately avoids freezing obsolete security revisions
+or claiming a reproducible Ubuntu snapshot. CPython's exact source version and
+SHA-256 remain unchanged. Public package pages establish availability, not a
+successful install or build on the next runner. The owner explicitly approved in
+the task conversation this narrow CI-only policy: official Ubuntu 24.04/Noble
+distro-managed packages, including security updates, with logged installed
+direct-package versions rather than exact pins for every APT revision. This is
+policy approval only, not release/publication approval, a governance waiver, a
+full SBOM, or a reproducible-build claim. It does not renew authorization for
+the blocked additional mutation-test execution; independent review and actual
+Linux verification remain required.
+
+Regression tests execute the prerequisite shell with intercepted package calls,
+requiring update-before-install with `APT::Update::Error-Mode=any`, the complete
+required package set, the package/version receipt format, and immediate failure
+on nonzero update/install exits. The [Noble apt-get manual](https://manpages.ubuntu.com/manpages/noble/en/man8/apt-get.8.html)
+documents this error mode as failing update on any error, including transient
+errors; the local tests intercept calls and do not reproduce real APT failures.
+A workflow-order guard
+requires prerequisites before the source build. Each of the seven existing
+required imports is independently fault-injected into the real post-install
+validation: every missing module must fail before publishing `GITHUB_PATH`.
+The imports, close-from assertion, and stock safe-spawn implementation are not
+weakened. These local tests do not replace a real reviewed Linux run: mise setup,
+the direct/nested preflight, full process suite, full quality gate, and stock
+smoke were all skipped in the failed run.
+
 ## Public source registration
 
 | Component | Version / license | Source and role |

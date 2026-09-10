@@ -54,6 +54,19 @@ jobs:
           : "${GITHUB_ENV:?GitHub Actions environment output is required}"
           printf 'MISE_PYTHON_VERSION=path:%s/aster-ci-python-3.13.7\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
+      - name: Install CI Python build prerequisites
+        timeout-minutes: 5
+        # Ubuntu 24.04 archive/security revisions; log actual installed versions.
+        # CI-only native build inputs and version policy: docs/ci-python.md.
+        run: |
+          sudo apt-get -o APT::Update::Error-Mode=any update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential pkg-config libbz2-dev libffi-dev liblzma-dev \
+            libsqlite3-dev libssl-dev zlib1g-dev
+          dpkg-query --show --showformat='${Package}\t${Version}\n' \
+            build-essential pkg-config libbz2-dev libffi-dev liblzma-dev \
+            libsqlite3-dev libssl-dev zlib1g-dev
+
       - name: Build exact-source signal-safe Python
         timeout-minutes: 15
         run: bash .github/scripts/build-ci-python.sh
