@@ -29371,6 +29371,16 @@ mod tests {
         } else {
             (right, left)
         };
+        // Keep this test's elected responder passive through both 60-second
+        // convergence phases. Under loaded parallel CI, the one-second
+        // production fallback can otherwise start a second contact while the
+        // preferred initiator is still completing its authenticated handshake.
+        responder.sync_interval = Duration::from_secs(120);
+        assert!(
+            non_preferred_contact_fallback_delay(responder.sync_interval)
+                > Duration::from_secs(120),
+            "test responder fallback must outlive both convergence phases"
+        );
         responder.peers[0].carrier.address = SocketAddr::from(([127, 0, 0, 1], 9));
         let responder = start_node(responder).await.expect("responder readiness");
         let address = responder

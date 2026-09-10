@@ -121,15 +121,26 @@ mission-lock change while investigating two provisioning failures. That
 historical composition is not a prerequisite for this network branch, and the
 mission-lock change remains separately paused for ownership-contract review.
 
-On 2026-09-10 this branch was composed with `main` at merge commit `28c7d26`
+On 2026-09-10 this branch was composed with `main` at merge commit `31b7b24`
 without the mission-lock change. Focused validation through the owner-only CI
 shell passed the direct-Iroh Blob convergence/restart test in 11.5 seconds and
 the State/Record convergence/resolution test in 28.6 seconds. Five Blob-progress
 watchdog tests, three mutable-convergence watchdog tests, and both
 authorization-before-write tests also passed. Formatting, descriptor-wrapper
-syntax and behavior, and contention-runner parsing passed. This focused result
-does not replace the required hosted CI run on the composed branch. The
-ordinary relay deadlines and zero-contact-error assertions remain intact.
+syntax and behavior, and contention-runner parsing passed.
+
+The first composed hosted run exposed a test-fixture race under parallel load:
+the elected responder's production fallback timer could expire while the
+preferred initiator was still completing its authenticated handshake. The
+resulting intentional collision resolution recorded the aborted redundant
+handshake as a failed contact. The shared direct-contact test helper now keeps
+only its elected responder passive beyond both convergence phases; production
+election, fallback timing, and zero-contact-error assertions are unchanged.
+After that fixture change, the exact failed State/Record test passed, the
+direct-Iroh Blob test passed in 11.7 seconds, and one four-worker/four-thread
+contention round covering all three shared-helper scenarios plus the watchdog
+suites passed in 31.8 seconds. This focused result does not replace the required
+hosted CI run on the updated branch.
 
 The Linux image was the repository's existing pinned Rust image,
 `rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97`.
