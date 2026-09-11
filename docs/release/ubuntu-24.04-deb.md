@@ -16,6 +16,12 @@ installation, protected service startup, local Event smoke, restart, and
 removal on both targets. This does not close all of P0-3: reproducibility,
 upgrade/rollback, release signatures and release-container work follow.
 
+The architectures have [separate manual CI workflows](../ci.md#manual-ubuntu-debian-packages):
+`Build: Ubuntu 24.04 deb amd64` and `Build: Ubuntu 24.04 deb arm64`.
+Each runs the same native build, package checks and installation harness.
+Arm64 qualification requires a successful arm64 run; workflow configuration
+alone does not qualify it.
+
 ## Compatibility finding
 
 Ubuntu Noble uses the systemd 255.4 line. The current

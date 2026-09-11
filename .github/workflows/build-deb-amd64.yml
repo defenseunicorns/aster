@@ -1,4 +1,4 @@
-name: "Build: Ubuntu 24.04 deb"
+name: "Build: Ubuntu 24.04 deb amd64"
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: deb-${{ github.ref }}
+  group: deb-amd64-${{ github.ref }}
   cancel-in-progress: true
 
 defaults:
@@ -16,15 +16,8 @@ defaults:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-24.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+    name: "Build: Ubuntu 24.04 deb amd64"
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       CARGO_INCREMENTAL: "0"
@@ -54,9 +47,9 @@ jobs:
           CARGO_NET_OFFLINE: "true"
         run: dpkg-buildpackage -b -us -uc
       - name: Verify package payload
-        run: python3 tools/test_deb_package.py ../aster_*_${{ matrix.arch }}.deb ${{ matrix.arch }}
+        run: python3 tools/test_deb_package.py ../aster_*_amd64.deb amd64
       - name: Install and exercise the protected service on the disposable runner
-        run: sudo bash tools/test-deb-install.sh ../aster_*_${{ matrix.arch }}.deb
+        run: sudo bash tools/test-deb-install.sh ../aster_*_amd64.deb
       - name: Retain package and build records
         run: |
           mkdir -p target/deb-artifacts
@@ -65,7 +58,7 @@ jobs:
           sha256sum ./* > SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: aster-ubuntu24.04-${{ matrix.arch }}-${{ github.sha }}
+          name: aster-ubuntu24.04-amd64-${{ github.sha }}
           path: target/deb-artifacts/
           if-no-files-found: error
           retention-days: 14

@@ -45,6 +45,35 @@ This independent workflow runs `mise run build` on Ubuntu 24.04 to build `aster`
 from the run's **Artifacts** section; it contains `aster-linux-x86_64.tar` and
 is retained for 14 days. The build is manual and is not part of `CI / required`.
 
+## Manual Ubuntu Debian packages
+
+Choose the required architecture in **Actions**, then **Run workflow** and
+select the source branch:
+
+| Workflow | Native runner | Package |
+| --- | --- | --- |
+| `Build: Ubuntu 24.04 deb amd64` | `ubuntu-24.04` | `aster_*_amd64.deb` |
+| `Build: Ubuntu 24.04 deb arm64` | `ubuntu-24.04-arm` | `aster_*_arm64.deb` |
+
+These are independent `workflow_dispatch` workflows. Starting one does not
+start or cancel the other. Their files must be present on the default branch
+for their manual launch buttons to appear. They are not part of `CI / required`.
+The runner labels follow the [GitHub-hosted runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+
+Both use the same `debian/build.sh` and Debian rules: acquire locked Cargo
+dependencies, build the native package offline, validate ELF architecture and
+SBOM/checksum payloads, then install and exercise the protected service on the
+disposable runner. They include `aster`, `aster-agent` and
+`aster-credential-admin`. No cross-compilation or emulation is used.
+
+Download `aster-ubuntu24.04-<arch>-<commit SHA>` from the successful run's
+**Artifacts** section. It contains the `.deb`, `.buildinfo`, `.changes` and
+`SHA256SUMS`, retained for 14 days. A configured workflow alone is not evidence
+of a successful arm64 build or runtime test; keep the actual run result.
+See the [package candidate](release/ubuntu-24.04-deb.md) for build scope and
+the [existing operations procedure](implementation/raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex)
+for the currently documented amd64 installation procedure.
+
 ## Network reliability under contention
 
 Run the bounded loopback diagnostic from the repository root:
