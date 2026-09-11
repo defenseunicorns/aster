@@ -19,7 +19,6 @@ run = [
   "python3 tools/check-project-license.py",
   "python3 tools/check-implementation-requirements.py",
   "python3 tools/test_aster_tour_ui.py",
-  "python3 tools/test_debian_provision.py",
   "python3 tools/test_aster_mesh_playground.py",
   "python3 tools/test_aster_lan_mvp.py",
   "python3 tools/test_aster_lan_mvp_compose.py",

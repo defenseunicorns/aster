@@ -9,7 +9,7 @@ Homepage: https://github.com/edgesoftops/astertech
 
 Package: aster
 Architecture: amd64 arm64
-Depends: ${shlibs:Depends}, ${misc:Depends}, systemd (>= 255.4), adduser, python3
+Depends: ${shlibs:Depends}, ${misc:Depends}, systemd (>= 255.4), adduser
 Description: Aster Event agent and node evaluation package
  Offline-first Event node, local ConnectRPC agent, and stopped-service
  provisioning administration. Requires operator provisioning before startup.

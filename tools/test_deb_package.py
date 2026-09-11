@@ -43,8 +43,7 @@ with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         digest, name = line.split("  ", 1)
         assert hashlib.sha256(read(name)).hexdigest() == digest, name
         checked.add(name)
-    assert {"usr/bin/aster", "usr/bin/aster-agent", "usr/sbin/aster-credential-admin",
-            "usr/sbin/aster-provision"} <= checked
+    assert {"usr/bin/aster", "usr/bin/aster-agent", "usr/sbin/aster-credential-admin"} <= checked
     assert members["etc/aster/provisioning"].mode == 0o700
     assert members["var/lib/aster/provisioning-systemd"].mode == 0o700
     assert members["var/lib/aster-agent"].mode == 0o700

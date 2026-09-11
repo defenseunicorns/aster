@@ -174,7 +174,7 @@ sha256sum ../aster_*.deb
 
 The package includes three schema-validated Cargo SBOMs. Its internal
 `/usr/share/doc/aster/SHA256SUMS` hashes installed binaries **after stripping**,
-the helper, SBOMs, BUILD.txt and LICENSE; verify from `/`. Preserve the external
+SBOMs, BUILD.txt and LICENSE; verify from `/`. Preserve the external
 `.buildinfo` and `.changes` too. BUILD.txt explicitly describes a working-tree
 build, not a cryptographic source attestation. OS packages and Python
 transitive dependencies are not fully locked; bit-for-bit repeatability,
@@ -199,7 +199,7 @@ Copy `/usr/share/doc/aster/examples/agent.example.json` to
 approved peers and limits. Place the application bearer token through an
 approved owner-only input mechanism at
 `/etc/aster/agent-credentials/client-token`, owned by `aster:aster`, mode `0600`.
-The example load ID is synthetic; the helper replaces it during provisioning.
+The example load ID is synthetic; replace it with the actual load operation ID.
 
 On a fresh host, initialize systemd's host encryption key before the first
 provisioning operation:
@@ -218,20 +218,31 @@ Retain `/usr/share/doc/aster` and `/usr/share/doc/aster/*` with dpkg
 `path-include` rules before installation to use the packaged example and
 SBOM files.
 
-With the authorized Aster bundle already supplied on standard input, invoke
-`/usr/sbin/aster-provision install --operation HEX64 --load-operation HEX64`
-as root. The wrapper locks package provisioning, stops and confirms termination
-of the agent, invokes the existing admin binary, and accepts only its complete
-successful result. It atomically installs the service-owned reference and
-updates the config load ID. It prints neither reference nor bundle. It leaves
-the service stopped on success. `rotate` uses the same form and handoff.
+Provision directly with the existing
+[`aster-credential-admin`](../../crates/aster-systemd-credentials/README.md).
+Run these steps as root, with no concurrent provisioning or service starts:
 
-Retain the operation IDs in the authorized operation record. On any error keep
-the service stopped: the provider operation may already have committed. Retry
-with exactly the same IDs and authorized input, or reconcile using the provider
-procedure. Do not allocate a new operation just because handoff failed. Never
-run the wrapper concurrently with direct admin commands. Keep other root
-operators from starting the service while provisioning is in progress.
+1. Stop `aster-agent.service` with `systemctl stop aster-agent.service` and
+   confirm it is inactive with no remaining service processes.
+2. Supply the authorized Aster bundle on standard input to
+   `/usr/sbin/aster-credential-admin install --operation HEX64 --load-operation HEX64`.
+   Capture its output in a root-only file; do not send it to shared logs.
+3. Only after a successful exit and complete `INSTALL disposition=installed`
+   or `INSTALL disposition=existing` result, decode the `reference=HEX` field
+   from hexadecimal into the binary file
+   `/etc/aster/agent-credentials/mission-reference`. Set owner `aster:aster`
+   and mode `0600`.
+4. Set `credentials.mission_load_id` in `/etc/aster/agent.json` to the same
+   `--load-operation` value. Preserve owner `root:aster` and mode `0640`.
+
+For rotation use the existing `rotate` command and its `ROTATE` result,
+then perform the same reference/configuration updates while stopped.
+Retain both operation IDs in the authorized operation record. On error keep
+the service stopped: the provider operation may already have committed.
+Retry with exactly the same IDs and authorized input, or reconcile using
+the provider procedure. Do not allocate a new operation solely because
+the reference/configuration update failed. Package installation does not
+perform these provisioning steps automatically.
 
 Then validate as the service user and start:
 

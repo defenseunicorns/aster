@@ -19,7 +19,6 @@ override_dh_auto_build:
 	bash debian/build.sh
 
 override_dh_auto_test:
-	python3 tools/test_debian_provision.py
 
 override_dh_auto_install:
 
@@ -38,7 +37,7 @@ override_dh_strip:
 	dh_strip --no-automatic-dbgsym
 	cd debian/aster && find usr/bin usr/sbin usr/share/doc/aster -type f \
 		\( -name aster -o -name aster-agent -o -name aster-credential-admin \
-		-o -name aster-provision -o -name '*.cdx.json' -o -name BUILD.txt -o -name LICENSE \) \
+		-o -name '*.cdx.json' -o -name BUILD.txt -o -name LICENSE \) \
 		-print0 | LC_ALL=C sort -z | xargs -0 sha256sum > usr/share/doc/aster/SHA256SUMS
 
 override_dh_compress:

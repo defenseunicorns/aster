@@ -39,8 +39,26 @@ load=$(printf '%064d' 2)
 # The provider binds its ledger to the existing systemd host key.
 # This harness has already refused any existing Aster deployment.
 systemd-creds setup >/dev/null
-/usr/sbin/aster-provision install --operation "$operation" --load-operation "$load" \
-    < "$root/bindings/testdata/non-production-provisioning.bundle"
+# Only this disposable test fixture is provisioned here; no installed wrapper.
+python3 - "$root/bindings/testdata/non-production-provisioning.bundle" "$operation" "$load" <<'PYTEST'
+import json, os, pwd, re, subprocess, sys
+from pathlib import Path
+with open(sys.argv[1], "rb") as bundle:
+    result = subprocess.run([
+        "/usr/sbin/aster-credential-admin", "install", "--operation", sys.argv[2],
+        "--load-operation", sys.argv[3]], stdin=bundle, capture_output=True, check=True)
+match = re.fullmatch(rb"INSTALL disposition=(?:installed|existing) generation=[1-9][0-9]* reference=([0-9a-f]+)\n", result.stdout)
+assert match, "invalid admin result"
+account = pwd.getpwnam("aster")
+fd = os.open("/etc/aster/agent-credentials/mission-reference", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "wb") as stream:
+    stream.write(bytes.fromhex(match[1].decode()))
+    os.fchown(stream.fileno(), account.pw_uid, account.pw_gid)
+path = Path("/etc/aster/agent.json")
+config = json.loads(path.read_text())
+config["credentials"]["mission_load_id"] = sys.argv[3]
+path.write_text(json.dumps(config, indent=2) + "\n")
+PYTEST
 runuser -u aster -- /usr/bin/aster-agent --check-config /etc/aster/agent.json
 systemctl start aster-agent.service
 wait_ready() {

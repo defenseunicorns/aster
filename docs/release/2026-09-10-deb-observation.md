@@ -131,6 +131,19 @@ The log is `outputs/deb-package-2026-09-11/check.log`, SHA-256
 `64faaf52d1f0a125bca1dd3eb828029e588f0078163304ea6051d3c3558a6a9b`.
 Native arm64 build and runtime validation are deferred.
 
+## Wrapper removal (2026-09-11)
+
+The package-specific provisioning wrapper and its six tests were removed
+following review. Operators now use the existing `aster-credential-admin`
+and explicitly update the service reference/configuration. The disposable
+VM harness calls that binary directly. The maintainer script uses POSIX shell
+and standard system utilities; Python is no longer a runtime dependency.
+The shell maintainer script passed first and repeated configuration, expected
+owner/mode checks and rejection of writable or symlinked directories in an
+isolated Ubuntu 24.04 container. Shell and embedded Python syntax checks passed.
+The artifact hashes and VM receipt above describe the earlier package with
+the wrapper; they do not certify a rebuilt package after this removal.
+
 ## Remaining evidence
 
 This is one amd64 VM evaluation receipt, not a complete provider lifecycle
