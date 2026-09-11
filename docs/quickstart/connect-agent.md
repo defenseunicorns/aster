@@ -173,7 +173,10 @@ attempt:
 4. Never create a new key merely because the result was unknown.
 
 The same key and byte-equivalent request returns the original effect; it does
-not publish a duplicate. Reusing the key with different content fails closed
+not publish a duplicate. Durable receipt fields stay the same, while the
+per-call `inserted` flag changes from `true` on first acceptance to `false` on
+retry. Do not compare the complete responses as byte-identical. Reusing the
+key with different content fails closed
 with `Aborted` and `PUBLIC_ERROR_REASON_OPERATION_KEY_CONFLICT`. This resolves
 uncertain outcomes; it does not make two different application effects
 equivalent.
@@ -204,6 +207,22 @@ remains complete across restart.
 acknowledges implicitly and does not provide exactly-once application effects.
 `DeleteEventSubscription` idempotently removes the selector and its delivery
 ledger; recreating a selector establishes a new subscription contract.
+
+### Generated-Go client replacement example
+
+The [two-process Go example](../../conformance/agent-go/cmd/agent-smoke/README.md)
+publishes and retries one fixed operation key, then exits after validating the
+exact attempt-one delivery without ACK. A new client process attaches to the
+same live agent and durable subscription, validates exact attempt-two
+redelivery, and ACKs. Successful empty, caught-up polls then span at least
+500 ms before a final exact retained-Event query. The window starts after the
+first successful empty response and requires a successful final poll initiated
+at or after its end; slow RPC responses cannot consume the observation window.
+
+This is a bounded exclusive-consumer integration example, not agent-crash,
+exactly-once application, physical-network, or production-provider evidence.
+The existing process checker includes it without changing runtime or wire
+semantics. Its fixture remains unprotected and test-only.
 
 ## Back off on resource pressure
 

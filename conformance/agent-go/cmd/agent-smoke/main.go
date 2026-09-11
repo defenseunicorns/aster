@@ -181,7 +181,7 @@ func parseOptions(args []string) (options, error) {
 		return options{}, errors.New("invalid arguments")
 	}
 	switch opts.command {
-	case "status", "publish", "query", "subscribe", "poll", "stream", "ack":
+	case "status", "publish", "query", "subscribe", "poll", "stream", "ack", "recovery-begin", "recovery-resume":
 		return opts, nil
 	default:
 		return options{}, errors.New("invalid arguments")
@@ -439,6 +439,10 @@ func statusEvidence(message *applicationv1alpha1.GetStatusResponse) (result, err
 
 func runCommand(ctx context.Context, client applicationv1alpha1.AsterApplicationServiceClient, command, token string, input io.Reader, output io.Writer) error {
 	switch command {
+	case "recovery-begin":
+		return recoveryBegin(ctx, client, token, input, output)
+	case "recovery-resume":
+		return recoveryResume(ctx, client, token, input, output)
 	case "status":
 		var value statusInput
 		if err := decodeInput(input, &value); err != nil {

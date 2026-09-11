@@ -74,6 +74,10 @@ run = [
 description = "Run bounded sanitizer-instrumented decoder fuzz campaigns"
 run = "sh ./tools/run-fuzz-smoke.sh"
 
+[tasks.ci-python-preflight]
+description = "Fail closed unless CI uses the exact compatible signal-safe interpreter"
+run = "python3 .github/scripts/check-ci-python.py"
+
 [tasks.agent-process-smoke]
 description = "Exercise bounded customer-agent crash, restart, reload, and drain behavior"
 run = '''
