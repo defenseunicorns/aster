@@ -1,0 +1,5 @@
+aster (0.1.0-1~ubuntu24.04.1) noble; urgency=medium
+
+  * Initial Ubuntu 24.04 amd64 and arm64 evaluation packaging.
+
+ -- Eugeny Shcheglov <e.shcheglov@astertech.io>  Thu, 10 Sep 2026 12:00:00 +0000

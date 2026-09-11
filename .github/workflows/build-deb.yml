@@ -1,0 +1,71 @@
+name: "Build: Ubuntu 24.04 deb"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deb-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: false
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: 2026.4.28
+          cache: false
+      - name: Provision build tools and locked Cargo dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y debhelper build-essential pkg-config python3-venv python3-dev libicu-dev
+          cargo install --locked --version 0.5.9 cargo-cyclonedx --root "$RUNNER_TEMP/sbom-cargo"
+          /usr/bin/python3 -m venv "$RUNNER_TEMP/sbom-python"
+          "$RUNNER_TEMP/sbom-python/bin/pip" install cyclonedx-editor-validator==0.34.0
+          echo "$RUNNER_TEMP/sbom-cargo/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/sbom-python/bin" >> "$GITHUB_PATH"
+          cargo fetch --locked
+      - name: Build the native package offline
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: dpkg-buildpackage -b -us -uc
+      - name: Verify package payload
+        run: python3 tools/test_deb_package.py ../aster_*_${{ matrix.arch }}.deb ${{ matrix.arch }}
+      - name: Install and exercise the protected service on the disposable runner
+        run: sudo bash tools/test-deb-install.sh ../aster_*_${{ matrix.arch }}.deb
+      - name: Retain package and build records
+        run: |
+          mkdir -p target/deb-artifacts
+          cp ../aster_*.deb ../aster_*.buildinfo ../aster_*.changes target/deb-artifacts/
+          cd target/deb-artifacts
+          sha256sum ./* > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: aster-ubuntu24.04-${{ matrix.arch }}-${{ github.sha }}
+          path: target/deb-artifacts/
+          if-no-files-found: error
+          retention-days: 14

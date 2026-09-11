@@ -19,6 +19,7 @@ run = [
   "python3 tools/check-project-license.py",
   "python3 tools/check-implementation-requirements.py",
   "python3 tools/test_aster_tour_ui.py",
+  "python3 tools/test_debian_provision.py",
   "python3 tools/test_aster_mesh_playground.py",
   "python3 tools/test_aster_lan_mvp.py",
   "python3 tools/test_aster_lan_mvp_compose.py",
@@ -192,3 +193,7 @@ run = "sh ./tools/age-reference/audit.sh"
 [tasks.build]
 description = "Build aster and aster-agent for Linux x86_64"
 run = "bash tools/build-linux-x86_64.sh"
+
+[tasks.build-deb]
+description = "Build the native Ubuntu 24.04 amd64 or arm64 evaluation deb"
+run = "dpkg-buildpackage -b -us -uc"

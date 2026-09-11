@@ -1,0 +1,16 @@
+Source: aster
+Section: net
+Priority: optional
+Maintainer: Eugeny Shcheglov <e.shcheglov@astertech.io>
+Build-Depends: debhelper-compat (= 13), build-essential, pkg-config, python3, ca-certificates
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/edgesoftops/astertech
+
+Package: aster
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}, systemd (>= 255.4), adduser, python3
+Description: Aster Event agent and node evaluation package
+ Offline-first Event node, local ConnectRPC agent, and stopped-service
+ provisioning administration. Requires operator provisioning before startup.
+ Ubuntu 24.04 evaluation candidate; not a production qualification.

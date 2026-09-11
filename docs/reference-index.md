@@ -59,6 +59,8 @@ For a shorter path based on what you are trying to accomplish, start at the
 - [Requirements-first FOSS evaluation record](evaluations/0005/README.md)
 - [Selected FOSS reference-stack validation](evaluations/0006/README.md)
 - [Executable SBOM workflow](release/sbom/README.md)
+- [Ubuntu 24.04 Debian-package candidate](release/ubuntu-24.04-deb.md)
+- [Debian-package observation — 2026-09-10](release/2026-09-10-deb-observation.md)
 - [Executable SBOM observation — 2026-09-08](release/sbom/2026-09-08-observation.md)
 
 ## Proposals and results

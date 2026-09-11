@@ -1,0 +1,6 @@
+target/debian-install/bin/aster usr/bin
+target/debian-install/bin/aster-agent usr/bin
+target/debian-install/bin/aster-credential-admin usr/sbin
+target/debian-install/doc/* usr/share/doc/aster
+debian/aster-provision usr/sbin
+debian/agent.example.json usr/share/doc/aster/examples

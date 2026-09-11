@@ -1,0 +1,44 @@
+#!/bin/sh
+set -eu
+if [ "$1" = configure ]; then
+    if ! getent passwd aster >/dev/null; then
+        adduser --system --group --home /var/lib/aster-agent --no-create-home \
+            --disabled-login --gecos 'Aster service' aster
+    fi
+    test "$(id -u aster)" -ne 0
+    # Refuse symlinked or group/world-writable existing package directories.
+    /usr/bin/python3 -I - <<'PY'
+import grp, os, pwd, stat
+account = pwd.getpwnam("aster")
+if (not 0 < account.pw_uid < 1000 or account.pw_dir != "/var/lib/aster-agent"
+        or grp.getgrnam("aster").gr_gid != account.pw_gid):
+    raise SystemExit("aster: existing account is not the package service account")
+directories = [
+    ("/etc/aster", 0, 0, 0o755),
+    ("/var/lib/aster", 0, 0, 0o755),
+    ("/etc/aster/provisioning", 0, 0, 0o700),
+    ("/var/lib/aster/provisioning-systemd", 0, 0, 0o700),
+    ("/etc/aster/agent-credentials", 0, account.pw_gid, 0o750),
+    ("/var/lib/aster-agent", account.pw_uid, account.pw_gid, 0o700),
+]
+for path, uid, gid, mode in directories:
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in path.strip("/").split("/"):
+            try:
+                os.mkdir(part, 0o755, dir_fd=fd)
+            except FileExistsError:
+                pass
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            s = os.fstat(fd)
+            if s.st_uid not in (0, uid) or stat.S_IMODE(s.st_mode) & 0o022:
+                raise SystemExit("aster: insecure package directory")
+        os.fchown(fd, uid, gid)
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+PY
+fi
+#DEBHELPER#
