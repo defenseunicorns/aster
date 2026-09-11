@@ -235,7 +235,7 @@ it conditional.
 | Package authentication reference | Annex §§3, 13 | Authentication result and detached-signature/signed-repository reference | Method/result/reference/digest structurally present; no claim of cryptographic verification by this validator |
 | Installation and lifecycle procedures | Profile §§Protected provisioning boundary, Resource and lifecycle targets, Artifact contract; Annex §§3–4 | Immutable procedure records and target receipts | Exact procedure versions/digests; no secret-bearing commands; exact-artifact/state rules |
 | D06 design and amendment | Profile §Protected provisioning boundary; Register `P0-1-D06`/`P0-1-E01`; Annex §4 | Committed design records and E01 approval references | Exact provider contract and published digests; do not infer E01 approval |
-| E01 Security and Deployment | Register `P0-1-E01`; Annex §4 | Two separate signed approval-reference records | Both required for issue; exact roles, timestamps, digests, provider/package boundary, limitations, and acceptance plan |
+| E01 Security and Deployment | Register `P0-1-E01`; Annex §4 | Two separate signed approval-reference records | Both required before any G3 `pass` and for issue; each approval time is not later than production of the bound G3 artifact; exact roles, timestamps, digests, provider/package boundary, limitations, and acceptance plan |
 | Provider and admin artifact | Profile §Protected provisioning boundary; Annex §4 | G3 provider/admin manifests | Exact implementation/version/source/build/architecture/contract; immutable admin command-set digest |
 | Provider lifecycle results | Profile §Protected provisioning boundary; Annex §§4, 9 | Installed-package lifecycle receipts | Install/load/rotations/backup/recovery/revoke/rekey/destroy results and exact candidate bindings |
 | Sanitized mission/policy identity | Profile §Protocol, security, and mission policy; Annex §5 | Owner-controlled public identifiers/commitments and policy manifest | One root, one signer, distinct roster, one scope/topic per scenario, semantic 6, profile/suite `0x0001`, no fallback |
@@ -252,6 +252,7 @@ it conditional.
 | Operation-map boundary | Profile §Durable publish-operation containment; Annex §§8, 9, 11 | Status and capacity receipts | Warning no later than 512; profile stop at 1,024; keys 1–256 bytes; exact retry adds zero; hard caps remain separate |
 | Mission timing | Profile §§Intended use, Capacity matrix; Annex §§8–9 | Workload receipt timestamps | Exactly 24 hours disconnected publication; no more than 24 hours later convergence/evidence; publication stops at 24 hours |
 | Authenticated observability | Profile §Minimum observability and failure contract; Annex §§8, 9, 11 | Authenticated status and sanitized error receipts | Configured/effective mode; item/payload use and limits; operation rows/bytes/ceilings/boundary/headroom; pending-delivery/saturation; contact counts; bounded peer outcome; no sensitive unauthenticated detail |
+| Packet/log/error inspection | Profile §§Metadata exposure budget, Acceptance condition 12; Annex §9 condition 12 | Candidate-bound inspection record, inspected-surface manifest, metadata-budget reference, and immutable receipt | Exact candidate/artifact/provider/configuration/inventory/scenario bindings; explicit packet/log/error surfaces and procedure digest; `pass`/`fail` or typed blocker; no forbidden plaintext or credentials found within the stated budget; claim no broader than the retained inspected surfaces |
 | Four workload rows | Profile §Capacity and workload matrix; Annex §9 | Four immutable workload receipts or typed blockers | Exact row names, nodes, payloads, counts/rates/durations, start/end, candidate/inventory/config bindings |
 | Thirteen acceptance conditions | Profile §Acceptance and retained evidence; Annex §9 | Condition-specific receipts or typed blockers | One unambiguous record per condition; issue requires all executed pass against exact candidate |
 | Crash/restart/state preservation | Profile §§Event and retry semantics, Resource and lifecycle targets, Acceptance; Annex §§3, 9 conditions 5, 8, 10 | Forced-loss, same-version restart, peerless reopen, reinstall/rollback, uninstall/state receipts | Existing state directory retained; durable Events, mappings, subscriptions, pending deliveries, acknowledgements, and controls preserved; no snapshot restore/downgrade |
@@ -362,7 +363,9 @@ It may validate only that:
   detached-record bytes under §2.1, recomputes their byte size and SHA-256 from
   the same descriptor, and requires both to match the reference metadata;
 - E01 has two distinct records with Security and Deployment roles and the exact
-  D06 design/amendment/provider bindings;
+  D06 design/amendment/provider bindings; both records must exist before any G3
+  result can be `pass`, and neither approval timestamp may be later than the
+  production time of the bound G3 artifact;
 - Section 15 records all sign the same canonical body digest;
 - the final decision names the bytewise-sorted lowercase list of Section 15
   candidate-approval record digests;
@@ -376,6 +379,25 @@ The report must use `signature-reference-present` or
 `signature-reference-binding-invalid`, never `signature-verified`, unless a
 later approved implementation explicitly adds cryptographic verification and
 updates this specification.
+
+### 7.1 Acceptance-condition-12 inspection reference
+
+Acceptance condition 12 is a retained inspection-evidence requirement, not a
+request for the validator to inspect packet captures, logs, or devices. Its
+record must contain the exact candidate, G3 artifact, provider, configuration,
+inventory, scenario-set, and applicable workload bindings; an immutable
+manifest of the packet, log, and error surfaces actually inspected; the stated
+metadata-budget reference/digest; inspection procedure/tool identity and
+digest; execution time; `pass`/`fail` plus receipt reference/digest, or an exact
+typed downstream blocker when the condition was not reached.
+
+An `issue` requires an executed `pass`. A missing, failed, unbound, or drifted
+record is nonconformant. The retained claim may state only that no forbidden
+plaintext or credentials were found within the named surfaces and stated
+metadata budget. It must not generalize that observation to uninspected
+surfaces, all traffic, all logs, all errors, production, or another candidate.
+The validator compares metadata and referenced-byte bindings only; it does not
+copy packet/log/error content into its report or claim to repeat the inspection.
 
 ## 8. Negative-test specification
 
@@ -490,12 +512,14 @@ findings unless multiple errors are inherently coupled.
 | `QVG014` | Scenario set omits or drifts authority, scope, topic, durable subscription, state-directory commitment, participant, artifact, config, peer/device, or network binding | Scenario binding incomplete |
 | `QVG015` | Gate key omits or mismatches its predecessor key/exit digest, or an earlier receipt is required to bind a later fact | Gate-chain binding violation |
 | `QVG016` | Receipt index omits producer identity/role, producer tool/version digest, production time, exact claim, non-claims, environment digest, or verification/replay reference | Receipt provenance incomplete |
+| `QVG017` | Acceptance-condition-12 record is missing/duplicated, is `fail` or untyped when `issue` is claimed, or drifts in candidate, G3 artifact, provider, configuration, inventory, scenario/workload, inspected-surface manifest, procedure/tool, metadata-budget, or receipt binding | Packet/log/error inspection evidence missing or unbound |
+| `QVG018` | Acceptance-condition-12 record claims an uninspected surface, omits material surface exclusions, or generalizes its bounded result to all traffic/logs/errors, production, or another candidate | Packet/log/error inspection overclaim |
 
 ### 8.6 Approval and signature references
 
 | Code | Mutation | Required rejection |
 |---|---|---|
-| `QVS001` | E01 Security or Deployment record missing for issue | Open E01 candidate gate |
+| `QVS001` | G3 is marked `pass`, or `issue` is claimed, while either E01 Security or Deployment record is missing; mutate each role independently | Open E01 candidate gate |
 | `QVS002` | E01 role, D06 digest, amendment digest, provider, timing, limitation, or package boundary differs | E01 binding mismatch |
 | `QVS003` | D15 tuple/digest/graph drift or production resolution claimed | D15 scope violation |
 | `QVS004` | Section 15 approval bound to another body/candidate/schema/G3 binding | Detached approval mismatch |
@@ -506,6 +530,7 @@ findings unless multiple errors are inherently coupled.
 | `QVS009` | Validator reports cryptographic verification from reference metadata alone | Unsupported verification claim |
 | `QVS010` | Signature substitutes for a missing fact, gate, receipt, or blocker | Missing substantive evidence |
 | `QVS011` | Supplied detached approval/decision bytes, size, or digest disagree with their reference metadata | Detached-record byte binding failure |
+| `QVS012` | Either E01 Security or Deployment approval timestamp is later than production of the bound G3 artifact; mutate each role independently | Late E01 approval cannot support G3 pass |
 
 ### 8.7 Mutation coverage rule
 
