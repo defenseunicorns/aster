@@ -25,6 +25,10 @@ override_dh_auto_install:
 override_dh_auto_clean:
 	rm -rf target/debian target/debian-install
 
+override_dh_clean:
+	# Preserve the upstream manifest required by the vendored patch verifier.
+	dh_clean -Xthird-party/netlink-packet-core-0.8.2-aster/Cargo.toml.orig
+
 override_dh_installsystemd:
 	dh_installsystemd --name=aster-agent --no-enable --no-start --no-restart-after-upgrade
 
