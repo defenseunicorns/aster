@@ -13,8 +13,11 @@ source-level tests. It supports authenticated status, offline-first publish,
 query, durable subscription, poll or stream, acknowledgement, gap inspection,
 restart recovery, and restart-selected Normal or ReceiveOnly operation.
 
-The customer ARM64 package, hardened systemd unit, protected provider
-composition, and final device qualification are still separate deliverables.
+The protected provider is already statically composed into `aster-agent`;
+see the [provider implementation boundary](../../crates/aster-systemd-credentials/README.md#current-implementation-boundary).
+The customer ARM64 package, hardened systemd unit, package-owned credential
+handoff, and final device qualification remain separate deliverables. Source
+integration does not close Security/Deployment approval or packaged acceptance.
 Until those artifacts are frozen, use the local development path below or the
 OS engineer's explicitly identified candidate package. Do not invent service
 names, installed paths, or credential handoff steps.
@@ -114,6 +117,13 @@ required.
 | `OPERATION_CAPACITY_EXHAUSTED` | Do not retry with new keys; escalate for controlled recovery. |
 | Unacknowledged Event returns after restart | Commit idempotently, then acknowledge the stable Event identity. |
 
+The 1,024-key boundary is an operator/harness stop, not an enforced store
+admission limit. Actual operation-mapping ceilings are 4,096 rows / 512 KiB;
+aggregate quotas can reject work earlier. The
+[register records the unresolved release-planning request for hard rejection at 1,024](../implementation/linux-event-mvp-evaluation-profile-v0.1-register.md#unresolved-release-planning-capacity-conflict).
+Do not treat that request as implemented behavior or change the accepted
+profile without its owners' decision.
+
 Do not raise limits during a candidate run. A changed limit changes the tested
 profile.
 
@@ -136,10 +146,13 @@ aster-credential-admin recover --operation HEX64
 aster-credential-admin destroy --operation HEX64 --reference HEX
 ```
 
-Do not use them as a customer procedure until the provider branch and final
-package are integrated. The package must define stopping and termination
-confirmation, protected input descriptors, reference handoff, output custody,
-backup acceptance, readiness checks, and recovery/escalation. Every semantic
+The provider code is integrated; use the
+[D06 operations procedure](../implementation/raspberry-pi-provider-v2-operations.md)
+for its engineering lifecycle boundary. These command shapes are not yet a
+qualified customer package procedure. The final package must define stopping
+and termination confirmation, protected input descriptors, reference handoff,
+output custody, backup acceptance, readiness checks, and recovery/escalation.
+E01 approval and E09 packaged lifecycle qualification remain open. Every semantic
 operation uses a fresh retained operation ID; an uncertain result is retried
 with the identical ID and identical input.
 
