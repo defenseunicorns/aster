@@ -84,6 +84,55 @@ remain unchanged and may remain production-governance work.
 | `P0-1-D14-22` | `DM-14-22` | Explicitly non-FIPS; production FIPS-path decision remains open outside v0.1 | Excluded | no | no | Atomic requirement unchanged; production-governance work may remain | none |
 | `P0-1-D14-23` | `DM-14-23` | No validated-module claim; production module-availability decision remains open outside v0.1 | Excluded | no | no | Atomic requirement unchanged; production-governance work may remain | none |
 
+## Implementation and evidence checkpoint — 2026-09-11
+
+This checkpoint describes inspected `main` commit
+`e1545d51ed07bcae260c7787742e4576ceb49231`, not a G2 source freeze or
+candidate approval. Implemented code, automated checks, and qualification
+receipts are different evidence classes. The gate rows below retain their
+owners, exits, and `Open` status; no atomic requirement gains evidence credit.
+
+| Area / gates | Implemented source and automated coverage | Remaining candidate evidence |
+|---|---|---|
+| Event service and clients — E03/E07 | [Event service](../../crates/aster-agent/src/event_service.rs), [real-node Rust client tests](../../crates/aster-agent/tests/real_node_connect.rs), and [generated-Go client](../../conformance/agent-go/cmd/agent-smoke/main.go) exist. | Accepted source/process gate and exact-profile Rust/Go execution against the unchanged G3 package on both mandatory CM4 devices; client code is not a qualifying receipt. |
+| ReceiveOnly — E04 | [Customer runtime test](../../crates/aster-agent/tests/customer_runtime.rs) covers `receive_only` readiness and local publication; the configuration and authenticated status path are implemented. | Both-ordering transfer/non-initiation acceptance against the final candidate, including two ReceiveOnly nodes; no radio-silence claim. |
+| Capacity — E05 | [Authenticated status and its unit test](../../crates/aster-agent/src/event_service.rs) distinguish warning, profile headroom, and [store hard ceilings](../../crates/aster-redb-store/src/lib.rs). | Audited mapping/item/byte use, accurate hard failure, and generated-Go/crash-reopen acceptance; the unresolved release-planning conflict below must be settled before source freeze. |
+| Protected provider — E01/E09 | [`SystemdCredentialLoader` is statically composed](../../crates/aster-agent/src/main.rs) and the [provider administration lifecycle](../../crates/aster-systemd-credentials/README.md#current-implementation-boundary) is implemented. | E01 Security and Deployment acceptance of both immutable D06 records and E09 lifecycle qualification on the exact installed package remain open. |
+| Qualification tooling, package, and resources — E06/E08/E10/E11 | The generic process harness and source tests are preparation, not exact-profile receipt validation or a signed native `arm64` package. | Exact v0.1 receipt validation, reproducible signed package, both-device workload/resource receipts, and threshold disposition remain required. |
+
+[Main CI run 34493712421](https://github.com/edgesoftops/astertech/actions/runs/34493712421)
+completed successfully on that exact source. Its
+[quality workflow](../../.github/workflows/ci.yml) invokes
+[`mise run check`](../../mise.toml), including Rust workspace and generated-Go
+checks, but not the standalone `agent-process-smoke` task or full
+`tools/test-aster-agent-process.py` suite. This is existing automated evidence,
+not a new local run or physical acceptance. At this checkpoint,
+[PR #14](https://github.com/edgesoftops/astertech/pull/14) (Rust examples) and
+[PR #15](https://github.com/edgesoftops/astertech/pull/15) (generated-Go recovery
+and supported process CI) remain open, separate increments; their changes are
+not credited to this main commit.
+
+The [CM4 engineering spike](evidence/2026-09-09-cm4-provider-event-engineering-spike.md)
+records pre-candidate physical observations using a temporary unit, explicitly
+not G3/G4 qualification. It did not run the generated-Go qualification client
+or full capacity workload. Final package-bound physical acceptance, resources,
+and the required 24-hour workload remain pending; the
+[prepared inventory](evidence/2026-09-10-cm4-candidate-inventory.md) does not
+close E02.
+
+### Unresolved release-planning capacity conflict
+
+The release meeting action plan requests hard rejection at 1,024 keys. The
+[accepted containment contract](linux-event-mvp-evaluation-profile-v0.1.md#durable-publish-operation-containment)
+instead requires an operator/harness stop at 1,024 distinct accepted operation
+keys over the state directory's lifetime, warns at 512, and keeps actual store
+ceilings at 4,096 rows / 512 KiB; aggregate quotas can stop admission earlier.
+These are not equivalent requirements. Profile/product and lifecycle/capacity
+owners must record a clarification or approve a versioned enforcement change
+before G1/G2 can freeze the contract. This checkpoint resolves neither option,
+changes no limit, and does not amend the preserved meeting baseline or the
+accepted profile. Green CI cannot decide this conflict.
+
 ## Open candidate and production gates
 
 The following register preserves the approved design's owners, targets,
