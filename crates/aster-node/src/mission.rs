@@ -468,6 +468,8 @@ impl From<io::Error> for SoftwareErasureError {
 
 pub(crate) struct RetainedSecretArtifact {
     pub(crate) file: File,
+    #[cfg(unix)]
+    lock_owner_pid: u32,
     target: SoftwareErasureTarget,
     destroyed: bool,
 }
@@ -514,6 +516,7 @@ impl RetainedSecretArtifact {
         }
         Ok(Self {
             file,
+            lock_owner_pid: std::process::id(),
             target: SoftwareErasureTarget {
                 artifact,
                 path,
@@ -588,6 +591,21 @@ impl RetainedSecretArtifact {
     #[cfg(not(unix))]
     fn destroy_contents(&mut self) -> Result<SoftwareErasureReceipt, SoftwareErasureError> {
         Err(SoftwareErasureError::PlatformUnavailable)
+    }
+}
+
+impl Drop for RetainedSecretArtifact {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.lock_owner_pid == std::process::id() {
+            // Arc ownership has ended, but a concurrently spawned child may
+            // still hold an inherited descriptor. Closing our descriptor alone
+            // does not release that shared flock. A forked child's cleanup must
+            // not explicitly unlock the originating process's live artifact.
+            // If unlock fails, closing the file remains the fallback; Drop
+            // cannot report an error and must not panic during unwinding.
+            let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
+        }
     }
 }
 
@@ -3471,6 +3489,102 @@ mod tests {
 
         drop(mission);
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mission_lock_release_waits_for_clones_and_erasure_but_not_duplicate_descriptors() {
+        let root = std::env::temp_dir().join(format!(
+            "aster-mission-lock-lifetime-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create root");
+        let path = root.join("mission.bundle");
+        let mut provisioner = ReferenceProvisioner::from_seed([0x47; 32]).expect("provisioner");
+        let mission =
+            UnprotectedReferenceMission::persist(&path, issue(&mut provisioner, 1).bundle)
+                .expect("persist mission");
+        let identity = mission.identity();
+        let clone = mission.clone();
+        let duplicate = mission
+            .artifact
+            .as_ref()
+            .expect("artifact")
+            .lock()
+            .expect("artifact mutex")
+            .file
+            .try_clone()
+            .expect("duplicate descriptor");
+        let assert_in_use = || {
+            assert!(matches!(
+                UnprotectedReferenceMission::load(&path),
+                Err(MissionProvisioningError::Artifact(
+                    SoftwareErasureError::InUse(_)
+                ))
+            ));
+        };
+        drop(mission);
+        assert_in_use();
+        let prepared = clone.prepare_software_erasure().expect("prepare erasure");
+        drop(clone);
+        assert_in_use();
+        drop(prepared);
+        // A duplicate models the shared open-file description inherited during
+        // process creation, without a timing-dependent spawn race.
+        let reopened = UnprotectedReferenceMission::load(&path)
+            .expect("last owner releases lock despite duplicate descriptor");
+        assert_eq!(reopened.identity(), identity);
+        drop(duplicate);
+        assert_in_use();
+        drop(reopened);
+        drop(UnprotectedReferenceMission::load(&path).expect("reopen again"));
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_artifact_cleanup_preserves_originating_owner_lock() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let path = std::env::temp_dir().join(format!(
+            "aster-artifact-inherited-lock-{}",
+            std::process::id()
+        ));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .expect("create artifact");
+        let owner = RetainedSecretArtifact::from_open_file(
+            file,
+            path.clone(),
+            SoftwareSecretArtifact::CarrierIdentity,
+            None,
+        )
+        .expect("lock artifact");
+        // Model cleanup of an inherited artifact in a different process. No
+        // unsafe fork is needed in the multithreaded test harness.
+        let inherited = RetainedSecretArtifact {
+            file: owner
+                .file
+                .try_clone()
+                .expect("duplicate inherited descriptor"),
+            lock_owner_pid: std::process::id().wrapping_add(1),
+            target: owner.target.clone(),
+            destroyed: false,
+        };
+        drop(inherited);
+        assert!(matches!(
+            RetainedSecretArtifact::open_existing(&path, SoftwareSecretArtifact::CarrierIdentity),
+            Err(SoftwareErasureError::InUse(_))
+        ));
+        drop(owner);
+        drop(
+            RetainedSecretArtifact::open_existing(&path, SoftwareSecretArtifact::CarrierIdentity)
+                .expect("reopen after owning process cleanup"),
+        );
+        std::fs::remove_file(path).expect("cleanup");
     }
 
     #[cfg(unix)]
