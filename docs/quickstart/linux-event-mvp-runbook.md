@@ -13,11 +13,11 @@ source-level tests. It supports authenticated status, offline-first publish,
 query, durable subscription, poll or stream, acknowledgement, gap inspection,
 restart recovery, and restart-selected Normal or ReceiveOnly operation.
 
-The customer ARM64 package, hardened systemd unit, protected provider
-composition, and final device qualification are still separate deliverables.
-Until those artifacts are frozen, use the local development path below or the
-OS engineer's explicitly identified candidate package. Do not invent service
-names, installed paths, or credential handoff steps.
+For a first Ubuntu 24.04 amd64 package installation, use the
+[provider operations package annex](../implementation/raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex).
+It defines the candidate's service, paths and credential handoff. ARM64 and
+final device qualification remain separate deliverables. The development
+path below is still available for local API evaluation.
 
 ## Run the local API smoke test
 

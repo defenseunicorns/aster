@@ -109,9 +109,10 @@ pre-intent staged-evidence escalation, is the
 
 The five provider lifecycle CLI commands and the code-level Event-agent
 integration are executable; a three-device engineering spike has exercised
-startup and the lifecycle, but the integration is not yet packaged or
-qualified. The provider's
-`active/reference` stays root-only; the future package must atomically populate
+startup and the lifecycle, while final qualification remains open. The Ubuntu amd64 candidate now has
+[package installation details](../../docs/implementation/raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex);
+this does not qualify the original Raspberry Pi target. The provider's
+`active/reference` stays root-only; the deployment procedure must atomically populate
 a separate mode-`0600`, final-service-UID-owned reference handoff from
 successful INSTALL/ROTATE output. Agent configuration checks and runtime must
 run as that final service UID, while the administration CLI remains root-only.

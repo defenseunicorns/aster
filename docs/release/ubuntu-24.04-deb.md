@@ -188,75 +188,12 @@ preserved test state after package removal. Never run it on a deployed node.
 
 ## Install and provision an evaluation candidate
 
-Use Ubuntu 24.04 with local ext4 for the provider directories. Install the
-architecture-matching package with `sudo apt install ./aster_VERSION_ARCH.deb`.
-Installation leaves the service disabled and stopped. It preserves an existing
-configuration, node state, and provider state. No plaintext bundle or test
-credential is shipped.
-
-Copy `/usr/share/doc/aster/examples/agent.example.json` to
-`/etc/aster/agent.json`, owned by `root:aster`, mode `0640`. Set the actual
-approved peers and limits. Place the application bearer token through an
-approved owner-only input mechanism at
-`/etc/aster/agent-credentials/client-token`, owned by `aster:aster`, mode `0600`.
-The example load ID is synthetic; replace it with the actual load operation ID.
-
-On a fresh host, initialize systemd's host encryption key before the first
-provisioning operation:
-
-```sh
-sudo systemd-creds setup
-```
-
-The provider requires this key before it opens its ledger. On an existing
-deployment, a missing key is a recovery issue: restore the original host key
-through the approved recovery procedure; do not generate a replacement to
-work around a provisioning failure.
-
-Ubuntu Minimal images may configure dpkg to exclude `/usr/share/doc/*`.
-Retain `/usr/share/doc/aster` and `/usr/share/doc/aster/*` with dpkg
-`path-include` rules before installation to use the packaged example and
-SBOM files.
-
-Provision directly with the existing
-[`aster-credential-admin`](../../crates/aster-systemd-credentials/README.md).
-Run these steps as root, with no concurrent provisioning or service starts:
-
-1. Stop `aster-agent.service` with `systemctl stop aster-agent.service` and
-   confirm it is inactive with no remaining service processes.
-2. Supply the authorized Aster bundle on standard input to
-   `/usr/sbin/aster-credential-admin install --operation HEX64 --load-operation HEX64`.
-   Capture its output in a root-only file; do not send it to shared logs.
-3. Only after a successful exit and complete `INSTALL disposition=installed`
-   or `INSTALL disposition=existing` result, decode the `reference=HEX` field
-   from hexadecimal into the binary file
-   `/etc/aster/agent-credentials/mission-reference`. Set owner `aster:aster`
-   and mode `0600`.
-4. Set `credentials.mission_load_id` in `/etc/aster/agent.json` to the same
-   `--load-operation` value. Preserve owner `root:aster` and mode `0640`.
-
-For rotation use the existing `rotate` command and its `ROTATE` result,
-then perform the same reference/configuration updates while stopped.
-Retain both operation IDs in the authorized operation record. On error keep
-the service stopped: the provider operation may already have committed.
-Retry with exactly the same IDs and authorized input, or reconcile using
-the provider procedure. Do not allocate a new operation solely because
-the reference/configuration update failed. Package installation does not
-perform these provisioning steps automatically.
-
-Then validate as the service user and start:
-
-```sh
-sudo -u aster /usr/bin/aster-agent --check-config /etc/aster/agent.json
-sudo systemctl start aster-agent.service
-curl --fail http://127.0.0.1:8182/readyz
-```
-
-Enable boot startup only after the candidate checks pass:
-`sudo systemctl enable aster-agent.service`. Readiness is separate from
-`systemctl start` success. The unit allows 40 seconds for stopping; the agent's
-configured grace is at most 30 seconds. `systemctl reload aster-agent.service`
-sends SIGHUP for bearer-token reload; it does not reload mesh configuration.
+Follow the existing [provider operations procedure, Ubuntu 24.04 amd64
+package annex](../implementation/raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex).
+It supplies the package paths, service account, first installation, host-key
+setup, direct `aster-credential-admin` invocation, atomic reference/configuration
+handoff and startup/readiness commands. Provider lifecycle and retry semantics
+remain in that procedure. Arm64 validation is deferred.
 
 ## Upgrade, removal, and remaining qualification
 

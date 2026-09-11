@@ -10,17 +10,16 @@ This procedure describes the intended seven provider and Event-agent
 operations. The five `aster-credential-admin` command forms and statically
 composed runtime loader are exact and executable. A 2026-09-09 engineering
 spike exercised the code-level integration on the selected physical hardware.
-Packaged qualification remains blocked and unqualified: the repository does
-not yet contain the final hardened systemd unit or native package.
-The G3 candidate annex must supply the package-owned service UID, provider-
-reference handoff path and ownership setup, installed executable and
-configuration paths, unit and control values, and exact stop, start,
-termination-confirmation, and readiness commands. None is invented here.
+The original Raspberry Pi packaged qualification remains open. The
+[Ubuntu 24.04 amd64 candidate annex](#ubuntu-2404-amd64-package-annex) below
+supplies concrete package paths, service identity, reference handoff and
+supervisor commands for that separate evaluation target.
 
 This is an evaluation-only procedure for the exact Raspberry Pi reference
 2026-06-18 / Debian 13 / CM4 Rev 1.1 / `aarch64` / kernel
 `6.18.39+rpt-rpi-v8` / systemd `257.13-1~deb13u1` / local ext4 profile. It is
-not a general Debian, Raspberry Pi, or systemd procedure.
+not a general Debian, Raspberry Pi, or systemd procedure. The Ubuntu annex
+reuses the lifecycle rules below; it does not extend Raspberry Pi qualification.
 
 ## Rules shared by every operation
 
@@ -47,12 +46,12 @@ not** be configured as the unprivileged Event agent's
 `mission_secret_ref_file`.
 
 Instead, the deployment/package owns a separate service-readable reference
-handoff file. After a successful INSTALL or ROTATE, trusted package logic must
+handoff file. After a successful INSTALL or ROTATE, the deployment procedure must
 parse the exact complete `reference=HEX` success field, decode that canonical
 hex to the serialized `ProvisioningSecretRef` bytes expected by the agent, and
 atomically replace the handoff file. The file must be owned exactly by the
-final service UID with mode `0600`. No shell extraction command or handoff path
-is specified because both belong to the not-yet-frozen package annex. The
+final service UID with mode `0600`. The Ubuntu candidate annex specifies its
+path and manual handoff; the original Raspberry Pi package annex remains open. The
 agent's `mission_secret_ref_file` must name that handoff file, and its
 configured `mission_load_id` must equal the load-operation ID used for the
 Active generation.
@@ -148,7 +147,7 @@ ERROR provisioning secret store reports the secret destroyed
    generation and reference. Retain the returned opaque reference in the
    authorized root-only operation record: it is the exact future rotation or
    destruction input. Do not copy it into general logs.
-4. Through the package-owned trusted handoff, atomically populate the separate
+4. Through the deployment-owned handoff, atomically populate the separate
    service-readable reference file from the exact successful `reference=HEX`
    field. Its owner must be the final service UID and its mode must be `0600`;
    do not expose or directly configure the root-only provider reference file.
@@ -483,3 +482,143 @@ Component tests and successful local commands are implementation evidence, not
 E01/E09/G3/G4 or physical-target receipts. The exact candidate must still bind
 and qualify the package, hardened unit, provider executable, runtime loader,
 administration binary, platform, filesystem, and complete procedure unchanged.
+
+
+## Ubuntu 24.04 amd64 package annex
+
+This annex supplies installation details for the existing operations 1 and 2,
+using the Ubuntu `.deb` candidate. Follow the shared rules and existing
+operations above for retries, rotation, backup/recovery and destruction.
+Arm64 qualification is deferred. Build instructions and the scope of existing
+runtime evidence are in the [package candidate document](../release/ubuntu-24.04-deb.md).
+
+### Package paths and identity
+
+| Purpose | Installed value |
+| --- | --- |
+| Service / account | `aster-agent.service` / `aster:aster` (system-assigned UID/GID) |
+| Agent / administration CLI | `/usr/bin/aster-agent` / `/usr/sbin/aster-credential-admin` |
+| Configuration | `/etc/aster/agent.json`, `root:aster`, `0640` |
+| Bearer token | `/etc/aster/agent-credentials/client-token`, `aster:aster`, `0600` |
+| Service reference | `/etc/aster/agent-credentials/mission-reference`, `aster:aster`, `0600` |
+| Agent state | `/var/lib/aster-agent`, `aster:aster`, `0700` |
+| Provider / ledger directories | `/etc/aster/provisioning`, `/var/lib/aster/provisioning-systemd`, `root:root`, `0700` |
+
+The example configuration comes from the
+[configuration reference](../reference/aster-agent-config-v1.md), with these
+package credential paths. The package installs it only as documentation.
+
+### Prepare a first installation
+
+Use Ubuntu 24.04 amd64 and local ext4 for provider storage. On Ubuntu Minimal,
+check dpkg documentation exclusions before installing: retain
+`/usr/share/doc/aster` and `/usr/share/doc/aster/*` with `path-include` rules
+if `/usr/share/doc/*` is excluded.
+
+```sh
+sudo apt install ./aster_VERSION_amd64.deb
+sudo install -o root -g aster -m 0640 \
+  /usr/share/doc/aster/examples/agent.example.json /etc/aster/agent.json
+sudo systemd-creds setup
+```
+
+These are first-install commands: do not overwrite an existing configuration
+or replace a lost host key on an existing deployment. Existing-key loss uses
+operation 5's recovery requirements. The package leaves the service disabled
+and stopped; provisioning is an explicit operator step.
+
+Configure approved peers and limits. Supply the bearer-token file through the
+existing owner-only credential procedure, using the path and permissions in
+the table. Do not use the repository test bundle for deployment.
+
+### Operation 1: install and hand off the reference
+
+Use a root Bash maintenance session with `set -euo pipefail`. As required by
+operation 1, descriptor 3 must already supply the authorized bundle, and
+`INSTALL_OPERATION` and `LOAD_OPERATION` must contain the retained operation
+IDs. Keep the service stopped and prevent concurrent administration or starts.
+
+```sh
+set -euo pipefail
+systemctl stop aster-agent.service
+systemctl show aster-agent.service \
+  --property=ActiveState,SubState,MainPID,ControlPID
+```
+
+Proceed only with `ActiveState=inactive`, `SubState=dead`, `MainPID=0` and
+`ControlPID=0`. The unit uses `KillMode=control-group` and a 40-second stop
+timeout; the configured agent shutdown grace is at most 30 seconds.
+
+Capture the existing install command's success output privately. A failed
+command ends the sequence; use the shared retry procedure, not a new ID.
+
+```sh
+umask 077
+admin_result=$(mktemp /etc/aster/.install-result.XXXXXX)
+/usr/sbin/aster-credential-admin install \
+  --operation "$INSTALL_OPERATION" --load-operation "$LOAD_OPERATION" \
+  <&3 > "$admin_result"
+test "$(wc -l < "$admin_result")" -eq 1
+grep -Eq '^INSTALL disposition=(installed|existing) generation=[1-9][0-9]* reference=([0-9a-f]{2})+$' "$admin_result"
+```
+
+Decode only that successful result, set ownership before publishing it, and
+atomically rename within the protected destination directory. `basenc`,
+`mktemp`, `sync`, `mv`, and the other commands are standard system utilities;
+no additional administration wrapper is installed.
+
+```sh
+reference_stage=$(mktemp /etc/aster/agent-credentials/.mission-reference.XXXXXX)
+sed -n 's/^.* reference=//p' "$admin_result" | tr 'a-f' 'A-F' | \
+  basenc --base16 --decode > "$reference_stage"
+chown aster:aster "$reference_stage"
+chmod 0600 "$reference_stage"
+sync -f "$reference_stage"
+mv -T "$reference_stage" /etc/aster/agent-credentials/mission-reference
+sync -f /etc/aster/agent-credentials
+rm -- "$admin_result"
+```
+
+Prepare a configuration copy in `/etc/aster`, preserving ownership and mode:
+
+```sh
+config_stage=$(mktemp /etc/aster/.agent.json.XXXXXX)
+cp --preserve=mode,ownership /etc/aster/agent.json "$config_stage"
+```
+
+Edit that copy with your editor: set `credentials.mission_load_id` to the
+retained `LOAD_OPERATION`, and confirm the credential paths in the table.
+Then validate and atomically publish it:
+
+```sh
+runuser -u aster -- /usr/bin/aster-agent --check-config "$config_stage"
+sync -f "$config_stage"
+mv -T "$config_stage" /etc/aster/agent.json
+sync -f /etc/aster
+```
+
+The two file replacements are individually atomic, not a transaction; keep
+the service stopped if either fails. This is the handoff required by
+operation 1, not an additional provider operation. For operation 4's rotation,
+use its existing `rotate` command and exact `ROTATE` success format, then
+apply the same file ownership and atomic replacement requirements.
+
+### Operation 2: start and check readiness
+
+```sh
+sudo -u aster /usr/bin/aster-agent --check-config /etc/aster/agent.json
+sudo systemctl start aster-agent.service
+curl --fail --silent --output /dev/null http://127.0.0.1:8182/livez
+curl --fail --silent --output /dev/null http://127.0.0.1:8182/readyz
+```
+
+Readiness may take time after `systemctl start`; require HTTP 200 before
+application traffic. Continue with the authenticated `GetStatus` and Event
+checks in the [operator runbook](../quickstart/linux-event-mvp-runbook.md#operate-a-provider-composed-candidate).
+Enable boot startup only after those checks succeed:
+`sudo systemctl enable aster-agent.service`.
+
+For operation 3's bearer-token reload, the package command is
+`sudo systemctl reload aster-agent.service`; it sends SIGHUP and does not
+reload mesh configuration. Package upgrade/removal behavior is documented
+[separately](../release/ubuntu-24.04-deb.md#upgrade-removal-and-remaining-qualification).
