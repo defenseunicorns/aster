@@ -198,6 +198,31 @@ E01 approval and E09 packaged lifecycle qualification remain open. Every semanti
 operation uses a fresh retained operation ID; an uncertain result is retried
 with the identical ID and identical input.
 
+## Validate a completed candidate bundle
+
+After the owners assemble a canonical candidate body, receipt index, detached
+role approvals, and one release decision, validate only those local immutable
+bytes:
+
+```sh
+python3 tools/check-linux-event-mvp-qualification.py \
+  --bundle-root /controlled/candidate-bundle \
+  --artifact-root /controlled/candidate-artifacts \
+  --body candidate-body.json \
+  --index receipt-index.json \
+  --approval approvals/profile-product.json \
+  --approval approvals/security.json \
+  --decision release-decision.json
+```
+
+Supply every detached candidate approval with another `--approval`. Omit
+`--artifact-root` only when the receipt index has no artifact-root entry. The
+validator reads no devices or credentials, makes no network calls, and emits
+one sanitized canonical JSON report. Exit 0 means the supplied bundle is
+structurally conformant only; it is not a qualification or signature-
+verification result. Exit 2 means nonconformant, exit 3 means required local
+bytes are unavailable, and exit 70 means the validator itself failed.
+
 ## Stop and escalate
 
 Keep the process stopped and preserve sanitized receipts when any of these
