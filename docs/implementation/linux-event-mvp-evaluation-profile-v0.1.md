@@ -54,8 +54,8 @@ devices, and retained receipts under review.
    transfer across intermittent approved IP connectivity.
 4. Include restart-selected `ReceiveOnly` operation without describing it as
    physical radio silence.
-5. Bound durable publish-operation mappings honestly without introducing an
-   unsafe deletion or key-reuse mechanism.
+5. Bound the durable publish-operation ledger honestly while preserving
+   permanent retry classification and prohibiting key reuse.
 6. Separate candidate implementation, retained evidence, and release claims.
 7. Allow customer-specific annexes to narrow one reusable base profile without
    creating undocumented variants.
@@ -75,8 +75,8 @@ devices, and retained receipts under review.
   emission certification.
 - Real-time streaming, message-broker semantics, exactly-once delivery, or a
   guarantee that every connected peer is currently converged.
-- Online operation-mapping garbage collection, key reuse, generation rollover,
-  or unbounded mission lifetime.
+- Operation-key reuse, deletion of permanent retirement fences, generation
+  rollover, or unbounded mission lifetime.
 - Snapshot-resistant rollback, recovery after complete state loss, filesystem
   rollback, or power-loss assurance beyond retained evidence.
 - FIPS 140-3 validation, independent server interoperability, hostile-peer
@@ -388,16 +388,28 @@ including all restarts**. The implementation does not enforce this lower
 profile boundary. The qualification harness and operator procedure count
 distinct accepted keys, stop new publication at 1,024, and end the profile
 claim. Keys are 1 through 256 bytes. Exact retries do not consume another
-mapping. A key never expires and must never be rebound to a different
+ledger record. A key never expires and must never be rebound to a different
 publication intent.
 
-The operation mapping does not retire in v0.1.
+The selected implementation stores a fixed-size, mission-bound operation
+fingerprint and canonical intent commitment rather than the raw operation key.
+While the Event remains replayable, an active record retains its exact durable
+result and a bounded reverse index. When Event custody retires that Event, the
+store atomically replaces every active alias with a permanent compact
+retirement fence. An exact retry of a retired operation remains
+`ExpiredOrRetired`; changed intent remains a conflict. At most 64 active
+operation aliases may name one Event. Retirement compacts the record; it never
+permits key reuse or removes the permanent classification fence.
 
-The supported 1,024-operation workload is deliberately below both current
-store ceilings: 4,096 rows and 512 KiB of aggregate key-plus-record bytes. A
-maximum 256-byte key plus a maximum 130-byte mapping record consumes 386 bytes;
-1,024 such entries consume 395,264 bytes. Aggregate item/byte quotas can still
-stop admission earlier.
+The strict v0.1 configuration selects a separate permanent ledger quota of
+`storage.operations.max_records = 1_000_000`,
+`storage.operations.max_logical_bytes = 201_326_592` (192 MiB), and
+`storage.operations.emergency_reserve = 10_000`. One active record plus its
+reverse-index key charges at most 162 logical bytes; one retired fence charges
+67 bytes. Ordinary publication preserves the 10,000-record/1,620,000-byte
+emergency reserve. The 1,024-operation profile workload therefore remains far
+below the configured ledger ceiling. The aggregate Event/control store quota
+is separately enforced and can still stop Event admission earlier.
 
 This is a supported operational workload boundary, not a new store admission
 limit or reclamation mechanism.
@@ -407,23 +419,33 @@ that directory is not same-mission capacity recovery and invalidates durability
 and restart claims. A later evaluation uses a new mission identity and a fresh
 state directory.
 
-Authenticated status must expose operation rows, operation bytes, both store
-ceilings, the 1,024-operation profile boundary, and remaining profile headroom.
-A warning becomes actionable no later than 512 distinct operations. Reaching
-1,024 ends the supported workload even though the store may still accept it.
-Exhaustion of the implementation's 4,096-row or 512-KiB mapping store is a
-separate Connect `ResourceExhausted` failure with new additive public reason
+Authenticated status must expose total, active, retired, and reverse ledger
+rows; logical bytes; configured record/byte ceilings; ordinary and emergency
+headroom; the 1,024-operation profile boundary and remaining profile headroom;
+the bounded rolling acceptance estimate; and startup/background audit state.
+A profile warning becomes actionable no later than 512 distinct operations.
+Separately, configured-ledger occupancy is `OK` below 70%, `WARNING` at 70%,
+`CRITICAL` at 90%, and `EXHAUSTED` when no ordinary active record fits. The
+rolling rate uses the preceding 60-second in-process observation window, resets
+on restart, and has planning value only; neither it nor the derived exhaustion
+estimate changes qualification pass/fail authority.
+Reaching 1,024 ends the supported workload even though the ledger may still
+accept it. Exhaustion of either configured ledger ceiling is a separate Connect
+`ResourceExhausted` failure with additive public reason
 `PUBLIC_ERROR_REASON_OPERATION_CAPACITY_EXHAUSTED = 12`, `retryable = false`,
 and no retry delay. Changing the key or retrying indefinitely is not recovery.
 Other aggregate storage pressure retains its separately accurate capacity
 guidance.
 
-A full crash-safe generation/retirement lifecycle belongs to `P1-1`. TTL, LRU,
-FIFO, or deletion of a bare mapping is prohibited because a delayed retry could
-otherwise create a second Event. The decision is reopened after the first
-retained physical workload on both mandatory CM4 nodes and before approving a
-profile revision above 1,024 distinct operations, any `P2-2` workload bracket,
-or any production profile, whichever occurs first.
+Startup and background audit examine the permanent ledger incrementally and
+must fail closed for new Event publication on an invariant violation while
+preserving bounded status, reads, and shutdown. The implementation's
+crash-safe active-to-retired lifecycle is selected for P1-1, but v0.1 exposes no
+black-box finite-TTL or Event-content-deletion trigger and claims no physical,
+long-duration, or production qualification of that lifecycle. A profile review
+is still required after the first retained workload on both mandatory CM4
+nodes and before approving a workload above 1,024 operations, any `P2-2`
+bracket, or a production profile.
 
 The review records distinct accepted operations, key-length distribution,
 logical operation bytes, database/filesystem growth, reopen time, RSS, CPU,
@@ -437,6 +459,10 @@ The strict customer configuration explicitly sets:
 
 - `storage.max_items = 10_000` aggregate logical tracked rows;
 - `storage.max_payload_bytes = 67_108_864` aggregate logical tracked bytes;
+- `storage.operations.max_records = 1_000_000` permanent ledger records;
+- `storage.operations.max_logical_bytes = 201_326_592` ledger and reverse-index
+  logical bytes;
+- `storage.operations.emergency_reserve = 10_000` records;
 - at most 19 configured peers per node;
 - `limits.max_connections = 1`; and
 - at most 8 node-global in-flight application operations.
@@ -462,10 +488,12 @@ In particular, 65,536 bytes is not an independently enforced server payload
 limit.
 
 The 10,000/64-MiB values are required profile configuration, not generic
-production sizing or customer-schema defaults. They include durable Event and
-operation rows and exclude redb/filesystem amplification, untracked files,
-snapshots, swap, backups, and process memory. Control and emergency reserves
-reduce ordinary usable capacity.
+production sizing or customer-schema defaults. They govern the aggregate
+Event/control store and exclude the separately accounted operation ledger,
+redb/filesystem amplification, untracked files, snapshots, swap, backups, and
+process memory. Control and emergency store reserves reduce ordinary usable
+capacity. The operation-ledger quota is also logical accounting and likewise
+excludes backend/filesystem amplification and process memory.
 
 The qualification dimensions are not an unconstrained Cartesian product:
 
@@ -487,19 +515,21 @@ The agent's compiled request/message ceiling is 1 MiB, but v0.1 makes no 1-MiB
 plaintext payload claim because protobuf and protected-envelope overhead also
 consume bounded request and mesh-object space.
 
-Hard 4,096-row/512-KiB mapping saturation is exercised only in an isolated
-engineering test outside the v0.1 workload, or through a test-only lower limit
-that preserves the production transaction path. It validates terminal failure
-and exact replay at capacity without expanding the supported 1,024-operation
+Configured ledger saturation is exercised only in an isolated engineering test
+outside the v0.1 workload, normally through test-only lowered record/byte limits
+that preserve the production transaction path. It validates terminal failure,
+exact active replay, retired classification, changed-intent conflict, and
+emergency-reserve behavior without expanding the supported 1,024-operation
 profile boundary.
 
 After control and emergency reserves, the configured store provides 5,840
 ordinary aggregate item slots and 50,266,112 ordinary logical bytes. The
-two-node soak projects 720 ordinary aggregate items per converged node: 480
-Events plus 240 local publish-operation mappings. That leaves 5,120 item slots
-before other aggregate-counted rows. Byte fit remains provisional until the
-receipts record exact protected source-object bytes and physical database
-growth; plaintext payload arithmetic alone is not evidence of fit.
+two-node soak projects 480 ordinary Event items per converged node, leaving
+5,360 item slots before other aggregate-counted rows. Each publishing node also
+projects 240 separate active operation-ledger records and their reverse-index
+entries. Byte fit remains provisional until the receipts record exact protected
+source-object bytes, operation-ledger logical use, and physical database growth;
+plaintext payload arithmetic alone is not evidence of fit.
 
 ## Resource and lifecycle targets
 
@@ -525,8 +555,8 @@ version; a test result does not silently redefine v0.1.
 Startup fails closed before readiness for invalid configuration, credentials,
 provider state, mission policy/profile mismatch, or inconsistent durable state.
 Same-version process crash and restart reuse the existing state directory and
-must preserve durable acceptance, operation mappings, subscriptions, pending
-deliveries, acknowledgements, and mission controls.
+must preserve durable acceptance, operation-ledger records and fences,
+subscriptions, pending deliveries, acknowledgements, and mission controls.
 
 Ordinary configuration, peers, relay, mission reference, storage, and emission
 mode change only through controlled restart. Bearer-token reload is the sole
@@ -550,8 +580,9 @@ Event-service fields, qualification requires:
 
 - configured and effective emission mode;
 - logical item and payload-byte use and configured limits;
-- publish-operation rows, bytes, hard ceilings, profile boundary, and remaining
-  profile headroom;
+- publish-operation total/active/retired/reverse rows, logical bytes, configured
+  ceilings, ordinary/emergency headroom, profile boundary/headroom, bounded rate
+  estimate, warning state, and ledger-audit state;
 - durable pending-delivery count and saturation indication;
 - cumulative authenticated and failed contact counts; and
 - bounded per-peer authorization and last-contact outcome already present in
@@ -629,11 +660,12 @@ artifacts causes refusal or deferral.
    exposes its effective mode, and retains mandatory response traffic as an
    explicit non-silence limitation. Failure requires an implementation fix or
    refusal of v0.1.
-10. Operation and storage headroom remain within the profile boundary; exact
-    retry, changed-intent conflict, implementation-cap saturation,
-    crash/reopen, and warning behavior are retained. Existing component tests
-    retain the post-retirement `ExpiredOrRetired` invariant; v0.1 claims no
-    black-box retirement trigger because its API exposes neither finite TTL nor
+10. Operation-ledger and store headroom remain within the profile boundary;
+    exact active retry, changed-intent conflict, configured-cap saturation,
+    emergency reserve, audit, crash/reopen, and warning behavior are retained.
+    Component tests retain atomic active-to-retired compaction and the
+    post-retirement `ExpiredOrRetired` invariant; v0.1 claims no black-box
+    retirement trigger because its API exposes neither finite TTL nor
     Event-content deletion.
 11. RSS, CPU, executable size, startup, stop, state growth, and energy are
     measured on each participating physical CM4 node. Every thresholded target
@@ -675,12 +707,13 @@ parallel:
 
 - Evaluators receive one precise Linux/Event product slice rather than a broad
   claim based on unrelated mechanisms.
-- The two-node soak projects 720 ordinary items against 5,840 available
-  ordinary slots. Its 5,120-slot margin and byte fit remain qualification
+- The two-node soak projects 480 ordinary Event items against 5,840 available
+  ordinary store slots, plus 240 separate operation-ledger records per
+  publishing node. Store, ledger, and physical byte fit remain qualification
   gates, not production sizing evidence.
-- The 1,024-operation lifetime boundary is safe for maximum legal operation
-  keys and leaves margin over the 240-operation offline workload, but it is not
-  a production lifetime or reclamation solution.
+- The 1,024-operation boundary leaves substantial configured ledger headroom
+  over the 240-operation offline workload, but does not qualify higher rates,
+  longer missions, or production capacity.
 - Restart-selected ReceiveOnly satisfies the bounded receive-only use case but
   deliberately does not use the words radio silence or zero transfer.
 - Rust is the first reference client and Go remains a required API/client
