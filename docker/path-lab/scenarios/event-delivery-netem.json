@@ -1,0 +1,8 @@
+{
+  "schema": "aster-path-delivery-scenario/v1",
+  "id": "event-delivery-netem",
+  "seed": 104729,
+  "operation_key": "path-delivery-one",
+  "logical_key": "dispatch/one",
+  "payload": "bounded real Event over routed netem"
+}
