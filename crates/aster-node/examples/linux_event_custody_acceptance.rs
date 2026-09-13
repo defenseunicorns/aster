@@ -1184,7 +1184,7 @@ fn validate_relay_phase_one_inspection(inspection: &StoreInspection) -> Result<(
             && inspection.event_stats.retiring_route_cached == 0
             && inspection.event_stats.route_cached_bytes > 0
             && inspection.event_stats.acceptance_markers == 0
-            && inspection.event_stats.operations == 0
+            && inspection.event_stats.operation_stats.records_total == 0
             && inspection.event_subscription_stats.subscriptions == 1
             && inspection.event_subscription_stats.pending_deliveries == 0
             && inspection.event_subscription_stats.acknowledged_deliveries == 0
@@ -1209,7 +1209,7 @@ fn validate_relay_after_expiry_inspection(inspection: &StoreInspection) -> Resul
             && inspection.event_stats.retiring_route_cached == 0
             && inspection.event_stats.route_cached_bytes > 0
             && inspection.event_stats.acceptance_markers == 0
-            && inspection.event_stats.operations == 0
+            && inspection.event_stats.operation_stats.records_total == 0
             && inspection.event_subscription_stats.subscriptions == 1
             && inspection.event_subscription_stats.pending_deliveries == 0
             && inspection.event_subscription_stats.acknowledged_deliveries == 0
@@ -1234,7 +1234,7 @@ fn validate_relay_after_pressure_inspection(inspection: &StoreInspection) -> Res
             && inspection.event_stats.retiring_route_cached == 0
             && inspection.event_stats.route_cached_bytes > 0
             && inspection.event_stats.acceptance_markers == 0
-            && inspection.event_stats.operations == 0
+            && inspection.event_stats.operation_stats.records_total == 0
             && inspection.event_subscription_stats.subscriptions == 1
             && inspection.event_subscription_stats.pending_deliveries == 0
             && inspection.event_subscription_stats.acknowledged_deliveries == 0
@@ -1259,7 +1259,7 @@ fn validate_relay_final_inspection(inspection: &StoreInspection) -> Result<(), D
             && inspection.event_stats.retiring_route_cached == 0
             && inspection.event_stats.route_cached_bytes > 0
             && inspection.event_stats.acceptance_markers == 0
-            && inspection.event_stats.operations == 0
+            && inspection.event_stats.operation_stats.records_total == 0
             && inspection.event_subscription_stats.subscriptions == 1
             && inspection.event_subscription_stats.pending_deliveries == 0
             && inspection.event_subscription_stats.acknowledged_deliveries == 0
@@ -1307,7 +1307,7 @@ fn validate_receiver_final_inspection(inspection: &StoreInspection) -> Result<()
             && inspection.event_stats.route_cached == 0
             && inspection.event_stats.retiring_route_cached == 0
             && inspection.event_stats.acceptance_markers == 2
-            && inspection.event_stats.operations == 0
+            && inspection.event_stats.operation_stats.records_total == 0
             && inspection.event_subscription_stats.subscriptions == 1
             && inspection.event_subscription_stats.pending_deliveries == 2
             && inspection.event_subscription_stats.acknowledged_deliveries == 0

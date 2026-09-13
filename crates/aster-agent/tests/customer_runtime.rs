@@ -169,6 +169,86 @@ async fn receive_only_starts_ready_and_accepts_local_publication() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn customer_operation_limits_process_preserves_over_limit_reopen() {
+    // Break caught: customer startup defaults the selected quota, consumes its
+    // emergency reserve, or treats a smaller reopen quota as ledger corruption.
+    const CHILD: &str = "ASTER_TEST_OPERATION_LIMITS_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "customer_operation_limits_process_preserves_over_limit_reopen",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("start customer runtime test process");
+        assert!(
+            output.status.success(),
+            "child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    assert!(
+        socket_access_available(),
+        "this process test requires loopback sockets"
+    );
+    for (records, bytes, ordinary, lower_records, lower_bytes) in [
+        (6, 1_296, 4, 5, 1_296), // record quota, then retained count above the new maximum
+        (10, 648, 2, 10, 486),   // byte quota, then retained bytes above the new maximum
+    ] {
+        let fixture = CustomerFixture::new();
+        fixture.set_operation_limits(records, bytes, 2);
+        let running = RunningFixture::start(&fixture).await;
+        let mut originals = Vec::new();
+        for key in 0..ordinary {
+            let (status, response) = publish_operation(&fixture, key, false, false).await;
+            assert_eq!(status, 200, "{response}");
+            assert_eq!(response["inserted"], true);
+            originals.push(response);
+        }
+        let (status, response) = publish_operation(&fixture, 8, false, false).await;
+        assert_eq!(status, 429, "{response}");
+        assert_eq!(response["message"], "durable operation capacity exhausted");
+        for key in ordinary..ordinary + 2 {
+            let (status, response) = publish_operation(&fixture, key, true, false).await;
+            assert_eq!(status, 200, "reserved tombstone: {response}");
+            originals.push(response);
+        }
+        let (status, response) = publish_operation(&fixture, 9, true, false).await;
+        assert_eq!(status, 429, "{response}");
+        assert_eq!(response["message"], "durable operation capacity exhausted");
+        running.stop_clean().await;
+
+        fixture.set_operation_limits(lower_records, lower_bytes, 2);
+        let running = RunningFixture::start(&fixture).await;
+        for (key, original) in originals.iter().enumerate() {
+            let (status, response) = publish_operation(&fixture, key, key >= ordinary, false).await;
+            assert_eq!(status, 200, "exact retained retry: {response}");
+            assert_eq!(response["id"], original["id"]);
+            assert_eq!(response["acceptanceMarker"], original["acceptanceMarker"]);
+            // Proto JSON omits the default false value.
+            assert!(!response["inserted"].as_bool().unwrap_or(false));
+        }
+        let (status, response) = publish_operation(&fixture, 0, false, true).await;
+        assert_eq!(status, 409, "{response}");
+        assert_eq!(
+            response["message"],
+            "operation key conflicts with an existing request"
+        );
+        for emergency in [false, true] {
+            let (status, response) = publish_operation(&fixture, 8, emergency, false).await;
+            assert_eq!(status, 429, "{response}");
+            assert_eq!(response["message"], "durable operation capacity exhausted");
+        }
+        assert_eq!(health_status(fixture.health(), "/readyz").await, 200);
+        running.stop_clean().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_hangup_keeps_the_old_token_and_readiness() {
     // Break caught: destructive or non-atomic reload revokes the working token
     // or drops readiness when the replacement file is invalid.
@@ -469,7 +549,7 @@ impl CustomerFixture {
         fs::write(
             &config,
             format!(
-                r#"{{"schema_version":1,"state":{{"directory":"{}"}},"application":{{"listen":"{application}"}},"health":{{"listen":"{health}"}},"mesh":{{"bind":"127.0.0.1:0","sync_interval_ms":500,"emission_policy":"normal","peers":[]}},"credentials":{{"client_token_file":"{}","mission_secret_ref_file":"{}","mission_load_id":"{}"}},"storage":{{"max_items":10000,"max_payload_bytes":67108864}},"limits":{{"max_in_flight_requests":1,"shutdown_grace_ms":{shutdown_grace_ms}}}}}"#,
+                r#"{{"schema_version":1,"state":{{"directory":"{}"}},"application":{{"listen":"{application}"}},"health":{{"listen":"{health}"}},"mesh":{{"bind":"127.0.0.1:0","sync_interval_ms":500,"emission_policy":"normal","peers":[]}},"credentials":{{"client_token_file":"{}","mission_secret_ref_file":"{}","mission_load_id":"{}"}},"storage":{{"max_items":10000,"max_payload_bytes":67108864,"operations":{{"max_records":1000000,"max_logical_bytes":201326592,"emergency_reserve":10000}}}},"limits":{{"max_in_flight_requests":1,"shutdown_grace_ms":{shutdown_grace_ms}}}}}"#,
                 state.display(),
                 token.display(),
                 mission_reference.display(),
@@ -536,6 +616,15 @@ impl CustomerFixture {
     fn chmod_reference(&self, mode: u32) {
         fs::set_permissions(&self.mission_reference, fs::Permissions::from_mode(mode))
             .expect("change reference permissions");
+    }
+
+    fn set_operation_limits(&self, records: u64, bytes: u64, reserve: u64) {
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&self.config).unwrap()).unwrap();
+        config["storage"]["operations"] = serde_json::json!({
+            "max_records": records, "max_logical_bytes": bytes, "emergency_reserve": reserve,
+        });
+        fs::write(&self.config, serde_json::to_vec(&config).unwrap()).unwrap();
     }
 }
 
@@ -729,10 +818,61 @@ async fn publish_event_status(address: SocketAddr, token: &[u8]) -> u16 {
 }
 
 async fn http_status(address: SocketAddr, request: &[u8]) -> u16 {
+    let response = http_response(address, request).await;
+    if response.is_empty() {
+        return 0;
+    }
+    http_response_status(&response)
+}
+
+async fn publish_operation(
+    fixture: &CustomerFixture,
+    key: usize,
+    tombstone: bool,
+    changed: bool,
+) -> (u16, serde_json::Value) {
+    // Base64 encoding of one distinct byte per operation key (0 through 9).
+    let keys = [
+        "AA==", "AQ==", "Ag==", "Aw==", "BA==", "BQ==", "Bg==", "Bw==", "CA==", "CQ==",
+    ];
+    let body = serde_json::json!({
+        "operationKey": keys[key], "topic": "chat.events", "scope": "mission/team/alpha",
+        "priority": "PRIORITY_IMMEDIATE", "logicalKey": keys[key],
+        "payload": if tombstone { "" } else if changed { "dHdv" } else { "b25l" },
+        "tombstone": tombstone,
+    })
+    .to_string();
+    let request = format!(
+        "POST /aster.application.v1alpha1.AsterApplicationService/PublishEvent HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        String::from_utf8_lossy(fixture.token_bytes()),
+        body.len(),
+        body,
+    );
+    let response = http_response(fixture.application(), request.as_bytes()).await;
+    let offset = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let body = if String::from_utf8_lossy(&response[..offset])
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        chunked_response_body(&response)
+    } else {
+        response[offset..].to_vec()
+    };
+    (
+        http_response_status(&response),
+        serde_json::from_slice(&body).expect("publication response"),
+    )
+}
+
+async fn http_response(address: SocketAddr, request: &[u8]) -> Vec<u8> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     let Ok(mut stream) = tokio::net::TcpStream::connect(address).await else {
-        return 0;
+        return Vec::new();
     };
     stream.write_all(request).await.expect("write HTTP request");
     let mut response = Vec::new();
@@ -740,7 +880,7 @@ async fn http_status(address: SocketAddr, request: &[u8]) -> u16 {
         .await
         .expect("HTTP response deadline")
         .expect("read HTTP response");
-    http_response_status(&response)
+    response
 }
 
 fn http_response_status(response: &[u8]) -> u16 {

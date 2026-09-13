@@ -20,9 +20,10 @@ use aster_node::{
     DemoScenario, MissionExpectedPeer, MutableSourceInterests, NodeApplication, NodeConfig,
     NodeIdentity, RegistryGenerationWitness, RevocationRequest, ScopeRekeyRequest,
     SelectedControlAdmin, SelectedForwardingConfig, SourceInterestSelector,
-    ensure_state_accepts_normal_operation, format_control_transfer_id, format_path_field,
-    format_receipt_field, inspect_store, mission::UnprotectedReferenceMission, parse_item_id,
-    parse_node_id, put_opaque, run_demo_scenario, run_node_with_forwarding, zeroize_node,
+    audit_store_event_operations, ensure_state_accepts_normal_operation,
+    format_control_transfer_id, format_path_field, format_receipt_field, inspect_store,
+    mission::UnprotectedReferenceMission, parse_item_id, parse_node_id, put_opaque,
+    run_demo_scenario, run_node_with_forwarding, zeroize_node,
 };
 use zeroize::Zeroize as _;
 
@@ -88,7 +89,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "inspect" => {
             let state = arguments.required_path("--state")?;
+            let audit_operations = arguments.switch("--audit-event-operations")?;
             arguments.finish()?;
+            if audit_operations {
+                let audit = audit_store_event_operations(&state)?;
+                println!(
+                    "EVENT_OPERATION_AUDIT status=pass state=complete scanned={} total={} units=ledger-and-reverse-rows",
+                    audit.scanned, audit.total
+                );
+            }
             let receipt = inspect_store(&state)?;
             println!(
                 "INSPECT status=pass state={} zeroization={} opaque_items={} opaque_acceptance_markers={} opaque_bytes={} events={} event_acceptance_markers={} event_sealed_bytes={} route_cached_events={} route_cached_bytes={} controls={} applied_controls={} pending_controls={} control_highwater={}",
@@ -698,7 +707,7 @@ const HELP: &str = "Aster selected-stack mesh CLI\n\n\
          Commands:\n\
            aster init --state DIR\n\
            aster put --state DIR --id HEX64 --file PATH  # maximum 1,048,576 bytes\n\
-           aster inspect --state DIR\n\
+           aster inspect --state DIR [--audit-event-operations]\n\
            aster playground-init --nodes N --root DIR\n\
            aster zeroize --state DIR \\
              --mission-bundle-unprotected-reference FILE [--wait-seconds SEC]\n\

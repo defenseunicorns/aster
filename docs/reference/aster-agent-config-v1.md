@@ -46,7 +46,12 @@ credential or provisioning reference.
   },
   "storage": {
     "max_items": 10000,
-    "max_payload_bytes": 67108864
+    "max_payload_bytes": 67108864,
+    "operations": {
+      "max_records": 1000000,
+      "max_logical_bytes": 201326592,
+      "emergency_reserve": 10000
+    }
   },
   "limits": {
     "max_connections": 64,
@@ -64,6 +69,11 @@ crash/recovery acceptance scenario passed. They are qualification evidence,
 not a production sizing recommendation and not a change to the validation
 minimum. Logical limits do not include redb/filesystem overhead, process RSS,
 untracked files, snapshots, swap, backups, or Blob-depot allocation.
+The operation values select the candidate ledger capacity: 1,000,000 permanent
+records, 192 MiB of logical bytes, and 10,000 emergency records. They do not
+advance the approved evaluation workload boundary or constitute scale/rate
+qualification. Include this separate logical allocation plus backend overhead
+in deployment state sizing.
 
 ## Field reference
 
@@ -86,6 +96,10 @@ Unsigned integer fields use their JSON integer representation.
 | `credentials.mission_load_id` | string | none | Exactly 64 hexadecimal characters (case-insensitive), decoded as the provider load-operation ID. |
 | `storage.max_items` | integer | none | Aggregate logical store limit, `4161..=18446744073709551615`. |
 | `storage.max_payload_bytes` | integer | none | Aggregate logical retained-byte limit, `17891328..=18446744073709551615`. |
+| `storage.operations` | object | none | Required; exactly the three fields below. No implicit defaults in agent config v1. |
+| `storage.operations.max_records` | integer | none | Nonzero `u64` permanent-record ceiling, greater than `emergency_reserve`. |
+| `storage.operations.max_logical_bytes` | integer | none | Nonzero `u64` logical ledger-plus-reverse-index byte ceiling, at least `emergency_reserve * 162`. |
+| `storage.operations.emergency_reserve` | integer | none | Nonzero `u64` emergency-record reserve below `max_records`; multiplication by `162` must fit `u64`. |
 | `limits` | object | compiled ceilings | May be omitted or contain any subset of the six tightening fields below. |
 | `limits.max_connections` | integer | `64` | `1..=64` total application connections. |
 | `limits.max_unauthenticated_connections` | integer | `8` | `1..=8` not-yet-authenticated application connections. This is an independent ceiling and may exceed a tightened `max_connections`, although doing so provides no extra total capacity. |
@@ -129,7 +143,8 @@ selection and relay fallback outside this one pinned origin are not supported.
 
 ## Storage reserve calculation
 
-The configured values map directly to `StoreLimits`. Validation then reserves:
+The aggregate `max_items` and `max_payload_bytes` values map directly to
+`StoreLimits`. Validation then reserves:
 
 - 4,096 items for mission-control authority;
 - 64 items of emergency tombstone slack;
@@ -145,15 +160,74 @@ has no per-scope, bridge, or Blob-depot quota field and never raises a limit
 automatically. Saturation returns the sanitized public resource-exhaustion
 error; clients must back off or request a smaller valid page.
 
-The durable Event publish-operation map has a separate implementation ceiling
-of 4,096 rows and 524,288 bytes. For this evaluation profile, treat 512 rows as
-the operator warning point and stop new publication work at 1,024 rows pending
-review; the profile does not delete or reclaim operation mappings online.
-Authenticated `GetStatus` reports the exact row/byte use, hard ceilings,
-profile boundary and remaining headroom. Reaching either implementation hard
-ceiling returns `PUBLIC_ERROR_REASON_OPERATION_CAPACITY_EXHAUSTED`, which is
-terminal for the attempted new operation and must not be retried with a new
-operation key.
+The permanent Event operation ledger uses the separate required `operations`
+quota, validated by the store's `EventOperationLimits` rules. One active record
+uses 98 logical ledger bytes plus a 64-byte reverse-index key; a retired record
+uses 67 bytes. Ordinary admission preserves `emergency_reserve` records and
+`emergency_reserve * 162` bytes. The ordinary ceilings are therefore
+`max_records - emergency_reserve` and
+`max_logical_bytes - emergency_reserve * 162`. The exact byte-reserve boundary
+is valid even when no ordinary active record fits. The 64-active-alias limit
+per Event is a fixed profile constant and cannot be configured.
+
+Reaching either selected operation ceiling rejects new keys with
+`PUBLIC_ERROR_REASON_OPERATION_CAPACITY_EXHAUSTED`; it is terminal for that
+attempt and must not be retried with a new operation key. Exact active retries
+recover their original result, exact retired retries remain `ExpiredOrRetired`,
+and changed intent remains a conflict. Reopening an existing v3 ledger with
+lower limits preserves its records and accounting, even when retained use is
+already above a new ceiling. Startup and background structural audit can still
+complete; admission rejects growth. Lowering a limit never resets, migrates,
+deletes, or rebinds existing v3 operation records. Legacy-schema migration
+continues to require capacity for its complete image and fails atomically if
+the selected limits cannot hold it.
+
+Authenticated `GetStatus.publish_operation_capacity` now exposes two capacity
+views. `rows` and `bytes` are the actual permanent ledger record count and
+logical bytes; `row_hard_limit` and `byte_hard_limit` are the configured
+candidate limits. The approved evaluation workload boundary remains 1,024
+operations pending evidence and role review: `profile_boundary = 1024`,
+`profile_remaining = max(1024 - rows, 0)`, `profile_warning` starts at 512, and
+`profile_exhausted` starts at 1,024. An exhausted approved profile can therefore
+coexist with candidate implementation headroom. These observations do not
+approve a higher evaluation workload or grant requirements evidence credit.
+
+The additive fields `active_rows`, `retired_rows`, and `reverse_rows` distinguish
+live operation references from permanent compact fences. `ordinary_remaining`
+is the smaller of ordinary record headroom and ordinary byte headroom divided
+by 162, rounded down. `emergency_remaining` is total record/byte headroom minus
+ordinary headroom. Every headroom subtraction saturates at zero, including
+after reopening with lower limits. `warning_state` is `OK` below 70%, `WARNING`
+at 70%, `CRITICAL` at 90%, and `EXHAUSTED` when no ordinary active record fits.
+Occupancy uses the larger fraction of ordinary record and byte limits.
+
+`rolling_accept_rate` counts newly committed permanent operation records over
+the preceding monotonic 60 seconds, divided by 60. A newly bound alias or
+direct compact retired fence counts; an exact retry, conflict, or failed
+admission adds nothing. Restart begins an empty observation window, so the
+first minute can understate the ongoing rate. Samples exactly 60 seconds old
+expire. `estimated_seconds_to_exhaustion` is ordinary headroom divided by that
+rate, rounded up to whole seconds and saturated at `u64::MAX`; zero means no
+observed rate (or zero headroom). The observations are not durable authority.
+Until Event retention is configurable, rate and estimate are planning
+information and do not change the occupancy warning.
+
+The nested `audit` has `state`, `scanned`, and `total`. `PENDING` means the
+background pass has not started; `RUNNING` reports traversal of one fixed
+snapshot; `COMPLETE` means traversal and final accounting checks passed;
+`FAILED` closes new Event publication. Counts include ledger and reverse rows;
+records committed after the snapshot belong to the next pass. After failure,
+reported store and operation usage/headroom are last-known figures and must
+not be treated as trusted current capacity. Completion is structural integrity
+evidence, not qualification of the configured capacity.
+
+Operation keys are permanent for the mission even after payload retirement.
+For capacity remediation, close the mission and start a new mission namespace,
+or select a larger prequalified limit before mission start. Never manually
+delete ledger or reverse-index rows, reuse a retired key, or rely on automatic
+rollover or limit increases. Crate-level constructors that do not select
+operation limits retain `EventOperationLimits::DEFAULT`; strict agent config
+v1 always requires all three explicit values.
 
 The profile workload boundary for unacknowledged Event deliveries is 256,
 while the implementation hard ceiling remains 262,144. `GetStatus` reports
@@ -211,6 +285,7 @@ of these fixed configuration reasons (the stock CLI prefixes it with `ERROR`):
 - `configuration peer is invalid`
 - `configuration relay is invalid`
 - `configuration storage limits are invalid`
+- `configuration storage.operations requires nonzero limits, emergency_reserve < max_records, and max_logical_bytes >= emergency_reserve * 162 without overflow`
 - `configuration limit is out of range`
 - `configuration listener must be loopback`
 - `configuration is missing a required field`

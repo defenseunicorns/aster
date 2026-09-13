@@ -4,14 +4,13 @@ use aster_node::EventEmissionPolicy;
 use aster_node::application::{
     AuthenticatedPeerStatus, ContactSyncStatus as NodeContactSyncStatus, EventAcknowledgement,
     EventDelivery as NodeEventDelivery, EventGap as NodeEventGap, EventGapQuery, EventId,
-    EventItem, EventPollRequest, EventPublishRequest, EventPublishResult, EventQuery,
-    EventSubscriptionId, EventSubscriptionRequest, EventSyncStatus as NodeEventSyncStatus,
-    EventUnsubscribe, PeerAuthorization as NodePeerAuthorization, Priority as NodePriority, Scope,
+    EventItem, EventOperationAuditState, EventOperationCapacityWarning, EventPollRequest,
+    EventPublishRequest, EventPublishResult, EventQuery, EventSubscriptionId,
+    EventSubscriptionRequest, EventSyncStatus as NodeEventSyncStatus, EventUnsubscribe,
+    PeerAuthorization as NodePeerAuthorization, Priority as NodePriority, Scope,
     SelectedEventHandle, SelectedEventStatus, Topic,
 };
-use aster_redb_store::{
-    MAX_EVENT_OPERATION_BYTES, MAX_EVENT_OPERATIONS, MAX_EVENT_PENDING_DELIVERIES,
-};
+use aster_redb_store::MAX_EVENT_PENDING_DELIVERIES;
 use connectrpc::{
     ConnectError, ErrorCode, RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream,
 };
@@ -568,8 +567,9 @@ fn status_response(
     configured_emission_policy: EventEmissionPolicy,
     status: SelectedEventStatus,
 ) -> api::GetStatusResponse {
+    let operations = status.event_operation_capacity;
     let profile_remaining =
-        PROFILE_EVENT_OPERATION_BOUNDARY.saturating_sub(status.event_operations);
+        PROFILE_EVENT_OPERATION_BOUNDARY.saturating_sub(operations.stats.records_total);
     api::GetStatusResponse {
         identity: identity.to_vec(),
         mission_authority: mission_authority.to_vec(),
@@ -588,14 +588,43 @@ fn status_response(
         }
         .into(),
         publish_operation_capacity: api::PublishOperationCapacityStatus {
-            rows: status.event_operations,
-            bytes: status.event_operation_bytes,
-            row_hard_limit: MAX_EVENT_OPERATIONS,
-            byte_hard_limit: MAX_EVENT_OPERATION_BYTES,
+            rows: operations.stats.records_total,
+            bytes: operations.stats.logical_bytes,
+            row_hard_limit: operations.limits.max_records(),
+            byte_hard_limit: operations.limits.max_logical_bytes(),
             profile_boundary: PROFILE_EVENT_OPERATION_BOUNDARY,
             profile_remaining,
-            profile_warning: status.event_operations >= PROFILE_EVENT_OPERATION_WARNING,
-            profile_exhausted: status.event_operations >= PROFILE_EVENT_OPERATION_BOUNDARY,
+            profile_warning: operations.stats.records_total >= PROFILE_EVENT_OPERATION_WARNING,
+            profile_exhausted: operations.stats.records_total >= PROFILE_EVENT_OPERATION_BOUNDARY,
+            active_rows: operations.stats.records_active,
+            retired_rows: operations.stats.records_retired,
+            reverse_rows: operations.stats.reverse_rows,
+            ordinary_remaining: operations.ordinary_remaining,
+            emergency_remaining: operations.emergency_remaining,
+            rolling_accept_rate: status.event_operation_rolling_accept_rate,
+            estimated_seconds_to_exhaustion: status.event_operation_estimated_seconds_to_exhaustion,
+            warning_state: match operations.warning {
+                EventOperationCapacityWarning::Ok => api::OperationCapacityWarning::Ok,
+                EventOperationCapacityWarning::Warning => api::OperationCapacityWarning::Warning,
+                EventOperationCapacityWarning::Critical => api::OperationCapacityWarning::Critical,
+                EventOperationCapacityWarning::Exhausted => {
+                    api::OperationCapacityWarning::Exhausted
+                }
+            }
+            .into(),
+            audit: api::OperationLedgerAuditStatus {
+                state: match status.event_operation_audit.state {
+                    EventOperationAuditState::Pending => api::OperationLedgerAudit::Pending,
+                    EventOperationAuditState::Running => api::OperationLedgerAudit::Running,
+                    EventOperationAuditState::Complete => api::OperationLedgerAudit::Complete,
+                    EventOperationAuditState::Failed => api::OperationLedgerAudit::Failed,
+                }
+                .into(),
+                scanned: status.event_operation_audit.scanned,
+                total: status.event_operation_audit.total,
+                ..Default::default()
+            }
+            .into(),
             ..Default::default()
         }
         .into(),
@@ -932,6 +961,7 @@ mod tests {
             [0x22; 32],
             EventEmissionPolicy::Normal,
             SelectedEventStatus {
+                event_operation_audit: Default::default(),
                 sync: NodeEventSyncStatus::Offline,
                 authenticated_contacts: 0,
                 failed_contact_attempts: 0,
@@ -939,8 +969,12 @@ mod tests {
                 emission_policy: EventEmissionPolicy::ReceiveOnly,
                 store_usage: AggregateStoreUsage::default(),
                 store_limits: StoreLimits::new(10_000, 64 * 1024 * 1024).expect("limits"),
-                event_operations: 0,
-                event_operation_bytes: 0,
+                event_operation_capacity: aster_node::application::EventOperationCapacity::new(
+                    Default::default(),
+                    aster_redb_store::EventOperationLimits::DEFAULT,
+                ),
+                event_operation_rolling_accept_rate: 0.0,
+                event_operation_estimated_seconds_to_exhaustion: 0,
                 pending_deliveries: 0,
             },
         );
@@ -965,12 +999,20 @@ mod tests {
             Some(&api::PublishOperationCapacityStatus {
                 rows: 0,
                 bytes: 0,
-                row_hard_limit: 4_096,
-                byte_hard_limit: 524_288,
+                row_hard_limit: 1_000_000,
+                byte_hard_limit: 201_326_592,
                 profile_boundary: 1_024,
                 profile_remaining: 1_024,
                 profile_warning: false,
                 profile_exhausted: false,
+                ordinary_remaining: 990_000,
+                emergency_remaining: 10_000,
+                warning_state: api::OperationCapacityWarning::Ok.into(),
+                audit: api::OperationLedgerAuditStatus {
+                    state: api::OperationLedgerAudit::Pending.into(),
+                    ..Default::default()
+                }
+                .into(),
                 ..Default::default()
             })
         );
@@ -984,6 +1026,124 @@ mod tests {
                 ..Default::default()
             })
         );
+    }
+
+    #[test]
+    fn status_reports_ledger_health_and_all_audit_states_without_changing_approved_profile() {
+        use aster_node::application::{
+            EventOperationAuditStatus, EventOperationCapacity, EventOperationLimits,
+            EventOperationStats,
+        };
+        for (rows, state, scanned, total, expected_state, expected_warning, expected_exhausted) in [
+            (
+                511,
+                EventOperationAuditState::Pending,
+                0,
+                0,
+                api::OperationLedgerAudit::Pending,
+                false,
+                false,
+            ),
+            (
+                512,
+                EventOperationAuditState::Running,
+                12,
+                520,
+                api::OperationLedgerAudit::Running,
+                true,
+                false,
+            ),
+            (
+                1_023,
+                EventOperationAuditState::Complete,
+                1_030,
+                1_030,
+                api::OperationLedgerAudit::Complete,
+                true,
+                false,
+            ),
+            (
+                1_024,
+                EventOperationAuditState::Failed,
+                40,
+                1_031,
+                api::OperationLedgerAudit::Failed,
+                true,
+                true,
+            ),
+        ] {
+            let response = status_response(
+                [0x11; 32],
+                [0x22; 32],
+                EventEmissionPolicy::Normal,
+                SelectedEventStatus {
+                    event_operation_audit: EventOperationAuditStatus {
+                        state,
+                        scanned,
+                        total,
+                    },
+                    sync: NodeEventSyncStatus::Offline,
+                    authenticated_contacts: 0,
+                    failed_contact_attempts: 0,
+                    peers: Vec::new(),
+                    emission_policy: EventEmissionPolicy::Normal,
+                    store_usage: AggregateStoreUsage::default(),
+                    store_limits: StoreLimits::default(),
+                    event_operation_capacity: EventOperationCapacity::new(
+                        EventOperationStats {
+                            records_total: rows,
+                            records_active: 7,
+                            records_retired: rows - 7,
+                            reverse_rows: 7,
+                            logical_bytes: 7 * 162 + (rows - 7) * 67,
+                        },
+                        EventOperationLimits::new(2_000, 400_000, 100).unwrap(),
+                    ),
+                    event_operation_rolling_accept_rate: 1.5,
+                    event_operation_estimated_seconds_to_exhaustion: 123,
+                    pending_deliveries: 0,
+                },
+            );
+            let operations = response.publish_operation_capacity.as_option().unwrap();
+            assert_eq!(
+                (
+                    operations.rows,
+                    operations.active_rows,
+                    operations.retired_rows,
+                    operations.reverse_rows
+                ),
+                (rows, 7, rows - 7, 7)
+            );
+            assert_eq!(operations.bytes, 7 * 162 + (rows - 7) * 67);
+            assert_eq!(
+                (operations.row_hard_limit, operations.byte_hard_limit),
+                (2_000, 400_000)
+            );
+            assert_eq!(operations.profile_boundary, 1_024);
+            assert_eq!(operations.profile_remaining, 1_024 - rows);
+            assert_eq!(
+                (operations.profile_warning, operations.profile_exhausted),
+                (expected_warning, expected_exhausted)
+            );
+            assert_eq!(
+                (
+                    operations.ordinary_remaining,
+                    operations.emergency_remaining
+                ),
+                (1_900 - rows, 100)
+            );
+            assert_eq!(operations.warning_state, api::OperationCapacityWarning::Ok);
+            assert_eq!(
+                (
+                    operations.rolling_accept_rate,
+                    operations.estimated_seconds_to_exhaustion
+                ),
+                (1.5, 123)
+            );
+            let audit = operations.audit.as_option().unwrap();
+            assert_eq!(audit.state, expected_state);
+            assert_eq!((audit.scanned, audit.total), (scanned, total));
+        }
     }
 
     #[cfg(all(feature = "client", feature = "server"))]

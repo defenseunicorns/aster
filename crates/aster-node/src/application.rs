@@ -26,12 +26,15 @@ use aster_mesh::{
 pub use aster_mesh::{NodeId, Priority, Scope, Topic};
 use aster_redb_store::{
     AggregateStoreUsage, BlobStoreError, ControlPolicySnapshot, ControlTransferId,
-    CustodyObjectKey, CustodyStoreError, EventDeliveryAck as StoreEventDeliveryAck,
+    CustodyObjectKey, CustodyQuota, CustodyStoreError, EventDeliveryAck as StoreEventDeliveryAck,
     EventGapScanPlan, EventOperationKey, EventQueryFilter, EventReplicationPolicySnapshot,
     EventSemanticId, EventSubscriptionId as StoreEventSubscriptionId, EventSubscriptionKey,
     EventSubscriptionMode, EventSubscriptionPollSelection, EventSubscriptionRemoveOutcome,
     EventSubscriptionSpec, MAX_EVENT_PAGE, MAX_EVENT_POLL_DELIVERIES, MAX_EVENT_SUBSCRIPTION_SCAN,
     Store, StoreError, StoreLimits, StoredEvent,
+};
+pub use aster_redb_store::{
+    EventOperationAuditState, EventOperationAuditStatus, EventOperationLimits, EventOperationStats,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -44,13 +47,16 @@ use crate::{
         StartupEventVerification, absolute_path_from, absolute_state_path,
         cache_accepted_stored_event, drive_custody_maintenance, ensure_principal_active,
         ensure_state_accepts_normal_operation, event_is_inactive,
-        migrate_legacy_event_operation_witnesses, open_startup_event_verifier_and_cache,
+        open_startup_event_verifier_and_cache,
         prune_authenticated_event_route_cache_to_sender_projection, publish_selected_event_once,
         refresh_application_policy, verify_content_stored_claim, verify_stored_claim,
     },
 };
 
 mod blob;
+#[cfg(test)]
+#[path = "application/operation_capacity_test.rs"]
+mod operation_capacity_test;
 mod record;
 mod state;
 pub(crate) use blob::SelectedBlobCommand;
@@ -565,9 +571,75 @@ pub enum EventSyncStatus {
     PolicyChangedSinceContact,
 }
 
-/// Sanitized live selected-Event status snapshot.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Occupancy-only warning against the configured ordinary operation limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventOperationCapacityWarning {
+    Ok,
+    Warning,
+    Critical,
+    Exhausted,
+}
+
+/// Candidate ledger headroom, independent of the approved evaluation profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventOperationCapacity {
+    pub stats: EventOperationStats,
+    pub limits: EventOperationLimits,
+    pub ordinary_remaining: u64,
+    pub emergency_remaining: u64,
+    pub warning: EventOperationCapacityWarning,
+}
+
+impl EventOperationCapacity {
+    pub fn new(stats: EventOperationStats, limits: EventOperationLimits) -> Self {
+        const ACTIVE_BYTES: u64 = 162;
+        // EventOperationLimits construction checked both reserve arithmetic
+        // and subtraction. Retained usage may exceed a lower reopened limit.
+        let ordinary_records = limits.ordinary_record_limit();
+        let ordinary_bytes = limits.max_logical_bytes() - limits.emergency_byte_reserve();
+        let ordinary_remaining = ordinary_records
+            .saturating_sub(stats.records_total)
+            .min(ordinary_bytes.saturating_sub(stats.logical_bytes) / ACTIVE_BYTES);
+        let total_remaining = limits
+            .max_records()
+            .saturating_sub(stats.records_total)
+            .min(
+                limits
+                    .max_logical_bytes()
+                    .saturating_sub(stats.logical_bytes)
+                    / ACTIVE_BYTES,
+            );
+        let at_percent = |percent: u128| {
+            u128::from(stats.records_total) * 100 >= u128::from(ordinary_records) * percent
+                || u128::from(stats.logical_bytes) * 100 >= u128::from(ordinary_bytes) * percent
+        };
+        let warning = if ordinary_remaining == 0 {
+            EventOperationCapacityWarning::Exhausted
+        } else if at_percent(90) {
+            EventOperationCapacityWarning::Critical
+        } else if at_percent(70) {
+            EventOperationCapacityWarning::Warning
+        } else {
+            EventOperationCapacityWarning::Ok
+        };
+        Self {
+            stats,
+            limits,
+            ordinary_remaining,
+            emergency_remaining: total_remaining.saturating_sub(ordinary_remaining),
+            warning,
+        }
+    }
+}
+
+/// Sanitized live selected-Event status snapshot. When the operation audit is
+/// `Failed`, store usage, operation counts/bytes, and pending deliveries are
+/// the last successfully read figures, not current or trusted capacity. Peer,
+/// synchronization, emission, and audit observations remain actor-current.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SelectedEventStatus {
+    /// One background audit; traversal counts include ledger and reverse rows.
+    pub event_operation_audit: EventOperationAuditStatus,
     pub sync: EventSyncStatus,
     pub authenticated_contacts: u64,
     pub failed_contact_attempts: u64,
@@ -575,8 +647,11 @@ pub struct SelectedEventStatus {
     pub emission_policy: EventEmissionPolicy,
     pub store_usage: AggregateStoreUsage,
     pub store_limits: StoreLimits,
-    pub event_operations: u64,
-    pub event_operation_bytes: u64,
+    pub event_operation_capacity: EventOperationCapacity,
+    /// New permanent records committed in the preceding monotonic 60 seconds / 60.
+    pub event_operation_rolling_accept_rate: f64,
+    /// Ceiling of remaining / rate, saturated to u64; zero without observations.
+    pub event_operation_estimated_seconds_to_exhaustion: u64,
     pub pending_deliveries: u64,
 }
 
@@ -875,6 +950,7 @@ pub struct SelectedEventNode {
     verifier_head: Option<(u64, ControlTransferId)>,
     custody_clock: NodeCustodyClock,
     event_route_cache: Arc<AuthenticatedEventRouteCache>,
+    operation_retirement_quarantined: bool,
 }
 
 impl SelectedEventNode {
@@ -990,21 +1066,14 @@ impl SelectedEventNode {
             .require_process_exclusive_lock()
             .map_err(|error| application_error("open", error.into()))?;
         let StartupEventVerification {
-            mut verifier,
-            mut historical_verifier,
+            verifier,
+            historical_verifier,
             cache: event_route_cache,
             policy,
         } = open_startup_event_verifier_and_cache(&store, &mission)
             .map_err(|error| application_error("open", error))?;
         ensure_principal_active(&store, verifier.identity())
             .map_err(|error| application_error("open", error))?;
-        migrate_legacy_event_operation_witnesses(
-            &store,
-            &policy,
-            &mut verifier,
-            &mut historical_verifier,
-        )
-        .map_err(|error| application_error("open", error))?;
         drop(historical_verifier);
         let verifier_head = store
             .control_head()
@@ -1032,6 +1101,7 @@ impl SelectedEventNode {
             verifier_head,
             custody_clock,
             event_route_cache,
+            operation_retirement_quarantined: false,
         };
         selected.current_policy("open")?;
         Ok(selected)
@@ -1052,7 +1122,22 @@ impl SelectedEventNode {
             verifier_head,
             custody_clock,
             event_route_cache,
+            operation_retirement_quarantined: false,
         }
+    }
+
+    pub(crate) fn quarantine_operation_retirement(&mut self) {
+        self.operation_retirement_quarantined = true;
+    }
+
+    pub(crate) fn maintain_runtime_custody(
+        &self,
+        scope_quotas: &[CustodyQuota],
+    ) -> Result<(), NodeError> {
+        operation_audit_maintenance_result(
+            self.operation_retirement_quarantined,
+            drive_custody_maintenance(&self.store, &self.custody_clock, scope_quotas),
+        )
     }
 
     pub(crate) fn refresh_runtime_policy(
@@ -1461,7 +1546,7 @@ impl SelectedEventNode {
     }
 
     fn maintain_custody_for(&self, operation: &'static str) -> Result<(), ApplicationError> {
-        drive_custody_maintenance(&self.store, &self.custody_clock, &[])
+        self.maintain_runtime_custody(&[])
             .map_err(|error| application_error(operation, error))
     }
 
@@ -1778,6 +1863,21 @@ fn event_sequence(stored: &StoredEvent, operation: &'static str) -> Result<u64, 
         .ok_or_else(|| ApplicationError::new(ApplicationErrorKind::Integrity, operation))
 }
 
+fn operation_audit_maintenance_result(
+    quarantined: bool,
+    result: Result<(), NodeError>,
+) -> Result<(), NodeError> {
+    match result {
+        Err(NodeError::Store(StoreError::EventOperationRetirementInvariant(_))) if quarantined => {
+            // The compaction transaction aborted. Retain the untrusted rows,
+            // without repair; reads still enforce custody TTL/authorization.
+            // Unrelated storage/security errors propagate unchanged.
+            Ok(())
+        }
+        result => result,
+    }
+}
+
 fn application_error(operation: &'static str, error: NodeError) -> ApplicationError {
     let kind = match error {
         NodeError::Configuration(_) => ApplicationErrorKind::InvalidRequest,
@@ -1818,6 +1918,7 @@ pub(crate) fn runtime_application_error(
 
 fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
     match error {
+        StoreError::EventOperationAuditCancelled => ApplicationErrorKind::StateUnavailable,
         StoreError::Blob(error) => blob_store_error_kind(error),
         // The bridge foundation has no selected application surface yet. Any
         // bridge-store error reaching this classifier is therefore an internal
@@ -1920,7 +2021,9 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::RecordSubscriptionConflict
         | StoreError::BlobSubscriptionConflict => ApplicationErrorKind::Conflict,
         StoreError::EventOperationLimitExceeded { .. }
-        | StoreError::EventOperationByteLimitExceeded { .. } => {
+        | StoreError::EventOperationByteLimitExceeded { .. }
+        | StoreError::EventOperationMigrationAliasOverflow
+        | StoreError::EventOperationMigrationDestinationCapacity => {
             ApplicationErrorKind::OperationCapacity
         }
         StoreError::ItemLimitExceeded { .. }
@@ -1974,6 +2077,9 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::StoreInUse
         | StoreError::StoreZeroized(_) => ApplicationErrorKind::StateUnavailable,
         StoreError::SemanticVerification(_)
+        | StoreError::EventOperationMigrationMissingMissionBinding
+        | StoreError::EventOperationMigrationMissingAuthenticatedIntent
+        | StoreError::EventOperationMigrationFingerprintCollision
         | StoreError::StateVerification(_)
         | StoreError::RecordVerification(_)
         | StoreError::MissingAcceptanceMarker { .. }
@@ -1982,6 +2088,7 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::AccountingMismatch { .. }
         | StoreError::MissingAccountingMetadata { .. }
         | StoreError::SemanticInvariant(_)
+        | StoreError::EventOperationRetirementInvariant(_)
         | StoreError::StateInvariant(_)
         | StoreError::RecordInvariant(_)
         | StoreError::BlobInvariant(_)
@@ -2091,13 +2198,11 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
+    use super::*;
     use aster_mesh::{
         ProvisioningAccess, ProvisioningLoadReceipt, ProvisioningProtectionError,
         ProvisioningSecretStoreError, ReferenceProvisioner, UnprotectedProvisioning,
     };
-    use redb::{ReadableDatabase as _, ReadableTable as _};
-
-    use super::*;
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -2141,6 +2246,12 @@ mod tests {
     fn event_operation_capacity_has_a_distinct_application_kind() {
         for error in [
             StoreError::EventOperationLimitExceeded {
+                current: 64,
+                limit: 64,
+            },
+            StoreError::EventOperationMigrationAliasOverflow,
+            StoreError::EventOperationMigrationDestinationCapacity,
+            StoreError::EventOperationLimitExceeded {
                 current: 4_096,
                 limit: 4_096,
             },
@@ -2162,6 +2273,41 @@ mod tests {
             }),
             ApplicationErrorKind::ResourceLimit
         );
+        for error in [
+            StoreError::EventOperationMigrationMissingMissionBinding,
+            StoreError::EventOperationMigrationMissingAuthenticatedIntent,
+            StoreError::EventOperationMigrationFingerprintCollision,
+        ] {
+            assert_eq!(store_error_kind(&error), ApplicationErrorKind::Integrity);
+        }
+    }
+
+    #[test]
+    fn operation_audit_maintenance_quarantine_is_narrow_and_requires_failure() {
+        for quarantined in [false, true] {
+            let ledger_error = StoreError::EventOperationRetirementInvariant(Box::new(
+                StoreError::SemanticInvariant("ledger retirement"),
+            ));
+            assert_eq!(
+                operation_audit_maintenance_result(quarantined, Err(ledger_error.into())).is_ok(),
+                quarantined
+            );
+            for error in [
+                StoreError::Backend(redb::Error::Io(std::io::Error::other("storage"))),
+                StoreError::Custody(CustodyStoreError::Invariant("custody")),
+                StoreError::ControlPolicyUnsettled { pending: 1 },
+                StoreError::SemanticInvariant("outside ledger retirement"),
+                StoreError::AccountingMismatch {
+                    field: "outside ledger retirement",
+                    durable: 1,
+                    reconstructed: 0,
+                },
+            ] {
+                assert!(
+                    operation_audit_maintenance_result(quarantined, Err(error.into())).is_err()
+                );
+            }
+        }
     }
 
     struct TestRoot(PathBuf);
@@ -2383,6 +2529,38 @@ mod tests {
                 .expect("reload persisted test mission after dropping its owner"))
         })
         .expect("open selected Event node")
+    }
+
+    #[test]
+    fn event_operation_quota_is_terminal_and_exact_retry_survives_exhaustion() {
+        use aster_redb_store::{BlobDepotLimits, EventOperationLimits, StoreLimits};
+        for (records, bytes) in [(2, 1_000), (10, 324)] {
+            let root = TestRoot::new("operation-capacity-classification");
+            let mut node = selected_node(&root);
+            node.store = Arc::new(
+                Store::open_with_limits_and_operation_limits_for_mission(
+                    root.path().join("limited.redb"),
+                    StoreLimits::default(),
+                    BlobDepotLimits::DEFAULT,
+                    EventOperationLimits::new(records, bytes, 1).expect("limits"),
+                    node.mission.mission_authority_id(),
+                )
+                .expect("limited store"),
+            );
+            let first_request = request(b"first", "ops.alpha", b"asset", b"ready");
+            let first = node
+                .publish(first_request.clone())
+                .expect("first ordinary slot");
+            let error = node
+                .publish(request(b"second", "ops.alpha", b"asset", b"ready"))
+                .expect_err("new key at operation capacity");
+            assert_eq!(error.kind(), ApplicationErrorKind::OperationCapacity);
+            let retry = node
+                .publish(first_request)
+                .expect("exact retry at capacity");
+            assert_eq!(retry.id, first.id);
+            assert!(!retry.inserted);
+        }
     }
 
     #[test]
@@ -2848,10 +3026,34 @@ mod tests {
                 "expired bytes held by a lease must remain application-invisible"
             );
 
+            assert_eq!(
+                node.publish_with_options(publication.clone(), options)
+                    .expect_err("exact retry while the lease retains bytes")
+                    .kind(),
+                ApplicationErrorKind::ExpiredOrRetired,
+            );
+            let mut changed_held = publication.clone();
+            changed_held.payload = b"changed-while-held".to_vec();
+            assert_eq!(
+                node.publish_with_options(changed_held, options)
+                    .expect_err("changed retry while the lease retains bytes")
+                    .kind(),
+                ApplicationErrorKind::Conflict
+            );
             node.store
                 .release_transfer_lease(lease.id)
                 .expect("release held lease");
             node.maintain_custody().expect("finalize retirement");
+            assert_eq!(
+                node.store
+                    .event_operation_resolution(&operation)
+                    .expect("compact resolution"),
+                Some(
+                    aster_redb_store::EventOperationResolution::RetiredOperation {
+                        reason: aster_redb_store::CustodyRetirementReason::Expired,
+                    }
+                )
+            );
             let retired = node.store.event_stats().expect("retired Event stats");
             assert_eq!(retired.events, 0);
             assert_eq!(retired.retiring_events, 0);
@@ -3036,226 +3238,6 @@ mod tests {
                 .items
                 .len(),
             1
-        );
-    }
-
-    #[test]
-    fn legacy_operation_binds_retained_plaintext_before_any_randomized_reseal() {
-        const EVENT_OPERATIONS: redb::TableDefinition<&[u8], &[u8]> =
-            redb::TableDefinition::new("aster.event-operations.v1");
-        const EVENT_OPERATION_WITNESSES: redb::TableDefinition<&[u8], &[u8]> =
-            redb::TableDefinition::new("aster.event-operation-witnesses.v1");
-        const METADATA: redb::TableDefinition<&str, u64> =
-            redb::TableDefinition::new("aster.metadata.v1");
-        const EVENT_OPERATION_TOTAL_BYTES: &str = "semantic_event_operation_total_bytes";
-        let root = TestRoot::new("legacy-operation-intent-upgrade");
-        let publication = request(b"ops/legacy", "ops.alpha", b"asset", b"retained");
-        let first = {
-            let mut node = selected_node(&root);
-            node.publish(publication.clone())
-                .expect("initial publication")
-        };
-
-        // Recreate the accepted v1 operation encoding: version, exact transfer
-        // ID, and absent predecessor. The v2 plaintext/intent digests are
-        // deliberately removed while the original Event bytes remain live.
-        let database = redb::Database::open(root.path().join(STORE_FILE))
-            .expect("open operation table for legacy fixture");
-        let write = database.begin_write().expect("legacy fixture write");
-        let removed_operation_bytes = {
-            let mut operations = write.open_table(EVENT_OPERATIONS).expect("operations");
-            let current = operations
-                .get(publication.operation_key.as_slice())
-                .expect("read operation")
-                .expect("operation row")
-                .value()
-                .to_vec();
-            assert_eq!(current[0], 2, "fixture starts from canonical v2");
-            assert_eq!(current[33], 0, "fixture operation has no predecessor");
-            let mut legacy = Vec::with_capacity(34);
-            legacy.push(1);
-            legacy.extend_from_slice(&current[1..34]);
-            operations
-                .insert(publication.operation_key.as_slice(), legacy.as_slice())
-                .expect("install legacy row");
-            u64::try_from(current.len() - legacy.len()).expect("fixture size difference fits u64")
-        };
-        {
-            let mut metadata = write.open_table(METADATA).expect("metadata");
-            let operation_bytes = metadata
-                .get(EVENT_OPERATION_TOTAL_BYTES)
-                .expect("read operation accounting")
-                .expect("operation accounting")
-                .value();
-            metadata
-                .insert(
-                    EVENT_OPERATION_TOTAL_BYTES,
-                    operation_bytes
-                        .checked_sub(removed_operation_bytes)
-                        .expect("legacy row is smaller"),
-                )
-                .expect("adjust operation accounting for legacy fixture");
-        }
-        write.commit().expect("commit legacy fixture");
-        drop(database);
-
-        let mut reopened = SelectedEventNode::open_unprotected_reference(
-            root.path(),
-            root.path().join("mission.unprotected-reference.bundle"),
-        )
-        .expect("reopen legacy operation");
-        let policy = reopened
-            .store
-            .control_policy_snapshot()
-            .expect("settled proactive-migration policy");
-        assert!(
-            reopened
-                .store
-                .unbound_legacy_event_operations_with_policy(&policy, None, MAX_EVENT_PAGE)
-                .expect("scan proactive legacy recovery")
-                .is_empty(),
-            "stopped-node open must bind the retained plaintext witness before replay"
-        );
-        let retried = reopened
-            .publish(publication.clone())
-            .expect("bind exact retained plaintext");
-        assert!(!retried.inserted);
-        assert_eq!(retried.id, first.id);
-        assert_eq!(retried.publisher_counter, first.publisher_counter);
-        assert_eq!(retried.event_sequence, first.event_sequence);
-        assert_eq!(
-            reopened
-                .query(EventQuery::default())
-                .expect("query one exact Event")
-                .items
-                .len(),
-            1
-        );
-        let mut changed = publication;
-        changed.payload = b"changed".to_vec();
-        assert_eq!(
-            reopened
-                .publish(changed)
-                .expect_err("changed legacy operation intent")
-                .kind(),
-            ApplicationErrorKind::Conflict
-        );
-        drop(reopened);
-
-        let database = redb::Database::open(root.path().join(STORE_FILE))
-            .expect("reopen witnessed operation table");
-        let read = database.begin_read().expect("read witnessed operation");
-        let operations = read.open_table(EVENT_OPERATIONS).expect("operations");
-        assert_eq!(
-            operations
-                .get(b"ops/legacy".as_slice())
-                .expect("read witnessed operation")
-                .expect("witnessed row")
-                .value()[0],
-            1,
-            "transfer-keyed witnesses deliberately preserve aliasable v1 operation rows"
-        );
-        let witnesses = read
-            .open_table(EVENT_OPERATION_WITNESSES)
-            .expect("operation witnesses");
-        let witness_rows = witnesses
-            .iter()
-            .expect("iterate operation witnesses")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("read operation witnesses");
-        assert_eq!(witness_rows.len(), 1);
-        assert_eq!(witness_rows[0].1.value()[0], 1);
-    }
-
-    #[test]
-    fn proactive_legacy_migration_pages_past_a_full_alias_page() {
-        const EVENT_OPERATIONS: redb::TableDefinition<&[u8], &[u8]> =
-            redb::TableDefinition::new("aster.event-operations.v1");
-        const METADATA: redb::TableDefinition<&str, u64> =
-            redb::TableDefinition::new("aster.metadata.v1");
-        const EVENT_OPERATION_COUNT: &str = "semantic_event_operation_count";
-        const EVENT_OPERATION_TOTAL_BYTES: &str = "semantic_event_operation_total_bytes";
-        let root = TestRoot::new("legacy-operation-page-and-aliases");
-        let first = request(b"ops/page/0-first", "ops.alpha", b"first", b"one");
-        let second = request(b"ops/page/z-final", "ops.alpha", b"second", b"two");
-        {
-            let mut node = selected_node(&root);
-            node.publish(first.clone()).expect("publish first Event");
-            node.publish(second.clone()).expect("publish second Event");
-        }
-
-        let database = redb::Database::open(root.path().join(STORE_FILE))
-            .expect("open operation table for paged fixture");
-        let write = database.begin_write().expect("paged fixture write");
-        let (operation_count, operation_bytes) = {
-            let mut operations = write.open_table(EVENT_OPERATIONS).expect("operations");
-            let legacy_row = |key: &[u8]| {
-                let current = operations
-                    .get(key)
-                    .expect("read operation")
-                    .expect("operation row")
-                    .value()
-                    .to_vec();
-                assert_eq!(current[0], 2);
-                assert_eq!(current[33], 0);
-                let mut legacy = Vec::with_capacity(34);
-                legacy.push(1);
-                legacy.extend_from_slice(&current[1..34]);
-                legacy
-            };
-            let first_legacy = legacy_row(&first.operation_key);
-            let second_legacy = legacy_row(&second.operation_key);
-            operations
-                .insert(first.operation_key.as_slice(), first_legacy.as_slice())
-                .expect("downgrade first operation");
-            operations
-                .insert(second.operation_key.as_slice(), second_legacy.as_slice())
-                .expect("downgrade second operation");
-            for index in 0..MAX_EVENT_PAGE {
-                let alias = format!("ops/page/a{index:04}");
-                operations
-                    .insert(alias.as_bytes(), first_legacy.as_slice())
-                    .expect("insert legacy alias");
-            }
-            operations
-                .iter()
-                .expect("iterate operation fixture")
-                .try_fold((0u64, 0u64), |(count, bytes), row| {
-                    let (key, value) = row.expect("operation row");
-                    let row_bytes = u64::try_from(key.value().len() + value.value().len())
-                        .expect("operation row usage fits u64");
-                    Some((count.checked_add(1)?, bytes.checked_add(row_bytes)?))
-                })
-                .expect("operation fixture accounting fits")
-        };
-        {
-            let mut metadata = write.open_table(METADATA).expect("metadata");
-            metadata
-                .insert(EVENT_OPERATION_COUNT, operation_count)
-                .expect("replace operation count");
-            metadata
-                .insert(EVENT_OPERATION_TOTAL_BYTES, operation_bytes)
-                .expect("replace operation bytes");
-        }
-        write.commit().expect("commit paged legacy fixture");
-        drop(database);
-
-        let reopened = SelectedEventNode::open_unprotected_reference(
-            root.path(),
-            root.path().join("mission.unprotected-reference.bundle"),
-        )
-        .expect("proactively recover every legacy page");
-        let policy = reopened
-            .store
-            .control_policy_snapshot()
-            .expect("settled recovery policy");
-        assert!(
-            reopened
-                .store
-                .unbound_legacy_event_operations_with_policy(&policy, None, MAX_EVENT_PAGE)
-                .expect("scan remaining legacy operations")
-                .is_empty(),
-            "exclusive paging must reach the distinct transfer beyond a full alias page"
         );
     }
 
