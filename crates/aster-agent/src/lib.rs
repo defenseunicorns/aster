@@ -6,6 +6,7 @@
 //! `SelectedEventHandle`; it does not provide runtime module selection, a
 //! plugin ABI, another durable authority, or a second service executable.
 
+#![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 
 pub mod config;
@@ -27,6 +28,10 @@ pub use error::{PublicOperation, connect_application_error, public_error};
 use aster_node::application::SelectedEventHandle;
 
 /// Generated, repository-owned application protocol.
+///
+/// See the crate-level examples for authenticated Aster usage. The generator's
+/// ignored snippets contain placeholders, including a response `name` field
+/// that does not exist in `GetStatusResponse`.
 pub mod proto {
     connectrpc::include_generated!();
 }

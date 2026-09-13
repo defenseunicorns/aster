@@ -176,6 +176,12 @@ provisioning, or the customer supervisor.
 
 ## Authenticate application calls
 
+Rust callers can use the [compile-checked API examples](../../crates/aster-agent/README.md)
+for authenticated Connect and gRPC clients, borrowed and owned responses, and
+the development/migration server entry point. Enable the `aster-agent` `client`
+feature for the generated Rust client. Customer binaries use the provider-composed
+runtime described above.
+
 Generate a normal client from the local authoritative schema at
 [`proto/aster/application/v1alpha1/aster.proto`](../../proto/aster/application/v1alpha1/aster.proto).
 The module needs no Buf Schema Registry. Point it at the configured application

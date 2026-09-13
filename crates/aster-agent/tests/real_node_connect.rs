@@ -194,6 +194,34 @@ fn connect_client_uses_the_real_live_event_authority() {
         assert_eq!(status.identity.len(), 32);
         assert_eq!(status.mission_authority.len(), 32);
 
+        // Exercise the generated Connect client with authentication as well as
+        // the gRPC client above. Borrow actual Aster fields before consuming
+        // the response into an independently owned message.
+        let connect_client = api::AsterApplicationServiceClient::new(
+            HttpClient::plaintext(),
+            ClientConfig::new(base_uri.parse().expect("Connect client URI"))
+                .with_protocol(Protocol::Connect)
+                .with_default_header(
+                    "authorization",
+                    format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+                ),
+        );
+        let response = connect_client
+            .get_status(api::GetStatusRequest::default())
+            .await
+            .expect("read status over authenticated Connect");
+        {
+            let view = response.view();
+            let identity: &[u8] = view.identity;
+            let authority: &[u8] = view.mission_authority;
+            assert_eq!(identity, status.identity);
+            assert_eq!(authority, status.mission_authority);
+        }
+        let owned: api::GetStatusResponse = response.into_owned();
+        drop(connect_client);
+        assert_eq!(owned.identity, status.identity);
+        assert_eq!(owned.mission_authority, status.mission_authority);
+
         let subscription = client
             .create_event_subscription(api::CreateEventSubscriptionRequest {
                 operation_key: b"connect-real-subscription".to_vec(),
