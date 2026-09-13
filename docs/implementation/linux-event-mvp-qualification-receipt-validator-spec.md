@@ -246,16 +246,17 @@ it conditional.
 | Network conditions | Profile §§Topology, Acceptance; Annex §§7–9 | Frozen sanitized network-condition record | Exact digest and scenario binding; no invented bandwidth/loss/NAT claim |
 | Canonical scenario set | Profile §§Topology, Capacity matrix, Acceptance; Annex §§8–9 | Frozen scenario-set manifest | Per-scenario authority, scope, topic, durable subscription, participants, state-directory commitment, config, peer/device/network bindings, artifact, workload label, and start/end identity agree |
 | Discovery and carrier state | Profile §Topology; Annex §8 | Effective-config receipt | Discovery exactly off; direct IP enabled; relay state matches §6 |
-| Store and application limits | Profile §Capacity and workload matrix; Annex §8 | Effective status/config receipts | 10,000 items; 67,108,864 bytes; one total app connection; eight node-global in-flight operations |
+| Store and application limits | Profile §Capacity and workload matrix; Annex §8 | Effective status/config receipts | 10,000 aggregate store items; 67,108,864 aggregate store bytes; ledger accounting separate; one total app connection; eight node-global in-flight operations |
+| Operation-ledger configuration | Profile §§Durable publish-operation containment, Capacity and workload matrix; Annex §§8, 9, 11 | Effective configuration/status and audit receipts | 1,000,000 permanent records; 201,326,592 logical bytes; 10,000-record emergency reserve; fixed 64-active-alias bound; values agree across candidate, status, and receipts |
 | Harness limits | Profile §Capacity and workload matrix; Annex §8 | Harness manifest and run receipts | One client; pages 16; scans 128; unacknowledged maximum 256; payloads 0–65,536 bytes |
 | Emission mode | Profile §Emission modes; Annex §8 | Config/status/restart receipts | Only `normal`/`receive_only`; configured equals effective; restart for change; no radio-silence claim |
-| Operation-map boundary | Profile §Durable publish-operation containment; Annex §§8, 9, 11 | Status and capacity receipts | Warning no later than 512; profile stop at 1,024; keys 1–256 bytes; exact retry adds zero; hard caps remain separate |
+| Operation-ledger boundary | Profile §Durable publish-operation containment; Annex §§8, 9, 11 | Status, audit, and capacity receipts | Warning no later than 512; profile stop at 1,024; keys 1–256 bytes; exact retry adds zero; active records compact only to permanent fences; configured caps remain separate |
 | Mission timing | Profile §§Intended use, Capacity matrix; Annex §§8–9 | Workload receipt timestamps | Exactly 24 hours disconnected publication; no more than 24 hours later convergence/evidence; publication stops at 24 hours |
-| Authenticated observability | Profile §Minimum observability and failure contract; Annex §§8, 9, 11 | Authenticated status and sanitized error receipts | Configured/effective mode; item/payload use and limits; operation rows/bytes/ceilings/boundary/headroom; pending-delivery/saturation; contact counts; bounded peer outcome; no sensitive unauthenticated detail |
+| Authenticated observability | Profile §Minimum observability and failure contract; Annex §§8, 9, 11 | Authenticated status and sanitized error receipts | Configured/effective mode; item/payload use and limits; operation total/active/retired/reverse rows, bytes, configured ceilings, ordinary/emergency and profile headroom; profile warning at 512; configured-ledger state `OK` below 70%, `WARNING` at 70%, `CRITICAL` at 90%, and `EXHAUSTED` when no ordinary active record fits; 60-second restart-local rate/estimate remain observational; audit state/progress; pending-delivery/saturation; contact counts; bounded peer outcome; no sensitive unauthenticated detail |
 | Packet/log/error inspection | Profile §§Metadata exposure budget, Acceptance condition 12; Annex §9 condition 12 | Candidate-bound inspection record, inspected-surface manifest, metadata-budget reference, and immutable receipt | Exact candidate/artifact/provider/configuration/inventory/scenario bindings; explicit packet/log/error surfaces and procedure digest; `pass`/`fail` or typed blocker; no forbidden plaintext or credentials found within the stated budget; claim no broader than the retained inspected surfaces |
 | Four workload rows | Profile §Capacity and workload matrix; Annex §9 | Four immutable workload receipts or typed blockers | Exact row names, nodes, payloads, counts/rates/durations, start/end, candidate/inventory/config bindings |
 | Thirteen acceptance conditions | Profile §Acceptance and retained evidence; Annex §9 | Condition-specific receipts or typed blockers | One unambiguous record per condition; issue requires all executed pass against exact candidate |
-| Crash/restart/state preservation | Profile §§Event and retry semantics, Resource and lifecycle targets, Acceptance; Annex §§3, 9 conditions 5, 8, 10 | Forced-loss, same-version restart, peerless reopen, reinstall/rollback, uninstall/state receipts | Existing state directory retained; durable Events, mappings, subscriptions, pending deliveries, acknowledgements, and controls preserved; no snapshot restore/downgrade |
+| Crash/restart/state preservation | Profile §§Event and retry semantics, Resource and lifecycle targets, Acceptance; Annex §§3, 9 conditions 5, 8, 10 | Forced-loss, same-version restart, peerless reopen, reinstall/rollback, uninstall/state receipts | Existing state directory retained; durable Events, active/retired ledger records and fences, subscriptions, pending deliveries, acknowledgements, and controls preserved; no snapshot restore/downgrade |
 | Evidence classifications | Profile §Acceptance; Annex §10 | Receipt index | Exact evidence type and one independent environment class; no class promotion |
 | Resource measurements | Profile §Resource and lifecycle targets; Annex §11 | Per-node/per-scenario measurement receipts | Exact unit/method/node/workload/start/end/result/reference/digest and threshold treatment |
 | Receipt index | Annex §12 | Immutable index and referenced receipt bytes | Unique IDs; reference/size/media/digest; producer/tool/time; claim/non-claims; replay reference; exact candidate binding |
@@ -275,7 +276,7 @@ The validator compares values, never derives replacements:
 | API boundary | 2 nodes; payloads 0, 4 KiB, 64 KiB | Exactly one Event at each boundary; durable publish, transfer, query, delivery, and acknowledgement evidence; publishing-node assignment awaits the machine-schema decision below |
 | Small topology | 2 nodes; 4 KiB | Exactly 10 Events total at 1 Event/s; direct coverage and explicit relay disposition; the profile calls this row “Two-node topology,” so a canonical machine label awaits owner freeze |
 | Offline soak | 2 nodes; 4 KiB | 10 Events/hour/node for exactly 24 hours disconnected; 240 accepted local operations/node; sustained publication stops at the boundary; reconnection/evidence completes within the following 24 hours |
-| Capacity-warning probe | 2 nodes; 4 KiB | 512 distinct local operations plus one exact retry; warning no later than 512; retry adds zero rows/bytes attributable to a new mapping; per-node operation and retry assignment awaits owner freeze |
+| Capacity-warning probe | 2 nodes; 4 KiB | 512 distinct local operations plus one exact retry; warning no later than 512; retry adds zero ledger rows/bytes; per-node operation and retry assignment awaits owner freeze |
 
 Each row starts from a fresh zero-workload state directory while retaining its
 provisioning controls. Replacing a state directory to reset a lifetime counter,
@@ -298,10 +299,10 @@ reference/digest, workload or scenario ID, start/end state, result, and receipt:
 | Deployment memory | `>= 1 GiB`, interpretation pending owner decision below |
 | Initial state-path free space | `>= 256 MiB` at each scenario start |
 | State growth and final free space | measured; no added pass/fail threshold |
-| Logical item use | measured against 10,000 aggregate and 5,840 ordinary slots; 720 is only the two-node soak projection |
+| Logical item use | measured against 10,000 aggregate and 5,840 ordinary store slots; 480 Events is only the two-node soak projection; ledger rows are separate |
 | Logical byte use | measured against 67,108,864 aggregate and 50,266,112 ordinary logical bytes |
-| Operation rows/bytes | measured; 4,096-row/512-KiB hard ceilings and 1,024 profile boundary kept distinct |
-| Operation headroom/warning | non-negative audited headroom; warning no later than 512 |
+| Operation-ledger rows/bytes | total/active/retired/reverse rows and logical bytes measured; configured 1,000,000-record/201,326,592-byte ceilings, 10,000-record emergency reserve, and 1,024 profile boundary kept distinct |
+| Operation headroom/warning/audit | non-negative ordinary/emergency and profile headroom; profile warning no later than 512; configured-ledger state `OK` below 70%, `WARNING` at 70%, `CRITICAL` at 90%, and `EXHAUSTED` when no ordinary active record fits; completed healthy bounded audit with consistent progress/total; 60-second restart-local rate/estimate are observation-only |
 | Energy | measured and reported; no v0.1 pass/fail threshold |
 
 Binary units must be frozen before implementation (`KiB`, `MiB`, and `GiB`
@@ -463,13 +464,13 @@ findings unless multiple errors are inherently coupled.
 | `QVP006` | Discovery enabled or effective state missing | Discovery profile deviation |
 | `QVP007` | Direct disabled, public/default relay, WebPKI, relay-only, multiple relays, or silent relay omission | Carrier profile deviation |
 | `QVP008` | More than one mission authority, scope, topic, or durable subscription per scenario | Scenario shape deviation |
-| `QVP009` | Wrong storage, connection, in-flight, page, scan, unacknowledged, or payload limit | Limit deviation |
+| `QVP009` | Wrong aggregate storage, operation-ledger, reserve, connection, in-flight, page, scan, unacknowledged, or payload limit | Limit deviation |
 | `QVP010` | Emission mode outside allowed values, live change, mismatch, or radio-silence claim | Emission contract deviation |
 | `QVP011` | Protocol not 6, profile/suite not `0x0001`, fallback, or multiple roots/signers | Mission-policy deviation |
 | `QVP012` | Mission and relay authority are conflated | Authority-separation failure |
 | `QVP013` | Required API method missing/renamed, or Go evidence presented without the Rust-server boundary | API-contract deviation |
 | `QVP014` | Service identity is privileged, listener is not loopback-only, namespace boundary is missing, or host port/ingress/tunnel/unrelated sidecar is present | Service-exposure deviation |
-| `QVP015` | Required authenticated status field is absent/mismatched, or unauthenticated health/error contains detailed identifier/coordinate data | Observability/privacy deviation |
+| `QVP015` | Required authenticated status or ledger-audit field is absent/mismatched, or unauthenticated health/error contains detailed identifier/coordinate data | Observability/privacy deviation |
 | `QVP016` | `/livez` or `/readyz` is detail-bearing, bearer authentication is absent on the application/status boundary, `SIGHUP` changes anything beyond bearer token, or `SIGINT`/`SIGTERM` lacks bounded drain/shutdown evidence | Health/authentication/signal deviation |
 | `QVP017` | Invalid configuration, credentials, provider state, mission profile/policy, or durable state reaches readiness instead of failing closed | Startup fail-closed violation |
 
@@ -481,16 +482,16 @@ findings unless multiple errors are inherently coupled.
 | `QVW002` | API row changes node count, payload set, or one-Event-per-boundary count | API-boundary deviation |
 | `QVW003` | Small-topology row uses per-node 10 Events, wrong payload, count, or rate | Small-topology deviation |
 | `QVW004` | Soak is shorter/longer, restarts calendar, publishes after 24 hours, changes rate/payload/node count, omits intervening restart, convergence, exact gaps, at-least-once redelivery, acknowledgement, or peerless reopen, or exceeds convergence window | Soak deviation |
-| `QVW005` | Capacity probe changes 512 operations, omits exact retry, warns late, or grows mapping on retry | Capacity-probe deviation |
+| `QVW005` | Capacity probe changes 512 operations, omits exact retry, warns late, grows the ledger on retry, or omits a completed healthy audit | Capacity-probe deviation |
 | `QVW006` | New publication continues beyond 1,024 or state directory is replaced as recovery | Profile-lifetime violation |
-| `QVW007` | 1,024 is reported as the generic hard store cap or 4,096/512 KiB is used to widen profile workload | Capacity semantic conflation |
-| `QVW008` | Hard-cap engineering result is classified as ordinary profile workload | Evidence-class violation |
+| `QVW007` | 1,024 is reported as the generic ledger cap or the configured 1,000,000-record/192-MiB capacity is used to widen the profile workload | Capacity semantic conflation |
+| `QVW008` | Configured-cap engineering result is classified as ordinary profile workload or production qualification | Evidence-class violation |
 | `QVW009` | Thresholded resource is missing, wrong unit, wrong node/scenario, or outside limit | Resource rejection |
 | `QVW010` | Energy has a pass/fail threshold or state growth invents a threshold | Invented profile value |
-| `QVW011` | 720 projected items are presented as complete audited composition or plaintext bytes as physical growth | Projection substituted for measurement |
+| `QVW011` | 480 projected Event items or 240 separate operation records are presented as complete audited composition, ledger rows are charged to the aggregate store, or plaintext bytes are used as physical growth | Projection substituted for measurement |
 | `QVW012` | Initial state-path free space is taken from unbound root-filesystem inventory observation | Unbound storage preflight |
-| `QVW013` | Exact retry changes durable result or mapping count, or the same operation key is reused with changed intent without conflict | Retry/changed-intent violation |
-| `QVW014` | Crash/restart/reinstall/rollback/uninstall uses a replaced or snapshot-restored state directory, loses durable Events/mappings/subscriptions/deliveries/acks/controls, or uses another artifact | State-preservation violation |
+| `QVW013` | Exact retry changes durable result or ledger count, a retired exact retry is not classified missing-durable-object, changed retired intent does not conflict, or an operation key is rebound | Retry/changed-intent violation |
+| `QVW014` | Crash/restart/reinstall/rollback/uninstall uses a replaced or snapshot-restored state directory, loses durable Events/ledger records or fences/subscriptions/deliveries/acks/controls, or uses another artifact | State-preservation violation |
 
 ### 8.5 Results, blockers, evidence classes, and gate order
 
@@ -551,24 +552,28 @@ Generic-schema acceptance and v0.1 rejection must be tested together for broader
 values that are legal generically but outside v0.1. This proves profile overlay
 separation without narrowing the generic schema.
 
-## 9. Decisions required before implementation
+## 9. Frozen inputs and decisions required before implementation
 
 No implementation may invent the following values or treat current planning
-text as a new approval.
+text as a new approval. Explicitly frozen inputs below are mandatory; remaining
+owner decisions must be approved before their checks are implemented.
 
-### 9.1 Capacity semantics
+### 9.1 Frozen operation-ledger semantics
 
-The accepted profile currently defines 512 as an actionable-warning boundary,
-1,024 distinct accepted operation keys as an operator/harness stop boundary,
-and 4,096 rows or 512 KiB as separate implementation hard ceilings. The
-preserved meeting action plan instead asks for hard rejection at 1,024.
+The profile defines 512 as the actionable-warning boundary and 1,024 distinct
+accepted operation keys as the operator/harness stop boundary. The latter is
+not a generic runtime rejection. The candidate separately configures 1,000,000
+permanent records, 201,326,592 logical bytes, and a 10,000-record emergency
+reserve. Active records charge at most 162 logical bytes including their
+reverse-index key and compact only to permanent 67-byte retirement fences.
 
-Owner decision required: either confirm the accepted profile semantics for this
-validator, or approve a versioned profile/enforcement change defining the last
-accepted key, first rejected key, replay behavior, row-versus-byte precedence,
-terminal error, and restart persistence. Until then, implementation must not
-claim that the runtime hard-rejects at 1,024. This specification follows the
-currently accepted profile only and must be revised if that authority changes.
+The machine schema must bind those exact configured values, active/retired/
+reverse accounting, ordinary/emergency headroom, audit state/progress, exact
+retry and changed-intent behavior, and the distinct profile stop. A configured
+record or byte ceiling may reject new keys with the terminal operation-capacity
+reason; reaching 1,024 only ends the v0.1 workload. No implementation decision
+remains open for this distinction, and neither the candidate ceiling nor
+engineering saturation evidence may widen the successful profile workload.
 
 ### 9.2 E01 approval representation
 
