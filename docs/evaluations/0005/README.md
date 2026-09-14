@@ -126,7 +126,7 @@ required, and external disposition remains pending.
 - [`connectivity-comparison.md`](connectivity-comparison.md)
 - [`discovery-admission.md`](discovery-admission.md)
 - [`carrier-arm.md`](carrier-arm.md)
-- [Iroh/Patchbay connectivity observation and image provenance](iroh-patchbay-topology.md)
+- [Iroh/Patchbay connectivity observation and image provenance](results/iroh-patchbay.json)
 
 ### Replaceable components and product surface
 
