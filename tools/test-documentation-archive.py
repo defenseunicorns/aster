@@ -570,6 +570,52 @@ class DocumentationNavigationTests(unittest.TestCase):
         ):
             CHECKER.validate_navigation(self.root)
 
+    def test_reference_labels_allow_soft_break_next_to_delimiters(self) -> None:
+        for text in (
+            "[x][foo\n]\n\n[foo\n]: ../archive/\n",
+            "[x][\nfoo]\n\n[\nfoo]: ../archive/\n",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    CHECKER.markdown_destinations(text),
+                    ("../archive/",),
+                )
+                self.write("README.md", b"# Aster\n")
+                self.write("docs/README.md", text.encode())
+
+                with self.assertRaisesRegex(
+                    CHECKER.ArchiveViolation,
+                    "default navigation.*docs/README.md",
+                ):
+                    CHECKER.validate_navigation(self.root)
+
+    def test_reference_labels_allow_whitespace_crlf_and_escaped_brackets(self) -> None:
+        for text in (
+            "[x][ label ]\n\n[ label ]: ../archive/\n",
+            (
+                "[x][\r\n\tfoo\\[bar\\]\r\n]\r\n\r\n"
+                "[\r\n\tfoo\\[bar\\]\r\n]: ../archive/\r\n"
+            ),
+            "[x][foo\\]bar]\n\n[foo\\]bar]: ../archive/\n",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    CHECKER.markdown_destinations(text),
+                    ("../archive/",),
+                )
+
+    def test_malformed_reference_definitions_are_ignored(self) -> None:
+        for text in (
+            "[]: ../archive/\n",
+            "[ \t\n ]: ../archive/\n",
+            "[foo[bar]: ../archive/\n",
+            "[foo]:\n",
+            "[foo]:\n    ../archive/\n",
+            "[foo]: ../archive/ trailing\n",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(CHECKER.markdown_destinations(text), ())
+
     def test_repeated_cr_soft_breaks_in_reference_label_resolve_archive(self) -> None:
         text = "[x][a\rb\rc]\r\r[a\rb\rc]: ../archive/\r"
         self.assertEqual(CHECKER.markdown_destinations(text), ("../archive/",))

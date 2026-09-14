@@ -68,14 +68,7 @@ ARCHIVE_PREFIXES = {
 }
 DEFAULT_NAVIGATION = (Path("README.md"), Path("docs/README.md"))
 FENCE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})(.*)$")
-REFERENCE_DEFINITION = re.compile(
-    r"^[ ]{0,3}\[(?:\\.|[^\]\\\r\n])+"
-    r"(?:(?:\r\n|[\r\n])(?=[^\r\n]*\S)(?:\\.|[^\]\\\r\n])+)*"
-    r"\]:[ \t]*"
-    r"(?:(?:\r\n|[\r\n])[ \t]{0,3})?"
-    r"(?:<((?:\\.|[^>\\\r\n])*)>|((?:\\.|[^\s])+))",
-    re.MULTILINE,
-)
+REFERENCE_START = re.compile(r"^[ ]{0,3}\[", re.MULTILINE)
 MARKDOWN_ESCAPABLE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
 
 
@@ -605,6 +598,8 @@ def _inline_destination(text: str, start: int) -> tuple[str, int] | None:
                 return None
             return text[start:position], position
         position += 1
+    if depth == 0:
+        return text[start:position], position
     return None
 
 
@@ -735,14 +730,97 @@ def _inline_destinations(text: str) -> tuple[tuple[int, str], ...]:
     return tuple(destinations)
 
 
+def _reference_label_end(text: str, opening: int) -> int | None:
+    position = opening + 1
+    has_content = False
+    while position < len(text):
+        character = text[position]
+        if (
+            character == "\\"
+            and position + 1 < len(text)
+            and MARKDOWN_ESCAPABLE.fullmatch(text[position:position + 2])
+        ):
+            has_content = True
+            position += 2
+            continue
+        if character == "[":
+            return None
+        if character == "]":
+            return position if has_content else None
+        if character == "\n":
+            next_content = position + 1
+            while next_content < len(text) and text[next_content] in " \t":
+                next_content += 1
+            if next_content < len(text) and text[next_content] == "\n":
+                return None
+        elif not character.isspace():
+            has_content = True
+        position += 1
+    return None
+
+
+def _reference_destination_start(text: str, start: int) -> int | None:
+    position = start
+    while position < len(text) and text[position] in " \t":
+        position += 1
+    if position < len(text) and text[position] == "\n":
+        position += 1
+        indentation = 0
+        while position < len(text) and text[position] in " \t":
+            indentation += 1
+            position += 1
+        if indentation > 3:
+            return None
+    return position
+
+
+def _reference_definition(
+    text: str, opening: int
+) -> tuple[str, int] | None:
+    label_end = _reference_label_end(text, opening)
+    if label_end is None or not text.startswith("]:", label_end):
+        return None
+    destination_start = _reference_destination_start(text, label_end + 2)
+    if destination_start is None:
+        return None
+    parsed = _inline_destination(text, destination_start)
+    if parsed is None or not parsed[0]:
+        return None
+    destination, position = parsed
+    while position < len(text) and text[position] in " \t":
+        position += 1
+    if position == len(text) or text[position] == "\n":
+        return destination, position
+    title_end = _inline_title_end(text, position)
+    if title_end is None:
+        return None
+    position = title_end
+    while position < len(text) and text[position] in " \t":
+        position += 1
+    if position < len(text) and text[position] != "\n":
+        return None
+    return destination, position
+
+
+def _reference_destinations(text: str) -> tuple[tuple[int, str], ...]:
+    destinations: list[tuple[int, str]] = []
+    for match in REFERENCE_START.finditer(text):
+        opening = match.end() - 1
+        parsed = _reference_definition(text, opening)
+        if parsed is not None:
+            destination, _ = parsed
+            destinations.append(
+                (match.start(), _decoded_markdown_destination(destination))
+            )
+    return tuple(destinations)
+
+
 def markdown_destinations(text: str) -> tuple[str, ...]:
     """Return decoded link destinations outside Markdown code spans."""
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     visible = _without_inline_code(_without_fenced_code(normalized))
     destinations = list(_inline_destinations(visible))
-    for match in REFERENCE_DEFINITION.finditer(visible):
-        destination = match.group(1) if match.group(1) is not None else match.group(2)
-        destinations.append((match.start(), _decoded_markdown_destination(destination)))
+    destinations.extend(_reference_destinations(visible))
     destinations.sort(key=lambda item: item[0])
     return tuple(destination for _, destination in destinations)
 
