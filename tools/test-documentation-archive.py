@@ -559,6 +559,36 @@ class DocumentationNavigationTests(unittest.TestCase):
         ):
             CHECKER.validate_navigation(self.root)
 
+    def test_repeated_soft_breaks_in_reference_label_resolve_archive(self) -> None:
+        text = "[x][a\nb\nc]\n\n[a\nb\nc]: ../archive/\n"
+        self.assertEqual(CHECKER.markdown_destinations(text), ("../archive/",))
+        self.write("README.md", b"# Aster\n")
+        self.write("docs/README.md", text.encode())
+
+        with self.assertRaisesRegex(
+            CHECKER.ArchiveViolation, "default navigation.*docs/README.md"
+        ):
+            CHECKER.validate_navigation(self.root)
+
+    def test_repeated_cr_soft_breaks_in_reference_label_resolve_archive(self) -> None:
+        text = "[x][a\rb\rc]\r\r[a\rb\rc]: ../archive/\r"
+        self.assertEqual(CHECKER.markdown_destinations(text), ("../archive/",))
+        self.write("README.md", b"# Aster\r")
+        self.write("docs/README.md", text.encode())
+
+        with self.assertRaisesRegex(
+            CHECKER.ArchiveViolation, "default navigation.*docs/README.md"
+        ):
+            CHECKER.validate_navigation(self.root)
+
+    def test_blank_line_in_reference_label_is_not_a_definition(self) -> None:
+        text = "[x][a\n \nb]\n\n[a\n \nb]: ../archive/\n"
+        self.assertEqual(CHECKER.markdown_destinations(text), ())
+        self.write("README.md", b"# Aster\n")
+        self.write("docs/README.md", text.encode())
+
+        CHECKER.validate_navigation(self.root)
+
     def test_blank_line_after_inline_opener_is_not_a_link(self) -> None:
         text = "[x](\n\narchive/\n)\n"
         self.assertEqual(CHECKER.markdown_destinations(text), ())
@@ -580,6 +610,32 @@ class DocumentationNavigationTests(unittest.TestCase):
 
     def test_inline_title_content_is_not_scanned_as_navigation(self) -> None:
         text = '[safe](docs/current.md "[history](archive/)")\n'
+        self.assertEqual(
+            CHECKER.markdown_destinations(text),
+            ("docs/current.md",),
+        )
+        self.write("README.md", text.encode())
+        self.write("docs/README.md", b"# Documentation\n")
+
+        CHECKER.validate_navigation(self.root)
+
+    def test_repeated_soft_breaks_in_archive_link_title_still_fail(self) -> None:
+        text = '[x](archive/ "one\ntwo\nthree")\n'
+        self.assertEqual(CHECKER.markdown_destinations(text), ("archive/",))
+        self.write("README.md", text.encode())
+        self.write("docs/README.md", b"# Documentation\n")
+
+        with self.assertRaisesRegex(
+            CHECKER.ArchiveViolation, "default navigation.*README.md"
+        ):
+            CHECKER.validate_navigation(self.root)
+
+    def test_multiline_safe_title_consumes_link_shaped_final_line(self) -> None:
+        text = (
+            '[safe](docs/current.md "one  \n'
+            '\ttwo\t\n'
+            '[history](archive/)")\n'
+        )
         self.assertEqual(
             CHECKER.markdown_destinations(text),
             ("docs/current.md",),

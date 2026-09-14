@@ -70,8 +70,10 @@ DEFAULT_NAVIGATION = (Path("README.md"), Path("docs/README.md"))
 FENCE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})(.*)$")
 REFERENCE_DEFINITION = re.compile(
     r"^[ ]{0,3}\[(?:\\.|[^\]\\\r\n])+"
-    r"(?:\r?\n(?:\\.|[^\]\\\r\n])+)?\]:[ \t]*(?:\r?\n[ \t]{0,3})?"
-    r"(?:<((?:\\.|[^>\\\n])*)>|((?:\\.|[^\s])+))",
+    r"(?:(?:\r\n|[\r\n])(?=[^\r\n]*\S)(?:\\.|[^\]\\\r\n])+)*"
+    r"\]:[ \t]*"
+    r"(?:(?:\r\n|[\r\n])[ \t]{0,3})?"
+    r"(?:<((?:\\.|[^>\\\r\n])*)>|((?:\\.|[^\s])+))",
     re.MULTILINE,
 )
 MARKDOWN_ESCAPABLE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
@@ -611,23 +613,25 @@ def _inline_title_end(text: str, start: int) -> int | None:
         return None
     closing = ")" if text[start] == "(" else text[start]
     position = start + 1
-    line_endings = 0
     while position < len(text):
         if text[position] == "\\":
             position += 2
             continue
         if text.startswith("\r\n", position):
-            line_endings += 1
-            position += 2
+            line_end = position + 2
         elif text[position] in "\r\n":
-            line_endings += 1
-            position += 1
+            line_end = position + 1
         elif text[position] == closing:
             return position + 1
         else:
             position += 1
-        if line_endings > 1:
+            continue
+        next_content = line_end
+        while next_content < len(text) and text[next_content] in " \t":
+            next_content += 1
+        if next_content < len(text) and text[next_content] in "\r\n":
             return None
+        position = line_end
     return None
 
 
@@ -733,7 +737,8 @@ def _inline_destinations(text: str) -> tuple[tuple[int, str], ...]:
 
 def markdown_destinations(text: str) -> tuple[str, ...]:
     """Return decoded link destinations outside Markdown code spans."""
-    visible = _without_inline_code(_without_fenced_code(text))
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    visible = _without_inline_code(_without_fenced_code(normalized))
     destinations = list(_inline_destinations(visible))
     for match in REFERENCE_DEFINITION.finditer(visible):
         destination = match.group(1) if match.group(1) is not None else match.group(2)
