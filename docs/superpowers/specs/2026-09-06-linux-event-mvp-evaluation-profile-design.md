@@ -5,8 +5,8 @@
 **Status:** Approved in design review on 2026-09-06; implementation planning
 authorized
 
-**Implementation plan:**
-[`2026-09-06-linux-event-mvp-evaluation-profile.md`](../plans/2026-09-06-linux-event-mvp-evaluation-profile.md)
+**Current profile authority:**
+[`docs/implementation/linux-event-mvp-evaluation-profile-v0.1.md`](../../implementation/linux-event-mvp-evaluation-profile-v0.1.md)
 
 **Date:** 2026-09-06
 
