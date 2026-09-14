@@ -408,6 +408,25 @@ class DocumentationInventoryTests(unittest.TestCase):
         CHECKER.write_manifest(self.root)
         CHECKER.validate_inventory(rows, ("archive/research/proposals/a.md",))
 
+    def test_archived_source_must_remain_in_an_original_review_root(self) -> None:
+        current = "archive/research/proposals/a.md"
+        self.write(current)
+        self.track(current)
+        CHECKER.write_manifest(self.root)
+        candidates = CHECKER.tracked_candidate_paths(self.root)
+        for source in (
+            "docs/not-a-review-root/wrong.md",
+            "docs/proposals-elsewhere/wrong.md",
+            "docs/superpowers/plans-elsewhere/wrong.md",
+        ):
+            with self.subTest(source=source):
+                with self.assertRaises(CHECKER.ArchiveViolation):
+                    rows = CHECKER.parse_inventory(self.csv(self.row(
+                        source_path=source, current_path=current,
+                        disposition="archived",
+                    )))
+                    CHECKER.validate_inventory(rows, candidates)
+
     def test_git_failure_and_missing_nonregular_tracked_entries_fail(self) -> None:
         with tempfile.TemporaryDirectory() as other:
             with self.assertRaises(CHECKER.ArchiveViolation):

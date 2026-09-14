@@ -40,12 +40,16 @@ BATCHES = {
     "retain", "archive-plans", "archive-research", "archive-decisions",
     "current-hierarchy", "consolidation"
 }
-REVIEW_ROOTS = (
+ORIGINAL_REVIEW_ROOTS = (
     "docs/superpowers/plans",
     "docs/superpowers/specs",
     "docs/proposals",
     "docs/evaluations",
     "docs/decisions",
+)
+SOURCE_PREFIXES = tuple(f"{root}/" for root in ORIGINAL_REVIEW_ROOTS)
+REVIEW_ROOTS = (
+    *ORIGINAL_REVIEW_ROOTS,
     "archive/research/proposals",
     "archive/research/evaluations",
     "archive/design-history/plans",
@@ -324,8 +328,8 @@ def _validate_inventory_rows(rows: tuple[InventoryRow, ...]) -> None:
             fail(f"invalid disposition {row.disposition!r}")
         if row.batch not in BATCHES:
             fail(f"invalid batch {row.batch!r}")
-        if not row.source_path.startswith("docs/"):
-            fail("inventory source_path must retain its original docs/ identity")
+        if not row.source_path.startswith(SOURCE_PREFIXES):
+            fail("inventory source_path must be below an original review root")
 
         if row.disposition == "archived":
             if row.target_path:
