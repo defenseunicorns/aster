@@ -524,6 +524,11 @@ class DocumentationNavigationTests(unittest.TestCase):
             ("README.md", b"[x](\narchive/\n)\n"),
             ("README.md", b"[unclosed\n[history](archive/)\n"),
             (
+                "README.md",
+                b"[broken](docs/current.md \"unterminated\n"
+                b"[history](archive/)\n",
+            ),
+            (
                 "docs/README.md",
                 b"[x][r]\n\n[r]:\n  ../archive/\n",
             ),
@@ -542,6 +547,47 @@ class DocumentationNavigationTests(unittest.TestCase):
                     CHECKER.ArchiveViolation, "default navigation"
                 ):
                     CHECKER.validate_navigation(self.root)
+
+    def test_multiline_reference_label_resolves_archive_destination(self) -> None:
+        text = "[x][foo\nbar]\n\n[foo\nbar]: ../archive/\n"
+        self.assertEqual(CHECKER.markdown_destinations(text), ("../archive/",))
+        self.write("README.md", b"# Aster\n")
+        self.write("docs/README.md", text.encode())
+
+        with self.assertRaisesRegex(
+            CHECKER.ArchiveViolation, "default navigation.*docs/README.md"
+        ):
+            CHECKER.validate_navigation(self.root)
+
+    def test_blank_line_after_inline_opener_is_not_a_link(self) -> None:
+        text = "[x](\n\narchive/\n)\n"
+        self.assertEqual(CHECKER.markdown_destinations(text), ())
+        self.write("README.md", text.encode())
+        self.write("docs/README.md", b"# Documentation\n")
+
+        CHECKER.validate_navigation(self.root)
+
+    def test_other_block_and_destination_breaks_are_not_inline_links(self) -> None:
+        for text in (
+            "[line\n\nbreak](archive/)\n",
+            "[x](archive/(not allowed))\n",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(CHECKER.markdown_destinations(text), ())
+                self.write("README.md", text.encode())
+                self.write("docs/README.md", b"# Documentation\n")
+                CHECKER.validate_navigation(self.root)
+
+    def test_inline_title_content_is_not_scanned_as_navigation(self) -> None:
+        text = '[safe](docs/current.md "[history](archive/)")\n'
+        self.assertEqual(
+            CHECKER.markdown_destinations(text),
+            ("docs/current.md",),
+        )
+        self.write("README.md", text.encode())
+        self.write("docs/README.md", b"# Documentation\n")
+
+        CHECKER.validate_navigation(self.root)
 
     def test_non_link_archive_text_code_and_external_urls_are_allowed(self) -> None:
         self.write(

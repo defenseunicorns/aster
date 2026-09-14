@@ -69,7 +69,8 @@ ARCHIVE_PREFIXES = {
 DEFAULT_NAVIGATION = (Path("README.md"), Path("docs/README.md"))
 FENCE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})(.*)$")
 REFERENCE_DEFINITION = re.compile(
-    r"^[ ]{0,3}\[(?:\\.|[^\]\\\n])+\]:[ \t]*(?:\r?\n[ \t]{0,3})?"
+    r"^[ ]{0,3}\[(?:\\.|[^\]\\\r\n])+"
+    r"(?:\r?\n(?:\\.|[^\]\\\r\n])+)?\]:[ \t]*(?:\r?\n[ \t]{0,3})?"
     r"(?:<((?:\\.|[^>\\\n])*)>|((?:\\.|[^\s])+))",
     re.MULTILINE,
 )
@@ -548,9 +549,27 @@ def _decoded_markdown_destination(destination: str) -> str:
         fail("Markdown destination is not valid UTF-8 percent-encoding")
 
 
+def _link_whitespace(text: str, start: int) -> tuple[int, bool] | None:
+    position = start
+    line_endings = 0
+    while position < len(text):
+        if text[position] in " \t":
+            position += 1
+            continue
+        if text.startswith("\r\n", position):
+            line_endings += 1
+            position += 2
+        elif text[position] in "\r\n":
+            line_endings += 1
+            position += 1
+        else:
+            break
+        if line_endings > 1:
+            return None
+    return position, position != start
+
+
 def _inline_destination(text: str, start: int) -> tuple[str, int] | None:
-    while start < len(text) and text[start].isspace():
-        start += 1
     if start >= len(text):
         return None
     if text[start] == "<":
@@ -579,10 +598,70 @@ def _inline_destination(text: str, start: int) -> tuple[str, int] | None:
             if depth == 0:
                 return text[start:position], position
             depth -= 1
-        elif character.isspace() and depth == 0:
+        elif character.isspace():
+            if depth:
+                return None
             return text[start:position], position
         position += 1
     return None
+
+
+def _inline_title_end(text: str, start: int) -> int | None:
+    if start >= len(text) or text[start] not in "\"'(":
+        return None
+    closing = ")" if text[start] == "(" else text[start]
+    position = start + 1
+    line_endings = 0
+    while position < len(text):
+        if text[position] == "\\":
+            position += 2
+            continue
+        if text.startswith("\r\n", position):
+            line_endings += 1
+            position += 2
+        elif text[position] in "\r\n":
+            line_endings += 1
+            position += 1
+        elif text[position] == closing:
+            return position + 1
+        else:
+            position += 1
+        if line_endings > 1:
+            return None
+    return None
+
+
+def _inline_construct(text: str, opening: int) -> tuple[str, int] | None:
+    leading = _link_whitespace(text, opening + 1)
+    if leading is None:
+        return None
+    position, _ = leading
+    parsed = _inline_destination(text, position)
+    if parsed is None:
+        return None
+    destination, position = parsed
+    if position < len(text) and text[position] == ")":
+        return destination, position
+
+    separation = _link_whitespace(text, position)
+    if separation is None:
+        return None
+    position, consumed = separation
+    if not consumed:
+        return None
+    if position < len(text) and text[position] == ")":
+        return destination, position
+
+    title_end = _inline_title_end(text, position)
+    if title_end is None:
+        return None
+    trailing = _link_whitespace(text, title_end)
+    if trailing is None:
+        return None
+    position, _ = trailing
+    if position >= len(text) or text[position] != ")":
+        return None
+    return destination, position
 
 
 def _is_escaped(text: str, position: int) -> bool:
@@ -599,6 +678,19 @@ def _link_label_end(text: str, start: int) -> int | None:
     position = start + 1
     while position < len(text):
         character = text[position]
+        line_end = None
+        if text.startswith("\r\n", position):
+            line_end = position + 2
+        elif character in "\r\n":
+            line_end = position + 1
+        if line_end is not None:
+            next_content = line_end
+            while next_content < len(text) and text[next_content] in " \t":
+                next_content += 1
+            if next_content < len(text) and text[next_content] in "\r\n":
+                return None
+            position = line_end
+            continue
         if character == "\\":
             position += 2
             continue
@@ -627,7 +719,7 @@ def _inline_destinations(text: str) -> tuple[tuple[int, str], ...]:
             position = start + 1
             continue
         if closing + 1 < len(text) and text[closing + 1] == "(":
-            parsed = _inline_destination(text, closing + 2)
+            parsed = _inline_construct(text, closing + 1)
             if parsed is not None:
                 destination, end = parsed
                 destinations.append(
