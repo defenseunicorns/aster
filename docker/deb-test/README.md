@@ -43,13 +43,8 @@ Validate inputs and Compose interpolation without contacting the Docker daemon:
 mise run deb-compose -- --deb /absolute/path/to/aster.deb --config-only
 ```
 
-The private internal bridge defaults to `172.29.240.0/24` with A at `.2` and B
-at `.3`. If that subnet overlaps an existing Docker network, select an unused
-private IPv4 subnet; the runner derives both addresses and peer configuration:
-
-```sh
-mise run deb-compose -- --deb /absolute/path/to/aster.deb --subnet 172.29.241.0/24
-```
+The private internal bridge uses `172.29.240.0/24` with A at `.2` and B
+at `.3`.
 
 ## What passes
 

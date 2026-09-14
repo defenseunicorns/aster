@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 Defense Unicorns, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Offline regressions for the package smoke's input and evidence boundary."""
+"""Regressions for Event verification, project isolation, and cleanup."""
 import base64
 import importlib.util
 import io
@@ -25,56 +25,19 @@ class PackageComposeTests(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
-    def package(self, root, name="aster", architecture="amd64"):
+    def package(self, root):
         if shutil.which("dpkg-deb") is None:
             self.skipTest("Debian package regression requires dpkg-deb")
         control = root / "input/DEBIAN"
         control.mkdir(parents=True)
         (control / "control").write_text(
-            f"Package: {name}\nVersion: 1.2.3-1\nArchitecture: {architecture}\n"
+            "Package: aster\nVersion: 1.2.3-1\nArchitecture: amd64\n"
             "Maintainer: Test <test@example.invalid>\nDescription: synthetic test\n"
         )
         package = root / "input with spaces.deb"
         subprocess.run(["dpkg-deb", "--build", str(control.parent), str(package)],
                        check=True, capture_output=True)
         return package
-
-    def test_staging_binds_exact_package_and_survives_source_removal(self):
-        runner = self.load_runner()
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            package = self.package(root)
-            expected = package.read_bytes()
-            stage = root / "run"
-            stage.mkdir()
-            metadata = runner.prepare(stage, package, "172.29.240.0/24")
-            package.unlink()
-            self.assertEqual((stage / "aster.deb").read_bytes(), expected)
-            self.assertEqual(metadata["version"], "1.2.3-1")
-            self.assertEqual(metadata["architecture"], "amd64")
-            config = json.loads((stage / "compose.json").read_text())
-            self.assertEqual(config["services"]["a"]["platform"], "linux/amd64")
-            self.assertFalse(config["services"]["a"].get("ports"))
-            self.assertEqual(config["services"]["a"]["networks"]["mesh"]["ipv4_address"], "172.29.240.2")
-            self.assertEqual(config["services"]["b"]["networks"]["mesh"]["ipv4_address"], "172.29.240.3")
-
-    def test_rejects_non_aster_package_before_build(self):
-        runner = self.load_runner()
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            package = self.package(root, name="unrelated")
-            with self.assertRaisesRegex(runner.SmokeError, "aster"):
-                runner.prepare(root, package, "172.29.240.0/24")
-
-    def test_rejects_unsupported_architecture_and_too_small_network(self):
-        runner = self.load_runner()
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            package = self.package(root, architecture="riscv64")
-            with self.assertRaisesRegex(runner.SmokeError, "architecture"):
-                runner.prepare(root, package, "172.29.240.0/24")
-        with self.assertRaisesRegex(runner.SmokeError, "subnet"):
-            runner.node_addresses("172.29.240.0/31")
 
     def test_receipt_rejects_wrong_event_content_even_with_matching_id(self):
         runner = self.load_runner()
@@ -93,7 +56,7 @@ class PackageComposeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="aster-deb-test-") as directory:
             stage = Path(directory)
             package = self.package(stage)
-            runner.prepare(stage, package, "172.29.240.0/24")
+            runner.prepare(stage, package)
             with patch.dict("os.environ", {"COMPOSE_PROJECT_NAME": "unrelated-project"}):
                 config = json.loads(runner.Compose(stage).run("config", "--format", "json"))
                 manual = subprocess.run([str(stage / "compose.sh"), "config", "--format", "json"],

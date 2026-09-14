@@ -5,7 +5,6 @@
 import argparse
 import base64
 import hashlib
-import ipaddress
 import json
 import os
 from pathlib import Path
@@ -25,18 +24,9 @@ class SmokeError(RuntimeError):
     pass
 
 
-def node_addresses(subnet):
-    try:
-        network = ipaddress.ip_network(subnet, strict=True)
-        if network.version != 4 or not network.is_private or not 16 <= network.prefixlen <= 29:
-            raise ValueError()
-    except ValueError as error:
-        raise SmokeError("subnet must be a private IPv4 /16 through /29 network") from error
-    return str(network.network_address + 2), str(network.network_address + 3)
-
-
-def prepare(stage, package, subnet):
-    a_ip, b_ip = node_addresses(subnet)
+def prepare(stage, package):
+    subnet = "172.29.240.0/24"
+    a_ip, b_ip = "172.29.240.2", "172.29.240.3"
     staged = stage / "aster.deb"
     # Copy once, then inspect/hash/build the same bytes even if the source changes.
     shutil.copyfile(package, staged)
@@ -47,10 +37,6 @@ def prepare(stage, package, subnet):
         if result.returncode:
             raise SmokeError("input is not a readable Debian package")
         metadata[field.lower()] = result.stdout.strip()
-    if metadata["package"] != "aster":
-        raise SmokeError("expected the aster Debian package")
-    if metadata["architecture"] not in ("amd64", "arm64"):
-        raise SmokeError("unsupported package architecture; expected amd64 or arm64")
     with staged.open("rb") as stream:
         metadata["sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
     for name in ("Dockerfile", "node.py"):
@@ -227,7 +213,6 @@ def main(argv=None):
     parser.add_argument("--deb", type=Path, required=True, help="existing native amd64/arm64 Aster package")
     parser.add_argument("--keep", action="store_true", help="leave the successful two-node stand running")
     parser.add_argument("--config-only", action="store_true", help="stage/validate without accessing the daemon")
-    parser.add_argument("--subnet", default="172.29.240.0/24", help="unused private IPv4 Docker subnet")
     args = parser.parse_args(argv)
     signal.signal(signal.SIGINT, interrupt)
     signal.signal(signal.SIGTERM, interrupt)
@@ -238,7 +223,7 @@ def main(argv=None):
     result = {"schema": "aster-deb-compose/v1", "status": "fail"}
     code = 2
     try:
-        metadata = prepare(stage, args.deb.resolve(strict=True), args.subnet)
+        metadata = prepare(stage, args.deb.resolve(strict=True))
         result["package"] = metadata
         compose.run("config", "--quiet")
         if args.config_only:

@@ -22,6 +22,11 @@
   },
   "storage": {
     "max_items": 10000,
-    "max_payload_bytes": 67108864
+    "max_payload_bytes": 67108864,
+    "operations": {
+      "max_records": 1000000,
+      "max_logical_bytes": 201326592,
+      "emergency_reserve": 10000
+    }
   }
 }

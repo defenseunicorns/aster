@@ -60,22 +60,21 @@ Public sources consulted, 2026-09-10:
 - [GitHub runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners):
   native `ubuntu-24.04` and `ubuntu-24.04-arm` runner labels.
 
-Local validation on 2026-09-11: the complete checkout check and the amd64
-package installation/runtime harness passed after wrapper removal. The ARM64
-build and installation/runtime harness also completed successfully in an
-emulated Ubuntu 24.04 VM on an x86_64 host: package payload, ELF architecture,
-external SBOMs and checksums, protected local Event publish/delivery/ack,
-service restart, removal and state preservation passed. Native ARM64 hardware
-and GitHub CI runs remain unverified. Historical observations are retained in
-[the dated receipt](2026-09-10-deb-observation.md).
+Local validation: amd64 package installation/runtime and two-node Compose
+checks passed. On 2026-09-14, native ARM64 package builds, protected systemd
+startup, Event delivery/acknowledgement, restart, removal/purge preservation,
+and same-runtime package upgrade/downgrade checks also passed. The package
+configuration example now includes the required `storage.operations` limits.
+See the [current validation record](2026-09-14-deb-observation.md) for artifact
+hashes, retained evidence, test-helper failures and qualification limits.
+Historical observations remain in [the earlier record](2026-09-10-deb-observation.md).
 
 The separate [two-node package Compose smoke](../../docker/deb-test/README.md)
-passed on amd64 again on 2026-09-14, including offline backlog delivery and
-persistence across container recreation. It does not qualify systemd or the
-protected service and has not been run on ARM64. The Compose checkout's full
-`mise run check` on 2026-09-11 stopped at a contact-deadline failure in one of
-266 `aster-node` tests; that test passed in isolation, but later check tasks
-were not reached. This is not a fully green checkout result.
+passed on amd64 and native ARM64, including offline backlog delivery and
+persistence across container recreation. Compose does not qualify systemd or
+the protected service. The full local `mise run check` passed on 2026-09-14;
+the earlier contact-deadline failure did not recur in that run. GitHub Actions
+package workflows remain unverified until their actual CI runs complete.
 
 The probe below is an optional compatibility diagnostic, not a required
 package-build or installation step.
@@ -221,7 +220,7 @@ Documentation stays in the repository and is not installed by the package.
 The existing procedure supplies package paths, service account, first installation, host-key
 setup, direct `aster-credential-admin` invocation, atomic reference/configuration
 handoff and startup/readiness commands. Provider lifecycle and retry semantics
-remain in that procedure. Native ARM64 validation is deferred.
+remain in that procedure. Native ARM64 evaluation results are recorded above; final device and production qualification remain open.
 
 ## Upgrade, removal, and remaining qualification
 
