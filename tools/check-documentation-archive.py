@@ -68,9 +68,8 @@ ARCHIVE_PREFIXES = {
 }
 DEFAULT_NAVIGATION = (Path("README.md"), Path("docs/README.md"))
 FENCE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})(.*)$")
-INLINE_LINK = re.compile(r"!?\[(?:\\.|[^\]\\\n])*\]\([ \t]*")
 REFERENCE_DEFINITION = re.compile(
-    r"^[ ]{0,3}\[(?:\\.|[^\]\\\n])+\]:[ \t]*"
+    r"^[ ]{0,3}\[(?:\\.|[^\]\\\n])+\]:[ \t]*(?:\r?\n[ \t]{0,3})?"
     r"(?:<((?:\\.|[^>\\\n])*)>|((?:\\.|[^\s])+))",
     re.MULTILINE,
 )
@@ -550,6 +549,8 @@ def _decoded_markdown_destination(destination: str) -> str:
 
 
 def _inline_destination(text: str, start: int) -> tuple[str, int] | None:
+    while start < len(text) and text[start].isspace():
+        start += 1
     if start >= len(text):
         return None
     if text[start] == "<":
@@ -584,17 +585,64 @@ def _inline_destination(text: str, start: int) -> tuple[str, int] | None:
     return None
 
 
+def _is_escaped(text: str, position: int) -> bool:
+    backslashes = 0
+    position -= 1
+    while position >= 0 and text[position] == "\\":
+        backslashes += 1
+        position -= 1
+    return backslashes % 2 == 1
+
+
+def _link_label_end(text: str, start: int) -> int | None:
+    depth = 1
+    position = start + 1
+    while position < len(text):
+        character = text[position]
+        if character == "\\":
+            position += 2
+            continue
+        if character == "[":
+            depth += 1
+        elif character == "]":
+            depth -= 1
+            if depth == 0:
+                return position
+        position += 1
+    return None
+
+
+def _inline_destinations(text: str) -> tuple[tuple[int, str], ...]:
+    destinations: list[tuple[int, str]] = []
+    position = 0
+    while position < len(text):
+        start = text.find("[", position)
+        if start < 0:
+            break
+        if _is_escaped(text, start):
+            position = start + 1
+            continue
+        closing = _link_label_end(text, start)
+        if closing is None:
+            position = start + 1
+            continue
+        if closing + 1 < len(text) and text[closing + 1] == "(":
+            parsed = _inline_destination(text, closing + 2)
+            if parsed is not None:
+                destination, end = parsed
+                destinations.append(
+                    (start, _decoded_markdown_destination(destination))
+                )
+                position = max(end + 1, closing + 2)
+                continue
+        position = start + 1
+    return tuple(destinations)
+
+
 def markdown_destinations(text: str) -> tuple[str, ...]:
     """Return decoded link destinations outside Markdown code spans."""
     visible = _without_inline_code(_without_fenced_code(text))
-    destinations: list[tuple[int, str]] = []
-    for match in INLINE_LINK.finditer(visible):
-        parsed = _inline_destination(visible, match.end())
-        if parsed is not None:
-            destination, _ = parsed
-            destinations.append(
-                (match.start(), _decoded_markdown_destination(destination))
-            )
+    destinations = list(_inline_destinations(visible))
     for match in REFERENCE_DEFINITION.finditer(visible):
         destination = match.group(1) if match.group(1) is not None else match.group(2)
         destinations.append((match.start(), _decoded_markdown_destination(destination)))
@@ -637,7 +685,13 @@ def validate_navigation(repository_root: Path) -> None:
         except ArchiveViolation:
             fail(f"default navigation has an invalid destination: {relative_path.as_posix()}")
         for destination in destinations:
-            normalized = _navigation_path(relative_path, destination)
+            try:
+                normalized = _navigation_path(relative_path, destination)
+            except ValueError:
+                fail(
+                    "default navigation has an invalid destination: "
+                    f"{relative_path.as_posix()}"
+                )
             if normalized == "archive" or (
                 normalized is not None and normalized.startswith("archive/")
             ):

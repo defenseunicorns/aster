@@ -517,6 +517,32 @@ class DocumentationNavigationTests(unittest.TestCase):
         ):
             CHECKER.validate_navigation(self.root)
 
+    def test_valid_multiline_and_nested_archive_links_fail(self) -> None:
+        cases = (
+            ("README.md", b"[outer [inner]](archive/)\n"),
+            ("README.md", b"[line\nbreak](archive/)\n"),
+            ("README.md", b"[x](\narchive/\n)\n"),
+            ("README.md", b"[unclosed\n[history](archive/)\n"),
+            (
+                "docs/README.md",
+                b"[x][r]\n\n[r]:\n  ../archive/\n",
+            ),
+            (
+                "docs/README.md",
+                b"[x][r]\n\n[r]:\n<../archive/>\n",
+            ),
+        )
+        for source, content in cases:
+            with self.subTest(source=source, content=content):
+                self.write("README.md", b"# Aster\n")
+                self.write("docs/README.md", b"# Documentation\n")
+                self.write(source, content)
+
+                with self.assertRaisesRegex(
+                    CHECKER.ArchiveViolation, "default navigation"
+                ):
+                    CHECKER.validate_navigation(self.root)
+
     def test_non_link_archive_text_code_and_external_urls_are_allowed(self) -> None:
         self.write(
             "README.md",
@@ -553,6 +579,41 @@ class DocumentationNavigationTests(unittest.TestCase):
             CHECKER.ArchiveViolation, "default navigation.*README.md"
         ):
             CHECKER.validate_navigation(self.root)
+
+    def test_malformed_url_fails_closed_without_path_or_traceback(self) -> None:
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self.write("archive/README.md", b"policy\n")
+        CHECKER.write_manifest(self.root)
+        self.write(
+            "docs/implementation/documentation-refactor-inventory.csv",
+            (",".join(CHECKER.INVENTORY_HEADER) + "\n").encode(),
+        )
+        self.write("README.md", b"[bad](http://[)\n")
+        self.write("docs/README.md", b"# Documentation\n")
+
+        with self.assertRaisesRegex(
+            CHECKER.ArchiveViolation,
+            "^default navigation has an invalid destination: README.md$",
+        ) as raised:
+            CHECKER.validate_navigation(self.root)
+        self.assertNotIn(str(self.root), str(raised.exception))
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            patch.object(CHECKER, "ROOT", self.root),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(CHECKER.main([]), 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            stderr.getvalue(),
+            "documentation archive failed: default navigation has an invalid "
+            "destination: README.md\n",
+        )
+        self.assertNotIn(str(self.root), stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_cli_validates_navigation_after_manifest_and_inventory(self) -> None:
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
