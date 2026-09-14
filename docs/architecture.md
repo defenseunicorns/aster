@@ -176,21 +176,7 @@ freshly verified so they cannot hide structural corruption, but they are not
 returned as application current or recoverable values. A current tombstone is
 returned visibly as authenticated State with an empty payload. There is no
 delete-wins rule, and deletion is not collapsed into an unauthenticated
-`None`. A
-[retained 7,752-byte v2 receipt](validation/evidence/selected-live-mutable-6cabb4c.json)
-(SHA-256
-`054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`,
-signed source `6cabb4c`) first verifies two disconnected State heads as the exact
-max-ID-current/other-concurrent projection. In the producer-attested ordered
-loopback chain, a later successor observes and supersedes both heads; after the
-other actor observes that successor, its authenticated empty tombstone observes
-and supersedes all three predecessors. Both actors select the tombstone as
-current, and one immediate peerless restart reproduces that exact four-version
-projection. This is one-host, same-implementation evidence, not indefinite
-tombstone retention, garbage collection, delete-wins, physical or mixed
-implementations, scale, or release acceptance. Expiry, durable State
-subscriptions, selected-node bindings, relay/multi-hop acceptance, finite TTL,
-and independent interoperability remain unimplemented.
+`None`.
 
 ## Live or stopped Record projection, guarded resolution, and network reconciliation
 
@@ -237,21 +223,12 @@ plan before exposure or commit. Inactive revoked or old-epoch rows are not
 returned to the application. A current Record tombstone remains visible with an
 empty payload; a concurrent tombstone has no delete-wins priority.
 
-Registered merge policies are never run automatically by this selected slice.
+Registered merge policies are never run automatically by the selected
+implementation.
 Remote ingest stores an immutable, already source-authenticated revision and
 recomputes structural causal heads without invoking application code. A
-retained direct-Iroh acceptance run publishes one revision through each live
-handle while disconnected, reconciles both directions under an explicit Record
-interest, verifies that both actors retain the same two heads, rejects an
-ordinary conflict-collapsing publish without changing them, then resolves and
-exactly retries the guard through the live authority. Both original heads are
-superseded, and the resolved projection survives restart. The
-[canonical v2 receipt](validation/evidence/selected-live-mutable-6cabb4c.json)
-does not establish physical-network or mixed-implementation acceptance. Record
-still has no durable application subscription, selected-node binding, or
-selected relay acceptance. Multi-hop/partition sweeps, independent
-interoperability, finite TTL, expiry, garbage collection, and retention-driven
-deletion remain unimplemented.
+resolution successor supersedes the guarded heads without deleting their
+authenticated history.
 
 ## Live and stopped Blob streaming and depot authority
 
@@ -355,26 +332,8 @@ before requesting only missing, peer-neutral 16-KiB carrier prefixes. Every
 source and range send requires the authenticated peer's current exact content
 proof plus route and nonrevocation authority. Pending bytes remain outside
 ordinary publication until the exact depot, full-content, and current-lineage
-proofs agree atomically. This is bounded direct, same-implementation automation,
-not route-only Blob relay/custody or Blob-over-controlled-relay acceptance. A
-[retained 10,728-byte v2 live-Blob receipt](validation/evidence/selected-live-blob-044d90f.json)
-(SHA-256
-`4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)
-binds signed source commit `044d90ff07c8e754b3d490cb810d42de3c915e3d`
-with `Good` signature status. Its three participants ran 11 actor lifetimes and
-32 error-free direct `CONTACT` records: a publisher committed while peerless; a replica
-received all 98,638 carrier bytes; a receiver retained an interrupted
-exactly-one-contact 16,384-byte prefix, reopened peerless with that exact
-progress, resumed exactly 16,384 bytes from the different replica without
-refetching the source, fetched the exact remaining 65,870 bytes, reconstructed
-all 98,638 carrier bytes, and reopened peerless for a final authenticated read.
-Its source-to-execution link remains operator-attested, not cryptographically
-proven. This is one-host, same-implementation evidence of graceful same-process
-actor/store/provider reopen only. It does not prove process-crash, power-loss,
-long-offline, arbitrary-peer, or route-only resume; NAT, Internet, relay, or
-BTLE paths; independent-implementation interoperability; scale beyond three
-participants; resource thresholds or soak; physical sanitization; or release
-authorization.
+proofs agree atomically. This path implements bounded direct transfer, not
+route-only Blob relay or custody.
 
 `BlobDepotLimits` reserve canonical ciphertext-file bytes for every durable
 expected chunk record and bound durable per-chunk metadata rows and
@@ -390,12 +349,8 @@ mission/content and identity secrets and locks the store, but deliberately
 preserves the encrypted Blob depot and audited data rows. This is bounded
 cryptographic shredding, not Blob-file deletion or physical sanitization.
 Current code has a durable metadata-only exact-publication Blob delivery
-ledger; its local counts are not peer or convergence status. Retained
-delivery acceptance, Blob peer/convergence status, route-only relay/custody,
-Blob-over-controlled-relay
-acceptance, arbitrary-peer resume, crash/power-loss/long-offline recovery,
-finite TTL, retention/GC, large/physical acceptance, mixed implementations,
-and representative network evidence remain open.
+ledger. Its local counts do not grant authority and are neither peer nor
+convergence status.
 
 ## Live application command and status flow
 
@@ -438,21 +393,6 @@ the store rechecks the exact policy-bound plan before a half-open gap interval
 is exposed. Absence of a returned gap says only that the locally observed,
 verified positions in that page are contiguous; it is not publisher
 completeness or mesh convergence.
-
-The [retained 9,573-byte live-Event receipt](validation/evidence/selected-live-event-c464129.json)
-(SHA-256
-`4d71d04e4ebcc9f63c0e84e7f11e83bf1f3d1ad2ca8608486cdcc875b6dfeef0`,
-signed source `c464129`) composes this path on one same-implementation loopback
-host. Four peerless Events include three alpha sequences and one authorized
-beta Event. A priority-threshold contact transfers alpha 1 and 3, exposing
-authenticated gap `[2,3)`; a forced receiver-child termination after the
-flushed unacknowledged poll is followed by fresh-process attempt-2 redelivery
-and ack/re-ack. A normal contact transfers alpha 2 and closes the gap. Beta is
-withheld; subscribing changes the selector snapshot and yields
-`PolicyChangedSinceContact`, then removal, but no post-change contact or beta
-delivery. Awaiting status has zero failed attempts. This is not physical,
-NAT/relay/BTLE, mixed-implementation, scale/resource, other-class, or release
-evidence.
 
 ## One authenticated contact
 
@@ -527,41 +467,12 @@ Pathnames remain as zero-length tombstones. Physical media,
 copy-on-write history, snapshots, swap, backups, database rollback/replacement,
 and non-Unix behavior are outside the proof.
 
-The selected N=32 retained receipt changes evidence depth, not this authority
-layout. An operator-attested Cargo release-profile binary run for the signed
-source ran the Event line with 32 distinct mission identities/stores in 65
-exact cohorts and 158 exact-named executions with distinct READY PIDs on one
-macOS arm64 host over direct loopback. The directed data-motion cohorts were
-serial two-process edges; the final no-op recorded 32 distinct READY PIDs,
-without overlap timing or an OS sampler that would prove simultaneity.
-That same-build, same-implementation, one-scope/authority/topic line does not
-establish distributed or physical architecture, the separate at-least-100-node
-target, NAT/relay/BTLE/cross-transport behavior, independent interoperability,
-resource thresholds, or release readiness.
+## Related documentation
 
-A separate retained two-cell selected-Iroh receipt observes one exact Event and
-an exact replay no-op through cone/direct and restrictive/controlled-relay
-Docker Linux namespace NATs on one physical host. The cone cell uses static
-operator-known mappings; the restrictive cell records direct drops and carries
-only through the exact DER-pinned relay. This does not establish endpoint
-discovery or punching, a temporal direct-first sequence, representative or
-physical NAT, public Internet or relay operation, another data class,
-independent implementation, resource evidence, or release acceptance. See the
-[retained receipt and replay boundary](validation/requirements-status.md#selected-iroh-nat-retained-receipt).
-
-## Follow the evidence
-
-- [Capability tour](quickstart/capability-tour.md) — fastest visible behavior.
-- [Selected Event API](quickstart/selected-event-api.md) — live publish/query,
-  durable delivery, gaps, unsubscribe, bounded status, and the retained
-  [live-Event receipt](validation/evidence/selected-live-event-c464129.json).
-- [Selected State API](quickstart/selected-state-api.md) — live or stopped
-  latest-value projection, recoverable history, and visible tombstones.
-- [Selected Record API](quickstart/selected-record-api.md) — live or stopped
-  explicit conflict projection and exact-sibling guarded resolution.
-- [Selected Blob API](quickstart/selected-blob-api.md) — bounded live file
-  publication/page reads, stopped streaming, and semantic-v5 direct automation.
-- [Carriers and contacts](transports.md) — selected and migration-source carrier boundaries.
-- [Mesh CLI guide](quickstart/mesh-cli.md) — phase-by-phase and retained receipts.
-- [Requirements status](validation/requirements-status.md) — exact credited rows and open gaps.
-- [Security model](security.md) — production gates and explicit non-claims.
+- [Application quickstarts](quickstart/README.md) explain how to exercise each
+  supported surface.
+- [Protocol](protocol.md) defines the wire and semantic contract.
+- [Security model](security.md) describes security properties and production
+  gates.
+- [Requirements status](validation/requirements-status.md) records retained
+  evidence, credited behavior, and open validation gaps.
