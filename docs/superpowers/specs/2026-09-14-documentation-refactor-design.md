@@ -1,332 +1,199 @@
 #
 
-# Aster Documentation and Archive Refactor Design
+# Aster Documentation Refactor Design
 
 - Status: approved direction; written design awaiting review
 - Date: 2026-09-14
 - Scope: documentation architecture and lifecycle only
 - Runtime effect: none
-- Requirements effect: none; no requirement status or evidence claim changes
+- Requirements effect: none
 
 ## Purpose
 
-Aster's documentation contains valuable protocol, implementation, validation,
-research, and project-history material, but it presents too much of that
-material as one current engineer-facing corpus. A reader must distinguish
-current authority from completed plans, superseded designs, experiment reports,
-and historical evidence by reading the documents themselves.
+Aster's current documentation is difficult for a human engineer to consume
+because product documentation, implementation plans, experiment reports,
+validation evidence, and project history are presented together.
 
-The refactor will make `docs/` a compact guide to the system that exists now and
-will move historical material into a separate, frozen `archive/` tree before
-the remaining current documentation is consolidated. MVP operation and
-validation will become separate concerns. Historical material will remain in
-Git and retain its evidentiary value.
+The refactor makes `docs/` a compact description of the product that exists
+now. Material that is no longer needed to understand or operate the current
+product moves to a separate, passive `archive/`. Experiment material that is
+not reflected in the codebase and has no durable evidence value is removed.
 
-## Baseline
+The archive is not another documentation product. It is historical storage.
+Git remains the mechanism for history and integrity; normal review remains the
+mechanism for checking documentation changes.
 
-At `814e549` the repository contains 220 Markdown files with 55,234 lines.
-Three obviously historical/process-heavy areas account for 73 files and 21,409
-lines:
+## Principles
 
-| Area | Markdown files | Lines | Present concern |
-|---|---:|---:|---|
-| `docs/superpowers/` | 18 | 8,315 | completed plans mixed with active designs |
-| `docs/proposals/` | 12 | 4,778 | closed research presented beside current docs |
-| `docs/evaluations/` | 43 | 8,316 | historical evidence mixed with live validation inputs |
-
-Two other large areas need reclassification rather than wholesale archival:
-`docs/quickstart/` has 19 files and 5,379 lines, while
-`docs/implementation/` has 14 Markdown files and 7,896 lines. Both contain
-current material, but MVP operation, qualification, coordination, status, and
-reference content are interleaved.
-
-The current path layout is also part of the repository's implementation:
-scripts, manifests, tests, requirements mappings, Markdown links, and recorded
-digests refer to exact documentation paths. Moving a document safely therefore
-requires migrating its consumers and preserving any hash-bound evidence.
-
-## Goals
-
-1. Keep the default engineer-facing documentation focused on current protocol,
-   architecture, public interfaces, operating procedures, and implementation
-   boundaries.
-2. Establish the in-repository archive first, then use it as the destination
-   for completed, rejected, experiment-only, or superseded material.
-3. Separate MVP use and operation from validation, qualification, evidence,
-   and traceability.
-4. Extract durable decisions or constraints from completed plans before
-   archiving their full design history.
-5. Preserve the hash-bound requirements baseline, historical receipts, and
-   exact evidence needed to audit prior decisions.
-6. Give each current fact one canonical owner and make navigation reveal that
-   owner quickly.
-
-## Non-goals
-
-This work does not change protocol, API, wire, runtime, security, or deployment
-behavior. It does not revise `data-mesh-requirements.md`, inflate implementation
-claims, or move requirement rows merely because documentation moves. It does
-not discard Git history, delete retained evidence, or move the archive to an
-external service. It also does not rewrite every current document in one pull
-request.
-
-## Authority model
-
-Every document belongs to one of the following classes.
-
-| Class | Location | Authority |
-|---|---|---|
-| Repository overview | root `README.md` | current entry point and implementation boundary summary |
-| Concept or architecture | `docs/` | current explanatory model |
-| Protocol or security profile | `docs/protocol/` | current normative behavior |
-| API or integration guide | `docs/api/` | current public integration contract |
-| MVP operation | `docs/mvp/` | current bounded product profile and operator workflow |
-| Validation and evidence | `docs/validation/` | current commands, schemas, qualification, and traceability |
-| Roadmap and implementation status | `docs/implementation/` | current capability planning and evidence boundary |
-| Governing decision | `docs/decisions/` | active architectural constraint and rationale |
-| Historical research or design | `archive/` | non-normative retained history |
-
-A document in `archive/` is not current authority unless a current document
-explicitly cites a retained historical fact. Current behavior must never be
-specified only in the archive.
+1. `docs/` contains only information a human engineer needs for the current
+   product.
+2. Code and tests are the source of truth for implemented behavior. Current
+   documentation explains protocol, public interfaces, operation, and
+   non-obvious implementation constraints without duplicating the code.
+3. Completed implementation plans and designs do not remain in the current
+   documentation after their durable decisions are reflected in code or a
+   current reference.
+4. MVP operation and validation are separate concerns and have separate
+   sections.
+5. Archived material is non-normative and is not linked from the normal
+   product-documentation path.
+6. The refactor introduces no custom documentation enforcement framework.
 
 ## Target hierarchy
 
 ```text
-README.md
-data-mesh-requirements.md
+README.md                         short entry point and current boundary
 docs/
-  README.md
-  concepts.md
-  architecture.md
-  protocol/
-  api/
-  mvp/
-  validation/
-  implementation/
-  decisions/
+  README.md                       current documentation map
+  protocol/                       wire rules and protocol semantics
+  api/                            public interfaces and integration contracts
+  implementation/                 current architecture and constraints
+  mvp/                            minimal-product setup and operation
+  validation/                     qualification, evidence, and traceability
+  operations/                     non-MVP production operation, when needed
+  decisions/                      only decisions that still govern the product
 archive/
-  README.md
-  MANIFEST.sha256
-  research/
-    proposals/
-    evaluations/
-  design-history/
-    plans/
-    superseded-specs/
-    retired-decisions/
+  README.md                       brief non-normative notice
+  design-history/                 completed or superseded plans and designs
+  research/                       closed evaluations, proposals, and experiments
 ```
 
-The hierarchy describes ownership, not a requirement to rename every file at
-once. Moves should be small enough that path consumers and claims can be
-reviewed coherently.
+The hierarchy is a destination, not a requirement to create empty directories.
+A section exists only when current retained material needs it.
 
-## Canonical ownership rules
+The root `README.md` points readers into current documentation. It does not
+make the archive part of the normal reading path. `archive/README.md` states
+only that archived files are historical, non-normative, and may describe
+behavior that no longer exists.
 
-- Root `README.md` explains what Aster is, states the current implementation
-  boundary briefly, and gives the shortest supported route to first use.
-- `docs/README.md` is navigation, not a second status report.
-- `docs/concepts.md` defines stable vocabulary; `docs/architecture.md` explains
-  the current component model without retaining implementation chronology.
-- `docs/protocol/` owns normative wire, envelope, transport, conformance, and
-  security-profile material.
-- `docs/api/` owns public application and language binding guidance. Crate
-  READMEs continue to own code-local details.
-- `docs/mvp/` owns the current Linux Event MVP profile, setup, operations, and
-  troubleshooting. It does not own evidence acceptance criteria.
-- `docs/validation/` owns qualification procedures, receipt schemas, current
-  evaluation inputs, traceability, and evidence interpretation.
-- `docs/implementation/capability-roadmap.md` remains the planning and PR-review
-  view. A compact generated status view should replace repeated prose where
-  structured mappings can be authoritative.
-- `docs/decisions/` contains only decisions that still constrain the current
-  system. Rejected alternatives and decisions wholly superseded by a later
-  authority belong in the archive.
+## Classification rules
 
-## Archive contract
+Each document is reviewed by its present value, not merely its current path.
 
-The archive is an in-repository, frozen historical collection. Admitted files
-are immutable; the collection may grow as work completes.
+### Keep in current documentation
 
-`archive/README.md` will define its non-normative status, admission rules, and
-correction policy. `archive/MANIFEST.sha256` will bind every regular archive
-file except the manifest itself by relative path and content digest. Entries
-will use SHA-256, bytewise path ordering, and paths relative to the repository
-root so regeneration is deterministic. Files will normally enter through
-`git mv` so that history remains easy to follow, and archived content remains
-byte-for-byte intact.
+Keep a document in `docs/` when a human engineer needs it to understand,
+integrate, operate, validate, or safely change the current product. The
+document must have a distinct current purpose that is not already better
+expressed by code, tests, or another canonical document.
 
-Archived documents are excluded from normal documentation navigation and from
-default human-facing size metrics. PR review and the documentation refactor
-enforce this information-architecture policy; CI does not parse Markdown
-navigation. Corrections are made in current authority or
-in a new, clearly labeled archive erratum; historical claims are not silently
-rewritten. Archive entries may be reorganized only with a manifest update and
-the same path-consumer verification required for initial admission.
+Examples include:
 
-Archiving is not deletion. A later external-history repository may be
-considered separately after the in-repository model has demonstrated that no
-build, test, evidence, or audit workflow depends on ambient historical paths.
+- current protocol rules and public API contracts;
+- current architectural boundaries and non-obvious implementation constraints;
+- MVP setup and runbooks that match working code;
+- current validation procedures and requirements traceability;
+- decisions that still constrain implementation choices.
 
-## Admission decision
+### Move to the archive
 
-Classification follows this order:
+Move a document to `archive/` when it is no longer needed for current product
+work but remains useful as project history or retained evidence.
 
-1. Keep a document current when it defines current behavior, supports an active
-   operator workflow, governs an open capability gate, or is consumed by live
-   validation and traceability.
-2. Archive it when its outcome is completed, rejected, superseded, or retained
-   only to explain how a decision was reached.
-3. For a mixed document, first move its still-current constraints into the
-   canonical current owner, update citations, and only then archive the
-   original.
-4. When authority or consumers are ambiguous, leave the document current until
-   the ambiguity is resolved. Uncertainty never justifies a destructive move.
+Examples include:
 
-## Initial disposition
+- completed implementation plans;
+- superseded designs;
+- rejected proposals with durable decision context;
+- closed evaluations or experiments retained as historical evidence;
+- old coordination and milestone records.
 
-The first archive pass targets self-contained, closed material:
+If a historical document mixes obsolete narrative with a durable current
+constraint, first place the constraint in its current canonical document, then
+archive the historical document intact.
 
-- completed implementation plans under `docs/superpowers/plans/`;
-- design specifications whose implementation is merged and whose lasting
-  constraints have been absorbed into current protocol, architecture, MVP, or
-  validation documentation;
-- closed provider proposals and their result narratives;
-- rejected or experiment-only evaluations that are not current qualification
-  inputs; and
-- ADRs describing discarded alternatives or demonstrations that no longer
-  constrain current code.
+### Remove
 
-The first pass explicitly keeps these materials current:
+Remove a document when it describes an abandoned experiment or proposal that
+is absent from the codebase, has no current consumer, and is not required as
+historical requirements evidence. Git history is sufficient for recovery.
 
-- `data-mesh-requirements.md` and its hash-bound baseline;
-- the capability roadmap, requirement mappings, and requirement status view;
-- current protocol, security, transport, envelope, conformance, API, schema,
-  release, and deployment material;
-- the Linux Event MVP profile, operator runbook, coordination material, current
-  qualification procedures, receipts, and SBOM evidence; and
-- any evaluation matrix or design specification still consumed by a checker,
-  test, manifest, qualification command, or active evidence claim.
+Removal requires ordinary human review of references and evidentiary use. It
+does not require a custom tool or a permanent classification record.
 
-In particular, `docs/evaluations/0005/requirements-matrix.csv` remains a live
-validation input even though it currently sits below an evaluations path. It
-must move to `docs/validation/` only in the same change that updates all code,
-tests, mappings, and documentation that consume its exact path. The recently
-merged Linux Event MVP qualification receipt validator specification remains
-current until its lasting contract is represented in the validator and current
-qualification documentation.
+## Requirements and evidence boundary
 
-## Migration sequence
+The refactor preserves `data-mesh-requirements.md`, the 348 atomic requirement
+IDs, the hash-bound baseline, and historical evidence required by repository
+policy. Documentation location alone does not change a requirement's status or
+expand an implementation claim.
 
-### Phase 1: archive foundation and inventory
+The current requirements status and capability roadmap belong under
+`docs/validation/` because they describe qualification and traceability rather
+than implementation design. Any relocation updates exact path consumers and
+recorded hashes in the same focused change. Exact requirement IDs are updated
+only when their implementation or evidence boundary genuinely changes.
 
-Create the archive hierarchy, policy, manifest generator or deterministic
-manifest procedure, and a reviewed classification inventory. Add checks for
-archive filesystem shape, manifest integrity, and inventory grammar, state,
-and exact Git coverage. Review navigation and references to candidate paths
-as part of the documentation refactor. The archive checker does not read or
-validate Markdown navigation documents. No ambiguous or hash-bound document
-moves in this phase.
+## Migration approach
 
-### Phase 2: low-risk historical moves
+The work proceeds in small, reviewable pull requests:
 
-Move self-contained completed plans and closed research with `git mv`. For each
-batch, update current inbound links, scripts, and manifests before the move;
-regenerate the archive manifest afterward. Keep each pull request focused on
-one historical group.
+1. Remove the abandoned archive-specific checker, tests, manifest, permanent
+   inventory, and task/CI integration.
+2. Create a short current-documentation map and make the root `README.md` the
+   clear entry point.
+3. Review completed plans, proposals, evaluations, and experiments; extract
+   any durable current constraints; then archive or remove the source material.
+4. Separate MVP operation from validation and relocate current documents into
+   the target hierarchy.
+5. Consolidate overlapping current documents and remove descriptions already
+   made redundant by code and tests.
+6. Finish by removing any temporary local inventory used during the refactor.
 
-### Phase 3: current hierarchy and MVP/validation split
+Use `git mv` when retaining a file in the archive so its history remains easy
+to follow. Use `git rm` only after checking current references and evidence
+roles. Each pull request fixes affected links and repository consumers as part
+of the same coherent move.
 
-Create the current directories and move live documents by responsibility.
-Separate the Linux Event MVP operator journey from qualification acceptance,
-receipt schemas, and evidence interpretation. Update exact path consumers in
-the same commits as their documents.
+## No archive tooling
 
-### Phase 4: consolidation
+The final repository has none of the following:
 
-Reduce root and docs navigation to short entry points; consolidate duplicate
-architecture, status, CI, API, and reference prose; and archive the originals
-only after their durable content has a canonical current owner. Move the HTML
-product presentation out of the engineering-doc navigation or generate it from
-an explicitly owned site source.
+- an archive manifest or digest registry;
+- an archive checker or checker test suite;
+- a permanent documentation-refactor inventory;
+- archive-specific `mise` tasks or CI gates;
+- a custom Markdown navigation or link parser.
 
-### Phase 5: lifecycle enforcement
+These mechanisms would add another system that engineers must understand and
+maintain. They do not make the documentation itself easier to read.
 
-Use contribution guidance and human review for document class, owner, status,
-links, and archive admission. Repository archive checks validate manifest
-integrity and inventory grammar, state, and coverage. Completed plans should move
-to `archive/design-history/plans/` as part of completing their capability, not
-accumulate indefinitely in current docs.
-
-## Safe move transaction
-
-Each moved batch follows one fail-closed transaction:
-
-```text
-inventory exact inbound consumers
-  -> classify and extract durable current content
-  -> update code, tests, links, mappings, and manifests
-  -> git mv the historical source
-  -> regenerate archive/MANIFEST.sha256
-  -> run focused and repository-wide verification
-```
-
-If a required consumer cannot be updated, a recorded digest would be invalid,
-or current authority is unclear, the move does not land. The requirements
-checker remains authoritative for traceability. Requirement IDs and evidence
-statuses change only when their actual implementation or evidence boundary
-changes, never as a side effect of path cleanup.
+During the refactor, maintainers may use ordinary Git diffs, `rg`, and a local
+ignored scratch list to plan batches. The scratch list is not product
+documentation and is deleted when the migration is complete.
 
 ## Verification
 
-Every archive or current-hierarchy pull request includes human review of
-Markdown navigation and exact path consumers, and runs:
+Each documentation pull request is reviewed as documentation by a human. The
+author also runs checks appropriate to the files whose repository role changed:
 
-- `git diff --check`;
-- `python3 tools/check-documentation-archive.py` for archive and inventory
-  validation;
-- `python3 tools/check-implementation-requirements.py`;
-- focused tests for every changed script, manifest, schema, or lab workflow;
-- archive manifest regeneration followed by an independent digest check; and
-- `mise run check` before handoff.
+- `git diff --check` for patch hygiene;
+- `rg` searches for stale paths and broken repository references;
+- `python3 tools/check-implementation-requirements.py` whenever requirements
+  evidence or traceability changes;
+- focused tests for scripts or code whose inputs moved;
+- `mise run check` before handing off a substantive code change, as required
+  by repository policy.
 
-`mise run fuzz-smoke` is not required for path-only documentation changes. It
-becomes required if a change also modifies parsers, framing, envelopes,
-fragmentation, or another hostile-input boundary.
-
-The baseline `mise run check` for this design branch passed formatting, lint,
-traceability, Python tooling, and most Rust tests but failed 28 `aster-node`
-tests. The failures include secure temporary-directory checks rejecting the
-runner's `/tmp` ownership or permissions, followed by related actor and timeout
-failures. Because the run preceded this document, the baseline failure must
-remain visible in handoff and must not be attributed to this documentation
-change.
+No archive-specific verification is added.
 
 ## Success criteria
 
 The refactor is complete when:
 
-- a new engineer can understand the product boundary and reach the primary MVP
-  workflow through at most five documents totaling no more than 1,500 lines;
-- normal navigation exposes no completed implementation plan, rejected
-  proposal, or experiment-only report;
-- current human-facing Markdown under `docs/`, excluding generated/machine
-  evidence, is at most 35 documents and 15,000 lines;
-- MVP operation and validation have distinct navigation and canonical owners;
-- the implementation boundary and requirement state each have one canonical
-  current representation;
-- every regular archive file except the manifest itself is present in
-  `archive/MANIFEST.sha256` and every digest verifies;
-- human review confirms navigation and exact path consumers have no stale
-  internal paths or broken current links;
-  and
-- requirements traceability and all retained evidence remain valid without
-  broadening any implementation claim.
+- a new engineer can enter through `README.md` and reach current protocol,
+  implementation, MVP, and validation material without reading project history;
+- `docs/` contains no completed plans, superseded designs, abandoned
+  experiments, or historical coordination records;
+- MVP operation and validation have distinct, obvious homes;
+- each retained current document has one clear purpose and canonical owner;
+- `archive/` is visibly non-normative and absent from normal navigation;
+- no custom archive tooling or permanent migration inventory remains;
+- the requirements baseline and retained historical evidence remain valid.
 
-## Design lifecycle
+## Non-goals
 
-This design remains under `docs/superpowers/specs/` while the refactor is
-active. After the hierarchy and lifecycle checks are complete and current
-documentation owns all lasting rules, this document becomes its own final
-archive-admission test and moves to
-`archive/design-history/superseded-specs/`.
+This work does not change protocol, API, runtime, security, or deployment
+behavior. It does not broaden requirements claims, replace existing repository
+verification, build a general documentation linter, or rewrite every current
+document in a single pull request.
