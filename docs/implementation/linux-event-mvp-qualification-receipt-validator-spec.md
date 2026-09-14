@@ -165,6 +165,9 @@ required to bind facts that do not exist yet:
 
 1. The root key binds candidate ID/revision, frozen schema version/digest, exact
    profile ID/version/digest, and the G1 emission/capacity-contract references.
+   The candidate supplies the profile digest as the required
+   `prerequisites.profile_digest` field; it must equal the digest of the retained
+   accepted profile bytes and must never default to the machine-schema digest.
 2. The G2 key binds the root key plus the G1 exit digest, full source commit,
    dependency lock/toolchain, sanitized strict configuration, and harness
    source/version/configuration digest.
@@ -222,7 +225,7 @@ it conditional.
 | Validator field group | Normative source | Candidate evidence source | Required validation |
 |---|---|---|---|
 | Schema identity | Annex §§Completion conventions, 1, 13, 15 | Frozen schema record | Reviewed non-proposed version, immutable digest, same digest in body/approvals/decision |
-| Profile identity and claim | Profile §§Profile identity and reuse, Consequences; Annex §1 | Immutable profile bytes and claim/non-claims record | Exact ID/version; digest match; non-production Event-only claim; exclusions retained |
+| Profile identity and claim | Profile §§Profile identity and reuse, Consequences; Annex §1 | Immutable profile bytes and claim/non-claims record | Exact ID/version; required `prerequisites.profile_digest` matches the retained profile bytes and root binding; non-production Event-only claim; exclusions retained |
 | Candidate identity and checkpoint | Annex §1 | Release-owned candidate record | Unique ID/revision; exact checkpoint date; review time is not approval |
 | Global G3 binding | Annex §§Completion conventions, 1, 3, 13 | G3 exit or failure receipt and attempt manifest | Exact produced/no-output grammar; partial outputs force produced attempt manifest |
 | Complete artifact-set binding | Annex §§1, 3, 13 | Complete artifact-set manifest | Required for issue; agrees with every produced attempt entry |

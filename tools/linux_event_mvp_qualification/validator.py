@@ -20,6 +20,7 @@ from .schema import (
     CANONICALIZATION_ID,
     DECISION_SCHEMA,
     INDEX_SCHEMA,
+    PROFILE_DIGEST,
     machine_schema_digest,
 )
 
@@ -250,7 +251,7 @@ def _validate_body_shapes(body: dict[str, Any], findings: list[Finding]) -> None
             for procedure in artifact["procedures"].values():
                 _keys(procedure, {"version", "digest"}, findings, "QVR002")
     prerequisites = body.get("prerequisites")
-    if _keys(prerequisites, {"d06", "e01", "d15"}, findings, "QVR002"):
+    if _keys(prerequisites, {"profile_digest", "d06", "e01", "d15"}, findings, "QVR002"):
         _keys(prerequisites["d06"], {"design_digest", "amendment_digest", "provider_contract"}, findings, "QVR002")
         _keys(prerequisites["d15"], {"proposal_digest", "approval_digest", "roles", "evaluation_only", "production_requirement_open"}, findings, "QVR002")
         if isinstance(prerequisites["e01"], list):
@@ -274,10 +275,12 @@ def _validate_body_shapes(body: dict[str, Any], findings: list[Finding]) -> None
     )
     if not inventory_valid:
         findings.append(_finding("QVR002", "document shape does not match the frozen schema"))
+    node_keys = {"alias", "device_commitment", "physical", "model", "architecture", "image_reference", "os", "kernel", "systemd", "filesystem", "nominal_memory_bytes", "kernel_visible_memory_bytes", "initial_state_free_bytes", "peer_role", "artifact_digest"}
     if inventory_valid and isinstance(inventory["nodes"], list):
-        node_keys = {"alias", "device_commitment", "physical", "model", "architecture", "image_reference", "os", "kernel", "systemd", "filesystem", "nominal_memory_bytes", "kernel_visible_memory_bytes", "initial_state_free_bytes", "peer_role", "artifact_digest"}
         for node in inventory["nodes"]:
             _keys(node, node_keys, findings, "QVR002")
+    if inventory_valid and "spare" in inventory:
+        _keys(inventory["spare"], node_keys, findings, "QVR002")
     _keys(body.get("configuration"), {"discovery", "direct_ip", "manual_peers_per_node", "storage_max_items", "storage_max_payload_bytes", "operations_max_records", "operations_max_logical_bytes", "operations_emergency_reserve", "operations_active_alias_limit", "application_max_connections", "max_in_flight_operations", "emission_modes", "local_clients_per_node", "query_page", "gap_page", "delivery_page", "delivery_scan", "gap_scan", "unacknowledged_deliveries", "payload_min_bytes", "payload_max_bytes", "operation_key_min_bytes", "operation_key_max_bytes", "operation_profile_warning", "operation_profile_stop", "mission_publish_seconds", "mission_convergence_max_seconds", "focused_test_procedure_digests"}, findings, "QVR002")
     workload_base = {"label", "nodes", "payload_bytes", "publisher_assignments", "events_per_node", "total_events", "rate_per_hour_per_node", "duration_seconds", "distinct_operations_per_node", "exact_retries_per_node", "result"}
     for workload in body.get("workloads", ()) if isinstance(body.get("workloads"), list) else ():
@@ -459,6 +462,13 @@ def _validate_gates_and_result_references(
 
 
 def _validate_profile(body: dict[str, Any], outcome: Any, findings: list[Finding]) -> None:
+    if body.get("prerequisites", {}).get("profile_digest") != PROFILE_DIGEST:
+        findings.append(
+            _finding(
+                "QVB002",
+                "candidate profile digest is not the selected v0.1 profile",
+            )
+        )
     schema = body.get("schema", {})
     if schema != {
         "id": BODY_DOCUMENT_SCHEMA,

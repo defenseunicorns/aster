@@ -31,6 +31,7 @@ from linux_event_mvp_qualification.schema import (
     CANONICALIZATION_ID,
     REPORT_SCHEMA_ID,
     SCHEMA_PATH,
+    PROFILE_DIGEST,
     load_machine_schema,
     machine_schema_digest,
 )
@@ -75,6 +76,45 @@ class MachineSchemaTests(unittest.TestCase):
             {"approval", "candidate_body", "receipt_index", "release_decision"},
         )
         self.assertRegex(machine_schema_digest(), r"\Asha256:[0-9a-f]{64}\Z")
+        profile_path = (
+            SCHEMA_PATH.parent.parent / "linux-event-mvp-evaluation-profile-v0.1.md"
+        )
+        self.assertEqual(
+            PROFILE_DIGEST,
+            f"sha256:{hashlib.sha256(profile_path.read_bytes()).hexdigest()}",
+        )
+
+    def test_every_nested_object_and_array_has_an_exact_schema(self) -> None:
+        """Break caught: published schema accepts fields the validator rejects."""
+
+        def assert_exact(node: object, path: str) -> None:
+            if not isinstance(node, dict):
+                return
+            if node.get("type") == "object" and "oneOf" not in node:
+                self.assertIs(
+                    node.get("additionalProperties"),
+                    False,
+                    f"open object schema at {path}",
+                )
+                self.assertIsInstance(
+                    node.get("properties"), dict, f"missing properties at {path}"
+                )
+            if node.get("type") == "array":
+                self.assertIn("items", node, f"unconstrained array at {path}")
+            for keyword in ("properties", "$defs"):
+                children = node.get(keyword, {})
+                if isinstance(children, dict):
+                    for name, child in children.items():
+                        assert_exact(child, f"{path}.{name}")
+            if "items" in node:
+                assert_exact(node["items"], f"{path}[]")
+            for keyword in ("allOf", "anyOf", "oneOf"):
+                children = node.get(keyword, [])
+                if isinstance(children, list):
+                    for index, child in enumerate(children):
+                        assert_exact(child, f"{path}.{keyword}[{index}]")
+
+        assert_exact(load_machine_schema(), "$")
 
 
 class SafeRootTests(unittest.TestCase):
@@ -341,6 +381,7 @@ def valid_body(index_bytes: bytes) -> dict[str, object]:
             },
         },
         "prerequisites": {
+            "profile_digest": PROFILE_DIGEST,
             "d06": {
                 "design_digest": "sha256:30c5dfe71a203fcdd69dd330f9b5c68eeaee5032b624ee41912aa4723a9f853f",
                 "amendment_digest": "sha256:549ea3fd5bdfd62c01bab5a8f1adac4b84a2710ab406ea006119c9048e28d4cd",
@@ -645,11 +686,45 @@ class CompleteBundleTests(unittest.TestCase):
         finding_keys = [(item.code, item.field_path) for item in report.findings]
         self.assertEqual(len(finding_keys), len(set(finding_keys)))
 
+    def test_candidate_profile_digest_must_match_selected_profile_bytes(self) -> None:
+        """Break caught: root binding substitutes the machine-schema digest."""
+
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            inputs = write_valid_bundle(root)
+            self.mutate_body(
+                root,
+                inputs,
+                lambda body: body["prerequisites"].__setitem__(
+                    "profile_digest", "sha256:" + "f" * 64
+                ),
+            )
+            rebind_bundle(root, inputs)
+            report = validate_bundle(inputs)
+        self.assertEqual(report.disposition, "nonconformant")
+        self.assertIn("QVB002", tuple(item.code for item in report.findings))
+
     def test_unknown_nested_field_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as parent:
             root = Path(parent)
             inputs = write_valid_bundle(root)
             self.mutate_body(root, inputs, lambda body: body["configuration"].__setitem__("max_connections_per_client", 1))
+            report = validate_bundle(inputs)
+        self.assertIn("QVR002", tuple(item.code for item in report.findings))
+
+    def test_unknown_spare_inventory_shape_is_rejected(self) -> None:
+        """Break caught: optional spare inventory bypasses the field allowlist."""
+
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            inputs = write_valid_bundle(root)
+            self.mutate_body(
+                root,
+                inputs,
+                lambda body: body["inventory"].__setitem__(
+                    "spare", {"raw_device_identity": "must-not-be-accepted"}
+                ),
+            )
             report = validate_bundle(inputs)
         self.assertIn("QVR002", tuple(item.code for item in report.findings))
 

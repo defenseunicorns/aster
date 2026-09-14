@@ -33,7 +33,7 @@ def expected_binding_chain(body: dict[str, Any]) -> dict[str, str]:
             "schema_digest": schema["digest"],
             "profile_id": "aster-linux-event-mvp-evaluation-v0.1",
             "profile_version": "0.1",
-            "profile_digest": body["prerequisites"].get("profile_digest", schema["digest"]),
+            "profile_digest": body["prerequisites"]["profile_digest"],
             "g1_contracts": {
                 "emission_modes": configuration["emission_modes"],
                 "operation_profile_warning": configuration["operation_profile_warning"],
