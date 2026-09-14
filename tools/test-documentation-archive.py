@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 # Copyright 2026 Defense Unicorns, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Regression tests for the deterministic documentation archive manifest."""
+"""Regression tests for the documentation archive manifest and inventory."""
 
 from __future__ import annotations
 
+import csv
 import importlib.util
+import io
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 CHECKER_PATH = Path(__file__).with_name("check-documentation-archive.py")
@@ -217,6 +221,219 @@ class DocumentationArchiveManifestTests(unittest.TestCase):
             CHECKER.ArchiveViolation, "existing manifest is not a regular file"
         ):
             CHECKER.write_manifest(self.root)
+
+
+class DocumentationInventoryTests(unittest.TestCase):
+    HEADER = "source_path,current_path,target_path,document_class,disposition,batch,reason\n"
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self.root_patch = patch.object(CHECKER, "ROOT", self.root)
+        self.root_patch.start()
+        self.addCleanup(self.root_patch.stop)
+
+    def write(self, path: str, content: bytes = b"document\n") -> Path:
+        destination = self.root / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+        return destination
+
+    def track(self, *paths: str) -> None:
+        subprocess.run(["git", "-C", str(self.root), "add", "--", *paths], check=True)
+
+    def row(self, **changes: str) -> list[str]:
+        values = dict(zip(self.HEADER.strip().split(","), (
+            "docs/proposals/a.md", "docs/proposals/a.md", "", "research",
+            "keep-current", "retain", "ADR 0028 retains this authority",
+        )))
+        values.update(changes)
+        return list(values.values())
+
+    def csv(self, *rows: list[str]) -> str:
+        output = io.StringIO(newline="")
+        output.write(self.HEADER)
+        csv.writer(output, lineterminator="\n").writerows(rows)
+        return output.getvalue()
+
+    def test_all_dispositions_and_quoted_reason_roundtrip(self) -> None:
+        for disposition, current, target, batch in (
+            ("keep-current", "docs/proposals/a.md", "", "retain"),
+            ("relocate-current", "docs/proposals/a.md", "docs/architecture/a.md", "current-hierarchy"),
+            ("archive-ready", "docs/proposals/a.md", "archive/research/proposals/a.md", "archive-research"),
+            ("extract-current-first", "docs/proposals/a.md", "archive/research/proposals/a.md", "consolidation"),
+            ("migrate-consumers-first", "docs/proposals/a.md", "archive/research/proposals/a.md", "archive-research"),
+            ("archived", "archive/research/proposals/a.md", "", "archive-research"),
+        ):
+            with self.subTest(disposition=disposition):
+                self.write(current)
+                self.track(current)
+                (self.root / "archive").mkdir(exist_ok=True)
+                CHECKER.write_manifest(self.root)
+                rows = CHECKER.parse_inventory(self.csv(self.row(
+                    disposition=disposition, current_path=current,
+                    target_path=target, batch=batch, reason='ADR 0028, "selected" boundary',
+                )))
+                self.assertEqual(rows[0].reason, 'ADR 0028, "selected" boundary')
+                CHECKER.validate_inventory(rows, (current,))
+
+    def test_noncanonical_csv_fails(self) -> None:
+        valid = self.csv(self.row())
+        for text in (
+            valid.replace("source_path", "source"), "\ufeff" + valid,
+            valid.replace("\n", "\r\n"), valid + "\n", valid.rstrip("\n"),
+            valid.replace("ADR 0028", "ADR\x00 0028"),
+            valid.replace("ADR 0028", " ADR 0028"),
+            valid.replace("docs/proposals/a.md", '"docs/proposals/a.md"'),
+            valid.replace("authority\n", "authority,extra\n"),
+            self.HEADER + "docs/proposals/a.md\n",
+            self.HEADER + '"unterminated\n',
+            valid.replace("authority", "\udcff"),
+        ):
+            with self.subTest(text=repr(text)):
+                with self.assertRaises(CHECKER.ArchiveViolation):
+                    CHECKER.parse_inventory(text)
+
+    def test_blank_required_fields_fail(self) -> None:
+        for field in ("source_path", "current_path", "document_class", "disposition", "batch", "reason"):
+            with self.subTest(field=field):
+                with self.assertRaises(CHECKER.ArchiveViolation):
+                    CHECKER.parse_inventory(self.csv(self.row(**{field: ""})))
+
+    def test_unsafe_paths_fail_in_every_path_column(self) -> None:
+        for path in ("/docs/a.md", "docs/../a.md", "docs/./a.md", "docs//a.md", "docs\\a.md", ".", "..", "docs/a.md/", "docs/a\nb.md"):
+            for field in ("source_path", "current_path", "target_path"):
+                with self.subTest(path=path, field=field):
+                    with self.assertRaises(CHECKER.ArchiveViolation):
+                        CHECKER.parse_inventory(self.csv(self.row(**{field: path})))
+
+    def test_duplicate_source_current_and_future_target_fail(self) -> None:
+        cases = (
+            (self.row(), self.row()),
+            (self.row(disposition="archived", current_path="archive/research/proposals/x.md"),
+             self.row(source_path="docs/proposals/b.md", disposition="archived", current_path="archive/research/proposals/x.md")),
+            (self.row(disposition="archive-ready", target_path="archive/research/proposals/x.md"),
+             self.row(source_path="docs/proposals/b.md", current_path="docs/proposals/b.md", disposition="archive-ready", target_path="archive/research/proposals/x.md")),
+        )
+        for rows in cases:
+            with self.subTest(rows=rows):
+                with self.assertRaises(CHECKER.ArchiveViolation):
+                    CHECKER.parse_inventory(self.csv(*rows))
+
+    def test_unsorted_sources_fail(self) -> None:
+        with self.assertRaises(CHECKER.ArchiveViolation):
+            CHECKER.parse_inventory(self.csv(
+                self.row(source_path="docs/proposals/z.md", current_path="docs/proposals/z.md"), self.row(),
+            ))
+
+    def test_invalid_states_classes_and_prefixes_fail(self) -> None:
+        for changes in (
+            {"document_class": "unknown"}, {"disposition": "pending"}, {"batch": "later"},
+            {"current_path": "docs/proposals/b.md"}, {"source_path": "archive/research/proposals/a.md"},
+            {"target_path": "docs/a.md"}, {"disposition": "relocate-current"},
+            {"disposition": "relocate-current", "target_path": "archive/research/proposals/a.md"},
+            {"disposition": "archive-ready", "target_path": "docs/a.md"},
+            {"disposition": "extract-current-first", "target_path": "archive/research/a.md"},
+            {"disposition": "migrate-consumers-first", "document_class": "decision", "target_path": "archive/research/proposals/a.md"},
+            {"disposition": "archived"},
+            {"disposition": "archived", "current_path": "archive/design-history/plans/a.md"},
+            {"disposition": "archived", "current_path": "archive/research/proposals/a.md", "target_path": "docs/a.md"},
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaises(CHECKER.ArchiveViolation):
+                    CHECKER.parse_inventory(self.csv(self.row(**changes)))
+        for document_class in ("implementation", "validation"):
+            for disposition in ("archive-ready", "extract-current-first", "migrate-consumers-first", "archived"):
+                with self.subTest(document_class=document_class, disposition=disposition):
+                    with self.assertRaises(CHECKER.ArchiveViolation):
+                        CHECKER.parse_inventory(self.csv(self.row(
+                            document_class=document_class, disposition=disposition,
+                            target_path="archive/research/proposals/a.md",
+                        )))
+
+    def test_class_compatible_archive_prefixes_and_current_classes(self) -> None:
+        for document_class, prefix in (
+            ("research", "archive/research/proposals/"),
+            ("research", "archive/research/evaluations/"),
+            ("design-history", "archive/design-history/plans/"),
+            ("design-history", "archive/design-history/superseded-specs/"),
+            ("decision", "archive/design-history/retired-decisions/"),
+        ):
+            rows = CHECKER.parse_inventory(self.csv(self.row(
+                document_class=document_class, disposition="archive-ready", target_path=prefix + "a.md",
+            )))
+            self.assertEqual(rows[0].target_path, prefix + "a.md")
+        for document_class in ("implementation", "validation"):
+            for disposition, target in (("keep-current", ""), ("relocate-current", "docs/validation/a.md")):
+                self.assertEqual(len(CHECKER.parse_inventory(self.csv(self.row(
+                    document_class=document_class, disposition=disposition, target_path=target,
+                )))), 1)
+
+    def test_tracked_coverage_includes_archive_roots_and_ignores_untracked(self) -> None:
+        paths = ("archive/research/proposals/a.md", "docs/decisions/a.md", "docs/superpowers/specs/é.md")
+        for path in (*paths, "docs/proposals/untracked.md", "docs/implementation/outside.md"):
+            self.write(path)
+        self.track(*paths, "docs/implementation/outside.md")
+        self.assertEqual(CHECKER.tracked_candidate_paths(self.root), paths)
+
+    def test_missing_unexpected_and_nonexistent_current_paths_fail(self) -> None:
+        rows = CHECKER.parse_inventory(self.csv(self.row()))
+        self.write("docs/proposals/a.md")
+        for candidates in ((), ("docs/proposals/a.md", "docs/proposals/b.md")):
+            with self.assertRaises(CHECKER.ArchiveViolation):
+                CHECKER.validate_inventory(rows, candidates)
+        (self.root / "docs/proposals/a.md").unlink()
+        with self.assertRaises(CHECKER.ArchiveViolation):
+            CHECKER.validate_inventory(rows, ("docs/proposals/a.md",))
+
+    def test_existing_future_target_fails(self) -> None:
+        self.write("docs/proposals/a.md")
+        target = self.write("archive/research/proposals/a.md")
+        rows = CHECKER.parse_inventory(self.csv(self.row(disposition="archive-ready", target_path=target.relative_to(self.root).as_posix())))
+        with self.assertRaises(CHECKER.ArchiveViolation):
+            CHECKER.validate_inventory(rows, ("docs/proposals/a.md",))
+        target.unlink()
+        target.symlink_to(self.root / "missing")
+        with self.assertRaises(CHECKER.ArchiveViolation):
+            CHECKER.validate_inventory(rows, ("docs/proposals/a.md",))
+
+    def test_archived_current_requires_manifest_coverage(self) -> None:
+        self.write("archive/research/proposals/a.md")
+        self.write("archive/MANIFEST.sha256", b"")
+        rows = CHECKER.parse_inventory(self.csv(self.row(disposition="archived", current_path="archive/research/proposals/a.md")))
+        with self.assertRaises(CHECKER.ArchiveViolation):
+            CHECKER.validate_inventory(rows, ("archive/research/proposals/a.md",))
+        CHECKER.write_manifest(self.root)
+        CHECKER.validate_inventory(rows, ("archive/research/proposals/a.md",))
+
+    def test_git_failure_and_missing_nonregular_tracked_entries_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as other:
+            with self.assertRaises(CHECKER.ArchiveViolation):
+                CHECKER.tracked_candidate_paths(Path(other))
+        path = self.write("docs/proposals/a.md")
+        self.track("docs/proposals/a.md")
+        path.unlink()
+        with self.assertRaises(CHECKER.ArchiveViolation):
+            CHECKER.tracked_candidate_paths(self.root)
+        path.mkdir()
+        with self.assertRaises(CHECKER.ArchiveViolation):
+            CHECKER.tracked_candidate_paths(self.root)
+        path.rmdir()
+        path.symlink_to(self.write("outside.md"))
+        with self.assertRaises(CHECKER.ArchiveViolation):
+            CHECKER.tracked_candidate_paths(self.root)
+
+    @unittest.skipUnless(os.name == "posix", "byte-oriented filenames need POSIX")
+    def test_non_utf8_git_path_fails_closed(self) -> None:
+        (self.root / "docs/proposals").mkdir(parents=True)
+        path = os.fsencode(self.root / "docs/proposals") + b"/invalid-\xff.md"
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(descriptor)
+        subprocess.run([b"git", b"-C", os.fsencode(self.root), b"add", b"--", path], check=True)
+        with self.assertRaises(CHECKER.ArchiveViolation):
+            CHECKER.tracked_candidate_paths(self.root)
 
 
 if __name__ == "__main__":
