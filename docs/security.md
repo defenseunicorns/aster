@@ -20,7 +20,7 @@ policy-selectable; neither profile reinterprets the other's bytes or evidence.
 | Which controls are mandatory? | [Mandatory controls](#mandatory-controls) and [key access matrix](#key-access-matrix) |
 | What do revocation and zeroization mean? | [Authority custody](#authority-custody-and-control-continuity) and [revocation meaning](#revocation-meaning) |
 | How is availability bounded? | [Causal evidence](#causal-evidence-and-bounded-state) and [availability controls](#availability-controls) |
-| What blocks production authorization? | [Mesh cryptographic provider status](#mesh-cryptographic-provider-status) and [security test gates](#security-test-gates) |
+| What blocks production authorization? | [Mesh cryptographic provider status](#mesh-cryptographic-provider-status) and [production authorization boundary](#production-authorization-boundary) |
 
 ## Implemented profile boundary
 
@@ -121,35 +121,15 @@ that identity's lifetime, IP/port, timing, and packet sizes. The mission
 handshake and protected Event metadata begin only after Iroh authenticates an
 exact provisioned carrier identity. Discovery never grants admission.
 
-Continuous discovery is deliberately not selected: prior measurement found
-material recurring traffic, and the provider's internal peer maps are not
-hostile-cardinality bounded. Expiry or shutdown clears the provider, while
-invitation mode produces no recurring discovery traffic. See
-[Nearby discovery FOSS selection](evaluations/0005/nearby-discovery-selection.md).
+Continuous discovery is deliberately not selected because the provider's
+internal peer maps are not hostile-cardinality bounded. Expiry or shutdown
+clears the provider, while invitation mode produces no recurring discovery
+traffic.
 
 The controlled Iroh relay is transport infrastructure, not an Aster mission
 node: it has no Aster store or route grant. The payload-blind Aster Event relay
 below is instead a mission node with route-only Event custody, and route-only
-Blob relay/custody remains unimplemented. Current real-process controlled-relay
-evidence is one-host and Event-only. A separate focused direct-Iroh runtime test
-proves that a wrong expected mission fails before inventory; it is not part of
-the relay-path process proof. Neither source/test result creates retained,
-physical, representative-NAT, BTLE, mixed-implementation, N=32,
-State/Record/Blob-over-relay, or release credit.
-
-A separately frozen retained receipt observes the selected Event carrier in two
-Docker Linux namespace cells on one Darwin arm64 host. One cell disables every
-relay and selects Direct across two software NAT routers with static
-operator-known mappings. The restrictive cell records direct drops and selects
-the exact DER-pinned controlled relay. Each cell delivers and acknowledges one
-exact 32-byte Event and repeats as an exact no-op. The public receipt contains
-only bounded sanitized data and packet tuple/count metadata; the raw pcaps,
-mission bundles, credentials, and encrypted stores remain external-restricted.
-Its canary scan covers exactly 26 enumerated finalized targets, not every file
-or the whole host. This is not discovery/punching, a temporal fallback sequence,
-representative or physical NAT, public Internet/relay operation, independent
-implementation, packet-capture confidentiality acceptance, complete-MVP, or
-release evidence. See the [receipt and replay boundary](validation/requirements-status.md#selected-iroh-nat-retained-receipt).
+Blob relay/custody is not implemented.
 
 Aster application relays are not content readers by default. The implemented
 semantic-version-2/3/v4/v5/v6 bridge similarly limits a bridge to rule-specific endpoint routing grants and
@@ -158,8 +138,7 @@ format-2 source carrier without content access, preserves the source signature
 and origin scope, and exposes a distinct authenticated current scope. A target
 reader still needs the exact origin scope/topic/content-epoch grant; target
 membership, bridge authority, and target content grants cannot substitute for
-it. The remaining cross-implementation and physical acceptance gates are in
-[conformance.md](validation/conformance.md).
+it.
 
 The exact protected bytes, signature messages, KDF inputs, and bounds are
 normative in [envelope.md](envelope.md).
@@ -180,9 +159,9 @@ Protected artifacts are bounded to one MiB. Provider errors retain only safe
 typed categories, and failure cannot fall back to interpreting the artifact as
 plaintext.
 
-The interface does not itself guarantee encryption. In addition to behavioral
-test providers, the repository ships an isolated `aster-provisioning-age` pilot
-using exactly pinned Rust `age` 0.11.5 with `default-features = false`. The
+The interface does not itself guarantee encryption. The repository ships an
+optional `aster-provisioning-age` provider using exactly pinned Rust `age`
+0.11.5 with `default-features = false`. The
 configuration accepts only 1–16 classic X25519 recipients or identities; it
 does not expose passphrases, SSH identities, plugins, tagged hardware
 recipients, or any post-quantum recipient profile. Its
@@ -209,24 +188,9 @@ those upstream temporaries, allocator/compiler copies, crash dumps, swap, or
 complete process-memory erasure. This residual is separate from successful
 ciphertext authentication and is another production-review gate.
 
-This is an experimental Rust-only provider, not an operational default. Rust
-`age` describes pre-1.0 releases as beta software for testing and its repository
-has no detected security-policy file. The plugin feature is disabled, and
-0.11.5 includes the plugin-execution fix first released in 0.11.1 for
-`GHSA-4fg7-vxc8-qx5w`. Bidirectional interoperability with exact
-reference Go age v1.3.1 is a required batch gate, not a mesh-interoperability or
-security-audit claim. [Decision 0018](decisions/0018-age-provisioning-provider.md)
-records the dependency graph, sources, exception, and exit gates.
-
-The pilot graph also contains build-time `proc-macro-error2` 2.0.1 through
-`i18n-embed-fl` 0.9.4. RustSec `RUSTSEC-2026-0173` marks it unmaintained and
-lists no patched release; the advisory is informational and reports no
-vulnerability. Current Rust separately reports future-incompatibility `E0365`.
-The exact advisory is ignored by dependency policy only for this bounded pilot,
-with locked checksums and offline validation after dependency acquisition. It
-is not a reported runtime vulnerability, but build-time code can influence the
-produced binary. It therefore remains an unresolved supply-chain and
-compiler-lifecycle risk and independently prohibits production admission.
+This Rust-only provider is disabled by default and is not production admitted.
+[Decision 0018](decisions/0018-age-provisioning-provider.md) owns its dependency
+review, exceptions, and exit gates.
 
 The profile is X25519 and ChaCha20-Poly1305 based. It provides no post-quantum
 artifact-confidentiality or FIPS 140-3 validation claim. The raw
@@ -297,14 +261,15 @@ assurance, parent-directory symlink/rename races across every boundary,
 database rollback or replacement, and a supported restore/rebind procedure
 remain open.
 
-A production backend still needs platform or hardware key policy,
+No production persistent-custody backend is selected. Such a backend still
+needs platform or hardware key policy,
 authentication/access control, unattended-start decisions, recovery and backup
 procedures, rollback handling, operation-ledger retirement, and verified
-failure behavior. The in-memory fixture tests only the API model; it is not
-evidence of backend durability, secrecy, or erasure. This model does not defend
-secrets against a fully compromised running process or root, unlocked-memory
-inspection, swap, DMA, backups, or crash dumps unless the selected platform and
-deployment add those controls.
+failure behavior. The provider-neutral contract does not establish backend
+durability, secrecy, or erasure. This model does not defend secrets against a
+fully compromised running process or root, unlocked-memory inspection, swap,
+DMA, backups, or crash dumps unless the selected platform and deployment add
+those controls.
 
 ## Mandatory controls
 
@@ -722,26 +687,12 @@ invalid authenticated depot capability, page-integrity failure, or post-commit
 verification contradiction is `FatalBlobCoherence`: the worker closes shared
 admission and terminates the actor rather than serving through divergent
 authorities. This is a local fail-closed mechanism, not retained network or
-release acceptance.
+remote-delivery authority.
 
 Normal and `AtLeast` run this lane because `AtLeast` is Event-only;
 `ReceiveOnly` sends, requests, stages, promotes, and counts zero Blob work.
 The local delivery-ledger counts are not Blob peer, contact, transfer-progress,
-or convergence status. A
-[retained 10,269-byte Blob-delivery receipt](validation/evidence/selected-live-blob-subscription-26e0a09.json)
-(SHA-256
-`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
-Good-signed source `26e0a09`) observes one peerless participant across three
-processes and four actor lifetimes. After a flushed unacknowledged attempt-one
-poll, the child receives `SIGKILL`; a fresh process receives attempt 2 and
-acknowledges it with the persisted attempt-one token, rejects a token bound to
-the other exact publication sharing the same `BlobId`, settles both, and leaves
-the final reopened ledger empty. This adds no network, peer-status,
-selector-withholding, or network-interest-separation claim. Route-only Blob
-relay or custody, Blob TTL/expiry/garbage collection,
-metadata-independent whole-byte identity/deduplication, or retained large-file,
-power-loss/filesystem-crash, physical, mixed-implementation, resource/soak,
-and release-acceptance claims remain open.
+or convergence status.
 
 ### Selected semantic-v6 Event-bridge isolation
 
@@ -764,13 +715,10 @@ its broader inventory.
 
 The forwarding path materializes and transmits only sealed source/wrapper bytes
 and does not open payload plaintext. A content-authorized target may open a
-freshly verified route only after its durable commit; the selected receipt logs
-only payload length and SHA-256 and never the payload bytes. The current static
-composition fails closed when its captured control-policy snapshot changes.
-Dynamic join/leave administration, automatic authorization replacement,
-finite-TTL bridge age, generalized bridge quotas/scale, physical-network
-capture evidence, independent interoperability, and production authorization
-remain outside this version statement.
+freshly verified route only after its durable commit. The current static
+composition fails closed when its captured control-policy snapshot changes and
+does not implement dynamic join/leave administration, automatic authorization
+replacement, or finite-TTL bridge age.
 
 ## Availability controls
 
@@ -905,10 +853,9 @@ transient local failures as a staging-erasure oracle.
 The runtime retains a failed backend range for another attempt and implements a
 bounded monotonic retransmission loop with priority deadlines, causal retirement,
 and adapter retry floors. The Rust application host owns and pumps configured
-link instances and wakes the runtime on local inventory change. Current tests
-use controlled in-memory links; they do not establish general congestion-control
-behavior, permanent-loss progress, a concrete BTLE controller, or a physical
-live-carrier path.
+link instances and wakes the runtime on local inventory change. This mechanism
+does not establish general congestion-control behavior, permanent-loss
+progress, a concrete BTLE controller, or a physical live-carrier path.
 
 Flight 1 proves possession of a shared mission proof key anonymously; it is not
 a per-credential revocation check. A captured or revoked node that retains that
@@ -934,94 +881,28 @@ and an independently reviewed hybrid combiner. Every future production profile
 has its own applicable module and review gate; a hybrid-PQ module gate does not
 apply to a profile that excludes PQ.
 
-## Security test gates
+## Production authorization boundary
 
-Listing a production gate is not evidence that it has passed. Independent NIST
-algorithm-vector validation remains required; the checked-in, reference-generated
-protocol conformance vectors do not satisfy that gate.
-
-The retained selected N=32 Event run is likewise a scale-boundary observation,
-not broader security acceptance. It used one macOS arm64 host, direct loopback,
-one binary/implementation, one scope/authority/topic, and unprotected-reference
-provisioning. Its raw root contains mission bundles and carrier identity keys
-and must remain outside source control; the checked-in receipt contains only a
-bounded sanitized manifest. The run adds no physical, distributed, NAT,
-controlled-relay, BTLE/cross-transport, packet-capture, mixed-implementation,
-resource-threshold, cryptographic-module, or release claim.
-
-- Bit-level tamper of every envelope/handshake field.
-- signature stripping and classical/PQ downgrade attempts.
-- stripping the current `[6, 5, 4, 3, 2, 1]` offer to `[5, 4, 3, 2, 1]`,
-  `[4, 3, 2, 1]`, `[3, 2, 1]`, `[2, 1]`, or `[1]`,
-  and the retained `[2, 1]` compatibility offer to `[1]`; the initiator must reject even though
-  membership checks alone would accept the selected lower version.
-- malformed public keys/ciphertexts and implicit-rejection behavior.
-- nonce uniqueness across concurrency, crash, rollback, and epoch change.
-- replay windows and old control/key epochs.
-- packet-capture canary scan for payload and routing fields.
-- relay/bridge negative decryption tests.
-- The repository ships `wire_decode`, `fragment_decode`, and
-  `envelope_inspect` fuzz targets plus allocation-limit tests; an FFI fuzz target
-  remains a production gate.
-- Aster-owned zeroization hook invocation and post-zeroize handle rejection;
-  this does not assert clearing of upstream age internals.
-- age-provider ordinary/binary/maximum-size and real-bundle round trips;
-  one-to-sixteen recipient/identity bounds, duplicate rejection, sanitized
-  configuration errors, redacted secret debug output, and multi-recipient
-  recovery; incoming no-X25519, over-16-X25519, scrypt, and multiple-extension
-  stanza-set rejection before identity unwrap while accepting standard GREASE;
-  wrong-identity, malformed-header,
-  stanza/header-MAC/body/final-byte, truncation, and trailing-data rejection;
-  bounded output and recovered
-  plaintext; randomized ciphertext; and failure without partial plaintext
-  release.
-- bidirectional outer-file interoperability with exact reference Go age v1.3.1;
-  this checks only the classic X25519 age file profile.
-- dependency-policy confirmation that the sole ignored advisory is the
-  pilot-scoped informational `RUSTSEC-2026-0173`, with no additional advisory
-  or vulnerability exception.
-
-The semantic-version tamper gate proves only on-path transcript downgrade
-resistance. Client offers are mission-proof bound; honest responder selections
-are transcript/KDF/confirmation/authentication bound. The handshake has no
+Independent NIST algorithm-vector validation remains required; checked-in,
+reference-generated conformance vectors do not satisfy that gate. Client offers
+are mission-proof bound and honest responder selections are transcript, KDF,
+confirmation, and authentication bound. The handshake nevertheless has no
 authenticated responder capability ceiling, authority-signed mission minimum,
-or durable per-identity semantic high-water. Consequently, a valid older or
-modified responder can authenticate semantic `1`. Downgrade-sensitive
-production authorization MUST fail closed until the signed floor, high-water,
-explicit rollback authorization, and independently authored mixed-version
-validation exist.
+or durable per-identity semantic high-water. A valid older or modified responder
+can therefore authenticate semantic version 1. Downgrade-sensitive deployments
+must fail closed until a signed floor, high-water, and explicit rollback policy
+exist.
 
-Packet-capture success means protected payload, topic, scope, priority, and
-publisher credential canaries are absent from Aster carrier bytes. It does not
-claim resistance to correlation by link/network identifiers established before
-the first Aster flight—including IP addresses and a rendezvous pairing token
-visible to the rendezvous service—nor does it hide timing, direction, sizes, RF
-energy, or protocol presence. Local discovery sends a fresh nonce and truncated
-HKDF proof, never the provisioned discovery token itself. Its subsequent
-challenge and response are also truncated token-derived proofs; they establish
-live reachability at the apparent socket, not identity or resistance to an
-active real-time relay.
+Packet-capture canary checks can show that selected protected fields were not
+found in captured Aster carrier bytes. They cannot establish resistance to
+correlation through pre-session IP or rendezvous identifiers and do not hide
+timing, direction, size, RF energy, or protocol presence. Local discovery sends
+fresh truncated token-derived proofs; these establish reachability at the
+apparent socket, not peer identity or resistance to an active real-time relay.
 
-The reference now has a passing runtime capture subtest that reassembles all
-four tiny-MTU handshake flights and verifies that neither peer's mission,
-credential, credential body, NodeID, nor route-grant commitments occur in the
-clear. This satisfies the handshake portion of the capture gate, not the broader
-physical-carrier traffic-analysis boundary.
-
-The canonical batch codec, provider authentication, and explicit atomic
-source/store/application path reduce the transferred verification closure for a
-semantic-version-2/3/v4/v5/v6 batch. The default retained-dual policy preserves v1
-compatibility at extra signing/storage cost; explicit batch-only cannot reach a
-selected-v1 peer. Reference peer proof-first, compact-first pending/restart,
-v1-rejection, and Blob-carrier tests pass; the required 3 kbps end-to-end
-measurement, physical-carrier validation, and an independent SUT remain open.
-Recipient-excluding rekey is implemented in the core fixed profile, with the
-external registry high-water and missing administration workflow limitations
-above. Typed Blob-carrier relay and different-peer ranged resume are verified in
-the in-memory reference runtime, while a separate 101 MiB local streaming case
-passes with bounded component buffers. A combined 100+ MiB different-peer run
-with measured process RSS and physical live-carrier validation remains open. See
-[envelope.md](envelope.md) §§5.4, 6, and 10.
+The complete test matrix, credited evidence, and open production gates live in
+[requirements status](validation/requirements-status.md) and
+[conformance status](validation/conformance.md).
 
 Report vulnerabilities through the private process in `.github/SECURITY.md`.
 Do not include mission data or credentials in a public issue.
