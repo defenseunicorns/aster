@@ -79,7 +79,7 @@ equivalent tests.
 | Current semantic BTLE | MTU-aware link, unicast plus an advertisement primitive, disconnect handling, platform `BleRadio` seam | Selected-node integration; a shipped Android, iOS, Linux, or controller-specific radio driver; complete one-to-many profile |
 | LoRa, serial, file | The requirements and semantic design do not preclude them | No selected adapters ship |
 
-The [retained 9,656-byte State-delivery receipt](implementation/evidence/selected-live-state-subscription-8912fc3.json)
+The [retained 9,656-byte State-delivery receipt](validation/evidence/selected-live-state-subscription-8912fc3.json)
 (SHA-256
 `7d0b568dd4d57c3f2967da55953896829261877513c59c51a0b274eeda69485f`,
 signed source `8912fc3`) exercises the application queue and direct carrier together
@@ -95,7 +95,7 @@ It is not a materialized-view/status result, dynamic network-interest mutation,
 physical/NAT/relay/BTLE or mixed-implementation evidence, scale beyond two,
 resource/soak evidence, or release authorization.
 
-The [retained 10,357-byte Record-delivery receipt](implementation/evidence/selected-live-record-subscription-0c11344.json)
+The [retained 10,357-byte Record-delivery receipt](validation/evidence/selected-live-record-subscription-0c11344.json)
 (SHA-256
 `ba0e2bf47291f7e87000b85fa280cc957f3710ac800def82a51fb9b4657a1b48`,
 Good-signed source `0c1134411953f4bb52133b50aff9989cd4ce3930`) exercises the
@@ -138,11 +138,11 @@ nft and WAN tuple metadata are bound to the sanitized receipt. This is not
 endpoint discovery or punching, a temporal direct-first sequence,
 representative or physical NAT, public Internet or relay operation, independent
 implementation, another data class, resource evidence, or release acceptance.
-See the [retained receipt and replay boundary](implementation/requirements-status.md#selected-iroh-nat-retained-receipt).
+See the [retained receipt and replay boundary](validation/requirements-status.md#selected-iroh-nat-retained-receipt).
 
 Code presence is not deployment credit. See the tracked
-[production requirements status](implementation/requirements-status.md) and
-[Conformance](conformance.md) for exact retained receipts, evidence, and open
+[production requirements status](validation/requirements-status.md) and
+[Conformance](validation/conformance.md) for exact retained receipts, evidence, and open
 gates.
 
 ## Selected direct-Iroh contact
@@ -255,7 +255,7 @@ authenticated cache state, depot capability, or post-commit verification is a
 the actor rather than becoming an ordinary request error. Event's
 `LastContactComplete` reports only the most recent bounded negotiation with each
 active configured peer; it does not assert State/Record or global convergence.
-A [retained 7,752-byte v2 receipt](implementation/evidence/selected-live-mutable-6cabb4c.json)
+A [retained 7,752-byte v2 receipt](validation/evidence/selected-live-mutable-6cabb4c.json)
 (SHA-256
 `054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`,
 signed source `6cabb4c`) publishes State and conflicting Record revisions while
@@ -271,7 +271,7 @@ indefinite tombstone retention, garbage collection, delete-wins, physical or
 mixed implementations, NAT/relay, BTLE, scale, resource, or release acceptance.
 The live Blob handle and
 the semantic-v5 direct-Iroh Blob automation now have a separate
-[retained 10,728-byte receipt](implementation/evidence/selected-live-blob-044d90f.json)
+[retained 10,728-byte receipt](validation/evidence/selected-live-blob-044d90f.json)
 (SHA-256
 `4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)
 binding source commit `044d90ff07c8e754b3d490cb810d42de3c915e3d` with
@@ -290,7 +290,7 @@ or power-loss recovery, long-offline recovery, arbitrary-peer or route-only
 resume, scale beyond three participants, resource thresholds or soak,
 physical sanitization, independent-implementation interoperability, or release
 authorization. Blob delivery now has a metadata-only mechanism and a separate
-[retained 10,269-byte peerless delivery receipt](implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+[retained 10,269-byte peerless delivery receipt](validation/evidence/selected-live-blob-subscription-26e0a09.json)
 (SHA-256
 `3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
 Good-signed source `26e0a09`). It observes one participant across three
@@ -657,7 +657,7 @@ compatibility is not downgrade-resistance evidence.
 ## Before a real deployment
 
 - Complete the migration ledger in
-  [production requirements status](implementation/requirements-status.md), and
+  [production requirements status](validation/requirements-status.md), and
   do not interpret the direct-Iroh carrier handshake as mission authentication
   or the reference mission session as source-item authorization.
 - Issue distinct operational bundles through an approved provisioning process,
@@ -671,6 +671,6 @@ compatibility is not downgrade-resistance evidence.
 - Capture every enabled physical carrier and compare it with the privacy
   canaries in [Security](security.md).
 - Run the relevant loss, bandwidth, restart, alternate-peer, and large-Blob
-  scenarios in [Conformance](conformance.md).
-- Treat every open item in [Conformance](conformance.md) as an explicit
+  scenarios in [Conformance](validation/conformance.md).
+- Treat every open item in [Conformance](validation/conformance.md) as an explicit
   acceptance decision, not an implied guarantee.

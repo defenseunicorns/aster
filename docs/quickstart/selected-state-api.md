@@ -16,12 +16,12 @@ lane when the receiver configures an exact topic/scope interest.
 
 Durable positive-current-version application delivery is available through the
 selected Rust surface and has a
-[retained bounded receipt](../implementation/evidence/selected-live-state-subscription-8912fc3.json).
+[retained bounded receipt](../validation/evidence/selected-live-state-subscription-8912fc3.json).
 It is not a synthetic-withdrawal or materialized-view feed. Configured
 `NodeConfig` State interests remain the network receive
 policy in this slice; subscriptions do not dynamically replace them. Record
 has a separate durable whole-key delivery mechanism with a
-[retained bounded receipt](../implementation/evidence/selected-live-record-subscription-0c11344.json).
+[retained bounded receipt](../validation/evidence/selected-live-record-subscription-0c11344.json).
 That Record receipt moves only `DM-5.1-08` and does not broaden this State
 contract. Dynamic network selectors, State/node contact
 status, and Blob peer/convergence status,
@@ -33,7 +33,7 @@ authorization remain open. The selected store rejects every finite-TTL State
 object; there is no forwarding-age path to enable yet.
 
 Blob delivery separately has a
-[retained 10,269-byte peerless receipt](../implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+[retained 10,269-byte peerless receipt](../validation/evidence/selected-live-blob-subscription-26e0a09.json)
 (SHA-256
 `3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
 Good-signed source `26e0a09`) covering one participant, forced attempt-one
@@ -212,7 +212,7 @@ cargo test --locked -p aster-node \
 
 These focused commands are source-level current-code automation and do not by
 themselves create retained evidence. A separate
-[9,656-byte v1 receipt](../implementation/evidence/selected-live-state-subscription-8912fc3.json)
+[9,656-byte v1 receipt](../validation/evidence/selected-live-state-subscription-8912fc3.json)
 (SHA-256
 `7d0b568dd4d57c3f2967da55953896829261877513c59c51a0b274eeda69485f`)
 binds signed source commit `8912fc33571449d1beb4a4cb0f204b5dcd44e8c2`
@@ -277,7 +277,7 @@ cargo test --locked -p aster-node \
   -- --exact
 ```
 
-A separate [retained v2 live mutable receipt](../implementation/evidence/selected-live-mutable-6cabb4c.json)
+A separate [retained v2 live mutable receipt](../validation/evidence/selected-live-mutable-6cabb4c.json)
 is a 7,752-byte canonical projection (SHA-256
 `054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`)
 bound to signed source `6cabb4c`. Two same-implementation participants ran six
@@ -458,5 +458,5 @@ policy snapshot. The live `SelectedStateHandle` instead routes commands to the
 already-running authority. Continue with the
 [selected architecture](../architecture.md) for the full trust split, the
 [selected Event API](selected-event-api.md) for the live networked surface, and
-the [requirements status](../implementation/requirements-status.md) for the
+the [requirements status](../validation/requirements-status.md) for the
 exact partial credit and remaining gaps.

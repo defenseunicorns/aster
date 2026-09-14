@@ -350,7 +350,7 @@ and both insert flags true in 1.26 seconds; an exact 0.84-second rerun returned
 the same semantic ID and projection with both insert flags false.
 
 The exact Record source/dependency hashes are pinned in the
-[requirements evidence](../implementation/requirements-status.md#prior-selected-record-stopped-slice-automated-evidence).
+[requirements evidence](requirements-status.md#prior-selected-record-stopped-slice-automated-evidence).
 This is the earlier stopped/local automated evidence, not a Record contact,
 disconnected-process acceptance result, retained execution receipt, or release
 artifact. At this frozen slice Record had no live handle or reconciliation
@@ -436,7 +436,7 @@ an earlier sandboxed attempt was denied by the host before those socket tests
 could run and is not counted as a test failure or success.
 
 The exact Blob source identities are pinned in the
-[requirements evidence](../implementation/requirements-status.md#prior-selected-blob-automated-evidence).
+[requirements evidence](requirements-status.md#prior-selected-blob-automated-evidence).
 A disposable provisioned fixture then ran the compiled Blob example twice over
 18,783 input bytes. The 4.792-second first run returned one chunk,
 `inserted=true`, and Blob ID
@@ -477,7 +477,7 @@ continuous/lost age, route promotion, retirement/lease drain, retry/receipt
 settlement, sender/receiver visibility, crash-reopen cleanup, cardinality/audit
 corruption, and one-transaction bounded scheduling. Exact final counts, timings,
 and source hashes are recorded in the
-[prior semantic-v3 custody requirements evidence](../implementation/requirements-status.md#prior-semantic-v3-selected-event-custody-automated-evidence).
+[prior semantic-v3 custody requirements evidence](requirements-status.md#prior-semantic-v3-selected-event-custody-automated-evidence).
 
 This is current-code automated evidence, not a retained physical acceptance
 receipt. Finite TTL is Linux/Event/v3-format only, inherited in v3/v4/v5/v6;
@@ -493,7 +493,7 @@ software gate below does not relabel it.
 
 The subsequent stopped protected-provisioning/control-administration Step 4
 gate is pinned separately in the
-[requirements evidence](../implementation/requirements-status.md#prior-protected-provisioning-and-control-administration-automated-evidence).
+[requirements evidence](requirements-status.md#prior-protected-provisioning-and-control-administration-automated-evidence).
 On fresh isolated targets, current Rust 1.97.1 and Rust 1.91.0 each passed 927
 executable workspace tests with zero failures and one deliberately ignored
 performance experiment; every-target/every-feature Clippy and all 17 Rustdoc
@@ -536,7 +536,7 @@ and lexical state-witness mutation. Focused core/mission tests additionally name
 `protected_state_witness_is_lexical_and_clone_local`.
 
 At the exact source identities recorded in the
-[requirements ledger](../implementation/requirements-status.md#current-protected-live-startup-and-control-automated-evidence),
+[requirements ledger](requirements-status.md#current-protected-live-startup-and-control-automated-evidence),
 the reported current-code gates passed: core library 380/380 in 45.21s; node library
 180/180 in 69.94s; protected-runtime integration 12/12 in 0.15s; node
 all-target/all-feature check in 12m04s; strict node all-target/all-feature
@@ -617,7 +617,7 @@ cargo check --locked --manifest-path fuzz/Cargo.toml --bin selected_frame_decode
 
 The final source manifest, exact two-toolchain matrix results, binding gates,
 and the disclosed pre-existing lab-oracle retry are pinned in the
-[prior State/Record requirements evidence](../implementation/requirements-status.md#prior-selected-state-and-record-network-automated-evidence).
+[prior State/Record requirements evidence](requirements-status.md#prior-selected-state-and-record-network-automated-evidence).
 That earlier network-mechanics matrix remains current-code automation only; it
 does not itself create a retained execution root. Event last-contact status is
 not State/Record convergence. The later live-application receipt below adds a
@@ -647,7 +647,7 @@ python3 tools/test-selected-live-mutable-receipt.py
 ```
 
 The separate v2
-[`selected-live-mutable-6cabb4c.json`](../implementation/evidence/selected-live-mutable-6cabb4c.json)
+[`selected-live-mutable-6cabb4c.json`](evidence/selected-live-mutable-6cabb4c.json)
 canonical receipt is 7,752 bytes with SHA-256
 `054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`
 and binds the run to good-signature source commit `6cabb4c`. Its two distinct
@@ -687,7 +687,7 @@ do not evidence the newer live Blob mechanism.
 ## Selected live State subscription retained gate
 
 The v1
-[`selected-live-state-subscription-8912fc3.json`](../implementation/evidence/selected-live-state-subscription-8912fc3.json)
+[`selected-live-state-subscription-8912fc3.json`](evidence/selected-live-state-subscription-8912fc3.json)
 canonical receipt is 9,656 bytes with SHA-256
 `7d0b568dd4d57c3f2967da55953896829261877513c59c51a0b274eeda69485f`
 and binds the run to good-signature source commit `8912fc3`. Two participants
@@ -741,7 +741,7 @@ signed source freeze:
 
 ```sh
 ASTER_SOURCE=/path/to/aster-source-detached-at-8912fc33571449d1beb4a4cb0f204b5dcd44e8c2
-ASTER_RECEIPT=/absolute/path/to/current-aster-checkout/docs/implementation/evidence/selected-live-state-subscription-8912fc3.json
+ASTER_RECEIPT=/absolute/path/to/current-aster-checkout/docs/validation/evidence/selected-live-state-subscription-8912fc3.json
 cd /private/tmp
 ASTER_PYTHON="$(mise where python@3.13.7)/bin/python3"
 "$ASTER_PYTHON" "$ASTER_SOURCE/tools/check-selected-live-state-subscription-receipt.py" \
@@ -769,7 +769,7 @@ causal convergence observation.
 ## Selected live Record subscription retained gate
 
 The v1
-[`selected-live-record-subscription-0c11344.json`](../implementation/evidence/selected-live-record-subscription-0c11344.json)
+[`selected-live-record-subscription-0c11344.json`](evidence/selected-live-record-subscription-0c11344.json)
 canonical receipt is 10,357 bytes with SHA-256
 `ba0e2bf47291f7e87000b85fa280cc957f3710ac800def82a51fb9b4657a1b48`
 and binds the run to Good-signed source commit
@@ -818,7 +818,7 @@ checkout detached at the exact signed source:
 
 ```sh
 ASTER_SOURCE=/path/to/aster-source-detached-at-0c1134411953f4bb52133b50aff9989cd4ce3930
-ASTER_RECEIPT=/absolute/path/to/current-aster-checkout/docs/implementation/evidence/selected-live-record-subscription-0c11344.json
+ASTER_RECEIPT=/absolute/path/to/current-aster-checkout/docs/validation/evidence/selected-live-record-subscription-0c11344.json
 cd /private/tmp
 ASTER_PYTHON="$(mise where python@3.13.7)/bin/python3"
 "$ASTER_PYTHON" "$ASTER_SOURCE/tools/check-selected-live-record-subscription-receipt.py" \
@@ -841,7 +841,7 @@ evidence. It moves only `DM-5.1-08`; `DM-7-11`, `DM-7-14`, `DM-7-15`, and
 ## Selected live Event retained gate
 
 The v1
-[`selected-live-event-c464129.json`](../implementation/evidence/selected-live-event-c464129.json)
+[`selected-live-event-c464129.json`](evidence/selected-live-event-c464129.json)
 canonical receipt is 9,573 bytes with SHA-256
 `4d71d04e4ebcc9f63c0e84e7f11e83bf1f3d1ad2ca8608486cdcc875b6dfeef0`
 and binds the run to signed source commit
@@ -891,7 +891,7 @@ and a clean checkout detached at its exact signed source:
 python3 tools/check-selected-live-event-receipt.py \
   --raw-root /path/to/retained/selected-live-event-raw-root \
   --source /path/to/aster-source-detached-at-c464129d58c250dea2ecbf5f51d7ece0e5aab6d0 \
-  docs/implementation/evidence/selected-live-event-c464129.json
+  docs/validation/evidence/selected-live-event-c464129.json
 python3 tools/test-selected-live-event-receipt.py
 ```
 
@@ -977,7 +977,7 @@ cargo check --locked --manifest-path fuzz/Cargo.toml --bin selected_frame_decode
 
 The exact three-node, cleanup, delayed-insert/abort, terminal multi-carrier,
 all-open-path audit, and predecessor-migration results plus the frozen source
-manifest are recorded in the [prior semantic-v5 Blob requirements evidence](../implementation/requirements-status.md#prior-semantic-v5-direct-blob-network-automated-evidence).
+manifest are recorded in the [prior semantic-v5 Blob requirements evidence](requirements-status.md#prior-semantic-v5-direct-blob-network-automated-evidence).
 Independent final audit found no remaining P0–P3. The repair retains the bounded
 non-public physical-lineage fence, serializes durable-source/cache transitions,
 and advances terminal cursor state to the lexicographic maximum. Exactly six
@@ -993,7 +993,7 @@ source change or an accepted substitute for the clean isolated build.
 The dated 2026-08-27 v2 retained gate supersedes the earlier v1 live-Blob
 observation and only the statements above that no retained direct-Iroh Blob
 resume receipt existed. The canonical
-[`selected-live-blob-044d90f.json`](../implementation/evidence/selected-live-blob-044d90f.json)
+[`selected-live-blob-044d90f.json`](evidence/selected-live-blob-044d90f.json)
 receipt is 10,728 bytes with SHA-256
 `4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`
 and binds the run to good-signature source commit
@@ -1047,7 +1047,7 @@ a separate clean checkout detached at the exact signed source commit:
 python3 tools/check-selected-live-blob-receipt.py \
   --raw-root /path/to/retained/selected-live-blob-raw-root \
   --source /path/to/aster-source-detached-at-044d90ff07c8e754b3d490cb810d42de3c915e3d \
-  docs/implementation/evidence/selected-live-blob-044d90f.json
+  docs/validation/evidence/selected-live-blob-044d90f.json
 python3 tools/test-selected-live-blob-receipt.py
 ```
 
@@ -1071,7 +1071,7 @@ a release artifact; or production authorization.
 The dated 2026-08-27 v1 retained delivery gate supersedes only present-tense
 statements that the metadata-only Blob queue had no retained acceptance. The
 canonical
-[`selected-live-blob-subscription-26e0a09.json`](../implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+[`selected-live-blob-subscription-26e0a09.json`](evidence/selected-live-blob-subscription-26e0a09.json)
 receipt is 10,269 bytes with SHA-256
 `3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`
 and binds Good-signed source commit
@@ -1110,7 +1110,7 @@ a clean checkout detached at the exact signed source commit:
 python3 tools/check-selected-live-blob-subscription-receipt.py \
   --raw-root /path/to/retained/selected-live-blob-subscription-raw-root \
   --source /path/to/aster-source-detached-at-26e0a090b9a6f644d96b38cfaa23f4e2139ad8b1 \
-  docs/implementation/evidence/selected-live-blob-subscription-26e0a09.json
+  docs/validation/evidence/selected-live-blob-subscription-26e0a09.json
 python3 tools/test-selected-live-blob-subscription-receipt.py
 ```
 
@@ -1225,7 +1225,7 @@ HTTPS packet observations. Each cell delivered and acknowledged one exact
 32-byte Event and repeated as an exact no-op.
 
 The canonical checked-in receipt is
-[`selected-iroh-nat-15f4e0b.json`](../implementation/evidence/selected-iroh-nat-15f4e0b.json):
+[`selected-iroh-nat-15f4e0b.json`](evidence/selected-iroh-nat-15f4e0b.json):
 48,302 bytes, SHA-256
 `55dc67ac606e92c44c2e36d959b23bc52880b483bdab21a7c2ec47487eee0393`.
 The raw root contains external-restricted packet captures, mission bundles,
@@ -1250,7 +1250,7 @@ all curated raw artifacts:
 python3 tools/check-selected-iroh-nat-receipt.py \
   --raw-root /private/tmp/aster-selected-iroh-nat.zFpaqB/20260826T143559Z-selected-iroh-nat-50726015670670e9 \
   --source . \
-  docs/implementation/evidence/selected-iroh-nat-15f4e0b.json
+  docs/validation/evidence/selected-iroh-nat-15f4e0b.json
 python3 tools/test-selected-iroh-nat-receipt.py
 ```
 
@@ -1262,7 +1262,7 @@ exclusivity, a complete listener-wide pre-authentication cap, BTLE,
 independent implementation or clock, resource thresholds, a hermetic build,
 complete MVP, or release authorization. Exact identities, replay commands, and
 status movements are in the
-[requirements ledger](../implementation/requirements-status.md#selected-iroh-nat-retained-receipt).
+[requirements ledger](requirements-status.md#selected-iroh-nat-retained-receipt).
 
 The 57th test in that parent redb-store receipt is a Unix writable-open
 durability adversary. Every new or existing writer, including a terminal
@@ -1307,7 +1307,7 @@ A pass must finish with
 default N4, and N8 observed loopback results and their exact claim boundaries
 are recorded in
 the [mesh CLI quickstart](../quickstart/mesh-cli.md) and [requirements
-status](../implementation/requirements-status.md). Unit-test or demo success does
+status](requirements-status.md). Unit-test or demo success does
 not override dependency-policy failure and does not authorize a production
 release.
 
@@ -1375,7 +1375,7 @@ duplicate-contact or connection-loss lines from the final no-op despite the
 exact terminal convergence pass. All 228 passing no-op contacts reported all
 11 counters zero. The command, root, artifact digest, and claim boundary are
 recorded in the
-[requirements status](../implementation/requirements-status.md).
+[requirements status](requirements-status.md).
 
 A separate 2026-08-25 manual gate used an operator-attested Cargo release-
 profile binary run for the signed current-tree source at N=32 on one macOS
@@ -1391,7 +1391,7 @@ receipt is reviewable. This moves only `DM-9-21A` to `observed-bounded`. It is
 not the at-least-100-node target, a distributed/physical topology, NAT,
 controlled-relay, BTLE/cross-transport, mixed-implementation, resource-threshold,
 or release evidence. The exact receipt and replay command are in the
-[requirements status](../implementation/requirements-status.md#selected-n32-retained-receipt).
+[requirements status](requirements-status.md#selected-n32-retained-receipt).
 
 The node tests establish the existing `aster-core` four-flight hybrid session
 over real loopback Iroh and exercise it in the selected runtime before

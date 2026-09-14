@@ -14,7 +14,7 @@ the complete protocol and semantic reference implementation.
 Read the diagrams from broadest to narrowest: application surfaces, runtime
 ownership, then the publication and contact flows for each mechanism. Exact
 evidence and remaining release gates live in
-[requirements status](implementation/requirements-status.md), not in these
+[requirements status](validation/requirements-status.md), not in these
 diagrams.
 
 ## Components and trust boundaries
@@ -177,7 +177,7 @@ returned as application current or recoverable values. A current tombstone is
 returned visibly as authenticated State with an empty payload. There is no
 delete-wins rule, and deletion is not collapsed into an unauthenticated
 `None`. A
-[retained 7,752-byte v2 receipt](implementation/evidence/selected-live-mutable-6cabb4c.json)
+[retained 7,752-byte v2 receipt](validation/evidence/selected-live-mutable-6cabb4c.json)
 (SHA-256
 `054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`,
 signed source `6cabb4c`) first verifies two disconnected State heads as the exact
@@ -246,7 +246,7 @@ interest, verifies that both actors retain the same two heads, rejects an
 ordinary conflict-collapsing publish without changing them, then resolves and
 exactly retries the guard through the live authority. Both original heads are
 superseded, and the resolved projection survives restart. The
-[canonical v2 receipt](implementation/evidence/selected-live-mutable-6cabb4c.json)
+[canonical v2 receipt](validation/evidence/selected-live-mutable-6cabb4c.json)
 does not establish physical-network or mixed-implementation acceptance. Record
 still has no durable application subscription, selected-node binding, or
 selected relay acceptance. Multi-hop/partition sweeps, independent
@@ -357,7 +357,7 @@ proof plus route and nonrevocation authority. Pending bytes remain outside
 ordinary publication until the exact depot, full-content, and current-lineage
 proofs agree atomically. This is bounded direct, same-implementation automation,
 not route-only Blob relay/custody or Blob-over-controlled-relay acceptance. A
-[retained 10,728-byte v2 live-Blob receipt](implementation/evidence/selected-live-blob-044d90f.json)
+[retained 10,728-byte v2 live-Blob receipt](validation/evidence/selected-live-blob-044d90f.json)
 (SHA-256
 `4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)
 binds signed source commit `044d90ff07c8e754b3d490cb810d42de3c915e3d`
@@ -439,7 +439,7 @@ is exposed. Absence of a returned gap says only that the locally observed,
 verified positions in that page are contiguous; it is not publisher
 completeness or mesh convergence.
 
-The [retained 9,573-byte live-Event receipt](implementation/evidence/selected-live-event-c464129.json)
+The [retained 9,573-byte live-Event receipt](validation/evidence/selected-live-event-c464129.json)
 (SHA-256
 `4d71d04e4ebcc9f63c0e84e7f11e83bf1f3d1ad2ca8608486cdcc875b6dfeef0`,
 signed source `c464129`) composes this path on one same-implementation loopback
@@ -547,14 +547,14 @@ only through the exact DER-pinned relay. This does not establish endpoint
 discovery or punching, a temporal direct-first sequence, representative or
 physical NAT, public Internet or relay operation, another data class,
 independent implementation, resource evidence, or release acceptance. See the
-[retained receipt and replay boundary](implementation/requirements-status.md#selected-iroh-nat-retained-receipt).
+[retained receipt and replay boundary](validation/requirements-status.md#selected-iroh-nat-retained-receipt).
 
 ## Follow the evidence
 
 - [Capability tour](quickstart/capability-tour.md) — fastest visible behavior.
 - [Selected Event API](quickstart/selected-event-api.md) — live publish/query,
   durable delivery, gaps, unsubscribe, bounded status, and the retained
-  [live-Event receipt](implementation/evidence/selected-live-event-c464129.json).
+  [live-Event receipt](validation/evidence/selected-live-event-c464129.json).
 - [Selected State API](quickstart/selected-state-api.md) — live or stopped
   latest-value projection, recoverable history, and visible tombstones.
 - [Selected Record API](quickstart/selected-record-api.md) — live or stopped
@@ -563,5 +563,5 @@ independent implementation, resource evidence, or release acceptance. See the
   publication/page reads, stopped streaming, and semantic-v5 direct automation.
 - [Carriers and contacts](transports.md) — selected and migration-source carrier boundaries.
 - [Mesh CLI guide](quickstart/mesh-cli.md) — phase-by-phase and retained receipts.
-- [Requirements status](implementation/requirements-status.md) — exact credited rows and open gaps.
+- [Requirements status](validation/requirements-status.md) — exact credited rows and open gaps.
 - [Security model](security.md) — production gates and explicit non-claims.

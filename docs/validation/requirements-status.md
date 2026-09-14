@@ -3,7 +3,7 @@
 - Status date: 2026-08-31
 - Requirements authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Requirements SHA-256: `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
-- Planning view: [`capability-roadmap.md`](../validation/capability-roadmap.md)
+- Planning view: [`capability-roadmap.md`](capability-roadmap.md)
 - Atomic requirements index: [`requirements-matrix.csv`](../evaluations/0005/requirements-matrix.csv)
 - Exhaustive cross-lane trace: [`requirements-implementation.csv`](requirements-implementation.csv)
 - Matrix SHA-256: `57518c2aaeb7341f0d2ef7169a30a1666e337def2bb6a34f9225fad6e438e5b2`
@@ -108,7 +108,7 @@ separate source, evidence, or gate dimensions.
 
 The hash-bound requirements baseline remains unchanged. On 2026-08-28,
 [Decision 0033](../decisions/0033-policy-selected-security-profiles.md) and the
-[security-profile requirements disposition](../validation/security-profile-requirements-disposition.md)
+[security-profile requirements disposition](security-profile-requirements-disposition.md)
 refined its universal metadata and post-quantum wording for current planning and
 release review:
 
@@ -689,7 +689,7 @@ priority order:
    follows from the implementation slices.
 
 The dependency-aware implementation priorities and exit criteria are maintained
-in the [capability roadmap](../validation/capability-roadmap.md). Before broader multi-hop,
+in the [capability roadmap](capability-roadmap.md). Before broader multi-hop,
 long-retention, public-binding, or supported-profile claims, that roadmap now
 gates the relevant work on causal/lifecycle design and runs executable
 conformance, operational security, and physical carrier risk as parallel
@@ -1431,7 +1431,7 @@ signed commit object and the reviewer's configured trusted signer:
 python3 tools/check-selected-iroh-nat-receipt.py \
   --raw-root /private/tmp/aster-selected-iroh-nat.zFpaqB/20260826T143559Z-selected-iroh-nat-50726015670670e9 \
   --source . \
-  docs/implementation/evidence/selected-iroh-nat-15f4e0b.json
+  docs/validation/evidence/selected-iroh-nat-15f4e0b.json
 ```
 
 To independently reproject the sanitized JSON, choose a fresh nonexistent
@@ -1445,7 +1445,7 @@ python3 lab/orchestrate.py selected-iroh-nat-project \
   --raw-root /private/tmp/aster-selected-iroh-nat.zFpaqB/20260826T143559Z-selected-iroh-nat-50726015670670e9 \
   --output "$nat_review_dir/selected-iroh-nat-receipt.json"
 cmp "$nat_review_dir/selected-iroh-nat-receipt.json" \
-  docs/implementation/evidence/selected-iroh-nat-15f4e0b.json
+  docs/validation/evidence/selected-iroh-nat-15f4e0b.json
 shasum -a 256 "$nat_review_dir/selected-iroh-nat-receipt.json"
 ```
 
@@ -1587,13 +1587,13 @@ python3 tools/check-selected-live-event-receipt.py - \
 cmp "$projection_a/selected-live-event-receipt.json" \
   "$projection_b/selected-live-event-receipt.json"
 cmp "$projection_a/selected-live-event-receipt.json" \
-  docs/implementation/evidence/selected-live-event-c464129.json
+  docs/validation/evidence/selected-live-event-c464129.json
 shasum -a 256 "$projection_a/selected-live-event-receipt.json"
 
 python3 tools/check-selected-live-event-receipt.py \
   --raw-root /path/to/retained-owner-only-raw-root \
   --source /path/to/aster-source-worktree-detached-at-c464129d58c250dea2ecbf5f51d7ece0e5aab6d0 \
-  docs/implementation/evidence/selected-live-event-c464129.json
+  docs/validation/evidence/selected-live-event-c464129.json
 ```
 
 The source-to-binary-to-execution link is explicitly
@@ -1746,7 +1746,7 @@ as follows:
 python3 tools/check-selected-live-mutable-receipt.py \
   --raw-root /private/tmp/aster-selected-live-mutable-6cabb4c-final \
   --source /path/to/aster-source-worktree-detached-at-6cabb4c \
-  docs/implementation/evidence/selected-live-mutable-6cabb4c.json
+  docs/validation/evidence/selected-live-mutable-6cabb4c.json
 ```
 
 The receipt's source-to-binary-to-execution link is explicitly
@@ -1893,7 +1893,7 @@ signed source freeze:
 
 ```sh
 ASTER_SOURCE=/path/to/aster-source-detached-at-8912fc33571449d1beb4a4cb0f204b5dcd44e8c2
-ASTER_RECEIPT=/absolute/path/to/current-aster-checkout/docs/implementation/evidence/selected-live-state-subscription-8912fc3.json
+ASTER_RECEIPT=/absolute/path/to/current-aster-checkout/docs/validation/evidence/selected-live-state-subscription-8912fc3.json
 cd /private/tmp
 ASTER_PYTHON="$(mise where python@3.13.7)/bin/python3"
 "$ASTER_PYTHON" "$ASTER_SOURCE/tools/check-selected-live-state-subscription-receipt.py" \
@@ -2043,7 +2043,7 @@ receipt postdates the signed source freeze, so pass both paths explicitly:
 
 ```sh
 ASTER_SOURCE=/path/to/aster-source-detached-at-0c1134411953f4bb52133b50aff9989cd4ce3930
-ASTER_RECEIPT=/absolute/path/to/current-aster-checkout/docs/implementation/evidence/selected-live-record-subscription-0c11344.json
+ASTER_RECEIPT=/absolute/path/to/current-aster-checkout/docs/validation/evidence/selected-live-record-subscription-0c11344.json
 cd /private/tmp
 ASTER_PYTHON="$(mise where python@3.13.7)/bin/python3"
 "$ASTER_PYTHON" "$ASTER_SOURCE/tools/check-selected-live-record-subscription-receipt.py" \
@@ -2194,7 +2194,7 @@ receipt postdates the signed source freeze, so pass both paths explicitly:
 
 ```sh
 ASTER_SOURCE=/path/to/aster-source-detached-at-26e0a090b9a6f644d96b38cfaa23f4e2139ad8b1
-ASTER_RECEIPT=/absolute/path/to/current-aster-checkout/docs/implementation/evidence/selected-live-blob-subscription-26e0a09.json
+ASTER_RECEIPT=/absolute/path/to/current-aster-checkout/docs/validation/evidence/selected-live-blob-subscription-26e0a09.json
 cd /private/tmp
 ASTER_PYTHON="$(mise where python@3.13.7)/bin/python3"
 "$ASTER_PYTHON" "$ASTER_SOURCE/tools/check-selected-live-blob-subscription-receipt.py" \
@@ -2344,7 +2344,7 @@ the retained raw root available, replay the checked-in receipt byte-for-byte:
 python3 tools/check-selected-live-blob-receipt.py \
   --raw-root /path/to/retained-owner-only-raw-root \
   --source /path/to/aster-source-worktree-detached-at-044d90ff07c8e754b3d490cb810d42de3c915e3d \
-  docs/implementation/evidence/selected-live-blob-044d90f.json
+  docs/validation/evidence/selected-live-blob-044d90f.json
 ```
 
 The source-bound producer is 88,859 bytes with SHA-256
@@ -2481,7 +2481,7 @@ the retained raw root available, replay the checked-in receipt byte-for-byte:
 python3 tools/check-selected-linux-event-custody-receipt.py \
   --raw-root /path/to/retained-owner-only-raw-root \
   --source /path/to/aster-source-worktree-detached-at-ade6ee1839997e14f479463d724e208a89ec8b89 \
-  docs/implementation/evidence/selected-linux-event-custody-ade6ee1.json
+  docs/validation/evidence/selected-linux-event-custody-ade6ee1.json
 ```
 
 The source-bound producer is 83,534 bytes with SHA-256
@@ -2556,7 +2556,7 @@ The current-toolchain and Rust 1.91 results are separate executions and their
 timings are not pooled.
 
 Representative focused commands and the selected CI gate are documented in
-[Continuous integration](../validation/ci.md#selected-composition-coverage). The two
+[Continuous integration](ci.md#selected-composition-coverage). The two
 499-test totals above are recorded exact-tree validation results; this ledger
 does not claim that the focused command excerpt is a complete transcript of
 either matrix execution.

@@ -20,7 +20,7 @@ Describe the behavior changed and why.
   evidence.
 - [ ] Cross-track dependencies and unresolved stakeholder, physical,
   independent, or other external gates remain explicit and owned.
-- [ ] `docs/implementation/requirements-status.md` and its generated trace were
+- [ ] `docs/validation/requirements-status.md` and its generated trace were
   updated when requirement evidence changed, or no evidence boundary changed.
 - [ ] The capability roadmap was updated only when the planning boundary
   changed; planning changes alone did not move requirement evidence status.

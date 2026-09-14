@@ -58,7 +58,7 @@ close admission, reject queued work, and join that worker before authority
 release, so retained handles fail with sanitized `StateUnavailable`.
 Caller-copied Blob bytes and caller-owned source files remain outside node
 zeroization. A
-[retained 10,269-byte Blob-delivery receipt](implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+[retained 10,269-byte Blob-delivery receipt](validation/evidence/selected-live-blob-subscription-26e0a09.json)
 (SHA-256
 `3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
 Good-signed source `26e0a09`) observes two exact publications sharing one
@@ -72,7 +72,7 @@ dynamic State network interests, ConnectRPC/C/Go/Python selected-node bindings,
 finite TTL/GC, power-loss/filesystem-crash, representative physical or
 mixed-implementation acceptance, resource/soak, and release authorization
 remain open. A
-[retained 7,752-byte v2 live-path receipt](implementation/evidence/selected-live-mutable-6cabb4c.json)
+[retained 7,752-byte v2 live-path receipt](validation/evidence/selected-live-mutable-6cabb4c.json)
 (SHA-256
 `054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`,
 signed source `6cabb4c`) covers peerless State/Record publication, direct
@@ -85,7 +85,7 @@ mixed implementations, scale, or release acceptance. Its zero Blob counters
 make it neither live-Blob evidence nor a claim about the newer Blob mechanism.
 
 A separate
-[retained 9,656-byte State-delivery receipt](implementation/evidence/selected-live-state-subscription-8912fc3.json)
+[retained 9,656-byte State-delivery receipt](validation/evidence/selected-live-state-subscription-8912fc3.json)
 (SHA-256
 `7d0b568dd4d57c3f2967da55953896829261877513c59c51a0b274eeda69485f`,
 signed source `8912fc3`) observes forced termination after a flushed
@@ -98,7 +98,7 @@ synthetic-withdrawal feed, dynamic network-interest mutation, physical/mixed
 or scale/resource evidence, or release authorization.
 
 A separate
-[retained 10,357-byte Record-delivery receipt](implementation/evidence/selected-live-record-subscription-0c11344.json)
+[retained 10,357-byte Record-delivery receipt](validation/evidence/selected-live-record-subscription-0c11344.json)
 (SHA-256
 `ba0e2bf47291f7e87000b85fa280cc957f3710ac800def82a51fb9b4657a1b48`,
 Good-signed source commit `0c1134411953f4bb52133b50aff9989cd4ce3930`)
@@ -144,7 +144,7 @@ application-delivery evidence or Blob peer/convergence status, route-only
 custody, TTL/GC, pure-byte deduplication, large/RSS acceptance, or
 representative physical or mixed-implementation acceptance.
 
-A [retained 10,728-byte v2 live-Blob receipt](implementation/evidence/selected-live-blob-044d90f.json)
+A [retained 10,728-byte v2 live-Blob receipt](validation/evidence/selected-live-blob-044d90f.json)
 (SHA-256
 `4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)
 binds signed source commit `044d90ff07c8e754b3d490cb810d42de3c915e3d`

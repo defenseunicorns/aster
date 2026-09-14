@@ -32,7 +32,7 @@ typed `SelectedControlHandle`; those bounded Rust-only seams are documented
 below. Linux semantic-v3/v4/v5 finite Event TTL is documented in the
 [selected custody quickstart](selected-custody-api.md).
 
-A [retained 9,573-byte live-Event receipt](../implementation/evidence/selected-live-event-c464129.json)
+A [retained 9,573-byte live-Event receipt](../validation/evidence/selected-live-event-c464129.json)
 (SHA-256
 `4d71d04e4ebcc9f63c0e84e7f11e83bf1f3d1ad2ca8608486cdcc875b6dfeef0`,
 signed source `c464129`) observes this live surface on one same-implementation
@@ -53,7 +53,7 @@ software evidence, not physical, NAT/Internet, relay, BTLE, mixed or independent
 implementation, scale/resource/soak, State/Record/Blob, release, or production
 acceptance.
 
-A [retained 10,728-byte live-Blob receipt](../implementation/evidence/selected-live-blob-044d90f.json)
+A [retained 10,728-byte live-Blob receipt](../validation/evidence/selected-live-blob-044d90f.json)
 (SHA-256
 `4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)
 binds source commit `044d90ff07c8e754b3d490cb810d42de3c915e3d` with
@@ -74,7 +74,7 @@ physical sanitization, independent-implementation interoperability, or release
 authorization.
 
 A separate
-[retained 10,269-byte Blob-delivery receipt](../implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+[retained 10,269-byte Blob-delivery receipt](../validation/evidence/selected-live-blob-subscription-26e0a09.json)
 (SHA-256
 `3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
 Good-signed source `26e0a09`) observes peerless forced-process attempt-2
@@ -533,5 +533,5 @@ overlapping `Consume` wins for local delivery.
 
 Continue with the [capability tour](capability-tour.md) for a fast visible mesh,
 the [selected architecture](../architecture.md) for the complete authority
-split, and the [requirements status](../implementation/requirements-status.md)
+split, and the [requirements status](../validation/requirements-status.md)
 for exact credited and open obligations.

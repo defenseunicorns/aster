@@ -816,7 +816,7 @@ here.
 The current selected `aster-node` schedules this grammar automatically on its
 direct-Iroh contacts after semantic-v5-or-v6 negotiation, control activation, and an
 exact configured Blob receive selector. A
-[retained 10,728-byte live-Blob receipt](implementation/evidence/selected-live-blob-044d90f.json)
+[retained 10,728-byte live-Blob receipt](validation/evidence/selected-live-blob-044d90f.json)
 (SHA-256
 `4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)
 binds source commit `044d90ff07c8e754b3d490cb810d42de3c915e3d` with
@@ -908,7 +908,7 @@ metadata-independent whole-byte identity or deduplication claim, or large-file,
 physical-carrier, mixed-implementation, and release acceptance.
 
 The separate application ledger now has a
-[retained 10,269-byte peerless Blob-delivery receipt](implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+[retained 10,269-byte peerless Blob-delivery receipt](validation/evidence/selected-live-blob-subscription-26e0a09.json)
 (SHA-256
 `3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
 Good-signed source `26e0a09`). One participant executes three processes and
@@ -1126,7 +1126,7 @@ three modes but not `PassiveOnly`. Physical emission measurement and the
 distinction between receive-only protocol responses and literal radio silence
 remain stakeholder-validation items.
 
-A [retained 9,573-byte live-Event receipt](implementation/evidence/selected-live-event-c464129.json)
+A [retained 9,573-byte live-Event receipt](validation/evidence/selected-live-event-c464129.json)
 (SHA-256
 `4d71d04e4ebcc9f63c0e84e7f11e83bf1f3d1ad2ca8608486cdcc875b6dfeef0`,
 signed source `c464129`) provides one bounded observation of these rules. On a

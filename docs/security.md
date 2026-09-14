@@ -149,7 +149,7 @@ Its canary scan covers exactly 26 enumerated finalized targets, not every file
 or the whole host. This is not discovery/punching, a temporal fallback sequence,
 representative or physical NAT, public Internet/relay operation, independent
 implementation, packet-capture confidentiality acceptance, complete-MVP, or
-release evidence. See the [receipt and replay boundary](implementation/requirements-status.md#selected-iroh-nat-retained-receipt).
+release evidence. See the [receipt and replay boundary](validation/requirements-status.md#selected-iroh-nat-retained-receipt).
 
 Aster application relays are not content readers by default. The implemented
 semantic-version-2/3/v4/v5/v6 bridge similarly limits a bridge to rule-specific endpoint routing grants and
@@ -159,7 +159,7 @@ and origin scope, and exposes a distinct authenticated current scope. A target
 reader still needs the exact origin scope/topic/content-epoch grant; target
 membership, bridge authority, and target content grants cannot substitute for
 it. The remaining cross-implementation and physical acceptance gates are in
-[conformance.md](conformance.md).
+[conformance.md](validation/conformance.md).
 
 The exact protected bytes, signature messages, KDF inputs, and bounds are
 normative in [envelope.md](envelope.md).
@@ -728,7 +728,7 @@ Normal and `AtLeast` run this lane because `AtLeast` is Event-only;
 `ReceiveOnly` sends, requests, stages, promotes, and counts zero Blob work.
 The local delivery-ledger counts are not Blob peer, contact, transfer-progress,
 or convergence status. A
-[retained 10,269-byte Blob-delivery receipt](implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+[retained 10,269-byte Blob-delivery receipt](validation/evidence/selected-live-blob-subscription-26e0a09.json)
 (SHA-256
 `3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
 Good-signed source `26e0a09`) observes one peerless participant across three

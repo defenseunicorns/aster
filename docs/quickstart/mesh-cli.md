@@ -204,7 +204,7 @@ accepted maximum N=32, but no N=32 execution receipt is claimed. Eight nodes do
 not prove the full 2–32 range, a many-node target, physical multi-system
 operation, or resource targets. Exact
 terminal receipts and the parent-snapshot release artifact digest are in the
-[requirements status](../implementation/requirements-status.md).
+[requirements status](../validation/requirements-status.md).
 
 ## Run the four-role control scenario
 
@@ -249,7 +249,7 @@ generation-one revocation for node 3 and a recipient-filtered transition of
    `remaining`.
 
 A pass ends with these invariant fields; exact transfer IDs and the full receipt
-are in the [requirements status](../implementation/requirements-status.md#mission-control-revocation-and-rekey-receipt):
+are in the [requirements status](../validation/requirements-status.md#mission-control-revocation-and-rekey-receipt):
 
 ```text
 PHASE status=pass name=pong-ping-forward processes=2 carrier_authenticated_edges=verified mission_authenticated_edges=verified provisioning=unprotected-reference
@@ -331,7 +331,7 @@ the mission bundle must independently authorize the exact source, topic,
 scope, and current epoch. Eligible semantic-v5 direct-Iroh contacts
 automatically reconcile Blob sources and peer-neutral contiguous carrier ranges
 of at most 16 KiB. A
-[retained 10,728-byte live-Blob receipt](../implementation/evidence/selected-live-blob-044d90f.json)
+[retained 10,728-byte live-Blob receipt](../validation/evidence/selected-live-blob-044d90f.json)
 (SHA-256
 `4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)
 binds source commit `044d90ff07c8e754b3d490cb810d42de3c915e3d` with
@@ -366,7 +366,7 @@ retains concurrent revisions and never executes application merge code.
 
 State's live Rust handle additionally exposes durable positive-current-version
 subscription, poll, acknowledgement, and unsubscribe operations. A
-[retained 9,656-byte receipt](../implementation/evidence/selected-live-state-subscription-8912fc3.json)
+[retained 9,656-byte receipt](../validation/evidence/selected-live-state-subscription-8912fc3.json)
 (SHA-256
 `7d0b568dd4d57c3f2967da55953896829261877513c59c51a0b274eeda69485f`,
 signed source `8912fc3`) observes a forced receiver-process termination after a
@@ -398,7 +398,7 @@ This evidence does not establish selected endpoint discovery or punching, a
 temporal direct-first/fallback sequence, representative or physical NAT,
 public-network or public-relay operation, State/Record/Blob-over-relay, BTLE,
 mixed implementations, resource brackets, or release authorization. See the
-exact [evidence and replay boundary](../implementation/requirements-status.md#selected-iroh-nat-retained-receipt).
+exact [evidence and replay boundary](../validation/requirements-status.md#selected-iroh-nat-retained-receipt).
 
 The Iroh handshake binds the expected endpoint and rejects an unlisted carrier
 before an application frame. The node then runs the hybrid reference session,
@@ -466,7 +466,7 @@ uncompleted pathname that still identifies the exact recorded inode may be
 reopened and erased. A missing, replaced, linked, symlinked, permission-changed,
 or otherwise indeterminate target leaves the store terminal and fails closed;
 the retry never erases replacement data. The retained
-[receipt](../implementation/requirements-status.md#local-software-zeroization-receipt)
+[receipt](../validation/requirements-status.md#local-software-zeroization-receipt)
 includes a live child-process run and a separate child abruptly terminated
 immediately after marker commit.
 
@@ -547,7 +547,7 @@ reconciliation. Do not use `put` as evidence for the source-authenticated mesh.
 
 No old path is removed until its replacement passes equivalent tests. Blob
 delivery has a separate
-[retained 10,269-byte peerless forced-process-redelivery receipt](../implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+[retained 10,269-byte peerless forced-process-redelivery receipt](../validation/evidence/selected-live-blob-subscription-26e0a09.json)
 (SHA-256
 `3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
 Good-signed source `26e0a09`), but it does not enlarge this Event-only CLI
@@ -564,5 +564,5 @@ non-Linux finite Event custody, protected provisioning, generalized control
 administration and repeated multi-scope rekey,
 platform-complete zeroization assurance, physical/multi-carrier or
 mixed-implementation acceptance, and release gates. The tracked [requirements
-status](../implementation/requirements-status.md) keeps those boundaries
+status](../validation/requirements-status.md) keeps those boundaries
 explicit.

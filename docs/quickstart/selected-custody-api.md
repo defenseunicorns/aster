@@ -269,7 +269,7 @@ The selected implementation covers Event and RouteEvent custody only. It does
 not add State/Record custody; their cloneable live handles and separate
 semantic-v4/v5 mutable reconciliation run outside this custody policy in Normal
 and AtLeast, as do the live Blob application surface and semantic-v5 direct Blob
-work. A [separate retained Blob receipt](../implementation/evidence/selected-live-blob-044d90f.json)
+work. A [separate retained Blob receipt](../validation/evidence/selected-live-blob-044d90f.json)
 observes only a bounded
 three-participant direct partial/different-eligible-peer resume across graceful
 same-process reopens on one host; it adds no custody acceptance to this guide.
@@ -278,10 +278,10 @@ positive-current-version application subscription runs outside custody and is
 documented in the [selected State API](selected-state-api.md). This slice adds
 no Record subscription itself; Record's separate retained-bounded durable
 whole-key queue is documented in the [selected Record API](selected-record-api.md)
-and its [Record-delivery receipt](../implementation/evidence/selected-live-record-subscription-0c11344.json).
+and its [Record-delivery receipt](../validation/evidence/selected-live-record-subscription-0c11344.json).
 That receipt adds no custody or TTL/GC claim here. Blob application delivery is
 now a separate metadata-only queue with a
-[retained 10,269-byte peerless receipt](../implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+[retained 10,269-byte peerless receipt](../validation/evidence/selected-live-blob-subscription-26e0a09.json)
 (SHA-256
 `3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
 Good-signed source `26e0a09`) covering forced attempt-one process termination,

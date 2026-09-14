@@ -20,7 +20,7 @@ Negentropy lane under exact receiver interests. Ingest never executes registered
 merge code, so concurrent heads remain durable and explicit.
 
 Durable whole-key Record delivery has a
-[retained bounded receipt](../implementation/evidence/selected-live-record-subscription-0c11344.json).
+[retained bounded receipt](../validation/evidence/selected-live-record-subscription-0c11344.json).
 It covers one same-implementation, one-host direct-loopback run, not
 selected-node ConnectRPC/C/Go/Python bindings, class-specific status, finite
 TTL, expiry, garbage collection, automatic registered-policy merge, broader
@@ -289,7 +289,7 @@ cargo test --locked -p aster-node \
 ```
 
 No application merge callback runs during ingest. A separate
-[retained v1 Record-delivery receipt](../implementation/evidence/selected-live-record-subscription-0c11344.json)
+[retained v1 Record-delivery receipt](../validation/evidence/selected-live-record-subscription-0c11344.json)
 is a 10,357-byte canonical projection with SHA-256
 `ba0e2bf47291f7e87000b85fa280cc957f3710ac800def82a51fb9b4657a1b48`,
 bound to Good-signed source
@@ -312,7 +312,7 @@ credit. A forced `SIGKILL` is not power-loss or filesystem-crash recovery, and
 the final immediate reopen is not long-retention or garbage-collection proof.
 
 A different
-[retained v2 live mutable receipt](../implementation/evidence/selected-live-mutable-6cabb4c.json)
+[retained v2 live mutable receipt](../validation/evidence/selected-live-mutable-6cabb4c.json)
 is a 7,752-byte canonical projection (SHA-256
 `054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`)
 bound to signed source `6cabb4c`. Its two peerless Record publications become
@@ -547,5 +547,5 @@ already-running authority. Continue with the
 [selected architecture](../architecture.md) for the full trust split, the
 [selected State API](selected-state-api.md) for causal latest-value semantics,
 the [selected Event API](selected-event-api.md) for the live networked surface,
-and the [requirements status](../implementation/requirements-status.md) for the
+and the [requirements status](../validation/requirements-status.md) for the
 exact partial credit and remaining gaps.

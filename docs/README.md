@@ -31,7 +31,7 @@ part of the normal reading path.
 | Application APIs | [Application recipes](application-recipes.md), [ConnectRPC agent](quickstart/connect-agent.md), [selected Rust APIs](quickstart/README.md), [agent configuration](reference/aster-agent-config-v1.md), and [binding pattern](bindings/pattern.md) |
 | Implementation | [Architecture](architecture.md), [Security](security.md), [Carriers and contacts](transports.md), and component README files under `crates/` |
 | MVP operation | [Linux Event MVP coordination](mvp/linux-event-mvp-coordination-guide.md), [operator runbook](mvp/linux-event-mvp-runbook.md), and [credential-provider operations](mvp/raspberry-pi-provider-v2-operations.md) |
-| Validation | [Capability roadmap](validation/capability-roadmap.md), [security-profile disposition](validation/security-profile-requirements-disposition.md), [CI](validation/ci.md), [qualification receipt validator](validation/linux-event-mvp-qualification-receipt-validator-spec.md), [requirements status](implementation/requirements-status.md), and [conformance](conformance.md) |
+| Validation | [Capability roadmap](validation/capability-roadmap.md), [requirements status](validation/requirements-status.md), [conformance](validation/conformance.md), [security-profile disposition](validation/security-profile-requirements-disposition.md), [CI](validation/ci.md), and [qualification receipt validator](validation/linux-event-mvp-qualification-receipt-validator-spec.md) |
 | Decisions | [`docs/decisions/`](decisions/) records the rationale for boundaries that still constrain the product; specifications and current references remain authoritative for behavior |
 
 ## Document authority
@@ -40,7 +40,7 @@ part of the normal reading path.
   interoperable behavior.
 - The [classical Iroh profile](classical-iroh-security-profile.md) defines the
   additive evaluation-only profile `0x0002` boundary.
-- The [requirements status](implementation/requirements-status.md) is the
+- The [requirements status](validation/requirements-status.md) is the
   evidence authority; the [capability roadmap](validation/capability-roadmap.md)
   is the planning and PR-review view.
 - The Linux Event MVP profile and register define a bounded, non-production

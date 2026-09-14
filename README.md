@@ -17,8 +17,8 @@ constrained, and disconnected operation.
 > production-authorized system. Event, State, Record, and Blob have live Rust
 > APIs; Event also has a local ConnectRPC API. Review the
 > [current implementation boundary](#current-implementation-boundary),
-> [security gates](docs/security.md), [conformance status](docs/conformance.md),
-> and [requirements status](docs/implementation/requirements-status.md) before
+> [security gates](docs/security.md), [conformance status](docs/validation/conformance.md),
+> and [requirements status](docs/validation/requirements-status.md) before
 > planning a deployment.
 
 ## See it work
@@ -226,7 +226,7 @@ or real-time streaming. Work should proceed in this order:
 
 The [capability roadmap](docs/validation/capability-roadmap.md) is the
 planning and merge-review view. The
-[requirements status](docs/implementation/requirements-status.md) remains the
+[requirements status](docs/validation/requirements-status.md) remains the
 authority for exact evidence and open acceptance gates.
 
 ## When Aster fits
@@ -254,7 +254,7 @@ conventional database or broker will usually be simpler.
 | Understand trust and component boundaries | [Selected architecture](docs/architecture.md) |
 | Connect nodes or evaluate carriers | [Carriers and contacts](docs/transports.md) |
 | Implement compatible protocol bytes | [Protocol](docs/protocol.md), [wire grammar](docs/wire.cddl), and [security objects](docs/envelope.md) |
-| Assess progress or readiness | [Capability roadmap](docs/validation/capability-roadmap.md), [requirements status](docs/implementation/requirements-status.md), [conformance](docs/conformance.md), and [security](docs/security.md) |
+| Assess progress or readiness | [Capability roadmap](docs/validation/capability-roadmap.md), [requirements status](docs/validation/requirements-status.md), [conformance](docs/validation/conformance.md), and [security](docs/security.md) |
 | Browse current product documentation | [Documentation map](docs/README.md) |
 
 ## Repository map

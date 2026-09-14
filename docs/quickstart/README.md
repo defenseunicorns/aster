@@ -41,7 +41,7 @@ publication, bounded zeroize-on-drop page reads, and durable metadata-only
 publication delivery, as well as the exclusive stopped streaming facade,
 immutable metadata-bound identity, crash-resumable encrypted chunks, and exact
 durable retry. Its
-[retained 10,269-byte Blob-delivery receipt](../implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+[retained 10,269-byte Blob-delivery receipt](../validation/evidence/selected-live-blob-subscription-26e0a09.json)
 (SHA-256
 `3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
 Good-signed source `26e0a09`) observes one peerless participant across three
@@ -56,7 +56,7 @@ atomic Event subscription update, selected-node language bindings, and
 TTL/GC, power-loss/filesystem-crash, resource/soak, representative physical or
 mixed-implementation acceptance, and release authorization remain open.
 
-A [retained 9,656-byte State-delivery receipt](../implementation/evidence/selected-live-state-subscription-8912fc3.json)
+A [retained 9,656-byte State-delivery receipt](../validation/evidence/selected-live-state-subscription-8912fc3.json)
 (SHA-256
 `7d0b568dd4d57c3f2967da55953896829261877513c59c51a0b274eeda69485f`,
 signed source `8912fc3`) observes one durable State application subscription
@@ -71,7 +71,7 @@ materialized State view or synthetic withdrawals, dynamic network interests,
 physical/NAT/relay/BTLE or mixed implementations, scale beyond two,
 resource/soak thresholds, or release authorization.
 
-A [retained 10,357-byte Record-delivery receipt](../implementation/evidence/selected-live-record-subscription-0c11344.json)
+A [retained 10,357-byte Record-delivery receipt](../validation/evidence/selected-live-record-subscription-0c11344.json)
 (SHA-256
 `ba0e2bf47291f7e87000b85fa280cc957f3710ac800def82a51fb9b4657a1b48`,
 Good-signed source `0c11344`) observes one complete edit/tombstone projection
@@ -83,7 +83,7 @@ separation, and reopens peerless with an empty queue. It moves only
 `DM-5.1-08`; it is not TTL/GC, physical/NAT/relay/BTLE, mixed, scale/resource,
 binding, automatic-merge, reproducible-build, or release evidence.
 
-A [retained 9,573-byte live-Event receipt](../implementation/evidence/selected-live-event-c464129.json)
+A [retained 9,573-byte live-Event receipt](../validation/evidence/selected-live-event-c464129.json)
 (SHA-256
 `4d71d04e4ebcc9f63c0e84e7f11e83bf1f3d1ad2ca8608486cdcc875b6dfeef0`,
 signed source `c464129`) observes four peerless Events, threshold transfer of
@@ -96,7 +96,7 @@ attempts. This is one-host, same-implementation direct-loopback evidence—not
 physical/NAT/relay/BTLE, mixed, scale/resource, other-class, or release
 acceptance.
 
-A [retained 10,728-byte live-Blob receipt](../implementation/evidence/selected-live-blob-044d90f.json)
+A [retained 10,728-byte live-Blob receipt](../validation/evidence/selected-live-blob-044d90f.json)
 (SHA-256
 `4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)
 binds source commit `044d90ff07c8e754b3d490cb810d42de3c915e3d` with

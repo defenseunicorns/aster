@@ -203,7 +203,7 @@ recorded in [ADR 0009](0009-public-api-boundary.md#live-selected-blob-applicatio
 This amendment supersedes only the preceding statement that the bounded live
 composition has no retained execution receipt and supersedes the earlier v1
 live-transfer observation. The canonical
-[`selected-live-blob-044d90f.json`](../implementation/evidence/selected-live-blob-044d90f.json)
+[`selected-live-blob-044d90f.json`](../validation/evidence/selected-live-blob-044d90f.json)
 receipt is 10,728 bytes with SHA-256
 `4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`
 and binds good-signature source commit
@@ -242,7 +242,7 @@ operator/producer-attested rather than cryptographically proven.
 
 Blob application delivery remains separate from the direct source/carrier
 protocol decided here. Its canonical
-[`selected-live-blob-subscription-26e0a09.json`](../implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+[`selected-live-blob-subscription-26e0a09.json`](../validation/evidence/selected-live-blob-subscription-26e0a09.json)
 receipt is 10,269 bytes with SHA-256
 `3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`
 and binds Good-signed source `26e0a09`. On one peerless host, one participant

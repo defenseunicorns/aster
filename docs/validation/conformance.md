@@ -14,11 +14,11 @@ Passing the reference implementation against itself is necessary but is not the
 independent-interoperability acceptance claim.
 
 Profile-`0x0001` fixed security-object bytes and bounds come from
-[envelope.md](envelope.md) and the semantic-v2/v3/v4/v5 batch profile in
-[protocol.md](protocol.md) §6.1; replication CBOR comes from
-[wire.cddl](wire.cddl). The bounded profile-`0x0002` implementation is
+[envelope.md](../envelope.md) and the semantic-v2/v3/v4/v5 batch profile in
+[protocol.md](../protocol.md) §6.1; replication CBOR comes from
+[wire.cddl](../wire.cddl). The bounded profile-`0x0002` implementation is
 documented separately in the
-[classical Iroh-QUIC profile](classical-iroh-security-profile.md). A test
+[classical Iroh-QUIC profile](../classical-iroh-security-profile.md). A test
 harness MUST retain those namespaces and must not normalize a rejected encoding
 or retry another profile after a profile/ALPN/policy failure.
 
@@ -270,7 +270,7 @@ the separate at-least-100-node target, any resource or hardware gate, physical
 or distributed topology, NAT/relay/BTLE/cross-transport behavior, independent
 interoperability, or release acceptance.
 
-A separate [9,573-byte selected live-Event receipt](implementation/evidence/selected-live-event-c464129.json)
+A separate [9,573-byte selected live-Event receipt](evidence/selected-live-event-c464129.json)
 (SHA-256
 `4d71d04e4ebcc9f63c0e84e7f11e83bf1f3d1ad2ca8608486cdcc875b6dfeef0`,
 signed source `c464129`) is also a bounded reference-implementation observation,
@@ -387,7 +387,7 @@ Blob relay/custody, the 100+ MiB or RSS target, physical-media behavior, mixed
 implementation, or release acceptance.
 
 The delivery queue separately has a dated
-[`V-BLOB-DELIVERY` retained receipt](implementation/evidence/selected-live-blob-subscription-26e0a09.json).
+[`V-BLOB-DELIVERY` retained receipt](evidence/selected-live-blob-subscription-26e0a09.json).
 Its 10,269 canonical bytes have SHA-256
 `3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`
 and bind Good-signed source `26e0a09`. One participant executes three
@@ -403,7 +403,7 @@ TTL/GC, physical or mixed implementation, resource/soak, reproducible build,
 or release acceptance.
 
 A separate dated
-[`V-BLOB-LIVE` retained receipt](implementation/evidence/selected-live-blob-044d90f.json)
+[`V-BLOB-LIVE` retained receipt](evidence/selected-live-blob-044d90f.json)
 supersedes the earlier v1 observation and records the bounded live-application
 resume composition at good-signature source commit
 `044d90ff07c8e754b3d490cb810d42de3c915e3d`. Its 10,728 canonical bytes have
@@ -505,7 +505,7 @@ protocol. They do not prove concurrent-writer consensus, automated signer
 rotation, root override, total-history recovery, or rollback resistance after
 complete control-store replacement. Those would require the separately
 specified root-signed epoch/cutover and external chain high-water described in
-[security.md](security.md).
+[security.md](../security.md).
 
 The core passes complementary A-11 software subgates. A generated 101 MiB local
 streaming case interrupts/reopens, deduplicates, reads back, and rejects tamper
@@ -538,7 +538,7 @@ custody, protected replication, and each physical carrier claimed by the
 release profile. For the current security construction using suite `0x0001`,
 all named protected metadata canaries remain required absent. A future profile
 instead must declare its exact exposure budget under
-[Decision 0033](decisions/0033-policy-selected-security-profiles.md), and its
+[Decision 0033](../decisions/0033-policy-selected-security-profiles.md), and its
 captures must reveal no payload plaintext or metadata beyond that budget. A-09
 excludes correlation already available from link/network/rendezvous
 identifiers before the first Aster flight unless a named profile mechanism

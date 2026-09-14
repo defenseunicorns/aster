@@ -22,7 +22,7 @@ content-capable peers, and semantic v6 inherits that Blob lane unchanged. The
 default offer is `[6, 5, 4, 3, 2, 1]`; v1-v4 emit zero Blob frames, and stable
 wire/ABI, source, manifest, and `ASTRBT01` formats remain version 1.
 
-A [retained 10,728-byte live-Blob receipt](../implementation/evidence/selected-live-blob-044d90f.json)
+A [retained 10,728-byte live-Blob receipt](../validation/evidence/selected-live-blob-044d90f.json)
 (SHA-256
 `4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)
 binds source commit `044d90ff07c8e754b3d490cb810d42de3c915e3d` with
@@ -44,7 +44,7 @@ authorization. That frozen receipt predates the delivery queue and gives it no
 retained execution credit; the queue currently has focused mechanism tests only.
 
 A separate
-[retained 10,269-byte v1 Blob-delivery receipt](../implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+[retained 10,269-byte v1 Blob-delivery receipt](../validation/evidence/selected-live-blob-subscription-26e0a09.json)
 (SHA-256
 `3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`)
 binds Good-signed source `26e0a09`. It is a peerless one-host,
@@ -528,5 +528,5 @@ with the [selected architecture](../architecture.md), the
 [selected Record API](selected-record-api.md), the
 [selected State API](selected-state-api.md), the
 [selected Event API](selected-event-api.md), and the
-[requirements status](../implementation/requirements-status.md) for the exact
+[requirements status](../validation/requirements-status.md) for the exact
 partial credit and remaining network, acceptance, and release gaps.
