@@ -1,12 +1,13 @@
 # Decision 0033: Select security properties through authenticated mission profiles
 
+> ****
 
 - Status: accepted; initial classical evaluation implementation present; release gates open
 - Date: 2026-08-28
 - Authority: stakeholder-approved applicability revision dated 2026-08-28 to
   the preserved [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Derived row mapping:
-  [security-profile requirements disposition](../implementation/security-profile-requirements-disposition.md)
+  [security-profile requirements disposition](../validation/security-profile-requirements-disposition.md)
 - Related: [Decision 0001](0001-standards-and-provider-boundaries.md),
   [Decision 0003](0003-fips-production-gate.md),
   [Decision 0012](0012-content-committing-pq-batches.md), and

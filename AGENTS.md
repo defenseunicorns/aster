@@ -10,7 +10,7 @@
 
 Read these before selecting implementation work:
 
-1. `docs/implementation/capability-roadmap.md`
+1. `docs/validation/capability-roadmap.md`
 2. `docs/implementation/requirements-status.md`
 3. `README.md#current-implementation-boundary`
 4. `data-mesh-requirements.md`

@@ -547,7 +547,7 @@ SECURITY_PROFILE_DECISION = (
     "docs/decisions/0033-policy-selected-security-profiles.md"
 )
 SECURITY_PROFILE_DISPOSITION = (
-    "docs/implementation/security-profile-requirements-disposition.md"
+    "docs/validation/security-profile-requirements-disposition.md"
 )
 SECURITY_PROFILE_REFERENCE = "docs/classical-iroh-security-profile.md"
 SECURITY_PROFILE_ARTIFACTS = (

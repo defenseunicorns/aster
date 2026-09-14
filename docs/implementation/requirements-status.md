@@ -3,7 +3,7 @@
 - Status date: 2026-08-31
 - Requirements authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Requirements SHA-256: `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
-- Planning view: [`capability-roadmap.md`](capability-roadmap.md)
+- Planning view: [`capability-roadmap.md`](../validation/capability-roadmap.md)
 - Atomic requirements index: [`requirements-matrix.csv`](../evaluations/0005/requirements-matrix.csv)
 - Exhaustive cross-lane trace: [`requirements-implementation.csv`](requirements-implementation.csv)
 - Matrix SHA-256: `57518c2aaeb7341f0d2ef7169a30a1666e337def2bb6a34f9225fad6e438e5b2`
@@ -108,7 +108,7 @@ separate source, evidence, or gate dimensions.
 
 The hash-bound requirements baseline remains unchanged. On 2026-08-28,
 [Decision 0033](../decisions/0033-policy-selected-security-profiles.md) and the
-[security-profile requirements disposition](security-profile-requirements-disposition.md)
+[security-profile requirements disposition](../validation/security-profile-requirements-disposition.md)
 refined its universal metadata and post-quantum wording for current planning and
 release review:
 
@@ -689,7 +689,7 @@ priority order:
    follows from the implementation slices.
 
 The dependency-aware implementation priorities and exit criteria are maintained
-in the [capability roadmap](capability-roadmap.md). Before broader multi-hop,
+in the [capability roadmap](../validation/capability-roadmap.md). Before broader multi-hop,
 long-retention, public-binding, or supported-profile claims, that roadmap now
 gates the relevant work on causal/lifecycle design and runs executable
 conformance, operational security, and physical carrier risk as parallel

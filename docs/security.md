@@ -3,7 +3,7 @@
 - Version: 0.1.0
 - Status: reference design; production security and integration gates unsatisfied
 - Profile policy: [Decision 0033](decisions/0033-policy-selected-security-profiles.md)
-  and its [requirements disposition](implementation/security-profile-requirements-disposition.md)
+  and its [requirements disposition](validation/security-profile-requirements-disposition.md)
 
 This document primarily describes suite/profile `0x0001` and the stock selected
 runtime. The additive, evaluation-only profile `0x0002` boundary is documented
@@ -311,7 +311,7 @@ deployment add those controls.
 The suite-specific controls below remain mandatory for current complete suite
 `0x0001`. The profile-invariant controls and applicability of future profiles
 are recorded separately in the
-[security-profile requirements disposition](implementation/security-profile-requirements-disposition.md).
+[security-profile requirements disposition](validation/security-profile-requirements-disposition.md).
 
 - Canonical ordered semantic-version and complete-suite offers, with selection
   bound into the transcript, KDF, key confirmations, and hybrid authentication;

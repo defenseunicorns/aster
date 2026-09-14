@@ -87,7 +87,7 @@ authorization.
   proof of scale.
 - Resource and duplicate-offer reports identify the next concrete bottleneck;
   they do not silently become product thresholds or maturity evidence.
-- The [roadmap's active implementation lanes](../implementation/capability-roadmap.md#active-post-hierarchy-implementation-lanes)
+- The [roadmap's active implementation lanes](../validation/capability-roadmap.md#active-post-hierarchy-implementation-lanes)
   first establishes a durable generation for bounded dynamic Event-bridge
   configuration, then binds peer-specific difference reconciliation to that
   generation. Increasing this fixed tree further comes after those increments.

@@ -224,7 +224,7 @@ or real-time streaming. Work should proceed in this order:
 | **P1** | Harden controlled-relay operations | The relay has documented certificate rotation, peer allowlisting, quotas, denial-of-service bounds, health checks, log redaction, backup-free recovery, upgrade procedures, and an availability model appropriate to the first customer deployments |
 | **P2** | Expand beyond the Event MVP only after field evidence | State, Record, Blob, dynamic hierarchy, automatic discovery, and additional carriers each receive an explicit API, lifecycle, relay, recovery, resource, physical-network, and mixed-implementation acceptance gate before entering the supported profile |
 
-The [capability roadmap](docs/implementation/capability-roadmap.md) is the
+The [capability roadmap](docs/validation/capability-roadmap.md) is the
 planning and merge-review view. The
 [requirements status](docs/implementation/requirements-status.md) remains the
 authority for exact evidence and open acceptance gates.
@@ -254,7 +254,7 @@ conventional database or broker will usually be simpler.
 | Understand trust and component boundaries | [Selected architecture](docs/architecture.md) |
 | Connect nodes or evaluate carriers | [Carriers and contacts](docs/transports.md) |
 | Implement compatible protocol bytes | [Protocol](docs/protocol.md), [wire grammar](docs/wire.cddl), and [security objects](docs/envelope.md) |
-| Assess progress or readiness | [Capability roadmap](docs/implementation/capability-roadmap.md), [requirements status](docs/implementation/requirements-status.md), [conformance](docs/conformance.md), and [security](docs/security.md) |
+| Assess progress or readiness | [Capability roadmap](docs/validation/capability-roadmap.md), [requirements status](docs/implementation/requirements-status.md), [conformance](docs/conformance.md), and [security](docs/security.md) |
 | Browse current product documentation | [Documentation map](docs/README.md) |
 
 ## Repository map

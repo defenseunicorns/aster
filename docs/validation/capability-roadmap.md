@@ -4,8 +4,8 @@
 - Product-intent authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Security-profile applicability:
   [`security-profile-requirements-disposition.md`](security-profile-requirements-disposition.md)
-- Evidence authority: [`requirements-status.md`](requirements-status.md)
-- Atomic trace: [`requirements-implementation.csv`](requirements-implementation.csv)
+- Evidence authority: [`requirements-status.md`](../implementation/requirements-status.md)
+- Atomic trace: [`requirements-implementation.csv`](../implementation/requirements-implementation.csv)
 - Current release posture: **evaluation-stage; not production-authorized**
 
 ## Purpose
