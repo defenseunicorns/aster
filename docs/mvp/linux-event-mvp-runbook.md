@@ -16,7 +16,7 @@ restart recovery, and restart-selected Normal or ReceiveOnly operation.
 The protected provider is already statically composed into `aster-agent`;
 see the [provider implementation boundary](../../crates/aster-systemd-credentials/README.md#current-implementation-boundary).
 For a first Ubuntu 24.04 amd64 package installation, use the
-[provider operations package annex](../implementation/raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex).
+[provider operations package annex](raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex).
 It defines the candidate's service, paths and credential handoff. Native ARM64
 and final device qualification remain separate deliverables. Source integration
 does not close Security/Deployment approval or packaged acceptance. The local
@@ -191,7 +191,7 @@ aster-credential-admin destroy --operation HEX64 --reference HEX
 ```
 
 The provider code is integrated; use the
-[D06 operations procedure](../implementation/raspberry-pi-provider-v2-operations.md)
+[D06 operations procedure](raspberry-pi-provider-v2-operations.md)
 for its engineering lifecycle boundary. These command shapes are not yet a
 qualified customer package procedure. The final package must define stopping
 and termination confirmation, protected input descriptors, reference handoff,
@@ -239,7 +239,7 @@ occurs:
 - a capacity stop that cannot be relieved without changing the profile.
 
 For API details, error handling, and shutdown semantics, use the
-[Event agent quickstart](connect-agent.md). For the exact evaluation boundary
+[Event agent quickstart](../quickstart/connect-agent.md). For the exact evaluation boundary
 and acceptance gates, use the
 [Linux Event MVP profile](../implementation/linux-event-mvp-evaluation-profile-v0.1.md)
 and its [candidate annex](../implementation/linux-event-mvp-evaluation-profile-v0.1-annex-template.md).

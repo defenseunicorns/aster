@@ -8,7 +8,7 @@
 - Approved design date: 2026-09-06
 - Candidate decision checkpoint: 2026-09-13
 - Product class: time-bounded, non-production customer evaluation
-- Start here: [human-focused MVP coordination guide](linux-event-mvp-coordination-guide.md)
+- Start here: [human-focused MVP coordination guide](../mvp/linux-event-mvp-coordination-guide.md)
 - Ratification authority: [Decision 0042](../decisions/0042-adopt-linux-event-mvp-evaluation-profile-v0-1.md)
 - Decision register: [v0.1 register](linux-event-mvp-evaluation-profile-v0.1-register.md)
 - Candidate-annex schema: [provisional schema](linux-event-mvp-evaluation-profile-v0.1-annex-template.md)
@@ -21,7 +21,7 @@ passes and one completed annex binds the exact source, artifacts, provider,
 configuration, nodes, results, receipts, and approvals.
 
 Most engineers should read the
-[coordination guide](linux-event-mvp-coordination-guide.md) first. It explains
+[coordination guide](../mvp/linux-event-mvp-coordination-guide.md) first. It explains
 the outcome, workstream handoffs, G1–G6 sequence, current blockers, and
 definition of done. This document remains the exact profile authority.
 

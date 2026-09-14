@@ -20,7 +20,7 @@ This page indexes the offline application and language-binding quickstarts.
 For the shortest operator-focused path through the customer Event evaluation
 slice, including health, capacity, ReceiveOnly, restart, and the boundary to
 the still-unpackaged D06 provider lifecycle, use the
-[Linux Event MVP operator runbook](linux-event-mvp-runbook.md).
+[Linux Event MVP operator runbook](../mvp/linux-event-mvp-runbook.md).
 
 For the selected production-lane composition, start with the Rust
 [live Event quickstart](selected-event-api.md). It demonstrates peerless publish,

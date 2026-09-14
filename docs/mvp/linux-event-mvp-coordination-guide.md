@@ -9,9 +9,9 @@ It is an explanatory coordination aid; the profile and register remain the
 authoritative boundary and status records.
 
 For exact limits and acceptance language, use the
-[evaluation profile](linux-event-mvp-evaluation-profile-v0.1.md). For live
+[evaluation profile](../implementation/linux-event-mvp-evaluation-profile-v0.1.md). For live
 ownership and gate status, use the
-[decision and gate register](linux-event-mvp-evaluation-profile-v0.1-register.md).
+[decision and gate register](../implementation/linux-event-mvp-evaluation-profile-v0.1-register.md).
 
 ## The outcome we are coordinating
 
@@ -77,7 +77,7 @@ or soak results from a locally rebuilt package cannot qualify the G3 candidate.
 | **OS, packaging, and artifacts** | Prepare locked build inputs, the native `arm64` package recipe, `systemd`/namespace setup, SBOM, notice, provenance, signing, and reproduction procedures | One provider-composed `arm64` package and one artifact manifest for G3 | The final package must be built from G2 and include `aster-systemd-credential-store/v2` |
 | **Integration and real devices** | Prepare the two-CM4 harness, exact device/network inventory, optional third-CM4 support declaration, and receipt collection | G4 receipts for both mandatory CM4 devices and G5 two-node workload/resource receipts against G3 | Qualification starts only after G3; G5 also requires G4; a participating third CM4 must be declared |
 | **Security and deployment** | Review the exact v2 protected-provider design and digest and prepare package integration | E01 role approvals before candidate qualification, then provider lifecycle acceptance in G3/G4 | Provider choice must be stable before the final artifact and exact to the Raspberry Pi profile boundary |
-| **Dependency, legal, and release** | Maintain the [approved evaluation-only `DM-8-05` disposition](dm-8-05-linux-event-v0.1-disposition.md) and review dependency drift | Committed [role-approval record](dm-8-05-linux-event-v0.1-role-approvals.md) bound into the candidate annex | All three roles are Approved; the exact coordinates must still match the candidate graph |
+| **Dependency, legal, and release** | Maintain the [approved evaluation-only `DM-8-05` disposition](../implementation/dm-8-05-linux-event-v0.1-disposition.md) and review dependency drift | Committed [role-approval record](../implementation/dm-8-05-linux-event-v0.1-role-approvals.md) bound into the candidate annex | All three roles are Approved; the exact coordinates must still match the candidate graph |
 | **Profile/product owner** | Keep the boundary, owners, dates, and customer exclusions explicit; prepare the candidate annex | Ratified profile plus one complete annex linking every handoff | Collects evidence from all lanes; does not replace their approvals |
 
 The profile work is therefore an integration map, not a competing engineering
@@ -88,7 +88,7 @@ combined into a false readiness claim.
 ## The shared handoff: one candidate annex
 
 All workstreams contribute to one
-[candidate annex](linux-event-mvp-evaluation-profile-v0.1-annex-template.md).
+[candidate annex](../implementation/linux-event-mvp-evaluation-profile-v0.1-annex-template.md).
 The annex ties together:
 
 1. the exact G2 source commit and deterministic-gate result;
@@ -129,9 +129,9 @@ resolved, without granting candidate or production authorization:
   Security and deployment approvals of that exact design and digest remain
   candidate gate E01.
 - **D15 — `DM-8-05` evaluation disposition:** the
-  [exact proposal](dm-8-05-linux-event-v0.1-disposition.md) at
+  [exact proposal](../implementation/dm-8-05-linux-event-v0.1-disposition.md) at
   `sha256:a6fe15f39fb553f87bc1224fe7f266e7c906d451d8140402d3bc1620011bfa53`.
-  The [internal role-approval record](dm-8-05-linux-event-v0.1-role-approvals.md)
+  The [internal role-approval record](../implementation/dm-8-05-linux-event-v0.1-role-approvals.md)
   records Dependency/license, Legal/compliance, and Release as **Approved**
   against the exact dependency tuples and evaluation-only limitation.
 
@@ -190,7 +190,7 @@ candidate.
 
 | Document | Use it for |
 |---|---|
-| [Evaluation profile](linux-event-mvp-evaluation-profile-v0.1.md) | Exact supported behavior, limits, exclusions, and acceptance contract |
-| [Decision and gate register](linux-event-mvp-evaluation-profile-v0.1-register.md) | Current owner, date, status, blocker, and exit artifact for each decision or gate |
-| [Candidate-annex schema](linux-event-mvp-evaluation-profile-v0.1-annex-template.md) | Shared handoff record for one exact candidate |
+| [Evaluation profile](../implementation/linux-event-mvp-evaluation-profile-v0.1.md) | Exact supported behavior, limits, exclusions, and acceptance contract |
+| [Decision and gate register](../implementation/linux-event-mvp-evaluation-profile-v0.1-register.md) | Current owner, date, status, blocker, and exit artifact for each decision or gate |
+| [Candidate-annex schema](../implementation/linux-event-mvp-evaluation-profile-v0.1-annex-template.md) | Shared handoff record for one exact candidate |
 | [Decision 0042](../decisions/0042-adopt-linux-event-mvp-evaluation-profile-v0-1.md) | Ratification authority and the distinction between defining and issuing the profile |

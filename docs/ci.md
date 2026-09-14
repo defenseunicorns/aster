@@ -77,7 +77,7 @@ to verify `SHA256SUMS`. Both artifacts are retained for 14 days. The `.deb`
 contains no documentation. A configured workflow alone is not evidence of a
 successful build or runtime test; keep the actual run result.
 See the [package candidate](release/ubuntu-24.04-deb.md) for build scope and
-the [existing operations procedure](implementation/raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex)
+the [existing operations procedure](mvp/raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex)
 for the currently documented amd64 installation procedure.
 
 ## Network reliability under contention

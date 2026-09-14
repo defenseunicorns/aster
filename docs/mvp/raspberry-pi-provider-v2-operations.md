@@ -613,7 +613,7 @@ curl --fail --silent --output /dev/null http://127.0.0.1:8182/readyz
 
 Readiness may take time after `systemctl start`; require HTTP 200 before
 application traffic. Continue with the authenticated `GetStatus` and Event
-checks in the [operator runbook](../quickstart/linux-event-mvp-runbook.md#operate-a-provider-composed-candidate).
+checks in the [operator runbook](linux-event-mvp-runbook.md#operate-a-provider-composed-candidate).
 Enable boot startup only after those checks succeed:
 `sudo systemctl enable aster-agent.service`.
 

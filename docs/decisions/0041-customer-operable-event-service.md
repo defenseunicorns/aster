@@ -177,7 +177,7 @@ retained Previous generation, host-bound backup, same-host current-generation
 recovery through a narrow recovery open, and durable logical destruction. The
 root administration CLI exposes five exact, operation-bound commands with
 sanitized text output and a binary-only backup stdout. The
-[operator procedure](../implementation/raspberry-pi-provider-v2-operations.md)
+[operator procedure](../mvp/raspberry-pi-provider-v2-operations.md)
 composes those commands with the existing Event-agent bearer-token SIGHUP
 reload and stopped-authority revoke/rekey workflow to describe all seven
 operations without duplicating either authority.

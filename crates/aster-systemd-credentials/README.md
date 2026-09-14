@@ -105,12 +105,12 @@ The complete human-first sequence, including required stopped-service state,
 safe backup redirection, bearer-token SIGHUP composition, mission/provider
 rotation, same-host recovery, revoke/rekey composition, destruction, and
 pre-intent staged-evidence escalation, is the
-[Raspberry Pi provider v2 operations procedure](../../docs/implementation/raspberry-pi-provider-v2-operations.md).
+[Raspberry Pi provider v2 operations procedure](../../docs/mvp/raspberry-pi-provider-v2-operations.md).
 
 The five provider lifecycle CLI commands and the code-level Event-agent
 integration are executable; a three-device engineering spike has exercised
 startup and the lifecycle, while final qualification remains open. The Ubuntu amd64 candidate now has
-[package installation details](../../docs/implementation/raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex);
+[package installation details](../../docs/mvp/raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex);
 this does not qualify the original Raspberry Pi target. The provider's
 `active/reference` stays root-only; the deployment procedure must atomically populate
 a separate mode-`0600`, final-service-UID-owned reference handoff from

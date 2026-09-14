@@ -215,7 +215,7 @@ preserved test state after package removal. Never run it on a deployed node.
 ## Install and provision an evaluation candidate
 
 Follow the existing [provider operations procedure, Ubuntu 24.04 amd64
-package annex](../implementation/raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex).
+package annex](../mvp/raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex).
 Documentation stays in the repository and is not installed by the package.
 The existing procedure supplies package paths, service account, first installation, host-key
 setup, direct `aster-credential-admin` invocation, atomic reference/configuration
