@@ -97,7 +97,7 @@ Expected: all commands exit `0`; `git diff --summary` reports five renames with
 Run:
 
 ```bash
-git diff --summary
+git diff --cached --summary
 ```
 
 Expected: exactly the five Task 1 paths appear as `rename ... (100%)`.
