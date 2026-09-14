@@ -70,6 +70,7 @@ DEFAULT_NAVIGATION = (Path("README.md"), Path("docs/README.md"))
 FENCE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})(.*)$")
 REFERENCE_START = re.compile(r"^[ ]{0,3}\[", re.MULTILINE)
 MARKDOWN_ESCAPABLE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
+BLANK_LINE = re.compile(r"\n[ \t]*\n")
 
 
 class InventoryRow(NamedTuple):
@@ -80,6 +81,12 @@ class InventoryRow(NamedTuple):
     disposition: str
     batch: str
     reason: str
+
+
+class DestinationSpan(NamedTuple):
+    start: int
+    end: int
+    destination: str
 
 
 class ArchiveViolation(ValueError):
@@ -509,7 +516,7 @@ def _without_inline_code(text: str) -> str:
     rendered: list[str] = []
     position = 0
     while position < len(text):
-        if text[position] != "`":
+        if text[position] != "`" or _is_escaped(text, position):
             rendered.append(text[position])
             position += 1
             continue
@@ -519,7 +526,8 @@ def _without_inline_code(text: str) -> str:
         delimiter = text[position:end]
         closing = text.find(delimiter, end)
         while closing >= 0 and (
-            (closing > 0 and text[closing - 1] == "`")
+            _is_escaped(text, closing)
+            or (closing > 0 and text[closing - 1] == "`")
             or (
                 closing + len(delimiter) < len(text)
                 and text[closing + len(delimiter)] == "`"
@@ -527,6 +535,10 @@ def _without_inline_code(text: str) -> str:
         ):
             closing = text.find(delimiter, closing + 1)
         if closing < 0:
+            rendered.append(delimiter)
+            position = end
+            continue
+        if BLANK_LINE.search(text, end, closing):
             rendered.append(delimiter)
             position = end
             continue
@@ -570,7 +582,10 @@ def _inline_destination(text: str, start: int) -> tuple[str, int] | None:
     if text[start] == "<":
         position = start + 1
         while position < len(text):
-            if text[position] == "\\":
+            if (
+                text[position] == "\\"
+                and MARKDOWN_ESCAPABLE.fullmatch(text[position:position + 2])
+            ):
                 position += 2
                 continue
             if text[position] == ">":
@@ -584,7 +599,10 @@ def _inline_destination(text: str, start: int) -> tuple[str, int] | None:
     depth = 0
     while position < len(text):
         character = text[position]
-        if character == "\\":
+        if (
+            character == "\\"
+            and MARKDOWN_ESCAPABLE.fullmatch(text[position:position + 2])
+        ):
             position += 2
             continue
         if character == "(":
@@ -609,7 +627,10 @@ def _inline_title_end(text: str, start: int) -> int | None:
     closing = ")" if text[start] == "(" else text[start]
     position = start + 1
     while position < len(text):
-        if text[position] == "\\":
+        if (
+            text[position] == "\\"
+            and MARKDOWN_ESCAPABLE.fullmatch(text[position:position + 2])
+        ):
             position += 2
             continue
         if text.startswith("\r\n", position):
@@ -690,7 +711,10 @@ def _link_label_end(text: str, start: int) -> int | None:
                 return None
             position = line_end
             continue
-        if character == "\\":
+        if (
+            character == "\\"
+            and MARKDOWN_ESCAPABLE.fullmatch(text[position:position + 2])
+        ):
             position += 2
             continue
         if character == "[":
@@ -703,8 +727,8 @@ def _link_label_end(text: str, start: int) -> int | None:
     return None
 
 
-def _inline_destinations(text: str) -> tuple[tuple[int, str], ...]:
-    destinations: list[tuple[int, str]] = []
+def _inline_destinations(text: str) -> tuple[DestinationSpan, ...]:
+    destinations: list[DestinationSpan] = []
     position = 0
     while position < len(text):
         start = text.find("[", position)
@@ -722,7 +746,11 @@ def _inline_destinations(text: str) -> tuple[tuple[int, str], ...]:
             if parsed is not None:
                 destination, end = parsed
                 destinations.append(
-                    (start, _decoded_markdown_destination(destination))
+                    DestinationSpan(
+                        start,
+                        end + 1,
+                        _decoded_markdown_destination(destination),
+                    )
                 )
                 position = max(end + 1, closing + 2)
                 continue
@@ -765,12 +793,22 @@ def _reference_destination_start(text: str, start: int) -> int | None:
         position += 1
     if position < len(text) and text[position] == "\n":
         position += 1
-        indentation = 0
         while position < len(text) and text[position] in " \t":
-            indentation += 1
             position += 1
-        if indentation > 3:
+    return position
+
+
+def _reference_title_line_end(text: str, start: int) -> int | None:
+    title_end = _inline_title_end(text, start)
+    if title_end is None:
+        return None
+    position = title_end
+    while position < len(text) and text[position] in " \t":
+        position += 1
+    if position < len(text):
+        if text[position] != "\n":
             return None
+        position += 1
     return position
 
 
@@ -789,28 +827,35 @@ def _reference_definition(
     destination, position = parsed
     while position < len(text) and text[position] in " \t":
         position += 1
-    if position == len(text) or text[position] == "\n":
+    if position == len(text):
         return destination, position
-    title_end = _inline_title_end(text, position)
-    if title_end is None:
-        return None
-    position = title_end
-    while position < len(text) and text[position] in " \t":
-        position += 1
-    if position < len(text) and text[position] != "\n":
-        return None
-    return destination, position
+    if text[position] != "\n":
+        title_line_end = _reference_title_line_end(text, position)
+        if title_line_end is None:
+            return None
+        return destination, title_line_end
+
+    definition_end = position + 1
+    next_line = definition_end
+    while next_line < len(text) and text[next_line] in " \t":
+        next_line += 1
+    title_line_end = _reference_title_line_end(text, next_line)
+    if title_line_end is not None:
+        return destination, title_line_end
+    return destination, definition_end
 
 
-def _reference_destinations(text: str) -> tuple[tuple[int, str], ...]:
-    destinations: list[tuple[int, str]] = []
+def _reference_destinations(text: str) -> tuple[DestinationSpan, ...]:
+    destinations: list[DestinationSpan] = []
     for match in REFERENCE_START.finditer(text):
         opening = match.end() - 1
         parsed = _reference_definition(text, opening)
         if parsed is not None:
-            destination, _ = parsed
+            destination, end = parsed
             destinations.append(
-                (match.start(), _decoded_markdown_destination(destination))
+                DestinationSpan(
+                    match.start(), end, _decoded_markdown_destination(destination)
+                )
             )
     return tuple(destinations)
 
@@ -821,8 +866,15 @@ def markdown_destinations(text: str) -> tuple[str, ...]:
     visible = _without_inline_code(_without_fenced_code(normalized))
     destinations = list(_inline_destinations(visible))
     destinations.extend(_reference_destinations(visible))
-    destinations.sort(key=lambda item: item[0])
-    return tuple(destination for _, destination in destinations)
+    destinations.sort(key=lambda item: (item.start, -item.end))
+    selected: list[str] = []
+    occupied_until = 0
+    for destination in destinations:
+        if destination.start < occupied_until:
+            continue
+        selected.append(destination.destination)
+        occupied_until = destination.end
+    return tuple(selected)
 
 
 def _navigation_path(source: Path, destination: str) -> str | None:

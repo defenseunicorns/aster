@@ -517,6 +517,109 @@ class DocumentationNavigationTests(unittest.TestCase):
         ):
             CHECKER.validate_navigation(self.root)
 
+    def test_reference_destination_continuation_allows_deep_indentation(self) -> None:
+        for indentation in ("    ", "        ", "\t\t"):
+            text = f"[x][r]\n\n[r]:\n{indentation}../archive/\n"
+            with self.subTest(indentation=repr(indentation)):
+                self.assertEqual(
+                    CHECKER.markdown_destinations(text),
+                    ("../archive/",),
+                )
+                self.write("README.md", b"# Aster\n")
+                self.write("docs/README.md", text.encode())
+                with self.assertRaisesRegex(
+                    CHECKER.ArchiveViolation,
+                    "default navigation.*docs/README.md",
+                ):
+                    CHECKER.validate_navigation(self.root)
+
+    def test_complete_reference_titles_occupy_embedded_link_text(self) -> None:
+        cases = (
+            '[safe]: docs/current.md "[history](archive/)"\n',
+            (
+                "[safe]: docs/current.md\n"
+                '  "one\n'
+                "  [fake]: archive/\n"
+                '  three"\n'
+            ),
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    CHECKER.markdown_destinations(text),
+                    ("docs/current.md",),
+                )
+                self.write("README.md", text.encode())
+                self.write("docs/README.md", b"# Documentation\n")
+                CHECKER.validate_navigation(self.root)
+
+    def test_multiline_inline_title_occupies_reference_shaped_text(self) -> None:
+        text = (
+            '[safe](docs/current.md "one\n'
+            "[fake]: archive/\n"
+            'three")\n'
+        )
+        self.assertEqual(
+            CHECKER.markdown_destinations(text),
+            ("docs/current.md",),
+        )
+        self.write("README.md", text.encode())
+        self.write("docs/README.md", b"# Documentation\n")
+        CHECKER.validate_navigation(self.root)
+
+    def test_blank_paragraph_precedes_backslash_escape_handling(self) -> None:
+        title_text = (
+            '[safe](docs/current.md "title\\\n\n'
+            '[history](archive/)")\n'
+        )
+        self.assertEqual(
+            CHECKER.markdown_destinations(title_text),
+            ("archive/",),
+        )
+        self.write("README.md", title_text.encode())
+        self.write("docs/README.md", b"# Documentation\n")
+        with self.assertRaisesRegex(
+            CHECKER.ArchiveViolation, "default navigation.*README.md"
+        ):
+            CHECKER.validate_navigation(self.root)
+
+        label_text = "[safe\\\n\nlabel](archive/)\n"
+        self.assertEqual(CHECKER.markdown_destinations(label_text), ())
+        self.write("README.md", label_text.encode())
+        CHECKER.validate_navigation(self.root)
+
+    def test_inline_code_cannot_span_a_blank_paragraph(self) -> None:
+        for text in (
+            "`code\n\n[history](archive/)`\n",
+            "`code\n \t \n[history](archive/)`\n",
+            "\\`literal\\`\n[history](archive/)\n",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    CHECKER.markdown_destinations(text),
+                    ("archive/",),
+                )
+                self.write("README.md", text.encode())
+                self.write("docs/README.md", b"# Documentation\n")
+                with self.assertRaisesRegex(
+                    CHECKER.ArchiveViolation, "default navigation.*README.md"
+                ):
+                    CHECKER.validate_navigation(self.root)
+
+    def test_all_title_delimiters_preserve_atomic_inline_spans(self) -> None:
+        for text in (
+            "[safe](docs/current.md 'one\n[fake]: archive/\nthree')\n",
+            "[safe](docs/current.md (one\n[fake]: archive/\nthree))\n",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    CHECKER.markdown_destinations(text),
+                    ("docs/current.md",),
+                )
+                self.write("README.md", text.encode())
+                self.write("docs/README.md", b"# Documentation\n")
+                CHECKER.validate_navigation(self.root)
+
     def test_valid_multiline_and_nested_archive_links_fail(self) -> None:
         cases = (
             ("README.md", b"[outer [inner]](archive/)\n"),
@@ -610,7 +713,7 @@ class DocumentationNavigationTests(unittest.TestCase):
             "[ \t\n ]: ../archive/\n",
             "[foo[bar]: ../archive/\n",
             "[foo]:\n",
-            "[foo]:\n    ../archive/\n",
+            "[foo]:\n\n    ../archive/\n",
             "[foo]: ../archive/ trailing\n",
         ):
             with self.subTest(text=text):
