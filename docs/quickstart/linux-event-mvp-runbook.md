@@ -15,12 +15,14 @@ restart recovery, and restart-selected Normal or ReceiveOnly operation.
 
 The protected provider is already statically composed into `aster-agent`;
 see the [provider implementation boundary](../../crates/aster-systemd-credentials/README.md#current-implementation-boundary).
-The customer ARM64 package, hardened systemd unit, package-owned credential
-handoff, and final device qualification remain separate deliverables. Source
-integration does not close Security/Deployment approval or packaged acceptance.
-Until those artifacts are frozen, use the local development path below or the
-OS engineer's explicitly identified candidate package. Do not invent service
-names, installed paths, or credential handoff steps.
+For a first Ubuntu 24.04 amd64 package installation, use the
+[provider operations package annex](../implementation/raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex).
+It defines the candidate's service, paths and credential handoff. Native ARM64
+and final device qualification remain separate deliverables. Source integration
+does not close Security/Deployment approval or packaged acceptance. The local
+development path below remains available for API evaluation. Use the documented
+candidate procedure; do not invent service names, installed paths, or credential
+handoff steps.
 
 ## Run the local API smoke test
 

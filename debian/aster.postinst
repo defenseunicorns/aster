@@ -1,0 +1,51 @@
+#!/bin/sh
+set -eu
+
+check_directory() {
+    test ! -L "$1" && test -d "$1" || {
+        echo "aster: expected a directory, not a symlink: $1" >&2
+        exit 1
+    }
+    checked_owner=$(stat -c %u -- "$1")
+    checked_mode=$(stat -c %a -- "$1")
+    if { test "$checked_owner" != 0 && test "$checked_owner" != "$2"; } ||
+       test "$((0$checked_mode & 022))" -ne 0; then
+        echo "aster: insecure package directory: $1" >&2
+        exit 1
+    fi
+}
+
+if [ "$1" = configure ]; then
+    if ! getent passwd aster >/dev/null; then
+        adduser --system --group --home /var/lib/aster-agent --no-create-home \
+            --disabled-login --gecos 'Aster service' aster
+    fi
+    uid=$(id -u aster)
+    gid=$(id -g aster)
+    if ! { test "$uid" -gt 0 && test "$uid" -lt 1000 &&
+           test "$(getent passwd aster | cut -d: -f6)" = /var/lib/aster-agent &&
+           test "$(getent group aster | cut -d: -f3)" = "$gid"; }; then
+        echo 'aster: existing account is not the package service account' >&2
+        exit 1
+    fi
+    # Validate ancestors before operating on package directories.
+    for path in / /etc /var /var/lib; do
+        check_directory "$path" 0
+    done
+    while read -r path owner group mode; do
+        if test ! -e "$path" && test ! -L "$path"; then
+            mkdir -m 0755 -- "$path"
+        fi
+        check_directory "$path" "$owner"
+        chown "$owner:$group" -- "$path"
+        chmod "$mode" -- "$path"
+    done <<EOF
+/etc/aster 0 0 0755
+/var/lib/aster 0 0 0755
+/etc/aster/provisioning 0 0 0700
+/var/lib/aster/provisioning-systemd 0 0 0700
+/etc/aster/agent-credentials 0 $gid 0750
+/var/lib/aster-agent $uid $gid 0700
+EOF
+fi
+#DEBHELPER#

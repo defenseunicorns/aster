@@ -1,0 +1,14 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Aster
+Source: https://github.com/edgesoftops/astertech
+
+Files: *
+Copyright: 2026 Defense Unicorns, Inc.
+License: Apache-2.0
+ On Debian systems the full Apache-2.0 text is available at
+ /usr/share/common-licenses/Apache-2.0.
+ .
+ This describes first-party code. The accompanying Cargo SBOMs contain
+ dependency license declarations; LICENSE and THIRD_PARTY_NOTICES.md are
+ retained separately. Complete dependency license-text admission remains
+ release work; this evaluation package is not license-admission evidence.

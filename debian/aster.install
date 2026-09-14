@@ -1,0 +1,3 @@
+target/debian-install/bin/aster usr/bin
+target/debian-install/bin/aster-agent usr/bin
+target/debian-install/bin/aster-credential-admin usr/sbin

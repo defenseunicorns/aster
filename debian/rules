@@ -1,0 +1,47 @@
+#!/usr/bin/make -f
+export CARGO_NET_OFFLINE = true
+export CARGO_INCREMENTAL = 0
+export CARGO_TARGET_DIR = $(CURDIR)/target/debian
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	@. /etc/os-release; test "$$ID:$$VERSION_ID" = ubuntu:24.04
+	@test "$(shell dpkg-architecture -qDEB_BUILD_ARCH)" = "$(shell dpkg-architecture -qDEB_HOST_ARCH)"
+	@case "$(shell dpkg-architecture -qDEB_HOST_ARCH)" in amd64|arm64) ;; *) exit 1;; esac
+	@rustc --version | grep -q '^rustc 1\.97\.1 '
+	@cargo cyclonedx --version | grep -Eq '(^|[[:space:]])0\.5\.9$$'
+	@cdx-ev --version | grep -Eq '(^|[[:space:]])0\.34\.0$$'
+
+override_dh_auto_build:
+	bash debian/build.sh
+
+override_dh_auto_test:
+
+override_dh_auto_install:
+
+override_dh_auto_clean:
+	rm -rf target/debian target/debian-install target/deb-metadata
+
+override_dh_clean:
+	# Preserve the upstream manifest required by the vendored patch verifier.
+	dh_clean -Xthird-party/netlink-packet-core-0.8.2-aster/Cargo.toml.orig
+
+override_dh_installsystemd:
+	dh_installsystemd --name=aster-agent --no-enable --no-start --no-restart-after-upgrade
+
+override_dh_fixperms:
+	dh_fixperms
+	chmod 0700 debian/aster/etc/aster/provisioning debian/aster/var/lib/aster/provisioning-systemd debian/aster/var/lib/aster-agent
+	chmod 0750 debian/aster/etc/aster/agent-credentials
+
+override_dh_strip:
+	dh_strip --no-automatic-dbgsym
+	cd debian/aster && sha256sum usr/bin/aster usr/bin/aster-agent usr/sbin/aster-credential-admin > ../../target/deb-metadata/BINARY-SHA256SUMS
+
+# This package intentionally contains no documentation.
+override_dh_installdocs:
+
+override_dh_installchangelogs:

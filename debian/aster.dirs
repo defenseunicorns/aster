@@ -1,0 +1,5 @@
+etc/aster
+etc/aster/agent-credentials
+etc/aster/provisioning
+var/lib/aster-agent
+var/lib/aster/provisioning-systemd

@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+case "$1" in
+    remove|upgrade|deconfigure)
+        if [ -d /run/systemd/system ]; then
+            deb-systemd-invoke stop aster-agent.service
+        fi
+        ;;
+esac
+#DEBHELPER#

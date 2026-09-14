@@ -1,0 +1,45 @@
+#
+[Unit]
+Description=Aster local Event agent
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=exec
+User=aster
+Group=aster
+UMask=0077
+WorkingDirectory=/var/lib/aster-agent
+ExecStartPre=/usr/bin/aster-agent --check-config /etc/aster/agent.json
+ExecStart=/usr/bin/aster-agent --config /etc/aster/agent.json
+ExecReload=/bin/kill -HUP $MAINPID
+LoadCredentialEncrypted=aster-provisioning.bundle:/etc/aster/provisioning/active/credential.cred
+StateDirectory=aster-agent
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=40s
+KillSignal=SIGTERM
+KillMode=control-group
+SendSIGKILL=yes
+LimitCORE=0
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+# The credential loader requires openat2; RestrictSUIDSGID blocks that syscall.
+RestrictSUIDSGID=no
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

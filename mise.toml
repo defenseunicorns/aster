@@ -22,6 +22,7 @@ run = [
   "python3 tools/test_aster_mesh_playground.py",
   "python3 tools/test_aster_lan_mvp.py",
   "python3 tools/test_aster_lan_mvp_compose.py",
+  "python3 tools/test_aster_deb_compose.py",
   "python3 tools/test_aster_lan_scale_compose.py",
   "python3 tools/test_aster_hierarchy_mvp_compose.py",
   "python3 tools/test_aster_hierarchy_scale_compose.py",
@@ -131,6 +132,10 @@ run = "sh ./tools/test-aster-mesh-playground-real.sh"
 description = "Exercise the staged rosterless LAN Event MVP on one Docker bridge"
 run = "python3 tools/aster_lan_mvp_compose.py"
 
+[tasks.deb-compose]
+description = "Test an existing Aster .deb on two Ubuntu containers with static peers"
+run = "python3 tools/aster_deb_compose.py"
+
 [tasks.lan-scale-compose]
 description = "Measure one generated 8, 16, or 32-node rosterless LAN baseline"
 run = "python3 tools/aster_lan_scale_compose.py"
@@ -216,3 +221,7 @@ run = "sh ./tools/age-reference/audit.sh"
 [tasks.build]
 description = "Build aster and aster-agent for Linux x86_64"
 run = "bash tools/build-linux-x86_64.sh"
+
+[tasks.build-deb]
+description = "Build the native Ubuntu 24.04 amd64 or arm64 evaluation deb"
+run = "dpkg-buildpackage -b -us -uc"
