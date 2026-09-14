@@ -183,7 +183,7 @@ No production architecture or dependency is selected or admitted.
 ## 2026-08-23 — Iroh/Patchbay topology result
 
 The historical setup and execution chronology is retained separately. The
-public [topology report](iroh-patchbay-topology.md) identifies the public Iroh
+public [topology report](results/iroh-patchbay.json) identifies the public Iroh
 and Patchbay inputs, locally assembled test images, final observation, and
 its use in the evaluation conclusions and Proposal 0006. This condensed entry
 was prepared on 2026-09-27; it is not a new execution receipt.
