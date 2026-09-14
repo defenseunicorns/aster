@@ -66,12 +66,16 @@ SBOM/checksum payloads, then install and exercise the protected service on the
 disposable runner. They include `aster`, `aster-agent` and
 `aster-credential-admin`. No cross-compilation or emulation is used.
 
-Download `aster-ubuntu24.04-<arch>-<commit SHA>` from the successful run's
-**Artifacts** section. It contains the `.deb`, `.buildinfo`, `.changes` and
-`SHA256SUMS`, plus a `metadata/` directory with SBOMs, license/build records
-and hashes of packaged binaries, retained for 14 days. These records are
-external; the `.deb` contains no documentation. A configured workflow alone is not evidence
-of a successful arm64 build or runtime test; keep the actual run result.
+In a successful run's **Artifacts** section, download `aster_<version>_<arch>.deb`
+directly: the package is uploaded without an outer ZIP using SHA-pinned
+[`actions/upload-artifact` v7](https://github.com/actions/upload-artifact/tree/043fb46d1a93c77aae656e7c1c64a875d1fc6a0a)
+with `archive: false`. Build records are a separate
+`aster-ubuntu24.04-<arch>-metadata-<commit SHA>` ZIP containing `.buildinfo`,
+`.changes`, `SHA256SUMS` and `metadata/` with SBOMs, license/build records and
+hashes of packaged binaries. Extract those records next to the downloaded `.deb`
+to verify `SHA256SUMS`. Both artifacts are retained for 14 days. The `.deb`
+contains no documentation. A configured workflow alone is not evidence of a
+successful build or runtime test; keep the actual run result.
 See the [package candidate](release/ubuntu-24.04-deb.md) for build scope and
 the [existing operations procedure](implementation/raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex)
 for the currently documented amd64 installation procedure.

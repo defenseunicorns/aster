@@ -57,9 +57,19 @@ jobs:
           cp -r target/deb-metadata target/deb-artifacts/metadata
           cd target/deb-artifacts
           find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > SHA256SUMS
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - name: Upload installable Debian package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: aster-ubuntu24.04-arm64-${{ github.sha }}
-          path: target/deb-artifacts/
+          path: target/deb-artifacts/*_arm64.deb
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload package build records
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: aster-ubuntu24.04-arm64-metadata-${{ github.sha }}
+          path: |
+            target/deb-artifacts/
+            !target/deb-artifacts/*.deb
           if-no-files-found: error
           retention-days: 14
