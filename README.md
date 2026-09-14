@@ -255,7 +255,7 @@ conventional database or broker will usually be simpler.
 | Connect nodes or evaluate carriers | [Carriers and contacts](docs/transports.md) |
 | Implement compatible protocol bytes | [Protocol](docs/protocol.md), [wire grammar](docs/wire.cddl), and [security objects](docs/envelope.md) |
 | Assess progress or readiness | [Capability roadmap](docs/implementation/capability-roadmap.md), [requirements status](docs/implementation/requirements-status.md), [conformance](docs/conformance.md), and [security](docs/security.md) |
-| Browse all project records | [Documentation index](docs/README.md) |
+| Browse current product documentation | [Documentation map](docs/README.md) |
 
 ## Repository map
 
