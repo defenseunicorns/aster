@@ -160,6 +160,32 @@ class DocumentationArchiveManifestTests(unittest.TestCase):
                 finally:
                     path.unlink()
 
+    @unittest.skipUnless(os.name == "posix", "byte-oriented filenames need POSIX")
+    def test_non_utf8_filesystem_filename_fails_closed(self) -> None:
+        archive_bytes = os.fsencode(self.root / "archive")
+        path_bytes = archive_bytes + b"/invalid-\xff.md"
+        descriptor = os.open(path_bytes, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(descriptor)
+
+        try:
+            CHECKER.render_manifest(self.root)
+        except Exception as error:
+            self.assertIsInstance(error, CHECKER.ArchiveViolation)
+            self.assertRegex(str(error), "UTF-8")
+        else:
+            self.fail("non-UTF-8 filesystem name was accepted")
+
+    def test_surrogate_in_supplied_manifest_fails_closed(self) -> None:
+        manifest = f"{ZERO_DIGEST}  archive/invalid-\udcff.md\n"
+
+        try:
+            CHECKER.validate_manifest(self.root, manifest)
+        except Exception as error:
+            self.assertIsInstance(error, CHECKER.ArchiveViolation)
+            self.assertRegex(str(error), "UTF-8")
+        else:
+            self.fail("surrogate-containing manifest was accepted")
+
     def test_write_manifest_atomically_replaces_regular_manifest(self) -> None:
         self.write("archive/README.md", b"policy\n")
         self.write("archive/MANIFEST.sha256", b"stale\n")

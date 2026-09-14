@@ -35,6 +35,13 @@ def _reject_unsafe_name(name: str) -> None:
         fail(f"unsafe archive filename {name!r}")
 
 
+def _utf8_bytes(value: str, description: str) -> bytes:
+    try:
+        return value.encode("utf-8")
+    except UnicodeEncodeError:
+        fail(f"{description} is not valid UTF-8")
+
+
 def archive_files(repository_root: Path) -> list[Path]:
     """Return regular archive files in canonical bytewise path order."""
     repository_root = repository_root.resolve()
@@ -61,6 +68,7 @@ def archive_files(repository_root: Path) -> list[Path]:
             _reject_unsafe_name(entry.name)
             path = Path(entry.path)
             relative_path = path.relative_to(repository_root)
+            _utf8_bytes(relative_path.as_posix(), "archive path")
 
             if entry.is_symlink():
                 fail(f"archive contains symbolic link {relative_path.as_posix()}")
@@ -162,9 +170,10 @@ def validate_manifest(repository_root: Path, manifest: str | None = None) -> int
     supplied = _read_manifest(repository_root) if manifest is None else manifest
     if not isinstance(supplied, str):
         fail("archive manifest must be supplied as decoded UTF-8 text")
+    supplied_bytes = _utf8_bytes(supplied, "archive manifest")
     paths = _canonical_manifest_paths(supplied)
     expected = render_manifest(repository_root)
-    if supplied.encode("utf-8") != expected.encode("utf-8"):
+    if supplied_bytes != _utf8_bytes(expected, "rendered archive manifest"):
         fail("archive manifest differs from the archived files")
     return len(paths)
 
