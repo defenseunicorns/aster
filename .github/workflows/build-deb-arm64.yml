@@ -54,8 +54,9 @@ jobs:
         run: |
           mkdir -p target/deb-artifacts
           cp ../aster_*.deb ../aster_*.buildinfo ../aster_*.changes target/deb-artifacts/
+          cp -r target/deb-metadata target/deb-artifacts/metadata
           cd target/deb-artifacts
-          sha256sum ./* > SHA256SUMS
+          find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: aster-ubuntu24.04-arm64-${{ github.sha }}

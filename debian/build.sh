@@ -9,8 +9,9 @@ case "$(dpkg-architecture -qDEB_HOST_ARCH)" in
     *) echo 'Unsupported package architecture' >&2; exit 1 ;;
 esac
 stage=target/debian-install
-rm -rf "$stage"
-mkdir -p "$stage/bin" "$stage/doc"
+metadata=target/deb-metadata
+rm -rf "$stage" "$metadata"
+mkdir -p "$stage/bin" "$metadata"
 sha256sum Cargo.lock > "$stage/Cargo.lock.sha256"
 python3 tools/check-netlink-packet-core-patch.py
 cargo build --frozen --release --target "$target" \
@@ -22,13 +23,13 @@ for pair in aster-node:aster aster-agent:aster-agent aster-systemd-credentials:a
     crate=${pair%%:*}
     name=${pair#*:}
     install -m 0755 "$CARGO_TARGET_DIR/$target/release/$name" "$stage/bin/$name"
-    cp "crates/$crate/${name}_bin.cdx.json" "$stage/doc/$name.cdx.json"
+    cp "crates/$crate/${name}_bin.cdx.json" "$metadata/$name.cdx.json"
     if [ "$name" != aster-credential-admin ]; then
         "$stage/bin/$name" --help >/dev/null
     fi
-    cdx-ev validate "$stage/doc/$name.cdx.json" --schema-type default
+    cdx-ev validate "$metadata/$name.cdx.json" --schema-type default
 done
-python3 - "$stage/doc" <<'PY'
+python3 - "$metadata" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -38,9 +39,7 @@ for name in ("aster", "aster-agent", "aster-credential-admin"):
     assert bom.get("metadata", {}).get("component", {}).get("name") == name
     assert bom.get("components") and all(c.get("licenses") for c in bom["components"])
 PY
-cp LICENSE THIRD_PARTY_NOTICES.md "$stage/doc/"
-cp docs/release/ubuntu-24.04-deb.md "$stage/doc/README.md"
-cp docs/release/sbom/README.md "$stage/doc/SBOM-SCOPE.md"
+cp LICENSE THIRD_PARTY_NOTICES.md "$metadata/"
 {
     printf '\n'
     printf 'source_identity=working tree; this record is not a source attestation\n'
@@ -51,4 +50,4 @@ cp docs/release/sbom/README.md "$stage/doc/SBOM-SCOPE.md"
     cargo cyclonedx --version
     cdx-ev --version
     dpkg-query -W -f='${Package}=${Version}\n' libc6 debhelper
-} > "$stage/doc/BUILD.txt"
+} > "$metadata/BUILD.txt"

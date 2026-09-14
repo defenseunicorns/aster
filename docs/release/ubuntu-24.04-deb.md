@@ -60,10 +60,25 @@ Public sources consulted, 2026-09-10:
 - [GitHub runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners):
   native `ubuntu-24.04` and `ubuntu-24.04-arm` runner labels.
 
-Local environment observed: x86_64; no effective capabilities and
-`NoNewPrivs=1`. The existing Ubuntu 24.04 runtime chroot has no systemd
-package. No usable ARM64 test machine or VM has been identified. Neither
-target's PID-1 credential presentation has been tested in this task.
+Local validation on 2026-09-11: the complete checkout check and the amd64
+package installation/runtime harness passed after wrapper removal. The ARM64
+build and installation/runtime harness also completed successfully in an
+emulated Ubuntu 24.04 VM on an x86_64 host: package payload, ELF architecture,
+external SBOMs and checksums, protected local Event publish/delivery/ack,
+service restart, removal and state preservation passed. Native ARM64 hardware
+and GitHub CI runs remain unverified. Historical observations are retained in
+[the dated receipt](2026-09-10-deb-observation.md).
+
+The separate [two-node package Compose smoke](../../docker/deb-test/README.md)
+passed on amd64 again on 2026-09-14, including offline backlog delivery and
+persistence across container recreation. It does not qualify systemd or the
+protected service and has not been run on ARM64. The Compose checkout's full
+`mise run check` on 2026-09-11 stopped at a contact-deadline failure in one of
+266 `aster-node` tests; that test passed in isolation, but later check tasks
+were not reached. This is not a fully green checkout result.
+
+The probe below is an optional compatibility diagnostic, not a required
+package-build or installation step.
 
 ## Target-machine probe
 
@@ -119,22 +134,23 @@ probe nor an accepted metadata shape qualifies the v2 lifecycle on Ubuntu.
 - `/usr/sbin/aster-credential-admin` is the stopped-service root admin tool.
 - `aster-agent.service` runs as a dedicated static `aster` user, with
   restrictive umask and no automatic activation on install or upgrade.
-- Configuration is `/etc/aster/agent.json`. Install an example under
-  `/usr/share/doc/aster/examples/`; no operational configuration or test
-  provisioning is silently installed.
+- Configuration is `/etc/aster/agent.json`. The example remains in the source
+  checkout at `debian/agent.example.json`; no documentation, example, operational
+  configuration or test provisioning is installed by the package.
 - `/etc/aster/provisioning` and `/var/lib/aster/provisioning-systemd` are
   root-owned `0700` directories on local ext4, as required by the provider.
 - `/var/lib/aster-agent` holds service-owned persistent node state.
 - The encrypted input remains the provider's fixed
   `/etc/aster/provisioning/active/credential.cred`, delivered by PID 1 as
   `aster-provisioning.bundle`.
-- A package-owned atomic reference handoff must decode the complete success
+- The operator procedure for atomic reference handoff must decode the complete success
   output of an admin invocation that exited zero. It must set the final
   service UID and `0600`, and bind the configured load-operation ID. Never
   make provider-internal `active/reference` service-readable.
 - Per-executable CycloneDX SBOMs include the administration executable too;
   preserve the existing overinclusive-Cargo qualification. Include project
-  license and build records; complete dependency notices remain release work.
+  license and build records alongside the package, outside the `.deb`; complete
+  dependency notices remain release work.
 - Removal stops the service and preserves persistent state and provisioning.
   Purge must not silently destroy provisioning or claim physical erasure.
 
@@ -146,7 +162,7 @@ probe nor an accepted metadata shape qualifies the v2 lifecycle on Ubuntu.
    maintainer scripts and operator documentation. Use debhelper 13 and native
    `dpkg-buildpackage`; calculate shared-library dependencies from the actual
    binaries. Build with Rust 1.97.1 and locked offline Cargo inputs.
-3. Implement and test the reference handoff: reject nonzero admin exit,
+3. Document and test the existing admin CLI and manual reference handoff: reject nonzero admin exit,
    partial/invalid output and insecure paths; make replacement atomic;
    leave the service stopped on failure. Avoid a new provisioning backend.
 4. Add native Ubuntu 24.04 CI jobs for amd64 and arm64, including SBOM
@@ -178,16 +194,21 @@ python3 tools/test_deb_package.py ../aster_*_$(dpkg --print-architecture).deb "$
 sha256sum ../aster_*.deb
 ```
 
-The package includes three schema-validated Cargo SBOMs. Its internal
-`/usr/share/doc/aster/SHA256SUMS` hashes installed binaries **after stripping**,
-SBOMs, BUILD.txt and LICENSE; verify from `/`. Preserve the external
-`.buildinfo` and `.changes` too. BUILD.txt explicitly describes a working-tree
+The build produces three schema-validated Cargo SBOMs in
+`target/deb-metadata`, outside the `.deb`, together with license/build records.
+`BINARY-SHA256SUMS` hashes the three packaged executables after stripping;
+verify these paths from `/` on an installed target. Preserve this metadata and
+external `.buildinfo` and `.changes` alongside the package. The CI artifact
+includes the metadata directory and an external checksum manifest.
+The `.deb` contains no documentation, examples, SBOMs or build records.
+BUILD.txt explicitly describes a working-tree
 build, not a cryptographic source attestation. OS packages and Python
 transitive dependencies are not fully locked; bit-for-bit repeatability,
 complete native/toolchain license admission and signing remain open.
 
-The manual `Build: Ubuntu 24.04 deb` workflow builds and exercises both targets.
-It does not publish a release or change requirement status. The disposable VM
+The separate manual `Build: Ubuntu 24.04 deb amd64` and
+`Build: Ubuntu 24.04 deb arm64` workflows build and exercise their respective
+targets. Neither publishes a release or changes requirement status. The disposable VM
 harness is `tools/test-deb-install.sh`; it refuses existing Aster deployments,
 uses only the repository non-production fixture, and intentionally leaves
 preserved test state after package removal. Never run it on a deployed node.
@@ -196,10 +217,11 @@ preserved test state after package removal. Never run it on a deployed node.
 
 Follow the existing [provider operations procedure, Ubuntu 24.04 amd64
 package annex](../implementation/raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex).
-It supplies the package paths, service account, first installation, host-key
+Documentation stays in the repository and is not installed by the package.
+The existing procedure supplies package paths, service account, first installation, host-key
 setup, direct `aster-credential-admin` invocation, atomic reference/configuration
 handoff and startup/readiness commands. Provider lifecycle and retry semantics
-remain in that procedure. Arm64 validation is deferred.
+remain in that procedure. Native ARM64 validation is deferred.
 
 ## Upgrade, removal, and remaining qualification
 

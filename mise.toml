@@ -22,6 +22,7 @@ run = [
   "python3 tools/test_aster_mesh_playground.py",
   "python3 tools/test_aster_lan_mvp.py",
   "python3 tools/test_aster_lan_mvp_compose.py",
+  "python3 tools/test_aster_deb_compose.py",
   "python3 tools/test_aster_lan_scale_compose.py",
   "python3 tools/test_aster_hierarchy_mvp_compose.py",
   "python3 tools/test_aster_hierarchy_scale_compose.py",
@@ -122,6 +123,10 @@ run = "sh ./tools/test-aster-mesh-playground-real.sh"
 [tasks.lan-mvp-compose]
 description = "Exercise the staged rosterless LAN Event MVP on one Docker bridge"
 run = "python3 tools/aster_lan_mvp_compose.py"
+
+[tasks.deb-compose]
+description = "Test an existing Aster .deb on two Ubuntu containers with static peers"
+run = "python3 tools/aster_deb_compose.py"
 
 [tasks.lan-scale-compose]
 description = "Measure one generated 8, 16, or 32-node rosterless LAN baseline"

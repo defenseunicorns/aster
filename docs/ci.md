@@ -68,7 +68,9 @@ disposable runner. They include `aster`, `aster-agent` and
 
 Download `aster-ubuntu24.04-<arch>-<commit SHA>` from the successful run's
 **Artifacts** section. It contains the `.deb`, `.buildinfo`, `.changes` and
-`SHA256SUMS`, retained for 14 days. A configured workflow alone is not evidence
+`SHA256SUMS`, plus a `metadata/` directory with SBOMs, license/build records
+and hashes of packaged binaries, retained for 14 days. These records are
+external; the `.deb` contains no documentation. A configured workflow alone is not evidence
 of a successful arm64 build or runtime test; keep the actual run result.
 See the [package candidate](release/ubuntu-24.04-deb.md) for build scope and
 the [existing operations procedure](implementation/raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex)

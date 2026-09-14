@@ -23,7 +23,7 @@ override_dh_auto_test:
 override_dh_auto_install:
 
 override_dh_auto_clean:
-	rm -rf target/debian target/debian-install
+	rm -rf target/debian target/debian-install target/deb-metadata
 
 override_dh_clean:
 	# Preserve the upstream manifest required by the vendored patch verifier.
@@ -39,10 +39,9 @@ override_dh_fixperms:
 
 override_dh_strip:
 	dh_strip --no-automatic-dbgsym
-	cd debian/aster && find usr/bin usr/sbin usr/share/doc/aster -type f \
-		\( -name aster -o -name aster-agent -o -name aster-credential-admin \
-		-o -name '*.cdx.json' -o -name BUILD.txt -o -name LICENSE \) \
-		-print0 | LC_ALL=C sort -z | xargs -0 sha256sum > usr/share/doc/aster/SHA256SUMS
+	cd debian/aster && sha256sum usr/bin/aster usr/bin/aster-agent usr/sbin/aster-credential-admin > ../../target/deb-metadata/BINARY-SHA256SUMS
 
-override_dh_compress:
-	dh_compress -X.cdx.json -XBUILD.txt -XSHA256SUMS -XLICENSE
+# This package intentionally contains no documentation.
+override_dh_installdocs:
+
+override_dh_installchangelogs:

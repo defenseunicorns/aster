@@ -506,19 +506,18 @@ runtime evidence are in the [package candidate document](../release/ubuntu-24.04
 
 The example configuration comes from the
 [configuration reference](../reference/aster-agent-config-v1.md), with these
-package credential paths. The package installs it only as documentation.
+package credential paths. It remains in the source checkout at `debian/agent.example.json`; the package
+contains no documentation or configuration examples.
 
 ### Prepare a first installation
 
-Use Ubuntu 24.04 amd64 and local ext4 for provider storage. On Ubuntu Minimal,
-check dpkg documentation exclusions before installing: retain
-`/usr/share/doc/aster` and `/usr/share/doc/aster/*` with `path-include` rules
-if `/usr/share/doc/*` is excluded.
+Use Ubuntu 24.04 amd64 and local ext4 for provider storage. Run the following
+commands from the reviewed source checkout matching the package.
 
 ```sh
 sudo apt install ./aster_VERSION_amd64.deb
 sudo install -o root -g aster -m 0640 \
-  /usr/share/doc/aster/examples/agent.example.json /etc/aster/agent.json
+  debian/agent.example.json /etc/aster/agent.json
 sudo systemd-creds setup
 ```
 

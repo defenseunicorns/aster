@@ -152,6 +152,7 @@ Choose the API closest to your application:
 | Language | API you use | Quickstart |
 |---|---|---|
 | Human-driven three-node introduction | `mise run hello` | [Aster Field Notes](hello.md) |
+| Ready-built Debian package, two static peers | `mise run deb-compose -- --deb /path/to/aster.deb` | [Package Compose smoke](../../docker/deb-test/README.md) |
 | One-host automatic-discovery rehearsal | `mise run lan-mvp-compose` | [LAN MVP](lan-mvp.md#fast-one-host-docker-rehearsal) |
 | Concurrent 8/16/32-node LAN diagnostic | `mise run lan-scale-compose -- --nodes N` | [LAN scale baseline](lan-scale.md) |
 | Five-node, three-segment static Event hierarchy | `mise run hierarchy-mvp-compose` | [Hierarchy MVP](../../docker/hierarchy-mvp/README.md) |
