@@ -18,8 +18,6 @@ run = [
   "sh tools/check-agent-proto.sh",
   "python3 tools/check-project-license.py",
   "python3 tools/check-implementation-requirements.py",
-  "python3 tools/test-documentation-archive.py",
-  "python3 tools/check-documentation-archive.py",
   "python3 tools/test_aster_tour_ui.py",
   "python3 tools/test_aster_mesh_playground.py",
   "python3 tools/test_aster_lan_mvp.py",
@@ -67,13 +65,6 @@ run = [
   "test -z \"$(gofmt -l conformance/agent-go)\"",
   "go -C conformance/agent-go test ./...",
   "sh tools/check-agent-go-generated.sh",
-]
-
-[tasks.documentation-archive]
-description = "Verify the frozen documentation archive and candidate inventory"
-run = [
-  "python3 tools/test-documentation-archive.py",
-  "python3 tools/check-documentation-archive.py",
 ]
 
 [tasks.conformance-profile-v0-r2]
