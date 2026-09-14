@@ -25,6 +25,7 @@ from urllib.parse import unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_RELATIVE = Path("archive/MANIFEST.sha256")
 TEMP_MANIFEST_NAME = ".MANIFEST.sha256.tmp"
+BACKUP_MANIFEST_NAME = ".MANIFEST.sha256.previous"
 HASH_CHUNK_BYTES = 1024 * 1024
 MANIFEST_ENTRY = re.compile(r"([0-9a-f]{64})  ([^\r\n]+)\n")
 INVENTORY_RELATIVE = Path("docs/implementation/documentation-refactor-inventory.csv")
@@ -71,6 +72,15 @@ FENCE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})(.*)$")
 REFERENCE_START = re.compile(r"^[ ]{0,3}\[", re.MULTILINE)
 MARKDOWN_ESCAPABLE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
 BLANK_LINE = re.compile(r"\n[ \t]*\n")
+BLOCKQUOTE_PREFIX = re.compile(r"^[ ]{0,3}>[ \t]?")
+ATX_HEADING = re.compile(
+    r"^[ ]{0,3}(?:(?:[-+*]|[0-9]{1,9}[.)])[ \t]+)*#{1,6}(?:[ \t]|$)"
+)
+INLINE_BLOCK_START = re.compile(
+    r"^[ ]{0,3}(?:#{1,6}(?:[ \t]|$)|>|[-+*][ \t]|[0-9]{1,9}[.)][ \t]"
+    r"|(?:\*[ \t]*){3,}$|(?:_[ \t]*){3,}$|(?:-[ \t]*){3,}$"
+    r"|(?:=+|-+)[ \t]*$|<[/!A-Za-z?])"
+)
 
 
 class InventoryRow(NamedTuple):
@@ -213,7 +223,16 @@ def _canonical_manifest_paths(manifest: str) -> list[str]:
 
 
 def _read_manifest(repository_root: Path) -> str:
-    manifest_path = repository_root.resolve() / MANIFEST_RELATIVE
+    parent = repository_root.resolve()
+    for part in MANIFEST_RELATIVE.parts[:-1]:
+        parent = parent / part
+        try:
+            parent_status = parent.lstat()
+        except OSError as error:
+            fail(f"cannot inspect archive manifest parent: {error}")
+        if not stat.S_ISDIR(parent_status.st_mode):
+            fail("archive manifest parent is not a real directory")
+    manifest_path = parent / MANIFEST_RELATIVE.name
     try:
         manifest_status = manifest_path.lstat()
     except FileNotFoundError:
@@ -270,7 +289,9 @@ def write_manifest(repository_root: Path) -> int:
     archive_root = repository_root / "archive"
     manifest_path = repository_root / MANIFEST_RELATIVE
     temporary_path = archive_root / TEMP_MANIFEST_NAME
+    backup_path = archive_root / BACKUP_MANIFEST_NAME
 
+    existing_manifest = False
     try:
         existing_status = manifest_path.lstat()
     except FileNotFoundError:
@@ -280,9 +301,12 @@ def write_manifest(repository_root: Path) -> int:
             existing_status.st_mode
         ):
             fail("existing manifest is not a regular file")
+        existing_manifest = True
 
     rendered = render_manifest(repository_root).encode("utf-8")
     created_temporary = False
+    created_backup = False
+    replaced_manifest = False
     try:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         flags |= getattr(os, "O_CLOEXEC", 0)
@@ -293,19 +317,43 @@ def write_manifest(repository_root: Path) -> int:
             destination.write(rendered)
             destination.flush()
             os.fsync(destination.fileno())
+        if existing_manifest:
+            # Keep the original inode until the replacement directory entry is
+            # synced, so a reported sync failure can restore the prior bytes.
+            os.link(manifest_path, backup_path, follow_symlinks=False)
+            created_backup = True
         os.replace(temporary_path, manifest_path)
         created_temporary = False
+        replaced_manifest = True
         _sync_directory(archive_root)
     except ArchiveViolation:
         raise
     except OSError as error:
+        if replaced_manifest:
+            try:
+                if created_backup:
+                    os.replace(backup_path, manifest_path)
+                    created_backup = False
+                else:
+                    manifest_path.unlink()
+            except OSError as rollback_error:
+                # A second I/O failure must not delete the only retained copy.
+                created_backup = False
+                fail(
+                    f"cannot write archive manifest: {error}; "
+                    f"rollback failed: {rollback_error}; "
+                    f"inspect archive/{BACKUP_MANIFEST_NAME} for prior bytes"
+                )
         fail(f"cannot write archive manifest: {error}")
     finally:
-        if created_temporary:
-            try:
-                temporary_path.unlink()
-            except FileNotFoundError:
-                pass
+        for path, created in (
+            (temporary_path, created_temporary), (backup_path, created_backup)
+        ):
+            if created:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
 
     return validate_manifest(repository_root, _read_manifest(repository_root))
 
@@ -485,66 +533,122 @@ def _read_inventory(repository_root: Path) -> tuple[InventoryRow, ...]:
 
 
 def _without_fenced_code(text: str) -> str:
+    """Expose explicit quote contents and omit fences within their container.
+
+    Lazy continuation across quote boundaries is outside this narrow scanner:
+    keep such text visible rather than let uncertain code spans hide links.
+    """
     rendered: list[str] = []
     fence_character = ""
     fence_length = 0
+    fence_depth = 0
+    previous_depth = 0
     for line in text.splitlines(keepends=True):
-        candidate = line.rstrip("\r\n")
-        match = FENCE.match(candidate)
+        depth = 0
         if fence_character:
-            if (
-                match is not None
-                and match.group(1)[0] == fence_character
-                and len(match.group(1)) >= fence_length
-                and not match.group(2).strip()
-            ):
-                fence_character = ""
-                fence_length = 0
-            rendered.append("\n" if line.endswith("\n") else "")
-            continue
+            # Quote markers beyond the opener's depth are literal code. A
+            # missing enclosing quote ends that fence before this line.
+            while depth < fence_depth and (prefix := BLOCKQUOTE_PREFIX.match(line)):
+                line = line[prefix.end():]
+                depth += 1
+            if depth == fence_depth:
+                match = FENCE.match(line.rstrip("\r\n"))
+                if (
+                    match is not None
+                    and match.group(1)[0] == fence_character
+                    and len(match.group(1)) >= fence_length
+                    and not match.group(2).strip()
+                ):
+                    fence_character = ""
+                rendered.append("\n" if line.endswith("\n") else "")
+                continue
+            fence_character = ""
+        while prefix := BLOCKQUOTE_PREFIX.match(line):
+            line = line[prefix.end():]
+            depth += 1
+        if depth != previous_depth:
+            rendered.append("\n")
+        previous_depth = depth
+        match = FENCE.match(line.rstrip("\r\n"))
         if match is not None and not (
             match.group(1)[0] == "`" and "`" in match.group(2)
         ):
             fence_character = match.group(1)[0]
             fence_length = len(match.group(1))
+            fence_depth = depth
             rendered.append("\n" if line.endswith("\n") else "")
             continue
         rendered.append(line)
     return "".join(rendered)
 
 
+def _inline_code_end(text: str, start: int) -> int | None:
+    end = start + 1
+    while end < len(text) and text[end] == "`":
+        end += 1
+    delimiter = text[start:end]
+    closing = text.find(delimiter, end)
+    while closing >= 0 and (
+        (closing > 0 and text[closing - 1] == "`")
+        or (
+            closing + len(delimiter) < len(text)
+            and text[closing + len(delimiter)] == "`"
+        )
+    ):
+        closing = text.find(delimiter, closing + 1)
+    if closing < 0 or BLANK_LINE.search(text, end, closing):
+        return None
+    line_start = text.rfind("\n", 0, start) + 1
+    lines = text[line_start:closing].split("\n")
+    if len(lines) > 1 and (
+        ATX_HEADING.match(lines[0])
+        or any(INLINE_BLOCK_START.match(line) for line in lines[1:])
+    ):
+        return None
+    return closing + len(delimiter)
+
+
 def _without_inline_code(text: str) -> str:
+    """Mask code only in inline text, never in destinations or titles."""
     rendered: list[str] = []
+    opaque: dict[int, int] = {}
     position = 0
     while position < len(text):
+        if position in opaque:
+            end = opaque[position]
+            rendered.append(text[position:end])
+            position = end
+            continue
+        if text[position] == "[" and not _is_escaped(text, position):
+            line_start = text.rfind("\n", 0, position) + 1
+            reference = REFERENCE_START.match(text, line_start)
+            if reference is not None and reference.end() - 1 == position:
+                parsed = _reference_definition(text, position)
+                if parsed is not None:
+                    _, end = parsed
+                    rendered.append(text[position:end])
+                    position = end
+                    continue
+            closing = _link_label_end(text, position)
+            if closing is not None and text.startswith("](", closing):
+                parsed = _inline_construct(text, closing + 1)
+                if parsed is not None:
+                    opaque[closing] = parsed[1] + 1
         if text[position] != "`" or _is_escaped(text, position):
             rendered.append(text[position])
             position += 1
             continue
-        end = position + 1
-        while end < len(text) and text[end] == "`":
-            end += 1
-        delimiter = text[position:end]
-        closing = text.find(delimiter, end)
-        while closing >= 0 and (
-            (closing > 0 and text[closing - 1] == "`")
-            or (
-                closing + len(delimiter) < len(text)
-                and text[closing + len(delimiter)] == "`"
-            )
-        ):
-            closing = text.find(delimiter, closing + 1)
-        if closing < 0:
-            rendered.append(delimiter)
+        end = _inline_code_end(text, position)
+        if end is None:
+            end = position + 1
+            while end < len(text) and text[end] == "`":
+                end += 1
+            rendered.append(text[position:end])
             position = end
             continue
-        if BLANK_LINE.search(text, end, closing):
-            rendered.append(delimiter)
-            position = end
-            continue
-        code = text[position:closing + len(delimiter)]
+        code = text[position:end]
         rendered.extend("\n" if character == "\n" else " " for character in code)
-        position = closing + len(delimiter)
+        position = end
     return "".join(rendered)
 
 
@@ -717,12 +821,22 @@ def _link_label_end(text: str, start: int) -> int | None:
         ):
             position += 2
             continue
+        if character == "`":
+            code_end = _inline_code_end(text, position)
+            if code_end is not None:
+                position = code_end
+                continue
         if character == "[":
             depth += 1
         elif character == "]":
             depth -= 1
             if depth == 0:
                 return position
+            if text.startswith("](", position):
+                nested = _inline_construct(text, position + 1)
+                if nested is not None:
+                    position = nested[1] + 1
+                    continue
         position += 1
     return None
 

@@ -7,10 +7,12 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 import csv
+import errno
 import importlib.util
 import io
 import os
 from pathlib import Path
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -146,6 +148,37 @@ class DocumentationArchiveManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(CHECKER.ArchiveViolation, "symbolic link"):
             CHECKER.render_manifest(self.root)
 
+    def test_symlinked_manifest_parent_fails_before_manifest_is_read(self) -> None:
+        for manifest_relative, linked_parent in (
+            (Path("archive/MANIFEST.sha256"), self.root / "archive"),
+            (Path("archive/nested/MANIFEST.sha256"), self.root / "archive/nested"),
+        ):
+            with self.subTest(manifest_relative=manifest_relative):
+                outside = self.root / "outside"
+                outside.mkdir(exist_ok=True)
+                (outside / "MANIFEST.sha256").write_bytes(b"")
+                if linked_parent.is_dir():
+                    linked_parent.rmdir()
+                linked_parent.symlink_to(outside, target_is_directory=True)
+                opened: list[Path] = []
+                original_open = Path.open
+
+                def observe_open(path: Path, *args, **kwargs):
+                    opened.append(path)
+                    return original_open(path, *args, **kwargs)
+
+                try:
+                    with (
+                        patch.object(CHECKER, "MANIFEST_RELATIVE", manifest_relative),
+                        patch.object(Path, "open", observe_open),
+                        self.assertRaises(CHECKER.ArchiveViolation),
+                    ):
+                        CHECKER.validate_manifest(self.root)
+                    self.assertEqual(opened, [], "manifest was opened through a symlink")
+                finally:
+                    linked_parent.unlink()
+                    linked_parent.mkdir()
+
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation is unavailable")
     def test_fifo_fails(self) -> None:
         fifo = self.root / "archive" / "named-pipe"
@@ -222,6 +255,153 @@ class DocumentationArchiveManifestTests(unittest.TestCase):
             CHECKER.ArchiveViolation, "existing manifest is not a regular file"
         ):
             CHECKER.write_manifest(self.root)
+
+    def test_temporary_creation_failure_preserves_existing_files(self) -> None:
+        manifest = self.write("archive/MANIFEST.sha256", b"previous manifest\n")
+        unrelated = self.write("archive/unrelated.tmp", b"another invocation\n")
+        temporary = self.root / "archive" / CHECKER.TEMP_MANIFEST_NAME
+        original_open = os.open
+
+        def deny_temporary(path, flags, *args, **kwargs):
+            if Path(path) == temporary:
+                raise OSError(errno.EACCES, "injected temporary creation failure")
+            return original_open(path, flags, *args, **kwargs)
+
+        with (
+            patch.object(CHECKER.os, "open", deny_temporary),
+            self.assertRaisesRegex(CHECKER.ArchiveViolation, "cannot write"),
+        ):
+            CHECKER.write_manifest(self.root)
+        self.assertEqual(manifest.read_bytes(), b"previous manifest\n")
+        self.assertEqual(unrelated.read_bytes(), b"another invocation\n")
+        self.assertFalse(temporary.exists())
+
+    def test_exclusive_creation_collision_does_not_remove_competing_temporary(self) -> None:
+        manifest = self.write("archive/MANIFEST.sha256", b"previous manifest\n")
+        temporary = self.root / "archive" / CHECKER.TEMP_MANIFEST_NAME
+        original_open = os.open
+
+        def race_temporary(path, flags, *args, **kwargs):
+            if Path(path) == temporary:
+                temporary.write_bytes(b"another invocation\n")
+            return original_open(path, flags, *args, **kwargs)
+
+        with (
+            patch.object(CHECKER.os, "open", race_temporary),
+            self.assertRaisesRegex(CHECKER.ArchiveViolation, "cannot write"),
+        ):
+            CHECKER.write_manifest(self.root)
+        self.assertEqual(manifest.read_bytes(), b"previous manifest\n")
+        self.assertEqual(temporary.read_bytes(), b"another invocation\n")
+
+    def test_fsync_failure_preserves_previous_manifest_and_cleans_owned_files(self) -> None:
+        for fail_directory in (False, True):
+            with self.subTest(fail_directory=fail_directory):
+                manifest = self.write("archive/MANIFEST.sha256", b"previous manifest\n")
+                self.write("archive/README.md", b"policy\n")
+                unrelated = self.write("archive/unrelated.tmp", b"another invocation\n")
+                prior_names = sorted(path.name for path in manifest.parent.iterdir())
+                original_fsync = os.fsync
+
+                def fail_fsync(descriptor):
+                    is_directory = stat.S_ISDIR(os.fstat(descriptor).st_mode)
+                    if is_directory == fail_directory:
+                        raise OSError(errno.EIO, "injected fsync failure")
+                    return original_fsync(descriptor)
+
+                with (
+                    patch.object(CHECKER.os, "fsync", fail_fsync),
+                    self.assertRaisesRegex(CHECKER.ArchiveViolation, "cannot write"),
+                ):
+                    CHECKER.write_manifest(self.root)
+                self.assertEqual(manifest.read_bytes(), b"previous manifest\n")
+                self.assertEqual(unrelated.read_bytes(), b"another invocation\n")
+                self.assertEqual(
+                    sorted(path.name for path in manifest.parent.iterdir()), prior_names
+                )
+
+    def test_replacement_failure_preserves_manifest_and_cleans_owned_temporary(self) -> None:
+        manifest = self.write("archive/MANIFEST.sha256", b"previous manifest\n")
+        unrelated = self.write("archive/unrelated.tmp", b"another invocation\n")
+        prior_names = sorted(path.name for path in manifest.parent.iterdir())
+
+        with (
+            patch.object(CHECKER.os, "replace", side_effect=OSError(errno.EIO, "injected replace failure")),
+            self.assertRaisesRegex(CHECKER.ArchiveViolation, "cannot write"),
+        ):
+            CHECKER.write_manifest(self.root)
+        self.assertEqual(manifest.read_bytes(), b"previous manifest\n")
+        self.assertEqual(unrelated.read_bytes(), b"another invocation\n")
+        self.assertEqual(sorted(path.name for path in manifest.parent.iterdir()), prior_names)
+
+    def test_directory_fsync_failure_restores_absent_manifest(self) -> None:
+        self.write("archive/README.md", b"policy\n")
+        manifest = self.root / "archive/MANIFEST.sha256"
+        original_fsync = os.fsync
+
+        def fail_directory_sync(descriptor):
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise OSError(errno.EIO, "injected directory fsync failure")
+            return original_fsync(descriptor)
+
+        with (
+            patch.object(CHECKER.os, "fsync", fail_directory_sync),
+            self.assertRaisesRegex(CHECKER.ArchiveViolation, "cannot write"),
+        ):
+            CHECKER.write_manifest(self.root)
+        self.assertFalse(manifest.exists())
+        self.assertEqual(sorted(path.name for path in manifest.parent.iterdir()), ["README.md"])
+
+    def test_failed_rollback_retains_previous_manifest_for_recovery(self) -> None:
+        self.write("archive/README.md", b"policy\n")
+        manifest = self.write("archive/MANIFEST.sha256", b"previous manifest\n")
+        original_replace = os.replace
+        original_fsync = os.fsync
+        replaced = False
+
+        def fail_directory_sync(descriptor):
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise OSError(errno.EIO, "injected directory fsync failure")
+            return original_fsync(descriptor)
+
+        def fail_rollback(source, destination):
+            nonlocal replaced
+            if replaced:
+                raise OSError(errno.EIO, "injected rollback failure")
+            original_replace(source, destination)
+            replaced = True
+
+        with (
+            patch.object(CHECKER.os, "fsync", fail_directory_sync),
+            patch.object(CHECKER.os, "replace", fail_rollback),
+            self.assertRaisesRegex(CHECKER.ArchiveViolation, "cannot write"),
+        ):
+            CHECKER.write_manifest(self.root)
+        retained = [
+            path for path in manifest.parent.iterdir()
+            if path.read_bytes() == b"previous manifest\n"
+        ]
+        self.assertEqual(len(retained), 1, "rollback failure lost the previous bytes")
+
+    def test_default_cli_rejects_stale_manifest_without_rewriting_it(self) -> None:
+        self.write("archive/README.md", b"policy\n")
+        stale = (
+            b"87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7"
+            b"  archive/README.md\n"
+        )
+        manifest = self.write("archive/MANIFEST.sha256", stale)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            patch.object(CHECKER, "ROOT", self.root),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(CHECKER.main([]), 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("manifest differs", stderr.getvalue())
+        self.assertEqual(manifest.read_bytes(), stale)
 
 
 class DocumentationInventoryTests(unittest.TestCase):
@@ -605,6 +785,116 @@ class DocumentationNavigationTests(unittest.TestCase):
                     CHECKER.ArchiveViolation, "default navigation.*README.md"
                 ):
                     CHECKER.validate_navigation(self.root)
+
+    def test_inline_code_cannot_cross_a_markdown_block_boundary(self) -> None:
+        for text in (
+            "`unfinished\n# [history](archive/)\n`\n",
+            "# `unfinished\n[history](archive/)\n`\n",
+            "- # `unfinished\n  [history](archive/)\n  `\n",
+            "1. # `unfinished\n   [history](archive/)\n   `\n",
+            "`unfinished\n---\n[history](archive/)\n`\n",
+            "`unfinished\n===\n[history](archive/)\n`\n",
+            "`unfinished\n- [history](archive/)\n`\n",
+            "`unfinished\n1. [history](archive/)\n`\n",
+            "`unfinished\n> [history](archive/)\n`\n",
+        ):
+            with self.subTest(text=text):
+                self.write("README.md", text.encode())
+                self.write("docs/README.md", b"# Documentation\n")
+                with self.assertRaisesRegex(
+                    CHECKER.ArchiveViolation, "default navigation.*README.md"
+                ):
+                    CHECKER.validate_navigation(self.root)
+
+    def test_backticks_in_destinations_are_not_inline_code(self) -> None:
+        for text in (
+            "[history](archive/`file`.md)\n",
+            "[history](<archive/`file`.md>)\n",
+            "[outer ![image](archive/`file`.md)](docs/current.md)\n",
+            "[history]: archive/`file`.md\n",
+            "[history]: <archive/`file`.md>\n",
+            "[`history`]: archive/`file`.md\n",
+            "[`]`](archive/`file`.md)\n",
+        ):
+            with self.subTest(text=text):
+                self.write("README.md", text.encode())
+                self.write("docs/README.md", b"# Documentation\n")
+                with self.assertRaisesRegex(
+                    CHECKER.ArchiveViolation, "default navigation.*README.md"
+                ):
+                    CHECKER.validate_navigation(self.root)
+                self.assertIn(
+                    "archive/`file`.md", CHECKER.markdown_destinations(text)
+                )
+
+    def test_backticks_in_titles_cannot_mask_a_later_archive_link(self) -> None:
+        for text in (
+            '[safe](docs/current.md "`unfinished")\n[history](archive/)\n`\n',
+            '[safe]: docs/current.md "`unfinished"\n[history](archive/)\n`\n',
+        ):
+            with self.subTest(text=text):
+                self.write("README.md", text.encode())
+                self.write("docs/README.md", b"# Documentation\n")
+                with self.assertRaisesRegex(
+                    CHECKER.ArchiveViolation, "default navigation.*README.md"
+                ):
+                    CHECKER.validate_navigation(self.root)
+
+    def test_blockquoted_reference_definitions_resolving_to_archive_fail(self) -> None:
+        for text in (
+            "> [history]: archive/\n",
+            "> [history]:\n> archive/\n",
+            "> [history]:\n>     <archive/>\n",
+            "> > [history]: archive/\n",
+            "> [history\n> label]: archive/\n",
+            "`unfinished\n> [history]: archive/\n`\n",
+        ):
+            with self.subTest(text=text):
+                self.write("README.md", text.encode())
+                self.write("docs/README.md", b"# Documentation\n")
+                with self.assertRaisesRegex(
+                    CHECKER.ArchiveViolation, "default navigation.*README.md"
+                ):
+                    CHECKER.validate_navigation(self.root)
+
+    def test_real_inline_and_quoted_code_and_atomic_titles_remain_ignored(self) -> None:
+        for text, expected in (
+            ("`example\n[history](archive/)`\n", ()),
+            ("[safe `] [history](archive/)`](docs/current.md)\n", ("docs/current.md",)),
+            ('[safe](docs/current.md "`[history](archive/)`")\n', ("docs/current.md",)),
+            ('> [safe]: docs/current.md "`[history](archive/)`"\n', ("docs/current.md",)),
+            ("> `example\n> [history](archive/)`\n", ()),
+            ("> ```markdown\n> [history]: archive/\n> ```\n", ()),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(CHECKER.markdown_destinations(text), expected)
+                self.write("README.md", text.encode())
+                self.write("docs/README.md", b"# Documentation\n")
+                CHECKER.validate_navigation(self.root)
+
+    def test_quoted_fence_cannot_hide_navigation_outside_its_container(self) -> None:
+        for text in (
+            "> ```markdown\n[history](archive/)\n",
+            "> > ~~~\n> [history]: archive/\n",
+        ):
+            with self.subTest(text=text):
+                self.write("README.md", text.encode())
+                self.write("docs/README.md", b"# Documentation\n")
+                with self.assertRaisesRegex(
+                    CHECKER.ArchiveViolation, "default navigation.*README.md"
+                ):
+                    CHECKER.validate_navigation(self.root)
+
+    def test_quote_markers_inside_fences_do_not_change_the_fence_container(self) -> None:
+        for text in (
+            "```markdown\n> ```\n[history](archive/)\n```\n",
+            "> ```markdown\n> > ```\n> [history]: archive/\n> ```\n",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(CHECKER.markdown_destinations(text), ())
+                self.write("README.md", text.encode())
+                self.write("docs/README.md", b"# Documentation\n")
+                CHECKER.validate_navigation(self.root)
 
     def test_backslash_does_not_escape_a_closing_code_span_backtick(self) -> None:
         text = "`code \\` [history](archive/) `\n"
