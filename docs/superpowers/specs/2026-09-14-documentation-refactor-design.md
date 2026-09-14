@@ -2,7 +2,7 @@
 
 # Aster Documentation Refactor Design
 
-- Status: approved direction; written design awaiting review
+- Status: approved
 - Date: 2026-09-14
 - Scope: documentation architecture and lifecycle only
 - Runtime effect: none
