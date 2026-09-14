@@ -111,18 +111,42 @@ required.
 | --- | --- |
 | `/livez` is unavailable or `503` | Inspect sanitized service telemetry; do not send work. |
 | `/readyz` is `503` | Wait for Ready or resolve startup/draining failure. |
-| Publish-operation rows reach 512 | Plan intervention; this is the profile warning level. |
-| Publish-operation rows reach 1,024 | Stop new publication and preserve existing operation keys. |
+| Distinct accepted publish-operation keys reach 512 | Plan intervention; this is the profile warning level, separate from configured-ledger occupancy warnings. |
+| Distinct accepted publish-operation keys reach 1,024 | Stop new publication; preserve existing operation keys and the state directory for inspection. |
 | Pending deliveries reach 256 | Stop increasing workload and drain or repair consumers. |
 | `OPERATION_CAPACITY_EXHAUSTED` | Do not retry with new keys; escalate for controlled recovery. |
 | Unacknowledged Event returns after restart | Commit idempotently, then acknowledge the stable Event identity. |
 
-The 1,024-key boundary is an operator/harness stop, not an enforced store
-admission limit. Actual operation-mapping ceilings are 4,096 rows / 512 KiB;
-aggregate quotas can reject work earlier. The
-[register records the unresolved release-planning request for hard rejection at 1,024](../implementation/linux-event-mvp-evaluation-profile-v0.1-register.md#unresolved-release-planning-capacity-conflict).
-Do not treat that request as implemented behavior or change the accepted
-profile without its owners' decision.
+The 1,024-key boundary counts distinct accepted publish-operation keys over the
+entire state-directory lifetime, including restarts. It is an operator/harness
+stop, not an enforced store admission limit. The
+[accepted containment contract](../implementation/linux-event-mvp-evaluation-profile-v0.1.md#durable-publish-operation-containment)
+selects a separate permanent ledger quota:
+
+- `storage.operations.max_records = 1_000_000` records;
+- `storage.operations.max_logical_bytes = 201_326_592` logical ledger and
+  reverse-index bytes (192 MiB); and
+- `storage.operations.emergency_reserve = 10_000` records, with corresponding
+  byte headroom reserved from ordinary publication.
+
+Confirm these configured ceilings and ordinary/emergency headroom in
+authenticated `GetStatus`, separately from profile headroom and warning state.
+The aggregate Event/control store quota is separate and can stop admission
+earlier. These are logical quotas, not physical database-size limits or
+qualification of a workload above 1,024 operations. The
+[register records the selected capacity boundary](../implementation/linux-event-mvp-evaluation-profile-v0.1-register.md#selected-operation-ledger-capacity-boundary).
+
+Configured-ledger exhaustion returns Connect `ResourceExhausted` with
+`OPERATION_CAPACITY_EXHAUSTED`, `retryable = false`, and no retry delay. Do not
+retry indefinitely or change keys to bypass it. For an unknown publication
+outcome, retain the original key and identical intent: exact retries add no
+ledger record. An exact retry of a retired operation remains the selected-node
+`ExpiredOrRetired` cause (Connect `NotFound` / `MISSING_DURABLE_OBJECT`);
+changed intent remains a conflict, and retirement never permits key reuse.
+
+Do not delete or replace the state directory to recover same-mission capacity;
+that invalidates durability and restart claims. Preserve it for inspection and
+follow the audit procedure below after unclean recovery.
 
 Do not raise limits during a candidate run. A changed limit changes the tested
 profile.
