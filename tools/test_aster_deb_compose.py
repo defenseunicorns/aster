@@ -30,13 +30,16 @@ class PackageComposeTests(unittest.TestCase):
             self.skipTest("Debian package regression requires dpkg-deb")
         control = root / "input/DEBIAN"
         control.mkdir(parents=True)
+        # dpkg-deb requires this mode even under the CI shell's umask 077.
+        control.chmod(0o755)
         (control / "control").write_text(
             "Package: aster\nVersion: 1.2.3-1\nArchitecture: amd64\n"
             "Maintainer: Test <test@example.invalid>\nDescription: synthetic test\n"
         )
         package = root / "input with spaces.deb"
-        subprocess.run(["dpkg-deb", "--build", str(control.parent), str(package)],
-                       check=True, capture_output=True)
+        result = subprocess.run(["dpkg-deb", "--build", str(control.parent), str(package)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
         return package
 
     def test_receipt_rejects_wrong_event_content_even_with_matching_id(self):
