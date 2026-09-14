@@ -181,8 +181,15 @@ Run:
 git diff --summary HEAD
 ```
 
-Expected: exactly the seven Task 2 paths appear as `rename ... (100%)`, plus
-the one retained specification modification.
+Expected: exactly the seven Task 2 paths appear as `rename ... (100%)`.
+
+Run:
+
+```bash
+git diff --name-status HEAD
+```
+
+Expected: seven `R100` paths and one `M` entry for the retained specification.
 
 Run:
 
@@ -264,9 +271,17 @@ Run:
 git diff --summary 90bb7cd..HEAD
 ```
 
-Expected: twelve `rename ... (100%)` lines, this active plan's added-file line,
-and the retained evaluation-profile specification link change; no historical
-plan has content changes.
+Expected: twelve `rename ... (100%)` lines and this active plan's create-mode
+line; no historical plan has content changes.
+
+Run:
+
+```bash
+git diff --name-status 90bb7cd..HEAD
+```
+
+Expected: twelve `R100` paths, one `A` entry for this active plan, and one `M`
+entry for the retained evaluation-profile specification.
 
 - [ ] **Step 5: Check patch hygiene**
 
