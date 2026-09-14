@@ -9,7 +9,7 @@
   follow-on statements in [Decision 0030](0030-event-first-local-connect-agent.md)
 - Related: [Decision 0009](0009-public-api-boundary.md),
   [Decision 0013](0013-protected-provisioning-boundary.md), and the
-  [customer-operable Event-service design](../superpowers/specs/2026-09-05-customer-operable-event-service-design.md)
+  [current agent operational contract](../../crates/aster-agent/README.md)
 
 ## Context
 

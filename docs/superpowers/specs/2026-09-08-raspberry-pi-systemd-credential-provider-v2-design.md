@@ -9,15 +9,15 @@
 - Provider contract: `aster-systemd-credential-store/v2`
 - Evidence effect: none
 
-This design expands the D06 boundary approved in the
-[Raspberry Pi profile amendment](2026-09-08-raspberry-pi-linux-event-mvp-profile-amendment-design.md).
+This design expands the D06 boundary incorporated into the
+[current Linux Event MVP profile](../../implementation/linux-event-mvp-evaluation-profile-v0.1.md).
 It resolves D06 for the amended profile definition; it does not approve an
 implementation or qualify an artifact. Security and Deployment E01 approval of
 the exact design digest remains required; profile approval does not replace
 it. G3/G4 later bind and qualify the implemented provider in the exact package.
 
-The [Ubuntu v1 design](2026-09-07-systemd-credential-provider-design.md) remains
-unchanged historical material and does not qualify v2. This design supersedes
+The earlier Ubuntu v1 design remains unchanged historical material and does
+not qualify v2. This design supersedes
 its platform, provider-contract, architecture-package, target-acceptance, and
 artifact-binding selections for the amended profile. The runtime loader,
 administration binary, provider ledger, seven-operation lifecycle,

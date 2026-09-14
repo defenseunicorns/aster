@@ -194,4 +194,3 @@ candidate.
 | [Decision and gate register](linux-event-mvp-evaluation-profile-v0.1-register.md) | Current owner, date, status, blocker, and exit artifact for each decision or gate |
 | [Candidate-annex schema](linux-event-mvp-evaluation-profile-v0.1-annex-template.md) | Shared handoff record for one exact candidate |
 | [Decision 0042](../decisions/0042-adopt-linux-event-mvp-evaluation-profile-v0-1.md) | Ratification authority and the distinction between defining and issuing the profile |
-| [Approved design](../superpowers/specs/2026-09-06-linux-event-mvp-evaluation-profile-design.md) | Historical rationale and detailed design discussion |

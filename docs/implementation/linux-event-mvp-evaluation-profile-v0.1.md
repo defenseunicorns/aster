@@ -9,8 +9,7 @@
 - Candidate decision checkpoint: 2026-09-13
 - Product class: time-bounded, non-production customer evaluation
 - Start here: [human-focused MVP coordination guide](linux-event-mvp-coordination-guide.md)
-- Historical design authority: [approved design](../superpowers/specs/2026-09-06-linux-event-mvp-evaluation-profile-design.md)
-- Amendment authority: [approved Raspberry Pi profile amendment](../superpowers/specs/2026-09-08-raspberry-pi-linux-event-mvp-profile-amendment-design.md), which supersedes conflicting platform, architecture, topology, artifact, D06, and acceptance text in the historical design
+- Ratification authority: [Decision 0042](../decisions/0042-adopt-linux-event-mvp-evaluation-profile-v0-1.md)
 - Decision register: [v0.1 register](linux-event-mvp-evaluation-profile-v0.1-register.md)
 - Candidate-annex schema: [provisional schema](linux-event-mvp-evaluation-profile-v0.1-annex-template.md)
 

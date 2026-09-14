@@ -6,7 +6,7 @@
 - Proposed: 2026-09-06
 - Accepted: 2026-09-08
 - Authority: [Linux Event MVP Evaluation Profile v0.1](../implementation/linux-event-mvp-evaluation-profile-v0.1.md)
-- Amendment: [Raspberry Pi Linux Event MVP profile amendment](../superpowers/specs/2026-09-08-raspberry-pi-linux-event-mvp-profile-amendment-design.md)
+- Amendment status: incorporated into the current profile authority
 - Register: [P0-1 decision and gate register](../implementation/linux-event-mvp-evaluation-profile-v0.1-register.md)
 - Roadmap action: `P0-1 — define the claim boundary`
 
@@ -100,11 +100,9 @@ claim boundary:
   production `DM-8-05`.
 
 With D06 and D15 resolved for profile definition, this decision accepts the
-profile as amended. The
-[approved design](../superpowers/specs/2026-09-06-linux-event-mvp-evaluation-profile-design.md)
-remains its historical design authority; the 2026-09-08 amendment supersedes
-its conflicting platform, architecture, topology, artifact, D06, and
-acceptance selections for the unmerged v0.1 profile.
+profile as amended. The current profile incorporates the accepted 2026-09-08
+platform, architecture, topology, artifact, D06, and acceptance selections;
+historical design records do not override that profile authority.
 
 ## Candidate and production boundary
 
