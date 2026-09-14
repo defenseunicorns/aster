@@ -13,10 +13,11 @@ any existing documentation.
 
 **Architecture:** A small standard-library Python checker owns deterministic
 archive enumeration, SHA-256 manifest verification, inventory coverage and
-state validation, and the rule that the two default navigation pages do not
-link into historical material. The repository initially contains only archive
-policy/index files; later plans use the validated inventory and manifest
-interface to move one coherent historical batch at a time.
+state validation. PR review and the documentation refactor keep historical
+material out of normal engineer navigation; the checker does not read or
+validate Markdown navigation documents. The repository initially contains
+only archive policy/index files; later plans use the validated inventory and
+manifest interface to move one coherent historical batch at a time.
 
 **Tech Stack:** Python 3.13 standard library (`argparse`, `csv`, `hashlib`,
 `pathlib`, `subprocess`, `unittest`), SHA-256, Markdown, CSV, Git, and `mise`.
@@ -41,8 +42,8 @@ interface to move one coherent historical batch at a time.
 - [ ] Reject archive symlinks, special files, duplicate paths, malformed
       manifest entries, path traversal, stale digests, and unmanifested files.
 - [ ] Keep `archive/` out of root `README.md` and `docs/README.md` navigation.
-      Other current documents may cite an archived historical fact explicitly
-      in later phases.
+      Enforce this through human review. Other current documents may cite an
+      archived historical fact explicitly in later phases.
 - [ ] The reviewed inventory must cover every Git-tracked candidate file below
       the current history roots or their matching archive leaf roots exactly
       once. Coverage follows each row's `current_path` after a move while its
@@ -65,7 +66,7 @@ interface to move one coherent historical batch at a time.
 | `archive/MANIFEST.sha256` | Deterministic integrity inventory for the three archive policy files |
 | `docs/implementation/documentation-refactor-inventory.csv` | Reviewed disposition and future destination of every candidate file |
 | `tools/check-documentation-archive.py` | Read-only validation plus explicit `--write-manifest` maintenance command |
-| `tools/test-documentation-archive.py` | Isolated manifest, inventory, navigation, and CLI regression tests |
+| `tools/test-documentation-archive.py` | Isolated manifest, inventory, and CLI regression tests |
 | `mise.toml` | Focused `documentation-archive` task and inclusion in `mise run check` |
 
 The checker exposes these stable interfaces for later archive-move plans:
@@ -82,12 +83,10 @@ parse_inventory(text: str) -> tuple[InventoryRow, ...]
 tracked_candidate_paths(repository_root: Path) -> tuple[str, ...]
 validate_inventory(rows: tuple[InventoryRow, ...],
                    candidate_paths: tuple[str, ...]) -> None
-markdown_destinations(text: str) -> tuple[str, ...]
-validate_navigation(repository_root: Path) -> None
 ```
 
 `python3 tools/check-documentation-archive.py` is read-only and returns `0`
-only when all three boundaries pass. The sole write mode is
+only when both archive and inventory boundaries pass. The sole write mode is
 `python3 tools/check-documentation-archive.py --write-manifest`, which rewrites
 only `archive/MANIFEST.sha256` with an atomic same-directory replacement and
 then validates the written bytes.
@@ -497,7 +496,7 @@ git add docs/implementation/documentation-refactor-inventory.csv tools/check-doc
 git commit -m "docs: inventory documentation archive candidates"
 ```
 
-### Task 4: Enforce navigation and CI boundaries
+### Task 4: Integrate manifest and inventory checks into CI
 
 **Files:**
 
@@ -508,58 +507,49 @@ git commit -m "docs: inventory documentation archive candidates"
 **Interfaces:**
 
 - Consumes: validated manifest and candidate inventory from Tasks 2 and 3.
-- Produces: `markdown_destinations`, `validate_navigation`, a focused
+- Produces: a CLI limited to those two boundaries, a focused
   `documentation-archive` task, and default CI enforcement.
 
-- [ ] **Step 1: Write failing Markdown-navigation tests**
+Navigation remains a human-reviewed information-architecture outcome.
+Neither the checker nor CI parses or validates Markdown navigation documents.
 
-Test inline and reference-style Markdown destinations without attempting to
-parse prose or code spans:
+- [ ] **Step 1: Write the CLI boundary regression**
 
-```python
-def test_default_navigation_rejects_archive_links(self) -> None:
-    self.write("README.md", b"[history](archive/research/)\n")
-    self.write("docs/README.md", b"# Docs\n")
-    with self.assertRaisesRegex(CHECKER.ArchiveViolation, "default navigation"):
-        CHECKER.validate_navigation(self.root)
+Construct a temporary Git repository with a valid archive and an empty
+canonical inventory, without root `README.md` or `docs/README.md`. Call
+`main([])` and assert return code `0`, empty stderr, and exactly:
 
-def test_non_link_archive_text_is_allowed(self) -> None:
-    self.write("README.md", b"The word archive is ordinary prose.\n")
-    self.write("docs/README.md", b"Use `archive/` only for maintenance.\n")
-    CHECKER.validate_navigation(self.root)
+```text
+documentation archive passed: 1 archive files, 0 candidate rows
 ```
 
-Also reject `../archive/`, `/archive/`, destinations with fragments or query
-strings, and reference definitions resolving to the archive. Allow external
-URLs containing the word `archive` and ordinary text/code spans.
+This regression catches an accidental dependency on navigation documents.
+Preserve every manifest and inventory regression, including stale-manifest
+rejection and manifest-write failure injection.
 
-- [ ] **Step 2: Run the navigation tests and observe failure**
+- [ ] **Step 2: Observe the regression before removing the extra boundary**
 
 Run:
 
 ```bash
-python3 tools/test-documentation-archive.py -v
+python3 tools/test-documentation-archive.py DocumentationInventoryTests.test_cli_succeeds_without_navigation_readmes -v
 ```
 
-Expected: FAIL because navigation validation is not implemented.
+Expected against a checker that still reads navigation: FAIL because the
+root README is absent.
 
-- [ ] **Step 3: Implement the narrow navigation rule**
+- [ ] **Step 3: Limit the CLI to manifest and inventory validation**
 
-`markdown_destinations` returns decoded destination strings from Markdown
-inline links and reference definitions. It must ignore fenced code blocks and
-inline code spans. `validate_navigation` reads only root `README.md` and
-`docs/README.md`, normalizes local destinations without filesystem resolution,
-and rejects destinations whose normalized path begins with `archive/`.
-
-The CLI validates in this order and emits no paths on failure beyond the
-repository-relative policy file involved:
+Remove navigation parsing, its dedicated helpers, and its parser test class.
+The CLI validates in this order:
 
 ```text
-manifest -> inventory -> default navigation
+manifest -> inventory
 ```
 
-Success output is one line containing manifested-file count, candidate-row
-count, and `default navigation excludes archive`.
+Success output is one line containing only the archive-file and candidate-row
+counts. Do not change manifest hardening or inventory grammar, state, and
+exact Git coverage.
 
 - [ ] **Step 4: Run the complete focused suite**
 
@@ -574,7 +564,8 @@ Expected: all tests PASS and the live repository check exits `0`.
 
 - [ ] **Step 5: Add focused and default `mise` integration**
 
-Add these entries without reordering unrelated checks:
+Add these entries without reordering unrelated checks; preserve them when
+already present:
 
 ```toml
 [tasks.documentation-archive]
@@ -641,8 +632,8 @@ sha256sum --check archive/MANIFEST.sha256
 python3 tools/check-documentation-archive.py
 ```
 
-Expected: all three policy files report `OK`; the checker passes manifest,
-inventory, and navigation validation.
+Expected: all three policy files report `OK`; the checker passes manifest and
+inventory validation.
 
 - [ ] **Step 3: Run focused tests and requirements validation**
 

@@ -157,7 +157,9 @@ root so regeneration is deterministic. Files will normally enter through
 byte-for-byte intact.
 
 Archived documents are excluded from normal documentation navigation and from
-default human-facing size metrics. Corrections are made in current authority or
+default human-facing size metrics. PR review and the documentation refactor
+enforce this information-architecture policy; CI does not parse Markdown
+navigation. Corrections are made in current authority or
 in a new, clearly labeled archive erratum; historical claims are not silently
 rewritten. Archive entries may be reorganized only with a manifest update and
 the same path-consumer verification required for initial admission.
@@ -219,9 +221,12 @@ qualification documentation.
 ### Phase 1: archive foundation and inventory
 
 Create the archive hierarchy, policy, manifest generator or deterministic
-manifest procedure, and a reviewed classification inventory. Add checks that
-keep archived material out of normal navigation and identify references to
-candidate paths. No ambiguous or hash-bound document moves in this phase.
+manifest procedure, and a reviewed classification inventory. Add checks for
+archive filesystem shape, manifest integrity, and inventory grammar, state,
+and exact Git coverage. Review navigation and references to candidate paths
+as part of the documentation refactor. The archive checker does not read or
+validate Markdown navigation documents. No ambiguous or hash-bound document
+moves in this phase.
 
 ### Phase 2: low-risk historical moves
 
@@ -247,8 +252,9 @@ an explicitly owned site source.
 
 ### Phase 5: lifecycle enforcement
 
-Add lightweight repository checks and contribution guidance for document
-class, owner, status, links, and archive admission. Completed plans should move
+Use contribution guidance and human review for document class, owner, status,
+links, and archive admission. Repository archive checks validate manifest
+integrity and inventory grammar, state, and coverage. Completed plans should move
 to `archive/design-history/plans/` as part of completing their capability, not
 accumulate indefinitely in current docs.
 
@@ -273,10 +279,12 @@ changes, never as a side effect of path cleanup.
 
 ## Verification
 
-Every archive or current-hierarchy pull request runs:
+Every archive or current-hierarchy pull request includes human review of
+Markdown navigation and exact path consumers, and runs:
 
 - `git diff --check`;
-- a repository-local Markdown link and path-reference check;
+- `python3 tools/check-documentation-archive.py` for archive and inventory
+  validation;
 - `python3 tools/check-implementation-requirements.py`;
 - focused tests for every changed script, manifest, schema, or lab workflow;
 - archive manifest regeneration followed by an independent digest check; and
