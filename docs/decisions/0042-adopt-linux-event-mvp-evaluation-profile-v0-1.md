@@ -5,9 +5,9 @@
 - Status: Accepted
 - Proposed: 2026-09-06
 - Accepted: 2026-09-08
-- Authority: [Linux Event MVP Evaluation Profile v0.1](../implementation/linux-event-mvp-evaluation-profile-v0.1.md)
+- Authority: [Linux Event MVP Evaluation Profile v0.1](../validation/linux-event-mvp-evaluation-profile-v0.1.md)
 - Amendment status: incorporated into the current profile authority
-- Register: [P0-1 decision and gate register](../implementation/linux-event-mvp-evaluation-profile-v0.1-register.md)
+- Register: [P0-1 decision and gate register](../validation/linux-event-mvp-evaluation-profile-v0.1-register.md)
 - Roadmap action: `P0-1 — define the claim boundary`
 
 ## Context
@@ -53,28 +53,28 @@ require durable operation keys that cannot be silently deleted or reused.
 ## Decision
 
 Adopt the
-[Linux Event MVP Evaluation Profile v0.1](../implementation/linux-event-mvp-evaluation-profile-v0.1.md)
+[Linux Event MVP Evaluation Profile v0.1](../validation/linux-event-mvp-evaluation-profile-v0.1.md)
 as the reusable P0-1 claim boundary. The package has four distinct roles:
 
 1. The profile defines the bounded application, platform, topology,
    security, workload, resource, lifecycle, artifact, and evidence contract.
 2. The mutable
-   [decision and gate register](../implementation/linux-event-mvp-evaluation-profile-v0.1-register.md)
+   [decision and gate register](../validation/linux-event-mvp-evaluation-profile-v0.1-register.md)
    records resolved boundary choices, open candidate gates, production
    deferrals, owners, targets, and exit artifacts. It does not replace the
    profile or atomic requirements trace.
 3. The
-   [DM-8-05 disposition](../implementation/dm-8-05-linux-event-v0.1-disposition.md)
+   [DM-8-05 disposition](../validation/dm-8-05-linux-event-v0.1-disposition.md)
    (`sha256:a6fe15f39fb553f87bc1224fe7f266e7c906d451d8140402d3bc1620011bfa53`)
    is the hash-bound evaluation-only proposal for two exact dependency tuples.
    Its separate
-   [internal role-approval record](../implementation/dm-8-05-linux-event-v0.1-role-approvals.md)
+   [internal role-approval record](../validation/dm-8-05-linux-event-v0.1-role-approvals.md)
    (`sha256:4edda9457c78d0c1d177590c1583691071e708ccbbace078cc15a82dd9bcac85`)
    records Dependency/license, Legal/compliance, and Release approval and
    resolves D15. Neither record grants candidate release, production, or
    general-license authority.
 4. The
-   [candidate-annex schema](../implementation/linux-event-mvp-evaluation-profile-v0.1-annex-template.md)
+   [candidate-annex schema](../validation/linux-event-mvp-evaluation-profile-v0.1-annex-template.md)
    is provisional and revisionable. It describes how a later exact candidate
    would bind artifacts, environments, results, receipts, and approvals; the
    schema is not qualification evidence by itself.

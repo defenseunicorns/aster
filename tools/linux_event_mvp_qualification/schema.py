@@ -18,12 +18,12 @@ APPROVAL_SCHEMA = "aster-linux-event-mvp-candidate-approval/v0.1"
 DECISION_SCHEMA = "aster-linux-event-mvp-release-decision/v0.1"
 REPORT_SCHEMA_ID = "aster-linux-event-mvp-qualification-validation-report/v0.1"
 CANONICALIZATION_ID = "aster-canonical-json-integer-v1"
-PROFILE_DIGEST = "sha256:3d2ab7a8f7237bb58abf633f4d1a9e596dfba649f7b037a2aadbca3819b791e8"
+PROFILE_DIGEST = "sha256:7c42a40802b89a121282f05d8cf99f67c82d33d29c82c565acaeaa1a08cb5750"
 
 SCHEMA_PATH = (
     Path(__file__).resolve().parents[2]
     / "docs"
-    / "implementation"
+    / "validation"
     / "schemas"
     / "linux-event-mvp-qualification-v0.1.json"
 )

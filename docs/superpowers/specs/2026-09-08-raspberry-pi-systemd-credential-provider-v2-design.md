@@ -10,7 +10,7 @@
 - Evidence effect: none
 
 This design expands the D06 boundary incorporated into the
-[current Linux Event MVP profile](../../implementation/linux-event-mvp-evaluation-profile-v0.1.md).
+[current Linux Event MVP profile](../../validation/linux-event-mvp-evaluation-profile-v0.1.md).
 It resolves D06 for the amended profile definition; it does not approve an
 implementation or qualify an artifact. Security and Deployment E01 approval of
 the exact design digest remains required; profile approval does not replace

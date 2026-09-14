@@ -12,7 +12,7 @@ This document specifies a side-effect-free validator for one completed Linux
 Event MVP candidate-annex bundle. It translates the accepted profile and the
 provisional annex schema into deterministic structural, binding, and
 profile-deviation checks. The initial machine contract is frozen by
-[`linux-event-mvp-qualification-v0.1.json`](../implementation/schemas/linux-event-mvp-qualification-v0.1.json).
+[`linux-event-mvp-qualification-v0.1.json`](schemas/linux-event-mvp-qualification-v0.1.json).
 It does not close E06, approve
 a candidate, produce a qualification receipt, create a `pass` result, verify a
 cryptographic signature, or authorize release.
@@ -640,7 +640,7 @@ not replace or fail the nominal-capacity check.
 ### 9.6 Machine schema and canonicalization
 
 The initial machine contract is
-[`aster-linux-event-mvp-qualification-machine-schema/v0.1`](../implementation/schemas/linux-event-mvp-qualification-v0.1.json).
+[`aster-linux-event-mvp-qualification-machine-schema/v0.1`](schemas/linux-event-mvp-qualification-v0.1.json).
 Canonical values are compact, key-sorted, ASCII-safe UTF-8 JSON with integer
 numbers only and exactly one trailing LF; duplicate keys and noncanonical bytes
 are rejected. `KiB`, `MiB`, and `GiB` are powers of 1024. The report schema is

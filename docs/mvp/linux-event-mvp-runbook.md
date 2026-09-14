@@ -122,7 +122,7 @@ required.
 The 1,024-key boundary counts distinct accepted publish-operation keys over the
 entire state-directory lifetime, including restarts. It is an operator/harness
 stop, not an enforced store admission limit. The
-[accepted containment contract](../implementation/linux-event-mvp-evaluation-profile-v0.1.md#durable-publish-operation-containment)
+[accepted containment contract](../validation/linux-event-mvp-evaluation-profile-v0.1.md#durable-publish-operation-containment)
 selects a separate permanent ledger quota:
 
 - `storage.operations.max_records = 1_000_000` records;
@@ -136,7 +136,7 @@ authenticated `GetStatus`, separately from profile headroom and warning state.
 The aggregate Event/control store quota is separate and can stop admission
 earlier. These are logical quotas, not physical database-size limits or
 qualification of a workload above 1,024 operations. The
-[register records the selected capacity boundary](../implementation/linux-event-mvp-evaluation-profile-v0.1-register.md#selected-operation-ledger-capacity-boundary).
+[register records the selected capacity boundary](../validation/linux-event-mvp-evaluation-profile-v0.1-register.md#selected-operation-ledger-capacity-boundary).
 
 Configured-ledger exhaustion returns Connect `ResourceExhausted` with
 `OPERATION_CAPACITY_EXHAUSTED`, `retryable = false`, and no retry delay. Do not
@@ -241,5 +241,5 @@ occurs:
 For API details, error handling, and shutdown semantics, use the
 [Event agent quickstart](../quickstart/connect-agent.md). For the exact evaluation boundary
 and acceptance gates, use the
-[Linux Event MVP profile](../implementation/linux-event-mvp-evaluation-profile-v0.1.md)
-and its [candidate annex](../implementation/linux-event-mvp-evaluation-profile-v0.1-annex-template.md).
+[Linux Event MVP profile](../validation/linux-event-mvp-evaluation-profile-v0.1.md)
+and its [candidate annex](../validation/linux-event-mvp-evaluation-profile-v0.1-annex-template.md).

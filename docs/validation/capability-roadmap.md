@@ -5,7 +5,7 @@
 - Security-profile applicability:
   [`security-profile-requirements-disposition.md`](security-profile-requirements-disposition.md)
 - Evidence authority: [`requirements-status.md`](requirements-status.md)
-- Atomic trace: [`requirements-implementation.csv`](../implementation/requirements-implementation.csv)
+- Atomic trace: [`requirements-implementation.csv`](requirements-implementation.csv)
 - Current release posture: **evaluation-stage; not production-authorized**
 
 ## Purpose
