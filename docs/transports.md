@@ -62,123 +62,33 @@ semantic v5, the same selected runtime automatically reconciles
 already-durable Blob sources and transfers peer-neutral contiguous carrier
 ranges of at most 16 KiB directly between content-capable peers. The broader
 semantic implementation remains the migration source for behavior that has not
-yet moved into this composition, and it is retained until replacements pass
-equivalent tests.
+yet moved into this composition.
 
 ## Capability boundary
 
 | Path | Implemented | Boundary |
 |---|---|---|
-| Selected direct Iroh | Manually admitted exact endpoint ID and socket, authenticated direct UDP/QUIC, and bounded exchange | A retained one-host cone software-namespace cell observed Direct and exact Event delivery across two NAT routers with static operator-known mappings. Carrier authentication is not mission or control/source authorization; discovery/punching, dynamic or representative NAT, physical-network acceptance, and multi-carrier failover remain open. |
-| Selected nearby Iroh evaluation | Feature-gated official Iroh mDNS direct-address publication and lookup in two explicit modes: an exact pre-provisioned endpoint-to-mission roster, or mission-authenticated `--discover-lan` admission without an operator-supplied neighbor or locator; each window is at most 30 seconds | Default off and demo/evaluation only. Automatic mode repeats bounded windows, but upstream discovery observation is not globally capped; hostile-LAN, physical/resource, NAT/WAN, and production qualification remain open. |
-| Selected controlled Iroh relay | One operator-pinned HTTPS relay with explicit trust, either alongside the initial direct locator or with IP disabled | A retained one-host restrictive software-namespace cell blocked direct traffic, observed Relay, and delivered one exact Event through the controlled relay. It is not a temporal direct-first/fallback chronology, representative or physical NAT, public or independently operated relay, an Aster payload-blind relay, State/Record/Blob-over-relay acceptance, or release authorization. |
-| Selected node and CLI | Networked Event and State/Record reconciliation, semantic-v5 direct Blob source/carrier transfer, live Event/State/Record/Blob Rust APIs, durable Event stream, State positive-current-version delivery, Record whole-key active-head delivery, and Blob metadata-only publication delivery in Rust, stopped Event/State/Record/Blob facades, payload-blind Event relay, restart/idempotency, bounded retained one-host State, Record, and peerless Blob forced-process-redelivery evidence, three-participant direct Blob publication/partial/different-peer-resume/read/graceful-reopen evidence, and bounded Unix zeroization | Reference provisioning; no State contact/status, materialized-view, or synthetic-withdrawal delivery, Blob peer/convergence status, network/application selector-separation acceptance, or selected-node language bindings; State/Record/Blob application subscriptions do not dynamically change configured network interests; no automatic Record merge, arbitrary-peer or route-only Blob resume acceptance, Blob-over-controlled-relay acceptance, finite State/Record/Blob TTL and non-Linux finite Event custody, generalized control administration, representative physical or mixed-implementation evidence, resource/soak evidence, or production authorization |
-| Current semantic in-memory link | Full high-level host contact, authentication, reconciliation, resume, and failure tests | It is a test carrier and is not wired to the selected composition |
+| Selected direct Iroh | Manually admitted exact endpoint ID and socket, authenticated direct UDP/QUIC, and bounded exchange | Carrier identity is separate from mission and data authorization; no address discovery, port mapping, dynamic-NAT policy, or multi-carrier failover |
+| Selected nearby Iroh discovery | Feature-gated Iroh mDNS lookup using an exact roster or mission-authenticated `--discover-lan`; each window is at most 30 seconds | Default off; upstream observations are not globally capped, so this is not a hostile-LAN or production discovery service |
+| Selected controlled Iroh relay | One operator-pinned HTTPS relay with explicit trust, alongside an initial direct locator or with IP disabled | No public/default relay selection; the relay is transport infrastructure rather than an Aster mission or payload-blind application relay |
+| Selected node and CLI | Networked Event, State, and Record reconciliation; semantic-v5 direct Blob transfer; live and stopped Rust APIs; bounded application delivery; payload-blind Event relay; restart/idempotency; Unix zeroization | Reference provisioning; no dynamic application-driven network interests, automatic Record merge, route-only Blob custody, finite State/Record/Blob TTL, generalized control administration, or production authorization |
+| Current semantic in-memory link | High-level host contact, authentication, reconciliation, resume, and failure behavior | Reference carrier; not wired to the selected composition |
 | Current semantic UDP/IP | Nonblocking link, manual endpoint mapping, protected local discovery, rendezvous helpers, opaque relay components | Migration onto the selected node; full host acceptance on physical or operational networks |
-| Current semantic NAT/rendezvous and relay | Bounded rendezvous, endpoint-punching, and opaque-relay helpers with local software tests | Selected-node integration and a two-device representative-NAT direct/fallback result |
+| Current semantic NAT/rendezvous and relay | Bounded rendezvous, endpoint-punching, and opaque-relay helpers | Not integrated into the selected node |
 | Current semantic BTLE | MTU-aware link, unicast plus an advertisement primitive, disconnect handling, platform `BleRadio` seam | Selected-node integration; a shipped Android, iOS, Linux, or controller-specific radio driver; complete one-to-many profile |
 | LoRa, serial, file | The requirements and semantic design do not preclude them | No selected adapters ship |
 
-The [retained 9,656-byte State-delivery receipt](validation/evidence/selected-live-state-subscription-8912fc3.json)
-(SHA-256
-`7d0b568dd4d57c3f2967da55953896829261877513c59c51a0b274eeda69485f`,
-signed source `8912fc3`) exercises the application queue and direct carrier together
-on one same-implementation loopback host. Across two participants, three
-processes, 10 actor lifetimes, and 10 positive direct contacts, it forces the
-receiver process down after a flushed unacknowledged poll and observes the same
-State identity as attempt 2 in a fresh process before acknowledgement,
-idempotent re-acknowledgement, and an empty poll. It also distinguishes
-application delivery intent from static network interest, withholds one
-authorized but network-uninterested State, suppresses causal ancestors, and
-retains a current tombstone and subscription through one final peerless reopen.
-It is not a materialized-view/status result, dynamic network-interest mutation,
-physical/NAT/relay/BTLE or mixed-implementation evidence, scale beyond two,
-resource/soak evidence, or release authorization.
-
-The [retained 10,357-byte Record-delivery receipt](validation/evidence/selected-live-record-subscription-0c11344.json)
-(SHA-256
-`ba0e2bf47291f7e87000b85fa280cc957f3710ac800def82a51fb9b4657a1b48`,
-Good-signed source `0c1134411953f4bb52133b50aff9989cd4ce3930`) exercises the
-Record application queue and direct carrier together on one same-implementation
-loopback host. Across two participants, three processes, and seven actor
-lifetimes, it keeps a complete two-head edit/tombstone conflict in one delivery
-at `delivery_limit=1` and `scan_limit=16`. The receiver is sent `SIGKILL` after
-its flushed durable unacknowledged attempt-one conflict poll; a fresh process
-then receives the same projection at attempt two with a rotated 89-byte token.
-Resolution requires a fresh exact query guard covering both heads, produces a
-new successor projection, and leaves both originals as query-only superseded
-history. Network-interested/application-unmatched beta is retained without
-delivery, while application-matched/network-uninterested gamma is withheld; the
-subscription does not mutate network interest. A final peerless reopen replays
-the subscription with an empty acknowledged queue, the resolved current
-successor, and two query-only superseded originals. This receipt moves only
-`DM-5.1-08`. It is not finite-TTL/GC, physical/NAT/relay/BTLE,
-mixed-implementation, scale/resource/soak, selected-node bindings, automatic
-merge, reproducible source-to-binary, or release evidence.
-
-Separately from the parent and controlled-relay evidence summarized in the
-table, an operator-attested Cargo release-profile binary run for the signed
-current-tree source passed one selected Event N=32 direct-loopback line on one
-macOS arm64 host. Its 65 exact cohorts used 158 exact-named executions with
-distinct READY PIDs and 32 distinct mission identities/stores; the 62
-directed data-motion cohorts remained serial two-process edges, while the final
-equal-inventory no-op recorded 32 distinct READY PIDs. No overlap timing or OS
-sampler proves simultaneity. This bounded
-same-build, same-implementation, one-scope/authority/topic, line-topology
-receipt is not the full 2–32 range, the separate at-least-100-node target,
-distributed/physical scale, NAT, controlled-relay, BTLE/cross-transport,
-mixed-implementation, resource-threshold, or release acceptance.
-
-A separate retained two-cell selected-Iroh receipt observes one exact Event and
-an exact replay no-op through cone/direct and restrictive/controlled-relay
-Docker Linux namespace NATs on one Darwin arm64 host. The cone cell uses exact
-operator-known static mappings with every relay disabled; the restrictive cell
-records direct drops and carries only through the exact DER-pinned relay. Its
-nft and WAN tuple metadata are bound to the sanitized receipt. This is not
-endpoint discovery or punching, a temporal direct-first sequence,
-representative or physical NAT, public Internet or relay operation, independent
-implementation, another data class, resource evidence, or release acceptance.
-See the [retained receipt and replay boundary](validation/requirements-status.md#selected-iroh-nat-retained-receipt).
-
-Code presence is not deployment credit. See the tracked
-[production requirements status](validation/requirements-status.md) and
-[Conformance](validation/conformance.md) for exact retained receipts, evidence, and open
-gates.
+Deployment evidence and open gates are tracked in
+[requirements status](validation/requirements-status.md) and
+[conformance](validation/conformance.md); code presence alone is not deployment
+credit.
 
 ## Selected direct-Iroh contact
 
-For the fastest two-node result, run `mise run tour` from the
-[capability tour](quickstart/capability-tour.md). The fastest relay example uses
-three nodes and is documented in the [live mesh CLI quickstart](quickstart/mesh-cli.md):
-
-```sh
-ASTER_DEMO_PARENT="$(mktemp -d)"
-cargo run --locked -p aster-node --bin aster -- \
-  demo --nodes 3 --root "$ASTER_DEMO_PARENT/mesh"
-```
-
-Omitting `--scenario` keeps Ping/Pong for every supported node count. The
-separate role-bound control receipt uses exactly four nodes:
-
-```sh
-ASTER_CONTROL_PARENT="$(mktemp -d)"
-cargo run --locked -p aster-node --bin aster -- \
-  demo --nodes 4 --scenario control --root "$ASTER_CONTROL_PARENT/mesh"
-```
-
-In that bounded loopback scenario a payload-blind relay forwards one ordered
-revocation/rekey suffix while the authority CLI and authority carrier node are
-offline. After the survivor commits that prefix, a separate one-process cohort
-publishes epoch-two Ping with no configured peer or contact; only the following
-cohort forwards the Event into the relay. After the captured-node denials, four
-more barriers deliver that durable Ping to node 0, publish causal Pong with no
-peer or contact, move Pong into the relay, and return it to node 2. Eligible
-members reject the captured member, but the captured store retains stale
-epoch-one local signing material. That negative condition is intentional:
-rekey/exclusion is not destruction. A separately invoked local hook covers the
-selected node's retained secret artifacts.
-See the [CLI quickstart](quickstart/mesh-cli.md#run-the-four-role-control-scenario)
-for the exact boundary.
+Use the [capability tour](quickstart/capability-tour.md) for the fastest two-node
+path. The [live mesh CLI quickstart](quickstart/mesh-cli.md) owns the runnable
+three-node relay example and the
+[four-role control scenario](quickstart/mesh-cli.md#run-the-four-role-control-scenario).
 
 For separately managed processes, initialize a unique persistent state root on
 each system, exchange the endpoint IDs printed by `aster init`, and separately
@@ -202,7 +112,7 @@ mission-protected canonical Consume/Carry interest narrows each direction
 further, and empty interest means receive-none. Content grants gate semantic
 acceptance and reaction; revoked mission principals fail closed.
 
-### Short-lived nearby evaluation
+### Short-lived nearby discovery
 
 An explicitly discovery-enabled build also accepts
 nearby-peer bindings in the form CARRIER_ID=MISSION_NODE_ID_HEX64 plus a
@@ -233,16 +143,13 @@ run concurrently. These are separate bounds, not a global inbound-carrier cap:
 the upstream mDNS provider can observe and retain more peers before Aster's
 candidate, admission, and concurrent-worker boundaries apply.
 
-Both modes are default-off and evaluation-only. Neither proves hostile-LAN
-resource resistance, and no retained physical-host run establishes automatic
-discovery through authenticated Aster delivery. Mission proof is scoped to the
-same contact; this MVP does not bind it to a TLS exporter or prove common
-ownership of the carrier and mission keys. The exact decisions, cost history,
-FOSS comparison, and qualification gates are in
-[Nearby discovery FOSS selection](evaluations/0005/nearby-discovery-selection.md)
-and [ADR 0036](decisions/0036-mission-authenticated-lan-discovery-mvp.md). The
-[three-host LAN Event quickstart](quickstart/lan-mvp.md) gives the bounded
-operator procedure without turning it into physical or production evidence.
+Both modes are default-off and are not hostile-LAN or production discovery
+services. Mission proof is scoped to the same contact; this implementation does
+not bind it to a TLS exporter or prove common ownership of the carrier and
+mission keys. [ADR 0036](decisions/0036-mission-authenticated-lan-discovery-mvp.md)
+defines the selected boundary, and the
+[three-host LAN Event quickstart](quickstart/lan-mvp.md) gives the operator
+procedure.
 
 The live selected Event, State, Record, and Blob handles compose high-level
 operations with this path through the running actor's shared bounded command
@@ -255,57 +162,6 @@ authenticated cache state, depot capability, or post-commit verification is a
 the actor rather than becoming an ordinary request error. Event's
 `LastContactComplete` reports only the most recent bounded negotiation with each
 active configured peer; it does not assert State/Record or global convergence.
-A [retained 7,752-byte v2 receipt](validation/evidence/selected-live-mutable-6cabb4c.json)
-(SHA-256
-`054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`,
-signed source `6cabb4c`) publishes State and conflicting Record revisions while
-peerless, later reconciles them over direct loopback Iroh, queries both peers
-through live handles, and resolves/retries the guarded Record conflict across
-restart. Its eight direct `CONTACT` records account for 7/7/7 selected-item
-offer/fetch/insert totals with zero Event/control/Blob counters. The
-producer-attested ordered State chain proves exact concurrent heads, a causal
-successor that supersedes both, and an authenticated empty tombstone that
-supersedes all three predecessors and remains current at both actors and one
-immediate peerless restart. This is same-implementation one-host evidence—not
-indefinite tombstone retention, garbage collection, delete-wins, physical or
-mixed implementations, NAT/relay, BTLE, scale, resource, or release acceptance.
-The live Blob handle and
-the semantic-v5 direct-Iroh Blob automation now have a separate
-[retained 10,728-byte receipt](validation/evidence/selected-live-blob-044d90f.json)
-(SHA-256
-`4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)
-binding source commit `044d90ff07c8e754b3d490cb810d42de3c915e3d` with
-`Good` signature status; 45 adversarial verifier tests pass. Its
-source-to-execution link remains operator-attested, not cryptographically
-proven. Across three participants and 32 direct-loopback `CONTACT` records, it
-observes peerless publication and seeding, an exactly-one-contact partial
-transfer, retained-prefix persistence across receiver reopen, an
-exactly-one-contact continuation from the different eligible replica with no
-source refetch and exact-complement advancement, exact byte reconstruction and
-promotion, bounded live page reads, and a final receiver reopen. This is
-one-host, same-implementation evidence, and every interruption or restart is a
-graceful same-process actor/store/provider reopen. It does not prove physical
-hosts, NAT or Internet paths, controlled or public relay, BTLE, process crash
-or power-loss recovery, long-offline recovery, arbitrary-peer or route-only
-resume, scale beyond three participants, resource thresholds or soak,
-physical sanitization, independent-implementation interoperability, or release
-authorization. Blob delivery now has a metadata-only mechanism and a separate
-[retained 10,269-byte peerless delivery receipt](validation/evidence/selected-live-blob-subscription-26e0a09.json)
-(SHA-256
-`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
-Good-signed source `26e0a09`). It observes one participant across three
-processes/four actor lifetimes, `SIGKILL` after a flushed attempt-one poll,
-fresh-process attempt-2 redelivery acknowledged with the older token, two exact
-publications sharing one `BlobId`, and an empty final reopen. It adds no network
-transport, selector-separation, peer-status, power-loss/filesystem-crash,
-TTL/GC, physical/mixed-implementation, resource/soak, or release evidence. Blob
-peer/convergence status, State contact/status and
-materialized-view/synthetic-withdrawal behavior,
-dynamic State/Record network interests, selected-node bindings, route-only Blob
-relay/custody, Blob-over-controlled-relay acceptance, generalized control
-administration, repeated multi-scope lifecycle, finite State/Record/Blob TTL,
-non-Linux finite Event custody, and protected provisioning remain to be
-composed.
 The mission bundle is owner-only on Unix but explicitly unprotected-reference
 at rest; other platforms fail closed because that owner-only contract cannot be
 verified.
@@ -508,11 +364,8 @@ The IP crate provides separate tools for three deployment situations:
   direct reachability fails. A relay is useful infrastructure, not part of data
   correctness and not automatically a content reader.
 
-These retained semantic/reference helpers are migration sources, not the
-selected controlled-Iroh relay path above. They do not supply the
-selected retained NAT evidence: that receipt uses exact operator-known static
-cone mappings and the selected controlled relay, and makes no selected
-discovery or punching claim.
+These semantic/reference helpers are migration sources, not the selected
+controlled-Iroh relay path above.
 
 Start with manually known addresses. Add discovery or rendezvous only after the
 authenticated two-node path is understood and measured in the target network.
