@@ -2,21 +2,24 @@
 
 # Linux Event MVP qualification receipt validator specification
 
-- Status: design specification; implementation and schema freeze pending owner review
+- Status: initial implementation contract frozen; implementation review pending
 - Target profile: `aster-linux-event-mvp-evaluation-v0.1`
-- Target annex: `linux-event-mvp-evaluation-profile-v0.1-annex-template.md`, schema `0.1-proposed`
+- Target annex: `linux-event-mvp-evaluation-profile-v0.1-annex-template.md`, supplemented by machine schema `aster-linux-event-mvp-qualification-machine-schema/v0.1`
 - Register gate advanced: preparation for `P0-1-E06`
 - Evidence effect: none
 
 This document specifies a side-effect-free validator for one completed Linux
 Event MVP candidate-annex bundle. It translates the accepted profile and the
 provisional annex schema into deterministic structural, binding, and
-profile-deviation checks. It does not freeze the annex schema, close E06, approve
+profile-deviation checks. The initial machine contract is frozen by
+[`linux-event-mvp-qualification-v0.1.json`](schemas/linux-event-mvp-qualification-v0.1.json).
+It does not close E06, approve
 a candidate, produce a qualification receipt, create a `pass` result, verify a
 cryptographic signature, or authorize release.
 
-Implementation starts only after the profile and integration owners approve the
-semantics identified in [Decisions required before implementation](#decisions-required-before-implementation).
+The profile and integration owner decisions recorded in §9 authorize this
+initial implementation. `P0-1-E06` remains Open until the required owners review
+the implementation and its retained test evidence.
 
 ## 1. Purpose and non-goals
 
@@ -113,9 +116,8 @@ rejection yields `nonconformant`; otherwise any unresolved required check yields
 severity, stable code, and field path, and duplicate code/path findings are
 collapsed before report serialization.
 
-Suggested process exit codes are `0` for `conformant`, `2` for
-`nonconformant`, `3` for `indeterminate`, and `70` for validator failure. Owner
-approval is required before freezing these codes as a public interface.
+The frozen process exit codes are `0` for `conformant`, `2` for
+`nonconformant`, `3` for `indeterminate`, and `70` for validator failure.
 
 ### 2.3 Determinism and side effects
 
@@ -163,6 +165,9 @@ required to bind facts that do not exist yet:
 
 1. The root key binds candidate ID/revision, frozen schema version/digest, exact
    profile ID/version/digest, and the G1 emission/capacity-contract references.
+   The candidate supplies the profile digest as the required
+   `prerequisites.profile_digest` field; it must equal the digest of the retained
+   accepted profile bytes and must never default to the machine-schema digest.
 2. The G2 key binds the root key plus the G1 exit digest, full source commit,
    dependency lock/toolchain, sanitized strict configuration, and harness
    source/version/configuration digest.
@@ -220,7 +225,7 @@ it conditional.
 | Validator field group | Normative source | Candidate evidence source | Required validation |
 |---|---|---|---|
 | Schema identity | Annex §§Completion conventions, 1, 13, 15 | Frozen schema record | Reviewed non-proposed version, immutable digest, same digest in body/approvals/decision |
-| Profile identity and claim | Profile §§Profile identity and reuse, Consequences; Annex §1 | Immutable profile bytes and claim/non-claims record | Exact ID/version; digest match; non-production Event-only claim; exclusions retained |
+| Profile identity and claim | Profile §§Profile identity and reuse, Consequences; Annex §1 | Immutable profile bytes and claim/non-claims record | Exact ID/version; required `prerequisites.profile_digest` matches the retained profile bytes and root binding; non-production Event-only claim; exclusions retained |
 | Candidate identity and checkpoint | Annex §1 | Release-owned candidate record | Unique ID/revision; exact checkpoint date; review time is not approval |
 | Global G3 binding | Annex §§Completion conventions, 1, 3, 13 | G3 exit or failure receipt and attempt manifest | Exact produced/no-output grammar; partial outputs force produced attempt manifest |
 | Complete artifact-set binding | Annex §§1, 3, 13 | Complete artifact-set manifest | Required for issue; agrees with every produced attempt entry |
@@ -552,11 +557,12 @@ Generic-schema acceptance and v0.1 rejection must be tested together for broader
 values that are legal generically but outside v0.1. This proves profile overlay
 separation without narrowing the generic schema.
 
-## 9. Frozen inputs and decisions required before implementation
+## 9. Frozen inputs and approved implementation decisions
 
-No implementation may invent the following values or treat current planning
-text as a new approval. Explicitly frozen inputs below are mandatory; remaining
-owner decisions must be approved before their checks are implemented.
+No implementation may invent candidate facts or treat this contract as candidate
+approval. The following profile and integration decisions are frozen for the
+initial validator. They authorize code behavior but produce no qualification
+evidence and do not close E01 or E06.
 
 ### 9.1 Frozen operation-ledger semantics
 
@@ -582,13 +588,15 @@ design digest, systemd 257 presentation-amendment digest, provider contract,
 trust/presentation boundary, administration artifact, lifecycle procedure,
 limitations, and acceptance plan before G3 can pass or a candidate can issue.
 
-Owner decision required: freeze the detached record format, signature scheme,
-signer-identity representation, trust-store source, canonicalization, and whether
-cryptographic verification belongs in this validator or a separate approved
-tool. Until then, the validator validates references and binding metadata only
-and always reports signature authenticity as not assessed. Required reference
-metadata may still be structurally `conformant`; no cryptographic-verification
-claim is implied.
+Approved initial boundary: detached E01, candidate-approval, and release-decision
+records use the canonical JSON formats in the machine schema. Each record binds
+its sanitized signer identifier and role, time, candidate/body/schema/G3 facts,
+and an immutable signature reference. The validator checks record bytes,
+digests, roles, times, ordering, and binding metadata only. Signature format,
+trust-store authority, and cryptographic verification remain outside this tool;
+every report says signature authenticity is `not-assessed`. Required reference
+metadata may therefore be structurally `conformant` without implying signature
+authenticity or closing E01.
 
 ### 9.3 Device and peer binding
 
@@ -597,11 +605,12 @@ The prepared inventory selects sanitized `cm4-a`/`rpi4-1` and
 device serial, carrier coordinates, and peer identities are intentionally held
 in an owner-controlled binding outside the repository.
 
-Owner decision required: freeze a canonical sanitized device/peer-binding
-record, its allowed identifier/commitment fields, storage authority, and digest
-handoff. The validator consumes only the immutable reference/digest and
-sanitized consistency fields. It must not retrieve, print, or infer serials,
-addresses, host keys, private identity, or credentials.
+Approved initial boundary: the candidate carries only ordered aliases, declared
+roles, sanitized public commitments, and the immutable owner-controlled
+device/peer-binding record digest. The record itself stays under owner control.
+The validator checks bundle-local alias/role/commitment consistency and digest
+handoff only. It never retrieves, prints, or infers serials, addresses, host
+keys, private identity, or credentials.
 
 ### 9.4 Network/relay candidate choice
 
@@ -610,9 +619,12 @@ carrier conditions. The candidate must freeze a sanitized direct-path
 network-condition record and either one exact relay bundle or a detached signed
 `relay not used` statement.
 
-Owner decision required: select and freeze that candidate path before producing
-qualifying receipts. The validator must not infer the choice from historical
-inspection evidence.
+Approved initial boundary: each candidate explicitly selects exactly
+`direct_only` or `direct_plus_one_pinned_relay`. The latter binds one
+customer-controlled, pinned-DER, `direct_preferred` relay bundle; the former
+binds the detached `relay not used` statement. Direct coverage remains required
+in both cases. The validator never infers this choice from historical inspection
+evidence.
 
 ### 9.5 Deployment memory interpretation
 
@@ -620,27 +632,28 @@ The profile says deployment memory is at least 1 GiB. Prepared inventory reports
 949,702,656 bytes of installed/kernel-visible RAM, and those quantities have not
 been declared equivalent.
 
-Owner decision required: state whether the threshold concerns nominal installed
-hardware capacity, kernel-visible memory, or another measured quantity, including
-unit and procedure. The validator returns `indeterminate` for this threshold
-until the frozen schema carries that interpretation; it must not invent a pass or
-failure.
+Approved initial boundary: the threshold is nominal installed hardware capacity
+in bytes and passes at or above `1,073,741,824` bytes (1 GiB). The candidate also
+records kernel-visible memory bytes as a separate measurement; that value does
+not replace or fail the nominal-capacity check.
 
 ### 9.6 Machine schema and canonicalization
 
-The annex remains `0.1-proposed` and prose-first. Owners must freeze:
+The initial machine contract is
+[`aster-linux-event-mvp-qualification-machine-schema/v0.1`](schemas/linux-event-mvp-qualification-v0.1.json).
+Canonical values are compact, key-sorted, ASCII-safe UTF-8 JSON with integer
+numbers only and exactly one trailing LF; duplicate keys and noncanonical bytes
+are rejected. `KiB`, `MiB`, and `GiB` are powers of 1024. The report schema is
+`aster-linux-event-mvp-qualification-validation-report/v0.1`, with public exit
+codes 0/2/3/70 as defined in §2.2 and stable finding codes from §8.
 
-- a machine-readable field/path schema and schema version;
-- canonical byte serialization and duplicate-key handling;
-- binary-unit definitions;
-- report schema and public exit codes;
-- maximum input/file/count limits;
-- which referenced evidence bytes are mandatory locally;
-- the approval/signature boundary; and
-- stable error-code governance.
-
-Until these are approved, this document is implementable design input but not a
-frozen validator contract.
+Frozen safety limits are 4 MiB for the candidate body, 8 MiB for the receipt
+index, 256 KiB for each detached record, 128 MiB for each referenced artifact,
+4,096 receipt-index entries, 64 detached candidate approvals, and 512 MiB total
+declared or actually read referenced bytes. Every receipt-index entry required
+by the selected outcome must have its exact bytes locally under the explicit
+bundle or artifact root. Missing required bytes are `indeterminate`; present unsafe, malformed,
+changed, or mismatched bytes are `nonconformant`.
 
 ### 9.7 Workload labels and node assignment
 
@@ -651,11 +664,13 @@ a publishing node, and the capacity-warning row does not say whether 512 local
 operations and the exact retry occur on one named node, on each node, or under
 another fixed distribution.
 
-Owner decision required: freeze the four machine labels, map the two prose names
-for the 10-Event row to one label, and define publishing-node/operation/retry
-assignment for the API-boundary and capacity-warning rows. Before that decision,
-the validator may check only the unambiguous aggregate constraints and must mark
-the unresolved per-node check `indeterminate`; it must not choose a distribution.
+Approved machine labels are `api_boundary`, `two_node_topology`, `offline_soak`,
+and `capacity_warning_probe`; `Small topology` and `Two-node topology` both map
+only to `two_node_topology`. For `api_boundary`, `cm4-a` publishes the 0-,
+4,096-, and 65,536-byte Events and `cm4-b` receives. For
+`capacity_warning_probe`, `cm4-a` publishes 512 distinct operations plus one
+exact retry and `cm4-b` receives; the retry adds zero ledger growth. The soak
+publishes exactly 240 operations per node.
 
 ### 9.8 Candidate-ID uniqueness scope
 
@@ -663,11 +678,10 @@ The declared validator inputs contain one bundle and no trusted registry of
 previous candidates. The validator can reject conflicting uses of a candidate ID
 inside that bundle but cannot prove global non-reuse across prior bundles.
 
-Owner decision required: either define a trusted read-only candidate registry
-and its canonical lookup/binding contract or leave global uniqueness to release
-review. Without that input, the report states `global candidate-ID uniqueness
-not assessed` rather than claiming uniqueness or rejecting an otherwise
-internally consistent bundle.
+Approved initial boundary: no candidate registry is an input. The validator
+enforces bundle-local candidate-ID consistency only and reports
+`global candidate-ID uniqueness not assessed`. Global non-reuse remains a
+release-review responsibility.
 
 ## 10. Implementation and CI acceptance plan
 
@@ -718,6 +732,8 @@ A later implementation increment is complete only when:
   claim is emitted; and
 - `P0-1-E06` is changed only after owner review of actual implementation evidence.
 
-This specification alone advances preparation for E06. It changes no profile,
-register, requirement evidence status, candidate gate, package, receipt,
-approval, or release decision.
+The initial implementation and its synthetic falsification suite advance
+preparation for E06. They change no register or requirement evidence status,
+candidate gate, package, qualification receipt, approval, or release decision.
+E06 remains Open until the named owners review the actual implementation and
+the remaining mutation-coverage boundary.
