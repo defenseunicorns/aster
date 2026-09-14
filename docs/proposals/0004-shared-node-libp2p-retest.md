@@ -1,5 +1,6 @@
 # Proposal 0004: Shared-node rust-libp2p retest
 
+> ****
 
 - Status: superseded — stopped before formal Phase 0; no arm selected and
   the rust-libp2p pilot rejected from the continuing stack
@@ -16,16 +17,16 @@
   clean shared-node checkpoint rather than treating this value as a candidate
   receipt
 - Execution cap: 30 engineer-days; this is a stop limit, not an estimate
-- Parent result:
-  [Proposal 0003 result](0003-idiomatic-ip-mesh-provider-results.md)
 - Governing decision:
   [Decision 0024](../decisions/0024-refactor-durable-node-ownership-before-ip-provider-selection.md)
 - Closure decision:
   [Decision 0029](../decisions/0029-close-proposal-0004-libp2p-pilot.md)
 - Preserves: Decisions
   [0002](../decisions/0002-dependency-admission.md),
-  0014 (“Build versus buy is governed by total assurance cost”;  not part of this repository artifact),
-  0015 (“Delete custom mechanism behind narrow library-backed seams”; not part of this repository artifact),
+  0014 (“Build versus buy is governed by total assurance cost”; privileged local
+  record, not part of this repository artifact),
+  0015 (“Delete custom mechanism behind narrow library-backed seams”; privileged
+  local record, not part of this repository artifact),
   [0022](../decisions/0022-ip-mesh-experiment-no-selection.md), and
   [0023](../decisions/0023-mesh-host-contract-no-libp2p-selection.md)
 

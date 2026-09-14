@@ -1,5 +1,6 @@
 # Aster proposals and experiments
 
+> ****
 
 Proposals describe bounded investigations that may inform a later architecture
 decision. They complement the accepted records in [`docs/decisions`](../decisions/)
@@ -51,9 +52,6 @@ Proposal files use an independent four-digit sequence:
 
 | Proposal | Status | Decision sought |
 |---|---|---|
-| [0001 — Operational IP mesh vertical-slice experiment](0001-ip-mesh-vertical-slice.md) | completed — no winner | [Result](0001-ip-mesh-vertical-slice-results.md): LAN custody proven; no operational IP profile selected |
-| [0002 — Provider-neutral mesh host and focused rust-libp2p profile](0002-provider-neutral-mesh-host.md) | completed — contract retained; provider rejected | [Result](0002-provider-neutral-mesh-host-results.md): bounded host contract passed; focused rust-libp2p failed selection gates |
-| [0003 — Idiomatic IP mesh provider comparison](0003-idiomatic-ip-mesh-provider-comparison.md) | completed — no winner | [Result](0003-idiomatic-ip-mesh-provider-results.md): all arms stopped on shared durable-owner/resource gates; refactor before another selection |
 | [0004 — Shared-node rust-libp2p retest](0004-shared-node-libp2p-retest.md) | superseded — stopped before formal Phase 0; no arm selected | [Result](0004-shared-node-libp2p-retest-results.md): provider-free Gate H retained; rust-libp2p rejected from the continuing stack and retained only as a bounded test oracle |
 | [0005 — Requirements-first FOSS architecture evaluation](0005-requirements-first-foss-architecture-evaluation.md) | accepted for phased evaluation; no candidate selected | Compare whole-stack FOSS and published-standard compositions without treating the experimental Aster implementation as an architecture constraint |
 | [0006 — Selected FOSS reference stack build and validation](0006-selected-foss-reference-stack.md) | completed — bounded reference core validated; no production selection | Retain Iroh + Negentropy + redb as the engineering baseline and build the still-missing normative, security, policy, Blob, physical, and release owners |

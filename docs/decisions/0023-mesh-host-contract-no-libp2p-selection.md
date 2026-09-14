@@ -1,14 +1,15 @@
 # Decision 0023: Retain the mesh-host contract without selecting rust-libp2p
 
+> ****
 
 - Status: accepted — host contract retained; no provider admitted
 - Date: 2026-08-21
-- Proposal: [0002](../proposals/0002-provider-neutral-mesh-host.md)
-- Results: [Proposal 0002 result](../proposals/0002-provider-neutral-mesh-host-results.md)
 - Amends: [Decision 0022](0022-ip-mesh-experiment-no-selection.md)
 - Preserves: Decisions [0002](0002-dependency-admission.md),
-  0014 (“Build versus buy is governed by total assurance cost”;  not part of this repository artifact), and
-  0015 (“Delete custom mechanism behind narrow library-backed seams”; not part of this repository artifact)
+  0014 (“Build versus buy is governed by total assurance cost”; privileged local
+  record, not part of this repository artifact), and
+  0015 (“Delete custom mechanism behind narrow library-backed seams”; privileged
+  local record, not part of this repository artifact)
 
 ## Context
 
