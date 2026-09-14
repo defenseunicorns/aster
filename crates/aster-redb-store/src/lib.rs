@@ -16,11 +16,15 @@
 //! or control namespace. Semantic mutation requires a live strong capability from
 //! `aster-core`, while persisted decoded metadata is only structurally audited.
 //! [`StoreLimits`] bound aggregate redb rows and encoded bytes across the
-//! accounted logical namespaces; selector/delivery/custody ledgers have separate
-//! caps, while accepted-dot and causal-frontier aggregate retirement remains an
-//! explicit open boundary. [`BlobDepotLimits`] separately bound durable depot import/chunk
-//! rows and redb-marked chunk-file bytes, without claiming a bound on untracked
-//! filesystem allocation.
+//! accounted logical namespaces. Permanent schema-v3 Event operations are
+//! excluded from that ordinary quota and bounded by [`EventOperationLimits`],
+//! while legacy Event-operation rows remain ordinary-accounted until atomic
+//! migration makes v3 authoritative. Both quotas remain part of deployment's
+//! total logical state-allocation calculation. Selector/delivery/custody ledgers
+//! have separate caps, while accepted-dot and causal-frontier aggregate
+//! retirement remains an explicit open boundary. [`BlobDepotLimits`] separately
+//! bound durable depot import/chunk rows and redb-marked chunk-file bytes, without
+//! claiming a bound on untracked filesystem allocation.
 
 #![forbid(unsafe_code)]
 
@@ -28,6 +32,8 @@ mod blob;
 mod blob_subscription;
 mod bridge_event;
 mod custody;
+#[allow(dead_code)] // Ledger codec/delta pieces become authoritative in Tasks 3-5.
+mod event_operation;
 mod record_subscription;
 mod state_subscription;
 
@@ -35,6 +41,10 @@ pub use blob::*;
 pub use blob_subscription::*;
 pub use bridge_event::*;
 pub use custody::*;
+pub use event_operation::{
+    EventOperationAuditProgress, EventOperationAuditState, EventOperationAuditStatus,
+    EventOperationKey, EventOperationLimits, EventOperationStats, MAX_EVENT_OPERATION_ALIASES,
+};
 pub use record_subscription::*;
 pub use state_subscription::*;
 
@@ -269,9 +279,10 @@ const CONTROL_HEAD_VERSION: u8 = 1;
 pub const MAX_EVENT_PAGE: usize = 1_024;
 /// Maximum byte length of one application operation key.
 pub const MAX_EVENT_OPERATION_KEY_BYTES: usize = 256;
-/// Maximum durable idempotent Event operation mappings per store.
+/// Maximum legacy Event operation rows accepted by store-open migration.
+/// Current publication uses [`EventOperationLimits`].
 pub const MAX_EVENT_OPERATIONS: u64 = 4_096;
-/// Maximum aggregate key plus record bytes retained by Event operations.
+/// Maximum legacy raw-key plus record bytes accepted by migration.
 pub const MAX_EVENT_OPERATION_BYTES: u64 = 512 * 1024;
 /// Maximum byte length of one selected-State application operation key.
 pub const MAX_STATE_OPERATION_KEY_BYTES: usize = 256;
@@ -399,13 +410,16 @@ impl MutableTransferCursorMode {
 /// Validated durable admission limits for one store.
 ///
 /// Both limits count aggregate legacy opaque rows, accepted exact source-sealed
-/// Event, State, Record, and signed Blob representations, durable selected-store
-/// operation mappings, route-only cache entries, exact controls, canonical
-/// local control-publication intents, and opaque selected Event bridge
-/// authorizations, deduplicated sources, wrappers, and route metadata. Physical
-/// Blob-depot files are governed by [`BlobDepotLimits`] instead of being
-/// double-counted here. Unmarked or hostile untracked filesystem allocation and
-/// filesystem/redb overhead remain outside these logical admission claims.
+/// Event, State, Record, and signed Blob representations, durable State, Record,
+/// Blob, and not-yet-migrated legacy Event operation mappings, route-only cache
+/// entries, exact controls, canonical local control-publication intents, and
+/// opaque selected Event bridge authorizations, deduplicated sources, wrappers,
+/// and route metadata. Permanent schema-v3 Event operations are governed by
+/// [`EventOperationLimits`] instead, but remain part of deployment's total state
+/// allocation. Physical Blob-depot files are governed by [`BlobDepotLimits`]
+/// instead of being double-counted here. Unmarked or hostile untracked filesystem
+/// allocation and filesystem/redb overhead remain outside these logical
+/// admission claims.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoreLimits {
     max_items: u64,
@@ -1039,32 +1053,6 @@ impl ControlInventory {
                 .copied()
                 .map(ControlTransferId::reconciliation_item_id),
         )
-    }
-}
-
-/// A bounded, application-defined idempotency key for one local Event operation.
-///
-/// The key is durable and maps to exactly one accepted source Event. A caller
-/// should namespace the bytes by application and operation kind. Reactive work
-/// can append the authenticated predecessor's semantic item identifier.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct EventOperationKey(Vec<u8>);
-
-impl EventOperationKey {
-    /// Validates a nonempty bounded operation key.
-    pub fn new(bytes: impl Into<Vec<u8>>) -> Result<Self, StoreError> {
-        let bytes = bytes.into();
-        if bytes.is_empty() || bytes.len() > MAX_EVENT_OPERATION_KEY_BYTES {
-            return Err(StoreError::InvalidEventOperationKey {
-                length: bytes.len(),
-            });
-        }
-        Ok(Self(bytes))
-    }
-
-    /// Returns the exact durable key bytes.
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
     }
 }
 
@@ -2733,6 +2721,8 @@ pub enum StoredEventTransfer {
 /// Result of an atomic idempotent local Event operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventOnceOutcome {
+    /// Exact retry of a compact permanent fence, with no retained result pointer.
+    RetiredOperation { reason: CustodyRetirementReason },
     /// This transaction committed the operation and Event together.
     Inserted {
         /// Exact transfer identity of the newly retained representation.
@@ -2775,8 +2765,12 @@ pub enum EventOnceOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EventOperationResolution {
     Live(Box<StoredEvent>),
+    /// A compact permanent fence retains no Event/result pointer.
+    RetiredOperation {
+        reason: CustodyRetirementReason,
+    },
     /// The operation identity remains durable while payload bytes are retained
-    /// solely for lease drain or verified legacy-operation recovery.  It is
+    /// solely for lease drain. It is
     /// not application or sender authority.
     Withheld {
         transfer_id: EventTransferId,
@@ -2789,31 +2783,6 @@ pub enum EventOperationResolution {
         acceptance_marker: u64,
         reason: CustodyRetirementReason,
     },
-}
-
-/// One bounded housekeeping candidate for capability-backed migration of a
-/// pre-intent Event operation. Exact bytes are exposed only by this narrow
-/// mission/policy-bound recovery projection; they are not sender or
-/// application-delivery authority when custody is already marked retiring.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LegacyEventOperationRecovery {
-    operation: EventOperationKey,
-    predecessor: Option<EventSemanticId>,
-    event: StoredEvent,
-}
-
-impl LegacyEventOperationRecovery {
-    pub const fn operation(&self) -> &EventOperationKey {
-        &self.operation
-    }
-
-    pub const fn predecessor(&self) -> Option<EventSemanticId> {
-        self.predecessor
-    }
-
-    pub const fn event(&self) -> &StoredEvent {
-        &self.event
-    }
 }
 
 /// Missing half-open range in one authenticated publisher Event stream.
@@ -2969,10 +2938,8 @@ pub struct EventStoreStats {
     pub retiring_route_cached: u64,
     /// Exact bytes retained in the route-only cache.
     pub route_cached_bytes: u64,
-    /// Durable idempotent Event operation mappings.
-    pub operations: u64,
-    /// Aggregate operation-key plus operation-record bytes.
-    pub operation_bytes: u64,
+    /// Exact permanent Event operation ledger accounting.
+    pub operation_stats: EventOperationStats,
 }
 
 /// Consistent counts for the mission-bound semantic State namespace.
@@ -3382,6 +3349,22 @@ pub enum StoreError {
     },
     /// An Event operation key was replayed with another canonical public intent.
     EventOperationConflict,
+    /// Legacy operations lack a durable mission binding required for migration.
+    EventOperationMigrationMissingMissionBinding,
+    /// A legacy operation lacks the authenticated intent needed for migration.
+    EventOperationMigrationMissingAuthenticatedIntent,
+    /// Distinct legacy raw keys produced the same mission-bound fingerprint.
+    EventOperationMigrationFingerprintCollision,
+    /// A legacy Event exceeds the destination's bounded operation alias count.
+    EventOperationMigrationAliasOverflow,
+    /// The complete migration image exceeds the configured destination limits.
+    EventOperationMigrationDestinationCapacity,
+    /// A complete operation audit was cancelled between bounded pages.
+    EventOperationAuditCancelled,
+    /// A logical operation-ledger invariant blocked final Event retirement.
+    /// Backend/I/O errors and other custody or security invariants are never
+    /// wrapped in this category. The failed transaction remains uncommitted.
+    EventOperationRetirementInvariant(Box<StoreError>),
     /// The dedicated durable Event operation row cap was reached.
     EventOperationLimitExceeded { current: u64, limit: u64 },
     /// Retaining another Event operation would exceed its dedicated byte cap.
@@ -3837,6 +3820,27 @@ impl fmt::Display for StoreError {
             ),
             Self::EventOperationConflict => {
                 formatter.write_str("Event operation retry differs from its durable public intent")
+            }
+            Self::EventOperationMigrationMissingMissionBinding => {
+                formatter.write_str("Event operation migration lacks a mission binding")
+            }
+            Self::EventOperationMigrationMissingAuthenticatedIntent => {
+                formatter.write_str("Event operation migration lacks authenticated intent")
+            }
+            Self::EventOperationMigrationFingerprintCollision => {
+                formatter.write_str("Event operation migration fingerprint collision")
+            }
+            Self::EventOperationMigrationAliasOverflow => {
+                formatter.write_str("Event operation migration exceeds the alias limit")
+            }
+            Self::EventOperationMigrationDestinationCapacity => {
+                formatter.write_str("Event operation migration exceeds destination capacity")
+            }
+            Self::EventOperationAuditCancelled => {
+                formatter.write_str("Event operation audit cancelled before completion")
+            }
+            Self::EventOperationRetirementInvariant(error) => {
+                write!(formatter, "Event operation retirement invariant: {error}")
             }
             Self::EventOperationLimitExceeded { current, limit } => write!(
                 formatter,
@@ -4396,6 +4400,7 @@ impl Error for StoreError {
             Self::Blob(error) => Some(error),
             Self::Bridge(error) => Some(error),
             Self::Custody(error) => Some(error),
+            Self::EventOperationRetirementInvariant(error) => Some(error.as_ref()),
             Self::StorePath(error) => Some(error),
             _ => None,
         }
@@ -4649,7 +4654,6 @@ struct PendingRecordOperation<'a> {
 struct PendingOperation<'a> {
     key: &'a EventOperationKey,
     predecessor: Option<EventSemanticId>,
-    payload_digest: [u8; 32],
     intent_digest: [u8; 32],
 }
 
@@ -4660,6 +4664,20 @@ struct PendingEventCustody {
     sample: Option<aster_mesh::CustodySample>,
 }
 
+enum EventCommitResult {
+    Retained(EventCommit),
+    RetiredOperation { reason: CustodyRetirementReason },
+}
+
+impl EventCommitResult {
+    fn into_apply(self) -> Result<ApplyOutcome, StoreError> {
+        match self {
+            Self::Retained(committed) => Ok(committed.apply),
+            Self::RetiredOperation { .. } => Err(CustodyStoreError::AlreadyRetired.into()),
+        }
+    }
+}
+
 struct EventCommit {
     transfer_id: EventTransferId,
     semantic_id: EventSemanticId,
@@ -4668,7 +4686,13 @@ struct EventCommit {
     retirement: Option<CustodyRetirementReason>,
 }
 
-fn event_once_outcome(committed: EventCommit) -> Result<EventOnceOutcome, StoreError> {
+fn event_once_outcome(result: EventCommitResult) -> Result<EventOnceOutcome, StoreError> {
+    let committed = match result {
+        EventCommitResult::Retained(committed) => committed,
+        EventCommitResult::RetiredOperation { reason } => {
+            return Ok(EventOnceOutcome::RetiredOperation { reason });
+        }
+    };
     let transfer_id = committed.transfer_id;
     let semantic_id = committed.semantic_id;
     let acceptance_marker = committed.apply.acceptance_marker();
@@ -4895,6 +4919,7 @@ pub struct Store {
     backing_identity: StoreBackingIdentity,
     limits: StoreLimits,
     blob_depot_limits: BlobDepotLimits,
+    operation_limits: EventOperationLimits,
     mission_authority: Option<NodeId>,
     live: AtomicBool,
     blob_depot_lock: std::sync::Mutex<()>,
@@ -4936,6 +4961,7 @@ struct OpenedStoreBacking {
 fn open_store_backing_file(
     path: &Path,
     create_new: bool,
+    read_only: bool,
 ) -> Result<OpenedStoreBacking, StoreError> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -4957,7 +4983,12 @@ fn open_store_backing_file(
         rustix::fs::Mode::empty(),
     )
     .map_err(|error| StoreError::StorePath(error.into()))?;
-    let mut flags = rustix::fs::OFlags::RDWR
+    let access = if read_only {
+        rustix::fs::OFlags::RDONLY
+    } else {
+        rustix::fs::OFlags::RDWR
+    };
+    let mut flags = access
         | rustix::fs::OFlags::CLOEXEC
         | rustix::fs::OFlags::NOFOLLOW
         | rustix::fs::OFlags::NONBLOCK;
@@ -5008,9 +5039,10 @@ fn open_store_backing_file(
 fn open_store_backing_file(
     path: &Path,
     create_new: bool,
+    read_only: bool,
 ) -> Result<OpenedStoreBacking, StoreError> {
     let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create_new(create_new);
+    options.read(true).write(!read_only).create_new(create_new);
     let file = options.open(path).map_err(StoreError::StorePath)?;
     let metadata = file.metadata().map_err(StoreError::StorePath)?;
     if !metadata.is_file() {
@@ -5029,7 +5061,16 @@ fn open_store_backing_file(
 }
 
 fn open_existing_store_backing(path: &Path) -> Result<OpenedStoreBacking, StoreError> {
-    let backing = open_store_backing_file(path, false)?;
+    validate_nonempty_store_backing(open_store_backing_file(path, false, false)?)
+}
+
+fn open_read_only_store_backing(path: &Path) -> Result<OpenedStoreBacking, StoreError> {
+    validate_nonempty_store_backing(open_store_backing_file(path, false, true)?)
+}
+
+fn validate_nonempty_store_backing(
+    backing: OpenedStoreBacking,
+) -> Result<OpenedStoreBacking, StoreError> {
     if backing.length == 0 {
         return Err(StoreError::StoreBackingInvariant(
             "existing backing file is empty",
@@ -5039,15 +5080,15 @@ fn open_existing_store_backing(path: &Path) -> Result<OpenedStoreBacking, StoreE
 }
 
 fn open_or_create_store_backing(path: &Path) -> Result<OpenedStoreBacking, StoreError> {
-    let backing = match open_store_backing_file(path, false) {
+    let backing = match open_store_backing_file(path, false, false) {
         Ok(backing) => backing,
         Err(StoreError::StorePath(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            match open_store_backing_file(path, true) {
+            match open_store_backing_file(path, true, false) {
                 Ok(backing) => backing,
                 Err(StoreError::StorePath(error))
                     if error.kind() == std::io::ErrorKind::AlreadyExists =>
                 {
-                    open_store_backing_file(path, false)?
+                    open_store_backing_file(path, false, false)?
                 }
                 Err(error) => return Err(error),
             }
@@ -5278,6 +5319,7 @@ impl Store {
             path,
             StoreLimits::default(),
             BlobDepotLimits::default(),
+            EventOperationLimits::DEFAULT,
             Some(binding.mission_authority),
             Some(expectation),
         )?;
@@ -5304,6 +5346,29 @@ impl Store {
         path: impl AsRef<Path>,
         limits: StoreLimits,
         blob_depot_limits: BlobDepotLimits,
+        mission_authority: NodeId,
+    ) -> Result<Self, StoreError> {
+        Self::open_with_limits_and_operation_limits_for_mission(
+            path,
+            limits,
+            blob_depot_limits,
+            EventOperationLimits::DEFAULT,
+            mission_authority,
+        )
+    }
+
+    /// Opens a mission-bound store with explicit ordinary, physical Blob-depot,
+    /// and permanent Event-operation ledger limits.
+    ///
+    /// The Event-operation logical-byte limit remains part of the deployment's
+    /// total state-allocation preflight even though schema-v3 operation rows do
+    /// not consume [`StoreLimits`]. Existing legacy operation rows remain
+    /// ordinary-accounted until migration makes the v3 ledger authoritative.
+    pub fn open_with_limits_and_operation_limits_for_mission(
+        path: impl AsRef<Path>,
+        limits: StoreLimits,
+        blob_depot_limits: BlobDepotLimits,
+        operation_limits: EventOperationLimits,
         mission_authority: NodeId,
     ) -> Result<Self, StoreError> {
         let path = path.as_ref();
@@ -5333,6 +5398,7 @@ impl Store {
             path,
             limits,
             blob_depot_limits,
+            operation_limits,
             Some(mission_authority),
             None,
         )?;
@@ -5349,9 +5415,9 @@ impl Store {
     /// so an absent store is never created as a side effect of inspection.
     pub fn inspect_existing(path: impl AsRef<Path>) -> Result<StoreInspection, StoreError> {
         let path = std::path::absolute(path).map_err(StoreError::StorePath)?;
-        let before = open_existing_store_backing(&path)?.identity;
+        let before = open_read_only_store_backing(&path)?.identity;
         let database = redb::Builder::new().open_read_only(&path)?;
-        let after = open_existing_store_backing(&path)?.identity;
+        let after = open_read_only_store_backing(&path)?.identity;
         if before != after {
             return Err(StoreError::StoreBackingInvariant(
                 "backing path changed during read-only inspection",
@@ -5434,6 +5500,7 @@ impl Store {
             path.as_ref(),
             limits,
             BlobDepotLimits::default(),
+            EventOperationLimits::DEFAULT,
             None,
             None,
         )
@@ -5443,6 +5510,7 @@ impl Store {
         path: &Path,
         limits: StoreLimits,
         blob_depot_limits: BlobDepotLimits,
+        operation_limits: EventOperationLimits,
         expected_mission_authority: Option<NodeId>,
         expected_security_profile_policy: Option<SecurityProfilePolicyExpectation>,
     ) -> Result<Self, StoreError> {
@@ -5558,7 +5626,15 @@ impl Store {
         // additive Blob migration. A foreign/pre-marker physical root blocks
         // migration while this exact writer transaction can still roll back.
         blob::depot::prepare_depot_owner_token_write(&write, &path)?;
+        let operation_migration =
+            event_operation::stage_legacy_event_operations_write(&write, operation_limits)?;
+        // Audit all retained metadata, predecessor relations, witnesses and
+        // legacy accounting before replacing any legacy row.
         let blob_stats = audit_semantic_tables(&write, limits)?;
+        if let Some(migration) = &operation_migration {
+            migration.apply(&write)?;
+        }
+        let operation_stats = event_operation::audit_event_operation_accounting_write(&write)?;
         let blob_depot_owner_token = blob::depot::depot_owner_token_write(&write)?;
         blob::depot::bind_depot_owner_write(
             &write,
@@ -5582,6 +5658,7 @@ impl Store {
                 || write.open_table(blob::BLOB_CHUNKS)?.len()? != 0
                 || write.open_table(ROUTE_CACHE)?.len()? != 0
                 || write.open_table(CONTROL_RECORDS)?.len()? != 0
+                || operation_stats.records_total != 0
                 || bridge_event_stats.aggregate_items()? != 0
                 || mutable_transfer_cursors.rows != 0)
         {
@@ -5605,13 +5682,35 @@ impl Store {
             ));
         }
         custody::audit_custody_tables_write(&write, limits, mission_authority)?;
+        if operation_migration.is_some() {
+            // A failed physical audit must not leave a committed operation
+            // migration behind. Keep all fallible depot validation/reclaim in
+            // this same transaction for the bounded legacy conversion. The
+            // token/binding checks above forbid adopting an existing root with
+            // a newly generated owner token; this audit never creates a root.
+            blob::depot::audit_depot_write(
+                &write,
+                &path,
+                backing_identity,
+                blob_depot_owner_token,
+                blob_stats,
+            )?;
+        }
+        #[cfg(test)]
+        if operation_migration.is_some() && event_operation::MIGRATION_TEST_FAULT.get() == 2 {
+            return Err(StoreError::SemanticInvariant(
+                "injected Event operation migration abort",
+            ));
+        }
         write.commit()?;
 
-        // Persist the database-specific owner token before installing its
-        // crash-safe filesystem peer. Physical inspection and reclaim remain
-        // mission-bound effects, and the second exact writer transaction
-        // rechecks terminal and mission truth before touching the depot.
-        if let Some(authority) = mission_authority {
+        // Opens without an operation migration retain the separate physical
+        // audit after persisting their database owner token. The second exact
+        // writer transaction rechecks terminal and mission truth before depot
+        // effects. A migration already completed this audit before its commit.
+        if operation_migration.is_none()
+            && let Some(authority) = mission_authority
+        {
             let physical = database.begin_write()?;
             enforce_live_write(&physical)?;
             check_expected_mission_binding(&physical, authority)?;
@@ -5631,6 +5730,7 @@ impl Store {
             backing_identity,
             limits,
             blob_depot_limits,
+            operation_limits,
             mission_authority,
             live: AtomicBool::new(true),
             blob_depot_lock: std::sync::Mutex::new(()),
@@ -5648,6 +5748,11 @@ impl Store {
     /// Returns the admission limits active on this handle.
     pub const fn limits(&self) -> StoreLimits {
         self.limits
+    }
+
+    /// Returns the permanent Event-operation ledger limits active on this handle.
+    pub const fn operation_limits(&self) -> EventOperationLimits {
+        self.operation_limits
     }
 
     /// Returns exact logical usage charged against this handle's aggregate
@@ -5841,6 +5946,7 @@ impl Store {
             backing_identity,
             limits: _,
             blob_depot_limits: _,
+            operation_limits: _,
             mission_authority: _,
             live: _,
             blob_depot_lock: _,
@@ -8762,7 +8868,7 @@ impl Store {
         self.require_live()?;
         let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Remote)?;
         self.commit_prepared_event(&prepared, None, None, EventAdmissionGuard::Current, None)
-            .map(|outcome| outcome.apply)
+            .and_then(EventCommitResult::into_apply)
     }
 
     /// Accepts one remotely verified Event only under an exact settled control policy.
@@ -8781,7 +8887,7 @@ impl Store {
             EventAdmissionGuard::Control(policy),
             None,
         )
-        .map(|outcome| outcome.apply)
+        .and_then(EventCommitResult::into_apply)
     }
 
     /// Accepts one remotely verified Event only while an exact replication snapshot remains current.
@@ -8808,7 +8914,7 @@ impl Store {
             },
             None,
         )
-        .map(|outcome| outcome.apply)
+        .and_then(EventCommitResult::into_apply)
     }
 
     /// Atomically accepts a remotely content-verified finite Event together
@@ -8851,7 +8957,7 @@ impl Store {
                 sample: Some(receiver_sample),
             }),
         )
-        .map(|outcome| outcome.apply)
+        .and_then(EventCommitResult::into_apply)
     }
 
     /// Commits one locally sealed Event against its optimistic durable reservation.
@@ -8870,7 +8976,7 @@ impl Store {
             EventAdmissionGuard::Control(&reservation.control_policy),
             None,
         )
-        .map(|outcome| outcome.apply)
+        .and_then(EventCommitResult::into_apply)
     }
 
     /// Commits a reserved local Event only if its captured policy remains exact.
@@ -8893,7 +8999,7 @@ impl Store {
             EventAdmissionGuard::Control(policy),
             None,
         )
-        .map(|outcome| outcome.apply)
+        .and_then(EventCommitResult::into_apply)
     }
 
     /// Atomically commits a local Event and a durable application operation mapping.
@@ -8980,206 +9086,76 @@ impl Store {
         event_once_outcome(committed)
     }
 
-    /// Returns an exclusive, key-ordered page of witnessless legacy Event
-    /// operations for proactive startup migration. A fresh content provider
-    /// must reopen each exact retained representation and pass it to
-    /// [`Self::bind_legacy_event_operation_intent_with_policy`].
-    pub fn unbound_legacy_event_operations_with_policy(
+    /// Compares a request with its mission-bound commitment before resolving
+    /// any Event bytes, in one read transaction. Commit rechecks authority.
+    pub fn event_operation_resolution_for_request(
         &self,
-        policy: &ControlPolicySnapshot,
-        after: Option<&EventOperationKey>,
-        limit: usize,
-    ) -> Result<Vec<LegacyEventOperationRecovery>, StoreError> {
-        self.require_live()?;
-        let authority = self.require_bound_mission()?;
-        if limit == 0 || limit > MAX_EVENT_PAGE {
-            return Err(StoreError::EventPageLimitExceeded {
-                requested: limit,
-                maximum: MAX_EVENT_PAGE,
-            });
-        }
-        let read = self.database.begin_read()?;
-        require_control_policy_read(&read, authority, policy)?;
-        let operations = read.open_table(EVENT_OPERATIONS)?;
-        let lower = after.map_or(std::ops::Bound::Unbounded, |operation| {
-            std::ops::Bound::Excluded(operation.as_bytes())
-        });
-        // Coalesce aliases before loading any sealed bytes. Event-operation
-        // rows are capped, but one accepted transfer may have many legacy
-        // operation aliases and a maximal payload; cloning the representation
-        // once per alias would amplify one bounded store into an unbounded
-        // recovery page. The representative is advanced to the latest scanned
-        // alias so callers using its key as the exclusive cursor make progress.
-        let mut lightweight =
-            Vec::<(EventOperationKey, Option<EventSemanticId>, EventTransferId)>::new();
-        let mut transfer_indexes = std::collections::BTreeMap::<[u8; 32], usize>::new();
-        for row in operations.range::<&[u8]>((lower, std::ops::Bound::Unbounded))? {
-            let (key, value) = row?;
-            let record = decode_operation_record(value.value())?;
-            if !record.legacy_unbound
-                || event_operation_witness_read(&read, record.transfer_id)?.is_some()
-            {
-                continue;
-            }
-            let operation = EventOperationKey::new(key.value().to_vec())?;
-            if let Some(index) = transfer_indexes.get(record.transfer_id.as_bytes()).copied() {
-                lightweight[index] = (operation, record.predecessor, record.transfer_id);
-                continue;
-            }
-            if lightweight.len() == limit {
-                break;
-            }
-            transfer_indexes.insert(*record.transfer_id.as_bytes(), lightweight.len());
-            lightweight.push((operation, record.predecessor, record.transfer_id));
-        }
-        lightweight.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
-        let mut candidates = Vec::with_capacity(lightweight.len());
-        for (operation, predecessor, transfer_id) in lightweight {
-            let event =
-                load_event_from_read(&read, transfer_id)?.ok_or(StoreError::SemanticInvariant(
-                    "witnessless legacy Event operation lost protected exact bytes",
-                ))?;
-            candidates.push(LegacyEventOperationRecovery {
-                operation,
-                predecessor,
-                event,
-            });
-        }
-        Ok(candidates)
-    }
-
-    /// Atomically binds a legacy Event operation row to a stable plaintext
-    /// intent using the freshly reopened original accepted representation.
-    ///
-    /// This pre-reseal migration seam never accepts a newly randomized transfer
-    /// as evidence for the old plaintext. The supplied content capability,
-    /// payload, sealed bytes, and durable legacy transfer must all be exact.
-    pub fn bind_legacy_event_operation_intent_with_policy(
-        &self,
-        policy: &ControlPolicySnapshot,
         request: &EventOperationRequest<'_>,
-        event: &ContentVerifiedEventEnvelope,
-        sealed: &[u8],
     ) -> Result<Option<EventOperationResolution>, StoreError> {
         self.require_live()?;
-        self.require_mission_authority(event.mission_authority_id())?;
-        event
-            .verify_exact_sealed(sealed)
-            .map_err(|error| StoreError::SemanticVerification(error.to_string()))?;
-        validate_event_header(event.header())?;
-        let pending = prepare_event_operation(request, event, event.header())?;
-        let transfer_id = EventTransferId::new(event.envelope_id());
-        let write = self.database.begin_write()?;
-        enforce_live_write(&write)?;
-        require_control_policy_write(&write, event.mission_authority_id(), policy)?;
-        custody::require_custody_mission_write(&write, event.mission_authority_id())?;
-        let existing = write
-            .open_table(EVENT_OPERATIONS)?
-            .get(request.operation().as_bytes())?
-            .map(|value| decode_operation_record(value.value()))
-            .transpose()?;
-        let Some(existing) = existing else {
-            return Ok(None);
-        };
-        if existing.predecessor != request.predecessor() {
-            return Err(StoreError::OperationPredecessorMismatch);
-        }
-        if !existing.legacy_unbound {
-            if existing.payload_digest != pending.payload_digest
-                || existing.intent_digest != pending.intent_digest
-            {
-                return Err(StoreError::EventOperationConflict);
-            }
-            if let Some(stored) = load_event_from_write(&write, existing.transfer_id)? {
-                if !custody::sender_row_live_write(
-                    &write,
-                    CustodyObjectKey::event(existing.transfer_id),
-                )? {
-                    return Ok(Some(EventOperationResolution::Withheld {
-                        transfer_id: stored.transfer_id,
-                        semantic_id: stored.semantic_id,
-                        acceptance_marker: stored.acceptance_marker,
-                    }));
-                }
-                return Ok(Some(EventOperationResolution::Live(Box::new(stored))));
-            }
-            let (semantic_id, acceptance_marker, reason) =
-                custody::retired_event_receipt_write(&write, existing.transfer_id)?.ok_or(
-                    StoreError::SemanticInvariant(
-                        "bound Event operation lost live and retired authority",
-                    ),
-                )?;
-            return Ok(Some(EventOperationResolution::Retired {
-                transfer_id: existing.transfer_id,
-                semantic_id,
-                acceptance_marker,
-                reason,
-            }));
-        }
-        if existing.transfer_id != transfer_id {
-            return Err(StoreError::EventOperationConflict);
-        }
-        let stored =
-            load_event_from_write(&write, transfer_id)?.ok_or(StoreError::SemanticInvariant(
-                "unbound legacy Event operation lost its protected live payload",
-            ))?;
-        if stored.semantic_id.as_bytes() != &event.item_id()
-            || stored.header != *event.header()
-            || stored.sealed != sealed
-        {
-            return Err(StoreError::EventOperationConflict);
-        }
-        bind_event_operation_witness_write(&write, transfer_id, pending.payload_digest)?;
-        let resolution =
-            if custody::sender_row_live_write(&write, CustodyObjectKey::event(transfer_id))? {
-                EventOperationResolution::Live(Box::new(stored))
-            } else {
-                EventOperationResolution::Withheld {
-                    transfer_id: stored.transfer_id,
-                    semantic_id: stored.semantic_id,
-                    acceptance_marker: stored.acceptance_marker,
-                }
-            };
-        write.commit()?;
-        Ok(Some(resolution))
+        self.resolve_event_operation(
+            request.operation,
+            Some(event_operation_intent_digest(
+                request.intent,
+                request.predecessor,
+            )?),
+        )
     }
 
-    /// Resolves an idempotent application operation to its accepted Event.
+    /// Resolves an idempotent application operation to its live accepted Event.
     pub fn event_for_operation(
         &self,
         operation: &EventOperationKey,
     ) -> Result<Option<StoredEvent>, StoreError> {
-        self.require_bound_mission()?;
-        let read = self.database.begin_read()?;
-        let operations = read.open_table(EVENT_OPERATIONS)?;
-        let transfer = operations
-            .get(operation.as_bytes())?
-            .map(|value| decode_operation_record(value.value()).map(|record| record.transfer_id))
-            .transpose()?;
-        drop(operations);
-        drop(read);
-        transfer
-            .map(|id| self.get_event(id))
-            .transpose()?
-            .flatten()
-            .map_or(Ok(None), |event| Ok(Some(event)))
+        Ok(match self.event_operation_resolution(operation)? {
+            Some(EventOperationResolution::Live(event)) => Some(*event),
+            _ => None,
+        })
     }
 
-    /// Resolves an operation without losing its permanent identity after
-    /// finite payload retirement.
+    /// Resolves one mission-bound operation in a single read transaction.
     pub fn event_operation_resolution(
         &self,
         operation: &EventOperationKey,
     ) -> Result<Option<EventOperationResolution>, StoreError> {
-        self.require_bound_mission()?;
+        self.resolve_event_operation(operation, None)
+    }
+
+    fn resolve_event_operation(
+        &self,
+        operation: &EventOperationKey,
+        intent_digest: Option<[u8; 32]>,
+    ) -> Result<Option<EventOperationResolution>, StoreError> {
+        let authority = self.require_bound_mission()?;
         let read = self.database.begin_read()?;
-        let Some(transfer_id) = read
-            .open_table(EVENT_OPERATIONS)?
-            .get(operation.as_bytes())?
-            .map(|value| decode_operation_record(value.value()).map(|record| record.transfer_id))
+        let fingerprint = event_operation::event_operation_fingerprint(&authority, operation);
+        let Some(record) = read
+            .open_table(event_operation::EVENT_OPERATION_LEDGER_V3)?
+            .get(fingerprint.as_slice())?
+            .map(|value| event_operation::decode_event_operation_ledger_record(value.value()))
             .transpose()?
         else {
             return Ok(None);
+        };
+        let transfer_id = match record {
+            event_operation::EventOperationLedgerRecord::Active {
+                intent_digest: stored,
+                transfer_id,
+            } => {
+                if intent_digest.is_some_and(|digest| digest != stored) {
+                    return Err(StoreError::EventOperationConflict);
+                }
+                transfer_id
+            }
+            event_operation::EventOperationLedgerRecord::Retired {
+                intent_digest: stored,
+                reason,
+            } => {
+                if intent_digest.is_some_and(|digest| digest != stored) {
+                    return Err(StoreError::EventOperationConflict);
+                }
+                return Ok(Some(EventOperationResolution::RetiredOperation { reason }));
+            }
         };
         if custody::sender_row_live_read(&read, CustodyObjectKey::event(transfer_id))? {
             let event =
@@ -9381,12 +9357,12 @@ impl Store {
                 )
                 .ok_or(StoreError::PayloadByteAccountingOverflow)?;
         }
-        let mut operation_bytes = 0u64;
+        let mut legacy_operation_bytes = 0u64;
         for row in operations.iter()? {
             let (key, value) = row?;
             EventOperationKey::new(key.value().to_vec())?;
             decode_operation_record(value.value())?;
-            operation_bytes = operation_bytes
+            legacy_operation_bytes = legacy_operation_bytes
                 .checked_add(
                     key.value()
                         .len()
@@ -9396,6 +9372,8 @@ impl Store {
                 )
                 .ok_or(StoreError::PayloadByteAccountingOverflow)?;
         }
+        let operation_stats = event_operation::inspect_event_operation_accounting_read(&read)?;
+        let legacy_operations = operations.len()?;
         let stats = EventStoreStats {
             events: live_events,
             retiring_events,
@@ -9405,8 +9383,7 @@ impl Store {
             route_cached: route_cache.len()?,
             retiring_route_cached,
             route_cached_bytes,
-            operations: operations.len()?,
-            operation_bytes,
+            operation_stats,
         };
         for (field, durable, reconstructed) in [
             (
@@ -9449,14 +9426,14 @@ impl Store {
                 metadata
                     .get(EVENT_OPERATION_COUNT)?
                     .map_or(0, |value| value.value()),
-                stats.operations,
+                legacy_operations,
             ),
             (
                 EVENT_OPERATION_TOTAL_BYTES,
                 metadata
                     .get(EVENT_OPERATION_TOTAL_BYTES)?
                     .map_or(0, |value| value.value()),
-                stats.operation_bytes,
+                legacy_operation_bytes,
             ),
         ] {
             if durable != reconstructed {
@@ -9751,7 +9728,7 @@ impl Store {
         operation: Option<PendingOperation<'_>>,
         guard: EventAdmissionGuard<'_>,
         pending_custody: Option<PendingEventCustody>,
-    ) -> Result<EventCommit, StoreError> {
+    ) -> Result<EventCommitResult, StoreError> {
         self.require_mission_authority(prepared.mission_authority)?;
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
@@ -9804,93 +9781,46 @@ impl Store {
             });
         }
 
-        // A durable operation result wins before optimistic reservation checks.
-        // This is the restart/replay boundary for both initial publication and
-        // reactive publication.
+        // Compare the durable intent before loading any retained Event bytes.
+        // The operation result wins before optimistic reservation checks.
         if let Some(operation) = operation {
-            let existing = {
-                let operations = write.open_table(EVENT_OPERATIONS)?;
-                operations
-                    .get(operation.key.as_bytes())?
-                    .map(|value| decode_operation_record(value.value()))
-                    .transpose()?
-            };
+            let fingerprint = event_operation::event_operation_fingerprint(
+                &prepared.mission_authority,
+                operation.key,
+            );
+            let existing = write
+                .open_table(event_operation::EVENT_OPERATION_LEDGER_V3)?
+                .get(fingerprint.as_slice())?
+                .map(|value| event_operation::decode_event_operation_ledger_record(value.value()))
+                .transpose()?;
             if let Some(existing) = existing {
-                if existing.predecessor != operation.predecessor {
-                    return Err(StoreError::OperationPredecessorMismatch);
-                }
-                if existing.legacy_unbound {
-                    let witness = event_operation_witness_write(&write, existing.transfer_id)?;
-                    if let Some(payload_digest) = witness {
-                        let metadata = write
-                            .open_table(EVENTS)?
-                            .get(existing.transfer_id.as_bytes().as_slice())?
-                            .map(|value| decode_event_metadata(value.value()))
-                            .transpose()?
-                            .ok_or(StoreError::SemanticInvariant(
-                                "witnessed Event operation lost retained metadata",
-                            ))?;
-                        let intent =
-                            event_operation_intent_from_header(&metadata.header, payload_digest);
-                        if operation.payload_digest != payload_digest
-                            || operation.intent_digest
-                                != event_operation_intent_digest(&intent, existing.predecessor)?
-                        {
-                            return Err(StoreError::EventOperationConflict);
-                        }
-                    } else {
-                        if existing.transfer_id != prepared.transfer_id {
-                            return Err(StoreError::EventOperationConflict);
-                        }
-                        let stored = load_event_from_write(&write, existing.transfer_id)?.ok_or(
-                            StoreError::SemanticInvariant(
-                                "unbound legacy Event operation lost its live payload",
-                            ),
-                        )?;
-                        if stored.header != prepared.header || stored.sealed != prepared.sealed {
-                            return Err(StoreError::EventOperationConflict);
-                        }
-                        bind_event_operation_witness_write(
-                            &write,
-                            existing.transfer_id,
-                            operation.payload_digest,
-                        )?;
-                    }
-                    let transfer_id = existing.transfer_id;
-                    if let Some(stored) = load_event_from_write(&write, transfer_id)? {
-                        write.commit()?;
-                        return Ok(EventCommit {
-                            transfer_id,
-                            semantic_id: stored.semantic_id,
-                            apply: ApplyOutcome::Duplicate {
-                                acceptance_marker: stored.acceptance_marker,
-                            },
-                            operation_existing: true,
-                            retirement: None,
-                        });
-                    }
-                    let (semantic_id, acceptance_marker, reason) =
-                        custody::retired_event_receipt_write(&write, transfer_id)?.ok_or(
-                            StoreError::SemanticInvariant(
-                                "witnessed Event operation lost live and retired authority",
-                            ),
-                        )?;
-                    return Ok(EventCommit {
+                let (intent_digest, transfer_id) = match existing {
+                    event_operation::EventOperationLedgerRecord::Active {
+                        intent_digest,
                         transfer_id,
-                        semantic_id,
-                        apply: ApplyOutcome::Duplicate { acceptance_marker },
-                        operation_existing: true,
-                        retirement: Some(reason),
-                    });
-                }
-                if existing.payload_digest != operation.payload_digest
-                    || existing.intent_digest != operation.intent_digest
-                {
+                    } => (intent_digest, transfer_id),
+                    event_operation::EventOperationLedgerRecord::Retired {
+                        intent_digest,
+                        reason,
+                    } => {
+                        if intent_digest != operation.intent_digest {
+                            return Err(StoreError::EventOperationConflict);
+                        }
+                        return Ok(EventCommitResult::RetiredOperation { reason });
+                    }
+                };
+                if intent_digest != operation.intent_digest {
                     return Err(StoreError::EventOperationConflict);
                 }
-                let transfer_id = existing.transfer_id;
+                if !custody::sender_row_live_write(&write, CustodyObjectKey::event(transfer_id))?
+                    && custody::retired_event_receipt_write(&write, transfer_id)?.is_none()
+                {
+                    // Lease drain retains bytes but never restores application
+                    // authority. Keep the active ledger until custody compacts it.
+                    return Err(CustodyStoreError::AlreadyRetired.into());
+                }
                 if let Some(stored) = load_event_from_write(&write, transfer_id)? {
-                    return Ok(EventCommit {
+                    return Ok(EventCommitResult::Retained(EventCommit {
                         transfer_id,
                         semantic_id: stored.semantic_id,
                         apply: ApplyOutcome::Duplicate {
@@ -9898,7 +9828,7 @@ impl Store {
                         },
                         operation_existing: true,
                         retirement: None,
-                    });
+                    }));
                 }
                 let (semantic_id, acceptance_marker, reason) =
                     custody::retired_event_receipt_write(&write, transfer_id)?.ok_or(
@@ -9906,33 +9836,13 @@ impl Store {
                             "Event operation points to missing live and retired authority",
                         ),
                     )?;
-                let metadata = write
-                    .open_table(EVENTS)?
-                    .get(transfer_id.as_bytes().as_slice())?
-                    .map(|value| decode_event_metadata(value.value()))
-                    .transpose()?
-                    .ok_or(StoreError::SemanticInvariant(
-                        "retired Event operation is missing retained metadata",
-                    ))?;
-                let marker = write
-                    .open_table(EVENT_ACCEPTANCE_MARKERS)?
-                    .get(transfer_id.as_bytes().as_slice())?
-                    .map(|value| value.value())
-                    .ok_or(StoreError::SemanticInvariant(
-                        "retired Event operation is missing its acceptance marker",
-                    ))?;
-                if metadata.semantic_id != semantic_id || marker != acceptance_marker {
-                    return Err(StoreError::SemanticInvariant(
-                        "retired Event operation receipt differs from retained metadata",
-                    ));
-                }
-                return Ok(EventCommit {
+                return Ok(EventCommitResult::Retained(EventCommit {
                     transfer_id,
                     semantic_id,
                     apply: ApplyOutcome::Duplicate { acceptance_marker },
                     operation_existing: true,
                     retirement: Some(reason),
-                });
+                }));
             }
         }
 
@@ -10041,42 +9951,25 @@ impl Store {
                     ));
                 }
                 if let Some(operation) = operation {
-                    let operation_record = encode_operation_record(OperationRecord {
-                        transfer_id: prepared.transfer_id,
-                        predecessor: operation.predecessor,
-                        payload_digest: operation.payload_digest,
-                        intent_digest: operation.intent_digest,
-                        legacy_unbound: false,
-                    });
-                    admit_event_operation(
+                    event_operation::admit_retired_event_operation_write(
                         &write,
+                        &prepared.mission_authority,
                         operation.key,
-                        operation_record.len(),
-                        EventOperationCapacity::new(
-                            self.limits,
-                            &prepared.header,
-                            custody_continuity,
-                            custody.sample,
-                        ),
+                        operation.intent_digest,
+                        reason,
+                        self.operation_limits,
                     )?;
-                    if write
-                        .open_table(EVENT_OPERATIONS)?
-                        .insert(operation.key.as_bytes(), operation_record.as_slice())?
-                        .is_some()
-                    {
-                        return Err(StoreError::SemanticInvariant(
-                            "Event operation appeared during retired replay",
-                        ));
-                    }
+                    write.commit()?;
+                    return Ok(EventCommitResult::RetiredOperation { reason });
                 }
                 write.commit()?;
-                return Ok(EventCommit {
+                return Ok(EventCommitResult::Retained(EventCommit {
                     transfer_id: accepted,
                     semantic_id,
                     apply: ApplyOutcome::Duplicate { acceptance_marker },
                     operation_existing: false,
                     retirement: Some(reason),
-                });
+                }));
             }
             let stored =
                 load_event_from_write(&write, accepted)?.ok_or(StoreError::SemanticInvariant(
@@ -10117,36 +10010,18 @@ impl Store {
                 &prepared.sealed,
             )?;
             if let Some(operation) = operation {
-                let operation_record = encode_operation_record(OperationRecord {
-                    transfer_id: prepared.transfer_id,
-                    predecessor: operation.predecessor,
-                    payload_digest: operation.payload_digest,
-                    intent_digest: operation.intent_digest,
-                    legacy_unbound: false,
-                });
-                admit_event_operation(
+                event_operation::admit_active_event_operation_write(
                     &write,
+                    &prepared.mission_authority,
                     operation.key,
-                    operation_record.len(),
-                    EventOperationCapacity::new(
-                        self.limits,
-                        &prepared.header,
-                        custody_continuity,
-                        custody.sample,
-                    ),
+                    operation.intent_digest,
+                    prepared.transfer_id,
+                    self.operation_limits,
+                    prepared.header.tombstone,
                 )?;
-                if write
-                    .open_table(EVENT_OPERATIONS)?
-                    .insert(operation.key.as_bytes(), operation_record.as_slice())?
-                    .is_some()
-                {
-                    return Err(StoreError::SemanticInvariant(
-                        "Event operation appeared during duplicate admission",
-                    ));
-                }
             }
             write.commit()?;
-            return Ok(EventCommit {
+            return Ok(EventCommitResult::Retained(EventCommit {
                 transfer_id: accepted,
                 semantic_id: prepared.semantic_id,
                 apply: ApplyOutcome::Duplicate {
@@ -10154,7 +10029,7 @@ impl Store {
                 },
                 operation_existing: false,
                 retirement: None,
-            });
+            }));
         }
 
         if let Some(reservation) = reservation {
@@ -10379,37 +10254,19 @@ impl Store {
         )?;
 
         if let Some(operation) = operation {
-            let operation_record = encode_operation_record(OperationRecord {
-                transfer_id: prepared.transfer_id,
-                predecessor: operation.predecessor,
-                payload_digest: operation.payload_digest,
-                intent_digest: operation.intent_digest,
-                legacy_unbound: false,
-            });
-            admit_event_operation(
+            event_operation::admit_active_event_operation_write(
                 &write,
+                &prepared.mission_authority,
                 operation.key,
-                operation_record.len(),
-                EventOperationCapacity::new(
-                    self.limits,
-                    &prepared.header,
-                    custody_continuity,
-                    custody.sample,
-                ),
+                operation.intent_digest,
+                prepared.transfer_id,
+                self.operation_limits,
+                prepared.header.tombstone,
             )?;
-            if write
-                .open_table(EVENT_OPERATIONS)?
-                .insert(operation.key.as_bytes(), operation_record.as_slice())?
-                .is_some()
-            {
-                return Err(StoreError::SemanticInvariant(
-                    "Event operation appeared during admission",
-                ));
-            }
         }
         write.commit()?;
 
-        Ok(EventCommit {
+        Ok(EventCommitResult::Retained(EventCommit {
             transfer_id: prepared.transfer_id,
             semantic_id: prepared.semantic_id,
             apply: ApplyOutcome::Inserted {
@@ -10417,7 +10274,7 @@ impl Store {
             },
             operation_existing: false,
             retirement: None,
-        })
+        }))
     }
 
     /// Commits one locally sealed State against its optimistic durable reservation.
@@ -13509,116 +13366,6 @@ fn require_ordinary_aggregate_capacity(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-struct EventOperationCapacity {
-    limits: StoreLimits,
-    aggregate: custody::AggregateCapacityRequest,
-}
-
-impl EventOperationCapacity {
-    fn new(
-        limits: StoreLimits,
-        header: &EnvelopeHeader,
-        continuity: Option<custody::ContinuityRecord>,
-        sample: Option<aster_mesh::CustodySample>,
-    ) -> Self {
-        Self {
-            limits,
-            aggregate: custody::AggregateCapacityRequest {
-                usage: CustodyUsage::default(),
-                priority: header.priority,
-                emergency: header.tombstone,
-                continuity,
-                sample,
-            },
-        }
-    }
-}
-
-fn admit_event_operation(
-    write: &redb::WriteTransaction,
-    operation: &EventOperationKey,
-    encoded_record_len: usize,
-    capacity: EventOperationCapacity,
-) -> Result<(), StoreError> {
-    let incoming = operation
-        .as_bytes()
-        .len()
-        .checked_add(encoded_record_len)
-        .and_then(|length| u64::try_from(length).ok())
-        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-    if capacity.aggregate.emergency {
-        custody::require_event_tombstone_operation_capacity_write(
-            write,
-            capacity.limits,
-            incoming,
-        )?;
-    }
-    custody::make_aggregate_capacity_write(
-        write,
-        capacity.limits,
-        custody::AggregateCapacityRequest {
-            usage: CustodyUsage {
-                items: 1,
-                bytes: incoming,
-            },
-            ..capacity.aggregate
-        },
-    )?;
-    let mut metadata = write.open_table(METADATA)?;
-    let current_count = metadata
-        .get(EVENT_OPERATION_COUNT)?
-        .map_or(0, |value| value.value());
-    let next_count = current_count
-        .checked_add(1)
-        .ok_or(StoreError::ItemCountAccountingOverflow)?;
-    if next_count > MAX_EVENT_OPERATIONS {
-        return Err(StoreError::EventOperationLimitExceeded {
-            current: current_count,
-            limit: MAX_EVENT_OPERATIONS,
-        });
-    }
-    let current_bytes = metadata
-        .get(EVENT_OPERATION_TOTAL_BYTES)?
-        .map_or(0, |value| value.value());
-    let next_bytes = current_bytes
-        .checked_add(incoming)
-        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
-    if next_bytes > MAX_EVENT_OPERATION_BYTES {
-        return Err(StoreError::EventOperationByteLimitExceeded {
-            current: current_bytes,
-            incoming,
-            limit: MAX_EVENT_OPERATION_BYTES,
-        });
-    }
-    if capacity.aggregate.emergency {
-        require_aggregate_capacity(&metadata, capacity.limits, 1, incoming)?;
-        let tombstone_operation_count = metadata
-            .get(EVENT_TOMBSTONE_OPERATION_COUNT)?
-            .map_or(0, |value| value.value());
-        let tombstone_operation_bytes = metadata
-            .get(EVENT_TOMBSTONE_OPERATION_TOTAL_BYTES)?
-            .map_or(0, |value| value.value());
-        metadata.insert(
-            EVENT_TOMBSTONE_OPERATION_COUNT,
-            tombstone_operation_count
-                .checked_add(1)
-                .ok_or(StoreError::ItemCountAccountingOverflow)?,
-        )?;
-        metadata.insert(
-            EVENT_TOMBSTONE_OPERATION_TOTAL_BYTES,
-            tombstone_operation_bytes
-                .checked_add(incoming)
-                .ok_or(StoreError::PayloadByteAccountingOverflow)?,
-        )?;
-    } else {
-        require_ordinary_aggregate_capacity(write, &metadata, capacity.limits, 1, incoming)?;
-    }
-    metadata.insert(EVENT_OPERATION_COUNT, next_count)?;
-    metadata.insert(EVENT_OPERATION_TOTAL_BYTES, next_bytes)?;
-    Ok(())
-}
-
 fn admit_state_operation(
     write: &redb::WriteTransaction,
     limits: StoreLimits,
@@ -15822,6 +15569,11 @@ fn inspect_mission_binding_read_only(path: &Path) -> Result<Option<NodeId>, Stor
         None
     };
     if binding.is_none() {
+        if table_names.contains(EVENT_OPERATIONS.name())
+            && read.open_table(EVENT_OPERATIONS)?.len()? != 0
+        {
+            return Err(StoreError::EventOperationMigrationMissingMissionBinding);
+        }
         let semantic_rows = if table_names.contains(EVENTS.name()) {
             read.open_table(EVENTS)?.len()?
         } else {
@@ -19470,7 +19222,6 @@ fn prepare_event_operation<'a>(
     Ok(PendingOperation {
         key: request.operation,
         predecessor: request.predecessor,
-        payload_digest: request.intent.payload_digest,
         intent_digest: event_operation_intent_digest(request.intent, request.predecessor)?,
     })
 }
@@ -19533,6 +19284,7 @@ fn decode_operation_record(bytes: &[u8]) -> Result<OperationRecord, StoreError> 
     Ok(record)
 }
 
+#[cfg(test)]
 fn encode_event_operation_witness(payload_digest: [u8; 32]) -> [u8; 33] {
     let mut encoded = [0u8; 33];
     encoded[0] = EVENT_OPERATION_WITNESS_VERSION;
@@ -19561,40 +19313,6 @@ fn event_operation_witness_write(
         .get(transfer_id.as_bytes().as_slice())?
         .map(|value| decode_event_operation_witness(value.value()))
         .transpose()
-}
-
-fn event_operation_witness_read(
-    read: &redb::ReadTransaction,
-    transfer_id: EventTransferId,
-) -> Result<Option<[u8; 32]>, StoreError> {
-    read.open_table(EVENT_OPERATION_WITNESSES)?
-        .get(transfer_id.as_bytes().as_slice())?
-        .map(|value| decode_event_operation_witness(value.value()))
-        .transpose()
-}
-
-fn bind_event_operation_witness_write(
-    write: &redb::WriteTransaction,
-    transfer_id: EventTransferId,
-    payload_digest: [u8; 32],
-) -> Result<(), StoreError> {
-    if let Some(existing) = event_operation_witness_write(write, transfer_id)? {
-        if existing != payload_digest {
-            return Err(StoreError::EventOperationConflict);
-        }
-        return Ok(());
-    }
-    let encoded = encode_event_operation_witness(payload_digest);
-    if write
-        .open_table(EVENT_OPERATION_WITNESSES)?
-        .insert(transfer_id.as_bytes().as_slice(), encoded.as_slice())?
-        .is_some()
-    {
-        return Err(StoreError::SemanticInvariant(
-            "Event operation witness appeared during its transaction",
-        ));
-    }
-    Ok(())
 }
 
 fn event_subscription_id(authority: NodeId, key: &EventSubscriptionKey) -> EventSubscriptionId {
@@ -22037,6 +21755,7 @@ fn inspect_semantic_readable(
         .list_tables()?
         .map(|table| table.name().to_owned())
         .collect::<std::collections::BTreeSet<_>>();
+    let operation_stats = event_operation::inspect_event_operation_accounting_read(read)?;
     let acceptance_order_present = table_names.contains(EVENT_ACCEPTANCE_ORDER.name());
     let semantic_tables = [
         EVENTS.name(),
@@ -22058,7 +21777,7 @@ fn inspect_semantic_readable(
         .filter(|name| table_names.contains(**name))
         .count();
     if present == 0 {
-        if acceptance_order_present {
+        if acceptance_order_present || operation_stats != EventOperationStats::default() {
             return Err(StoreError::SemanticInvariant(
                 "mission-scoped Event schema is incomplete",
             ));
@@ -22685,6 +22404,7 @@ fn inspect_semantic_readable(
             || blob_stats.publications != 0
             || blob_stats.variants != 0
             || blob_stats.committed_chunks != 0
+            || operation_stats.records_total != 0
             || route_count != 0)
     {
         return Err(StoreError::SemanticInvariant(
@@ -22701,8 +22421,7 @@ fn inspect_semantic_readable(
         route_cached: route_count,
         retiring_route_cached: 0,
         route_cached_bytes: route_bytes,
-        operations: operation_count,
-        operation_bytes,
+        operation_stats,
     };
     for (field, reconstructed) in [
         (SEMANTIC_ITEM_COUNT, stats.events),
@@ -22713,8 +22432,8 @@ fn inspect_semantic_readable(
         ),
         (ROUTE_CACHE_ITEM_COUNT, stats.route_cached),
         (ROUTE_CACHE_TOTAL_BYTES, stats.route_cached_bytes),
-        (EVENT_OPERATION_COUNT, stats.operations),
-        (EVENT_OPERATION_TOTAL_BYTES, stats.operation_bytes),
+        (EVENT_OPERATION_COUNT, operation_count),
+        (EVENT_OPERATION_TOTAL_BYTES, operation_bytes),
         (EVENT_TOMBSTONE_OPERATION_COUNT, tombstone_operation_count),
         (
             EVENT_TOMBSTONE_OPERATION_TOTAL_BYTES,
@@ -23171,6 +22890,10 @@ fn parse_id(table: &'static str, bytes: &[u8]) -> Result<ItemId, StoreError> {
 
 #[cfg(test)]
 mod tests {
+    mod event_operation_audit;
+    mod event_operation_migration;
+    mod event_operation_publication;
+    mod event_operation_retirement;
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -27785,7 +27508,9 @@ mod tests {
                     panic!("first Ping cannot bind an existing Event")
                 }
                 EventOnceOutcome::Existing { .. } => panic!("first Ping is new"),
-                EventOnceOutcome::Retired { .. } => panic!("first Ping cannot be retired"),
+                EventOnceOutcome::Retired { .. } | EventOnceOutcome::RetiredOperation { .. } => {
+                    panic!("first Ping cannot be retired")
+                }
             };
             let ping_alias_request =
                 EventOperationRequest::new(&ping_alias_key, &ping_intent, ping_payload, None)
@@ -27863,7 +27588,7 @@ mod tests {
                     &pong_event,
                     &pong_bytes,
                 ),
-                Err(StoreError::OperationPredecessorMismatch)
+                Err(StoreError::EventOperationConflict)
             ));
         }
 
@@ -27902,12 +27627,16 @@ mod tests {
         assert_eq!(stats.events, 2);
         assert_eq!(stats.acceptance_markers, 2);
         let usage = reopened.aggregate_usage().expect("aggregate usage");
-        assert_eq!(usage.items, 5, "two Events plus three operation rows");
         assert_eq!(
-            usage.payload_bytes,
-            stats.total_sealed_bytes + stats.operation_bytes,
-            "aggregate usage includes both Event and operation bytes"
+            usage.items, 2,
+            "only the two Events consume ordinary item quota"
         );
+        assert_eq!(
+            usage.payload_bytes, stats.total_sealed_bytes,
+            "the operation ledger has dedicated logical-byte accounting"
+        );
+        assert_eq!(stats.operation_stats.records_total, 3);
+        assert_eq!(stats.operation_stats.logical_bytes, 486);
         assert!(usage.items <= reopened.limits().max_items());
         assert!(usage.payload_bytes <= reopened.limits().max_total_payload_bytes());
     }
@@ -37803,144 +37532,14 @@ mod tests {
             ),
             Err(StoreError::EventOperationConflict)
         ));
-        assert_eq!(store.event_stats().expect("stats").operations, 1);
-    }
-
-    #[test]
-    fn proactive_legacy_event_operation_page_binds_exact_witness_without_row_growth() {
-        let file = TestFile::new("Event proactive legacy witness");
-        let mut services = event_services(0xd7);
-        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
-        let policy = store.control_policy_snapshot().expect("policy");
-        let operation = EventOperationKey::new(b"event/legacy-witness".to_vec()).expect("key");
-        let payload = vec![0xa7; 4 * 1024 * 1024];
-        let reservation = store
-            .reserve_event_with_policy(
-                &policy,
-                services.publisher.identity(),
-                &event_topic(),
-                &event_scope(),
-            )
-            .expect("reservation");
-        let header = reservation
-            .header(
-                Priority::Routine,
-                b"legacy".to_vec(),
-                None,
-                payload.len() as u64,
-                false,
-                1,
-            )
-            .expect("header");
-        let intent = event_publication_intent(&header, &payload);
-        let request =
-            EventOperationRequest::new(&operation, &intent, &payload, None).expect("request");
-        let sealed = services
-            .publisher
-            .seal_event(&header, &payload)
-            .expect("seal");
-        let event = content_event(&mut services.reader, &sealed.bytes);
-        let transfer_id = match store
-            .commit_reserved_event_once_with_policy(
-                &policy,
-                &request,
-                &reservation,
-                &event,
-                &sealed.bytes,
-            )
-            .expect("commit")
-        {
-            EventOnceOutcome::Inserted { transfer_id, .. } => transfer_id,
-            outcome => panic!("unexpected outcome: {outcome:?}"),
-        };
-
-        // Recreate the exact released v1 row shape; migration must not invent
-        // a plaintext digest from semantic metadata.
-        let write = store.database.begin_write().expect("legacy rewrite");
-        let (operation_count, operation_bytes) = {
-            let mut operations = write.open_table(EVENT_OPERATIONS).expect("operations");
-            let _old = operations
-                .get(operation.as_bytes())
-                .expect("read operation")
-                .expect("operation row")
-                .value()
-                .to_vec();
-            let mut legacy = Vec::with_capacity(34);
-            legacy.push(EVENT_OPERATION_LEGACY_VERSION);
-            legacy.extend_from_slice(transfer_id.as_bytes());
-            legacy.push(0);
-            operations
-                .insert(operation.as_bytes(), legacy.as_slice())
-                .expect("write legacy row");
-            let mut operation_bytes = operation
-                .as_bytes()
-                .len()
-                .checked_add(legacy.len())
-                .expect("primary legacy row length");
-            for alias_index in 1..MAX_EVENT_PAGE {
-                let alias = EventOperationKey::new(
-                    format!("event/legacy-witness/{alias_index:04}").into_bytes(),
-                )
-                .expect("legacy alias key");
-                assert!(
-                    operations
-                        .insert(alias.as_bytes(), legacy.as_slice())
-                        .expect("insert legacy alias")
-                        .is_none()
-                );
-                operation_bytes = operation_bytes
-                    .checked_add(alias.as_bytes().len())
-                    .and_then(|value| value.checked_add(legacy.len()))
-                    .expect("legacy alias accounting");
-            }
-            (MAX_EVENT_PAGE as u64, operation_bytes as u64)
-        };
-        {
-            let mut metadata = write.open_table(METADATA).expect("metadata update");
-            metadata
-                .insert(EVENT_OPERATION_COUNT, operation_count)
-                .expect("adjust operation count");
-            metadata
-                .insert(EVENT_OPERATION_TOTAL_BYTES, operation_bytes)
-                .expect("adjust operation bytes");
-        }
-        write.commit().expect("commit legacy fixture");
-
-        let candidates = store
-            .unbound_legacy_event_operations_with_policy(&policy, None, 8)
-            .expect("legacy page");
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].predecessor(), None);
-        assert_eq!(candidates[0].event().transfer_id, transfer_id);
-        assert_eq!(candidates[0].event().sealed.len(), sealed.bytes.len());
-        let recovery_operation = candidates[0].operation().clone();
-        let recovery_request =
-            EventOperationRequest::new(&recovery_operation, &intent, &payload, None)
-                .expect("recovery request");
-        assert!(matches!(
-            store
-                .bind_legacy_event_operation_intent_with_policy(
-                    &policy,
-                    &recovery_request,
-                    &event,
-                    &sealed.bytes,
-                )
-                .expect("bind witness"),
-            Some(EventOperationResolution::Live(_))
-        ));
-        assert!(
-            store
-                .unbound_legacy_event_operations_with_policy(&policy, None, 8)
-                .expect("post-bind page")
-                .is_empty()
-        );
         assert_eq!(
-            store.event_stats().expect("stats").operations,
-            MAX_EVENT_PAGE as u64
+            store
+                .event_stats()
+                .expect("stats")
+                .operation_stats
+                .records_total,
+            1
         );
-        drop(store);
-        Store::inspect_existing(&file.0).expect("inspect witnessed legacy row");
-        Store::open_for_mission(&file.0, services.authority).expect("reopen witnessed legacy row");
     }
 
     #[test]
@@ -38110,6 +37709,19 @@ mod tests {
         assert_eq!(report.marked, vec![key]);
         assert!(report.retired.is_empty());
         assert_eq!(report.blocked_by_leases, 1);
+        assert_eq!(
+            event_operation::inspect_event_operation_accounting_read(
+                &store.database.begin_read().expect("held ledger read")
+            )
+            .expect("held ledger"),
+            EventOperationStats {
+                records_total: 1,
+                records_active: 1,
+                records_retired: 0,
+                reverse_rows: 1,
+                logical_bytes: 162,
+            }
+        );
         assert_eq!(store.get_event(transfer_id).expect("public get"), None);
         assert!(
             store
@@ -38211,9 +37823,8 @@ mod tests {
             store
                 .event_operation_resolution(&operation)
                 .expect("retired operation"),
-            Some(EventOperationResolution::Retired {
+            Some(EventOperationResolution::RetiredOperation {
                 reason: CustodyRetirementReason::Expired,
-                ..
             })
         ));
         drop(store);
@@ -40686,12 +40297,15 @@ mod tests {
             Store::inspect_existing(&file.0).map(|_| ()),
             Store::open_for_mission(&file.0, services.authority).map(|_| ()),
         ] {
-            assert!(matches!(
-                result,
-                Err(StoreError::SemanticInvariant(
-                    "Event operation-witness index has the wrong table kind"
-                ))
-            ));
+            assert!(
+                matches!(
+                    result,
+                    Err(StoreError::SemanticInvariant(
+                        "Event operation-witness index has the wrong table kind"
+                    ))
+                ),
+                "unexpected wrong-kind result: {result:?}"
+            );
         }
     }
 

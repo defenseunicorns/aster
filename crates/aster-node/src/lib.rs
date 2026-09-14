@@ -57,7 +57,7 @@ pub use runtime::{
     NodeApplication, NodeBootstrapError, NodeBootstrapErrorKind, NodeConfig, NodeConfigOptions,
     NodeError, NodeOperatorOutputPolicy, NodeReceipt, PeerReceipt, RunningNode,
     SelectedForwardingConfig, SoftwareZeroizationPathState, SoftwareZeroizationReceipt,
-    SoftwareZeroizationState, SourceInterestSelector, StoreReceipt,
+    SoftwareZeroizationState, SourceInterestSelector, StoreReceipt, audit_store_event_operations,
     ensure_state_accepts_normal_operation, format_control_transfer_id, inspect_store, put_opaque,
     run_demo, run_demo_scenario, run_node, run_node_with_forwarding, start_node,
     start_node_with_forwarding, start_node_with_forwarding_and_output_policy,

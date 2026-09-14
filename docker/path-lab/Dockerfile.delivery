@@ -1,0 +1,36 @@
+# Copyright 2026 Defense Unicorns, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+ARG ASTER_PATH_DELIVERY_BASE_IMAGE=rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97
+
+FROM ${ASTER_PATH_DELIVERY_BASE_IMAGE} AS build
+WORKDIR /work
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY proto ./proto
+COPY third-party ./third-party
+RUN cargo build --locked --release -p aster-node -p aster-agent
+
+FROM ${ASTER_PATH_DELIVERY_BASE_IMAGE} AS runtime
+ENV PYTHONDONTWRITEBYTECODE=1 HOME=/tmp
+COPY lab/debian.sources /etc/apt/sources.list.d/debian.sources
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends iproute2 python3 \
+    && install -d -m 0755 /usr/local/libexec/aster /usr/share/licenses/aster \
+    && dpkg-query -W -f='${binary:Package}\t${Version}\n' iproute2 python3 \
+        > /usr/share/licenses/aster/runtime-package-inventory.tsv \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /work/target/release/aster /usr/local/bin/aster
+COPY --from=build /work/target/release/aster-agent /usr/local/bin/aster-agent
+COPY tools/aster_path_delivery.py /usr/local/libexec/aster/aster_path_delivery.py
+COPY tools/aster_lan_mvp.py /usr/local/libexec/aster/aster_lan_mvp.py
+COPY docker/path-lab/delivery-provision.py /usr/local/libexec/aster/delivery-provision.py
+COPY docker/path-lab/delivery-network-init.py /usr/local/libexec/aster/delivery-network-init.py
+COPY docker/path-lab/delivery-agent.py /usr/local/libexec/aster/delivery-agent.py
+COPY docker/path-lab/delivery-wan.py /usr/local/libexec/aster/delivery-wan.py
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/licenses/aster/
+RUN chmod 0755 /usr/local/bin/aster /usr/local/bin/aster-agent \
+    /usr/local/libexec/aster/*.py
+WORKDIR /opt/aster
+USER 10001:10001
+CMD ["sleep", "600"]

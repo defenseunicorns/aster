@@ -37,6 +37,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -45,11 +46,43 @@ jobs:
           persist-credentials: false
           submodules: false
 
+      - name: Initialize CI Python selection
+        # runner is unavailable in job env; persist the shell-resolved path
+        # for the build, mise setup action, and all later nested mise calls.
+        run: |
+          : "${RUNNER_TEMP:?CI runner scratch directory is required}"
+          : "${GITHUB_ENV:?GitHub Actions environment output is required}"
+          printf 'MISE_PYTHON_VERSION=path:%s/aster-ci-python-3.13.7\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Install CI Python build prerequisites
+        timeout-minutes: 5
+        # Ubuntu 24.04 archive/security revisions; log actual installed versions.
+        # CI-only native build inputs and version policy: docs/ci-python.md.
+        run: |
+          sudo apt-get -o APT::Update::Error-Mode=any update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential pkg-config libbz2-dev libffi-dev liblzma-dev \
+            libsqlite3-dev libssl-dev zlib1g-dev
+          dpkg-query --show --showformat='${Package}\t${Version}\n' \
+            build-essential pkg-config libbz2-dev libffi-dev liblzma-dev \
+            libsqlite3-dev libssl-dev zlib1g-dev
+
+      - name: Build exact-source signal-safe Python
+        timeout-minutes: 15
+        run: bash .github/scripts/build-ci-python.sh
+
       - name: Install repository toolchain
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           version: 2026.4.28
           cache: false
+
+      - name: Verify direct and nested mise signal-safe Python
+        timeout-minutes: 2
+        run: |
+          python3 .github/scripts/test-ci-python.py
+          python3 .github/scripts/check-ci-python.py
+          mise exec -- mise run ci-python-preflight
 
       - name: Install Rust quality components
         run: rustup component add --toolchain 1.97.1 rustfmt clippy
@@ -60,10 +93,101 @@ jobs:
           cargo fetch --locked --manifest-path fuzz/Cargo.toml
           cargo fetch --locked --manifest-path conformance/evaluation-v0/runner/Cargo.toml
 
+      # Keep process acceptance on Linux with the pinned Python 3.13 toolchain;
+      # the signal-safe subprocess path requires POSIX_SPAWN_CLOSEFROM.
+      - name: Run full agent process contract suite
+        timeout-minutes: 5
+        run: python3 tools/test-aster-agent-process.py
+
       - name: Run formatting, lint, tests, bindings, and conformance
         env:
           CARGO_NET_OFFLINE: "true"
         run: mise run check
+
+      - name: Run stock agent process smoke
+        timeout-minutes: 10
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: mise run agent-process-smoke
+
+  path-lab-smoke:
+    name: path-lab netem smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Install exact-pinned Containerlab
+        env:
+          CONTAINERLAB_SHA256: f90d36d58bb6c4afd3b3a4dca006b81594c6d16f7a04be0184b03f44291085a2
+          CONTAINERLAB_URL: https://github.com/srl-labs/containerlab/releases/download/v0.79.0/containerlab_0.79.0_linux_amd64.tar.gz
+        run: |
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            "$CONTAINERLAB_URL" \
+            --output "$RUNNER_TEMP/containerlab.tar.gz"
+          printf '%s  %s\n' "$CONTAINERLAB_SHA256" \
+            "$RUNNER_TEMP/containerlab.tar.gz" | sha256sum --check --strict
+          tar --extract --gzip --file "$RUNNER_TEMP/containerlab.tar.gz" \
+            --directory "$RUNNER_TEMP" containerlab
+          chmod 0755 "$RUNNER_TEMP/containerlab"
+          "$RUNNER_TEMP/containerlab" version --short
+
+      - name: Build the pinned path-lab node image
+        run: |
+          docker pull rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97
+          docker build --pull=false --network=none \
+            --file docker/path-lab/Dockerfile \
+            --tag aster-path-lab:local .
+
+      - name: Execute the netem read-back smoke
+        run: |
+          sudo python3 tools/aster_path_lab.py \
+            docker/path-lab/scenarios/netem-readback-smoke.json \
+            --execute \
+            --containerlab "$RUNNER_TEMP/containerlab"
+
+  path-delivery-smoke:
+    name: path-lab real Event delivery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Validate delivery controller contracts
+        run: |
+          python3 tools/test_aster_path_delivery.py
+          python3 tools/aster_path_delivery.py docker/path-lab/scenarios/event-delivery-netem.json
+          docker version --format '{{.Server.Version}}'
+          uname -r
+
+      - name: Verify isolated delivery build context
+        run: |
+          python3 tools/test_delivery_docker_context_probe.py
+          python3 tools/probe_delivery_docker_context.py --execute
+
+      - name: Build the real-Event delivery image
+        run: |
+          docker pull rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97
+          docker build --pull=false \
+            --file docker/path-lab/Dockerfile.delivery \
+            --tag aster-path-delivery:local .
+
+      - name: Execute the bounded real-Event scenario
+        run: |
+          sudo python3 tools/aster_path_delivery.py \
+            docker/path-lab/scenarios/event-delivery-netem.json \
+            --execute \
+            --docker "$(command -v docker)"
 
   macos-tests:
     name: macOS tests
@@ -244,6 +368,8 @@ jobs:
     if: ${{ always() }}
     needs:
       - quality
+      - path-lab-smoke
+      - path-delivery-smoke
       - macos-tests
       - msrv
       - age-reference-interop
@@ -257,6 +383,8 @@ jobs:
         shell: bash
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
+          PATH_LAB_RESULT: ${{ needs.path-lab-smoke.result }}
+          PATH_DELIVERY_RESULT: ${{ needs.path-delivery-smoke.result }}
           MACOS_RESULT: ${{ needs.macos-tests.result }}
           MSRV_RESULT: ${{ needs.msrv.result }}
           AGE_INTEROP_RESULT: ${{ needs.age-reference-interop.result }}
@@ -266,6 +394,8 @@ jobs:
           umask 077
           for result in \
             "$QUALITY_RESULT" \
+            "$PATH_LAB_RESULT" \
+            "$PATH_DELIVERY_RESULT" \
             "$MACOS_RESULT" \
             "$MSRV_RESULT" \
             "$AGE_INTEROP_RESULT" \

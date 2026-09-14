@@ -29,7 +29,7 @@ and reviewed decision.
 | `P0-1-D05` | P0-1; Decision 0033; security-profile disposition | Semantic v6, profile/suite `0x0001`, unordered IDs, no fallback, non-FIPS | Resolved | no | no | Production security and FIPS paths remain separately gated | none |
 | `P0-1-D06` | P0-1; [approved Raspberry Pi provider v2 design](../superpowers/specs/2026-09-08-raspberry-pi-systemd-credential-provider-v2-design.md) (`sha256:30c5dfe71a203fcdd69dd330f9b5c68eeaee5032b624ee41912aa4723a9f853f`); [systemd 257 presentation amendment](../superpowers/specs/2026-09-09-systemd-257-credential-presentation-amendment.md) (`sha256:549ea3fd5bdfd62c01bab5a8f1adac4b84a2710ab406ea006119c9048e28d4cd`) | `aster-systemd-credential-store/v2`; exact Raspberry Pi reference `2026-06-18` and systemd `257.13-1~deb13u1` credential interface; original `0400`/`ramfs` or exact non-root ACL/read-only-`tmpfs`/`noswap` presentation; explicit host-key protection; statically composed loader; root-operated `aster-credential-admin`; seven-operation lifecycle | Resolved | no | yes | Security/deployment approval of the amendment and provider qualification remain candidate and production gates; no generic `tmpfs` or Debian claim | none |
 | `P0-1-D07` | P0-1; design `Emission modes` | Restart-selected Normal/ReceiveOnly, non-initiation/non-disclosure, both identity orderings, no radio-silence claim | Resolved | no | no | No physical-silence or production emission claim | none |
-| `P0-1-D08` | P0-1; P1-1 follow-on boundary | 1,024-key workload, 512 warning, hard caps/status/error; lifecycle/reclamation excluded | Resolved | no | no | Operation-mapping lifecycle remains production-blocking | none |
+| `P0-1-D08` | P0-1; [selected Event operation-ledger design](../superpowers/specs/2026-09-10-event-operation-ledger-lifecycle-design.md); P1-1 follow-on boundary | 1,024-key evaluation workload and 512 warning over a separately configured permanent mission-bound ledger; active records compact only to permanent retirement fences; exact retry/conflict, reserve, audit, status, and terminal-cap behavior retained | Resolved | no | no | Higher-rate/long-duration physical qualification and production sizing remain blocking; the lifecycle design does not authorize operation-key reuse or a workload above 1,024 | none |
 | `P0-1-D09` | P0-1; `DM-14-03..06`, `DM-14-12..18` | Exact two-node workload/resource matrix and provisional byte-fit gate on both mandatory physical CM4 devices | Resolved | no | no | No production sizing, broader scale, or capacity claim | none |
 | `P0-1-D10` | P0-1; design `Resource and lifecycle targets` | Same-artifact reinstall only; no downgrade or snapshot restore | Resolved | no | no | Production upgrade, rollback, and recovery remain open | none |
 | `P0-1-D11` | P0-1; design metadata/observability sections | Exact metadata budget and bounded authenticated status/error surface | Resolved | no | no | Production observability and exposure acceptance remain open | none |
@@ -74,7 +74,7 @@ remain unchanged and may remain production-governance work.
 | `P0-1-D14-12` | `DM-14-12` | Stripped deployed executable no more than 16 MiB | Resolved | no | no | Atomic requirement unchanged; production-governance work may remain | none |
 | `P0-1-D14-13` | `DM-14-13` | Steady RSS no more than 64 MiB; peak RSS no more than 128 MiB | Resolved | no | no | Atomic requirement unchanged; production-governance work may remain | none |
 | `P0-1-D14-14` | `DM-14-14` | Preferred 32-MiB RAM target is not a v0.1 pass threshold | Excluded | no | no | Atomic requirement unchanged; production-governance work may remain | none |
-| `P0-1-D14-15` | `DM-14-15` | Measure 480 Event rows, 240 local mappings, and documented control/reserve use within the 10,000 aggregate cap; 720 is the ordinary-item projection, not the complete audited composition | Resolved | no | no | Atomic requirement unchanged; production-governance work may remain | none |
+| `P0-1-D14-15` | `DM-14-15` | Measure 480 aggregate Event rows and documented control/reserve use within the 10,000-item store cap; measure 240 local operation-ledger records separately under the dedicated ledger quota; neither projection is complete audited composition | Resolved | no | no | Atomic requirement unchanged; production-governance work may remain | none |
 | `P0-1-D14-16` | `DM-14-16` | Functional with one core; idle at no more than 5% of one core | Resolved | no | no | Atomic requirement unchanged; production-governance work may remain | none |
 | `P0-1-D14-17` | `DM-14-17` | Exactly two required physical CM4 nodes; 8-/20-node qualification excluded from v0.1 | Resolved | no | no | Atomic requirement unchanged; broader scale remains production-governance work | none |
 | `P0-1-D14-18` | `DM-14-18` | Bridged scale excluded | Excluded | no | no | Atomic requirement unchanged; production-governance work may remain | none |
@@ -83,6 +83,54 @@ remain unchanged and may remain production-governance work.
 | `P0-1-D14-21` | `DM-14-21` | Decisions 0025/0028 resolve v0.1 composition only; production-wide buy/build work excluded | Resolved | no | no | Atomic requirement unchanged; production-governance work may remain | none |
 | `P0-1-D14-22` | `DM-14-22` | Explicitly non-FIPS; production FIPS-path decision remains open outside v0.1 | Excluded | no | no | Atomic requirement unchanged; production-governance work may remain | none |
 | `P0-1-D14-23` | `DM-14-23` | No validated-module claim; production module-availability decision remains open outside v0.1 | Excluded | no | no | Atomic requirement unchanged; production-governance work may remain | none |
+
+## Implementation and evidence checkpoint — 2026-09-13
+
+This checkpoint describes inspected `main` commit
+`aec90c96e396ddbae0823f9110414f0a5fd80fd1`, not a G2 source freeze or
+candidate approval. Implemented code, automated checks, and qualification
+receipts are different evidence classes. The gate rows below retain their
+owners, exits, and `Open` status; no atomic requirement gains evidence credit.
+
+| Area / gates | Implemented source and automated coverage | Remaining candidate evidence |
+|---|---|---|
+| Event service and clients — E03/E07 | [Event service](../../crates/aster-agent/src/event_service.rs), [compile-checked Rust examples](../../crates/aster-agent/README.md), [real-node Rust client tests](../../crates/aster-agent/tests/real_node_connect.rs), and [generated-Go recovery client](../../conformance/agent-go/cmd/agent-smoke/main.go) are merged. | Accepted source/process gate and exact-profile Rust/Go execution against the unchanged G3 package on both mandatory CM4 devices; client code is not a qualifying receipt. |
+| ReceiveOnly — E04 | [Customer runtime test](../../crates/aster-agent/tests/customer_runtime.rs) covers `receive_only` readiness and local publication; the configuration and authenticated status path are implemented. | Both-ordering transfer/non-initiation acceptance against the final candidate, including two ReceiveOnly nodes; no radio-silence claim. |
+| Capacity — E05 | The [permanent Event operation ledger](../../crates/aster-redb-store/src/event_operation.rs), [strict candidate configuration](../reference/aster-agent-config-v1.md), and [authenticated status](../../crates/aster-agent/src/event_service.rs) implement separate configured limits, reserve, active/retired compaction, bounded audit, profile headroom, rate estimates, and terminal capacity errors. | Exact-candidate configuration/status bindings, complete healthy audit, physical state/RSS/startup measurements, and generated-Go/crash-reopen acceptance against the unchanged G3 package remain required. |
+| Protected provider — E01/E09 | [`SystemdCredentialLoader` is statically composed](../../crates/aster-agent/src/main.rs) and the [provider administration lifecycle](../../crates/aster-systemd-credentials/README.md#current-implementation-boundary) is implemented. | E01 Security and Deployment acceptance of both immutable D06 records and E09 lifecycle qualification on the exact installed package remain open. |
+| Qualification tooling, package, and resources — E06/E08/E10/E11 | The generic process harness and source tests are preparation, not exact-profile receipt validation or a signed native `arm64` package. | Exact v0.1 receipt validation, reproducible signed package, both-device workload/resource receipts, and threshold disposition remain required. |
+
+[PR #14 CI run 34758425713](https://github.com/edgesoftops/astertech/actions/runs/34758425713)
+completed successfully for head `3c9453dfc7ddb3a08860ae43e3022796b17b0d75`
+before merge into the checkpoint above. The
+[CI workflow](../../.github/workflows/ci.yml) includes quality with
+[`mise run check`](../../mise.toml), Rust workspace/generated-Go checks and the
+full agent process contract suite, plus both path-lab jobs, dependency policy,
+fuzz smoke, MSRV, macOS, and age interoperability. This is existing automated
+evidence, not a new local run or physical acceptance. Merged PRs #14, #15, and
+#16 are credited only as implementation source and automated coverage; they do
+not close candidate gates or create physical qualification receipts. This
+checkpoint does not claim a separate post-merge `main` CI run.
+
+The [CM4 engineering spike](evidence/2026-09-09-cm4-provider-event-engineering-spike.md)
+records pre-candidate physical observations using a temporary unit, explicitly
+not G3/G4 qualification. It did not run the generated-Go qualification client
+or full capacity workload. Final package-bound physical acceptance, resources,
+and the required 24-hour workload remain pending; the
+[prepared inventory](evidence/2026-09-10-cm4-candidate-inventory.md) does not
+close E02.
+
+### Selected operation-ledger capacity boundary
+
+The [accepted containment contract](linux-event-mvp-evaluation-profile-v0.1.md#durable-publish-operation-containment)
+retains an operator/harness stop at 1,024 distinct accepted operation keys and
+warns no later than 512. It now binds the separately configured permanent
+ledger to 1,000,000 records, 192 MiB of logical ledger bytes, and a 10,000-record
+emergency reserve. The runtime may retain implementation headroom after the
+profile stops; 1,024 is not a generic hard rejection. This resolves the earlier
+release-planning ambiguity for v0.1 without widening its successful workload.
+Physical measurements and required role review may retain, lower, or revise a
+later profile, but cannot silently change this candidate contract.
 
 ## Open candidate and production gates
 
@@ -97,7 +145,7 @@ block v0.1 except where the evaluation-blocking cell says otherwise.
 | `P0-1-E02` | Freeze signed qualification annex and exact two-CM4 inventory | Profile + integration | 2026-09-08 | Open | yes | yes | Annex names both mandatory physical CM4 nodes' exact image, Debian identity, kernel, systemd package, architecture, hardware revision, filesystem, relay placement, and network conditions; any participating third CM4 is explicitly declared with its support role | [Non-qualifying prepared sanitized inventory input](evidence/2026-09-10-cm4-candidate-inventory.md); E02 remains open until annex freeze and approval |
 | `P0-1-E03` | Merge/review candidate Event service | Event-service owner | 2026-09-09 | Open | yes | yes | Accepted commit passes clean gate and process suite | none |
 | `P0-1-E04` | Add restart-selected `receive_only` config/status | Event-service + node owner | 2026-09-10 | Open | yes | yes | Both-ordering acceptance passes | none |
-| `P0-1-E05` | Implement authenticated evaluation-capacity status and accurate operation-map exhaustion | Lifecycle/capacity + Event-service + selected-store/node owners | 2026-09-10 | Open | yes | yes | Audited mapping/item/byte use and profile headroom are reported; hard mapping-cap failures are distinguishable and nonretryable; generated-Go and crash/reopen tests pass | none |
+| `P0-1-E05` | Qualify authenticated Event operation-ledger capacity, audit, and failure behavior | Lifecycle/capacity + Event-service + selected-store/node owners | 2026-09-10 | Open | yes | yes | Exact configured ledger/store use, active/retired/reverse rows, ordinary/emergency and profile headroom, completed audit, and warning state are reported; configured-cap failures are distinguishable and nonretryable; generated-Go and crash/reopen tests pass | none |
 | `P0-1-E06` | Add exact v0.1 validation to the qualification harness | Integration + profile owner | 2026-09-10 | Open | yes | yes | Harness rejects a receipt for every tested configuration or workload deviation while leaving the broader generic schema explicit | none |
 | `P0-1-E07` | Deliver the Rust reference client and retain Go contract coverage | API + Event-service owner | 2026-09-10 | Open | yes | yes | Both clients execute the exact v0.1 publish/query/delivery/recovery contract | none |
 | `P0-1-E08` | Produce one signed reproducible native `arm64` package | Deployment/release owner | 2026-09-10 | Open | yes | yes | The provider-composed package reproduces and its complete artifact inventory passes | none |
@@ -105,7 +153,7 @@ block v0.1 except where the evaluation-blocking cell says otherwise.
 | `P0-1-E10` | Run physical target/resource matrix on both mandatory CM4 devices | Integration/physical-carrier owner | 2026-09-12 | Open | yes | yes | Retained receipts for both mandatory physical CM4 devices pass | none |
 | `P0-1-E11` | Review pre-frozen capacity/resource targets | Profile + release owner | 2026-09-13 | Open | yes | yes | Every v0.1 threshold passed, or v0.1 is refused and a revised profile is scheduled | none |
 | `P0-1-E12` | Resolve `DM-8-05` for production | Dependency/license + release owner | 2026-09-30 | Deferred | no | yes | Requirement disposition or technical alternative | none |
-| `P0-1-E13` | Select operation-mapping lifecycle | Lifecycle/capacity owner | 2026-09-30 or before proposing a profile above 1,024 operations | Deferred | no | yes | Reviewed P1-1 generation/retirement decision | none |
+| `P0-1-E13` | Qualify the selected operation-ledger lifecycle above the v0.1 workload or for production | Lifecycle/capacity owner | Before proposing a profile above 1,024 operations | Deferred | no | yes | Reviewed physical/long-duration evidence supports configured capacity, audit latency, active-to-retired compaction, permanent fences, and production sizing | none |
 | `P0-1-E14` | Validate usability-time/sample-size targets | API/product owner | 2026-09-30 | Deferred | no | yes | Independent adopter study sets accepted targets | none |
 | `P0-1-E15` | Complete production-wide standards/build-buy disposition | Architecture + release owner | 2026-09-30 | Deferred | no, unless a candidate adds an undispositioned dependency or bespoke mechanism | yes | Reviewed production composition closes `DM-14-20/21` | none |
 | `P0-1-E16` | Select FIPS/validated-module path | Security/compliance owner | 2026-10-15 | Deferred | no | yes | Reviewed production-profile disposition | none |

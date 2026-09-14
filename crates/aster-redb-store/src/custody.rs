@@ -532,8 +532,8 @@ pub enum CustodyAgeStatus {
 
 /// Snapshot status used by every sender path, including semantic versions
 /// which do not carry finite-lifetime claims on the wire.  `Retiring` is a
-/// receiver-only suppression state: retained bytes may exist for lease drain
-/// or legacy-operation recovery, but they are never public send authority.
+/// receiver-only suppression state: retained bytes may exist for lease drain,
+/// but they are never public send authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CustodySenderStatus {
     Age(CustodyAgeStatus),
@@ -2714,24 +2714,6 @@ fn selected_tombstone_usage_read(
     })
 }
 
-pub(crate) fn require_event_tombstone_operation_capacity_write(
-    write: &redb::WriteTransaction,
-    limits: StoreLimits,
-    incoming_bytes: u64,
-) -> Result<(), StoreError> {
-    let (max_items, max_bytes) = custody_tombstone_allowance(limits);
-    require_quota_capacity(
-        selected_tombstone_usage_write(write)?,
-        &CustodyQuota {
-            scope: None,
-            max_items,
-            max_bytes,
-        },
-        1,
-        incoming_bytes,
-    )
-}
-
 fn check_admission_capacity(
     write: &redb::WriteTransaction,
     admission: &CustodyAdmission,
@@ -2886,7 +2868,7 @@ fn make_admission_capacity_write(
         if retirement_batch.has_active_lease(key) {
             continue;
         }
-        if !finalize_retirement_write(
+        finalize_retirement_write(
             write,
             key,
             &marked,
@@ -2896,9 +2878,7 @@ fn make_admission_capacity_write(
                 CustodyRetirementReason::QuotaPressure
             },
             &mut retirement_batch,
-        )? {
-            continue;
-        }
+        )?;
         let global_fits = require_quota_capacity(
             custody_usage_write(write, None)?,
             &global_quota,
@@ -3011,7 +2991,7 @@ pub(crate) fn make_aggregate_capacity_write(
         if retirement_batch.has_active_lease(key) {
             continue;
         }
-        if !finalize_retirement_write(
+        finalize_retirement_write(
             write,
             key,
             &marked,
@@ -3021,9 +3001,7 @@ pub(crate) fn make_aggregate_capacity_write(
                 CustodyRetirementReason::QuotaPressure
             },
             &mut retirement_batch,
-        )? {
-            continue;
-        }
+        )?;
         if fits(write).is_ok() {
             return Ok(());
         }
@@ -3095,7 +3073,7 @@ fn insert_retirement_fence(
 ///
 /// Peer/object keys are deliberately peer-prefixed for contact lookup, while
 /// retirement is object-oriented. Building these reverse maps once prevents a
-/// pressure or GC batch from rescanning every receipt, delivery, and operation
+/// pressure or GC batch from rescanning every receipt and delivery
 /// for every victim.
 #[derive(Default)]
 struct RetirementBatchIndex {
@@ -3104,7 +3082,6 @@ struct RetirementBatchIndex {
     receipt_keys: BTreeMap<CustodyObjectKey, Vec<Vec<u8>>>,
     pending_keys: BTreeMap<[u8; 32], Vec<Vec<u8>>>,
     acknowledgement_keys: BTreeMap<[u8; 32], Vec<Vec<u8>>>,
-    unbound_event_transfers: BTreeSet<[u8; 32]>,
 }
 
 impl RetirementBatchIndex {
@@ -3156,27 +3133,11 @@ impl RetirementBatchIndex {
                 .or_default()
                 .push(key.value().to_vec());
         }
-        for row in write.open_table(EVENT_OPERATIONS)?.iter()? {
-            let (_, value) = row?;
-            let operation = decode_operation_record(value.value())?;
-            if operation.legacy_unbound
-                && event_operation_witness_write(write, operation.transfer_id)?.is_none()
-            {
-                index
-                    .unbound_event_transfers
-                    .insert(*operation.transfer_id.as_bytes());
-            }
-        }
         Ok(index)
     }
 
     fn has_active_lease(&self, object: CustodyObjectKey) -> bool {
         self.lease_counts.get(&object).copied().unwrap_or(0) != 0
-    }
-
-    fn has_unbound_event_operation(&self, object: CustodyObjectKey) -> bool {
-        object.class == CustodyObjectClass::Event
-            && self.unbound_event_transfers.contains(&object.transfer_id)
     }
 
     fn pending_semantics(&self) -> BTreeSet<[u8; 32]> {
@@ -3678,22 +3639,25 @@ fn finalize_retirement_write(
     record: &CustodyItemRecord,
     reason: CustodyRetirementReason,
     batch: &mut RetirementBatchIndex,
-) -> Result<bool, StoreError> {
+) -> Result<(), StoreError> {
     if !record.retiring {
         return Err(CustodyStoreError::Invariant("retirement finalized before its mark").into());
     }
     if batch.has_active_lease(key) {
         return Err(CustodyStoreError::Retiring.into());
     }
-    if batch.has_unbound_event_operation(key) {
-        // Legacy operation rows carry no authenticated plaintext digest. Keep
-        // the already-marked payload unavailable for delivery/forwarding, but
-        // retain its exact bytes until a content capability atomically upgrades
-        // every operation fence to the stable codec.
-        return Ok(false);
+    if key.class == CustodyObjectClass::Event {
+        event_operation::retire_event_operations_write(
+            write,
+            EventTransferId::new(key.transfer_id),
+            reason,
+        )
+        .map_err(event_operation::classify_retirement_invariant)?;
     }
     batch.remove_peer_rows(write, key)?;
     retire_payload_write(write, key, record, batch)?;
+    #[cfg(test)]
+    event_operation::retirement_test_fault(4)?;
     let retired_revision = advance_revision(write, false)?.1;
     insert_retirement_fence(
         write,
@@ -3721,7 +3685,7 @@ fn finalize_retirement_write(
         );
     }
     update_item_accounting_remove(write, record)?;
-    Ok(true)
+    Ok(())
 }
 
 fn deferred_retirement_reason(record: &CustodyItemRecord) -> CustodyRetirementReason {
@@ -3759,7 +3723,7 @@ fn mark_retiring_write_indexed(
         record.checkpoint = None;
         if key.class == CustodyObjectClass::Event {
             // Application-visible delivery authority ends at the mark, not
-            // after leases or legacy witnesses allow payload collection.
+            // after leases allow payload collection.
             batch.remove_event_delivery_rows(write, record.semantic_id)?;
         }
         let encoded = encode_item(&record)?;
@@ -4025,18 +3989,13 @@ pub(crate) fn admit_event_custody_row_write(
             durable_age_ms,
             &mut retirement_batch,
         )?;
-        if !finalize_retirement_write(
+        finalize_retirement_write(
             write,
             route_key,
             &marked,
             CustodyRetirementReason::Expired,
             &mut retirement_batch,
-        )? {
-            return Err(CustodyStoreError::Invariant(
-                "route-only Event unexpectedly retained an unbound local operation",
-            )
-            .into());
-        }
+        )?;
         return Ok(CustodyAdmissionOutcome::AlreadyRetired { durable_age_ms });
     }
     record.route_only = false;
@@ -4392,7 +4351,7 @@ impl Store {
     }
 
     /// Returns an exclusive, class-separated page of receiver-only Event
-    /// fences, including both marked retirement awaiting lease/legacy drain
+    /// fences, including both marked retirement awaiting lease drain
     /// and permanent logical retirement. Current receive policy, interest,
     /// source revocation, and exact active scope epoch are rechecked in the
     /// snapshot. These records suppress exact re-offers and are never sender
@@ -5873,15 +5832,13 @@ impl Store {
                 continue;
             }
             let bytes = item.accounted_bytes;
-            if !finalize_retirement_write(
+            finalize_retirement_write(
                 &write,
                 key,
                 &item,
                 deferred_retirement_reason(&item),
                 &mut retirement_batch,
-            )? {
-                continue;
-            }
+            )?;
             report.retired.push(key);
             report.released_bytes = report
                 .released_bytes
@@ -6012,7 +5969,7 @@ impl Store {
                 continue;
             }
             let bytes = marked.accounted_bytes;
-            if !finalize_retirement_write(
+            finalize_retirement_write(
                 &write,
                 key,
                 &marked,
@@ -6022,9 +5979,7 @@ impl Store {
                     CustodyRetirementReason::QuotaPressure
                 },
                 &mut retirement_batch,
-            )? {
-                continue;
-            }
+            )?;
             report.retired.push(key);
             report.released_bytes = report
                 .released_bytes

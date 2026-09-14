@@ -17,7 +17,7 @@ use aster_node::{
 };
 use aster_redb_store::{
     CUSTODY_EMERGENCY_BYTE_RESERVE, CUSTODY_EMERGENCY_ITEM_RESERVE, CustodyQuota,
-    MAX_CONTROL_BYTES, MAX_CONTROL_ITEMS,
+    EventOperationLimits, MAX_CONTROL_BYTES, MAX_CONTROL_ITEMS,
 };
 use serde::Deserialize;
 
@@ -47,6 +47,7 @@ pub enum ConfigReason {
     InvalidPeer,
     InvalidRelay,
     InvalidStorage,
+    InvalidOperationStorage,
     LimitOutOfRange,
     LoopbackListenerRequired,
     MissingField,
@@ -73,6 +74,9 @@ impl ConfigReason {
             Self::InvalidPeer => "configuration peer is invalid",
             Self::InvalidRelay => "configuration relay is invalid",
             Self::InvalidStorage => "configuration storage limits are invalid",
+            Self::InvalidOperationStorage => {
+                "configuration storage.operations requires nonzero limits, emergency_reserve < max_records, and max_logical_bytes >= emergency_reserve * 162 without overflow"
+            }
             Self::LimitOutOfRange => "configuration limit is out of range",
             Self::LoopbackListenerRequired => "configuration listener must be loopback",
             Self::MissingField => "configuration is missing a required field",
@@ -337,6 +341,15 @@ struct RawCredentials {
 struct RawStorage {
     max_items: u64,
     max_payload_bytes: u64,
+    operations: RawOperationStorage,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOperationStorage {
+    max_records: u64,
+    max_logical_bytes: u64,
+    emergency_reserve: u64,
 }
 
 #[derive(Default, Deserialize)]
@@ -518,9 +531,17 @@ fn validate_forwarding(
     }
     CustodyQuota::for_store_limits(limits)
         .map_err(|_| ConfigError::new(ConfigReason::StorageTooSmall))?;
+    let operations = raw_storage.operations;
+    let operation_limits = EventOperationLimits::new(
+        operations.max_records,
+        operations.max_logical_bytes,
+        operations.emergency_reserve,
+    )
+    .map_err(|_| ConfigError::new(ConfigReason::InvalidOperationStorage))?;
     let forwarding = SelectedForwardingConfig::default()
         .with_emission_policy(emission_policy)
-        .with_store_limits(limits);
+        .with_store_limits(limits)
+        .with_operation_limits(operation_limits);
     let Some(raw_relay) = raw_relay else {
         return Ok(forwarding);
     };
@@ -681,6 +702,87 @@ mod tests {
             17_891_328
         );
         let _options = config.node_options();
+    }
+
+    #[test]
+    fn v1_operation_storage_accepts_explicit_profile_and_boundary_limits() {
+        // Break caught: ignoring or silently replacing the operator's ledger quota.
+        for (records, bytes, reserve) in [(1_000_000, 201_326_592, 10_000), (3, 324, 2)] {
+            let config = validate_json(config_with_operations(serde_json::json!({
+                "max_records": records,
+                "max_logical_bytes": bytes,
+                "emergency_reserve": reserve,
+            })))
+            .expect("explicit valid operation limits");
+            let limits = config.forwarding().operation_limits();
+            assert_eq!(limits.max_records(), records);
+            assert_eq!(limits.max_logical_bytes(), bytes);
+            assert_eq!(limits.emergency_reserve(), reserve);
+        }
+    }
+
+    #[test]
+    fn v1_operation_storage_requires_exact_object_and_fields() {
+        // Break caught: serde defaults or permissive parsing silently change capacity.
+        let mut config: serde_json::Value =
+            serde_json::from_str(&config_with_storage(4_161, 17_891_328)).unwrap();
+        config["storage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("operations");
+        assert_reason(config.to_string(), ConfigReason::MissingField);
+        for field in ["max_records", "max_logical_bytes", "emergency_reserve"] {
+            let mut operations = valid_operations();
+            operations.as_object_mut().unwrap().remove(field);
+            assert_reason(
+                config_with_operations(operations),
+                ConfigReason::MissingField,
+            );
+        }
+        for field in ["unknown", "max_aliases_per_event"] {
+            let mut operations = valid_operations();
+            operations[field] = 64.into();
+            assert_reason(
+                config_with_operations(operations),
+                ConfigReason::UnknownField,
+            );
+        }
+        assert_reason(
+            config_with_operations(serde_json::Value::Null),
+            ConfigReason::Syntax,
+        );
+        let duplicate = config_with_operations(valid_operations()).replace(
+            "\"max_records\":1000000",
+            "\"max_records\":1000000,\"max_records\":1000000",
+        );
+        assert_reason(duplicate, ConfigReason::DuplicateField);
+    }
+
+    #[test]
+    fn v1_operation_storage_rejects_invalid_reserves_without_echoing_input() {
+        // Break caught: admitting zero/overflowing quotas or consuming emergency bytes.
+        for (records, bytes, reserve) in [
+            (0, 324, 1),
+            (3, 0, 1),
+            (3, 324, 0),
+            (3, 486, 3),
+            (3, 648, 4),
+            (3, 323, 2),
+            (u64::MAX, u64::MAX, u64::MAX / 162 + 1),
+        ] {
+            let error = rejected(
+                validate_json(config_with_operations(serde_json::json!({
+                    "max_records": records,
+                    "max_logical_bytes": bytes,
+                    "emergency_reserve": reserve,
+                }))),
+                "invalid operation limits",
+            );
+            assert_eq!(
+                error.to_string(),
+                "configuration storage.operations requires nonzero limits, emergency_reserve < max_records, and max_logical_bytes >= emergency_reserve * 162 without overflow"
+            );
+        }
     }
 
     #[test]
@@ -940,8 +1042,19 @@ mod tests {
 
     fn config_with_storage(max_items: u64, max_payload_bytes: u64) -> String {
         format!(
-            r#"{{"schema_version":1,"state":{{"directory":"/var/lib/aster-agent"}},"application":{{"listen":"127.0.0.1:8181"}},"health":{{"listen":"127.0.0.1:8182"}},"mesh":{{"bind":"127.0.0.1:8183","sync_interval_ms":500,"emission_policy":"normal","peers":[]}},"credentials":{{"client_token_file":"/run/aster-agent/client-token","mission_secret_ref_file":"/run/aster-agent/mission-ref","mission_load_id":"1111111111111111111111111111111111111111111111111111111111111111"}},"storage":{{"max_items":{max_items},"max_payload_bytes":{max_payload_bytes}}}}}"#
+            r#"{{"schema_version":1,"state":{{"directory":"/var/lib/aster-agent"}},"application":{{"listen":"127.0.0.1:8181"}},"health":{{"listen":"127.0.0.1:8182"}},"mesh":{{"bind":"127.0.0.1:8183","sync_interval_ms":500,"emission_policy":"normal","peers":[]}},"credentials":{{"client_token_file":"/run/aster-agent/client-token","mission_secret_ref_file":"/run/aster-agent/mission-ref","mission_load_id":"1111111111111111111111111111111111111111111111111111111111111111"}},"storage":{{"max_items":{max_items},"max_payload_bytes":{max_payload_bytes},"operations":{{"max_records":1000000,"max_logical_bytes":201326592,"emergency_reserve":10000}}}}}}"#
         )
+    }
+
+    fn valid_operations() -> serde_json::Value {
+        serde_json::json!({"max_records": 1_000_000, "max_logical_bytes": 201_326_592, "emergency_reserve": 10_000})
+    }
+
+    fn config_with_operations(operations: serde_json::Value) -> String {
+        let mut config: serde_json::Value =
+            serde_json::from_str(&config_with_storage(4_161, 17_891_328)).unwrap();
+        config["storage"]["operations"] = operations;
+        config.to_string()
     }
 
     fn json_with(field: &str, value: &str) -> String {

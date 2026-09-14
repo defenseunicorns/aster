@@ -1,0 +1,19 @@
+# Copyright 2026 Defense Unicorns, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+name: aster-path-lab
+
+topology:
+  defaults:
+    kind: linux
+    image: aster-path-lab:local
+  nodes:
+    node-a:
+      cmd: sleep infinity
+    wan:
+      cmd: sleep infinity
+    node-b:
+      cmd: sleep infinity
+  links:
+    - endpoints: ["node-a:eth1", "wan:eth1"]
+    - endpoints: ["wan:eth2", "node-b:eth1"]

@@ -80,12 +80,44 @@ authority and application listener accept work; it does not require a peer,
 carrier connectivity, a recent contact, an empty queue, or convergence.
 Offline-first publication is ready behavior.
 
-`GetStatus` also returns the configured and effective emission mode, aggregate
-logical store use/limits, durable publish-operation rows/bytes and headroom,
-and pending-delivery pressure. For this profile, the operation warning begins
-at 512 rows and the workload stops at 1,024 rows; pending-delivery workload
-saturates at 256. These profile boundaries are lower than the implementation
-hard ceilings and are intended to trigger operator action before refusal.
+`GetStatus` also returns configured and effective emission mode, aggregate
+logical store use/limits, permanent publish-operation usage, and pending
+delivery pressure. The approved profile remains unchanged: operation
+`profile_warning` begins at 512 records and `profile_exhausted` at 1,024;
+`profile_boundary` is 1,024 and `profile_remaining` saturates at zero. Pending
+delivery workload saturates at 256. A higher configured limit does not approve
+a larger evaluation workload.
+
+In `publish_operation_capacity`, `rows`/`bytes` report actual permanent ledger
+use and `row_hard_limit`/`byte_hard_limit` report configured candidate limits.
+The additive `active_rows`, `retired_rows`, and `reverse_rows` expose compact
+retirement, while `ordinary_remaining` and `emergency_remaining` account for
+both record and byte headroom, preserving 162 bytes for each reserved active
+operation. The candidate `warning_state` becomes `WARNING` at 70% and
+`CRITICAL` at 90% of the larger ordinary record/byte occupancy, then `EXHAUSTED`
+when no ordinary record fits. Candidate headroom can remain positive after
+the approved profile is exhausted.
+
+`rolling_accept_rate` is newly committed permanent records in the last
+monotonic 60 seconds divided by 60. New aliases and direct retired fences
+count; exact retries, conflicts, and failed admission do not. The window starts
+empty on restart and expires samples at exactly 60 seconds. The estimate in
+`estimated_seconds_to_exhaustion` rounds ordinary headroom/rate up to whole
+seconds, saturates at `u64::MAX`, and is zero without an observed rate or
+headroom. It is planning information; warning state remains occupancy-only
+until Event retention is configurable.
+
+The nested `audit` reports `PENDING`, `RUNNING`, `COMPLETE`, or `FAILED`, with
+`scanned`/`total` counting ledger and reverse rows in one fixed snapshot.
+Completion includes accounting checks; later commits belong to the next pass.
+Failure closes new Event publication and leaves usage/headroom at the last
+successfully read figures, which must not be trusted as current capacity.
+
+Every operation key remains bound to its mission and intent after payload
+retirement. Plan a new mission namespace or a larger prequalified limit before
+mission start when capacity is insufficient. Never manually delete ledger
+rows or reuse retired keys. See the [capacity reference](../reference/aster-agent-config-v1.md#storage-reserve-calculation)
+for configuration details; no larger-capacity qualification is claimed here.
 
 Only `GET` with no body is accepted. Unknown paths return `404`, other methods
 return `405`, and responses contain no node, mission, peer, path, queue, or
@@ -144,6 +176,12 @@ provisioning, or the customer supervisor.
 
 ## Authenticate application calls
 
+Rust callers can use the [compile-checked API examples](../../crates/aster-agent/README.md)
+for authenticated Connect and gRPC clients, borrowed and owned responses, and
+the development/migration server entry point. Enable the `aster-agent` `client`
+feature for the generated Rust client. Customer binaries use the provider-composed
+runtime described above.
+
 Generate a normal client from the local authoritative schema at
 [`proto/aster/application/v1alpha1/aster.proto`](../../proto/aster/application/v1alpha1/aster.proto).
 The module needs no Buf Schema Registry. Point it at the configured application
@@ -173,7 +211,10 @@ attempt:
 4. Never create a new key merely because the result was unknown.
 
 The same key and byte-equivalent request returns the original effect; it does
-not publish a duplicate. Reusing the key with different content fails closed
+not publish a duplicate. Durable receipt fields stay the same, while the
+per-call `inserted` flag changes from `true` on first acceptance to `false` on
+retry. Do not compare the complete responses as byte-identical. Reusing the
+key with different content fails closed
 with `Aborted` and `PUBLIC_ERROR_REASON_OPERATION_KEY_CONFLICT`. This resolves
 uncertain outcomes; it does not make two different application effects
 equivalent.
@@ -204,6 +245,22 @@ remains complete across restart.
 acknowledges implicitly and does not provide exactly-once application effects.
 `DeleteEventSubscription` idempotently removes the selector and its delivery
 ledger; recreating a selector establishes a new subscription contract.
+
+### Generated-Go client replacement example
+
+The [two-process Go example](../../conformance/agent-go/cmd/agent-smoke/README.md)
+publishes and retries one fixed operation key, then exits after validating the
+exact attempt-one delivery without ACK. A new client process attaches to the
+same live agent and durable subscription, validates exact attempt-two
+redelivery, and ACKs. Successful empty, caught-up polls then span at least
+500 ms before a final exact retained-Event query. The window starts after the
+first successful empty response and requires a successful final poll initiated
+at or after its end; slow RPC responses cannot consume the observation window.
+
+This is a bounded exclusive-consumer integration example, not agent-crash,
+exactly-once application, physical-network, or production-provider evidence.
+The existing process checker includes it without changing runtime or wire
+semantics. Its fixture remains unprotected and test-only.
 
 ## Back off on resource pressure
 
