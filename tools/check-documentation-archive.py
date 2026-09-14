@@ -9,14 +9,17 @@ import argparse
 import csv
 import errno
 import hashlib
+import html
 import io
 import os
 from pathlib import Path, PurePosixPath
+import posixpath
 import re
 import stat
 import subprocess
 import sys
 from typing import NamedTuple
+from urllib.parse import unquote, urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,6 +66,15 @@ ARCHIVE_PREFIXES = {
     ),
     "decision": ("archive/design-history/retired-decisions/",),
 }
+DEFAULT_NAVIGATION = (Path("README.md"), Path("docs/README.md"))
+FENCE = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})(.*)$")
+INLINE_LINK = re.compile(r"!?\[(?:\\.|[^\]\\\n])*\]\([ \t]*")
+REFERENCE_DEFINITION = re.compile(
+    r"^[ ]{0,3}\[(?:\\.|[^\]\\\n])+\]:[ \t]*"
+    r"(?:<((?:\\.|[^>\\\n])*)>|((?:\\.|[^\s])+))",
+    re.MULTILINE,
+)
+MARKDOWN_ESCAPABLE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
 
 
 class InventoryRow(NamedTuple):
@@ -469,6 +481,169 @@ def _read_inventory(repository_root: Path) -> tuple[InventoryRow, ...]:
     return parse_inventory(text)
 
 
+def _without_fenced_code(text: str) -> str:
+    rendered: list[str] = []
+    fence_character = ""
+    fence_length = 0
+    for line in text.splitlines(keepends=True):
+        candidate = line.rstrip("\r\n")
+        match = FENCE.match(candidate)
+        if fence_character:
+            if (
+                match is not None
+                and match.group(1)[0] == fence_character
+                and len(match.group(1)) >= fence_length
+                and not match.group(2).strip()
+            ):
+                fence_character = ""
+                fence_length = 0
+            rendered.append("\n" if line.endswith("\n") else "")
+            continue
+        if match is not None and not (
+            match.group(1)[0] == "`" and "`" in match.group(2)
+        ):
+            fence_character = match.group(1)[0]
+            fence_length = len(match.group(1))
+            rendered.append("\n" if line.endswith("\n") else "")
+            continue
+        rendered.append(line)
+    return "".join(rendered)
+
+
+def _without_inline_code(text: str) -> str:
+    rendered: list[str] = []
+    position = 0
+    while position < len(text):
+        if text[position] != "`":
+            rendered.append(text[position])
+            position += 1
+            continue
+        end = position + 1
+        while end < len(text) and text[end] == "`":
+            end += 1
+        delimiter = text[position:end]
+        closing = text.find(delimiter, end)
+        while closing >= 0 and (
+            (closing > 0 and text[closing - 1] == "`")
+            or (
+                closing + len(delimiter) < len(text)
+                and text[closing + len(delimiter)] == "`"
+            )
+        ):
+            closing = text.find(delimiter, closing + 1)
+        if closing < 0:
+            rendered.append(delimiter)
+            position = end
+            continue
+        code = text[position:closing + len(delimiter)]
+        rendered.extend("\n" if character == "\n" else " " for character in code)
+        position = closing + len(delimiter)
+    return "".join(rendered)
+
+
+def _decoded_markdown_destination(destination: str) -> str:
+    decoded = MARKDOWN_ESCAPABLE.sub(r"\1", html.unescape(destination))
+    try:
+        return unquote(decoded, encoding="utf-8", errors="strict")
+    except UnicodeDecodeError:
+        fail("Markdown destination is not valid UTF-8 percent-encoding")
+
+
+def _inline_destination(text: str, start: int) -> tuple[str, int] | None:
+    if start >= len(text):
+        return None
+    if text[start] == "<":
+        position = start + 1
+        while position < len(text):
+            if text[position] == "\\":
+                position += 2
+                continue
+            if text[position] == ">":
+                return text[start + 1:position], position + 1
+            if text[position] in "\r\n":
+                return None
+            position += 1
+        return None
+
+    position = start
+    depth = 0
+    while position < len(text):
+        character = text[position]
+        if character == "\\":
+            position += 2
+            continue
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            if depth == 0:
+                return text[start:position], position
+            depth -= 1
+        elif character.isspace() and depth == 0:
+            return text[start:position], position
+        position += 1
+    return None
+
+
+def markdown_destinations(text: str) -> tuple[str, ...]:
+    """Return decoded link destinations outside Markdown code spans."""
+    visible = _without_inline_code(_without_fenced_code(text))
+    destinations: list[tuple[int, str]] = []
+    for match in INLINE_LINK.finditer(visible):
+        parsed = _inline_destination(visible, match.end())
+        if parsed is not None:
+            destination, _ = parsed
+            destinations.append(
+                (match.start(), _decoded_markdown_destination(destination))
+            )
+    for match in REFERENCE_DEFINITION.finditer(visible):
+        destination = match.group(1) if match.group(1) is not None else match.group(2)
+        destinations.append((match.start(), _decoded_markdown_destination(destination)))
+    destinations.sort(key=lambda item: item[0])
+    return tuple(destination for _, destination in destinations)
+
+
+def _navigation_path(source: Path, destination: str) -> str | None:
+    parsed = urlsplit(destination)
+    if parsed.scheme or parsed.netloc or destination.startswith("//"):
+        return None
+    if not parsed.path:
+        return ""
+    if parsed.path.startswith("/"):
+        combined = parsed.path
+    else:
+        parent = source.parent.as_posix()
+        combined = f"{parent}/{parsed.path}" if parent != "." else parsed.path
+    return posixpath.normpath("/" + combined).lstrip("/")
+
+
+def validate_navigation(repository_root: Path) -> None:
+    """Reject archive links from the two default documentation indexes."""
+    for relative_path in DEFAULT_NAVIGATION:
+        path = repository_root / relative_path
+        try:
+            status = path.lstat()
+            if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
+                fail(
+                    "default navigation file is not regular: "
+                    f"{relative_path.as_posix()}"
+                )
+            text = path.read_bytes().decode("utf-8", errors="strict")
+        except ArchiveViolation:
+            raise
+        except (OSError, UnicodeDecodeError):
+            fail(f"cannot read default navigation file: {relative_path.as_posix()}")
+        try:
+            destinations = markdown_destinations(text)
+        except ArchiveViolation:
+            fail(f"default navigation has an invalid destination: {relative_path.as_posix()}")
+        for destination in destinations:
+            normalized = _navigation_path(relative_path, destination)
+            if normalized == "archive" or (
+                normalized is not None and normalized.startswith("archive/")
+            ):
+                fail(f"default navigation links to archive: {relative_path.as_posix()}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -484,10 +659,14 @@ def main(argv: list[str] | None = None) -> int:
             count = validate_manifest(ROOT)
         rows = _read_inventory(ROOT)
         validate_inventory(rows, tracked_candidate_paths(ROOT))
+        validate_navigation(ROOT)
     except ArchiveViolation as error:
         print(f"documentation archive failed: {error}", file=sys.stderr)
         return 1
-    print(f"documentation archive passed: {len(rows)} candidate rows, {count} archive files")
+    print(
+        f"documentation archive passed: {count} archive files, "
+        f"{len(rows)} candidate rows; default navigation excludes archive"
+    )
     return 0
 
 

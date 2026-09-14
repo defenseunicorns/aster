@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout
 import csv
 import importlib.util
 import io
@@ -453,6 +454,134 @@ class DocumentationInventoryTests(unittest.TestCase):
         subprocess.run([b"git", b"-C", os.fsencode(self.root), b"add", b"--", path], check=True)
         with self.assertRaises(CHECKER.ArchiveViolation):
             CHECKER.tracked_candidate_paths(self.root)
+
+
+class DocumentationNavigationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+
+    def write(self, relative_path: str, content: bytes) -> Path:
+        destination = self.root / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+        return destination
+
+    def test_markdown_destinations_decodes_inline_and_reference_destinations(self) -> None:
+        text = (
+            "[inline](archive&#47;research/)\n"
+            "[encoded](archive%2Fresearch%2F)\n"
+            "[reference][history]\n"
+            "[history]: <docs/design\\(history\\).md> \"Design history\"\n"
+        )
+
+        self.assertEqual(
+            CHECKER.markdown_destinations(text),
+            (
+                "archive/research/",
+                "archive/research/",
+                "docs/design(history).md",
+            ),
+        )
+
+    def test_default_navigation_rejects_normalized_archive_links(self) -> None:
+        cases = (
+            ("README.md", "archive/research/"),
+            ("README.md", "/archive/design-history/"),
+            ("README.md", "docs/../archive/?view=all#history"),
+            ("docs/README.md", "../archive/#research"),
+        )
+        for source, destination in cases:
+            with self.subTest(source=source, destination=destination):
+                self.write("README.md", b"# Aster\n")
+                self.write("docs/README.md", b"# Documentation\n")
+                self.write(source, f"[history]({destination})\n".encode())
+
+                with self.assertRaisesRegex(
+                    CHECKER.ArchiveViolation,
+                    rf"default navigation.*{source.replace('/', r'\/')}",
+                ):
+                    CHECKER.validate_navigation(self.root)
+
+    def test_reference_definition_resolving_to_archive_fails(self) -> None:
+        self.write("README.md", b"# Aster\n")
+        self.write(
+            "docs/README.md",
+            b"[history][archive-history]\n\n"
+            b"[archive-history]: ../archive/design-history/\n",
+        )
+
+        with self.assertRaisesRegex(
+            CHECKER.ArchiveViolation, "default navigation.*docs/README.md"
+        ):
+            CHECKER.validate_navigation(self.root)
+
+    def test_non_link_archive_text_code_and_external_urls_are_allowed(self) -> None:
+        self.write(
+            "README.md",
+            b"The word archive is ordinary prose.\n"
+            b"Use `archive/` only for maintenance.\n"
+            b"[public](https://example.com/archive/research/)\n"
+            b"[protocol-relative](//example.com/archive/)\n"
+            b"[mail](mailto:archive@example.com)\n"
+            b"```markdown\n[ignored](archive/research/)\n```\n",
+        )
+        self.write(
+            "docs/README.md",
+            b"~~~\n[ignored][history]\n[history]: ../archive/\n~~~\n",
+        )
+
+        CHECKER.validate_navigation(self.root)
+
+    def test_navigation_ignores_documents_outside_default_indexes(self) -> None:
+        self.write("README.md", b"# Aster\n")
+        self.write("docs/README.md", b"# Documentation\n")
+        self.write("docs/guide.md", b"[history](../archive/)\n")
+
+        CHECKER.validate_navigation(self.root)
+
+    def test_inline_triple_backticks_do_not_hide_a_later_link(self) -> None:
+        self.write(
+            "README.md",
+            b"```[not a fence](archive/)```\n"
+            b"[history](archive/design-history/)\n",
+        )
+        self.write("docs/README.md", b"# Documentation\n")
+
+        with self.assertRaisesRegex(
+            CHECKER.ArchiveViolation, "default navigation.*README.md"
+        ):
+            CHECKER.validate_navigation(self.root)
+
+    def test_cli_validates_navigation_after_manifest_and_inventory(self) -> None:
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self.write("archive/README.md", b"policy\n")
+        self.write("archive/MANIFEST.sha256", b"invalid\n")
+        self.write(
+            "docs/implementation/documentation-refactor-inventory.csv",
+            (",".join(CHECKER.INVENTORY_HEADER) + "\n").encode(),
+        )
+        self.write("README.md", b"[history](archive/)\n")
+        self.write("docs/README.md", b"# Documentation\n")
+        stderr = io.StringIO()
+
+        with patch.object(CHECKER, "ROOT", self.root), redirect_stderr(stderr):
+            self.assertEqual(CHECKER.main([]), 1)
+        self.assertIn("manifest", stderr.getvalue())
+        self.assertNotIn("default navigation", stderr.getvalue())
+
+        CHECKER.write_manifest(self.root)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            patch.object(CHECKER, "ROOT", self.root),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(CHECKER.main([]), 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertRegex(stderr.getvalue(), "default navigation.*README.md")
 
 
 if __name__ == "__main__":
