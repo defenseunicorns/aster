@@ -87,6 +87,7 @@ class DestinationSpan(NamedTuple):
     start: int
     end: int
     destination: str
+    label_end: int | None = None
 
 
 class ArchiveViolation(ValueError):
@@ -526,8 +527,7 @@ def _without_inline_code(text: str) -> str:
         delimiter = text[position:end]
         closing = text.find(delimiter, end)
         while closing >= 0 and (
-            _is_escaped(text, closing)
-            or (closing > 0 and text[closing - 1] == "`")
+            (closing > 0 and text[closing - 1] == "`")
             or (
                 closing + len(delimiter) < len(text)
                 and text[closing + len(delimiter)] == "`"
@@ -734,6 +734,16 @@ def _inline_destinations(text: str) -> tuple[DestinationSpan, ...]:
         start = text.find("[", position)
         if start < 0:
             break
+        occupied_end = next(
+            (
+                span.end for span in destinations
+                if span.label_end is not None and span.label_end <= start < span.end
+            ),
+            None,
+        )
+        if occupied_end is not None:
+            position = occupied_end
+            continue
         if _is_escaped(text, start):
             position = start + 1
             continue
@@ -750,10 +760,9 @@ def _inline_destinations(text: str) -> tuple[DestinationSpan, ...]:
                         start,
                         end + 1,
                         _decoded_markdown_destination(destination),
+                        closing,
                     )
                 )
-                position = max(end + 1, closing + 2)
-                continue
         position = start + 1
     return tuple(destinations)
 
@@ -868,12 +877,19 @@ def markdown_destinations(text: str) -> tuple[str, ...]:
     destinations.extend(_reference_destinations(visible))
     destinations.sort(key=lambda item: (item.start, -item.end))
     selected: list[str] = []
-    occupied_until = 0
+    occupied: list[tuple[int, int]] = []
     for destination in destinations:
-        if destination.start < occupied_until:
+        if any(start <= destination.start < end for start, end in occupied):
             continue
         selected.append(destination.destination)
-        occupied_until = destination.end
+        # Inline labels may contain real links or images; destinations and
+        # titles, and entire reference definitions, are not navigation text.
+        start = (
+            destination.start
+            if destination.label_end is None
+            else destination.label_end
+        )
+        occupied.append((start, destination.end))
     return tuple(selected)
 
 

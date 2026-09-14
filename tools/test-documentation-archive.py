@@ -606,6 +606,32 @@ class DocumentationNavigationTests(unittest.TestCase):
                 ):
                     CHECKER.validate_navigation(self.root)
 
+    def test_backslash_does_not_escape_a_closing_code_span_backtick(self) -> None:
+        text = "`code \\` [history](archive/) `\n"
+        self.assertEqual(CHECKER.markdown_destinations(text), ("archive/",))
+        self.write("README.md", text.encode())
+        self.write("docs/README.md", b"# Documentation\n")
+
+        with self.assertRaisesRegex(
+            CHECKER.ArchiveViolation, "default navigation.*README.md"
+        ):
+            CHECKER.validate_navigation(self.root)
+
+    def test_nested_link_or_image_destinations_cannot_hide_in_an_outer_label(self) -> None:
+        for text in (
+            "[outer [inner](archive/)](docs/current.md)\n",
+            "[outer ![image](archive/)](docs/current.md)\n",
+        ):
+            with self.subTest(text=text):
+                self.assertIn("archive/", CHECKER.markdown_destinations(text))
+                self.write("README.md", text.encode())
+                self.write("docs/README.md", b"# Documentation\n")
+
+                with self.assertRaisesRegex(
+                    CHECKER.ArchiveViolation, "default navigation.*README.md"
+                ):
+                    CHECKER.validate_navigation(self.root)
+
     def test_all_title_delimiters_preserve_atomic_inline_spans(self) -> None:
         for text in (
             "[safe](docs/current.md 'one\n[fake]: archive/\nthree')\n",
@@ -767,6 +793,13 @@ class DocumentationNavigationTests(unittest.TestCase):
         self.write("docs/README.md", b"# Documentation\n")
 
         CHECKER.validate_navigation(self.root)
+
+    def test_inline_title_destinations_are_not_decoded(self) -> None:
+        text = '[safe](docs/current.md "[example](%FF)")\n'
+        self.assertEqual(
+            CHECKER.markdown_destinations(text),
+            ("docs/current.md",),
+        )
 
     def test_repeated_soft_breaks_in_archive_link_title_still_fail(self) -> None:
         text = '[x](archive/ "one\ntwo\nthree")\n'
