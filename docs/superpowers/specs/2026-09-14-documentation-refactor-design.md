@@ -317,7 +317,8 @@ The refactor is complete when:
   current representation;
 - every regular archive file except the manifest itself is present in
   `archive/MANIFEST.sha256` and every digest verifies;
-- repository checks report no stale internal paths or broken current links;
+- human review confirms navigation and exact path consumers have no stale
+  internal paths or broken current links;
   and
 - requirements traceability and all retained evidence remain valid without
   broadening any implementation claim.
