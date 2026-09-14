@@ -1,12 +1,12 @@
 # Decision 0036: Admit discovered LAN peers through mission authentication
 
+> ****
 
 - Status: Accepted for the Event mesh MVP
 - Date: 2026-08-31
 - Authority: [data-mesh-requirements.md](../../data-mesh-requirements.md)
-- Related: [Decision 0030](0030-event-first-local-connect-agent.md),
-  [Decision 0034](0034-short-lived-iroh-nearby-discovery.md), and
-  [Decision 0035](0035-field-notes-human-introduction.md)
+- Related: [Decision 0030](0030-event-first-local-connect-agent.md) and
+  [Decision 0034](0034-short-lived-iroh-nearby-discovery.md)
 
 ## Context
 

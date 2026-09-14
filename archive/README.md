@@ -8,5 +8,5 @@ Archived documents may describe behavior or decisions that no longer apply.
 They are retained for historical context and are not part of the normal product
 documentation path.
 
-- `design-history/` contains completed or superseded plans and designs.
+- `design-history/` contains completed or superseded plans, designs, and decisions.
 - `research/` contains closed evaluations, proposals, and experiments.
