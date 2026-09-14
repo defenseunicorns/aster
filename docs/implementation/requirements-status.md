@@ -2556,7 +2556,7 @@ The current-toolchain and Rust 1.91 results are separate executions and their
 timings are not pooled.
 
 Representative focused commands and the selected CI gate are documented in
-[Continuous integration](../ci.md#selected-composition-coverage). The two
+[Continuous integration](../validation/ci.md#selected-composition-coverage). The two
 499-test totals above are recorded exact-tree validation results; this ledger
 does not claim that the focused command excerpt is a complete transcript of
 either matrix execution.

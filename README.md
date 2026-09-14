@@ -274,7 +274,7 @@ mise install
 mise run check
 ```
 
-See [CI and local validation](docs/ci.md) for narrower checks and the precise
+See [CI and local validation](docs/validation/ci.md) for narrower checks and the precise
 claim attached to each gate.
 
 ## License

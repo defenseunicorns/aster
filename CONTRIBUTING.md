@@ -36,5 +36,5 @@ mise run fuzz-smoke
   resource, and migration effects.
 
 All GitHub Actions execute untrusted pull requests without repository secrets
-and with a read-only token. See `docs/ci.md` before changing workflow files or
+and with a read-only token. See `docs/validation/ci.md` before changing workflow files or
 tool pins.

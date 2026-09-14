@@ -31,7 +31,7 @@ part of the normal reading path.
 | Application APIs | [Application recipes](application-recipes.md), [ConnectRPC agent](quickstart/connect-agent.md), [selected Rust APIs](quickstart/README.md), [agent configuration](reference/aster-agent-config-v1.md), and [binding pattern](bindings/pattern.md) |
 | Implementation | [Architecture](architecture.md), [Security](security.md), [Carriers and contacts](transports.md), and component README files under `crates/` |
 | MVP operation | [Linux Event MVP coordination](mvp/linux-event-mvp-coordination-guide.md), [operator runbook](mvp/linux-event-mvp-runbook.md), and [credential-provider operations](mvp/raspberry-pi-provider-v2-operations.md) |
-| Validation | [Capability roadmap](implementation/capability-roadmap.md), [requirements status](implementation/requirements-status.md), [conformance](conformance.md), [CI](ci.md), and [qualification receipt validator](implementation/linux-event-mvp-qualification-receipt-validator-spec.md) |
+| Validation | [CI](validation/ci.md), [qualification receipt validator](validation/linux-event-mvp-qualification-receipt-validator-spec.md), [capability roadmap](implementation/capability-roadmap.md), [requirements status](implementation/requirements-status.md), and [conformance](conformance.md) |
 | Decisions | [`docs/decisions/`](decisions/) records the rationale for boundaries that still constrain the product; specifications and current references remain authoritative for behavior |
 
 ## Document authority

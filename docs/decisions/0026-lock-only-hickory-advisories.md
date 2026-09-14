@@ -6,7 +6,7 @@
   mDNS-disabled libp2p profile in Proposal 0003
 - Related: [Decision 0002](0002-dependency-admission.md),
   [Proposal 0002](../proposals/0002-provider-neutral-mesh-host.md), and
-  [CI policy](../ci.md)
+  [CI policy](../validation/ci.md)
 
 ## Context
 
