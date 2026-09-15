@@ -38,103 +38,24 @@ stay local to the display and are never discovery metadata. The
 nearby windows, no-silent-fallback rule, invitation option, and exact
 evaluation boundary.
 
-To try automatic discovery across three Ubuntu hosts on one trusted LAN, build
-the feature-gated agents and follow the
-[three-host LAN Event quickstart](docs/quickstart/lan-mvp.md). It uses no
-operator-supplied peer identities or addresses, carries one offline Event from
-A through B to C across separate contacts, verifies restart persistence, and
-rejects a separately provisioned outsider. This is an evaluation procedure,
-not retained physical or production evidence.
-
-For the fastest rehearsal on a native Linux Docker Engine, run the same staged
-acceptance shape on one private Compose bridge:
-
-```sh
-mise run lan-mvp-compose
-```
-
-The controller validates exact delivery, outsider rejection, and peerless
-restart persistence, then removes its project-scoped containers, bridge, and
-volumes plus its uniquely named image. This is same-host development feedback,
-not physical-LAN evidence.
-
-After the four-node path passes, measure the current flat discovery ceiling one
-tier at a time with the generated
-[concurrent LAN scale baseline](docs/quickstart/lan-scale.md):
-
-```sh
-mise run lan-scale-compose -- --nodes 8
-mise run lan-scale-compose -- --nodes 16
-mise run lan-scale-compose -- --nodes 32
-```
-
-Each authorized node publishes offline, every authorized node must converge on
-the exact complete Event set, and one different-authority outsider must remain
-empty. The diagnostic reports container and contact-graph measurements but moves
-no retained evidence status. Thirty-two is the intentional flat-LAN boundary
-before composing scopes through filtered hierarchical bridges.
-
-To try that bounded hierarchy, run the five-node, three-segment
-[hierarchy MVP](docker/hierarchy-mvp/README.md):
-
-```sh
-mise run hierarchy-mvp-compose
-```
-
-The publisher and consumer share no IP segment. Two multi-homed, route-only
-bridges discover adjacent peers without configured peer IDs or peer addresses and
-carry one allowed Event from `alpha` through `parent` to `bravo`; the controller
-also checks topic/priority denial, outsider rejection, payload-blind bridge
-logs, and peerless consumer restart recovery. This is a same-host Docker
-evaluation, not retained scale or physical-network evidence.
-
-Then advance one explicit tier with the generated
-[hierarchy scale diagnostic](docs/quickstart/hierarchy-scale.md):
-
-```sh
-mise run hierarchy-scale-compose -- --publishers-per-leaf 1
-```
-
-It composes eight leaf scopes through two regional scopes into one root while
-keeping every discovery domain small. Its resource and duplicate-offer reports
-are same-host development measurements, not retained capacity evidence.
-
-For deterministic acceptance receipts, use the capability tours.
-
-The capability tour starts real processes with independent stores and
-identities, publishes while disconnected, reconnects the nodes over direct
-Iroh contacts, and verifies that a second pass has nothing left to transfer.
+For a deterministic noninteractive two-node path, run the capability tour. It
+starts real processes with independent stores and identities, publishes while
+disconnected, reconnects over direct Iroh, and verifies an equal-inventory
+second pass:
 
 ```sh
 mise install
 mise run tour
 ```
 
-Two focused tours expose the less familiar boundaries:
+Continue with the [capability tour](docs/quickstart/capability-tour.md) for the
+relay and control variants. Other runnable paths have their own focused guides:
 
-```sh
-mise run tour-relay    # a relay carries protected data it cannot read
-mise run tour-control  # revocation, rekey, and captured-node exclusion
-```
-
-The tours update a terminal dashboard while real processes run, then retain
-their working directories and exact raw receipts for inspection. The
-[capability tour](docs/quickstart/capability-tour.md) explains each result and
-its limits.
-
-For an exploratory view, keep a user-selected 2-through-32-node line running,
-send messages through any node, and isolate or restart nodes while watching
-exact Event observations move:
-
-```sh
-mise run playground -- --nodes 5
-```
-
-The [message playground](docs/quickstart/message-playground.md) uses real local
-agent processes and independent stores. Every playground node can read the
-synthetic messages; this one-host Event demo is separate from the payload-blind
-relay tour and does not establish global convergence, scale, transport, or
-release claims.
+- [trusted-LAN discovery](docs/quickstart/lan-mvp.md) and its
+  [flat scale diagnostic](docs/quickstart/lan-scale.md);
+- the [hierarchy MVP](docker/hierarchy-mvp/README.md) and
+  [hierarchy scale diagnostic](docs/quickstart/hierarchy-scale.md); and
+- the interactive [message playground](docs/quickstart/message-playground.md).
 
 ## How Aster moves data
 
@@ -181,7 +102,7 @@ Protobuf schema and does not require a hosted Buf Schema Registry.
 |---|---|---|
 | **Connect, gRPC, or gRPC-Web** | [ConnectRPC agent](docs/quickstart/connect-agent.md) | Live Event and local status; authenticated loopback process |
 | **Rust selected node** | [Selected Event API](docs/quickstart/selected-event-api.md) | Live Event publish, query, durable delivery, gaps, and status |
-| **State or Record in Rust** | [State](docs/quickstart/selected-state-api.md) and [Record](docs/quickstart/selected-record-api.md) | Cloneable live actor handles plus exclusive stopped-node facades; direct-Iroh reconciliation under explicit interests; State adds durable positive-current-version delivery and Record adds retained-bounded durable whole-key active-head delivery |
+| **State or Record in Rust** | [State](docs/quickstart/selected-state-api.md) and [Record](docs/quickstart/selected-record-api.md) | Cloneable live handles and exclusive stopped facades; direct-Iroh reconciliation; State latest-value and Record conflict-preserving delivery |
 | **Blob in Rust** | [Blob](docs/quickstart/selected-blob-api.md) | Cloneable `RunningNode::selected_blobs()` handle for durable file publication, bounded pages, and metadata-only at-least-once publication delivery, plus an exclusive stopped facade; already-durable Blob data can transfer directly under semantic v5 |
 | **Rust semantic API** | [Rust quickstart](docs/quickstart/rust.md) | Broader proven semantic surface used as the migration source |
 | **Python, Go, or C** | [Language quickstarts](docs/quickstart/README.md) | Offline semantic API through the current C ABI, not the selected live node |
@@ -197,37 +118,20 @@ provisioning remain open work.
 | Surface | Implemented | Still open |
 |---|---|---|
 | **Event** | Source-authenticated reconciliation over direct Iroh or one operator-pinned controlled Iroh connectivity relay; live Rust and local ConnectRPC APIs; durable consume/carry selectors and at-least-once delivery | Atomic subscription update, production automatic/hosted discovery, public relay selection, and broader physical-network acceptance |
-| **State** | Source-authenticated live or stopped publication/query, causal projection, direct-Iroh reconciliation under explicit interests, durable positive-current-version delivery, and bounded retained one-host evidence including forced-process redelivery | Contact/status and materialized-view/synthetic-withdrawal behavior, dynamic network-interest mutation, selected-node bindings, finite TTL, relay acceptance, expiry/garbage collection, and representative physical/mixed evidence |
-| **Record** | Live or stopped conflict-preserving query/publication, exact-sibling guarded resolution, direct-Iroh reconciliation, durable whole-key active-head delivery, and bounded retained one-host conflict, forced-process redelivery, resolution, and reopen evidence | Selected-node bindings, automatic merge execution, finite TTL, relay acceptance, expiry/garbage collection, and representative physical/mixed evidence |
-| **Blob** | Authenticated immutable publication through a cloneable live Rust handle or exclusive stopped facade; bounded zeroize-on-drop pages; durable metadata-only application delivery with exact publication identity and token-bound acknowledgement and bounded retained one-host forced-process-redelivery evidence; direct semantic-v5 source/carrier transfer with durable resume state and bounded retained one-host interrupted/reopened/different-peer evidence | Peer/convergence and transfer-progress status, network/application selector-separation acceptance, route-only relay/custody, arbitrary-peer resume, power-loss/filesystem-crash/long-offline recovery, large/RSS acceptance, representative physical or mixed-implementation evidence, retention, garbage collection, and release authorization |
-| **Static Event hierarchy** | Profile-`0x0001` authenticated directed edges, exact topic/priority narrowing, route-only first and nested wrappers, durable redb candidates with fresh restart promotion, and a semantic-v6 selected runtime. Opt-in [hierarchy MVP](docker/hierarchy-mvp/README.md) and [generated scale](docs/quickstart/hierarchy-scale.md) Compose diagnostics cross isolated IP/mDNS segments without configured peer coordinates. | Supported bridge administration, live join/leave, bandwidth and complete storage quotas, dynamic routing/interest policy and revocation/rekey lifecycle, cross-class bridge custody, physical/mixed operation, retained bridged-scale evidence, and complete-MVP credit |
-| **Security profiles** | Stock runtime profile `0x0001` retains hybrid-PQ source/control, mission handshake, and Aster records. Additive profile `0x0002` exposes a provisioned P-256 semantic-v1 Event/control and exporter-bound two-node Iroh path without a second Aster application record. | Stock runtime/CLI selection, authenticated offers or general negotiation, complete classical data/lifecycle coverage, snapshot-resistant rollback, retained capture/resource evidence, independent interoperability, and release authorization |
-| **Operations** | Manually admitted direct addresses, an operator-pinned controlled relay, default-off Iroh-compatible mDNS evaluation modes for exact rostered peers or mission-authorized `--discover-lan` contacts in repeated maximum-30-second windows, explicit bounded IPv4 interface selection for multi-homed discovery, bounded one-host software namespace-NAT acceptance, reference mission provisioning, and bounded same-UID Unix software zeroization | Protected operational provisioning, physically qualified/hostile-bounded production discovery, representative/physical NAT, public/default relay selection, BTLE platform integration, physical sanitization, and release authorization |
+| **State** | Live or stopped publication/query, causal latest-value projection, direct-Iroh reconciliation under explicit interests, and durable positive-current-version delivery | Contact/status, synthetic withdrawals, dynamic network interests, selected-node bindings, finite TTL, relay support, expiry, and garbage collection |
+| **Record** | Live or stopped conflict-preserving publication/query, exact-sibling guarded resolution, direct-Iroh reconciliation, and durable whole-key active-head delivery | Selected-node bindings, automatic merge execution, finite TTL, relay support, expiry, and garbage collection |
+| **Blob** | Live or stopped immutable publication, bounded authenticated reads, durable metadata-only delivery, and semantic-v5 direct source/range transfer with resumable staging | Peer/convergence status, route-only relay/custody, arbitrary-peer recovery, finite TTL, retention, and garbage collection |
+| **Static Event hierarchy** | Profile-`0x0001` authenticated directed edges, topic/priority narrowing, route-only nested wrappers, durable candidates, and semantic-v6 runtime integration | Supported bridge administration, live join/leave, complete quotas, dynamic policy, revocation/rekey lifecycle, and cross-class bridge custody |
+| **Security profiles** | Stock hybrid-PQ profile `0x0001`; additive P-256 Event/control profile `0x0002` with an exporter-bound two-node Iroh path | Stock runtime/CLI selection for `0x0002`, general negotiation, complete classical data/lifecycle coverage, and rollback policy |
+| **Operations** | Manually admitted direct addresses, one operator-pinned controlled relay, default-off time-windowed mDNS with bounded Aster admission, reference provisioning, and same-UID Unix software zeroization | Protected operational provisioning, hostile-LAN discovery, public/default relay selection, BTLE integration, and physical sanitization |
 
-## Customer-readiness priorities
+## Product readiness
 
-The shortest supportable path to customer use is a deliberately narrow Linux
-and Event-only product profile. It should promise durable transfer across
-intermittently available approved IP paths, not seamless multipath networking
-or real-time streaming. Work should proceed in this order:
-
-| Priority | Task | Minimum completion evidence |
-|---|---|---|
-| **P0** | Freeze and document the first supported profile | One versioned profile covering Linux, Event, bounded payloads and node counts, manually admitted direct peers, one customer-controlled pinned relay, explicit quotas, and disabled automatic LAN discovery; unsupported State, Record, Blob, public-relay, automatic-discovery, and dynamic-routing behavior is rejected or clearly marked preview |
-| **P0** | Make the release gate deterministic | The pinned `mise run check` passes from a clean checkout; network integration tests remain reliable under loaded CI; the secure file-creation umask is established by the runner; every language binding reports semantic version 6; future-incompatible dependencies are removed or dispositioned |
-| **P0** | Produce reproducible deployable artifacts | Signed Linux packages and container images build from locked, reviewed inputs through an approved package proxy or vendored offline dependencies; enterprise CA installation is supported without disabling TLS verification; SBOM, provenance, license notices, checksums, upgrade, rollback, and uninstall procedures ship with each release |
-| **P0** | Replace reference provisioning with an operational secret boundary | Node and mission material can be installed, rotated, revoked, backed up, restored, and destroyed through an approved protected provider; plaintext credentials are never required in arguments, logs, images, or ordinary configuration files |
-| **P0** | Establish a customer-operable Event service | The loopback ConnectRPC agent has stable configuration, health/readiness endpoints, bounded publish/query/subscription behavior, documented acknowledgement and retry semantics, service-manager integration, graceful shutdown, crash recovery, and actionable sanitized errors |
-| **P1** | Qualify unstable direct and relay paths | Retained tests cover packet loss, latency, reordering, bandwidth limits, NAT rebinding, address replacement, interface loss, long outages, process termination, relay loss, and recovery; they prove no unauthorized disclosure, no accepted-data loss, bounded resource use, and eventual delivery after an approved path returns |
-| **P1** | Add controlled IP multi-network switching | A bounded supervisor observes interface and route changes, refreshes approved endpoint candidates, reauthenticates every new contact, prefers usable direct paths, falls back only to the pinned relay, retries direct paths after backoff, and exposes every path transition without transferring authorization between interfaces |
-| **P1** | Ship production observability and capacity controls | Operators can monitor queued items and bytes, oldest pending age, last authenticated contact, direct/relay selection, retry deadlines, path transitions, storage pressure, rejected work, and saturation; alerts and sizing guidance are validated at the supported node and payload limits |
-| **P1** | Harden controlled-relay operations | The relay has documented certificate rotation, peer allowlisting, quotas, denial-of-service bounds, health checks, log redaction, backup-free recovery, upgrade procedures, and an availability model appropriate to the first customer deployments |
-| **P2** | Expand beyond the Event MVP only after field evidence | State, Record, Blob, dynamic hierarchy, automatic discovery, and additional carriers each receive an explicit API, lifecycle, relay, recovery, resource, physical-network, and mixed-implementation acceptance gate before entering the supported profile |
-
-The [capability roadmap](docs/validation/capability-roadmap.md) is the
-planning and merge-review view. The
-[requirements status](docs/validation/requirements-status.md) remains the
-authority for exact evidence and open acceptance gates.
+The first supportable profile is deliberately narrower than the implemented
+surface. Use the [capability roadmap](docs/validation/capability-roadmap.md) for
+planning and PR review, and
+[requirements status](docs/validation/requirements-status.md) for exact
+credited behavior and open gates.
 
 ## When Aster fits
 
@@ -263,7 +167,10 @@ conventional database or broker will usually be simpler.
 |---|---|
 | [`crates`](crates) | Selected node, carrier, persistence, protocol, semantic reference, and conformance implementations |
 | [`bindings`](bindings) | C ABI plus Go and Python wrappers |
-| [`docs`](docs) | Guides, concepts, specifications, decisions, and evidence |
+| [`docs`](docs) | Current product guides, concepts, specifications, and decisions |
+| [`docs/mvp`](docs/mvp) | MVP operating procedures |
+| [`docs/validation`](docs/validation) | Capability planning, requirements trace, conformance status, and retained evidence |
+| [`archive`](archive) | Passive non-normative design and research history |
 | [`lab`](lab) | Controlled network and impairment experiments |
 | [`fuzz`](fuzz) | Parser and protocol robustness targets |
 
@@ -274,8 +181,8 @@ mise install
 mise run check
 ```
 
-See [CI and local validation](docs/validation/ci.md) for narrower checks and the precise
-claim attached to each gate.
+See [CI and local validation](docs/validation/ci.md) for narrower checks and the
+precise claim attached to each gate.
 
 ## License
 
