@@ -79,4 +79,3 @@
 - [ ] Search for old paths outside archive, evidence files, and explicitly identified historical manifest blocks; resolve every live consumer.
 - [ ] Run `git diff --check`, inspect `git diff --summary`, and confirm only intended files changed.
 - [ ] Commit the relocation, archive this completed plan byte-for-byte, verify again, and push to `docs-refactor-foundation`.
-

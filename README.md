@@ -170,7 +170,6 @@ conventional database or broker will usually be simpler.
 | [`docs`](docs) | Current product guides, concepts, specifications, and decisions |
 | [`docs/mvp`](docs/mvp) | MVP operating procedures |
 | [`docs/validation`](docs/validation) | Capability planning, requirements trace, conformance status, and retained evidence |
-| [`archive`](archive) | Passive non-normative design and research history |
 | [`lab`](lab) | Controlled network and impairment experiments |
 | [`fuzz`](fuzz) | Parser and protocol robustness targets |
 

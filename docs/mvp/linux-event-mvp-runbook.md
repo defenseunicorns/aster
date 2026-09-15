@@ -2,9 +2,9 @@
 
 > ****
 
-This is the shortest operator path through the currently implemented Linux
-Event evaluation profile. It is for engineering evaluation, not production or
-release authorization.
+This is the shortest operator path through the currently implemented portions
+of the Linux Event evaluation profile. It is for engineering evaluation; open
+qualification gates still prevent a profile or release claim.
 
 ## Know the boundary
 

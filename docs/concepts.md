@@ -114,14 +114,19 @@ decide whether one update supersedes another.
 
 ### Deletion with tombstones
 
-A deletion is a replicated tombstone, not a local row removal. It prevents an
-offline node from reintroducing an older value only within the configured
-retention window. The current default is 45 days: 30 days of offline tolerance
-plus a 15-day margin. Returning after that boundary can resurrect data.
+A deletion in the broader semantic `ApplicationNode` API is a replicated
+tombstone, not a local row removal. It prevents an offline node from
+reintroducing an older value only within the configured retention window. The
+default for that store is 45 days: 30 days of offline tolerance plus a 15-day
+margin. Returning after that boundary can resurrect data.
 
 Configure tombstone and superseded-version retention through
 [`ApplicationNodeOptions`](../crates/aster-core/src/api.rs) and align it with
 the deployment’s actual offline tolerance.
+
+The selected runtime does not yet provide retention-driven State, Record, or
+Blob garbage collection. See the
+[current implementation boundary](../README.md#current-implementation-boundary).
 
 ### Priority and TTL
 
@@ -157,10 +162,11 @@ documented in [Architecture](architecture.md) and the
 
 ### Atomic batches
 
-An explicit batch commits 2–64 ordered items with one publisher, data class,
-topic, scope, and active epoch. Either every member commits or none does. Blob
-batches atomically finalize distinct streaming writers without exposing
-manifests or route commitments to application code.
+The broader semantic `ApplicationNode` API supports an explicit batch of 2–64
+ordered items with one publisher, data class, topic, scope, and active epoch.
+Either every member commits or none does. Blob batches atomically finalize
+distinct streaming writers without exposing manifests or route commitments to
+application code.
 
 ## Routing and propagation
 

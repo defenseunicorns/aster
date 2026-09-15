@@ -410,14 +410,9 @@ default retained format-2 singleton set or an explicit batch-only policy. Blob
 items use the same source-authenticated route-commitment checks, and Rust/C/Go/
 Python can atomically finalize 2–64 distinct Blob writers while keeping them
 retryable after rejection. Failure before commit exposes none of the set, and
-reopen reauthenticates the proof before proof-backed application reads. This
-source/store/application/binding implementation and the local reference peer
-runtime are green. Automated reference tests cover exact v1 singleton-only
-versus v2 proof/compact inventory, batch-only proof-to-compact replication,
-compact-first private restart followed by exact-proof promotion, selected-v1 compact
-rejection, and finalized two-Blob proof/compact/carrier transfer with plaintext
-verification. Independent interoperability, live-carrier, and 3 kbps acceptance
-remain separate gates.
+reopen reauthenticates the proof before proof-backed application reads.
+Selected semantic-v1 peers reject compact batch items. Independent
+interoperability, live-carrier, and 3 kbps acceptance remain separate gates.
 
 ## 7. Causality
 
@@ -545,19 +540,9 @@ use ordinary WANT/DATA/RECEIPT ranges; Blob DATA has no custody wrapper. A
 route-only relay verifies the source association, ciphertext hash/length, and
 Merkle proof without a content key. A content reader additionally matches the
 protected manifest record, authenticates/decrypts the chunk, and verifies the
-whole digest. A reference runtime test durably interrupts a carrier larger than
-64 KiB, reopens SQLite and Blob state with a new driver and sync reducer, then
-requests the exact missing complement from a different authenticated route-only
-peer and recovers identical plaintext. Its adversarial branch accepts a corrupt
-range from an authenticated producer under the genuine ObjectID, detects the
-poison only at terminal object authentication, deletes only that typed object's
-staging, reopens with no poisoned progress, and completes the retransmission from
-byte zero through a different honest route-only relay. This is local
-reference-to-reference validation. A separate generated 101 MiB local streaming
-test covers interruption/reopen, deduplication, readback, and tamper rejection
-with component buffers no larger than 65,552 bytes. The different-peer runtime
-case is smaller; a combined 100+ MiB different-peer run with measured process
-RSS and live-carrier acceptance remains open.
+whole digest. If terminal object authentication detects corrupt staged bytes,
+the receiver deletes only that typed object's staging and restarts that object
+from byte zero; authenticated staging for other objects remains intact.
 
 The high-level and FFI Blob deduplication/read path re-inspects the stored sealed
 source envelope and requires the exact authenticated route commitment and exact
@@ -815,26 +800,9 @@ here.
 
 The current selected `aster-node` schedules this grammar automatically on its
 direct-Iroh contacts after semantic-v5-or-v6 negotiation, control activation, and an
-exact configured Blob receive selector. A
-[retained 10,728-byte live-Blob receipt](validation/evidence/selected-live-blob-044d90f.json)
-(SHA-256
-`4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)
-binds source commit `044d90ff07c8e754b3d490cb810d42de3c915e3d` with
-`Good` signature status; 45 adversarial verifier tests pass. Its
-source-to-execution link remains operator-attested, not cryptographically
-proven. Across three participants and 32 direct-loopback `CONTACT` records, it
-observes peerless publication and seeding, an exactly-one-contact partial
-transfer, exact retained-prefix persistence across a receiver reopen, an
-exactly-one-contact continuation from the different eligible replica with no
-source refetch and exact-complement advancement, exact byte reconstruction and
-promotion, bounded live page reads, and a final receiver reopen. This is
-one-host, same-implementation evidence, and every interruption or restart is a
-graceful same-process actor/store/provider reopen. It does not prove distinct
-physical hosts, NAT or Internet paths, controlled or public relay, BTLE,
-process-crash or power-loss recovery, long-offline recovery, arbitrary-peer or
-route-only resume, scale beyond three participants, resource thresholds or
-soak, physical sanitization, independent-implementation interoperability, or
-release authorization.
+exact configured Blob receive selector. Current validation coverage and its
+environment limits are tracked in the
+[requirements status](validation/requirements-status.md).
 
 For each receiver direction, the Blob source phase completes first through the
 class-separated mutable inventory/difference/Offer/Fetch/result/ack/finish
@@ -899,28 +867,12 @@ served only after the same current policy and lineage checks.
 `Normal` and every `AtLeast(priority)` run Blob source and carrier work because
 `AtLeast` filters Event emission only. `ReceiveOnly` initiates, requests,
 advertises, sends, accepts, reserves, and counts zero selected Blob work. This
-network slice adds no retained application-delivery evidence or Blob peer/
-convergence status. The separate selected application layer now has a durable
-metadata-only publication queue, but it does not alter this wire path or its
-configured interests. This slice adds no selected route-only Blob relay/
-custody, Blob TTL/expiry/garbage collection, a
-metadata-independent whole-byte identity or deduplication claim, or large-file,
-physical-carrier, mixed-implementation, and release acceptance.
-
-The separate application ledger now has a
-[retained 10,269-byte peerless Blob-delivery receipt](validation/evidence/selected-live-blob-subscription-26e0a09.json)
-(SHA-256
-`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
-Good-signed source `26e0a09`). One participant executes three processes and
-four actor lifetimes on one host. Two exact source publications share one
-`BlobId`; an attempt-one child flushes an unacknowledged token and receives
-`SIGKILL`, then a fresh process receives attempt 2 and acknowledges it with the
-persisted attempt-one token before settling both publications. The final
-peerless reopen has one replayed subscription, zero pending, two acknowledged,
-and an empty poll. This receipt does not amend the wire grammar or configured
-interests and claims no contact, transfer, peer/convergence status,
-selector/network-interest separation, TTL/GC, physical or mixed carrier,
-resource/soak, reproducible-build, or release result.
+separate selected application layer has a durable metadata-only publication
+queue, but it does not alter this wire path or its configured interests. The
+selected profile defines no route-only Blob relay or custody, Blob TTL, expiry,
+or garbage collection, or metadata-independent whole-byte identity or
+deduplication. These selected behaviors do not establish large-file,
+physical-carrier, mixed-implementation, or release acceptance.
 
 The reference driver can initiate an exchange and can answer one through its
 responder-with-start path, so its in-memory authenticated flow is bidirectional.
@@ -941,12 +893,6 @@ the receiver's replay window remains authoritative. A bounded standalone NODE
 response expires after those rounds and is regenerated only by its retained
 causal PROBE. The responder's final handshake flight is retained until the next
 authenticated session record acknowledges it causally.
-
-Reference tests cover a forced lost SUMMARY, seeded approximately 50% frame
-loss in both directions, a 96-byte MTU, and fragmented 4 KiB DATA. It converges
-and commits exactly once, then re-acknowledges duplicate committed DATA so a
-lost RECEIPT cannot strand the sender. This remains software
-reference-to-reference validation, not the required 3 kbps/live-carrier gate.
 
 ### 9.3 Selected semantic-v6 Event bridge transfer
 
@@ -1126,22 +1072,8 @@ three modes but not `PassiveOnly`. Physical emission measurement and the
 distinction between receive-only protocol responses and literal radio silence
 remain stakeholder-validation items.
 
-A [retained 9,573-byte live-Event receipt](validation/evidence/selected-live-event-c464129.json)
-(SHA-256
-`4d71d04e4ebcc9f63c0e84e7f11e83bf1f3d1ad2ca8608486cdcc875b6dfeef0`,
-signed source `c464129`) provides one bounded observation of these rules. On a
-same-implementation loopback host, `AtLeast(PRIORITY)` transfers alpha
-sequences 1 and 3 while routine sequence 2 remains outside negotiated eligible
-work; the authenticated stream gap is `[2,3)`, while last-contact status is
-complete for that negotiated policy, not `WorkRemained`. After a flushed,
-unacknowledged poll, the parent forcibly terminates the receiver child; a fresh
-process receives the same IDs as attempt 2 and ack/re-acks them. A later Normal
-contact transfers sequence 2 and closes the gap. An authorized beta Event
-remains withheld while unsubscribed; subscribing produces
-`PolicyChangedSinceContact`, then removal, without a fresh post-change contact
-or beta delivery. Awaiting observations have zero failed attempts. This receipt
-does not establish physical/NAT/relay/BTLE, mixed implementation, scale or
-resource behavior, another data class, or release acceptance.
+Implementation evidence and bounded environment limitations for these modes
+are tracked in the [requirements status](validation/requirements-status.md).
 
 ## 12. Scopes, topics, relay, and bridge policy
 
@@ -1378,15 +1310,6 @@ its NAT negotiation. The profile therefore makes no direct-first ordering,
 temporal fallback, or representative NAT claim. Relay-only binding supplies no
 IP transport and waits for the pinned relay to become ready; direct-plus-relay
 binding retains IP and does not block startup on relay readiness.
-
-A retained implementation receipt separately observes this selected carrier
-through one cone/direct and one restrictive/controlled-relay Docker Linux
-namespace-NAT cell on one physical host. That evidence does not change the
-normative route semantics above: the cone cell uses exact operator-known static
-mappings; the receipt makes no discovery or punching claim, records final
-Direct/Relay observations rather than a temporal fallback sequence, and grants
-no representative, physical, public-network, independent-implementation, or
-release credit.
 
 For one authenticated connection, a `PathWitness` reports the last observed
 Direct or Relay selection and at most 1,024 coalesced observed path-kind
@@ -1796,12 +1719,8 @@ forbidden. The closed fixed-binary magic, kind, and role registries are in
   Signer handoff requires a trusted exact head; total history loss and
   authorized fork replacement have no defined root-signed epoch/reset or
   external chain high-water mechanism in this profile.
-- Typed Blob chunk transfer and different-peer range resume are verified in the
-  in-memory reference runtime. The separate retained selected-node receipt now
-  observes one bounded exactly-one-contact partial and exactly-one-contact
-  different-eligible-peer resume across graceful same-process reopens on one
-  host. A separate generated 101 MiB local streaming case passes with bounded
-  component buffers, but a combined 100+ MiB different-peer run with measured
+- Typed Blob chunk transfer and different-peer range resume exist in the
+  reference runtime. A combined 100+ MiB different-peer run with measured
   process RSS and a live carrier remains an acceptance gap. Zero-byte Blob
   publication is not supported by envelope format 2.
 - A custom hybrid composition needs independent cryptographic review.

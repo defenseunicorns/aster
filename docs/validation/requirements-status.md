@@ -1,6 +1,6 @@
 # Production implementation requirements status
 
-- Status date: 2026-08-31
+- Status date: 2026-09-15
 - Requirements authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Requirements SHA-256: `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
 - Planning view: [`capability-roadmap.md`](capability-roadmap.md)

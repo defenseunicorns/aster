@@ -1,6 +1,6 @@
 # Capability roadmap
 
-- Status date: 2026-08-31
+- Status date: 2026-09-15
 - Product-intent authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Security-profile applicability:
   [`security-profile-requirements-disposition.md`](security-profile-requirements-disposition.md)
