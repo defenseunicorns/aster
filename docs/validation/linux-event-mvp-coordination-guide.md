@@ -117,6 +117,14 @@ fail, or a typed reason the work was not run.
 
 ## Current decision state
 
+[Decision 0043](../decisions/0043-authorize-linux-event-mvp-validation.md)
+records all approvals for the bounded MVP increment as team-internal and
+accepted, freezes the annex/two-CM4 inventory boundary, and defers the 24-hour
+soak. Current direct CI-package observations and explicit unrun checks are in
+the [device evidence record](evidence/2026-09-15-cm4-ci-package-mvp-validation.md).
+The OS engineer now owns device testing; this record must not infer results
+from that separate work.
+
 The profile is **Accepted** by Decision 0042. Both definition decisions are
 resolved, without granting candidate or production authorization:
 
@@ -135,8 +143,8 @@ resolved, without granting candidate or production authorization:
   records Dependency/license, Legal/compliance, and Release as **Approved**
   against the exact dependency tuples and evaluation-only limitation.
 
-P0-1 is now defined. E01 and G1–G6 remain separate candidate-delivery gates and
-must pass before an evaluation candidate can issue.
+P0-1 is now defined. Internal MVP approvals require no further action.
+Technical evidence remains bounded by the checks actually completed.
 
 ## Working rules for the team
 

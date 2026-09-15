@@ -9,8 +9,14 @@
 - Amendment status: incorporated into the current profile authority
 - Register: [P0-1 decision and gate register](../validation/linux-event-mvp-evaluation-profile-v0.1-register.md)
 - Roadmap action: `P0-1 — define the claim boundary`
+- MVP governance amendment: [Decision 0043](0043-authorize-linux-event-mvp-validation.md)
 
 ## Context
+
+Decision 0043 subsequently accepted the internal MVP approvals, froze the
+annex and two-CM4 inventory boundary, and simplified the current engineering
+validation to direct checks of the actual CI package. Its deferrals apply to
+the MVP increment only; this decision's production non-claims remain intact.
 
 The 348 atomic requirements preserve the hash-bound target and evidence trace,
 but they are not a flat backlog, progress percentage, or sufficient definition

@@ -6,6 +6,11 @@ This is the shortest operator path through the currently implemented portions
 of the Linux Event evaluation profile. It is for engineering evaluation; open
 qualification gates still prevent a profile or release claim.
 
+The 2026-09-15 two-node activity stopped when the OS engineer took ownership of
+device testing. Do not resume or infer device results from this runbook; use the
+[partial direct CI-package record](../validation/evidence/2026-09-15-cm4-ci-package-mvp-validation.md)
+for the completed observation boundary.
+
 ## Know the boundary
 
 The repository currently provides the Event application service and its

@@ -133,6 +133,14 @@ planning and PR review, and
 [requirements status](docs/validation/requirements-status.md) for exact
 credited behavior and open gates.
 
+For the Linux Event MVP, [Decision
+0043](docs/decisions/0043-authorize-linux-event-mvp-validation.md) records the
+team-internal approvals and frozen two-CM4 boundary. The [direct CI-package
+device record](docs/validation/evidence/2026-09-15-cm4-ci-package-mvp-validation.md)
+contains the completed observations and explicitly identifies the checks that
+stopped at the OS-engineer handoff; it is partial engineering evidence, not a
+production or full-profile qualification claim.
+
 ## When Aster fits
 
 Aster is a strong fit when:

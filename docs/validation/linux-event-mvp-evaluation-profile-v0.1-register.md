@@ -5,7 +5,7 @@
 - Profile: [`aster-linux-event-mvp-evaluation-v0.1`](linux-event-mvp-evaluation-profile-v0.1.md)
 - Register date: 2026-09-06
 - Candidate-decision checkpoint: 2026-09-13
-- Evidence effect: none
+- Evidence effect: [partial direct CI-package device observations](evidence/2026-09-15-cm4-ci-package-mvp-validation.md)
 
 This register separates resolved v0.1 boundary decisions, open
 candidate-authorization gates, and production/later-profile deferrals.
@@ -27,7 +27,7 @@ and reviewed decision.
 | `P0-1-D03` | P0-1; `DM-14-17..18` | Exactly two mandatory physical CM4 participants; an optional third support node must be declared if it carries candidate traffic; 8-/20-node qualification deferred; manual peers, one scope/topic/subscription per scenario, discovery off | Resolved | no | no | Broader topology and scale remain outside v0.1 | none |
 | `P0-1-D04` | P0-1; `DM-14-07..09`, `DM-14-19`; Decision 0030 | Exact local API/lifecycle methods, Rust reference client, generated-Go qualification client | Resolved | no | no | Production bindings and independent interoperability remain open | none |
 | `P0-1-D05` | P0-1; Decision 0033; security-profile disposition | Semantic v6, profile/suite `0x0001`, unordered IDs, no fallback, non-FIPS | Resolved | no | no | Production security and FIPS paths remain separately gated | none |
-| `P0-1-D06` | P0-1; [approved Raspberry Pi provider v2 design](inputs/raspberry-pi-systemd-credential-provider-v2-design.md) (`sha256:30c5dfe71a203fcdd69dd330f9b5c68eeaee5032b624ee41912aa4723a9f853f`); [systemd 257 presentation amendment](inputs/systemd-257-credential-presentation-amendment.md) (`sha256:549ea3fd5bdfd62c01bab5a8f1adac4b84a2710ab406ea006119c9048e28d4cd`) | `aster-systemd-credential-store/v2`; exact Raspberry Pi reference `2026-06-18` and systemd `257.13-1~deb13u1` credential interface; original `0400`/`ramfs` or exact non-root ACL/read-only-`tmpfs`/`noswap` presentation; explicit host-key protection; statically composed loader; root-operated `aster-credential-admin`; seven-operation lifecycle | Resolved | no | yes | Security/deployment approval of the amendment and provider qualification remain candidate and production gates; no generic `tmpfs` or Debian claim | none |
+| `P0-1-D06` | P0-1; [approved Raspberry Pi provider v2 design](inputs/raspberry-pi-systemd-credential-provider-v2-design.md) (`sha256:30c5dfe71a203fcdd69dd330f9b5c68eeaee5032b624ee41912aa4723a9f853f`); [systemd 257 presentation amendment](inputs/systemd-257-credential-presentation-amendment.md) (`sha256:549ea3fd5bdfd62c01bab5a8f1adac4b84a2710ab406ea006119c9048e28d4cd`) | `aster-systemd-credential-store/v2`; exact Raspberry Pi reference `2026-06-18` and systemd `257.13-1~deb13u1` credential interface; original `0400`/`ramfs` or exact non-root ACL/read-only-`tmpfs`/`noswap` presentation; explicit host-key protection; statically composed loader; root-operated `aster-credential-admin`; seven-operation lifecycle | Resolved | no | no | Internal MVP approval accepted by Decision 0043; provider qualification and production acceptance remain technical gates | none |
 | `P0-1-D07` | P0-1; design `Emission modes` | Restart-selected Normal/ReceiveOnly, non-initiation/non-disclosure, both identity orderings, no radio-silence claim | Resolved | no | no | No physical-silence or production emission claim | none |
 | `P0-1-D08` | P0-1; [current operation-ledger boundary](linux-event-mvp-evaluation-profile-v0.1.md#durable-publish-operation-containment); P1-1 follow-on boundary | 1,024-key evaluation workload and 512 warning over a separately configured permanent mission-bound ledger; active records compact only to permanent retirement fences; exact retry/conflict, reserve, audit, status, and terminal-cap behavior retained | Resolved | no | no | Higher-rate/long-duration physical qualification and production sizing remain blocking; the profile does not authorize operation-key reuse or a workload above 1,024 | none |
 | `P0-1-D09` | P0-1; `DM-14-03..06`, `DM-14-12..18` | Exact two-node workload/resource matrix and provisional byte-fit gate on both mandatory physical CM4 devices | Resolved | no | no | No production sizing, broader scale, or capacity claim | none |
@@ -42,10 +42,11 @@ was recorded for the profile definition on 2026-09-08. `P0-1-D06` is resolved
 for the P0-1 profile definition by the approved Raspberry Pi provider v2 design
 at `sha256:30c5dfe71a203fcdd69dd330f9b5c68eeaee5032b624ee41912aa4723a9f853f`.
 Product approval to implement and validate the exact systemd 257 presentation
-amendment was recorded on 2026-09-09. Security and Deployment approval of both
-immutable records remains required at `P0-1-E01`; it blocks candidate
-qualification, not profile definition. Another platform requires a new
-reviewed provider and profile boundary before the affected candidate proceeds.
+amendment was recorded on 2026-09-09. Decision 0043 records Security and
+Deployment approval as internal and accepted for this MVP increment. Provider
+qualification remains a technical evidence boundary. Another platform requires
+a new reviewed provider and profile boundary before the affected candidate
+proceeds.
 Dependency/license, Legal/compliance, and Release approval of the exact D15
 evaluation-only disposition and bound digest was recorded on 2026-09-08.
 `P0-1-D15` is therefore resolved for P0-1 and is not a candidate blocker. The
@@ -62,7 +63,7 @@ remain unchanged and may remain production-governance work.
 |---|---|---|---|:---:|:---:|---|:---:|
 | `P0-1-D14-01` | `DM-14-01` | Preserve four protocol/API priority values; no doctrine-validation claim | Resolved | no | no | Atomic requirement unchanged; production-governance work may remain | none |
 | `P0-1-D14-02` | `DM-14-02` | Preserve priority names as stable API tokens; no doctrine-validation claim | Resolved | no | no | Atomic requirement unchanged; production-governance work may remain | none |
-| `P0-1-D14-03` | `DM-14-03` | 24 hours at 4 KiB and 10 Events/hour/node | Resolved | no | no | Atomic requirement unchanged; production-governance work may remain | none |
+| `P0-1-D14-03` | `DM-14-03` | 24-hour workload deferred from this MVP increment | Excluded | no | no | Atomic requirement unchanged; post-MVP work remains | none |
 | `P0-1-D14-04` | `DM-14-04` | No minimum link-rate claim; report exact test conditions | Excluded | no | no | Atomic requirement unchanged; production-governance work may remain | none |
 | `P0-1-D14-05` | `DM-14-05` | No maximum-loss claim; report exact test conditions | Excluded | no | no | Atomic requirement unchanged; production-governance work may remain | none |
 | `P0-1-D14-06` | `DM-14-06` | Blob excluded, so no Blob-size floor | Excluded | no | no | Atomic requirement unchanged; production-governance work may remain | none |
@@ -141,16 +142,16 @@ block v0.1 except where the evaluation-blocking cell says otherwise.
 
 | ID | Gate | Owner | Target | Status | Evaluation blocking | Production blocking | Exit | Evidence effect |
 |---|---|---|---:|---|:---:|:---:|---|:---:|
-| `P0-1-E01` | Approve the [exact Raspberry Pi protected provider v2 design](inputs/raspberry-pi-systemd-credential-provider-v2-design.md) (`sha256:30c5dfe71a203fcdd69dd330f9b5c68eeaee5032b624ee41912aa4723a9f853f`), [systemd 257 presentation amendment](inputs/systemd-257-credential-presentation-amendment.md) (`sha256:549ea3fd5bdfd62c01bab5a8f1adac4b84a2710ab406ea006119c9048e28d4cd`), and administration record | Security + deployment | 2026-09-09 | Open | yes | yes | Both roles accept both exact digests, provider contract/version, trust boundary, pinned ACL/mount predicates, administration artifact, lifecycle procedure, limitations, and acceptance plan | none |
-| `P0-1-E02` | Freeze signed qualification annex and exact two-CM4 inventory | Profile + integration | 2026-09-08 | Open | yes | yes | Annex names both mandatory physical CM4 nodes' exact image, Debian identity, kernel, systemd package, architecture, hardware revision, filesystem, relay placement, and network conditions; any participating third CM4 is explicitly declared with its support role | [Non-qualifying prepared sanitized inventory input](evidence/2026-09-10-cm4-candidate-inventory.md); E02 remains open until annex freeze and approval |
+| `P0-1-E01` | Accept the exact Raspberry Pi protected-provider boundary for internal MVP validation | Aster project team | 2026-09-15 | Accepted by Decision 0043 | no | yes | Internal approval complete; provider behavior remains technical evidence | none |
+| `P0-1-E02` | Freeze the v0.1 annex boundary and exact two-CM4 inventory | Aster project team | 2026-09-15 | Accepted by Decision 0043 | no | yes | [Frozen sanitized inventory](evidence/2026-09-10-cm4-candidate-inventory.md); run-specific facts remain evidence | none |
 | `P0-1-E03` | Merge/review candidate Event service | Event-service owner | 2026-09-09 | Open | yes | yes | Accepted commit passes clean gate and process suite | none |
 | `P0-1-E04` | Add restart-selected `receive_only` config/status | Event-service + node owner | 2026-09-10 | Open | yes | yes | Both-ordering acceptance passes | none |
 | `P0-1-E05` | Qualify authenticated Event operation-ledger capacity, audit, and failure behavior | Lifecycle/capacity + Event-service + selected-store/node owners | 2026-09-10 | Open | yes | yes | Exact configured ledger/store use, active/retired/reverse rows, ordinary/emergency and profile headroom, completed audit, and warning state are reported; configured-cap failures are distinguishable and nonretryable; generated-Go and crash/reopen tests pass | none |
-| `P0-1-E06` | Add exact v0.1 validation to the qualification harness | Integration + profile owner | 2026-09-10 | Open | yes | yes | Harness rejects a receipt for every tested configuration or workload deviation while leaving the broader generic schema explicit | none |
+| `P0-1-E06` | Add further qualification automation | Integration + profile owner | Post-MVP | Deferred | no | yes | Add automation only when it reduces validation cost without replacing direct package tests | none |
 | `P0-1-E07` | Deliver the Rust reference client and retain Go contract coverage | API + Event-service owner | 2026-09-10 | Open | yes | yes | Both clients execute the exact v0.1 publish/query/delivery/recovery contract | none |
-| `P0-1-E08` | Produce one signed reproducible native `arm64` package | Deployment/release owner | 2026-09-10 | Open | yes | yes | The provider-composed package reproduces and its complete artifact inventory passes | none |
+| `P0-1-E08` | Validate the actual CI-produced native `arm64` package | Deployment/release owner | 2026-09-15 | Accepted for MVP artifact use | no | yes | Exact package checksum, payload, ELF architecture, external SBOMs, and checksums verified; signing and independent reproduction are post-MVP | [CI-package device record](evidence/2026-09-15-cm4-ci-package-mvp-validation.md) |
 | `P0-1-E09` | Integrate and qualify the protected-provider lifecycle | Security + deployment + integration | 2026-09-11 | Open | yes | yes | Exact packaged provider passes install/load/rotation/recovery/revoke/rekey/destroy tests | none |
-| `P0-1-E10` | Run physical target/resource matrix on both mandatory CM4 devices | Integration/physical-carrier owner | 2026-09-12 | Open | yes | yes | Retained receipts for both mandatory physical CM4 devices pass | none |
+| `P0-1-E10` | Run direct physical target/resource checks on both mandatory CM4 devices | Integration/physical-carrier owner | 2026-09-15 | Partial; stopped at OS-engineer handoff | yes | yes | Complete the explicitly unrun scenarios or retain a partial disposition | [Completed observations and unrun checks](evidence/2026-09-15-cm4-ci-package-mvp-validation.md) |
 | `P0-1-E11` | Review pre-frozen capacity/resource targets | Profile + release owner | 2026-09-13 | Open | yes | yes | Every v0.1 threshold passed, or v0.1 is refused and a revised profile is scheduled | none |
 | `P0-1-E12` | Resolve `DM-8-05` for production | Dependency/license + release owner | 2026-09-30 | Deferred | no | yes | Requirement disposition or technical alternative | none |
 | `P0-1-E13` | Qualify the selected operation-ledger lifecycle above the v0.1 workload or for production | Lifecycle/capacity owner | Before proposing a profile above 1,024 operations | Deferred | no | yes | Reviewed physical/long-duration evidence supports configured capacity, audit latency, active-to-retired compaction, permanent fences, and production sizing | none |

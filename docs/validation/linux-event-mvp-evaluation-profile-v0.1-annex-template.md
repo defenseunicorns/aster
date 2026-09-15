@@ -4,12 +4,12 @@
 
 - Schema version: `0.1-proposed`
 - Profile ID: `aster-linux-event-mvp-evaluation-v0.1`
-- Status: provisional and revisionable; never qualification evidence by itself
-- Freeze gate: OS/artifact, integration/device, deterministic-gate, security,
-  dependency/legal, and release owners approve the schema interfaces
+- Status: scope frozen for the bounded MVP increment by Decision 0043; never
+  qualification evidence by itself
+- Approval: team-internal and accepted; no additional MVP approval required
 
-A candidate cannot qualify before this schema is reviewed and frozen and G2,
-G3, G4, and G5 pass in order. A completed annex contains concrete immutable
+A candidate cannot qualify before applicable technical gates pass. A completed
+annex contains concrete immutable
 identifiers, digests, results, and approvals for every applicable required
 field. An omitted, unfilled, ambiguous, mutable, or unsigned required field
 makes that annex non-qualifying.
