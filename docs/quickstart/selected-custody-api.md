@@ -3,28 +3,11 @@
 The selected runtime applies source-authenticated priority and finite TTL to
 Event and route-only Event custody. It also exposes aggregate logical-store
 limits, exact-scope custody quotas, a minimum emitted priority, and receive-only
-operation. State and Record remain outside Event custody/priority/TTL pressure,
-but semantic-v4/v5 Normal and `AtLeast` contacts still run their independent
-mutable lanes. Under v5 they also run direct content-capable Blob transfer for
-already-durable objects. `AtLeast` is an Event threshold only. `ReceiveOnly`
-initiates or discloses no State/Record/Blob lane or work. V1-v4 emit zero Blob
-frames. State and Record have separate cloneable live actor handles, but those
-operations do not enter Event custody. Blob likewise has a separate cloneable
-live handle: publish consumes an already-open regular nonempty file at cursor
-zero with a 64-MiB/1,024 canonical 64-KiB-chunk ceiling, and a live absolute-
-offset page read returns at most 64 KiB in zeroize-on-drop plaintext. These Blob
-operations require a fresh selected source, current policy/lineage, and the
-exact authenticated `BlobDepotCompletion` capability; they do not enter Event
-custody or turn `AtLeast` into a Blob threshold.
-
-The live Blob handle shares the 32-slot application command lane and delegates
-file work to a joined worker of capacity one. Any contradiction among durable
-rows, authenticated cache state, depot completion, or post-commit verification
-is fatal coherence: the actor closes all application admission and terminates
-instead of returning an ordinary per-request failure. Shutdown and terminal
-zeroization also close and join that worker; zeroization cryptographically
-shreds mission/content and carrier-identity secrets while preserving audited
-rows and encrypted depot ciphertext, and makes no physical-sanitization claim.
+operation. State, Record, and Blob remain outside Event custody, priority, and
+TTL pressure. Their independent semantic-v4/v5 lanes still run during `Normal`
+and `AtLeast` contacts; `AtLeast` is an Event threshold only. `ReceiveOnly`
+initiates or discloses none of those lanes. See the selected State, Record, and
+Blob API guides for their application surfaces and limits.
 
 This is an additive configuration surface. Existing callers of `start_node`
 retain durable Event publication, default store limits, and normal emission.
@@ -60,7 +43,7 @@ CUSTODY_APPLICATION finite_ttl=unsupported_on_this_platform,durable_fallback=tru
 
 The fixture contains an explicitly unprotected reference mission bundle. It is
 for a disposable demonstration, not operational provisioning or a network,
-finite-TTL, physical-emission, or release receipt.
+finite-TTL, or physical-emission test.
 
 ## Configure the bounded runtime
 
@@ -267,30 +250,16 @@ equivalent deterministic whole-contact partial claim is made for v1/v2.
 
 The selected implementation covers Event and RouteEvent custody only. It does
 not add State/Record custody; their cloneable live handles and separate
-semantic-v4/v5 mutable reconciliation run outside this custody policy in Normal
-and AtLeast, as do the live Blob application surface and semantic-v5 direct Blob
-work. A [separate retained Blob receipt](../validation/evidence/selected-live-blob-044d90f.json)
-observes only a bounded
-three-participant direct partial/different-eligible-peer resume across graceful
-same-process reopens on one host; it adds no custody acceptance to this guide.
-This slice does not add finite State/Record TTL. State's separate durable
-positive-current-version application subscription runs outside custody and is
-documented in the [selected State API](selected-state-api.md). This slice adds
-no Record subscription itself; Record's separate retained-bounded durable
-whole-key queue is documented in the [selected Record API](selected-record-api.md)
-and its [Record-delivery receipt](../validation/evidence/selected-live-record-subscription-0c11344.json).
-That receipt adds no custody or TTL/GC claim here. Blob application delivery is
-now a separate metadata-only queue with a
-[retained 10,269-byte peerless receipt](../validation/evidence/selected-live-blob-subscription-26e0a09.json)
-(SHA-256
-`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
-Good-signed source `26e0a09`) covering forced attempt-one process termination,
-fresh-process attempt-2 redelivery acknowledged with the older token, two exact
-publications sharing one `BlobId`, and an empty final ledger. That receipt adds
-no custody evidence. Blob peer/convergence status, network/selector separation,
-Blob custody/TTL/GC,
-arbitrary-peer or route-only Blob resume, selected-node bindings, cross-class
-priority eviction, physical-radio silence or media-sanitization proof, protected
-provisioning, representative/physical NAT or Internet, public/default or
-controlled-relay acceptance, BTLE, crash/power-loss or long-offline recovery,
-scale or resource proof, mixed implementations, or release authorization.
+semantic-v4/v5 mutable reconciliation run outside this custody policy in `Normal`
+and `AtLeast`, as do the live Blob application surface and semantic-v5 direct
+Blob work. This guide adds no finite State/Record TTL or Blob custody/TTL/GC.
+See the selected [State](selected-state-api.md),
+[Record](selected-record-api.md), and [Blob](selected-blob-api.md) API guides for
+those independent application boundaries.
+
+This guide also makes no claim about cross-class priority eviction, physical
+radio silence or media sanitization, protected provisioning, representative NAT
+or Internet paths, controlled relays, BTLE, crash/power-loss recovery, scale,
+mixed implementations, or release authorization. Current implementation and
+validation boundaries are tracked in the
+[requirements status](../validation/requirements-status.md).
