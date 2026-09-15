@@ -11,77 +11,14 @@ The selected Event surface now provides live and stopped-state publish, bounded
 query, durable subscribe/poll/ack, idempotent unsubscribe, and authenticated gap
 inspection. A live `SelectedEventHandle` additionally reports bounded peer and
 last-contact Event status while the actor owns the store. That status is not a
-State/Record/Blob convergence signal. State and Record reconcile already
-durable objects on semantic-v4/v5 contacts and expose their own cloneable live
-handles. `RunningNode::selected_blobs()` now adds peerless-capable durable
-regular-file publication and authenticated reads of at most one
-zeroize-on-drop 64-KiB page plus durable metadata-only exact-publication
-delivery. Its local delivery counts are not Blob peer or convergence status.
-Semantic v5 separately transfers already-durable Blobs directly between
-current content-capable peers, including after a peerless publish and later
-restart. V1-v4 emit zero Blob frames. Route-only Blob relay/custody, Blob
-TTL/GC, large/RSS acceptance, representative physical or mixed-implementation
-acceptance remain open. Non-Linux finite Event TTL, atomic subscription update,
-selected-node language bindings, a production provisioning/SecretStore backend,
-protected stock CLI startup, generalized multi-family control policy, and
-automatic/atomic revoke-plus-rekey remediation remain open. The stopped
-`SelectedEventNode` and stopped `SelectedControlAdmin` do accept protected
+State, Record, or Blob convergence signal. Subscriptions do not update
+atomically: changing one requires an unsubscribe followed by a subscribe. The
+stopped `SelectedEventNode` and `SelectedControlAdmin` accept protected
 artifacts or exact opaque secret references. Caller-provided Rust `NodeConfig`
 construction now accepts the same sources, and a running authority exposes the
 typed `SelectedControlHandle`; those bounded Rust-only seams are documented
 below. Linux semantic-v3/v4/v5 finite Event TTL is documented in the
 [selected custody quickstart](selected-custody-api.md).
-
-A [retained 9,573-byte live-Event receipt](../validation/evidence/selected-live-event-c464129.json)
-(SHA-256
-`4d71d04e4ebcc9f63c0e84e7f11e83bf1f3d1ad2ca8608486cdcc875b6dfeef0`,
-signed source `c464129`) observes this live surface on one same-implementation
-loopback host. The publisher creates three alpha Events and one authorized beta
-Event while peerless. A priority-threshold direct contact delivers alpha
-sequences 1 and 3 and exposes authenticated half-open gap `[2,3)`. After the
-receiver child flushes that unacknowledged poll, the parent forcibly terminates
-it; a fresh process receives the same IDs as attempt 2 and acknowledges plus
-idempotently re-acknowledges them. A normal contact then delivers sequence 2,
-acknowledges/re-acknowledges it, and closes the gap.
-
-The beta Event remains withheld while unsubscribed. A temporary beta
-subscription produces `PolicyChangedSinceContact`, then exact removal and
-idempotent removal; the receipt includes no later contact or beta delivery.
-Both awaiting observations report zero failed attempts, so positive
-failed-contact propagation is not evidenced. This is bounded direct-loopback
-software evidence, not physical, NAT/Internet, relay, BTLE, mixed or independent
-implementation, scale/resource/soak, State/Record/Blob, release, or production
-acceptance.
-
-A [retained 10,728-byte live-Blob receipt](../validation/evidence/selected-live-blob-044d90f.json)
-(SHA-256
-`4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)
-binds source commit `044d90ff07c8e754b3d490cb810d42de3c915e3d` with
-`Good` signature status; 45 adversarial verifier tests pass. Its
-source-to-execution link remains operator-attested, not cryptographically
-proven. Across three participants and 32 direct-loopback `CONTACT` records, it
-observes peerless publication and seeding, an exactly-one-contact partial
-transfer, exact retained-prefix persistence across receiver reopen, an
-exactly-one-contact continuation from the different eligible replica with no
-source refetch and exact-complement advancement, exact byte reconstruction and
-promotion, bounded live page reads, and a final receiver reopen. This is
-one-host, same-implementation evidence, and every interruption or restart is a
-graceful same-process actor/store/provider reopen. It does not prove physical
-hosts, NAT or Internet paths, controlled or public relay, BTLE, process crash
-or power-loss recovery, long-offline recovery, arbitrary-peer or route-only
-resume, scale beyond three participants, resource thresholds or soak,
-physical sanitization, independent-implementation interoperability, or release
-authorization.
-
-A separate
-[retained 10,269-byte Blob-delivery receipt](../validation/evidence/selected-live-blob-subscription-26e0a09.json)
-(SHA-256
-`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
-Good-signed source `26e0a09`) observes peerless forced-process attempt-2
-redelivery, older-token acknowledgement, two exact publications sharing one
-`BlobId`, and an empty final ledger on one host. It adds no Event, network or
-peer-status, selector-separation, TTL/GC, physical/mixed, resource/soak, or
-release acceptance to this guide.
 
 ## Run the live example
 
@@ -262,11 +199,6 @@ cargo test --locked -p aster-node --test mesh_cli \
   --exact --nocapture
 ```
 
-This is current-code loopback evidence for one same-implementation Event flow.
-It is not the stakeholder-set supported offline interval, all-reachable-node
-convergence, physical-network acceptance, mixed-implementation
-interoperability, or a no-loss claim for State, Record, and Blob.
-
 ```mermaid
 sequenceDiagram
     participant P as Publisher process/store
@@ -439,9 +371,7 @@ capability.
 This is process-local Rust control, not cross-process administrator IPC. It does
 not discover affected scopes, combine revoke and rekey atomically, issue
 credentials or registries, authorize an operator, destroy provider secrets, or
-add a protected stock CLI/binding. The current tests are automated source-tree
-evidence only; they create no retained control receipt or additional
-`observed-bounded` credit.
+add a protected stock CLI or language binding.
 
 ## Interpret gaps conservatively
 
