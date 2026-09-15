@@ -57,7 +57,7 @@ jobs:
       - name: Install CI Python build prerequisites
         timeout-minutes: 5
         # Ubuntu 24.04 archive/security revisions; log actual installed versions.
-        # CI-only native build inputs and version policy: docs/ci-python.md.
+        # CI-only native build inputs and version policy: docs/validation/ci-python.md.
         run: |
           sudo apt-get -o APT::Update::Error-Mode=any update
           sudo apt-get install --yes --no-install-recommends \

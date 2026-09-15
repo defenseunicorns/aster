@@ -3,7 +3,7 @@
 > ****
 
 Proposals describe bounded investigations that may inform a later architecture
-decision. They complement the accepted records in [`docs/decisions`](../decisions/)
+decision. They complement the accepted records in [`docs/decisions`](../../../docs/decisions/)
 without changing them.
 
 A proposal is deliberately non-normative. It does not, by itself:

@@ -72,7 +72,7 @@ alone.
 | Class | Use it for | Disconnected-update behavior |
 |---|---|---|
 | **State** | Replaceable current values such as position, health, or active configuration | Sequential values supersede; concurrent values converge to one deterministic projection while losing versions remain recoverable |
-| **Event** | Immutable messages, observations, audit records, or samples | Every entry remains; each publisher has a durable sequence and receivers can inspect gaps |
+| **Event** | Immutable messages, observations, audit records, or samples | Entries are append-only rather than replaced; TTL and storage policy still bound retention, and receivers can inspect each publisher's sequence gaps |
 | **Record** | Plans, forms, and other documents edited by disconnected writers | Concurrent siblings remain until the application resolves an exact current head set; a stale resolution guard fails |
 | **Blob** | Large immutable imagery, maps, attachments, or models | Authenticated partial transfer may resume, but incomplete content stays hidden; identity includes content and manifest choices |
 

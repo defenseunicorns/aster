@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the CI-only interpreter against the Ubuntu runner's native libc.
-# See docs/ci-python.md for exact source provenance and the mise selection contract.
+# See docs/validation/ci-python.md for exact source provenance and the mise selection contract.
 set -euo pipefail
 umask 077
 : "${RUNNER_TEMP:?CI runner scratch directory is required}"
