@@ -190,13 +190,3 @@ Mechanical validation confirmed:
 - `final_stack_invariant=false` for every provisional target; and
 - coverage of every requirement-bearing source line in sections 1 through 3 and
   5 through 14.
-
-## Project acceptance follow-up
-
-`SRC-001` already registers the only consulted semantic source, so no new public
-source-registration row is required. This task was explicitly limited to two new
-files, so it does not modify the append-only evidence ledger, project log, or
-requirements traceability. Before accepting the change, the project owner
-should retain the review and validation receipt for these two artifacts through
-the normal evidence process. No implementation behavior changes in this task, so
-the behavior traceability file does not require a semantic-status update.

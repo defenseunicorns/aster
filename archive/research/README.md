@@ -6,3 +6,4 @@ dependency choices.
 
 - `evaluations/` contains completed evaluation reports and their frozen inputs.
 - `proposals/` contains completed, superseded, or closed investigation records.
+- `reconciliation-bakeoff.md` contains the closed set-reconciliation comparison.

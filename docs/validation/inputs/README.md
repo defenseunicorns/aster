@@ -10,3 +10,7 @@ archived destinations are the
 [Raspberry Pi profile amendment](../../../archive/design-history/specs/2026-09-08-raspberry-pi-linux-event-mvp-profile-amendment-design.md)
 and the
 [Ubuntu v1 provider design](../../../archive/design-history/specs/2026-09-07-systemd-credential-provider-design.md).
+
+Hash-identical copies of the two active inputs remain at the original
+`docs/superpowers/specs` paths so the immutable profile's literal path-and-digest
+bindings continue to verify.

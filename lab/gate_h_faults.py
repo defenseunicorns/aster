@@ -818,7 +818,7 @@ def freeze_candidate(
         raise GateHFaultError("candidate binary must be a regular executable file")
 
     sources = bind_source_files(execution)
-    proposal = WORKSPACE / "archive/research/proposals/0004-shared-node-libp2p-retest.md"
+    proposal = WORKSPACE / "docs/proposals/0004-shared-node-libp2p-retest.md"
     return {
         "candidate_commit": commit,
         "candidate_tree": tree,
