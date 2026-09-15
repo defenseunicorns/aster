@@ -47,8 +47,6 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       RUST_BACKTRACE: "1"
       RUSTUP_AUTO_INSTALL: "0"
-      RUSTUP_HOME: ${{ runner.temp }}/volume-rustup
-      CARGO_HOME: ${{ runner.temp }}/volume-cargo
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - name: Verify reviewed immutable workflow identity
@@ -64,6 +62,7 @@ jobs:
           [[ "$REVIEWED_RUSTUP_SHA256" =~ ^[0-9a-f]{64}$ ]]
           mkdir -p "$RUNNER_TEMP/volume-evidence" "$RUNNER_TEMP/volume-private"
           printf '%s\n' '{"state":"preparation","diagnostic_only":true,"qualification":false,"test_executions":0}' > "$RUNNER_TEMP/volume-evidence/preparation.json"
+          printf 'RUSTUP_HOME=%s/volume-rustup\nCARGO_HOME=%s/volume-cargo\n' "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
       - name: Check out exact reviewed diagnostic tooling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, admitted current CI
