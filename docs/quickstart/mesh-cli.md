@@ -14,18 +14,10 @@ activates the contiguous mission-control prefix before Event, then
 authenticates each Event's source and protected metadata through the existing
 `aster-core` envelopes. A successful run remains bounded to Event, one sample
 topic/scope, durable `ttl=None`, direct loopback, and unprotected reference
-provisioning. It does not prove State, Record, Blob, finite-TTL custody,
-atomic subscription update, generalized control
-administration, protected provisioning,
-non-Unix or physical-media zeroization assurance, physical multi-system
-operation, NAT/hosted relay, BTLE, independent interoperability, or release
-authorization. The selected live Event handle is documented separately; this
-CLI tour uses built-in roles and does not turn last-contact status into a
-global-convergence claim. State/Record reconciliation, the live Blob
-application surface, and the semantic-v5 direct-Iroh Blob mechanism are current
-selected-code surfaces tested separately. A retained State-delivery receipt is
-described below, but neither it nor the separate Blob receipt enlarges this
-Event-only CLI tour into broader acceptance.
+provisioning. The selected live Event handle is documented separately; this CLI
+tour uses built-in roles and does not turn last-contact status into a global
+convergence claim. State, Record, Blob, finite-TTL custody, and other carrier
+paths are outside this walkthrough.
 
 ## Prerequisites
 
@@ -38,8 +30,8 @@ mise install
 ```
 
 For the shortest first success, use the one-command
-[capability tour](capability-tour.md). This guide keeps the complete phase and
-evidence detail.
+[capability tour](capability-tour.md). This guide keeps the complete operator
+and phase detail.
 
 | Goal | Command | Shape |
 |---|---|---|
@@ -67,7 +59,7 @@ The command performs `2N+1` bounded cohorts and `5N-2` child-process
 executions:
 
 Before those cohorts, the demo seeds one durable receive selector per node and
-prints a receipt like:
+prints a summary like:
 
 ```text
 SUBSCRIPTIONS status=seeded consume=2 carry=<N-2> selectors=<N> interest_exchange=mission-protected lanes=receiver-directed
@@ -147,65 +139,6 @@ event_acceptance_markers=2 route_cached_events=0`. The intermediate reports
 `opaque_items=0 events=0 event_acceptance_markers=0 route_cached_events=2`.
 Exact sealed-byte totals match even though the relay has no semantic row.
 
-## Observed bounded results
-
-On 2026-08-24 the parent PR-A frozen-tree debug binary completed the
-three-node command with
-exit status zero at:
-
-```text
-/private/tmp/aster-final-default-causal-20260824-n3.fPvORJ/mesh
-```
-
-It ran 13 child processes across seven cohorts in 33.44 seconds. Both endpoints
-held two semantic Events and 21,130 sealed bytes; the intermediate held zero
-semantic Events and two route-cache rows totaling the same 21,130 bytes. All
-opaque and control counts were zero and all stores reported `zeroization=live`.
-All 13 child stdout logs were nonempty (142 lines, 81,708 bytes); all 13 child
-stderr files were empty. The
-three-node no-op retained 36 passing contact lines, each with all 11
-reconciliation counters zero. Every terminal invariant passed.
-
-These retained generic/control/zeroization roots predate the PR-B
-subscription-aware wire change and PR-C live Event surface. Those slices credit
-their exact current code and automated tests rather than relabeling the older
-roots as current-tree evidence.
-
-The omitted-selector default also passed at four nodes and 18 child processes
-across nine cohorts in 40.74 seconds at:
-
-```text
-/private/tmp/aster-final-default-causal-20260824-n4.wSr6so/mesh
-```
-
-Its terminal receipt says `scenario=ping-pong`; two endpoints held the two
-semantic Events, both intermediates held only the two exact route-cache
-representations, and every node had zero controls. The root retains 18 child
-stdout logs (210 lines, 121,209 bytes) and five transient no-op lines (1,067
-bytes) across two child stderr files: two duplicate-concurrent-contact notices, two
-connection losses, and one clean peer-close notice. Its no-op retained 62
-passing contact lines with all 11 reconciliation counters zero.
-
-The same binary passed an eight-node, 38-process line across 17 cohorts at:
-
-```text
-/private/tmp/aster-final-default-causal-20260824-n8.uduyD4/mesh
-```
-
-Nodes 0 and 7 held the two semantic Events; each of nodes 1 through 6 held only
-the two exact route-cache representations. Every node had zero controls. The
-run finished in 84.32 seconds; all 38 child stdout logs were nonempty (572
-lines, 331,748 bytes), and seven child stderr files retained ten transient no-op lines
-(2,195 bytes): five duplicate-concurrent-contact notices and five connection
-losses. Its no-op retained 228 passing contact lines with all 11 counters zero.
-Again, corresponding required contacts succeeded and the terminal invariants
-passed. The generic formulas imply 65 cohorts and 158 child processes at the
-accepted maximum N=32, but no N=32 execution receipt is claimed. Eight nodes do
-not prove the full 2–32 range, a many-node target, physical multi-system
-operation, or resource targets. Exact
-terminal receipts and the parent-snapshot release artifact digest are in the
-[requirements status](../validation/requirements-status.md).
-
 ## Run the four-role control scenario
 
 The control acceptance path is explicit and requires exactly four nodes. Plain
@@ -220,16 +153,15 @@ cargo run --locked -p aster-node --bin aster -- \
 The roles are authority/member node 0, route-only node 1, surviving member node
 2, and captured member node 3. Two short-lived authority CLI processes commit a
 generation-one revocation for node 3 and a recipient-filtered transition of
-`demo/mesh` to epoch two. The demo then proves this bounded sequence:
+`demo/mesh` to epoch two. The demo then runs this bounded sequence:
 
 1. Node 0 gives the exact two-control Flash suffix to node 1.
 2. Both the authority CLI and node 0's carrier process exit. Node 1 forwards the
    suffix without content access; node 2 atomically activates it.
 3. Node 2 then runs alone with `peers=0` and `contacts=0` and atomically commits
    epoch-two Ping. A separate following node-1/node-2 cohort transfers that one
-   exact Event; its paired contact receipts show no control transfer, one Event
-   offered, one fetched, and one inserted. This is the deterministic barrier
-   between control convergence, local publication, and later forwarding.
+   exact Event. This is the deterministic barrier between control convergence,
+   local publication, and later forwarding.
 4. Two later node-2/node-3 cohorts must fail. Node 3 receives no control or
    epoch-two Event, and its stale epoch-one Ping is not admitted by node 2.
 5. Nodes 0 and 1 start with relay applications. That cohort delivers the
@@ -248,51 +180,26 @@ generation-one revocation for node 3 and a recipient-filtered transition of
    `control_remaining`, `offered`, `fetched`, `inserted`, `duplicates`, and
    `remaining`.
 
-A pass ends with these invariant fields; exact transfer IDs and the full receipt
-are in the [requirements status](../validation/requirements-status.md#mission-control-revocation-and-rekey-receipt):
+A pass ends with these invariant summaries:
 
 ```text
-PHASE status=pass name=pong-ping-forward processes=2 carrier_authenticated_edges=verified mission_authenticated_edges=verified provisioning=unprotected-reference
-PHASE status=pass name=pong-publish processes=1 carrier_authenticated_edges=not-applicable mission_authenticated_edges=not-applicable provisioning=unprotected-reference
-PHASE status=pass name=pong-relay-forward processes=2 carrier_authenticated_edges=verified mission_authenticated_edges=verified provisioning=unprotected-reference
-PHASE status=pass name=pong-return processes=2 carrier_authenticated_edges=verified mission_authenticated_edges=verified provisioning=unprotected-reference
 CONTROL_RESULT status=pass nodes=4 authority_processes=2 controls=2 control_priority=flash authority_absent_forwarding=pass route_only_forward=pass survivor_epoch=2 captured_node=3 captured_sync=denied captured_epoch2_read=denied captured_mesh_publication=denied captured_rejoin=denied captured_local_signing=stale-only commit_before_activate=true mission_auth=hybrid-pq root=<demo-root>
 DEMO_RESULT status=pass scenario=control nodes=4 processes=23 contacts=real-iroh mission_auth=hybrid-pq provisioning=unprotected-reference stores=independent-redb reconciliation=negentropy authority_absent_during_forwarding=true authority_cli_absent_after_commit=true authority_carrier_restart=pass controls=source-authenticated-flash recipient_filtered=true payload_blind_relay=pass captured_exclusion=pass epoch2_ping_pong=pass restarts=pass atomic_reaction=pass equal_inventory_noop=pass eligible_transfers_each=2 epoch2_publisher=node-2 root=<demo-root>
 ```
 
-The frozen same-tree run passed in 53 seconds at:
-
-```text
-/private/tmp/aster-final-control-causal-v4-20260824.M8mlbv/mesh
-```
-
-Nodes 0 and 2 held two Events and the two applied controls; route-only node 1
-held two cached Events and the two applied controls; captured node 3 held one
-locally created stale epoch-one Event and no controls. Parent stdout retained
-the exact 16-line terminal block (3,851 bytes), and parent stderr was empty.
-Its 23 child stdout logs were all nonempty (128 lines, 72,159 bytes). Four of 23
-child stderr files retained 109 lines (26,431 bytes), all inside the two
-required denial cohorts: 30
-durable-revocation errors, 25 duplicate-concurrent-contact notices, and 54
-peer-close effects. Every successful cohort retained zero stderr.
-
-`captured_local_signing=stale-only` is deliberately negative evidence. The
-captured node retains old local signing material; the scenario demonstrates
-current-peer exclusion, not zeroization. It also keeps the demo's authority and
-node bundles as raw unprotected-reference files. This is one-host direct
-loopback with one scope and one rekey, not protected administration, physical
-capture, repeated/multi-scope rekey, scale, or release acceptance.
+`captured_local_signing=stale-only` means the captured node retains old local
+signing material: exclusion is not secret destruction. The demo also keeps its
+authority and node bundles as raw unprotected-reference files.
 
 The separate local hook below can destroy one selected node's retained secret
-file contents. It does not change what this control phase proves.
+file contents. It does not change this control flow.
 
 ## Run manually addressed processes
 
-The same binary can run separately managed nodes on directly routable systems,
-but this path has not passed physical multi-system acceptance. Unlike `demo`,
-manual commands do not issue credentials. An operator must supply a separate
-reference mission bundle with the needed route/content grants and the exact
-mission `NodeId` for each peer. There is intentionally no production
+The same binary can run separately managed nodes on directly routable systems.
+Unlike `demo`, manual commands do not issue credentials. An operator must supply
+a separate reference mission bundle with the needed route/content grants and
+the exact mission `NodeId` for each peer. There is intentionally no production
 provisioning CLI or admitted at-rest provider yet.
 
 Create an independent state root on each system:
@@ -306,7 +213,7 @@ other side's exact carrier identity, reachable address, and independent mission
 `NodeId`:
 
 ```sh
-# System A; test application role is optional
+# System A; sample application role is optional
 target/debug/aster node --state ./aster-state --bind 0.0.0.0:49100 \
   --mission-bundle-unprotected-reference "$SYSTEM_A_MISSION_BUNDLE" \
   --peer "$SYSTEM_B_ID@$SYSTEM_B_IP:49100=$SYSTEM_B_MISSION_ID" \
@@ -330,27 +237,7 @@ Empty means receive-none. These selectors do not grant route or content access;
 the mission bundle must independently authorize the exact source, topic,
 scope, and current epoch. Eligible semantic-v5 direct-Iroh contacts
 automatically reconcile Blob sources and peer-neutral contiguous carrier ranges
-of at most 16 KiB. A
-[retained 10,728-byte live-Blob receipt](../validation/evidence/selected-live-blob-044d90f.json)
-(SHA-256
-`4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)
-binds source commit `044d90ff07c8e754b3d490cb810d42de3c915e3d` with
-`Good` signature status; 45 adversarial verifier tests pass. Its
-source-to-execution link remains operator-attested, not cryptographically
-proven. Across three participants and 32 direct-loopback `CONTACT` records, it
-observes peerless publication and seeding, an exactly-one-contact partial
-transfer, exact retained-prefix persistence across receiver reopen, an
-exactly-one-contact continuation from the different eligible replica with no
-source refetch and exact-complement advancement, exact byte reconstruction and
-promotion, bounded live page reads, and a final receiver reopen. This is
-one-host, same-implementation evidence, and every interruption or restart is a
-graceful same-process actor/store/provider reopen. It does not prove physical
-hosts, NAT or Internet paths, controlled or public relay, BTLE, process crash
-or power-loss recovery, long-offline recovery, arbitrary-peer or route-only
-resume, scale beyond three participants, resource thresholds or soak,
-physical sanitization, independent-implementation interoperability, or release
-authorization. The CLI's built-in roles did not produce that receipt and gain
-no Blob acceptance credit from it.
+of at most 16 KiB.
 
 Any stopped State/Record/Blob facade must be closed before the runtime owns the
 same store. Rust applications may instead call
@@ -365,40 +252,13 @@ and its built-in roles neither publish nor read Blob. Record network ingest
 retains concurrent revisions and never executes application merge code.
 
 State's live Rust handle additionally exposes durable positive-current-version
-subscription, poll, acknowledgement, and unsubscribe operations. A
-[retained 9,656-byte receipt](../validation/evidence/selected-live-state-subscription-8912fc3.json)
-(SHA-256
-`7d0b568dd4d57c3f2967da55953896829261877513c59c51a0b274eeda69485f`,
-signed source `8912fc3`) observes a forced receiver-process termination after a
-flushed unacknowledged poll and fresh-process attempt-2 redelivery,
-acknowledgement, re-acknowledgement, and empty poll. The one-host,
-same-implementation run also proves that the application subscription does not
-mutate static network interest, withholds an authorized network-uninterested
-State, suppresses acknowledged/superseded ancestors, and retains a current
-tombstone and subscription through one final peerless reopen. It does not add
-State contact/status, a materialized view or synthetic withdrawals, dynamic
-network interests, physical/mixed or scale/resource evidence, or release
-authorization. The CLI's built-in roles did not produce this receipt.
+subscription, poll, acknowledgement, and unsubscribe operations. Application
+subscriptions do not mutate the configured network interests.
 
 The built-in application roles require bundles granting scope `demo/mesh`, key
 epoch 1, and topic `mesh.ping-pong` to the endpoint applications. A relay role
 requires only the scope/epoch route grant. This manual shape is documentation of
 the process interface, not an operational provisioning workflow.
-
-### Retained selected-Iroh NAT evidence
-
-A separately frozen one-host receipt observes one exact Event and an exact
-replay no-op through cone/direct and restrictive/controlled-relay Docker Linux
-namespace NATs. The cone cell uses static operator-known mappings; the
-restrictive cell records blocked direct traffic and carries only through the
-exact DER-pinned relay. Source and test automation alone do not create this
-retained receipt.
-
-This evidence does not establish selected endpoint discovery or punching, a
-temporal direct-first/fallback sequence, representative or physical NAT,
-public-network or public-relay operation, State/Record/Blob-over-relay, BTLE,
-mixed implementations, resource brackets, or release authorization. See the
-exact [evidence and replay boundary](../validation/requirements-status.md#selected-iroh-nat-retained-receipt).
 
 The Iroh handshake binds the expected endpoint and rejects an unlisted carrier
 before an application frame. The node then runs the hybrid reference session,
@@ -413,8 +273,8 @@ rejected.
 Without controlled-relay flags, hosted discovery, Iroh relays, and port mapping
 are disabled. Direct IP reachability and firewalls are operator
 responsibilities. Manual mission bundle files must be regular, bounded,
-non-symlink files with owner-only Unix permissions; receipts deliberately label
-them `provisioning=unprotected-reference`.
+non-symlink files with owner-only Unix permissions. CLI output labels this mode
+`provisioning=unprotected-reference`.
 
 ### Trigger bounded local software zeroization
 
@@ -459,18 +319,15 @@ Erasing the mission/content and carrier-identity secrets makes that ciphertext
 unavailable through normal operation: this is bounded cryptographic shredding,
 not deletion or physical sanitization of depot files. Restoring credential
 bytes into the retained zero-length files does not reopen that same database.
-Replacing or rolling back the database is outside this proof.
+Replacing or rolling back the database is outside the supported boundary.
 
 Cleanup is idempotent and crash-resumable after the terminal marker: only an
 uncompleted pathname that still identifies the exact recorded inode may be
 reopened and erased. A missing, replaced, linked, symlinked, permission-changed,
 or otherwise indeterminate target leaves the store terminal and fails closed;
-the retry never erases replacement data. The retained
-[receipt](../validation/requirements-status.md#local-software-zeroization-receipt)
-includes a live child-process run and a separate child abruptly terminated
-immediately after marker commit.
+the retry never erases replacement data.
 
-The claim stops at bounded local Unix software erasure. The CLI has no network
+The boundary stops at bounded local Unix software erasure. The CLI has no network
 or mission-control trigger and does not prove inode deletion, deterministic
 remote observation of a mid-flight teardown, physical flash sanitization,
 copy-on-write history removal, snapshot/swap/backup destruction, database
@@ -532,37 +389,19 @@ needed for production administration.
 
 `aster put` remains an isolated caller-ID opaque compatibility command. Those
 rows are inspectable but are not advertised or transferred by selected Event
-reconciliation. Do not use `put` as evidence for the source-authenticated mesh.
+reconciliation. Do not use `put` for source-authenticated mesh data.
 
 ## What this implementation owns
 
 | Component | Sole responsibility in the selected lane |
 |---|---|
 | `aster-profile` | Stable complete reconciliation keys and canonical inventory ordering; class-specific exact Event/State/Record transfer IDs enter by explicit conversion |
-| `aster-redb-store` | Mission-bound audited control chain and atomic policy snapshots plus semantic Event/State/Record/Blob causal/operation state, durable Event, positive-current-version State, whole-key active-head Record, and metadata-only Blob publication delivery state, bounded Event route-only cache, a durable terminal software-zeroization intent/phase receipt, and a disjoint retained opaque compatibility namespace |
+| `aster-redb-store` | Mission-bound audited control chain and atomic policy snapshots plus semantic Event/State/Record/Blob causal/operation state, durable Event, positive-current-version State, whole-key active-head Record, and metadata-only Blob publication delivery state, bounded Event route-only cache, durable terminal software-zeroization state, and a disjoint opaque compatibility namespace |
 | `aster-negentropy` | Bounded, clock-independent set difference over exact transfer IDs |
 | `aster-iroh` | Direct and operator-pinned controlled-relay endpoint lifecycle, carrier identity, and bounded exchange |
-| `aster-node` | Composition, mission-before-inventory and control-before-data ordering, peer route/interest filtering, exact control/Event/State/Record transfer, semantic-v5 direct Blob source/range automation, live Event/State/Record/Blob handles, durable Event/State/Record delivery plus current-code metadata-only Blob delivery, authority commands, sample applications, bounded same-UID Unix local zeroization lifecycle, receipts, and CLI |
+| `aster-node` | Composition, mission-before-inventory and control-before-data ordering, peer route/interest filtering, exact control/Event/State/Record transfer, semantic-v5 direct Blob source/range automation, live Event/State/Record/Blob handles, durable application delivery, authority commands, sample applications, bounded same-UID Unix local zeroization lifecycle, and CLI |
 | `aster-core` | Existing spec-verified hybrid mission session, control envelope, recipient-filtered rekey, and typed source-envelope Event/State/Record/Blob semantics, used rather than rewritten |
 
-No old path is removed until its replacement passes equivalent tests. Blob
-delivery has a separate
-[retained 10,269-byte peerless forced-process-redelivery receipt](../validation/evidence/selected-live-blob-subscription-26e0a09.json)
-(SHA-256
-`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
-Good-signed source `26e0a09`), but it does not enlarge this Event-only CLI
-tour. Current open work includes broader Record-delivery partition/carrier acceptance,
-State contact/status and
-materialized-view/synthetic-withdrawal behavior, dynamic State network
-interests, selected-node bindings, network/application Blob selector-separation
-acceptance, broader State/Record partition/relay
-acceptance, Blob peer/convergence status, and Blob resume beyond the bounded retained
-three-participant/different-eligible-peer direct-Iroh observation,
-controlled-relay Blob acceptance, route-only Blob relay/custody, generalized
-publish/subscribe and topic filtering, finite State/Record/Blob custody and
-non-Linux finite Event custody, protected provisioning, generalized control
-administration and repeated multi-scope rekey,
-platform-complete zeroization assurance, physical/multi-carrier or
-mixed-implementation acceptance, and release gates. The tracked [requirements
-status](../validation/requirements-status.md) keeps those boundaries
-explicit.
+Current validation coverage and open product gates are tracked in
+[requirements status](../validation/requirements-status.md) and
+[conformance](../validation/conformance.md).
