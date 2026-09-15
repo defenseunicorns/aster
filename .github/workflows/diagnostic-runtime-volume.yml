@@ -1,0 +1,148 @@
+name: "Diagnostic: one runtime-volume test"
+
+# Proposal only until independently reviewed and registered.
+# Never add push, pull_request, workflow_run or schedule to bypass registration.
+on:
+  workflow_dispatch:
+    inputs:
+      reviewed_candidate_sha:
+        description: "Full immutable workflow commit approved by independent review"
+        type: string
+        required: true
+      source_admission_receipt_sha256:
+        description: "SHA-256 of accountable approval for existing CI download sources and locked diagnostic graph"
+        type: string
+        required: true
+      reviewed_rustup_sha256:
+        description: "Accountable owner-approved SHA-256 of existing runner rustup 1.28.2; no installer download"
+        type: string
+        required: true
+      confirm_one_diagnostic:
+        description: "One instrumented observation only; no CI qualification or retries"
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-volume-single-diagnostic
+  cancel-in-progress: false
+
+jobs:
+  diagnostic:
+    if: ${{ inputs.confirm_one_diagnostic }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      REVIEWED_RUSTUP_SHA256: ${{ inputs.reviewed_rustup_sha256 }}
+      SOURCE_ADMISSION_RECEIPT_SHA256: ${{ inputs.source_admission_receipt_sha256 }}
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUST_BACKTRACE: "1"
+      RUSTUP_AUTO_INSTALL: "0"
+      RUSTUP_HOME: ${{ runner.temp }}/volume-rustup
+      CARGO_HOME: ${{ runner.temp }}/volume-cargo
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Verify reviewed immutable workflow identity
+        env:
+          REVIEWED_SHA: ${{ inputs.reviewed_candidate_sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$REVIEWED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$REVIEWED_SHA" == "$GITHUB_SHA" ]]
+          [[ "$GITHUB_RUN_ATTEMPT" == "1" ]]
+          [[ "$SOURCE_ADMISSION_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$REVIEWED_RUSTUP_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/volume-evidence" "$RUNNER_TEMP/volume-private"
+          printf '%s\n' '{"state":"preparation","diagnostic_only":true,"qualification":false,"test_executions":0}' > "$RUNNER_TEMP/volume-evidence/preparation.json"
+
+      - name: Check out exact reviewed diagnostic tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, admitted current CI
+        with:
+          repository: edgesoftops/astertech
+          ref: ${{ github.sha }}
+          path: tooling
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Check out immutable historical test source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: edgesoftops/astertech
+          ref: 14d795390a84d425681d7d40ee4c0e1072be0fb9
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Validate diagnostic contracts without Rust
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B -m unittest discover -v -s tooling/.github/diagnostics/runtime-volume -p 'test_*.py'
+          python3 tooling/.github/diagnostics/runtime-volume/preflight.py "$GITHUB_WORKSPACE/source" "$RUNNER_TEMP/volume-evidence"
+
+      - name: Prepare existing admitted pinned Rust and policy tools
+        timeout-minutes: 12
+        working-directory: source
+        run: |
+          set -euo pipefail
+          umask 077
+          # Exact input binding through an owner-pending local verified mirror.
+          # No weaker manifest claim and no installer download/fallback.
+          python3 "$GITHUB_WORKSPACE/tooling/.github/diagnostics/runtime-volume/installer.py" \
+            "$RUNNER_TEMP/volume-private" "$RUNNER_TEMP/volume-evidence"
+          export PATH="$RUNNER_TEMP/volume-private/verified-bin:$CARGO_HOME/bin:$PATH"
+          printf '%s/bin\n' "$CARGO_HOME" >> "$GITHUB_PATH"
+          cargo +1.97.1 install --locked cargo-deny --version 0.20.2
+          cargo +1.97.1 install --locked cargo-audit --version 0.22.2
+
+      - name: Acquire existing approved registry inputs and enforce current policy
+        timeout-minutes: 12
+        working-directory: source
+        run: |
+          set -euo pipefail
+          umask 077
+          cargo +1.97.1 fetch --locked
+          cargo +1.97.1 fetch --locked --manifest-path fuzz/Cargo.toml
+          cargo +1.97.1 deny --config "$GITHUB_WORKSPACE/tooling/deny.toml" fetch all
+          CARGO_NET_OFFLINE=true sh tools/check-dependency-exception-scope.sh
+          cargo +1.97.1 audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119 --file Cargo.lock
+          cargo +1.97.1 audit --no-fetch --file fuzz/Cargo.lock
+          cargo +1.97.1 deny --config "$GITHUB_WORKSPACE/tooling/deny.toml" --locked --offline check
+          cargo +1.97.1 deny --manifest-path fuzz/Cargo.toml --config "$GITHUB_WORKSPACE/tooling/deny.toml" --locked --offline check
+          python3 tools/check-netlink-packet-core-patch.py
+          CARGO_NET_OFFLINE=true python3 tools/check-retained-libp2p-oracle-boundary.py
+          # A policy failure stops before the one probe; no exceptions added.
+          printf '%s\n' '{"state":"policy_passed","diagnostic_only":true,"qualification":false}' > "$RUNNER_TEMP/volume-evidence/policy.json"
+
+      - name: Build once offline and execute the single instrumented test
+        timeout-minutes: 29
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 tooling/.github/diagnostics/runtime-volume/driver.py \
+            "$GITHUB_WORKSPACE/source" \
+            "$RUNNER_TEMP/volume-evidence" \
+            "$RUNNER_TEMP/volume-private"
+
+      - name: Retain only sanitized bounded diagnostic evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2, admitted manual build workflow
+        with:
+          name: runtime-volume-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/volume-evidence/*.json
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 7

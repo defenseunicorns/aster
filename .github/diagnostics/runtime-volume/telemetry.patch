@@ -1,0 +1,292 @@
+--- a/crates/aster-lab/src/mesh_experiment/libp2p_candidate.rs
++++ b/crates/aster-lab/src/mesh_experiment/libp2p_candidate.rs
+@@ -31,6 +31,107 @@
+ use std::sync::{Arc, Mutex};
+ use std::time::{Duration, Instant};
+
++// CI-VOLUME-DIAG-BEGIN
++// Instrumented diagnostic only, not qualification.
++#[derive(Clone)]
++struct VolumeDiagnostic {
++    started: Instant,
++    sampled_ms: u128,
++    loop_started_ms: u128,
++    durable_sampled_ms: u128,
++    phase: &'static str,
++    counters: [u64; 22],
++    durable: [u8; 4],
++    costs: [[u128; 3]; 5],
++    emitted: u32,
++}
++thread_local! {
++    static VOLUME_DIAGNOSTIC: std::cell::RefCell<Option<VolumeDiagnostic>> = const { std::cell::RefCell::new(None) };
++}
++struct VolumeDiagnosticGuard;
++impl VolumeDiagnosticGuard {
++    fn start() -> Self {
++        VOLUME_DIAGNOSTIC.with(|cell| {
++            *cell.borrow_mut() = Some(VolumeDiagnostic {
++                started: Instant::now(), sampled_ms: 0, loop_started_ms: 0,
++                durable_sampled_ms: 0, phase: "prepare", counters: [0; 22],
++                durable: [0; 4], costs: [[0; 3]; 5], emitted: 0,
++            });
++        });
++        Self
++    }
++}
++impl Drop for VolumeDiagnosticGuard {
++    fn drop(&mut self) {
++        volume_diag_emit("final");
++        VOLUME_DIAGNOSTIC.with(|cell| { *cell.borrow_mut() = None; });
++    }
++}
++fn volume_diag_phase(phase: &'static str) {
++    VOLUME_DIAGNOSTIC.with(|cell| {
++        if let Some(d) = cell.borrow_mut().as_mut() { d.phase = phase; }
++    });
++    volume_diag_emit("phase");
++}
++struct VolumeDiagnosticSpan(usize, Instant);
++impl Drop for VolumeDiagnosticSpan {
++    fn drop(&mut self) {
++        let elapsed = self.1.elapsed().as_nanos();
++        VOLUME_DIAGNOSTIC.with(|cell| {
++            if let Some(d) = cell.borrow_mut().as_mut() {
++                d.costs[self.0][0] += 1;
++                d.costs[self.0][1] += elapsed;
++                d.costs[self.0][2] = d.costs[self.0][2].max(elapsed);
++            }
++        });
++    }
++}
++fn volume_diag_boundaries(a: &ChannelBridge, c: &ChannelBridge, ao: &ProviderObservations, co: &ProviderObservations) {
++    VOLUME_DIAGNOSTIC.with(|cell| {
++        if let Some(d) = cell.borrow_mut().as_mut() {
++            d.sampled_ms = d.started.elapsed().as_millis();
++            d.counters = [
++                a.accepted_sends(), ao.frames_submitted, ao.frames_sent,
++                co.frames_received, c.runtime_receives(),
++                c.accepted_sends(), co.frames_submitted, co.frames_sent,
++                ao.frames_received, a.runtime_receives(),
++                a.queued_to_provider.load(Ordering::Relaxed),
++                c.queued_to_provider.load(Ordering::Relaxed),
++                (LINK_FRAME_CAPACITY as u64).saturating_sub(ao.frames_submitted.saturating_sub(ao.frames_sent)),
++                (LINK_FRAME_CAPACITY as u64).saturating_sub(co.frames_submitted.saturating_sub(co.frames_sent)),
++                a.outbound_high_water(), c.outbound_high_water(),
++                a.queue_backpressure(), c.queue_backpressure(),
++                ao.stream_opened as u64, co.stream_opened as u64,
++                u64::from(matches!(ao.expected_direction, StreamDirection::Outbound)),
++                u64::from(matches!(co.expected_direction, StreamDirection::Outbound)),
++            ];
++        }
++    });
++}
++fn volume_diag_durable(states: [u8; 4]) {
++    VOLUME_DIAGNOSTIC.with(|cell| {
++        if let Some(d) = cell.borrow_mut().as_mut() {
++            d.durable = states;
++            d.durable_sampled_ms = d.started.elapsed().as_millis();
++        }
++    });
++}
++// 0=not sampled; 1=absent; 2=present; 3=query error. No error text or early propagation.
++fn volume_diag_item<E>(result: Result<bool, E>) -> u8 {
++    match result { Ok(false) => 1, Ok(true) => 2, Err(_) => 3 }
++}
++fn volume_diag_emit(kind: &str) {
++    VOLUME_DIAGNOSTIC.with(|cell| {
++        if let Some(d) = cell.borrow_mut().as_mut() {
++            if d.emitted >= 64 && kind != "final" { return; }
++            d.emitted += 1;
++            eprintln!("[CI-VOLUME-DIAG-22] kind={} phase={} outer_ms={} loop_started_ms={} sampled_ms={} durable_sampled_ms={} counters={:?} durable={:?} costs={:?}",
++                kind, d.phase, d.started.elapsed().as_millis(), d.loop_started_ms,
++                d.sampled_ms, d.durable_sampled_ms, d.counters, d.durable, d.costs);
++        }
++    });
++}
++// CI-VOLUME-DIAG-END
+ const CONTACT: ContactId = ContactId(1);
+ const REPLACEMENT_CONTACT: ContactId = ContactId(2);
+ const LINK_FRAME_CAPACITY: usize = 1_024;
+@@ -616,6 +717,9 @@
+         prepared.scope.clone(),
+         prepared.publisher,
+     );
++// CI-VOLUME-DIAG-BEGIN
++    volume_diag_phase("supervisors");
++// CI-VOLUME-DIAG-END
+     let (a_identity, mut a_supervisor, _) = open_native_shared_supervisor_with_limits(
+         &a_config,
+         EmissionPolicy::default(),
+@@ -643,6 +747,9 @@
+         return Err(invalid("provider base reservation was not node-global"));
+     }
+
++// CI-VOLUME-DIAG-BEGIN
++    volume_diag_phase("adapters");
++// CI-VOLUME-DIAG-END
+     // The leases above deliberately precede both Swarm constructions.
+     let a_key = Keypair::generate_ed25519();
+     let b_key = Keypair::generate_ed25519();
+@@ -660,6 +767,9 @@
+     let a_carrier_peer = a_adapter.local_peer_id();
+     let b_carrier_peer = b_adapter.local_peer_id();
+
++// CI-VOLUME-DIAG-BEGIN
++    volume_diag_phase("listen");
++// CI-VOLUME-DIAG-END
+     a_adapter.listen("/ip4/127.0.0.1/tcp/0".parse()?)?;
+     b_adapter.listen("/ip4/127.0.0.1/tcp/0".parse()?)?;
+     let a_address = listen_address(&mut a_adapter).await?;
+@@ -696,6 +806,9 @@
+     }) {
+         return Err(invalid("shared supervisor did not select the libp2p dial"));
+     }
++// CI-VOLUME-DIAG-BEGIN
++    volume_diag_phase("connect");
++// CI-VOLUME-DIAG-END
+     a_adapter.dial(DialCandidate {
+         expected_peer_id: Some(b_carrier_peer),
+         address: b_address,
+@@ -729,6 +842,9 @@
+     let (a_link, a_bridge) = ChannelLink::bounded(b_identity);
+     let (b_link, b_bridge) = ChannelLink::bounded(a_identity);
+
++// CI-VOLUME-DIAG-BEGIN
++    volume_diag_phase("contacts");
++// CI-VOLUME-DIAG-END
+     // The supervisor owns the RuntimeDriver and reserves the complete contact
+     // claim before either provider is allowed to activate `/aster/sync/2`.
+     open_supervised_contact(
+@@ -771,6 +887,9 @@
+         ));
+     }
+
++// CI-VOLUME-DIAG-BEGIN
++    volume_diag_phase("activation");
++// CI-VOLUME-DIAG-END
+     a_adapter.activate_session(a_carrier.session)?;
+     b_adapter.activate_session(b_carrier.session)?;
+     let mut a_observations = ProviderObservations {
+@@ -795,13 +914,44 @@
+     let volume_started = Instant::now();
+     let mut next_progress = Duration::from_secs(10);
+
++// CI-VOLUME-DIAG-BEGIN
++    volume_diag_phase("volume");
++    VOLUME_DIAGNOSTIC.with(|cell| { if let Some(d) = cell.borrow_mut().as_mut() { d.loop_started_ms = d.started.elapsed().as_millis(); } });
++// CI-VOLUME-DIAG-END
+     loop {
+         let now = Instant::now();
++// CI-VOLUME-DIAG-BEGIN
++        let diagnostic_span_0 = VolumeDiagnosticSpan(0, Instant::now());
++// CI-VOLUME-DIAG-END
+         a_supervisor.drive_contact(CONTACT, now)?;
++// CI-VOLUME-DIAG-BEGIN
++        drop(diagnostic_span_0);
++// CI-VOLUME-DIAG-END
++// CI-VOLUME-DIAG-BEGIN
++        let diagnostic_span_1 = VolumeDiagnosticSpan(1, Instant::now());
++// CI-VOLUME-DIAG-END
+         b_supervisor.drive_contact(CONTACT, now)?;
++// CI-VOLUME-DIAG-BEGIN
++        drop(diagnostic_span_1);
++// CI-VOLUME-DIAG-END
++// CI-VOLUME-DIAG-BEGIN
++        let diagnostic_span_2 = VolumeDiagnosticSpan(2, Instant::now());
++// CI-VOLUME-DIAG-END
+         flush_runtime_frames(&mut a_adapter, &a_bridge, &mut a_observations)?;
++// CI-VOLUME-DIAG-BEGIN
++        drop(diagnostic_span_2);
++// CI-VOLUME-DIAG-END
++// CI-VOLUME-DIAG-BEGIN
++        let diagnostic_span_3 = VolumeDiagnosticSpan(3, Instant::now());
++// CI-VOLUME-DIAG-END
+         flush_runtime_frames(&mut b_adapter, &b_bridge, &mut b_observations)?;
++// CI-VOLUME-DIAG-BEGIN
++        drop(diagnostic_span_3);
++// CI-VOLUME-DIAG-END
+
++// CI-VOLUME-DIAG-BEGIN
++        volume_diag_boundaries(&a_bridge, &b_bridge, &a_observations, &b_observations);
++// CI-VOLUME-DIAG-END
+         let a_admitted = a_supervisor
+             .contact_status()
+             .into_iter()
+@@ -823,9 +973,25 @@
+             && b_supervisor.durable_item_present(prepared.item_id)?
+             && b_supervisor.durable_item_present(a_second_item)?
+         {
++// CI-VOLUME-DIAG-BEGIN
++            volume_diag_durable([2; 4]);
++            volume_diag_emit("complete_predicate");
++// CI-VOLUME-DIAG-END
+             break;
+         }
+         if volume_started.elapsed() >= next_progress {
++// CI-VOLUME-DIAG-BEGIN
++
++            let diagnostic_observation_started = Instant::now();
++            volume_diag_durable([
++                volume_diag_item(a_supervisor.durable_item_present(c_first_item)),
++                volume_diag_item(a_supervisor.durable_item_present(c_second_item)),
++                volume_diag_item(b_supervisor.durable_item_present(prepared.item_id)),
++                volume_diag_item(b_supervisor.durable_item_present(a_second_item)),
++            ]);
++            volume_diag_emit("progress");
++            eprintln!("[CI-VOLUME-DIAG-22] observation_ns={}", diagnostic_observation_started.elapsed().as_nanos());
++// CI-VOLUME-DIAG-END
+             eprintln!(
+                 "libp2p volume progress: elapsed_s={} A_submitted={} A_sent={} C_received={}; C_submitted={} C_sent={} A_received={}",
+                 volume_started.elapsed().as_secs(),
+@@ -839,6 +1005,9 @@
+             next_progress = next_progress.saturating_add(Duration::from_secs(10));
+         }
+
++// CI-VOLUME-DIAG-BEGIN
++        let diagnostic_poll_span = VolumeDiagnosticSpan(4, Instant::now());
++// CI-VOLUME-DIAG-END
+         tokio::select! {
+             event = a_adapter.next_event() => {
+                 handle_provider_event(event, &a_bridge, &mut a_observations)?;
+@@ -848,6 +1017,10 @@
+             }
+             () = tokio::time::sleep(Duration::from_millis(1)) => {}
+         }
++// CI-VOLUME-DIAG-BEGIN
++        drop(diagnostic_poll_span);
++        volume_diag_boundaries(&a_bridge, &b_bridge, &a_observations, &b_observations);
++// CI-VOLUME-DIAG-END
+     }
+
+     eprintln!(
+@@ -905,6 +1078,9 @@
+             "volume run did not saturate the bounded RuntimeDriver Link queue",
+         ));
+     }
++// CI-VOLUME-DIAG-BEGIN
++    volume_diag_phase("resource_oracles");
++// CI-VOLUME-DIAG-END
+     let expected_resources = admitted_resource_total(base_claim)?;
+     for supervisor in [&a_supervisor, &b_supervisor] {
+         let snapshot = supervisor.resource_snapshot()?;
+@@ -918,6 +1094,9 @@
+         }
+     }
+
++// CI-VOLUME-DIAG-BEGIN
++    volume_diag_phase("cleanup");
++// CI-VOLUME-DIAG-END
+     // Keep the base leases alive until after the persistent Swarms are gone.
+     drop(a_adapter);
+     drop(b_adapter);
+@@ -1304,6 +1483,9 @@
+
+ #[tokio::test(flavor = "current_thread")]
+ async fn two_persistent_swarms_drive_ten_thousand_runtime_frames_each_way() -> LabResult<()> {
++// CI-VOLUME-DIAG-BEGIN
++    let _volume_diagnostic_guard = VolumeDiagnosticGuard::start();
++// CI-VOLUME-DIAG-END
+     // This bounds deadlock; it is not a throughput gate. In the shared debug
+     // suite this current-thread oracle competes with other CPU-heavy lab tests.
+     tokio::time::timeout(Duration::from_secs(300), real_two_node_bridge())
