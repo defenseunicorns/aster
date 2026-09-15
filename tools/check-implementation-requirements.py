@@ -19,7 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS = ROOT / "data-mesh-requirements.md"
-MATRIX = ROOT / "docs/evaluations/0005/requirements-matrix.csv"
+MATRIX = ROOT / "docs/validation/requirements-matrix.csv"
 TRACE = ROOT / "docs/validation/requirements-implementation.csv"
 LEDGER = ROOT / "docs/validation/requirements-status.md"
 EXPECTED_REQUIREMENTS_SHA256 = (
@@ -1589,9 +1589,9 @@ RELEVANT_ARTIFACTS = {
     "DM-13-08": "docs/validation/conformance.md; crates/aster-conformance; conformance",
     "DM-13-09": "docs/quickstart; docs/application-recipes.md",
     "DM-13-10": "examples; docs/quickstart",
-    "DM-13-11": "deny.toml; docs/decisions; docs/evaluations/0005",
-    "DM-14-20": "docs/evaluations/0005; docs/decisions/0025-requirements-first-foss-architecture-evaluation.md",
-    "DM-14-21": "docs/evaluations/0005/responsibility-map.md; docs/decisions/0025-requirements-first-foss-architecture-evaluation.md",
+    "DM-13-11": "deny.toml; docs/decisions; archive/research/evaluations/0005",
+    "DM-14-20": "archive/research/evaluations/0005; docs/decisions/0025-requirements-first-foss-architecture-evaluation.md",
+    "DM-14-21": "archive/research/evaluations/0005/responsibility-map.md; docs/decisions/0025-requirements-first-foss-architecture-evaluation.md",
     "DM-14-23": SECURITY_PROFILE_ARTIFACTS,
 }
 

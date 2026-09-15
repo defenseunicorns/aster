@@ -13,9 +13,9 @@
 - Exact FOSS graph: BVB-722/BVB-723 (`coset` 0.4.2 plus
   `aws-lc-rs` 1.18.0, non-FIPS)
 - Result:
-  [`summary.json`](results/security-profile.json)
+  [`summary.json`](../../../../docs/evaluations/0005/results/security-profile.json)
 - Atomic requirement map:
-  [`requirements-map.json`](requirement-maps/security-profile.json)
+  [`requirements-map.json`](../../../../docs/evaluations/0005/requirement-maps/security-profile.json)
 - Research profile seed:
   [`integrated-security-profile-seed.md`](integrated-security-profile-seed.md)
 

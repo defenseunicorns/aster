@@ -172,7 +172,7 @@ cause another bounded dial. `DM-6-23` freshness therefore receives no credit.
 | `DM-9-21` provisional per-scope scale | Decision curve only | Hint-table counts are not mesh scale and 128 is not a requirement threshold. |
 
 The detailed atomic mapping is preserved in
-[`requirements-map.csv`](requirement-maps/discovery.csv).
+[`requirements-map.csv`](../../../../docs/evaluations/0005/requirement-maps/discovery.csv).
 
 ## Delete/delete/delete disposition
 

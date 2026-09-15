@@ -108,7 +108,7 @@ required, and external disposition remains pending.
 - [`greenfield integrated control`](final-stack-bakeoff.md)
 - [`semantic/carrier cross-product`](rolling-results.md)
 - [`final A-versus-G bakeoff`](final-stack-bakeoff.md)
-- [`machine-readable final comparison`](results/stack-comparison.json)
+- [`machine-readable final comparison`](../../../../docs/evaluations/0005/results/stack-comparison.json)
 
 ### Security and membership
 
@@ -126,7 +126,7 @@ required, and external disposition remains pending.
 - [`connectivity-comparison.md`](connectivity-comparison.md)
 - [`discovery-admission.md`](discovery-admission.md)
 - [`carrier-arm.md`](carrier-arm.md)
-- [Iroh/Patchbay connectivity observation and image provenance](results/iroh-patchbay.json)
+- [Iroh/Patchbay connectivity observation and image provenance](../../../../docs/evaluations/0005/results/iroh-patchbay.json)
 
 ### Replaceable components and product surface
 
@@ -142,13 +142,13 @@ required, and external disposition remains pending.
 ## Public record and maintained checks
 
 The public evaluation record retains decisions, positive and negative findings,
-claim limits, selected result summaries under [`results/`](results), and the
-exact research requirement maps under [`requirement-maps/`](requirement-maps).
+claim limits, selected result summaries under [`../../../../docs/evaluations/0005/results/`](../../../../docs/evaluations/0005/results), and the
+exact research requirement maps under [`../../../../docs/evaluations/0005/requirement-maps/`](../../../../docs/evaluations/0005/requirement-maps).
 Raw execution logs, downloaded sources, one-off build recipes, candidate
 harnesses, and historical control ledgers are retained separately.
 
 The maintained differential corpus lives in
-[`conformance/evaluation-v0`](../../../conformance/evaluation-v0/README.md).
+[`conformance/evaluation-v0`](../../../../conformance/evaluation-v0/README.md).
 `mise run conformance-profile-v0-r2` builds and checks that corpus. Historical
 validation counts and source hashes describe their dated archived snapshots;
 they are not assertions about the reduced public tree or new test executions.

@@ -62,7 +62,7 @@ RSS observations. These are small-run observations, not sizing evidence.
 
 - The original D06 mode-`0400`/`ramfs` assumption does not match systemd 257 on
   the selected image. The exact accepted presentation is now recorded in the
-  [systemd 257 amendment](../../superpowers/specs/2026-09-09-systemd-257-credential-presentation-amendment.md).
+  [systemd 257 amendment](../inputs/systemd-257-credential-presentation-amendment.md).
 - `systemd-creds list` labels the ACL-backed mode-`0440` presentation
   `insecure`. Aster therefore makes only its narrower independently checked
   ACL/mount/no-swap claim. Security and Deployment approval of the immutable

@@ -102,7 +102,7 @@ forwarding, Event bridges, and dynamic bridge administration.
     The mode-`0400`/`ramfs` description remains the original accepted
     presentation. The exact systemd 257 profile additionally uses the narrowly
     pinned root-owned ACL/read-only-`tmpfs`/`noswap` presentation defined in
-    the [2026-09-09 credential-presentation amendment](../superpowers/specs/2026-09-09-systemd-257-credential-presentation-amendment.md).
+    the [2026-09-09 credential-presentation amendment](../validation/inputs/systemd-257-credential-presentation-amendment.md).
     That amendment requires separate Security and Deployment approval at E01
     and creates no generic Debian, `tmpfs`, or production support claim.
 

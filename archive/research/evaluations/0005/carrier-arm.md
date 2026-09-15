@@ -495,7 +495,7 @@ partial reads/writes, flow control, unplug/replug, corruption, and peer reset.
 
 Selected requirement atoms materially evaluated by this arm, with result and
 next gate, are in
-[`requirements-map.csv`](requirement-maps/carrier.csv).
+[`requirements-map.csv`](../../../../docs/evaluations/0005/requirement-maps/carrier.csv).
 The arm supplies material decision data for `DM-3-04`, `DM-3-09`,
 `DM-5.6-04`, `DM-5.8-03` through `DM-5.8-05`, `DM-5.8-15`, `DM-9-19`,
 and `DM-9-20`; an architecture seam for `DM-3-07`, `DM-3-08`,

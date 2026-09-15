@@ -88,7 +88,7 @@ claim boundary:
 - `P0-1-D06` is resolved for the profile definition. Internal approval of the
   exact provider selection and bound digest was recorded on 2026-09-08 against
   the
-  [approved Raspberry Pi systemd credential provider v2 design](../superpowers/specs/2026-09-08-raspberry-pi-systemd-credential-provider-v2-design.md)
+  [approved Raspberry Pi systemd credential provider v2 design](../validation/inputs/raspberry-pi-systemd-credential-provider-v2-design.md)
   at
   `sha256:30c5dfe71a203fcdd69dd330f9b5c68eeaee5032b624ee41912aa4723a9f853f`.
   Security and deployment approvals of that exact design and digest remain

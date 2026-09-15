@@ -66,9 +66,9 @@ sender-success/receiver-completion asymmetry. No hidden retry was used.
 
 The deterministic verifier checked the exact G manifest, exact A logs, and
 required absent result files. Its outputs are
-[`comparison-summary.json`](results/stack-comparison.json)
+[`comparison-summary.json`](../../../../docs/evaluations/0005/results/stack-comparison.json)
 and
-[`comparison-matrix.csv`](results/stack-comparison.csv)
+[`comparison-matrix.csv`](../../../../docs/evaluations/0005/results/stack-comparison.csv)
 under corrected `BVB-948`.
 
 Endpoint control, durable-domain count, graph size, and binary size were

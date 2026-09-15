@@ -4,7 +4,7 @@
 - Requirements authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Requirements SHA-256: `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
 - Planning view: [`capability-roadmap.md`](capability-roadmap.md)
-- Atomic requirements index: [`requirements-matrix.csv`](../evaluations/0005/requirements-matrix.csv)
+- Atomic requirements index: [`requirements-matrix.csv`](requirements-matrix.csv)
 - Exhaustive cross-lane trace: [`requirements-implementation.csv`](requirements-implementation.csv)
 - Matrix SHA-256: `57518c2aaeb7341f0d2ef7169a30a1666e337def2bb6a34f9225fad6e438e5b2`
 - Retained receipt baseline (parent PR-A/pre-subscription): signed commit `ee57c0f1a0ff67b9a301220b63bb009593ef626b`

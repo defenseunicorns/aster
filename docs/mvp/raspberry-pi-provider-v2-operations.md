@@ -58,7 +58,7 @@ Active generation.
 
 The runtime presentation must satisfy either the original service-owned
 mode-`0400` `ramfs` form or every predicate of the exact
-[systemd 257 credential-presentation amendment](../superpowers/specs/2026-09-09-systemd-257-credential-presentation-amendment.md).
+[systemd 257 credential-presentation amendment](../validation/inputs/systemd-257-credential-presentation-amendment.md).
 The latter is not a generic `tmpfs` fallback and remains subject to Security
 and Deployment approval at E01.
 

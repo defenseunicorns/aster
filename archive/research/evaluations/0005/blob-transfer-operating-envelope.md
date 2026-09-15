@@ -64,7 +64,7 @@ The Blob layer must own more than a hash helper:
 Items 1 through 4 were exercised in the bounded profile. Item 5 is only a
 logical policy probe. Item 6 belongs to the selected security composition and
 was deliberately not duplicated here. Detailed dispositions are in
-[`requirements-map.csv`](requirement-maps/blob.csv).
+[`requirements-map.csv`](../../../../docs/evaluations/0005/requirement-maps/blob.csv).
 
 ## Exact freeze
 

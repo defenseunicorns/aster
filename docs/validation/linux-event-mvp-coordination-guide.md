@@ -123,7 +123,7 @@ resolved, without granting candidate or production authorization:
 - **D06 — protected provider:** the exact provider selection and bound design
   digest were approved internally for the profile definition on 2026-09-08.
   D06 is resolved by the
-  [approved Raspberry Pi systemd credential provider v2 design](../superpowers/specs/2026-09-08-raspberry-pi-systemd-credential-provider-v2-design.md)
+  [approved Raspberry Pi systemd credential provider v2 design](inputs/raspberry-pi-systemd-credential-provider-v2-design.md)
   for `aster-systemd-credential-store/v2` at
   `sha256:30c5dfe71a203fcdd69dd330f9b5c68eeaee5032b624ee41912aa4723a9f853f`.
   Security and deployment approvals of that exact design and digest remain

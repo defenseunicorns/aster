@@ -277,7 +277,7 @@ All paths below are inside the clean BVB-700 v0.7.1 source freeze.
 ## Requirements disposition
 
 The atomic map is
-[`phase1-closure-requirements-map.csv`](requirement-maps/p2panda.csv).
+[`phase1-closure-requirements-map.csv`](../../../../docs/evaluations/0005/requirement-maps/p2panda.csv).
 The decisive groups are:
 
 - **Implemented/pass, bounded:** DM-7-16; DM-7-17; Event-like portions of

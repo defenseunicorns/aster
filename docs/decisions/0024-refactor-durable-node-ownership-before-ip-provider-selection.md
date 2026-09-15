@@ -4,7 +4,7 @@
 
 - Status: accepted — no provider selected
 - Date: 2026-08-21
-- Follow-on experiment: [Proposal 0004](../proposals/0004-shared-node-libp2p-retest.md)
+- Follow-on experiment: [Proposal 0004](../../archive/research/proposals/0004-shared-node-libp2p-retest.md)
 - Requirements baseline:
   [`data-mesh-requirements.md`](../../data-mesh-requirements.md), SHA-256
   `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
@@ -72,7 +72,7 @@ defect.
 
 ### Implementation follow-up
 
-Proposal [0004](../proposals/0004-shared-node-libp2p-retest.md) now contains a
+Proposal [0004](../../archive/research/proposals/0004-shared-node-libp2p-retest.md) now contains a
 provider-free implementation of this decision's shared authority,
 transactional admission, generation fanout, and aggregate budget. Its common
 supervisor also owns pending-dial capacity and deadlines through settlement,

@@ -65,7 +65,7 @@ This report uses four gate dispositions deliberately:
 
 The full cell-by-cell distinction, including requirement-credit boundaries, is
 in
-[`requirements-map.csv`](requirement-maps/product-assurance.csv).
+[`requirements-map.csv`](../../../../docs/evaluations/0005/requirement-maps/product-assurance.csv).
 
 ## Exact scope and final receipt
 
