@@ -5,11 +5,12 @@
 - Profile ID: `aster-linux-event-mvp-evaluation-v0.1`
 - Status: Accepted by Decision 0042 on 2026-09-08
 - Profile version: `0.1`
-- Profile decision: [Decision 0042](../decisions/0042-adopt-linux-event-mvp-evaluation-profile-v0-1.md)
+- Approved design date: 2026-09-06
 - Candidate decision checkpoint: 2026-09-13
 - Product class: time-bounded, non-production customer evaluation
 - Start here: [human-focused MVP coordination guide](linux-event-mvp-coordination-guide.md)
-- Approval inputs: [protected provider design](inputs/raspberry-pi-systemd-credential-provider-v2-design.md) and [systemd 257 presentation amendment](inputs/systemd-257-credential-presentation-amendment.md)
+- Historical design authority: [approved design](../superpowers/specs/2026-09-06-linux-event-mvp-evaluation-profile-design.md)
+- Amendment authority: [approved Raspberry Pi profile amendment](../superpowers/specs/2026-09-08-raspberry-pi-linux-event-mvp-profile-amendment-design.md), which supersedes conflicting platform, architecture, topology, artifact, D06, and acceptance text in the historical design
 - Decision register: [v0.1 register](linux-event-mvp-evaluation-profile-v0.1-register.md)
 - Candidate-annex schema: [provisional schema](linux-event-mvp-evaluation-profile-v0.1-annex-template.md)
 
@@ -286,9 +287,9 @@ prohibited.
 The exact initial v0.1 provider binding is:
 
 - provider = `aster-systemd-credential-store/v2`
-- design = [`docs/validation/inputs/raspberry-pi-systemd-credential-provider-v2-design.md`](inputs/raspberry-pi-systemd-credential-provider-v2-design.md)
+- design = [`docs/superpowers/specs/2026-09-08-raspberry-pi-systemd-credential-provider-v2-design.md`](../superpowers/specs/2026-09-08-raspberry-pi-systemd-credential-provider-v2-design.md)
 - design_digest = `sha256:30c5dfe71a203fcdd69dd330f9b5c68eeaee5032b624ee41912aa4723a9f853f`
-- presentation_amendment = [`docs/validation/inputs/systemd-257-credential-presentation-amendment.md`](inputs/systemd-257-credential-presentation-amendment.md)
+- presentation_amendment = [`docs/superpowers/specs/2026-09-09-systemd-257-credential-presentation-amendment.md`](../superpowers/specs/2026-09-09-systemd-257-credential-presentation-amendment.md)
 - presentation_amendment_digest = `sha256:549ea3fd5bdfd62c01bab5a8f1adac4b84a2710ab406ea006119c9048e28d4cd`
 - systemd = `257.13-1~deb13u1`
 

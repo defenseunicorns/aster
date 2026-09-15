@@ -18,6 +18,11 @@ itself authorize a production release.
 
 ## Linux Event MVP qualification
 
+The accepted profile is hash-bound and remains the exact authority. Its
+original design links resolve through compatibility pointers: superseded
+designs live in the archive, while active approval inputs live in this
+validation package.
+
 - [Coordination guide](linux-event-mvp-coordination-guide.md) — human-oriented
   sequence, ownership, blockers, and definition of done.
 - [Evaluation profile](linux-event-mvp-evaluation-profile-v0.1.md) — exact
