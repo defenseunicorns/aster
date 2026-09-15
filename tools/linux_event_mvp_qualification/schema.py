@@ -23,7 +23,7 @@ PROFILE_DIGEST = "sha256:7c42a40802b89a121282f05d8cf99f67c82d33d29c82c565acaeaa1
 SCHEMA_PATH = (
     Path(__file__).resolve().parents[2]
     / "docs"
-    / "implementation"
+    / "validation"
     / "schemas"
     / "linux-event-mvp-qualification-v0.1.json"
 )

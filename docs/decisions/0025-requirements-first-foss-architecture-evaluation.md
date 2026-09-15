@@ -1,9 +1,10 @@
 # Decision 0025: Run a requirements-first FOSS architecture evaluation
 
+> ****
 
 - Status: accepted — evaluation governance only; no implementation selected
 - Date: 2026-08-22
-- Proposal: [0005](../proposals/0005-requirements-first-foss-architecture-evaluation.md)
+- Proposal: [0005](../../archive/research/proposals/0005-requirements-first-foss-architecture-evaluation.md)
 - Requirements baseline:
   [`data-mesh-requirements.md`](../../data-mesh-requirements.md), SHA-256
   `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`

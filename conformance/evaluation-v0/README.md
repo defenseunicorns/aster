@@ -17,7 +17,7 @@ shasum -a 256 -c MANIFEST.sha256
 ```
 
 Review `profile-v0.cddl`, `summary.json`, `MANIFEST.sha256`, and the report at
-`docs/evaluations/0005/conformance-profile-seed.md`. Build products and repeated
+`archive/research/evaluations/0005/conformance-profile-seed.md`. Build products and repeated
 execution evidence remain ignored locally.
 
 The current runner source implements v0-r2 and cannot regenerate the historical
@@ -45,10 +45,8 @@ Current artifacts are `vectors-v0-r2/`, `summary-v0-r2.json`,
 `independent-v0-r2.json`, and `MANIFEST-v0-r2.sha256`. They remain evaluation
 evidence, not a product protocol or independent implementation.
 The Rust summary identifies `corpus_revision: "v0-r2"` and an empty
-`known_extension_ids` registry. The manifest also binds the Python oracle source. The public relocation
-updates its relative path and the hashes of the already metadata-sanitized
-Python source and independent result. Decoder behavior and all vector bytes
-are unchanged; the original manifests are retained separately.
+`known_extension_ids` registry. The manifest also binds the unchanged Python
+oracle source.
 
 Run the repository-owned gate with:
 

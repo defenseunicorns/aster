@@ -1,13 +1,14 @@
 # Decision 0028: Start the selected-stack implementation behind an isolated profile
 
+> ****
 
 - Status: accepted — Iroh-first implementation migration; release admission gates open
 - Date: 2026-08-23
 - Authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Related: [Decision 0002](0002-dependency-admission.md),
   [Decision 0025](0025-requirements-first-foss-architecture-evaluation.md),
-  [Proposal 0006](../proposals/0006-selected-foss-reference-stack.md), and
-  [Proposal 0006 result](../evaluations/0006/README.md)
+  [Proposal 0006](../../archive/research/proposals/0006-selected-foss-reference-stack.md), and
+  [Proposal 0006 result](../../archive/research/evaluations/0006/README.md)
 
 ## Context
 

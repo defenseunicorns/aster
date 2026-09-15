@@ -141,5 +141,5 @@ discovery, NAT behavior, controlled-relay fallback, BTLE, cross-transport or
 mixed-implementation interoperability, State/Record/Blob live behavior,
 protected operational provisioning, independent review, or production and
 release authorization. Use the deterministic capability tours and
-[requirements status](../implementation/requirements-status.md) for their
+[requirements status](../validation/requirements-status.md) for their
 separate evidence boundaries.

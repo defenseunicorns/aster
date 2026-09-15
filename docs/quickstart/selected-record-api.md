@@ -19,14 +19,10 @@ over a semantic-v4/v5 mission-authenticated, class- and direction-specific
 Negentropy lane under exact receiver interests. Ingest never executes registered
 merge code, so concurrent heads remain durable and explicit.
 
-Durable whole-key Record delivery has a
-[retained bounded receipt](../implementation/evidence/selected-live-record-subscription-0c11344.json).
-It covers one same-implementation, one-host direct-loopback run, not
-selected-node ConnectRPC/C/Go/Python bindings, class-specific status, finite
-TTL, expiry, garbage collection, automatic registered-policy merge, broader
-relay acceptance, representative physical/mixed-implementation evidence, or
-release authorization. The selected store rejects every finite-TTL Record
-object; there is no forwarding-age path to enable yet.
+Durable whole-key Record delivery is available through the selected Rust
+surface. It is not a revision stream, materialized view, automatic merge engine,
+or withdrawal feed. The selected store rejects finite-TTL Record because no
+forwarding-age path is implemented.
 
 ## Run the stopped example
 
@@ -217,11 +213,7 @@ rearm an acknowledged projection. Poll emits no synthetic withdrawal, and an
 empty page means only that no unacknowledged positive active/conflicted
 projection is currently available; it does not prove that a key is absent.
 
-This is a durable projection queue, not a revision stream, transition log,
-materialized view, automatic merge engine, or withdrawal feed. The focused
-tests remain source-level mechanism evidence. The separate signed retained
-receipt binds one forced receiver-process replacement and exact whole-projection
-redelivery to its frozen source and raw run.
+This is a durable projection queue, not a revision stream or transition log.
 
 Run the focused whole-projection mechanism regression with:
 
@@ -242,10 +234,6 @@ cargo test --locked -p aster-node \
   runtime::tests::protected_live_mutable_handles_cache_exact_retry_across_same_epoch_rekey \
   -- --exact
 ```
-
-These focused commands are source-level current-code automation and do not by
-themselves create retained acceptance. The separate retained run below binds
-its narrow claim to signed source and a frozen canonical projection.
 
 ## Reconcile disconnected Record revisions while live
 
@@ -288,57 +276,11 @@ cargo test --locked -p aster-node \
   -- --exact
 ```
 
-No application merge callback runs during ingest. A separate
-[retained v1 Record-delivery receipt](../implementation/evidence/selected-live-record-subscription-0c11344.json)
-is a 10,357-byte canonical projection with SHA-256
-`ba0e2bf47291f7e87000b85fa280cc957f3710ac800def82a51fb9b4657a1b48`,
-bound to Good-signed source
-`0c1134411953f4bb52133b50aff9989cd4ce3930`. Across two participants, three OS
-processes, and seven actor lifetimes, it flushes one complete two-head
-edit/tombstone delivery at attempt one, forcibly terminates that receiver with
-`SIGKILL`, and has a fresh process redeliver the same projection at attempt two
-with a distinct 89-byte token. It then acknowledges exact work, rejects
-malformed and cross-bound tokens, obtains a fresh query-only guard, resolves the
-conflict, delivers the successor under a new projection, keeps both originals
-query-only as Superseded, and reopens peerless with an empty delivery queue.
-
-The same run proves static selector separation: network-interested but
-application-unmatched beta remains retained without delivery, while
-application-matched but network-uninterested gamma remains withheld. This is
-not dynamic network-interest administration. The receipt moves only
-`DM-5.1-08`; it adds no TTL/GC, physical/NAT/relay/BTLE, mixed-implementation,
-scale/resource/soak, binding, automatic-merge, reproducible-build, or release
-credit. A forced `SIGKILL` is not power-loss or filesystem-crash recovery, and
-the final immediate reopen is not long-retention or garbage-collection proof.
-
-A different
-[retained v2 live mutable receipt](../implementation/evidence/selected-live-mutable-6cabb4c.json)
-is a 7,752-byte canonical projection (SHA-256
-`054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`)
-bound to signed source `6cabb4c`. Its two peerless Record publications become
-two explicit conflict siblings. An ordinary publish is rejected without
-changing them; guarded resolution observes both, supersedes both originals,
-exactly retries without insertion, converges at both actors, and survives
-restart across four resolved/restart views. The enclosing two-participant run
-uses six actor lifetimes with at most two concurrent, eight direct `CONTACT`
-records, aggregate 7/7/7 selected-item offer/fetch/insert counts, six
-graceful shutdowns, four closed retained handles, and zero Event/control/Blob
-counters. Its State side also proves exact concurrent heads, a causal successor,
-and an authenticated empty tombstone current at both actors and through one
-immediate peerless restart.
-
-The source-to-execution link is operator-attested, not cryptographically proven
-or reproducible, and secret artifacts were inspected by metadata only. The
-ordered State observation/publication chain is producer-attested. This is
-one-host same-implementation loopback evidence, not indefinite tombstone
-retention, garbage collection, delete-wins, physical or mixed implementations,
-NAT/relay, BTLE, scale, resource, long-duration, Event/Blob-live, or release
-acceptance. Current-code regressions also cover exact
-result/acknowledgement, capacity deferral, and fair rotation. Same-epoch old
-lineage is withheld from ordinary current projection/query and network
+No application merge callback runs during ingest. Old same-epoch lineage is
+withheld from ordinary current projection/query and network
 inventory/transfer; only an exact idempotent publish/resolution retry may recover
-its committed result through strict cached/projection/historical verification.
-The receipt is not a multi-hop/partition sweep or automatic merge implementation.
+its committed result through strict cached, projection, and historical
+verification.
 
 ## Use the stopped API
 
@@ -459,13 +401,9 @@ successful request returns its original commit, even
 after its own successor has advanced the projection and after an authorized
 rekey; a new operation cannot reuse an old-policy guard.
 
-The current example remains intentionally conflict-free because one stopped
-writer creates causally ordered successors. Selected-node tests construct
-independently source-authenticated publishers and exercise two-way, N-way,
-stale-guard, restart, rekey-retry, and both semantic-ID-order directions. That
-is automated local mechanism evidence. The separate live real-Iroh test
-establishes only the bounded two-publisher transfer, guarded resolution, and
-restart behavior described above.
+The stopped example remains intentionally conflict-free because one writer
+creates causally ordered successors. Applications must use the explicit guarded
+resolution path whenever two or more heads exist.
 
 ## Treat tombstones as authenticated Record revisions
 
@@ -491,61 +429,15 @@ delete-wins priority. Superseded and concurrent revisions remain recoverable in
 this bounded slice. Expiry, explicit-policy garbage collection, and
 retention-driven deletion are not implemented.
 
-## Follow the verification boundary
+## Verification and ownership boundary
 
-On publish, the facade refreshes current control policy, reserves the next
-shared causal dot and context, source-seals the Record, obtains route- and
-content-verified capabilities, verifies the exact plaintext, and commits the
-operation and revision atomically. An exact replay still has to pass current
-policy, revocation, and authority checks before the original result is
-returned.
+Publish, exact retry, query, and guarded resolution always pass current policy,
+revocation, source, content, and projection checks. Store rows and projection
+plans are structural inputs, not authorization capabilities.
 
-On query, redb supplies a bounded structural plan, not an authorization
-capability. The facade freshly authenticates current-lineage source/content and
-exact keys; lineage-withheld rows are rebound to startup-authenticated sender
-projections and current policy without exposing plaintext. It excludes revoked
-or stale-epoch revisions from the application projection, independently
-recomputes every causal disposition and head identity, and asks the store to
-recheck the exact policy-bound plan before returning application data.
-Resolution adds the exact verified conflict guard to that transaction.
-
-```mermaid
-sequenceDiagram
-    participant A as Application
-    participant N as Record composition (live handle or stopped facade)
-    participant C as Source-envelope provider
-    participant S as Mission-bound redb
-
-    A->>N: publish(operation key, exact Record fields)
-    N->>S: current policy + shared causal reservation
-    N->>C: source-seal, route verify, content verify
-    N->>S: atomic policy-bound idempotent commit
-    S-->>N: durable semantic result
-    N->>C: fresh result verification
-    N-->>A: RecordPublishResult
-
-    A->>N: query(exact topic, scope, logical key)
-    N->>S: bounded structural projection plan
-    S-->>N: all retained candidates + claimed dispositions
-    N->>C: fresh source/content verification for every candidate
-    N->>N: recompute heads, current, concurrent, superseded
-    N->>S: recheck exact policy-bound plan
-    N-->>A: projection + optional exact conflict guard
-
-    A->>N: resolve(operation key, guard, reviewed payload)
-    N->>N: verify complete guarded sibling set
-    N->>S: atomic guard-bound causal successor
-    N-->>A: RecordPublishResult
-```
-
-The stopped handle takes the same process-exclusive store authority used by the
-live actor and the stopped State facade. Stop that actor and drop any other
-stopped facade before opening `SelectedRecordNode`, and close this facade before
-starting the actor; Aster does not permit two writers around one policy
-snapshot. The live `SelectedRecordHandle` instead routes commands to the
-already-running authority. Continue with the
-[selected architecture](../architecture.md) for the full trust split, the
-[selected State API](selected-state-api.md) for causal latest-value semantics,
-the [selected Event API](selected-event-api.md) for the live networked surface,
-and the [requirements status](../implementation/requirements-status.md) for the
-exact partial credit and remaining gaps.
+The live actor and stopped State or Record facades cannot own the same store
+concurrently. Close every stopped facade before starting the actor. See the
+[selected architecture](../architecture.md) for the complete trust path, the
+[selected State API](selected-state-api.md) for latest-value semantics, and
+[requirements status](../validation/requirements-status.md) for validation
+coverage.

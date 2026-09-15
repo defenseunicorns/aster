@@ -8,8 +8,7 @@
 - Related: [Decision 0002](0002-dependency-admission.md),
   [Decision 0023](0023-mesh-host-contract-no-libp2p-selection.md),
   [Decision 0029](0029-close-proposal-0004-libp2p-pilot.md),
-  [Proposal 0003](../proposals/0003-idiomatic-ip-mesh-provider-activation.md),
-  and [CI policy](../ci.md)
+  and [CI policy](../validation/ci.md)
 
 ## Context
 

@@ -4,9 +4,8 @@
 - Date: 2026-08-23
 - Supersedes: only the raw-lock no-waiver disposition for the focused,
   mDNS-disabled libp2p profile in Proposal 0003
-- Related: [Decision 0002](0002-dependency-admission.md),
-  [Proposal 0002](../proposals/0002-provider-neutral-mesh-host.md), and
-  [CI policy](../ci.md)
+- Related: [Decision 0002](0002-dependency-admission.md) and
+  [CI policy](../validation/ci.md)
 
 ## Context
 

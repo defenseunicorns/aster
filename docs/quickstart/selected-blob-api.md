@@ -22,45 +22,6 @@ content-capable peers, and semantic v6 inherits that Blob lane unchanged. The
 default offer is `[6, 5, 4, 3, 2, 1]`; v1-v4 emit zero Blob frames, and stable
 wire/ABI, source, manifest, and `ASTRBT01` formats remain version 1.
 
-A [retained 10,728-byte live-Blob receipt](../implementation/evidence/selected-live-blob-044d90f.json)
-(SHA-256
-`4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`)
-binds source commit `044d90ff07c8e754b3d490cb810d42de3c915e3d` with
-`Good` signature status; 45 adversarial verifier tests pass. Its
-source-to-execution link remains operator-attested, not cryptographically
-proven. Across three participants and 32 direct-loopback `CONTACT` records, it
-observes peerless publication and seeding, an exactly-one-contact partial
-transfer, exact retained-prefix persistence across receiver reopen, an
-exactly-one-contact continuation from the different eligible replica with no
-source refetch and exact-complement advancement, exact byte reconstruction and
-promotion, bounded live page reads, and a final receiver reopen. This is
-one-host, same-implementation evidence, and every interruption or restart is a
-graceful same-process actor/store/provider reopen. It does not prove physical
-hosts, NAT or Internet paths, controlled or public relay, BTLE, process crash
-or power-loss recovery, long-offline recovery, arbitrary-peer or route-only
-resume, scale beyond three participants, resource thresholds or soak,
-physical sanitization, independent-implementation interoperability, or release
-authorization. That frozen receipt predates the delivery queue and gives it no
-retained execution credit; the queue currently has focused mechanism tests only.
-
-A separate
-[retained 10,269-byte v1 Blob-delivery receipt](../implementation/evidence/selected-live-blob-subscription-26e0a09.json)
-(SHA-256
-`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`)
-binds Good-signed source `26e0a09`. It is a peerless one-host,
-one-participant run with three processes and four actor lifetimes. Two exact
-publications share one `BlobId`. The attempt-one child flushes a durable
-unacknowledged token and is sent `SIGKILL`; a fresh process receives the same
-publication as attempt 2 and acknowledges it using the persisted attempt-one
-token, rejects that publication's token against the second publication, then
-settles both exact publications. A final parent reopen replays one subscription
-and polls an empty ledger with zero pending and two acknowledged publications.
-This receipt observes no contacts or network Blob activity and does not claim
-peer/convergence status, selector withholding or network-interest separation,
-plaintext delivery or exact-publication reads, power-loss/filesystem-crash
-recovery, physical or mixed systems, TTL/GC, resource/soak, reproducible build,
-or release authorization.
-
 ## Use the live actor API
 
 Start the node as described in the [selected Event quickstart](selected-event-api.md),
@@ -220,11 +181,7 @@ completed removal. `delivery_status` is read-only. These recovery rules do not
 make application side effects transactional with acknowledgement.
 
 `delivery_status` is a structurally audited local ledger snapshot, not sync,
-contact, peer, transfer-progress, or convergence status. The focused mechanism
-tests cover retry, re-acknowledgement, selector replacement/removal, durable
-reopen, policy withholding, bounded scans, and distinct publications sharing
-one Blob ID. The retained receipt above covers only its narrower peerless
-forced-process retry and final empty ledger.
+contact, peer, transfer-progress, or convergence status.
 
 ## Run the example
 
@@ -318,12 +275,7 @@ down, and later restart with an exact configured peer. On a v5 or v6 contact, a
 content-capable interested receiver can durably stage the source and missing
 carrier ranges, promote only after whole-Blob verification, and read the Blob
 through its own live handle. The receiver's completed publication and page
-reads survive another peerless restart. Current same-implementation loopback
-tests exercise that sequence, and the retained receipt above now observes it
-alongside the bounded interrupted partial/different-eligible-peer continuation.
-That receipt is still one-host direct loopback with graceful same-process
-reopens, not a physical-carrier, crash-recovery, arbitrary-peer,
-mixed-implementation, scale, or resource acceptance artifact.
+reads survive another peerless restart.
 
 The provider turns that exact topic/scope and the current epoch into an opaque
 32-byte peer proof inside the protected v5-or-v6 contact. Every Blob inventory,
@@ -374,16 +326,8 @@ ID, not the last manifest record.
 Normal and `AtLeast` run the v5 lane because `AtLeast` filters Event only.
 `ReceiveOnly` advertises, requests, stages, promotes, and counts zero Blob work.
 The live handle does not change those contact rules and reports no Blob peer or
-convergence status. The retained direct-transfer receipt above is only the bounded
-three-participant, one-host, graceful-reopen observation described there. The
-selected slice still has no route-only Blob relay/custody, arbitrary-peer
-resume evidence, network/application selector-separation acceptance, Blob
-TTL/expiry/GC,
-metadata-independent
-whole-byte identity or deduplication, 100+ MiB/RSS or resource/soak acceptance,
-representative physical carrier, NAT/Internet, relay, BTLE,
-mixed-implementation, crash/power-loss, or long-offline acceptance, or release
-authorization.
+convergence status. Route-only Blob relay/custody, Blob TTL/expiry/GC, and a
+metadata-independent whole-byte identity are not implemented.
 
 `publish` requires a seekable source because it makes two bounded passes. The
 first computes the whole-content and per-chunk digests with one bounded,
@@ -416,86 +360,22 @@ variant even when the `BlobId` stays the same. Exact retry of an authorized old
 operation returns its historical publication without allocating a new variant;
 a new operation at the active epoch installs or reuses that epoch's variant.
 
-## Follow the durable verification boundary
+## Durable storage and verification boundary
 
-Signed publication metadata and exact source-envelope bytes live in redb.
-Potentially large ciphertext chunks live in the private sibling
-`blob-depot-v1` directory. A chunk becomes durable in this order:
+Blob publication becomes authoritative only after private chunk files are
+written, synchronized, renamed, directory-synchronized, and matched by exact
+redb commit markers. Unmarked files are reclaimed; a marked missing, truncated,
+or mismatched file is an integrity failure rather than repair input.
 
-1. write and synchronize a private temporary file;
-2. rename it to its canonical final name;
-3. synchronize the containing directory; and
-4. atomically record the matching committed-chunk marker in redb.
+The database and sibling depot are owner-bound. Moving, copying, replacing, or
+partially migrating them is rejected where the platform can prove the identity
+change; no supported depot-rebind or backup-restore workflow exists.
 
-An unmarked temporary or final file is not authority and is reclaimed on a
-mission-bound writable reopen. A marked missing, truncated, or mismatched file
-is an integrity failure and is never silently repaired. A signed Blob
-publication commits only after every authenticated manifest record equals both
-the expected and committed durable record and the finalized manifest digest is
-exact.
-
-The database is pinned to one physical depot owner from its first successful
-Store open, before the depot exists. Redb persists a domain-separated
-commitment over a random owner token, the canonical database path, and, on
-Unix, the exact device/inode backing identity; the sibling depot’s private
-marker must carry the same binding before any chunk/variant scan or reclaim.
-The first database to initialize that parent’s fixed depot wins; another
-database is rejected without adopting or cleaning it. Moving/copying even an
-empty bound database to another path fails on reopen. On Unix, a new inode also
-fails, moving the depot with the database does not preserve the binding, and a
-same-path replacement cannot adopt an existing depot. This slice has no
-supported depot-rebind or backup-restore migration. Non-Unix retains the
-database-token and canonical-path binding, but a copied database restored over
-that same path is not distinguishable; equivalent inode/rollback resistance is
-not claimed.
-Legacy owner-token or owner-binding migration is all-or-none: only canonical
-empty Blob rows/counters with no fixed depot root may acquire the missing
-fields. Partial fields, any logical Blob state, or any fixed depot root fail
-without repair.
-
-```mermaid
-sequenceDiagram
-    participant A as Application
-    participant N as SelectedBlobNode
-    participant C as Source-envelope and Blob provider
-    participant S as Mission-bound redb
-    participant D as Encrypted Blob depot
-
-    A->>N: publish(operation key, metadata, seekable source)
-    N->>S: current policy + operation preflight
-    N->>C: bounded preparation pass
-    N->>D: encrypt, sync, rename, mark chunks
-    N->>C: source-seal + fresh route/content verification
-    N->>D: prove exact authenticated completion
-    N->>S: atomic policy-bound publication + operation commit
-    N->>C: fresh durable-result verification
-    N-->>A: BlobPublishResult
-
-    A->>N: read_into(topic, scope, BlobId, output)
-    N->>S: bounded structural publication plan
-    S-->>N: all retained source publications
-    N->>C: fresh source/content verification for every candidate
-    N->>N: select greatest active semantic publication ID
-    N->>S: recheck exact policy-bound plan
-    N->>D: prove selected completion once, then stream verified chunks
-    N-->>A: BlobReadResult
-```
-
-The redb read plan is structural, not authorization. The facade freshly
-authenticates every retained publication, checks exact topic, scope, Blob ID,
-variant, source identity, and active epoch, excludes revoked or inactive
-publications, independently recomputes the deterministic active selection, and
-rechecks the complete plan before opening the selected depot variant.
-
-`read_into` never returns a provider reader or copied epoch key. It borrows the
-node and caller output synchronously, verifies each chunk's stored record,
-ciphertext digest, AEAD tag, plaintext digest, and final whole-content digest,
-and reports the core streaming engine's peak chunk-buffer capacity. Store
-adapters may concurrently use additional independently chunk-bounded buffers;
-the field is not a whole-operation memory measurement. If a later chunk or the
-final digest fails, the caller-owned output may already contain an
-independently verified prefix; write to a temporary destination if all-or-none
-application output is required.
+Every read rechecks current policy, source identity, content authority, active
+epoch, publication selection, and depot completion. A late `read_into` failure
+may leave an independently verified prefix in caller-owned output, so use a
+temporary destination when replacement must be all-or-none. The complete trust
+path is documented in the [selected architecture](../architecture.md).
 
 ## Understand the current limits
 
@@ -518,7 +398,7 @@ descriptors with no-follow checks and private modes. Non-Unix uses a narrower
 path-based fallback and does not receive equivalent hardened-filesystem credit.
 Blob ciphertext remains after software zeroization, but mission and content
 secrets are destroyed and the terminal store cannot reopen normally. Physical
-media sanitization is explicitly outside this evidence.
+media sanitization is outside the software-zeroization boundary.
 
 The stopped handle takes the same process-exclusive store authority used by
 the live actor and stopped State and Record facades. Stop that actor and drop
@@ -528,5 +408,5 @@ with the [selected architecture](../architecture.md), the
 [selected Record API](selected-record-api.md), the
 [selected State API](selected-state-api.md), the
 [selected Event API](selected-event-api.md), and the
-[requirements status](../implementation/requirements-status.md) for the exact
-partial credit and remaining network, acceptance, and release gaps.
+[requirements status](../validation/requirements-status.md) for credited
+behavior and open validation gaps.

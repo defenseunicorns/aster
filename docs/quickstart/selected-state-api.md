@@ -15,32 +15,10 @@ semantic-v4/v5 mission-authenticated, class- and direction-specific Negentropy
 lane when the receiver configures an exact topic/scope interest.
 
 Durable positive-current-version application delivery is available through the
-selected Rust surface and has a
-[retained bounded receipt](../implementation/evidence/selected-live-state-subscription-8912fc3.json).
-It is not a synthetic-withdrawal or materialized-view feed. Configured
-`NodeConfig` State interests remain the network receive
-policy in this slice; subscriptions do not dynamically replace them. Record
-has a separate durable whole-key delivery mechanism with a
-[retained bounded receipt](../implementation/evidence/selected-live-record-subscription-0c11344.json).
-That Record receipt moves only `DM-5.1-08` and does not broaden this State
-contract. Dynamic network selectors, State/node contact
-status, and Blob peer/convergence status,
-selected-node ConnectRPC/C/Go/Python bindings, finite
-TTL, tombstone retention duration,
-expiry, compaction, garbage collection, broader relay acceptance,
-representative physical/mixed-implementation evidence, and release
-authorization remain open. The selected store rejects every finite-TTL State
-object; there is no forwarding-age path to enable yet.
-
-Blob delivery separately has a
-[retained 10,269-byte peerless receipt](../implementation/evidence/selected-live-blob-subscription-26e0a09.json)
-(SHA-256
-`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`,
-Good-signed source `26e0a09`) covering one participant, forced attempt-one
-process termination, fresh-process attempt-2 redelivery acknowledged with the
-older token, two exact publications sharing one `BlobId`, and an empty final
-reopen. It adds no State, network/peer-status, selector-separation, TTL/GC,
-physical/mixed, resource/soak, or release evidence to this guide.
+selected Rust surface. It is not a synthetic-withdrawal or materialized-view
+feed. Configured `NodeConfig` State interests remain the network receive policy;
+subscriptions do not dynamically replace them. The selected store rejects
+finite-TTL State because no forwarding-age path is implemented.
 
 ## Run the stopped example
 
@@ -210,33 +188,6 @@ cargo test --locked -p aster-node \
   -- --exact
 ```
 
-These focused commands are source-level current-code automation and do not by
-themselves create retained evidence. A separate
-[9,656-byte v1 receipt](../implementation/evidence/selected-live-state-subscription-8912fc3.json)
-(SHA-256
-`7d0b568dd4d57c3f2967da55953896829261877513c59c51a0b274eeda69485f`)
-binds signed source commit `8912fc33571449d1beb4a4cb0f204b5dcd44e8c2`
-to one bounded run. Two same-implementation participants used three processes,
-10 actor lifetimes, and 10 positive direct contacts on one loopback host. The
-receiver process was forcibly terminated after a flushed unacknowledged poll;
-a fresh process replayed the durable subscription, redelivered the same State
-identity as attempt 2, acknowledged it, accepted idempotent
-re-acknowledgement, and then polled empty.
-
-The same run observes five exact State offer/fetch/insert transfers, six
-publications, an authorized but network-uninterested withheld State, a
-network-interested but application-unsubscribed retained State, acknowledged
-and superseded ancestor suppression, one causal successor, and an explicit
-current tombstone through a final peerless subscription replay. The application
-subscription never mutates the configured network interest. This is
-producer-attested, one-host, same-implementation evidence with an
-operator-attested rather than cryptographically proven source-to-execution
-link. It does not establish a State contact/status API, materialized projection
-or synthetic withdrawal feed, dynamic network interests, indefinite tombstone
-retention or garbage collection, physical/NAT/relay/BTLE paths, independent or
-mixed implementations, scale beyond two participants, resource/soak bounds,
-or release authorization.
-
 ## Reconcile live State over a contact
 
 Use `SelectedStateHandle` while the network actor runs. If an application chose
@@ -277,36 +228,10 @@ cargo test --locked -p aster-node \
   -- --exact
 ```
 
-A separate [retained v2 live mutable receipt](../implementation/evidence/selected-live-mutable-6cabb4c.json)
-is a 7,752-byte canonical projection (SHA-256
-`054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`)
-bound to signed source `6cabb4c`. Two same-implementation participants ran six
-actor lifetimes with at most two concurrent and published State and Record while
-peerless. Eight direct `CONTACT` records account for aggregate 7/7/7 selected
-items offered/fetched/inserted. The initial two State publications produce the
-exact max-ID `Current`/other `Concurrent` projection. A node-a successor then
-observes and supersedes both heads. Only after node-b observes that successor
-does node-b publish an authenticated empty tombstone that observes and
-supersedes all three predecessors. Both actors select the tombstone as current,
-and one immediate peerless restart reproduces that exact four-version
-projection. Six graceful shutdowns completed, four retained handles closed,
-and Event/control/Blob counters stayed zero.
-
-The receipt's source-to-execution link is operator-attested, not
-cryptographically proven or reproducible, and secret artifacts were inspected
-by metadata only. The ordered State observation/publication chain is
-producer-attested. It is one-host same-implementation loopback evidence, and
-the restart is one immediate peerless reopen—not indefinite tombstone
-retention, compaction, garbage collection, delete-wins, physical or mixed
-implementations, NAT/relay, BTLE, scale, resource, long-duration,
-Event/Blob-live, or release acceptance. Additional current-code regressions
-cover exact
-result/acknowledgement, capacity deferral, and fair rotation. Same-epoch old
-lineage is withheld from ordinary current projection/query and network
-inventory/transfer; only an exact idempotent publish retry may recover its
-committed result through strict cached/projection/historical verification. The
-receipt is not a multi-hop/partition sweep or proof of convergence for every
-interested peer.
+Old same-epoch lineage is withheld from ordinary current projection/query and
+network inventory/transfer; only an exact idempotent publish retry may recover
+its committed result through strict cached, projection, and historical
+verification.
 
 ## Use the stopped API
 
@@ -413,50 +338,15 @@ not duration-bounded by this slice: storage capacity is bounded by row, byte,
 per-key version, and operation-ledger quotas, while tombstone retention
 duration, expiry, compaction, and garbage collection remain open.
 
-## Follow the verification boundary
+## Verification and ownership boundary
 
-On publish, the facade refreshes current control policy, reserves the next
-shared causal dot and context, source-seals the State, obtains route- and
-content-verified capabilities, verifies the exact plaintext, and commits the
-operation and version atomically. A replay still has to pass current policy,
-revocation, and authority checks before the original result is returned.
+Publish, exact retry, and query always pass current policy, revocation, source,
+content, and projection checks. Store rows and projection plans are structural
+inputs, not authorization capabilities.
 
-On query, redb supplies a bounded structural plan, not an authorization
-capability. The facade freshly authenticates every retained candidate, verifies
-its plaintext and exact key, excludes revoked or stale-epoch versions,
-independently recomputes every causal disposition, and asks the store to recheck
-the exact policy-bound plan before returning application data.
-
-```mermaid
-sequenceDiagram
-    participant A as Application
-    participant N as State composition (live handle or stopped facade)
-    participant C as Source-envelope provider
-    participant S as Mission-bound redb
-
-    A->>N: publish(operation key, exact State fields)
-    N->>S: current policy + causal reservation
-    N->>C: source-seal, route verify, content verify
-    N->>S: atomic policy-bound idempotent commit
-    S-->>N: durable semantic result
-    N->>C: fresh result verification
-    N-->>A: StatePublishResult
-
-    A->>N: query(exact topic, scope, logical key)
-    N->>S: bounded structural projection plan
-    S-->>N: candidate versions + claimed dispositions
-    N->>C: fresh source/content verification for every candidate
-    N->>N: independently recompute causal projection
-    N->>S: recheck exact policy-bound plan
-    N-->>A: current + optional recoverable versions
-```
-
-The stopped handle takes the same process-exclusive store authority used by the
-live actor. Stop that actor before opening `SelectedStateNode`, and close this
-facade before starting the actor; Aster does not permit two writers around one
-policy snapshot. The live `SelectedStateHandle` instead routes commands to the
-already-running authority. Continue with the
-[selected architecture](../architecture.md) for the full trust split, the
-[selected Event API](selected-event-api.md) for the live networked surface, and
-the [requirements status](../implementation/requirements-status.md) for the
-exact partial credit and remaining gaps.
+The live actor and stopped facade cannot own the same store concurrently. Stop
+the actor before opening `SelectedStateNode`, and close that facade before
+starting the actor. See the [selected architecture](../architecture.md) for the
+complete trust path, the [selected Event API](selected-event-api.md) for the
+live runtime, and [requirements status](../validation/requirements-status.md)
+for validation coverage.

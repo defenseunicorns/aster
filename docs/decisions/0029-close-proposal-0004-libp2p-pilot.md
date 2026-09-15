@@ -1,12 +1,13 @@
 # Decision 0029: Close Proposal 0004 without selecting rust-libp2p
 
+> ****
 
 - Status: accepted — Proposal 0004 closed; no provider selected
 - Date: 2026-08-23
 - Authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Related:
-  [Proposal 0004](../proposals/0004-shared-node-libp2p-retest.md),
-  [Proposal 0004 result](../proposals/0004-shared-node-libp2p-retest-results.md),
+  [Proposal 0004](../../archive/research/proposals/0004-shared-node-libp2p-retest.md),
+  [Proposal 0004 result](../../archive/research/proposals/0004-shared-node-libp2p-retest-results.md),
   [Decision 0024](0024-refactor-durable-node-ownership-before-ip-provider-selection.md),
   [Decision 0025](0025-requirements-first-foss-architecture-evaluation.md),
   and [Decision 0027](0027-libp2p-pilot-dependency-policy.md)

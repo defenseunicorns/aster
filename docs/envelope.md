@@ -34,7 +34,7 @@ below. It MUST NOT probe one encoding and then reinterpret a failure as another.
 | Implement the common encoding rules | [Byte notation](#1-byte-notation-and-canonical-rules) and [object registry](#2-complete-fixed-object-registry) |
 | Provision a node | [Credentials and local provisioning](#3-credentials-and-local-provisioning) |
 | Seal or verify application data | [Semantic item core](#4-semantic-item-core-and-identifiers) and [source envelope](#5-source-envelope) |
-| Apply authority controls or custody | [Authority controls](#6-authority-control-objects) and [custody wrapper](#7-per-hop-custody-wrapper) |
+| Apply authority controls or custody | [Authority controls](#6-authority-control-objects) and [session custody claim](#71-semantic-v3-format-session-custody-claim) |
 | Implement an authenticated session | [Handshake flights](#8-handshake-flights-and-transcript) and [transport records](#9-protected-transport-records) |
 | Transfer Blob data | [Blob manifest and chunk cryptography](#10-blob-manifest-and-chunk-cryptography) |
 | Enforce fail-closed parsing | [Required rejection behavior](#11-required-rejection-behavior-and-format-boundaries) |

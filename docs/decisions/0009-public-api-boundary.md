@@ -304,7 +304,7 @@ shutdown and live zeroization close admission before authority release, and
 retained handles fail with sanitized `StateUnavailable`. The exclusive stopped
 facades remain available only while no live actor owns the store.
 
-The [retained v2 canonical receipt](../implementation/evidence/selected-live-mutable-6cabb4c.json)
+The [retained v2 canonical receipt](../validation/evidence/selected-live-mutable-6cabb4c.json)
 is 7,752 bytes with SHA-256
 `054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`
 and binds the execution to good-signature source commit `6cabb4c`. Two distinct
@@ -398,7 +398,7 @@ This amendment supersedes only the preceding statement that the live selected
 Blob composition has no retained execution receipt and supersedes the earlier
 v1 live-Blob observation. It does not change the application ownership, page
 custody, cancellation, shutdown, or zeroization decision above. The canonical
-[`selected-live-blob-044d90f.json`](../implementation/evidence/selected-live-blob-044d90f.json)
+[`selected-live-blob-044d90f.json`](../validation/evidence/selected-live-blob-044d90f.json)
 receipt is 10,728 bytes with SHA-256
 `4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`
 and binds the bounded execution to good-signature source commit
@@ -461,7 +461,7 @@ attempt, and exact acknowledgement is idempotent; superseded pending versions
 are retired rather than delivered as current.
 
 The canonical
-[`selected-live-state-subscription-8912fc3.json`](../implementation/evidence/selected-live-state-subscription-8912fc3.json)
+[`selected-live-state-subscription-8912fc3.json`](../validation/evidence/selected-live-state-subscription-8912fc3.json)
 receipt retains one bounded two-participant, three-process, one-host direct-Iroh
 observation. It includes forced receiver-process termination after a flushed
 unacknowledged poll, fresh-process attempt-two redelivery and acknowledgement,
@@ -512,7 +512,7 @@ This is a durable active-head projection queue, not a revision stream,
 transition log, materialized view, automatic merge engine, or withdrawal feed.
 
 The canonical 10,357-byte
-[`selected-live-record-subscription-0c11344.json`](../implementation/evidence/selected-live-record-subscription-0c11344.json)
+[`selected-live-record-subscription-0c11344.json`](../validation/evidence/selected-live-record-subscription-0c11344.json)
 receipt (SHA-256
 `ba0e2bf47291f7e87000b85fa280cc957f3710ac800def82a51fb9b4657a1b48`)
 binds Good-signed source commit `0c1134411953f4bb52133b50aff9989cd4ce3930`.
@@ -591,7 +591,7 @@ metadata-only queue has no retained delivery receipt. It does not amend the
 older direct-transfer receipt, the application ownership decision, or the
 separation between application selectors and configured network interests. The
 canonical
-[`selected-live-blob-subscription-26e0a09.json`](../implementation/evidence/selected-live-blob-subscription-26e0a09.json)
+[`selected-live-blob-subscription-26e0a09.json`](../validation/evidence/selected-live-blob-subscription-26e0a09.json)
 receipt is 10,269 bytes with SHA-256
 `3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`
 and binds Good-signed source commit

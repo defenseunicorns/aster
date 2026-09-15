@@ -16,7 +16,7 @@ installation, protected service startup, local Event smoke, restart, and
 removal on both targets. This does not close all of P0-3: reproducibility,
 upgrade/rollback, release signatures and release-container work follow.
 
-The architectures have [separate manual CI workflows](../ci.md#manual-ubuntu-debian-packages):
+The architectures have [separate manual CI workflows](../validation/ci.md#manual-ubuntu-debian-packages):
 `Build: Ubuntu 24.04 deb amd64` and `Build: Ubuntu 24.04 deb arm64`.
 Each runs the same native build, package checks and installation harness.
 Arm64 qualification requires a successful arm64 run; workflow configuration
@@ -215,7 +215,7 @@ preserved test state after package removal. Never run it on a deployed node.
 ## Install and provision an evaluation candidate
 
 Follow the existing [provider operations procedure, Ubuntu 24.04 amd64
-package annex](../implementation/raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex).
+package annex](../mvp/raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex).
 Documentation stays in the repository and is not installed by the package.
 The existing procedure supplies package paths, service account, first installation, host-key
 setup, direct `aster-credential-admin` invocation, atomic reference/configuration

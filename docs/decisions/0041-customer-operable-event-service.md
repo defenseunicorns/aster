@@ -9,7 +9,7 @@
   follow-on statements in [Decision 0030](0030-event-first-local-connect-agent.md)
 - Related: [Decision 0009](0009-public-api-boundary.md),
   [Decision 0013](0013-protected-provisioning-boundary.md), and the
-  [customer-operable Event-service design](../superpowers/specs/2026-09-05-customer-operable-event-service-design.md)
+  [current agent operational contract](../../crates/aster-agent/README.md)
 
 ## Context
 
@@ -102,7 +102,7 @@ forwarding, Event bridges, and dynamic bridge administration.
     The mode-`0400`/`ramfs` description remains the original accepted
     presentation. The exact systemd 257 profile additionally uses the narrowly
     pinned root-owned ACL/read-only-`tmpfs`/`noswap` presentation defined in
-    the [2026-09-09 credential-presentation amendment](../superpowers/specs/2026-09-09-systemd-257-credential-presentation-amendment.md).
+    the [2026-09-09 credential-presentation amendment](../validation/inputs/systemd-257-credential-presentation-amendment.md).
     That amendment requires separate Security and Deployment approval at E01
     and creates no generic Debian, `tmpfs`, or production support claim.
 
@@ -177,7 +177,7 @@ retained Previous generation, host-bound backup, same-host current-generation
 recovery through a narrow recovery open, and durable logical destruction. The
 root administration CLI exposes five exact, operation-bound commands with
 sanitized text output and a binary-only backup stdout. The
-[operator procedure](../implementation/raspberry-pi-provider-v2-operations.md)
+[operator procedure](../mvp/raspberry-pi-provider-v2-operations.md)
 composes those commands with the existing Event-agent bearer-token SIGHUP
 reload and stopped-authority revoke/rekey workflow to describe all seven
 operations without duplicating either authority.

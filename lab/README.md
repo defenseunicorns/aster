@@ -1,12 +1,5 @@
 # Aster OrbStack laboratory controller
 
-This directory contains the maintained Docker acceptance controller and its
-regression tests. Historical component experiments are summarized in
-[`docs/evaluations/0005`](../docs/evaluations/0005/README.md); the maintained
-candidate-neutral corpus lives in
-[`conformance/evaluation-v0`](../conformance/evaluation-v0/README.md).
-
-
 `orchestrate.py` is the reproducible host-side controller for the task-created
 `aster-lab` executable. It uses only the Python standard library and invokes
 Docker with argument arrays; it never invokes a command shell.
@@ -265,7 +258,8 @@ show `passed=true`, the same ItemID and EnvelopeID through custody and delivery,
 application acknowledgement, no post-ack redelivery, duplicate suppression,
 internal-only networks, and `a_c_contact_count=0`.
 
-This is the retained native LAN oracle from [Proposal 0001's result](../docs/proposals/0001-ip-mesh-vertical-slice-results.md).
+This is the retained native LAN oracle governed by
+[Decision 0022](../docs/decisions/0022-ip-mesh-experiment-no-selection.md).
 It deliberately does not claim manual peering, NAT traversal, connectivity
 relay fallback, or fair large-peer scheduling. The historical Iroh and
 rust-libp2p comparison binaries and exact commands are bound to experiment

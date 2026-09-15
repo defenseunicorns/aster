@@ -10,8 +10,8 @@
 
 Read these before selecting implementation work:
 
-1. `docs/implementation/capability-roadmap.md`
-2. `docs/implementation/requirements-status.md`
+1. `docs/validation/capability-roadmap.md`
+2. `docs/validation/requirements-status.md`
 3. `README.md#current-implementation-boundary`
 4. `data-mesh-requirements.md`
 5. `.github/pull_request_template.md`

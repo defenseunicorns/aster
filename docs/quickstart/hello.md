@@ -1,5 +1,6 @@
 # Aster Field Notes: the human hello
 
+> ****
 
 Aster Field Notes is a small, human-driven way to feel the offline-first mesh
 instead of watching an automation claim that it worked. You activate named real
@@ -99,7 +100,7 @@ An open QUIC connection can still exchange transport keepalives or
 acknowledgements; closing discovery does not close an authenticated connection.
 An idle open connection is not a promise of zero radio or battery cost.
 
-See [Nearby discovery FOSS selection](../evaluations/0005/nearby-discovery-selection.md)
+See the [nearby discovery decision](../decisions/0034-short-lived-iroh-nearby-discovery.md)
 for the alternatives, measured caveats, and physical qualification plan.
 
 ## Exact claim boundary

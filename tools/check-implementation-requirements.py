@@ -19,9 +19,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS = ROOT / "data-mesh-requirements.md"
-MATRIX = ROOT / "docs/evaluations/0005/requirements-matrix.csv"
-TRACE = ROOT / "docs/implementation/requirements-implementation.csv"
-LEDGER = ROOT / "docs/implementation/requirements-status.md"
+MATRIX = ROOT / "docs/validation/requirements-matrix.csv"
+TRACE = ROOT / "docs/validation/requirements-implementation.csv"
+LEDGER = ROOT / "docs/validation/requirements-status.md"
 EXPECTED_REQUIREMENTS_SHA256 = (
     "e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987"
 )
@@ -53,45 +53,45 @@ VALID_SELECTED_STATES = frozenset(
     {"observed-bounded", "implemented-uncredited", "open"}
 )
 
-RECEIPT = "docs/implementation/requirements-status.md#reproducible-receipt"
+RECEIPT = "docs/validation/requirements-status.md#reproducible-receipt"
 MISSION_RECEIPT = (
-    "docs/implementation/requirements-status.md#mission-authenticated-runtime-validation"
+    "docs/validation/requirements-status.md#mission-authenticated-runtime-validation"
 )
 CONTROL_RECEIPT = (
-    "docs/implementation/requirements-status.md#mission-control-revocation-and-rekey-receipt"
+    "docs/validation/requirements-status.md#mission-control-revocation-and-rekey-receipt"
 )
 ZEROIZATION_RECEIPT = (
-    "docs/implementation/requirements-status.md#local-software-zeroization-receipt"
+    "docs/validation/requirements-status.md#local-software-zeroization-receipt"
 )
 N32_RECEIPT = (
-    "docs/implementation/requirements-status.md#selected-n32-retained-receipt"
+    "docs/validation/requirements-status.md#selected-n32-retained-receipt"
 )
 NAT_RECEIPT = (
-    "docs/implementation/requirements-status.md#selected-iroh-nat-retained-receipt"
+    "docs/validation/requirements-status.md#selected-iroh-nat-retained-receipt"
 )
 LIVE_EVENT_RECEIPT = (
-    "docs/implementation/requirements-status.md#selected-live-event-retained-receipt"
+    "docs/validation/requirements-status.md#selected-live-event-retained-receipt"
 )
 LIVE_STATE_SUBSCRIPTION_RECEIPT = (
-    "docs/implementation/requirements-status.md#selected-live-state-subscription-retained-receipt"
+    "docs/validation/requirements-status.md#selected-live-state-subscription-retained-receipt"
 )
 LIVE_RECORD_SUBSCRIPTION_RECEIPT = (
-    "docs/implementation/requirements-status.md#selected-live-record-subscription-retained-receipt"
+    "docs/validation/requirements-status.md#selected-live-record-subscription-retained-receipt"
 )
 LIVE_BLOB_SUBSCRIPTION_RECEIPT = (
-    "docs/implementation/evidence/selected-live-blob-subscription-26e0a09.json"
+    "docs/validation/evidence/selected-live-blob-subscription-26e0a09.json"
 )
 LIVE_MUTABLE_RECEIPT = (
-    "docs/implementation/requirements-status.md#selected-live-state-and-record-retained-receipt"
+    "docs/validation/requirements-status.md#selected-live-state-and-record-retained-receipt"
 )
 LIVE_BLOB_RECEIPT = (
-    "docs/implementation/requirements-status.md#selected-live-blob-retained-receipt"
+    "docs/validation/requirements-status.md#selected-live-blob-retained-receipt"
 )
 LINUX_CUSTODY_RECEIPT = (
-    "docs/implementation/requirements-status.md#selected-linux-event-custody-retained-receipt"
+    "docs/validation/requirements-status.md#selected-linux-event-custody-retained-receipt"
 )
 DEPENDENCY_GATE = (
-    "docs/implementation/requirements-status.md#dependency-admission-gate"
+    "docs/validation/requirements-status.md#dependency-admission-gate"
 )
 EVENT_SLICE = (
     "crates/aster-core/src/source_event.rs; crates/aster-redb-store/src/lib.rs; "
@@ -184,21 +184,21 @@ LIVE_EVENT_ACCEPTANCE_SLICE = (
     "tools/run-selected-live-event.py; "
     "tools/check-selected-live-event-receipt.py; "
     "tools/test-selected-live-event-receipt.py; "
-    "docs/implementation/evidence/selected-live-event-c464129.json"
+    "docs/validation/evidence/selected-live-event-c464129.json"
 )
 LIVE_STATE_SUBSCRIPTION_ACCEPTANCE_SLICE = (
     "crates/aster-node/examples/live_state_subscription_acceptance.rs; "
     "tools/run-selected-live-state-subscription.py; "
     "tools/check-selected-live-state-subscription-receipt.py; "
     "tools/test-selected-live-state-subscription-receipt.py; "
-    "docs/implementation/evidence/selected-live-state-subscription-8912fc3.json"
+    "docs/validation/evidence/selected-live-state-subscription-8912fc3.json"
 )
 LIVE_RECORD_SUBSCRIPTION_ACCEPTANCE_SLICE = (
     "crates/aster-node/examples/live_record_subscription_acceptance.rs; "
     "tools/run-selected-live-record-subscription.py; "
     "tools/check-selected-live-record-subscription-receipt.py; "
     "tools/test-selected-live-record-subscription-receipt.py; "
-    "docs/implementation/evidence/selected-live-record-subscription-0c11344.json"
+    "docs/validation/evidence/selected-live-record-subscription-0c11344.json"
 )
 CUSTODY_SLICE = (
     "crates/aster-core/src/custody.rs; crates/aster-core/src/source_event.rs; "
@@ -214,7 +214,7 @@ LINUX_CUSTODY_ACCEPTANCE_SLICE = (
     "tools/run-selected-linux-event-custody.py; "
     "tools/check-selected-linux-event-custody-receipt.py; "
     "tools/test-selected-linux-event-custody-receipt.py; "
-    "docs/implementation/evidence/selected-linux-event-custody-ade6ee1.json"
+    "docs/validation/evidence/selected-linux-event-custody-ade6ee1.json"
 )
 AGENT_SLICE = (
     "proto/aster/application/v1alpha1/aster.proto; crates/aster-agent/src/lib.rs; "
@@ -270,7 +270,7 @@ LIVE_MUTABLE_SLICE = (
     "tools/run-selected-live-mutable.py; "
     "tools/check-selected-live-mutable-receipt.py; "
     "tools/test-selected-live-mutable-receipt.py; "
-    "docs/implementation/evidence/selected-live-mutable-6cabb4c.json; "
+    "docs/validation/evidence/selected-live-mutable-6cabb4c.json; "
     "docs/quickstart/selected-state-api.md; "
     "docs/quickstart/selected-record-api.md"
 )
@@ -365,7 +365,7 @@ LIVE_BLOB_ACCEPTANCE_SLICE = (
     "tools/run-selected-live-blob.py; "
     "tools/check-selected-live-blob-receipt.py; "
     "tools/test-selected-live-blob-receipt.py; "
-    "docs/implementation/evidence/selected-live-blob-044d90f.json; "
+    "docs/validation/evidence/selected-live-blob-044d90f.json; "
     "docs/quickstart/selected-blob-api.md"
 )
 LIVE_BLOB_SUBSCRIPTION_ACCEPTANCE_SLICE = (
@@ -547,7 +547,7 @@ SECURITY_PROFILE_DECISION = (
     "docs/decisions/0033-policy-selected-security-profiles.md"
 )
 SECURITY_PROFILE_DISPOSITION = (
-    "docs/implementation/security-profile-requirements-disposition.md"
+    "docs/validation/security-profile-requirements-disposition.md"
 )
 SECURITY_PROFILE_REFERENCE = "docs/classical-iroh-security-profile.md"
 SECURITY_PROFILE_ARTIFACTS = (
@@ -1528,7 +1528,7 @@ RELEVANT_ARTIFACTS = {
     "DM-2-01": "docs/protocol.md; docs/wire.cddl; docs/envelope.md",
     "DM-2-03": "bindings/c; bindings/go; bindings/python",
     "DM-2-04": "docs/bindings/pattern.md",
-    "DM-2-07": "docs/conformance.md; crates/aster-conformance; conformance",
+    "DM-2-07": "docs/validation/conformance.md; crates/aster-conformance; conformance",
     "DM-2-08": "data-mesh-requirements.md",
     "DM-2-09": "data-mesh-requirements.md",
     "DM-2-10": "data-mesh-requirements.md",
@@ -1569,11 +1569,11 @@ RELEVANT_ARTIFACTS = {
     "DM-8-02": "Cargo.toml; Cargo.lock",
     "DM-8-05": "docs/decisions/0028-selected-stack-implementation-boundary.md; deny.toml; THIRD_PARTY_NOTICES.md; tools/check-dependency-exception-scope.sh",
     "DM-8-16": "docs/decisions/0025-requirements-first-foss-architecture-evaluation.md",
-    "DM-8-17": "docs/protocol.md; docs/wire.cddl; docs/conformance.md",
+    "DM-8-17": "docs/protocol.md; docs/wire.cddl; docs/validation/conformance.md",
     "DM-8-19": "docs/protocol.md; docs/wire.cddl",
-    "DM-10-01": "docs/protocol.md; docs/conformance.md",
-    "DM-10-02": "docs/protocol.md; docs/conformance.md",
-    "DM-10-03": "docs/protocol.md; docs/conformance.md",
+    "DM-10-01": "docs/protocol.md; docs/validation/conformance.md",
+    "DM-10-02": "docs/protocol.md; docs/validation/conformance.md",
+    "DM-10-03": "docs/protocol.md; docs/validation/conformance.md",
     "DM-10-04": "docs/protocol.md; docs/deprecation-policy.md",
     "DM-10-05": "docs/protocol.md; docs/deprecation-policy.md",
     "DM-10-06": "docs/deprecation-policy.md",
@@ -1586,12 +1586,12 @@ RELEVANT_ARTIFACTS = {
     "DM-13-05": "crates/aster-host; crates/aster-ble",
     "DM-13-06": "crates/aster-ffi; bindings/c; bindings/go; bindings/python",
     "DM-13-07": "docs/bindings/pattern.md",
-    "DM-13-08": "docs/conformance.md; crates/aster-conformance; conformance",
+    "DM-13-08": "docs/validation/conformance.md; crates/aster-conformance; conformance",
     "DM-13-09": "docs/quickstart; docs/application-recipes.md",
     "DM-13-10": "examples; docs/quickstart",
-    "DM-13-11": "deny.toml; docs/decisions; docs/evaluations/0005",
-    "DM-14-20": "docs/evaluations/0005; docs/decisions/0025-requirements-first-foss-architecture-evaluation.md",
-    "DM-14-21": "docs/evaluations/0005/responsibility-map.md; docs/decisions/0025-requirements-first-foss-architecture-evaluation.md",
+    "DM-13-11": "deny.toml; docs/decisions; archive/research/evaluations/0005",
+    "DM-14-20": "archive/research/evaluations/0005; docs/decisions/0025-requirements-first-foss-architecture-evaluation.md",
+    "DM-14-21": "archive/research/evaluations/0005/responsibility-map.md; docs/decisions/0025-requirements-first-foss-architecture-evaluation.md",
     "DM-14-23": SECURITY_PROFILE_ARTIFACTS,
 }
 

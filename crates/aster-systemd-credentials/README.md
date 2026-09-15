@@ -57,7 +57,7 @@ provider does not log or retain the credential path, reference, operation ID,
 envelope, parser detail, or plaintext.
 
 The systemd 257 ACL/tmpfs boundary is defined by the
-[profile amendment](../../docs/superpowers/specs/2026-09-09-systemd-257-credential-presentation-amendment.md).
+[profile amendment](../../docs/validation/inputs/systemd-257-credential-presentation-amendment.md).
 It does not claim systemd's `secure` label, generic `tmpfs` safety, generic
 Debian support, or production qualification. Security and Deployment approval
 of the immutable amendment remains required at candidate gate E01.
@@ -105,12 +105,12 @@ The complete human-first sequence, including required stopped-service state,
 safe backup redirection, bearer-token SIGHUP composition, mission/provider
 rotation, same-host recovery, revoke/rekey composition, destruction, and
 pre-intent staged-evidence escalation, is the
-[Raspberry Pi provider v2 operations procedure](../../docs/implementation/raspberry-pi-provider-v2-operations.md).
+[Raspberry Pi provider v2 operations procedure](../../docs/mvp/raspberry-pi-provider-v2-operations.md).
 
 The five provider lifecycle CLI commands and the code-level Event-agent
 integration are executable; a three-device engineering spike has exercised
 startup and the lifecycle, while final qualification remains open. The Ubuntu amd64 candidate now has
-[package installation details](../../docs/implementation/raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex);
+[package installation details](../../docs/mvp/raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex);
 this does not qualify the original Raspberry Pi target. The provider's
 `active/reference` stays root-only; the deployment procedure must atomically populate
 a separate mode-`0600`, final-service-UID-owned reference handoff from
@@ -123,7 +123,7 @@ snapshot rollback, physical erasure, production, and general-platform support
 remain open. There is no age, plaintext-file, TPM2, or alternate-provider
 fallback.
 
-The [approved v2 design](../../docs/superpowers/specs/2026-09-08-raspberry-pi-systemd-credential-provider-v2-design.md)
+The [approved v2 design](../../docs/validation/inputs/raspberry-pi-systemd-credential-provider-v2-design.md)
 on `main` defines this exact evaluation profile. Persistent v1 state is
 deliberately rejected rather than migrated; the historical v1 design does not
 qualify this v2 provider.

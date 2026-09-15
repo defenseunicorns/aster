@@ -3,17 +3,17 @@
 This is the shortest path from a checkout to visible Aster behavior. Each tour
 uses real operating-system processes, independent redb stores, direct Iroh
 contacts, the hybrid mission session, source-sealed Events, and durable
-restart/no-op verification. Tour artifacts are retained under a fresh temporary
-directory so you can inspect every receipt afterward.
+restart/no-op verification. Each run uses a fresh temporary directory and
+prints its location for later inspection.
 
 In an interactive terminal, each command opens a live dashboard as cohorts
 start and finish. Redirected output falls back to a line-oriented live view, so
 longer relay and control tours still show progress instead of releasing one
 large block only at the end.
 
-The boundary is deliberately small: one-host loopback, Event-only,
-unprotected-reference provisioning, and no physical or mixed-implementation
-evidence. Passing these tours is not production authorization.
+The boundary is deliberately small: one-host loopback, Event-only, and
+unprotected-reference provisioning. Passing a tour is not production
+authorization.
 
 ## Pick a tour
 
@@ -39,10 +39,8 @@ loopback sockets, so a host firewall or sandbox must permit loopback UDP.
 The default `auto` view uses an updating dashboard on a capable terminal and a
 plain, progressively printed view elsewhere. The presenter is deliberately
 separate from the demo result: every stdout and stderr byte is written to the
-raw receipt before it is interpreted for display. The demo and stopped-node
-inspection exit statuses determine command success. Structured `PHASE`, result,
-and inspection receipts remain the retained basis for the human-readable
-claims; presentation itself does not decide pass or fail.
+raw files before it is interpreted for display. The demo and stopped-node
+inspection exit statuses determine command success; presentation does not.
 
 Use a deterministic non-updating view for logs or screen readers:
 
@@ -58,11 +56,11 @@ ASTER_TOUR_VIEW=raw sh tools/aster-tour.sh control
 ```
 
 In raw mode the helper keeps demo and inspection records on stdout and sends
-artifact locations to stderr. The retained `.demo.stdout` file is the strict
-byte-for-byte authority; task runners may print their own command prefix.
+artifact locations to stderr. The `.demo.stdout` file contains the exact
+captured output; task runners may print their own command prefix.
 
 `ASTER_TOUR_VIEW=tui` forces the dashboard, while `NO_COLOR=1` keeps its layout
-but removes color. Every mode retains the same raw files:
+but removes color. Every mode writes the same files:
 
 - `<tour-parent>/<name>.demo.stdout` and `.demo.stderr` contain the demo
   process receipts;
@@ -71,11 +69,10 @@ but removes color. Every mode retains the same raw files:
 - `<tour-parent>/<name>/logs` contains each child process's exact output.
 
 The dashboard notices creation of a cohort's child logs so it can show which
-nodes are active before that cohort ends. It marks a step verified only after
-the demo emits the corresponding passing `PHASE` receipt. The view is not a
-second evidence format and does not broaden the bounded claim below.
+nodes are active before that cohort ends. It marks a step complete only after
+the demo emits the corresponding passing `PHASE` record.
 
-## What the quick tour proves
+## What to expect
 
 The two-node tour is five causal cohorts and eight child-process executions:
 
@@ -90,7 +87,7 @@ sequenceDiagram
     A->>B: restart/noop contact<br/>all 11 movement counters are zero
 ```
 
-Look for these terminal receipts:
+Look for these terminal records:
 
 ```text
 SUBSCRIPTIONS status=seeded consume=2 carry=0 selectors=2 interest_exchange=mission-protected lanes=receiver-directed
@@ -99,7 +96,7 @@ PONG status=received ... causal_observation=verified ttl=none
 DEMO_RESULT status=pass scenario=ping-pong nodes=2 processes=8 ...
 ```
 
-The `SUBSCRIPTIONS` receipt is the receive-policy boundary: endpoints get
+The `SUBSCRIPTIONS` record shows the receive-policy boundary: endpoints get
 durable `Consume` selectors, route-only intermediates get durable `Carry`
 selectors, and every authenticated contact exchanges the canonical interests
 before loading an Event inventory. An empty selector set means receive-none,
@@ -130,7 +127,7 @@ rg '^CONTACT .*status=pass' /path/from-the-script/logs
 ```
 
 Each directed edge begins with exactly one durable Event difference. A passing
-edge receipt moves exactly that one Event and reports all control counters zero.
+edge moves exactly that one Event and reports all control counters zero.
 The final restart reports no Event or control movement.
 
 ## See revocation and recipient-filtered rekey
@@ -202,8 +199,8 @@ for node in 0 1 2; do
 done
 ```
 
-Continue with the [full mesh CLI guide](mesh-cli.md) for exact phase receipts,
-manual node configuration, zeroization recovery boundaries, and retained test
-evidence. Read the [selected architecture](../architecture.md) to see where
+Continue with the [full mesh CLI guide](mesh-cli.md) for phase output, manual
+node configuration, and zeroization recovery boundaries. Read the [selected
+architecture](../architecture.md) to see where
 carrier, mission, control, source, route, content, storage, and reconciliation
 authority live.

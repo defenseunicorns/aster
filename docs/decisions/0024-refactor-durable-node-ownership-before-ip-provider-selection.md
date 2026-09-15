@@ -1,17 +1,18 @@
 # Decision 0024: Refactor durable node ownership before selecting an IP provider
 
+> ****
 
 - Status: accepted — no provider selected
 - Date: 2026-08-21
-- Proposal: [0003](../proposals/0003-idiomatic-ip-mesh-provider-comparison.md)
-- Results: [Proposal 0003 result](../proposals/0003-idiomatic-ip-mesh-provider-results.md)
-- Follow-on experiment: [Proposal 0004](../proposals/0004-shared-node-libp2p-retest.md)
+- Follow-on experiment: [Proposal 0004](../../archive/research/proposals/0004-shared-node-libp2p-retest.md)
 - Requirements baseline:
   [`data-mesh-requirements.md`](../../data-mesh-requirements.md), SHA-256
   `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
 - Preserves: Decisions [0002](0002-dependency-admission.md),
-  0014 (“Build versus buy is governed by total assurance cost”;  not part of this repository artifact),
-  0015 (“Delete custom mechanism behind narrow library-backed seams”; not part of this repository artifact),
+  0014 (“Build versus buy is governed by total assurance cost”; privileged local
+  record, not part of this repository artifact),
+  0015 (“Delete custom mechanism behind narrow library-backed seams”; privileged
+  local record, not part of this repository artifact),
   [0022](0022-ip-mesh-experiment-no-selection.md), and
   [0023](0023-mesh-host-contract-no-libp2p-selection.md)
 
@@ -71,7 +72,7 @@ defect.
 
 ### Implementation follow-up
 
-Proposal [0004](../proposals/0004-shared-node-libp2p-retest.md) now contains a
+Proposal [0004](../../archive/research/proposals/0004-shared-node-libp2p-retest.md) now contains a
 provider-free implementation of this decision's shared authority,
 transactional admission, generation fanout, and aggregate budget. Its common
 supervisor also owns pending-dial capacity and deadlines through settlement,
