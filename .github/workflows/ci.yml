@@ -218,6 +218,9 @@ jobs:
       - name: Run message playground controller tests
         run: python3 tools/test_aster_mesh_playground.py
 
+      - name: Run qualification validator tests
+        run: python3 tools/test-linux-event-mvp-qualification.py
+
       - name: Run real-process message playground smoke
         env:
           CARGO_NET_OFFLINE: "true"
