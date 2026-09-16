@@ -355,3 +355,199 @@ fn connect_client_uses_the_real_live_event_authority() {
         node.shutdown().await.expect("node shutdown");
     });
 }
+
+#[tokio::test]
+async fn optional_event_ttl_is_enforced_by_the_live_agent() {
+    let state = TestState::new();
+    let mission = UnprotectedReferenceMission::from_bytes(
+        include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle").to_vec(),
+    )
+    .unwrap();
+    let node = start_node(NodeConfig {
+        state: state.0.clone(),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        mission,
+        peers: Vec::new(),
+        mutable_interests: MutableSourceInterests::default(),
+        sync_interval: Duration::from_millis(50),
+        run_for: None,
+        application: NodeApplication::Relay,
+    })
+    .await
+    .unwrap();
+    let agent = BoundAgent::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let address = agent.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(agent.serve(
+        node.selected_events(),
+        ClientToken::from_bytes(TEST_TOKEN.to_vec()).unwrap(),
+        shutdown_rx,
+    ));
+    let client = api::AsterApplicationServiceClient::new(
+        HttpClient::plaintext(),
+        ClientConfig::new(format!("http://{address}").parse().unwrap()).with_default_header(
+            "authorization",
+            format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+        ),
+    );
+    let mut request = api::PublishEventRequest {
+        operation_key: b"ttl-publication".to_vec(),
+        topic: "chat.events".to_owned(),
+        scope: "mission/team/alpha".to_owned(),
+        priority: api::Priority::Routine.into(),
+        logical_key: b"finite".to_vec(),
+        payload: b"short-lived".to_vec(),
+        ttl_ms: Some(0),
+        ..Default::default()
+    };
+    assert_eq!(
+        client
+            .publish_event(request.clone())
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidArgument
+    );
+    request.ttl_ms = Some(2_000);
+    request.tombstone = true;
+    assert_eq!(
+        client
+            .publish_event(request.clone())
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidArgument
+    );
+    request.tombstone = false;
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(
+        client
+            .publish_event(request.clone())
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::PermissionDenied
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let subscription = client
+            .create_event_subscription(api::CreateEventSubscriptionRequest {
+                operation_key: b"ttl-subscription".to_vec(),
+                topic: request.topic.clone(),
+                scope: request.scope.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_owned();
+        let published = client
+            .publish_event(request.clone())
+            .await
+            .unwrap()
+            .into_owned();
+        assert_eq!(published.ttl_ms, request.ttl_ms);
+        let retry = client
+            .publish_event(request.clone())
+            .await
+            .unwrap()
+            .into_owned();
+        assert_eq!(retry.id, published.id);
+        assert!(!retry.inserted);
+        let mut changed = request.clone();
+        changed.ttl_ms = Some(3_000);
+        assert_eq!(
+            client.publish_event(changed).await.unwrap_err().code,
+            ErrorCode::Aborted
+        );
+        let query = api::QueryEventsRequest {
+            limit: 16,
+            ..Default::default()
+        };
+        let page = client
+            .query_events(query.clone())
+            .await
+            .unwrap()
+            .into_owned();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].ttl_ms, request.ttl_ms);
+        let poll = api::PollEventsRequest {
+            subscription_id: subscription.subscription_id,
+            delivery_limit: 16,
+            scan_limit: 16,
+            ..Default::default()
+        };
+        let deliveries = client.poll_events(poll.clone()).await.unwrap().into_owned();
+        assert_eq!(deliveries.deliveries.len(), 1);
+        assert_eq!(
+            deliveries.deliveries[0].event.as_option().unwrap().ttl_ms,
+            request.ttl_ms
+        );
+        let full = client
+            .get_status(api::GetStatusRequest::default())
+            .await
+            .unwrap()
+            .into_owned();
+        tokio::time::sleep(Duration::from_millis(2_050)).await;
+        assert!(
+            client
+                .query_events(query)
+                .await
+                .unwrap()
+                .into_owned()
+                .events
+                .is_empty()
+        );
+        assert!(
+            client
+                .poll_events(poll)
+                .await
+                .unwrap()
+                .into_owned()
+                .deliveries
+                .is_empty()
+        );
+        assert_eq!(
+            client
+                .publish_event(request.clone())
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+        let empty = client
+            .get_status(api::GetStatusRequest::default())
+            .await
+            .unwrap()
+            .into_owned();
+        assert!(
+            empty.store_capacity.as_option().unwrap().items
+                < full.store_capacity.as_option().unwrap().items
+        );
+        assert!(
+            empty.store_capacity.as_option().unwrap().payload_bytes
+                < full.store_capacity.as_option().unwrap().payload_bytes
+        );
+        assert_eq!(
+            empty
+                .publish_operation_capacity
+                .as_option()
+                .unwrap()
+                .retired_rows,
+            1
+        );
+    }
+    request.operation_key = b"durable-publication".to_vec();
+    request.ttl_ms = None;
+    let durable = client.publish_event(request).await.unwrap().into_owned();
+    assert!(durable.inserted);
+    assert_eq!(durable.ttl_ms, None);
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    node.shutdown().await.unwrap();
+}

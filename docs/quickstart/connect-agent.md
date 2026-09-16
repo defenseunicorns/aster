@@ -105,7 +105,7 @@ empty on restart and expires samples at exactly 60 seconds. The estimate in
 `estimated_seconds_to_exhaustion` rounds ordinary headroom/rate up to whole
 seconds, saturates at `u64::MAX`, and is zero without an observed rate or
 headroom. It is planning information; warning state remains occupancy-only
-until Event retention is configurable.
+and does not assume that content expiry frees permanent operation records.
 
 The nested `audit` reports `PENDING`, `RUNNING`, `COMPLETE`, or `FAILED`, with
 `scanned`/`total` counting ledger and reverse rows in one fixed snapshot.
@@ -123,6 +123,51 @@ Only `GET` with no body is accepted. Unknown paths return `404`, other methods
 return `405`, and responses contain no node, mission, peer, path, queue, or
 failure detail. Use authenticated `GetStatus` when an application needs its
 bounded synchronization snapshot.
+
+## Publish Events with a finite lifetime
+
+On Linux, `PublishEventRequest.ttl_ms` optionally selects a positive lifetime
+in milliseconds. For example, add `"ttlMs": "30000"` to a Connect JSON
+publication to retain the Event for 30 seconds of tracked custody age. Omit
+`ttl_ms` for the existing durable behavior. Zero and finite tombstones return
+`InvalidArgument`; finite publication on unsupported clock platforms returns
+`PermissionDenied` with `PUBLIC_ERROR_REASON_FAILED_PRECONDITION`.
+
+The duration is part of the publisher-signed Event header. It is not a UTC
+deletion timestamp. Existing custody-age accounting carries elapsed lifetime
+across nodes; forwarding never resets it. Unknown clock continuity withholds
+finite Events rather than assuming they are fresh. See the
+[custody clock and forwarding contract](selected-custody-api.md#understand-age-and-expiry).
+
+Publication results and Events in query, poll, and stream responses include
+`ttl_ms`, the original duration, not remaining lifetime. TTL participates in
+operation-key intent: changing it under the same key returns the existing
+operation-conflict error. An exact retry before expiry returns the original
+result; after retirement it returns nonretryable `NotFound`. Use a new operation
+key only for intentional new work.
+
+At expiry, query, poll, stream, and forwarding withhold the Event. Existing
+bounded maintenance runs during publication, reads, and periodic runtime work;
+it removes expired content and delivery bookkeeping and releases logical row
+and byte capacity for new Events. Active transfer leases can delay removal of
+bytes, but cannot make an expired Event visible. No acknowledgement, consumer
+enrollment, or manual deletion call is required. Expiry does not prove that any
+consumer processed the Event. Database files need not shrink when rows are
+removed.
+
+This is an additive implementation extension beyond the approved Linux Event
+MVP v0.1 profile, which still excludes finite TTL. It does not enlarge the
+approved workload or add retained qualification evidence. The operation ledger
+still has its configured lifetime limit (default 1,000,000 records) and keeps
+compact permanent retry fences. Custody retirement fences and causal history
+have separate retention boundaries; content reuse is not indefinite bounded
+operation. Global deletion propagation and numbered-operation watermark
+compaction remain separate designs.
+
+Use an upgraded server with regenerated clients for finite publication. Older
+servers can ignore new Protobuf fields; require the returned `ttl_ms` to match
+the request before treating publication as finite. Old clients that omit TTL
+continue to publish durable Events. Mesh wire and storage formats are unchanged.
 
 ## Select normal or receive-only operation
 

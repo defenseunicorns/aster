@@ -5,7 +5,7 @@ use aster_node::application::{
     AuthenticatedPeerStatus, ContactSyncStatus as NodeContactSyncStatus, EventAcknowledgement,
     EventDelivery as NodeEventDelivery, EventGap as NodeEventGap, EventGapQuery, EventId,
     EventItem, EventOperationAuditState, EventOperationCapacityWarning, EventPollRequest,
-    EventPublishRequest, EventPublishResult, EventQuery, EventSubscriptionId,
+    EventPublishOptions, EventPublishRequest, EventPublishResult, EventQuery, EventSubscriptionId,
     EventSubscriptionRequest, EventSyncStatus as NodeEventSyncStatus, EventUnsubscribe,
     PeerAuthorization as NodePeerAuthorization, Priority as NodePriority, Scope,
     SelectedEventHandle, SelectedEventStatus, Topic,
@@ -182,9 +182,10 @@ impl api::AsterApplicationService for AsterConnectService {
         request: ServiceRequest<'_, api::PublishEventRequest>,
     ) -> ServiceResult<api::PublishEventResponse> {
         let request = request.to_owned_message();
+        let options = publish_options(&request)?;
         let result = self
             .events
-            .publish(publish_request(request)?)
+            .publish_with_options(publish_request(request)?, options)
             .await
             .map_err(connect_application_error)?;
         bounded_response(publish_response(result), PublicOperation::PublishEvent)
@@ -398,7 +399,33 @@ async fn next_stream_delivery(
         if state.stopped || *state.shutdown.borrow() {
             return None;
         }
-        if let Some(delivery) = state.pending.pop_front() {
+        if let Some(mut delivery) = state.pending.pop_front() {
+            // A slow stream can retain a polled page beyond its Events' TTL.
+            // Reopen the exact finite Event through the actor's current policy
+            // and custody checks immediately before exposing each message.
+            if delivery.event.ttl_ms.is_some() {
+                let query = EventQuery {
+                    after_acceptance_marker: delivery.event.acceptance_marker - 1,
+                    limit: 1,
+                    ..EventQuery::default()
+                };
+                match state.events.query(query).await {
+                    Ok(page) => {
+                        let Some(event) = page
+                            .items
+                            .into_iter()
+                            .find(|event| event.id == delivery.event.id)
+                        else {
+                            continue;
+                        };
+                        delivery.event = event;
+                    }
+                    Err(error) => {
+                        state.stopped = true;
+                        return Some((Err(connect_application_error(error)), state));
+                    }
+                }
+            }
             return Some((
                 bounded_message(
                     stream_delivery_message(delivery),
@@ -446,6 +473,18 @@ async fn next_stream_delivery(
                 state.stopped = true;
                 return Some((Err(connect_application_error(error)), state));
             }
+        }
+    }
+}
+
+fn publish_options(
+    request: &api::PublishEventRequest,
+) -> Result<EventPublishOptions, ConnectError> {
+    match request.ttl_ms {
+        None => Ok(EventPublishOptions::durable()),
+        Some(_) if request.tombstone => Err(malformed_input(PublicOperation::PublishEvent)),
+        Some(ttl_ms) => {
+            EventPublishOptions::finite_ttl_ms(ttl_ms).map_err(connect_application_error)
         }
     }
 }
@@ -513,6 +552,7 @@ fn publish_response(result: EventPublishResult) -> api::PublishEventResponse {
         priority: priority_message(result.priority).into(),
         acceptance_marker: result.acceptance_marker,
         inserted: result.inserted,
+        ttl_ms: result.ttl_ms,
         ..Default::default()
     }
 }
@@ -530,6 +570,7 @@ fn event_message(event: EventItem) -> api::Event {
         payload: event.payload,
         tombstone: event.tombstone,
         acceptance_marker: event.acceptance_marker,
+        ttl_ms: event.ttl_ms,
         ..Default::default()
     }
 }
@@ -890,6 +931,108 @@ mod tests {
         assert_eq!(decoded.operation, operation);
         assert_eq!(decoded.retryable, retryable);
         assert_eq!(decoded.retry_delay_ms, None);
+    }
+
+    #[cfg(all(feature = "client", feature = "server", target_os = "linux"))]
+    #[tokio::test]
+    async fn slow_stream_discards_expired_buffered_event() {
+        let state = TestState::new();
+        let mission = UnprotectedReferenceMission::from_bytes(
+            include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle")
+                .to_vec(),
+        )
+        .unwrap();
+        let node = start_node(NodeConfig {
+            state: state.0.clone(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            mission,
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(50),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .unwrap();
+        let events = node.selected_events();
+        let subscription = events
+            .subscribe(EventSubscriptionRequest {
+                operation_key: b"slow-stream-subscription".to_vec(),
+                topic: Topic::new("chat.events").unwrap(),
+                scope: Scope::new("mission/team/alpha").unwrap(),
+                include_descendant_scopes: false,
+            })
+            .await
+            .unwrap();
+        let mut publication = EventPublishRequest {
+            operation_key: b"slow-stream-finite".to_vec(),
+            predecessor: None,
+            topic: Topic::new("chat.events").unwrap(),
+            scope: Scope::new("mission/team/alpha").unwrap(),
+            priority: NodePriority::Routine,
+            logical_key: b"message".to_vec(),
+            payload: b"finite".to_vec(),
+            tombstone: false,
+        };
+        events
+            .publish_with_options(
+                publication.clone(),
+                EventPublishOptions::finite_ttl_ms(2_000).unwrap(),
+            )
+            .await
+            .unwrap();
+        publication.operation_key = b"slow-stream-durable".to_vec();
+        publication.payload = b"durable".to_vec();
+        let durable = events.publish(publication).await.unwrap();
+        let page = events
+            .poll(EventPollRequest {
+                subscription: subscription.id,
+                delivery_limit: 8,
+                scan_limit: 8,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.deliveries.len(), 2);
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        let stream = EventStreamState {
+            events,
+            subscription: subscription.id,
+            delivery_limit: 8,
+            scan_limit: 8,
+            backoff: Duration::from_millis(100),
+            pending: page.deliveries.into(),
+            backoff_before_poll: false,
+            shutdown,
+            stopped: false,
+        };
+        tokio::time::sleep(Duration::from_millis(2_050)).await;
+        let (message, _) = next_stream_delivery(stream).await.unwrap();
+        assert_eq!(
+            message.unwrap().event.as_option().unwrap().id,
+            durable.id.as_bytes()
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn ttl_options_preserve_presence_and_reject_zero_and_finite_tombstones() {
+        let mut request = api::PublishEventRequest::default();
+        assert_eq!(publish_options(&request).unwrap().ttl_ms(), None);
+        request.ttl_ms = Some(0);
+        assert_eq!(
+            publish_options(&request).unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
+        request.ttl_ms = Some(u64::MAX);
+        assert_eq!(publish_options(&request).unwrap().ttl_ms(), Some(u64::MAX));
+        let encoded = request.encode_to_vec();
+        let decoded = api::PublishEventRequest::decode_from_slice(&encoded).unwrap();
+        assert_eq!(decoded.ttl_ms, request.ttl_ms);
+        request.tombstone = true;
+        assert_eq!(
+            publish_options(&request).unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
     }
 
     #[test]
