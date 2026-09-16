@@ -74,6 +74,7 @@ permit identification.
 | Feedback ID | Date | Customer label | Topics | Feedback state | Recommendation status |
 | --- | --- | --- | --- | --- | --- |
 | [`CF-2026-09-10-01`](2026-09-10-potential-client-retention-sync/feedback.md) | 2026-09-10 | Potential client | Retention, synchronization cost, constrained links, higher-capacity custody | Reviewed | [Proposed](2026-09-10-potential-client-retention-sync/recommendation.md) |
+| [`CF-2026-09-16-01`](2026-09-16-anonymous-integration-workflows/feedback.md) | Date not supplied | Anonymous external feedback | Protected delivery, application integration, operational visibility, onboarding | Reviewed | [Proposed](2026-09-16-anonymous-integration-workflows/recommendation.md) |
 
 ## Maintenance rules
 
