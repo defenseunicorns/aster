@@ -10,7 +10,7 @@ license.workspace = true
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-aster-core = { version = "=0.1.0", path = "../aster-core", features = ["adapter-sdk"] }
+aster-core = { version = "=0.1.0-alpha.1", path = "../aster-core", features = ["adapter-sdk"] }
 
 [lints.rust]
 # FFI pointer validation necessarily uses narrowly scoped unsafe blocks. The

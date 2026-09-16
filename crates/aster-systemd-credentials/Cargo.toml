@@ -11,7 +11,7 @@ publish = false
 fuzzing = []
 
 [dependencies]
-aster-core = { version = "=0.1.0", path = "../aster-core", default-features = false, features = ["reference-session"] }
+aster-core = { version = "=0.1.0-alpha.1", path = "../aster-core", default-features = false, features = ["reference-session"] }
 getrandom.workspace = true
 rustix.workspace = true
 sha2.workspace = true

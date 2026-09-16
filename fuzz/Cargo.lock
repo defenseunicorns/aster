@@ -120,7 +120,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "aster-core"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aes-gcm 0.11.0",
  "getrandom 0.4.3",
@@ -150,7 +150,7 @@ dependencies = [
 
 [[package]]
 name = "aster-iroh"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "futures",
  "iroh",
@@ -160,7 +160,7 @@ dependencies = [
 
 [[package]]
 name = "aster-negentropy"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aster-profile",
  "negentropy",
@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "aster-node"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aster-core",
  "aster-iroh",
@@ -185,11 +185,11 @@ dependencies = [
 
 [[package]]
 name = "aster-profile"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 
 [[package]]
 name = "aster-redb-store"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aster-core",
  "aster-profile",
@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "aster-systemd-credentials"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aster-core",
  "getrandom 0.4.3",
