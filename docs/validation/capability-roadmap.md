@@ -189,6 +189,20 @@ execution. The IDs below are stable planning labels, not atomic requirement IDs.
 | **P2-3** | **P2 — complete and integrate capabilities** | Freeze and validate the adopter surface. | P0 binding choices and a stakeholder-ratified usability target; stable applicable P1 lifecycle/security contracts; and applicable P2-1 policy plus P2-2 status/resource decisions. Samples, status probes, and exploratory studies may advance earlier without closing the target. | For the complete-MVP adopter outcome, the selected-node C ABI and selected first-class bindings expose Event, State, Record, Blob, and required status without transport or cryptographic internals. Independent developers complete the minimal sample within the ratified usability target. A narrower evaluation profile may ship an explicitly named subset without claiming this track complete. |
 | **P3-1** | **P3 — close a production candidate** | Close the complete-MVP production profile. | Every applicable complete-MVP capability exit; every baseline, MVP, and release trace row marked as a [final-stack invariant](requirements-matrix-notes.md#final_stack_invariant); and every production-blocking external gate, unless a separately reviewed requirements disposition changes applicability. | An independently specification-built implementation passes the applicable conformance suite; independent cryptographic review and hostile-peer campaigns pass; the profile-specific FIPS/validated-module disposition and a reviewed `DM-8-05` disposition or technical alternative are recorded; full-graph SBOM/license admission, supported and reproducible packages, deprecation policy, representative physical/resource acceptance, and signed release authorization are complete for the exact production profile. |
 
+### Event TTL application increment (P1-1 / P2-3)
+
+The additive ConnectRPC `ttl_ms` field exposes the existing Linux Event custody
+lifetime and local expiry cleanup for logical content-capacity reuse. Its
+bounded exit is publication, expiry withholding, reclaimed row/byte capacity,
+and safe retries through the application API. This extension remains outside
+the approved v0.1 evaluation profile; the profile/release owners must review a
+successor before expanding supported workload or qualification claims.
+
+It does not change atomic requirement evidence, retained receipts, or capability
+maturity. Numbered operations/watermarks, global deletion propagation, custody
+fence retirement, and causal-history bounds remain separate work. See the
+[application TTL contract](../quickstart/connect-agent.md#publish-events-with-a-finite-lifetime).
+
 ### Active post-hierarchy implementation lanes
 
 The two bridge increments below remain ordered within the bridge lane, but they

@@ -1150,6 +1150,10 @@ type PublishEventRequest struct {
 	LogicalKey    []byte                 `protobuf:"bytes,6,opt,name=logical_key,json=logicalKey,proto3" json:"logical_key,omitempty"`
 	Payload       []byte                 `protobuf:"bytes,7,opt,name=payload,proto3" json:"payload,omitempty"`
 	Tombstone     bool                   `protobuf:"varint,8,opt,name=tombstone,proto3" json:"tombstone,omitempty"`
+	// Optional positive lifetime in milliseconds, authenticated by the publisher.
+	// Omitted means durable. Zero and finite tombstones are rejected.
+	// Requires a Linux server; this is a duration, not a wall-clock timestamp.
+	TtlMs         *uint64 `protobuf:"varint,9,opt,name=ttl_ms,json=ttlMs,proto3,oneof" json:"ttl_ms,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1240,6 +1244,13 @@ func (x *PublishEventRequest) GetTombstone() bool {
 	return false
 }
 
+func (x *PublishEventRequest) GetTtlMs() uint64 {
+	if x != nil && x.TtlMs != nil {
+		return *x.TtlMs
+	}
+	return 0
+}
+
 type PublishEventResponse struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	Id               []byte                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
@@ -1249,8 +1260,10 @@ type PublishEventResponse struct {
 	Priority         Priority               `protobuf:"varint,5,opt,name=priority,proto3,enum=aster.application.v1alpha1.Priority" json:"priority,omitempty"`
 	AcceptanceMarker uint64                 `protobuf:"varint,6,opt,name=acceptance_marker,json=acceptanceMarker,proto3" json:"acceptance_marker,omitempty"`
 	Inserted         bool                   `protobuf:"varint,7,opt,name=inserted,proto3" json:"inserted,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Exact source-authenticated duration; omitted for durable Events.
+	TtlMs         *uint64 `protobuf:"varint,8,opt,name=ttl_ms,json=ttlMs,proto3,oneof" json:"ttl_ms,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PublishEventResponse) Reset() {
@@ -1330,6 +1343,13 @@ func (x *PublishEventResponse) GetInserted() bool {
 		return x.Inserted
 	}
 	return false
+}
+
+func (x *PublishEventResponse) GetTtlMs() uint64 {
+	if x != nil && x.TtlMs != nil {
+		return *x.TtlMs
+	}
+	return 0
 }
 
 type QueryEventsRequest struct {
@@ -1497,8 +1517,10 @@ type Event struct {
 	Payload          []byte                 `protobuf:"bytes,9,opt,name=payload,proto3" json:"payload,omitempty"`
 	Tombstone        bool                   `protobuf:"varint,10,opt,name=tombstone,proto3" json:"tombstone,omitempty"`
 	AcceptanceMarker uint64                 `protobuf:"varint,11,opt,name=acceptance_marker,json=acceptanceMarker,proto3" json:"acceptance_marker,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Original lifetime, not remaining lifetime or a deletion timestamp.
+	TtlMs         *uint64 `protobuf:"varint,12,opt,name=ttl_ms,json=ttlMs,proto3,oneof" json:"ttl_ms,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Event) Reset() {
@@ -1604,6 +1626,13 @@ func (x *Event) GetTombstone() bool {
 func (x *Event) GetAcceptanceMarker() uint64 {
 	if x != nil {
 		return x.AcceptanceMarker
+	}
+	return 0
+}
+
+func (x *Event) GetTtlMs() uint64 {
+	if x != nil && x.TtlMs != nil {
+		return *x.TtlMs
 	}
 	return 0
 }
@@ -2475,7 +2504,7 @@ const file_aster_application_v1alpha1_aster_proto_rawDesc = "" +
 	"\x04peer\x18\x01 \x01(\fR\x04peer\x12S\n" +
 	"\rauthorization\x18\x02 \x01(\x0e2-.aster.application.v1alpha1.PeerAuthorizationR\rauthorization\x125\n" +
 	"\x16authenticated_contacts\x18\x03 \x01(\x04R\x15authenticatedContacts\x12L\n" +
-	"\flast_contact\x18\x04 \x01(\x0e2).aster.application.v1alpha1.ContactStatusR\vlastContact\"\xc0\x02\n" +
+	"\flast_contact\x18\x04 \x01(\x0e2).aster.application.v1alpha1.ContactStatusR\vlastContact\"\xe7\x02\n" +
 	"\x13PublishEventRequest\x12#\n" +
 	"\roperation_key\x18\x01 \x01(\fR\foperationKey\x12*\n" +
 	"\x0epredecessor_id\x18\x02 \x01(\fH\x00R\rpredecessorId\x88\x01\x01\x12\x14\n" +
@@ -2485,8 +2514,10 @@ const file_aster_application_v1alpha1_aster_proto_rawDesc = "" +
 	"\vlogical_key\x18\x06 \x01(\fR\n" +
 	"logicalKey\x12\x18\n" +
 	"\apayload\x18\a \x01(\fR\apayload\x12\x1c\n" +
-	"\ttombstone\x18\b \x01(\bR\ttombstoneB\x11\n" +
-	"\x0f_predecessor_id\"\xa3\x02\n" +
+	"\ttombstone\x18\b \x01(\bR\ttombstone\x12\x1a\n" +
+	"\x06ttl_ms\x18\t \x01(\x04H\x01R\x05ttlMs\x88\x01\x01B\x11\n" +
+	"\x0f_predecessor_idB\t\n" +
+	"\a_ttl_ms\"\xca\x02\n" +
 	"\x14PublishEventResponse\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\fR\x02id\x12\x1c\n" +
 	"\tpublisher\x18\x02 \x01(\fR\tpublisher\x12+\n" +
@@ -2494,7 +2525,9 @@ const file_aster_application_v1alpha1_aster_proto_rawDesc = "" +
 	"\x0eevent_sequence\x18\x04 \x01(\x04R\reventSequence\x12@\n" +
 	"\bpriority\x18\x05 \x01(\x0e2$.aster.application.v1alpha1.PriorityR\bpriority\x12+\n" +
 	"\x11acceptance_marker\x18\x06 \x01(\x04R\x10acceptanceMarker\x12\x1a\n" +
-	"\binserted\x18\a \x01(\bR\binserted\"\xcf\x02\n" +
+	"\binserted\x18\a \x01(\bR\binserted\x12\x1a\n" +
+	"\x06ttl_ms\x18\b \x01(\x04H\x00R\x05ttlMs\x88\x01\x01B\t\n" +
+	"\a_ttl_ms\"\xcf\x02\n" +
 	"\x12QueryEventsRequest\x12!\n" +
 	"\tpublisher\x18\x01 \x01(\fH\x00R\tpublisher\x88\x01\x01\x12\x19\n" +
 	"\x05topic\x18\x02 \x01(\tH\x01R\x05topic\x88\x01\x01\x12\x19\n" +
@@ -2512,7 +2545,7 @@ const file_aster_application_v1alpha1_aster_proto_rawDesc = "" +
 	"\x13QueryEventsResponse\x129\n" +
 	"\x06events\x18\x01 \x03(\v2!.aster.application.v1alpha1.EventR\x06events\x12'\n" +
 	"\x0fscanned_through\x18\x02 \x01(\x04R\x0escannedThrough\x12\x19\n" +
-	"\bhas_more\x18\x03 \x01(\bR\ahasMore\"\xfd\x02\n" +
+	"\bhas_more\x18\x03 \x01(\bR\ahasMore\"\xa4\x03\n" +
 	"\x05Event\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\fR\x02id\x12\x1c\n" +
 	"\tpublisher\x18\x02 \x01(\fR\tpublisher\x12+\n" +
@@ -2526,7 +2559,9 @@ const file_aster_application_v1alpha1_aster_proto_rawDesc = "" +
 	"\apayload\x18\t \x01(\fR\apayload\x12\x1c\n" +
 	"\ttombstone\x18\n" +
 	" \x01(\bR\ttombstone\x12+\n" +
-	"\x11acceptance_marker\x18\v \x01(\x04R\x10acceptanceMarker\"\xad\x01\n" +
+	"\x11acceptance_marker\x18\v \x01(\x04R\x10acceptanceMarker\x12\x1a\n" +
+	"\x06ttl_ms\x18\f \x01(\x04H\x00R\x05ttlMs\x88\x01\x01B\t\n" +
+	"\a_ttl_ms\"\xad\x01\n" +
 	"\x1eCreateEventSubscriptionRequest\x12#\n" +
 	"\roperation_key\x18\x01 \x01(\fR\foperationKey\x12\x14\n" +
 	"\x05topic\x18\x02 \x01(\tR\x05topic\x12\x14\n" +
@@ -2757,7 +2792,9 @@ func file_aster_application_v1alpha1_aster_proto_init() {
 	}
 	file_aster_application_v1alpha1_aster_proto_msgTypes[0].OneofWrappers = []any{}
 	file_aster_application_v1alpha1_aster_proto_msgTypes[8].OneofWrappers = []any{}
+	file_aster_application_v1alpha1_aster_proto_msgTypes[9].OneofWrappers = []any{}
 	file_aster_application_v1alpha1_aster_proto_msgTypes[10].OneofWrappers = []any{}
+	file_aster_application_v1alpha1_aster_proto_msgTypes[12].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

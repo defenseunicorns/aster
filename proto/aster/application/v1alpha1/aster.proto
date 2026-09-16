@@ -177,6 +177,10 @@ message PublishEventRequest {
   bytes logical_key = 6;
   bytes payload = 7;
   bool tombstone = 8;
+  // Optional positive lifetime in milliseconds, authenticated by the publisher.
+  // Omitted means durable. Zero and finite tombstones are rejected.
+  // Requires a Linux server; this is a duration, not a wall-clock timestamp.
+  optional uint64 ttl_ms = 9;
 }
 
 message PublishEventResponse {
@@ -187,6 +191,8 @@ message PublishEventResponse {
   Priority priority = 5;
   uint64 acceptance_marker = 6;
   bool inserted = 7;
+  // Exact source-authenticated duration; omitted for durable Events.
+  optional uint64 ttl_ms = 8;
 }
 
 message QueryEventsRequest {
@@ -217,6 +223,8 @@ message Event {
   bytes payload = 9;
   bool tombstone = 10;
   uint64 acceptance_marker = 11;
+  // Original lifetime, not remaining lifetime or a deletion timestamp.
+  optional uint64 ttl_ms = 12;
 }
 
 message CreateEventSubscriptionRequest {

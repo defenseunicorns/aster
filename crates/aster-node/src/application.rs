@@ -2962,6 +2962,79 @@ mod tests {
     }
 
     #[test]
+    fn finite_event_expiry_reuses_full_store_capacity_without_reusing_operation_keys() {
+        let root = TestRoot::new("finite-capacity-reuse");
+        let mut node = selected_node(&root);
+        node.store = Arc::new(
+            Store::open_with_limits_for_mission(
+                root.path().join("limited.redb"),
+                aster_redb_store::StoreLimits::new(
+                    aster_redb_store::MAX_CONTROL_ITEMS
+                        + aster_redb_store::CUSTODY_EMERGENCY_ITEM_RESERVE
+                        + 1,
+                    aster_redb_store::MAX_CONTROL_BYTES
+                        + aster_redb_store::CUSTODY_EMERGENCY_BYTE_RESERVE
+                        + 1024 * 1024,
+                )
+                .unwrap(),
+                node.mission.mission_authority_id(),
+            )
+            .unwrap(),
+        );
+        let clock_id = [0x91; 16];
+        let options = EventPublishOptions::finite_ttl_ms(10).unwrap();
+        for round in 0_u64..8 {
+            node.custody_clock = NodeCustodyClock::injected(clock_id, round * 10, 0);
+            let publication = request(&round.to_be_bytes(), "ops.alpha", b"asset", b"brief");
+            let result = node
+                .publish_with_options(publication.clone(), options)
+                .unwrap();
+            assert_eq!(result.event_sequence, round + 1);
+            let full = node.store.aggregate_usage().unwrap();
+            assert_eq!(full.items, 1);
+            assert!(full.payload_bytes > 0);
+            let overflow = node.publish_with_options(
+                request(b"cannot-fit", "ops.alpha", b"asset", b"another"),
+                options,
+            );
+            assert!(
+                overflow.is_err(),
+                "equal priority cannot displace the live Event"
+            );
+            assert_eq!(node.store.aggregate_usage().unwrap(), full);
+            let mut changed = publication.clone();
+            changed.payload = b"changed".to_vec();
+            assert_eq!(
+                node.publish_with_options(changed, options)
+                    .unwrap_err()
+                    .kind(),
+                ApplicationErrorKind::Conflict
+            );
+            assert_eq!(
+                node.publish_with_options(
+                    publication.clone(),
+                    EventPublishOptions::finite_ttl_ms(11).unwrap()
+                )
+                .unwrap_err()
+                .kind(),
+                ApplicationErrorKind::Conflict
+            );
+            node.custody_clock = NodeCustodyClock::injected(clock_id, (round + 1) * 10, 0);
+            assert_eq!(
+                node.publish_with_options(publication, options)
+                    .unwrap_err()
+                    .kind(),
+                ApplicationErrorKind::ExpiredOrRetired
+            );
+            // Publication itself runs cleanup; no separate maintenance call.
+            assert_eq!(
+                node.store.aggregate_usage().unwrap(),
+                AggregateStoreUsage::default()
+            );
+        }
+    }
+
+    #[test]
     fn finite_retirement_waits_for_lease_and_operation_fence_survives_reopen() {
         let root = TestRoot::new("finite-retirement-fence");
         let clock_id = [0x8b; 16];
