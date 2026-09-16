@@ -137,13 +137,16 @@ For the Linux Event MVP, [Decision
 0043](docs/decisions/0043-authorize-linux-event-mvp-validation.md) records the
 team-internal approvals and frozen two-CM4 boundary. The [direct CI-package
 device record](docs/validation/evidence/2026-09-15-cm4-ci-package-mvp-validation.md)
-contains the completed observations and explicitly identifies the checks that
-passed, failed, or remained unavailable on the selected package. Direct Event
-behavior passed. The incomplete ReceiveOnly non-initiation/disclosure checks,
-failed overload receipt, missing packaged provider administration, unavailable
-current Rust-client execution, incomplete strict Go recovery example, and
-unresolved CPU observation prevent an MVP candidate pass. It is engineering
-evidence, not a production or full-profile qualification claim.
+records passing direct Event/API and restart behavior in Rust and generated Go,
+both instrumented ReceiveOnly identity orderings, clean 1,024-operation
+capacity and offline audits, packaged-provider backup/recovery, and strict idle
+resource checks on the selected CI package. The directly exercisable bounded
+MVP functionality passes on both frozen devices. Protected mission
+rotation/revoke/rekey/destruction still requires externally issued authorized
+replacement material, and Decision 0043 defers the soak, true-partition,
+signing/reproduction, independent-review, and production-authorization work.
+This remains engineering evidence, not complete v0.1 release qualification or
+production authorization.
 
 ## When Aster fits
 
