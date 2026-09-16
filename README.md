@@ -138,8 +138,12 @@ For the Linux Event MVP, [Decision
 team-internal approvals and frozen two-CM4 boundary. The [direct CI-package
 device record](docs/validation/evidence/2026-09-15-cm4-ci-package-mvp-validation.md)
 contains the completed observations and explicitly identifies the checks that
-stopped at the OS-engineer handoff; it is partial engineering evidence, not a
-production or full-profile qualification claim.
+passed, failed, or remained unavailable on the selected package. Direct Event
+behavior passed. The incomplete ReceiveOnly non-initiation/disclosure checks,
+failed overload receipt, missing packaged provider administration, unavailable
+current Rust-client execution, incomplete strict Go recovery example, and
+unresolved CPU observation prevent an MVP candidate pass. It is engineering
+evidence, not a production or full-profile qualification claim.
 
 ## When Aster fits
 

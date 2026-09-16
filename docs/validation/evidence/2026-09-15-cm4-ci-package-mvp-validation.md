@@ -1,19 +1,32 @@
 #
 
-# CM4 CI-package MVP validation — 2026-09-15
+# CM4 CI-package MVP validation — 2026-09-15 through 2026-09-16
 
 ## Outcome
 
-Status: **partial direct validation; stopped for OS-engineer handoff**.
+Status: **direct two-device run completed with blockers and incomplete checks**.
 
-The exact CI-generated `arm64` package was installed on the two frozen CM4
-participants and exercised directly, without the experimental device harness.
-The completed observations below passed. Remaining checks are explicitly
-unrun; this record does not claim full G4, G6, production qualification, or a
-24-hour soak.
+The actual CI-generated `arm64` package was installed on both frozen CM4
+participants and exercised through its package service and public API, without
+the removed device harness. Package installation, protected startup, local
+Event behavior, restart recovery, Normal-mode peer exchange, inbound transfer
+in both ReceiveOnly orderings, bearer-token reload, the 1,024-operation profile
+stop, and offline operation-ledger audits passed the direct checks described
+below.
 
-Device access stopped when the OS engineer began testing. No observations made
-by that engineer are incorporated here.
+This artifact is not an MVP candidate pass. The package omits the provider
+administration executable required for the protected-provider lifecycle, the
+current Rust reference client was unavailable for device execution, and the
+resource samples showed sustained CPU near 89% of one core without proving the
+profile's strict idle preconditions. One deliberately over-offered capacity
+attempt on `cm4-a` also produced transport-indeterminate results before the
+workload was completed conservatively. ReceiveOnly non-initiation and local
+inventory non-disclosure were not instrumented. These observations keep E04,
+E05, E07, E09, E10, and E11 from passing.
+
+Decision 0043's internal approvals, frozen inventory, and post-MVP deferrals
+remain valid. This record does not claim production authorization, full G4/G6,
+a 24-hour soak, or a true network partition.
 
 ## Artifact binding
 
@@ -22,95 +35,190 @@ by that engineer are incorporated here.
 | Package | `aster` |
 | Version | `0.1.0-1~ubuntu24.04.1` |
 | Architecture | `arm64` |
-| Package SHA-256 | `d4a245499590862f83739d93d0d441529d9e2e9b7c1fec80329d09b3d6d71b1e` |
-| CI run | [`34857228552`](https://github.com/edgesoftops/astertech/actions/runs/34857228552) |
-| Source commit | `96700b53732848327edfe7294396f47221348580` |
-| Installed `/usr/bin/aster-agent` SHA-256, both nodes | `011a38cebf4b3166dacd398b7edcf67c93ea350509cb5dddffc253b5a5922e21` |
+| Package bytes | 10,958,256 |
+| Package SHA-256 | `d934eee9e1a32fa41f2a1b5890df8d7e02d4cbee13c5a57ca75da5ddfc753156` |
+| CI run | [`35064358840`](https://github.com/edgesoftops/astertech/actions/runs/35064358840) |
+| Source commit | `78855860fc5c59404f77c60324240d7b60a5564c` |
+| Installed `/usr/bin/aster-agent` SHA-256, both nodes | `35c53f34e19474c2b9e8c476c2aa97d33ba12668cf8df27256ef5606fed72304` |
 
-The package identity matched the CI checksum metadata. The repository's
-focused Debian-package check accepted the payload, ARM64 ELF architecture,
-external SBOMs, and checksums. Signing and an independent reproduction replay
-are post-MVP under Decision 0043.
+The repository's focused Debian-package check accepted the package metadata,
+ARM64 payload, ELF architecture, external SBOMs, and checksums. Both devices
+reported the exact package version and architecture; `dpkg --verify aster` and
+`dpkg --audit` were clean. Signing and independent reproduction remain
+post-MVP under Decision 0043.
 
-## Frozen devices
+The package upgrade stopped the manually started, disabled service and did not
+restart it. The service was started explicitly for validation. This is a
+package-lifecycle observation, not a data-plane failure.
+
+## Frozen devices and configuration
 
 Both mandatory participants matched the accepted inventory: physical
 Raspberry Pi Compute Module 4 Rev 1.1, `aarch64`, Debian 13, systemd 257, local
 `ext4`, four online CPUs, and 949,702,656 bytes of RAM. Network addresses,
-credentials, host keys, and device identifiers are intentionally excluded.
+credentials, host keys, device identifiers, peer coordinates, and authorized
+topic/scope values are intentionally excluded. The declared spare did not
+participate.
 
-The declared spare did not participate.
+Both configurations passed `aster-agent --check-config` as the final service
+user. Each used Normal mode, one manual peer, no relay, the accepted
+10,000-item/64-MiB store limits, and the accepted operation-ledger limits of
+1,000,000 rows, 201,326,592 logical bytes, and a 10,000-row emergency reserve.
+Original configuration digests were restored after ReceiveOnly testing:
 
-## Completed direct observations
+| Participant | Configuration SHA-256 |
+| --- | --- |
+| `cm4-a` | `752ff4f2647869eb0fea2706dca11a58698d9cc0bb7715c11e7011e561b761c8` |
+| `cm4-b` | `4a91d4863e8bc1b31290308d26451dd871f2c898359e1f7523d0770fd21884ab` |
 
-The following checks completed against the installed CI package on both
-mandatory nodes unless a node is named explicitly:
+## Direct functional observations
 
-- protected provisioning and service readiness;
-- local API status, subscription, publish, poll, acknowledgement, and query;
-- service restart followed by readiness;
-- direct peer configuration and mutual authenticated contact;
-- a fresh 4,096-byte Event exchange, delivered on the first poll, acknowledged,
-  acknowledged idempotently a second time, and returned exactly by query;
-- ReceiveOnly in both node orderings: a ReceiveOnly node started alone without
-  an authenticated contact or failed contact attempt, then accepted inbound
-  delivery and acknowledgement after its Normal peer started; and
-- on `cm4-a`, 512 distinct operations were accepted, an identical retry added
-  no operation-ledger row, the capacity audit completed, and the configured
-  profile warning was active.
+The following completed against the installed package on both nodes:
 
-The peer setup initially used the mission authority where the peer node
-identity was required. Correcting that configuration produced mutual
-authenticated contact; this was a test-configuration error, not an artifact
-change.
+- `/livez` and `/readyz` returned HTTP 200;
+- the generated-Go status client authenticated and validated configured and
+  effective mode, store and delivery bounds, operation accounting, warning
+  state, and audit coherence;
+- a fresh Event publication returned `inserted=true`; an identical retry
+  returned the same durable effect with `inserted=false`;
+- a unique logical-key query returned the exact retained Event and payload
+  after nine bounded scan pages;
+- a durable subscription returned an attempt-1 delivery; after a package
+  service restart, the same Event returned at attempt 2; first acknowledgement
+  was fresh and the repeated acknowledgement was idempotent;
+- restart-to-ready measured 5,695 ms on `cm4-a` and 5,756 ms on `cm4-b`;
+- in Normal mode, each node queried the other node's uniquely keyed Event with
+  an exact payload match and no convergence wait;
+- ReceiveOnly configuration and inbound transfer passed in both orderings: the
+  ReceiveOnly node was started while the Normal peer was stopped, authenticated
+  status reported configured and effective `receive_only`, and the exact newly
+  published Event arrived after the Normal peer started. The checks did not
+  directly measure outbound-contact non-initiation or local inventory
+  non-disclosure, so E04 remains partial; and
+- atomic bearer-token replacement plus `SIGHUP` accepted the new token,
+  rejected the old token as unauthenticated, and accepted the restored original
+  token without losing readiness.
+
+The current generated-Go clients were built from the artifact source commit as
+static ARM64 executables. Their device hashes were:
+
+| Client | SHA-256 |
+| --- | --- |
+| `agent-smoke` | `f708bb6c547699f672b146a7a04478263c64e21867fc40796f6a57802a368bac` |
+| `agent-load` | `ebc1ecafccf460749cf0ff3fbf2321c02184115042a26fdb26665ca709e29214` |
+
+## Operation-capacity observations
+
+Both nodes finished at exactly 1,024 active operation rows with 1,024 reverse
+rows, zero retired rows, zero profile remaining, and both profile warning and
+profile exhaustion active. The package's offline inspection command then
+reported on each node:
+
+```text
+EVENT_OPERATION_AUDIT status=pass state=complete scanned=2048 total=2048 units=ledger-and-reverse-rows
+```
+
+`cm4-b` supplied the clean workload receipt: starting from 5 rows, all 1,019
+planned publications were accepted and inserted with no skips, rejections,
+protocol errors, or transport-indeterminate outcomes. Twenty-one exact-replay
+and twenty-one changed-intent conflict probes matched. Latency was 669 ms p50,
+1,078 ms p95, and 1,214 ms p99.
+
+`cm4-a` reached the same audited boundary, but its workload history includes a
+failed overload attempt and must not be represented as a clean qualification
+receipt:
+
+1. Four workers offered 100/s: 42 inserted and 462 late slots were skipped;
+   one exact-replay and one conflict probe matched.
+2. Thirty-two workers offered 20/s: 224 results were accepted, 30 were
+   transport-indeterminate, and the probe stopped the run. Authenticated
+   capacity advanced by all 254 attempts, demonstrating that the 30 uncertain
+   calls committed; they were not retried with new keys.
+3. The remaining 208 rows ran at 2/s with four workers: all 208 were accepted
+   and inserted with zero skips or uncertain results; eleven exact-replay and
+   eleven conflict probes matched.
+
+This establishes the stored profile boundary and healthy offline audit on
+both devices. It does not erase the failed overload receipt or qualify a rate.
 
 ## Resource observations
 
-| Measurement | `cm4-a` | `cm4-b` |
-| --- | ---: | ---: |
-| Executable bytes | 14,383,376 | 14,383,376 |
-| RSS / peak RSS bytes | 28,753,920 | 28,499,968 |
-| Start-to-ready milliseconds | 5,396 | 5,346 |
-| Stop milliseconds | 214 | 315 |
-| Initial state bytes | 1,056,800 | 16,846,880 |
-| Final state bytes | 16,846,880 | 16,846,880 |
-| State growth bytes | 15,790,080 | 0 |
-| Final free state bytes | 10,494,054,400 | 10,420,854,784 |
-| Operation rows | 517 | 2 |
-| Audit complete | yes | yes |
+| Measurement | `cm4-a` | `cm4-b` | Profile disposition |
+| --- | ---: | ---: | --- |
+| Executable bytes | 14,383,376 | 14,383,376 | pass, at most 16 MiB |
+| RSS bytes (`VmRSS`) | 63,905,792 | 65,003,520 | pass, at most 64 MiB |
+| Peak RSS bytes (`VmHWM`) | 63,905,792 | 65,003,520 | pass, at most 128 MiB |
+| State bytes | 50,532,384 | 67,375,136 | observed |
+| Free state bytes | 10,466,168,832 | 10,392,854,528 | observed |
+| Post-workload CPU, percent of one core | 88.7% and 89.4% confirmation | 89.8% | **not accepted**; idle preconditions not established |
 
-Short CPU samples taken immediately after the workload were 67% on `cm4-a`
-and 64% on `cm4-b`. They are not steady-idle measurements and therefore do not
-establish the profile idle-CPU threshold. Replication activity may have still
-been in progress on `cm4-b`.
+RSS and peak RSS are `/proc/<pid>/status` `VmRSS` and `VmHWM` readings captured
+after the final restart. The CPU samples were separate 20-second `/proc`
+observations after workloads, offline audits, service restarts, and observed
+convergence had completed. No controller request or workload was launched
+during those samples, but active peer contact was not instrumented or excluded.
+The similar result on both devices and the `cm4-a` confirmation sample retain a
+resource concern, but the samples do not establish the profile-defined idle
+condition and therefore cannot be called a conclusive 5% idle-threshold
+failure. E11 remains not passed pending an explicitly instrumented idle rerun.
 
-## Not run in this session
+## Blocking gaps and failed checks
 
-The following items did not complete before the device handoff and are not
-passes:
+- **Rust client unavailable:** an exact-source ARM64 Rust client could not be
+  built because the controller lacks an ARM C compiler required by `ring`, and
+  the retained older Rust fixture rejected the current response schema with
+  `internal`.
+  The current Rust client check therefore remained incomplete on both devices;
+  this is not attributed to an installed-package defect.
+- **Packaged provider administration:** protected provider loading and service
+  readiness passed, and bearer-token reload passed, but the CI package does not
+  install `/usr/bin/aster-credential-admin`. Backup/recovery stopped at command
+  lookup before provider mutation; rotation, destructive recovery, revoke,
+  rekey, and destroy were not run. Zero-byte invalid backup stdout files were
+  removed and both services were returned to Ready.
+- **Idle CPU:** both devices showed sustained post-workload CPU near 89% of one
+  core, but the strict idle preconditions were not established. The 5% target
+  cannot be accepted or conclusively rejected from this sample and requires a
+  rerun with active peer contact explicitly excluded or measured.
+- **Go recovery example:** the exact generated-Go status and load clients ran,
+  while restart recovery was exercised directly through the public package
+  API. The strict fresh-selector `recovery-begin`/`recovery-resume` example was
+  not completed against the pre-populated mission state.
 
-- generated Rust and Go client binaries on the devices;
-- the complete protected-provider rotation, backup, recovery, revoke, rekey,
-  and destroy sequence;
-- bounded service-isolation and recovery;
-- the full operation-capacity boundary and steady-idle CPU measurement; and
-- any 24-hour soak or true network partition.
+These are candidate blockers, not post-MVP deferrals and not passes.
 
-## Access-path observation
+## Explicit post-MVP exclusions
 
-The controller's ZeroTier access path exhibited a path-MTU mismatch: the
-interface advertised 2,800 bytes while stable ICMP payload was observed only
-through 1,280 bytes. A 1,000-byte TCP MSS was used for controller SSH access.
-Direct CM4-to-CM4 UDP probing, Aster mutual authenticated contact, and the fresh
-Event exchange succeeded. This describes the test access path and is not an
-Aster failure or a broader carrier qualification.
+Per Decision 0043, this increment does not run or claim:
+
+- a 24-hour soak or true network partition;
+- package/archive signing or independent reproducibility replay;
+- package renaming;
+- independent implementation, external review, FIPS, or production
+  authorization; or
+- additional qualification automation.
+
+## Access path and final device state
+
+The controller's ZeroTier path required a 1,000-byte TCP MSS for reliable bulk
+SSH transfer; ordinary short SSH control traffic and direct CM4-to-CM4 Aster
+traffic worked. This describes the controller access path, not an Aster carrier
+qualification.
+
+At the end of validation, both nodes had their original configuration and
+bearer token restored, were in Normal mode, and returned HTTP 200 from
+`/readyz`. Temporary invalid provider outputs and temporary restart receipts
+were removed. The synthetic Event and operation rows are intentionally retained
+as the durable state supporting the capacity and restart observations.
 
 ## Disposition
 
-The actual CI package is the sole artifact represented by this record. Its
-completed direct checks demonstrate working install, provisioning, lifecycle,
-local Event behavior, direct peer exchange, ReceiveOnly behavior, and the
-observed 512-operation warning boundary on the two frozen devices.
-
-Because the listed scenarios remain unrun, this is partial MVP engineering
-evidence rather than a complete profile qualification or release decision.
+The selected CI package demonstrates a substantial working Linux Event slice
+on both frozen CM4 devices, including direct package install/start, local and
+peer Event behavior, restart recovery, ReceiveOnly, token reload, and the
+audited 1,024-operation boundary. It must not advance as a passing MVP
+candidate until at least the incomplete ReceiveOnly non-initiation/disclosure
+checks, failed overload receipt, missing packaged provider administration path,
+unavailable current Rust-client device execution, incomplete strict Go recovery
+example, and unresolved CPU concern are dispositioned and the affected checks
+are rerun.

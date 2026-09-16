@@ -38,8 +38,8 @@ The following work is explicitly post-MVP or a later validation increment:
 - additional validation automation beyond focused CI and direct device checks.
 
 Deferral does not convert an unrun check into a pass. The evidence record must
-distinguish completed observations from checks that stopped when the OS
-engineer took ownership of the devices.
+distinguish completed observations, failed checks, unavailable checks, and
+acceptance criteria that were not fully measured.
 
 ## Claim boundary
 
