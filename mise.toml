@@ -18,6 +18,7 @@ run = [
   "sh tools/check-agent-proto.sh",
   "python3 tools/check-project-license.py",
   "python3 tools/check-implementation-requirements.py",
+  "python3 tools/test-run-fuzz-smoke.py",
   "python3 tools/test_aster_tour_ui.py",
   "python3 tools/test_aster_mesh_playground.py",
   "python3 tools/test_aster_lan_mvp.py",
@@ -78,6 +79,7 @@ run = [
 
 [tasks.fuzz-smoke]
 description = "Run bounded sanitizer-instrumented decoder fuzz campaigns"
+tools = { rust = "nightly-2026-08-18", "cargo:cargo-fuzz" = "0.13.2" }
 run = "sh ./tools/run-fuzz-smoke.sh"
 
 [tasks.qualification-validator]
