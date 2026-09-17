@@ -119,7 +119,7 @@ def bounded(argv, cwd, private, evidence, name, seconds, env=None):
     DEFER_INTERRUPTS = True
     CANCELLED = False
     started = time.monotonic()
-    result = {'argv': [str(x) for x in argv], 'deadline_seconds': seconds,
+    result = {'command': name, 'deadline_seconds': seconds,
               'exit': None, 'started': False, 'timed_out': False,
               'cleanup_absent': False, 'capture_overflow': False, 'samples': []}
     raw = Path(private) / (name + '.raw')
@@ -288,10 +288,16 @@ def _sanitize(text):
             rows.append({'telemetry_error': 'invalid_numeric_record'})
     return rows
 
-def verify_source(source, manifest):
+def verify_commit(source, expected_sha):
+    if not re.fullmatch(r'[0-9a-f]{40}', expected_sha or ''):
+        raise ValueError('invalid expected source identity')
     actual = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=source, text=True).strip()
-    if actual != manifest['source_sha']:
-        raise ValueError('immutable source mismatch')
+    if actual != expected_sha:
+        raise ValueError('dispatched source mismatch')
+    return actual
+
+def verify_source(source, manifest, expected_sha):
+    verify_commit(source, expected_sha)
     for path, expected in manifest['source_files'].items():
         if digest(source / path) != expected:
             raise ValueError('source context digest mismatch')
@@ -327,8 +333,9 @@ def main():
     evidence.mkdir(mode=0o700, parents=True, exist_ok=True)
     private.mkdir(mode=0o700, parents=True, exist_ok=True)
     manifest = json.loads((HERE / 'manifest.json').read_text())
+    expected_sha = os.environ.get('EXPECTED_SOURCE_SHA', '')
     receipt = {'diagnostic_only': True, 'qualification': False, 'source': manifest,
-               'workflow_sha': os.environ.get('GITHUB_SHA'),
+               'source_sha': expected_sha, 'workflow_sha': os.environ.get('GITHUB_SHA'),
                'os': platform.system(), 'arch': platform.machine(),
                'kernel': platform.release(), 'python': platform.python_version(),
                'cpu_count': os.cpu_count(), 'clock_ticks': os.sysconf('SC_CLK_TCK'),
@@ -337,7 +344,7 @@ def main():
                'state': 'preflight', 'test_executions': 0}
     result_code = 1
     try:
-        verify_source(source, manifest)
+        verify_source(source, manifest, expected_sha)
         receipt['toolchain'] = subprocess.check_output(['rustc', '+1.97.1', '-Vv'], text=True)
         receipt['cargo'] = subprocess.check_output(['cargo', '+1.97.1', '-V'], text=True).strip()
         if not receipt['toolchain'].startswith('rustc 1.97.1 '):
@@ -349,13 +356,6 @@ def main():
                                  if key in {'ID', 'VERSION_ID'}}
         if receipt['os_release'] != {'ID': 'ubuntu', 'VERSION_ID': '24.04'} or platform.machine() != 'x86_64':
             raise ValueError('supported diagnostic environment mismatch')
-        receipt['policy_tools'] = {}
-        for tool in ('cargo-deny', 'cargo-audit'):
-            executable = shutil.which(tool)
-            if executable is None:
-                raise ValueError('policy tool missing')
-            receipt['policy_tools'][tool] = {'sha256': digest(executable),
-                'version': subprocess.check_output([executable, '--version'], text=True, timeout=20).strip()}
         env = os.environ.copy()
         env.update({'CARGO_NET_OFFLINE': 'true', 'RUSTUP_AUTO_INSTALL': '0',
                     'CARGO_INCREMENTAL': '0', 'CARGO_TERM_COLOR': 'never',
@@ -370,9 +370,9 @@ def main():
         binary = select_executable(bounded_text(private / 'build.raw')).resolve()
         if not binary.is_file() or not binary.is_relative_to(source):
             raise ValueError('unexpected executable location')
-        receipt['binary'] = str(binary)
         receipt['binary_sha256'] = digest(binary)
         receipt['binary_identity_claim'] = 'rebuilt instrumented diagnostic, not original CI artifact'
+        receipt['test'] = TEST
         runtime = private / 'runtime'
         runtime.mkdir(mode=0o700)
         env['TMPDIR'] = str(runtime)

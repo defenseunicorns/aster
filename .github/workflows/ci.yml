@@ -366,6 +366,13 @@ jobs:
           CARGO_NET_OFFLINE: "true"
         run: sh ./tools/run-fuzz-smoke.sh
 
+  runtime-volume-diagnostic:
+    name: Run manual runtime-volume diagnostic
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/ci-runtime-volume-diagnostic'
+    uses: ./.github/workflows/diagnostic-runtime-volume.yml
+    permissions:
+      contents: read
+
   required:
     name: required
     if: ${{ always() }}

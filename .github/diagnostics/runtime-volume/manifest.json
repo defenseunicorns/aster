@@ -3,7 +3,7 @@
   "diagnostic_only": true,
   "qualification": false,
   "repository": "edgesoftops/astertech",
-  "source_sha": "14d795390a84d425681d7d40ee4c0e1072be0fb9",
+  "source_binding": "workflow_sha",
   "source_path": "crates/aster-lab/src/mesh_experiment/libp2p_candidate.rs",
   "baseline_sha256": "7b12a8f028593729a36a1bc524cff09939c803bc168b36959e6fb576d6dfa1fe",
   "patched_sha256": "d4869b0113bab9ea4714d011a0148d283f86a1a55bbc36c294def294abe0df6b",
@@ -14,15 +14,15 @@
   "test_seconds": 400,
   "cleanup_seconds": 10,
   "source_files": {
-    "Cargo.lock": "2b640e05ad09cb956453757b19decc85007d0a4df8cab3a08e0f899982adaf87",
-    "Cargo.toml": "6b54bfc3c98853b40766bab40f8c1d1fd54c17eb9bbb0544502cbdeef0868028",
+    "Cargo.lock": "ba59ba1b8e93dc55597a4292719e3ce941968d5b5033f0c4348c7c48a412854f",
+    "Cargo.toml": "d872a80063509b52ef97f5822b3792499411111b453f1cc2b9f6869c23123653",
     "rust-toolchain.toml": "8e390d6a0838315f972690f46ef8bae8b7ecc9ee6c1ed70140ef852869c2482e",
-    "tools/with-test-resources.sh": "56df4c16724c05df91bb1190bfdf1a6443923d57de55010887c95ca81c210dd2"
+    "tools/with-test-resources.sh": "2fdec9b0572806279ec5ed825371dabb13db42747f7799555d3f3782adfa2fcf",
+    "deny.toml": "61abb96214ef54b8d34cdaeafe6a6c11dbe581837dc19569b20a93e50e07daba"
   },
   "controller_capture_bytes": 16777216,
   "controller_line_bytes": 65536,
   "telemetry_numeric_digits": 20,
   "telemetry_records": 160,
-  "installer_binding": "verified immutable loopback allowlist; original manifest; xz archives; rustup 1.28.2 owner-supplied exact executable SHA-256",
-  "installer_admission": "PENDING_ACCOUNTABLE_OWNER"
+  "toolchain_binding": "repository rust-toolchain.toml plus workflow receipt"
 }

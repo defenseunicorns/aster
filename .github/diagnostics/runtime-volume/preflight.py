@@ -9,7 +9,7 @@ import platform
 import re
 import sys
 import tomllib
-from driver import HERE, digest, write_json
+from driver import HERE, digest, verify_commit, write_json
 
 REGISTRY = 'registry+https://github.com/rust-lang/crates.io-index'
 
@@ -36,6 +36,7 @@ def main():
     evidence = Path(sys.argv[2]).resolve()
     evidence.mkdir(mode=0o700, parents=True, exist_ok=True)
     m = json.loads((HERE / 'manifest.json').read_text())
+    source_sha = verify_commit(source, os.environ.get('EXPECTED_SOURCE_SHA', ''))
     for name, expected in m['source_files'].items():
         if digest(source/name) != expected:
             raise ValueError('source digest mismatch')
@@ -46,14 +47,13 @@ def main():
         raise ValueError('unexpected repository Cargo configuration')
     policy = HERE.parents[2] / 'deny.toml'
     if digest(policy) != digest(source/'deny.toml'):
-        raise ValueError('policy differs from reviewed current/historical identical policy')
+        raise ValueError('policy differs from dispatched source policy')
     lock = tomllib.loads((source/'Cargo.lock').read_text())
     packages = inventory(lock)
     write_json(evidence/'resources.json', {'diagnostic_only': True,
-        'source_sha': m['source_sha'], 'lock_sha256': digest(source/'Cargo.lock'),
+        'source_sha': source_sha, 'lock_sha256': digest(source/'Cargo.lock'),
         'policy_sha256': digest(policy), 'packages': packages,
         'package_count': len(packages), 'not_full_release_admission': True,
-        'source_admission_receipt_sha256': os.environ.get('SOURCE_ADMISSION_RECEIPT_SHA256'),
         'tooling_files': {str(p.relative_to(HERE)):digest(p) for p in HERE.iterdir() if p.is_file()},
         'python': platform.python_version()})
     write_json(evidence/'source-provenance.json', m)

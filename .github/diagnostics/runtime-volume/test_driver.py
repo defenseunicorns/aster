@@ -33,7 +33,10 @@ class DriverContract(unittest.TestCase):
                 self.assertEqual(r['timed_out'],name=='timeout')
                 if expected is not None: self.assertEqual(r['exit'],expected)
                 self.assertEqual(d.success(r),name=='ok')
-                self.assertEqual(json.loads((p/(name+'.json')).read_text())['exit'],r['exit'])
+                receipt=json.loads((p/(name+'.json')).read_text())
+                self.assertEqual(receipt['exit'],r['exit'])
+                self.assertNotIn('argv',receipt)
+                self.assertNotIn(str(p),json.dumps(receipt))
     def test_sanitizer_drops_arbitrary_content_and_limits_records(self):
         d=self.driver()
         self.assertEqual(d.sanitize('private payload\npassword=example\n\u001b[0m[CI-VOLUME-DIAG-22] observation_ns=5'),[])
@@ -48,8 +51,18 @@ class DriverContract(unittest.TestCase):
         # Mock the missing-object seam; no repository initialization or Git writes.
         with mock.patch.object(d.subprocess, 'check_output', side_effect=subprocess.CalledProcessError(128, ['git'])), mock.patch.object(d.subprocess, 'run') as apply:
             with self.assertRaises(subprocess.CalledProcessError):
-                d.verify_source(Path('/missing-source-fixture'), {'source_sha':'0'*40})
+                d.verify_source(Path('/missing-source-fixture'), {}, '0'*40)
             apply.assert_not_called()
+
+    def test_source_commit_is_bound_to_explicit_workflow_sha(self):
+        import subprocess
+        d=self.driver()
+        root=Path(__file__).resolve().parents[3]
+        head=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
+        self.assertTrue(hasattr(d,'verify_commit'), 'driver must bind source to the dispatched workflow SHA')
+        self.assertEqual(d.verify_commit(root,head),head)
+        with self.assertRaises(ValueError):
+            d.verify_commit(root,'0'*40)
     def test_inventory_refuses_unadmitted_source_and_checksum(self):
         import preflight
         good={'package':[{'name':'example','version':'1.0.0','source':preflight.REGISTRY,'checksum':'a'*64}]}
@@ -67,5 +80,21 @@ class DriverContract(unittest.TestCase):
         removed=[line for line in patch.decode().splitlines() if line.startswith('-') and not line.startswith('--- ')]
         self.assertEqual(removed,[])
         self.assertEqual(m['test_seconds'],400)
-        self.assertEqual(m['source_sha'],'14d795390a84d425681d7d40ee4c0e1072be0fb9')
+        self.assertNotIn('source_sha',m)
+        self.assertEqual(m['source_binding'],'workflow_sha')
+
+    def test_manifest_matches_current_source_context(self):
+        import hashlib
+        root=Path(__file__).resolve().parents[3]
+        m=json.loads((Path(__file__).with_name('manifest.json')).read_text())
+        for name,expected in m['source_files'].items():
+            with self.subTest(name=name):
+                self.assertEqual(hashlib.sha256((root/name).read_bytes()).hexdigest(),expected)
+        source=root/m['source_path']
+        self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(),m['baseline_sha256'])
+
+    def test_published_provenance_excludes_absolute_binary_path(self):
+        source=Path(__file__).with_name('driver.py').read_text()
+        self.assertNotIn("receipt['binary'] =",source)
+        self.assertIn("receipt['test'] = TEST",source)
 if __name__=='__main__': unittest.main()
