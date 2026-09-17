@@ -148,6 +148,14 @@ signing/reproduction, independent-review, and production-authorization work.
 This remains engineering evidence, not complete v0.1 release qualification or
 production authorization.
 
+The [latest-main package and finite-TTL device
+record](docs/validation/evidence/2026-09-17-latest-main-package-ttl-device-validation.md)
+adds direct two-node regression evidence for the manually dispatched ARM64
+package and the merged TTL expiry, restart, permanent retry-fence, and logical
+content-capacity-reuse behavior. The exact package was installed on a third
+test CM4, but that unconfigured device has install-integrity evidence only and
+does not expand the frozen two-node qualification boundary.
+
 ## When Aster fits
 
 Aster is a strong fit when:
