@@ -2206,6 +2206,26 @@ def make_run(
 
 class IpMeshResultsTests(unittest.TestCase):
     def setUp(self):
+        # These receipts use a synthetic Git runner and source tree. Give them
+        # matching private metadata instead of inspecting the checkout's .git
+        # (which is a file in linked worktrees, and may have local attributes).
+        workspace_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(workspace_directory.cleanup)
+        workspace = Path(workspace_directory.name).resolve()
+        (workspace / ".git/info").mkdir(parents=True)
+        inspect_attributes = results.gate_h_source._info_attributes_state
+
+        def fixture_attributes(requested_workspace):
+            self.assertEqual(requested_workspace, results.REPOSITORY_WORKSPACE)
+            return inspect_attributes(workspace)
+
+        attributes_patch = mock.patch.object(
+            results.gate_h_source,
+            "_info_attributes_state",
+            side_effect=fixture_attributes,
+        )
+        attributes_patch.start()
+        self.addCleanup(attributes_patch.stop)
         signature_runner_patch = mock.patch.object(
             results.gate_h_experiment_contract,
             "run_gate_h_signature_command",
