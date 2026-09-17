@@ -8,11 +8,11 @@ license.workspace = true
 autobins = false
 
 [dependencies]
-aster-core = { version = "=0.1.0", path = "../aster-core", features = ["adapter-sdk"] }
-aster-host = { version = "=0.1.0", path = "../aster-host", default-features = false }
-aster-ip = { version = "=0.1.0", path = "../aster-ip" }
-aster-node = { version = "=0.1.0", path = "../aster-node", optional = true }
-aster-libp2p-provider = { version = "=0.1.0", path = "../aster-libp2p-provider", optional = true }
+aster-core = { version = "=0.1.0-alpha.1", path = "../aster-core", features = ["adapter-sdk"] }
+aster-host = { version = "=0.1.0-alpha.1", path = "../aster-host", default-features = false }
+aster-ip = { version = "=0.1.0-alpha.1", path = "../aster-ip" }
+aster-node = { version = "=0.1.0-alpha.1", path = "../aster-node", optional = true }
+aster-libp2p-provider = { version = "=0.1.0-alpha.1", path = "../aster-libp2p-provider", optional = true }
 getrandom.workspace = true
 iroh = { workspace = true, optional = true }
 iroh-relay = { version = "=1.0.3", default-features = false, features = ["server", "tls-ring"], optional = true }

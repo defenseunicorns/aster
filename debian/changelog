@@ -1,3 +1,10 @@
+aster (0.1.0~alpha.1-1) unstable; urgency=medium
+
+  * Release v0.1.0-alpha.1 for amd64 and arm64.
+  * Use distribution-neutral package descriptions and CI artifact names.
+
+ -- Eugeny Shcheglov <e.shcheglov@astertech.io>  Wed, 16 Sep 2026 00:00:00 +0300
+
 aster (0.1.0-1~ubuntu24.04.1) noble; urgency=medium
 
   * Initial Ubuntu 24.04 amd64 and arm64 evaluation packaging.

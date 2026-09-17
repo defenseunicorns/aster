@@ -58,7 +58,7 @@ packages=$(printf '%s\n' "$tree" | awk '{ print $1 " " $2 }')
 expected='proc-macro-error2 v2.0.1
 i18n-embed-fl v0.9.4
 age v0.11.5
-aster-provisioning-age v0.1.0'
+aster-provisioning-age v0.1.0-alpha.1'
 
 if [ "$packages" != "$expected" ]; then
   printf '%s\n' 'dependency-exception scope failed: unexpected reverse dependency graph' >&2
