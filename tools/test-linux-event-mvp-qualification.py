@@ -120,7 +120,8 @@ class MachineSchemaTests(unittest.TestCase):
 class SafeRootTests(unittest.TestCase):
     def setUp(self) -> None:
         self.parent = tempfile.TemporaryDirectory()
-        self.root = Path(self.parent.name) / "bundle"
+        # macOS temporary directories may have a symlinked /var ancestor.
+        self.root = Path(self.parent.name).resolve() / "bundle"
         self.root.mkdir(mode=0o700)
         (self.root / "nested").mkdir(mode=0o700)
         self.payload = canonical_json_bytes({"schema": "fixture/v1"})
@@ -513,6 +514,9 @@ def valid_body(index_bytes: bytes) -> dict[str, object]:
 
 
 def write_valid_bundle(root: Path) -> BundleInputs:
+    # Canonicalize the test-owned root before creating any fixture symlinks;
+    # SafeRoot must still reject symlinks in inputs supplied to the validator.
+    root = root.resolve()
     (root / "receipts").mkdir()
     evidence_bytes = canonical_json_bytes({"schema": "synthetic-evidence-not-qualification/v1"})
     (root / "receipts" / "evidence.json").write_bytes(evidence_bytes)
@@ -1061,7 +1065,7 @@ class CompleteBundleTests(unittest.TestCase):
 
     def test_explicit_artifact_root_remains_open_for_indexed_reads(self) -> None:
         with tempfile.TemporaryDirectory() as parent:
-            root = Path(parent)
+            root = Path(parent).resolve()
             inputs = write_valid_bundle(root)
             index = json.loads((root / inputs.index).read_bytes())
             index["entries"][0]["root"] = "artifact"

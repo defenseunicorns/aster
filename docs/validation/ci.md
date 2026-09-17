@@ -23,7 +23,7 @@ single stable check name **`CI / required`**.
 | `Rust 1.91 MSRV` | `ubuntu-24.04` | Checks every workspace target and feature with the declared minimum supported Rust version. |
 | `dependency policy` | `ubuntu-24.04` | Enforces the retained-libp2p-oracle boundary, applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
 | `age reference interoperability` | `ubuntu-24.04` | Installs exact `govulncheck` v1.6.0, runs `mise run age-reference-audit`, then runs `mise run age-reference-interop`: the Go oracle's reachable vulnerability and compiled-module license gates must pass before exact reference Go `filippo.io/age` v1.3.1 and the Rust provider exchange classic-X25519 artifacts in both directions, compare recovered plaintext, and agree on the recipient. |
-| `bounded fuzz smoke` | `ubuntu-24.04` | Runs five fixed 10,000-case hostile-input campaigns with the pinned nightly toolchain and `cargo-fuzz`: semantic wire decode, fragment decode, reference-envelope inspection, selected mechanics-frame decode, and selected Negentropy state-machine/bounds exercise. |
+| `bounded fuzz smoke` | `ubuntu-24.04` | Runs all nine fixed 10,000-case hostile-input campaigns with the pinned nightly toolchain and `cargo-fuzz`: semantic wire decode, fragment decode, reference-envelope inspection, selected mechanics-frame decode, selected Negentropy, classical-profile decode, systemd credential decode, systemd admin-record decode, and systemd backup decode. |
 | `required` | `ubuntu-24.04` | Fails unless every validation lane completed successfully; this is the branch-protection check. |
 
 The Rust dependency downloads happen before Cargo validation is switched to
@@ -1599,12 +1599,15 @@ persistent-custody evidence, or production authorization.
 Run the bounded fuzz campaigns separately:
 
 ```sh
-rustup toolchain install nightly-2026-08-18 --profile minimal
-cargo +nightly-2026-08-18 install --locked cargo-fuzz --version 0.13.2
 mise run fuzz-smoke
 ```
 
-The five target names and their exact mechanics-only claim boundaries are
+Mise installs the task's pinned `nightly-2026-08-18` and `cargo-fuzz` 0.13.2
+prerequisites automatically. Linux runs all nine targets; macOS runs seven
+portable targets and explicitly skips the two Linux-only systemd admin-record
+and backup targets. Linux CI continues to run all nine.
+
+The target names and their exact mechanics-only claim boundaries are
 documented in [`fuzz/README.md`](../../fuzz/README.md). Fuzz success is not mission,
 semantic-conformance, or release authorization by itself.
 

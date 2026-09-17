@@ -65,9 +65,15 @@ cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz classical_profile_decode "$cl
 cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz systemd_credential_decode "$systemd_credential_corpus" -- \
     -runs=10000 -max_len=262144 -seed=2026090801 \
     -artifact_prefix="$systemd_credential_artifacts/" -print_final_stats=1
-cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz systemd_admin_record_decode "$systemd_admin_record_corpus" -- \
+if [ "$(uname -s)" = Linux ]; then
+  cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz systemd_admin_record_decode "$systemd_admin_record_corpus" -- \
     -runs=10000 -max_len=262144 -seed=2026090802 \
     -artifact_prefix="$systemd_admin_record_artifacts/" -print_final_stats=1
-cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz systemd_backup_decode "$systemd_backup_corpus" -- \
+  cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz systemd_backup_decode "$systemd_backup_corpus" -- \
     -runs=10000 -max_len=262144 -seed=2026090803 \
     -artifact_prefix="$systemd_backup_artifacts/" -print_final_stats=1
+else
+  printf '%s\n' \
+    'SKIP systemd_admin_record_decode: requires Linux' \
+    'SKIP systemd_backup_decode: requires Linux'
+fi
