@@ -10,6 +10,28 @@ import tempfile
 import unittest
 
 PREFLIGHT = Path(__file__).with_name("check-ci-python.py")
+RESOURCE_WRAPPER = PREFLIGHT.resolve().parents[2] / "tools/with-test-resources.sh"
+
+
+class ResourceWrapperTests(unittest.TestCase):
+    def test_default_test_threads_do_not_exceed_online_cpus(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            getconf = root / "getconf"
+            getconf.write_text("#!/bin/sh\nprintf '2\\n'\n")
+            getconf.chmod(0o700)
+            capture = root / "capture"
+            capture.write_text("#!/bin/sh\nprintf '%s\\n' \"$RUST_TEST_THREADS\"\n")
+            capture.chmod(0o700)
+            env = dict(os.environ)
+            env.pop("RUST_TEST_THREADS", None)
+            env["PATH"] = directory + os.pathsep + env["PATH"]
+            result = subprocess.run(
+                ["sh", str(RESOURCE_WRAPPER), str(capture)], env=env,
+                capture_output=True, text=True, timeout=15,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "2\n")
 
 
 class WorkflowSelectionTests(unittest.TestCase):

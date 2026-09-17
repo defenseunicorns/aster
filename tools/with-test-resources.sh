@@ -1,10 +1,35 @@
 #!/bin/sh
-# Keep capacity fixtures runnable alongside other tests without changing their scale.
+# Keep capacity fixtures runnable without inheriting unbounded host parallelism.
 set -eu
 if [ "$#" -eq 0 ]; then
     echo "usage: with-test-resources.sh command [argument ...]" >&2
     exit 2
 fi
+
+# Several security fixtures create owner-only state and deliberately validate
+# it. Match the CI shell instead of inheriting a collaborative login umask.
+umask 077
+
+# Cargo otherwise scales compilation and the Rust test harness to every host
+# CPU. Large all-feature test binaries can exhaust memory and grow incremental
+# artifacts by tens of GiB on high-core developer systems. Keep the established
+# full-check defaults while allowing an explicit caller override.
+export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-0}"
+export CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG:-0}"
+default_test_threads=4
+online_cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+case "$online_cpus" in
+    ''|*[!0-9]*) ;;
+    *)
+        if [ "$online_cpus" -gt 0 ] && [ "$online_cpus" -lt "$default_test_threads" ]; then
+            default_test_threads=$online_cpus
+        fi
+        ;;
+esac
+export RUST_TEST_THREADS="${RUST_TEST_THREADS:-$default_test_threads}"
+
 # The 256-pair TCP relay fixture alone holds 1,024 socket descriptors (both
 # clients and both accepted sockets per pair), plus its listener/runtime files.
 # Leave room for the other parallel fixtures. Change only this process's soft
