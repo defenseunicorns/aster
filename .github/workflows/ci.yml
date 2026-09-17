@@ -32,7 +32,7 @@ jobs:
     name: quality
     runs-on: ubuntu-24.04
     # Keep headroom for the complete quality gate and hosted-runner variance.
-    # Workspace tests use default parallelism with an explicit descriptor budget.
+    # Workspace tests use bounded build/test parallelism and a descriptor budget.
     timeout-minutes: 45
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"

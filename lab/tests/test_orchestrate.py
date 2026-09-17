@@ -2089,6 +2089,14 @@ index\tserial\tnode_id
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             root.chmod(0o700)
+
+            def create_owner_only_parents(path):
+                path.mkdir(parents=True, exist_ok=True)
+                current = path
+                while current != root:
+                    current.chmod(0o700)
+                    current = current.parent
+
             expected = orchestrate.selected_nat_manifest_paths()
             self.assertEqual(
                 {scope: len(roles) for scope, roles in expected.items()},
@@ -2098,7 +2106,7 @@ index\tserial\tnode_id
             for roles in expected.values():
                 for relative in roles.values():
                     path = root / relative
-                    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+                    create_owner_only_parents(path.parent)
                     path.write_bytes(b"x" * (24 if path.suffix == ".pcap" else 1))
                     path.chmod(0o644)
             for profile in ["cone-direct", "restrictive-relay"]:
@@ -2141,7 +2149,7 @@ index\tserial\tnode_id
                 / "private"
                 / "node-a.bundle"
             )
-            retained.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            create_owner_only_parents(retained.parent)
             retained.write_bytes(b"retained restricted credential")
             retained.chmod(0o600)
             orchestrate.normalize_selected_nat_curated_artifacts(root)
