@@ -22005,7 +22005,18 @@ fn demo_process_receipts_complete(
         });
         ready && application
     });
+    let successful_contact_receipts_complete = !require_successful_contacts
+        || active.len() < 2
+        || active.iter().all(|index| {
+            outputs.get(index).is_some_and(|output| {
+                output
+                    .stdout
+                    .lines()
+                    .any(|line| line.starts_with("CONTACT ") && line.ends_with("status=pass"))
+            })
+        });
     process_receipts_complete
+        && successful_contact_receipts_complete
         && (require_successful_contacts
             || outputs.values().any(|output| {
                 output
@@ -39802,14 +39813,14 @@ mod tests {
             (
                 0,
                 DemoPhaseOutput {
-                    stdout: "READY selected=true\nAPPLICATION status=emitted kind=ping\n".into(),
+                    stdout: "READY selected=true\nAPPLICATION status=emitted kind=ping\nCONTACT direction=out status=pass\n".into(),
                     stderr: String::new(),
                 },
             ),
             (
                 1,
                 DemoPhaseOutput {
-                    stdout: "READY selected=true\n".into(),
+                    stdout: "READY selected=true\nCONTACT direction=in status=pass\n".into(),
                     stderr: String::new(),
                 },
             ),
@@ -39829,6 +39840,14 @@ mod tests {
             &outputs
         ));
         outputs.get_mut(&1).expect("node one output").stdout = "READY selected=true\n".into();
+        assert!(!demo_process_receipts_complete(
+            &active,
+            &applications,
+            true,
+            &outputs
+        ));
+        outputs.get_mut(&1).expect("node one output").stdout =
+            "READY selected=true\nCONTACT direction=in status=pass\n".into();
         outputs.get_mut(&0).expect("node zero output").stdout = "READY selected=true\n".into();
         assert!(!demo_process_receipts_complete(
             &active,
