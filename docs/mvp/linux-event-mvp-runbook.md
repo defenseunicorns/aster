@@ -6,6 +6,11 @@ This is the shortest operator path through the currently implemented portions
 of the Linux Event evaluation profile. It is for engineering evaluation; open
 qualification gates still prevent a profile or release claim.
 
+The 2026-09-15 through 2026-09-16 two-node activity is recorded in the
+[direct CI-package record](../validation/evidence/2026-09-15-cm4-ci-package-mvp-validation.md).
+Use that record for the exact pass, failure, and unavailable-check boundary;
+do not infer additional device results from this runbook.
+
 ## Know the boundary
 
 The repository currently provides the Event application service and its
@@ -196,9 +201,11 @@ for its engineering lifecycle boundary. These command shapes are not yet a
 qualified customer package procedure. The final package must define stopping
 and termination confirmation, protected input descriptors, reference handoff,
 output custody, backup acceptance, readiness checks, and recovery/escalation.
-E01 approval and E09 packaged lifecycle qualification remain open. Every semantic
-operation uses a fresh retained operation ID; an uncertain result is retried
-with the identical ID and identical input.
+Decision 0043 accepts E01's team-internal approval for this bounded MVP
+increment; no additional approval is required. E09 packaged lifecycle
+qualification remains open. Every semantic operation uses a fresh retained
+operation ID; an uncertain result is retried with the identical ID and
+identical input.
 
 ## Validate a completed candidate bundle
 

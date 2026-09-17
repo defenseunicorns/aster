@@ -28,6 +28,11 @@ The fast path reaches that decision through:
 5. one two-node 24-hour disconnected/reconnection run; and
 6. one signed G6 disposition before 2026-09-14.
 
+That is the original full-profile chain. Decision 0043 narrows the current
+team-internal increment: the verified CI package may be used without signing or
+independent reproduction, and the 24-hour/true-partition exercise is deferred.
+Evidence from this increment therefore cannot be called a full G4/G6 issue.
+
 An issued candidate must let an application:
 
 - publish durable Events while nodes are disconnected;
@@ -76,7 +81,7 @@ or soak results from a locally rebuilt package cannot qualify the G3 candidate.
 | **Rust and deterministic release gate** | Remove flaky outcomes; make clean-checkout results repeatable; prepare exact gate reporting | Passing deterministic checks bound to G2, then a rerun bound to G6 | Uses the exact source commit selected at G2 |
 | **OS, packaging, and artifacts** | Prepare locked build inputs, the native `arm64` package recipe, `systemd`/namespace setup, SBOM, notice, provenance, signing, and reproduction procedures | One provider-composed `arm64` package and one artifact manifest for G3 | The final package must be built from G2 and include `aster-systemd-credential-store/v2` |
 | **Integration and real devices** | Prepare the two-CM4 harness, exact device/network inventory, optional third-CM4 support declaration, and receipt collection | G4 receipts for both mandatory CM4 devices and G5 two-node workload/resource receipts against G3 | Qualification starts only after G3; G5 also requires G4; a participating third CM4 must be declared |
-| **Security and deployment** | Review the exact v2 protected-provider design and digest and prepare package integration | E01 role approvals before candidate qualification, then provider lifecycle acceptance in G3/G4 | Provider choice must be stable before the final artifact and exact to the Raspberry Pi profile boundary |
+| **Security and deployment** | Review the exact v2 protected-provider design and digest and prepare package integration | Decision 0043 satisfies E01 internally for the bounded increment; provider lifecycle acceptance remains technical evidence for G3/G4 | Provider choice must be stable before the final artifact and exact to the Raspberry Pi profile boundary; production approval is unaffected |
 | **Dependency, legal, and release** | Maintain the [approved evaluation-only `DM-8-05` disposition](dm-8-05-linux-event-v0.1-disposition.md) and review dependency drift | Committed [role-approval record](dm-8-05-linux-event-v0.1-role-approvals.md) bound into the candidate annex | All three roles are Approved; the exact coordinates must still match the candidate graph |
 | **Profile/product owner** | Keep the boundary, owners, dates, and customer exclusions explicit; prepare the candidate annex | Ratified profile plus one complete annex linking every handoff | Collects evidence from all lanes; does not replace their approvals |
 
@@ -117,6 +122,16 @@ fail, or a typed reason the work was not run.
 
 ## Current decision state
 
+[Decision 0043](../decisions/0043-authorize-linux-event-mvp-validation.md)
+records all approvals for the bounded MVP increment as team-internal and
+accepted, freezes the annex/two-CM4 inventory boundary, and defers the 24-hour
+soak. Current direct CI-package passes, failures, and unavailable checks are in
+the [device evidence record](evidence/2026-09-15-cm4-ci-package-mvp-validation.md).
+The selected package passed the direct Event scenarios but did not pass the
+ReceiveOnly non-initiation/disclosure, clean overload/capacity, current
+Rust-client, strict Go recovery, packaged provider-administration, or
+instrumented idle-resource boundaries.
+
 The profile is **Accepted** by Decision 0042. Both definition decisions are
 resolved, without granting candidate or production authorization:
 
@@ -126,8 +141,10 @@ resolved, without granting candidate or production authorization:
   [approved Raspberry Pi systemd credential provider v2 design](inputs/raspberry-pi-systemd-credential-provider-v2-design.md)
   for `aster-systemd-credential-store/v2` at
   `sha256:30c5dfe71a203fcdd69dd330f9b5c68eeaee5032b624ee41912aa4723a9f853f`.
-  Security and deployment approvals of that exact design and digest remain
-  candidate gate E01.
+  Decision 0043 records Security and Deployment approval of that exact design
+  and digest as team-internal and accepted for this bounded MVP increment.
+  Provider behavior remains a technical evidence gate; production approval is
+  not implied.
 - **D15 — `DM-8-05` evaluation disposition:** the
   [exact proposal](dm-8-05-linux-event-v0.1-disposition.md) at
   `sha256:a6fe15f39fb553f87bc1224fe7f266e7c906d451d8140402d3bc1620011bfa53`.
@@ -135,8 +152,8 @@ resolved, without granting candidate or production authorization:
   records Dependency/license, Legal/compliance, and Release as **Approved**
   against the exact dependency tuples and evaluation-only limitation.
 
-P0-1 is now defined. E01 and G1–G6 remain separate candidate-delivery gates and
-must pass before an evaluation candidate can issue.
+P0-1 is now defined. Internal MVP approvals require no further action.
+Technical evidence remains bounded by the checks actually completed.
 
 ## Working rules for the team
 
@@ -156,7 +173,7 @@ must pass before an evaluation candidate can issue.
 
 | Date | Coordinated result |
 |---:|---|
-| **2026-09-08** | All three D15 role approvals recorded, the Raspberry Pi amendment and v2 provider design approved, and Decision 0042 aligned. Security/deployment E01 review remains required for candidate qualification |
+| **2026-09-08** | All three D15 role approvals recorded, the Raspberry Pi amendment and v2 provider design approved, and Decision 0042 aligned; Decision 0043 subsequently accepted E01 internally for the bounded MVP increment |
 | **2026-09-09** | G1 Event baseline and ReceiveOnly/capacity contract frozen |
 | **2026-09-10** | G2 source/API frozen; the one `arm64` G3 package is produced only from that source |
 | **2026-09-11** | G4 passes on both mandatory CM4 devices and the required two-node G5 24-hour scenario starts |

@@ -4,7 +4,7 @@
 
 ## Disposition
 
-Status: **prepared inventory input; E02 remains open**.
+Status: **accepted and frozen for bounded MVP validation by Decision 0043**.
 
 This record selects the two mandatory physical participants for the Linux Event
 MVP evaluation profile and declares the third available device as a
@@ -119,18 +119,14 @@ private key, SSH host-key fingerprint, device serial, machine ID, boot ID,
 interface name, carrier address, WLAN address, gateway address, mission
 identity, or raw command log is retained here.
 
-## Required work before E02 can close
+## Frozen boundary and limitations
 
-1. Freeze the candidate annex schema and bind its digest.
-2. Bind this mandatory pair to the exact G2 source and unchanged G3 artifact.
-3. Produce the sanitized strict configuration and exact peer-binding digest.
-4. Freeze the direct-path network-condition record for G4/G5 and complete the
-   signed `relay not used` disposition unless a relay is deliberately added.
-5. Re-run the storage preflight after package installation and before every
-   qualifying scenario.
-6. Add the immutable G4/G5 receipt-set index and inventory digest.
-7. Obtain Profile and Integration/physical-carrier owner approval in the
-   completed candidate annex.
+[Decision 0043](../../decisions/0043-authorize-linux-event-mvp-validation.md)
+accepts this sanitized two-node inventory and the non-participating spare for
+the bounded MVP increment. No additional approval is required. Run-specific
+artifact, peer, network, state-path, and result facts remain evidence rather
+than inventory fields.
 
-Until those steps complete, this record narrows the intended inventory but does
-not satisfy `P0-1-E02` by itself.
+This freeze does not qualify the package, carrier, scenarios, resource
+thresholds, or production use. Those claims remain limited to the observations
+actually recorded for the installed CI package.

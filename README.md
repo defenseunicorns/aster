@@ -133,6 +133,29 @@ planning and PR review, and
 [requirements status](docs/validation/requirements-status.md) for exact
 credited behavior and open gates.
 
+For the Linux Event MVP, [Decision
+0043](docs/decisions/0043-authorize-linux-event-mvp-validation.md) records the
+team-internal approvals and frozen two-CM4 boundary. The [direct CI-package
+device record](docs/validation/evidence/2026-09-15-cm4-ci-package-mvp-validation.md)
+records passing direct Event/API and restart behavior in Rust and generated Go,
+both instrumented ReceiveOnly identity orderings, clean 1,024-operation
+capacity and offline audits, packaged-provider backup/recovery, and strict idle
+resource checks on the selected CI package. The directly exercisable bounded
+MVP functionality passes on both frozen devices. Protected mission
+rotation/revoke/rekey/destruction still requires externally issued authorized
+replacement material, and Decision 0043 defers the soak, true-partition,
+signing/reproduction, independent-review, and production-authorization work.
+This remains engineering evidence, not complete v0.1 release qualification or
+production authorization.
+
+The [latest-main package and finite-TTL device
+record](docs/validation/evidence/2026-09-17-latest-main-package-ttl-device-validation.md)
+adds direct two-node regression evidence for the manually dispatched ARM64
+package and the merged TTL expiry, restart, permanent retry-fence, and logical
+content-capacity-reuse behavior. The exact package was installed on a third
+test CM4, but that unconfigured device has install-integrity evidence only and
+does not expand the frozen two-node qualification boundary.
+
 ## When Aster fits
 
 Aster is a strong fit when:
