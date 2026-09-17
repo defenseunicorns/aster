@@ -21,6 +21,17 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// Resolve only the fixture root: macOS's default temporary path contains /var,
+// a symlink to /private/var. Links introduced by rejection tests stay intact.
+func canonicalTempDir(t *testing.T) string {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
 func validArgs() []string {
 	return []string{"--url", "http://127.0.0.1:8080", "--token-file", "/private/token", "--count", "5", "--rate", "50", "--payload-bytes", "256", "--topic", "load.events", "--scope", "test/load", "--operation-prefix", "fixture", "--concurrency", "2", "--timeout-seconds", "10", "--output", "/private/result.json", "--source-commit", strings.Repeat("a", 40), "--binary-sha256", strings.Repeat("b", 64), "--config-sha256", strings.Repeat("c", 64), "--sample-every", "0"}
 }
@@ -259,7 +270,7 @@ func TestReceiptStableVersionedAndContainsOnlySanitizedConfiguration(t *testing.
 }
 
 func TestTokenRejectsSymlinkFIFOAndWorldReadable(t *testing.T) {
-	root := t.TempDir()
+	root := canonicalTempDir(t)
 	path := filepath.Join(root, "token")
 	token := strings.Repeat("a", 32)
 	if err := os.WriteFile(path, []byte(token+"\n"), 0600); err != nil {
@@ -285,7 +296,7 @@ func TestTokenRejectsSymlinkFIFOAndWorldReadable(t *testing.T) {
 }
 
 func TestOutputIsPrivateAtomicAndNeverOverwrites(t *testing.T) {
-	root := t.TempDir()
+	root := canonicalTempDir(t)
 	_ = os.Chmod(root, 0700)
 	path := filepath.Join(root, "receipt.json")
 	out, err := prepareOutput(path)
@@ -484,7 +495,7 @@ func TestLateNotDispatchedResultPreservesTerminalUnscheduledSlots(t *testing.T) 
 }
 
 func TestOutputRejectsUnsafeAncestorAndSubstitutedStaging(t *testing.T) {
-	root := t.TempDir()
+	root := canonicalTempDir(t)
 	_ = os.Chmod(root, 0777)
 	child := filepath.Join(root, "private")
 	_ = os.Mkdir(child, 0700)
@@ -509,7 +520,7 @@ func TestOutputRejectsUnsafeAncestorAndSubstitutedStaging(t *testing.T) {
 }
 
 func TestOutputRejectsDirectorySwap(t *testing.T) {
-	root := t.TempDir()
+	root := canonicalTempDir(t)
 	_ = os.Chmod(root, 0700)
 	child := filepath.Join(root, "private")
 	_ = os.Mkdir(child, 0700)
@@ -725,7 +736,7 @@ func TestPublicCommandPeriodicProbesOverRealH2C(t *testing.T) {
 			server.Config.Protocols = protocols
 			server.Start()
 			defer server.Close()
-			root := t.TempDir()
+			root := canonicalTempDir(t)
 			_ = os.Chmod(root, 0700)
 			token := filepath.Join(root, "token")
 			_ = os.WriteFile(token, []byte(strings.Repeat("t", 32)), 0600)
