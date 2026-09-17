@@ -12000,12 +12000,20 @@ async fn run_node_actor_inner(
     let mut ticker = tokio::time::interval(config.sync_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let stop = async move {
-        if let Some(deadline) = stop_deadline {
-            sleep(deadline.saturating_duration_since(Instant::now())).await;
-        } else if handle_sigint {
-            let _ = tokio::signal::ctrl_c().await;
-        } else {
-            std::future::pending::<()>().await;
+        match (stop_deadline, handle_sigint) {
+            (Some(deadline), true) => {
+                tokio::select! {
+                    _ = sleep(deadline.saturating_duration_since(Instant::now())) => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            (Some(deadline), false) => {
+                sleep(deadline.saturating_duration_since(Instant::now())).await;
+            }
+            (None, true) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+            (None, false) => std::future::pending::<()>().await,
         }
     };
     tokio::pin!(stop);
@@ -21969,6 +21977,83 @@ struct DemoTopology<'a> {
     addresses: &'a [SocketAddr],
 }
 
+struct DemoPhaseOutput {
+    stdout: String,
+    stderr: String,
+}
+
+fn demo_process_receipts_complete(
+    active: &BTreeSet<usize>,
+    applications: &[NodeApplication],
+    require_successful_contacts: bool,
+    outputs: &BTreeMap<usize, DemoPhaseOutput>,
+) -> bool {
+    let process_receipts_complete = active.iter().all(|index| {
+        let Some(output) = outputs.get(index) else {
+            return false;
+        };
+        let ready = output
+            .stdout
+            .lines()
+            .any(|line| line.starts_with("READY selected=true"));
+        let application = applications.get(*index).is_some_and(|application| {
+            matches!(application, NodeApplication::Relay)
+                || output
+                    .stdout
+                    .lines()
+                    .any(|line| line.starts_with("APPLICATION status="))
+        });
+        ready && application
+    });
+    process_receipts_complete
+        && (require_successful_contacts
+            || outputs.values().any(|output| {
+                output
+                    .stderr
+                    .lines()
+                    .any(|line| line.starts_with("CONTACT ") && line.contains(" status=error "))
+            }))
+}
+
+fn read_demo_phase_outputs(
+    children: &[(
+        usize,
+        std::process::Child,
+        PathBuf,
+        PathBuf,
+        Option<std::process::ExitStatus>,
+    )],
+) -> Result<BTreeMap<usize, DemoPhaseOutput>, NodeError> {
+    children
+        .iter()
+        .map(|(index, _, log_path, error_path, _)| {
+            Ok((
+                *index,
+                DemoPhaseOutput {
+                    stdout: fs::read_to_string(log_path)?,
+                    stderr: fs::read_to_string(error_path)?,
+                },
+            ))
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn interrupt_demo_child(child: &std::process::Child) -> io::Result<()> {
+    let status = Command::new("kill")
+        .arg("-INT")
+        .arg(child.id().to_string())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "could not interrupt completed demo child {}; kill exited {status}",
+            child.id()
+        )))
+    }
+}
+
 fn run_demo_phase(
     topology: &DemoTopology<'_>,
     phase: &str,
@@ -22057,6 +22142,7 @@ fn run_demo_phase_internal(
         children.push((index, child, log_path, error_path, None));
     }
     let deadline = Instant::now() + Duration::from_secs(run_seconds + 15);
+    let mut completion_observed = false;
     loop {
         let mut all_finished = true;
         for (_, child, _, _, status) in &mut children {
@@ -22067,6 +22153,31 @@ fn run_demo_phase_internal(
         }
         if all_finished {
             break;
+        }
+        #[cfg(unix)]
+        if !completion_observed {
+            let outputs = read_demo_phase_outputs(&children)?;
+            let process_receipts_complete = demo_process_receipts_complete(
+                &active,
+                applications,
+                require_successful_contacts,
+                &outputs,
+            );
+            let contact_receipts_complete = !require_successful_contacts
+                || verify_phase_contacts(phase, &active, identities, missions, &logs).is_ok();
+            if process_receipts_complete && contact_receipts_complete {
+                for (_, child, _, _, status) in &mut children {
+                    if status.is_none()
+                        && let Err(error) = interrupt_demo_child(child)
+                    {
+                        *status = child.try_wait()?;
+                        if status.is_none() {
+                            return Err(error.into());
+                        }
+                    }
+                }
+                completion_observed = true;
+            }
         }
         if Instant::now() >= deadline {
             for (_, child, _, _, status) in &mut children {
@@ -22101,7 +22212,7 @@ fn run_demo_phase_internal(
             .is_some_and(|right| active.contains(&right))
     });
     println!(
-        "PHASE status=pass name={} processes={} carrier_authenticated_edges={} mission_authenticated_edges={} provisioning=unprotected-reference",
+        "PHASE status=pass name={} processes={} carrier_authenticated_edges={} mission_authenticated_edges={} provisioning=unprotected-reference completion={}",
         phase,
         active.len(),
         if require_successful_contacts {
@@ -22121,6 +22232,11 @@ fn run_demo_phase_internal(
             }
         } else {
             "denied-as-required"
+        },
+        if completion_observed {
+            "condition-observed"
+        } else {
+            "child-watchdog"
         },
     );
     Ok(())
@@ -39676,6 +39792,87 @@ mod tests {
         assert_eq!(demo_run_seconds(3), 9);
         assert_eq!(demo_run_seconds(8), 14);
         assert_eq!(demo_run_seconds(32), 38);
+    }
+
+    #[test]
+    fn demo_phase_completion_requires_every_process_receipt() {
+        let active = [0, 1].into_iter().collect();
+        let applications = [NodeApplication::PingEmitter, NodeApplication::Relay];
+        let mut outputs = BTreeMap::from([
+            (
+                0,
+                DemoPhaseOutput {
+                    stdout: "READY selected=true\nAPPLICATION status=emitted kind=ping\n".into(),
+                    stderr: String::new(),
+                },
+            ),
+            (
+                1,
+                DemoPhaseOutput {
+                    stdout: "READY selected=true\n".into(),
+                    stderr: String::new(),
+                },
+            ),
+        ]);
+
+        assert!(demo_process_receipts_complete(
+            &active,
+            &applications,
+            true,
+            &outputs
+        ));
+        outputs.get_mut(&1).expect("node one output").stdout.clear();
+        assert!(!demo_process_receipts_complete(
+            &active,
+            &applications,
+            true,
+            &outputs
+        ));
+        outputs.get_mut(&1).expect("node one output").stdout = "READY selected=true\n".into();
+        outputs.get_mut(&0).expect("node zero output").stdout = "READY selected=true\n".into();
+        assert!(!demo_process_receipts_complete(
+            &active,
+            &applications,
+            true,
+            &outputs
+        ));
+    }
+
+    #[test]
+    fn denied_demo_phase_completion_requires_contact_error() {
+        let active = [0, 1].into_iter().collect();
+        let applications = [NodeApplication::Relay, NodeApplication::PingEmitter];
+        let mut outputs = BTreeMap::from([
+            (
+                0,
+                DemoPhaseOutput {
+                    stdout: "READY selected=true\n".into(),
+                    stderr: String::new(),
+                },
+            ),
+            (
+                1,
+                DemoPhaseOutput {
+                    stdout: "READY selected=true\nAPPLICATION status=existing kind=ping\n".into(),
+                    stderr: String::new(),
+                },
+            ),
+        ]);
+
+        assert!(!demo_process_receipts_complete(
+            &active,
+            &applications,
+            false,
+            &outputs
+        ));
+        outputs.get_mut(&0).expect("node zero output").stderr =
+            "CONTACT direction=out status=error error=denied\n".into();
+        assert!(demo_process_receipts_complete(
+            &active,
+            &applications,
+            false,
+            &outputs
+        ));
     }
 
     #[test]
