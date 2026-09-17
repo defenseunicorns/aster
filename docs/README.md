@@ -32,6 +32,7 @@ part of the normal reading path.
 | Implementation | [Architecture](architecture.md), [Security](security.md), [Carriers and contacts](transports.md), and component README files under `crates/` |
 | MVP operation | [Operator runbook](mvp/linux-event-mvp-runbook.md) and [credential-provider operations](mvp/raspberry-pi-provider-v2-operations.md) |
 | Validation | [Validation and readiness map](validation/README.md) for capability planning, requirements trace, conformance, the Linux Event MVP profile, and retained evidence |
+| Customer feedback | [Customer feedback index](customer-feedback/README.md) for advisory input and separate product recommendation reviews; feedback is not requirements or evidence |
 | Decisions | [`docs/decisions/`](decisions/) records the rationale for boundaries that still constrain the product; specifications and current references remain authoritative for behavior |
 
 ## Document authority

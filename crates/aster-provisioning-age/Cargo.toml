@@ -9,11 +9,11 @@ license.workspace = true
 [dependencies]
 age.workspace = true
 age-core.workspace = true
-aster-core = { version = "=0.1.0", path = "../aster-core" }
+aster-core = { version = "=0.1.0-alpha.1", path = "../aster-core" }
 zeroize.workspace = true
 
 [dev-dependencies]
-aster-core = { version = "=0.1.0", path = "../aster-core", features = ["adapter-sdk"] }
+aster-core = { version = "=0.1.0-alpha.1", path = "../aster-core", features = ["adapter-sdk"] }
 
 [lints]
 workspace = true

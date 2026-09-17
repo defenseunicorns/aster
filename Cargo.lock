@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "aster-agent"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aster-core",
  "aster-iroh",
@@ -302,21 +302,21 @@ dependencies = [
 
 [[package]]
 name = "aster-ble"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aster-core",
 ]
 
 [[package]]
 name = "aster-conformance"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aster-core",
 ]
 
 [[package]]
 name = "aster-core"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aes-gcm 0.11.0",
  "getrandom 0.4.3",
@@ -334,21 +334,21 @@ dependencies = [
 
 [[package]]
 name = "aster-ffi"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aster-core",
 ]
 
 [[package]]
 name = "aster-host"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aster-core",
 ]
 
 [[package]]
 name = "aster-ip"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aster-core",
  "getrandom 0.4.3",
@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "aster-iroh"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "futures",
  "iroh",
@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "aster-lab"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aster-core",
  "aster-host",
@@ -397,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "aster-libp2p-provider"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "futures",
  "libp2p",
@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "aster-negentropy"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aster-profile",
  "negentropy",
@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "aster-node"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aster-core",
  "aster-iroh",
@@ -433,11 +433,11 @@ dependencies = [
 
 [[package]]
 name = "aster-profile"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 
 [[package]]
 name = "aster-provisioning-age"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "age",
  "age-core",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "aster-redb-store"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aster-core",
  "aster-profile",
@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "aster-systemd-credentials"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "aster-core",
  "getrandom 0.4.3",
