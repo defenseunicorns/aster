@@ -104,9 +104,11 @@ The full workspace test commands in `mise run check` and the macOS CI lane use
 socket descriptors, before its listener/runtime files and neighboring tests.
 The wrapper applies the CI's owner-only `077` umask, disables incremental and
 debug-info artifacts, and defaults Cargo build jobs to 2 and Rust test threads
-to 4 so a high-core developer host cannot multiply the all-feature workspace
-test's memory and disk demand without bound. Explicit caller overrides still
-win. It also raises the child process's soft open-file limit to at least 4,096,
+to the smaller of 4 or the host's online CPU count. This keeps the two-core
+Linux CI runner at its previously stable concurrency while preventing a
+high-core developer host from multiplying the all-feature workspace test's
+memory and disk demand without bound. Explicit caller overrides still win. It
+also raises the child process's soft open-file limit to at least 4,096,
 preserves a larger existing limit, and fails clearly if the hard limit cannot
 support it. These execution bounds do not reduce fixture scale or change the
 host's hard limit. For a direct workspace run, use:

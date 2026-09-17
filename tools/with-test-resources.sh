@@ -18,7 +18,17 @@ export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-0}"
 export CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG:-0}"
-export RUST_TEST_THREADS="${RUST_TEST_THREADS:-4}"
+default_test_threads=4
+online_cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+case "$online_cpus" in
+    ''|*[!0-9]*) ;;
+    *)
+        if [ "$online_cpus" -gt 0 ] && [ "$online_cpus" -lt "$default_test_threads" ]; then
+            default_test_threads=$online_cpus
+        fi
+        ;;
+esac
+export RUST_TEST_THREADS="${RUST_TEST_THREADS:-$default_test_threads}"
 
 # The 256-pair TCP relay fixture alone holds 1,024 socket descriptors (both
 # clients and both accepted sockets per pair), plus its listener/runtime files.
