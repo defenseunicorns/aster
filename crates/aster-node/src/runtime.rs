@@ -21383,13 +21383,18 @@ fn run_controlled_n4_demo(
 
     let mut captured_applications = relay_applications.clone();
     captured_applications[3] = NodeApplication::PingEmitter;
+    let denied_contact = DemoDeniedContact {
+        rejecting_node: 2,
+        revoked_carrier: topology.identities[3],
+        revoked_mission: missions[3].identity(),
+    };
     run_demo_denied_phase(
         topology,
         "captured-publication-denied",
         &[2, 3],
         &captured_applications,
+        &denied_contact,
     )?;
-    require_denied_mesh_contact(root, "captured-publication-denied", &[2, 3])?;
     let captured_ping = load_demo_operation(&states[3], &missions[3], &ping_operation_key()?)?
         .ok_or_else(|| {
             NodeError::Demo("captured node did not exercise stale local signing".into())
@@ -21408,8 +21413,8 @@ fn run_controlled_n4_demo(
         "captured-rejoin-denied",
         &[2, 3],
         &captured_applications,
+        &denied_contact,
     )?;
-    require_denied_mesh_contact(root, "captured-rejoin-denied", &[2, 3])?;
     require_application_receipt(root, "captured-rejoin-denied", 3, "existing", "ping")?;
     require_survivor_unchanged(&states[2], &missions[2], &ping)?;
 
@@ -21609,8 +21614,13 @@ fn verify_controlled_route_cache(
     Ok(())
 }
 
-fn require_denied_mesh_contact(root: &Path, phase: &str, nodes: &[usize]) -> Result<(), NodeError> {
-    let mut saw_error = false;
+fn require_denied_mesh_contact(
+    root: &Path,
+    phase: &str,
+    nodes: &BTreeSet<usize>,
+    expected: &DemoDeniedContact,
+) -> Result<(), NodeError> {
+    let mut outputs = BTreeMap::new();
     for node in nodes {
         let stdout =
             fs::read_to_string(root.join("logs").join(format!("{phase}-node-{node}.log")))?;
@@ -21624,13 +21634,14 @@ fn require_denied_mesh_contact(root: &Path, phase: &str, nodes: &[usize]) -> Res
                 "{phase} unexpectedly completed a revoked peer contact"
             )));
         }
-        saw_error |= stderr
-            .lines()
-            .any(|line| line.starts_with("CONTACT ") && line.contains(" status=error "));
+        outputs.insert(*node, DemoPhaseOutput { stdout, stderr });
     }
-    if !saw_error {
+    if !demo_denied_contact_observed(expected, &outputs) {
         return Err(NodeError::Demo(format!(
-            "{phase} omitted the expected revoked-peer rejection receipt"
+            "{phase} omitted node {}'s rejection of revoked mission peer {} at carrier {}",
+            expected.rejecting_node,
+            format_node_id(expected.revoked_mission),
+            expected.revoked_carrier,
         )));
     }
     Ok(())
@@ -21982,10 +21993,48 @@ struct DemoPhaseOutput {
     stderr: String,
 }
 
+struct DemoDeniedContact {
+    rejecting_node: usize,
+    revoked_carrier: EndpointId,
+    revoked_mission: NodeId,
+}
+
+fn demo_denied_contact_observed(
+    expected: &DemoDeniedContact,
+    outputs: &BTreeMap<usize, DemoPhaseOutput>,
+) -> bool {
+    if outputs.values().any(|output| {
+        output
+            .stdout
+            .lines()
+            .any(|line| line.starts_with("CONTACT ") && line.ends_with("status=pass"))
+    }) {
+        return false;
+    }
+    let carrier = format!("carrier_peer={}", expected.revoked_carrier);
+    let error = format!(
+        "error={}",
+        format_receipt_field(&NodeError::Revoked(expected.revoked_mission).to_string())
+    );
+    outputs.get(&expected.rejecting_node).is_some_and(|output| {
+        output.stderr.lines().any(|line| {
+            line.starts_with("CONTACT ")
+                && line
+                    .split_ascii_whitespace()
+                    .any(|field| matches!(field, "direction=in" | "direction=out"))
+                && line.split_ascii_whitespace().any(|field| field == carrier)
+                && line
+                    .split_ascii_whitespace()
+                    .any(|field| field == "status=error")
+                && line.split_ascii_whitespace().any(|field| field == error)
+        })
+    })
+}
+
 fn demo_process_receipts_complete(
     active: &BTreeSet<usize>,
     applications: &[NodeApplication],
-    require_successful_contacts: bool,
+    denied_contact: Option<&DemoDeniedContact>,
     outputs: &BTreeMap<usize, DemoPhaseOutput>,
 ) -> bool {
     let process_receipts_complete = active.iter().all(|index| {
@@ -22005,7 +22054,7 @@ fn demo_process_receipts_complete(
         });
         ready && application
     });
-    let successful_contact_receipts_complete = !require_successful_contacts
+    let successful_contact_receipts_complete = denied_contact.is_some()
         || active.len() < 2
         || active.iter().all(|index| {
             outputs.get(index).is_some_and(|output| {
@@ -22017,13 +22066,7 @@ fn demo_process_receipts_complete(
         });
     process_receipts_complete
         && successful_contact_receipts_complete
-        && (require_successful_contacts
-            || outputs.values().any(|output| {
-                output
-                    .stderr
-                    .lines()
-                    .any(|line| line.starts_with("CONTACT ") && line.contains(" status=error "))
-            }))
+        && denied_contact.is_none_or(|expected| demo_denied_contact_observed(expected, outputs))
 }
 
 fn read_demo_phase_outputs(
@@ -22071,7 +22114,7 @@ fn run_demo_phase(
     active: &[usize],
     applications: &[NodeApplication],
 ) -> Result<(), NodeError> {
-    run_demo_phase_internal(topology, phase, active, applications, true)
+    run_demo_phase_internal(topology, phase, active, applications, None)
 }
 
 fn run_demo_denied_phase(
@@ -22079,8 +22122,9 @@ fn run_demo_denied_phase(
     phase: &str,
     active: &[usize],
     applications: &[NodeApplication],
+    denied_contact: &DemoDeniedContact,
 ) -> Result<(), NodeError> {
-    run_demo_phase_internal(topology, phase, active, applications, false)
+    run_demo_phase_internal(topology, phase, active, applications, Some(denied_contact))
 }
 
 fn run_demo_phase_internal(
@@ -22088,7 +22132,7 @@ fn run_demo_phase_internal(
     phase: &str,
     active: &[usize],
     applications: &[NodeApplication],
-    require_successful_contacts: bool,
+    denied_contact: Option<&DemoDeniedContact>,
 ) -> Result<(), NodeError> {
     let DemoTopology {
         root,
@@ -22097,6 +22141,7 @@ fn run_demo_phase_internal(
         missions,
         addresses,
     } = topology;
+    let require_successful_contacts = denied_contact.is_none();
     if applications.len() != states.len() {
         return Err(NodeError::Configuration(
             "demo application-role count differs from state count".into(),
@@ -22168,12 +22213,8 @@ fn run_demo_phase_internal(
         #[cfg(unix)]
         if !completion_observed {
             let outputs = read_demo_phase_outputs(&children)?;
-            let process_receipts_complete = demo_process_receipts_complete(
-                &active,
-                applications,
-                require_successful_contacts,
-                &outputs,
-            );
+            let process_receipts_complete =
+                demo_process_receipts_complete(&active, applications, denied_contact, &outputs);
             let contact_receipts_complete = !require_successful_contacts
                 || verify_phase_contacts(phase, &active, identities, missions, &logs).is_ok();
             if process_receipts_complete && contact_receipts_complete {
@@ -22216,6 +22257,8 @@ fn run_demo_phase_internal(
     }
     if require_successful_contacts {
         verify_phase_contacts(phase, &active, identities, missions, &logs)?;
+    } else if let Some(expected) = denied_contact {
+        require_denied_mesh_contact(root, phase, &active, expected)?;
     }
     let has_active_edge = active.iter().any(|index| {
         index
@@ -39829,21 +39872,21 @@ mod tests {
         assert!(demo_process_receipts_complete(
             &active,
             &applications,
-            true,
+            None,
             &outputs
         ));
         outputs.get_mut(&1).expect("node one output").stdout.clear();
         assert!(!demo_process_receipts_complete(
             &active,
             &applications,
-            true,
+            None,
             &outputs
         ));
         outputs.get_mut(&1).expect("node one output").stdout = "READY selected=true\n".into();
         assert!(!demo_process_receipts_complete(
             &active,
             &applications,
-            true,
+            None,
             &outputs
         ));
         outputs.get_mut(&1).expect("node one output").stdout =
@@ -39852,15 +39895,48 @@ mod tests {
         assert!(!demo_process_receipts_complete(
             &active,
             &applications,
-            true,
+            None,
             &outputs
         ));
     }
 
     #[test]
-    fn denied_demo_phase_completion_requires_contact_error() {
+    fn denied_demo_phase_requires_expected_revocation_before_stop_and_after_watchdog() {
         let active = [0, 1].into_iter().collect();
         let applications = [NodeApplication::Relay, NodeApplication::PingEmitter];
+        let expected = DemoDeniedContact {
+            rejecting_node: 0,
+            revoked_carrier: aster_iroh::SecretKey::from_bytes(&[1; 32]).public(),
+            revoked_mission: [2; 32],
+        };
+        let other_carrier = aster_iroh::SecretKey::from_bytes(&[3; 32]).public();
+        let receipt = |direction: &str, carrier: EndpointId, mission: NodeId| {
+            format!(
+                "CONTACT direction={direction} carrier_peer={carrier} status=error error=mission%20principal%20{}%20is%20durably%20revoked\n",
+                format_node_id(mission),
+            )
+        };
+        let state = root("demo-denied-contact");
+        let logs = state.join("logs");
+        fs::create_dir_all(&logs).expect("create denial logs");
+        let check = |outputs: &BTreeMap<usize, DemoPhaseOutput>, complete: bool| {
+            assert_eq!(
+                demo_process_receipts_complete(&active, &applications, Some(&expected), outputs),
+                complete,
+                "early completion must require the expected revocation"
+            );
+            for (node, output) in outputs {
+                fs::write(logs.join(format!("denied-node-{node}.log")), &output.stdout)
+                    .expect("write stdout");
+                fs::write(logs.join(format!("denied-node-{node}.err")), &output.stderr)
+                    .expect("write stderr");
+            }
+            assert_eq!(
+                require_denied_mesh_contact(&state, "denied", &active, &expected).is_ok(),
+                complete,
+                "watchdog completion must enforce the same revocation evidence"
+            );
+        };
         let mut outputs = BTreeMap::from([
             (
                 0,
@@ -39878,20 +39954,39 @@ mod tests {
             ),
         ]);
 
-        assert!(!demo_process_receipts_complete(
-            &active,
-            &applications,
-            false,
-            &outputs
-        ));
-        outputs.get_mut(&0).expect("node zero output").stderr =
-            "CONTACT direction=out status=error error=denied\n".into();
-        assert!(demo_process_receipts_complete(
-            &active,
-            &applications,
-            false,
-            &outputs
-        ));
+        check(&outputs, false);
+        for unrelated in [
+            "CONTACT direction=in status=error error=accept_task_stopped\n".into(),
+            format!(
+                "CONTACT direction=out carrier_peer={} status=error error=connection_refused\n",
+                expected.revoked_carrier
+            ),
+            receipt("in", other_carrier, expected.revoked_mission),
+            receipt("out", expected.revoked_carrier, [4; 32]),
+        ] {
+            outputs.get_mut(&0).expect("rejecting node").stderr = unrelated;
+            check(&outputs, false);
+        }
+        outputs.get_mut(&0).expect("rejecting node").stderr.clear();
+        outputs.get_mut(&1).expect("captured node").stderr =
+            receipt("in", expected.revoked_carrier, expected.revoked_mission);
+        check(&outputs, false);
+        outputs.get_mut(&1).expect("captured node").stderr.clear();
+        for direction in ["in", "out"] {
+            outputs.get_mut(&0).expect("rejecting node").stderr = receipt(
+                direction,
+                expected.revoked_carrier,
+                expected.revoked_mission,
+            );
+            check(&outputs, true);
+        }
+        outputs
+            .get_mut(&1)
+            .expect("captured node")
+            .stdout
+            .push_str("CONTACT direction=out status=pass\n");
+        check(&outputs, false);
+        fs::remove_dir_all(state).expect("remove denial logs");
     }
 
     #[test]

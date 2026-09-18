@@ -34,12 +34,13 @@ jobs:
     # Keep headroom for exact-Python setup, support checks, and runner variance.
     # The complete Rust workspace gate runs concurrently in rust-quality.
     timeout-minutes: 45
-    env:
+    env: &rust-build-profiles
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
 
     steps:
-      - name: Check out source
+      - &checkout-source
+        name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
@@ -71,7 +72,8 @@ jobs:
         timeout-minutes: 15
         run: bash .github/scripts/build-ci-python.sh
 
-      - name: Install repository toolchain
+      - &setup-toolchain
+        name: Install repository toolchain
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           version: 2026.4.28
@@ -84,8 +86,8 @@ jobs:
           python3 .github/scripts/check-ci-python.py
           mise exec -- mise run ci-python-preflight
 
-      - name: Install Rust quality components
-        run: rustup component add --toolchain 1.97.1 rustfmt clippy
+      - name: Install Rust formatting and conformance lint components
+        run: &install-rust-components rustup component add --toolchain 1.97.1 rustfmt clippy
 
       - name: Acquire Rust dependencies
         run: |
@@ -238,25 +240,14 @@ jobs:
     # This is the former Clippy/workspace-test segment of mise run check.
     # It runs concurrently with the unchanged support checks in quality.
     timeout-minutes: 40
-    env:
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
+    env: *rust-build-profiles
     steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 1
-          persist-credentials: false
-          submodules: false
+      - *checkout-source
 
-      - name: Install repository toolchain
-        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
-        with:
-          version: 2026.4.28
-          cache: false
+      - *setup-toolchain
 
       - name: Install Rust quality components
-        run: rustup component add --toolchain 1.97.1 rustfmt clippy
+        run: *install-rust-components
 
       - name: Acquire Rust dependencies
         run: cargo fetch --locked
