@@ -1,0 +1,28 @@
+{
+  "classification": "",
+  "diagnostic_only": true,
+  "qualification": false,
+  "repository": "edgesoftops/astertech",
+  "source_binding": "workflow_sha",
+  "source_path": "crates/aster-lab/src/mesh_experiment/libp2p_candidate.rs",
+  "baseline_sha256": "7b12a8f028593729a36a1bc524cff09939c803bc168b36959e6fb576d6dfa1fe",
+  "patched_sha256": "d4869b0113bab9ea4714d011a0148d283f86a1a55bbc36c294def294abe0df6b",
+  "telemetry_patch_sha256": "2e9d6f5eb6b1e0f1e0b862245e465ff259f2b333112322198c693c72ac6e9a9f",
+  "rust": "1.97.1",
+  "test": "mesh_experiment::libp2p_candidate::two_persistent_swarms_drive_ten_thousand_runtime_frames_each_way",
+  "build_seconds": 1200,
+  "test_seconds": 400,
+  "cleanup_seconds": 10,
+  "source_files": {
+    "Cargo.lock": "ba59ba1b8e93dc55597a4292719e3ce941968d5b5033f0c4348c7c48a412854f",
+    "Cargo.toml": "d872a80063509b52ef97f5822b3792499411111b453f1cc2b9f6869c23123653",
+    "rust-toolchain.toml": "8e390d6a0838315f972690f46ef8bae8b7ecc9ee6c1ed70140ef852869c2482e",
+    "tools/with-test-resources.sh": "2fdec9b0572806279ec5ed825371dabb13db42747f7799555d3f3782adfa2fcf",
+    "deny.toml": "61abb96214ef54b8d34cdaeafe6a6c11dbe581837dc19569b20a93e50e07daba"
+  },
+  "controller_capture_bytes": 16777216,
+  "controller_line_bytes": 65536,
+  "telemetry_numeric_digits": 20,
+  "telemetry_records": 160,
+  "toolchain_binding": "repository rust-toolchain.toml plus workflow receipt"
+}

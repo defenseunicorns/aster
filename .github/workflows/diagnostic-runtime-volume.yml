@@ -1,0 +1,84 @@
+name: "Diagnostic: manual runtime-volume test"
+
+# Manual/reusable validation harness. Do not add automatic triggers.
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-volume-diagnostic-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      EXPECTED_SOURCE_SHA: ${{ github.sha }}
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      RUST_BACKTRACE: "1"
+      RUSTUP_AUTO_INSTALL: "0"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Check out the exact dispatched source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Bind the run to the checked-out commit
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git rev-parse HEAD)" == "$EXPECTED_SOURCE_SHA" ]]
+          mkdir -p "$RUNNER_TEMP/volume-evidence" "$RUNNER_TEMP/volume-private"
+          printf '%s\n' '{"state":"preparation","diagnostic_only":true,"qualification":false,"test_executions":0}' > "$RUNNER_TEMP/volume-evidence/preparation.json"
+
+      - name: Install repository Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal
+
+      - name: Acquire locked Rust dependencies
+        run: cargo +1.97.1 fetch --locked
+
+      - name: Validate diagnostic contracts
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -B -m unittest discover -v -s .github/diagnostics/runtime-volume -p 'test_*.py'
+          python3 .github/diagnostics/runtime-volume/preflight.py \
+            "$GITHUB_WORKSPACE" "$RUNNER_TEMP/volume-evidence"
+
+      - name: Execute the single instrumented test
+        timeout-minutes: 29
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 .github/diagnostics/runtime-volume/driver.py \
+            "$GITHUB_WORKSPACE" \
+            "$RUNNER_TEMP/volume-evidence" \
+            "$RUNNER_TEMP/volume-private"
+
+      - name: Retain only sanitized bounded diagnostic evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: runtime-volume-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/volume-evidence/*.json
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 7
