@@ -74,9 +74,76 @@ The additive patch preserves the workload and assertions while emitting:
 - five timing distributions represented as count/sum/max nanoseconds;
 - a measured observation-overhead counter.
 
-Observation changes timing and the rebuilt instrumented binary is not identical
-to the stock CI artifact. Interpret one run as a bounded measurement of this
-commit and runner, not proof of general performance or causality.
+## Telemetry dictionary and observation limits
+
+`telemetry.json` is an ordered array of sanitized records. Records with `kind`
+set to `phase`, `progress`, `complete_predicate`, or `final` contain the timing
+fields and fixed arrays below. Separate records may contain `observation_ns` or
+the allowlisted Rust test-harness summary.
+
+`counters` is a fixed 22-value array:
+
+| Indices | Meaning |
+| --- | --- |
+| 0–4 | A→C: runtime accepted, provider submitted, sent, peer received, runtime consumed |
+| 5–9 | C→A: runtime accepted, provider submitted, sent, peer received, runtime consumed |
+| 10–11 | A/C runtime-to-provider queue occupancy |
+| 12–13 | A/C provider submission credit: 1024 minus submitted−sent |
+| 14–15 | A/C outbound queue high-water |
+| 16–17 | A/C full-queue backpressure count |
+| 18–19 | A/C opened stream count |
+| 20–21 | A/C selected stream role: 1 outbound, 0 inbound (not key/peer material) |
+
+The provider-to-runtime backlog is received minus consumed at each destination;
+accepted minus submitted is the runtime-to-provider boundary gap. Neither raw
+frames nor a backlog estimate proves unique-item progress or packet loss.
+`durable` contains C-first/C-second at A, then A-first/A-second at C. Values:
+0 not sampled, 1 absent, 2 present, 3 query error. Observational queries discard
+error text and do not introduce earlier error propagation. They run only at the
+existing 10-second progress point; the original short-circuited completion
+predicate is unchanged. On predicate completion all four are recorded present
+because that exact original predicate has just succeeded.
+
+`costs` has five `[count, sum_ns, max_ns]` rows: A drive, C drive, A flush,
+C flush, and combined select/service wait. Select cost includes waiting, chosen
+handler execution, and timer branches; it is **not per-adapter CPU attribution**.
+`outer_ms` includes setup, the original timeout, and final cleanup; subtract
+`loop_started_ms` only after the volume phase begins. Phase records delimit
+the exact `prepare`, `supervisors`, `adapters`, `listen`, `connect`, `contacts`,
+`activation`, `volume`, `resource_oracles`, and `cleanup` milestones.
+`sampled_ms` and `durable_sampled_ms` explicitly expose stale samples. Counters
+are refreshed at loop boundaries, not synchronously on every frame.
+
+An outer RAII guard emits last-known state on ordinary success/error, cooperative
+Tokio timeout, and unwind. On synchronous stalls or forced termination, that guard
+may not run: the supervising process retains last-known counters and process
+CPU/RSS/I/O sampled during execution. Parsing and receipt creation happen only
+after termination; the resource sample remains last-known, not a new pre-kill
+measurement. Unknown or stale state is never relabeled as fresh. At most 64
+regular diagnostic snapshots plus one final snapshot, bounded observation-cost
+records, and 160 sanitized output records are retained. `/proc` samples are
+five-second, finite-budget process snapshots, not full-runner load.
+
+Each combined stdout/stderr capture is limited to **16 MiB**, read through a
+nonblocking pipe in at-most-64-KiB turns, with bounded draining during cleanup.
+Only captured bytes are hashed and written privately after termination. Parsing
+is incremental over that bounded capture: **64 KiB per line**, **20 digits per
+telemetry numeric token**, and **160 retained telemetry records**, including an
+explicit failure marker if the record budget is exceeded. Raw/Cargo overflow is
+never accepted as successful truncation, even if a matching artifact appears
+earlier. These are conservative diagnostic budgets, not claims that every
+compiler output will fit. No full-log `splitlines` or uncapped raw-file read is
+used. Receipt-write failure can prevent the receipt itself; it cannot prevent
+termination/reaping, and the returned controller result remains failure.
+
+Observation changes timing: thread-local numeric snapshots occur twice per loop;
+`Instant` reads surround four synchronous operations and one select; four
+read-only durable queries and output occur at existing progress points.
+`observation_ns` measures the additional periodic queries/output, not all
+per-loop bookkeeping. The rebuilt instrumented binary is not identical to the
+stock CI artifact. Interpret one run as a bounded measurement of this commit and
+runner, not proof of general performance, causality, zero overhead, or equivalence
+to the original CI binary.
 
 ## Traceability
 
