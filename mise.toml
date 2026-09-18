@@ -14,6 +14,14 @@ PYTHONDONTWRITEBYTECODE = "1"
 [tasks.check]
 description = "Run format, lint, unit, binding, and conformance checks"
 run = [
+  "mise run check-foundation",
+  "mise run check-rust",
+  "mise run check-integration",
+]
+
+[tasks.check-foundation]
+description = "Run formatting, policy, traceability, and receipt checks"
+run = [
   "cargo fmt --all -- --check",
   "sh tools/check-agent-proto.sh",
   "python3 tools/check-project-license.py",
@@ -49,8 +57,18 @@ run = [
   "python3 tools/test-retained-libp2p-oracle-boundary.py",
   "sh ./tools/check-dependency-exception-scope.sh",
   "sh ./tools/test-dependency-exception-scope.sh",
+]
+
+[tasks.check-rust]
+description = "Run Clippy and the complete all-feature Rust workspace tests"
+run = [
   "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings",
   "sh tools/with-test-resources.sh cargo test --locked --workspace --all-features",
+]
+
+[tasks.check-integration]
+description = "Run real-process, binding, and conformance checks"
+run = [
   "sh tools/test-aster-mesh-playground-real.sh",
   "sh tools/test-aster-hello-real.sh",
   "cargo build --locked -p aster-ffi",

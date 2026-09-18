@@ -18,7 +18,8 @@ single stable check name **`CI / required`**.
 
 | Check | Runner | Purpose |
 | --- | --- | --- |
-| `quality` | `ubuntu-24.04` | Runs `mise run check`: Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, the retained-libp2p-oracle boundary, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, Clippy with warnings denied, the full Rust workspace test suite, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and the lab-controller tests. |
+| `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, the retained-libp2p-oracle boundary, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
+| `Rust quality` | `ubuntu-24.04` | Runs Clippy with warnings denied and the complete locked, all-feature Rust workspace test suite. This is the same `mise run check-rust` segment included by the local aggregate, isolated as a parallel required lane rather than package-sharded. |
 | `macOS tests` | `macos-14` | Runs all Rust workspace tests on the supported Apple runner with Rust 1.97.1. |
 | `Rust 1.91 MSRV` | `ubuntu-24.04` | Checks every workspace target and feature with the declared minimum supported Rust version. |
 | `dependency policy` | `ubuntu-24.04` | Enforces the retained-libp2p-oracle boundary, applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
@@ -32,6 +33,58 @@ current advisory data once, audits the root lockfile during that refresh, and
 reuses the same database without another fetch for the fuzz lockfile. Its
 vulnerability result therefore reflects the RustSec database available when
 the workflow ran, rather than a permanently reproducible snapshot.
+
+### CI critical-path profile (2026-09-17)
+
+Recent successful Linux quality jobs took approximately 31--38 minutes. In
+representative run `35188617562`, `mise run check` took 26 minutes 41 seconds;
+the complete workspace test command accounted for 19 minutes 34 seconds, while
+Clippy accounted for 2 minutes 13 seconds. Run `35198052279` completed quality
+in 37 minutes 39 seconds after the resource-bound wrapper was corrected for its
+two-CPU runner. These are hosted-run observations, not performance guarantees.
+
+Three existing real-process demo tests were a material part of that serial test
+time. Their phases used the topology-scaled duration as both a watchdog and the
+normal completion mechanism even after the exact application/contact receipts
+were durable. The parent now observes every active process's readiness, every
+non-relay application receipt, and either every exact authenticated edge receipt
+or the required denied-contact receipt. It then requests graceful shutdown.
+The original child `--run-for` bound and the longer parent deadline remain as
+failure watchdogs, and all stopped-state, exact-transfer, authorization, and
+restart assertions remain. On the local 2026-09-17 comparison, the same three
+tests completed in 69.90 seconds instead of approximately 229 seconds; this is
+a development-host result, not hosted-CI or throughput evidence.
+
+`mise run check` remains the complete local aggregate, in its established
+command order:
+
+1. `mise run check-foundation`
+2. `mise run check-rust`
+3. `mise run check-integration`
+
+Hosted Linux CI runs the Rust segment in the separate required `Rust quality`
+lane while `quality` runs the foundation and integration segments. The stable
+`required` job fails unless both lanes and every pre-existing validation lane
+succeed. No test, feature set, receipt assertion, binding check, conformance
+check, or process smoke is omitted.
+
+The following observations are intentionally deferred rather than folded into
+this low-risk split:
+
+- Actions and compiler caches remain disabled. Cache trust, eviction, keying,
+  restore integrity, and disk-growth behavior need a separate design; local
+  profiling showed build artifacts, rather than partition size, caused prior
+  disk pressure.
+- Larger private-repository runners may reduce compile and test time, but their
+  availability and recurring cost need an explicit operational decision.
+- The bounded fuzz lane spends most of its roughly 13-minute runtime compiling;
+  dependency-policy spends roughly 8--9 minutes installing policy tools; and
+  real-Event delivery spends roughly 8 minutes building its isolated Docker
+  image. They are already parallel and are not the current required-check
+  critical path, so build reuse or prebuilt tools/images remain separate work.
+- Package-level Cargo sharding and alternate test runners are not adopted. They
+  would change scheduling, process-fixture interaction, or evidence shape and
+  need dedicated equivalence and resource profiling before use.
 
 ## Manual Linux build
 
@@ -149,9 +202,10 @@ invokes the payload writer and that a subsequent authorized exchange completes.
 The receiver checks bytes incrementally. An observation timeout is a failure,
 not evidence that no payload was sent.
 
-The Linux quality lane now uses default test parallelism. Narrow isolation in
-individual process fixtures remains. Investigate errors before weakening
-zero-error assertions or increasing carrier deadlines.
+The Linux `Rust quality` lane uses the CPU-aware test-thread cap from
+`tools/with-test-resources.sh`. Narrow isolation in individual process fixtures
+remains. Investigate errors before weakening zero-error assertions or
+increasing carrier deadlines.
 
 Historical local validation on 2026-09-08:
 

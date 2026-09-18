@@ -13,6 +13,11 @@ PREFLIGHT = Path(__file__).with_name("check-ci-python.py")
 RESOURCE_WRAPPER = PREFLIGHT.resolve().parents[2] / "tools/with-test-resources.sh"
 
 
+def named_steps(job):
+    """Return named workflow steps, including mappings declared with anchors."""
+    return re.split(r"(?m)^      - (?:&[A-Za-z0-9_-]+\n        )?name: ", job)[1:]
+
+
 class ResourceWrapperTests(unittest.TestCase):
     def test_default_test_threads_do_not_exceed_online_cpus(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -75,7 +80,7 @@ class WorkflowSelectionTests(unittest.TestCase):
         root = PREFLIGHT.resolve().parents[2]
         workflow = (root / ".github/workflows/ci.yml").read_text()
         quality = workflow.split("  quality:\n", 1)[1].split("\n  macos-tests:", 1)[0]
-        steps = quality.split("      - name: ")[1:]
+        steps = named_steps(quality)
         candidates = [i for i, step in enumerate(steps)
                       if step.startswith("Install CI Python build prerequisites\n")]
         self.assertEqual(len(candidates), 1, "explicit Python build prerequisites are missing")
@@ -139,7 +144,9 @@ class WorkflowSelectionTests(unittest.TestCase):
                 self.assertNotRegex(job_env, r"\$\{\{[^}]*\brunner\s*[.\[]")
 
         quality = workflow.split("  quality:\n", 1)[1].split("\n  macos-tests:", 1)[0]
-        steps = quality.split("      - name: ")[1:]
+        steps = named_steps(quality)
+        checkout = next(i for i, step in enumerate(steps)
+                        if step.startswith("Check out source\n"))
         initialize = next(i for i, step in enumerate(steps)
                           if step.startswith("Initialize CI Python selection\n"))
         build = next(i for i, step in enumerate(steps)
@@ -147,7 +154,7 @@ class WorkflowSelectionTests(unittest.TestCase):
         mise = next(i for i, step in enumerate(steps) if "uses: jdx/mise-action@" in step)
         preflight = next(i for i, step in enumerate(steps)
                          if "python3 .github/scripts/check-ci-python.py" in step)
-        self.assertLess(0, initialize)  # checkout precedes the repository shell wrapper
+        self.assertLess(checkout, initialize)
         self.assertLess(initialize, build)
         self.assertLess(build, mise)
         self.assertLess(mise, preflight)

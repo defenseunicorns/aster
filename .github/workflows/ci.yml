@@ -31,15 +31,16 @@ jobs:
   quality:
     name: quality
     runs-on: ubuntu-24.04
-    # Keep headroom for the complete quality gate and hosted-runner variance.
-    # Workspace tests use bounded build/test parallelism and a descriptor budget.
+    # Keep headroom for exact-Python setup, support checks, and runner variance.
+    # The complete Rust workspace gate runs concurrently in rust-quality.
     timeout-minutes: 45
-    env:
+    env: &rust-build-profiles
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
 
     steps:
-      - name: Check out source
+      - &checkout-source
+        name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
@@ -71,7 +72,8 @@ jobs:
         timeout-minutes: 15
         run: bash .github/scripts/build-ci-python.sh
 
-      - name: Install repository toolchain
+      - &setup-toolchain
+        name: Install repository toolchain
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
           version: 2026.4.28
@@ -84,8 +86,8 @@ jobs:
           python3 .github/scripts/check-ci-python.py
           mise exec -- mise run ci-python-preflight
 
-      - name: Install Rust quality components
-        run: rustup component add --toolchain 1.97.1 rustfmt clippy
+      - name: Install Rust formatting and conformance lint components
+        run: &install-rust-components rustup component add --toolchain 1.97.1 rustfmt clippy
 
       - name: Acquire Rust dependencies
         run: |
@@ -99,10 +101,15 @@ jobs:
         timeout-minutes: 5
         run: python3 tools/test-aster-agent-process.py
 
-      - name: Run formatting, lint, tests, bindings, and conformance
+      - name: Run formatting, policy, traceability, and receipt checks
         env:
           CARGO_NET_OFFLINE: "true"
-        run: mise run check
+        run: mise run check-foundation
+
+      - name: Run real-process, binding, and conformance checks
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: mise run check-integration
 
       - name: Run stock agent process smoke
         timeout-minutes: 10
@@ -226,6 +233,29 @@ jobs:
           CARGO_NET_OFFLINE: "true"
           RUSTUP_TOOLCHAIN: "1.97.1"
         run: sh tools/test-aster-mesh-playground-real.sh
+
+  rust-quality:
+    name: Rust quality
+    runs-on: ubuntu-24.04
+    # This is the former Clippy/workspace-test segment of mise run check.
+    # It runs concurrently with the unchanged support checks in quality.
+    timeout-minutes: 40
+    env: *rust-build-profiles
+    steps:
+      - *checkout-source
+
+      - *setup-toolchain
+
+      - name: Install Rust quality components
+        run: *install-rust-components
+
+      - name: Acquire Rust dependencies
+        run: cargo fetch --locked
+
+      - name: Run Clippy and complete workspace tests offline
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: mise run check-rust
 
   msrv:
     name: Rust 1.91 MSRV
@@ -378,6 +408,7 @@ jobs:
     if: ${{ always() }}
     needs:
       - quality
+      - rust-quality
       - path-lab-smoke
       - path-delivery-smoke
       - macos-tests
@@ -393,6 +424,7 @@ jobs:
         shell: bash
         env:
           QUALITY_RESULT: ${{ needs.quality.result }}
+          RUST_QUALITY_RESULT: ${{ needs.rust-quality.result }}
           PATH_LAB_RESULT: ${{ needs.path-lab-smoke.result }}
           PATH_DELIVERY_RESULT: ${{ needs.path-delivery-smoke.result }}
           MACOS_RESULT: ${{ needs.macos-tests.result }}
@@ -404,6 +436,7 @@ jobs:
           umask 077
           for result in \
             "$QUALITY_RESULT" \
+            "$RUST_QUALITY_RESULT" \
             "$PATH_LAB_RESULT" \
             "$PATH_DELIVERY_RESULT" \
             "$MACOS_RESULT" \

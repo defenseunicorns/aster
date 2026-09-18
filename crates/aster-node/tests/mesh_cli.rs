@@ -2727,6 +2727,12 @@ fn four_real_processes_default_to_ping_pong_and_restart_cleanly() {
     assert!(stdout.contains(
         "DEMO_RESULT status=pass scenario=ping-pong nodes=4 processes=18 contacts=real-iroh"
     ));
+    #[cfg(unix)]
+    assert_eq!(
+        stdout.matches("completion=condition-observed").count(),
+        9,
+        "every demo phase must complete from its receipts before its watchdog"
+    );
     assert!(stdout.contains(
         "reconciliation=negentropy producer_process_absent=true restarts=pass atomic_reaction=pass equal_inventory_noop=pass transfers_each=2 semantics=source-authenticated-event emitted_by=running-node-processes payload_blind_relays=pass ttl=durable-none"
     ));
@@ -2895,6 +2901,12 @@ fn two_real_processes_use_the_same_stopped_state_ping_pong_plan() {
     assert!(stdout.contains(
         "DEMO_RESULT status=pass scenario=ping-pong nodes=2 processes=8 contacts=real-iroh"
     ));
+    #[cfg(unix)]
+    assert_eq!(
+        stdout.matches("completion=condition-observed").count(),
+        5,
+        "every two-node phase must complete from its receipts before its watchdog"
+    );
     assert!(stdout.contains("payload_blind_relays=not-applicable ttl=durable-none"));
 
     let process_logs = std::fs::read_dir(root.join("logs"))
@@ -2997,6 +3009,12 @@ fn four_real_processes_propagate_controls_without_authority_and_exclude_captured
     assert!(stdout.contains(
         "DEMO_RESULT status=pass scenario=control nodes=4 processes=23 contacts=real-iroh mission_auth=hybrid-pq"
     ));
+    #[cfg(unix)]
+    assert_eq!(
+        stdout.matches("completion=condition-observed").count(),
+        11,
+        "every controlled phase must complete from its receipts before its watchdog"
+    );
     let revoke = std::fs::read_to_string(root.join("logs/authority-revoke.log"))
         .expect("authority revoke log");
     let rekey = std::fs::read_to_string(root.join("logs/authority-rekey.log"))
