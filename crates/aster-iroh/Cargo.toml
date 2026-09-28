@@ -16,7 +16,7 @@ test-utils = ["dep:iroh-relay"]
 futures.workspace = true
 iroh.workspace = true
 iroh-mdns-address-lookup = { workspace = true, optional = true }
-iroh-relay = { version = "=1.0.3", default-features = false, features = ["server", "test-utils", "tls-ring"], optional = true }
+iroh-relay = { version = "=1.2.0", default-features = false, features = ["server", "test-utils", "tls-ring"], optional = true }
 rustls.workspace = true
 swarm-discovery = { workspace = true, optional = true }
 tokio.workspace = true

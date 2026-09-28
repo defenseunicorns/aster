@@ -15,7 +15,7 @@ aster-node = { version = "=0.1.0-alpha.1", path = "../aster-node", optional = tr
 aster-libp2p-provider = { version = "=0.1.0-alpha.1", path = "../aster-libp2p-provider", optional = true }
 getrandom.workspace = true
 iroh = { workspace = true, optional = true }
-iroh-relay = { version = "=1.0.3", default-features = false, features = ["server", "tls-ring"], optional = true }
+iroh-relay = { version = "=1.2.0", default-features = false, features = ["server", "tls-ring"], optional = true }
 libc = { workspace = true, optional = true }
 rcgen = { version = "=0.14.9", default-features = false, features = ["crypto", "ring"], optional = true }
 rustls = { workspace = true, optional = true }
