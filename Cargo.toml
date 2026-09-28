@@ -45,7 +45,7 @@ iroh-mdns-address-lookup = { version = "=0.5.0", default-features = false }
 http = "=1.5.0"
 http-body-util = "=0.1.5"
 hyper = { version = "=1.11.0", features = ["http1", "http2", "server"] }
-hyper-util = { version = "=0.1.20", features = ["http1", "http2", "server-auto", "server-graceful", "service", "tokio"] }
+hyper-util = { version = "=0.1.21", features = ["http1", "http2", "server-auto", "server-graceful", "service", "tokio"] }
 libc = "=0.2.189"
 libp2p = { version = "=0.56.0", default-features = false, features = ["dcutr", "ed25519", "identify", "macros", "memory-connection-limits", "noise", "relay", "tcp", "tokio", "yamux"] }
 libp2p-autonat = { version = "=0.15.0", default-features = false, features = ["v1"] }
