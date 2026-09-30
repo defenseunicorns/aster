@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Reduced CI turnaround with Rust compiler caching and partitioned nextest runs.
+- Bounded custody maintenance scans and wake processing to keep background work predictable.
+- Reused custody authorization decisions within each send attempt.
 
 ### Security
 

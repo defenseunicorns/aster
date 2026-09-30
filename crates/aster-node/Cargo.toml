@@ -35,6 +35,7 @@ rustix = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 aster-iroh = { path = "../aster-iroh", features = ["test-utils"] }
+aster-redb-store = { path = "../aster-redb-store", features = ["test-utils"] }
 redb.workspace = true
 
 [lints]

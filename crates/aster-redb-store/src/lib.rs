@@ -6996,6 +6996,26 @@ impl Store {
         self.mission_authority.ok_or(StoreError::MissionNotBound)
     }
 
+    /// Holds an uncommitted write transaction while `operation` runs.
+    ///
+    /// This test-only seam lets dependent crates prove that read-only work does
+    /// not enter redb's serialized writer queue. The transaction is always
+    /// dropped without a commit.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_test_uncommitted_write_transaction<T>(
+        &self,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, StoreError> {
+        let authority = self.require_bound_mission()?;
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        custody::require_custody_mission_write(&write, authority)?;
+        let result = operation();
+        drop(write);
+        Ok(result)
+    }
+
     fn require_mission_authority(&self, received: NodeId) -> Result<(), StoreError> {
         let bound = self.require_bound_mission()?;
         if bound != received {
@@ -38101,6 +38121,361 @@ mod tests {
         assert_eq!(inspection.event_stats.retiring_events, 0);
         assert_eq!(inspection.custody_stats.retirements, 1);
         Store::open_for_mission(&file.0, services.authority).expect("reopen retired store");
+    }
+    #[test]
+    fn custody_garbage_collection_examines_only_due_rows() {
+        let file = TestFile::new("indexed custody garbage collection");
+        let mut services = event_services(0xe4);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let publisher = services.publisher.identity();
+        for sequence in 1_u64..=64 {
+            let logical_key = sequence.to_be_bytes();
+            accept_event(
+                &store,
+                &mut services,
+                event_header(
+                    publisher,
+                    sequence,
+                    sequence,
+                    VersionVector::default(),
+                    &logical_key,
+                    &logical_key,
+                    None,
+                ),
+                &logical_key,
+            );
+        }
+
+        let clock_id = [0x64; 16];
+        let initial_sample = aster_mesh::CustodySample {
+            clock_id,
+            tick_ms: 1_000,
+        };
+        let finite =
+            accept_local_finite_event(&store, &mut services, 0, b"finite", 100, initial_sample);
+
+        let before_due = store
+            .collect_custody_garbage(
+                Some(aster_mesh::CustodySample {
+                    clock_id,
+                    tick_ms: 1_099,
+                }),
+                store
+                    .custody_policy_revision()
+                    .expect("before-due GC revision"),
+                MAX_CUSTODY_PAGE,
+            )
+            .expect("before-due GC pass");
+        assert_eq!(before_due.examined_expirations, 0);
+        assert_eq!(before_due.examined_retirements, 0);
+        assert!(before_due.marked.is_empty());
+        assert!(before_due.retired.is_empty());
+        let persisted_tick = store
+            .database
+            .begin_read()
+            .expect("continuity read")
+            .open_table(custody::CUSTODY_CONTINUITY)
+            .expect("continuity table")
+            .get("clock")
+            .expect("continuity lookup")
+            .expect("continuity row")
+            .value()[25..33]
+            .try_into()
+            .map(u64::from_be_bytes)
+            .expect("continuity tick bytes");
+        assert_eq!(persisted_tick, initial_sample.tick_ms);
+
+        let at_due = store
+            .collect_custody_garbage(
+                Some(aster_mesh::CustodySample {
+                    clock_id,
+                    tick_ms: 1_100,
+                }),
+                store.custody_policy_revision().expect("due GC revision"),
+                MAX_CUSTODY_PAGE,
+            )
+            .expect("due GC pass");
+        assert_eq!(at_due.examined_expirations, 1);
+        assert_eq!(at_due.examined_retirements, 1);
+        assert_eq!(at_due.marked, vec![CustodyObjectKey::event(finite)]);
+        assert_eq!(at_due.retired, vec![CustodyObjectKey::event(finite)]);
+        assert_eq!(store.event_count().expect("durable Events remain"), 64);
+    }
+
+    #[test]
+    fn custody_pressure_noop_does_not_enter_the_write_queue() {
+        let file = TestFile::new("custody pressure read fast path");
+        let services = event_services(0xe6);
+        let store = std::sync::Arc::new(
+            Store::open_for_mission(&file.0, services.authority).expect("store"),
+        );
+        let policy_revision = store.custody_policy_revision().expect("policy revision");
+        let blocker = store.database.begin_write().expect("hold writer queue");
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker_ready = std::sync::Arc::clone(&ready);
+        let worker_store = std::sync::Arc::clone(&store);
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            worker_ready.wait();
+            let result = worker_store.collect_custody_pressure(
+                None,
+                CustodyPressureDemand {
+                    usage: CustodyUsage { items: 0, bytes: 0 },
+                    priority: Priority::Flash,
+                },
+                None,
+                policy_revision,
+                MAX_CUSTODY_PAGE,
+            );
+            send.send(result).expect("report pressure result");
+        });
+        ready.wait();
+        let before_release = receive.recv_timeout(std::time::Duration::from_millis(250));
+        drop(blocker);
+        let completed_without_writer = before_release.is_ok();
+        let report = match before_release {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => receive
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("pressure pass completes after writer releases"),
+            Err(error) => panic!("pressure worker disconnected: {error}"),
+        }
+        .expect("no-pressure pass");
+        worker.join().expect("pressure worker");
+        assert_eq!(report, CustodyGcReport::default());
+        assert!(
+            completed_without_writer,
+            "a no-pressure pass must not wait for redb's single-writer queue"
+        );
+    }
+
+    #[test]
+    fn custody_maintenance_index_corruption_fails_inspection_and_reopen() {
+        let file = TestFile::new("custody maintenance index corruption");
+        let mut services = event_services(0xe5);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        accept_local_finite_event(
+            &store,
+            &mut services,
+            0,
+            b"finite",
+            100,
+            aster_mesh::CustodySample {
+                clock_id: [0x65; 16],
+                tick_ms: 1_000,
+            },
+        );
+        drop(store);
+
+        let database = Database::open(&file.0).expect("raw database");
+        let write = database.begin_write().expect("raw write");
+        let expiration_key = write
+            .open_table(custody::CUSTODY_EXPIRATIONS)
+            .expect("expiration index")
+            .iter()
+            .expect("expiration rows")
+            .next()
+            .expect("finite expiration row")
+            .expect("read expiration row")
+            .0
+            .value()
+            .to_vec();
+        write
+            .open_table(custody::CUSTODY_EXPIRATIONS)
+            .expect("expiration index")
+            .remove(expiration_key.as_slice())
+            .expect("remove expiration row");
+        write.commit().expect("commit corruption");
+        drop(database);
+
+        for result in [
+            Store::inspect_existing(&file.0).map(|_| ()),
+            Store::open_for_mission(&file.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::Custody(CustodyStoreError::Invariant(
+                    "custody expiration index differs from live items"
+                )))
+            ));
+        }
+    }
+
+    #[test]
+    fn retiring_index_survives_reopen_and_stale_lease_cleanup() {
+        let file = TestFile::new("custody retiring index restart");
+        let mut services = event_services(0xe6);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let initial = aster_mesh::CustodySample {
+            clock_id: [0x66; 16],
+            tick_ms: 1_000,
+        };
+        let transfer = accept_local_finite_event(&store, &mut services, 0, b"finite", 100, initial);
+        let key = CustodyObjectKey::event(transfer);
+        let _lease = store
+            .begin_custody_send(
+                services.relay.identity(),
+                key,
+                CustodyPeerSelectorRevision::new(1),
+                Some(initial),
+                1,
+                store.custody_policy_revision().expect("lease revision"),
+            )
+            .expect("lease");
+        let expired = aster_mesh::CustodySample {
+            clock_id: initial.clock_id,
+            tick_ms: 1_100,
+        };
+        let marked = store
+            .collect_custody_garbage(
+                Some(expired),
+                store.custody_policy_revision().expect("mark revision"),
+                1,
+            )
+            .expect("mark expiration");
+        assert_eq!(marked.marked, vec![key]);
+        assert!(marked.retired.is_empty());
+        assert_eq!(marked.examined_retirements, 1);
+        assert_eq!(marked.blocked_by_leases, 1);
+        drop(store);
+
+        let reopened =
+            Store::open_for_mission(&file.0, services.authority).expect("reopen and clear lease");
+        let retired = reopened
+            .collect_custody_garbage(
+                Some(expired),
+                reopened.custody_policy_revision().expect("retire revision"),
+                1,
+            )
+            .expect("finish retirement");
+        assert_eq!(retired.examined_expirations, 0);
+        assert_eq!(retired.examined_retirements, 1);
+        assert!(retired.marked.is_empty());
+        assert_eq!(retired.retired, vec![key]);
+        drop(reopened);
+        Store::inspect_existing(&file.0).expect("inspect retired restart state");
+    }
+
+    #[test]
+    fn retiring_scan_skips_lease_blocked_rows_without_starving_ready_work() {
+        let file = TestFile::new("custody retiring lease skip");
+        let mut services = event_services(0xe8);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let initial = aster_mesh::CustodySample {
+            clock_id: [0x68; 16],
+            tick_ms: 1_000,
+        };
+        let first = CustodyObjectKey::event(accept_local_finite_event(
+            &store,
+            &mut services,
+            0,
+            b"first",
+            100,
+            initial,
+        ));
+        let second = CustodyObjectKey::event(accept_local_finite_event(
+            &store,
+            &mut services,
+            1,
+            b"second",
+            100,
+            initial,
+        ));
+        let first_lease = store
+            .begin_custody_send(
+                services.relay.identity(),
+                first,
+                CustodyPeerSelectorRevision::new(1),
+                Some(initial),
+                1,
+                store
+                    .custody_policy_revision()
+                    .expect("first lease revision"),
+            )
+            .expect("first lease");
+        let second_lease = store
+            .begin_custody_send(
+                services.relay.identity(),
+                second,
+                CustodyPeerSelectorRevision::new(1),
+                Some(initial),
+                1,
+                store
+                    .custody_policy_revision()
+                    .expect("second lease revision"),
+            )
+            .expect("second lease");
+        let expired = aster_mesh::CustodySample {
+            clock_id: initial.clock_id,
+            tick_ms: 1_100,
+        };
+        let marked = store
+            .collect_custody_garbage(
+                Some(expired),
+                store.custody_policy_revision().expect("mark revision"),
+                2,
+            )
+            .expect("mark both expirations");
+        assert_eq!(marked.marked.len(), 2);
+        assert!(marked.retired.is_empty());
+        assert_eq!(marked.blocked_by_leases, 2);
+
+        store
+            .release_transfer_lease(second_lease.id)
+            .expect("release later lease");
+        let progressed = store
+            .collect_custody_garbage(
+                Some(expired),
+                store.custody_policy_revision().expect("progress revision"),
+                1,
+            )
+            .expect("skip blocked retirement");
+        assert_eq!(progressed.examined_retirements, 2);
+        assert_eq!(progressed.blocked_by_leases, 1);
+        assert_eq!(progressed.retired, vec![second]);
+
+        store
+            .release_transfer_lease(first_lease.id)
+            .expect("release first lease");
+        let finished = store
+            .collect_custody_garbage(
+                Some(expired),
+                store.custody_policy_revision().expect("finish revision"),
+                1,
+            )
+            .expect("finish first retirement");
+        assert_eq!(finished.retired, vec![first]);
+    }
+
+    #[test]
+    fn custody_schema_v1_is_rejected_without_migration() {
+        let file = TestFile::new("custody schema v1 rejection");
+        let services = event_services(0xe7);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        drop(store);
+
+        let database = Database::open(&file.0).expect("raw database");
+        let write = database.begin_write().expect("raw write");
+        write
+            .delete_table(custody::CUSTODY_EXPIRATIONS)
+            .expect("delete v2 expiration index");
+        write
+            .delete_table(custody::CUSTODY_RETIRING)
+            .expect("delete v2 retiring index");
+        write.commit().expect("commit v1 image");
+        drop(database);
+
+        for result in [
+            Store::inspect_existing(&file.0).map(|_| ()),
+            Store::open_for_mission(&file.0, services.authority).map(|_| ()),
+        ] {
+            assert!(matches!(
+                result,
+                Err(StoreError::Custody(CustodyStoreError::Invariant(
+                    "custody schema group is incomplete"
+                )))
+            ));
+        }
     }
 
     #[test]

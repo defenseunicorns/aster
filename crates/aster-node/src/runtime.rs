@@ -404,6 +404,37 @@ fn custody_finalization_charge_ms(exact_len: u64) -> Result<u64, NodeError> {
     Ok(charge)
 }
 
+fn custody_age_at_sample(
+    checkpoint_age_ms: u64,
+    checkpoint: CustodySample,
+    sample: CustodySample,
+    finite_ttl_ms: Option<u64>,
+) -> Result<(u64, CustodySample), NodeError> {
+    if sample.clock_id != checkpoint.clock_id {
+        return Err(NodeError::Store(StoreError::Custody(
+            CustodyStoreError::ContinuityLost,
+        )));
+    }
+    let sample = CustodySample {
+        clock_id: checkpoint.clock_id,
+        tick_ms: sample.tick_ms.max(checkpoint.tick_ms),
+    };
+    let elapsed_ms = sample
+        .tick_ms
+        .checked_sub(checkpoint.tick_ms)
+        .ok_or_else(|| {
+            NodeError::Protocol("custody clock regressed while preparing a send".into())
+        })?;
+    let age_ms = if finite_ttl_ms.is_some() {
+        checkpoint_age_ms.checked_add(elapsed_ms).ok_or_else(|| {
+            NodeError::Protocol("custody age overflowed while preparing a send".into())
+        })?
+    } else {
+        checkpoint_age_ms
+    };
+    Ok((age_ms, sample))
+}
+
 fn charged_custody_finalization_age(
     observed_age_ms: u64,
     exact_len: u64,
@@ -1960,7 +1991,7 @@ tokio::task_local! {
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 enum TestCustodyPreopenRace {
     Expire {
         transfer_id: EventTransferId,
@@ -1972,6 +2003,120 @@ enum TestCustodyPreopenRace {
     RetryNotDue(EventTransferId),
     ForceRouteOnly(EventTransferId),
     FinalPolicyChange,
+    FinalCustodyPolicyChange,
+    HoldWriterAfterLease {
+        transfer_id: EventTransferId,
+        state: Arc<TestCustodyWriterHold>,
+    },
+    CountAuthorizations {
+        transfer_id: EventTransferId,
+        count: Arc<AtomicU64>,
+    },
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TestCustodyWriterHold {
+    writer_held: AtomicBool,
+    offer_built_while_held: AtomicBool,
+    acquired: (StdMutex<bool>, std::sync::Condvar),
+    release: (StdMutex<bool>, std::sync::Condvar),
+    completed: (StdMutex<bool>, std::sync::Condvar),
+    error: StdMutex<Option<String>>,
+}
+
+#[cfg(test)]
+impl TestCustodyWriterHold {
+    fn new() -> Self {
+        Self {
+            writer_held: AtomicBool::new(false),
+            offer_built_while_held: AtomicBool::new(false),
+            acquired: (StdMutex::new(false), std::sync::Condvar::new()),
+            release: (StdMutex::new(false), std::sync::Condvar::new()),
+            completed: (StdMutex::new(false), std::sync::Condvar::new()),
+            error: StdMutex::new(None),
+        }
+    }
+
+    fn set_error(&self, message: String) {
+        *self.error.lock().expect("writer-hold error mutex") = Some(message);
+    }
+
+    fn signal(pair: &(StdMutex<bool>, std::sync::Condvar)) {
+        *pair.0.lock().expect("writer-hold signal mutex") = true;
+        pair.1.notify_all();
+    }
+
+    fn wait(
+        pair: &(StdMutex<bool>, std::sync::Condvar),
+        phase: &'static str,
+    ) -> Result<(), NodeError> {
+        let ready = pair.0.lock().map_err(|_| {
+            NodeError::Protocol(format!("custody writer-hold {phase} mutex is poisoned"))
+        })?;
+        let (ready, _) = pair
+            .1
+            .wait_timeout_while(ready, Duration::from_secs(5), |ready| !*ready)
+            .map_err(|_| {
+                NodeError::Protocol(format!("custody writer-hold {phase} mutex is poisoned"))
+            })?;
+        if !*ready {
+            return Err(NodeError::Protocol(format!(
+                "custody writer-hold timed out during {phase}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn start(self: &Arc<Self>, store: Arc<Store>) -> Result<(), NodeError> {
+        let state = self.clone();
+        thread::spawn(move || {
+            let held = store.with_test_uncommitted_write_transaction(|| {
+                state.writer_held.store(true, Ordering::SeqCst);
+                Self::signal(&state.acquired);
+                let released = Self::wait(&state.release, "release");
+                state.writer_held.store(false, Ordering::SeqCst);
+                released
+            });
+            match held {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => state.set_error(error.to_string()),
+                Err(error) => {
+                    state.set_error(error.to_string());
+                    Self::signal(&state.acquired);
+                }
+            }
+            Self::signal(&state.completed);
+        });
+        Self::wait(&self.acquired, "acquisition")?;
+        self.require_success()
+    }
+
+    fn finish_offer(&self) -> Result<(), NodeError> {
+        if !self.writer_held.load(Ordering::SeqCst) {
+            return Err(NodeError::Protocol(
+                "custody offer build did not overlap the held writer".into(),
+            ));
+        }
+        self.offer_built_while_held.store(true, Ordering::SeqCst);
+        Self::signal(&self.release);
+        Self::wait(&self.completed, "completion")?;
+        self.require_success()
+    }
+
+    fn require_success(&self) -> Result<(), NodeError> {
+        if let Some(error) = self
+            .error
+            .lock()
+            .map_err(|_| NodeError::Protocol("custody writer-hold error mutex is poisoned".into()))?
+            .as_ref()
+        {
+            return Err(NodeError::Protocol(format!(
+                "custody writer-hold failed: {error}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn require_contact_policy_current() -> Result<Option<EmissionPolicySnapshot>, NodeError> {
@@ -7097,6 +7242,8 @@ impl CustodyLeaseGuard {
         sample: CustodySample,
         policy_revision: CustodyPolicyRevision,
     ) -> Result<CustodySendAuthorization, NodeError> {
+        #[cfg(test)]
+        record_test_custody_send_authorization(self.lease()?);
         Ok(self
             .store
             .require_custody_send(self.lease()?, Some(sample), policy_revision)?)
@@ -7189,20 +7336,15 @@ impl PreparedOutboundCustody {
         let sample = contact_custody_sample()?.ok_or_else(|| {
             NodeError::Protocol("authenticated custody send lacks a local clock sample".into())
         })?;
-        let authorization = self
-            .lease
-            .require_send(sample, self.policy_revision)
-            .map_err(map_preopen_custody_expiry)?;
-        let observed_age_ms = authorization.age_ms;
-        let sample = authorization.sample.ok_or_else(|| {
-            NodeError::Protocol("custody store omitted the normalized send checkpoint".into())
-        })?;
+        let lease = self.lease.lease()?;
+        let (observed_age_ms, sample) =
+            custody_age_at_sample(lease.age_ms, lease.sample, sample, self.finite_ttl_ms)?;
         let authenticated_age_ms = charged_custody_finalization_age(
             observed_age_ms,
             self.transfer.exact_len(),
             self.finite_ttl_ms,
         )?;
-        let prior_age_ms = self.lease.lease()?.age_ms;
+        let prior_age_ms = lease.age_ms;
         let hop_delta_ms = authenticated_age_ms
             .checked_sub(prior_age_ms)
             .ok_or_else(|| {
@@ -7214,16 +7356,16 @@ impl PreparedOutboundCustody {
             CustodyClaims::new(self.transfer, self.exchange_id, self.emission_revision, hop)
                 .map_err(custody_claim_error)?;
         let wrapper = mission.seal_custody_wrapper(&claims)?;
-        Ok((
-            Frame::OfferV3 {
-                direction,
-                id: transfer_id,
-                exchange_id: self.exchange_id,
-                custody: wrapper,
-                bytes,
-            },
-            (authenticated_age_ms, sample),
-        ))
+        let offer = Frame::OfferV3 {
+            direction,
+            id: transfer_id,
+            exchange_id: self.exchange_id,
+            custody: wrapper,
+            bytes,
+        };
+        #[cfg(test)]
+        finish_test_custody_writer_hold(transfer_id)?;
+        Ok((offer, (authenticated_age_ms, sample)))
     }
 
     fn require_final_send(
@@ -7234,6 +7376,8 @@ impl PreparedOutboundCustody {
         let sample = contact_custody_sample()?.ok_or_else(|| {
             NodeError::Protocol("final custody send lacks a local clock sample".into())
         })?;
+        #[cfg(test)]
+        apply_test_custody_policy_change_during_final_send(&self.lease.store)?;
         let authorization = self.lease.require_send(sample, self.policy_revision)?;
         let authorization_sample = authorization.sample.ok_or_else(|| {
             NodeError::Protocol("custody store omitted the normalized final-send checkpoint".into())
@@ -7342,7 +7486,7 @@ fn prepare_outbound_custody(
         NodeError::Protocol("authenticated custody send lacks a local clock sample".into())
     })?;
     let lease = CustodyLeaseGuard::begin(
-        store,
+        store.clone(),
         peer,
         object,
         peer_selector_revision,
@@ -7350,6 +7494,8 @@ fn prepare_outbound_custody(
         policy_revision,
     )
     .map_err(map_preopen_custody_expiry)?;
+    #[cfg(test)]
+    start_test_custody_writer_hold(store, transfer_id)?;
     let exact_len = u64::try_from(exact_len)
         .map_err(|_| NodeError::Protocol("Event transfer length exceeds u64".into()))?;
     let transfer = CustodyTransferClaims::new(
@@ -10935,7 +11081,8 @@ fn execute_selected_event_command(
     status: &mut SelectedEventStatusTracker,
     receipt: &NodeReceipt,
     command: SelectedEventCommand,
-) {
+) -> bool {
+    let mut new_event_inserted = false;
     match command {
         SelectedEventCommand::Publish {
             request,
@@ -10949,6 +11096,7 @@ fn execute_selected_event_command(
                     application.publish_with_options(request, options)
                 })
             };
+            new_event_inserted = result.as_ref().is_ok_and(|result| result.inserted);
             let _ = response.send(result);
         }
         SelectedEventCommand::BeginPublicationSession {
@@ -10979,6 +11127,7 @@ fn execute_selected_event_command(
         } => {
             let result = status
                 .observe_operation_commit(store, || application.publish_numbered(request, options));
+            new_event_inserted = result.as_ref().is_ok_and(|result| result.inserted);
             let _ = response.send(result);
         }
         SelectedEventCommand::AbandonPublication {
@@ -11042,6 +11191,7 @@ fn execute_selected_event_command(
             let _ = response.send(result);
         }
     }
+    new_event_inserted
 }
 
 fn execute_selected_state_command(
@@ -11208,26 +11358,22 @@ fn execute_selected_application_command(
     status: &mut SelectedEventStatusTracker,
     receipt: &NodeReceipt,
     command: SelectedApplicationCommand,
-) {
+) -> bool {
     match command {
         SelectedApplicationCommand::Event(command) => {
-            execute_selected_event_command(
-                events,
-                store,
-                emission_policy,
-                status,
-                receipt,
-                command,
-            );
+            execute_selected_event_command(events, store, emission_policy, status, receipt, command)
         }
         SelectedApplicationCommand::State(command) => {
             execute_selected_state_command(state, command);
+            false
         }
         SelectedApplicationCommand::Record(command) => {
             execute_selected_record_command(records, command);
+            false
         }
         SelectedApplicationCommand::Blob(command) => {
             dispatch_selected_blob_command(blobs, command);
+            false
         }
     }
 }
@@ -12765,7 +12911,7 @@ async fn run_node_actor_inner(
                 let command = pending_application_command
                     .take()
                     .expect("application policy lease requires a pending command");
-                execute_selected_application_command(
+                let new_event_inserted = execute_selected_application_command(
                     &mut application,
                     &mut state_application,
                     &mut record_application,
@@ -12777,6 +12923,9 @@ async fn run_node_actor_inner(
                     command,
                 );
                 application_tick_yield_required = false;
+                if new_event_inserted {
+                    application_tick_pending = true;
+                }
                 network_events_since_application = 0;
                 application_commands_since_yield += 1;
                 if application_commands_since_yield >= APPLICATION_COMMAND_BUDGET {
@@ -13122,7 +13271,7 @@ async fn run_node_actor_inner(
                 let command = pending_application_command
                     .take()
                     .expect("application policy lease requires a pending command");
-                execute_selected_application_command(
+                let new_event_inserted = execute_selected_application_command(
                     &mut application,
                     &mut state_application,
                     &mut record_application,
@@ -13134,6 +13283,9 @@ async fn run_node_actor_inner(
                     command,
                 );
                 application_tick_yield_required = false;
+                if new_event_inserted {
+                    application_tick_pending = true;
+                }
                 network_events_since_application = 0;
                 application_commands_since_yield += 1;
                 if application_commands_since_yield >= APPLICATION_COMMAND_BUDGET {
@@ -14357,6 +14509,54 @@ enum V3OfferOutcome {
 }
 
 #[cfg(test)]
+fn record_test_custody_send_authorization(lease: &TransferLease) {
+    let _ = TEST_CUSTODY_PREOPEN_RACES.try_with(|races| {
+        for race in races.borrow().iter() {
+            if let TestCustodyPreopenRace::CountAuthorizations { transfer_id, count } = race
+                && transfer_id.as_bytes() == &lease.object.transfer_id()
+            {
+                count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+fn test_custody_writer_hold(transfer_id: EventTransferId) -> Option<Arc<TestCustodyWriterHold>> {
+    TEST_CUSTODY_PREOPEN_RACES
+        .try_with(|races| {
+            races.borrow().iter().find_map(|race| match race {
+                TestCustodyPreopenRace::HoldWriterAfterLease {
+                    transfer_id: target,
+                    state,
+                } if *target == transfer_id => Some(state.clone()),
+                _ => None,
+            })
+        })
+        .ok()
+        .flatten()
+}
+
+#[cfg(test)]
+fn start_test_custody_writer_hold(
+    store: Arc<Store>,
+    transfer_id: EventTransferId,
+) -> Result<(), NodeError> {
+    if let Some(state) = test_custody_writer_hold(transfer_id) {
+        state.start(store)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn finish_test_custody_writer_hold(transfer_id: EventTransferId) -> Result<(), NodeError> {
+    if let Some(state) = test_custody_writer_hold(transfer_id) {
+        state.finish_offer()?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn take_test_custody_preopen_race(transfer_id: EventTransferId) -> Option<TestCustodyPreopenRace> {
     TEST_CUSTODY_PREOPEN_RACES
         .try_with(|races| {
@@ -14369,6 +14569,9 @@ fn take_test_custody_preopen_race(transfer_id: EventTransferId) -> Option<TestCu
                 | TestCustodyPreopenRace::RetryNotDue(target) => *target == transfer_id,
                 TestCustodyPreopenRace::ForceRouteOnly(_) => false,
                 TestCustodyPreopenRace::FinalPolicyChange => false,
+                TestCustodyPreopenRace::FinalCustodyPolicyChange => false,
+                TestCustodyPreopenRace::CountAuthorizations { .. } => false,
+                TestCustodyPreopenRace::HoldWriterAfterLease { .. } => false,
             })?;
             Some(races.remove(index))
         })
@@ -14397,7 +14600,10 @@ fn apply_test_expiry_before_scheduled_load(transfer_id: EventTransferId) -> Resu
                 | TestCustodyPreopenRace::RetryLimitExceeded(_)
                 | TestCustodyPreopenRace::RetryNotDue(_)
                 | TestCustodyPreopenRace::ForceRouteOnly(_) => None,
-                TestCustodyPreopenRace::FinalPolicyChange => None,
+                TestCustodyPreopenRace::FinalPolicyChange
+                | TestCustodyPreopenRace::FinalCustodyPolicyChange
+                | TestCustodyPreopenRace::HoldWriterAfterLease { .. }
+                | TestCustodyPreopenRace::CountAuthorizations { .. } => None,
             }
         })
         .ok()
@@ -14430,6 +14636,32 @@ fn apply_test_policy_change_during_final_send() -> Result<(), NodeError> {
             .map_err(|_| {
                 NodeError::Protocol("custody test hook lacks a contact emission guard".into())
             })??;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn apply_test_custody_policy_change_during_final_send(store: &Store) -> Result<(), NodeError> {
+    let change = TEST_CUSTODY_PREOPEN_RACES
+        .try_with(|races| {
+            let mut races = races.borrow_mut();
+            let index = races.iter().position(|race| {
+                matches!(race, TestCustodyPreopenRace::FinalCustodyPolicyChange)
+            })?;
+            races.remove(index);
+            Some(())
+        })
+        .ok()
+        .flatten()
+        .is_some();
+    if change {
+        let quota = CustodyQuota::for_scope(
+            Scope::new("test/final-send-custody-policy").expect("fixed test scope"),
+            1,
+            1,
+        )
+        .map_err(StoreError::from)?;
+        store.set_custody_quota(quota)?;
     }
     Ok(())
 }
@@ -14562,8 +14794,17 @@ async fn send_v3_offer(
         Some(TestCustodyPreopenRace::FinalPolicyChange) => {
             unreachable!("final policy change is applied at the carrier-adjacent check")
         }
+        Some(TestCustodyPreopenRace::FinalCustodyPolicyChange) => {
+            unreachable!("final custody policy change is applied at the carrier-adjacent check")
+        }
+        Some(TestCustodyPreopenRace::HoldWriterAfterLease { .. }) => {
+            unreachable!("writer holds are applied after lease acquisition")
+        }
         Some(TestCustodyPreopenRace::ForceRouteOnly(_)) => {
             unreachable!("route-only receive hook is not a sender pre-open race")
+        }
+        Some(TestCustodyPreopenRace::CountAuthorizations { .. }) => {
+            unreachable!("authorization counters are not pre-open races")
         }
         None => None,
     };
@@ -23892,6 +24133,76 @@ mod tests {
     }
 
     #[test]
+    fn custody_offer_age_uses_fresh_sample_from_the_lease_checkpoint() {
+        let clock_id = [0x55; 16];
+        let checkpoint = CustodySample {
+            clock_id,
+            tick_ms: 1_000,
+        };
+        let fresh = CustodySample {
+            clock_id,
+            tick_ms: 1_017,
+        };
+        assert_eq!(
+            custody_age_at_sample(100, checkpoint, fresh, Some(151))
+                .expect("fresh same-clock sample"),
+            (117, fresh)
+        );
+        assert_eq!(
+            custody_age_at_sample(100, checkpoint, fresh, None).expect("durable same-clock sample"),
+            (100, fresh),
+            "durable custody must preserve cumulative age while retaining a fresh sample"
+        );
+
+        assert_eq!(
+            custody_age_at_sample(
+                100,
+                checkpoint,
+                CustodySample {
+                    clock_id,
+                    tick_ms: 999,
+                },
+                Some(151),
+            )
+            .expect("delayed same-clock sample"),
+            (100, checkpoint),
+            "the lease's durable high-water must normalize a delayed local sample"
+        );
+
+        assert!(matches!(
+            custody_age_at_sample(
+                100,
+                checkpoint,
+                CustodySample {
+                    clock_id: [0x56; 16],
+                    tick_ms: 1_017,
+                },
+                Some(151),
+            ),
+            Err(NodeError::Store(StoreError::Custody(
+                CustodyStoreError::ContinuityLost
+            )))
+        ));
+        assert!(
+            custody_age_at_sample(
+                u64::MAX,
+                checkpoint,
+                CustodySample {
+                    clock_id,
+                    tick_ms: 1_001,
+                },
+                Some(151),
+            )
+            .is_err()
+        );
+
+        let charged = charged_custody_finalization_age(117, 256, Some(151))
+            .expect("freshly observed age remains strictly before TTL after charge");
+        assert_eq!(charged, 150);
+        assert!(charged_custody_finalization_age(117, 256, Some(150)).is_err());
+    }
+
+    #[test]
     fn v3_custody_schedule_uses_exact_codec_overheads_and_reserves_finish() {
         let id = EventTransferId::new([0x5a; 32]);
         assert_eq!(
@@ -30436,6 +30747,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn newly_published_event_wakes_idle_peer_sync() {
+        use crate::application::{EventPollRequest, EventPublishRequest, EventSubscriptionRequest};
+
+        let test_root = root("new-event-wakes-idle-peer-sync");
+        let first_state = test_root.join("first");
+        let second_state = test_root.join("second");
+        fs::create_dir_all(&test_root).expect("event wake test root");
+        let first_carrier = {
+            let identity = NodeIdentity::load_or_create(&first_state)
+                .expect("first event wake carrier identity");
+            let id = identity.id();
+            drop(identity);
+            id
+        };
+        let second_carrier = {
+            let identity = NodeIdentity::load_or_create(&second_state)
+                .expect("second event wake carrier identity");
+            let id = identity.id();
+            drop(identity);
+            id
+        };
+        #[cfg(unix)]
+        for state in [&first_state, &second_state] {
+            fs::set_permissions(state, fs::Permissions::from_mode(0o700))
+                .expect("owner-only event wake state");
+        }
+        let mut missions = issue_missions(2);
+        let first_mission = missions.remove(0);
+        let second_mission = missions.remove(0);
+        let (
+            source_state,
+            source_carrier,
+            source_mission,
+            receiver_state,
+            receiver_carrier,
+            receiver_mission,
+        ) = if first_carrier < second_carrier {
+            (
+                first_state,
+                first_carrier,
+                first_mission,
+                second_state,
+                second_carrier,
+                second_mission,
+            )
+        } else {
+            (
+                second_state,
+                second_carrier,
+                second_mission,
+                first_state,
+                first_carrier,
+                first_mission,
+            )
+        };
+        let topic = Topic::new("opaque").expect("event wake topic");
+        let scope = Scope::new("test/runtime-contact").expect("event wake scope");
+
+        let receiver_offline = start_node(NodeConfig {
+            state: receiver_state.clone(),
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: receiver_mission.credentials.clone(),
+            peers: Vec::new(),
+            mutable_interests: Default::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start offline event wake receiver");
+        let subscription = receiver_offline
+            .selected_events()
+            .subscribe(EventSubscriptionRequest {
+                operation_key: b"event-wake-subscription".to_vec(),
+                topic: topic.clone(),
+                scope: scope.clone(),
+                include_descendant_scopes: false,
+            })
+            .await
+            .expect("create event wake subscription");
+        receiver_offline
+            .shutdown()
+            .await
+            .expect("stop offline event wake receiver");
+
+        let placeholder = SocketAddr::from(([127, 0, 0, 1], 0));
+        let source_config = NodeConfig {
+            state: source_state,
+            bind: placeholder,
+            mission: source_mission.credentials,
+            peers: vec![MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: receiver_carrier,
+                    address: placeholder,
+                },
+                mission: receiver_mission.identity,
+            }],
+            mutable_interests: Default::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        };
+        let receiver_config = NodeConfig {
+            state: receiver_state,
+            bind: placeholder,
+            mission: receiver_mission.credentials,
+            peers: vec![MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: source_carrier,
+                    address: placeholder,
+                },
+                mission: source_mission.identity,
+            }],
+            mutable_interests: Default::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        };
+        let (source, receiver) = start_test_pair(
+            source_config,
+            receiver_config,
+            source_carrier,
+            receiver_carrier,
+        )
+        .await;
+        let source_events = source.selected_events();
+        let receiver_events = receiver.selected_events();
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let source_status = source_events.status().await.expect("source status");
+                let receiver_status = receiver_events.status().await.expect("receiver status");
+                if source_status.authenticated_contacts > 0
+                    && receiver_status.authenticated_contacts > 0
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("initial empty event contact");
+
+        let published = source_events
+            .publish(EventPublishRequest {
+                operation_key: b"event-wake-publication".to_vec(),
+                predecessor: None,
+                topic,
+                scope,
+                priority: Priority::Priority,
+                logical_key: b"event-wake-key".to_vec(),
+                payload: b"wake idle peer synchronization".to_vec(),
+                tombstone: false,
+            })
+            .await
+            .expect("publish event after empty contact");
+        assert!(published.inserted);
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let page = receiver_events
+                    .poll(EventPollRequest {
+                        subscription: subscription.id,
+                        delivery_limit: 8,
+                        scan_limit: 8,
+                    })
+                    .await
+                    .expect("poll event wake receiver");
+                if page
+                    .deliveries
+                    .iter()
+                    .any(|delivery| delivery.event.id == published.id)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("new Event must sync before the next periodic tick");
+
+        let (source_receipt, receiver_receipt) =
+            tokio::join!(source.shutdown(), receiver.shutdown());
+        assert!(source_receipt.expect("source shutdown").contacts > 0);
+        assert_eq!(receiver_receipt.expect("receiver shutdown").events, 1);
+        fs::remove_dir_all(test_root).expect("event wake test cleanup");
+    }
+
+    #[tokio::test]
     async fn live_selected_blob_converges_over_direct_iroh_and_restarts_peerless() {
         use crate::application::{ApplicationErrorKind, BlobReadPageRequest, BlobReadRequest};
 
@@ -33174,6 +33674,28 @@ mod tests {
         );
         assert_eq!(authorization.age_ms, 101);
         drop(delayed);
+
+        let normalized = CustodyLeaseGuard::begin(
+            store.clone(),
+            [0x64; 32],
+            key,
+            CustodyPeerSelectorRevision::new(0),
+            CustodySample {
+                clock_id,
+                tick_ms: 100,
+            },
+            revision,
+        )
+        .expect("begin send from a delayed same-clock sample");
+        assert_eq!(
+            normalized.lease().expect("normalized lease").sample,
+            CustodySample {
+                clock_id,
+                tick_ms: 101,
+            }
+        );
+        assert_eq!(normalized.lease().expect("normalized lease").age_ms, 101);
+        drop(normalized);
         drop(store);
         fs::remove_dir_all(state).expect("cleanup");
     }
@@ -36227,6 +36749,7 @@ mod tests {
                 tombstone: false,
             },
         );
+        let authorization_count = Arc::new(AtomicU64::new(0));
         let (client, server) = contact_test_pair_with_forwarding_results(
             TestForwardingNode {
                 store: server_store.clone(),
@@ -36246,7 +36769,10 @@ mod tests {
                     MAX_CUSTODY_FINALIZATION_CHARGE_MS + 1,
                 ),
                 reconciliation_exchanges_before_defer: None,
-                preopen_custody_races: Vec::new(),
+                preopen_custody_races: vec![TestCustodyPreopenRace::CountAuthorizations {
+                    transfer_id: source.transfer_id,
+                    count: authorization_count.clone(),
+                }],
             },
         )
         .await;
@@ -36255,6 +36781,11 @@ mod tests {
             matches!(client_error, NodeError::Protocol(message) if message.contains(
                 "finalization exceeded its authenticated age charge"
             ))
+        );
+        assert_eq!(
+            authorization_count.load(Ordering::Relaxed),
+            1,
+            "one carrier-adjacent durable authorization must guard each offer"
         );
         if let Ok(completed) = server {
             assert_eq!(completed.receipt.inserted, 0);
@@ -36266,6 +36797,216 @@ mod tests {
                 .expect("peer Event lookup")
                 .is_none(),
             "carrier callback rejection must occur before any OfferV3 byte reaches the peer"
+        );
+        drop(server_store);
+        drop(client_store);
+        fs::remove_dir_all(server_state).expect("server cleanup");
+        fs::remove_dir_all(client_state).expect("client cleanup");
+    }
+
+    #[tokio::test]
+    async fn v3_final_send_rejects_committed_custody_policy_change_and_releases_lease() {
+        let services = control_test_services([0x7c; 32]);
+        let server_state = root("v3-final-custody-policy-server");
+        let client_state = root("v3-final-custody-policy-client");
+        fs::create_dir_all(&server_state).expect("server state");
+        fs::create_dir_all(&client_state).expect("client state");
+        let client_path = client_state.join(STORE_FILE);
+        let server_store = Arc::new(
+            Store::open_for_mission(
+                server_state.join(STORE_FILE),
+                services.member.mission_authority_id(),
+            )
+            .expect("server store"),
+        );
+        let client_store = Arc::new(
+            Store::open_for_mission(&client_path, services.other.mission_authority_id())
+                .expect("client store"),
+        );
+        seed_test_event_subscription(
+            &server_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"final-custody-policy-consume",
+        );
+        let clock_id = [0x7d; 16];
+        let mut client_sealer = open_test_sealer(&services.other);
+        let source = publish_test_custody_event(
+            &client_store,
+            &mut client_sealer,
+            TestCustodyPublication {
+                operation: b"final-custody-policy/source",
+                topic: &services.topic,
+                scope: &services.scope,
+                priority: Priority::Immediate,
+                ttl_ms: Some(10_000_000),
+                sample: CustodySample {
+                    clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"custody-policy-change-must-not-reach-peer",
+                tombstone: false,
+            },
+        );
+        let policy_before = client_store
+            .custody_policy_revision()
+            .expect("custody policy before contact");
+        let authorization_count = Arc::new(AtomicU64::new(0));
+        let (client, server) = contact_test_pair_with_forwarding_results(
+            TestForwardingNode {
+                store: server_store.clone(),
+                mission: services.member.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
+                clock: NodeCustodyClock::injected([0x7e; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: client_store.clone(),
+                mission: services.other.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(clock_id, 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: vec![
+                    TestCustodyPreopenRace::FinalCustodyPolicyChange,
+                    TestCustodyPreopenRace::CountAuthorizations {
+                        transfer_id: source.transfer_id,
+                        count: authorization_count.clone(),
+                    },
+                ],
+            },
+        )
+        .await;
+        assert!(matches!(
+            client.expect_err("final durable policy change must reject the send"),
+            NodeError::Store(StoreError::Custody(CustodyStoreError::PolicyChanged))
+        ));
+        assert_eq!(authorization_count.load(Ordering::Relaxed), 1);
+        assert!(
+            client_store
+                .custody_policy_revision()
+                .expect("custody policy after contact")
+                > policy_before,
+            "the final-send hook must commit its policy change before authorization"
+        );
+        if let Ok(completed) = server {
+            assert_eq!(completed.receipt.inserted, 0);
+            assert_eq!(completed.receipt.fetched, 0);
+        }
+        assert!(
+            server_store
+                .get_event(source.transfer_id)
+                .expect("peer Event lookup")
+                .is_none(),
+            "the committed policy race must reject before any OfferV3 byte reaches the peer"
+        );
+        drop(server_store);
+        drop(client_store);
+        assert_eq!(
+            Store::inspect_existing(&client_path)
+                .expect("inspect source after rejected final send")
+                .custody_stats
+                .transfer_leases,
+            0,
+            "the rejected final send must release its durable transfer lease"
+        );
+        fs::remove_dir_all(server_state).expect("server cleanup");
+        fs::remove_dir_all(client_state).expect("client cleanup");
+    }
+
+    #[tokio::test]
+    async fn v3_offer_build_completes_while_unrelated_writer_is_held() {
+        let services = control_test_services([0x6a; 32]);
+        let server_state = root("v3-offer-build-writer-hold-server");
+        let client_state = root("v3-offer-build-writer-hold-client");
+        fs::create_dir_all(&server_state).expect("server state");
+        fs::create_dir_all(&client_state).expect("client state");
+        let server_store = Arc::new(
+            Store::open_for_mission(
+                server_state.join(STORE_FILE),
+                services.member.mission_authority_id(),
+            )
+            .expect("server store"),
+        );
+        let client_store = Arc::new(
+            Store::open_for_mission(
+                client_state.join(STORE_FILE),
+                services.other.mission_authority_id(),
+            )
+            .expect("client store"),
+        );
+        seed_test_event_subscription(
+            &server_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"writer-hold-consume",
+        );
+        let clock_id = [0x6b; 16];
+        let mut client_sealer = open_test_sealer(&services.other);
+        let source = publish_test_custody_event(
+            &client_store,
+            &mut client_sealer,
+            TestCustodyPublication {
+                operation: b"writer-hold/source",
+                topic: &services.topic,
+                scope: &services.scope,
+                priority: Priority::Immediate,
+                ttl_ms: Some(10_000_000),
+                sample: CustodySample {
+                    clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"offer-build-does-not-need-a-store-writer",
+                tombstone: false,
+            },
+        );
+        let writer_hold = Arc::new(TestCustodyWriterHold::new());
+        let authorization_count = Arc::new(AtomicU64::new(0));
+        let (client, server) = contact_test_pair_with_forwarding_results(
+            TestForwardingNode {
+                store: server_store.clone(),
+                mission: services.member.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
+                clock: NodeCustodyClock::injected([0x6c; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: client_store.clone(),
+                mission: services.other.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(clock_id, 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: vec![
+                    TestCustodyPreopenRace::HoldWriterAfterLease {
+                        transfer_id: source.transfer_id,
+                        state: writer_hold.clone(),
+                    },
+                    TestCustodyPreopenRace::CountAuthorizations {
+                        transfer_id: source.transfer_id,
+                        count: authorization_count.clone(),
+                    },
+                ],
+            },
+        )
+        .await;
+        let client = client.expect("client contact completes after releasing the writer");
+        let server = server.expect("server contact receives the offer");
+        assert_eq!(client.receipt.offered, 1);
+        assert_eq!(server.receipt.fetched, 1);
+        assert!(
+            writer_hold.offer_built_while_held.load(Ordering::SeqCst),
+            "the authenticated offer must be fully built without acquiring a second writer"
+        );
+        assert!(!writer_hold.writer_held.load(Ordering::SeqCst));
+        assert_eq!(authorization_count.load(Ordering::Relaxed), 1);
+        assert!(
+            server_store
+                .get_event(source.transfer_id)
+                .expect("peer Event lookup")
+                .is_some()
         );
         drop(server_store);
         drop(client_store);
