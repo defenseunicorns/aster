@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Reduced CI turnaround with Rust compiler caching and partitioned nextest runs.
+- Prefiltered Event query candidates before authentication to avoid unnecessary verification work.
 
 ### Security
 

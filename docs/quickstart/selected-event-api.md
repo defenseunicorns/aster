@@ -317,6 +317,12 @@ returned. A selective page can therefore contain no items while `has_more` is
 true. Continue with its `scanned_through` acceptance marker. Returned items are
 active, policy-authorized, and freshly source/content verified; transfer IDs,
 sealed bytes, keys, route caches, and reconciliation state are not exposed.
+Publisher, topic, scope (including optional descendants), and logical-key
+filters first narrow candidates using retained storage metadata. This does not
+make that metadata trusted: each candidate is freshly authenticated, checked
+against its stored metadata and the query, and subject to current authorization
+and TTL checks before return. With no filters, all candidates still undergo
+these checks.
 
 A subscription operation key identifies one durable Consume selector. Reusing
 the key with the same topic/scope contract returns the same subscription;

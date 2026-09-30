@@ -1812,11 +1812,20 @@ impl SelectedEventNode {
         self.maintain_custody_for("query")?;
         query.validate()?;
         let policy = self.current_policy("query")?;
+        // Retained metadata only narrows the candidate set. Each candidate is
+        // still freshly authenticated and checked against these filters below.
+        let filter = EventQueryFilter {
+            publisher: query.publisher,
+            topic: query.topic.clone(),
+            scope: query.scope.clone(),
+            logical_key: query.logical_key.clone(),
+            include_descendant_scopes: query.include_descendant_scopes,
+        };
         let candidates = self
             .store
             .query_event_candidates_with_policy(
                 &policy,
-                &EventQueryFilter::default(),
+                &filter,
                 query.after_acceptance_marker,
                 query.limit,
             )
@@ -3543,6 +3552,283 @@ mod tests {
     }
 
     #[test]
+    fn query_prefilters_each_field_before_source_verification() {
+        let root = TestRoot::new("query-prefilter");
+        let mut node = selected_node(&root);
+        node.publish(request(b"query/one", "ops.alpha", b"asset", b"ready"))
+            .expect("publish fixture");
+        let publisher = node.identity();
+        // Every source verification now fails under a different mission trust
+        // root. A nonmatching query can succeed only if no candidate reaches
+        // that verifier. No production counter or mock verifier is needed.
+        let other_mission =
+            UnprotectedReferenceMission::from_bytes(selected_mission_bytes([0x6b; 32]))
+                .expect("independent test mission");
+        node.verifier = ReferenceEnvelopeSealer::open(other_mission.fresh_bundle().unwrap())
+            .expect("different trust root");
+        let matching = EventQuery {
+            publisher: Some(publisher),
+            topic: Some(Topic::new("ops.alpha").unwrap()),
+            scope: Some(Scope::new("mission/apps").unwrap()),
+            logical_key: Some(b"asset".to_vec()),
+            ..EventQuery::default()
+        };
+        let mismatches = [
+            EventQuery {
+                publisher: Some([0xee; 32]),
+                ..matching.clone()
+            },
+            EventQuery {
+                topic: Some(Topic::new("ops.beta").unwrap()),
+                ..matching.clone()
+            },
+            EventQuery {
+                scope: Some(Scope::new("mission").unwrap()),
+                ..matching.clone()
+            },
+            EventQuery {
+                scope: Some(Scope::new("mission/elsewhere").unwrap()),
+                include_descendant_scopes: true,
+                ..matching.clone()
+            },
+            EventQuery {
+                logical_key: Some(b"absent".to_vec()),
+                ..matching.clone()
+            },
+        ];
+        for query in mismatches {
+            let page = node.query(query.clone()).unwrap_or_else(|error| {
+                panic!("nonmatching query reached source verification: {query:?}: {error}")
+            });
+            assert!(page.items.is_empty());
+            assert_eq!(page.scanned_through, 1);
+            assert!(!page.has_more);
+        }
+        for query in [
+            matching,
+            EventQuery::default(),
+            EventQuery {
+                scope: Some(Scope::new("mission").unwrap()),
+                include_descendant_scopes: true,
+                ..EventQuery::default()
+            },
+        ] {
+            assert!(
+                node.query(query).is_err(),
+                "selected candidates must still be authenticated"
+            );
+        }
+    }
+
+    #[test]
+    fn query_filters_and_combinations_preserve_authenticated_results() {
+        let root = TestRoot::new("query-filter-results");
+        let mut node = selected_node(&root);
+        node.publish(request(b"query/one", "ops.alpha", b"asset", b"alpha"))
+            .unwrap();
+        node.publish(request(b"query/two", "ops.beta", b"other", b"beta"))
+            .unwrap();
+        // Every combination of optional filters must select the first Event.
+        // With no filters, both Events remain visible in acceptance order.
+        for mask in 0..16 {
+            let page = node
+                .query(EventQuery {
+                    publisher: (mask & 1 != 0).then_some(node.identity()),
+                    topic: (mask & 2 != 0).then(|| Topic::new("ops.alpha").unwrap()),
+                    scope: (mask & 4 != 0).then(|| Scope::new("mission/apps").unwrap()),
+                    logical_key: (mask & 8 != 0).then(|| b"asset".to_vec()),
+                    ..EventQuery::default()
+                })
+                .unwrap();
+            let expected = if mask & (2 | 8) == 0 {
+                vec![1, 2]
+            } else {
+                vec![1]
+            };
+            assert_eq!(
+                page.items
+                    .iter()
+                    .map(|item| item.acceptance_marker)
+                    .collect::<Vec<_>>(),
+                expected,
+                "mask {mask}"
+            );
+            assert_eq!(page.items[0].payload, b"alpha");
+            assert_eq!(page.scanned_through, 2);
+            assert!(!page.has_more);
+        }
+        for (scope, descendants, expected) in [
+            (Some("mission"), false, 0),
+            (Some("mission"), true, 2),
+            (Some("mission/app"), true, 0),
+            (Some("mission/apps"), false, 2),
+            (Some("mission/apps"), true, 2),
+            (None, true, 2),
+        ] {
+            let page = node
+                .query(EventQuery {
+                    scope: scope.map(|scope| Scope::new(scope).unwrap()),
+                    include_descendant_scopes: descendants,
+                    ..EventQuery::default()
+                })
+                .unwrap();
+            assert_eq!(
+                page.items.len(),
+                expected,
+                "scope {scope:?}, descendants {descendants}"
+            );
+        }
+    }
+
+    #[test]
+    fn filtered_query_rechecks_current_content_grants_and_local_revocation() {
+        use aster_mesh::ScopeRekeyRecipient;
+
+        let root = TestRoot::new("query-current-grants");
+        let scope = Scope::new("mission/apps").unwrap();
+        let topics = vec![
+            Topic::new("ops.alpha").unwrap(),
+            Topic::new("ops.beta").unwrap(),
+        ];
+        let access = ProvisioningAccess::member(scope.clone(), vec![1], topics.clone()).unwrap();
+        let mut provisioner = ReferenceProvisioner::from_seed([0x5a; 32]).unwrap();
+        let mission_path = root.path().join("query-mission.bundle");
+        let bundle = provisioner
+            .issue_node(1, std::slice::from_ref(&access))
+            .unwrap();
+        drop(
+            UnprotectedReferenceMission::persist(&mission_path, bundle.to_bytes().unwrap())
+                .unwrap(),
+        );
+        let mut node =
+            SelectedEventNode::open_unprotected_reference(root.path(), &mission_path).unwrap();
+        node.publish(request(b"query/one", "ops.alpha", b"asset", b"ready"))
+            .unwrap();
+        let query = EventQuery {
+            topic: Some(Topic::new("ops.alpha").unwrap()),
+            logical_key: Some(b"asset".to_vec()),
+            ..EventQuery::default()
+        };
+        assert_eq!(node.query(query.clone()).unwrap().items.len(), 1);
+        let mut authority = provisioner
+            .issue_control_authority(60, &[access])
+            .and_then(ReferenceEnvelopeSealer::open)
+            .unwrap();
+        let registry = provisioner.export_rekey_registry().unwrap();
+        let (sealed, _) = authority
+            .seal_chained_scope_rekey_control_from_registry(
+                &registry,
+                0,
+                scope,
+                1,
+                vec![
+                    ScopeRekeyRecipient::member(authority.identity(), topics).unwrap(),
+                    ScopeRekeyRecipient::member(
+                        node.identity(),
+                        vec![Topic::new("ops.beta").unwrap()],
+                    )
+                    .unwrap(),
+                ],
+                1,
+                None,
+            )
+            .unwrap();
+        let verified = node.verifier.verify_control(&sealed).unwrap();
+        let rekey_id = verified.envelope_id();
+        node.store
+            .ingest_verified_control(&verified, &sealed)
+            .unwrap();
+        // Same epoch and unchanged stored metadata still match. Fresh policy
+        // replay must remove alpha content access before returning plaintext.
+        assert_eq!(
+            node.query(query).unwrap_err().kind(),
+            ApplicationErrorKind::Integrity
+        );
+        let revocation = authority
+            .seal_chained_revocation_control(node.identity(), 1, 2, Some(rekey_id))
+            .unwrap();
+        let verified = node.verifier.verify_control(&revocation).unwrap();
+        node.store
+            .ingest_verified_control(&verified, &revocation)
+            .unwrap();
+        assert!(
+            node.query(EventQuery {
+                logical_key: Some(b"absent".to_vec()),
+                ..EventQuery::default()
+            })
+            .is_err(),
+            "even an empty selection must enforce current local authorization"
+        );
+    }
+
+    #[test]
+    fn query_candidates_reject_corrupt_bytes_and_forged_metadata() {
+        let root = TestRoot::new("query-candidate-integrity");
+        let mut node = selected_node(&root);
+        node.publish(request(b"query/one", "ops.alpha", b"asset", b"ready"))
+            .unwrap();
+        let stored = node.store.events_after(0, 1).unwrap().remove(0);
+        let matching = EventQuery {
+            publisher: Some(node.identity()),
+            topic: Some(Topic::new("ops.alpha").unwrap()),
+            scope: Some(Scope::new("mission/apps").unwrap()),
+            logical_key: Some(b"asset".to_vec()),
+            ..EventQuery::default()
+        };
+        assert!(
+            node.open_application_event(&matching, stored.clone())
+                .unwrap()
+                .is_some()
+        );
+        let mut corrupt = stored.clone();
+        *corrupt.sealed.last_mut().unwrap() ^= 0x40;
+        assert!(node.open_application_event(&matching, corrupt).is_err());
+        for field in 0..5 {
+            let mut forged = stored.clone();
+            let mut query = matching.clone();
+            match field {
+                0 => {
+                    forged.header.stamp.dot.publisher = [0xee; 32];
+                    query.publisher = Some([0xee; 32]);
+                }
+                1 => {
+                    forged.header.topic = Topic::new("ops.beta").unwrap();
+                    query.topic = Some(forged.header.topic.clone());
+                }
+                2 => {
+                    forged.header.scope = Scope::new("mission/elsewhere").unwrap();
+                    query.scope = Some(forged.header.scope.clone());
+                }
+                3 => {
+                    forged.header.logical_key = b"forged".to_vec();
+                    query.logical_key = Some(b"forged".to_vec());
+                }
+                _ => {
+                    forged.header.priority = Priority::Flash;
+                }
+            }
+            assert_eq!(
+                node.open_application_event(&query, forged)
+                    .unwrap_err()
+                    .kind(),
+                ApplicationErrorKind::Integrity
+            );
+        }
+        assert!(
+            node.open_application_event(
+                &EventQuery {
+                    logical_key: Some(b"absent".to_vec()),
+                    ..matching
+                },
+                stored
+            )
+            .unwrap()
+            .is_none(),
+            "authenticated candidates are checked against the query again"
+        );
+    }
+
+    #[test]
     fn finite_event_crossing_ttl_during_final_query_and_poll_recheck_is_withheld() {
         let query_root = TestRoot::new("finite-final-query-recheck");
         let mut node = selected_node(&query_root);
@@ -3558,7 +3844,12 @@ mod tests {
         // The initial source/age check observes TTL-1. Content verification is
         // followed by the final sample at exactly TTL, which must not escape.
         node.custody_clock = NodeCustodyClock::injected(clock_id, 8, 1);
-        let queried = node.query(EventQuery::default()).expect("finite query");
+        let queried = node
+            .query(EventQuery {
+                logical_key: Some(b"asset-ttl".to_vec()),
+                ..EventQuery::default()
+            })
+            .expect("finite filtered query");
         assert!(queried.items.is_empty());
 
         // Use an independent durable clock history to exercise the same

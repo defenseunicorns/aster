@@ -361,6 +361,152 @@ fn connect_client_uses_the_real_live_event_authority() {
 }
 
 #[tokio::test]
+async fn query_filters_preserve_scan_cursors_across_empty_rpc_pages() {
+    let state = TestState::new();
+    let mission = UnprotectedReferenceMission::from_bytes(
+        include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle").to_vec(),
+    )
+    .unwrap();
+    let node = start_node(NodeConfig {
+        state: state.0.clone(),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        mission,
+        peers: Vec::new(),
+        mutable_interests: MutableSourceInterests::default(),
+        sync_interval: Duration::from_millis(50),
+        run_for: None,
+        application: NodeApplication::Relay,
+    })
+    .await
+    .unwrap();
+    let agent = BoundAgent::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let address = agent.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(agent.serve(
+        node.selected_events(),
+        ClientToken::from_bytes(TEST_TOKEN.to_vec()).unwrap(),
+        shutdown_rx,
+    ));
+    let client = api::AsterApplicationServiceClient::new(
+        HttpClient::plaintext(),
+        ClientConfig::new(format!("http://{address}").parse().unwrap()).with_default_header(
+            "authorization",
+            format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+        ),
+    );
+    let publisher = client
+        .get_status(api::GetStatusRequest::default())
+        .await
+        .unwrap()
+        .into_owned()
+        .identity;
+    let empty = client
+        .query_events(api::QueryEventsRequest {
+            limit: 2,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_owned();
+    assert!(empty.events.is_empty());
+    assert_eq!(empty.scanned_through, 0);
+    assert!(!empty.has_more);
+    let mut published = Vec::new();
+    for index in 1..=7 {
+        published.push(
+            client
+                .publish_event(api::PublishEventRequest {
+                    operation_key: format!("query/{index}").into_bytes(),
+                    topic: "chat.events".to_owned(),
+                    scope: "mission/team/alpha".to_owned(),
+                    priority: api::Priority::Routine.into(),
+                    logical_key: if index == 3 || index == 6 {
+                        b"target".to_vec()
+                    } else {
+                        b"other".to_vec()
+                    },
+                    payload: format!("payload {index}").into_bytes(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_owned()
+                .id,
+        );
+    }
+    for (key, expected_pages) in [
+        (None, vec![vec![1, 2], vec![3, 4], vec![5, 6], vec![7]]),
+        (
+            Some(b"absent".to_vec()),
+            vec![vec![], vec![], vec![], vec![]],
+        ),
+        (
+            Some(b"target".to_vec()),
+            vec![vec![], vec![3], vec![6], vec![]],
+        ),
+    ] {
+        let mut cursor = 0;
+        for (page_index, expected) in expected_pages.into_iter().enumerate() {
+            let page = client
+                .query_events(api::QueryEventsRequest {
+                    // Test the completely unfiltered path too. On selective paths,
+                    // combine every RPC field and an ancestor scope.
+                    publisher: key.as_ref().map(|_| publisher.clone()),
+                    topic: key.as_ref().map(|_| "chat.events".to_owned()),
+                    scope: key.as_ref().map(|_| "mission/team".to_owned()),
+                    include_descendant_scopes: key.is_some(),
+                    logical_key: key.clone(),
+                    after_acceptance_marker: cursor,
+                    limit: 2,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_owned();
+            assert_eq!(
+                page.events
+                    .iter()
+                    .map(|event| event.acceptance_marker)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            for event in &page.events {
+                assert_eq!(event.id, published[event.acceptance_marker as usize - 1]);
+                assert_eq!(
+                    event.payload,
+                    format!("payload {}", event.acceptance_marker).as_bytes()
+                );
+            }
+            assert_eq!(page.scanned_through, [2, 4, 6, 7][page_index]);
+            assert_eq!(page.has_more, page_index < 3);
+            cursor = page.scanned_through;
+        }
+        let terminal = client
+            .query_events(api::QueryEventsRequest {
+                logical_key: key,
+                after_acceptance_marker: cursor,
+                limit: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_owned();
+        assert!(terminal.events.is_empty());
+        assert_eq!(terminal.scanned_through, 7);
+        assert!(!terminal.has_more);
+    }
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn optional_event_ttl_is_enforced_by_the_live_agent() {
     const TEST_TTL_MS: u64 = 10_000;
 
@@ -468,6 +614,7 @@ async fn optional_event_ttl_is_enforced_by_the_live_agent() {
             ErrorCode::Aborted
         );
         let query = api::QueryEventsRequest {
+            logical_key: Some(b"finite".to_vec()),
             limit: 16,
             ..Default::default()
         };
