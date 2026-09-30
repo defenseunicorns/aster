@@ -10935,7 +10935,8 @@ fn execute_selected_event_command(
     status: &mut SelectedEventStatusTracker,
     receipt: &NodeReceipt,
     command: SelectedEventCommand,
-) {
+) -> bool {
+    let mut new_event_inserted = false;
     match command {
         SelectedEventCommand::Publish {
             request,
@@ -10949,6 +10950,7 @@ fn execute_selected_event_command(
                     application.publish_with_options(request, options)
                 })
             };
+            new_event_inserted = result.as_ref().is_ok_and(|result| result.inserted);
             let _ = response.send(result);
         }
         SelectedEventCommand::BeginPublicationSession {
@@ -10979,6 +10981,7 @@ fn execute_selected_event_command(
         } => {
             let result = status
                 .observe_operation_commit(store, || application.publish_numbered(request, options));
+            new_event_inserted = result.as_ref().is_ok_and(|result| result.inserted);
             let _ = response.send(result);
         }
         SelectedEventCommand::AbandonPublication {
@@ -11042,6 +11045,7 @@ fn execute_selected_event_command(
             let _ = response.send(result);
         }
     }
+    new_event_inserted
 }
 
 fn execute_selected_state_command(
@@ -11208,26 +11212,22 @@ fn execute_selected_application_command(
     status: &mut SelectedEventStatusTracker,
     receipt: &NodeReceipt,
     command: SelectedApplicationCommand,
-) {
+) -> bool {
     match command {
         SelectedApplicationCommand::Event(command) => {
-            execute_selected_event_command(
-                events,
-                store,
-                emission_policy,
-                status,
-                receipt,
-                command,
-            );
+            execute_selected_event_command(events, store, emission_policy, status, receipt, command)
         }
         SelectedApplicationCommand::State(command) => {
             execute_selected_state_command(state, command);
+            false
         }
         SelectedApplicationCommand::Record(command) => {
             execute_selected_record_command(records, command);
+            false
         }
         SelectedApplicationCommand::Blob(command) => {
             dispatch_selected_blob_command(blobs, command);
+            false
         }
     }
 }
@@ -12765,7 +12765,7 @@ async fn run_node_actor_inner(
                 let command = pending_application_command
                     .take()
                     .expect("application policy lease requires a pending command");
-                execute_selected_application_command(
+                let new_event_inserted = execute_selected_application_command(
                     &mut application,
                     &mut state_application,
                     &mut record_application,
@@ -12777,6 +12777,9 @@ async fn run_node_actor_inner(
                     command,
                 );
                 application_tick_yield_required = false;
+                if new_event_inserted {
+                    application_tick_pending = true;
+                }
                 network_events_since_application = 0;
                 application_commands_since_yield += 1;
                 if application_commands_since_yield >= APPLICATION_COMMAND_BUDGET {
@@ -13122,7 +13125,7 @@ async fn run_node_actor_inner(
                 let command = pending_application_command
                     .take()
                     .expect("application policy lease requires a pending command");
-                execute_selected_application_command(
+                let new_event_inserted = execute_selected_application_command(
                     &mut application,
                     &mut state_application,
                     &mut record_application,
@@ -13134,6 +13137,9 @@ async fn run_node_actor_inner(
                     command,
                 );
                 application_tick_yield_required = false;
+                if new_event_inserted {
+                    application_tick_pending = true;
+                }
                 network_events_since_application = 0;
                 application_commands_since_yield += 1;
                 if application_commands_since_yield >= APPLICATION_COMMAND_BUDGET {
@@ -30433,6 +30439,195 @@ mod tests {
         } else {
             (initiator, responder)
         }
+    }
+
+    #[tokio::test]
+    async fn newly_published_event_wakes_idle_peer_sync() {
+        use crate::application::{EventPollRequest, EventPublishRequest, EventSubscriptionRequest};
+
+        let test_root = root("new-event-wakes-idle-peer-sync");
+        let first_state = test_root.join("first");
+        let second_state = test_root.join("second");
+        fs::create_dir_all(&test_root).expect("event wake test root");
+        let first_carrier = {
+            let identity = NodeIdentity::load_or_create(&first_state)
+                .expect("first event wake carrier identity");
+            let id = identity.id();
+            drop(identity);
+            id
+        };
+        let second_carrier = {
+            let identity = NodeIdentity::load_or_create(&second_state)
+                .expect("second event wake carrier identity");
+            let id = identity.id();
+            drop(identity);
+            id
+        };
+        #[cfg(unix)]
+        for state in [&first_state, &second_state] {
+            fs::set_permissions(state, fs::Permissions::from_mode(0o700))
+                .expect("owner-only event wake state");
+        }
+        let mut missions = issue_missions(2);
+        let first_mission = missions.remove(0);
+        let second_mission = missions.remove(0);
+        let (
+            source_state,
+            source_carrier,
+            source_mission,
+            receiver_state,
+            receiver_carrier,
+            receiver_mission,
+        ) = if first_carrier < second_carrier {
+            (
+                first_state,
+                first_carrier,
+                first_mission,
+                second_state,
+                second_carrier,
+                second_mission,
+            )
+        } else {
+            (
+                second_state,
+                second_carrier,
+                second_mission,
+                first_state,
+                first_carrier,
+                first_mission,
+            )
+        };
+        let topic = Topic::new("opaque").expect("event wake topic");
+        let scope = Scope::new("test/runtime-contact").expect("event wake scope");
+
+        let receiver_offline = start_node(NodeConfig {
+            state: receiver_state.clone(),
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            mission: receiver_mission.credentials.clone(),
+            peers: Vec::new(),
+            mutable_interests: Default::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start offline event wake receiver");
+        let subscription = receiver_offline
+            .selected_events()
+            .subscribe(EventSubscriptionRequest {
+                operation_key: b"event-wake-subscription".to_vec(),
+                topic: topic.clone(),
+                scope: scope.clone(),
+                include_descendant_scopes: false,
+            })
+            .await
+            .expect("create event wake subscription");
+        receiver_offline
+            .shutdown()
+            .await
+            .expect("stop offline event wake receiver");
+
+        let placeholder = SocketAddr::from(([127, 0, 0, 1], 0));
+        let source_config = NodeConfig {
+            state: source_state,
+            bind: placeholder,
+            mission: source_mission.credentials,
+            peers: vec![MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: receiver_carrier,
+                    address: placeholder,
+                },
+                mission: receiver_mission.identity,
+            }],
+            mutable_interests: Default::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        };
+        let receiver_config = NodeConfig {
+            state: receiver_state,
+            bind: placeholder,
+            mission: receiver_mission.credentials,
+            peers: vec![MissionExpectedPeer {
+                carrier: ExpectedPeer {
+                    id: source_carrier,
+                    address: placeholder,
+                },
+                mission: source_mission.identity,
+            }],
+            mutable_interests: Default::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        };
+        let (source, receiver) = start_test_pair(
+            source_config,
+            receiver_config,
+            source_carrier,
+            receiver_carrier,
+        )
+        .await;
+        let source_events = source.selected_events();
+        let receiver_events = receiver.selected_events();
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let source_status = source_events.status().await.expect("source status");
+                let receiver_status = receiver_events.status().await.expect("receiver status");
+                if source_status.authenticated_contacts > 0
+                    && receiver_status.authenticated_contacts > 0
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("initial empty event contact");
+
+        let published = source_events
+            .publish(EventPublishRequest {
+                operation_key: b"event-wake-publication".to_vec(),
+                predecessor: None,
+                topic,
+                scope,
+                priority: Priority::Priority,
+                logical_key: b"event-wake-key".to_vec(),
+                payload: b"wake idle peer synchronization".to_vec(),
+                tombstone: false,
+            })
+            .await
+            .expect("publish event after empty contact");
+        assert!(published.inserted);
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let page = receiver_events
+                    .poll(EventPollRequest {
+                        subscription: subscription.id,
+                        delivery_limit: 8,
+                        scan_limit: 8,
+                    })
+                    .await
+                    .expect("poll event wake receiver");
+                if page
+                    .deliveries
+                    .iter()
+                    .any(|delivery| delivery.event.id == published.id)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("new Event must sync before the next periodic tick");
+
+        let (source_receipt, receiver_receipt) =
+            tokio::join!(source.shutdown(), receiver.shutdown());
+        assert!(source_receipt.expect("source shutdown").contacts > 0);
+        assert_eq!(receiver_receipt.expect("receiver shutdown").events, 1);
+        fs::remove_dir_all(test_root).expect("event wake test cleanup");
     }
 
     #[tokio::test]

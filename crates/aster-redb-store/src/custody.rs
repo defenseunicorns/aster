@@ -16,6 +16,10 @@ use super::*;
 
 pub(crate) const CUSTODY_ITEMS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.custody-items.v1");
+pub(crate) const CUSTODY_EXPIRATIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.custody-expirations.v2");
+pub(crate) const CUSTODY_RETIRING: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.custody-retiring.v2");
 pub(crate) const CUSTODY_RETIREMENTS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.custody-retirements.v1");
 pub(crate) const CUSTODY_RETIRED_SEMANTICS: TableDefinition<&[u8], &[u8]> =
@@ -55,7 +59,7 @@ const CUSTODY_MISSION_AUTHORITY_KEY: &str = "mission_authority";
 const CUSTODY_CONTINUITY_KEY: &str = "clock";
 const GLOBAL_QUOTA_KEY: &str = "";
 
-const CUSTODY_SCHEMA_VERSION: u64 = 1;
+const CUSTODY_SCHEMA_VERSION: u64 = 2;
 const CUSTODY_ITEM_VERSION: u8 = 1;
 const CUSTODY_RETIREMENT_VERSION: u8 = 1;
 const CUSTODY_LEASE_LEGACY_VERSION: u8 = 1;
@@ -813,6 +817,8 @@ pub enum CustodyRetirementReason {
 /// Bounded result of one garbage-collection transaction.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CustodyGcReport {
+    pub examined_expirations: u64,
+    pub examined_retirements: u64,
     pub marked: Vec<CustodyObjectKey>,
     pub retired: Vec<CustodyObjectKey>,
     pub released_bytes: u64,
@@ -1313,6 +1319,125 @@ fn decode_item(bytes: &[u8]) -> Result<CustodyItemRecord, CustodyStoreError> {
     Ok(record)
 }
 
+const CUSTODY_EXPIRATION_KEY_LEN: usize = 8 + 16 + 8 + 33;
+const CUSTODY_RETIRING_KEY_LEN: usize = 8 + 33;
+
+fn custody_expiration_key(
+    key: CustodyObjectKey,
+    record: &CustodyItemRecord,
+) -> Result<Option<Vec<u8>>, CustodyStoreError> {
+    if record.retiring || record.tombstone || record.ttl_ms.is_none() || record.continuity_lost {
+        return Ok(None);
+    }
+    let checkpoint = record.checkpoint.ok_or(CustodyStoreError::Invariant(
+        "finite custody item lacks an expiry checkpoint",
+    ))?;
+    if record.continuity_generation == 0 {
+        return Err(CustodyStoreError::Invariant(
+            "finite custody item has a zero expiry generation",
+        ));
+    }
+    let remaining = record
+        .ttl_ms
+        .expect("finite branch")
+        .saturating_sub(record.cumulative_age_ms);
+    let due_tick_ms = checkpoint.tick_ms.saturating_add(remaining);
+    let mut encoded = Vec::with_capacity(CUSTODY_EXPIRATION_KEY_LEN);
+    encoded.extend_from_slice(&record.continuity_generation.to_be_bytes());
+    encoded.extend_from_slice(&checkpoint.clock_id);
+    encoded.extend_from_slice(&due_tick_ms.to_be_bytes());
+    encoded.extend_from_slice(&key.encoded());
+    Ok(Some(encoded))
+}
+
+fn decode_custody_expiration_key(
+    encoded: &[u8],
+) -> Result<(u64, [u8; 16], u64, CustodyObjectKey), CustodyStoreError> {
+    if encoded.len() != CUSTODY_EXPIRATION_KEY_LEN {
+        return Err(CustodyStoreError::Invariant(
+            "custody expiration key has invalid length",
+        ));
+    }
+    let generation = u64::from_be_bytes(encoded[..8].try_into().expect("generation bytes"));
+    let clock_id = encoded[8..24].try_into().expect("clock bytes");
+    let due_tick_ms = u64::from_be_bytes(encoded[24..32].try_into().expect("tick bytes"));
+    let object = CustodyObjectKey::decode(&encoded[32..])?;
+    Ok((generation, clock_id, due_tick_ms, object))
+}
+
+fn custody_retiring_key(key: CustodyObjectKey, record: &CustodyItemRecord) -> Option<Vec<u8>> {
+    record.retiring.then(|| {
+        let mut encoded = Vec::with_capacity(CUSTODY_RETIRING_KEY_LEN);
+        encoded.extend_from_slice(&record.acceptance_order.to_be_bytes());
+        encoded.extend_from_slice(&key.encoded());
+        encoded
+    })
+}
+
+fn decode_custody_retiring_key(
+    encoded: &[u8],
+) -> Result<(u64, CustodyObjectKey), CustodyStoreError> {
+    if encoded.len() != CUSTODY_RETIRING_KEY_LEN {
+        return Err(CustodyStoreError::Invariant(
+            "custody retiring key has invalid length",
+        ));
+    }
+    let order = u64::from_be_bytes(encoded[..8].try_into().expect("acceptance-order bytes"));
+    let object = CustodyObjectKey::decode(&encoded[8..])?;
+    Ok((order, object))
+}
+
+fn replace_custody_maintenance_indexes_write(
+    write: &redb::WriteTransaction,
+    key: CustodyObjectKey,
+    before: Option<&CustodyItemRecord>,
+    after: Option<&CustodyItemRecord>,
+) -> Result<(), StoreError> {
+    let before_expiration = before
+        .map(|record| custody_expiration_key(key, record))
+        .transpose()?
+        .flatten();
+    let after_expiration = after
+        .map(|record| custody_expiration_key(key, record))
+        .transpose()?
+        .flatten();
+    if before_expiration != after_expiration {
+        let mut expirations = write.open_table(CUSTODY_EXPIRATIONS)?;
+        if let Some(encoded) = before_expiration
+            && expirations.remove(encoded.as_slice())?.is_none()
+        {
+            return Err(CustodyStoreError::Invariant(
+                "custody item is missing its expiration index",
+            )
+            .into());
+        }
+        if let Some(encoded) = after_expiration
+            && expirations.insert(encoded.as_slice(), &[][..])?.is_some()
+        {
+            return Err(CustodyStoreError::Invariant("custody expiration index collides").into());
+        }
+    }
+
+    let before_retiring = before.and_then(|record| custody_retiring_key(key, record));
+    let after_retiring = after.and_then(|record| custody_retiring_key(key, record));
+    if before_retiring != after_retiring {
+        let mut retiring = write.open_table(CUSTODY_RETIRING)?;
+        if let Some(encoded) = before_retiring
+            && retiring.remove(encoded.as_slice())?.is_none()
+        {
+            return Err(
+                CustodyStoreError::Invariant("custody item is missing its retiring index").into(),
+            );
+        }
+        if let Some(encoded) = after_retiring
+            && retiring.insert(encoded.as_slice(), &[][..])?.is_some()
+        {
+            return Err(CustodyStoreError::Invariant("custody retiring index collides").into());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn reencode_item_source_claims_for_test(
     bytes: &[u8],
@@ -1631,8 +1756,10 @@ impl<'a> CustodyCursor<'a> {
     }
 }
 
-const CUSTODY_TABLE_NAMES: [&str; 11] = [
+const CUSTODY_TABLE_NAMES: [&str; 13] = [
     "aster.custody-items.v1",
+    "aster.custody-expirations.v2",
+    "aster.custody-retiring.v2",
     "aster.custody-retirements.v1",
     "aster.custody-retired-semantics.v1",
     "aster.custody-transfer-leases.v1",
@@ -1906,6 +2033,11 @@ fn initialize_custody_schema(
                 .into());
             }
         }
+    }
+    write.open_table(CUSTODY_EXPIRATIONS)?;
+    write.open_table(CUSTODY_RETIRING)?;
+    for (key, record) in &backfill {
+        replace_custody_maintenance_indexes_write(write, *key, None, Some(record))?;
     }
     write.open_table(CUSTODY_RETIREMENTS)?;
     write.open_table(CUSTODY_RETIRED_SEMANTICS)?;
@@ -2501,8 +2633,10 @@ fn mark_continuity_lost_write(
     mut record: CustodyItemRecord,
 ) -> Result<CustodyItemRecord, StoreError> {
     if !record.continuity_lost {
+        let original = record.clone();
         record.continuity_lost = true;
         record.checkpoint = None;
+        replace_custody_maintenance_indexes_write(write, key, Some(&original), Some(&record))?;
         let encoded = encode_item(&record)?;
         write
             .open_table(CUSTODY_ITEMS)?
@@ -2510,6 +2644,34 @@ fn mark_continuity_lost_write(
         advance_revision(write, true)?;
     }
     Ok(record)
+}
+
+fn custody_usage_read(
+    read: &redb::ReadTransaction,
+    scope: Option<&Scope>,
+) -> Result<CustodyUsage, StoreError> {
+    if scope.is_none() {
+        let metadata = read.open_table(CUSTODY_METADATA)?;
+        return Ok(CustodyUsage {
+            items: metadata_value(&metadata, CUSTODY_ORDINARY_ITEM_COUNT_KEY)?,
+            bytes: metadata_value(&metadata, CUSTODY_ORDINARY_TOTAL_BYTES_KEY)?,
+        });
+    }
+    read.open_table(CUSTODY_SCOPE_USAGE)?
+        .get(scope.expect("checked scoped usage").as_str())?
+        .map(|value| decode_scope_usage(value.value()).map_err(StoreError::from))
+        .transpose()
+        .map(|usage| usage.unwrap_or_default())
+}
+
+fn quota_read(
+    read: &redb::ReadTransaction,
+    scope: Option<&Scope>,
+) -> Result<Option<CustodyQuota>, StoreError> {
+    read.open_table(CUSTODY_QUOTAS)?
+        .get(quota_key(scope))?
+        .map(|value| decode_quota(quota_key(scope), value.value()).map_err(StoreError::from))
+        .transpose()
 }
 
 fn custody_usage_write(
@@ -3690,6 +3852,7 @@ fn finalize_retirement_write(
             CustodyStoreError::Invariant("custody item disappeared during retirement").into(),
         );
     }
+    replace_custody_maintenance_indexes_write(write, key, Some(record), None)?;
     update_item_accounting_remove(write, record)?;
     Ok(())
 }
@@ -3724,6 +3887,7 @@ fn mark_retiring_write_indexed(
     batch: &mut RetirementBatchIndex,
 ) -> Result<CustodyItemRecord, StoreError> {
     if !record.retiring {
+        let original = record.clone();
         record.retiring = true;
         record.cumulative_age_ms = record.cumulative_age_ms.max(age_ms);
         record.checkpoint = None;
@@ -3744,6 +3908,7 @@ fn mark_retiring_write_indexed(
             )
             .map_err(event_operation::classify_retirement_invariant)?;
         }
+        replace_custody_maintenance_indexes_write(write, key, Some(&original), Some(&record))?;
         batch.remove_retry_rows(write, key)?;
         advance_revision(write, true)?;
     }
@@ -3808,8 +3973,22 @@ pub(crate) fn admit_custody_row_write(
             admission.authenticated_age_ms,
         )?;
         if expired {
+            if record != original {
+                replace_custody_maintenance_indexes_write(
+                    write,
+                    admission.key,
+                    Some(&original),
+                    Some(&record),
+                )?;
+            }
             mark_retiring_write(write, admission.key, record, durable_age_ms)?;
         } else if record != original {
+            replace_custody_maintenance_indexes_write(
+                write,
+                admission.key,
+                Some(&original),
+                Some(&record),
+            )?;
             let encoded = encode_item(&record)?;
             write
                 .open_table(CUSTODY_ITEMS)?
@@ -3891,6 +4070,7 @@ pub(crate) fn admit_custody_row_write(
     write
         .open_table(CUSTODY_ITEMS)?
         .insert(key.as_slice(), encoded.as_slice())?;
+    replace_custody_maintenance_indexes_write(write, admission.key, None, Some(&record))?;
     update_item_accounting_add(write, &record)?;
     Ok(CustodyAdmissionOutcome::Inserted)
 }
@@ -3969,6 +4149,7 @@ pub(crate) fn admit_event_custody_row_write(
         return Err(CustodyStoreError::ItemChanged.into());
     }
     let mut record = decode_item(&route_item)?;
+    let original_route_record = record.clone();
     if record.semantic_id != admission.semantic_id
         || record.topic != admission.topic
         || record.scope != admission.scope
@@ -3995,6 +4176,14 @@ pub(crate) fn admit_event_custody_row_write(
         admission.authenticated_age_ms,
     )?;
     if expired {
+        if record != original_route_record {
+            replace_custody_maintenance_indexes_write(
+                write,
+                route_key,
+                Some(&original_route_record),
+                Some(&record),
+            )?;
+        }
         let mut retirement_batch = RetirementBatchIndex::build(write)?;
         let marked = mark_retiring_write_indexed(
             write,
@@ -4028,6 +4217,13 @@ pub(crate) fn admit_event_custody_row_write(
         .into());
     }
     drop(items);
+    replace_custody_maintenance_indexes_write(
+        write,
+        route_key,
+        Some(&original_route_record),
+        None,
+    )?;
+    replace_custody_maintenance_indexes_write(write, admission.key, None, Some(&record))?;
 
     // A RouteEvent receipt proves only that the peer received a route-only
     // representation under the then-current selector. Promotion creates the
@@ -5541,8 +5737,22 @@ impl Store {
                 let (merged_age, newly_lost, expired) =
                     merge_authenticated_age(&mut item, continuity, sample, authenticated_age_ms)?;
                 if expired {
+                    if item != original {
+                        replace_custody_maintenance_indexes_write(
+                            &write,
+                            lease.object,
+                            Some(&original),
+                            Some(&item),
+                        )?;
+                    }
                     item = mark_retiring_write(&write, lease.object, item, merged_age)?;
                 } else if item != original {
+                    replace_custody_maintenance_indexes_write(
+                        &write,
+                        lease.object,
+                        Some(&original),
+                        Some(&item),
+                    )?;
                     let encoded = encode_item(&item)?;
                     write
                         .open_table(CUSTODY_ITEMS)?
@@ -5788,6 +5998,65 @@ impl Store {
         }
         self.require_live()?;
         let authority = self.require_bound_mission()?;
+        {
+            let read = self.database.begin_read()?;
+            let bound: Option<NodeId> = read
+                .open_table(CUSTODY_DOMAIN)?
+                .get(CUSTODY_MISSION_AUTHORITY_KEY)?
+                .map(|value| {
+                    value.value().try_into().map_err(|_| {
+                        StoreError::from(CustodyStoreError::Invariant(
+                            "custody mission authority has invalid length",
+                        ))
+                    })
+                })
+                .transpose()?;
+            match bound {
+                Some(bound) if bound == authority => {}
+                Some(_) => return Err(CustodyStoreError::MissionMismatch.into()),
+                None => return Err(CustodyStoreError::MissionNotBound.into()),
+            }
+            require_policy_revision_read(&read, expected_policy)?;
+            let continuity = read
+                .open_table(CUSTODY_CONTINUITY)?
+                .get(CUSTODY_CONTINUITY_KEY)?
+                .map(|value| decode_continuity(value.value()))
+                .transpose()?;
+            let discontinuity = sample.is_some_and(|sample| {
+                continuity.is_none_or(|current| current.sample.clock_id != sample.clock_id)
+            });
+            let due_expiration = match (continuity, sample) {
+                (Some(current), Some(sample)) if current.sample.clock_id == sample.clock_id => {
+                    let mut lower = Vec::with_capacity(CUSTODY_EXPIRATION_KEY_LEN);
+                    lower.extend_from_slice(&current.generation.to_be_bytes());
+                    lower.extend_from_slice(&current.sample.clock_id);
+                    lower.extend_from_slice(&0u64.to_be_bytes());
+                    lower.extend_from_slice(&[0; 33]);
+                    let mut upper = Vec::with_capacity(CUSTODY_EXPIRATION_KEY_LEN);
+                    upper.extend_from_slice(&current.generation.to_be_bytes());
+                    upper.extend_from_slice(&current.sample.clock_id);
+                    upper.extend_from_slice(
+                        &current.sample.tick_ms.max(sample.tick_ms).to_be_bytes(),
+                    );
+                    upper.extend_from_slice(&[u8::MAX; 33]);
+                    read.open_table(CUSTODY_EXPIRATIONS)?
+                        .range::<&[u8]>(lower.as_slice()..=upper.as_slice())?
+                        .next()
+                        .transpose()?
+                        .is_some()
+                }
+                _ => false,
+            };
+            let retiring = read
+                .open_table(CUSTODY_RETIRING)?
+                .iter()?
+                .next()
+                .transpose()?
+                .is_some();
+            if !discontinuity && !due_expiration && !retiring {
+                return Ok(CustodyGcReport::default());
+            }
+        }
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
         require_custody_mission_write(&write, authority)?;
@@ -5800,23 +6069,71 @@ impl Store {
             write.commit()?;
             return Err(CustodyStoreError::PolicyChanged.into());
         }
-        let rows = write
-            .open_table(CUSTODY_ITEMS)?
-            .iter()?
-            .map(|row| {
-                let (key, value) = row?;
-                Ok((key.value().to_vec(), value.value().to_vec()))
-            })
-            .collect::<Result<Vec<_>, redb::StorageError>>()?;
         let mut report = CustodyGcReport::default();
+        let due_expirations = if let Some(continuity) = continuity {
+            let mut lower = Vec::with_capacity(CUSTODY_EXPIRATION_KEY_LEN);
+            lower.extend_from_slice(&continuity.generation.to_be_bytes());
+            lower.extend_from_slice(&continuity.sample.clock_id);
+            lower.extend_from_slice(&0u64.to_be_bytes());
+            lower.extend_from_slice(&[0; 33]);
+            let mut upper = Vec::with_capacity(CUSTODY_EXPIRATION_KEY_LEN);
+            upper.extend_from_slice(&continuity.generation.to_be_bytes());
+            upper.extend_from_slice(&continuity.sample.clock_id);
+            upper.extend_from_slice(&continuity.sample.tick_ms.to_be_bytes());
+            upper.extend_from_slice(&[u8::MAX; 33]);
+            write
+                .open_table(CUSTODY_EXPIRATIONS)?
+                .range::<&[u8]>(lower.as_slice()..=upper.as_slice())?
+                .take(limit)
+                .map(|row| row.map(|(key, _)| key.value().to_vec()))
+                .collect::<Result<Vec<_>, redb::StorageError>>()?
+        } else {
+            Vec::new()
+        };
+
+        let lease_count = {
+            let metadata = write.open_table(CUSTODY_METADATA)?;
+            metadata_value(&metadata, CUSTODY_LEASE_COUNT_KEY)?
+        };
+        let retirement_scan_limit = limit
+            .checked_add(
+                usize::try_from(lease_count).map_err(|_| CustodyStoreError::CounterOverflow)?,
+            )
+            .ok_or(CustodyStoreError::CounterOverflow)?;
+        let retiring_keys = write
+            .open_table(CUSTODY_RETIRING)?
+            .iter()?
+            .take(retirement_scan_limit)
+            .map(|row| row.map(|(key, _)| key.value().to_vec()))
+            .collect::<Result<Vec<_>, redb::StorageError>>()?;
+
+        if due_expirations.is_empty() && retiring_keys.is_empty() {
+            write.commit()?;
+            return Ok(report);
+        }
+
         let mut retirement_batch = RetirementBatchIndex::build(&write)?;
-        let mut retiring = Vec::new();
-        for (encoded_key, encoded_item) in rows {
-            let key = CustodyObjectKey::decode(&encoded_key)?;
-            let mut item = decode_item(&encoded_item)?;
-            if item.retiring {
-                retiring.push((item.acceptance_order, key, item));
-                continue;
+        for encoded_expiration in due_expirations {
+            report.examined_expirations = report
+                .examined_expirations
+                .checked_add(1)
+                .ok_or(CustodyStoreError::CounterOverflow)?;
+            let (_, _, _, key) = decode_custody_expiration_key(&encoded_expiration)?;
+            let encoded_key = key.encoded();
+            let item = write
+                .open_table(CUSTODY_ITEMS)?
+                .get(encoded_key.as_slice())?
+                .map(|value| decode_item(value.value()))
+                .transpose()?
+                .ok_or(CustodyStoreError::Invariant(
+                    "custody expiration index references a missing item",
+                ))?;
+            if custody_expiration_key(key, &item)?.as_deref() != Some(encoded_expiration.as_slice())
+            {
+                return Err(CustodyStoreError::Invariant(
+                    "custody expiration index differs from its item",
+                )
+                .into());
             }
             let (status, lost) = evaluate_item(&item, continuity, sample);
             if lost {
@@ -5826,17 +6143,41 @@ impl Store {
             let CustodyAgeStatus::Expired { age_ms } = status else {
                 continue;
             };
-            if report.marked.len() == limit {
-                continue;
-            }
-            item = mark_retiring_write_indexed(&write, key, item, age_ms, &mut retirement_batch)?;
+            mark_retiring_write_indexed(&write, key, item, age_ms, &mut retirement_batch)?;
             report.marked.push(key);
-            retiring.push((item.acceptance_order, key, item));
         }
-        retiring.sort_by_key(|(order, key, _)| (*order, *key));
-        for (_, key, item) in retiring {
+
+        let retiring_keys = write
+            .open_table(CUSTODY_RETIRING)?
+            .iter()?
+            .take(retirement_scan_limit)
+            .map(|row| row.map(|(key, _)| key.value().to_vec()))
+            .collect::<Result<Vec<_>, redb::StorageError>>()?;
+        for encoded_retiring in retiring_keys {
             if report.retired.len() == limit {
                 break;
+            }
+            report.examined_retirements = report
+                .examined_retirements
+                .checked_add(1)
+                .ok_or(CustodyStoreError::CounterOverflow)?;
+            let (acceptance_order, key) = decode_custody_retiring_key(&encoded_retiring)?;
+            let encoded_key = key.encoded();
+            let item = write
+                .open_table(CUSTODY_ITEMS)?
+                .get(encoded_key.as_slice())?
+                .map(|value| decode_item(value.value()))
+                .transpose()?
+                .ok_or(CustodyStoreError::Invariant(
+                    "custody retiring index references a missing item",
+                ))?;
+            if item.acceptance_order != acceptance_order
+                || custody_retiring_key(key, &item).as_deref() != Some(encoded_retiring.as_slice())
+            {
+                return Err(CustodyStoreError::Invariant(
+                    "custody retiring index differs from its item",
+                )
+                .into());
             }
             if retirement_batch.has_active_lease(key) {
                 report.blocked_by_leases = report
@@ -5883,6 +6224,43 @@ impl Store {
         }
         self.require_live()?;
         let authority = self.require_bound_mission()?;
+        {
+            let read = self.database.begin_read()?;
+            let bound: Option<NodeId> = read
+                .open_table(CUSTODY_DOMAIN)?
+                .get(CUSTODY_MISSION_AUTHORITY_KEY)?
+                .map(|value| {
+                    value.value().try_into().map_err(|_| {
+                        StoreError::from(CustodyStoreError::Invariant(
+                            "custody mission authority has invalid length",
+                        ))
+                    })
+                })
+                .transpose()?;
+            match bound {
+                Some(bound) if bound == authority => {}
+                Some(_) => return Err(CustodyStoreError::MissionMismatch.into()),
+                None => return Err(CustodyStoreError::MissionNotBound.into()),
+            }
+            require_policy_revision_read(&read, expected_policy)?;
+            // Preserve continuity-row validation even though a capacity-fit
+            // write transaction would discard its sampled high-water update.
+            read.open_table(CUSTODY_CONTINUITY)?
+                .get(CUSTODY_CONTINUITY_KEY)?
+                .map(|value| decode_continuity(value.value()))
+                .transpose()?;
+            let quota = match quota_read(&read, scope)? {
+                Some(quota) => quota,
+                None => quota_read(&read, None)?.ok_or(CustodyStoreError::Invariant(
+                    "custody schema is missing its global quota",
+                ))?,
+            };
+            let usage = custody_usage_read(&read, scope)?;
+            if require_quota_capacity(usage, &quota, demand.usage.items, demand.usage.bytes).is_ok()
+            {
+                return Ok(CustodyGcReport::default());
+            }
+        }
         let write = self.database.begin_write()?;
         enforce_live_write(&write)?;
         require_custody_mission_write(&write, authority)?;
@@ -6263,6 +6641,24 @@ fn require_unique_event_transfer_state(
     Ok(())
 }
 
+type CustodyMaintenanceIndexes = (BTreeSet<Vec<u8>>, BTreeSet<Vec<u8>>);
+
+fn expected_custody_maintenance_indexes(
+    items: &BTreeMap<CustodyObjectKey, CustodyItemRecord>,
+) -> Result<CustodyMaintenanceIndexes, StoreError> {
+    let mut expirations = BTreeSet::new();
+    let mut retiring = BTreeSet::new();
+    for (key, record) in items {
+        if let Some(encoded) = custody_expiration_key(*key, record)? {
+            expirations.insert(encoded);
+        }
+        if let Some(encoded) = custody_retiring_key(*key, record) {
+            retiring.insert(encoded);
+        }
+    }
+    Ok((expirations, retiring))
+}
+
 fn preflight_custody_cardinality_write(
     write: &redb::WriteTransaction,
     limits: StoreLimits,
@@ -6284,6 +6680,16 @@ fn preflight_custody_cardinality_write(
         retired_semantics,
         retirements,
         "retired semantic index exceeds retirement rows",
+    )?;
+    require_audit_table_bound(
+        write.open_table(CUSTODY_EXPIRATIONS)?.len()?,
+        items,
+        "custody expiration index exceeds live items",
+    )?;
+    require_audit_table_bound(
+        write.open_table(CUSTODY_RETIRING)?.len()?,
+        items,
+        "custody retiring index exceeds live items",
     )?;
     require_audit_table_bound(
         write.open_table(CUSTODY_LEASES)?.len()?,
@@ -6334,6 +6740,16 @@ fn preflight_custody_cardinality_read(
         retired_semantics,
         retirements,
         "retired semantic index exceeds retirement rows",
+    )?;
+    require_audit_table_bound(
+        read.open_table(CUSTODY_EXPIRATIONS)?.len()?,
+        items,
+        "custody expiration index exceeds live items",
+    )?;
+    require_audit_table_bound(
+        read.open_table(CUSTODY_RETIRING)?.len()?,
+        items,
+        "custody retiring index exceeds live items",
     )?;
     require_audit_table_bound(
         read.open_table(CUSTODY_LEASES)?.len()?,
@@ -6478,6 +6894,41 @@ pub(crate) fn audit_custody_tables_write(
                 .ok_or(CustodyStoreError::CounterOverflow)?;
         }
         items.insert(key, record);
+    }
+    let (expected_expirations, expected_retiring) = expected_custody_maintenance_indexes(&items)?;
+    let mut durable_expirations = BTreeSet::new();
+    for row in write.open_table(CUSTODY_EXPIRATIONS)?.iter()? {
+        let (key, value) = row?;
+        if !value.value().is_empty() {
+            return Err(CustodyStoreError::Invariant(
+                "custody expiration index value is not empty",
+            )
+            .into());
+        }
+        let _ = decode_custody_expiration_key(key.value())?;
+        durable_expirations.insert(key.value().to_vec());
+    }
+    if durable_expirations != expected_expirations {
+        return Err(CustodyStoreError::Invariant(
+            "custody expiration index differs from live items",
+        )
+        .into());
+    }
+    let mut durable_retiring = BTreeSet::new();
+    for row in write.open_table(CUSTODY_RETIRING)?.iter()? {
+        let (key, value) = row?;
+        if !value.value().is_empty() {
+            return Err(
+                CustodyStoreError::Invariant("custody retiring index value is not empty").into(),
+            );
+        }
+        let _ = decode_custody_retiring_key(key.value())?;
+        durable_retiring.insert(key.value().to_vec());
+    }
+    if durable_retiring != expected_retiring {
+        return Err(
+            CustodyStoreError::Invariant("custody retiring index differs from live items").into(),
+        );
     }
     let mut durable_scope_usages = BTreeMap::new();
     for row in write.open_table(CUSTODY_SCOPE_USAGE)?.iter()? {
@@ -7070,6 +7521,41 @@ pub(crate) fn inspect_custody_tables_read(
                 .ok_or(CustodyStoreError::CounterOverflow)?;
         }
         items.insert(key, record);
+    }
+    let (expected_expirations, expected_retiring) = expected_custody_maintenance_indexes(&items)?;
+    let mut durable_expirations = BTreeSet::new();
+    for row in read.open_table(CUSTODY_EXPIRATIONS)?.iter()? {
+        let (key, value) = row?;
+        if !value.value().is_empty() {
+            return Err(CustodyStoreError::Invariant(
+                "custody expiration index value is not empty",
+            )
+            .into());
+        }
+        let _ = decode_custody_expiration_key(key.value())?;
+        durable_expirations.insert(key.value().to_vec());
+    }
+    if durable_expirations != expected_expirations {
+        return Err(CustodyStoreError::Invariant(
+            "custody expiration index differs from live items",
+        )
+        .into());
+    }
+    let mut durable_retiring = BTreeSet::new();
+    for row in read.open_table(CUSTODY_RETIRING)?.iter()? {
+        let (key, value) = row?;
+        if !value.value().is_empty() {
+            return Err(
+                CustodyStoreError::Invariant("custody retiring index value is not empty").into(),
+            );
+        }
+        let _ = decode_custody_retiring_key(key.value())?;
+        durable_retiring.insert(key.value().to_vec());
+    }
+    if durable_retiring != expected_retiring {
+        return Err(
+            CustodyStoreError::Invariant("custody retiring index differs from live items").into(),
+        );
     }
     let mut durable_scope_usages = BTreeMap::new();
     for row in read.open_table(CUSTODY_SCOPE_USAGE)?.iter()? {
