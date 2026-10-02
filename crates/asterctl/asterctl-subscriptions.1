@@ -1,0 +1,77 @@
+.\" Copyright 2026 Defense Unicorns, Inc.
+.\" SPDX-License-Identifier: Apache-2.0
+.\" Clean Room — Privileged
+.TH ASTERCTL-SUBSCRIPTIONS 1 "2026-10-02" "Aster" "User Commands"
+.SH NAME
+asterctl-subscriptions \- list Event subscriptions
+.SH SYNOPSIS
+.SY asterctl
+.RI [ GLOBAL-OPTIONS ]
+.B subscriptions
+.YS
+.SH DESCRIPTION
+List this node's Event subscriptions, ordered by subscription ID.
+.SH OPTIONS
+Accepts the global options described in
+.BR asterctl (1).
+.SH OUTPUT
+Prints each subscription as a block with the following fields:
+.TP
+.B ID
+Full Base64 subscription ID.
+.TP
+.B Topic
+Subscribed topic.
+.TP
+.B Scope
+Subscribed scope. A trailing '/*' includes sub-scopes.
+.TP
+.B Operation key
+The key used to create the subscription. UTF-8 keys are quoted and escaped;
+other keys are shown as Base64 under the label "Operation key (Base64)".
+.PP
+With \-\-json, prints an array of objects containing:
+.PP
+.nf
+.RS
+subscriptionId           Base64 string
+topic                    String
+scope                    String, without the '/*' suffix
+includeDescendantScopes  Boolean
+operationKey             Base64 string
+.RE
+.fi
+.PP
+Unlike standard output, operationKey is always Base64.
+.PP
+An empty list produces no text output, or [] with \-\-json.
+.SH EXIT STATUS
+.TP
+.B 0
+Success, including an empty list.
+.TP
+.B 1
+Command failed.
+.TP
+.B 2
+Invalid or missing arguments.
+.SH EXAMPLES
+List subscriptions:
+.PP
+.nf
+.RS
+asterctl \-\-token\-file ./client.token subscriptions
+.RE
+.fi
+.PP
+List subscriptions as JSON:
+.PP
+.nf
+.RS
+asterctl \-\-token\-file ./client.token subscriptions \-\-json
+.RE
+.fi
+.SH SEE ALSO
+.BR asterctl (1),
+.BR asterctl-subscribe (1),
+.BR asterctl-query (1)

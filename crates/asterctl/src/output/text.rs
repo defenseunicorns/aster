@@ -184,6 +184,24 @@ pub(super) fn event(event: &api::Event) -> String {
     text
 }
 
+pub(super) fn subscription(subscription: &api::EventSubscription) -> String {
+    let mut text = String::from("SUBSCRIPTION:\n");
+    field(
+        &mut text,
+        "ID",
+        scalar(Bytes(&subscription.subscription_id)),
+    );
+    field(&mut text, "Topic", format!("{:?}", subscription.topic));
+    let scope = if subscription.include_descendant_scopes {
+        format!("{}/*", subscription.scope)
+    } else {
+        subscription.scope.clone()
+    };
+    field(&mut text, "Scope", format!("{scope:?}"));
+    bytes_field(&mut text, "Operation key", &subscription.operation_key);
+    text
+}
+
 fn bytes_field(text: &mut String, label: &str, value: &[u8]) {
     match std::str::from_utf8(value) {
         Ok(value) => field(text, label, format!("{value:?}")),

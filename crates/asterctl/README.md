@@ -5,8 +5,6 @@ Clean Room — Privileged
 `asterctl` is a command-line utility for introspecting and controlling Aster
 nodes through a running `aster-agent`. 
 
-Currently it provides `status`, `publish`, `query`, and `subscribe`.
-
 See man page for usage details
 
 ## Build and run
@@ -32,7 +30,7 @@ python3 tools/test-asterctl-real.py
 
 The smoke uses ephemeral test-only provisioning and exercises authenticated
 status, finite-TTL publication and its idempotent replay, query, subscription
-creation and replay, and rejected authentication. It does not qualify deployed
+creation and replay, subscription listing, and rejected authentication. It does not qualify deployed
 credentials, packages, or network delivery.
 
 ## Arguments
@@ -157,6 +155,23 @@ its ID to stdout. Reusing the key with different parameters fails.
 JSON reports `inserted: false` for an identical existing subscription. This
 changes the previous CLI behavior, which returned code `1` for that retry.
 See [asterctl-subscribe(1)](asterctl-subscribe.1).
+
+## Subscriptions
+
+```sh
+asterctl --token-file ./client.token subscriptions
+asterctl --token-file ./client.token subscriptions --json
+```
+
+Lists the node's Event subscriptions in subscription-ID order. Text output
+shows the ID, topic, scope, and operation key. A trailing `/*` in the scope
+includes sub-scopes. UTF-8 operation keys are quoted and escaped; other keys
+are labeled Base64.
+
+JSON is an array with `subscriptionId`, `topic`, `scope`,
+`includeDescendantScopes`, and `operationKey`. IDs and operation keys use
+Base64; `scope` has no `/*` suffix. An empty list produces no text, or `[]`
+in JSON. See [asterctl-subscriptions(1)](asterctl-subscriptions.1).
 
 ## Operation keys and manual recovery
 

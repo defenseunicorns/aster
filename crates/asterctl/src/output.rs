@@ -96,6 +96,35 @@ pub fn subscribe(
     }
 }
 
+pub fn subscriptions(
+    response: &api::ListEventSubscriptionsResponse,
+    json: bool,
+) -> Result<String, serde_json::Error> {
+    Ok(if json {
+        let rows = response
+            .subscriptions
+            .iter()
+            .map(|row| {
+                Output::Object(fields! {
+                    "subscriptionId": Bytes(&row.subscription_id),
+                    "topic": &row.topic,
+                    "scope": &row.scope,
+                    "includeDescendantScopes": row.include_descendant_scopes,
+                    "operationKey": Bytes(&row.operation_key),
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&Output::Array(rows))? + "\n"
+    } else {
+        response
+            .subscriptions
+            .iter()
+            .map(text::subscription)
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
 pub struct QueryWriter<W> {
     writer: W,
     json: bool,

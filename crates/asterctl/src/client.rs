@@ -166,6 +166,35 @@ pub async fn publish(
     Ok(response)
 }
 
+pub async fn subscriptions(
+    address: SocketAddr,
+    token: &Token,
+    timeout: Duration,
+) -> Result<api::ListEventSubscriptionsResponse, String> {
+    let client = query_client(address, token, timeout);
+    let response = tokio::time::timeout(
+        timeout,
+        client.list_event_subscriptions(api::ListEventSubscriptionsRequest::default()),
+    )
+    .await
+    .map_err(|_| {
+        describe_rpc_error(
+            "ListEventSubscriptions",
+            connectrpc::ErrorCode::DeadlineExceeded,
+        )
+    })?
+    .map_err(|error| describe_rpc_error("ListEventSubscriptions", error.code))?;
+    let response = response.into_owned();
+    if response
+        .subscriptions
+        .iter()
+        .any(|row| row.subscription_id.len() != 32)
+    {
+        return Err("ListEventSubscriptions failed: invalid subscription ID".to_owned());
+    }
+    Ok(response)
+}
+
 pub async fn subscribe(
     address: SocketAddr,
     token: &Token,

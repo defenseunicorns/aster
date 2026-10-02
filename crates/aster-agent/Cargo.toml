@@ -51,6 +51,7 @@ rustix.workspace = true
 connectrpc-build.workspace = true
 
 [dev-dependencies]
+aster-profile = { path = "../aster-profile" }
 connectrpc = { workspace = true, features = ["client", "json", "server"] }
 
 [lints]

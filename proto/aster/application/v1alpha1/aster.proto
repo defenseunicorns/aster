@@ -55,6 +55,8 @@ service AsterApplicationService {
   rpc QueryEvents(QueryEventsRequest) returns (QueryEventsResponse);
   // CreateEventSubscription creates or replays a durable receive selector.
   rpc CreateEventSubscription(CreateEventSubscriptionRequest) returns (CreateEventSubscriptionResponse);
+  // ListEventSubscriptions returns all local Consume subscriptions, ordered by raw ID.
+  rpc ListEventSubscriptions(ListEventSubscriptionsRequest) returns (ListEventSubscriptionsResponse);
   // PollEvents returns one bounded page of at-least-once deliveries.
   rpc PollEvents(PollEventsRequest) returns (PollEventsResponse);
   // StreamEvents repeatedly performs bounded durable polls until cancellation.
@@ -65,6 +67,21 @@ service AsterApplicationService {
   rpc DeleteEventSubscription(DeleteEventSubscriptionRequest) returns (DeleteEventSubscriptionResponse);
   // QueryEventGaps reports authenticated gaps in one exact publisher stream.
   rpc QueryEventGaps(QueryEventGapsRequest) returns (QueryEventGapsResponse);
+}
+
+message ListEventSubscriptionsRequest {}
+
+message ListEventSubscriptionsResponse {
+  repeated EventSubscription subscriptions = 1;
+}
+
+// One local Event subscription.
+message EventSubscription {
+  bytes subscription_id = 1;
+  string topic = 2;
+  string scope = 3;
+  bool include_descendant_scopes = 4;
+  bytes operation_key = 5;
 }
 
 message GetStatusRequest {}

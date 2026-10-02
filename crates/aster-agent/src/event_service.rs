@@ -165,6 +165,11 @@ pub(crate) fn rejection_router() -> connectrpc::Router {
         )
         .route_bidi_stream(
             APPLICATION_SERVICE_NAME,
+            "ListEventSubscriptions",
+            rejection_handler::<api::ListEventSubscriptionsRequest, api::ListEventSubscriptionsResponse>(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
             "PollEvents",
             rejection_handler::<api::PollEventsRequest, api::PollEventsResponse>(),
         )
@@ -400,6 +405,35 @@ impl api::AsterApplicationService for AsterConnectService {
                 ..Default::default()
             },
             PublicOperation::QueryEvents,
+        )
+    }
+
+    async fn list_event_subscriptions(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, api::ListEventSubscriptionsRequest>,
+    ) -> ServiceResult<api::ListEventSubscriptionsResponse> {
+        let subscriptions = self
+            .events
+            .list_subscriptions()
+            .await
+            .map_err(connect_application_error)?;
+        bounded_response(
+            api::ListEventSubscriptionsResponse {
+                subscriptions: subscriptions
+                    .into_iter()
+                    .map(|row| api::EventSubscription {
+                        subscription_id: row.id.as_bytes().to_vec(),
+                        topic: row.topic.as_str().to_owned(),
+                        scope: row.scope.as_str().to_owned(),
+                        include_descendant_scopes: row.include_descendant_scopes,
+                        operation_key: row.operation_key,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            PublicOperation::ListEventSubscriptions,
         )
     }
 
@@ -1318,6 +1352,44 @@ mod tests {
             api::PublicErrorReason::MalformedInput,
             "acknowledge_event",
             false,
+        );
+    }
+
+    #[test]
+    fn subscription_listing_maximum_fits_response_budget_and_oversize_fails_closed() {
+        use buffa::Message as _;
+        let row = api::EventSubscription {
+            subscription_id: vec![0xff; 32],
+            topic: "t".repeat(aster_profile::MAX_TOPIC_BYTES),
+            scope: "s".repeat(aster_profile::MAX_SCOPE_BYTES),
+            include_descendant_scopes: true,
+            operation_key: vec![0xff; aster_redb_store::MAX_EVENT_SUBSCRIPTION_KEY_BYTES],
+            ..Default::default()
+        };
+        let maximum = api::ListEventSubscriptionsResponse {
+            subscriptions: vec![row.clone(); aster_redb_store::MAX_EVENT_SUBSCRIPTIONS as usize],
+            ..Default::default()
+        };
+        assert!(maximum.try_encoded_len().unwrap() <= crate::MAX_AGENT_RESPONSE_PROTO_BYTES);
+        bounded_message(maximum, PublicOperation::ListEventSubscriptions).unwrap();
+        let error = bounded_message(
+            api::ListEventSubscriptionsResponse {
+                subscriptions: vec![api::EventSubscription {
+                    operation_key: vec![0; crate::MAX_AGENT_RESPONSE_PROTO_BYTES as usize],
+                    ..row
+                }],
+                ..Default::default()
+            },
+            PublicOperation::ListEventSubscriptions,
+        )
+        .unwrap_err();
+        assert_public_detail(
+            &error,
+            "aster.application.v1alpha1.PublicErrorDetail",
+            ErrorCode::ResourceExhausted,
+            api::PublicErrorReason::ResourceExhaustion,
+            "list_event_subscriptions",
+            true,
         );
     }
 

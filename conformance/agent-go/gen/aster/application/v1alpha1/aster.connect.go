@@ -59,6 +59,9 @@ const (
 	// AsterApplicationServiceCreateEventSubscriptionProcedure is the fully-qualified name of the
 	// AsterApplicationService's CreateEventSubscription RPC.
 	AsterApplicationServiceCreateEventSubscriptionProcedure = "/aster.application.v1alpha1.AsterApplicationService/CreateEventSubscription"
+	// AsterApplicationServiceListEventSubscriptionsProcedure is the fully-qualified name of the
+	// AsterApplicationService's ListEventSubscriptions RPC.
+	AsterApplicationServiceListEventSubscriptionsProcedure = "/aster.application.v1alpha1.AsterApplicationService/ListEventSubscriptions"
 	// AsterApplicationServicePollEventsProcedure is the fully-qualified name of the
 	// AsterApplicationService's PollEvents RPC.
 	AsterApplicationServicePollEventsProcedure = "/aster.application.v1alpha1.AsterApplicationService/PollEvents"
@@ -97,6 +100,8 @@ type AsterApplicationServiceClient interface {
 	QueryEvents(context.Context, *connect.Request[QueryEventsRequest]) (*connect.Response[QueryEventsResponse], error)
 	// CreateEventSubscription creates or replays a durable receive selector.
 	CreateEventSubscription(context.Context, *connect.Request[CreateEventSubscriptionRequest]) (*connect.Response[CreateEventSubscriptionResponse], error)
+	// ListEventSubscriptions returns all local Consume subscriptions, ordered by raw ID.
+	ListEventSubscriptions(context.Context, *connect.Request[ListEventSubscriptionsRequest]) (*connect.Response[ListEventSubscriptionsResponse], error)
 	// PollEvents returns one bounded page of at-least-once deliveries.
 	PollEvents(context.Context, *connect.Request[PollEventsRequest]) (*connect.Response[PollEventsResponse], error)
 	// StreamEvents repeatedly performs bounded durable polls until cancellation.
@@ -175,6 +180,12 @@ func NewAsterApplicationServiceClient(httpClient connect.HTTPClient, baseURL str
 			connect.WithSchema(asterApplicationServiceMethods.ByName("CreateEventSubscription")),
 			connect.WithClientOptions(opts...),
 		),
+		listEventSubscriptions: connect.NewClient[ListEventSubscriptionsRequest, ListEventSubscriptionsResponse](
+			httpClient,
+			baseURL+AsterApplicationServiceListEventSubscriptionsProcedure,
+			connect.WithSchema(asterApplicationServiceMethods.ByName("ListEventSubscriptions")),
+			connect.WithClientOptions(opts...),
+		),
 		pollEvents: connect.NewClient[PollEventsRequest, PollEventsResponse](
 			httpClient,
 			baseURL+AsterApplicationServicePollEventsProcedure,
@@ -219,6 +230,7 @@ type asterApplicationServiceClient struct {
 	acknowledgeEventPublicationResult *connect.Client[AcknowledgeEventPublicationResultRequest, AcknowledgeEventPublicationResultResponse]
 	queryEvents                       *connect.Client[QueryEventsRequest, QueryEventsResponse]
 	createEventSubscription           *connect.Client[CreateEventSubscriptionRequest, CreateEventSubscriptionResponse]
+	listEventSubscriptions            *connect.Client[ListEventSubscriptionsRequest, ListEventSubscriptionsResponse]
 	pollEvents                        *connect.Client[PollEventsRequest, PollEventsResponse]
 	streamEvents                      *connect.Client[StreamEventsRequest, StreamEventsResponse]
 	acknowledgeEvent                  *connect.Client[AcknowledgeEventRequest, AcknowledgeEventResponse]
@@ -277,6 +289,12 @@ func (c *asterApplicationServiceClient) CreateEventSubscription(ctx context.Cont
 	return c.createEventSubscription.CallUnary(ctx, req)
 }
 
+// ListEventSubscriptions calls
+// aster.application.v1alpha1.AsterApplicationService.ListEventSubscriptions.
+func (c *asterApplicationServiceClient) ListEventSubscriptions(ctx context.Context, req *connect.Request[ListEventSubscriptionsRequest]) (*connect.Response[ListEventSubscriptionsResponse], error) {
+	return c.listEventSubscriptions.CallUnary(ctx, req)
+}
+
 // PollEvents calls aster.application.v1alpha1.AsterApplicationService.PollEvents.
 func (c *asterApplicationServiceClient) PollEvents(ctx context.Context, req *connect.Request[PollEventsRequest]) (*connect.Response[PollEventsResponse], error) {
 	return c.pollEvents.CallUnary(ctx, req)
@@ -324,6 +342,8 @@ type AsterApplicationServiceHandler interface {
 	QueryEvents(context.Context, *connect.Request[QueryEventsRequest]) (*connect.Response[QueryEventsResponse], error)
 	// CreateEventSubscription creates or replays a durable receive selector.
 	CreateEventSubscription(context.Context, *connect.Request[CreateEventSubscriptionRequest]) (*connect.Response[CreateEventSubscriptionResponse], error)
+	// ListEventSubscriptions returns all local Consume subscriptions, ordered by raw ID.
+	ListEventSubscriptions(context.Context, *connect.Request[ListEventSubscriptionsRequest]) (*connect.Response[ListEventSubscriptionsResponse], error)
 	// PollEvents returns one bounded page of at-least-once deliveries.
 	PollEvents(context.Context, *connect.Request[PollEventsRequest]) (*connect.Response[PollEventsResponse], error)
 	// StreamEvents repeatedly performs bounded durable polls until cancellation.
@@ -397,6 +417,12 @@ func NewAsterApplicationServiceHandler(svc AsterApplicationServiceHandler, opts 
 		connect.WithSchema(asterApplicationServiceMethods.ByName("CreateEventSubscription")),
 		connect.WithHandlerOptions(opts...),
 	)
+	asterApplicationServiceListEventSubscriptionsHandler := connect.NewUnaryHandler(
+		AsterApplicationServiceListEventSubscriptionsProcedure,
+		svc.ListEventSubscriptions,
+		connect.WithSchema(asterApplicationServiceMethods.ByName("ListEventSubscriptions")),
+		connect.WithHandlerOptions(opts...),
+	)
 	asterApplicationServicePollEventsHandler := connect.NewUnaryHandler(
 		AsterApplicationServicePollEventsProcedure,
 		svc.PollEvents,
@@ -447,6 +473,8 @@ func NewAsterApplicationServiceHandler(svc AsterApplicationServiceHandler, opts 
 			asterApplicationServiceQueryEventsHandler.ServeHTTP(w, r)
 		case AsterApplicationServiceCreateEventSubscriptionProcedure:
 			asterApplicationServiceCreateEventSubscriptionHandler.ServeHTTP(w, r)
+		case AsterApplicationServiceListEventSubscriptionsProcedure:
+			asterApplicationServiceListEventSubscriptionsHandler.ServeHTTP(w, r)
 		case AsterApplicationServicePollEventsProcedure:
 			asterApplicationServicePollEventsHandler.ServeHTTP(w, r)
 		case AsterApplicationServiceStreamEventsProcedure:
@@ -500,6 +528,10 @@ func (UnimplementedAsterApplicationServiceHandler) QueryEvents(context.Context, 
 
 func (UnimplementedAsterApplicationServiceHandler) CreateEventSubscription(context.Context, *connect.Request[CreateEventSubscriptionRequest]) (*connect.Response[CreateEventSubscriptionResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("aster.application.v1alpha1.AsterApplicationService.CreateEventSubscription is not implemented"))
+}
+
+func (UnimplementedAsterApplicationServiceHandler) ListEventSubscriptions(context.Context, *connect.Request[ListEventSubscriptionsRequest]) (*connect.Response[ListEventSubscriptionsResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("aster.application.v1alpha1.AsterApplicationService.ListEventSubscriptions is not implemented"))
 }
 
 func (UnimplementedAsterApplicationServiceHandler) PollEvents(context.Context, *connect.Request[PollEventsRequest]) (*connect.Response[PollEventsResponse], error) {

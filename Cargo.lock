@@ -278,6 +278,7 @@ dependencies = [
  "aster-core",
  "aster-iroh",
  "aster-node",
+ "aster-profile",
  "aster-redb-store",
  "aster-systemd-credentials",
  "buffa",

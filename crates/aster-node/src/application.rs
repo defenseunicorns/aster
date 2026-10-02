@@ -447,6 +447,16 @@ pub struct EventSubscriptionRequest {
     pub include_descendant_scopes: bool,
 }
 
+/// Snapshot of one local Consume subscription.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventSubscriptionSnapshot {
+    pub id: EventSubscriptionId,
+    pub operation_key: Vec<u8>,
+    pub topic: Topic,
+    pub scope: Scope,
+    pub include_descendant_scopes: bool,
+}
+
 /// Result of creating or replaying one durable subscription request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EventSubscription {
@@ -903,6 +913,19 @@ impl SelectedEventHandle {
         .await
     }
 
+    /// Lists local Consume subscriptions without polling them.
+    pub async fn list_subscriptions(
+        &self,
+    ) -> Result<Vec<EventSubscriptionSnapshot>, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedEventCommand::ListSubscriptions { response },
+            received,
+            "list_subscriptions",
+        )
+        .await
+    }
+
     pub async fn subscribe(
         &self,
         request: EventSubscriptionRequest,
@@ -1005,6 +1028,9 @@ pub(crate) fn actor_unavailable(operation: &'static str) -> ApplicationError {
 }
 
 pub(crate) enum SelectedEventCommand {
+    ListSubscriptions {
+        response: oneshot::Sender<Result<Vec<EventSubscriptionSnapshot>, ApplicationError>>,
+    },
     Publish {
         request: EventPublishRequest,
         options: EventPublishOptions,
@@ -1106,6 +1132,9 @@ impl SelectedEventCommand {
                 _ = response.send(Err(actor_unavailable("unsubscribe")));
             }
             Self::Gaps { response, .. } => _ = response.send(Err(actor_unavailable("gaps"))),
+            Self::ListSubscriptions { response } => {
+                _ = response.send(Err(actor_unavailable("list_subscriptions")))
+            }
             Self::Status { response } => _ = response.send(Err(actor_unavailable("status"))),
         }
     }
@@ -1443,6 +1472,24 @@ impl SelectedEventNode {
             id: EventSubscriptionId::from_store(outcome.id),
             inserted: outcome.inserted,
         })
+    }
+
+    /// Lists all local Consume subscriptions in raw subscription-ID order.
+    pub fn list_subscriptions(&self) -> Result<Vec<EventSubscriptionSnapshot>, ApplicationError> {
+        self.store
+            .list_event_subscriptions()
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| EventSubscriptionSnapshot {
+                        id: EventSubscriptionId::from_store(row.id),
+                        operation_key: row.operation_key.as_bytes().to_vec(),
+                        topic: row.spec.topic,
+                        scope: row.spec.scope,
+                        include_descendant_scopes: row.spec.include_descendant_scopes,
+                    })
+                    .collect()
+            })
+            .map_err(|error| application_error("list_subscriptions", error.into()))
     }
 
     /// Polls one durable subscription with at-least-once delivery semantics.
