@@ -10999,6 +10999,9 @@ fn execute_selected_event_command(
             let result = application.acknowledge_publication_result(&client_id, session, sequence);
             let _ = response.send(result);
         }
+        SelectedEventCommand::ListSubscriptions { response } => {
+            let _ = response.send(application.list_subscriptions());
+        }
         SelectedEventCommand::Query { query, response } => {
             let result = application.query(query);
             let _ = response.send(result);

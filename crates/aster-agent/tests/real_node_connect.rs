@@ -226,6 +226,18 @@ fn connect_client_uses_the_real_live_event_authority() {
         assert_eq!(owned.identity, status.identity);
         assert_eq!(owned.mission_authority, status.mission_authority);
 
+        // Tracer exercises the real route independently of generated types.
+        {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let mut stream = tokio::net::TcpStream::connect(address).await.expect("connect");
+            let request = format!("POST /aster.application.v1alpha1.AsterApplicationService/ListEventSubscriptions HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nConnect-Protocol-Version: 1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}", String::from_utf8_lossy(TEST_TOKEN));
+            stream.write_all(request.as_bytes()).await.expect("write request");
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.expect("read response");
+            let response = String::from_utf8(bytes).expect("HTTP JSON");
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
+
         let subscription = client
             .create_event_subscription(api::CreateEventSubscriptionRequest {
                 operation_key: b"connect-real-subscription".to_vec(),
@@ -238,6 +250,14 @@ fn connect_client_uses_the_real_live_event_authority() {
             .expect("create durable subscription")
             .into_owned();
         assert!(subscription.inserted);
+        let listed = client.list_event_subscriptions(api::ListEventSubscriptionsRequest::default()).await.expect("list subscriptions").into_owned();
+        assert_eq!(listed.subscriptions.len(), 1);
+        let row = &listed.subscriptions[0];
+        assert_eq!(row.subscription_id, subscription.subscription_id);
+        assert_eq!(row.operation_key, b"connect-real-subscription");
+        assert_eq!(row.topic, "chat.events");
+        assert_eq!(row.scope, "mission/team/alpha");
+        assert!(!row.include_descendant_scopes);
 
         let published = client
             .publish_event(api::PublishEventRequest {
@@ -358,6 +378,152 @@ fn connect_client_uses_the_real_live_event_authority() {
             .expect("agent serve");
         node.shutdown().await.expect("node shutdown");
     });
+}
+
+#[tokio::test]
+async fn subscription_listing_survives_restart_with_binary_keys_and_distinct_selectors() {
+    let state = TestState::new();
+    let mut expected = Vec::new();
+    for generation in 0..2 {
+        let mission = UnprotectedReferenceMission::from_bytes(
+            include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle")
+                .to_vec(),
+        )
+        .unwrap();
+        let node = start_node(NodeConfig {
+            state: state.0.clone(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            mission,
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(50),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .unwrap();
+        let agent = BoundAgent::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let address = agent.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(agent.serve(
+            node.selected_events(),
+            ClientToken::from_bytes(TEST_TOKEN.to_vec()).unwrap(),
+            shutdown_rx,
+        ));
+        let client = api::AsterApplicationServiceClient::new(
+            HttpClient::plaintext(),
+            ClientConfig::new(format!("http://{address}").parse().unwrap()).with_default_header(
+                "authorization",
+                format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+            ),
+        );
+        let unauthenticated = api::AsterApplicationServiceClient::new(
+            HttpClient::plaintext(),
+            ClientConfig::new(format!("http://{address}").parse().unwrap()),
+        );
+        let error = unauthenticated
+            .list_event_subscriptions(api::ListEventSubscriptionsRequest::default())
+            .await
+            .unwrap_err();
+        assert_authentication_error(&error, api::PublicErrorDetail::FULL_NAME);
+        let before = client
+            .list_event_subscriptions(api::ListEventSubscriptionsRequest::default())
+            .await
+            .unwrap()
+            .into_owned();
+        assert_eq!(before.subscriptions, expected);
+        if generation == 0 {
+            for key in [
+                vec![0xff, 0, 0x80],
+                vec![0xfe; aster_redb_store::MAX_EVENT_SUBSCRIPTION_KEY_BYTES],
+                vec![0xfd, 0],
+            ] {
+                let request = api::CreateEventSubscriptionRequest {
+                    operation_key: key.clone(),
+                    topic: "chat.events".to_owned(),
+                    scope: "mission/team/alpha".to_owned(),
+                    include_descendant_scopes: true,
+                    ..Default::default()
+                };
+                let created = client
+                    .create_event_subscription(request.clone())
+                    .await
+                    .unwrap()
+                    .into_owned();
+                let replay = client
+                    .create_event_subscription(request)
+                    .await
+                    .unwrap()
+                    .into_owned();
+                assert!(!replay.inserted);
+                assert_eq!(replay.subscription_id, created.subscription_id);
+                expected.push(api::EventSubscription {
+                    subscription_id: created.subscription_id,
+                    topic: "chat.events".to_owned(),
+                    scope: "mission/team/alpha".to_owned(),
+                    include_descendant_scopes: true,
+                    operation_key: key,
+                    ..Default::default()
+                });
+            }
+            expected.sort_by(|a, b| a.subscription_id.cmp(&b.subscription_id));
+        } else {
+            let removed = expected.remove(1);
+            client
+                .delete_event_subscription(api::DeleteEventSubscriptionRequest {
+                    subscription_id: removed.subscription_id,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        for _ in 0..2 {
+            assert_eq!(
+                client
+                    .list_event_subscriptions(api::ListEventSubscriptionsRequest::default())
+                    .await
+                    .unwrap()
+                    .into_owned()
+                    .subscriptions,
+                expected
+            );
+        }
+        let json_client = api::AsterApplicationServiceClient::new(
+            HttpClient::plaintext(),
+            ClientConfig::new(format!("http://{address}").parse().unwrap())
+                .with_protocol(Protocol::Connect)
+                .with_codec_format(connectrpc::CodecFormat::Json)
+                .with_default_header(
+                    "authorization",
+                    format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+                ),
+        );
+        assert_eq!(
+            json_client
+                .list_event_subscriptions(api::ListEventSubscriptionsRequest::default())
+                .await
+                .unwrap()
+                .into_owned()
+                .subscriptions,
+            expected,
+            "populated JSON response must preserve arbitrary binary operation keys"
+        );
+        let handle = node.selected_events();
+        node.shutdown().await.unwrap();
+        let error = json_client
+            .list_event_subscriptions(api::ListEventSubscriptionsRequest::default())
+            .await
+            .expect_err("closed actor must reject this RPC, not return an empty list");
+        assert_eq!(error.code, ErrorCode::Unavailable);
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+        assert!(
+            handle.list_subscriptions().await.is_err(),
+            "closed actor must not return an empty success"
+        );
+    }
 }
 
 #[tokio::test]

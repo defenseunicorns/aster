@@ -878,6 +878,10 @@ mod tests {
             "CreateEventSubscription"
         );
         assert_unary_rejected!(
+            client.list_event_subscriptions(api::ListEventSubscriptionsRequest::default()),
+            "ListEventSubscriptions"
+        );
+        assert_unary_rejected!(
             client.poll_events(api::PollEventsRequest::default()),
             "PollEvents"
         );

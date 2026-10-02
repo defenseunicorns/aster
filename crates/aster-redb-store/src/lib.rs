@@ -1688,6 +1688,17 @@ pub enum EventSubscriptionMode {
     Carry,
 }
 
+/// One local Consume subscription, excluding delivery progress.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventSubscriptionSnapshot {
+    /// Stable subscription identity.
+    pub id: EventSubscriptionId,
+    /// Exact application operation key.
+    pub operation_key: EventSubscriptionKey,
+    /// Subscription selector.
+    pub spec: EventSubscriptionSpec,
+}
+
 /// One durable Event receive selector.
 ///
 /// This is local intent only. Callers must independently enforce current
@@ -6126,6 +6137,83 @@ impl Store {
         self.require_bound_mission()?;
         let read = self.database.begin_read()?;
         event_subscription_stats_read(&read)
+    }
+
+    /// Reads the complete local Consume subscription snapshot without delivery mutation.
+    pub fn list_event_subscriptions(&self) -> Result<Vec<EventSubscriptionSnapshot>, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        if read_mission_binding_read(&read)? != Some(authority) {
+            return Err(StoreError::SemanticInvariant(
+                "Event subscription mission binding differs from the open store",
+            ));
+        }
+        let subscriptions = read.open_table(EVENT_SUBSCRIPTIONS)?;
+        let count = subscriptions.len()?;
+        if count > MAX_EVENT_SUBSCRIPTIONS {
+            return Err(StoreError::SemanticInvariant(
+                "Event subscription count exceeds its safety cap",
+            ));
+        }
+        let metadata = read.open_table(METADATA)?;
+        let durable = metadata
+            .get(EVENT_SUBSCRIPTION_COUNT)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: EVENT_SUBSCRIPTION_COUNT,
+            })?
+            .value();
+        if durable != count {
+            return Err(StoreError::AccountingMismatch {
+                field: EVENT_SUBSCRIPTION_COUNT,
+                durable,
+                reconstructed: count,
+            });
+        }
+        let revision = metadata
+            .get(EVENT_SELECTOR_REVISION)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: EVENT_SELECTOR_REVISION,
+            })?
+            .value();
+        validate_event_selector_generation(revision, count)?;
+        let last_marker = metadata
+            .get(LAST_SEMANTIC_ACCEPTANCE_MARKER)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: LAST_SEMANTIC_ACCEPTANCE_MARKER,
+            })?
+            .value();
+        // Only subscription rows and their metadata are audited here. Delivery
+        // and Event integrity belongs to the full audit, not this bounded read.
+        let mut snapshot = Vec::new();
+        // redb byte-slice keys iterate in lexicographic raw-ID order. Do not
+        // canonicalize selectors: separate operation keys remain separate rows.
+        for row in subscriptions.iter()? {
+            let (key, value) = row?;
+            let id = parse_event_subscription_id(key.value())?;
+            let record = decode_event_subscription_record(value.value())?;
+            if event_subscription_id(authority, &record.operation_key) != id {
+                return Err(StoreError::SemanticInvariant(
+                    "Event subscription identifier differs from its operation key",
+                ));
+            }
+            if record.discovered_through > last_marker
+                || (record.spec.mode == EventSubscriptionMode::Carry
+                    && record.discovered_through != 0)
+            {
+                return Err(StoreError::SemanticInvariant(
+                    "Event subscription contains an invalid delivery cursor",
+                ));
+            }
+            if record.spec.mode == EventSubscriptionMode::Consume {
+                snapshot.push(EventSubscriptionSnapshot {
+                    id,
+                    operation_key: record.operation_key,
+                    spec: record.spec,
+                });
+            }
+        }
+        Ok(snapshot)
     }
 
     /// Idempotently creates one durable Consume or Carry Event selector.
@@ -23163,6 +23251,7 @@ mod tests {
     mod event_operation_migration;
     mod event_operation_publication;
     mod event_operation_retirement;
+    mod event_subscription_listing;
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -26021,6 +26110,7 @@ mod tests {
             .commit_event_subscription_poll_with_policy(&policy, &plan, &selection)
             .expect("commit attempt one");
         assert_eq!(first_attempt.deliveries[0].attempt, 1);
+        event_subscription_listing::assert_listing_does_not_mutate_delivery(&store);
         assert_eq!(first_attempt.scanned_through, 1);
         assert!(first_attempt.has_more);
         assert!(matches!(
@@ -26062,6 +26152,7 @@ mod tests {
             EventDeliveryAck::AlreadyAcknowledged
         );
 
+        event_subscription_listing::assert_listing_does_not_mutate_delivery(&store);
         let gap_plan = store
             .prepare_event_subscription_poll_with_policy(&policy, subscription, 4, 1)
             .expect("bounded unfiltered gap plan");
