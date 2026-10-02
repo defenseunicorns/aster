@@ -65,6 +65,8 @@ class RealAgentTest(unittest.TestCase):
                         time.sleep(0.1)
                     self.assertEqual(len(base64.b64decode(json.loads(status.stdout)["identity"])), 32)
                     self.assertTrue(cli("status").stdout)
+                    self.assertEqual(cli("subscriptions").stdout, b"")
+                    self.assertEqual(json.loads(cli("subscriptions", "--json").stdout), [])
                     publish = ["--json", "publish", "--topic", "chat.events",
                                "--scope", "mission/team/alpha", "--operation-key", "cli-smoke-publish",
                                "--ttl-ms", "60000", "asterctl upstream smoke"]
@@ -88,13 +90,36 @@ class RealAgentTest(unittest.TestCase):
                     self.assertEqual(created["subscriptionId"], repeated["subscriptionId"])
                     self.assertEqual(len(base64.b64decode(created["subscriptionId"])), 32)
                     self.assertEqual(created["operation_key"], "cli-smoke-subscribe")
+                    descendant = json.loads(cli(
+                        "subscribe", "chat.events", "--scope=mission/team/alpha/*",
+                        "--operation-key=cli-smoke-descendant", "--json").stdout)
+                    listed = json.loads(cli("subscriptions", "--json").stdout)
+                    expected = [
+                        {"subscriptionId": created["subscriptionId"], "topic": "chat.events",
+                         "scope": "mission/team/alpha", "includeDescendantScopes": False,
+                         "operationKey": base64.b64encode(b"cli-smoke-subscribe").decode()},
+                        {"subscriptionId": descendant["subscriptionId"], "topic": "chat.events",
+                         "scope": "mission/team/alpha", "includeDescendantScopes": True,
+                         "operationKey": base64.b64encode(b"cli-smoke-descendant").decode()},
+                    ]
+                    expected.sort(key=lambda row: base64.b64decode(row["subscriptionId"]))
+                    self.assertEqual(listed, expected)
+                    text = cli("subscriptions").stdout.decode()
+                    self.assertEqual(text.count("SUBSCRIPTION:\n"), 2)
+                    self.assertIn('"mission/team/alpha"', text)
+                    self.assertIn('"mission/team/alpha/*"', text)
+                    self.assertIn('"cli-smoke-subscribe"', text)
+                    self.assertIn('"cli-smoke-descendant"', text)
+                    for row in expected:
+                        self.assertIn(row["subscriptionId"], text)
                     # Replace only the temporary fixture token file, not the agent's in-memory token.
                     Path(config["credentials"]["client_token_file"]).write_text("incorrect-test-token-" * 3)
-                    denied = cli("status", success=False)
-                    self.assertEqual(denied.returncode, 1)
-                    self.assertEqual(denied.stdout, b"")
-                    self.assertIn(b"unauthenticated", denied.stderr)
-                    self.assertNotIn(b"incorrect-test-token-", denied.stderr)
+                    for command in ("status", "subscriptions"):
+                        denied = cli(command, success=False)
+                        self.assertEqual(denied.returncode, 1)
+                        self.assertEqual(denied.stdout, b"")
+                        self.assertIn(b"unauthenticated", denied.stderr)
+                        self.assertNotIn(b"incorrect-test-token-", denied.stderr)
                 finally:
                     agent.terminate()
                     try:
