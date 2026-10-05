@@ -57,7 +57,8 @@ Short options with values require a separate argument, for example
 When supported by the command, print the response in JSON format.
 .TP
 .BR \-h ", " "\-\-host IP"
-Connect to the agent at the specified IPv4 or IPv6 address.
+Connect to the agent at the specified loopback IPv4 or IPv6 address.
+Non-loopback addresses are rejected because RPC uses plaintext HTTP.
 Default: 127.0.0.1.
 .TP
 .BR \-p ", " "\-\-port PORT"

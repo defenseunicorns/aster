@@ -5,6 +5,12 @@ Clean Room — Privileged
 `asterctl` is a command-line utility for introspecting and controlling Aster
 nodes through a running `aster-agent`. 
 
+The plaintext RPC client accepts only loopback IPv4 or IPv6 addresses. Remote
+agents require a local authenticated tunnel endpoint; `--host` cannot send
+bearer tokens or Event payloads directly over a remote plaintext connection.
+
+Currently it provides `status`, `publish`, `query`, and `subscribe`.
+
 See man page for usage details
 
 ## Build and run

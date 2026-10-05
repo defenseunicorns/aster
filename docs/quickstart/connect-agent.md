@@ -373,7 +373,7 @@ above its bound.
 ## Inspect Event subscriptions
 
 `ListEventSubscriptions` takes an empty request and returns `subscriptions`, a
-full list of this node's subscriptions ordered by subscription ID. Each row
+full list of this node's Consume subscriptions ordered by subscription ID. Each row
 contains `subscription_id`, `topic`, `scope`, `include_descendant_scopes`, and
 the `operation_key` bytes (including non-UTF-8 keys; Protobuf
 JSON represents bytes as base64).

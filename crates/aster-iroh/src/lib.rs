@@ -1414,6 +1414,12 @@ impl Endpoint {
         // this bounded HTTPS probe is what lets Iroh select that relay.
         net_report_config.https_probes = relay.is_some();
         let mut builder = IrohEndpoint::builder(presets::Minimal)
+            .dns_resolver(
+                iroh::dns::DnsResolver::builder()
+                    .with_system_defaults()
+                    .disable_fallback()
+                    .build(),
+            )
             .secret_key(secret)
             .clear_address_lookup()
             .clear_relay_transports()

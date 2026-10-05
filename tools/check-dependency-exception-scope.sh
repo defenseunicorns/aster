@@ -24,8 +24,7 @@ lock_hickory_packages=$(
 )
 expected_lock_hickory_packages='hickory-proto 0.25.2
 hickory-proto 0.26.1
-hickory-resolver 0.25.2
-hickory-resolver 0.26.1'
+hickory-resolver 0.25.2'
 
 if [ "$lock_hickory_packages" != "$expected_lock_hickory_packages" ]; then
   printf '%s\n' 'dependency-exception scope failed: unexpected lock-only Hickory package set' >&2

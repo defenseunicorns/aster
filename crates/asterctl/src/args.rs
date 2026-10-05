@@ -23,7 +23,7 @@ COMMANDS:
   subscriptions     List Event subscriptions
 
 OPTIONS:
-  -h, --host IP          Aster node IP address (default: 127.0.0.1)
+  -h, --host IP          Loopback agent IP address (default: 127.0.0.1)
   -p, --port PORT        Aster node RPC port (default: 8181)
       --timeout SECONDS Client RPC timeout, 1–86400 seconds (default: 10)
                         Agent-side deadlines may be shorter (currently at most 30s)
@@ -220,6 +220,11 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             _ => return Err("unknown argument or command; see --help".into()),
         }
     }
+    if !host.is_loopback() {
+        return Err(
+            "host must be a loopback IPv4 or IPv6 address; plaintext RPC is local-only".into(),
+        );
+    }
     if let Some(publication) = &publication {
         publication.validate()?;
     }
@@ -280,6 +285,25 @@ mod tests {
 
     fn raw_arguments(args: &[&str]) -> Result<Command, String> {
         parse(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn rejects_non_loopback_hosts_for_every_command() {
+        for command in ["status", "publish", "query", "subscribe"] {
+            for host in [
+                "0.0.0.0",
+                "192.0.2.1",
+                "::",
+                "2001:db8::1",
+                "::ffff:127.0.0.1",
+            ] {
+                let error = arguments(&[command, "--host", host]).unwrap_err();
+                assert!(error.contains("loopback"), "{command} {host}: {error}");
+            }
+        }
+        for host in ["127.0.0.1", "127.0.0.2", "::1"] {
+            assert!(arguments(&["status", "--host", host]).is_ok());
+        }
     }
 
     #[test]

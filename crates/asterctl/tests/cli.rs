@@ -338,3 +338,23 @@ fn timeout_before_command_sets_the_rpc_deadline_without_changing_output() {
     assert!((19_000..=20_000).contains(&milliseconds), "{milliseconds}");
     server.join().unwrap();
 }
+
+#[test]
+fn non_loopback_is_rejected_before_loading_credentials_or_payload() {
+    for command in ["status", "publish", "query", "subscribe"] {
+        let output = cli(&[
+            command,
+            "--host",
+            "192.0.2.1",
+            "--token-file",
+            "/nonexistent/asterctl-review-token",
+        ]);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("host must be a loopback")
+        );
+        assert!(output.stdout.is_empty());
+    }
+}

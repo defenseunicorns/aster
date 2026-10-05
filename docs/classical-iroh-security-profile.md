@@ -118,10 +118,10 @@ operations, so they receive QUIC protection once rather than QUIC plus
 `ASTRFR01`. All handshake failures close the connection. Dropping or explicitly
 closing the session also closes it and erases session-derived state.
 
-Holding a session open is not traffic-free. The pinned Iroh `1.0.3` transport
-configuration uses five-second connection/path keepalives. Callers should close
-the session when the bounded contact ends. No target-device battery or energy
-measurement is claimed by this implementation increment.
+Aster configures five-second connection and path keepalive intervals for the
+`IrohQuicV1` carrier profile, so an idle connection can still generate traffic.
+Close the session when the contact ends. Battery impact has not been measured
+on target devices.
 
 ## Source Event and control protection
 

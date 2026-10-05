@@ -173,12 +173,7 @@ impl PublicationJournal {
     pub fn initialize(path: impl AsRef<Path>, client_id: &[u8]) -> Result<()> {
         validate_client_id(client_id)?;
         let path = path.as_ref();
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|error| journal_error(path, "create", error))?;
+        let file = open_journal_file(path, true)?;
         let database = redb::Builder::new()
             .create_file(file)
             .map_err(|error| journal_error(path, "initialize", error))?;
@@ -218,13 +213,12 @@ impl PublicationJournal {
     pub fn open(path: impl AsRef<Path>, client_id: &[u8]) -> Result<Self> {
         validate_client_id(client_id)?;
         let path = path.as_ref().to_path_buf();
-        if !path.is_file() {
-            return Err(NumberedEventSdkError::Journal(format!(
-                "{} is missing; explicit initialization is required",
-                path.display()
-            )));
-        }
-        let database = Database::open(&path)
+        let file = open_journal_file(&path, false)?;
+        // create_file keeps the already validated descriptor and redb's writer
+        // exclusion. Empty existing files are refused by open_journal_file, so
+        // this cannot silently initialize a missing or empty journal.
+        let database = redb::Builder::new()
+            .create_file(file)
             .map_err(|error| journal_error(&path, "open exclusively", error))?;
         let journal = Self { database, path };
         let state = journal.read_state()?;
@@ -367,6 +361,47 @@ impl PublicationJournal {
             .map(|value| decode_json(value.value(), "entry"))
             .transpose()
     }
+}
+
+fn open_journal_file(path: &Path, create: bool) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(create);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| journal_error(path, "open journal", error))?;
+    #[cfg(unix)]
+    if create {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Creation mode is filtered by umask. Restore owner read/write on the
+        // same descriptor before initializing the journal, without granting
+        // group/other access or changing permissions on existing journals.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| journal_error(path, "set journal permissions", error))?;
+    }
+    let metadata = file
+        .metadata()
+        .map_err(|error| journal_error(path, "inspect journal", error))?;
+    if !metadata.is_file() || (!create && metadata.len() == 0) {
+        return Err(NumberedEventSdkError::Journal("journal must be a regular, nonempty existing file; explicit initialization is required".to_owned()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
+            return Err(NumberedEventSdkError::Journal(
+                "journal must be owned by the current user with no group or other permissions"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(file)
 }
 
 /// A generated Connect client paired with its durable numbered-operation journal.
@@ -1868,11 +1903,92 @@ mod tests {
         let path = journal_path("corrupt");
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, b"not a redb database").expect("write corrupt journal");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         assert!(PublicationJournal::open(&path, b"client-a").is_err());
         assert_eq!(
             std::fs::read(&path).expect("read corrupt journal"),
             b"not a redb database"
         );
         std::fs::remove_file(path).expect("remove journal");
+    }
+    #[test]
+    #[cfg(unix)]
+    fn journal_creation_is_private_and_reopenable_regardless_of_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+        const CHILD: &str = "ASTER_TEST_JOURNAL_UMASK_CHILD";
+        let Some(mask) = std::env::var_os(CHILD) else {
+            for mask in [0o000, 0o777] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "sdk::tests::journal_creation_is_private_and_reopenable_regardless_of_umask",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, mask.to_string())
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "umask {mask:03o}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        // Only this regression runs in each child; do not change the parallel
+        // parent harness's process-wide umask.
+        let mask = mask.to_str().unwrap().parse().unwrap();
+        rustix::process::umask(rustix::fs::Mode::from_bits_truncate(mask));
+        let path = journal_path("private-mode");
+        PublicationJournal::initialize(&path, b"client").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(PublicationJournal::open(&path, b"client").unwrap());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn insecure_and_symlink_journals_are_rejected_without_modification() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let path = journal_path("insecure-mode");
+        PublicationJournal::initialize(&path, b"client").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(PublicationJournal::open(&path, b"client").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = path.with_extension("symlink");
+        symlink(&path, &link).unwrap();
+        assert!(PublicationJournal::open(&link, b"client").is_err());
+        assert!(PublicationJournal::initialize(&link, b"client").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_file(link).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn empty_existing_journal_is_not_initialized_on_open() {
+        let path = journal_path("empty-existing");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        drop(file);
+        assert!(PublicationJournal::open(&path, b"client").is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        std::fs::remove_file(path).unwrap();
     }
 }

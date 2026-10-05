@@ -62,7 +62,14 @@ async fn grpc_status(
 
 With the `client` feature, [`sdk::PublicationJournal`] and
 [`sdk::NumberedEventSdk`] implement the experimental numbered-publication
-profile. Journal creation is explicit. Opening a missing, corrupt,
+profile. Journal creation is explicit. The journal contains plaintext publication
+intents and payloads: keep it in a protected directory. On Unix, creation uses
+mode `0600`, and opening rejects symlinks, non-regular files, files owned by
+another user, or group/other permissions. Existing journals with broader
+permissions must be restricted by their owner before opening. On other
+platforms, protect access through the directory and file ACLs.
+
+Opening a missing, corrupt,
 already-open, or differently configured journal fails closed. Call `recover`
 once per SDK process incarnation before assigning work; transport reconnects
 on the same SDK do not roll the publication session.
