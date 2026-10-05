@@ -20,6 +20,7 @@ COMMANDS:
   publish           Publish an Event
   query             Query stored Events
   subscribe         Create an Event subscription
+  subscriptions     List Event subscriptions
 
 OPTIONS:
   -h, --host IP          Loopback agent IP address (default: 127.0.0.1)
@@ -53,7 +54,9 @@ pub enum Command {
     PublishHelp,
     QueryHelp,
     SubscribeHelp,
+    SubscriptionsHelp,
     Status(Options),
+    Subscriptions(Options),
     Publish(Options, Box<Publication>),
     Query(Options, Query),
     Subscribe(Options, Subscription),
@@ -66,6 +69,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     let mut json = false;
     let mut token = None;
     let mut status = false;
+    let mut subscriptions = false;
     let mut publication: Option<Publication> = None;
     let mut query: Option<Query> = None;
     let mut subscription: Option<Subscription> = None;
@@ -100,18 +104,25 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     Command::QueryHelp
                 } else if subscription.is_some() {
                     Command::SubscribeHelp
+                } else if subscriptions {
+                    Command::SubscriptionsHelp
                 } else {
                     Command::Help
                 });
             }
-            "status" if inline.is_none() && !status && query.is_none() => status = true,
-            "publish" if inline.is_none() && !status && query.is_none() => {
+            "subscriptions" if inline.is_none() && !status && query.is_none() && !subscriptions => {
+                subscriptions = true;
+            }
+            "status" if inline.is_none() && !status && query.is_none() && !subscriptions => {
+                status = true
+            }
+            "publish" if inline.is_none() && !status && query.is_none() && !subscriptions => {
                 publication = Some(Publication::default())
             }
-            "query" if inline.is_none() && !status && query.is_none() => {
+            "query" if inline.is_none() && !status && query.is_none() && !subscriptions => {
                 query = Some(Query::default())
             }
-            "subscribe" if inline.is_none() && !status && query.is_none() => {
+            "subscribe" if inline.is_none() && !status && query.is_none() && !subscriptions => {
                 subscription = Some(Subscription::default())
             }
             "--" if inline.is_none() && (publication.is_some() || subscription.is_some()) => {
@@ -233,6 +244,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         Command::Query(options, query)
     } else if let Some(subscription) = subscription {
         Command::Subscribe(options, subscription)
+    } else if subscriptions {
+        Command::Subscriptions(options)
     } else {
         Command::Status(options)
     })

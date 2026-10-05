@@ -31,12 +31,20 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), (u8, String)> {
     let command = args::parse(std::env::args_os().skip(1)).map_err(|e| (2, e))?;
+    let subscriptions = matches!(&command, args::Command::Subscriptions(_));
     let (options, publication, query, subscription) = match command {
+        args::Command::SubscriptionsHelp => {
+            return write_output(
+                "Usage: asterctl (--token TOKEN | --token-file PATH) [OPTIONS] subscriptions\n\nList Event subscriptions.\nGlobal options: see asterctl --help.\n",
+            );
+        }
         args::Command::Help => return write_output(args::HELP),
         args::Command::PublishHelp => return write_output(publish::HELP),
         args::Command::QueryHelp => return write_output(query::HELP),
         args::Command::SubscribeHelp => return write_output(subscribe::HELP),
-        args::Command::Status(options) => (options, None, None, None),
+        args::Command::Status(options) | args::Command::Subscriptions(options) => {
+            (options, None, None, None)
+        }
         args::Command::Publish(options, publication) => (options, Some(publication), None, None),
         args::Command::Query(options, query) => (options, None, Some(query), None),
         args::Command::Subscribe(options, subscription) => {
@@ -81,7 +89,17 @@ fn run() -> Result<(), (u8, String)> {
             Err(query::Error::Rpc(error)) => Err((1, error)),
         };
     }
-    let text = if let Some(subscription) = subscription {
+    let text = if subscriptions {
+        let response = runtime
+            .block_on(client::subscriptions(address, &token, options.timeout))
+            .map_err(|e| (1, e))?;
+        output::subscriptions(&response, options.json).map_err(|_| {
+            (
+                1,
+                "cannot format ListEventSubscriptions response".to_owned(),
+            )
+        })?
+    } else if let Some(subscription) = subscription {
         let (request, key) = subscription.into_request().map_err(|e| (1, e.to_owned()))?;
         announce_key(&key)?;
         let response = runtime
