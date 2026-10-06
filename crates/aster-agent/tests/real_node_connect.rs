@@ -456,6 +456,76 @@ async fn query_filters_preserve_scan_cursors_across_empty_rpc_pages() {
                 .id,
         );
     }
+    // Decode field 8 directly to pin its wire number and exercise forwarding
+    // through the client's protobuf encoder and the real HTTP service.
+    let mut bounded = api::QueryEventsRequest::decode_from_slice(&[0x40, 4]).unwrap();
+    bounded.limit = 8;
+    let page = client.query_events(bounded).await.unwrap().into_owned();
+    assert_eq!(
+        page.events
+            .iter()
+            .map(|event| event.acceptance_marker)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(page.scanned_through, 3);
+    assert!(!page.has_more);
+
+    for (after, before) in [(0, 0), (0, 1), (3, 3), (4, 2), (u64::MAX, u64::MAX)] {
+        let page = client
+            .query_events(api::QueryEventsRequest {
+                after_acceptance_marker: after,
+                before_acceptance_marker: Some(before),
+                limit: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_owned();
+        assert!(page.events.is_empty(), "after={after}, before={before}");
+        assert_eq!(page.scanned_through, after);
+        assert!(!page.has_more);
+    }
+
+    // Combined exclusive bounds, a full final page, and filters that return
+    // empty pages must all stop at the upper bound, not the store high-water.
+    for (after, before, key, expected, scanned, more) in [
+        (1, 4, None, vec![2, 3], 3, false),
+        (1, 5, None, vec![2, 3], 3, true),
+        (3, 5, None, vec![4], 4, false),
+        (1, 5, Some(b"absent".to_vec()), vec![], 3, true),
+        (3, 5, Some(b"absent".to_vec()), vec![], 4, false),
+        (1, 4, Some(b"target".to_vec()), vec![3], 3, false),
+        (6, 8, None, vec![7], 7, false),
+        (6, u64::MAX, None, vec![7], 7, false),
+        (u64::MAX, u64::MAX, None, vec![], u64::MAX, false),
+    ] {
+        let page = client
+            .query_events(api::QueryEventsRequest {
+                publisher: Some(publisher.clone()),
+                topic: Some("chat.events".to_owned()),
+                scope: Some("mission/team".to_owned()),
+                include_descendant_scopes: true,
+                logical_key: key,
+                after_acceptance_marker: after,
+                before_acceptance_marker: Some(before),
+                limit: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_owned();
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| event.acceptance_marker)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(page.scanned_through, scanned);
+        assert_eq!(page.has_more, more);
+    }
+
     for (key, expected_pages) in [
         (None, vec![vec![1, 2], vec![3, 4], vec![5, 6], vec![7]]),
         (

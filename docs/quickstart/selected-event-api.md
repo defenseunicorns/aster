@@ -312,6 +312,13 @@ receive-only, quota, compatibility, and claim boundaries. State, Record, and
 Blob remain outside this custody path, so generic cross-class priority eviction
 is still open.
 
+`EventQuery::before_acceptance_marker` optionally sets an exclusive upper
+acceptance-marker bound (`None` is unbounded). Combined bounds scan only
+`after_acceptance_marker < marker < before_acceptance_marker`. Explicit zero,
+equal bounds, and reversed bounds yield an empty page with the lower marker
+unchanged and `has_more = false`. Continuation is restricted to the same upper
+bound, not the store's full acceptance history.
+
 `EventQuery::limit` bounds accepted rows **scanned**, not only matching rows
 returned. A selective page can therefore contain no items while `has_more` is
 true. Continue with its `scanned_through` acceptance marker. Returned items are

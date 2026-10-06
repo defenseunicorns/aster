@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Optional `before_acceptance_marker` filter for `QueryEvents` RPC call
 - subsriptions option for asterctl to get Event subscriptions list
 - `ListEventSubscriptions` RPC to list the node's Event subscriptions with their IDs, operation keys, and topic/scope filters.
 - `asterctl` CLI utility.

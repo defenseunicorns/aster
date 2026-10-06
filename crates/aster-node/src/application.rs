@@ -324,6 +324,8 @@ pub struct EventQuery {
     pub include_descendant_scopes: bool,
     pub logical_key: Option<Vec<u8>>,
     pub after_acceptance_marker: u64,
+    /// Exclusive upper bound, or unbounded when absent.
+    pub before_acceptance_marker: Option<u64>,
     pub limit: usize,
 }
 
@@ -336,6 +338,7 @@ impl Default for EventQuery {
             include_descendant_scopes: false,
             logical_key: None,
             after_acceptance_marker: 0,
+            before_acceptance_marker: None,
             limit: 128,
         }
     }
@@ -1874,6 +1877,7 @@ impl SelectedEventNode {
                 &policy,
                 &filter,
                 query.after_acceptance_marker,
+                query.before_acceptance_marker,
                 query.limit,
             )
             .map_err(|error| application_error("query", error.into()))?;

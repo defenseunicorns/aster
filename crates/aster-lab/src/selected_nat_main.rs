@@ -1453,6 +1453,7 @@ fn exact_query(publisher: [u8; 32], scope: &Scope, topic: &Topic) -> EventQuery 
         include_descendant_scopes: false,
         logical_key: Some(CANARY_LOGICAL_KEY.to_vec()),
         after_acceptance_marker: 0,
+        before_acceptance_marker: None,
         limit: 16,
     }
 }

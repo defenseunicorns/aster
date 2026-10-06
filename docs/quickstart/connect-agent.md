@@ -368,7 +368,14 @@ equivalent.
 
 `QueryEvents` returns an acceptance-marker-ordered page. Continue from
 `scanned_through` while `has_more` is true rather than raising the request
-above its bound.
+above its bound. The optional `before_acceptance_marker` is an exclusive upper
+bound: when both markers are supplied, only
+`after_acceptance_marker < marker < before_acceptance_marker` is scanned.
+Omitting the upper bound preserves the unbounded query; an explicit zero,
+equal bounds, or reversed bounds returns an empty page. `limit` still bounds
+rows scanned, including nonmatches. `has_more` refers only to the requested
+interval; an empty interval leaves `scanned_through` at the supplied lower
+marker. Keep the same upper bound when continuing from `scanned_through`.
 
 ## Inspect Event subscriptions
 

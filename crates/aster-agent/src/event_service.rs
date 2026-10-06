@@ -751,6 +751,7 @@ fn query_request(request: api::QueryEventsRequest) -> Result<EventQuery, Connect
         include_descendant_scopes: request.include_descendant_scopes,
         logical_key: request.logical_key,
         after_acceptance_marker: request.after_acceptance_marker,
+        before_acceptance_marker: request.before_acceptance_marker,
         limit: parse_limit(request.limit, operation)?,
     })
 }

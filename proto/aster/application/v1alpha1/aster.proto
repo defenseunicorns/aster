@@ -330,6 +330,8 @@ message QueryEventsRequest {
   optional bytes logical_key = 5;
   uint64 after_acceptance_marker = 6;
   uint32 limit = 7;
+  // Exclusive upper bound; absent means unbounded, present zero means empty.
+  optional uint64 before_acceptance_marker = 8;
 }
 
 message QueryEventsResponse {

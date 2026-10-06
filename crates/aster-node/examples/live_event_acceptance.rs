@@ -757,6 +757,7 @@ async fn query_stream(
             include_descendant_scopes: false,
             logical_key: Some(LOGICAL_KEY.to_vec()),
             after_acceptance_marker: 0,
+            before_acceptance_marker: None,
             limit: 8,
         })
         .await

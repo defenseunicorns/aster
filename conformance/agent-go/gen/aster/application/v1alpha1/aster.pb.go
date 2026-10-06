@@ -2448,8 +2448,10 @@ type QueryEventsRequest struct {
 	LogicalKey              []byte                 `protobuf:"bytes,5,opt,name=logical_key,json=logicalKey,proto3,oneof" json:"logical_key,omitempty"`
 	AfterAcceptanceMarker   uint64                 `protobuf:"varint,6,opt,name=after_acceptance_marker,json=afterAcceptanceMarker,proto3" json:"after_acceptance_marker,omitempty"`
 	Limit                   uint32                 `protobuf:"varint,7,opt,name=limit,proto3" json:"limit,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	// Exclusive upper bound; absent means unbounded, present zero means empty.
+	BeforeAcceptanceMarker *uint64 `protobuf:"varint,8,opt,name=before_acceptance_marker,json=beforeAcceptanceMarker,proto3,oneof" json:"before_acceptance_marker,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *QueryEventsRequest) Reset() {
@@ -2527,6 +2529,13 @@ func (x *QueryEventsRequest) GetAfterAcceptanceMarker() uint64 {
 func (x *QueryEventsRequest) GetLimit() uint32 {
 	if x != nil {
 		return x.Limit
+	}
+	return 0
+}
+
+func (x *QueryEventsRequest) GetBeforeAcceptanceMarker() uint64 {
+	if x != nil && x.BeforeAcceptanceMarker != nil {
+		return *x.BeforeAcceptanceMarker
 	}
 	return 0
 }
@@ -3685,7 +3694,7 @@ const file_aster_application_v1alpha1_aster_proto_rawDesc = "" +
 	"\vtransfer_id\x18\x01 \x01(\fR\n" +
 	"transferId\x12\x19\n" +
 	"\bevent_id\x18\x02 \x01(\fR\aeventId\x12+\n" +
-	"\x11acceptance_marker\x18\x03 \x01(\x04R\x10acceptanceMarker\"\xcf\x02\n" +
+	"\x11acceptance_marker\x18\x03 \x01(\x04R\x10acceptanceMarker\"\xab\x03\n" +
 	"\x12QueryEventsRequest\x12!\n" +
 	"\tpublisher\x18\x01 \x01(\fH\x00R\tpublisher\x88\x01\x01\x12\x19\n" +
 	"\x05topic\x18\x02 \x01(\tH\x01R\x05topic\x88\x01\x01\x12\x19\n" +
@@ -3694,12 +3703,14 @@ const file_aster_application_v1alpha1_aster_proto_rawDesc = "" +
 	"\vlogical_key\x18\x05 \x01(\fH\x03R\n" +
 	"logicalKey\x88\x01\x01\x126\n" +
 	"\x17after_acceptance_marker\x18\x06 \x01(\x04R\x15afterAcceptanceMarker\x12\x14\n" +
-	"\x05limit\x18\a \x01(\rR\x05limitB\f\n" +
+	"\x05limit\x18\a \x01(\rR\x05limit\x12=\n" +
+	"\x18before_acceptance_marker\x18\b \x01(\x04H\x04R\x16beforeAcceptanceMarker\x88\x01\x01B\f\n" +
 	"\n" +
 	"_publisherB\b\n" +
 	"\x06_topicB\b\n" +
 	"\x06_scopeB\x0e\n" +
-	"\f_logical_key\"\x94\x01\n" +
+	"\f_logical_keyB\x1b\n" +
+	"\x19_before_acceptance_marker\"\x94\x01\n" +
 	"\x13QueryEventsResponse\x129\n" +
 	"\x06events\x18\x01 \x03(\v2!.aster.application.v1alpha1.EventR\x06events\x12'\n" +
 	"\x0fscanned_through\x18\x02 \x01(\x04R\x0escannedThrough\x12\x19\n" +

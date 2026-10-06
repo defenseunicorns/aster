@@ -9692,7 +9692,9 @@ impl Store {
     /// At most `scan_limit` accepted rows after `after_acceptance_marker` are
     /// examined, even when the filter matches none of them. `scanned_through`
     /// therefore advances by examined rows rather than returned rows, and
-    /// `has_more` reports continuation independently of match count.
+    /// `has_more` reports continuation independently of match count, within the
+    /// exclusive `before_acceptance_marker` bound when present. Empty intervals
+    /// leave `scanned_through` at the lower bound and have no continuation.
     ///
     /// The exact control-policy snapshot is checked in the same redb read
     /// transaction as the index and Event rows. Success does not keep that
@@ -9704,6 +9706,7 @@ impl Store {
         policy: &ControlPolicySnapshot,
         filter: &EventQueryFilter,
         after_acceptance_marker: u64,
+        before_acceptance_marker: Option<u64>,
         scan_limit: usize,
     ) -> Result<EventCandidatePage, StoreError> {
         let authority = self.require_bound_mission()?;
@@ -9724,11 +9727,15 @@ impl Store {
             scanned_through: after_acceptance_marker,
             ..EventCandidatePage::default()
         };
+        let last_acceptance_marker = before_acceptance_marker
+            .map_or(last_acceptance_marker, |before| {
+                last_acceptance_marker.min(before.saturating_sub(1))
+            });
         let mut expected_marker = after_acceptance_marker.checked_add(1);
         let mut visited = 0usize;
         let range = (
             std::ops::Bound::Excluded(after_acceptance_marker),
-            std::ops::Bound::Unbounded,
+            before_acceptance_marker.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
         );
         for row in acceptance_order.range(range)?.take(scan_limit) {
             let (marker, transfer) = row?;
@@ -27037,6 +27044,7 @@ mod tests {
                     ..EventQueryFilter::default()
                 },
                 0,
+                None,
                 2,
             )
             .expect("bounded unmatched scan");
@@ -27045,7 +27053,7 @@ mod tests {
         assert!(unmatched.has_more, "continuation is independent of matches");
 
         let first_page = store
-            .query_event_candidates_with_policy(&policy, &EventQueryFilter::default(), 0, 2)
+            .query_event_candidates_with_policy(&policy, &EventQueryFilter::default(), 0, None, 2)
             .expect("first page");
         assert_eq!(
             first_page
@@ -27062,6 +27070,7 @@ mod tests {
                 &policy,
                 &EventQueryFilter::default(),
                 first_page.scanned_through,
+                None,
                 2,
             )
             .expect("second page");
@@ -27094,6 +27103,7 @@ mod tests {
                     include_descendant_scopes: true,
                 },
                 0,
+                None,
                 MAX_EVENT_PAGE,
             )
             .expect("combined descendant filter");
@@ -27117,6 +27127,7 @@ mod tests {
                     ..EventQueryFilter::default()
                 },
                 0,
+                None,
                 MAX_EVENT_PAGE,
             )
             .expect("exact scope filter");
@@ -27129,6 +27140,7 @@ mod tests {
                     ..EventQueryFilter::default()
                 },
                 0,
+                None,
                 MAX_EVENT_PAGE,
             )
             .expect("topic filter");
@@ -27141,6 +27153,7 @@ mod tests {
                     ..EventQueryFilter::default()
                 },
                 0,
+                None,
                 MAX_EVENT_PAGE,
             )
             .expect("logical-key filter");
@@ -27152,6 +27165,7 @@ mod tests {
                     &policy,
                     &EventQueryFilter::default(),
                     0,
+                    None,
                     requested,
                 ),
                 Err(StoreError::EventPageLimitExceeded { maximum, .. })
@@ -27167,9 +27181,120 @@ mod tests {
                 &wrong_policy,
                 &EventQueryFilter::default(),
                 0,
+                None,
                 1,
             ),
             Err(StoreError::MissionAuthorityMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn event_candidate_query_bounds_scan_before_loading_excluded_rows() {
+        let file = TestFile::new("event-candidate-query-upper-bound");
+        let mut services = event_services(0x44);
+        let store = Store::open_for_mission(&file.0, services.authority).unwrap();
+        let publisher = services.publisher.identity();
+        for marker in 1..=3u64 {
+            let payload = [marker as u8];
+            accept_event(
+                &store,
+                &mut services,
+                event_header(
+                    publisher,
+                    marker,
+                    marker,
+                    VersionVector::default(),
+                    &payload,
+                    &payload,
+                    None,
+                ),
+                &payload,
+            );
+        }
+        let policy = store.control_policy_snapshot().unwrap();
+        // An invalid excluded index row must not even be parsed, let alone
+        // loaded/authenticated and then filtered out.
+        let write = store.database.begin_write().unwrap();
+        write
+            .open_table(EVENT_ACCEPTANCE_ORDER)
+            .unwrap()
+            .insert(3, b"invalid".as_slice())
+            .unwrap();
+        write.commit().unwrap();
+        let filter = EventQueryFilter::default();
+        let page = store
+            .query_event_candidates_with_policy(&policy, &filter, 0, Some(3), 8)
+            .unwrap();
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|event| event.acceptance_marker)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(page.scanned_through, 2);
+        assert!(!page.has_more);
+        assert!(
+            store
+                .query_event_candidates_with_policy(&policy, &filter, 0, None, 8)
+                .is_err()
+        );
+
+        let unmatched = EventQueryFilter {
+            logical_key: Some(b"absent".to_vec()),
+            ..EventQueryFilter::default()
+        };
+        let first = store
+            .query_event_candidates_with_policy(&policy, &unmatched, 0, Some(3), 1)
+            .unwrap();
+        assert!(first.events.is_empty());
+        assert_eq!(first.scanned_through, 1);
+        assert!(first.has_more);
+        let second = store
+            .query_event_candidates_with_policy(
+                &policy,
+                &unmatched,
+                first.scanned_through,
+                Some(3),
+                1,
+            )
+            .unwrap();
+        assert!(second.events.is_empty());
+        assert_eq!(second.scanned_through, 2);
+        assert!(!second.has_more);
+        for (after, before) in [(0, 0), (0, 1), (2, 3), (3, 3), (4, 2), (u64::MAX, u64::MAX)] {
+            let page = store
+                .query_event_candidates_with_policy(&policy, &filter, after, Some(before), 8)
+                .unwrap();
+            assert!(page.events.is_empty());
+            assert_eq!(page.scanned_through, after);
+            assert!(!page.has_more);
+        }
+        // Bounds must not turn corruption inside the range into success.
+        let write = store.database.begin_write().unwrap();
+        write
+            .open_table(EVENT_ACCEPTANCE_ORDER)
+            .unwrap()
+            .remove(2)
+            .unwrap();
+        write.commit().unwrap();
+        assert!(
+            store
+                .query_event_candidates_with_policy(&policy, &filter, 0, Some(3), 8)
+                .is_err()
+        );
+        // The policy guard still applies even to an empty interval.
+        let wrong_policy = ControlPolicySnapshot {
+            authority: [0xed; 32],
+            head: policy.head,
+        };
+        assert!(matches!(
+            store.query_event_candidates_with_policy(&wrong_policy, &filter, 0, Some(0), 8),
+            Err(StoreError::MissionAuthorityMismatch { .. })
+        ));
+        assert!(matches!(
+            store.query_event_candidates_with_policy(&policy, &filter, 0, Some(0), 0),
+            Err(StoreError::EventPageLimitExceeded { .. })
         ));
     }
 
@@ -27210,7 +27335,13 @@ mod tests {
             write.commit().expect("commit middle gap");
         }
         assert!(matches!(
-            store.query_event_candidates_with_policy(&policy, &EventQueryFilter::default(), 0, 3,),
+            store.query_event_candidates_with_policy(
+                &policy,
+                &EventQueryFilter::default(),
+                0,
+                None,
+                3,
+            ),
             Err(StoreError::SemanticInvariant(
                 "Event acceptance-order query encountered a nonconsecutive marker"
             ))
@@ -27230,7 +27361,13 @@ mod tests {
             write.commit().expect("commit truncated tail");
         }
         assert!(matches!(
-            store.query_event_candidates_with_policy(&policy, &EventQueryFilter::default(), 0, 3,),
+            store.query_event_candidates_with_policy(
+                &policy,
+                &EventQueryFilter::default(),
+                0,
+                None,
+                3,
+            ),
             Err(StoreError::SemanticInvariant(
                 "Event acceptance-order query ended before durable acceptance high-water"
             ))
@@ -27303,6 +27440,7 @@ mod tests {
                     &policy,
                     &EventQueryFilter::default(),
                     0,
+                    None,
                     MAX_EVENT_PAGE,
                 )
                 .expect("query migrated order");
@@ -32932,6 +33070,7 @@ mod tests {
                 &event_query_policy,
                 &EventQueryFilter::default(),
                 0,
+                None,
                 1,
             )
             .expect("Event candidate before terminal transition");
@@ -33005,6 +33144,7 @@ mod tests {
                 &event_query_policy,
                 &EventQueryFilter::default(),
                 0,
+                None,
                 1,
             ),
             Err(StoreError::StoreZeroized(
