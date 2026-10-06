@@ -112,10 +112,23 @@ class RealAgentTest(unittest.TestCase):
                     self.assertIn('"cli-smoke-descendant"', text)
                     for row in expected:
                         self.assertIn(row["subscriptionId"], text)
+                    removed = cli("unsubscribe", created["subscriptionId"])
+                    self.assertEqual(removed.stdout, b"Subscription removed\n")
+                    remaining = json.loads(cli("subscriptions", "--json").stdout)
+                    self.assertEqual(remaining, [row for row in expected
+                                                if row["subscriptionId"] != created["subscriptionId"]])
+                    self.assertEqual(json.loads(cli("unsubscribe", created["subscriptionId"],
+                                                    "--json").stdout), {"alreadyAbsent": True})
+                    self.assertEqual(json.loads(cli("unsubscribe", descendant["subscriptionId"],
+                                                    "--json").stdout), {"alreadyAbsent": False})
+                    self.assertEqual(cli("unsubscribe", descendant["subscriptionId"]).stdout,
+                                     b"Subscription already absent\n")
+                    self.assertEqual(json.loads(cli("subscriptions", "--json").stdout), [])
                     # Replace only the temporary fixture token file, not the agent's in-memory token.
                     Path(config["credentials"]["client_token_file"]).write_text("incorrect-test-token-" * 3)
-                    for command in ("status", "subscriptions"):
-                        denied = cli(command, success=False)
+                    for arguments in (("status",), ("subscriptions",),
+                                      ("unsubscribe", created["subscriptionId"])):
+                        denied = cli(*arguments, success=False)
                         self.assertEqual(denied.returncode, 1)
                         self.assertEqual(denied.stdout, b"")
                         self.assertIn(b"unauthenticated", denied.stderr)

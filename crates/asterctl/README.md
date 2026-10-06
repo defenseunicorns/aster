@@ -9,7 +9,8 @@ The plaintext RPC client accepts only loopback IPv4 or IPv6 addresses. Remote
 agents require a local authenticated tunnel endpoint; `--host` cannot send
 bearer tokens or Event payloads directly over a remote plaintext connection.
 
-Currently it provides `status`, `publish`, `query`, and `subscribe`.
+Currently it provides `status`, `publish`, `query`, `subscribe`,
+`subscriptions`, and `unsubscribe`.
 
 See man page for usage details
 
@@ -36,7 +37,8 @@ python3 tools/test-asterctl-real.py
 
 The smoke uses ephemeral test-only provisioning and exercises authenticated
 status, finite-TTL publication and its idempotent replay, query, subscription
-creation and replay, subscription listing, and rejected authentication. It does not qualify deployed
+creation and replay, subscription listing, deletion and repeated deletion,
+and rejected authentication. It does not qualify deployed
 credentials, packages, or network delivery.
 
 ## Arguments
@@ -179,6 +181,22 @@ JSON is an array with `subscriptionId`, `topic`, `scope`,
 Base64; `scope` has no `/*` suffix. An empty list produces no text, or `[]`
 in JSON. See [asterctl-subscriptions(1)](asterctl-subscriptions.1).
 
+## Unsubscribe
+
+```sh
+asterctl --token-file ./client.token unsubscribe "$SUBSCRIPTION_ID"
+asterctl --token-file ./client.token --json unsubscribe "$SUBSCRIPTION_ID"
+```
+
+Removes an Event subscription and its delivery ledger. Use the ID returned by
+`subscribe` or listed by `subscriptions`.
+
+Prints `Subscription removed` or `Subscription already absent`; both succeed.
+With `--json`, prints `alreadyAbsent`: `false` when removed, `true` when already
+absent.
+
+See [asterctl-unsubscribe(1)](asterctl-unsubscribe.1).
+
 ## Operation keys and manual recovery
 
 Both `publish` and `subscribe` require `--operation-key KEY|auto`.
@@ -284,9 +302,9 @@ be incomplete. Exit codes are `0` for success/help (including an identical exist
 subscription and a downstream closed stdout pipe), `1` for
 authentication/RPC/input/output/command errors, and `2` for invalid arguments,
 including a missing operation key. RPC diagnostics use
-fixed protocol error codes and include the operation key when recovery is
-needed; remote error text and API tokens are never included.
-Unavailable-agent, authentication, permission, and deadline errors also include
-local troubleshooting hints. Mutation timeouts still report an unknown outcome:
-the agent may have committed the request, so retry only with the same operation
-key and identical parameters and payload.
+fixed protocol error codes; `publish` and `subscribe` include the operation key
+when recovery is needed. Remote error text and API tokens are never included.
+Rejections and read failures may include local troubleshooting hints.
+Mutation timeouts still report an unknown outcome: the agent may have committed
+the request. Retry `publish` or `subscribe` only with the same operation key and
+identical parameters and payload; retry `unsubscribe` with the same subscription ID.

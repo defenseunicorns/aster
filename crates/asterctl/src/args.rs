@@ -21,6 +21,7 @@ COMMANDS:
   query             Query stored Events
   subscribe         Create an Event subscription
   subscriptions     List Event subscriptions
+  unsubscribe       Remove an Event subscription
 
 OPTIONS:
   -h, --host IP          Loopback agent IP address (default: 127.0.0.1)
@@ -55,8 +56,10 @@ pub enum Command {
     QueryHelp,
     SubscribeHelp,
     SubscriptionsHelp,
+    UnsubscribeHelp,
     Status(Options),
     Subscriptions(Options),
+    Unsubscribe(Options, Vec<u8>),
     Publish(Options, Box<Publication>),
     Query(Options, Query),
     Subscribe(Options, Subscription),
@@ -70,6 +73,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     let mut token = None;
     let mut status = false;
     let mut subscriptions = false;
+    let mut unsubscribe = false;
+    let mut subscription_id = None;
     let mut publication: Option<Publication> = None;
     let mut query: Option<Query> = None;
     let mut subscription: Option<Subscription> = None;
@@ -78,6 +83,16 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let arg = arg.to_str().ok_or("invalid argument; see --help")?;
+        if unsubscribe && !arg.starts_with('-') {
+            if subscription_id.is_some() {
+                return Err("unsubscribe accepts exactly one SUBSCRIPTION_ID".into());
+            }
+            subscription_id = Some(
+                crate::validation::identity(arg)
+                    .ok_or("SUBSCRIPTION_ID must be a Base64 32-byte ID")?,
+            );
+            continue;
+        }
         if positional
             || (!arg.starts_with('-') && (publication.is_some() || subscription.is_some()))
         {
@@ -104,11 +119,22 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     Command::QueryHelp
                 } else if subscription.is_some() {
                     Command::SubscribeHelp
+                } else if unsubscribe {
+                    Command::UnsubscribeHelp
                 } else if subscriptions {
                     Command::SubscriptionsHelp
                 } else {
                     Command::Help
                 });
+            }
+            "unsubscribe"
+                if inline.is_none()
+                    && !status
+                    && query.is_none()
+                    && !subscriptions
+                    && !unsubscribe =>
+            {
+                unsubscribe = true;
             }
             "subscriptions" if inline.is_none() && !status && query.is_none() && !subscriptions => {
                 subscriptions = true;
@@ -231,6 +257,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     if let Some(subscription) = &subscription {
         subscription.validate()?;
     }
+    if unsubscribe && subscription_id.is_none() {
+        return Err("SUBSCRIPTION_ID is required; see unsubscribe --help".into());
+    }
     let options = Options {
         host,
         port,
@@ -244,6 +273,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         Command::Query(options, query)
     } else if let Some(subscription) = subscription {
         Command::Subscribe(options, subscription)
+    } else if let Some(id) = subscription_id {
+        Command::Unsubscribe(options, id)
     } else if subscriptions {
         Command::Subscriptions(options)
     } else {

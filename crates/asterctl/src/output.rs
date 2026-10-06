@@ -96,6 +96,21 @@ pub fn subscribe(
     }
 }
 
+pub fn unsubscribe(
+    response: &api::DeleteEventSubscriptionResponse,
+    json: bool,
+) -> Result<String, serde_json::Error> {
+    if json {
+        Ok(serde_json::to_string_pretty(&Output::Object(fields! {
+            "alreadyAbsent": response.already_absent,
+        }))? + "\n")
+    } else if response.already_absent {
+        Ok("Subscription already absent\n".to_owned())
+    } else {
+        Ok("Subscription removed\n".to_owned())
+    }
+}
+
 pub fn subscriptions(
     response: &api::ListEventSubscriptionsResponse,
     json: bool,

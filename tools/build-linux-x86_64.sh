@@ -44,7 +44,7 @@ cp crates/aster-agent/aster-agent_bin.cdx.json "$bundle/aster-agent.cdx.json"
 cp crates/asterctl/asterctl_bin.cdx.json "$bundle/asterctl.cdx.json"
 cp crates/asterctl/asterctl.1 crates/asterctl/asterctl-publish.1 \
     crates/asterctl/asterctl-query.1 crates/asterctl/asterctl-subscribe.1 \
-    crates/asterctl/asterctl-subscriptions.1 "$bundle/"
+    crates/asterctl/asterctl-subscriptions.1 crates/asterctl/asterctl-unsubscribe.1 "$bundle/"
 for name in aster aster-agent asterctl; do
     cp "$CARGO_TARGET_DIR/$target/release/$name" "$bundle/$name"
     "$bundle/$name" --help

@@ -44,6 +44,10 @@ Create a persistent Event subscription and print its ID. See
 .B subscriptions
 List Event subscriptions. See
 .BR asterctl-subscriptions (1)
+.TP
+.BI unsubscribe " SUBSCRIPTION_ID"
+Remove an Event subscription. See
+.BR asterctl-unsubscribe (1)
 .SH OPTION SYNTAX
 Long options with values accept both
 .B \-\-name value
@@ -102,7 +106,8 @@ Diagnostics go to stderr.
 .SH EXIT STATUS
 .TP
 .B 0
-Successful completion, including an identical existing subscription.
+Successful completion, including an identical existing subscription,
+a removed or already absent subscription, or help.
 .TP
 .B 1
 Command failed.
@@ -113,4 +118,5 @@ Invalid command-line arguments.
 .BR asterctl-publish (1),
 .BR asterctl-query (1),
 .BR asterctl-subscribe (1),
-.BR asterctl-subscriptions (1)
+.BR asterctl-subscriptions (1),
+.BR asterctl-unsubscribe (1)

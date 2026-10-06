@@ -70,6 +70,20 @@ impl MutationError {
         }
     }
 
+    pub fn describe_unsubscribe(&self) -> String {
+        if self.unknown {
+            format!(
+                "DeleteEventSubscription outcome unknown: {}\nretry unsubscribe with the same subscription ID",
+                self.reason
+            )
+        } else {
+            format!(
+                "DeleteEventSubscription failed: {}{}",
+                self.reason, self.hint
+            )
+        }
+    }
+
     pub fn describe(&self, method: &str, key: &Key) -> String {
         if self.unknown {
             format!(
@@ -164,6 +178,26 @@ pub async fn publish(
         ));
     }
     Ok(response)
+}
+
+pub async fn unsubscribe(
+    address: SocketAddr,
+    token: &Token,
+    subscription_id: Vec<u8>,
+    timeout: Duration,
+) -> Result<api::DeleteEventSubscriptionResponse, MutationError> {
+    let client = query_client(address, token, timeout);
+    let response = tokio::time::timeout(
+        timeout,
+        client.delete_event_subscription(api::DeleteEventSubscriptionRequest {
+            subscription_id,
+            ..Default::default()
+        }),
+    )
+    .await
+    .map_err(|_| MutationError::rpc(connectrpc::ErrorCode::DeadlineExceeded))?
+    .map_err(|e| MutationError::rpc(e.code))?;
+    Ok(response.into_owned())
 }
 
 pub async fn subscriptions(
