@@ -11,56 +11,37 @@ asterctl-unsubscribe \- remove an Event subscription
 .I SUBSCRIPTION_ID
 .YS
 .SH DESCRIPTION
-Remove one Event subscription using the DeleteEventSubscription RPC.
-The required argument is a Base64 ID decoding to exactly 32 bytes, as printed by
-.BR asterctl-subscribe (1)
-or
-.BR asterctl-subscriptions (1).
-Invalid arguments are rejected before token-file access or network activity.
-.PP
-There is no confirmation, stdin input, operation key, or automatic retry.
-.SH OPTIONS
-Accepts the global options described in
-.BR asterctl (1),
-before or after the command.
-.B \-\-help
-requires no token or subscription ID.
+Remove an Event subscription. Use the subscription ID returned by subscribe
+or listed by subscriptions.
 .SH OUTPUT
-Prints "Subscription removed" or "Subscription already absent", followed by a newline.
-Both outcomes are successful.
+Prints "Subscription removed" or "Subscription already absent" to stdout.
+Both outcomes succeed.
 .PP
-With \-\-json, prints a pretty ProtoJSON object containing only the boolean
-.B alreadyAbsent
-field: false when removed, true when already absent. The false default is included.
-.SH RECOVERY
-A timeout, lost connection, or malformed response can leave the outcome unknown:
-the agent may already have committed the removal. For example:
-.PP
-.nf
-.RS
-asterctl: DeleteEventSubscription outcome unknown: deadline_exceeded
-retry unsubscribe with the same subscription ID
-.RE
-.fi
-.PP
-Retry manually against the same agent with the same ID.
-Confirmed rejections report fixed RPC codes, not remote messages or tokens.
+With \-\-json, prints alreadyAbsent: false when removed, true when already absent.
 .SH EXIT STATUS
 .TP
 .B 0
-Removed, already absent, or help displayed. A closed stdout pipe is also successful.
+Subscription removed or already absent.
 .TP
 .B 1
-RPC, authentication, or I/O error, including an unknown mutation outcome.
+Command failed.
 .TP
 .B 2
 Invalid or missing arguments.
 .SH EXAMPLES
+Remove a subscription:
+.PP
 .nf
 .RS
 asterctl \-\-token\-file ./client.token unsubscribe "$SUBSCRIPTION_ID"
+.RE
+.fi
+.PP
+Print the result as JSON:
+.PP
+.nf
+.RS
 asterctl \-\-token\-file ./client.token unsubscribe "$SUBSCRIPTION_ID" \-\-json
-asterctl unsubscribe \-\-help
 .RE
 .fi
 .SH SEE ALSO
