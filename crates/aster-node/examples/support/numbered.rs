@@ -250,7 +250,20 @@ impl Journal {
                 use std::os::unix::fs::DirBuilderExt as _;
                 builder.mode(0o700);
             }
+            let created: Vec<_> = parent
+                .ancestors()
+                .take_while(|directory| !directory.exists())
+                .collect();
             builder.create(parent)?;
+            for directory in created.into_iter().rev() {
+                File::open(directory)?.sync_all()?;
+                File::open(
+                    directory
+                        .parent()
+                        .ok_or("new journal directory has no parent")?,
+                )?
+                .sync_all()?;
+            }
         }
         let database = redb::Builder::new().create_file(file(path, true)?)?;
         let journal = Self {
@@ -290,6 +303,8 @@ impl Journal {
                 .is_some_and(|(expected, _)| expected != state.session)
             || state.pending.as_ref().is_some_and(|pending| {
                 pending.sequence == 0
+                    || (pending.sequence != state.allocated
+                        && state.allocated.checked_add(1) != Some(pending.sequence))
                     || pending.sequence.checked_add(1) != Some(state.next)
                     || (pending.applied && pending.receipt.is_none())
             })
@@ -652,6 +667,9 @@ mod tests {
         let client = b"native-journal-test";
         assert!(Journal::open(&path, client).is_err());
         assert!(!path.exists());
+        let nested = root.0.join("new-private-parent/nested/publication.redb");
+        Journal::initialize(&nested, client).unwrap();
+        assert!(Journal::open(&nested, client).is_ok());
         Journal::initialize(&path, client).unwrap();
         assert!(Journal::initialize(&path, client).is_err());
         assert!(Journal::open(&path, b"wrong-client").is_err());

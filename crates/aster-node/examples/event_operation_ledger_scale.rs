@@ -1,29 +1,24 @@
-//! Selected-node lifecycle mechanism observer; never customer API retention
-//! qualification. Use a fresh private state directory and an explicitly
-//! unprotected clean-team mission fixture. No network peers are configured.
-//!
-//! Required flag/value pairs: --state, --mission-bundle, --output, --mode,
-//! --ttl-ms, --payload-bytes, --sample-every, --deadline-seconds, --topic,
-//! --scope, --operation-prefix, --source-commit, --binary-sha256,
-//! --config-sha256. Modes: small (requires --count 1..10000),
-//! small-byte-capacity (requires --count 1..10000; durable byte-edge fixture),
-//! The requested million-retired and candidate-capacity modes are disabled:
-//! they retain a feasibility-failure receipt before state creation because
-//! custody authority stops at 262,144 unique Events and this API cannot bind
-//! aliases. Their requested limit identities remain separate in receipts.
+//! Clean Room — Privileged.
+//! Numbered publication lifecycle observer; no customer or physical qualification.
+//! Requires a fresh private state directory and an unprotected fixture mission.
+//! --client-namespace configures ten fixed producer slots, never one client per
+//! publication. Journals retain one full intent per slot. V2 observations replace
+//! the old arbitrary-key ledger experiment without relabeling its v1 receipts.
 
+#[path = "support/numbered.rs"]
+mod numbered;
 use aster_node::{
     MutableSourceInterests, NodeApplication, NodeConfig, NodeOperatorOutputPolicy, RunningNode,
     SelectedForwardingConfig,
     application::{
-        ApplicationErrorKind, EventPublishOptions, EventPublishRequest, Priority, Scope,
-        SelectedEventHandle, Topic,
+        ApplicationError, ApplicationErrorKind, CommittedEventContent, NumberedEventPublishOutcome,
+        Priority, Scope, SelectedEventHandle, Topic,
     },
-    audit_store_event_operations,
     mission::UnprotectedReferenceMission,
     start_node_with_forwarding_and_output_policy,
 };
-use aster_redb_store::{EventOperationAuditState, EventOperationLimits, EventOperationStats};
+use aster_redb_store::{EventOperationLimits, Store};
+use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeMap,
@@ -37,74 +32,14 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::time::{sleep, timeout};
-
 type Failure = Box<dyn Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Failure>;
-
-fn unique_event_feasible(count: u64) -> bool {
-    count <= aster_redb_store::MAX_CUSTODY_RETIREMENTS
-}
-
-#[derive(Debug)]
-struct ObservedFailure {
-    phase: &'static str,
-    reason: &'static str,
-}
-impl std::fmt::Display for ObservedFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.phase, self.reason)
-    }
-}
-impl Error for ObservedFailure {}
-
-fn safe_reason(error: &Failure) -> &'static str {
-    if let Some(e) = error.downcast_ref::<ObservedFailure>() {
-        return e.reason;
-    }
-    if let Some(e) = error.downcast_ref::<aster_node::application::ApplicationError>() {
-        return match e.kind() {
-            ApplicationErrorKind::OperationCapacity => "operation_capacity",
-            ApplicationErrorKind::ResourceLimit => "resource_limit",
-            ApplicationErrorKind::StateUnavailable => "state_unavailable",
-            ApplicationErrorKind::Integrity => "integrity",
-            ApplicationErrorKind::RequestRejected => "request_rejected",
-            ApplicationErrorKind::UnauthorizedOrRevoked => "unauthorized_or_revoked",
-            ApplicationErrorKind::Conflict => "operation_conflict",
-            ApplicationErrorKind::ExpiredOrRetired => "expired_or_retired",
-            ApplicationErrorKind::InvalidRequest => "invalid_request",
-            ApplicationErrorKind::PolicyUnsettled => "policy_unsettled",
-            ApplicationErrorKind::Provisioning => "provisioning",
-            _ => "unknown_application_error",
-        };
-    }
-    if error.is::<std::io::Error>() {
-        return "io";
-    }
-    "state_unavailable"
-}
-
 fn require(ok: bool, reason: &'static str) -> Result<()> {
-    if ok {
-        return Ok(());
-    }
-    let reason = match reason {
-        "exact retry changed durable result"
-        | "exact replay changed original result"
-        | "new operation replayed" => "unexpected_replay",
-        "changed intent did not conflict" => "unexpected_conflict",
-        "ordinary boundary not reached" | "first new key did not reject at capacity" => {
-            "capacity_boundary"
-        }
-        "operation audit failed" => "integrity",
-        _ => "invariant",
-    };
-    Err(ObservedFailure {
-        phase: "validation",
-        reason,
-    }
-    .into())
+    if ok { Ok(()) } else { Err(reason.into()) }
 }
-
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 #[derive(Clone)]
 struct Workload {
     mode: &'static str,
@@ -114,38 +49,26 @@ struct Workload {
 }
 impl Workload {
     fn new(mode: &str, count: Option<u64>) -> Result<Self> {
-        let (name, ordinary, records, bytes, reserve, finite) = match (mode, count) {
-            ("small", Some(n @ 1..=10_000)) => ("small", n, n + 2, 201_326_592, 2, true),
-            ("small-byte-capacity", Some(n @ 1..=10_000)) => {
-                ("small-byte-capacity", n, n + 102, (n + 2) * 162, 2, false)
+        let (mode, ordinary, finite, bytes) = match (mode, count) {
+            ("small", Some(count @ 1..=10_000)) => ("small", count, true, 201_326_592),
+            // Ten 32-byte clients plus eight results use 2,954 logical bytes.
+            // Four spare ordinary bytes leave the ninth result outside the
+            // ordinary budget; two reserved emergency rows retain a tombstone.
+            ("small-byte-capacity", Some(count @ 1..=10_000)) => {
+                ("small-byte-capacity", count, false, 3_282)
             }
-            ("million-retired", None) => (
-                "million-retired",
-                1_000_000,
-                1_010_000,
-                201_326_592,
-                10_000,
-                true,
-            ),
-            ("candidate-capacity", None) => (
-                "candidate-capacity",
-                990_000,
-                1_000_000,
-                201_326_592,
-                10_000,
-                true,
-            ),
+            ("million-retired", None) => ("million-retired", 1_000_000, true, 201_326_592),
+            ("candidate-capacity", None) => ("candidate-capacity", 990_000, true, 201_326_592),
             _ => return Err("invalid workload mode/count".into()),
         };
         Ok(Self {
-            mode: name,
+            mode,
             ordinary,
-            limits: EventOperationLimits::new(records, bytes, reserve)?,
             finite,
+            limits: EventOperationLimits::new(20, bytes, 2)?,
         })
     }
 }
-
 struct Options {
     state: PathBuf,
     mission: PathBuf,
@@ -187,7 +110,7 @@ fn options(args: &[String]) -> Result<Options> {
                     | "--deadline-seconds"
                     | "--topic"
                     | "--scope"
-                    | "--operation-prefix"
+                    | "--client-namespace"
                     | "--source-commit"
                     | "--binary-sha256"
                     | "--config-sha256"
@@ -210,13 +133,13 @@ fn options(args: &[String]) -> Result<Options> {
         get("--mode")?,
         fields.get("--count").map(|v| v.parse()).transpose()?,
     )?;
-    let prefix = get("--operation-prefix")?;
+    let prefix = get("--client-namespace")?;
     require(
         prefix.len() <= 128
             && prefix
                 .bytes()
                 .all(|v| v.is_ascii_alphanumeric() || b"-_.".contains(&v)),
-        "invalid operation prefix",
+        "invalid client namespace",
     )?;
     for (name, length) in [
         ("--source-commit", 40),
@@ -260,61 +183,6 @@ fn options(args: &[String]) -> Result<Options> {
     })
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-fn digest(bytes: &[u8]) -> String {
-    hex(&Sha256::digest(bytes))
-}
-
-fn operation_key(prefix: &str, index: u64) -> Vec<u8> {
-    let mut h = Sha256::new();
-    h.update(b"aster/ledger-scale/key/v1\0");
-    h.update((prefix.len() as u16).to_be_bytes());
-    h.update(prefix.as_bytes());
-    h.update(index.to_be_bytes());
-    h.finalize().to_vec()
-}
-
-fn publication(o: &Options, index: u64, tombstone: bool) -> EventPublishRequest {
-    EventPublishRequest {
-        operation_key: operation_key(&o.prefix, index),
-        predecessor: None,
-        topic: o.topic.clone(),
-        scope: o.scope.clone(),
-        priority: Priority::Routine,
-        logical_key: b"ledger-scale/v1".to_vec(),
-        payload: if tombstone {
-            Vec::new()
-        } else {
-            vec![0x61; o.payload_bytes]
-        },
-        tombstone,
-    }
-}
-fn changed_publication(o: &Options, index: u64) -> EventPublishRequest {
-    let mut p = publication(o, index, false);
-    p.payload[0] ^= 1;
-    p
-}
-fn same_publication(
-    original: &aster_node::application::EventPublishResult,
-    replay: &aster_node::application::EventPublishResult,
-) -> bool {
-    let mut expected = original.clone();
-    expected.inserted = false;
-    expected == *replay
-}
-fn lifetime(o: &Options) -> Result<EventPublishOptions> {
-    Ok(if o.workload.finite {
-        EventPublishOptions::finite_ttl_ms(o.ttl_ms)?
-    } else {
-        EventPublishOptions::durable()
-    })
-}
-
-// At most four indices and four original results are retained. SplitMix's integer
-// mixing is for reproducible sampling only, not randomness or cryptography.
 fn samples(n: u64) -> Vec<u64> {
     if n == 0 {
         return Vec::new();
@@ -329,186 +197,13 @@ fn samples(n: u64) -> Vec<u64> {
     selected
 }
 
-#[derive(Default)]
-struct Receipt {
-    originals: BTreeMap<u64, aster_node::application::EventPublishResult>,
-    started_ms: u128,
-    ended_ms: u128,
-    elapsed_ms: u128,
-    startup_ms: u128,
-    shutdown_ms: u128,
-    created: u64,
-    retired: u64,
-    exact_active: u64,
-    exact_result_matches: u64,
-    exact_retired: u64,
-    conflicts: u64,
-    capacity_rejected: u64,
-    emergency_accepted: u64,
-    final_stats: EventOperationStats,
-    restarted: bool,
-    restart_ms: u128,
-    audit_complete: bool,
-    audit_ms: u128,
-    audit_scanned: u64,
-    status_samples: u64,
-    status_max_us: u128,
-    failure: &'static str,
-    phase: &'static str,
-}
-
-impl Receipt {
-    // Every interpolated string below is a fixed enum label or lowercase hex.
-    // No user text, IDs, paths, payloads, or operation bytes enter this encoder.
-    fn json(&self, o: &Options) -> String {
-        let config = format!(
-            "{{\"mode\":\"{}\",\"ordinary_target\":{},\"record_limit\":{},\"byte_limit\":{},\"emergency_reserve\":{},\"finite_ttl\":{},\"ttl_ms\":{},\"payload_bytes\":{},\"sample_every\":{},\"deadline_seconds\":{},\"topic_sha256\":\"{}\",\"scope_sha256\":\"{}\",\"operation_prefix_sha256\":\"{}\"}}",
-            o.workload.mode,
-            o.workload.ordinary,
-            o.workload.limits.max_records(),
-            o.workload.limits.max_logical_bytes(),
-            o.workload.limits.emergency_reserve(),
-            o.workload.finite,
-            o.ttl_ms,
-            o.payload_bytes,
-            o.sample_every,
-            o.deadline.as_secs(),
-            digest(o.topic.as_str().as_bytes()),
-            digest(o.scope.as_str().as_bytes()),
-            digest(o.prefix.as_bytes())
-        );
-        format!(
-            concat!(
-                "{{\"schema\":\"aster-event-operation-ledger-scale/v1\",\"claim\":\"selected-rust-node-mechanism-observation\",\"qualification\":false,",
-                "\"customer_api_retention\":\"unavailable_public_rpc_has_no_ttl\",\"provisioning\":\"unprotected_clean_team_fixture\",",
-                "\"alias_64_65\":\"unavailable_selected_api_has_no_alias_binding\",\"key_algorithm\":\"sha256:aster/ledger-scale/key/v1:u16be-prefix-length:prefix:u64be-index\",",
-                "\"sampling\":\"at_most_four_original_results_at_planned_early_middle_late_splitmix64_indices\",\"custody_unique_event_ceiling\":262144,\"long_unique_event_lifetimes\":\"blocked_7d_at_1hz_and_2d_at_5hz\",\"source_commit_supplied\":\"{}\",\"binary_sha256_supplied\":\"{}\",\"config_sha256_supplied\":\"{}\",",
-                "\"workload\":{},\"workload_sha256\":\"{}\",\"started_unix_ms\":{},\"ended_unix_ms\":{},\"elapsed_ms\":{},\"startup_ms\":{},\"shutdown_ms\":{},\"failure\":\"{}\",\"failure_phase\":\"{}\",\"request_disposition\":\"{}\",\"ledger_counts_observation\":\"last_successful_status\",",
-                "\"created_ordinary\":{},\"retired_ordinary\":{},\"exact_active_probes\":{},\"exact_retired_probes\":{},\"exact_full_result_matches\":{},\"changed_intent_conflicts\":{},\"first_new_key_rejections\":{},\"emergency_tombstones_accepted\":{},",
-                "\"records_total\":{},\"records_active\":{},\"records_retired\":{},\"reverse_rows\":{},\"logical_bytes\":{},",
-                "\"clean_restart\":{},\"restart_ms\":{},\"offline_audit_complete\":{},\"audit_ms\":{},\"audit_scanned\":{},\"status_samples\":{},\"status_max_us\":{}}}\n"
-            ),
-            o.commit,
-            o.binary_hash,
-            o.config_hash,
-            config,
-            digest(config.as_bytes()),
-            self.started_ms,
-            self.ended_ms,
-            self.elapsed_ms,
-            self.startup_ms,
-            self.shutdown_ms,
-            self.failure,
-            self.phase,
-            if self.phase == "feasibility" {
-                "not_started_feasibility_blocked"
-            } else if self.failure == "none" {
-                "observation_completed"
-            } else {
-                "observation_failed"
-            },
-            self.created,
-            self.retired,
-            self.exact_active,
-            self.exact_retired,
-            self.exact_result_matches,
-            self.conflicts,
-            self.capacity_rejected,
-            self.emergency_accepted,
-            self.final_stats.records_total,
-            self.final_stats.records_active,
-            self.final_stats.records_retired,
-            self.final_stats.reverse_rows,
-            self.final_stats.logical_bytes,
-            self.restarted,
-            self.restart_ms,
-            self.audit_complete,
-            self.audit_ms,
-            self.audit_scanned,
-            self.status_samples,
-            self.status_max_us
-        )
-    }
-}
-
-async fn sample_status(
-    events: &SelectedEventHandle,
-    r: &mut Receipt,
-) -> Result<aster_node::application::SelectedEventStatus> {
-    let began = Instant::now();
-    let status = events.status().await?;
-    r.status_samples += 1;
-    r.status_max_us = r.status_max_us.max(began.elapsed().as_micros());
-    require(
-        status.event_operation_audit.state != EventOperationAuditState::Failed,
-        "operation audit failed",
-    )?;
-    r.final_stats = status.event_operation_capacity.stats;
-    r.retired = r.final_stats.records_retired;
-    Ok(status)
-}
-
-async fn probe(
-    events: &SelectedEventHandle,
-    o: &Options,
-    n: u64,
-    r: &mut Receipt,
-    retired: bool,
-) -> Result<()> {
-    let before = sample_status(events, r)
-        .await?
-        .event_operation_capacity
-        .stats
-        .records_total;
-    for (i, original) in r.originals.clone().into_iter().filter(|(i, _)| *i < n) {
-        match events
-            .publish_with_options(publication(o, i, false), lifetime(o)?)
-            .await
-        {
-            Ok(value) => {
-                require(
-                    !retired && same_publication(&original, &value),
-                    "exact retry changed durable result",
-                )?;
-                r.exact_active += 1;
-                r.exact_result_matches += 1;
-            }
-            Err(e) if o.workload.finite && e.kind() == ApplicationErrorKind::ExpiredOrRetired => {
-                r.exact_retired += 1;
-            }
-            Err(e) => return Err(e.into()),
-        }
-        let changed = events
-            .publish_with_options(changed_publication(o, i), lifetime(o)?)
-            .await;
-        require(
-            changed.is_err_and(|e| e.kind() == ApplicationErrorKind::Conflict),
-            "changed intent did not conflict",
-        )?;
-        r.conflicts += 1;
-    }
-    require(
-        sample_status(events, r)
-            .await?
-            .event_operation_capacity
-            .stats
-            .records_total
-            == before,
-        "probes created operations",
-    )
-}
-
 async fn start(o: &Options) -> Result<RunningNode> {
     Ok(start_node_with_forwarding_and_output_policy(
         NodeConfig {
             state: o.state.clone(),
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-            mission: UnprotectedReferenceMission::load(&o.mission).map_err(|_| {
-                ObservedFailure {
-                    phase: "startup",
-                    reason: "provisioning",
-                }
-            })?,
+            mission: UnprotectedReferenceMission::load(&o.mission)
+                .map_err(|_| Failure::from("provisioning unavailable"))?,
             peers: Vec::new(),
             mutable_interests: MutableSourceInterests::default(),
             sync_interval: Duration::from_secs(300),
@@ -519,226 +214,6 @@ async fn start(o: &Options) -> Result<RunningNode> {
         NodeOperatorOutputPolicy::CustomerSafe,
     )
     .await?)
-}
-
-async fn exercise(events: &SelectedEventHandle, o: &Options, r: &mut Receipt) -> Result<()> {
-    require(
-        sample_status(events, r)
-            .await?
-            .event_operation_capacity
-            .stats
-            .records_total
-            == 0,
-        "state is not fresh",
-    )?;
-    let selected = samples(o.workload.ordinary);
-    for i in 0..o.workload.ordinary {
-        r.phase = "publication";
-        let published = events
-            .publish_with_options(publication(o, i, false), lifetime(o)?)
-            .await?;
-        require(published.inserted, "new operation replayed")?;
-        r.created += 1;
-        if selected.contains(&i) {
-            r.originals.insert(i, published.clone());
-        }
-        if r.created.is_multiple_of(o.sample_every) || r.created == o.workload.ordinary {
-            r.phase = "probe";
-            match events
-                .publish_with_options(publication(o, i, false), lifetime(o)?)
-                .await
-            {
-                Ok(replay) => {
-                    require(
-                        same_publication(&published, &replay),
-                        "exact replay changed original result",
-                    )?;
-                    r.exact_result_matches += 1;
-                }
-                Err(e)
-                    if o.workload.finite && e.kind() == ApplicationErrorKind::ExpiredOrRetired =>
-                {
-                    r.exact_retired += 1;
-                }
-                Err(e) => return Err(e.into()),
-            }
-            probe(events, o, r.created, r, false).await?;
-        }
-    }
-    r.phase = "capacity";
-    require(
-        sample_status(events, r)
-            .await?
-            .event_operation_capacity
-            .ordinary_remaining
-            == 0,
-        "ordinary boundary not reached",
-    )?;
-    let rejected = events
-        .publish_with_options(publication(o, o.workload.ordinary, false), lifetime(o)?)
-        .await;
-    require(
-        rejected.is_err_and(|e| e.kind() == ApplicationErrorKind::OperationCapacity),
-        "first new key did not reject at capacity",
-    )?;
-    r.capacity_rejected = 1;
-    let emergency = events
-        .publish(publication(o, o.workload.ordinary + 1, true))
-        .await?;
-    require(
-        emergency.inserted,
-        "emergency tombstone was not newly accepted",
-    )?;
-    r.emergency_accepted = 1;
-    if o.workload.finite {
-        r.phase = "retirement";
-        loop {
-            let stats = sample_status(events, r)
-                .await?
-                .event_operation_capacity
-                .stats;
-            if stats.records_retired == r.created {
-                break;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-    }
-    r.phase = "probe";
-    probe(events, o, r.created, r, o.workload.finite).await?;
-    require(
-        r.final_stats.records_total == r.created + 1,
-        "unexpected ledger growth",
-    )
-}
-
-fn unix_ms() -> Result<u128> {
-    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
-}
-
-async fn run_workload(o: &Options) -> Result<Receipt> {
-    let began = Instant::now();
-    let wall_start = unix_ms();
-    let mut r = Receipt {
-        started_ms: wall_start.as_ref().copied().unwrap_or(0),
-        failure: "none",
-        phase: "preflight",
-        ..Default::default()
-    };
-    if wall_start.is_err() {
-        r.phase = "clock";
-        r.failure = "wall_clock_unavailable";
-        return finish_observation(r, began);
-    }
-    // Do not create state or load provisioning for a known impossible run.
-    if !unique_event_feasible(o.workload.ordinary) {
-        r.phase = "feasibility";
-        r.failure = "custody_ceiling_alias_unavailable";
-        return finish_observation(r, began);
-    }
-    let preflight = (|| -> Result<()> {
-        private_directory(o.state.parent().ok_or("invalid state")?)?;
-        if !fs::symlink_metadata(&o.state).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-        {
-            return Err(ObservedFailure {
-                phase: "preflight",
-                reason: "state_exists",
-            }
-            .into());
-        }
-        fs::DirBuilder::new().mode(0o700).create(&o.state)?;
-        Ok(())
-    })();
-    if let Err(e) = preflight {
-        r.failure = safe_reason(&e);
-        return finish_observation(r, began);
-    }
-    r.phase = "startup";
-    let startup = Instant::now();
-    let started = start(o).await;
-    r.startup_ms = startup.elapsed().as_millis();
-    let running = match started {
-        Ok(node) => node,
-        Err(e) => {
-            r.failure = safe_reason(&e);
-            return finish_observation(r, began);
-        }
-    };
-    let events = running.selected_events();
-    match timeout(o.deadline, exercise(&events, o, &mut r)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => r.failure = safe_reason(&e),
-        Err(_) => r.failure = "workload_deadline",
-    }
-    drop(events);
-    let shutdown = Instant::now();
-    if let Err(e) = running.shutdown().await {
-        r.phase = "shutdown";
-        r.failure = safe_reason(&e.into());
-    }
-    r.shutdown_ms = shutdown.elapsed().as_millis();
-    if r.failure == "none" {
-        r.phase = "restart";
-        let restart = Instant::now();
-        match start(o).await {
-            Ok(reopened) => {
-                r.restart_ms = restart.elapsed().as_millis();
-                r.phase = "restart_probe";
-                let events = reopened.selected_events();
-                match timeout(
-                    Duration::from_secs(30),
-                    probe(&events, o, r.created, &mut r, o.workload.finite),
-                )
-                .await
-                {
-                    Ok(Ok(())) => r.restarted = true,
-                    Ok(Err(e)) => r.failure = safe_reason(&e),
-                    Err(_) => r.failure = "deadline",
-                }
-                drop(events);
-                if reopened.shutdown().await.is_err() {
-                    r.phase = "restart_shutdown";
-                    r.failure = "state_unavailable";
-                }
-            }
-            Err(e) => {
-                r.restart_ms = restart.elapsed().as_millis();
-                r.failure = safe_reason(&e);
-            }
-        }
-    }
-    if r.failure == "none" {
-        r.phase = "offline_audit";
-        let audit = Instant::now();
-        match audit_store_event_operations(&o.state) {
-            Ok(p) => {
-                r.audit_scanned = p.scanned;
-                r.audit_complete = p.scanned == p.total;
-                if !r.audit_complete {
-                    r.failure = "integrity";
-                }
-            }
-            Err(_) => r.failure = "integrity",
-        };
-        r.audit_ms = audit.elapsed().as_millis();
-    }
-    if r.failure == "none" {
-        r.phase = "complete";
-    }
-    finish_observation(r, began)
-}
-
-fn finish_observation(mut r: Receipt, began: Instant) -> Result<Receipt> {
-    match unix_ms() {
-        Ok(value) => r.ended_ms = value,
-        Err(_) => {
-            if r.failure == "none" {
-                r.phase = "clock";
-                r.failure = "wall_clock_unavailable";
-            }
-        }
-    }
-    r.elapsed_ms = began.elapsed().as_millis();
-    Ok(r)
 }
 
 struct AtomicOutput {
@@ -832,46 +307,400 @@ fn private_directory(path: &Path) -> Result<()> {
     )
 }
 
-async fn run(args: &[String]) -> Result<()> {
-    let o = options(args).map_err(|_| ObservedFailure {
-        phase: "arguments",
-        reason: "invalid_arguments",
-    })?;
-    let mut output = AtomicOutput::prepare(&o.output).map_err(|_| ObservedFailure {
-        phase: "output",
-        reason: "invalid_output",
-    })?;
-    let receipt = run_workload(&o).await?;
-    persist_receipt(&mut output, &receipt, &o)?;
-    if receipt.failure != "none" {
-        return Err(ObservedFailure {
-            phase: receipt.phase,
-            reason: receipt.failure,
+#[derive(Serialize)]
+struct Receipt {
+    schema: &'static str,
+    publication_model: &'static str,
+    qualification: bool,
+    claim: &'static str,
+    mode: &'static str,
+    requested_events: u64,
+    source_commit: String,
+    binary_sha256: String,
+    config_sha256: String,
+    configured_clients: u64,
+    created: u64,
+    exact_retries: u64,
+    conflicts: u64,
+    capacity_rejected: u64,
+    emergency_accepted: u64,
+    repaired_original: u64,
+    retired_receipts: u64,
+    peak_results: u64,
+    peak_record_rows: u64,
+    peak_logical_bytes: u64,
+    final_results: u64,
+    final_clients: u64,
+    final_reverse_rows: u64,
+    final_logical_bytes: u64,
+    restarted: bool,
+    offline_numbered_audit: bool,
+    started_ms: u128,
+    elapsed_ms: u128,
+    phase: &'static str,
+    failure: &'static str,
+}
+impl Receipt {
+    fn new(o: &Options) -> Self {
+        Self {
+            schema: "aster-event-operation-ledger-scale/v2",
+            publication_model: "numbered-v1",
+            qualification: false,
+            claim: "selected-rust-node-numbered-lifecycle-observation",
+            mode: o.workload.mode,
+            requested_events: o.workload.ordinary,
+            source_commit: o.commit.clone(),
+            binary_sha256: o.binary_hash.clone(),
+            config_sha256: o.config_hash.clone(),
+            configured_clients: 10,
+            created: 0,
+            exact_retries: 0,
+            conflicts: 0,
+            capacity_rejected: 0,
+            emergency_accepted: 0,
+            repaired_original: 0,
+            retired_receipts: 0,
+            peak_results: 0,
+            peak_record_rows: 0,
+            peak_logical_bytes: 0,
+            final_results: 0,
+            final_clients: 0,
+            final_reverse_rows: 0,
+            final_logical_bytes: 0,
+            restarted: false,
+            offline_numbered_audit: false,
+            started_ms: 0,
+            elapsed_ms: 0,
+            phase: "preflight",
+            failure: "none",
         }
-        .into());
     }
+    fn json(&self) -> Result<Vec<u8>> {
+        let mut bytes = serde_json::to_vec(self)?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+}
+fn client(o: &Options, slot: usize) -> Vec<u8> {
+    let mut hash = Sha256::new();
+    hash.update(b"aster/native-numbered-observer/client/v1\0");
+    hash.update((o.prefix.len() as u16).to_be_bytes());
+    hash.update(o.prefix.as_bytes());
+    hash.update([slot as u8]);
+    hash.finalize().to_vec()
+}
+fn intent(o: &Options, index: u64, tombstone: bool) -> numbered::Intent {
+    numbered::Intent {
+        predecessor: None,
+        topic: o.topic.as_str().into(),
+        scope: o.scope.as_str().into(),
+        priority: Priority::Routine as u8,
+        logical_key: format!("observer/{index}").into_bytes(),
+        payload: if tombstone {
+            Vec::new()
+        } else {
+            vec![0x61; o.payload_bytes]
+        },
+        tombstone,
+        ttl_ms: if o.workload.finite && !tombstone {
+            Some(o.ttl_ms)
+        } else {
+            None
+        },
+    }
+}
+fn journal_path(o: &Options, slot: usize) -> PathBuf {
+    o.state.join(format!("publication-slot-{slot}.redb"))
+}
+async fn open_journals(
+    o: &Options,
+    events: &SelectedEventHandle,
+    initialize: bool,
+) -> Result<Vec<numbered::Journal>> {
+    let mut journals = Vec::new();
+    for slot in 0..10 {
+        let path = journal_path(o, slot);
+        let id = client(o, slot);
+        if initialize {
+            numbered::Journal::initialize(&path, &id)?;
+        }
+        let mut journal = numbered::Journal::open(&path, &id)?;
+        journal
+            .recover(&mut numbered::Backend::Live(events))
+            .await?;
+        journals.push(journal);
+    }
+    Ok(journals)
+}
+async fn sample_status(events: &SelectedEventHandle, r: &mut Receipt) -> Result<()> {
+    let status = events.status().await?;
+    let stats = status.event_operation_capacity.numbered_stats;
+    require(
+        stats.clients == 10 && stats.reverse_edges == stats.outstanding_results,
+        "numbered accounting",
+    )?;
+    require(
+        status.event_operation_capacity.stats.records_total == 0,
+        "ordinary publication ledger must remain empty",
+    )?;
+    r.peak_results = r.peak_results.max(stats.outstanding_results);
+    r.peak_record_rows = r
+        .peak_record_rows
+        .max(stats.clients + stats.outstanding_results);
+    r.peak_logical_bytes = r.peak_logical_bytes.max(stats.logical_bytes);
+    r.final_results = stats.outstanding_results;
+    r.final_clients = stats.clients;
+    r.final_reverse_rows = stats.reverse_edges;
+    r.final_logical_bytes = stats.logical_bytes;
     Ok(())
 }
-
-fn persist_receipt(output: &mut AtomicOutput, receipt: &Receipt, o: &Options) -> Result<()> {
-    output.finish(receipt.json(o).as_bytes()).map_err(|_| {
-        ObservedFailure {
-            phase: "output",
-            reason: "output_commit_failed",
-        }
-        .into()
-    })
+fn kind(error: &Failure) -> Option<ApplicationErrorKind> {
+    error
+        .downcast_ref::<ApplicationError>()
+        .map(ApplicationError::kind)
 }
-
+fn immutable(original: &NumberedEventPublishOutcome, replay: &NumberedEventPublishOutcome) -> bool {
+    !replay.inserted
+        && original.result.sequence == replay.result.sequence
+        && original.result.receipt == replay.result.receipt
+}
+async fn probe(
+    journal: &mut numbered::Journal,
+    events: &SelectedEventHandle,
+    original: &NumberedEventPublishOutcome,
+    r: &mut Receipt,
+) -> Result<()> {
+    let retained = journal.pending().ok_or("probe intent missing")?.1.clone();
+    let replay = journal
+        .publish(&mut numbered::Backend::Live(events), retained.clone())
+        .await?;
+    require(
+        immutable(original, &replay),
+        "exact replay changed immutable receipt",
+    )?;
+    r.exact_retries += 1;
+    let mut changed = retained;
+    changed.payload[0] ^= 1;
+    let error = journal
+        .probe_changed(&mut numbered::Backend::Live(events), &changed)
+        .await
+        .err()
+        .ok_or("changed intent accepted")?;
+    require(
+        kind(&error) == Some(ApplicationErrorKind::Conflict),
+        "changed intent conflict missing",
+    )?;
+    r.conflicts += 1;
+    Ok(())
+}
+async fn exercise(events: &SelectedEventHandle, o: &Options, r: &mut Receipt) -> Result<()> {
+    let mut journals = open_journals(o, events, true).await?;
+    let selected = samples(o.workload.ordinary);
+    let mut worker = 0;
+    for index in 0..o.workload.ordinary {
+        r.phase = "publication";
+        let slot = if let Some(slot) = selected.iter().position(|sample| *sample == index) {
+            slot
+        } else {
+            let slot = 4 + worker % 4;
+            worker += 1;
+            slot
+        };
+        let outcome = journals[slot]
+            .publish(
+                &mut numbered::Backend::Live(events),
+                intent(o, index, false),
+            )
+            .await?;
+        require(outcome.inserted, "new sequence replayed")?;
+        r.created += 1;
+        if index.is_multiple_of(o.sample_every) || selected.contains(&index) {
+            probe(&mut journals[slot], events, &outcome, r).await?;
+        }
+        if slot >= 4 {
+            journals[slot]
+                .acknowledge(&mut numbered::Backend::Live(events))
+                .await?;
+        }
+        sample_status(events, r).await?;
+    }
+    // Fill the configured eight publication slots, retaining at most one
+    // original intent per fixed producer. These are separate capacity probes.
+    let mut originals = Vec::new();
+    for (slot, journal) in journals[..8].iter_mut().enumerate() {
+        let retained = journal
+            .pending()
+            .map(|(_, intent)| intent.clone())
+            .unwrap_or_else(|| intent(o, o.workload.ordinary + slot as u64, false));
+        let outcome = journal
+            .publish(&mut numbered::Backend::Live(events), retained)
+            .await?;
+        originals.push(outcome);
+    }
+    sample_status(events, r).await?;
+    require(r.final_results == 8, "capacity slots not full")?;
+    r.phase = "capacity";
+    let rejected = intent(o, o.workload.ordinary + 8, false);
+    let error = journals[8]
+        .publish(&mut numbered::Backend::Live(events), rejected.clone())
+        .await
+        .err()
+        .ok_or("ordinary capacity did not reject")?;
+    require(
+        kind(&error) == Some(ApplicationErrorKind::OperationCapacity),
+        "ordinary capacity classification",
+    )?;
+    r.capacity_rejected = 1;
+    let emergency = journals[9]
+        .publish(
+            &mut numbered::Backend::Live(events),
+            intent(o, o.workload.ordinary + 9, true),
+        )
+        .await?;
+    require(emergency.inserted, "reserved tombstone did not commit")?;
+    r.emergency_accepted = 1;
+    sample_status(events, r).await?;
+    journals[9]
+        .acknowledge(&mut numbered::Backend::Live(events))
+        .await?;
+    if o.workload.finite {
+        r.phase = "retirement";
+        sleep(Duration::from_millis(o.ttl_ms.saturating_add(50))).await;
+    }
+    for slot in 0..8 {
+        let retained = journals[slot]
+            .pending()
+            .ok_or("retained intent missing")?
+            .1
+            .clone();
+        let replay = journals[slot]
+            .publish(&mut numbered::Backend::Live(events), retained)
+            .await?;
+        require(
+            immutable(&originals[slot], &replay),
+            "retirement changed receipt",
+        )?;
+        if o.workload.finite {
+            require(
+                matches!(replay.result.content, CommittedEventContent::Retired(_)),
+                "receipt did not survive retirement",
+            )?;
+            r.retired_receipts += 1;
+        }
+        probe(&mut journals[slot], events, &originals[slot], r).await?;
+    }
+    // Explicitly free one result, then retry the exact preserved failed input.
+    // No abandonment, new client identity, or sequence reuse is hidden here.
+    journals[4]
+        .acknowledge(&mut numbered::Backend::Live(events))
+        .await?;
+    let repaired = journals[8]
+        .publish(&mut numbered::Backend::Live(events), rejected)
+        .await?;
+    require(
+        repaired.inserted && repaired.result.sequence.get() == 1,
+        "capacity repair changed original operation",
+    )?;
+    r.repaired_original = 1;
+    journals[8]
+        .acknowledge(&mut numbered::Backend::Live(events))
+        .await?;
+    drop(journals);
+    Ok(())
+}
+fn safe_reason(error: &Failure) -> &'static str {
+    match kind(error) {
+        Some(ApplicationErrorKind::RequestRejected) => "request_rejected",
+        Some(ApplicationErrorKind::UnauthorizedOrRevoked) => "unauthorized_or_revoked",
+        Some(ApplicationErrorKind::OperationCapacity) => "operation_capacity",
+        _ => "observation_failed",
+    }
+}
+async fn run_workload(o: &Options) -> Result<Receipt> {
+    let began = Instant::now();
+    let mut r = Receipt::new(o);
+    r.started_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    if o.workload.ordinary > aster_redb_store::MAX_CUSTODY_RETIREMENTS {
+        r.phase = "feasibility";
+        r.failure = "custody_ceiling_alias_unavailable";
+        return Ok(r);
+    }
+    private_directory(o.state.parent().ok_or("state parent missing")?)?;
+    require(
+        fs::symlink_metadata(&o.state)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+        "state must be fresh",
+    )?;
+    fs::DirBuilder::new().mode(0o700).create(&o.state)?;
+    r.phase = "startup";
+    let running = match start(o).await {
+        Ok(node) => node,
+        Err(error) => {
+            r.failure = safe_reason(&error);
+            return Ok(r);
+        }
+    };
+    let events = running.selected_events();
+    match timeout(o.deadline, exercise(&events, o, &mut r)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => r.failure = safe_reason(&error),
+        Err(_) => r.failure = "workload_deadline",
+    };
+    drop(events);
+    running.shutdown().await?;
+    if r.failure == "none" {
+        r.phase = "restart";
+        let reopened = start(o).await?;
+        let events = reopened.selected_events();
+        let mut journals = open_journals(o, &events, false).await?;
+        for journal in &mut journals {
+            if let Some((_, retained)) = journal.pending() {
+                let retained = retained.clone();
+                let replay = journal
+                    .publish(&mut numbered::Backend::Live(&events), retained)
+                    .await?;
+                require(
+                    !replay.inserted,
+                    "restart duplicated a retained publication",
+                )?;
+                r.exact_retries += 1;
+                journal
+                    .acknowledge(&mut numbered::Backend::Live(&events))
+                    .await?;
+            }
+        }
+        sample_status(&events, &mut r).await?;
+        require(
+            r.final_results == 0 && r.final_reverse_rows == 0 && r.final_clients == 10,
+            "acknowledgement did not release result headroom",
+        )?;
+        r.restarted = true;
+        drop(journals);
+        drop(events);
+        reopened.shutdown().await?;
+        // Read-only inspection runs numbered table/result/reverse authority audits.
+        Store::inspect_existing(o.state.join("mesh.redb"))?;
+        r.offline_numbered_audit = true;
+        r.phase = "complete";
+    }
+    r.elapsed_ms = began.elapsed().as_millis();
+    Ok(r)
+}
+async fn run(args: &[String]) -> Result<()> {
+    let o = options(args)?;
+    let mut output = AtomicOutput::prepare(&o.output)?;
+    let receipt = run_workload(&o).await?;
+    output.finish(&receipt.json()?)?;
+    require(
+        receipt.failure == "none",
+        "observer retained a failure receipt",
+    )
+}
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     if let Err(error) = run(&env::args().skip(1).collect::<Vec<_>>()).await {
-        let phase = error
-            .downcast_ref::<ObservedFailure>()
-            .map_or("observation", |e| e.phase);
         eprintln!(
-            "{{\"status\":\"error\",\"phase\":\"{}\",\"reason\":\"{}\"}}",
-            phase,
+            "numbered publication observer failed: {}",
             safe_reason(&error)
         );
         std::process::exit(1);
@@ -881,361 +710,26 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn failure_receipt_write_error_is_safe_typed_and_never_partial() {
-        let root = TestRoot::new();
-        let o = fixture_options(&root.0);
-        let mut output = AtomicOutput::prepare(&o.output).unwrap();
-        output.file = File::open(&output.temporary).unwrap();
-        let r = Receipt {
-            failure: "provisioning",
-            phase: "startup",
-            ..Default::default()
-        };
-        let error = persist_receipt(&mut output, &r, &o).unwrap_err();
-        let safe = error.downcast_ref::<ObservedFailure>().unwrap();
-        assert_eq!(safe.phase, "output");
-        assert_eq!(safe.reason, "output_commit_failed");
-        assert!(!o.output.exists());
-        assert!(!error.to_string().contains(root.0.to_str().unwrap()));
-    }
-
-    #[test]
-    fn unique_event_lifetime_feasibility_rejects_custody_ceiling() {
-        assert!(unique_event_feasible(262_144));
-        for count in [262_145, 604_800, 864_000, 990_000, 1_000_000] {
-            assert!(!unique_event_feasible(count));
-        }
-    }
-
     #[tokio::test]
-    async fn startup_failure_and_large_mode_blocker_have_atomic_receipts() {
-        for mode in ["small", "candidate-capacity", "million-retired"] {
-            let root = TestRoot::new();
-            let mut o = fixture_options(&root.0);
-            if mode != "small" {
-                o.workload = Workload::new(mode, None).unwrap();
-            }
-            assert!(run(&cli_args(&o)).await.is_err());
-            let receipt = fs::read_to_string(&o.output).expect("failure receipt missing");
-            assert!(receipt.contains("\"qualification\":false"));
-            if mode == "small" {
-                assert!(receipt.contains("\"failure_phase\":\"startup\""));
-                assert!(receipt.contains("\"failure\":\"provisioning\""));
-            } else {
-                assert!(receipt.contains("\"failure\":\"custody_ceiling_alias_unavailable\""));
-                assert!(!o.state.exists());
-            }
-            assert!(!receipt.contains(o.mission.to_str().unwrap()));
-        }
-    }
-
-    #[tokio::test]
-    async fn workload_failure_receipt_distinguishes_policy_rejection() {
+    async fn byte_capacity_repair_restart_and_bounded_result_cleanup() {
         let root = TestRoot::new();
         let mut o = fixture_options(&root.0);
-        provision(&o);
-        o.topic = Topic::new("unprovisioned.topic").unwrap();
-        assert!(run(&cli_args(&o)).await.is_err());
-        let receipt = fs::read_to_string(&o.output).unwrap();
-        assert!(receipt.contains("\"failure_phase\":\"publication\""));
-        assert!(receipt.contains("\"failure\":\"request_rejected\""));
-    }
-
-    #[tokio::test]
-    async fn older_active_probe_rejects_changed_original_result() {
-        let root = TestRoot::new();
-        let mut o = fixture_options(&root.0);
-        o.workload = Workload::new("small-byte-capacity", Some(4)).unwrap();
-        provision(&o);
-        fs::DirBuilder::new().mode(0o700).create(&o.state).unwrap();
-        let running = start(&o).await.unwrap();
-        let events = running.selected_events();
-        let mut original = events.publish(publication(&o, 0, false)).await.unwrap();
-        original.acceptance_marker += 1;
-        let mut r = Receipt::default();
-        r.originals.insert(0, original);
-        let result = probe(&events, &o, 1, &mut r, false).await;
-        drop(events);
-        running.shutdown().await.unwrap();
-        assert!(
-            result.is_err(),
-            "older active replay accepted a changed marker"
-        );
-    }
-
-    fn cli_args(o: &Options) -> Vec<String> {
-        let pairs = [
-            ("--state", o.state.to_str().unwrap().to_owned()),
-            ("--mission-bundle", o.mission.to_str().unwrap().to_owned()),
-            ("--output", o.output.to_str().unwrap().to_owned()),
-            ("--mode", o.workload.mode.into()),
-            ("--ttl-ms", o.ttl_ms.to_string()),
-            ("--payload-bytes", o.payload_bytes.to_string()),
-            ("--sample-every", o.sample_every.to_string()),
-            ("--deadline-seconds", o.deadline.as_secs().to_string()),
-            ("--topic", o.topic.as_str().into()),
-            ("--scope", o.scope.as_str().into()),
-            ("--operation-prefix", o.prefix.clone()),
-            ("--source-commit", o.commit.clone()),
-            ("--binary-sha256", o.binary_hash.clone()),
-            ("--config-sha256", o.config_hash.clone()),
-        ];
-        let mut args = pairs
-            .into_iter()
-            .flat_map(|(k, v)| [k.into(), v])
-            .collect::<Vec<_>>();
-        if o.workload.mode.starts_with("small") {
-            args.extend(["--count".into(), o.workload.ordinary.to_string()]);
-        }
-        args
-    }
-
-    #[tokio::test]
-    async fn selected_api_same_intent_new_keys_create_distinct_events_not_aliases() {
-        let root = TestRoot::new();
-        let mut o = fixture_options(&root.0);
-        o.ttl_ms = 60_000;
-        o.workload.limits = EventOperationLimits::new(512, 201_326_592, 2).unwrap();
-        provision(&o);
-        fs::DirBuilder::new().mode(0o700).create(&o.state).unwrap();
-        let running = start(&o).await.unwrap();
-        let events = running.selected_events();
-        let first = events
-            .publish_with_options(publication(&o, 0, false), lifetime(&o).unwrap())
-            .await
-            .unwrap();
-        let second = events
-            .publish_with_options(publication(&o, 1, false), lifetime(&o).unwrap())
-            .await
-            .unwrap();
-        let status = events.status().await.unwrap();
-        drop(events);
-        running.shutdown().await.unwrap();
-        assert!(first.inserted && second.inserted);
-        assert!(first.id != second.id);
-        assert_eq!(status.event_operation_capacity.stats.records_total, 2);
-    }
-
-    #[test]
-    fn output_rejects_writable_ancestor() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let root = TestRoot::new();
-        let child = root.0.join("private");
-        fs::DirBuilder::new().mode(0o700).create(&child).unwrap();
-        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(AtomicOutput::prepare(&child.join("receipt.json")).is_err());
-    }
-
-    #[test]
-    fn output_rejects_staging_substitution() {
-        let root = TestRoot::new();
-        let destination = root.0.join("receipt.json");
-        let mut out = AtomicOutput::prepare(&destination).unwrap();
-        fs::rename(&out.temporary, root.0.join("old.tmp")).unwrap();
-        std::os::unix::fs::symlink("target", &out.temporary).unwrap();
-        assert!(out.finish(b"{}").is_err());
-        assert!(!destination.exists());
-    }
-
-    #[test]
-    fn output_rejects_swapped_parent_directory() {
-        let root = TestRoot::new();
-        let child = root.0.join("private");
-        fs::DirBuilder::new().mode(0o700).create(&child).unwrap();
-        let mut out = AtomicOutput::prepare(&child.join("receipt.json")).unwrap();
-        fs::rename(&child, root.0.join("old")).unwrap();
-        fs::DirBuilder::new().mode(0o700).create(&child).unwrap();
-        fs::write(&out.temporary, b"substitution").unwrap();
-        assert!(out.finish(b"{}").is_err());
-    }
-
-    #[test]
-    fn replay_evidence_requires_every_original_result_field() {
-        use aster_node::application::{EventId, EventPublishResult};
-        let original = EventPublishResult {
-            id: EventId::from_bytes([1; 32]),
-            publisher: [2; 32],
-            publisher_counter: 3,
-            event_sequence: 4,
-            priority: Priority::Routine,
-            ttl_ms: Some(5),
-            acceptance_marker: 6,
-            inserted: true,
-        };
-        let mut replay = original.clone();
-        replay.inserted = false;
-        assert!(same_publication(&original, &replay));
-        for field in 0..8 {
-            let mut changed = replay.clone();
-            match field {
-                0 => changed.id = EventId::from_bytes([9; 32]),
-                1 => changed.publisher = [9; 32],
-                2 => changed.publisher_counter += 1,
-                3 => changed.event_sequence += 1,
-                4 => changed.priority = Priority::Flash,
-                5 => changed.ttl_ms = None,
-                6 => changed.acceptance_marker += 1,
-                _ => changed.inserted = true,
-            }
-            assert!(
-                !same_publication(&original, &changed),
-                "changed replay field accepted"
-            );
-        }
-    }
-
-    #[test]
-    fn arguments_reject_colliding_paths_and_invalid_or_conflicting_limits() {
-        let base = [
-            "--state",
-            "/private/state",
-            "--mission-bundle",
-            "/private/mission",
-            "--output",
-            "/private/result.json",
-            "--mode",
-            "small",
-            "--count",
-            "6",
-            "--ttl-ms",
-            "1",
-            "--payload-bytes",
-            "256",
-            "--sample-every",
-            "3",
-            "--deadline-seconds",
-            "20",
-            "--topic",
-            "load.events",
-            "--scope",
-            "test/load",
-            "--operation-prefix",
-            "fixture",
-            "--source-commit",
-            &"a".repeat(40),
-            "--binary-sha256",
-            &"b".repeat(64),
-            "--config-sha256",
-            &"c".repeat(64),
-        ]
-        .map(String::from)
-        .to_vec();
-        assert!(options(&base).is_ok());
-        for (flag, value) in [
-            ("--output", "/private/state"),
-            ("--state", "/private/mission"),
-            ("--ttl-ms", "0"),
-            ("--ttl-ms", "60001"),
-            ("--sample-every", "0"),
-            ("--payload-bytes", "65537"),
-            ("--count", "18446744073709551616"),
-            ("--deadline-seconds", "0"),
-            ("--mode", "candidate-capacity"),
-            ("--source-commit", "secret"),
-            ("--operation-prefix", "invalid prefix"),
-        ] {
-            let mut args = base.clone();
-            let i = args.iter().position(|v| v == flag).unwrap();
-            args[i + 1] = value.into();
-            assert!(
-                options(&args).is_err(),
-                "invalid arguments accepted: {flag}"
-            );
-        }
-        let mut duplicate = base.clone();
-        duplicate.extend(["--count".into(), "6".into()]);
-        assert!(options(&duplicate).is_err());
-    }
-
-    #[test]
-    fn modes_keep_million_retirement_separate_from_candidate_capacity() {
-        let million = Workload::new("million-retired", None).unwrap();
-        assert_eq!(million.ordinary, 1_000_000);
-        assert_eq!(million.limits.max_records(), 1_010_000);
-        assert_eq!(million.limits.emergency_reserve(), 10_000);
-        let candidate = Workload::new("candidate-capacity", None).unwrap();
-        assert_eq!(candidate.ordinary, 990_000);
-        assert_eq!(candidate.limits, EventOperationLimits::DEFAULT);
-        assert!(Workload::new("million-retired", Some(5)).is_err());
-        assert!(Workload::new("small", Some(0)).is_err());
-        assert!(Workload::new("small", Some(10_001)).is_err());
-        assert!(Workload::new("unknown", None).is_err());
-    }
-
-    #[test]
-    fn deterministic_sampling_is_unique_bounded_and_covers_age_ranges() {
-        assert_eq!(samples(1), vec![0]);
-        for n in [2, 3, 10, 10_000, 1_000_000] {
-            let s = samples(n);
-            assert!(s.len() <= 4);
-            assert!(s.contains(&0) && s.contains(&(n / 2)) && s.contains(&(n - 1)));
-            assert!(s.iter().all(|i| *i < n));
-            assert!(s.windows(2).all(|w| w[0] < w[1]));
-            assert_eq!(s, samples(n));
-        }
-    }
-
-    #[test]
-    fn derivation_preserves_intent_and_separates_keys_and_changed_probes() {
-        let o = fixture_options(std::path::Path::new("/unused"));
-        let original = publication(&o, 7, false);
-        let retry = publication(&o, 7, false);
-        assert_eq!(original, retry);
-        assert_ne!(
-            original.operation_key,
-            publication(&o, 8, false).operation_key
-        );
-        assert_eq!(original.operation_key.len(), 32);
-        assert_eq!(original.payload.len(), 256);
-        assert_eq!(original.topic, Topic::new("load.events").unwrap());
-        assert_eq!(original.scope, Scope::new("test/load").unwrap());
-        let changed = changed_publication(&o, 7);
-        assert_eq!(original.operation_key, changed.operation_key);
-        assert_ne!(original.payload, changed.payload);
-        let emergency = publication(&o, 8, true);
-        assert!(emergency.tombstone && emergency.payload.is_empty());
-    }
-
-    #[test]
-    fn output_never_replaces_existing_or_exposes_partial_receipt() {
-        let root = TestRoot::new();
-        let path = root.0.join("receipt.json");
-        let mut output = AtomicOutput::prepare(&path).unwrap();
-        assert!(!path.exists());
-        std::fs::write(&path, b"prior").unwrap();
-        assert!(output.finish(b"new").is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"prior");
-        assert!(AtomicOutput::prepare(&path).is_err());
-        let path2 = root.0.join("complete.json");
-        AtomicOutput::prepare(&path2)
-            .unwrap()
-            .finish(b"{}\n")
-            .unwrap();
-        assert_eq!(std::fs::read(path2).unwrap(), b"{}\n");
-    }
-
-    #[tokio::test]
-    async fn selected_api_small_retirement_capacity_restart_and_audit() {
-        // A skipped custody pass, forgotten conflict probe, or capacity/restart
-        // result counted without checking it fails this real selected-node run.
-        let root = TestRoot::new();
-        let o = fixture_options(&root.0);
+        o.workload = Workload::new("small-byte-capacity", Some(12)).unwrap();
         provision(&o);
         let r = run_workload(&o).await.unwrap();
-        assert_eq!(r.created, 6);
-        assert_eq!(r.retired, 6);
-        assert_eq!(r.emergency_accepted, 1);
+        assert_eq!(r.failure, "none");
+        assert_eq!(r.created, 12);
         assert_eq!(r.capacity_rejected, 1);
-        assert_eq!(r.final_stats.records_total, 7);
-        assert_eq!(r.final_stats.records_active, 1);
-        assert_eq!(r.final_stats.records_retired, 6);
-        assert!(r.exact_retired > 0 && r.conflicts > 0);
-        assert!(r.restarted && r.audit_complete);
-        assert_eq!(r.audit_scanned, 8);
-        let encoded = r.json(&o);
-        assert!(encoded.starts_with("{\"schema\":\"aster-event-operation-ledger-scale/v1\""));
+        assert_eq!(r.emergency_accepted, 1);
+        assert_eq!(r.repaired_original, 1);
+        assert_eq!(r.peak_results, 9);
+        assert_eq!(r.peak_record_rows, 19);
+        assert_eq!(r.final_clients, 10);
+        assert_eq!(r.final_results, 0);
+        assert_eq!(r.final_reverse_rows, 0);
+        assert_eq!(r.final_logical_bytes, 1130);
+        assert!(r.restarted && r.offline_numbered_audit);
+        let encoded = String::from_utf8(r.json().unwrap()).unwrap();
         for secret in [
             o.prefix.as_str(),
             o.state.to_str().unwrap(),
@@ -1243,49 +737,59 @@ mod tests {
             "test/load",
             "load.events",
         ] {
-            assert!(!encoded.contains(secret), "unsanitized input in receipt");
+            assert!(!encoded.contains(secret));
         }
         assert!(encoded.contains("\"qualification\":false"));
-        assert!(
-            encoded.contains("\"alias_64_65\":\"unavailable_selected_api_has_no_alias_binding\"")
-        );
-        assert!(!encoded.contains(&hex(&operation_key(&o.prefix, 0))));
-        assert_eq!(encoded, r.json(&o));
-        println!("{encoded}");
     }
-
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn selected_api_byte_boundary_uses_durable_rows_and_emergency_bytes() {
+    async fn finite_retirement_keeps_receipts_through_restart_and_acknowledgement() {
         let root = TestRoot::new();
-        let mut o = fixture_options(&root.0);
-        o.workload = Workload::new("small-byte-capacity", Some(4)).unwrap();
+        let o = fixture_options(&root.0);
         provision(&o);
         let r = run_workload(&o).await.unwrap();
         assert_eq!(r.failure, "none");
-        assert_eq!(r.created, 4);
-        assert_eq!(r.retired, 0);
-        assert_eq!(r.capacity_rejected, 1);
-        assert_eq!(r.emergency_accepted, 1);
-        assert_eq!(r.final_stats.logical_bytes, 810);
-        assert_eq!(r.final_stats.records_active, 5);
-        assert!(r.exact_result_matches > 0);
-        assert!(r.restarted && r.audit_complete);
+        assert_eq!(r.retired_receipts, 8);
+        assert_eq!(r.repaired_original, 1);
+        assert!(r.restarted && r.offline_numbered_audit);
+        assert_eq!(r.final_results, 0);
     }
-
     #[tokio::test]
-    async fn deadline_retains_failed_observation_and_does_not_claim_restart_or_audit() {
+    async fn deadline_preserves_pending_journals_without_claiming_success() {
         let root = TestRoot::new();
         let mut o = fixture_options(&root.0);
-        o.ttl_ms = 60_000;
-        o.deadline = Duration::from_millis(100);
+        o.workload = Workload::new("small-byte-capacity", Some(100)).unwrap();
+        o.deadline = Duration::ZERO;
         provision(&o);
         let r = run_workload(&o).await.unwrap();
         assert_eq!(r.failure, "workload_deadline");
-        assert!(!r.restarted && !r.audit_complete);
-        assert!(r.created <= 6);
-        assert_eq!(r.retired, 0);
+        assert!(!r.restarted && !r.offline_numbered_audit);
     }
-
+    #[tokio::test]
+    async fn impossible_large_modes_refuse_before_state_or_provisioning() {
+        for mode in ["million-retired", "candidate-capacity"] {
+            let root = TestRoot::new();
+            let mut o = fixture_options(&root.0);
+            o.workload = Workload::new(mode, None).unwrap();
+            let r = run_workload(&o).await.unwrap();
+            assert_eq!(r.failure, "custody_ceiling_alias_unavailable");
+            assert!(!o.state.exists());
+            assert!(!o.mission.exists());
+        }
+    }
+    #[test]
+    fn output_refuses_existing_file_and_substituted_stage() {
+        let root = TestRoot::new();
+        let path = root.0.join("receipt.json");
+        let mut output = AtomicOutput::prepare(&path).unwrap();
+        fs::remove_file(&output.temporary).unwrap();
+        fs::write(&output.temporary, b"substituted").unwrap();
+        assert!(output.finish(b"{}\n").is_err());
+        assert!(!path.exists());
+        fs::write(&path, b"original").unwrap();
+        assert!(AtomicOutput::prepare(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+    }
     fn fixture_options(root: &std::path::Path) -> Options {
         Options {
             state: root.join("state"),
@@ -1320,8 +824,10 @@ mod tests {
             use std::os::unix::fs::DirBuilderExt as _;
             let mut nonce = [0u8; 16];
             getrandom::fill(&mut nonce).unwrap();
-            let path =
-                std::env::temp_dir().join(format!("aster-ledger-scale-test-{}", hex(&nonce)));
+            let path = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("aster-ledger-scale-test-{}", hex(&nonce)));
             std::fs::DirBuilder::new()
                 .mode(0o700)
                 .create(&path)

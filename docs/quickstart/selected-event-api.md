@@ -487,3 +487,19 @@ Continue with the [capability tour](capability-tour.md) for a fast visible mesh,
 the [selected architecture](../architecture.md) for the complete authority
 split, and the [requirements status](../validation/requirements-status.md)
 for exact credited and open obligations.
+
+## Observe bounded numbered publication lifecycle
+
+`event_operation_ledger_scale` now emits `aster-event-operation-ledger-scale/v2`
+mechanism observations. It configures ten fixed producer slots with private
+journals, reuses result headroom after acknowledgement, preserves a rejected
+capacity probe for exact retry, exercises reserved tombstone admission, and
+reopens the same clients to recover retained receipts. It uses
+`--client-namespace` rather than a per-publication operation key.
+
+The `small-byte-capacity` mode uses durable Events and checks the byte boundary.
+The `small` mode additionally checks finite-TTL receipt retirement on Linux.
+The million-event modes still refuse before creating state because their
+unique-Event workload exceeds the custody ceiling. These observations remain
+local mechanism checks, with `qualification=false`; earlier v1 observations
+retain their original legacy-ledger meaning.
