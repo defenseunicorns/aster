@@ -14811,6 +14811,21 @@ async fn run_node_actor_inner(
         .map_or(0, |routing| routing.window.as_secs());
     #[cfg(not(feature = "nearby-discovery"))]
     let nearby_window_seconds = 0;
+    // Install the standalone signal handler before advertising readiness. The
+    // ctrl_c future registers lazily on its first poll; waiting until the actor
+    // loop leaves a window in which SIGINT still terminates the process.
+    // Embedded agents own shutdown and must not register a competing consumer.
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(interrupt);
+    let interrupt_seen = if handle_sigint {
+        std::future::poll_fn(|context| match interrupt.as_mut().poll(context) {
+            std::task::Poll::Pending => std::task::Poll::Ready(Ok(false)),
+            std::task::Poll::Ready(result) => std::task::Poll::Ready(result.map(|()| true)),
+        })
+        .await?
+    } else {
+        false
+    };
     let provisioning_origin = config.provisioning_origin().receipt_label();
     node_stdout!(
         "READY selected=true pid={} carrier_id={} mission_id={} mission_authority={} sockets={} state={} peers={} application={} carrier_route={} controlled_relay_url={} controlled_relay_trust={} controlled_relay_readiness={} public_relay_fallback=false hosted_discovery=false nearby_discovery={} nearby_window_seconds={} discovery_metadata={} discovery_authority={} discovery_candidate_limit={} nat_traversal=not-claimed path_observation=not-authorization mission_auth=hybrid-pq provisioning={} semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash commit_before_activate=true content_admission=capability-gated event_bridge={}",
@@ -15015,18 +15030,21 @@ async fn run_node_actor_inner(
     let mut ticker = tokio::time::interval(config.sync_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let stop = async move {
+        if interrupt_seen {
+            return;
+        }
         match (stop_deadline, handle_sigint) {
             (Some(deadline), true) => {
                 tokio::select! {
                     _ = sleep(deadline.saturating_duration_since(Instant::now())) => {}
-                    _ = tokio::signal::ctrl_c() => {}
+                    _ = &mut interrupt => {}
                 }
             }
             (Some(deadline), false) => {
                 sleep(deadline.saturating_duration_since(Instant::now())).await;
             }
             (None, true) => {
-                let _ = tokio::signal::ctrl_c().await;
+                let _ = interrupt.await;
             }
             (None, false) => std::future::pending::<()>().await,
         }
