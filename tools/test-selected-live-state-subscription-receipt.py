@@ -1252,6 +1252,13 @@ class RawRootTests(unittest.TestCase):
                 for identifier_value in participant.values():
                     self.assertNotIn(identifier_value.encode("ascii"), encoded)
 
+    def test_event_publication_diagnostics_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            raw = RawRootFixture(Path(temporary))
+            raw.write("stderr.log", b"event_publication_group group_sequence=1\n", 0o600)
+            with self.assertRaisesRegex(CHECKER.ReceiptViolation, "unclassified|classification"):
+                CHECKER.validate_raw_root(raw.root, raw.authority)
+
     def test_extra_raw_file_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             raw = RawRootFixture(Path(temporary))

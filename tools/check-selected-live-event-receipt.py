@@ -799,9 +799,14 @@ def validate_inventory(root_descriptor: int) -> dict[str, dict[str, os.stat_resu
             fail(f"{participant} identity artifact has the wrong metadata-only byte count")
         if not 0 < store.st_size <= STORE_MAX_BYTES:
             fail(f"{participant} state artifact violates its metadata-only size bound")
-    journal = observed_files["participants/publisher/state/live-acceptance-publication.redb"]
-    if not 0 < journal.st_size <= STORE_MAX_BYTES:
-        fail("publication journal violates its metadata-only size bound")
+    # Shared state-subscription support supplies its own exact inventory and
+    # has no Event publication journal. Event v2 still requires this file via
+    # EXPECTED_FILES before the metadata-only check below.
+    journal_path = "participants/publisher/state/live-acceptance-publication.redb"
+    if journal_path in EXPECTED_FILES:
+        journal = observed_files[journal_path]
+        if not 0 < journal.st_size <= STORE_MAX_BYTES:
+            fail("publication journal violates its metadata-only size bound")
     return {"directories": directory_metadata, "files": observed_files}
 
 
@@ -2274,7 +2279,10 @@ def validate_raw_root(root: Path, source_authority: dict[str, Any]) -> dict[str,
                 fail(f"public artifact {relative} changed after inventory inspection")
         if not binary:
             fail("copied release executable is empty")
-        validate_publication_diagnostics(stderr, inserted=3, retries=1, failures=1)
+        if SCHEMA == "aster-selected-live-event-receipt/v2":
+            validate_publication_diagnostics(stderr, inserted=3, retries=1, failures=1)
+        elif stderr:
+            fail("captured stderr is nonempty and has no selected acceptance classification")
         transcript_facts = validate_transcript(transcript)
         terminal_facts = validate_terminal_stdout(stdout, transcript, root, transcript_facts)
         document = load_canonical_json(run_data, "run metadata", RUN_JSON_MAX_BYTES)
@@ -2347,7 +2355,9 @@ def validate_raw_root(root: Path, source_authority: dict[str, Any]) -> dict[str,
                 "mission_artifacts": len(PARTICIPANTS),
                 "identity_artifacts": len(PARTICIPANTS),
                 "store_artifacts": len(PARTICIPANTS),
-                "publication_journal_artifacts": 1,
+                **({"publication_journal_artifacts": 1} if
+                   "participants/publisher/state/live-acceptance-publication.redb"
+                   in EXPECTED_FILES else {}),
                 "secret_artifact_contents": "metadata-only-not-opened-read-or-hashed",
                 "file_links": "all-one",
                 "inventory_aliases": "none",
