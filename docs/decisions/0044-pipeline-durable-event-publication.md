@@ -9,6 +9,20 @@
   [Decision 0030](0030-event-first-local-connect-agent.md), and
   [Decision 0042](0042-adopt-linux-event-mvp-evaluation-profile-v0-1.md)
 
+## Numbered publication amendment — 2026-10-08
+
+The current application surface is numbered-only. `PublishNumberedEvent` and
+`PublishNumberedEvents` replace the ordinary publishing RPCs; the historical decision below records
+the original PR #34/#54 pipeline. Its actor FIFO, fairness, compatible grouped
+commits, ordered fallback, Flash urgency, bounded HTTP/2 window, and healthy
+rotation remain. The SDK now journals complete intents and persists results
+before freeing slots. Exact replay uses client/session/sequence. A failed next
+sequence blocks that client until explicit repair or abandonment; independent
+configured clients continue. Browsers use ordered unary numbered calls.
+Nonempty old Event publication ledgers require fresh state and remain available
+for read-only inspection. This amendment changes application publication
+ownership, not v7 mesh page semantics or historical performance evidence.
+
 ## Context
 
 Aster separates local publication from mesh synchronization. An application

@@ -1850,29 +1850,34 @@ peer, and handshake limits are configured.
 
 ### 18.1 Reference local Event publication boundary
 
-The local application protocol is an adapter over the running selected node,
-not a sixth mesh layer or a second durable authority. Unary `PublishEvent` and
-native HTTP/2 bidirectional `PublishEvents` return successful results only
-after the Event and its operation-key mapping commit in the node's local
-durable store. They do not wait for, request, or imply a remote mesh receipt.
-The replication layer independently reconciles the committed source object
-when an eligible contact becomes available.
+The local application protocol adapts the running selected node's sole durable
+authority. Unary `PublishNumberedEvent` and native HTTP/2 bidirectional
+`PublishNumberedEvents` return success after the Event, client frontier, and
+sparse result commit atomically. They do not wait for a remote mesh receipt.
+Replication independently reconciles the unchanged source object.
 
-`PublishEvents` preserves request order and returns one durable result or one
-sanitized application failure per input. Transport loss can occur after a
-local commit but before its response. A client recovers that uncertain boundary
-by resending each sent-but-unanswered request with its unchanged operation key;
-the durable operation ledger returns the existing result rather than creating
-a duplicate. gRPC-Web request streaming is unsupported, so browser clients use
-bounded concurrent unary calls with the same retry rule.
+One stable configured client owns a fenced publication session and contiguous
+positive operation sequences. A durable application journal retains each
+complete intent before transmission. Recovery reconciles retained receipts and
+must complete before mutation. Exact retry resolves an unknown commit without
+creating another Event. Acknowledgement compacts an applied sparse result;
+`allocated_through` prevents reuse after compaction. A rejected next sequence
+must be repaired or explicitly abandoned before later work from that client
+can commit. Independent configured clients may continue.
 
-The selected-node actor may group adjacent compatible ordinary non-Flash Event
-commands already present in its bounded application lane into one local durable
-transaction. It does not wait for future input, skip intervening work, or
-change an input's independent outcome. Flash and experimental numbered
-publication retain their existing paths. Grouped Events keep their ordinary
-singleton source representation; this optimization is distinct from the
-explicit content-committing cryptographic batch in §6.1.
+The numbered stream preserves response order and bounded in-band failure
+classification. The SDK persists each result before freeing a window slot,
+replays unanswered original requests, and bounds disconnect/no-progress
+rotation. gRPC-Web request streaming is unsupported; browsers use ordered
+unary numbered calls per client.
+
+The actor groups compatible adjacent non-Flash publications already admitted
+in its bounded lane. It does not wait for future input or skip intervening
+work. Exceptional cohort failure falls back in order; Flash remains singleton.
+Grouping retains the individual source representations and is distinct from
+§6.1's explicit cryptographic batch. Normal startup refuses nonempty legacy
+Event operation ledgers before migration or maintenance. Historical inspection
+and fixture writers do not provide an ordinary application publishing lane.
 
 This local API addition allocates no semantic version, source-envelope format,
 reconciliation frame, or stable mesh registry value. Reference window,

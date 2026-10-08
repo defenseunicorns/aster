@@ -254,18 +254,19 @@ let subscription = events
     })
     .await?;
 
-let published = events
-    .publish(EventPublishRequest {
-        operation_key: b"my-app/asset-7/ready".to_vec(),
-        predecessor: None,
-        topic: topic.clone(),
-        scope: scope.clone(),
-        priority: Priority::Priority,
-        logical_key: b"asset-7".to_vec(),
-        payload: b"ready".to_vec(),
-        tombstone: false,
-    })
-    .await?;
+use aster_node::publication_journal::{Backend, Intent, Journal};
+// Initialize only during explicit fresh application provisioning.
+Journal::initialize(&journal_path, b"my-app-publisher")?;
+let mut journal = Journal::open(&journal_path, b"my-app-publisher")?;
+let mut backend = Backend::Live(&events);
+journal.recover(&mut backend).await?; // finish original pending work before new intents
+let published = journal.publish_metadata(&mut backend, Intent {
+    predecessor: None, topic: topic.as_str().to_owned(), scope: scope.as_str().to_owned(),
+    priority: Priority::Priority as u8, logical_key: b"asset-7".to_vec(),
+    payload: b"ready".to_vec(), tombstone: false, ttl_ms: None,
+}).await?;
+// Save the application's idempotent progress before compacting the result.
+journal.acknowledge(&mut backend).await?;
 
 let page = events
     .query(EventQuery {
@@ -304,16 +305,18 @@ events.unsubscribe(subscription.id).await?;
 running.shutdown().await?;
 ```
 
-Choose an operation key that identifies the application effect, not a random
-attempt. Reusing it with the same publish request returns the original commit;
-reusing it with different content fails closed. Topics and scopes must be
-authorized by current mission policy. Tombstones must have an empty payload.
-The selected Event slice authenticates and returns priority. Semantic-v3/v4/v5
-contacts use it for bounded transmission order and retry cadence, while the
-selected pressure policy fixes same-scope candidates ahead of off-scope rows
-when that exact scope is initially short, then retires expired rows and
-route-only rows before comparing priority within each cohort. The additive
-`publish_with_options` API accepts a positive
+Use a stable configured publisher client and retain its durable journal across
+process restarts. The journal assigns a positive contiguous sequence before
+sending and retains the complete original intent for uncertain outcomes.
+Missing or corrupt journals fail closed. Recover before new work; never assign
+a replacement sequence to hide an unknown result. Acknowledging an applied
+result frees sparse-result capacity while the client frontier prevents reuse.
+The native API also exposes explicit session/recovery/publication operations
+for applications that own their own durable protocol state.
+
+Topics and scopes remain subject to current mission policy; tombstones have an
+empty payload. Priority still controls bounded transmission order and custody
+pressure. `Intent::ttl_ms` optionally chooses a positive
 source-authenticated finite TTL on Linux; query, poll, and gap exposure withhold
 an Event at the exact expiry boundary. See [Selected Event custody and
 constrained operation](selected-custody-api.md) for configuration, clock,
