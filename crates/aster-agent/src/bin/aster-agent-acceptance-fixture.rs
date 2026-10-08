@@ -480,6 +480,8 @@ async fn run_client_command(options: &ClientArguments) -> Result<(), FixtureErro
     let client = api::AsterApplicationServiceClient::new(connection, client_config(uri, &token));
     match options.command.as_str() {
         "status" => client_status(&client).await,
+        "publication-init" => client_publication_init(),
+        "publication-ack" => client_publication_ack(&client).await,
         "publish" => client_publish(&client).await,
         "query" => client_query(&client).await,
         "subscribe" => client_subscribe(&client).await,
@@ -759,12 +761,49 @@ fn operation_estimate(remaining: u64, rate: f64) -> Option<u64> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PublishInput {
-    operation_key_hex: String,
+    client_id_hex: String,
+    journal_path: String,
+    #[serde(default)]
+    operation_sequence: u64,
     topic: String,
     scope: String,
     priority: String,
     logical_key_hex: String,
     payload_hex: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationIdentity {
+    client_id_hex: String,
+    journal_path: String,
+    #[serde(default)]
+    operation_sequence: u64,
+}
+
+fn client_publication_init() -> Result<(), FixtureError> {
+    let input: PublicationIdentity = read_client_input()?;
+    aster_agent::sdk::PublicationJournal::initialize(
+        &input.journal_path,
+        &decode_hex(&input.client_id_hex)?,
+    )
+    .map_err(|_| FixtureError::Local)?;
+    print_json(json!({"status":"ok"}))
+}
+
+async fn client_publication_ack(client: &Client) -> Result<(), FixtureError> {
+    let input: PublicationIdentity = read_client_input()?;
+    let sdk = aster_agent::sdk::NumberedEventSdk::open(
+        client.clone(),
+        &input.journal_path,
+        &decode_hex(&input.client_id_hex)?,
+    )
+    .map_err(|_| FixtureError::Local)?;
+    sdk.recover().await.map_err(|_| FixtureError::Local)?;
+    sdk.acknowledge(input.operation_sequence)
+        .await
+        .map_err(|_| FixtureError::Local)?;
+    print_json(json!({"status":"ok"}))
 }
 
 async fn client_publish(client: &Client) -> Result<(), FixtureError> {
@@ -776,27 +815,89 @@ async fn client_publish(client: &Client) -> Result<(), FixtureError> {
         "flash" => api::Priority::Flash,
         _ => return Err(FixtureError::Local),
     };
-    let response = client
-        .publish_event(api::PublishEventRequest {
-            operation_key: decode_hex(&input.operation_key_hex)?,
-            topic: input.topic,
-            scope: input.scope,
-            priority: priority.into(),
-            logical_key: decode_hex(&input.logical_key_hex)?,
-            payload: decode_hex(&input.payload_hex)?,
+    let sdk = aster_agent::sdk::NumberedEventSdk::open(
+        client.clone(),
+        &input.journal_path,
+        &decode_hex(&input.client_id_hex)?,
+    )
+    .map_err(|_| FixtureError::Local)?;
+    let recovered = sdk.recover().await.map_err(|_| FixtureError::Local)?;
+    let mut intent = api::PublishNumberedEventRequest {
+        topic: input.topic,
+        scope: input.scope,
+        priority: priority.into(),
+        logical_key: decode_hex(&input.logical_key_hex)?,
+        payload: decode_hex(&input.payload_hex)?,
+        ..Default::default()
+    };
+    let sequence = if input.operation_sequence == 0 {
+        if !recovered.operations.is_empty() {
+            return Err(FixtureError::Local);
+        }
+        sdk.journal_publication(intent.clone())
+            .map_err(|_| FixtureError::Local)?
+    } else {
+        let retained = sdk
+            .journaled_intent(input.operation_sequence)
+            .map_err(|_| FixtureError::Local)?
+            .ok_or(FixtureError::Local)?;
+        intent.client_id = retained.client_id.clone();
+        intent.session = sdk.session().map_err(|_| FixtureError::Local)?;
+        intent.operation_sequence = input.operation_sequence;
+        let mut original = retained;
+        original.session = intent.session;
+        if original != intent {
+            client.publish_numbered_event(intent.clone()).await?;
+            return Err(FixtureError::Local); // A changed retained intent must never succeed.
+        }
+        input.operation_sequence
+    };
+    let response = sdk
+        .publish_journaled_outcome(sequence)
+        .await
+        .map_err(|_| FixtureError::Local)?;
+    let receipt = response
+        .result
+        .as_option()
+        .and_then(|result| result.receipt.as_option())
+        .ok_or(FixtureError::Local)?;
+    let query = client
+        .query_events(api::QueryEventsRequest {
+            topic: Some(intent.topic.clone()),
+            scope: Some(intent.scope.clone()),
+            logical_key: Some(intent.logical_key.clone()),
+            after_acceptance_marker: receipt
+                .acceptance_marker
+                .checked_sub(1)
+                .ok_or(FixtureError::Local)?,
+            limit: 1,
             ..Default::default()
         })
         .await?
         .into_owned();
-    print_json(json!({
-        "status": "ok",
-        "event_id_hex": encode_hex(&response.id),
-        "publisher_id_hex": encode_hex(&response.publisher),
-        "publisher_counter": response.publisher_counter,
-        "event_sequence": response.event_sequence,
-        "acceptance_marker": response.acceptance_marker,
-        "inserted": response.inserted
-    }))
+    let event = query
+        .events
+        .first()
+        .filter(|event| {
+            query.events.len() == 1
+                && event.id == receipt.event_id
+                && event.acceptance_marker == receipt.acceptance_marker
+                && event.topic == intent.topic
+                && event.scope == intent.scope
+                && event.priority == intent.priority
+                && event.logical_key == intent.logical_key
+                && event.payload == intent.payload
+                && !event.tombstone
+                && event.publisher.len() == 32
+                && event.publisher_counter != 0
+                && event.event_sequence != 0
+        })
+        .ok_or(FixtureError::Local)?;
+    print_json(
+        json!({"status":"ok", "operation_sequence":sequence, "event_id_hex":encode_hex(&event.id),
+        "publisher_id_hex":encode_hex(&event.publisher),"publisher_counter":event.publisher_counter,
+        "event_sequence":event.event_sequence,"acceptance_marker":event.acceptance_marker,"inserted":response.inserted}),
+    )
 }
 
 #[derive(Deserialize)]

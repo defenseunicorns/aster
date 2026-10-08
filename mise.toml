@@ -81,6 +81,7 @@ description = "Run real-process, binding, and conformance checks"
 run = [
   "sh tools/test-aster-mesh-playground-real.sh",
   "sh tools/test-aster-hello-real.sh",
+  "sh tools/test-aster-numbered-go-real.sh",
   "cargo build --locked -p aster-ffi",
   "cc -std=c11 -Wall -Wextra -Werror -pedantic -Ibindings/c -fsyntax-only bindings/c/header_smoke.c",
   "c++ -std=c++17 -Wall -Wextra -Werror -pedantic -Ibindings/c -fsyntax-only bindings/c/header_smoke.cpp",

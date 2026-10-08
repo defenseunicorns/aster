@@ -53,7 +53,7 @@ func (c *recoveryTimingClient) QueryEvents(ctx context.Context, r *connect.Reque
 func timingRecovery(t *testing.T, delay int) (*recoveryTimingClient, map[string]any) {
 	t.Helper()
 	peer := new(recoveryPeer)
-	_, err := peer.PublishEvent(context.Background(), connect.NewRequest(&api.PublishEventRequest{OperationKey: []byte("publish"), Topic: "test-topic", Scope: "test-scope", Priority: api.Priority_PRIORITY_IMMEDIATE, LogicalKey: []byte("key"), Payload: []byte("payload")}))
+	_, err := peer.PublishNumberedEvent(context.Background(), connect.NewRequest(&api.PublishNumberedEventRequest{ClientId: []byte("go-timing-publisher"), Session: 1, OperationSequence: 1, Topic: "test-topic", Scope: "test-scope", Priority: api.Priority_PRIORITY_IMMEDIATE, LogicalKey: []byte("key"), Payload: []byte("payload")}))
 	if err != nil {
 		t.Fatal(err)
 	}

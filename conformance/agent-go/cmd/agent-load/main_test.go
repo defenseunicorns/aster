@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -33,7 +34,7 @@ func canonicalTempDir(t *testing.T) string {
 }
 
 func validArgs() []string {
-	return []string{"--url", "http://127.0.0.1:8080", "--token-file", "/private/token", "--count", "5", "--rate", "50", "--payload-bytes", "256", "--topic", "load.events", "--scope", "test/load", "--operation-prefix", "fixture", "--concurrency", "2", "--timeout-seconds", "10", "--output", "/private/result.json", "--source-commit", strings.Repeat("a", 40), "--binary-sha256", strings.Repeat("b", 64), "--config-sha256", strings.Repeat("c", 64), "--sample-every", "0"}
+	return []string{"--url", "http://127.0.0.1:8080", "--token-file", "/private/token", "--count", "5", "--rate", "50", "--payload-bytes", "256", "--topic", "load.events", "--scope", "test/load", "--operation-prefix", "fixture", "--concurrency", "2", "--timeout-seconds", "10", "--output", "/private/result.json", "--source-commit", strings.Repeat("a", 40), "--binary-sha256", strings.Repeat("b", 64), "--config-sha256", strings.Repeat("c", 64), "--sample-every", "0", "--journal-dir", "/private/publications", "--initialize-journals", "true"}
 }
 
 func TestOptionsRejectAmbiguousUnboundedAndSecretBearingInputs(t *testing.T) {
@@ -78,19 +79,17 @@ func TestOptionsRejectAmbiguousUnboundedAndSecretBearingInputs(t *testing.T) {
 
 func TestOperationDerivationAndRequestMapping(t *testing.T) {
 	// Removing index or domain separation would duplicate effects between slots.
-	a := operationKey("fixture", 0)
-	b := operationKey("fixture", 1)
-	if len(a) != 32 || bytes.Equal(a, b) || bytes.Equal(a, operationKey("different", 0)) || !bytes.Equal(a, operationKey("fixture", 0)) {
+	a := publisherID("fixture", 0)
+	b := publisherID("fixture", 1)
+	if len(a) != 32 || bytes.Equal(a, b) || bytes.Equal(a, publisherID("different", 0)) || !bytes.Equal(a, publisherID("fixture", 0)) {
 		t.Fatal("operation derivation is not stable and separated")
 	}
 	o, _ := parseOptions(validArgs())
-	r := publishRequest(o, 7, "SECRET_TOKEN_CANARY")
-	if r.Msg.Topic != "load.events" || r.Msg.Scope != "test/load" || len(r.Msg.Payload) != 256 || r.Msg.Priority != api.Priority_PRIORITY_ROUTINE || r.Msg.Tombstone || len(r.Msg.PredecessorId) != 0 || len(r.Msg.LogicalKey) == 0 {
-		t.Fatal("request mapping lost workload intent")
+	r := publishRequest(o, 7)
+	if r.Topic != "load.events" || r.Scope != "test/load" || len(r.Payload) != 256 || r.Priority != api.Priority_PRIORITY_ROUTINE || r.Tombstone || len(r.PredecessorId) != 0 || len(r.LogicalKey) == 0 || r.Session != 0 || r.OperationSequence != 0 || len(r.ClientId) != 0 {
+		t.Fatal("request mapping lost journal-owned sequence or workload intent")
 	}
-	if !bytes.Equal(r.Msg.OperationKey, operationKey("fixture", 7)) || r.Header().Get("Authorization") != "Bearer SECRET_TOKEN_CANARY" {
-		t.Fatal("request authentication/key mismatch")
-	}
+
 }
 
 func TestNearestRankHistogramIncludesAllResultsAndRoundsUp(t *testing.T) {
@@ -162,8 +161,8 @@ func TestResultClassificationStopsOnTerminalAndKeepsUnknownOutcomes(t *testing.T
 	}
 }
 
-func success() *connect.Response[api.PublishEventResponse] {
-	return connect.NewResponse(&api.PublishEventResponse{Id: bytes.Repeat([]byte{1}, 32), Publisher: bytes.Repeat([]byte{2}, 32), PublisherCounter: 1, EventSequence: 1, AcceptanceMarker: 1, Priority: api.Priority_PRIORITY_ROUTINE, Inserted: true})
+func success() *connect.Response[api.PublishNumberedEventResponse] {
+	return connect.NewResponse(&api.PublishNumberedEventResponse{Result: &api.CommittedPublicationResult{OperationSequence: 1, Receipt: &api.CommittedEventReceipt{EventId: bytes.Repeat([]byte{1}, 32), TransferId: bytes.Repeat([]byte{2}, 32), AcceptanceMarker: 1}, Content: api.CommittedContentStatus_COMMITTED_CONTENT_STATUS_AVAILABLE}, Inserted: true})
 }
 
 type roundTrip func(*http.Request) (*http.Response, error)
@@ -174,12 +173,21 @@ func TestGeneratedClientUsesPublicRequestAndDoesNotLeakTransportError(t *testing
 	o, _ := parseOptions(validArgs())
 	o.slots = 1
 	client := api.NewAsterApplicationServiceClient(&http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path != "/aster.application.v1alpha1.AsterApplicationService/PublishEvent" || r.Header.Get("Authorization") != "Bearer SECRET_TOKEN_CANARY" {
+		if r.URL.Path != "/aster.application.v1alpha1.AsterApplicationService/PublishNumberedEvent" || r.Header.Get("Authorization") != "Bearer SECRET_TOKEN_CANARY" {
 			t.Error("public API request mismatch")
 		}
 		return nil, errors.New("SECRET_TRANSPORT_CANARY")
 	})}, o.url)
-	receipt := execute(context.Background(), o, realClock{}, func(ctx context.Context, i uint64) result { return call(ctx, client, o, i, "SECRET_TOKEN_CANARY") })
+	receipt := execute(context.Background(), o, realClock{}, func(ctx context.Context, i uint64) result {
+		message := publishRequest(o, i)
+		message.ClientId = publisherID(o.prefix, 0)
+		message.Session = 1
+		message.OperationSequence = 1
+		req := connect.NewRequest(message)
+		req.Header().Set("Authorization", "Bearer SECRET_TOKEN_CANARY")
+		response, err := client.PublishNumberedEvent(ctx, req)
+		return classify(response, err)
+	})
 	if receipt.Counts.Transport != 1 || receipt.Counts.Completed != 1 {
 		t.Fatal("transport call not accounted")
 	}
@@ -255,10 +263,10 @@ func TestReceiptStableVersionedAndContainsOnlySanitizedConfiguration(t *testing.
 	r := execute(context.Background(), o, realClock{}, func(context.Context, uint64) result { return result{kind: "accepted", inserted: true} })
 	a, _ := json.Marshal(r)
 	b, _ := json.Marshal(r)
-	if !bytes.Equal(a, b) || r.Schema != "aster-agent-load/v1" || r.Claim != "public-connect-workload-observation" || r.Qualification || r.Counts.Scheduled != 1 || r.Counts.Inserted != 1 {
+	if !bytes.Equal(a, b) || r.Schema != "aster-agent-load/v2" || r.Claim != "public-connect-workload-observation" || r.Qualification || r.Counts.Scheduled != 1 || r.Counts.Inserted != 1 {
 		t.Fatal("receipt contract")
 	}
-	for _, secret := range []string{"SECRET", hex.EncodeToString(operationKey(o.prefix, 0)), o.url, o.tokenFile, o.output} {
+	for _, secret := range []string{"SECRET", hex.EncodeToString(publisherID(o.prefix, 0)), o.url, o.tokenFile, o.output} {
 		if bytes.Contains(a, []byte(secret)) {
 			t.Fatal("receipt contains private input")
 		}
@@ -539,7 +547,7 @@ func TestOutputRejectsDirectorySwap(t *testing.T) {
 
 func TestNewLoadOperationsUseDistinctEventIntent(t *testing.T) {
 	o, _ := parseOptions(validArgs())
-	if bytes.Equal(publishRequest(o, 0, "token").Msg.LogicalKey, publishRequest(o, 1, "token").Msg.LogicalKey) {
+	if bytes.Equal(publishRequest(o, 0).LogicalKey, publishRequest(o, 1).LogicalKey) {
 		t.Fatal("unique load operations share identical Event intent")
 	}
 }
@@ -629,11 +637,24 @@ type probeServer struct {
 
 type stubPublicClient struct {
 	api.AsterApplicationServiceClient
-	publish func(context.Context, *connect.Request[api.PublishEventRequest]) (*connect.Response[api.PublishEventResponse], error)
+	publish func(context.Context, *connect.Request[api.PublishNumberedEventRequest]) (*connect.Response[api.PublishNumberedEventResponse], error)
 }
 
-func (s stubPublicClient) PublishEvent(ctx context.Context, r *connect.Request[api.PublishEventRequest]) (*connect.Response[api.PublishEventResponse], error) {
+func (s stubPublicClient) PublishNumberedEvent(ctx context.Context, r *connect.Request[api.PublishNumberedEventRequest]) (*connect.Response[api.PublishNumberedEventResponse], error) {
 	return s.publish(ctx, r)
+}
+
+func (s stubPublicClient) BeginEventPublicationSession(_ context.Context, _ *connect.Request[api.BeginEventPublicationSessionRequest]) (*connect.Response[api.BeginEventPublicationSessionResponse], error) {
+	return connect.NewResponse(&api.BeginEventPublicationSessionResponse{Session: 1}), nil
+}
+func (s stubPublicClient) CompleteEventPublicationRecovery(_ context.Context, _ *connect.Request[api.CompleteEventPublicationRecoveryRequest]) (*connect.Response[api.CompleteEventPublicationRecoveryResponse], error) {
+	return connect.NewResponse(&api.CompleteEventPublicationRecoveryResponse{}), nil
+}
+func (s stubPublicClient) AcknowledgeEventPublicationResult(_ context.Context, _ *connect.Request[api.AcknowledgeEventPublicationResultRequest]) (*connect.Response[api.AcknowledgeEventPublicationResultResponse], error) {
+	return connect.NewResponse(&api.AcknowledgeEventPublicationResultResponse{}), nil
+}
+func fixtureOperation(message *api.PublishNumberedEventRequest) []byte {
+	return []byte(fmt.Sprintf("%x/%d", message.ClientId, message.OperationSequence))
 }
 
 func TestPeriodicProbesRetainBoundedOlderOriginalsAndExplicitDisable(t *testing.T) {
@@ -643,19 +664,20 @@ func TestPeriodicProbesRetainBoundedOlderOriginalsAndExplicitDisable(t *testing.
 		if enabled {
 			o.sampleEvery = 1
 		}
-		seen := map[string]*api.PublishEventResponse{}
+		seen := map[string]*api.PublishNumberedEventResponse{}
 		older := false
 		current := uint64(0)
-		client := stubPublicClient{publish: func(_ context.Context, req *connect.Request[api.PublishEventRequest]) (*connect.Response[api.PublishEventResponse], error) {
-			key := string(req.Msg.OperationKey)
+		client := stubPublicClient{publish: func(_ context.Context, req *connect.Request[api.PublishNumberedEventRequest]) (*connect.Response[api.PublishNumberedEventResponse], error) {
+			key := string(fixtureOperation(req.Msg))
 			original, ok := seen[key]
 			if !ok {
 				r := success()
-				r.Msg.AcceptanceMarker = current + 1
+				r.Msg.Result.Receipt.AcceptanceMarker = current + 1
+				r.Msg.Result.OperationSequence = req.Msg.OperationSequence
 				seen[key] = r.Msg
 				return r, nil
 			}
-			if current > 10 && bytes.Equal(req.Msg.OperationKey, operationKey(o.prefix, 0)) {
+			if current > 10 && bytes.Equal(req.Msg.ClientId, publisherID(o.prefix, 0)) && req.Msg.OperationSequence == 1 {
 				older = true
 			}
 			if req.Msg.Payload[0] != 0x61 {
@@ -664,11 +686,21 @@ func TestPeriodicProbesRetainBoundedOlderOriginalsAndExplicitDisable(t *testing.
 				e.AddDetail(d)
 				return nil, e
 			}
-			r := proto.Clone(original).(*api.PublishEventResponse)
+			r := proto.Clone(original).(*api.PublishNumberedEventResponse)
 			r.Inserted = false
 			return connect.NewResponse(r), nil
 		}}
-		work := publicWork(o, realClock{}, client, "token")
+		o.journalDir = filepath.Join(canonicalTempDir(t), "journals")
+		lanes, err := openPublishers(context.Background(), o, client, "token")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			for _, lane := range lanes {
+				lane.journal.Close()
+			}
+		}()
+		work := publicWork(o, realClock{}, client, "token", lanes)
 		for current = 0; current < o.slots; current++ {
 			v := work(context.Background(), current)
 			if v.probeStop != "" || v.probes.Scheduled > 8 || v.probes.Completed != v.probes.Scheduled {
@@ -684,7 +716,16 @@ func TestPeriodicProbesRetainBoundedOlderOriginalsAndExplicitDisable(t *testing.
 	}
 }
 
-func (s *probeServer) PublishEvent(_ context.Context, req *connect.Request[api.PublishEventRequest]) (*connect.Response[api.PublishEventResponse], error) {
+func (s *probeServer) BeginEventPublicationSession(ctx context.Context, req *connect.Request[api.BeginEventPublicationSessionRequest]) (*connect.Response[api.BeginEventPublicationSessionResponse], error) {
+	return stubPublicClient{}.BeginEventPublicationSession(ctx, req)
+}
+func (s *probeServer) CompleteEventPublicationRecovery(ctx context.Context, req *connect.Request[api.CompleteEventPublicationRecoveryRequest]) (*connect.Response[api.CompleteEventPublicationRecoveryResponse], error) {
+	return stubPublicClient{}.CompleteEventPublicationRecovery(ctx, req)
+}
+func (s *probeServer) AcknowledgeEventPublicationResult(ctx context.Context, req *connect.Request[api.AcknowledgeEventPublicationResultRequest]) (*connect.Response[api.AcknowledgeEventPublicationResultResponse], error) {
+	return stubPublicClient{}.AcknowledgeEventPublicationResult(ctx, req)
+}
+func (s *probeServer) PublishNumberedEvent(_ context.Context, req *connect.Request[api.PublishNumberedEventRequest]) (*connect.Response[api.PublishNumberedEventResponse], error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
@@ -692,10 +733,10 @@ func (s *probeServer) PublishEvent(_ context.Context, req *connect.Request[api.P
 		return nil, connect.NewError(connect.CodeUnauthenticated, errors.New("SECRET_TOKEN_ERROR"))
 	}
 	if s.calls == 1 {
-		s.key = append([]byte(nil), req.Msg.OperationKey...)
+		s.key = append([]byte(nil), fixtureOperation(req.Msg)...)
 		return success(), nil
 	}
-	if !bytes.Equal(req.Msg.OperationKey, s.key) {
+	if !bytes.Equal(fixtureOperation(req.Msg), s.key) {
 		return nil, errors.New("wrong probe operation")
 	}
 	reason := api.PublicErrorReason_PUBLIC_ERROR_REASON_OPERATION_KEY_CONFLICT
@@ -708,7 +749,7 @@ func (s *probeServer) PublishEvent(_ context.Context, req *connect.Request[api.P
 			response := success()
 			response.Msg.Inserted = false
 			if s.mode == "wrong-replay" {
-				response.Msg.AcceptanceMarker++
+				response.Msg.Result.Receipt.AcceptanceMarker++
 			}
 			return response, nil
 		}
@@ -754,9 +795,13 @@ func TestPublicCommandPeriodicProbesOverRealH2C(t *testing.T) {
 					args[i+1] = token
 				case "--output":
 					args[i+1] = output
+				case "--journal-dir":
+					args[i+1] = filepath.Join(root, "publications")
+				case "--sample-every":
+					args[i+1] = "1"
 				}
 			}
-			args[len(args)-1] = "1"
+
 			err := run(args)
 			if (err == nil) != (mode == "valid") {
 				t.Fatalf("unexpected command disposition for %s: %v", mode, err)
