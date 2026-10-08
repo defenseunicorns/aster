@@ -156,6 +156,19 @@ retain that sequence for recovery after an uncertain RPC outcome. See the
 [agent quickstart](../../docs/quickstart/connect-agent.md#use-crash-safe-numbered-publication)
 for an end-to-end example and the exact Increment 1 boundary.
 
+`publish_journaled_pipeline(&sequences, max_disconnect_retries)` sends a
+contiguous range beginning at the next first admission over native HTTP/2
+`PublishNumberedEvents`. Complete intents must already be journaled. It uses
+the existing eight-input window and rotates before the server's default
+stream deadline; each committed receipt is saved before the SDK releases a
+window slot. Disconnect replay preserves client ID, session, sequence, and
+intent. A rejected input stops this SDK pipeline and remains journaled, along
+with unresolved later inputs, for explicit repair or abandonment. Successful
+receipts already saved before a later error are available through recovery.
+The service returns ordered per-input numbered outcomes and rejects gRPC-Web
+request streaming; numbered unary calls remain available there. This addition
+does not migrate existing ordinary publishers or remove their public path.
+
 ### Serving a live node for development or migration
 
 `BoundAgent` is a development/migration compatibility entry point, not the

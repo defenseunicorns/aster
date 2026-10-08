@@ -152,6 +152,11 @@ pub(crate) fn rejection_router() -> connectrpc::Router {
         )
         .route_bidi_stream(
             APPLICATION_SERVICE_NAME,
+            "PublishNumberedEvents",
+            rejection_handler::<api::PublishNumberedEventsRequest, api::PublishNumberedEventsResponse>(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
             "PublishNumberedEvent",
             rejection_handler::<api::PublishNumberedEventRequest, api::PublishNumberedEventResponse>(),
         )
@@ -308,6 +313,69 @@ impl api::AsterApplicationService for AsterConnectService {
                         },
                     };
                     bounded_message(response, PublicOperation::PublishEvents)
+                }
+            })
+            .buffered(PUBLISH_EVENTS_WINDOW);
+        Response::stream_ok(responses)
+    }
+
+    async fn publish_numbered_events(
+        &self,
+        ctx: RequestContext,
+        requests: connectrpc::InboundStream<api::PublishNumberedEventsRequest>,
+    ) -> ServiceResult<ServiceStream<api::PublishNumberedEventsResponse>> {
+        if ctx.protocol() == Some(connectrpc::Protocol::GrpcWeb) {
+            return Err(public_error(
+                ErrorCode::Unimplemented,
+                api::PublicErrorReason::UnsupportedValue,
+                PublicOperation::PublishNumberedEvents,
+                false,
+                None,
+            ));
+        }
+        let events = self.events.clone();
+        let responses = requests
+            .map(move |request| {
+                let events = events.clone();
+                async move {
+                    let request = request?.to_owned_message();
+                    let response = match numbered_stream_publication_request(request) {
+                        Ok((request, options)) => {
+                            match events.publish_numbered(request, options).await {
+                                Ok(published) => api::PublishNumberedEventsResponse {
+                                    outcome: Some(
+                                        api::publish_numbered_events_response::Outcome::Published(
+                                            Box::new(api::PublishNumberedEventResponse {
+                                                result: numbered_result_message(published.result)
+                                                    .into(),
+                                                inserted: published.inserted,
+                                                ..Default::default()
+                                            }),
+                                        ),
+                                    ),
+                                    ..Default::default()
+                                },
+                                Err(error) => api::PublishNumberedEventsResponse {
+                                    outcome: Some(
+                                        api::publish_numbered_events_response::Outcome::Failure(
+                                            Box::new(public_application_error_detail(
+                                                error,
+                                                PublicOperation::PublishNumberedEvents,
+                                            )),
+                                        ),
+                                    ),
+                                    ..Default::default()
+                                },
+                            }
+                        }
+                        Err(failure) => api::PublishNumberedEventsResponse {
+                            outcome: Some(api::publish_numbered_events_response::Outcome::Failure(
+                                Box::new(failure),
+                            )),
+                            ..Default::default()
+                        },
+                    };
+                    bounded_message(response, PublicOperation::PublishNumberedEvents)
                 }
             })
             .buffered(PUBLISH_EVENTS_WINDOW);
@@ -856,6 +924,67 @@ fn stream_publication_request(
     Ok((
         EventPublishRequest {
             operation_key: request.operation_key,
+            predecessor,
+            topic: Topic::new(request.topic).map_err(|_| malformed())?,
+            scope: Scope::new(request.scope).map_err(|_| malformed())?,
+            priority,
+            logical_key: request.logical_key,
+            payload: request.payload,
+            tombstone: request.tombstone,
+        },
+        options,
+    ))
+}
+
+fn numbered_stream_publication_request(
+    request: api::PublishNumberedEventsRequest,
+) -> Result<(NumberedEventPublishRequest, EventPublishOptions), api::PublicErrorDetail> {
+    let operation = PublicOperation::PublishNumberedEvents;
+    let malformed = || {
+        public_error_detail(
+            api::PublicErrorReason::MalformedInput,
+            operation,
+            false,
+            None,
+        )
+    };
+    let unsupported = || {
+        public_error_detail(
+            api::PublicErrorReason::UnsupportedValue,
+            operation,
+            false,
+            None,
+        )
+    };
+    let request = request.publication.into_option().ok_or_else(malformed)?;
+    let options = match request.ttl_ms {
+        None => EventPublishOptions::durable(),
+        Some(_) if request.tombstone => return Err(malformed()),
+        Some(ttl_ms) => EventPublishOptions::finite_ttl_ms(ttl_ms).map_err(|_| malformed())?,
+    };
+    let predecessor = request
+        .predecessor_id
+        .as_deref()
+        .map(|value| {
+            value
+                .try_into()
+                .map(EventId::from_bytes)
+                .map_err(|_| malformed())
+        })
+        .transpose()?;
+    let priority = match request.priority.as_known() {
+        Some(api::Priority::Routine) => NodePriority::Routine,
+        Some(api::Priority::Priority) => NodePriority::Priority,
+        Some(api::Priority::Immediate) => NodePriority::Immediate,
+        Some(api::Priority::Flash) => NodePriority::Flash,
+        Some(api::Priority::Unspecified) | None => return Err(unsupported()),
+    };
+    Ok((
+        NumberedEventPublishRequest {
+            client_id: EventClientId::new(request.client_id).map_err(|_| malformed())?,
+            session: EventPublicationSession::new(request.session).map_err(|_| malformed())?,
+            sequence: EventOperationSequence::new(request.operation_sequence)
+                .map_err(|_| malformed())?,
             predecessor,
             topic: Topic::new(request.topic).map_err(|_| malformed())?,
             scope: Scope::new(request.scope).map_err(|_| malformed())?,

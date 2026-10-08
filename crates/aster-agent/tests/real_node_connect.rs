@@ -1110,6 +1110,61 @@ async fn numbered_sdk_recovers_its_committed_result_across_restart() {
     assert_eq!(operations.numbered_outstanding_results, 0);
     assert_eq!(operations.numbered_reverse_rows, 0);
 
+    // Exercise the journal-backed numbered pipeline over real native HTTP/2,
+    // across more than one bounded window, using the same selected node.
+    for (index, protocol) in [Protocol::Connect, Protocol::Grpc].into_iter().enumerate() {
+        let client_id = format!("numbered-pipeline-{index}");
+        let path = state.0.join(format!("pipeline-{index}.redb"));
+        PublicationJournal::initialize(&path, client_id.as_bytes()).unwrap();
+        let transport =
+            Http2Connection::connect_plaintext(format!("http://{address}").parse().unwrap())
+                .await
+                .unwrap()
+                .shared(8);
+        let sdk = NumberedEventSdk::open(
+            api::AsterApplicationServiceClient::new(transport, config().with_protocol(protocol)),
+            &path,
+            client_id.as_bytes(),
+        )
+        .unwrap();
+        sdk.recover().await.unwrap();
+        let sequences: Vec<_> = (0_u8..17)
+            .map(|suffix| {
+                sdk.journal_publication(api::PublishNumberedEventRequest {
+                    topic: "chat.events".to_owned(),
+                    scope: "mission/team/alpha".to_owned(),
+                    priority: api::Priority::Routine.into(),
+                    logical_key: vec![suffix],
+                    payload: vec![suffix],
+                    ..Default::default()
+                })
+                .unwrap()
+            })
+            .collect();
+        let results = sdk
+            .publish_journaled_pipeline(&sequences, 1)
+            .await
+            .expect("numbered native pipeline");
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.operation_sequence)
+                .collect::<Vec<_>>(),
+            sequences
+        );
+        for sequence in sequences {
+            sdk.acknowledge(sequence).await.unwrap();
+        }
+        drop(sdk);
+        let reopened = NumberedEventSdk::open(
+            api::AsterApplicationServiceClient::new(HttpClient::plaintext(), config()),
+            &path,
+            client_id.as_bytes(),
+        )
+        .unwrap();
+        assert!(reopened.recover().await.unwrap().operations.is_empty());
+    }
+
     shutdown_tx.send(true).expect("shutdown");
     tokio::time::timeout(Duration::from_secs(5), server)
         .await

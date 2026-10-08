@@ -49,6 +49,8 @@ service AsterApplicationService {
   rpc CompleteEventPublicationRecovery(CompleteEventPublicationRecoveryRequest) returns (CompleteEventPublicationRecoveryResponse);
   // PublishNumberedEvent admits exactly allocated_through + 1 or resolves an exact retry.
   rpc PublishNumberedEvent(PublishNumberedEventRequest) returns (PublishNumberedEventResponse);
+  // Ordered numbered publications over bounded native HTTP/2 streams.
+  rpc PublishNumberedEvents(stream PublishNumberedEventsRequest) returns (stream PublishNumberedEventsResponse);
   // AbandonEventPublication permanently consumes the next unadmitted sequence.
   rpc AbandonEventPublication(AbandonEventPublicationRequest) returns (AbandonEventPublicationResponse);
   // AcknowledgeEventPublicationResult compacts one sparse committed result.
@@ -247,6 +249,17 @@ message PublishEventsRequest {
 message PublishEventsResponse {
   oneof outcome {
     PublishEventResponse published = 1;
+    PublicErrorDetail failure = 2;
+  }
+}
+
+message PublishNumberedEventsRequest {
+  PublishNumberedEventRequest publication = 1;
+}
+
+message PublishNumberedEventsResponse {
+  oneof outcome {
+    PublishNumberedEventResponse published = 1;
     PublicErrorDetail failure = 2;
   }
 }
