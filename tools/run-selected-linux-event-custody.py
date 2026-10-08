@@ -64,7 +64,7 @@ ADMITTED_PATHS = tuple(
             "crates/aster-iroh/Cargo.toml",
             "crates/aster-iroh/src/lib.rs",
             "crates/aster-node/Cargo.toml",
-            "crates/aster-node/examples/support/numbered.rs",
+            "crates/aster-node/src/publication_journal.rs",
             "tools/historical/check-selected-live-event-receipt.py",
             "tools/historical/check-selected-linux-event-custody-receipt.py",
 

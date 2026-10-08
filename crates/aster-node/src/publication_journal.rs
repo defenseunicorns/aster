@@ -1,10 +1,13 @@
 //! Clean Room — Privileged.
-//! Bounded, application-owned journal used by the native example programs.
+//! Bounded, application-owned journal for native selected Event producers.
 //! One configured producer owns one redb writer and one pending full intent.
 //! Opening never creates state; callers explicitly initialize a fresh journal.
-#![allow(dead_code)] // Each example uses a different part of the fixture API.
+//! Recover the persisted claim and original pending intent before new work.
+//! Publication errors preserve that intent. After applying the result, call
+//! acknowledgement to durably mark progress before releasing result headroom.
+//! A persistence error poisons the owner until it is closed and reopened.
 
-use aster_node::application::{
+use crate::application::{
     EventClientId, EventId, EventOperationSequence, EventPublicationSession, EventPublishOptions,
     EventPublishResult, EventQuery, EventRecoverySnapshot, NumberedEventPublishOutcome,
     NumberedEventPublishRequest, Priority, Scope, SelectedEventHandle, SelectedEventNode, Topic,
@@ -73,7 +76,7 @@ struct Receipt {
     marker: u64,
 }
 impl Receipt {
-    fn matches(&self, outcome: &aster_node::application::NumberedEventResult) -> bool {
+    fn matches(&self, outcome: &crate::application::NumberedEventResult) -> bool {
         self.transfer == *outcome.receipt.transfer_id.as_bytes()
             && self.semantic == *outcome.receipt.semantic_id.as_bytes()
             && self.marker == outcome.receipt.acceptance_marker
@@ -205,6 +208,17 @@ impl Backend<'_> {
                 return Err("committed content is unavailable; retain its numbered receipt".into());
             }
             query.after_acceptance_marker = page.scanned_through;
+        }
+    }
+}
+
+fn ready_stopped<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    let mut future = std::pin::pin!(future);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(result) => result,
+        std::task::Poll::Pending => {
+            Err("stopped publication unexpectedly suspended; close and recover".into())
         }
     }
 }
@@ -359,6 +373,34 @@ impl Journal {
     fn client(&self) -> Result<EventClientId> {
         Ok(EventClientId::new(self.state.client.clone())?)
     }
+    /// Durable application progress for a fixed, ordered publication plan.
+    /// An assigned-but-unapplied pending operation is excluded.
+    pub fn completed_through(&self) -> u64 {
+        self.state
+            .pending
+            .as_ref()
+            .map_or(self.state.allocated, |pending| pending.sequence - 1)
+    }
+    pub fn recover_stopped(&mut self, node: &mut SelectedEventNode) -> Result<()> {
+        ready_stopped(self.recover(&mut Backend::Stopped(node)))
+    }
+    pub fn publish_stopped(
+        &mut self,
+        node: &mut SelectedEventNode,
+        intent: Intent,
+    ) -> Result<NumberedEventPublishOutcome> {
+        ready_stopped(self.publish(&mut Backend::Stopped(node), intent))
+    }
+    pub fn publish_metadata_stopped(
+        &mut self,
+        node: &mut SelectedEventNode,
+        intent: Intent,
+    ) -> Result<EventPublishResult> {
+        ready_stopped(self.publish_metadata(&mut Backend::Stopped(node), intent))
+    }
+    pub fn acknowledge_stopped(&mut self, node: &mut SelectedEventNode) -> Result<()> {
+        ready_stopped(self.acknowledge(&mut Backend::Stopped(node)))
+    }
     pub fn pending(&self) -> Option<(u64, &Intent)> {
         self.state.pending.as_ref().map(|p| (p.sequence, &p.intent))
     }
@@ -512,8 +554,8 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mission::UnprotectedReferenceMission;
     use aster_mesh::{ProvisioningAccess, ReferenceProvisioner};
-    use aster_node::mission::UnprotectedReferenceMission;
     struct Root(std::path::PathBuf);
     impl Root {
         fn new() -> Self {
@@ -568,6 +610,36 @@ mod tests {
             },
         )
     }
+    #[test]
+    fn stopped_journal_roundtrip_needs_no_async_runtime() {
+        let root = Root::new();
+        let (state, bundle, intent) = fixture(&root);
+        let path = root.0.join("stopped-publication.redb");
+        let client = b"native-stopped-test";
+        Journal::initialize(&path, client).unwrap();
+        let mut journal = Journal::open(&path, client).unwrap();
+        let mut node = SelectedEventNode::open_unprotected_reference(&state, &bundle).unwrap();
+        journal.recover_stopped(&mut node).unwrap();
+        let first = journal
+            .publish_metadata_stopped(&mut node, intent.clone())
+            .unwrap();
+        assert!(first.inserted);
+        assert_eq!(first.event_sequence, 1);
+        journal.acknowledge_stopped(&mut node).unwrap();
+        assert_eq!(journal.completed_through(), 1);
+        drop(journal);
+        drop(node);
+        let mut journal = Journal::open(&path, client).unwrap();
+        let mut node = SelectedEventNode::open_unprotected_reference(&state, &bundle).unwrap();
+        journal.recover_stopped(&mut node).unwrap();
+        assert_eq!(journal.completed_through(), 1);
+        let second = journal.publish_metadata_stopped(&mut node, intent).unwrap();
+        assert!(second.inserted);
+        assert_eq!(second.event_sequence, 2);
+        assert_ne!(first.id, second.id);
+        journal.acknowledge_stopped(&mut node).unwrap();
+    }
+
     #[tokio::test]
     async fn lost_commit_reply_recovers_original_before_next_allocation() {
         let root = Root::new();

@@ -108,6 +108,10 @@ def mutate(lines: list[str], index: int, key: str, value: str) -> list[str]:
 
 
 class TranscriptContractTests(unittest.TestCase):
+    def test_numbered_producer_source_manifest_matches_runner(self) -> None:
+        self.assertEqual(CHECKER.ADMITTED_SOURCE_PATHS, RUNNER.ADMITTED_PATHS)
+        self.assertIn("crates/aster-node/src/publication_journal.rs", CHECKER.ADMITTED_SOURCE_PATHS)
+
     def test_numbered_publication_diagnostics_are_exact_and_bounded(self) -> None:
         data = "".join(f"event_publication_group group_sequence={sequence} collected=1 cohorts=1 custody_writer_commits=1 event_writer_commits=1 total_writer_commits=2 accepted_new=1 exact_retries=0 failures=0 max_cohort_size=1 singleton_fallbacks=1\n" for sequence in range(1,5)).encode()
         CHECKER.validate_stderr(data, {})

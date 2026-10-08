@@ -38,6 +38,7 @@ mod event_pages;
 mod frame;
 mod identity;
 pub mod mission;
+pub mod publication_journal;
 mod runtime;
 
 pub use aster_redb_store::{BlobDepotLimits, CustodyQuota, StoreLimits};

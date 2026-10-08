@@ -6,8 +6,7 @@
 //! stdout so an independent checker can bind the forced receiver termination to
 //! a poll whose durable attempt was already returned and flushed.
 
-#[path = "support/numbered.rs"]
-mod numbered;
+use aster_node::publication_journal as numbered;
 
 use std::{
     collections::{BTreeMap, BTreeSet},

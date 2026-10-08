@@ -10,8 +10,7 @@ use aster_node::application::{
     Topic,
 };
 
-#[path = "support/numbered.rs"]
-mod numbered;
+use aster_node::publication_journal as numbered;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {

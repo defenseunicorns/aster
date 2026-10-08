@@ -5,8 +5,7 @@
 //! publication. Journals retain one full intent per slot. V2 observations replace
 //! the old arbitrary-key ledger experiment without relabeling its v1 receipts.
 
-#[path = "support/numbered.rs"]
-mod numbered;
+use aster_node::publication_journal as numbered;
 use aster_node::{
     MutableSourceInterests, NodeApplication, NodeConfig, NodeOperatorOutputPolicy, RunningNode,
     SelectedForwardingConfig,

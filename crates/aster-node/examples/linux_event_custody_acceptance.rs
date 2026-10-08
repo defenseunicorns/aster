@@ -10,8 +10,7 @@
 //! Runtime `READY`/`CONTACT`/`STOP` records and narrowly scoped
 //! `LINUX_CUSTODY_CHILD` coordination records remain visible as they occur.
 
-#[path = "support/numbered.rs"]
-mod numbered;
+use aster_node::publication_journal as numbered;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
