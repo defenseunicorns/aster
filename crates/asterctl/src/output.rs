@@ -51,28 +51,27 @@ pub fn status(response: &api::GetStatusResponse, json: bool) -> Result<String, s
     }
 }
 
-pub fn publish(
-    response: &api::PublishEventResponse,
-    operation_key: &str,
+pub fn numbered_publication(
+    result: &api::CommittedPublicationResult,
     json: bool,
 ) -> Result<String, serde_json::Error> {
-    if !json {
-        return Ok(text::publish(response));
+    if json {
+        return serde_json::to_string_pretty(result).map(|text| text + "\n");
     }
-    let mut fields = fields! {
-        "id": Bytes(&response.id),
-        "publisher": Bytes(&response.publisher),
-        "publisherCounter": response.publisher_counter.to_string(),
-        "eventSequence": response.event_sequence.to_string(),
-        "priority": response.priority,
-        "acceptanceMarker": response.acceptance_marker.to_string(),
-        "inserted": response.inserted,
-        "operation_key": operation_key,
+    let receipt = result.receipt.as_option().expect("validated receipt");
+    let event_id = serde_json::to_value(Bytes(&receipt.event_id))?;
+    let content = match result.content.as_known() {
+        Some(api::CommittedContentStatus::Available) => "Available",
+        Some(api::CommittedContentStatus::Retired) => "Retired",
+        _ => "Unknown",
     };
-    if let Some(ttl_ms) = response.ttl_ms {
-        fields.extend(fields! { "ttlMs": ttl_ms.to_string() });
-    }
-    Ok(serde_json::to_string_pretty(&Output::Object(fields))? + "\n")
+    Ok(format!(
+        "EVENT:\nCommitted locally\nOperation sequence: {}\nEvent ID (Base64): {}\nAcceptance marker: {}\nContent: {}\nAcknowledge after applying this result with publication-ack.\n",
+        result.operation_sequence,
+        event_id.as_str().expect("Base64 Event ID"),
+        receipt.acceptance_marker,
+        content
+    ))
 }
 
 pub fn subscribe(
@@ -306,36 +305,39 @@ mod tests {
     }
 
     #[test]
-    fn publication_receipts_preserve_scalar_defaults_unknown_enums_and_ttl_precision() {
-        for (ttl_ms, display) in [
-            (None, "None"),
-            (Some(1), "1 ms"),
-            (Some(999), "999 ms"),
-            (Some(1000), "1s"),
-            (Some(30001), "30s 1ms"),
-            (Some(u64::MAX), "213,503,982,334d 14h 25m 51s 615ms"),
+    fn numbered_receipt_output_preserves_commit_identity_and_retirement() {
+        for content in [
+            api::CommittedContentStatus::Available,
+            api::CommittedContentStatus::Retired,
         ] {
-            let receipt = api::PublishEventResponse {
-                ttl_ms,
-                priority: 123.into(),
+            let result = api::CommittedPublicationResult {
+                operation_sequence: u64::MAX,
+                receipt: api::CommittedEventReceipt {
+                    event_id: vec![1; 32],
+                    transfer_id: vec![2; 32],
+                    acceptance_marker: u64::MAX,
+                    ..Default::default()
+                }
+                .into(),
+                content: content.into(),
+                retirement_reason: (content == api::CommittedContentStatus::Retired)
+                    .then_some(api::RetirementReason::Expired.into()),
                 ..Default::default()
             };
-            let text = publish(&receipt, "test", false).unwrap();
-            assert_eq!(text_value(&text, "TTL"), display);
-            assert_eq!(text_value(&text, "Priority"), "Unknown (123)");
-            assert_eq!(text_value(&text, "Result"), "Already published");
+            let text = numbered_publication(&result, false).unwrap();
+            assert!(text.contains("Committed locally"));
+            assert!(text.contains("publication-ack"));
             let json: Value =
-                serde_json::from_str(&publish(&receipt, "test", true).unwrap()).unwrap();
-            assert_eq!(json["publisherCounter"], "0");
-            assert_eq!(json["eventSequence"], "0");
-            assert_eq!(json["acceptanceMarker"], "0");
-            assert_eq!(json["id"], "");
-            assert_eq!(json["publisher"], "");
-            assert_eq!(json["priority"], 123);
-            assert_eq!(json["inserted"], false);
+                serde_json::from_str(&numbered_publication(&result, true).unwrap()).unwrap();
+            assert_eq!(json["operationSequence"], u64::MAX.to_string());
+            assert_eq!(json["receipt"]["acceptanceMarker"], u64::MAX.to_string());
             assert_eq!(
-                json.get("ttlMs").cloned(),
-                ttl_ms.map(|ms| json!(ms.to_string()))
+                json["receipt"]["eventId"],
+                "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+            );
+            assert_eq!(
+                json.get("retirementReason").is_some(),
+                content == api::CommittedContentStatus::Retired
             );
         }
     }

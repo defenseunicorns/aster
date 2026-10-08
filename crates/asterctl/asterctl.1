@@ -95,8 +95,14 @@ Read the API token from PATH.
 Either this option or
 .B \-\-token
 is required to run a command; they cannot be used together.
+.SH NUMBERED PUBLICATION
+Use publication-init with \-\-journal PATH and \-\-client\-id ID once.
+Publish requires the same journal and stable identity. Recover uncertain work
+with publication-recover and publication-retry. Acknowledge applied results
+with publication-ack. Retry, acknowledgement, and explicit publication-abandon
+take \-\-sequence N. Initialization is local and requires no token.
 .SH OPERATION KEYS
-Both publish and subscribe require
+Subscribe requires
 .BR "\-\-operation\-key KEY|auto" .
 Use an explicit key or auto to generate one.
 For retries, use the actual key from the previous attempt and the same request.

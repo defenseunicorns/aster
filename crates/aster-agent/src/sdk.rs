@@ -1101,6 +1101,16 @@ where
         Ok(assigned)
     }
 
+    /// Returns the original durable intent for application recovery. This is
+    /// a local read, not an admission or acknowledgement. Consumed operations
+    /// have no retained journal row and return `None`.
+    pub fn journaled_intent(
+        &self,
+        sequence: u64,
+    ) -> Result<Option<api::PublishNumberedEventRequest>> {
+        Ok(self.journal.entry(sequence)?.map(|entry| entry.intent))
+    }
+
     /// Pipelines a contiguous range of journaled operations. Every successful
     /// receipt is durably saved before releasing another slot. A rejected
     /// operation stops the pipeline and remains journaled for explicit repair

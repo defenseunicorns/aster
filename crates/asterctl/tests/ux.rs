@@ -6,19 +6,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod support;
+
 const TOKEN: &str = "asterctl-test-token-00000000000000";
 
-fn command(kind: &str, port: u16) -> Command {
+fn command(kind: &str, port: u16) -> (Command, Option<support::Journal>) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_asterctl"));
     command.args(["--token", TOKEN, "--port", &port.to_string(), kind]);
+    let journal = (kind == "publish").then(support::Journal::new);
+    if let Some(journal) = &journal {
+        journal.configure(&mut command);
+    }
     match kind {
         "publish" => {
-            command.args([
-                "--topic=x",
-                "--scope=x",
-                "--operation-key=retry-key",
-                "hello",
-            ]);
+            command.args(["--topic=x", "--scope=x", "hello"]);
         }
         "subscribe" => {
             command.args(["--scope=x", "--operation-key=retry-key", "x"]);
@@ -29,7 +30,7 @@ fn command(kind: &str, port: u16) -> Command {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    command
+    (command, journal)
 }
 
 fn finish(mut child: Child) -> Output {
@@ -105,6 +106,7 @@ fn timeout_rejects_invalid_values_before_rpc() {
         "18446744073709551615",
     ] {
         let output = command("status", 1)
+            .0
             .arg(format!("--timeout={value}"))
             .output()
             .unwrap();
@@ -114,7 +116,7 @@ fn timeout_rejects_invalid_values_before_rpc() {
         assert!(error.contains("timeout must be an integer"), "{error}");
         assert!(!error.contains(TOKEN));
     }
-    let output = command("status", 1).arg("--timeout").output().unwrap();
+    let output = command("status", 1).0.arg("--timeout").output().unwrap();
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
@@ -126,7 +128,7 @@ fn timeout_rejects_invalid_values_before_rpc() {
 fn configured_timeout_bounds_every_rpc_and_preserves_mutation_recovery() {
     let cases: Vec<_> = ["status", "query", "publish", "subscribe"].into_iter().map(|kind| thread::spawn(move || {
         let listener = listener();
-        let mut command = command(kind, listener.local_addr().unwrap().port());
+        let (mut command, _journal) = command(kind, listener.local_addr().unwrap().port());
         command.args(["--timeout", "1"]);
         let started = Instant::now();
         let child = command.spawn().unwrap();
@@ -140,7 +142,7 @@ fn configured_timeout_bounds_every_rpc_and_preserves_mutation_recovery() {
         let error = String::from_utf8(output.stderr).unwrap();
         assert!(error.contains("deadline_exceeded"), "{error}");
         assert!(error.contains("--timeout"), "{error}");
-        if matches!(kind, "publish" | "subscribe") {
+        if kind == "subscribe" {
             assert!(error.contains("outcome unknown"), "{error}");
             assert!(error.contains("retry the identical request with --operation-key=retry-key"), "{error}");
         }
@@ -160,9 +162,8 @@ fn rpc_hints_are_local_and_do_not_echo_server_messages_or_tokens() {
             ("permission_denied", "permission"),
         ] {
             let listener = listener();
-            let child = command(kind, listener.local_addr().unwrap().port())
-                .spawn()
-                .unwrap();
+            let (mut command, _journal) = command(kind, listener.local_addr().unwrap().port());
+            let child = command.spawn().unwrap();
             let (mut stream, _) = request(&listener);
             let body = format!(r#"{{"code":"{code}","message":"REMOTE-CANARY {TOKEN}"}}"#);
             write!(stream, "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
