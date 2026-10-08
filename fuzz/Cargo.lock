@@ -178,6 +178,7 @@ dependencies = [
  "aster-redb-store",
  "getrandom 0.4.3",
  "libc",
+ "redb",
  "rustix",
  "serde",
  "serde_json",

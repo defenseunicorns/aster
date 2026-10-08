@@ -979,6 +979,7 @@ pub(crate) fn validate_numbered_cleanup_cursor(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn legacy_operation_allowed_write(
     write: &redb::WriteTransaction,
 ) -> Result<(), StoreError> {

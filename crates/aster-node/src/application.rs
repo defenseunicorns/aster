@@ -27,11 +27,11 @@ pub use aster_mesh::{NodeId, Priority, Scope, Topic};
 use aster_redb_store::{
     AggregateStoreUsage, BlobStoreError, ControlPolicySnapshot, ControlTransferId,
     CustodyObjectKey, CustodyQuota, CustodyStoreError, EventDeliveryAck as StoreEventDeliveryAck,
-    EventGapScanPlan, EventOperationKey, EventQueryFilter, EventReplicationPolicySnapshot,
-    EventSemanticId, EventSubscriptionId as StoreEventSubscriptionId, EventSubscriptionKey,
-    EventSubscriptionMode, EventSubscriptionPollSelection, EventSubscriptionRemoveOutcome,
-    EventSubscriptionSpec, MAX_EVENT_PAGE, MAX_EVENT_POLL_DELIVERIES, MAX_EVENT_SUBSCRIPTION_SCAN,
-    Store, StoreError, StoreLimits, StoredEvent, StoredEventTransfer,
+    EventGapScanPlan, EventQueryFilter, EventReplicationPolicySnapshot, EventSemanticId,
+    EventSubscriptionId as StoreEventSubscriptionId, EventSubscriptionKey, EventSubscriptionMode,
+    EventSubscriptionPollSelection, EventSubscriptionRemoveOutcome, EventSubscriptionSpec,
+    MAX_EVENT_PAGE, MAX_EVENT_POLL_DELIVERIES, MAX_EVENT_SUBSCRIPTION_SCAN, Store, StoreError,
+    StoreLimits, StoredEvent, StoredEventTransfer,
 };
 pub use aster_redb_store::{
     CommittedEventContent, CommittedEventReceipt, EventClientId, EventOperationAbandonment,
@@ -47,18 +47,24 @@ use crate::{
     mission::UnprotectedReferenceMission,
     runtime::{
         AuthenticatedEventRouteCache, EVENT_OPERATION_CONFLICT, EVENT_OPERATION_RETIRED,
-        EventEmissionPolicy, NodeCustodyClock, STORE_FILE, SelectedEventPublish,
-        SelectedNumberedEventPublish, StartupEventVerification, absolute_path_from,
-        absolute_state_path, cache_accepted_stored_event, drive_custody_maintenance,
-        drive_custody_maintenance_observed, ensure_principal_active,
-        ensure_state_accepts_normal_operation, event_is_inactive,
+        EventEmissionPolicy, NodeCustodyClock, STORE_FILE, SelectedNumberedEventPublish,
+        StartupEventVerification, absolute_path_from, absolute_state_path,
+        cache_accepted_stored_event, drive_custody_maintenance, drive_custody_maintenance_observed,
+        ensure_principal_active, ensure_state_accepts_normal_operation, event_is_inactive,
         open_startup_event_verifier_and_cache,
         prune_authenticated_event_route_cache_to_sender_projection,
-        publish_selected_event_group_once, publish_selected_event_once,
-        publish_selected_event_once_observed, publish_selected_numbered_event_group,
-        refresh_application_policy, verify_content_stored_claim, verify_stored_claim,
+        publish_selected_numbered_event_group, refresh_application_policy,
+        verify_content_stored_claim, verify_stored_claim,
     },
 };
+
+#[cfg(test)]
+use crate::runtime::{
+    SelectedEventPublish, publish_selected_event_group_once, publish_selected_event_once,
+    publish_selected_event_once_observed,
+};
+#[cfg(test)]
+use aster_redb_store::EventOperationKey;
 
 mod blob;
 #[cfg(test)]
@@ -237,7 +243,9 @@ impl fmt::Display for EventId {
 /// with different content fails closed. Resolution still requires the caller
 /// to remain authorized by current mission policy. [`EventPublishOptions`]
 /// supplies the additive finite-TTL path without changing this durable request.
+/// Historical unit-test fixture only; shipped node APIs publish numbered requests.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub struct EventPublishRequest {
     pub operation_key: Vec<u8>,
     pub predecessor: Option<EventId>,
@@ -296,6 +304,7 @@ impl EventPublicationGroupDiagnostic {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct EventPublicationGroupResult {
     pub(crate) results: Vec<Result<EventPublishResult, ApplicationError>>,
     pub(crate) diagnostic: EventPublicationGroupDiagnostic,
@@ -679,8 +688,18 @@ pub struct EventOperationCapacity {
 }
 
 impl EventOperationCapacity {
-    pub fn new(stats: EventOperationStats, limits: EventOperationLimits) -> Self {
-        Self::for_ledgers(stats, NumberedEventOperationStats::default(), limits)
+    /// Capacity of an explicitly inspected historical opaque-key ledger.
+    /// Normal node status uses `for_ledgers`, including an empty numbered store.
+    pub fn from_legacy_inspection(
+        stats: EventOperationStats,
+        limits: EventOperationLimits,
+    ) -> Self {
+        Self::calculate(
+            stats,
+            NumberedEventOperationStats::default(),
+            limits,
+            EventOperationLedgerMode::Legacy,
+        )
     }
 
     pub fn for_ledgers(
@@ -688,15 +707,28 @@ impl EventOperationCapacity {
         numbered_stats: NumberedEventOperationStats,
         limits: EventOperationLimits,
     ) -> Self {
+        #[cfg(test)]
+        if stats != EventOperationStats::default() {
+            return Self::from_legacy_inspection(stats, limits);
+        }
+        Self::calculate(
+            stats,
+            numbered_stats,
+            limits,
+            EventOperationLedgerMode::Numbered,
+        )
+    }
+
+    fn calculate(
+        stats: EventOperationStats,
+        numbered_stats: NumberedEventOperationStats,
+        limits: EventOperationLimits,
+        mode: EventOperationLedgerMode,
+    ) -> Self {
         const LEGACY_ACTIVE_BYTES: u64 = 162;
         const NUMBERED_RESULT_BYTES: u64 = 292;
         // EventOperationLimits construction checked both reserve arithmetic
         // and subtraction. Retained usage may exceed a lower reopened limit.
-        let mode = if numbered_stats != NumberedEventOperationStats::default() {
-            EventOperationLedgerMode::Numbered
-        } else {
-            EventOperationLedgerMode::Legacy
-        };
         let rows = match mode {
             EventOperationLedgerMode::Legacy => stats.records_total,
             EventOperationLedgerMode::Numbered => numbered_stats
@@ -815,6 +847,7 @@ impl SelectedEventHandle {
         self.mission_authority
     }
 
+    #[cfg(test)]
     pub async fn publish(
         &self,
         request: EventPublishRequest,
@@ -824,6 +857,7 @@ impl SelectedEventHandle {
     }
 
     /// Publishes with an explicit durable or finite-TTL custody policy.
+    #[cfg(test)]
     pub async fn publish_with_options(
         &self,
         request: EventPublishRequest,
@@ -1068,6 +1102,7 @@ pub(crate) enum SelectedEventCommand {
     ListSubscriptions {
         response: oneshot::Sender<Result<Vec<EventSubscriptionSnapshot>, ApplicationError>>,
     },
+    #[cfg(test)]
     Publish {
         request: EventPublishRequest,
         options: EventPublishOptions,
@@ -1139,6 +1174,7 @@ impl SelectedEventCommand {
 
     pub(crate) fn reject(self) {
         match self {
+            #[cfg(test)]
             Self::Publish { response, .. } => {
                 _ = response.send(Err(actor_unavailable("publish")));
             }
@@ -1345,10 +1381,18 @@ impl SelectedEventNode {
         let state = absolute_state_path(state).map_err(|error| application_error("open", error))?;
         ensure_state_accepts_normal_operation(&state)
             .map_err(|error| application_error("open", error))?;
+        Store::require_numbered_publication_compatible(state.join(STORE_FILE))
+            .map_err(|error| application_error("open", error.into()))?;
         let mission = load_mission()?;
         fs::create_dir_all(&state).map_err(|error| application_error("open", error.into()))?;
-        let store = Store::open_for_mission(state.join(STORE_FILE), mission.mission_authority_id())
-            .map_err(|error| application_error("open", error.into()))?;
+        let store = Store::open_numbered_for_mission(
+            state.join(STORE_FILE),
+            aster_redb_store::StoreLimits::default(),
+            aster_redb_store::BlobDepotLimits::DEFAULT,
+            aster_redb_store::EventOperationLimits::DEFAULT,
+            mission.mission_authority_id(),
+        )
+        .map_err(|error| application_error("open", error.into()))?;
         store
             .require_process_exclusive_lock()
             .map_err(|error| application_error("open", error.into()))?;
@@ -1732,6 +1776,7 @@ impl SelectedEventNode {
     }
 
     /// Durably publishes one arbitrary selected Event exactly once per operation key.
+    #[cfg(test)]
     pub fn publish(
         &mut self,
         request: EventPublishRequest,
@@ -1740,6 +1785,7 @@ impl SelectedEventNode {
     }
 
     /// Durably publishes with an explicit finite or durable custody lifetime.
+    #[cfg(test)]
     pub fn publish_with_options(
         &mut self,
         request: EventPublishRequest,
@@ -1749,6 +1795,7 @@ impl SelectedEventNode {
         self.publish_after_maintenance(request, options)
     }
 
+    #[cfg(test)]
     fn publish_after_maintenance(
         &mut self,
         request: EventPublishRequest,
@@ -1814,6 +1861,7 @@ impl SelectedEventNode {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn publish_group_with_options(
         &mut self,
         publications: Vec<(EventPublishRequest, EventPublishOptions)>,
@@ -1966,6 +2014,7 @@ impl SelectedEventNode {
         }
     }
 
+    #[cfg(test)]
     fn publish_singleton_after_maintenance_observed(
         &mut self,
         request: EventPublishRequest,
@@ -2021,6 +2070,7 @@ impl SelectedEventNode {
         (result, attempt.writer_commits)
     }
 
+    #[cfg(test)]
     fn finish_published_event(
         &mut self,
         stored: StoredEvent,
@@ -4819,28 +4869,28 @@ mod tests {
     fn finite_retirement_waits_for_lease_and_operation_fence_survives_reopen() {
         let root = TestRoot::new("finite-retirement-fence");
         let clock_id = [0x8b; 16];
-        let publication = request(
-            b"ops/finite-retired",
-            "ops.alpha",
-            b"asset-retired",
-            b"short-lived",
-        );
+        let client = EventClientId::new(b"finite-lease-fixture".to_vec()).unwrap();
+        let mut session = EventPublicationSession::new(1).unwrap();
+        let mut publication = numbered_request(&client, session, 1, b"short-lived");
+        let original_receipt;
         let options = EventPublishOptions::finite_ttl_ms(10).expect("positive TTL");
         {
             let mut node = selected_node(&root);
             node.custody_clock = NodeCustodyClock::injected(clock_id, 0, 0);
-            node.publish_with_options(publication.clone(), options)
-                .expect("publish finite Event");
-            let operation =
-                EventOperationKey::new(publication.operation_key.clone()).expect("operation key");
-            let aster_redb_store::EventOperationResolution::Live(stored) = node
-                .store
-                .event_operation_resolution(&operation)
-                .expect("resolve operation")
-                .expect("operation exists")
-            else {
-                panic!("fresh finite operation is not live");
-            };
+            let recovery = node
+                .begin_publication_session(&client, 0, b"initial-claim")
+                .unwrap();
+            node.complete_publication_recovery(
+                &client,
+                recovery.session,
+                recovery.snapshot_revision,
+            )
+            .unwrap();
+            session = recovery.session;
+            publication.session = session;
+            let outcome = node.publish_numbered(publication.clone(), options).unwrap();
+            original_receipt = outcome.result.receipt;
+            let transfer_id = original_receipt.transfer_id;
             let revision = node
                 .store
                 .custody_policy_revision()
@@ -4849,7 +4899,7 @@ mod tests {
                 .store
                 .begin_custody_send(
                     [0x37; 32],
-                    CustodyObjectKey::event(stored.transfer_id),
+                    CustodyObjectKey::event(transfer_id),
                     aster_redb_store::CustodyPeerSelectorRevision::new(0),
                     Some(CustodySample {
                         clock_id,
@@ -4880,16 +4930,18 @@ mod tests {
                 "expired bytes held by a lease must remain application-invisible"
             );
 
+            let retired = node.publish_numbered(publication.clone(), options).unwrap();
+            assert_eq!(retired.result.receipt, original_receipt);
             assert_eq!(
-                node.publish_with_options(publication.clone(), options)
-                    .expect_err("exact retry while the lease retains bytes")
-                    .kind(),
-                ApplicationErrorKind::ExpiredOrRetired,
+                retired.result.content,
+                aster_redb_store::CommittedEventContent::Retired(
+                    aster_redb_store::CustodyRetirementReason::Expired
+                )
             );
             let mut changed_held = publication.clone();
             changed_held.payload = b"changed-while-held".to_vec();
             assert_eq!(
-                node.publish_with_options(changed_held, options)
+                node.publish_numbered(changed_held, options)
                     .expect_err("changed retry while the lease retains bytes")
                     .kind(),
                 ApplicationErrorKind::Conflict
@@ -4898,23 +4950,13 @@ mod tests {
                 .release_transfer_lease(lease.id)
                 .expect("release held lease");
             node.maintain_custody().expect("finalize retirement");
-            assert_eq!(
-                node.store
-                    .event_operation_resolution(&operation)
-                    .expect("compact resolution"),
-                Some(
-                    aster_redb_store::EventOperationResolution::RetiredOperation {
-                        reason: aster_redb_store::CustodyRetirementReason::Expired,
-                    }
-                )
-            );
             let retired = node.store.event_stats().expect("retired Event stats");
             assert_eq!(retired.events, 0);
             assert_eq!(retired.retiring_events, 0);
             assert_eq!(retired.total_sealed_bytes, 0);
             assert!(
                 node.store
-                    .get_transfer(stored.transfer_id)
+                    .get_transfer(transfer_id)
                     .expect("retired transfer lookup")
                     .is_none()
             );
@@ -4926,29 +4968,45 @@ mod tests {
         )
         .expect("reopen retired node");
         reopened.custody_clock = NodeCustodyClock::injected(clock_id, 11, 0);
+        let recovery = reopened
+            .begin_publication_session(&client, session.get(), b"restart-claim")
+            .unwrap();
+        reopened
+            .complete_publication_recovery(&client, recovery.session, recovery.snapshot_revision)
+            .unwrap();
+        publication.session = recovery.session;
         let exact = reopened
-            .publish_with_options(publication.clone(), options)
-            .expect_err("exact retired retry must remain fenced");
-        assert_eq!(exact.kind(), ApplicationErrorKind::ExpiredOrRetired);
-
+            .publish_numbered(publication.clone(), options)
+            .unwrap();
+        assert_eq!(exact.result.receipt, original_receipt);
+        assert_eq!(
+            exact.result.content,
+            aster_redb_store::CommittedEventContent::Retired(
+                aster_redb_store::CustodyRetirementReason::Expired
+            )
+        );
         let mut changed = publication;
         changed.payload = b"changed-after-retirement".to_vec();
         let changed_error = reopened
-            .publish_with_options(changed, options)
+            .publish_numbered(changed, options)
             .expect_err("changed retired operation must remain fenced");
         assert_eq!(changed_error.kind(), ApplicationErrorKind::Conflict);
 
         let next = reopened
-            .publish(request(
-                b"ops/after-retired",
-                "ops.alpha",
-                b"asset-next",
-                b"next",
-            ))
-            .expect("publish after retired retries");
+            .publish_numbered(
+                numbered_request(&client, recovery.session, 2, b"next"),
+                EventPublishOptions::durable(),
+            )
+            .unwrap();
+        let page = reopened.query(EventQuery::default()).unwrap();
+        assert_eq!(page.items.len(), 1);
         assert_eq!(
-            next.publisher_counter, 2,
-            "retired retries must not consume a new source dot"
+            page.items[0].id,
+            EventId::from_store(next.result.receipt.semantic_id)
+        );
+        assert_eq!(
+            page.items[0].publisher_counter, 2,
+            "retired retries must not consume a source dot"
         );
     }
 
@@ -4957,14 +5015,23 @@ mod tests {
         let root = TestRoot::new("subscription-retry");
         let (subscription_id, event_id) = {
             let mut node = selected_node(&root);
-            let published = node
-                .publish(request(
-                    b"ops/subscribed",
-                    "ops.alpha",
-                    b"asset-7",
-                    b"ready",
-                ))
-                .expect("publish");
+            let client = EventClientId::new(b"subscription-fixture".to_vec()).unwrap();
+            let recovery = node
+                .begin_publication_session(&client, 0, b"initial-claim")
+                .unwrap();
+            node.complete_publication_recovery(
+                &client,
+                recovery.session,
+                recovery.snapshot_revision,
+            )
+            .unwrap();
+            let outcome = node
+                .publish_numbered(
+                    numbered_request(&client, recovery.session, 1, b"ready"),
+                    EventPublishOptions::durable(),
+                )
+                .unwrap();
+            let event_id = EventId::from_store(outcome.result.receipt.semantic_id);
             let subscription = node
                 .subscribe(subscription_request(b"subscriptions/alpha", "ops.alpha"))
                 .expect("subscribe");
@@ -4987,10 +5054,10 @@ mod tests {
                 })
                 .expect("first poll");
             assert_eq!(first.deliveries.len(), 1);
-            assert_eq!(first.deliveries[0].event.id, published.id);
+            assert_eq!(first.deliveries[0].event.id, event_id);
             assert_eq!(first.deliveries[0].attempt, 1);
             assert!(!first.has_more);
-            (subscription.id, published.id)
+            (subscription.id, event_id)
         };
 
         let mut reopened = SelectedEventNode::open_unprotected_reference(
@@ -5097,23 +5164,40 @@ mod tests {
 
     #[test]
     fn public_facade_restart_reuses_the_exact_durable_operation() {
-        let root = TestRoot::new("restart-operation");
-        let request = request(b"ops/restart", "ops.alpha", b"asset", b"ready");
+        use crate::publication_journal::{Intent, Journal};
+        let root = TestRoot::new("restart-numbered-publication");
+        let path = root.path().join("application.redb");
+        Journal::initialize(&path, b"restart-fixture").unwrap();
+        let intent = Intent {
+            predecessor: None,
+            topic: "ops.alpha".to_owned(),
+            scope: "mission/apps".to_owned(),
+            priority: Priority::Priority as u8,
+            logical_key: b"asset".to_vec(),
+            payload: b"ready".to_vec(),
+            tombstone: false,
+            ttl_ms: None,
+        };
         let first = {
             let mut node = selected_node(&root);
-            node.publish(request.clone()).expect("initial publication")
+            let mut journal = Journal::open(&path, b"restart-fixture").unwrap();
+            journal.recover_stopped(&mut node).unwrap();
+            journal.publish_stopped(&mut node, intent.clone()).unwrap()
         };
         let mut reopened = SelectedEventNode::open_unprotected_reference(
             root.path(),
             root.path().join("mission.unprotected-reference.bundle"),
         )
-        .expect("reopen selected Event node");
-        let retried = reopened.publish(request).expect("restart retry");
+        .unwrap();
+        let mut journal = Journal::open(&path, b"restart-fixture").unwrap();
+        journal.recover_stopped(&mut reopened).unwrap();
+        let retried = journal.publish_stopped(&mut reopened, intent).unwrap();
         assert!(!retried.inserted);
-        assert_eq!(retried.id, first.id);
-        assert_eq!(retried.publisher_counter, first.publisher_counter);
-        assert_eq!(retried.event_sequence, first.event_sequence);
-        assert_eq!(retried.acceptance_marker, first.acceptance_marker);
+        assert_eq!(retried.result.receipt, first.result.receipt);
+        let page = reopened.query(EventQuery::default()).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].publisher_counter, 1);
+        assert_eq!(page.items[0].event_sequence, 1);
     }
 
     #[test]

@@ -1,3 +1,12 @@
+#[cfg(test)]
+use crate::application::EventPublishRequest;
+
+#[cfg(test)]
+use aster_redb_store::{
+    EventOnceOutcome, EventOperationKey, EventOperationRequest, EventOperationResolution,
+    ReservedEventOnceCommit,
+};
+
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque, btree_map::Entry},
     error::Error,
@@ -63,9 +72,8 @@ use aster_redb_store::{
     ControlTransferId, CustodyObjectKey, CustodyPeerApplyDisposition, CustodyPeerApplyEvidence,
     CustodyPeerSelectorRevision, CustodyPolicyRevision, CustodyPressureDemand, CustodyQuota,
     CustodyReconciliationEvidence, CustodyReconciliationSelection, CustodySendAuthorization,
-    CustodySenderProjection, CustodyStoreError, CustodyUsage, EventOnceOutcome,
-    EventOperationAuditProgress, EventOperationAuditState, EventOperationAuditStatus,
-    EventOperationKey, EventOperationLimits, EventOperationRequest, EventOperationResolution,
+    CustodySenderProjection, CustodyStoreError, CustodyUsage, EventOperationAuditProgress,
+    EventOperationAuditState, EventOperationAuditStatus, EventOperationLimits,
     EventPageAttemptCursor, EventPageAttemptCursorUpdate, EventPublicationIntent,
     EventPublicationSpec, EventReplicationPolicySnapshot, EventSemanticId, EventSubscriptionKey,
     EventSubscriptionMode, EventSubscriptionSpec, EventTransferId, LocalCustodyCheckpoint,
@@ -74,11 +82,11 @@ use aster_redb_store::{
     MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS, MAX_ROUTE_CACHE_ITEMS,
     MutableTransferCursorClass, MutableTransferCursorMode, NumberedEventOperationRequest,
     NumberedEventPublishOutcome, RecordSenderProjection, RecordTransferId, RejectedControl,
-    ReservedEventOnceCommit, ReservedNumberedEventCommit, RouteCacheOutcome,
-    ScopeRekeyPublicationIntent, StateSenderProjection, StateTransferId, Store,
-    StoreBackingIdentity, StoreError, StoreInspection, StoreLimits, StoreZeroizationState,
-    StoredControl, StoredControlEffect, StoredEvent, StoredEventTransfer, StoredRecord,
-    StoredState, TransferLease, ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
+    ReservedNumberedEventCommit, RouteCacheOutcome, ScopeRekeyPublicationIntent,
+    StateSenderProjection, StateTransferId, Store, StoreBackingIdentity, StoreError,
+    StoreInspection, StoreLimits, StoreZeroizationState, StoredControl, StoredControlEffect,
+    StoredEvent, StoredEventTransfer, StoredRecord, StoredState, TransferLease,
+    ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
 };
 use sha2::{Digest as _, Sha256};
 #[cfg(unix)]
@@ -108,7 +116,7 @@ use crate::{
     NodeIdentity,
     application::{
         AuthenticatedPeerStatus, ContactSyncStatus, EventOperationCapacity,
-        EventPublicationGroupDiagnostic, EventPublishOptions, EventPublishRequest, EventSyncStatus,
+        EventPublicationGroupDiagnostic, EventPublishOptions, EventSyncStatus,
         NumberedEventPublishRequest, PeerAuthorization, SelectedApplicationCommand,
         SelectedBlobCommand, SelectedBlobHandle, SelectedBlobNode, SelectedEventCommand,
         SelectedEventHandle, SelectedEventNode, SelectedEventStatus, SelectedRecordCommand,
@@ -3711,9 +3719,19 @@ impl SelectedEventStatusTracker {
         // the result in the same turn. Claims, retries and retirement add no work.
         // Telemetry failures cannot alter the caller's publication result.
         let rows = || {
-            let legacy = store.event_operation_stats().ok()?;
             let numbered = store.committed_numbered_event_publication_count().ok()?;
-            legacy.records_total.checked_add(numbered)
+            #[cfg(test)]
+            {
+                store
+                    .event_operation_stats()
+                    .ok()?
+                    .records_total
+                    .checked_add(numbered)
+            }
+            #[cfg(not(test))]
+            {
+                Some(numbered)
+            }
         };
         let before = rows();
         let result = commit();
@@ -4964,6 +4982,7 @@ fn ping_operation_key() -> Result<EventOperationKey, NodeError> {
     EventOperationKey::new(DEMO_PING_OPERATION.to_vec()).map_err(Into::into)
 }
 
+#[cfg(test)]
 pub(crate) struct SelectedEventPublish<'a> {
     pub operation: &'a EventOperationKey,
     pub predecessor: Option<EventSemanticId>,
@@ -4977,6 +4996,7 @@ pub(crate) struct SelectedEventPublish<'a> {
     pub tombstone: bool,
 }
 
+#[cfg(test)]
 fn verify_existing_event_publication(
     sealer: &mut ReferenceEnvelopeSealer,
     stored: &StoredEvent,
@@ -5018,6 +5038,7 @@ fn verify_existing_event_publication(
     Ok(event)
 }
 
+#[cfg(test)]
 pub(crate) fn publish_selected_event_once(
     store: &Store,
     policy: &ControlPolicySnapshot,
@@ -5027,11 +5048,13 @@ pub(crate) fn publish_selected_event_once(
     publish_selected_event_once_observed(store, policy, sealer, request).result
 }
 
+#[cfg(test)]
 pub(crate) struct SelectedEventPublishAttempt {
     pub(crate) result: Result<(StoredEvent, bool), NodeError>,
     pub(crate) writer_commits: u64,
 }
 
+#[cfg(test)]
 pub(crate) fn publish_selected_event_once_observed(
     store: &Store,
     policy: &ControlPolicySnapshot,
@@ -5047,6 +5070,7 @@ pub(crate) fn publish_selected_event_once_observed(
     }
 }
 
+#[cfg(test)]
 fn publish_selected_event_once_counted(
     store: &Store,
     policy: &ControlPolicySnapshot,
@@ -5272,9 +5296,12 @@ fn publish_selected_event_once_counted(
     )))
 }
 
+#[cfg(test)]
 pub(crate) type SelectedEventPublishOutcome = Result<(StoredEvent, bool), NodeError>;
+#[cfg(test)]
 pub(crate) type SelectedEventGroupResult = Result<Vec<SelectedEventPublishOutcome>, NodeError>;
 
+#[cfg(test)]
 pub(crate) struct SelectedEventGroupAttempt {
     /// An outer error precedes a shared commit and permits singleton fallback.
     /// Inner errors are committed per-input outcomes and must not be replayed.
@@ -5286,6 +5313,7 @@ pub(crate) struct SelectedEventGroupAttempt {
 ///
 /// The caller owns cohort partitioning and singleton fallback. This function
 /// never acknowledges an Event before the shared durable commit succeeds.
+#[cfg(test)]
 pub(crate) fn publish_selected_event_group_once(
     store: &Store,
     policy: &ControlPolicySnapshot,
@@ -5306,6 +5334,7 @@ pub(crate) fn publish_selected_event_group_once(
     }
 }
 
+#[cfg(test)]
 fn publish_selected_event_group_once_counted(
     store: &Store,
     policy: &ControlPolicySnapshot,
@@ -13208,6 +13237,7 @@ fn execute_selected_event_command(
 ) -> bool {
     let mut new_event_inserted = false;
     match command {
+        #[cfg(test)]
         SelectedEventCommand::Publish {
             request,
             options,
@@ -13474,6 +13504,7 @@ async fn run_selected_blob_worker(
     Ok(())
 }
 
+#[cfg(test)]
 struct PendingEventPublication {
     request: EventPublishRequest,
     options: EventPublishOptions,
@@ -13485,6 +13516,7 @@ struct PendingEventPublication {
 // Ownership must return the unmatched command intact so FIFO can retain it;
 // boxing would add an allocation to every non-publication actor command.
 #[allow(clippy::result_large_err)]
+#[cfg(test)]
 fn ordinary_event_publication(
     command: SelectedApplicationCommand,
 ) -> Result<PendingEventPublication, SelectedApplicationCommand> {
@@ -13544,96 +13576,115 @@ fn execute_selected_application_command_coalesced(
             execution_gate,
         );
     }
-    let first = match ordinary_event_publication(command) {
-        Ok(first) => first,
-        Err(command) => {
-            let new_event_inserted = execute_selected_application_command(
-                events,
-                state,
-                records,
-                blobs,
-                store,
-                emission_policy,
-                status,
-                receipt,
-                command,
-            );
-            return (1, new_event_inserted);
-        }
-    };
-    let mut group = vec![first];
-    while group.len() < max_group_size.max(1) {
-        match commands.try_recv() {
-            Ok(command) => match ordinary_event_publication(command) {
-                Ok(publication) => group.push(publication),
-                Err(command) => {
-                    *pending = Some(command);
+    #[cfg(not(test))]
+    {
+        let inserted = execute_selected_application_command(
+            events,
+            state,
+            records,
+            blobs,
+            store,
+            emission_policy,
+            status,
+            receipt,
+            command,
+        );
+        (1, inserted)
+    }
+    #[cfg(test)]
+    {
+        let first = match ordinary_event_publication(command) {
+            Ok(first) => first,
+            Err(command) => {
+                let new_event_inserted = execute_selected_application_command(
+                    events,
+                    state,
+                    records,
+                    blobs,
+                    store,
+                    emission_policy,
+                    status,
+                    receipt,
+                    command,
+                );
+                return (1, new_event_inserted);
+            }
+        };
+        let mut group = vec![first];
+        while group.len() < max_group_size.max(1) {
+            match commands.try_recv() {
+                Ok(command) => match ordinary_event_publication(command) {
+                    Ok(publication) => group.push(publication),
+                    Err(command) => {
+                        *pending = Some(command);
+                        break;
+                    }
+                },
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    *commands_open = false;
                     break;
                 }
-            },
-            Err(mpsc::error::TryRecvError::Empty) => break,
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                *commands_open = false;
-                break;
             }
         }
-    }
-    #[cfg(all(test, unix))]
-    if let Some((reached, release)) = execution_gate.take() {
-        reached.wait();
-        release.wait();
-    }
-    let Some(sequence) = group_sequence.checked_add(1) else {
-        let processed = group.len();
-        for publication in group {
-            let _ = publication
-                .response
-                .send(Err(crate::application::actor_unavailable("publish")));
+        #[cfg(all(test, unix))]
+        if let Some((reached, release)) = execution_gate.take() {
+            reached.wait();
+            release.wait();
         }
-        return (processed, false);
-    };
-    *group_sequence = sequence;
-    let publications = group
-        .iter()
-        .map(|publication| (publication.request.clone(), publication.options))
-        .collect::<Vec<_>>();
-    let result = if status.operation_audit.state == EventOperationAuditState::Failed {
-        let collected = u64::try_from(group.len()).unwrap_or(u64::MAX);
-        crate::application::EventPublicationGroupResult {
-            results: (0..group.len())
-                .map(|_| Err(crate::application::actor_unavailable("publish")))
-                .collect(),
-            diagnostic: EventPublicationGroupDiagnostic {
-                collected,
-                failures: collected,
-                ..EventPublicationGroupDiagnostic::default()
-            },
+        let Some(sequence) = group_sequence.checked_add(1) else {
+            let processed = group.len();
+            for publication in group {
+                let _ = publication
+                    .response
+                    .send(Err(crate::application::actor_unavailable("publish")));
+            }
+            return (processed, false);
+        };
+        *group_sequence = sequence;
+        let publications = group
+            .iter()
+            .map(|publication| (publication.request.clone(), publication.options))
+            .collect::<Vec<_>>();
+        let result = if status.operation_audit.state == EventOperationAuditState::Failed {
+            let collected = u64::try_from(group.len()).unwrap_or(u64::MAX);
+            crate::application::EventPublicationGroupResult {
+                results: (0..group.len())
+                    .map(|_| Err(crate::application::actor_unavailable("publish")))
+                    .collect(),
+                diagnostic: EventPublicationGroupDiagnostic {
+                    collected,
+                    failures: collected,
+                    ..EventPublicationGroupDiagnostic::default()
+                },
+            }
+        } else {
+            status
+                .observe_operation_commit(store, || events.publish_group_with_options(publications))
+        };
+        let diagnostic = result.diagnostic;
+        for (publication, outcome) in group.into_iter().zip(result.results) {
+            let _ = publication.response.send(outcome);
         }
-    } else {
-        status.observe_operation_commit(store, || events.publish_group_with_options(publications))
-    };
-    let diagnostic = result.diagnostic;
-    for (publication, outcome) in group.into_iter().zip(result.results) {
-        let _ = publication.response.send(outcome);
+        bounded_node_diagnostic!(
+            "event_publication_group group_sequence={} collected={} cohorts={} custody_writer_commits={} event_writer_commits={} total_writer_commits={} accepted_new={} exact_retries={} failures={} max_cohort_size={} singleton_fallbacks={}",
+            sequence,
+            diagnostic.collected,
+            diagnostic.cohorts,
+            diagnostic.custody_writer_commits,
+            diagnostic.event_writer_commits,
+            diagnostic.total_writer_commits(),
+            diagnostic.accepted_new,
+            diagnostic.exact_retries,
+            diagnostic.failures,
+            diagnostic.max_cohort_size,
+            diagnostic.singleton_fallbacks,
+        );
+        (
+            usize::try_from(diagnostic.collected).unwrap_or(APPLICATION_COMMAND_BUDGET),
+            diagnostic.accepted_new > 0,
+        )
     }
-    bounded_node_diagnostic!(
-        "event_publication_group group_sequence={} collected={} cohorts={} custody_writer_commits={} event_writer_commits={} total_writer_commits={} accepted_new={} exact_retries={} failures={} max_cohort_size={} singleton_fallbacks={}",
-        sequence,
-        diagnostic.collected,
-        diagnostic.cohorts,
-        diagnostic.custody_writer_commits,
-        diagnostic.event_writer_commits,
-        diagnostic.total_writer_commits(),
-        diagnostic.accepted_new,
-        diagnostic.exact_retries,
-        diagnostic.failures,
-        diagnostic.max_cohort_size,
-        diagnostic.singleton_fallbacks,
-    );
-    (
-        usize::try_from(diagnostic.collected).unwrap_or(APPLICATION_COMMAND_BUDGET),
-        diagnostic.accepted_new > 0,
-    )
 }
 
 struct PendingNumberedEventPublication {
@@ -14106,6 +14157,7 @@ pub async fn run_node_with_forwarding(
 
 #[cfg(all(test, unix))]
 struct RunNodeActorTestControl {
+    allow_legacy_publication_fixture: bool,
     event_operation_audit: Option<EventOperationAuditTestControl>,
     before_loop_ready: oneshot::Sender<()>,
     before_loop_release: oneshot::Receiver<()>,
@@ -14572,13 +14624,32 @@ async fn run_node_actor_inner(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let store = Arc::new(Store::open_with_limits_and_operation_limits_for_mission(
-        &store_path,
-        forwarding.store_limits(),
-        forwarding.blob_depot_limits(),
-        forwarding.operation_limits(),
-        mission_authority,
-    )?);
+    #[cfg(all(test, unix))]
+    let legacy_fixture = test_control
+        .as_ref()
+        .is_some_and(|control| control.allow_legacy_publication_fixture);
+    #[cfg(not(all(test, unix)))]
+    let legacy_fixture = false;
+    if !legacy_fixture {
+        Store::require_numbered_publication_compatible(&store_path)?;
+    }
+    let store = Arc::new(if legacy_fixture {
+        Store::open_with_limits_and_operation_limits_for_mission(
+            &store_path,
+            forwarding.store_limits(),
+            forwarding.blob_depot_limits(),
+            forwarding.operation_limits(),
+            mission_authority,
+        )?
+    } else {
+        Store::open_numbered_for_mission(
+            &store_path,
+            forwarding.store_limits(),
+            forwarding.blob_depot_limits(),
+            forwarding.operation_limits(),
+            mission_authority,
+        )?
+    });
     store.require_process_exclusive_lock()?;
     #[cfg(unix)]
     {
@@ -31957,6 +32028,7 @@ mod tests {
                 ready: ready_sender,
                 contact_activity,
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
                     event_operation_audit: None,
                     before_loop_ready,
                     before_loop_release: release_loop,
@@ -32194,6 +32266,7 @@ mod tests {
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
                     event_operation_audit: None,
                     before_loop_ready,
                     before_loop_release: release_loop,
@@ -35041,6 +35114,7 @@ mod tests {
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
                     before_loop_ready: before_loop_ready_sender,
                     before_loop_release: before_loop_release_receiver,
                     zeroization_queued: zeroization_queued_sender,
@@ -35183,6 +35257,7 @@ mod tests {
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
                     before_loop_ready,
                     before_loop_release: release_loop,
                     zeroization_queued,
@@ -35520,6 +35595,7 @@ mod tests {
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
                     event_operation_audit: None,
                     before_loop_ready,
                     before_loop_release: release_loop,
@@ -35677,6 +35753,7 @@ mod tests {
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
                     event_operation_audit: None,
                     before_loop_ready,
                     before_loop_release: release_loop,
@@ -35835,6 +35912,7 @@ mod tests {
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
                     event_operation_audit: None,
                     before_loop_ready,
                     before_loop_release: release_loop,
@@ -37293,6 +37371,7 @@ mod tests {
                 ready,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: true,
                     before_loop_ready,
                     before_loop_release,
                     zeroization_queued,
@@ -39026,20 +39105,31 @@ mod tests {
         })
         .await
         .expect("start peerless A");
-        let published = peerless_a
-            .selected_events()
-            .publish(crate::application::EventPublishRequest {
-                operation_key: b"three-node-outbound-publication".to_vec(),
-                predecessor: None,
-                topic: topic.clone(),
-                scope: scope.clone(),
-                priority: Priority::Priority,
-                logical_key: b"three-node-outbound".to_vec(),
-                payload: b"outbound insertion must wake onward contact".to_vec(),
-                tombstone: false,
-            })
+        use crate::publication_journal::{Backend, Intent, Journal};
+        let path = a_state.join("source-publication.redb");
+        Journal::initialize(&path, b"three-node-source-fixture").unwrap();
+        let events = peerless_a.selected_events();
+        let mut journal = Journal::open(&path, b"three-node-source-fixture").unwrap();
+        let mut backend = Backend::Live(&events);
+        journal.recover(&mut backend).await.unwrap();
+        let published = journal
+            .publish_metadata(
+                &mut backend,
+                Intent {
+                    predecessor: None,
+                    topic: topic.as_str().to_owned(),
+                    scope: scope.as_str().to_owned(),
+                    priority: Priority::Priority as u8,
+                    logical_key: b"three-node-outbound".to_vec(),
+                    payload: b"outbound insertion must wake onward contact".to_vec(),
+                    tombstone: false,
+                    ttl_ms: None,
+                },
+            )
             .await
-            .expect("preseed peerless A Event");
+            .unwrap();
+        journal.acknowledge(&mut backend).await.unwrap();
+        drop(journal);
         assert!(published.inserted);
         peerless_a.shutdown().await.expect("shutdown peerless A");
 
@@ -41323,6 +41413,7 @@ mod tests {
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
                     before_loop_ready,
                     before_loop_release: release_received,
                     zeroization_queued,
