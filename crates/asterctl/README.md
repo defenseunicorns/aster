@@ -119,6 +119,10 @@ added to `MSG`. Use `--` before a message beginning with `-`. The complete
 encoded request, including space for the largest session and sequence fields,
 must fit within 1 MiB.
 
+Fresh publish JSON contains the numbered `result` and the service's transient
+`inserted` observation. Recovery/retry JSON contains the retained committed
+result; that receipt does not retain an insertion observation.
+
 The CLI recovers its fenced publication session, assigns a positive operation
 sequence durably, and announces that sequence before `PublishNumberedEvent`.
 It saves the committed result before displaying it. A failed publication stays

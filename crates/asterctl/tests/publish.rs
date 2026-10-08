@@ -232,7 +232,7 @@ fn publish_sends_all_fields_and_formats_the_rpc_receipt_as_protojson() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         value,
-        json!({ "operationSequence": "1", "receipt": { "eventId": ID, "transferId": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=", "acceptanceMarker": "128" }, "content": "COMMITTED_CONTENT_STATUS_AVAILABLE" })
+        json!({ "result": { "operationSequence": "1", "receipt": { "eventId": ID, "transferId": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=", "acceptanceMarker": "128" }, "content": "COMMITTED_CONTENT_STATUS_AVAILABLE" }, "inserted": true })
     );
 }
 
@@ -289,7 +289,10 @@ fn publish_tombstone_uses_an_empty_payload_without_waiting_for_stdin() {
     assert!(request.payload.is_empty());
     assert_eq!(request.ttl_ms, None);
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value["content"], "COMMITTED_CONTENT_STATUS_AVAILABLE");
+    assert_eq!(
+        value["result"]["content"],
+        "COMMITTED_CONTENT_STATUS_AVAILABLE"
+    );
     assert!(value.get("ttlMs").is_none());
     let (_, output) = publish(
         &["publish", "--topic", "x", "--scope", "x", "--tombstone"],

@@ -51,6 +51,19 @@ pub fn status(response: &api::GetStatusResponse, json: bool) -> Result<String, s
     }
 }
 
+pub fn numbered_publish_response(
+    response: &api::PublishNumberedEventResponse,
+    json: bool,
+) -> Result<String, serde_json::Error> {
+    if json {
+        return serde_json::to_string_pretty(response).map(|text| text + "\n");
+    }
+    numbered_publication(
+        response.result.as_option().expect("validated result"),
+        false,
+    )
+}
+
 pub fn numbered_publication(
     result: &api::CommittedPublicationResult,
     json: bool,

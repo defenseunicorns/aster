@@ -116,9 +116,9 @@ fn run() -> Result<(), (u8, String)> {
                 }
                 let sequence = sdk.journal_publication(request).map_err(journal::describe_error)?;
                 writeln!(io::stderr().lock(), "asterctl: operation-sequence={sequence}").and_then(|()| io::stderr().lock().flush()).map_err(|_| format!("cannot announce sequence {sequence}; intent remains journaled and was not sent"))?;
-                sdk.publish_journaled(sequence).await.map_err(|error| format!("{}; sequence {sequence} remains journaled; use publication-recover before retrying", journal::describe_error(error)))
+                sdk.publish_journaled_outcome(sequence).await.map_err(|error| format!("{}; sequence {sequence} remains journaled; use publication-recover before retrying", journal::describe_error(error)))
             }).map_err(|e| (1, e))?;
-            output::numbered_publication(&result, rpc.json)
+            output::numbered_publish_response(&result, rpc.json)
                 .map_err(|_| (1, "cannot format committed publication result".to_owned()))?
         }
         args::Command::PublicationInitialize(identity) => {

@@ -6,7 +6,8 @@
 This controller is deliberately a presentation and application-integration
 exercise.  It provisions disposable reference credentials through
 ``aster playground-init``, starts one real ``aster-agent`` process per node,
-and uses only the public loopback Connect JSON Event API.  A message is shown
+uses the public loopback Connect JSON Event API for observation, and publishes
+through the durable numbered asterctl SDK journal.  A message is shown
 at a node only after that node's QueryEvents response contains the exact Event
 identity.  Peer status is displayed as a last-contact observation and is never
 promoted into a global-convergence claim.
@@ -873,20 +874,6 @@ class ConnectJsonClient:
             },
         )
 
-    def publish(self, operation_key: bytes, logical_key: bytes, payload: bytes) -> Dict[str, object]:
-        return self.call(
-            "PublishEvent",
-            {
-                "operationKey": encode_b64(operation_key),
-                "topic": TOPIC,
-                "scope": SCOPE,
-                "priority": "PRIORITY_ROUTINE",
-                "logicalKey": encode_b64(logical_key),
-                "payload": encode_b64(payload),
-                "tombstone": False,
-            },
-        )
-
     def query_events(self, after_marker: int) -> Tuple[List[Dict[str, object]], int]:
         events: List[Dict[str, object]] = []
         marker = after_marker
@@ -920,6 +907,119 @@ class ConnectJsonClient:
         raise RpcError("QueryEvents exceeded the playground page bound")
 
 
+class NumberedPublisher:
+    """Application publisher using the same durable journal as asterctl.
+
+    The controller owns one stable identity per node. It applies recovered
+    results using their original journaled payload before acknowledging them.
+    No transport error silently consumes a sequence or changes the intent.
+    """
+
+    def __init__(self, cli: Path, journal: Path, client_id: str) -> None:
+        self.cli = cli
+        self.journal = journal
+        self.client_id = client_id
+        self.host: Optional[str] = None
+        self.port: Optional[int] = None
+        self.token_path: Optional[Path] = None
+
+    def initialize(self) -> None:
+        self._run("publication-init", local=True)
+
+    def connect(self, url: str, token_path: Path) -> None:
+        parsed = urlparse(url)
+        if parsed.scheme != "http" or not parsed.hostname or not parsed.port:
+            raise RpcError("numbered publisher requires an explicit loopback agent URL")
+        try:
+            if not ipaddress.ip_address(parsed.hostname).is_loopback:
+                raise ValueError("non-loopback host")
+        except ValueError as error:
+            raise RpcError("numbered publisher requires a loopback agent") from error
+        self.host, self.port, self.token_path = parsed.hostname, parsed.port, token_path
+
+    def _run(
+        self, action: str, options: Sequence[str] = (), payload: Optional[bytes] = None,
+        *, local: bool = False, json_response: bool = False,
+    ) -> Any:
+        command = [str(self.cli)]
+        if not local:
+            if self.host is None or self.port is None or self.token_path is None:
+                raise RpcError("numbered publisher is not connected")
+            command += ["--token-file", str(self.token_path), "--host", self.host,
+                        "--port", str(self.port), "--timeout", "10", "--json"]
+        command += [action, "--journal", str(self.journal), "--client-id", self.client_id]
+        command += list(options)
+        try:
+            result = subprocess.run(
+                command, input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=35, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise RpcError("numbered publication interrupted; original journal retained") from error
+        if result.returncode != 0:
+            detail = safe_text(result.stderr.decode("utf-8", errors="replace"), 400)
+            raise RpcError("numbered publication failed; journal retained: %s" % detail)
+        if len(result.stdout) > MAX_RPC_RESPONSE_BYTES:
+            raise RpcError("numbered publication response exceeded the playground bound")
+        if not json_response:
+            return None
+        try:
+            value = json.loads(result.stdout)
+        except (ValueError, UnicodeError) as error:
+            raise RpcError("numbered publication returned malformed JSON") from error
+        if not isinstance(value, dict):
+            raise RpcError("numbered publication returned a malformed result")
+        return value
+
+    def recover(self, apply: Callable[[Mapping[str, Any], Mapping[str, Any], bool, Optional[bool]], str]) -> None:
+        report = self._run("publication-recover", json_response=True)
+        operations = report.get("operations", [])
+        if not isinstance(operations, list) or len(operations) > MAX_TRACKED_MESSAGES:
+            raise RpcError("numbered recovery exceeded the playground operation bound")
+        for operation in operations:
+            if not isinstance(operation, dict):
+                raise RpcError("numbered recovery returned a malformed operation")
+            sequence = operation.get("operationSequence")
+            try:
+                if int(sequence) < 1:
+                    raise ValueError("non-positive sequence")
+            except (TypeError, ValueError) as error:
+                raise RpcError("numbered recovery returned an invalid sequence") from error
+            state = operation.get("state")
+            if state == "retired":
+                continue
+            intent = self._run("publication-show", ["--sequence", str(sequence)], json_response=True)
+            if state == "pending":
+                result = self._run("publication-retry", ["--sequence", str(sequence)], json_response=True)
+            elif state == "committed" and isinstance(operation.get("result"), dict):
+                result = operation["result"]
+            else:
+                raise RpcError("numbered recovery returned an invalid operation state")
+            apply(intent, result, True, None)
+            self._run("publication-ack", ["--sequence", str(sequence)])
+
+    def publish(
+        self, logical_key: bytes, payload: bytes,
+        apply: Callable[[Mapping[str, Any], Mapping[str, Any], bool, Optional[bool]], str],
+    ) -> str:
+        self.recover(apply)
+        response = self._run(
+            "publish", ["--topic", TOPIC, "--scope", SCOPE,
+                        "--logical-key", logical_key.decode("ascii")],
+            payload, json_response=True,
+        )
+        result = response.get("result")
+        inserted = response.get("inserted")
+        if not isinstance(result, dict) or not isinstance(inserted, bool):
+            raise RpcError("numbered publisher returned a malformed outcome")
+        alias = apply({"payload": encode_b64(payload)}, result, False, inserted)
+        sequence = result.get("operationSequence")
+        if not isinstance(sequence, str) or not sequence.isdigit() or int(sequence) < 1:
+            raise RpcError("numbered publisher returned an invalid sequence")
+        self._run("publication-ack", ["--sequence", sequence])
+        return alias
+
+
 @dataclass
 class EventRecord:
     alias: str
@@ -948,6 +1048,7 @@ class NodeState:
     generation: int = 0
     process: Optional[ManagedProcess] = None
     client: Optional[ConnectJsonClient] = None
+    publisher: Optional[NumberedPublisher] = None
     agent_url: Optional[str] = None
     pid: Optional[int] = None
     query_marker: int = 0
@@ -1136,6 +1237,8 @@ class PlaygroundController:
         process_factory: Callable[..., ManagedProcess] = ManagedProcess,
         client_factory: Callable[[str, str], ConnectJsonClient] = ConnectJsonClient,
         port_reservations: Optional[List[socket.socket]] = None,
+        cli: Optional[Path] = None,
+        publisher_factory: Callable[[Path, Path, str], NumberedPublisher] = NumberedPublisher,
         hello: bool = False,
         network_provenance: str = "direct",
         nearby_window_seconds: int = HELLO_NEARBY_WINDOW_SECONDS,
@@ -1148,6 +1251,8 @@ class PlaygroundController:
         self.poll_seconds = poll_seconds
         self.process_factory = process_factory
         self.client_factory = client_factory
+        self.cli = cli or agent.with_name("asterctl")
+        self.publisher_factory = publisher_factory
         self.hello = hello
         self.network_provenance = network_provenance
         self.nearby_window_seconds = nearby_window_seconds
@@ -1171,7 +1276,6 @@ class PlaygroundController:
         self.progress_callback: Optional[Callable[[], None]] = None
         self._message_counter = 0
         self._operation_counter = 0
-        self._session_nonce = secrets.token_bytes(16)
         self.events: Dict[str, EventRecord] = {}
         self.aliases: Dict[str, str] = {}
         self.last_alias: Optional[str] = None
@@ -1193,6 +1297,8 @@ class PlaygroundController:
                 _write_exclusive(token_path, token.encode("ascii"), 0o600)
                 port = int(reservation.getsockname()[1])
                 name = HELLO_NODE_NAMES[item.index] if self.hello else ""
+                publisher = self.publisher_factory(self.cli, state / "publication.redb", "aster-playground/node-%d/v1" % item.index)
+                publisher.initialize()
                 self.nodes.append(
                     NodeState(
                         item,
@@ -1202,6 +1308,7 @@ class PlaygroundController:
                         token,
                         port,
                         name=name,
+                        publisher=publisher,
                         activated=not self.hello,
                         desired_online=not self.hello,
                         status="available" if self.hello else "new",
@@ -1361,6 +1468,9 @@ class PlaygroundController:
             subscription = decode_b64(response.get("subscriptionId"), "subscription ID", 32)
             if not subscription:
                 raise PlaygroundError("agent returned an empty subscription identity")
+            if node.publisher is None:
+                raise PlaygroundError("node has no numbered publication journal")
+            node.publisher.connect(url, node.token_path)
         except BaseException as error:
             interrupted = isinstance(error, (KeyboardInterrupt, SystemExit))
             node.status = "stopping" if interrupted else "failed"
@@ -1411,6 +1521,13 @@ class PlaygroundController:
             pid=node.pid,
             peers=sorted(self.topology.neighbors(index)),
         )
+        try:
+            node.publisher.recover(lambda intent, result, recovered, inserted: self._apply_publication(index, intent, result, recovered, inserted))
+        except PlaygroundError as error:
+            # A blocked application publication must not stop the node's
+            # receive/carry or query capabilities. A later send retries the
+            # original journaled operation before allocating new work.
+            self.sink.emit("error", node=index, error="publication recovery pending: %s" % safe_text(error, 240))
         self._progress()
 
     def _poll_loop(self) -> None:
@@ -1746,39 +1863,40 @@ class PlaygroundController:
                     "the playground message-attempt limit (%d) has been reached"
                     % MAX_TRACKED_MESSAGES
                 )
-            # Advance before the RPC.  A connection failure can leave publish
-            # acceptance uncertain, so a later operator retry must not reuse
-            # the same idempotency key for a potentially different attempt.
             self._operation_counter += 1
-            operation_sequence = self._operation_counter
-            operation_key = self._session_nonce + operation_sequence.to_bytes(8, "big")
-            logical_key = ("playground-message-%d" % operation_sequence).encode("ascii")
-            response = node.client.publish(operation_key, logical_key, payload)
-            event_bytes = decode_b64(response.get("id"), "published Event ID", 32)
-            event_id = event_bytes.hex()
-            alias = self._new_alias(event_id)
-            record = self.events.get(event_id)
-            if record is None:
-                record = EventRecord(
-                    alias=alias,
-                    event_id=event_id,
-                    payload=payload,
-                    text=text,
-                    publisher_node=index,
-                )
-                self.events[event_id] = record
-            elif record.payload != payload:
-                raise PlaygroundError("publish response reused an Event identity with different content")
-            record.publisher_node = index
-            self.sink.emit(
-                "message_published",
-                message=alias,
-                eventId=event_id,
-                node=index,
-                inserted=bool(response.get("inserted", False)),
-                text=safe_text(text, 240),
-            )
-            return alias
+            logical_key = ("playground-message-%d" % self._operation_counter).encode("ascii")
+            if node.publisher is None:
+                raise PlaygroundError("node has no numbered publisher")
+            return node.publisher.publish(logical_key, payload, lambda intent, result, recovered, inserted: self._apply_publication(index, intent, result, recovered, inserted))
+
+    def _apply_publication(
+        self, index: int, intent: Mapping[str, Any], result: Mapping[str, Any], recovered: bool, inserted: Optional[bool],
+    ) -> str:
+        payload = decode_b64(intent.get("payload"), "journaled publication payload")
+        if not payload or len(payload) > MAX_MESSAGE_BYTES:
+            raise PlaygroundError("recovered payload violates the playground message bound")
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeError as error:
+            raise PlaygroundError("recovered message is not UTF-8") from error
+        receipt = result.get("receipt")
+        if not isinstance(receipt, dict):
+            raise PlaygroundError("numbered publication omitted its receipt")
+        event_id = decode_b64(receipt.get("eventId"), "published Event ID", 32).hex()
+        alias = self._new_alias(event_id)
+        record = self.events.get(event_id)
+        if record is None:
+            record = EventRecord(alias=alias, event_id=event_id, payload=payload, text=text, publisher_node=index)
+            self.events[event_id] = record
+        elif record.payload != payload:
+            raise PlaygroundError("publish response reused an Event identity with different content")
+        record.publisher_node = index
+        fields = {"message": alias, "eventId": event_id, "node": index,
+                  "recovered": recovered, "text": safe_text(text, 240)}
+        if inserted is not None:
+            fields["inserted"] = inserted
+        self.sink.emit("message_published", **fields)
+        return alias
 
     def isolate(self, index: int) -> None:
         with self._lock:
@@ -2778,6 +2896,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--aster", type=Path, required=True, help="path to the aster CLI")
     parser.add_argument("--agent", type=Path, required=True, help="path to aster-agent")
+    parser.add_argument("--cli", type=Path, help="path to asterctl (default: alongside aster-agent)")
     parser.add_argument("--nodes", type=int, required=True, help="real process count (2..32)")
     parser.add_argument(
         "--hello",
@@ -2883,6 +3002,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         aster = _validate_executable(arguments.aster, "--aster")
         agent = _validate_executable(arguments.agent, "--agent")
+        cli = _validate_executable(arguments.cli or agent.with_name("asterctl"), "--cli")
         root = choose_root(arguments.root)
         view = resolve_view(arguments.view)
         # A script must never enter the alternate screen.  Explicit raw stays
@@ -2911,6 +3031,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             agent,
             sink,
             startup_timeout=startup_timeout,
+            cli=cli,
             poll_seconds=arguments.poll_ms / 1000.0,
             hello=arguments.hello,
             network_provenance=arguments.network or "direct",

@@ -10,7 +10,7 @@ if [ ! -r "$scenario" ]; then
   exit 2
 fi
 
-# The playground wrapper builds both binaries and replaces itself with the
+# The playground wrapper builds the node, agent, and journaled publication CLI and replaces itself with the
 # controller. Its status is therefore the exact result of every wait in this
 # real three-agent scenario.
 exec sh "$script_dir/aster-mesh-playground.sh" \

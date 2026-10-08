@@ -1240,6 +1240,20 @@ where
         &self,
         sequence: u64,
     ) -> Result<api::CommittedPublicationResult> {
+        let outcome = self.publish_journaled_outcome(sequence).await?;
+        Ok(outcome
+            .result
+            .into_option()
+            .expect("validated and saved result"))
+    }
+
+    /// Returns the agent's transient insertion observation along with the
+    /// durable result. A result already recovered from the journal reports
+    /// `inserted = false`; insertion is not an additional durable receipt field.
+    pub async fn publish_journaled_outcome(
+        &self,
+        sequence: u64,
+    ) -> Result<api::PublishNumberedEventResponse> {
         let state = self.journal.read_state()?;
         require_recovered(&state)?;
         let mut entry = self.journal.entry(sequence)?.ok_or_else(|| {
@@ -1251,7 +1265,11 @@ where
             )));
         }
         if let Some(result) = entry.result {
-            return Ok(result);
+            return Ok(api::PublishNumberedEventResponse {
+                result: result.into(),
+                inserted: false,
+                ..Default::default()
+            });
         }
         if sequence != state.allocated_through + 1 {
             return Err(NumberedEventSdkError::Protocol(format!(
@@ -1277,7 +1295,7 @@ where
         }
         validate_committed_result(&result)?;
         self.save_publication_result(state.session, &result)?;
-        Ok(result)
+        Ok(response)
     }
 
     pub async fn publish(
