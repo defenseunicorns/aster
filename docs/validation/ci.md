@@ -1459,7 +1459,7 @@ The validator binds the public receipt to the immutable signed Git objects and
 all curated raw artifacts:
 
 ```sh
-python3 tools/check-selected-iroh-nat-receipt.py \
+python3 tools/check-selected-iroh-nat-receipt.py --historical-v1 \
   --raw-root /private/tmp/aster-selected-iroh-nat.zFpaqB/20260826T143559Z-selected-iroh-nat-50726015670670e9 \
   --source . \
   docs/validation/evidence/selected-iroh-nat-15f4e0b.json

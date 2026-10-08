@@ -65,7 +65,7 @@ SELECTED_NAT_RELAY_MAX_ADMITTED_CONNECTIONS = 8
 SELECTED_NAT_RELAY_BYTES_PER_SECOND = 1_048_576
 SELECTED_NAT_RELAY_MAX_BURST_BYTES = 1_048_576
 SELECTED_NAT_RELAY_KEY_CACHE_CAPACITY = 256
-SELECTED_NAT_RECEIPT_SCHEMA = "aster-selected-iroh-nat-receipt/v1"
+SELECTED_NAT_RECEIPT_SCHEMA = "aster-selected-iroh-nat-receipt/v2"
 SELECTED_NAT_RECEIPT_CLAIM = (
     "selected-iroh-one-host-namespace-nat-two-cell-acceptance"
 )
@@ -4744,9 +4744,14 @@ def validate_selected_nat_destroy(
 ) -> dict[str, str]:
     require_receipt_line_prefixes(value, [prefix])
     record = exact_receipt(value, prefix)
+    expected_version = "2" if prefix == "SELECTED_NAT_CANARY_DESTROY" else "1"
+    expected_extra = {"publication_journals_destroyed"} if expected_version == "2" else set()
+    if expected_extra and record.get("publication_journals_destroyed") != "2":
+        raise LabError("selected NAT publication journals were not destroyed")
     require_receipt_keys(
         record,
         {
+            *expected_extra,
             "status",
             "version",
             "artifact_destroyed",
@@ -4765,7 +4770,7 @@ def validate_selected_nat_destroy(
     )
     if (
         record.get("status") != "pass"
-        or record.get("version") != "1"
+        or record.get("version") != expected_version
         or record.get("artifact_destroyed") != "true"
         or record.get("global_secret_destruction") != "false"
         or record.get("target") != target
@@ -6454,6 +6459,7 @@ def validate_selected_nat_publish(
         {
             "status",
             "version",
+            "publication_model",
             "node",
             "event_id",
             "publisher",
@@ -6473,7 +6479,8 @@ def validate_selected_nat_publish(
     canary = manifest["canary_sha256"]
     if (
         record.get("status") != "pass"
-        or record.get("version") != "1"
+        or record.get("version") != "2"
+        or record.get("publication_model") != "numbered-v1"
         or record.get("node") != "a"
         or record.get("publisher") != manifest["nodes"]["a"]["mission_id"]
         or record.get("sequence") != "1"
