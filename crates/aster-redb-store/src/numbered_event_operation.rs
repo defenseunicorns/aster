@@ -19,6 +19,9 @@ use crate::{
     event_operation::{ACTIVE_OPERATION_BY_EVENT_V1, EVENT_OPERATION_LEDGER_V3},
 };
 
+const APPLICATION_CHECKPOINTS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("aster.application-publication-checkpoints.v1");
+
 const CLIENTS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.numbered-event-clients.v1");
 const RESULTS: TableDefinition<&[u8], &[u8]> =
@@ -27,6 +30,7 @@ const RESULT_BY_EVENT: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.numbered-event-result-by-event.v1");
 
 const MODE: &str = "numbered_event_operation_mode_v1";
+const COMMITTED_COUNT: &str = "numbered_event_operation_committed_total_v1";
 const CLIENT_COUNT: &str = "numbered_event_operation_clients_v1";
 const RESULT_COUNT: &str = "numbered_event_operation_results_v1";
 const REVERSE_COUNT: &str = "numbered_event_operation_reverse_v1";
@@ -250,6 +254,82 @@ pub(crate) enum NumberedOperationResolution {
 }
 
 impl Store {
+    /// Monotonic count of newly committed numbered operations, independent
+    /// of session claims, result acknowledgement, and content retirement.
+    pub fn committed_numbered_event_publication_count(&self) -> Result<u64, StoreError> {
+        self.require_live()?;
+        let read = self.database.begin_read()?;
+        Ok(read
+            .open_table(METADATA)?
+            .get(COMMITTED_COUNT)?
+            .map_or(0, |value| value.value()))
+    }
+
+    /// Reads bounded application-owned durable publication progress. The store
+    /// never interprets this checkpoint as a publication operation or receipt.
+    pub fn event_publication_checkpoint(
+        &self,
+        client: &EventClientId,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        self.require_live()?;
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        if !read
+            .list_tables()?
+            .any(|table| table.name() == APPLICATION_CHECKPOINTS.name())
+        {
+            return Ok(None);
+        }
+        Ok(read
+            .open_table(APPLICATION_CHECKPOINTS)?
+            .get(client.as_bytes())?
+            .map(|value| value.value().to_vec()))
+    }
+
+    /// Replaces one bounded application checkpoint with immediate durability.
+    /// A bounded client namespace prevents an application from creating an
+    /// unbounded secondary operation-key ledger.
+    pub fn save_event_publication_checkpoint(
+        &self,
+        client: &EventClientId,
+        checkpoint: &[u8],
+    ) -> Result<(), StoreError> {
+        self.require_live()?;
+        self.require_bound_mission()?;
+        if checkpoint.is_empty() || checkpoint.len() > 16 * 1024 {
+            return Err(StoreError::InvalidSemanticEvent(
+                "application publication checkpoint exceeds its bound",
+            ));
+        }
+        let write = self.database.begin_write()?;
+        crate::enforce_live_write(&write)?;
+        {
+            let mut table = write.open_table(APPLICATION_CHECKPOINTS)?;
+            if table.get(client.as_bytes())?.is_none() && table.len()? >= MAX_NUMBERED_EVENT_CLIENTS
+            {
+                return Err(StoreError::InvalidSemanticEvent(
+                    "application publication checkpoint namespace is full",
+                ));
+            }
+            table.insert(client.as_bytes(), checkpoint)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Tests registration without creating or claiming a publication client.
+    pub fn has_event_publication_client(&self, client: &EventClientId) -> Result<bool, StoreError> {
+        self.require_live()?;
+        let read = self.database.begin_read()?;
+        if !read
+            .list_tables()?
+            .any(|table| table.name() == CLIENTS.name())
+        {
+            return Ok(false);
+        }
+        Ok(read.open_table(CLIENTS)?.get(client.as_bytes())?.is_some())
+    }
+
     /// Atomically claims a new publication session or replays the same successful claim.
     pub fn begin_event_publication_session(
         &self,
@@ -748,6 +828,16 @@ pub(crate) fn admit_numbered_result_write(
         )
         .into());
     }
+    {
+        let mut metadata = write.open_table(METADATA)?;
+        let count = metadata
+            .get(COMMITTED_COUNT)?
+            .map_or(0, |value| value.value());
+        let next = count
+            .checked_add(1)
+            .ok_or(StoreError::AcceptanceMarkerExhausted)?;
+        metadata.insert(COMMITTED_COUNT, next)?;
+    }
     stats.outstanding_results += 1;
     stats.reverse_edges += 1;
     write_stats(write, stats)?;
@@ -918,6 +1008,28 @@ pub(crate) fn audit_numbered_tables_write(
         .list_tables()?
         .map(|table| table.name().to_owned())
         .collect::<BTreeSet<_>>();
+    if regular.contains(APPLICATION_CHECKPOINTS.name()) {
+        let checkpoints = write.open_table(APPLICATION_CHECKPOINTS)?;
+        if checkpoints.len()? != 0 && crate::read_mission_binding(write)?.is_none() {
+            return Err(StoreError::SemanticInvariant(
+                "unbound store contains application publication checkpoints",
+            ));
+        }
+        if checkpoints.len()? > MAX_NUMBERED_EVENT_CLIENTS {
+            return Err(StoreError::SemanticInvariant(
+                "application publication checkpoint namespace exceeds its bound",
+            ));
+        }
+        for row in checkpoints.iter()? {
+            let (client, checkpoint) = row?;
+            EventClientId::new(client.value().to_vec())?;
+            if checkpoint.value().is_empty() || checkpoint.value().len() > 16 * 1024 {
+                return Err(StoreError::SemanticInvariant(
+                    "application publication checkpoint exceeds its byte bound",
+                ));
+            }
+        }
+    }
     let present = table_names
         .iter()
         .filter(|name| regular.contains(**name))
@@ -1095,6 +1207,28 @@ pub(crate) fn audit_numbered_tables_read(
         .list_tables()?
         .map(|table| table.name().to_owned())
         .collect::<BTreeSet<_>>();
+    if regular.contains(APPLICATION_CHECKPOINTS.name()) {
+        let checkpoints = read.open_table(APPLICATION_CHECKPOINTS)?;
+        if checkpoints.len()? != 0 && crate::read_mission_binding_read(read)?.is_none() {
+            return Err(StoreError::SemanticInvariant(
+                "unbound store contains application publication checkpoints",
+            ));
+        }
+        if checkpoints.len()? > MAX_NUMBERED_EVENT_CLIENTS {
+            return Err(StoreError::SemanticInvariant(
+                "application publication checkpoint namespace exceeds its bound",
+            ));
+        }
+        for row in checkpoints.iter()? {
+            let (client, checkpoint) = row?;
+            EventClientId::new(client.value().to_vec())?;
+            if checkpoint.value().is_empty() || checkpoint.value().len() > 16 * 1024 {
+                return Err(StoreError::SemanticInvariant(
+                    "application publication checkpoint exceeds its byte bound",
+                ));
+            }
+        }
+    }
     let present = table_names
         .iter()
         .filter(|name| regular.contains(**name))

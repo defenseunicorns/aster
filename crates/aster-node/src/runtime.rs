@@ -442,8 +442,8 @@ const DEMO_EVENT_TOPIC: &str = "mesh.ping-pong";
 const DEMO_PING_PAYLOAD: &[u8] = b"ASTER_SAMPLE_PING_V1";
 const DEMO_PONG_PAYLOAD: &[u8] = b"ASTER_SAMPLE_PONG_V1";
 const DEMO_PING_LOGICAL_KEY: &[u8] = b"ping";
+#[cfg(test)]
 const DEMO_PING_OPERATION: &[u8] = b"aster.sample.ping-pong.v1/ping";
-const DEMO_PONG_OPERATION_PREFIX: &[u8] = b"aster.sample.ping-pong.v1/pong/";
 const DEMO_EVENT_SUBSCRIPTION_KEY: &[u8] = b"aster.sample.ping-pong.v1/receive";
 const MAX_EVENT_PUBLISH_RETRIES: usize = 4;
 const MAX_CUSTODY_MAINTENANCE_RETRIES: usize = 4;
@@ -3707,17 +3707,13 @@ impl SelectedEventStatusTracker {
     }
 
     fn observe_operation_commit<T>(&mut self, store: &Store, commit: impl FnOnce() -> T) -> T {
-        // Only the selected actor publishes local operations. Legacy retirement
-        // preserves its permanent count; numbered acknowledgement is not observed
-        // here and therefore cannot add a negative delta. Read failures or
-        // ambiguous deltas cannot alter the caller's result after a commit.
+        // Count first admissions even when the application applies and acknowledges
+        // the result in the same turn. Claims, retries and retirement add no work.
+        // Telemetry failures cannot alter the caller's publication result.
         let rows = || {
             let legacy = store.event_operation_stats().ok()?;
-            let numbered = store.numbered_event_operation_stats().ok()?;
-            legacy
-                .records_total
-                .checked_add(numbered.clients)?
-                .checked_add(numbered.outstanding_results)
+            let numbered = store.committed_numbered_event_publication_count().ok()?;
+            legacy.records_total.checked_add(numbered)
         };
         let before = rows();
         let result = commit();
@@ -4963,15 +4959,9 @@ fn seed_demo_event_subscription(
     Ok(())
 }
 
+#[cfg(test)]
 fn ping_operation_key() -> Result<EventOperationKey, NodeError> {
     EventOperationKey::new(DEMO_PING_OPERATION.to_vec()).map_err(Into::into)
-}
-
-fn pong_operation_key(ping: EventSemanticId) -> Result<EventOperationKey, NodeError> {
-    let mut bytes = Vec::with_capacity(DEMO_PONG_OPERATION_PREFIX.len() + 32);
-    bytes.extend_from_slice(DEMO_PONG_OPERATION_PREFIX);
-    bytes.extend_from_slice(ping.as_bytes());
-    EventOperationKey::new(bytes).map_err(Into::into)
 }
 
 pub(crate) struct SelectedEventPublish<'a> {
@@ -5960,6 +5950,7 @@ pub(crate) fn publish_selected_numbered_event_once_counted(
     )))
 }
 
+#[cfg(test)]
 struct DemoEventPublish<'a> {
     operation: &'a EventOperationKey,
     predecessor: Option<EventSemanticId>,
@@ -5968,6 +5959,7 @@ struct DemoEventPublish<'a> {
     payload: &'a [u8],
 }
 
+#[cfg(test)]
 fn publish_event_once(
     store: &Store,
     policy: &ControlPolicySnapshot,
@@ -6008,123 +6000,222 @@ struct SampleApplicationContext<'a> {
     event_route_cache: &'a AuthenticatedEventRouteCache,
 }
 
+fn emit_native_application_receipt(
+    event: &StoredEvent,
+    inserted: bool,
+    predecessor: Option<EventSemanticId>,
+    store: &Store,
+) -> Result<(), NodeError> {
+    if let Some(ping) = predecessor {
+        let ping_publisher = store
+            .event_by_semantic_id(ping)?
+            .ok_or_else(|| NodeError::Protocol("native Pong predecessor unavailable".into()))?
+            .header
+            .stamp
+            .dot
+            .publisher;
+        node_stdout!(
+            "APPLICATION status={} kind=pong transfer_id={} semantic_id={} publisher={} correlation_semantic_id={} ping_publisher={} source_authenticated=true causal_observation=verified ttl=none",
+            if inserted { "emitted" } else { "existing" },
+            format_transfer_id(event.transfer_id),
+            format_semantic_id(event.semantic_id),
+            format_node_id(event.header.stamp.dot.publisher),
+            format_semantic_id(ping),
+            format_node_id(ping_publisher)
+        );
+    } else {
+        node_stdout!(
+            "APPLICATION status={} kind=ping transfer_id={} semantic_id={} publisher={} source_authenticated=true ttl=none",
+            if inserted { "emitted" } else { "existing" },
+            format_transfer_id(event.transfer_id),
+            format_semantic_id(event.semantic_id),
+            format_node_id(event.header.stamp.dot.publisher)
+        );
+    }
+    Ok(())
+}
+
+fn finish_native_publication(
+    context: &mut SampleApplicationContext<'_>,
+    journal: &mut crate::demo_publication::Journal,
+) -> Result<(), NodeError> {
+    let intent = journal
+        .pending()
+        .ok_or_else(|| NodeError::Protocol("native publication has no retained intent".into()))?
+        .clone();
+    let predecessor = intent.predecessor.map(EventSemanticId::new);
+    let outcome = publish_selected_numbered_event_once(
+        context.store,
+        context.policy,
+        context.sealer,
+        NumberedEventPublishRequest {
+            client_id: journal.client.clone(),
+            session: journal.session()?,
+            sequence: aster_redb_store::EventOperationSequence::new(intent.sequence)
+                .map_err(StoreError::from)?,
+            predecessor: intent
+                .predecessor
+                .map(crate::application::EventId::from_bytes),
+            topic: demo_event_topic()?,
+            scope: demo_scope()?,
+            priority: Priority::Immediate,
+            logical_key: intent.logical_key,
+            payload: intent.payload,
+            tombstone: false,
+        },
+        EventPublishOptions::durable(),
+        Some(context.custody_clock.sample()?),
+    )?;
+    let event = context
+        .store
+        .get_event(outcome.result.receipt.transfer_id)?
+        .ok_or_else(|| {
+            NodeError::Protocol(
+                "native committed Event content is retired before application".into(),
+            )
+        })?;
+    cache_accepted_stored_event(context.event_route_cache, context.sealer, &event)?;
+    journal.apply(context.store, *event.semantic_id.as_bytes())?;
+    emit_native_application_receipt(&event, outcome.inserted, predecessor, context.store)?;
+    Ok(())
+}
+
 fn drive_sample_application(
     role: NodeApplication,
-    context: SampleApplicationContext<'_>,
-    cursor: &mut u64,
+    mut context: SampleApplicationContext<'_>,
+    journal: &mut Option<crate::demo_publication::Journal>,
     initial_receipt_emitted: &mut bool,
     status: &mut SelectedEventStatusTracker,
 ) -> Result<(), NodeError> {
     if matches!(role, NodeApplication::Relay) {
         return Ok(());
     }
-    let SampleApplicationContext {
-        store,
-        policy,
-        sealer,
-        custody_clock,
-        event_route_cache,
-    } = context;
-    status.observe_operation_commit(store, || match role {
-        NodeApplication::Relay => Ok(()),
-        NodeApplication::PingEmitter | NodeApplication::EpochTwoPingEmitter => {
-            if matches!(role, NodeApplication::EpochTwoPingEmitter)
-                && store
-                    .active_scope_epoch(&demo_scope()?)?
-                    .is_none_or(|(epoch, _)| epoch < 2)
-            {
-                return Ok(());
-            }
-            if *initial_receipt_emitted {
-                return Ok(());
-            }
-            let (ping, inserted) = publish_event_once(
-                store,
-                policy,
-                sealer,
-                DemoEventPublish {
-                    operation: &ping_operation_key()?,
-                    predecessor: None,
-                    custody_sample: custody_clock.sample()?,
-                    logical_key: DEMO_PING_LOGICAL_KEY.to_vec(),
-                    payload: DEMO_PING_PAYLOAD,
-                },
-            )?;
-            cache_accepted_stored_event(event_route_cache, sealer, &ping)?;
-            node_stdout!(
-                "APPLICATION status={} kind=ping transfer_id={} semantic_id={} publisher={} source_authenticated=true ttl=none",
-                if inserted { "emitted" } else { "existing" },
-                format_transfer_id(ping.transfer_id),
-                format_semantic_id(ping.semantic_id),
-                format_node_id(ping.header.stamp.dot.publisher),
-            );
-            *initial_receipt_emitted = true;
-            Ok(())
+    status.observe_operation_commit(context.store, || {
+        if journal.is_none() {
+            let client = aster_redb_store::EventClientId::new(match role {
+                NodeApplication::PongResponder => b"aster.native.pong.v1".to_vec(),
+                _ => b"aster.native.ping.v1".to_vec(),
+            })
+            .map_err(StoreError::from)?;
+            *journal = Some(crate::demo_publication::Journal::open(
+                context.store,
+                client,
+            )?);
         }
-        NodeApplication::PongResponder => {
-            let page = store.events_after_with_policy(policy, *cursor, MAX_EVENT_PAGE)?;
-            for event in page {
-                *cursor = event.acceptance_marker;
-                let route_verified = sealer.verify_event(&event.sealed)?;
-                verify_stored_claim(
-                    &route_verified,
-                    event.transfer_id,
-                    event.semantic_id,
-                    &event.header,
-                )?;
-                if event_is_inactive(store, &route_verified)? {
-                    continue;
-                }
-                let payload = match sealer.verify_event_content(route_verified, &event.sealed)? {
-                    EventContentVerification::ContentVerified {
-                        event: content_verified,
-                        payload,
-                    } => {
-                        verify_content_stored_claim(&content_verified, &event)?;
-                        payload
-                    }
-                    EventContentVerification::RouteOnly(_) => {
-                        return Err(NodeError::Protocol(
-                            "semantic Event lost required content authorization on restart".into(),
-                        ));
-                    }
-                };
-                if event.header.topic.as_str() != DEMO_EVENT_TOPIC
-                    || event.header.scope.as_str() != DEMO_SCOPE
+        let journal = journal.as_mut().expect("initialized native journal");
+        if journal.pending().is_some() {
+            finish_native_publication(&mut context, journal)?;
+            *initial_receipt_emitted = true;
+        }
+        if !*initial_receipt_emitted && let Some(last) = journal.last_event() {
+            if let Some(event) = context
+                .store
+                .event_by_semantic_id(EventSemanticId::new(last))?
+            {
+                let predecessor = matches!(role, NodeApplication::PongResponder)
+                    .then(|| {
+                        event
+                            .header
+                            .logical_key
+                            .as_slice()
+                            .try_into()
+                            .map(EventSemanticId::new)
+                    })
+                    .transpose()
+                    .map_err(|_| {
+                        NodeError::Protocol("native Pong correlation is invalid".into())
+                    })?;
+                emit_native_application_receipt(&event, false, predecessor, context.store)?;
+            }
+            *initial_receipt_emitted = true;
+        }
+        match role {
+            NodeApplication::Relay => Ok(()),
+            NodeApplication::PingEmitter | NodeApplication::EpochTwoPingEmitter => {
+                if journal.ping_completed()
+                    || matches!(role, NodeApplication::EpochTwoPingEmitter)
+                        && context
+                            .store
+                            .active_scope_epoch(&demo_scope()?)?
+                            .is_none_or(|(epoch, _)| epoch < 2)
                 {
-                    continue;
+                    return Ok(());
                 }
-                if payload != DEMO_PING_PAYLOAD
-                    || event.header.logical_key != DEMO_PING_LOGICAL_KEY
-                    || event.header.tombstone
-                {
-                    continue;
-                }
-                let operation = pong_operation_key(event.semantic_id)?;
-                let (pong, inserted) = publish_event_once(
-                    store,
-                    policy,
-                    sealer,
-                    DemoEventPublish {
-                        operation: &operation,
-                        predecessor: Some(event.semantic_id),
-                        custody_sample: custody_clock.sample()?,
-                        logical_key: event.semantic_id.as_bytes().to_vec(),
-                        payload: DEMO_PONG_PAYLOAD,
+                journal.retain(
+                    context.store,
+                    crate::demo_publication::Intent {
+                        sequence: 0,
+                        input_marker: journal.cursor(),
+                        predecessor: None,
+                        logical_key: DEMO_PING_LOGICAL_KEY.to_vec(),
+                        payload: DEMO_PING_PAYLOAD.to_vec(),
+                        applied: false,
                     },
                 )?;
-                cache_accepted_stored_event(event_route_cache, sealer, &pong)?;
-                node_stdout!(
-                    "APPLICATION status={} kind=pong transfer_id={} semantic_id={} publisher={} correlation_semantic_id={} ping_publisher={} source_authenticated=true causal_observation=verified ttl=none",
-                    if inserted { "emitted" } else { "existing" },
-                    format_transfer_id(pong.transfer_id),
-                    format_semantic_id(pong.semantic_id),
-                    format_node_id(pong.header.stamp.dot.publisher),
-                    format_semantic_id(event.semantic_id),
-                    format_node_id(event.header.stamp.dot.publisher),
-                );
+                finish_native_publication(&mut context, journal)?;
+                *initial_receipt_emitted = true;
+                Ok(())
             }
-            Ok(())
+            NodeApplication::PongResponder => {
+                for event in context.store.events_after_with_policy(
+                    context.policy,
+                    journal.cursor(),
+                    MAX_EVENT_PAGE,
+                )? {
+                    let route_verified = context.sealer.verify_event(&event.sealed)?;
+                    verify_stored_claim(
+                        &route_verified,
+                        event.transfer_id,
+                        event.semantic_id,
+                        &event.header,
+                    )?;
+                    if event_is_inactive(context.store, &route_verified)? {
+                        journal.advance_cursor(context.store, event.acceptance_marker)?;
+                        continue;
+                    }
+                    let payload = match context
+                        .sealer
+                        .verify_event_content(route_verified, &event.sealed)?
+                    {
+                        EventContentVerification::ContentVerified {
+                            event: verified,
+                            payload,
+                        } => {
+                            verify_content_stored_claim(&verified, &event)?;
+                            payload
+                        }
+                        EventContentVerification::RouteOnly(_) => {
+                            return Err(NodeError::Protocol(
+                                "semantic Event lost required content authorization on restart"
+                                    .into(),
+                            ));
+                        }
+                    };
+                    if event.header.topic.as_str() != DEMO_EVENT_TOPIC
+                        || event.header.scope.as_str() != DEMO_SCOPE
+                        || payload != DEMO_PING_PAYLOAD
+                        || event.header.logical_key != DEMO_PING_LOGICAL_KEY
+                        || event.header.tombstone
+                    {
+                        journal.advance_cursor(context.store, event.acceptance_marker)?;
+                        continue;
+                    }
+                    journal.retain(
+                        context.store,
+                        crate::demo_publication::Intent {
+                            sequence: 0,
+                            input_marker: event.acceptance_marker,
+                            predecessor: Some(*event.semantic_id.as_bytes()),
+                            logical_key: event.semantic_id.as_bytes().to_vec(),
+                            payload: DEMO_PONG_PAYLOAD.to_vec(),
+                            applied: false,
+                        },
+                    )?;
+                    finish_native_publication(&mut context, journal)?;
+                    *initial_receipt_emitted = true;
+                }
+                Ok(())
+            }
         }
     })
 }
@@ -14991,7 +15082,7 @@ async fn run_node_actor_inner(
     let mut automatic_candidates = BTreeSet::<EndpointId>::new();
     let mut automatic_events_open = automatic_nearby;
     let mut next_outbound_peer = 0usize;
-    let mut application_cursor = 0u64;
+    let mut application_journal = None;
     let mut initial_application_receipt_emitted = false;
     let mut fatal_error = None;
     let mut live_zeroization = None;
@@ -15433,7 +15524,7 @@ async fn run_node_actor_inner(
                             custody_clock: &custody_clock,
                             event_route_cache: &event_route_cache,
                         },
-                        &mut application_cursor,
+                        &mut application_journal,
                         &mut initial_application_receipt_emitted,
                         &mut selected_event_status,
                     )
@@ -27114,7 +27205,7 @@ pub fn run_demo_scenario(
     // Event representation that was already durable when its processes began.
     run_demo_phase(&topology, "ping-publish", &[0], &ping_applications)?;
     require_application_receipt(root, "ping-publish", 0, "emitted", "ping")?;
-    let ping = load_demo_operation(&states[0], &missions[0], &ping_operation_key()?)?
+    let ping = load_demo_operation(&states[0], &missions[0], None)?
         .ok_or_else(|| NodeError::Demo("origin process did not durably publish Ping".into()))?;
     verify_demo_event(&states[0], &missions[0], &ping, DEMO_PING_PAYLOAD)?;
     if ping.header.stamp.dot.publisher != missions[0].identity()
@@ -27168,7 +27259,7 @@ pub fn run_demo_scenario(
     let pong = load_demo_operation(
         &states[nodes - 1],
         &missions[nodes - 1],
-        &pong_operation_key(ping.semantic_id)?,
+        Some(ping.semantic_id),
     )?
     .ok_or_else(|| NodeError::Demo("destination process did not durably emit Pong".into()))?;
     verify_demo_event(
@@ -27381,7 +27472,7 @@ fn run_controlled_n4_demo(
         "emitted",
         "ping",
     )?;
-    let ping = load_demo_operation(&states[2], &missions[2], &ping_operation_key()?)?
+    let ping = load_demo_operation(&states[2], &missions[2], None)?
         .ok_or_else(|| NodeError::Demo("surviving member did not emit epoch-two Ping".into()))?;
     if ping.header.key_epoch != 2 || ping.header.stamp.dot.publisher != missions[2].identity() {
         return Err(NodeError::Demo(
@@ -27415,10 +27506,9 @@ fn run_controlled_n4_demo(
         &captured_applications,
         &denied_contact,
     )?;
-    let captured_ping = load_demo_operation(&states[3], &missions[3], &ping_operation_key()?)?
-        .ok_or_else(|| {
-            NodeError::Demo("captured node did not exercise stale local signing".into())
-        })?;
+    let captured_ping = load_demo_operation(&states[3], &missions[3], None)?.ok_or_else(|| {
+        NodeError::Demo("captured node did not exercise stale local signing".into())
+    })?;
     if captured_ping.header.key_epoch != 1
         || load_demo_semantic(&states[3], &missions[3], ping.semantic_id)?.is_some()
     {
@@ -27471,12 +27561,8 @@ fn run_controlled_n4_demo(
     pong_applications[2] = NodeApplication::EpochTwoPingEmitter;
     run_demo_phase(topology, "pong-publish", &[0], &pong_applications)?;
     require_application_receipt(root, "pong-publish", 0, "emitted", "pong")?;
-    let pong = load_demo_operation(
-        &states[0],
-        &missions[0],
-        &pong_operation_key(ping.semantic_id)?,
-    )?
-    .ok_or_else(|| NodeError::Demo("eligible epoch-two member did not emit Pong".into()))?;
+    let pong = load_demo_operation(&states[0], &missions[0], Some(ping.semantic_id))?
+        .ok_or_else(|| NodeError::Demo("eligible epoch-two member did not emit Pong".into()))?;
     verify_demo_event(&states[0], &missions[0], &pong, DEMO_PONG_PAYLOAD)?;
     if pong.header.key_epoch != 2
         || pong.header.stamp.dot.publisher != missions[0].identity()
@@ -27697,10 +27783,30 @@ fn open_demo_store(
 fn load_demo_operation(
     state: &Path,
     mission: &DemoMission,
-    operation: &EventOperationKey,
+    predecessor: Option<EventSemanticId>,
 ) -> Result<Option<StoredEvent>, NodeError> {
-    let (store, _) = open_demo_store(state, mission)?;
-    store.event_for_operation(operation).map_err(Into::into)
+    let (store, sealer) = open_demo_store(state, mission)?;
+    let key = predecessor.map_or_else(
+        || DEMO_PING_LOGICAL_KEY.to_vec(),
+        |ping| ping.as_bytes().to_vec(),
+    );
+    let mut cursor = 0;
+    loop {
+        let page = store.events_after(cursor, MAX_EVENT_PAGE)?;
+        if page.is_empty() {
+            return Ok(None);
+        }
+        for event in page {
+            cursor = event.acceptance_marker;
+            if event.header.stamp.dot.publisher == sealer.identity()
+                && event.header.topic.as_str() == DEMO_EVENT_TOPIC
+                && event.header.scope.as_str() == DEMO_SCOPE
+                && event.header.logical_key == key
+            {
+                return Ok(Some(event));
+            }
+        }
+    }
 }
 
 fn load_demo_semantic(
@@ -28430,6 +28536,7 @@ fn validate_port_block(base: u16, count: usize) -> Result<(), NodeError> {
 
 #[cfg(test)]
 mod tests {
+    mod native_publication_test;
     mod operation_rate_test;
     use std::sync::{Barrier, mpsc as std_mpsc};
 

@@ -25,6 +25,8 @@ aster-negentropy = { path = "../aster-negentropy" }
 aster-profile = { path = "../aster-profile" }
 aster-redb-store = { path = "../aster-redb-store" }
 getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 zeroize.workspace = true

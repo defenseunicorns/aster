@@ -33,6 +33,7 @@
 pub mod application;
 pub mod bridge_runtime;
 pub mod control_admin;
+mod demo_publication;
 mod event_pages;
 mod frame;
 mod identity;
