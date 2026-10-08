@@ -30,9 +30,9 @@ import sys
 from typing import Any, Iterable, Sequence
 
 
-SCHEMA = "aster-selected-live-event-receipt/v2"
-RAW_SCHEMA = "aster-selected-live-event-raw/v2"
-TRANSCRIPT_SCHEMA = "aster-selected-live-event-transcript/v2"
+SCHEMA = "aster-selected-live-event-receipt/v1"
+RAW_SCHEMA = "aster-selected-live-event-raw/v1"
+TRANSCRIPT_SCHEMA = "aster-selected-live-event-transcript/v1"
 CLAIM = (
     "selected-live-event-one-host-direct-iroh-priority-withheld-authenticated-gap-"
     "forced-receiver-process-termination-durable-redelivery-gap-closure-acceptance"
@@ -76,10 +76,6 @@ ADMITTED_SOURCE_PATHS = tuple(
             "crates/aster-core/src/lib.rs",
             "crates/aster-core/src/source_event.rs",
             "crates/aster-node/Cargo.toml",
-            "crates/aster-node/examples/support/numbered.rs",
-            "tools/historical/check-selected-live-event-receipt.py",
-            "tools/historical/check-selected-linux-event-custody-receipt.py",
-
             "crates/aster-node/src/application.rs",
             "crates/aster-node/src/frame.rs",
             "crates/aster-node/src/identity.rs",
@@ -135,7 +131,6 @@ EXPECTED_FILES = {
     "participants/receiver/state/identity.key": 0o600,
     "participants/receiver/state/mesh.redb": 0o600,
 }
-EXPECTED_FILES["participants/publisher/state/live-acceptance-publication.redb"] = 0o600
 SECRET_FILES = {
     "participants/publisher/mission.bundle",
     "participants/publisher/state/identity.key",
@@ -145,12 +140,10 @@ SECRET_FILES = {
     "participants/receiver/state/mesh.redb",
 }
 
-SECRET_FILES.add("participants/publisher/state/live-acceptance-publication.redb")
-
 RUN_KEYS = (
     "schema", "claim", "participants", "actor_lifetimes",
     "maximum_concurrent_actors", "topic", "beta_topic", "scope",
-    "stream_events", "authorized_unsubscribed_events", "publication_model",
+    "stream_events", "authorized_unsubscribed_events",
 )
 PARTICIPANT_KEYS = (
     "participant", "carrier_id", "mission_id", "mission_authority", "provisioning",
@@ -799,9 +792,6 @@ def validate_inventory(root_descriptor: int) -> dict[str, dict[str, os.stat_resu
             fail(f"{participant} identity artifact has the wrong metadata-only byte count")
         if not 0 < store.st_size <= STORE_MAX_BYTES:
             fail(f"{participant} state artifact violates its metadata-only size bound")
-    journal = observed_files["participants/publisher/state/live-acceptance-publication.redb"]
-    if not 0 < journal.st_size <= STORE_MAX_BYTES:
-        fail("publication journal violates its metadata-only size bound")
     return {"directories": directory_metadata, "files": observed_files}
 
 
@@ -962,7 +952,6 @@ def validate_transcript(data: bytes) -> dict[str, Any]:
         records[0],
         {
             "schema": TRANSCRIPT_SCHEMA,
-            "publication_model": "numbered-v1",
             "claim": CLAIM,
             "participants": "2",
             "actor_lifetimes": "7",
@@ -1110,7 +1099,7 @@ def validate_transcript(data: bytes) -> dict[str, Any]:
             "original_payload_sha256": PAYLOAD_HASHES["first"],
             "changed_payload_sha256": PAYLOAD_HASHES["changed_first"],
             "error_kind": "conflict",
-            "operation": "publish_numbered",
+            "operation": "publish",
             "sanitized": "true",
             "publication_preserved": "true",
         },
@@ -2314,7 +2303,6 @@ def validate_raw_root(root: Path, source_authority: dict[str, Any]) -> dict[str,
                 "mission_artifacts": len(PARTICIPANTS),
                 "identity_artifacts": len(PARTICIPANTS),
                 "store_artifacts": len(PARTICIPANTS),
-                "publication_journal_artifacts": 1,
                 "secret_artifact_contents": "metadata-only-not-opened-read-or-hashed",
                 "file_links": "all-one",
                 "inventory_aliases": "none",
@@ -2989,7 +2977,6 @@ def write_receipt(path: Path | None, data: bytes) -> None:
 
 def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--historical-v1", action="store_true", help="verify or project the unchanged historical v1 format")
     parser.add_argument(
         "receipt",
         nargs="?",
@@ -3010,19 +2997,7 @@ def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(arguments: list[str] | None = None) -> None:
-    selected_arguments = list(sys.argv[1:] if arguments is None else arguments)
-    if "--historical-v1" in selected_arguments:
-        import importlib.util
-        selected_arguments.remove("--historical-v1")
-        path = Path(__file__).parent / "historical" / Path(__file__).name
-        spec = importlib.util.spec_from_file_location("aster_historical_receipt", path)
-        if spec is None or spec.loader is None:
-            raise RuntimeError("historical receipt validator unavailable")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        module.main(selected_arguments)
-        return
-    options = parse_args(selected_arguments)
+    options = parse_args(arguments)
     try:
         raw_root = Path(os.path.abspath(os.fspath(options.raw_root)))
         source = Path(os.path.abspath(os.fspath(options.source)))

@@ -29,7 +29,7 @@ from types import ModuleType
 from typing import Any
 
 
-RAW_SCHEMA = "aster-selected-linux-event-custody-raw/v1"
+RAW_SCHEMA = "aster-selected-linux-event-custody-raw/v2"
 CLAIM = "selected-linux-arm64-event-custody-ttl-quota-receive-only-acceptance"
 IMAGE = "rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97"
 PLATFORM = "linux/arm64"
@@ -64,6 +64,10 @@ ADMITTED_PATHS = tuple(
             "crates/aster-iroh/Cargo.toml",
             "crates/aster-iroh/src/lib.rs",
             "crates/aster-node/Cargo.toml",
+            "crates/aster-node/examples/support/numbered.rs",
+            "tools/historical/check-selected-live-event-receipt.py",
+            "tools/historical/check-selected-linux-event-custody-receipt.py",
+
             "crates/aster-node/src/application.rs",
             "crates/aster-node/src/frame.rs",
             "crates/aster-node/src/identity.rs",

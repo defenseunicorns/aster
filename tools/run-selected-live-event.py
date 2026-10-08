@@ -22,7 +22,7 @@ import time
 from typing import Any
 
 
-RAW_SCHEMA = "aster-selected-live-event-raw/v1"
+RAW_SCHEMA = "aster-selected-live-event-raw/v2"
 CLAIM = "selected-live-event-one-host-direct-iroh-priority-withheld-authenticated-gap-forced-receiver-process-termination-durable-redelivery-gap-closure-acceptance"
 BINARY_NAME = "aster-live-event-acceptance"
 EXAMPLE_NAME = "live_event_acceptance"
@@ -59,6 +59,10 @@ ADMITTED_PATHS = tuple(
             "crates/aster-core/src/lib.rs",
             "crates/aster-core/src/source_event.rs",
             "crates/aster-node/Cargo.toml",
+            "crates/aster-node/examples/support/numbered.rs",
+            "tools/historical/check-selected-live-event-receipt.py",
+            "tools/historical/check-selected-linux-event-custody-receipt.py",
+
             "crates/aster-node/src/application.rs",
             "crates/aster-node/src/frame.rs",
             "crates/aster-node/src/identity.rs",
@@ -102,6 +106,7 @@ PARTICIPANT_SECRET_FILES = {
     for relative in ("mission.bundle", "state/identity.key", "state/mesh.redb")
 }
 
+PARTICIPANT_SECRET_FILES["participants/publisher/state/live-acceptance-publication.redb"] = 0o600
 
 class RunnerFailure(Exception):
     """Sanitized local runner failure."""

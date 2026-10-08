@@ -49,7 +49,7 @@ def transcript_lines() -> list[str]:
     result = [line("META", "META", {
         "schema": CHECKER.TRANSCRIPT_SCHEMA, "claim": CHECKER.CLAIM,
         "platform": "linux", "custody_clock": "clock_boottime_suspend_inclusive",
-        "participants": "3", "contacts": "2",
+        "participants": "3", "contacts": "2", "publication_model": "numbered-v1",
     })]
     for participant, access in zip(CHECKER.PARTICIPANTS, ("member", "route_only", "member")):
         result.append(line("PARTICIPANT", "PARTICIPANT", {
@@ -108,6 +108,22 @@ def mutate(lines: list[str], index: int, key: str, value: str) -> list[str]:
 
 
 class TranscriptContractTests(unittest.TestCase):
+    def test_historical_v1_transcript_stays_distinct_from_numbered_v2(self) -> None:
+        path = Path(__file__).parent / "historical/check-selected-linux-event-custody-receipt.py"
+        spec = importlib.util.spec_from_file_location("historical_linux_custody", path)
+        self.assertIsNotNone(spec)
+        historical = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(historical)
+        lines = transcript_lines()
+        fields = [field for field in lines[0].split("\t") if not field.startswith("publication_model=")]
+        lines[0] = "\t".join(fields).replace(CHECKER.TRANSCRIPT_SCHEMA, historical.TRANSCRIPT_SCHEMA)
+        data = encoded(lines)
+        historical.validate_transcript(data)
+        with self.assertRaises(CHECKER.ReceiptViolation):
+            CHECKER.validate_transcript(data)
+        self.assertEqual(historical.SCHEMA, "aster-selected-linux-event-custody-receipt/v1")
+        self.assertNotIn("participants/origin/state/linux-custody-publication.redb", historical.SECRET_FILES)
+
     def setUp(self) -> None:
         self.lines = transcript_lines()
 

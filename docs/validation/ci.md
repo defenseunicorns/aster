@@ -1072,7 +1072,7 @@ State/Record, and Blob activity remain zero.
 
 The raw root is owner-only evidence containing participant mission bundles,
 identity keys, and stores. Keep it outside source control. The runner/checker
-inventory those six secret files by metadata only and never open, read, or hash
+inventory the participant secret files and publication journal by metadata only and never open, read, or hash
 their contents. A new capture requires a clean, good-signed source checkout and
 a fresh exclusive raw-root path:
 
@@ -1087,11 +1087,18 @@ python3 tools/check-selected-live-event-receipt.py - \
   --output /private/tmp/event-receipt/selected-live-event-receipt.json
 ```
 
+Current native Event and Linux custody captures use v2 receipts with an explicit
+`numbered-v1` publication model and one private publication journal. The journal
+is included in the exact inventory and inspected only by metadata. The v1
+receipts retained below describe their original execution; use
+`--historical-v1` to invoke the frozen verifier without relabeling them. No new
+physical or performance qualification follows from this producer migration.
+
 Replaying the checked-in projection requires the externally retained raw root
 and a clean checkout detached at its exact signed source:
 
 ```sh
-python3 tools/check-selected-live-event-receipt.py \
+python3 tools/check-selected-live-event-receipt.py --historical-v1 \
   --raw-root /path/to/retained/selected-live-event-raw-root \
   --source /path/to/aster-source-detached-at-c464129d58c250dea2ecbf5f51d7ece0e5aab6d0 \
   docs/validation/evidence/selected-live-event-c464129.json

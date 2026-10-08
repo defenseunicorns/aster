@@ -6,6 +6,9 @@
 //! stdout so an independent checker can bind the forced receiver termination to
 //! a poll whose durable attempt was already returned and flushed.
 
+#[path = "support/numbered.rs"]
+mod numbered;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
@@ -28,7 +31,7 @@ use aster_node::{
     application::{
         ApplicationError, ApplicationErrorKind, AuthenticatedPeerStatus, ContactSyncStatus,
         EventAcknowledgement, EventDelivery, EventGapPage, EventGapQuery, EventPollRequest,
-        EventPublishRequest, EventPublishResult, EventQuery, EventQueryPage, EventSubscription,
+        EventPublishResult, EventQuery, EventQueryPage, EventSubscription,
         EventSubscriptionRequest, EventSyncStatus, EventUnsubscribe, PeerAuthorization, Priority,
         Scope, SelectedEventHandle, SelectedEventStatus, Topic,
     },
@@ -43,7 +46,7 @@ use tokio::{
 };
 use zeroize::Zeroize as _;
 
-const TRANSCRIPT_SCHEMA: &str = "aster-selected-live-event-transcript/v1";
+const TRANSCRIPT_SCHEMA: &str = "aster-selected-live-event-transcript/v2";
 const CLAIM: &str = "selected-live-event-one-host-direct-iroh-priority-withheld-authenticated-gap-forced-receiver-process-termination-durable-redelivery-gap-closure-acceptance";
 const TOPIC: &str = "opaque";
 const BETA_TOPIC: &str = "opaque.beta";
@@ -100,7 +103,6 @@ struct Participant {
 
 #[derive(Clone, Copy)]
 struct PublicationSpec {
-    operation: &'static [u8],
     payload: &'static [u8],
     priority: Priority,
 }
@@ -156,26 +158,44 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
         provision_participants(&participants_root, &topic, &beta_topic, &scope)?;
     validate_participant_domains(&publisher, &receiver)?;
 
+    let journal_path = publisher.state.join("live-acceptance-publication.redb");
+    numbered::Journal::initialize(&journal_path, b"native.live-acceptance.v1")?;
+    let mut journal = numbered::Journal::open(&journal_path, b"native.live-acceptance.v1")?;
     let peerless = start_peerless(&publisher).await?;
     let peerless_events = peerless.selected_events();
     validate_handle(&publisher, &peerless_events)?;
+    journal
+        .recover(&mut numbered::Backend::Live(&peerless_events))
+        .await?;
     let first_request = publication_request(
         PublicationSpec {
-            operation: FIRST_OPERATION,
             payload: FIRST_PAYLOAD,
             priority: Priority::Priority,
         },
         &topic,
         &scope,
     );
-    let first = peerless_events.publish(first_request.clone()).await?;
+    let first = journal
+        .publish_metadata(
+            &mut numbered::Backend::Live(&peerless_events),
+            first_request.clone(),
+        )
+        .await?;
     validate_publication(&first, &publisher, Priority::Priority, 1, 1)?;
-    let first_retry = peerless_events.publish(first_request.clone()).await?;
+    let first_retry = journal
+        .publish_metadata(
+            &mut numbered::Backend::Live(&peerless_events),
+            first_request.clone(),
+        )
+        .await?;
     validate_exact_retry(&first, &first_retry)?;
     let mut changed = first_request;
     changed.payload = CHANGED_FIRST_PAYLOAD.to_vec();
-    let conflict = match peerless_events.publish(changed).await {
-        Err(error) => error,
+    let conflict = match journal
+        .probe_changed(&mut numbered::Backend::Live(&peerless_events), &changed)
+        .await
+    {
+        Err(error) => *error.downcast::<ApplicationError>()?,
         Ok(_) => {
             return Err(Box::new(AcceptanceFailure(
                 "changed Event operation accepted",
@@ -183,44 +203,63 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
         }
     };
     validate_sanitized_conflict(&conflict)?;
+    journal
+        .acknowledge(&mut numbered::Backend::Live(&peerless_events))
+        .await?;
 
-    let second = peerless_events
-        .publish(publication_request(
-            PublicationSpec {
-                operation: SECOND_OPERATION,
-                payload: SECOND_PAYLOAD,
-                priority: Priority::Routine,
-            },
-            &topic,
-            &scope,
-        ))
+    let second = journal
+        .publish_metadata(
+            &mut numbered::Backend::Live(&peerless_events),
+            publication_request(
+                PublicationSpec {
+                    payload: SECOND_PAYLOAD,
+                    priority: Priority::Routine,
+                },
+                &topic,
+                &scope,
+            ),
+        )
         .await?;
     validate_publication(&second, &publisher, Priority::Routine, 2, 2)?;
-    let third = peerless_events
-        .publish(publication_request(
-            PublicationSpec {
-                operation: THIRD_OPERATION,
-                payload: THIRD_PAYLOAD,
-                priority: Priority::Flash,
-            },
-            &topic,
-            &scope,
-        ))
+    journal
+        .acknowledge(&mut numbered::Backend::Live(&peerless_events))
+        .await?;
+    let third = journal
+        .publish_metadata(
+            &mut numbered::Backend::Live(&peerless_events),
+            publication_request(
+                PublicationSpec {
+                    payload: THIRD_PAYLOAD,
+                    priority: Priority::Flash,
+                },
+                &topic,
+                &scope,
+            ),
+        )
         .await?;
     validate_publication(&third, &publisher, Priority::Flash, 3, 3)?;
-    let beta = peerless_events
-        .publish(EventPublishRequest {
-            operation_key: BETA_OPERATION.to_vec(),
-            predecessor: None,
-            topic: beta_topic.clone(),
-            scope: scope.clone(),
-            priority: Priority::Priority,
-            logical_key: LOGICAL_KEY.to_vec(),
-            payload: BETA_PAYLOAD.to_vec(),
-            tombstone: false,
-        })
+    journal
+        .acknowledge(&mut numbered::Backend::Live(&peerless_events))
+        .await?;
+    let beta = journal
+        .publish_metadata(
+            &mut numbered::Backend::Live(&peerless_events),
+            numbered::Intent {
+                predecessor: None,
+                topic: beta_topic.as_str().into(),
+                scope: scope.as_str().into(),
+                priority: Priority::Priority as u8,
+                logical_key: LOGICAL_KEY.to_vec(),
+                payload: BETA_PAYLOAD.to_vec(),
+                tombstone: false,
+                ttl_ms: None,
+            },
+        )
         .await?;
     validate_publication(&beta, &publisher, Priority::Priority, 4, 1)?;
+    journal
+        .acknowledge(&mut numbered::Backend::Live(&peerless_events))
+        .await?;
     let peerless_query =
         query_stream(&peerless_events, publisher.mission_id, &topic, &scope).await?;
     validate_exact_stream(&peerless_query.items, &first, &second, &third)?;
@@ -235,6 +274,19 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
     )?;
     validate_query_page(&peerless_beta_query, 1, 4, false, "publisher beta query")?;
     let peerless_status = peerless_events.status().await?;
+    require(
+        peerless_status
+            .event_operation_capacity
+            .numbered_stats
+            .clients
+            == 1
+            && peerless_status
+                .event_operation_capacity
+                .numbered_stats
+                .outstanding_results
+                == 0,
+        "bounded numbered publication clients and acknowledged results",
+    )?;
     validate_offline_status(&peerless_status)?;
     let retained_peerless = peerless_events.clone();
     let peerless_receipt = peerless.shutdown().await?;
@@ -698,16 +750,16 @@ fn connected_config(
     }
 }
 
-fn publication_request(spec: PublicationSpec, topic: &Topic, scope: &Scope) -> EventPublishRequest {
-    EventPublishRequest {
-        operation_key: spec.operation.to_vec(),
+fn publication_request(spec: PublicationSpec, topic: &Topic, scope: &Scope) -> numbered::Intent {
+    numbered::Intent {
         predecessor: None,
-        topic: topic.clone(),
-        scope: scope.clone(),
-        priority: spec.priority,
+        topic: topic.as_str().into(),
+        scope: scope.as_str().into(),
+        priority: spec.priority as u8,
         logical_key: LOGICAL_KEY.to_vec(),
         payload: spec.payload.to_vec(),
         tombstone: false,
+        ttl_ms: None,
     }
 }
 
@@ -841,7 +893,7 @@ fn validate_sanitized_conflict(error: &ApplicationError) -> Result<(), DynError>
     ]);
     require(
         error.kind() == ApplicationErrorKind::Conflict
-            && error.operation() == "publish"
+            && error.operation() == "publish_numbered"
             && Error::source(error).is_none()
             && forbidden
                 .iter()
@@ -1932,6 +1984,7 @@ fn emit_transcript(
             ("scope", SCOPE.to_owned()),
             ("stream_events", "3".to_owned()),
             ("authorized_unsubscribed_events", "1".to_owned()),
+            ("publication_model", "numbered-v1".to_owned()),
         ],
     );
     emit_participant(publisher);
@@ -1967,7 +2020,7 @@ fn emit_transcript(
             ("original_payload_sha256", sha256_hex(FIRST_PAYLOAD)),
             ("changed_payload_sha256", sha256_hex(CHANGED_FIRST_PAYLOAD)),
             ("error_kind", "conflict".to_owned()),
-            ("operation", "publish".to_owned()),
+            ("operation", "publish_numbered".to_owned()),
             ("sanitized", "true".to_owned()),
             ("publication_preserved", "true".to_owned()),
         ],
