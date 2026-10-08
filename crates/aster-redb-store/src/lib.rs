@@ -9954,7 +9954,9 @@ impl Store {
         .and_then(EventCommitResult::into_apply)
     }
 
+    /// Historical raw local-publication fixture; unavailable in normal store builds.
     /// Commits one locally sealed Event against its optimistic durable reservation.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_reserved_event(
         &self,
         reservation: &EventReservation,
@@ -9973,7 +9975,9 @@ impl Store {
         .and_then(EventCommitResult::into_apply)
     }
 
+    /// Historical raw local-publication fixture; unavailable in normal store builds.
     /// Commits a reserved local Event only if its captured policy remains exact.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_reserved_event_with_policy(
         &self,
         policy: &ControlPolicySnapshot,
