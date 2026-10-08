@@ -441,12 +441,13 @@ def run_smoke(compose: Compose) -> dict[str, object]:
 
     _progress("publishing one Event at isolated A")
     up(compose, ("a",), ())
+    compose.helper("a", ("publication-init", "--journal", "/state/publication.redb", "--client-id", "lan-mvp-source-a"))
     event_id = compose.helper(
         "a",
         (
             "publish",
-            "--operation-key",
-            "demo/publish/1",
+            "--journal", "/state/publication.redb",
+            "--client-id", "lan-mvp-source-a",
             "--logical-key",
             LOGICAL_KEY,
             "--payload",
