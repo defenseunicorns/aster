@@ -74,11 +74,11 @@ use aster_redb_store::{
     MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS, MAX_ROUTE_CACHE_ITEMS,
     MutableTransferCursorClass, MutableTransferCursorMode, NumberedEventOperationRequest,
     NumberedEventPublishOutcome, RecordSenderProjection, RecordTransferId, RejectedControl,
-    ReservedEventOnceCommit, RouteCacheOutcome, ScopeRekeyPublicationIntent, StateSenderProjection,
-    StateTransferId, Store, StoreBackingIdentity, StoreError, StoreInspection, StoreLimits,
-    StoreZeroizationState, StoredControl, StoredControlEffect, StoredEvent, StoredEventTransfer,
-    StoredRecord, StoredState, TransferLease, ZeroizationArtifact, ZeroizationIntent,
-    ZeroizationStore,
+    ReservedEventOnceCommit, ReservedNumberedEventCommit, RouteCacheOutcome,
+    ScopeRekeyPublicationIntent, StateSenderProjection, StateTransferId, Store,
+    StoreBackingIdentity, StoreError, StoreInspection, StoreLimits, StoreZeroizationState,
+    StoredControl, StoredControlEffect, StoredEvent, StoredEventTransfer, StoredRecord,
+    StoredState, TransferLease, ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
 };
 use sha2::{Digest as _, Sha256};
 #[cfg(unix)]
@@ -5584,6 +5584,196 @@ fn publish_selected_event_group_once_counted(
     )))
 }
 
+pub(crate) struct SelectedNumberedEventPublish<'a> {
+    pub client: &'a aster_redb_store::EventClientId,
+    pub session: aster_redb_store::EventPublicationSession,
+    pub sequence: aster_redb_store::EventOperationSequence,
+    pub predecessor: Option<EventSemanticId>,
+    pub topic: &'a Topic,
+    pub scope: &'a Scope,
+    pub priority: Priority,
+    pub ttl_ms: Option<u64>,
+    pub custody_sample: Option<CustodySample>,
+    pub logical_key: &'a [u8],
+    pub payload: &'a [u8],
+    pub tombstone: bool,
+}
+
+pub(crate) fn publish_selected_numbered_event_group(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    sealer: &mut ReferenceEnvelopeSealer,
+    requests: &[SelectedNumberedEventPublish<'_>],
+    writer_commits: &mut u64,
+) -> Result<Vec<NumberedEventPublishOutcome>, NodeError> {
+    let first = requests
+        .first()
+        .ok_or_else(|| NodeError::Configuration("Event publication group is empty".into()))?;
+    if requests.iter().any(|request| {
+        request.topic != first.topic
+            || request.scope != first.scope
+            || request.custody_sample.is_some() != first.custody_sample.is_some()
+    }) {
+        return Err(NodeError::Configuration(
+            "Event publication group crosses a topic, scope, or custody boundary".into(),
+        ));
+    }
+    for request in requests {
+        if request.ttl_ms == Some(0) {
+            return Err(NodeError::Configuration(
+                "finite Event TTL must be greater than zero milliseconds".into(),
+            ));
+        }
+        if request.ttl_ms.is_some() && request.custody_sample.is_none() {
+            return Err(NodeError::Configuration(
+                "finite Event publication requires a continuous custody sample".into(),
+            ));
+        }
+        if request.tombstone && request.ttl_ms.is_some() {
+            return Err(NodeError::Configuration(
+                "Event tombstones are durable and cannot carry finite TTL".into(),
+            ));
+        }
+        if request.tombstone && !request.payload.is_empty() {
+            return Err(NodeError::Configuration(
+                "Event tombstones must carry an empty payload".into(),
+            ));
+        }
+    }
+
+    let intents = requests
+        .iter()
+        .map(|request| {
+            EventPublicationIntent::new(
+                EventPublicationSpec::new(
+                    sealer.identity(),
+                    request.topic.clone(),
+                    request.scope.clone(),
+                    request.priority,
+                    request.logical_key.to_vec(),
+                    request.tombstone,
+                    request.ttl_ms,
+                )?,
+                request.payload,
+            )
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    let operation_requests = requests
+        .iter()
+        .zip(&intents)
+        .map(|(request, intent)| {
+            NumberedEventOperationRequest::new(
+                request.client,
+                request.session,
+                request.sequence,
+                request.predecessor,
+                intent,
+                request.payload,
+            )
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    let key_epoch = store
+        .active_scope_epoch(first.scope)?
+        .map_or(1, |(epoch, _)| epoch);
+    let predecessors = requests
+        .iter()
+        .map(|request| request.predecessor)
+        .collect::<Vec<_>>();
+    for _ in 0..MAX_EVENT_PUBLISH_RETRIES {
+        let custody_revision = first
+            .custody_sample
+            .map(|_| store.custody_policy_revision())
+            .transpose()?;
+        let reservations = store.reserve_event_group_with_policy(
+            policy,
+            sealer.identity(),
+            first.topic,
+            first.scope,
+            &predecessors,
+        )?;
+        let mut sealed_events = Vec::with_capacity(requests.len());
+        let mut verified_events = Vec::with_capacity(requests.len());
+        for (request, reservation) in requests.iter().zip(&reservations) {
+            let header = reservation.header(
+                request.priority,
+                request.logical_key.to_vec(),
+                request.ttl_ms,
+                u64::try_from(request.payload.len()).map_err(|_| {
+                    NodeError::Protocol("Event payload length overflows u64".into())
+                })?,
+                request.tombstone,
+                key_epoch,
+            )?;
+            let sealed = sealer.seal_event(&header, request.payload)?;
+            let route_verified = sealer.verify_event(&sealed.bytes)?;
+            let verified = match sealer.verify_event_content(route_verified, &sealed.bytes)? {
+                EventContentVerification::ContentVerified { event, payload }
+                    if payload == request.payload =>
+                {
+                    event
+                }
+                EventContentVerification::ContentVerified { .. } => {
+                    return Err(NodeError::Protocol(
+                        "locally sealed Event reopened with different content".into(),
+                    ));
+                }
+                EventContentVerification::RouteOnly(_) => {
+                    return Err(NodeError::Protocol(
+                        "local Event publisher lacks content authorization".into(),
+                    ));
+                }
+            };
+            sealed_events.push(sealed);
+            verified_events.push(verified);
+        }
+        let commits = operation_requests
+            .iter()
+            .zip(&reservations)
+            .zip(&verified_events)
+            .zip(&sealed_events)
+            .map(|(((operation, reservation), verified), sealed)| {
+                ReservedNumberedEventCommit::new(operation, reservation, verified, &sealed.bytes)
+            })
+            .collect::<Vec<_>>();
+        let committed = match (first.custody_sample, custody_revision) {
+            (Some(sample), Some(revision)) => store
+                .commit_reserved_numbered_event_group_with_custody_policy(
+                    policy,
+                    LocalCustodyCheckpoint::new(revision, sample),
+                    &commits,
+                ),
+            (None, None) => {
+                store.commit_reserved_numbered_event_group_with_policy(policy, &commits)
+            }
+            _ => Err(StoreError::SemanticInvariant(
+                "custody sample and policy revision were not captured together",
+            )),
+        };
+        match committed {
+            Ok(group) => {
+                *writer_commits = writer_commits
+                    .checked_add(group.writer_commits())
+                    .ok_or_else(|| {
+                        NodeError::Protocol("Event writer commit count overflowed".into())
+                    })?;
+                return Ok(group.into_outcomes());
+            }
+            Err(StoreError::ReservationChanged) => continue,
+            Err(StoreError::Custody(CustodyStoreError::PolicyChanged)) => continue,
+            Err(StoreError::Custody(CustodyStoreError::AlreadyRetired)) => {
+                return Err(NodeError::Protocol(EVENT_OPERATION_RETIRED.into()));
+            }
+            Err(StoreError::EventOperationConflict | StoreError::OperationPredecessorMismatch) => {
+                return Err(NodeError::Protocol(EVENT_OPERATION_CONFLICT.into()));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(NodeError::Protocol(format!(
+        "Event publication reservation changed {MAX_EVENT_PUBLISH_RETRIES} times"
+    )))
+}
+
 pub(crate) fn publish_selected_numbered_event_once(
     store: &Store,
     policy: &ControlPolicySnapshot,
@@ -5591,6 +5781,47 @@ pub(crate) fn publish_selected_numbered_event_once(
     request: NumberedEventPublishRequest,
     options: EventPublishOptions,
     custody_sample: Option<CustodySample>,
+) -> Result<NumberedEventPublishOutcome, NodeError> {
+    publish_selected_numbered_event_once_observed(
+        store,
+        policy,
+        sealer,
+        request,
+        options,
+        custody_sample,
+    )
+    .0
+}
+
+pub(crate) fn publish_selected_numbered_event_once_observed(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    sealer: &mut ReferenceEnvelopeSealer,
+    request: NumberedEventPublishRequest,
+    options: EventPublishOptions,
+    custody_sample: Option<CustodySample>,
+) -> (Result<NumberedEventPublishOutcome, NodeError>, u64) {
+    let mut writer_commits = 0;
+    let result = publish_selected_numbered_event_once_counted(
+        store,
+        policy,
+        sealer,
+        request,
+        options,
+        custody_sample,
+        &mut writer_commits,
+    );
+    (result, writer_commits)
+}
+
+pub(crate) fn publish_selected_numbered_event_once_counted(
+    store: &Store,
+    policy: &ControlPolicySnapshot,
+    sealer: &mut ReferenceEnvelopeSealer,
+    request: NumberedEventPublishRequest,
+    options: EventPublishOptions,
+    custody_sample: Option<CustodySample>,
+    writer_commits: &mut u64,
 ) -> Result<NumberedEventPublishOutcome, NodeError> {
     let NumberedEventPublishRequest {
         client_id,
@@ -5692,7 +5923,7 @@ pub(crate) fn publish_selected_numbered_event_once(
         };
         let committed = match (custody_sample, custody_revision) {
             (Some(sample), Some(revision)) => store
-                .commit_reserved_numbered_event_with_custody_policy(
+                .commit_reserved_numbered_event_with_custody_policy_observed(
                     policy,
                     LocalCustodyCheckpoint::new(revision, sample),
                     &operation_request,
@@ -5700,18 +5931,24 @@ pub(crate) fn publish_selected_numbered_event_once(
                     &verified,
                     &sealed.bytes,
                 ),
-            (None, None) => store.commit_reserved_numbered_event_with_policy(
+            (None, None) => store.commit_reserved_numbered_event_with_policy_observed(
                 policy,
                 &operation_request,
                 &reservation,
                 &verified,
                 &sealed.bytes,
             ),
-            _ => Err(StoreError::SemanticInvariant(
-                "custody sample and policy revision were not captured together",
-            )),
+            _ => {
+                return Err(StoreError::SemanticInvariant(
+                    "custody sample and policy revision were not captured together",
+                )
+                .into());
+            }
         };
-        match committed {
+        *writer_commits = writer_commits
+            .checked_add(committed.writer_commits)
+            .ok_or_else(|| NodeError::Protocol("Event writer commit count overflowed".into()))?;
+        match committed.result {
             Ok(outcome) => return Ok(outcome),
             Err(StoreError::ReservationChanged) => continue,
             Err(StoreError::Custody(CustodyStoreError::PolicyChanged)) => continue,
@@ -13195,6 +13432,27 @@ fn execute_selected_application_command_coalesced(
         Arc<std::sync::Barrier>,
     )>,
 ) -> (usize, bool) {
+    if matches!(&command, SelectedApplicationCommand::Event(SelectedEventCommand::PublishNumbered { request, .. }) if request.priority != Priority::Flash)
+    {
+        return execute_selected_numbered_command_coalesced(
+            events,
+            state,
+            records,
+            blobs,
+            store,
+            emission_policy,
+            status,
+            receipt,
+            command,
+            commands,
+            commands_open,
+            pending,
+            group_sequence,
+            max_group_size,
+            #[cfg(all(test, unix))]
+            execution_gate,
+        );
+    }
     let first = match ordinary_event_publication(command) {
         Ok(first) => first,
         Err(command) => {
@@ -13262,6 +13520,148 @@ fn execute_selected_application_command_coalesced(
         }
     } else {
         status.observe_operation_commit(store, || events.publish_group_with_options(publications))
+    };
+    let diagnostic = result.diagnostic;
+    for (publication, outcome) in group.into_iter().zip(result.results) {
+        let _ = publication.response.send(outcome);
+    }
+    bounded_node_diagnostic!(
+        "event_publication_group group_sequence={} collected={} cohorts={} custody_writer_commits={} event_writer_commits={} total_writer_commits={} accepted_new={} exact_retries={} failures={} max_cohort_size={} singleton_fallbacks={}",
+        sequence,
+        diagnostic.collected,
+        diagnostic.cohorts,
+        diagnostic.custody_writer_commits,
+        diagnostic.event_writer_commits,
+        diagnostic.total_writer_commits(),
+        diagnostic.accepted_new,
+        diagnostic.exact_retries,
+        diagnostic.failures,
+        diagnostic.max_cohort_size,
+        diagnostic.singleton_fallbacks,
+    );
+    (
+        usize::try_from(diagnostic.collected).unwrap_or(APPLICATION_COMMAND_BUDGET),
+        diagnostic.accepted_new > 0,
+    )
+}
+
+struct PendingNumberedEventPublication {
+    request: NumberedEventPublishRequest,
+    options: EventPublishOptions,
+    response:
+        oneshot::Sender<Result<NumberedEventPublishOutcome, crate::application::ApplicationError>>,
+}
+
+// Ownership must return the unmatched command intact so FIFO can retain it;
+// boxing would add an allocation to every non-publication actor command.
+#[allow(clippy::result_large_err)]
+fn ordinary_numbered_event_publication(
+    command: SelectedApplicationCommand,
+) -> Result<PendingNumberedEventPublication, SelectedApplicationCommand> {
+    match command {
+        SelectedApplicationCommand::Event(SelectedEventCommand::PublishNumbered {
+            request,
+            options,
+            response,
+        }) if request.priority != Priority::Flash => Ok(PendingNumberedEventPublication {
+            request,
+            options,
+            response,
+        }),
+        command => Err(command),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_selected_numbered_command_coalesced(
+    events: &mut SelectedEventNode,
+    state: &mut SelectedStateNode,
+    records: &mut SelectedRecordNode,
+    blobs: &mpsc::Sender<SelectedBlobCommand>,
+    store: &Store,
+    emission_policy: &LiveEmissionPolicy,
+    status: &mut SelectedEventStatusTracker,
+    receipt: &NodeReceipt,
+    command: SelectedApplicationCommand,
+    commands: &mut mpsc::Receiver<SelectedApplicationCommand>,
+    commands_open: &mut bool,
+    pending: &mut Option<SelectedApplicationCommand>,
+    group_sequence: &mut u64,
+    max_group_size: usize,
+    #[cfg(all(test, unix))] execution_gate: &mut Option<(
+        Arc<std::sync::Barrier>,
+        Arc<std::sync::Barrier>,
+    )>,
+) -> (usize, bool) {
+    let first = match ordinary_numbered_event_publication(command) {
+        Ok(first) => first,
+        Err(command) => {
+            let new_event_inserted = execute_selected_application_command(
+                events,
+                state,
+                records,
+                blobs,
+                store,
+                emission_policy,
+                status,
+                receipt,
+                command,
+            );
+            return (1, new_event_inserted);
+        }
+    };
+    let mut group = vec![first];
+    while group.len() < max_group_size.max(1) {
+        match commands.try_recv() {
+            Ok(command) => match ordinary_numbered_event_publication(command) {
+                Ok(publication) => group.push(publication),
+                Err(command) => {
+                    *pending = Some(command);
+                    break;
+                }
+            },
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                *commands_open = false;
+                break;
+            }
+        }
+    }
+    #[cfg(all(test, unix))]
+    if let Some((reached, release)) = execution_gate.take() {
+        reached.wait();
+        release.wait();
+    }
+    let Some(sequence) = group_sequence.checked_add(1) else {
+        let processed = group.len();
+        for publication in group {
+            let _ = publication
+                .response
+                .send(Err(crate::application::actor_unavailable("publish")));
+        }
+        return (processed, false);
+    };
+    *group_sequence = sequence;
+    let publications = group
+        .iter()
+        .map(|publication| (publication.request.clone(), publication.options))
+        .collect::<Vec<_>>();
+    let result = if status.operation_audit.state == EventOperationAuditState::Failed {
+        let collected = u64::try_from(group.len()).unwrap_or(u64::MAX);
+        crate::application::NumberedEventPublicationGroupResult {
+            results: (0..group.len())
+                .map(|_| Err(crate::application::actor_unavailable("publish")))
+                .collect(),
+            diagnostic: EventPublicationGroupDiagnostic {
+                collected,
+                failures: collected,
+                ..EventPublicationGroupDiagnostic::default()
+            },
+        }
+    } else {
+        status.observe_operation_commit(store, || {
+            events.publish_numbered_group_with_options(publications)
+        })
     };
     let diagnostic = result.diagnostic;
     for (publication, outcome) in group.into_iter().zip(result.results) {

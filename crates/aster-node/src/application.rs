@@ -48,14 +48,15 @@ use crate::{
     runtime::{
         AuthenticatedEventRouteCache, EVENT_OPERATION_CONFLICT, EVENT_OPERATION_RETIRED,
         EventEmissionPolicy, NodeCustodyClock, STORE_FILE, SelectedEventPublish,
-        StartupEventVerification, absolute_path_from, absolute_state_path,
-        cache_accepted_stored_event, drive_custody_maintenance, drive_custody_maintenance_observed,
-        ensure_principal_active, ensure_state_accepts_normal_operation, event_is_inactive,
+        SelectedNumberedEventPublish, StartupEventVerification, absolute_path_from,
+        absolute_state_path, cache_accepted_stored_event, drive_custody_maintenance,
+        drive_custody_maintenance_observed, ensure_principal_active,
+        ensure_state_accepts_normal_operation, event_is_inactive,
         open_startup_event_verifier_and_cache,
         prune_authenticated_event_route_cache_to_sender_projection,
         publish_selected_event_group_once, publish_selected_event_once,
-        publish_selected_event_once_observed, refresh_application_policy,
-        verify_content_stored_claim, verify_stored_claim,
+        publish_selected_event_once_observed, publish_selected_numbered_event_group,
+        refresh_application_policy, verify_content_stored_claim, verify_stored_claim,
     },
 };
 
@@ -297,6 +298,11 @@ impl EventPublicationGroupDiagnostic {
 
 pub(crate) struct EventPublicationGroupResult {
     pub(crate) results: Vec<Result<EventPublishResult, ApplicationError>>,
+    pub(crate) diagnostic: EventPublicationGroupDiagnostic,
+}
+
+pub(crate) struct NumberedEventPublicationGroupResult {
+    pub(crate) results: Vec<Result<NumberedEventPublishOutcome, ApplicationError>>,
     pub(crate) diagnostic: EventPublicationGroupDiagnostic,
 }
 
@@ -2078,6 +2084,150 @@ impl SelectedEventNode {
             .map_err(|error| application_error("acknowledge_publication_result", error.into()))
     }
 
+    pub(crate) fn publish_numbered_group_with_options(
+        &mut self,
+        publications: Vec<(NumberedEventPublishRequest, EventPublishOptions)>,
+    ) -> NumberedEventPublicationGroupResult {
+        let mut diagnostic = EventPublicationGroupDiagnostic {
+            collected: publications.len() as u64,
+            ..Default::default()
+        };
+        let maintenance = drive_custody_maintenance_observed(&self.store, &self.custody_clock, &[]);
+        diagnostic.custody_writer_commits = maintenance.writer_commits;
+        if let Err(error) = maintenance.result {
+            diagnostic.failures = diagnostic.collected;
+            let error = application_error("publish_numbered", error);
+            return NumberedEventPublicationGroupResult {
+                results: publications.into_iter().map(|_| Err(error)).collect(),
+                diagnostic,
+            };
+        }
+        let mut results = Vec::with_capacity(publications.len());
+        let mut start = 0;
+        while start < publications.len() {
+            let first = &publications[start];
+            let finite = first.1.ttl_ms().is_some();
+            let mut end = start + 1;
+            if first.0.priority != Priority::Flash {
+                while end < publications.len()
+                    && publications[end].0.priority != Priority::Flash
+                    && publications[end].0.topic == first.0.topic
+                    && publications[end].0.scope == first.0.scope
+                    && publications[end].1.ttl_ms().is_some() == finite
+                {
+                    end += 1;
+                }
+            }
+            let cohort = &publications[start..end];
+            diagnostic.cohorts += 1;
+            diagnostic.max_cohort_size = diagnostic.max_cohort_size.max(cohort.len() as u64);
+            let policy = self.current_policy("publish_numbered");
+            let sample = if finite {
+                self.custody_clock.sample().ok()
+            } else {
+                None
+            };
+            let grouped = if cohort.len() > 1 && (!finite || sample.is_some()) {
+                if let Ok(policy) = policy {
+                    let selected = cohort
+                        .iter()
+                        .map(|(request, options)| SelectedNumberedEventPublish {
+                            client: &request.client_id,
+                            session: request.session,
+                            sequence: request.sequence,
+                            predecessor: request.predecessor.map(EventId::into_store),
+                            topic: &request.topic,
+                            scope: &request.scope,
+                            priority: request.priority,
+                            ttl_ms: options.ttl_ms(),
+                            custody_sample: sample,
+                            logical_key: &request.logical_key,
+                            payload: &request.payload,
+                            tombstone: request.tombstone,
+                        })
+                        .collect::<Vec<_>>();
+                    publish_selected_numbered_event_group(
+                        &self.store,
+                        &policy,
+                        &mut self.verifier,
+                        &selected,
+                        &mut diagnostic.event_writer_commits,
+                    )
+                    .ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let outcomes = if let Some(outcomes) = grouped {
+                outcomes.into_iter().map(Ok).collect::<Vec<_>>()
+            } else {
+                diagnostic.singleton_fallbacks += cohort.len() as u64;
+                cohort
+                    .iter()
+                    .map(|(request, options)| {
+                        (|| {
+                            if options.ttl_ms().is_some()
+                                && !self.custody_clock.supports_finite_ttl()
+                            {
+                                return Err(ApplicationError::new(
+                                    ApplicationErrorKind::RequestRejected,
+                                    "publish_numbered",
+                                ));
+                            }
+                            let sample = self
+                                .custody_clock
+                                .sample()
+                                .map_err(|error| application_error("publish_numbered", error))?;
+                            let policy = self.current_policy("publish_numbered")?;
+                            let (outcome, commits) =
+                                crate::runtime::publish_selected_numbered_event_once_observed(
+                                    &self.store,
+                                    &policy,
+                                    &mut self.verifier,
+                                    request.clone(),
+                                    *options,
+                                    Some(sample),
+                                );
+                            diagnostic.event_writer_commits += commits;
+                            outcome.map_err(|error| application_error("publish_numbered", error))
+                        })()
+                    })
+                    .collect()
+            };
+            for outcome in outcomes {
+                match &outcome {
+                    Ok(outcome) if outcome.inserted => diagnostic.accepted_new += 1,
+                    Ok(_) => diagnostic.exact_retries += 1,
+                    Err(_) => diagnostic.failures += 1,
+                }
+                let outcome = outcome.and_then(|outcome| {
+                    let policy = self.current_policy("publish_numbered")?;
+                    if let Some(StoredEventTransfer::Accepted(stored)) = self
+                        .store
+                        .get_transfer_with_policy(&policy, outcome.result.receipt.transfer_id)
+                        .map_err(|error| application_error("publish_numbered", error.into()))?
+                    {
+                        cache_accepted_stored_event(
+                            &self.event_route_cache,
+                            &mut self.verifier,
+                            &stored,
+                        )
+                        .map_err(|error| application_error("publish_numbered", error))?;
+                    }
+                    Ok(outcome)
+                });
+                results.push(outcome);
+            }
+            start = end;
+        }
+        NumberedEventPublicationGroupResult {
+            results,
+            diagnostic,
+        }
+    }
+
     pub fn publish_numbered(
         &mut self,
         request: NumberedEventPublishRequest,
@@ -3552,6 +3702,139 @@ mod tests {
             payload: payload.to_vec(),
             tombstone: false,
         }
+    }
+
+    #[test]
+    fn numbered_publication_group_commits_contiguous_results_in_one_writer() {
+        let root = TestRoot::new("numbered-publication-group");
+        let mut node = selected_node(&root);
+        let client = EventClientId::new(b"group-client".to_vec()).unwrap();
+        let recovery = node
+            .begin_publication_session(&client, 0, b"group-session")
+            .unwrap();
+        node.complete_publication_recovery(&client, recovery.session, recovery.snapshot_revision)
+            .unwrap();
+        let publications = vec![
+            (
+                numbered_request(&client, recovery.session, 1, b"first"),
+                EventPublishOptions::durable(),
+            ),
+            (
+                numbered_request(&client, recovery.session, 2, b"second"),
+                EventPublishOptions::durable(),
+            ),
+        ];
+        let group = node.publish_numbered_group_with_options(publications.clone());
+        assert_eq!(group.diagnostic.event_writer_commits, 1);
+        assert_eq!(group.diagnostic.accepted_new, 2);
+        assert_eq!(group.diagnostic.singleton_fallbacks, 0);
+        let original = group
+            .results
+            .into_iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert!(original.iter().all(|outcome| outcome.inserted));
+        assert_eq!(original[0].result.sequence.get(), 1);
+        assert_eq!(original[1].result.sequence.get(), 2);
+        let retry = node.publish_numbered_group_with_options(publications);
+        assert_eq!(retry.diagnostic.exact_retries, 2);
+        assert_eq!(retry.diagnostic.event_writer_commits, 0);
+        for (retry, original) in retry.results.into_iter().zip(original) {
+            let retry = retry.unwrap();
+            assert!(!retry.inserted);
+            assert_eq!(retry.result, original.result);
+        }
+    }
+
+    #[test]
+    fn numbered_group_rolls_back_before_ordered_singleton_failure_isolation() {
+        let root = TestRoot::new("numbered-group-gap");
+        let mut node = selected_node(&root);
+        let client = EventClientId::new(b"gap-client".to_vec()).unwrap();
+        let recovery = node
+            .begin_publication_session(&client, 0, b"gap-session")
+            .unwrap();
+        node.complete_publication_recovery(&client, recovery.session, recovery.snapshot_revision)
+            .unwrap();
+        let group = node.publish_numbered_group_with_options(vec![
+            (
+                numbered_request(&client, recovery.session, 1, b"first"),
+                EventPublishOptions::durable(),
+            ),
+            (
+                numbered_request(&client, recovery.session, 3, b"gap"),
+                EventPublishOptions::durable(),
+            ),
+        ]);
+        assert!(
+            group.results[0].as_ref().unwrap().inserted,
+            "failed shared transaction must not retain first Event"
+        );
+        assert_eq!(
+            group.results[1].as_ref().unwrap_err().kind(),
+            ApplicationErrorKind::SequenceGap
+        );
+        assert_eq!(group.diagnostic.singleton_fallbacks, 2);
+        let next = node
+            .publish_numbered(
+                numbered_request(&client, recovery.session, 2, b"repair"),
+                EventPublishOptions::durable(),
+            )
+            .unwrap();
+        assert!(next.inserted);
+        assert_eq!(next.result.sequence.get(), 2);
+        let page = node.query(EventQuery::default()).unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[1].event_sequence, 2);
+    }
+
+    #[test]
+    fn numbered_group_fences_stale_client_without_blocking_independent_client() {
+        let root = TestRoot::new("numbered-group-fenced");
+        let mut node = selected_node(&root);
+        let a = EventClientId::new(b"client-a".to_vec()).unwrap();
+        let b = EventClientId::new(b"client-b".to_vec()).unwrap();
+        let old_a = node.begin_publication_session(&a, 0, b"first-a").unwrap();
+        node.complete_publication_recovery(&a, old_a.session, old_a.snapshot_revision)
+            .unwrap();
+        let current_a = node
+            .begin_publication_session(&a, old_a.session.get(), b"replacement-a")
+            .unwrap();
+        node.complete_publication_recovery(&a, current_a.session, current_a.snapshot_revision)
+            .unwrap();
+        let current_b = node.begin_publication_session(&b, 0, b"first-b").unwrap();
+        node.complete_publication_recovery(&b, current_b.session, current_b.snapshot_revision)
+            .unwrap();
+        let group = node.publish_numbered_group_with_options(vec![
+            (
+                numbered_request(&a, old_a.session, 1, b"stale"),
+                EventPublishOptions::durable(),
+            ),
+            (
+                numbered_request(&b, current_b.session, 1, b"independent"),
+                EventPublishOptions::durable(),
+            ),
+        ]);
+        assert_eq!(
+            group.results[0].as_ref().unwrap_err().kind(),
+            ApplicationErrorKind::SessionFenced
+        );
+        assert!(group.results[1].as_ref().unwrap().inserted);
+        assert_eq!(group.diagnostic.accepted_new, 1);
+        assert_eq!(group.diagnostic.failures, 1);
+        assert_eq!(group.diagnostic.event_writer_commits, 1);
+        let page = node.query(EventQuery::default()).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].event_sequence, 1);
+        assert_eq!(page.items[0].payload, b"independent");
+        assert!(
+            node.publish_numbered(
+                numbered_request(&a, current_a.session, 1, b"current"),
+                EventPublishOptions::durable()
+            )
+            .unwrap()
+            .inserted
+        );
     }
 
     #[test]

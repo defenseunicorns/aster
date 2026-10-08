@@ -2961,6 +2961,56 @@ impl EventGroupCommitOutcome {
     }
 }
 
+/// One already-reserved, source-verified numbered Event operation prepared for
+/// an ordered durable group commit.
+pub struct ReservedNumberedEventCommit<'a> {
+    request: &'a NumberedEventOperationRequest<'a>,
+    reservation: &'a EventReservation,
+    event: &'a ContentVerifiedEventEnvelope,
+    sealed: &'a [u8],
+}
+
+impl<'a> ReservedNumberedEventCommit<'a> {
+    /// Binds one operation request to its exact reservation and verified bytes.
+    pub const fn new(
+        request: &'a NumberedEventOperationRequest<'a>,
+        reservation: &'a EventReservation,
+        event: &'a ContentVerifiedEventEnvelope,
+        sealed: &'a [u8],
+    ) -> Self {
+        Self {
+            request,
+            reservation,
+            event,
+            sealed,
+        }
+    }
+}
+
+/// Ordered outcomes and exact redb writer-commit count for one Event cohort.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NumberedEventGroupCommitOutcome {
+    outcomes: Vec<NumberedEventPublishOutcome>,
+    writer_commits: u64,
+}
+
+impl NumberedEventGroupCommitOutcome {
+    /// Returns outcomes in the same order as the submitted cohort.
+    pub fn outcomes(&self) -> &[NumberedEventPublishOutcome] {
+        &self.outcomes
+    }
+
+    /// Returns the exact number of redb writer transactions committed.
+    pub const fn writer_commits(&self) -> u64 {
+        self.writer_commits
+    }
+
+    /// Consumes the group result and returns its ordered per-Event outcomes.
+    pub fn into_outcomes(self) -> Vec<NumberedEventPublishOutcome> {
+        self.outcomes
+    }
+}
+
 /// Stable resolution of one durable Event operation mapping.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EventOperationResolution {
@@ -4941,6 +4991,12 @@ impl EventCommitResult {
 pub struct NumberedEventPublishOutcome {
     pub result: NumberedEventResult,
     pub inserted: bool,
+}
+
+/// One numbered publication attempt, including writer commits made before an error.
+pub struct NumberedEventCommitAttempt {
+    pub result: Result<NumberedEventPublishOutcome, StoreError>,
+    pub writer_commits: u64,
 }
 
 struct EventCommit {
@@ -10035,6 +10091,111 @@ impl Store {
         })
     }
 
+    /// Atomically commits an ordered cohort of durable numbered Event operations.
+    pub fn commit_reserved_numbered_event_group_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        commits: &[ReservedNumberedEventCommit<'_>],
+    ) -> Result<NumberedEventGroupCommitOutcome, StoreError> {
+        self.commit_reserved_numbered_event_group_internal(policy, None, commits)
+    }
+
+    /// Atomically commits an ordered cohort of finite numbered Event operations
+    /// under one common commit-adjacent custody checkpoint.
+    pub fn commit_reserved_numbered_event_group_with_custody_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        custody: LocalCustodyCheckpoint,
+        commits: &[ReservedNumberedEventCommit<'_>],
+    ) -> Result<NumberedEventGroupCommitOutcome, StoreError> {
+        self.commit_reserved_numbered_event_group_internal(
+            policy,
+            Some(PendingEventCustody {
+                expected_policy: custody.policy_revision,
+                authenticated_age_ms: 0,
+                sample: Some(custody.sample),
+            }),
+            commits,
+        )
+    }
+
+    fn commit_reserved_numbered_event_group_internal(
+        &self,
+        policy: &ControlPolicySnapshot,
+        custody: Option<PendingEventCustody>,
+        commits: &[ReservedNumberedEventCommit<'_>],
+    ) -> Result<NumberedEventGroupCommitOutcome, StoreError> {
+        self.require_live()?;
+        let first = commits.first().ok_or(StoreError::InvalidSemanticEvent(
+            "Event commit group is empty",
+        ))?;
+        let cohort = (
+            first.reservation.publisher,
+            &first.reservation.topic,
+            &first.reservation.scope,
+        );
+        let mut prepared = Vec::with_capacity(commits.len());
+        for item in commits {
+            if policy != &item.reservation.control_policy {
+                return Err(StoreError::ControlPolicyChanged);
+            }
+            if item.reservation.publisher != cohort.0
+                || &item.reservation.topic != cohort.1
+                || &item.reservation.scope != cohort.2
+            {
+                return Err(StoreError::InvalidSemanticEvent(
+                    "Event commit group crosses a publisher, topic, or scope boundary",
+                ));
+            }
+            let event = match custody {
+                Some(_) => PreparedEvent::from_verified_with_custody(
+                    item.event,
+                    item.sealed,
+                    EventOrigin::Local,
+                )?,
+                None => PreparedEvent::from_verified(item.event, item.sealed, EventOrigin::Local)?,
+            };
+            self.require_mission_authority(event.mission_authority)?;
+            let operation =
+                prepare_numbered_event_operation(item.request, item.event, &event.header)?;
+            prepared.push((event, operation, item.reservation));
+        }
+
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        let mut outcomes = Vec::with_capacity(prepared.len());
+        let mut commit_required = false;
+        for (event, operation, reservation) in &prepared {
+            match self.stage_prepared_event(
+                &write,
+                event,
+                Some(reservation),
+                Some(PendingEventOperation::Numbered(*operation)),
+                EventAdmissionGuard::Control(policy),
+                custody,
+            )? {
+                PreparedEventStage::NoCommit(outcome) => {
+                    outcomes.push(numbered_event_outcome(outcome)?);
+                }
+                PreparedEventStage::Commit(outcome) => {
+                    commit_required = true;
+                    outcomes.push(numbered_event_outcome(outcome)?);
+                }
+                PreparedEventStage::CommitError(error) => return Err(error),
+            }
+        }
+        let writer_commits = if commit_required {
+            write.commit()?;
+            1
+        } else {
+            0
+        };
+        Ok(NumberedEventGroupCommitOutcome {
+            outcomes,
+            writer_commits,
+        })
+    }
+
     /// Atomically commits one numbered local Event and its recoverable result.
     pub fn commit_reserved_numbered_event_with_policy(
         &self,
@@ -10044,19 +10205,46 @@ impl Store {
         event: &ContentVerifiedEventEnvelope,
         sealed: &[u8],
     ) -> Result<NumberedEventPublishOutcome, StoreError> {
-        self.require_live()?;
-        if policy != &reservation.control_policy {
-            return Err(StoreError::ControlPolicyChanged);
+        self.commit_reserved_numbered_event_with_policy_observed(
+            policy,
+            request,
+            reservation,
+            event,
+            sealed,
+        )
+        .result
+    }
+
+    /// Reports durable writer commits even when the numbered attempt fails.
+    pub fn commit_reserved_numbered_event_with_policy_observed(
+        &self,
+        policy: &ControlPolicySnapshot,
+        request: &NumberedEventOperationRequest<'_>,
+        reservation: &EventReservation,
+        event: &ContentVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> NumberedEventCommitAttempt {
+        let mut writer_commits = 0;
+        let result = (|| {
+            self.require_live()?;
+            if policy != &reservation.control_policy {
+                return Err(StoreError::ControlPolicyChanged);
+            }
+            let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Local)?;
+            let operation = prepare_numbered_event_operation(request, event, &prepared.header)?;
+            numbered_event_outcome(self.commit_prepared_event_counted(
+                &prepared,
+                Some(reservation),
+                Some(PendingEventOperation::Numbered(operation)),
+                EventAdmissionGuard::Control(policy),
+                None,
+                &mut writer_commits,
+            )?)
+        })();
+        NumberedEventCommitAttempt {
+            result,
+            writer_commits,
         }
-        let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Local)?;
-        let operation = prepare_numbered_event_operation(request, event, &prepared.header)?;
-        numbered_event_outcome(self.commit_prepared_event(
-            &prepared,
-            Some(reservation),
-            Some(PendingEventOperation::Numbered(operation)),
-            EventAdmissionGuard::Control(policy),
-            None,
-        )?)
     }
 
     /// Atomically commits one finite numbered Event, its age checkpoint, and result.
@@ -10069,24 +10257,53 @@ impl Store {
         event: &ContentVerifiedEventEnvelope,
         sealed: &[u8],
     ) -> Result<NumberedEventPublishOutcome, StoreError> {
-        self.require_live()?;
-        if policy != &reservation.control_policy {
-            return Err(StoreError::ControlPolicyChanged);
+        self.commit_reserved_numbered_event_with_custody_policy_observed(
+            policy,
+            custody,
+            request,
+            reservation,
+            event,
+            sealed,
+        )
+        .result
+    }
+
+    /// Reports durable writer commits even when the numbered attempt fails.
+    pub fn commit_reserved_numbered_event_with_custody_policy_observed(
+        &self,
+        policy: &ControlPolicySnapshot,
+        custody: LocalCustodyCheckpoint,
+        request: &NumberedEventOperationRequest<'_>,
+        reservation: &EventReservation,
+        event: &ContentVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> NumberedEventCommitAttempt {
+        let mut writer_commits = 0;
+        let result = (|| {
+            self.require_live()?;
+            if policy != &reservation.control_policy {
+                return Err(StoreError::ControlPolicyChanged);
+            }
+            let prepared =
+                PreparedEvent::from_verified_with_custody(event, sealed, EventOrigin::Local)?;
+            let operation = prepare_numbered_event_operation(request, event, &prepared.header)?;
+            numbered_event_outcome(self.commit_prepared_event_counted(
+                &prepared,
+                Some(reservation),
+                Some(PendingEventOperation::Numbered(operation)),
+                EventAdmissionGuard::Control(policy),
+                Some(PendingEventCustody {
+                    expected_policy: custody.policy_revision,
+                    authenticated_age_ms: 0,
+                    sample: Some(custody.sample),
+                }),
+                &mut writer_commits,
+            )?)
+        })();
+        NumberedEventCommitAttempt {
+            result,
+            writer_commits,
         }
-        let prepared =
-            PreparedEvent::from_verified_with_custody(event, sealed, EventOrigin::Local)?;
-        let operation = prepare_numbered_event_operation(request, event, &prepared.header)?;
-        numbered_event_outcome(self.commit_prepared_event(
-            &prepared,
-            Some(reservation),
-            Some(PendingEventOperation::Numbered(operation)),
-            EventAdmissionGuard::Control(policy),
-            Some(PendingEventCustody {
-                expected_policy: custody.policy_revision,
-                authenticated_age_ms: 0,
-                sample: Some(custody.sample),
-            }),
-        )?)
     }
 
     /// Compares a request with its mission-bound commitment before resolving
