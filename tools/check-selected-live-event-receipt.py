@@ -2003,6 +2003,40 @@ def validate_terminal_stdout(
 
 
 
+def validate_publication_diagnostics(data: bytes, *, inserted: int, retries: int, failures: int) -> None:
+    keys = ("group_sequence", "collected", "cohorts", "custody_writer_commits", "event_writer_commits",
+            "total_writer_commits", "accepted_new", "exact_retries", "failures", "max_cohort_size", "singleton_fallbacks")
+    if len(data) > STDERR_MAX_BYTES or not data.endswith(b"\n"):
+        fail("publication diagnostics are missing or exceed their bound")
+    totals = [0, 0, 0]
+    try:
+        lines = data.decode("ascii", errors="strict").splitlines()
+    except UnicodeError:
+        fail("publication diagnostics are not canonical ASCII")
+    if len(lines) != inserted + retries + failures:
+        fail("publication diagnostic count differs from the sequential producer")
+    for sequence, line in enumerate(lines, 1):
+        fields = line.split(" ")
+        if fields[0] != "event_publication_group" or len(fields) != len(keys) + 1:
+            fail("stderr contains an unclassified diagnostic")
+        values = {}
+        for key, field in zip(keys, fields[1:]):
+            name, separator, value = field.partition("=")
+            if name != key or separator != "=" or re.fullmatch(r"0|[1-9][0-9]{0,19}", value) is None or int(value) >= 2**64:
+                fail("publication diagnostic field is noncanonical")
+            values[key] = int(value)
+        if (values["group_sequence"] != sequence or values["collected"] != 1 or values["cohorts"] != 1
+                or values["max_cohort_size"] != 1 or values["singleton_fallbacks"] != 1
+                or values["total_writer_commits"] != values["custody_writer_commits"] + values["event_writer_commits"]
+                or values["accepted_new"] + values["exact_retries"] + values["failures"] != 1
+                or (values["accepted_new"] and not values["event_writer_commits"])):
+            fail("publication diagnostic accounting differs from its admitted outcome")
+        for index, key in enumerate(("accepted_new", "exact_retries", "failures")):
+            totals[index] += values[key]
+    if totals != [inserted, retries, failures]:
+        fail("publication diagnostic outcomes differ from the producer scenario")
+
+
 def validate_artifact_record(
     value: Any,
     label: str,
@@ -2240,8 +2274,7 @@ def validate_raw_root(root: Path, source_authority: dict[str, Any]) -> dict[str,
                 fail(f"public artifact {relative} changed after inventory inspection")
         if not binary:
             fail("copied release executable is empty")
-        if stderr != b"":
-            fail("captured stderr is nonempty and has no selected acceptance classification")
+        validate_publication_diagnostics(stderr, inserted=3, retries=1, failures=1)
         transcript_facts = validate_transcript(transcript)
         terminal_facts = validate_terminal_stdout(stdout, transcript, root, transcript_facts)
         document = load_canonical_json(run_data, "run metadata", RUN_JSON_MAX_BYTES)
@@ -2719,7 +2752,7 @@ def build_receipt(source: dict[str, Any], evidence: dict[str, Any]) -> dict[str,
             "stderr": {
                 "bytes": run["artifacts"]["stderr"]["bytes"],
                 "sha256": run["artifacts"]["stderr"]["sha256"],
-                "classification": "exact-empty",
+                "classification": "exact-bounded-numbered-publication-diagnostics",
             },
             "transcript": {
                 "records": transcript["records"],

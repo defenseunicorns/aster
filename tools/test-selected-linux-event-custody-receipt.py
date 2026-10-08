@@ -108,6 +108,13 @@ def mutate(lines: list[str], index: int, key: str, value: str) -> list[str]:
 
 
 class TranscriptContractTests(unittest.TestCase):
+    def test_numbered_publication_diagnostics_are_exact_and_bounded(self) -> None:
+        data = "".join(f"event_publication_group group_sequence={sequence} collected=1 cohorts=1 custody_writer_commits=1 event_writer_commits=1 total_writer_commits=2 accepted_new=1 exact_retries=0 failures=0 max_cohort_size=1 singleton_fallbacks=1\n" for sequence in range(1,5)).encode()
+        CHECKER.validate_stderr(data, {})
+        for invalid in (b"", data + b"unknown diagnostic\n", data.replace(b"total_writer_commits=2", b"total_writer_commits=1", 1)):
+            with self.assertRaises(CHECKER.ReceiptViolation):
+                CHECKER.validate_stderr(invalid, {})
+
     def test_historical_v1_transcript_stays_distinct_from_numbered_v2(self) -> None:
         path = Path(__file__).parent / "historical/check-selected-linux-event-custody-receipt.py"
         spec = importlib.util.spec_from_file_location("historical_linux_custody", path)

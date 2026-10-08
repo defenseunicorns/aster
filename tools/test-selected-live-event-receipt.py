@@ -647,6 +647,13 @@ def child_tsv(kind: str, keys: tuple[str, ...], values: dict[str, str]) -> str:
     )
 
 
+def publication_diagnostics() -> bytes:
+    lines = []
+    for sequence, (inserted, retry, failure) in enumerate(((1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 0, 0), (1, 0, 0)), 1):
+        lines.append(f"event_publication_group group_sequence={sequence} collected=1 cohorts=1 custody_writer_commits=1 event_writer_commits={inserted} total_writer_commits={1+inserted} accepted_new={inserted} exact_retries={retry} failures={failure} max_cohort_size=1 singleton_fallbacks=1\n")
+    return "".join(lines).encode()
+
+
 class Fixture:
     def __init__(self, parent: Path) -> None:
         self.parent = parent
@@ -1553,7 +1560,7 @@ class Fixture:
         )
         self._write("transcript.tsv", transcript, 0o600)
         self._write("stdout.log", stdout, 0o600)
-        self._write("stderr.log", b"", 0o600)
+        self._write("stderr.log", publication_diagnostics(), 0o600)
         admitted = [
             {"path": path, **self.source["admitted"][path]}
             for path in ORACLE_ADMITTED_PATHS
@@ -1594,7 +1601,7 @@ class Fixture:
                     "binary/aster-live-event-acceptance", self.binary
                 ),
                 "stdout": self._artifact("stdout.log", stdout),
-                "stderr": self._artifact("stderr.log", b""),
+                "stderr": self._artifact("stderr.log", publication_diagnostics()),
                 "transcript": self._artifact("transcript.tsv", transcript),
             },
             "inventory": self.inventory_document(),
@@ -1647,6 +1654,13 @@ class SelectedLiveEventReceiptTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(dir=TEST_TEMP_PARENT)
         self.fixture = Fixture(Path(self.temporary.name))
+
+    def test_publication_diagnostics_reject_missing_extra_and_changed_accounting(self) -> None:
+        valid = publication_diagnostics()
+        CHECKER.validate_publication_diagnostics(valid, inserted=3, retries=1, failures=1)
+        for invalid in (b"", valid + b"\xff\n", valid + b"secret=leaked\n", valid.replace(b"accepted_new=1", b"accepted_new=2", 1), valid.replace(b"group_sequence=2", b"group_sequence=1", 1), valid.replace(b"event_writer_commits=1", b"event_writer_commits=0", 1)):
+            with self.assertRaises(CHECKER.ReceiptViolation):
+                CHECKER.validate_publication_diagnostics(invalid, inserted=3, retries=1, failures=1)
 
     def test_historical_v1_transcript_stays_distinct_from_numbered_v2(self) -> None:
         path = Path(__file__).parent / "historical/check-selected-live-event-receipt.py"

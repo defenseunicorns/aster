@@ -415,8 +415,7 @@ def validate_stdout(data: bytes, transcript: bytes, runtime_facts: bytes, transc
 
 def validate_stderr(data: bytes, transcript_facts: dict[str, Any]) -> dict[str, Any]:
     del transcript_facts
-    if data:
-        fail("captured stderr is nonempty and therefore not a passing run")
+    BASE.validate_publication_diagnostics(data, inserted=4, retries=0, failures=0)
     return {"contacts": 0, "sensitive": set()}
 
 

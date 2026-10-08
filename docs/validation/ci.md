@@ -1089,7 +1089,9 @@ python3 tools/check-selected-live-event-receipt.py - \
 
 Current native Event and Linux custody captures use v2 receipts with an explicit
 `numbered-v1` publication model and one private publication journal. The journal
-is included in the exact inventory and inspected only by metadata. The v1
+is included in the exact inventory and inspected only by metadata. V2 also
+classifies the exact bounded publication diagnostics retained from pipelining;
+unknown stderr and inconsistent outcome or writer accounting fail validation. The v1
 receipts retained below describe their original execution; use
 `--historical-v1` to invoke the frozen verifier without relabeling them. No new
 physical or performance qualification follows from this producer migration.
