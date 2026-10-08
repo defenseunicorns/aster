@@ -40,8 +40,13 @@ cargo run --locked -p aster-node --bin aster -- \
 cargo run --locked -p aster-node --example custody_application -- \
   "$ASTER_CUSTODY_ROOT/mesh/node-0" \
   "$ASTER_CUSTODY_ROOT/mesh/node-0/mission.unprotected-reference.bundle" \
-  demo/mesh mesh.ping-pong
+  demo/mesh mesh.ping-pong --initialize-publication-journal
 ```
+
+Initialize the private application journal once with the flag above. On later
+runs, omit the flag and retain the same state directory and journal. Recovery
+precedes publication; failed or uncertain work retains its full intent. A
+completed run advances the numbered sequence without adding a client identity.
 
 On Linux, the output reports `finite_ttl_ms=60000` and
 `authenticated_ttl_ms=Some(60000)`. On other platforms the example states the

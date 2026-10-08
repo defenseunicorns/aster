@@ -45,7 +45,7 @@ cargo run --locked -p aster-node --bin aster -- \
 cargo run --locked -p aster-node --example live_event_application -- \
   "$ASTER_EVENT_ROOT/mesh/node-0" \
   "$ASTER_EVENT_ROOT/mesh/node-0/mission.unprotected-reference.bundle" \
-  demo/mesh mesh.ping-pong
+  demo/mesh mesh.ping-pong --initialize-publication-journal
 ```
 
 Among the runtime lifecycle lines, expect one application line shaped like:
@@ -59,12 +59,12 @@ already populated the topic. The example filters its query to the local
 publisher, acknowledges every returned delivery, reports only gaps anchored by
 freshly verified local observations, unsubscribes, and gracefully shuts down.
 
-Run the same example again. Its fixed publication operation key makes publish
-idempotent, so `inserted=false` and the original Event identity returns. Because
-the example deliberately unsubscribes at the end, the next subscribe is a new
-replacement selector with a new delivery ledger; existing matching Events can
-therefore be delivered again. This is replacement behavior, not a subscription
-update claim.
+For subsequent runs, omit `--initialize-publication-journal`. The example opens
+its existing private journal, fences the previous session, and recovers a pending
+full intent before new work. A failed or uncertain publication stays pending;
+repair it rather than deleting the journal or changing the client identity.
+Each completed run allocates the next sequence and publishes a new Event. The
+subscription still uses a stable selector key and is removed at shutdown.
 
 The fixture persists explicitly unprotected reference mission bundles. They are
 suitable for this disposable demonstration, not operational provisioning.
