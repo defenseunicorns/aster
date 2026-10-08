@@ -12,7 +12,7 @@ use std::{
 use aster_agent::{
     BoundAgent, ClientToken,
     proto::aster::application::v1alpha1 as api,
-    sdk::{NumberedEventSdk, PipelinedEventPublisher, PublicationJournal, RecoveredState},
+    sdk::{NumberedEventSdk, PublicationJournal, RecoveredState},
 };
 use aster_node::mission::UnprotectedReferenceMission;
 use aster_node::{MutableSourceInterests, NodeApplication, NodeConfig, start_node};
@@ -262,9 +262,10 @@ fn connect_client_uses_the_real_live_event_authority() {
         assert_eq!(row.scope, "mission/team/alpha");
         assert!(!row.include_descendant_scopes);
 
+        claim_rpc_fixture(&client).await;
         let published = client
-            .publish_event(api::PublishEventRequest {
-                operation_key: b"connect-real-publication".to_vec(),
+            .publish_numbered_event(api::PublishNumberedEventRequest {
+                client_id: b"rpc-fixture".to_vec(), session: 1, operation_sequence: 1,
                 topic: "chat.events".to_owned(),
                 scope: "mission/team/alpha".to_owned(),
                 priority: api::Priority::Immediate.into(),
@@ -276,7 +277,7 @@ fn connect_client_uses_the_real_live_event_authority() {
             .expect("publish through ConnectRPC")
             .into_owned();
         assert!(published.inserted);
-        assert_eq!(published.id.len(), 32);
+        assert_eq!(published.result.as_option().unwrap().receipt.as_option().unwrap().event_id.len(), 32);
 
         let page = client
             .poll_events(api::PollEventsRequest {
@@ -293,14 +294,14 @@ fn connect_client_uses_the_real_live_event_authority() {
             .event
             .as_option()
             .expect("delivery event");
-        assert_eq!(event.id, published.id);
+        assert_eq!(event.id, published.result.as_option().unwrap().receipt.as_option().unwrap().event_id);
         assert_eq!(event.payload, b"offline-first through ConnectRPC");
         assert_eq!(page.deliveries[0].attempt, 1);
 
         let acknowledgement = client
             .acknowledge_event(api::AcknowledgeEventRequest {
                 subscription_id: subscription.subscription_id.clone(),
-                event_id: published.id,
+                event_id: published.result.as_option().unwrap().receipt.as_option().unwrap().event_id.clone(),
                 ..Default::default()
             })
             .await
@@ -319,8 +320,8 @@ fn connect_client_uses_the_real_live_event_authority() {
             .await
             .expect("start durable delivery stream");
         let streamed_publication = client
-            .publish_event(api::PublishEventRequest {
-                operation_key: b"connect-stream-publication".to_vec(),
+            .publish_numbered_event(api::PublishNumberedEventRequest {
+                client_id: b"rpc-fixture".to_vec(), session: 1, operation_sequence: 2,
                 topic: "chat.events".to_owned(),
                 scope: "mission/team/alpha".to_owned(),
                 priority: api::Priority::Routine.into(),
@@ -340,7 +341,7 @@ fn connect_client_uses_the_real_live_event_authority() {
         assert_eq!(streamed.attempt, 1);
         assert_eq!(
             streamed.event.as_option().expect("streamed event").id,
-            streamed_publication.id
+            streamed_publication.result.as_option().unwrap().receipt.as_option().unwrap().event_id
         );
         drop(stream);
 
@@ -362,38 +363,27 @@ fn connect_client_uses_the_real_live_event_authority() {
                 .as_option()
                 .expect("redelivered event")
                 .id,
-            streamed_publication.id
+            streamed_publication.result.as_option().unwrap().receipt.as_option().unwrap().event_id
         );
         client
             .acknowledge_event(api::AcknowledgeEventRequest {
                 subscription_id: subscription.subscription_id,
-                event_id: streamed_publication.id,
+                event_id: streamed_publication.result.as_option().unwrap().receipt.as_option().unwrap().event_id.clone(),
                 ..Default::default()
             })
             .await
             .expect("acknowledge redelivery");
 
-        let pipelined = PipelinedEventPublisher::new(client.clone(), 1)
-            .publish_all(
-                (0_u8..2)
-                    .map(|suffix| api::PublishEventRequest {
-                        operation_key: format!("real-node-pipelined/{suffix}").into_bytes(),
-                        topic: "chat.events".to_owned(),
-                        scope: "mission/team/alpha".to_owned(),
-                        priority: api::Priority::Routine.into(),
-                        logical_key: vec![suffix],
-                        payload: vec![suffix],
-                        ..Default::default()
-                    })
-                    .collect(),
-            )
-            .await
-            .expect("publish pipelined Events through the real agent");
+        let path = state.0.join("delivery-pipeline.redb");
+        PublicationJournal::initialize(&path, b"delivery-pipeline-fixture").unwrap();
+        let sdk = NumberedEventSdk::open(client.clone(), &path, b"delivery-pipeline-fixture").unwrap();
+        sdk.recover().await.unwrap();
+        let sequences = (0_u8..2).map(|suffix| sdk.journal_publication(api::PublishNumberedEventRequest {
+            topic: "chat.events".to_owned(), scope: "mission/team/alpha".to_owned(), priority: api::Priority::Routine.into(),
+            logical_key: vec![suffix], payload: vec![suffix], ..Default::default()
+        }).unwrap()).collect::<Vec<_>>();
+        let pipelined = sdk.publish_journaled_pipeline(&sequences, 1).await.unwrap();
         assert_eq!(pipelined.len(), 2);
-        assert!(pipelined.into_iter().all(|response| matches!(
-            response.outcome,
-            Some(api::publish_events_response::Outcome::Published(_))
-        )));
 
         shutdown_tx.send(true).expect("request agent shutdown");
         tokio::time::timeout(Duration::from_secs(5), server)
@@ -458,12 +448,15 @@ async fn query_filters_preserve_scan_cursors_across_empty_rpc_pages() {
     assert!(empty.events.is_empty());
     assert_eq!(empty.scanned_through, 0);
     assert!(!empty.has_more);
+    claim_rpc_fixture(&client).await;
     let mut published = Vec::new();
     for index in 1..=7 {
         published.push(
             client
-                .publish_event(api::PublishEventRequest {
-                    operation_key: format!("query/{index}").into_bytes(),
+                .publish_numbered_event(api::PublishNumberedEventRequest {
+                    client_id: b"rpc-fixture".to_vec(),
+                    session: 1,
+                    operation_sequence: index,
                     topic: "chat.events".to_owned(),
                     scope: "mission/team/alpha".to_owned(),
                     priority: api::Priority::Routine.into(),
@@ -478,7 +471,14 @@ async fn query_filters_preserve_scan_cursors_across_empty_rpc_pages() {
                 .await
                 .unwrap()
                 .into_owned()
-                .id,
+                .result
+                .as_option()
+                .unwrap()
+                .receipt
+                .as_option()
+                .unwrap()
+                .event_id
+                .clone(),
         );
     }
     // Decode field 8 directly to pin its wire number and exercise forwarding
@@ -805,8 +805,11 @@ async fn optional_event_ttl_is_enforced_by_the_live_agent() {
             format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
         ),
     );
-    let mut request = api::PublishEventRequest {
-        operation_key: b"ttl-publication".to_vec(),
+    claim_rpc_fixture(&client).await;
+    let mut request = api::PublishNumberedEventRequest {
+        client_id: b"rpc-fixture".to_vec(),
+        session: 1,
+        operation_sequence: 1,
         topic: "chat.events".to_owned(),
         scope: "mission/team/alpha".to_owned(),
         priority: api::Priority::Routine.into(),
@@ -817,7 +820,7 @@ async fn optional_event_ttl_is_enforced_by_the_live_agent() {
     };
     assert_eq!(
         client
-            .publish_event(request.clone())
+            .publish_numbered_event(request.clone())
             .await
             .unwrap_err()
             .code,
@@ -827,7 +830,7 @@ async fn optional_event_ttl_is_enforced_by_the_live_agent() {
     request.tombstone = true;
     assert_eq!(
         client
-            .publish_event(request.clone())
+            .publish_numbered_event(request.clone())
             .await
             .unwrap_err()
             .code,
@@ -837,7 +840,7 @@ async fn optional_event_ttl_is_enforced_by_the_live_agent() {
     #[cfg(not(target_os = "linux"))]
     assert_eq!(
         client
-            .publish_event(request.clone())
+            .publish_numbered_event(request.clone())
             .await
             .unwrap_err()
             .code,
@@ -856,22 +859,43 @@ async fn optional_event_ttl_is_enforced_by_the_live_agent() {
             .unwrap()
             .into_owned();
         let published = client
-            .publish_event(request.clone())
+            .publish_numbered_event(request.clone())
             .await
             .unwrap()
             .into_owned();
-        assert_eq!(published.ttl_ms, request.ttl_ms);
+        assert_eq!(request.ttl_ms, Some(TEST_TTL_MS));
         let retry = client
-            .publish_event(request.clone())
+            .publish_numbered_event(request.clone())
             .await
             .unwrap()
             .into_owned();
-        assert_eq!(retry.id, published.id);
+        assert_eq!(
+            retry
+                .result
+                .as_option()
+                .unwrap()
+                .receipt
+                .as_option()
+                .unwrap()
+                .event_id,
+            published
+                .result
+                .as_option()
+                .unwrap()
+                .receipt
+                .as_option()
+                .unwrap()
+                .event_id
+        );
         assert!(!retry.inserted);
         let mut changed = request.clone();
         changed.ttl_ms = Some(TEST_TTL_MS + 1_000);
         assert_eq!(
-            client.publish_event(changed).await.unwrap_err().code,
+            client
+                .publish_numbered_event(changed)
+                .await
+                .unwrap_err()
+                .code,
             ErrorCode::Aborted
         );
         let query = api::QueryEventsRequest {
@@ -926,7 +950,7 @@ async fn optional_event_ttl_is_enforced_by_the_live_agent() {
         );
         assert_eq!(
             client
-                .publish_event(request.clone())
+                .publish_numbered_event(request.clone())
                 .await
                 .unwrap_err()
                 .code,
@@ -954,11 +978,15 @@ async fn optional_event_ttl_is_enforced_by_the_live_agent() {
             1
         );
     }
-    request.operation_key = b"durable-publication".to_vec();
+    request.operation_sequence = if cfg!(target_os = "linux") { 2 } else { 1 };
     request.ttl_ms = None;
-    let durable = client.publish_event(request).await.unwrap().into_owned();
+    let durable = client
+        .publish_numbered_event(request)
+        .await
+        .unwrap()
+        .into_owned();
     assert!(durable.inserted);
-    assert_eq!(durable.ttl_ms, None);
+    assert!(durable.result.as_option().is_some());
     shutdown_tx.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(5), server)
         .await
@@ -1172,4 +1200,31 @@ async fn numbered_sdk_recovers_its_committed_result_across_restart() {
         .expect("agent task")
         .expect("agent serve");
     node.shutdown().await.expect("node shutdown");
+}
+
+async fn claim_rpc_fixture<T>(client: &api::AsterApplicationServiceClient<T>)
+where
+    T: connectrpc::client::ClientTransport,
+    T::ResponseBody: Unpin,
+    <T::ResponseBody as connectrpc::http_body::Body>::Error: std::fmt::Display,
+{
+    let snapshot = client
+        .begin_event_publication_session(api::BeginEventPublicationSessionRequest {
+            client_id: b"rpc-fixture".to_vec(),
+            claim_nonce: b"fixture-initial-claim".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_owned();
+    assert_eq!(snapshot.session, 1);
+    client
+        .complete_event_publication_recovery(api::CompleteEventPublicationRecoveryRequest {
+            client_id: b"rpc-fixture".to_vec(),
+            session: snapshot.session,
+            snapshot_revision: snapshot.snapshot_revision,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
 }

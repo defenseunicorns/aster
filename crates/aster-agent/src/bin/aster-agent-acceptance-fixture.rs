@@ -664,7 +664,7 @@ fn operation_health(
         {
             return Err(FixtureError::Local);
         }
-        EventOperationCapacity::new(
+        EventOperationCapacity::from_legacy_inspection(
             EventOperationStats {
                 records_total: operations.rows,
                 records_active: operations.active_rows,

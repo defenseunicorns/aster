@@ -366,8 +366,6 @@ class RpcFixture:
                     }
                 elif method == "CreateEventSubscription":
                     response = {"subscriptionId": base64.b64encode(b"s" * 32).decode("ascii"), "inserted": True}
-                elif method == "PublishEvent":
-                    response = {"id": event_one["id"], "inserted": True}
                 elif method == "QueryEvents":
                     marker = int(fixture.requests[-1][2].get("afterAcceptanceMarker", "0"))
                     if marker == 0:
