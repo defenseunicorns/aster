@@ -2,7 +2,8 @@
 
 > Clean Room — Privileged
 
-- Baseline: refreshed `origin/main` at `23be27e`
+- Initial baseline: refreshed `origin/main` at `23be27e`
+- Rebased baseline: `origin/main` at `f4f93c6` (PR #52), 2026-10-09
 - Branch: `feature/numbered-publication-switchover`
 - Outcome: one numbered application-publication model, retaining native HTTP/2
   pipelining, shared durable commits, bounded retry/backpressure, finite Event
@@ -17,7 +18,8 @@
 
 PR #54 merged ordinary publication pipelining at `1a356b5`. PR #53 merged
 semantic-v7 receipt-free Event pages and custody authority integration in the
-current baseline. Subscription listing, unsubscribe, query upper-bound,
+initial baseline. PR #52 adds the Compose credential provider and its status
+metadata in the rebased baseline. Subscription listing, unsubscribe, query upper-bound,
 bounded custody maintenance, and send-authorization changes are also present.
 The earlier ownership-plan branch belongs to old history and is not a merge
 base for this work. Preserve current content and retained historical receipts.
@@ -153,7 +155,7 @@ its original exact inventory and empty-stderr boundary. No requirements IDs or
 hash-bound baseline were changed, and no physical-host or performance credit is
 added.
 
-Verification status: strict workspace Clippy and strict normal node/store Clippy
+Initial verification: strict workspace Clippy and strict normal node/store Clippy
 passed. All 1,724 workspace tests passed, with two platform skips; documentation
 tests passed. Fuzz smoke passed all seven macOS-supported targets at 10,000 runs
 each; two systemd targets require Linux. The migrated Connect shell example
@@ -173,3 +175,27 @@ Final gates: `mise run check`, `mise run fuzz-smoke`, generated proto/Go checks,
 applicable real-process smoke tests, and
 `python3 tools/check-implementation-requirements.py` when traceability changes.
 Preserve the hash-bound baseline and historical manifests/receipts.
+
+## Rebase onto PR #52 — 2026-10-09
+
+All 22 switchover commits were replayed onto `f4f93c6`; range comparison preserved
+their changes. Binary descriptor conflicts were resolved by regenerating the
+combined schema and Go clients, preserving credential-generation status and
+numbered-only publication. Configuration, credential loading, runtime provider
+composition and Compose deployment files from PR #52 remain incorporated.
+
+Verification exposed two existing portability issues in the newly merged code.
+Test and non-secret example-plan temporary paths now resolve their macOS aliases
+before passing canonical-path validation. Linux-only credential helpers and
+test fixtures compile only on Linux; public unsupported-platform behavior stays
+available elsewhere. Production path and credential checks were not relaxed,
+and Linux behavior is unchanged by these platform gates.
+
+Post-rebase verification passed: `mise run check` in full, including strict
+workspace Clippy, 1,755 passing workspace tests (two platform skips),
+documentation tests, real playground/hello sessions, Go SIGKILL/restart and
+journal reopening, bindings/conformance, lab tests and reproducible generated
+clients. All seven supported fuzz targets passed 10,000 runs each; two systemd
+targets still require Linux. Requirements trace validation passed with the
+upstream PR #52 additions: 348 baseline IDs and 140 exact selected mappings.
+The earlier Linux process/physical qualification limitations still apply.
