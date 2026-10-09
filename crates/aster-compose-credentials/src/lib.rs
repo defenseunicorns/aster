@@ -4,6 +4,7 @@
 
 mod format;
 mod generation;
+#[cfg(target_os = "linux")]
 mod mountinfo;
 mod secret_file;
 

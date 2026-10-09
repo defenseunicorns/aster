@@ -2,15 +2,17 @@
 
 use std::{
     fs,
-    io::{Read as _, Write as _},
-    net::TcpListener,
     path::{Path, PathBuf},
     process::Command,
-    thread,
 };
 
 #[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    io::{Read as _, Write as _},
+    net::TcpListener,
+    sync::atomic::{AtomicU64, Ordering},
+    thread,
+};
 
 #[cfg(target_os = "linux")]
 use serde_json::Value;
@@ -277,11 +279,13 @@ impl Drop for Fixture {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct OneShotHttp {
     address: String,
     thread: Option<thread::JoinHandle<()>>,
 }
 
+#[cfg(target_os = "linux")]
 impl OneShotHttp {
     fn start(response: &'static str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock health server");
