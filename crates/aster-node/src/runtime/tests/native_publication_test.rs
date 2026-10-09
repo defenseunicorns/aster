@@ -108,8 +108,10 @@ fn native_publication_refuses_missing_or_corrupt_registered_client_checkpoint() 
     let store =
         Store::open_for_mission(state.join(STORE_FILE), mission.mission_authority_id()).unwrap();
     let client = aster_redb_store::EventClientId::new(b"aster.native.ping.v1".to_vec()).unwrap();
+    let mut claim = [0; 32];
+    getrandom::fill(&mut claim).expect("random publication claim");
     let snapshot = store
-        .begin_event_publication_session(&client, 0, b"first-test-claim")
+        .begin_event_publication_session(&client, 0, &claim)
         .unwrap();
     assert!(crate::demo_publication::Journal::open(&store, client.clone()).is_err());
     store
@@ -119,7 +121,7 @@ fn native_publication_refuses_missing_or_corrupt_registered_client_checkpoint() 
     // Both failures happened before a new claim could fence the original owner.
     assert_eq!(
         store
-            .begin_event_publication_session(&client, 0, b"first-test-claim")
+            .begin_event_publication_session(&client, 0, &claim)
             .unwrap()
             .session,
         snapshot.session

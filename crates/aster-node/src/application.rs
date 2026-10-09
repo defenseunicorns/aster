@@ -3754,13 +3754,19 @@ mod tests {
         }
     }
 
+    fn random_publication_claim() -> [u8; 32] {
+        let mut claim = [0; 32];
+        getrandom::fill(&mut claim).expect("random publication claim");
+        claim
+    }
+
     #[test]
     fn numbered_publication_group_commits_contiguous_results_in_one_writer() {
         let root = TestRoot::new("numbered-publication-group");
         let mut node = selected_node(&root);
         let client = EventClientId::new(b"group-client".to_vec()).unwrap();
         let recovery = node
-            .begin_publication_session(&client, 0, b"group-session")
+            .begin_publication_session(&client, 0, &random_publication_claim())
             .unwrap();
         node.complete_publication_recovery(&client, recovery.session, recovery.snapshot_revision)
             .unwrap();
@@ -3802,7 +3808,7 @@ mod tests {
         let mut node = selected_node(&root);
         let client = EventClientId::new(b"gap-client".to_vec()).unwrap();
         let recovery = node
-            .begin_publication_session(&client, 0, b"gap-session")
+            .begin_publication_session(&client, 0, &random_publication_claim())
             .unwrap();
         node.complete_publication_recovery(&client, recovery.session, recovery.snapshot_revision)
             .unwrap();
@@ -3844,15 +3850,19 @@ mod tests {
         let mut node = selected_node(&root);
         let a = EventClientId::new(b"client-a".to_vec()).unwrap();
         let b = EventClientId::new(b"client-b".to_vec()).unwrap();
-        let old_a = node.begin_publication_session(&a, 0, b"first-a").unwrap();
+        let old_a = node
+            .begin_publication_session(&a, 0, &random_publication_claim())
+            .unwrap();
         node.complete_publication_recovery(&a, old_a.session, old_a.snapshot_revision)
             .unwrap();
         let current_a = node
-            .begin_publication_session(&a, old_a.session.get(), b"replacement-a")
+            .begin_publication_session(&a, old_a.session.get(), &random_publication_claim())
             .unwrap();
         node.complete_publication_recovery(&a, current_a.session, current_a.snapshot_revision)
             .unwrap();
-        let current_b = node.begin_publication_session(&b, 0, b"first-b").unwrap();
+        let current_b = node
+            .begin_publication_session(&b, 0, &random_publication_claim())
+            .unwrap();
         node.complete_publication_recovery(&b, current_b.session, current_b.snapshot_revision)
             .unwrap();
         let group = node.publish_numbered_group_with_options(vec![
@@ -4878,7 +4888,7 @@ mod tests {
             let mut node = selected_node(&root);
             node.custody_clock = NodeCustodyClock::injected(clock_id, 0, 0);
             let recovery = node
-                .begin_publication_session(&client, 0, b"initial-claim")
+                .begin_publication_session(&client, 0, &random_publication_claim())
                 .unwrap();
             node.complete_publication_recovery(
                 &client,
@@ -4969,7 +4979,7 @@ mod tests {
         .expect("reopen retired node");
         reopened.custody_clock = NodeCustodyClock::injected(clock_id, 11, 0);
         let recovery = reopened
-            .begin_publication_session(&client, session.get(), b"restart-claim")
+            .begin_publication_session(&client, session.get(), &random_publication_claim())
             .unwrap();
         reopened
             .complete_publication_recovery(&client, recovery.session, recovery.snapshot_revision)
@@ -5017,7 +5027,7 @@ mod tests {
             let mut node = selected_node(&root);
             let client = EventClientId::new(b"subscription-fixture".to_vec()).unwrap();
             let recovery = node
-                .begin_publication_session(&client, 0, b"initial-claim")
+                .begin_publication_session(&client, 0, &random_publication_claim())
                 .unwrap();
             node.complete_publication_recovery(
                 &client,
