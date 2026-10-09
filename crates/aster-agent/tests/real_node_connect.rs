@@ -996,7 +996,9 @@ async fn optional_event_ttl_is_enforced_by_the_live_agent() {
         );
         assert_eq!(operations.retired_rows, 0);
         assert_eq!(operations.numbered_outstanding_results, 1);
-        assert_eq!(operations.numbered_reverse_rows, 0);
+        // The reverse row belongs to the retained result, not live content;
+        // it is removed only when the client acknowledges that result.
+        assert_eq!(operations.numbered_reverse_rows, 1);
     }
     request.operation_sequence = if cfg!(target_os = "linux") { 2 } else { 1 };
     request.ttl_ms = None;
