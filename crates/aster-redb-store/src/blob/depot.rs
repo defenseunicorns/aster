@@ -327,6 +327,19 @@ struct ImportRecord {
     finalized_manifest_digest: Option<[u8; 32]>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct AuditedLifecycleImport {
+    pub(super) variant_id: BlobVariantId,
+    pub(super) physical_lineage: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct MaintenanceImportProjection {
+    pub(super) variant_id: BlobVariantId,
+    pub(super) physical_lineage: [u8; 32],
+    pub(super) finalized: bool,
+}
+
 impl ImportRecord {
     fn from_manifest(
         manifest: &BlobManifest,
@@ -1066,6 +1079,18 @@ impl<'a> BlobDepot<'a> {
             .fetch_add(1, Ordering::Relaxed);
         let write = self.store.database.begin_write()?;
         enforce_live_write(&write)?;
+        super::lifecycle::require_import_lineage(&write, incoming.physical_lineage)?;
+        let owner_binding = incoming
+            .physical_lineage
+            .map(|_| {
+                require_depot_owner_binding_write(
+                    &write,
+                    &self.store.path,
+                    self.store.backing_identity,
+                    self.store.blob_depot_owner_token,
+                )
+            })
+            .transpose()?;
         let existing = load_import_write(&write, incoming.variant_id)?;
         match existing {
             Some(existing) if !existing.matches_manifest(manifest) => {
@@ -1081,7 +1106,18 @@ impl<'a> BlobDepot<'a> {
                     },
                 ));
             }
-            Some(_) => {}
+            Some(_) => {
+                if let (Some(physical_lineage), Some(owner_binding)) =
+                    (incoming.physical_lineage, owner_binding)
+                {
+                    super::lifecycle::require_lineage_fence(
+                        &write,
+                        incoming.variant_id,
+                        physical_lineage,
+                        owner_binding,
+                    )?;
+                }
+            }
             None => {
                 let current = write.open_table(BLOB_IMPORTS)?.len()?;
                 if current >= self.store.blob_depot_limits.max_variants {
@@ -1089,6 +1125,17 @@ impl<'a> BlobDepot<'a> {
                         current,
                         limit: self.store.blob_depot_limits.max_variants,
                     }));
+                }
+                if let (Some(physical_lineage), Some(owner_binding)) =
+                    (incoming.physical_lineage, owner_binding)
+                {
+                    super::lifecycle::ensure_lineage_fence(
+                        &write,
+                        self.store.blob_lifecycle_limits,
+                        incoming.variant_id,
+                        physical_lineage,
+                        owner_binding,
+                    )?;
                 }
                 let encoded = encode_import(&incoming)?;
                 write.open_table(BLOB_IMPORTS)?.insert(
@@ -1735,6 +1782,79 @@ pub(super) fn inspect_depot_metadata_read(
     Ok(stats)
 }
 
+fn lifecycle_import_from_record(
+    variant: BlobVariantId,
+    import: ImportRecord,
+) -> Result<AuditedLifecycleImport, StoreError> {
+    if import.variant_id != variant
+        || import.variant_id != blob_variant_id(import.blob_id, &import.content_group, import.epoch)
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob import key differs from its exact variant identity",
+        )));
+    }
+    let physical_lineage = import.physical_lineage.ok_or_else(|| {
+        blob_error(BlobStoreError::SchemaInvariant(
+            "retained Blob import is missing authenticated physical lineage",
+        ))
+    })?;
+    Ok(AuditedLifecycleImport {
+        variant_id: variant,
+        physical_lineage,
+    })
+}
+
+/// Decodes only the durable import facts needed by bounded maintenance. It
+/// does not inspect chunk metadata or touch the filesystem.
+pub(super) fn maintenance_import_projection(
+    key: &[u8],
+    value: &[u8],
+) -> Result<MaintenanceImportProjection, StoreError> {
+    let import = decode_import(value)?;
+    let finalized = import.finalized_manifest_digest.is_some();
+    let audited = lifecycle_import_from_record(parse_variant_id(key)?, import)?;
+    Ok(MaintenanceImportProjection {
+        variant_id: audited.variant_id,
+        physical_lineage: audited.physical_lineage,
+        finalized,
+    })
+}
+
+/// Returns only the audited import identity and authenticated lineage needed
+/// to construct permanent lifecycle fences.
+pub(super) fn audited_lifecycle_imports_write(
+    write: &redb::WriteTransaction,
+) -> Result<Vec<AuditedLifecycleImport>, StoreError> {
+    let imports = write.open_table(BLOB_IMPORTS)?;
+    imports
+        .iter()?
+        .map(|row| {
+            let (key, value) = row?;
+            lifecycle_import_from_record(
+                parse_variant_id(key.value())?,
+                decode_import(value.value())?,
+            )
+        })
+        .collect()
+}
+
+/// Read-only counterpart to [`audited_lifecycle_imports_write`].
+pub(super) fn audited_lifecycle_imports_read(
+    read: &redb::ReadTransaction,
+) -> Result<Vec<AuditedLifecycleImport>, StoreError> {
+    let imports = read.open_table(BLOB_IMPORTS)?;
+    imports
+        .iter()?
+        .map(|row| {
+            let (key, value) = row?;
+            lifecycle_import_from_record(
+                parse_variant_id(key.value())?,
+                decode_import(value.value())?,
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn depot_owner_token_write(
     write: &redb::WriteTransaction,
 ) -> Result<[u8; 32], StoreError> {
@@ -1916,7 +2036,7 @@ pub(crate) fn bind_depot_owner_write(
     backing_identity: StoreBackingIdentity,
     owner_token: [u8; 32],
     stats: BlobStoreStats,
-) -> Result<(), StoreError> {
+) -> Result<[u8; 32], StoreError> {
     let expected = depot_owner_binding(store_path, backing_identity, owner_token)?;
     let mut depot = write.open_table(BLOB_DEPOT_METADATA)?;
     let fields = depot_owner_binding_fields();
@@ -1947,7 +2067,7 @@ pub(crate) fn bind_depot_owner_write(
                 })?),
             )?;
         }
-        return Ok(());
+        return Ok(expected);
     }
     if values.iter().any(Option::is_none) {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
@@ -1968,15 +2088,36 @@ pub(crate) fn bind_depot_owner_write(
             "database-persisted Blob owner binding differs from its exact path/backing",
         )));
     }
-    Ok(())
+    Ok(expected)
 }
 
-fn require_depot_owner_binding_write(
+/// Returns the already persisted derived owner/backing binding. The caller
+/// receives no path material and cannot supply a path to a durable record.
+pub(super) fn depot_owner_binding_read(
+    read: &redb::ReadTransaction,
+) -> Result<[u8; 32], StoreError> {
+    let table = read.open_table(BLOB_DEPOT_METADATA)?;
+    let mut binding = [0u8; 32];
+    for (index, field) in depot_owner_binding_fields().into_iter().enumerate() {
+        let value = table
+            .get(field)?
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob depot owner binding is incomplete",
+                ))
+            })?
+            .value();
+        binding[index * 8..(index + 1) * 8].copy_from_slice(&value.to_be_bytes());
+    }
+    Ok(binding)
+}
+
+pub(super) fn require_depot_owner_binding_write(
     write: &redb::WriteTransaction,
     store_path: &Path,
     backing_identity: StoreBackingIdentity,
     owner_token: [u8; 32],
-) -> Result<(), StoreError> {
+) -> Result<[u8; 32], StoreError> {
     let table = write.open_table(BLOB_DEPOT_METADATA)?;
     require_depot_owner_binding(
         |field| {
@@ -1996,7 +2137,7 @@ fn require_depot_owner_binding_read(
     store_path: &Path,
     backing_identity: StoreBackingIdentity,
     owner_token: [u8; 32],
-) -> Result<(), StoreError> {
+) -> Result<[u8; 32], StoreError> {
     let table = read.open_table(BLOB_DEPOT_METADATA)?;
     require_depot_owner_binding(
         |field| {
@@ -2043,7 +2184,7 @@ fn require_depot_owner_binding(
     store_path: &Path,
     backing_identity: StoreBackingIdentity,
     owner_token: [u8; 32],
-) -> Result<(), StoreError> {
+) -> Result<[u8; 32], StoreError> {
     let expected = depot_owner_binding(store_path, backing_identity, owner_token)?;
     let mut durable = [0u8; 32];
     for (index, field) in depot_owner_binding_fields().into_iter().enumerate() {
@@ -2059,7 +2200,7 @@ fn require_depot_owner_binding(
             "database-persisted Blob owner binding differs from its exact path/backing",
         )));
     }
-    Ok(())
+    Ok(expected)
 }
 
 pub(crate) fn audit_depot_write(
@@ -2180,6 +2321,27 @@ pub(super) fn audit_publication_import_write(
             "accepted Blob publication is missing its depot import",
         ))
     })?;
+    audit_publication_import_record(
+        &import,
+        variant_id,
+        blob_id,
+        epoch,
+        manifest_digest,
+        chunk_count,
+        physical_lineage,
+    )
+}
+
+pub(super) fn audit_publication_import_evidence(
+    encoded: &[u8],
+    variant_id: BlobVariantId,
+    blob_id: BlobId,
+    epoch: u64,
+    manifest_digest: [u8; 32],
+    chunk_count: u64,
+    physical_lineage: Option<[u8; 32]>,
+) -> Result<(), StoreError> {
+    let import = decode_import(encoded)?;
     audit_publication_import_record(
         &import,
         variant_id,
@@ -3135,6 +3297,24 @@ pub(super) fn corrupt_completion_import_for_test(
             )));
         }
     }
+    let encoded = encode_import(&import)?;
+    write
+        .open_table(BLOB_IMPORTS)?
+        .insert(variant.as_bytes().as_slice(), encoded.as_slice())?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn remove_import_physical_lineage_for_test(
+    write: &redb::WriteTransaction,
+    variant: BlobVariantId,
+) -> Result<(), StoreError> {
+    let mut import = load_import_write(write, variant)?.ok_or_else(|| {
+        blob_error(BlobStoreError::SchemaInvariant(
+            "test Blob import is missing",
+        ))
+    })?;
+    import.physical_lineage = None;
     let encoded = encode_import(&import)?;
     write
         .open_table(BLOB_IMPORTS)?

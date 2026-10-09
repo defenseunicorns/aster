@@ -534,6 +534,16 @@ depot capability, or post-commit verification is `FatalBlobCoherence` and
 terminates the actor after closing application admission; it is not downgraded
 to an ordinary per-request error.
 
+Durable Blob lifecycle authority is local and wire-neutral. Permanent physical-
+lineage fences and accepted-publication replay fences are independently bounded
+by row and canonical encoded-byte caps; publication lifecycle rows have a
+separate row cap. Selected defaults are 65,536 rows/16 MiB per fence class and
+65,536 publication lifecycle rows. Typed variant references distinguish exact
+publication roots from exact pending-source roots. These are non-evictable
+security/accounting records, not TTL or reclamation policy, and semantic-v5
+source, carrier, and result bytes remain unchanged. This increment is durable-
+only: it adds no wire frame or public application operation.
+
 The manifest is the payload of a source-authenticated envelope whose signed
 header commits BlobID, nonzero chunk count, and a route Merkle root. Encrypted
 chunks travel as canonical `ASTRBT01` objects under kind-`2` typed ObjectIDs and
@@ -762,6 +772,17 @@ The subsequent schema-15-to-16 migration likewise rebuilds only
 provenance, and permits v6 provenance across restart. It changes no stable
 source, carrier, bridge authorization, or bridge-route-wrapper bytes.
 
+The selected redb store separately performs an audit-first Blob lifecycle
+migration. A complete predecessor schema is reconstructed before mutation,
+checked against lineage/replay/publication capacities and the paired depot, and
+then gains publication/operation lifecycle wrappers, permanent fences, typed
+variant references, exact accounting, and persistent maintenance cursors in one
+transaction. Failure leaves the predecessor unchanged. A complete current
+schema is audited strictly and bidirectionally on every open; partial current
+groups, missing/orphan relations, noncanonical cursors, and accounting mismatch
+fail rather than being repaired. Read-only predecessor inspection does not
+migrate it.
+
 The v5 protected-frame allocation is `0x6b` BlobInterest, `0x6c`
 BlobInterestReply, Blob class `3` under the existing mutable source tags
 `0x71..0x92`, and `0xa1` BlobRangeFetch, `0xa2` BlobRange, `0xa5`
@@ -865,6 +886,34 @@ and depot completion to agree, installs the ordinary publication/index/counter
 rows, and removes the pending source and prefixes. Failure leaves no partial
 publication; an exact duplicate promotion is idempotent. A completed source is
 served only after the same current policy and lineage checks.
+
+Lifecycle authority changes share the corresponding redb transactions. Local
+admission installs the replay fence, live publication/accounting, typed
+publication root, ordinary indexes, causal authority, and operation result
+atomically. Network staging installs the permanent lineage fence,
+pending-source root, depot plan, pending metadata, and staging accounting
+atomically. Promotion adds replay and publication authority while moving the
+typed root from pending source to publication and removing pending rows in the
+same commit. Terminal abort removes the pending source/prefix visibility and
+its typed root atomically, but retains the non-evictable lineage fence and
+bounded depot import.
+
+The store persists a fair six-class maintenance schedule in eligibility order:
+expired publications/pending sources, invalid pending work, unreferenced local
+import staging, unreferenced completed variants, expired retirement records,
+and manifest-backed physical deletion. Each turn inspects one wrapping page
+under independently nonzero row, file, and encoded-byte budgets, commits that
+class's cursor, and rotates the persisted next class. The selected node's turn
+is capped at 16 rows, one file, and 2 MiB. It runs once after startup audit and
+thereafter at most once in the background per periodic actor turn, after
+operational work has had an opportunity to run.
+
+This maintenance surface is deliberately non-destructive. Discovery of an
+unreferenced staging or completed variant returns a candidate, keeps it
+revisitable, and waits for a later handler; current turns inspect zero files and
+delete no durable row or depot artifact. Retention/retirement expiry, physical
+reclamation or deletion manifests, pressure eviction, and finite Blob TTL are
+not part of this increment. There is no public garbage-collection operation.
 
 `Normal` and every `AtLeast(priority)` run Blob source and carrier work because
 `AtLeast` filters Event emission only. `ReceiveOnly` initiates, requests,
@@ -1191,16 +1240,34 @@ Normal reconciliation may settle a retry when its authenticated common set
 proves the peer already holds the transfer. Blind ReceiveOnly contacts cannot
 make that inference.
 
-If finite-TTL age cannot be bounded across reboot or power loss, the node MUST
-mark the item non-forwardable until a trusted time source proves it unexpired; it
-MAY retain it locally with an indeterminate-age annotation. Durable items are not
-affected. An item known locally to have `age >= TTL` MUST NOT be offered,
-requested, retransmitted, or sent and MUST enter garbage collection.
+If exact clock continuity is lost across reboot, power loss, a changed clock
+identity, a missing sample, tick rollback, or checked-arithmetic overflow, the
+node MUST make that loss sticky and MUST withhold the finite item. The durable
+age remains a conservative lower bound. An unmeasurable interval adds zero; the
+first valid sample in a later continuity domain becomes a new lower-bound
+anchor and also adds zero. Each later nondecreasing sample in that same domain
+adds only its proven monotonic delta. A further domain change repeats this rule,
+so no restart or inter-domain gap is ever inferred or charged.
 
-That trusted-time recovery rule is available to profiles that define such a
-proof. The selected Event implementation does not: clock-domain loss is sticky,
-the exact transfer remains withheld, and recovery requires an
-application-specific replacement or a new source revision.
+Below TTL, a continuity-lost finite item remains `WithheldUnknownAge` and is
+never offered, requested, retransmitted, delivered, or used to create a send
+lease. At `lower_bound >= TTL`, expiry is certain even though exact age remains
+unknown; the item MUST enter the existing expiry-retirement path. Checked age
+overflow saturates the lower bound at `u64::MAX`, retains sticky loss, and is
+therefore certain expiry for every representable finite TTL. Authenticated
+duplicates merge `max(local_lower_bound, received_age)` and cannot reduce the
+age, move a same-domain anchor backward, or restore exact continuity.
+
+Selected Event/RouteEvent storage indexes every live finite row in the existing
+custody-expiration index. Continuous and lost-anchored rows use their exact
+domain/generation deadline; a lost unanchored row uses the generation-zero,
+zero-clock, zero-tick sentinel. Each maintenance transaction processes at most
+the caller's existing 1,024-row limit, prioritizing sentinel and older-generation
+re-anchor work before current-generation due deadlines. Re-anchoring, age/index
+mutation, and retirement marking are atomic and restart-safe. The change is
+wire-neutral: custody claims and item encoding are unchanged. This behavior is
+currently exercised for Event/RouteEvent; finite Blob lifecycle work consumes
+the same policy in a later implementation.
 
 Session counters/windows, full ItemID deduplication, publisher counter ledgers,
 mission epochs, and control-chain rollback checks ensure captured traffic is not

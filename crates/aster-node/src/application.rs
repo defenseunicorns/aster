@@ -2801,7 +2801,10 @@ fn custody_store_error_kind(error: &CustodyStoreError) -> ApplicationErrorKind {
         CustodyStoreError::MissionNotBound
         | CustodyStoreError::MissionMismatch
         | CustodyStoreError::ItemNotFound
-        | CustodyStoreError::LeaseNotFound => ApplicationErrorKind::StateUnavailable,
+        | CustodyStoreError::LeaseNotFound
+        | CustodyStoreError::LegacyCustodyMigrationRequired => {
+            ApplicationErrorKind::StateUnavailable
+        }
         // A recognized predecessor schema is not corrupt. It requires the
         // same explicit fresh-store boundary as other non-migratable legacy
         // application state.
@@ -2816,6 +2819,8 @@ fn custody_store_error_kind(error: &CustodyStoreError) -> ApplicationErrorKind {
 fn blob_store_error_kind(error: &BlobStoreError) -> ApplicationErrorKind {
     match error {
         BlobStoreError::InvalidDepotLimits
+        | BlobStoreError::InvalidLifecycleLimits
+        | BlobStoreError::InvalidMaintenanceBudget
         | BlobStoreError::InvalidOperationKey { .. }
         | BlobStoreError::InvalidPublication(_)
         | BlobStoreError::InvalidCarrierObjectId
@@ -2832,7 +2837,8 @@ fn blob_store_error_kind(error: &BlobStoreError) -> ApplicationErrorKind {
         BlobStoreError::OperationConflict
         | BlobStoreError::PendingSourceConflict
         | BlobStoreError::CarrierPrefixConflict
-        | BlobStoreError::PhysicalLineageConflict => ApplicationErrorKind::Conflict,
+        | BlobStoreError::PhysicalLineageConflict
+        | BlobStoreError::SourceRepresentationConflict => ApplicationErrorKind::Conflict,
         BlobStoreError::PublicationLimitExceeded { .. }
         | BlobStoreError::CausalFrontierLimitExceeded { .. }
         | BlobStoreError::OperationLimitExceeded { .. }
@@ -2840,6 +2846,9 @@ fn blob_store_error_kind(error: &BlobStoreError) -> ApplicationErrorKind {
         | BlobStoreError::DepotByteLimitExceeded { .. }
         | BlobStoreError::DepotChunkLimitExceeded { .. }
         | BlobStoreError::DepotVariantLimitExceeded { .. }
+        | BlobStoreError::LineageFenceCapacity { .. }
+        | BlobStoreError::ReplayFenceCapacity { .. }
+        | BlobStoreError::PublicationLifecycleCapacity { .. }
         | BlobStoreError::NetworkSourceTooLarge { .. }
         | BlobStoreError::NetworkBlobTooLarge { .. }
         | BlobStoreError::NetworkStagingRowLimitExceeded { .. }
@@ -2906,6 +2915,46 @@ mod tests {
                 "test integrity"
             )),
             ApplicationErrorKind::Integrity
+        );
+    }
+
+    #[test]
+    fn blob_lifecycle_store_errors_keep_narrow_application_kinds() {
+        for error in [
+            BlobStoreError::InvalidLifecycleLimits,
+            BlobStoreError::InvalidMaintenanceBudget,
+        ] {
+            assert_eq!(
+                blob_store_error_kind(&error),
+                ApplicationErrorKind::InvalidRequest
+            );
+        }
+        for error in [
+            BlobStoreError::LineageFenceCapacity {
+                required_rows: 2,
+                required_bytes: 2,
+                max_rows: 1,
+                max_bytes: 1,
+            },
+            BlobStoreError::ReplayFenceCapacity {
+                required_rows: 2,
+                required_bytes: 2,
+                max_rows: 1,
+                max_bytes: 1,
+            },
+            BlobStoreError::PublicationLifecycleCapacity {
+                required_rows: 2,
+                max_rows: 1,
+            },
+        ] {
+            assert_eq!(
+                blob_store_error_kind(&error),
+                ApplicationErrorKind::ResourceLimit
+            );
+        }
+        assert_eq!(
+            blob_store_error_kind(&BlobStoreError::SourceRepresentationConflict),
+            ApplicationErrorKind::Conflict
         );
     }
 

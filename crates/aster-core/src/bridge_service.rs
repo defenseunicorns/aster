@@ -1335,6 +1335,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lower_bound_bridge_age_advances_without_becoming_forwardable() {
+        let clock = [0x92; 16];
+        let header = EnvelopeHeader {
+            class: DataClass::State,
+            topic: topic("ops"),
+            scope: scope("alpha"),
+            priority: Priority::Routine,
+            stamp: CausalStamp {
+                dot: Dot {
+                    publisher: [0x93; 32],
+                    counter: 1,
+                },
+                context: VersionVector::default(),
+            },
+            event_sequence: None,
+            logical_key: b"lower-bound".to_vec(),
+            blob_route: None,
+            ttl_ms: Some(30),
+            content_len: 1,
+            tombstone: false,
+            key_epoch: 1,
+        };
+
+        let below_ttl = effective_custody(
+            10,
+            true,
+            Some(clock),
+            Some(1_000),
+            true,
+            Some(CustodySample {
+                clock_id: clock,
+                tick_ms: 1_019,
+            }),
+        );
+        assert_eq!(below_ttl, (29, true));
+        assert!(require_unexpired(&header, below_ttl.0, below_ttl.1).is_err());
+
+        let at_ttl = effective_custody(
+            29,
+            true,
+            Some(clock),
+            Some(1_019),
+            true,
+            Some(CustodySample {
+                clock_id: clock,
+                tick_ms: 1_020,
+            }),
+        );
+        assert_eq!(at_ttl, (30, true));
+        assert!(require_unexpired(&header, at_ttl.0, at_ttl.1).is_err());
+    }
+
     struct Fixture {
         authority: ReferenceEnvelopeSealer,
         bridge: ReferenceEnvelopeSealer,

@@ -811,16 +811,13 @@ fn custody_age_from_legacy_fields(
 }
 
 fn custody_fields_from_age(age: CustodyAge) -> LegacyCustodyFields {
-    if !age.is_continuous() {
-        return (age.cumulative_age_ms(), true, None, None, false);
-    }
     let checkpoint = age.checkpoint_sample();
     (
         age.cumulative_age_ms(),
-        false,
+        !age.is_continuous(),
         checkpoint.map(|value| value.clock_id),
         checkpoint.map(|value| value.tick_ms),
-        true,
+        checkpoint.is_some(),
     )
 }
 
@@ -836,14 +833,7 @@ fn merge_authenticated_custody_fields(
         );
     };
     let mut age = custody_age_from_legacy_fields(age_ms, unknown, clock_id, tick_ms, available);
-    if age
-        .merge_authenticated_age(authenticated_age_ms, sample)
-        .is_err()
-    {
-        return custody_fields_from_age(CustodyAge::unknown(
-            age.cumulative_age_ms().max(authenticated_age_ms),
-        ));
-    }
+    let _ = age.merge_authenticated_age(authenticated_age_ms, sample);
     custody_fields_from_age(age)
 }
 
@@ -10941,9 +10931,7 @@ fn ordinary_item_bridge_custody(
         item.custody_tick_ms,
         item.custody_elapsed_available,
     );
-    if sample.is_some() && age.checkpoint(sample).is_err() {
-        age.mark_continuity_lost();
-    }
+    let _ = age.checkpoint(sample);
     custody_fields_from_age(age)
 }
 
@@ -10974,9 +10962,7 @@ fn checkpoint_bridge_source_custody(
         source.custody_tick_ms,
         source.custody_elapsed_available,
     );
-    if sample.is_some() && age.checkpoint(sample).is_err() {
-        age.mark_continuity_lost();
-    }
+    let _ = age.checkpoint(sample);
     custody_fields_from_age(age)
 }
 
@@ -10992,9 +10978,7 @@ fn checkpoint_bridge_route_custody(
         route.custody_tick_ms,
         route.custody_elapsed_available,
     );
-    if sample.is_some() && age.checkpoint(sample).is_err() {
-        age.mark_continuity_lost();
-    }
+    let _ = age.checkpoint(sample);
     custody_fields_from_age(age)
 }
 
@@ -11010,9 +10994,7 @@ fn checkpoint_pending_bridge_wrapper_custody(
         wrapper.custody_tick_ms,
         wrapper.custody_elapsed_available,
     );
-    if age.checkpoint(sample).is_err() {
-        age.mark_continuity_lost();
-    }
+    let _ = age.checkpoint(sample);
     custody_fields_from_age(age)
 }
 
@@ -12775,10 +12757,7 @@ fn advance_custody_fields(
     if ttl_ms.is_none() && sample.is_none() {
         return;
     }
-    if age.checkpoint(sample).is_err() {
-        *custody_elapsed_available = false;
-        return;
-    }
+    let _ = age.checkpoint(sample);
     *custody_age_ms = age.cumulative_age_ms();
     let checkpoint = age.checkpoint_sample();
     *custody_clock_id = checkpoint.map(|value| value.clock_id);
@@ -12873,17 +12852,18 @@ fn merge_duplicate_custody_tx(
         .custody_elapsed_available
         .then(|| custody_checkpoint(incoming.custody_clock_id, incoming.custody_tick_ms))
         .flatten();
-    let (age, _, clock_id, tick, available) = merge_authenticated_custody_fields(
-        Some((
-            existing.custody_age_ms,
-            !existing.custody_elapsed_available,
-            existing.custody_clock_id,
-            existing.custody_tick_ms,
-            existing.custody_elapsed_available,
-        )),
-        incoming.custody_age_ms,
-        incoming_sample,
-    );
+    let (age, continuity_unknown, clock_id, tick, anchor_available) =
+        merge_authenticated_custody_fields(
+            Some((
+                existing.custody_age_ms,
+                !existing.custody_elapsed_available,
+                existing.custody_clock_id,
+                existing.custody_tick_ms,
+                existing.custody_elapsed_available,
+            )),
+            incoming.custody_age_ms,
+            incoming_sample,
+        );
     transaction.execute(
         "UPDATE items SET custody_age_ms=?1,custody_clock_id=?2,custody_tick_ms=?3,\n\
            custody_elapsed_available=?4 WHERE item_id=?5",
@@ -12892,7 +12872,11 @@ fn merge_duplicate_custody_tx(
             clock_id.map(|value| value.to_vec()),
             tick.map(|value| sql_u64(value, "custody tick"))
                 .transpose()?,
-            if available { 1i64 } else { 0i64 },
+            if !continuity_unknown && anchor_available {
+                1i64
+            } else {
+                0i64
+            },
             existing.id.as_slice()
         ],
     )?;
@@ -13691,12 +13675,6 @@ fn insert_item_tx(
 ) -> Result<ApplyOutcome, StoreError> {
     validate_item(&item)?;
     if let Some(existing) = load_item_tx(transaction, &item.id)? {
-        let incoming_sample = item
-            .custody_clock_id
-            .zip(item.custody_tick_ms)
-            .map(|(clock_id, tick_ms)| CustodySample { clock_id, tick_ms });
-        let existing = advance_custody_tx(transaction, existing.id, incoming_sample)?
-            .ok_or(StoreError::NotFound("duplicate item"))?;
         merge_duplicate_custody_tx(transaction, &existing, &item)?;
         return Ok(ApplyOutcome::Duplicate { id: item.id });
     }
@@ -21018,6 +20996,197 @@ mod sqlite_integration_tests {
         durable_tombstone.tombstone = true;
         assert!(!durable_tombstone.is_expired_at(None));
         assert!(durable_tombstone.is_forwardable_at(None));
+    }
+
+    #[test]
+    fn lower_bound_legacy_fields_preserve_lost_anchor_across_restart() {
+        let first_clock = [0x91; 16];
+        let later_clock = [0x92; 16];
+        let mut age = custody_age_from_legacy_fields(10, false, Some(first_clock), Some(100), true);
+        assert_eq!(
+            age.checkpoint(Some(CustodySample {
+                clock_id: later_clock,
+                tick_ms: 1_000,
+            })),
+            Err(crate::custody::CustodyError::ContinuityUnavailable)
+        );
+
+        let fields = custody_fields_from_age(age);
+        assert_eq!(fields, (10, true, Some(later_clock), Some(1_000), true));
+        let mut reopened =
+            custody_age_from_legacy_fields(fields.0, fields.1, fields.2, fields.3, fields.4);
+        assert_eq!(
+            reopened.checkpoint(Some(CustodySample {
+                clock_id: later_clock,
+                tick_ms: 1_019,
+            })),
+            Err(crate::custody::CustodyError::ContinuityUnavailable)
+        );
+
+        let persisted = custody_fields_from_age(reopened);
+        assert_eq!(persisted, (29, true, Some(later_clock), Some(1_019), true));
+        let reconstructed = custody_age_from_legacy_fields(
+            persisted.0,
+            persisted.1,
+            persisted.2,
+            persisted.3,
+            persisted.4,
+        );
+        assert_eq!(reconstructed.cumulative_age_ms(), 29);
+        assert_eq!(reconstructed.continuity(), CustodyContinuity::Lost);
+        assert_eq!(
+            reconstructed.checkpoint_sample(),
+            Some(CustodySample {
+                clock_id: later_clock,
+                tick_ms: 1_019,
+            })
+        );
+    }
+
+    #[test]
+    fn lower_bound_duplicate_merge_and_missing_sample_stay_monotone() {
+        let clock_b = [0xa1; 16];
+        let clock_c = [0xa2; 16];
+        let mut fields = (10, true, Some(clock_b), Some(1_000), true);
+
+        fields = merge_authenticated_custody_fields(
+            Some(fields),
+            8,
+            Some(CustodySample {
+                clock_id: clock_b,
+                tick_ms: 1_010,
+            }),
+        );
+        assert_eq!(fields, (20, true, Some(clock_b), Some(1_010), true));
+        fields = merge_authenticated_custody_fields(
+            Some(fields),
+            50,
+            Some(CustodySample {
+                clock_id: clock_b,
+                tick_ms: 1_015,
+            }),
+        );
+        assert_eq!(fields, (50, true, Some(clock_b), Some(1_015), true));
+        fields = merge_authenticated_custody_fields(Some(fields), 7, None);
+        assert_eq!(fields, (50, true, None, None, false));
+        fields = merge_authenticated_custody_fields(
+            Some(fields),
+            7,
+            Some(CustodySample {
+                clock_id: clock_c,
+                tick_ms: 5_000,
+            }),
+        );
+        assert_eq!(fields, (50, true, Some(clock_c), Some(5_000), true));
+        fields = merge_authenticated_custody_fields(
+            Some(fields),
+            7,
+            Some(CustodySample {
+                clock_id: clock_c,
+                tick_ms: 5_006,
+            }),
+        );
+        assert_eq!(fields, (56, true, Some(clock_c), Some(5_006), true));
+    }
+
+    #[test]
+    fn stale_duplicate_cannot_move_the_persisted_custody_anchor_backward() {
+        let clock = [0xa3; 16];
+        let initial = CustodySample {
+            clock_id: clock,
+            tick_ms: 1_000,
+        };
+        let mut store = SqliteStore::open_in_memory(StoreConfig::default()).unwrap();
+        let item = test_item(0xa4, 1, Some(100), 10, Some(initial));
+        store.ingest(item.clone()).unwrap();
+
+        let first_peer = [0xa5; 32];
+        let high_water = CustodySample {
+            clock_id: clock,
+            tick_ms: 1_010,
+        };
+        let emitted = store
+            .next_outbound(
+                first_peer,
+                Priority::Routine,
+                1,
+                u64::MAX,
+                None,
+                Some(high_water),
+            )
+            .unwrap();
+        assert_eq!(emitted[0].custody_age_ms, 20);
+
+        let mut stale_duplicate = item.clone();
+        stale_duplicate.custody_age_ms = 15;
+        stale_duplicate.custody_tick_ms = Some(1_005);
+        assert!(matches!(
+            store.ingest(stale_duplicate).unwrap(),
+            ApplyOutcome::Duplicate { .. }
+        ));
+
+        let later = CustodySample {
+            clock_id: clock,
+            tick_ms: 1_020,
+        };
+        assert!(
+            store
+                .next_outbound(
+                    [0xa6; 32],
+                    Priority::Routine,
+                    1,
+                    u64::MAX,
+                    None,
+                    Some(later),
+                )
+                .unwrap()
+                .is_empty(),
+            "the stale sample remains fail-closed after continuity loss"
+        );
+        let retained = store.get(&item.id).unwrap().unwrap();
+        assert_eq!(retained.custody_age_ms, 30);
+        assert_eq!(retained.custody_clock_id, Some(clock));
+        assert_eq!(retained.custody_tick_ms, Some(1_020));
+        assert!(!retained.custody_elapsed_available);
+    }
+
+    #[test]
+    fn lower_bound_ordinary_fields_reanchor_without_restoring_continuity() {
+        let mut age_ms = 10;
+        let mut clock_id = Some([0xb1; 16]);
+        let mut tick_ms = Some(100);
+        let mut elapsed_available = true;
+
+        advance_custody_fields(
+            Some(100),
+            &mut age_ms,
+            &mut clock_id,
+            &mut tick_ms,
+            &mut elapsed_available,
+            Some(CustodySample {
+                clock_id: [0xb2; 16],
+                tick_ms: 1_000,
+            }),
+        );
+        assert_eq!(
+            (age_ms, clock_id, tick_ms, elapsed_available),
+            (10, Some([0xb2; 16]), Some(1_000), false,)
+        );
+        advance_custody_fields(
+            Some(100),
+            &mut age_ms,
+            &mut clock_id,
+            &mut tick_ms,
+            &mut elapsed_available,
+            Some(CustodySample {
+                clock_id: [0xb2; 16],
+                tick_ms: 1_009,
+            }),
+        );
+        assert_eq!(
+            (age_ms, clock_id, tick_ms, elapsed_available),
+            (19, Some([0xb2; 16]), Some(1_009), false,)
+        );
     }
 
     #[test]

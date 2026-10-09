@@ -947,6 +947,7 @@ pub enum CustodyStoreError {
         supported: u64,
     },
     UnsupportedRetirementClass(CustodyObjectClass),
+    LegacyCustodyMigrationRequired,
     Invariant(&'static str),
 }
 
@@ -1029,6 +1030,9 @@ impl fmt::Display for CustodyStoreError {
                 formatter,
                 "payload retirement for {class:?} is not selected"
             ),
+            Self::LegacyCustodyMigrationRequired => {
+                formatter.write_str("legacy custody state requires a writable migration")
+            }
             Self::Invariant(reason) => {
                 write!(formatter, "custody schema invariant failed: {reason}")
             }
@@ -1358,6 +1362,18 @@ fn decode_item(bytes: &[u8]) -> Result<CustodyItemRecord, CustodyStoreError> {
     if record.ttl_ms.is_some()
         && !record.tombstone
         && !record.retiring
+        && (record.checkpoint.is_some() != (record.continuity_generation != 0))
+        && !(record.continuity_lost
+            && record.checkpoint.is_none()
+            && record.continuity_generation != 0)
+    {
+        return Err(CustodyStoreError::Invariant(
+            "finite custody checkpoint and generation differ",
+        ));
+    }
+    if record.ttl_ms.is_some()
+        && !record.tombstone
+        && !record.retiring
         && !record.continuity_lost
         && (record.checkpoint.is_none() || record.continuity_generation == 0)
     {
@@ -1489,25 +1505,36 @@ fn custody_expiration_key(
     key: CustodyObjectKey,
     record: &CustodyItemRecord,
 ) -> Result<Option<Vec<u8>>, CustodyStoreError> {
-    if record.retiring || record.tombstone || record.ttl_ms.is_none() || record.continuity_lost {
+    if record.retiring || record.tombstone || record.ttl_ms.is_none() {
         return Ok(None);
     }
-    let checkpoint = record.checkpoint.ok_or(CustodyStoreError::Invariant(
-        "finite custody item lacks an expiry checkpoint",
-    ))?;
-    if record.continuity_generation == 0 {
-        return Err(CustodyStoreError::Invariant(
-            "finite custody item has a zero expiry generation",
-        ));
-    }
-    let remaining = record
-        .ttl_ms
-        .expect("finite branch")
-        .saturating_sub(record.cumulative_age_ms);
-    let due_tick_ms = checkpoint.tick_ms.saturating_add(remaining);
+    let (generation, clock_id, due_tick_ms) = match record.checkpoint {
+        Some(checkpoint) => {
+            if record.continuity_generation == 0 {
+                return Err(CustodyStoreError::Invariant(
+                    "anchored finite custody item has a zero expiry generation",
+                ));
+            }
+            let remaining = record
+                .ttl_ms
+                .expect("finite branch")
+                .saturating_sub(record.cumulative_age_ms);
+            (
+                record.continuity_generation,
+                checkpoint.clock_id,
+                checkpoint.tick_ms.saturating_add(remaining),
+            )
+        }
+        None if record.continuity_lost && record.continuity_generation == 0 => (0, [0; 16], 0),
+        None => {
+            return Err(CustodyStoreError::Invariant(
+                "finite custody item lacks a canonical expiry anchor",
+            ));
+        }
+    };
     let mut encoded = Vec::with_capacity(CUSTODY_EXPIRATION_KEY_LEN);
-    encoded.extend_from_slice(&record.continuity_generation.to_be_bytes());
-    encoded.extend_from_slice(&checkpoint.clock_id);
+    encoded.extend_from_slice(&generation.to_be_bytes());
+    encoded.extend_from_slice(&clock_id);
     encoded.extend_from_slice(&due_tick_ms.to_be_bytes());
     encoded.extend_from_slice(&key.encoded());
     Ok(Some(encoded))
@@ -1526,6 +1553,25 @@ fn decode_custody_expiration_key(
     let due_tick_ms = u64::from_be_bytes(encoded[24..32].try_into().expect("tick bytes"));
     let object = CustodyObjectKey::decode(&encoded[32..])?;
     Ok((generation, clock_id, due_tick_ms, object))
+}
+
+fn is_unanchored_lost_finite(record: &CustodyItemRecord) -> bool {
+    record.ttl_ms.is_some()
+        && !record.tombstone
+        && !record.retiring
+        && record.continuity_lost
+        && record.checkpoint.is_none()
+}
+
+fn is_canonical_lost_sentinel_for(
+    encoded: &[u8],
+    items: &BTreeMap<CustodyObjectKey, CustodyItemRecord>,
+) -> Result<bool, CustodyStoreError> {
+    let (generation, clock_id, due_tick_ms, object) = decode_custody_expiration_key(encoded)?;
+    Ok(generation == 0
+        && clock_id == [0; 16]
+        && due_tick_ms == 0
+        && items.get(&object).is_some_and(is_unanchored_lost_finite))
 }
 
 fn custody_retiring_key(key: CustodyObjectKey, record: &CustodyItemRecord) -> Option<Vec<u8>> {
@@ -1958,6 +2004,38 @@ pub(crate) fn reencode_item_source_claims_for_test(
         record.continuity_generation = 0;
     }
     encode_item(&record)
+}
+
+#[cfg(test)]
+pub(crate) fn reencode_legacy_lost_item_for_test(
+    bytes: &[u8],
+    retain_generation: bool,
+) -> Result<Vec<u8>, CustodyStoreError> {
+    let mut record = decode_item(bytes)?;
+    record.continuity_lost = true;
+    record.checkpoint = None;
+    if !retain_generation {
+        record.continuity_generation = 0;
+    }
+    encode_item(&record)
+}
+
+#[cfg(test)]
+pub(crate) fn custody_expiration_key_for_test(
+    encoded_key: &[u8],
+    encoded_item: &[u8],
+) -> Result<Option<Vec<u8>>, CustodyStoreError> {
+    custody_expiration_key(
+        CustodyObjectKey::decode(encoded_key)?,
+        &decode_item(encoded_item)?,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn custody_expiration_generation_for_test(
+    encoded: &[u8],
+) -> Result<u64, CustodyStoreError> {
+    decode_custody_expiration_key(encoded).map(|(generation, _, _, _)| generation)
 }
 
 fn encode_retirement(record: &RetirementRecord) -> Result<Vec<u8>, CustodyStoreError> {
@@ -2971,57 +3049,139 @@ pub(crate) fn observe_continuity_write(
     Ok(next)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CustodyAgeEvaluation {
+    status: CustodyAgeStatus,
+    lower_bound_ms: u64,
+    checkpoint: Option<CustodySample>,
+    continuity_generation: u64,
+    continuity_lost: bool,
+    needs_write: bool,
+}
+
+fn evaluate_item_age(
+    record: &CustodyItemRecord,
+    continuity: Option<ContinuityRecord>,
+    sample: Option<CustodySample>,
+) -> Result<CustodyAgeEvaluation, StoreError> {
+    let unchanged = |status| CustodyAgeEvaluation {
+        status,
+        lower_bound_ms: record.cumulative_age_ms,
+        checkpoint: record.checkpoint,
+        continuity_generation: record.continuity_generation,
+        continuity_lost: record.continuity_lost,
+        needs_write: false,
+    };
+    if record.tombstone || record.ttl_ms.is_none() {
+        return Ok(unchanged(CustodyAgeStatus::Durable));
+    }
+    let ttl = record.ttl_ms.expect("finite branch");
+    if record.cumulative_age_ms >= ttl {
+        return Ok(unchanged(CustodyAgeStatus::Expired {
+            age_ms: record.cumulative_age_ms,
+        }));
+    }
+
+    let current = match (continuity, sample) {
+        (Some(continuity), Some(sample)) if continuity.sample.clock_id == sample.clock_id => {
+            Some((
+                continuity.generation,
+                if sample.tick_ms < continuity.sample.tick_ms {
+                    continuity.sample
+                } else {
+                    sample
+                },
+            ))
+        }
+        _ => None,
+    };
+    let (lower_bound_ms, checkpoint, continuity_generation, continuity_lost) =
+        if let Some((generation, current)) = current {
+            let same_domain = record.checkpoint.is_some_and(|checkpoint| {
+                record.continuity_generation == generation
+                    && checkpoint.clock_id == current.clock_id
+                    && current.tick_ms >= checkpoint.tick_ms
+            });
+            if same_domain {
+                let checkpoint = record.checkpoint.expect("checked same-domain checkpoint");
+                match record
+                    .cumulative_age_ms
+                    .checked_add(current.tick_ms - checkpoint.tick_ms)
+                {
+                    Some(age_ms) => (age_ms, Some(current), generation, record.continuity_lost),
+                    None => (u64::MAX, Some(current), generation, true),
+                }
+            } else {
+                (record.cumulative_age_ms, Some(current), generation, true)
+            }
+        } else {
+            (record.cumulative_age_ms, None, 0, true)
+        };
+    let status = if lower_bound_ms >= ttl {
+        CustodyAgeStatus::Expired {
+            age_ms: lower_bound_ms,
+        }
+    } else if continuity_lost {
+        CustodyAgeStatus::WithheldUnknownAge
+    } else {
+        CustodyAgeStatus::Forwardable {
+            age_ms: lower_bound_ms,
+            remaining_ms: ttl - lower_bound_ms,
+        }
+    };
+    Ok(CustodyAgeEvaluation {
+        status,
+        lower_bound_ms,
+        checkpoint,
+        continuity_generation,
+        continuity_lost,
+        needs_write: lower_bound_ms != record.cumulative_age_ms
+            || checkpoint != record.checkpoint
+            || continuity_generation != record.continuity_generation
+            || continuity_lost != record.continuity_lost,
+    })
+}
+
 fn evaluate_item(
     record: &CustodyItemRecord,
     continuity: Option<ContinuityRecord>,
     sample: Option<CustodySample>,
 ) -> (CustodyAgeStatus, bool) {
-    if record.tombstone || record.ttl_ms.is_none() {
-        return (CustodyAgeStatus::Durable, false);
+    match evaluate_item_age(record, continuity, sample) {
+        Ok(evaluation) => (
+            evaluation.status,
+            evaluation.continuity_lost && !record.continuity_lost,
+        ),
+        Err(_) => (
+            CustodyAgeStatus::WithheldUnknownAge,
+            !record.continuity_lost,
+        ),
     }
-    let ttl = record.ttl_ms.expect("finite branch");
-    if record.cumulative_age_ms >= ttl {
-        return (
-            CustodyAgeStatus::Expired {
-                age_ms: record.cumulative_age_ms,
-            },
-            false,
-        );
+}
+
+fn checkpoint_item_age_write(
+    write: &redb::WriteTransaction,
+    key: CustodyObjectKey,
+    mut record: CustodyItemRecord,
+    evaluation: CustodyAgeEvaluation,
+) -> Result<CustodyItemRecord, StoreError> {
+    if !evaluation.needs_write {
+        return Ok(record);
     }
-    if record.continuity_lost {
-        return (CustodyAgeStatus::WithheldUnknownAge, false);
-    }
-    let (Some(checkpoint), Some(continuity), Some(sample)) =
-        (record.checkpoint, continuity, sample)
-    else {
-        return (CustodyAgeStatus::WithheldUnknownAge, true);
-    };
-    if record.continuity_generation != continuity.generation
-        || checkpoint.clock_id != sample.clock_id
-        || continuity.sample.clock_id != sample.clock_id
-        || sample.tick_ms < checkpoint.tick_ms
-        || sample.tick_ms < continuity.sample.tick_ms
-    {
-        return (CustodyAgeStatus::WithheldUnknownAge, true);
-    }
-    let Some(age_ms) = sample
-        .tick_ms
-        .checked_sub(checkpoint.tick_ms)
-        .and_then(|elapsed| record.cumulative_age_ms.checked_add(elapsed))
-    else {
-        return (CustodyAgeStatus::WithheldUnknownAge, true);
-    };
-    if age_ms >= ttl {
-        (CustodyAgeStatus::Expired { age_ms }, false)
-    } else {
-        (
-            CustodyAgeStatus::Forwardable {
-                age_ms,
-                remaining_ms: ttl - age_ms,
-            },
-            false,
-        )
-    }
+    let original = record.clone();
+    record.cumulative_age_ms = evaluation.lower_bound_ms;
+    record.checkpoint = evaluation.checkpoint;
+    record.continuity_generation = evaluation.continuity_generation;
+    record.continuity_lost = evaluation.continuity_lost;
+    replace_custody_maintenance_indexes_write(write, key, Some(&original), Some(&record))?;
+    write
+        .open_table(CUSTODY_ITEMS)?
+        .insert(key.encoded().as_slice(), encode_item(&record)?.as_slice())?;
+    advance_revision(
+        write,
+        evaluation.continuity_lost && !original.continuity_lost,
+    )?;
+    Ok(record)
 }
 
 fn normalize_read_sample(
@@ -3295,54 +3455,17 @@ fn merge_authenticated_age(
     authenticated_age_ms: u64,
 ) -> Result<(u64, bool, bool), StoreError> {
     let original = record.clone();
-    let (status, lost) = evaluate_item(&original, continuity, sample);
-    let local_age_ms = match status {
-        CustodyAgeStatus::Forwardable { age_ms, .. } | CustodyAgeStatus::Expired { age_ms } => {
-            age_ms
-        }
-        CustodyAgeStatus::Durable | CustodyAgeStatus::WithheldUnknownAge => {
-            original.cumulative_age_ms
-        }
-    };
-    record.cumulative_age_ms = original
-        .cumulative_age_ms
-        .max(local_age_ms)
-        .max(authenticated_age_ms);
-    let newly_lost = lost && !original.continuity_lost;
-    if original.ttl_ms.is_some() && !original.tombstone {
-        if lost || original.continuity_lost {
-            record.continuity_lost = true;
-            record.checkpoint = None;
-        } else {
-            let continuity = continuity.ok_or(CustodyStoreError::ContinuityUnavailable)?;
-            record.checkpoint = sample;
-            record.continuity_generation = continuity.generation;
-        }
-    }
+    let evaluation = evaluate_item_age(&original, continuity, sample)?;
+    record.cumulative_age_ms = evaluation.lower_bound_ms.max(authenticated_age_ms);
+    record.checkpoint = evaluation.checkpoint;
+    record.continuity_generation = evaluation.continuity_generation;
+    record.continuity_lost = evaluation.continuity_lost;
+    let newly_lost = record.continuity_lost && !original.continuity_lost;
     let expired = !record.tombstone
         && record
             .ttl_ms
             .is_some_and(|ttl| record.cumulative_age_ms >= ttl);
     Ok((record.cumulative_age_ms, newly_lost, expired))
-}
-
-fn mark_continuity_lost_write(
-    write: &redb::WriteTransaction,
-    key: CustodyObjectKey,
-    mut record: CustodyItemRecord,
-) -> Result<CustodyItemRecord, StoreError> {
-    if !record.continuity_lost {
-        let original = record.clone();
-        record.continuity_lost = true;
-        record.checkpoint = None;
-        replace_custody_maintenance_indexes_write(write, key, Some(&original), Some(&record))?;
-        let encoded = encode_item(&record)?;
-        write
-            .open_table(CUSTODY_ITEMS)?
-            .insert(key.encoded().as_slice(), encoded.as_slice())?;
-        advance_revision(write, true)?;
-    }
-    Ok(record)
 }
 
 fn custody_usage_read(
@@ -6475,11 +6598,9 @@ impl Store {
             {
                 continue;
             }
-            let (status, lost) = evaluate_item(&record, continuity, sample);
-            if lost {
-                record = mark_continuity_lost_write(&write, key, record)?;
-            }
-            let (age_ms, remaining_ms) = match status {
+            let evaluation = evaluate_item_age(&record, continuity, sample)?;
+            record = checkpoint_item_age_write(&write, key, record, evaluation)?;
+            let (age_ms, remaining_ms) = match evaluation.status {
                 CustodyAgeStatus::Durable => (record.cumulative_age_ms, None),
                 CustodyAgeStatus::Forwardable {
                     age_ms,
@@ -6656,13 +6777,9 @@ impl Store {
         if peer_object_has_lease(&write, peer, key)? {
             return Err(CustodyStoreError::ItemChanged.into());
         }
-        let (status, lost) = evaluate_item(&record, continuity, sample);
-        if lost {
-            mark_continuity_lost_write(&write, key, record)?;
-            write.commit()?;
-            return Err(CustodyStoreError::ContinuityLost.into());
-        }
-        let age_ms = match status {
+        let evaluation = evaluate_item_age(&record, continuity, sample)?;
+        let record = checkpoint_item_age_write(&write, key, record, evaluation)?;
+        let age_ms = match evaluation.status {
             CustodyAgeStatus::Durable => record.cumulative_age_ms,
             CustodyAgeStatus::Forwardable { age_ms, .. } => age_ms,
             CustodyAgeStatus::Expired { age_ms } => {
@@ -6671,6 +6788,7 @@ impl Store {
                 return Err(CustodyStoreError::Expired.into());
             }
             CustodyAgeStatus::WithheldUnknownAge => {
+                write.commit()?;
                 return Err(CustodyStoreError::ContinuityLost.into());
             }
         };
@@ -6840,13 +6958,9 @@ impl Store {
         if item.retiring || item.revision != durable_lease.item_revision {
             return Err(CustodyStoreError::ItemChanged.into());
         }
-        let (status, lost) = evaluate_item(&item, continuity, sample);
-        if lost {
-            mark_continuity_lost_write(&write, lease.object, item)?;
-            write.commit()?;
-            return Err(CustodyStoreError::ContinuityLost.into());
-        }
-        let age_ms = match status {
+        let evaluation = evaluate_item_age(&item, continuity, sample)?;
+        let item = checkpoint_item_age_write(&write, lease.object, item, evaluation)?;
+        let age_ms = match evaluation.status {
             CustodyAgeStatus::Durable => item.cumulative_age_ms,
             CustodyAgeStatus::Forwardable { age_ms, .. } => age_ms,
             CustodyAgeStatus::Expired { age_ms } => {
@@ -6855,6 +6969,7 @@ impl Store {
                 return Err(CustodyStoreError::Expired.into());
             }
             CustodyAgeStatus::WithheldUnknownAge => {
+                write.commit()?;
                 return Err(CustodyStoreError::ContinuityLost.into());
             }
         };
@@ -6908,13 +7023,9 @@ impl Store {
             if record.retiring {
                 return Err(CustodyStoreError::Retiring.into());
             }
-            let (status, lost) = evaluate_item(&record, continuity, sample);
-            if lost {
-                mark_continuity_lost_write(&write, *key, record)?;
-                write.commit()?;
-                return Err(CustodyStoreError::ContinuityLost.into());
-            }
-            let age_ms = match status {
+            let evaluation = evaluate_item_age(&record, continuity, sample)?;
+            let record = checkpoint_item_age_write(&write, *key, record, evaluation)?;
+            let age_ms = match evaluation.status {
                 CustodyAgeStatus::Durable => record.cumulative_age_ms,
                 CustodyAgeStatus::Forwardable { age_ms, .. } => age_ms,
                 CustodyAgeStatus::Expired { age_ms } => {
@@ -6923,6 +7034,7 @@ impl Store {
                     return Err(CustodyStoreError::Expired.into());
                 }
                 CustodyAgeStatus::WithheldUnknownAge => {
+                    write.commit()?;
                     return Err(CustodyStoreError::ContinuityLost.into());
                 }
             };
@@ -7409,6 +7521,17 @@ impl Store {
                 .get(CUSTODY_CONTINUITY_KEY)?
                 .map(|value| decode_continuity(value.value()))
                 .transpose()?;
+            let reanchor_pending = match (continuity, sample) {
+                (Some(current), Some(sample)) if current.sample.clock_id == sample.clock_id => read
+                    .open_table(CUSTODY_EXPIRATIONS)?
+                    .iter()?
+                    .next()
+                    .transpose()?
+                    .map(|(key, _)| decode_custody_expiration_key(key.value()))
+                    .transpose()?
+                    .is_some_and(|(generation, _, _, _)| generation < current.generation),
+                _ => false,
+            };
             let due_expiration = match (continuity, sample) {
                 (Some(current), Some(sample)) if current.sample.clock_id == sample.clock_id => {
                     let mut lower = Vec::with_capacity(CUSTODY_EXPIRATION_KEY_LEN);
@@ -7437,7 +7560,7 @@ impl Store {
                 .next()
                 .transpose()?
                 .is_some();
-            if !continuity_write_required && !due_expiration && !retiring {
+            if !continuity_write_required && !reanchor_pending && !due_expiration && !retiring {
                 return Ok(CustodyGcReport::default());
             }
         }
@@ -7445,38 +7568,115 @@ impl Store {
         enforce_live_write(&write)?;
         require_custody_mission_write(&write, authority)?;
         require_policy_revision_write(&write, expected_policy)?;
+        let prior_continuity = continuity_write(&write)?;
         let continuity = sample
             .map(|sample| observe_continuity_write(&write, sample))
             .transpose()?;
         let sample = continuity.map(|record| record.sample).or(sample);
-        if policy_revision_write(&write)? != expected_policy {
+        let policy_changed = policy_revision_write(&write)? != expected_policy;
+        let mut report = CustodyGcReport::default();
+        let due_expirations = if let Some(continuity) = continuity {
+            let mut candidates = Vec::with_capacity(limit);
+            for row in write.open_table(CUSTODY_EXPIRATIONS)?.iter()? {
+                let (key, _) = row?;
+                let encoded = key.value();
+                let (generation, _, _, _) = decode_custody_expiration_key(encoded)?;
+                if generation >= continuity.generation {
+                    break;
+                }
+                candidates.push(encoded.to_vec());
+                if candidates.len() == limit {
+                    break;
+                }
+            }
+            let remaining = limit - candidates.len();
+            if remaining == 0 {
+                candidates
+            } else {
+                let mut lower = Vec::with_capacity(CUSTODY_EXPIRATION_KEY_LEN);
+                lower.extend_from_slice(&continuity.generation.to_be_bytes());
+                lower.extend_from_slice(&continuity.sample.clock_id);
+                lower.extend_from_slice(&0u64.to_be_bytes());
+                lower.extend_from_slice(&[0; 33]);
+                let mut upper = Vec::with_capacity(CUSTODY_EXPIRATION_KEY_LEN);
+                upper.extend_from_slice(&continuity.generation.to_be_bytes());
+                upper.extend_from_slice(&continuity.sample.clock_id);
+                upper.extend_from_slice(&continuity.sample.tick_ms.to_be_bytes());
+                upper.extend_from_slice(&[u8::MAX; 33]);
+                candidates.extend(
+                    write
+                        .open_table(CUSTODY_EXPIRATIONS)?
+                        .range::<&[u8]>(lower.as_slice()..=upper.as_slice())?
+                        .take(remaining)
+                        .map(|row| row.map(|(key, _)| key.value().to_vec()))
+                        .collect::<Result<Vec<_>, redb::StorageError>>()?,
+                );
+                candidates
+            }
+        } else {
+            Vec::new()
+        };
+
+        for encoded_expiration in &due_expirations {
+            report.examined_expirations = report
+                .examined_expirations
+                .checked_add(1)
+                .ok_or(CustodyStoreError::CounterOverflow)?;
+            let (indexed_generation, _, _, key) =
+                decode_custody_expiration_key(encoded_expiration)?;
+            let encoded_key = key.encoded();
+            let mut item = write
+                .open_table(CUSTODY_ITEMS)?
+                .get(encoded_key.as_slice())?
+                .map(|value| decode_item(value.value()))
+                .transpose()?
+                .ok_or(CustodyStoreError::Invariant(
+                    "custody expiration index references a missing item",
+                ))?;
+            if custody_expiration_key(key, &item)?.as_deref() != Some(encoded_expiration.as_slice())
+            {
+                return Err(CustodyStoreError::Invariant(
+                    "custody expiration index differs from its item",
+                )
+                .into());
+            }
+            let current = continuity.expect("age candidates require continuity");
+            if indexed_generation < current.generation
+                && prior_continuity.is_some_and(|prior| {
+                    item.continuity_generation == prior.generation
+                        && item
+                            .checkpoint
+                            .is_some_and(|checkpoint| checkpoint.clock_id == prior.sample.clock_id)
+                })
+            {
+                let prior = prior_continuity.expect("checked prior continuity");
+                let evaluation = evaluate_item_age(&item, Some(prior), Some(prior.sample))?;
+                item = checkpoint_item_age_write(&write, key, item, evaluation)?;
+                if matches!(evaluation.status, CustodyAgeStatus::Expired { .. }) {
+                    if !policy_changed
+                        && let CustodyAgeStatus::Expired { age_ms } = evaluation.status
+                    {
+                        mark_retiring_write_indexed(&write, key, item, age_ms)?;
+                        report.marked.push(key);
+                    }
+                    continue;
+                }
+            }
+            let evaluation = evaluate_item_age(&item, Some(current), sample)?;
+            item = checkpoint_item_age_write(&write, key, item, evaluation)?;
+            if !policy_changed && let CustodyAgeStatus::Expired { age_ms } = evaluation.status {
+                mark_retiring_write_indexed(&write, key, item, age_ms)?;
+                report.marked.push(key);
+            }
+        }
+
+        if policy_changed {
             write.commit()?;
             *writer_commits = (*writer_commits)
                 .checked_add(1)
                 .ok_or(CustodyStoreError::CounterOverflow)?;
             return Err(CustodyStoreError::PolicyChanged.into());
         }
-        let mut report = CustodyGcReport::default();
-        let due_expirations = if let Some(continuity) = continuity {
-            let mut lower = Vec::with_capacity(CUSTODY_EXPIRATION_KEY_LEN);
-            lower.extend_from_slice(&continuity.generation.to_be_bytes());
-            lower.extend_from_slice(&continuity.sample.clock_id);
-            lower.extend_from_slice(&0u64.to_be_bytes());
-            lower.extend_from_slice(&[0; 33]);
-            let mut upper = Vec::with_capacity(CUSTODY_EXPIRATION_KEY_LEN);
-            upper.extend_from_slice(&continuity.generation.to_be_bytes());
-            upper.extend_from_slice(&continuity.sample.clock_id);
-            upper.extend_from_slice(&continuity.sample.tick_ms.to_be_bytes());
-            upper.extend_from_slice(&[u8::MAX; 33]);
-            write
-                .open_table(CUSTODY_EXPIRATIONS)?
-                .range::<&[u8]>(lower.as_slice()..=upper.as_slice())?
-                .take(limit)
-                .map(|row| row.map(|(key, _)| key.value().to_vec()))
-                .collect::<Result<Vec<_>, redb::StorageError>>()?
-        } else {
-            Vec::new()
-        };
 
         let retirement_scan_limit = MAX_CUSTODY_RETIREMENT_SCAN;
         let retiring_keys = write
@@ -7492,40 +7692,6 @@ impl Store {
                 .checked_add(1)
                 .ok_or(CustodyStoreError::CounterOverflow)?;
             return Ok(report);
-        }
-
-        for encoded_expiration in due_expirations {
-            report.examined_expirations = report
-                .examined_expirations
-                .checked_add(1)
-                .ok_or(CustodyStoreError::CounterOverflow)?;
-            let (_, _, _, key) = decode_custody_expiration_key(&encoded_expiration)?;
-            let encoded_key = key.encoded();
-            let item = write
-                .open_table(CUSTODY_ITEMS)?
-                .get(encoded_key.as_slice())?
-                .map(|value| decode_item(value.value()))
-                .transpose()?
-                .ok_or(CustodyStoreError::Invariant(
-                    "custody expiration index references a missing item",
-                ))?;
-            if custody_expiration_key(key, &item)?.as_deref() != Some(encoded_expiration.as_slice())
-            {
-                return Err(CustodyStoreError::Invariant(
-                    "custody expiration index differs from its item",
-                )
-                .into());
-            }
-            let (status, lost) = evaluate_item(&item, continuity, sample);
-            if lost {
-                mark_continuity_lost_write(&write, key, item)?;
-                continue;
-            }
-            let CustodyAgeStatus::Expired { age_ms } = status else {
-                continue;
-            };
-            mark_retiring_write_indexed(&write, key, item, age_ms)?;
-            report.marked.push(key);
         }
 
         let retiring_keys = write
@@ -9072,10 +9238,12 @@ pub(crate) fn audit_custody_tables_write(
     let mut ordinary_total_bytes = 0u64;
     let mut items = BTreeMap::new();
     let mut scope_usages = BTreeMap::<String, CustodyUsage>::new();
+    let mut legacy_item_repairs = Vec::new();
     for row in write.open_table(CUSTODY_ITEMS)?.iter()? {
         let (key, value) = row?;
+        let encoded_key = key.value().to_vec();
         let key = CustodyObjectKey::decode(key.value())?;
-        let record = decode_item(value.value())?;
+        let mut record = decode_item(value.value())?;
         if record.route_only != (key.class == CustodyObjectClass::RouteEvent) {
             return Err(CustodyStoreError::Invariant(
                 "custody route-only flag differs from its class",
@@ -9089,6 +9257,10 @@ pub(crate) fn audit_custody_tables_write(
                 "custody item generation is ahead of the store clock",
             )
             .into());
+        }
+        if is_unanchored_lost_finite(&record) && record.continuity_generation != 0 {
+            record.continuity_generation = 0;
+            legacy_item_repairs.push((encoded_key, encode_item(&record)?));
         }
         validate_item_backing_write(write, key, &record)?;
         item_count = next_counter(item_count)?;
@@ -9111,6 +9283,12 @@ pub(crate) fn audit_custody_tables_write(
         }
         items.insert(key, record);
     }
+    if !legacy_item_repairs.is_empty() {
+        let mut item_table = write.open_table(CUSTODY_ITEMS)?;
+        for (key, value) in &legacy_item_repairs {
+            item_table.insert(key.as_slice(), value.as_slice())?;
+        }
+    }
     let (expected_expirations, expected_retiring) = expected_custody_maintenance_indexes(&items)?;
     let mut durable_expirations = BTreeSet::new();
     for row in write.open_table(CUSTODY_EXPIRATIONS)?.iter()? {
@@ -9124,11 +9302,34 @@ pub(crate) fn audit_custody_tables_write(
         let _ = decode_custody_expiration_key(key.value())?;
         durable_expirations.insert(key.value().to_vec());
     }
-    if durable_expirations != expected_expirations {
+    let missing_expirations = expected_expirations
+        .difference(&durable_expirations)
+        .cloned()
+        .collect::<Vec<_>>();
+    let has_extra_expirations = durable_expirations
+        .difference(&expected_expirations)
+        .next()
+        .is_some();
+    let repairable_missing = missing_expirations
+        .iter()
+        .map(|encoded| is_canonical_lost_sentinel_for(encoded, &items))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .all(|repairable| repairable);
+    if has_extra_expirations || !repairable_missing {
         return Err(CustodyStoreError::Invariant(
             "custody expiration index differs from live items",
         )
         .into());
+    }
+    if !missing_expirations.is_empty() {
+        let mut expirations = write.open_table(CUSTODY_EXPIRATIONS)?;
+        for encoded in &missing_expirations {
+            expirations.insert(encoded.as_slice(), &[][..])?;
+        }
+    }
+    if !legacy_item_repairs.is_empty() || !missing_expirations.is_empty() {
+        advance_revision(write, false)?;
     }
     let mut durable_retiring = BTreeSet::new();
     let mut retirement_cleanups = BTreeMap::new();
@@ -9761,10 +9962,11 @@ pub(crate) fn inspect_custody_tables_read(
     let mut ordinary_item_count = 0u64;
     let mut ordinary_total_bytes = 0u64;
     let mut scope_usages = BTreeMap::<String, CustodyUsage>::new();
+    let mut legacy_item_encoding = false;
     for row in read.open_table(CUSTODY_ITEMS)?.iter()? {
         let (key, value) = row?;
         let key = CustodyObjectKey::decode(key.value())?;
-        let record = decode_item(value.value())?;
+        let mut record = decode_item(value.value())?;
         if record.route_only != (key.class == CustodyObjectClass::RouteEvent)
             || continuity.is_some_and(|clock| record.continuity_generation > clock.generation)
         {
@@ -9772,6 +9974,10 @@ pub(crate) fn inspect_custody_tables_read(
                 "custody item class or generation is invalid",
             )
             .into());
+        }
+        if is_unanchored_lost_finite(&record) && record.continuity_generation != 0 {
+            record.continuity_generation = 0;
+            legacy_item_encoding = true;
         }
         validate_item_backing_read(read, key, &record)?;
         item_count = next_counter(item_count)?;
@@ -9807,7 +10013,26 @@ pub(crate) fn inspect_custody_tables_read(
         let _ = decode_custody_expiration_key(key.value())?;
         durable_expirations.insert(key.value().to_vec());
     }
-    if durable_expirations != expected_expirations {
+    let missing_expirations = expected_expirations
+        .difference(&durable_expirations)
+        .collect::<Vec<_>>();
+    let has_extra_expirations = durable_expirations
+        .difference(&expected_expirations)
+        .next()
+        .is_some();
+    let repairable_missing = missing_expirations
+        .iter()
+        .map(|encoded| is_canonical_lost_sentinel_for(encoded, &items))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .all(|repairable| repairable);
+    if !has_extra_expirations
+        && repairable_missing
+        && (legacy_item_encoding || !missing_expirations.is_empty())
+    {
+        return Err(CustodyStoreError::LegacyCustodyMigrationRequired.into());
+    }
+    if has_extra_expirations || !missing_expirations.is_empty() {
         return Err(CustodyStoreError::Invariant(
             "custody expiration index differs from live items",
         )
@@ -10206,4 +10431,234 @@ pub(crate) fn retired_event_receipt_read(
             ))
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod lower_bound_index_tests {
+    use super::*;
+
+    const CLOCK_A: [u8; 16] = [0xa1; 16];
+    const CLOCK_B: [u8; 16] = [0xb2; 16];
+
+    fn finite_record(
+        cumulative_age_ms: u64,
+        checkpoint: Option<CustodySample>,
+        continuity_generation: u64,
+        continuity_lost: bool,
+    ) -> CustodyItemRecord {
+        CustodyItemRecord {
+            semantic_id: [0x31; 32],
+            topic: Topic::new("lower.bound").expect("topic"),
+            scope: Scope::new("mission/lower-bound").expect("scope"),
+            source_publisher: [0x32; 32],
+            key_epoch: 1,
+            priority: Priority::Routine,
+            ttl_ms: Some(100),
+            tombstone: false,
+            route_only: false,
+            retiring: false,
+            continuity_lost,
+            protection: CustodyProtection::NONE,
+            accounted_bytes: 1,
+            cumulative_age_ms,
+            checkpoint,
+            continuity_generation,
+            acceptance_order: 1,
+            revision: 1,
+        }
+    }
+
+    fn apply_evaluation(record: &mut CustodyItemRecord, evaluation: CustodyAgeEvaluation) {
+        record.cumulative_age_ms = evaluation.lower_bound_ms;
+        record.checkpoint = evaluation.checkpoint;
+        record.continuity_generation = evaluation.continuity_generation;
+        record.continuity_lost = evaluation.continuity_lost;
+    }
+
+    #[test]
+    fn custody_lower_bound_index_encodes_lost_anchor_and_sentinel_forms() {
+        let key = CustodyObjectKey::new(CustodyObjectClass::Event, [0x41; 32]);
+
+        let unanchored = finite_record(10, None, 0, true);
+        let encoded = encode_item(&unanchored).expect("encode lost sentinel");
+        assert_eq!(
+            decode_item(&encoded).expect("decode lost sentinel"),
+            unanchored
+        );
+        let index = custody_expiration_key(key, &unanchored)
+            .expect("index")
+            .expect("sentinel");
+        assert_eq!(
+            decode_custody_expiration_key(&index).expect("decode sentinel"),
+            (0, [0; 16], 0, key)
+        );
+
+        let anchor = CustodySample {
+            clock_id: CLOCK_A,
+            tick_ms: 1_000,
+        };
+        let anchored = finite_record(10, Some(anchor), 7, true);
+        let encoded = encode_item(&anchored).expect("encode lost anchor");
+        assert_eq!(decode_item(&encoded).expect("decode lost anchor"), anchored);
+        let index = custody_expiration_key(key, &anchored)
+            .expect("index")
+            .expect("deadline");
+        assert_eq!(
+            decode_custody_expiration_key(&index).expect("decode deadline"),
+            (7, CLOCK_A, 1_090, key)
+        );
+
+        let mut saturated = anchored.clone();
+        saturated.ttl_ms = Some(u64::MAX);
+        saturated.cumulative_age_ms = 0;
+        let index = custody_expiration_key(key, &saturated)
+            .expect("index")
+            .expect("saturated deadline");
+        assert_eq!(
+            decode_custody_expiration_key(&index)
+                .expect("decode saturated deadline")
+                .2,
+            u64::MAX
+        );
+
+        let expired = finite_record(100, Some(anchor), 7, true);
+        let index = custody_expiration_key(key, &expired)
+            .expect("index")
+            .expect("immediate deadline");
+        assert_eq!(
+            decode_custody_expiration_key(&index)
+                .expect("decode immediate deadline")
+                .2,
+            anchor.tick_ms
+        );
+    }
+
+    #[test]
+    fn custody_lower_bound_index_evaluator_reanchors_and_accumulates() {
+        let mut record = finite_record(
+            10,
+            Some(CustodySample {
+                clock_id: CLOCK_A,
+                tick_ms: 100,
+            }),
+            1,
+            false,
+        );
+        let continuity = ContinuityRecord {
+            generation: 2,
+            sample: CustodySample {
+                clock_id: CLOCK_B,
+                tick_ms: 1_000,
+            },
+        };
+
+        let evaluation = evaluate_item_age(&record, Some(continuity), Some(continuity.sample))
+            .expect("re-anchor evaluation");
+        assert_eq!(evaluation.status, CustodyAgeStatus::WithheldUnknownAge);
+        assert_eq!(evaluation.lower_bound_ms, 10);
+        assert_eq!(evaluation.checkpoint, Some(continuity.sample));
+        assert_eq!(evaluation.continuity_generation, 2);
+        assert!(evaluation.continuity_lost);
+        assert!(evaluation.needs_write);
+        apply_evaluation(&mut record, evaluation);
+
+        let later = CustodySample {
+            clock_id: CLOCK_B,
+            tick_ms: 1_089,
+        };
+        let evaluation = evaluate_item_age(&record, Some(continuity), Some(later))
+            .expect("same-domain evaluation");
+        assert_eq!(evaluation.status, CustodyAgeStatus::WithheldUnknownAge);
+        assert_eq!(evaluation.lower_bound_ms, 99);
+        assert!(evaluation.continuity_lost);
+        apply_evaluation(&mut record, evaluation);
+
+        let expired = evaluate_item_age(
+            &record,
+            Some(continuity),
+            Some(CustodySample {
+                clock_id: CLOCK_B,
+                tick_ms: 1_090,
+            }),
+        )
+        .expect("expiry evaluation");
+        assert_eq!(expired.status, CustodyAgeStatus::Expired { age_ms: 100 });
+        assert!(expired.continuity_lost);
+    }
+
+    #[test]
+    fn custody_reanchor_duplicate_merge_is_monotone() {
+        let mut record = finite_record(
+            10,
+            Some(CustodySample {
+                clock_id: CLOCK_B,
+                tick_ms: 1_000,
+            }),
+            2,
+            true,
+        );
+        let continuity_b = ContinuityRecord {
+            generation: 2,
+            sample: CustodySample {
+                clock_id: CLOCK_B,
+                tick_ms: 1_015,
+            },
+        };
+        assert_eq!(
+            merge_authenticated_age(
+                &mut record,
+                Some(continuity_b),
+                Some(CustodySample {
+                    clock_id: CLOCK_B,
+                    tick_ms: 1_010,
+                }),
+                8,
+            )
+            .expect("younger duplicate"),
+            (25, false, false)
+        );
+        assert_eq!(record.checkpoint, Some(continuity_b.sample));
+        assert!(record.continuity_lost);
+
+        assert_eq!(
+            merge_authenticated_age(
+                &mut record,
+                Some(continuity_b),
+                Some(CustodySample {
+                    clock_id: CLOCK_B,
+                    tick_ms: 1_014,
+                }),
+                50,
+            )
+            .expect("greater duplicate"),
+            (50, false, false)
+        );
+        assert_eq!(record.checkpoint, Some(continuity_b.sample));
+
+        assert_eq!(
+            merge_authenticated_age(&mut record, Some(continuity_b), None, 7)
+                .expect("missing sample"),
+            (50, false, false)
+        );
+        assert_eq!(record.checkpoint, None);
+        assert_eq!(record.continuity_generation, 0);
+
+        let continuity_c = ContinuityRecord {
+            generation: 3,
+            sample: CustodySample {
+                clock_id: [0xc3; 16],
+                tick_ms: 5_000,
+            },
+        };
+        merge_authenticated_age(
+            &mut record,
+            Some(continuity_c),
+            Some(continuity_c.sample),
+            7,
+        )
+        .expect("new anchor");
+        assert_eq!(record.cumulative_age_ms, 50);
+        assert_eq!(record.checkpoint, Some(continuity_c.sample));
+        assert!(record.continuity_lost);
+    }
 }

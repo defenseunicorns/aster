@@ -24,7 +24,14 @@
 //! have separate caps, while accepted-dot and causal-frontier aggregate
 //! retirement remains an explicit open boundary. [`BlobDepotLimits`] separately
 //! bound durable depot import/chunk rows and redb-marked chunk-file bytes, without
-//! claiming a bound on untracked filesystem allocation.
+//! claiming a bound on untracked filesystem allocation. [`BlobLifecycleLimits`]
+//! independently bound non-evictable physical-lineage and accepted-publication
+//! replay fences plus publication lifecycle rows. Exact typed references keep
+//! publication and pending-source ownership of depot variants distinct. A
+//! persistent six-class scheduler performs row/file/byte-bounded, fair discovery,
+//! but destructive candidates remain pending: retention/retirement expiry,
+//! physical reclamation or deletion manifests, pressure eviction, and finite Blob
+//! TTL are not implemented by this crate boundary.
 
 #![forbid(unsafe_code)]
 
@@ -3933,7 +3940,11 @@ impl StoreError {
     pub const fn is_read_only_repair_required(&self) -> bool {
         // redb intentionally refuses allocator repair from a read-only handle
         // after an unclean exit; this was also observed after node SIGKILL.
-        matches!(self, Self::Backend(redb::Error::RepairAborted))
+        matches!(
+            self,
+            Self::Backend(redb::Error::RepairAborted)
+                | Self::Custody(CustodyStoreError::LegacyCustodyMigrationRequired)
+        )
     }
 }
 
@@ -5203,11 +5214,13 @@ pub struct Store {
     limits: StoreLimits,
     blob_depot_limits: BlobDepotLimits,
     operation_limits: EventOperationLimits,
+    blob_lifecycle_limits: BlobLifecycleLimits,
     mission_authority: Option<NodeId>,
     live: AtomicBool,
     blob_depot_lock: std::sync::Mutex<()>,
     blob_completion_authority: std::sync::Arc<()>,
     blob_depot_owner_token: [u8; 32],
+    blob_depot_owner_binding: [u8; 32],
     #[cfg(test)]
     blob_depot_test_counters: BlobDepotTestCounters,
     #[cfg(test)]
@@ -5603,6 +5616,7 @@ impl Store {
             StoreLimits::default(),
             BlobDepotLimits::default(),
             EventOperationLimits::DEFAULT,
+            BlobLifecycleLimits::default(),
             Some(binding.mission_authority),
             Some(expectation),
         )?;
@@ -5654,6 +5668,28 @@ impl Store {
         operation_limits: EventOperationLimits,
         mission_authority: NodeId,
     ) -> Result<Self, StoreError> {
+        Self::open_with_all_limits_for_mission(
+            path,
+            limits,
+            blob_depot_limits,
+            operation_limits,
+            BlobLifecycleLimits::default(),
+            mission_authority,
+        )
+    }
+
+    /// Opens a mission-bound store with every independent durable admission limit.
+    ///
+    /// Lifecycle fences and publication rows are a separate non-evictable
+    /// authority from ordinary store, Blob-depot, and Event-operation limits.
+    pub fn open_with_all_limits_for_mission(
+        path: impl AsRef<Path>,
+        limits: StoreLimits,
+        blob_depot_limits: BlobDepotLimits,
+        operation_limits: EventOperationLimits,
+        blob_lifecycle_limits: BlobLifecycleLimits,
+        mission_authority: NodeId,
+    ) -> Result<Self, StoreError> {
         let path = path.as_ref();
         let readable_preflight = if path.exists() {
             match reject_terminal_normal_open(path) {
@@ -5682,6 +5718,7 @@ impl Store {
             limits,
             blob_depot_limits,
             operation_limits,
+            blob_lifecycle_limits,
             Some(mission_authority),
             None,
         )?;
@@ -5784,6 +5821,7 @@ impl Store {
             limits,
             BlobDepotLimits::default(),
             EventOperationLimits::DEFAULT,
+            BlobLifecycleLimits::default(),
             None,
             None,
         )
@@ -5794,6 +5832,7 @@ impl Store {
         limits: StoreLimits,
         blob_depot_limits: BlobDepotLimits,
         operation_limits: EventOperationLimits,
+        blob_lifecycle_limits: BlobLifecycleLimits,
         expected_mission_authority: Option<NodeId>,
         expected_security_profile_policy: Option<SecurityProfilePolicyExpectation>,
     ) -> Result<Self, StoreError> {
@@ -5913,7 +5952,7 @@ impl Store {
             event_operation::stage_legacy_event_operations_write(&write, operation_limits)?;
         // Audit all retained metadata, predecessor relations, witnesses and
         // legacy accounting before replacing any legacy row.
-        let blob_stats = audit_semantic_tables(&write, limits)?;
+        let mut blob_stats = audit_semantic_tables(&write, limits)?;
         if let Some(migration) = &operation_migration {
             migration.apply(&write)?;
         }
@@ -5921,13 +5960,22 @@ impl Store {
         let numbered_operation_stats =
             numbered_event_operation::audit_numbered_tables_write(&write)?;
         let blob_depot_owner_token = blob::depot::depot_owner_token_write(&write)?;
-        blob::depot::bind_depot_owner_write(
+        let blob_depot_owner_binding = blob::depot::bind_depot_owner_write(
             &write,
             &path,
             backing_identity,
             blob_depot_owner_token,
             blob_stats,
         )?;
+        let blob_lifecycle_migration = blob::lifecycle::stage_blob_lifecycle_migration_write(
+            &write,
+            blob_lifecycle_limits,
+            blob_depot_owner_binding,
+            &mut blob_stats,
+        )?;
+        if let Some(migration) = &blob_lifecycle_migration {
+            migration.apply(&write)?;
+        }
         audit_control_tables(&write)?;
         let mut mission_authority = read_mission_binding(&write)?;
         let bridge_event_stats =
@@ -5973,10 +6021,10 @@ impl Store {
         }
         custody::audit_custody_tables_write(&write, limits, mission_authority)?;
         numbered_event_operation::audit_numbered_result_authority_write(&write)?;
-        if operation_migration.is_some() {
-            // A failed physical audit must not leave a committed operation
+        if operation_migration.is_some() || blob_lifecycle_migration.is_some() {
+            // A failed physical audit must not leave a committed database
             // migration behind. Keep all fallible depot validation/reclaim in
-            // this same transaction for the bounded legacy conversion. The
+            // this same transaction for the bounded conversions. The
             // token/binding checks above forbid adopting an existing root with
             // a newly generated owner token; this audit never creates a root.
             blob::depot::audit_depot_write(
@@ -5993,13 +6041,22 @@ impl Store {
                 "injected Event operation migration abort",
             ));
         }
+        #[cfg(test)]
+        if blob_lifecycle_migration.is_some()
+            && blob::lifecycle::TEST_BLOB_LIFECYCLE_MIGRATION_FAULT.get()
+        {
+            return Err(StoreError::SemanticInvariant(
+                "injected Blob lifecycle migration abort",
+            ));
+        }
         write.commit()?;
 
-        // Opens without an operation migration retain the separate physical
+        // Opens without either database migration retain the separate physical
         // audit after persisting their database owner token. The second exact
         // writer transaction rechecks terminal and mission truth before depot
         // effects. A migration already completed this audit before its commit.
         if operation_migration.is_none()
+            && blob_lifecycle_migration.is_none()
             && let Some(authority) = mission_authority
         {
             let physical = database.begin_write()?;
@@ -6022,11 +6079,13 @@ impl Store {
             limits,
             blob_depot_limits,
             operation_limits,
+            blob_lifecycle_limits,
             mission_authority,
             live: AtomicBool::new(true),
             blob_depot_lock: std::sync::Mutex::new(()),
             blob_completion_authority: std::sync::Arc::new(()),
             blob_depot_owner_token,
+            blob_depot_owner_binding,
             #[cfg(test)]
             blob_depot_test_counters: BlobDepotTestCounters::default(),
             #[cfg(test)]
@@ -6044,6 +6103,11 @@ impl Store {
     /// Returns the permanent Event-operation ledger limits active on this handle.
     pub const fn operation_limits(&self) -> EventOperationLimits {
         self.operation_limits
+    }
+
+    /// Returns the non-evictable Blob lifecycle authority limits active on this handle.
+    pub const fn blob_lifecycle_limits(&self) -> BlobLifecycleLimits {
+        self.blob_lifecycle_limits
     }
 
     /// Returns exact logical usage charged against this handle's aggregate
@@ -6382,11 +6446,13 @@ impl Store {
             limits: _,
             blob_depot_limits: _,
             operation_limits: _,
+            blob_lifecycle_limits: _,
             mission_authority: _,
             live: _,
             blob_depot_lock: _,
             blob_completion_authority: _,
             blob_depot_owner_token: _,
+            blob_depot_owner_binding: _,
             #[cfg(test)]
                 blob_depot_test_counters: _,
             #[cfg(test)]
@@ -25143,6 +25209,139 @@ mod tests {
         }
     }
 
+    fn seed_numbered_local_finite_event_group(
+        store: &Store,
+        services: &mut EventServices,
+        count: usize,
+        ttl_ms: u64,
+        sample: aster_mesh::CustodySample,
+    ) {
+        let policy = store
+            .control_policy_snapshot()
+            .expect("numbered finite Event policy");
+        let reservations = store
+            .reserve_event_group_with_policy(
+                &policy,
+                services.publisher.identity(),
+                &event_topic(),
+                &event_scope(),
+                &vec![None; count],
+            )
+            .expect("numbered finite Event reservations");
+        let payloads = (0..count)
+            .map(|suffix| {
+                u64::try_from(suffix)
+                    .expect("bounded Event suffix")
+                    .to_be_bytes()
+            })
+            .collect::<Vec<_>>();
+        let identities = payloads
+            .iter()
+            .map(|suffix| {
+                let mut identity = b"finite/page/".to_vec();
+                identity.extend_from_slice(suffix);
+                identity
+            })
+            .collect::<Vec<_>>();
+        let headers = reservations
+            .iter()
+            .zip(&identities)
+            .zip(&payloads)
+            .map(|((reservation, identity), payload)| {
+                reservation
+                    .header(
+                        Priority::Routine,
+                        identity.clone(),
+                        Some(ttl_ms),
+                        payload.len() as u64,
+                        false,
+                        1,
+                    )
+                    .expect("numbered finite Event header")
+            })
+            .collect::<Vec<_>>();
+        let intents = headers
+            .iter()
+            .zip(&payloads)
+            .map(|(header, payload)| event_publication_intent(header, payload))
+            .collect::<Vec<_>>();
+        let operations = identities
+            .iter()
+            .cloned()
+            .map(|identity| {
+                EventOperationKey::new(identity).expect("numbered finite Event operation")
+            })
+            .collect::<Vec<_>>();
+        let sealeds = headers
+            .iter()
+            .zip(&payloads)
+            .map(|(header, payload)| {
+                services
+                    .publisher
+                    .seal_event(header, payload)
+                    .expect("seal numbered finite Event")
+            })
+            .collect::<Vec<_>>();
+        let events = sealeds
+            .iter()
+            .map(|sealed| content_event(&mut services.reader, &sealed.bytes))
+            .collect::<Vec<_>>();
+        let requests = operations
+            .iter()
+            .zip(&intents)
+            .zip(&payloads)
+            .map(|((operation, intent), payload)| {
+                EventOperationRequest::new(operation, intent, payload, None)
+                    .expect("numbered finite Event request")
+            })
+            .collect::<Vec<_>>();
+        let commits = requests
+            .iter()
+            .zip(&reservations)
+            .zip(&events)
+            .zip(&sealeds)
+            .map(|(((request, reservation), event), sealed)| {
+                ReservedEventOnceCommit::new(request, reservation, event, &sealed.bytes)
+            })
+            .collect::<Vec<_>>();
+        let committed = store
+            .commit_reserved_event_group_once_with_custody_policy(
+                &policy,
+                LocalCustodyCheckpoint::new(
+                    store.custody_policy_revision().expect("custody revision"),
+                    sample,
+                ),
+                &commits,
+            )
+            .expect("commit numbered finite Event group");
+        assert_eq!(committed.writer_commits(), 1);
+        assert_eq!(committed.outcomes().len(), count);
+        assert!(
+            committed
+                .outcomes()
+                .iter()
+                .all(|outcome| matches!(outcome, EventOnceOutcome::Inserted { .. }))
+        );
+    }
+
+    fn custody_expiration_generation_count(store: &Store, generation: u64) -> usize {
+        store
+            .database
+            .begin_read()
+            .expect("expiration generation read")
+            .open_table(custody::CUSTODY_EXPIRATIONS)
+            .expect("expiration generation table")
+            .iter()
+            .expect("expiration generation rows")
+            .map(|row| {
+                let (key, _) = row.expect("expiration generation row");
+                custody::custody_expiration_generation_for_test(key.value())
+                    .expect("expiration generation key")
+            })
+            .filter(|candidate| *candidate == generation)
+            .count()
+    }
+
     fn seed_peer_receipt_fanout(store: &Store, object: CustodyObjectKey, count: usize) {
         let write = store.database.begin_write().expect("receipt fan-out write");
         custody::seed_peer_receipt_fanout_write(&write, object, count)
@@ -40872,6 +41071,308 @@ mod tests {
         assert_eq!(inspection.custody_stats.retirements, 1);
         Store::open_for_mission(&file.0, services.authority).expect("reopen retired store");
     }
+
+    #[test]
+    fn custody_lost_age_expires_across_later_domains() {
+        let file = TestFile::new("custody lost age expires across later domains");
+        let mut services = event_services(0xe1);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let initial = aster_mesh::CustodySample {
+            clock_id: [0xa1; 16],
+            tick_ms: 100,
+        };
+        let transfer = accept_local_finite_event(&store, &mut services, 1, b"finite", 30, initial);
+        let key = CustodyObjectKey::event(transfer);
+
+        let clock_b = aster_mesh::CustodySample {
+            clock_id: [0xb2; 16],
+            tick_ms: 1_000,
+        };
+        let transition = store.collect_custody_garbage_observed(
+            Some(clock_b),
+            store
+                .custody_policy_revision()
+                .expect("pre-B transition revision"),
+            1,
+        );
+        assert!(matches!(
+            transition.into_result(),
+            Err(StoreError::Custody(CustodyStoreError::PolicyChanged))
+        ));
+        let reanchored = store
+            .collect_custody_garbage(
+                Some(clock_b),
+                store.custody_policy_revision().expect("B revision"),
+                1,
+            )
+            .expect("re-anchor in B");
+        assert_eq!(reanchored.examined_expirations, 0);
+        assert!(reanchored.marked.is_empty());
+        assert_eq!(
+            store
+                .custody_age_status(key, Some(clock_b))
+                .expect("B status"),
+            Some(CustodyAgeStatus::WithheldUnknownAge)
+        );
+
+        let b_high_water = aster_mesh::CustodySample {
+            clock_id: clock_b.clock_id,
+            tick_ms: 1_029,
+        };
+        let before_due = store
+            .collect_custody_garbage(
+                Some(b_high_water),
+                store
+                    .custody_policy_revision()
+                    .expect("B high-water revision"),
+                1,
+            )
+            .expect("persist B high-water");
+        assert!(before_due.marked.is_empty());
+
+        let clock_c = aster_mesh::CustodySample {
+            clock_id: [0xc3; 16],
+            tick_ms: 9_000,
+        };
+        let transition = store.collect_custody_garbage_observed(
+            Some(clock_c),
+            store
+                .custody_policy_revision()
+                .expect("pre-C transition revision"),
+            1,
+        );
+        assert!(matches!(
+            transition.into_result(),
+            Err(StoreError::Custody(CustodyStoreError::PolicyChanged))
+        ));
+        let second_reanchor = store
+            .collect_custody_garbage(
+                Some(clock_c),
+                store.custody_policy_revision().expect("C revision"),
+                1,
+            )
+            .expect("account B and re-anchor C");
+        assert_eq!(second_reanchor.examined_expirations, 0);
+        assert!(second_reanchor.marked.is_empty());
+        assert_eq!(
+            store
+                .custody_age_status(key, Some(clock_c))
+                .expect("C status"),
+            Some(CustodyAgeStatus::WithheldUnknownAge)
+        );
+
+        let expired = aster_mesh::CustodySample {
+            clock_id: clock_c.clock_id,
+            tick_ms: 9_001,
+        };
+        let retired = store
+            .collect_custody_garbage(
+                Some(expired),
+                store.custody_policy_revision().expect("expiry revision"),
+                1,
+            )
+            .expect("expire from proven lower bound");
+        assert_eq!(retired.marked, vec![key]);
+        assert_eq!(retired.retired, vec![key]);
+        assert_eq!(
+            store
+                .custody_sender_status(key, Some(expired))
+                .expect("retired status"),
+            Some(CustodySenderStatus::Retired { age_ms: 30 })
+        );
+        assert!(matches!(
+            store
+                .event_operation_resolution(
+                    &EventOperationKey::new(vec![b'f', 1]).expect("operation key")
+                )
+                .expect("retired operation"),
+            Some(EventOperationResolution::RetiredOperation {
+                reason: CustodyRetirementReason::Expired,
+            })
+        ));
+    }
+
+    #[test]
+    fn custody_reanchor_progress_survives_reopen() {
+        let file = TestFile::new("custody re-anchor survives reopen");
+        let mut services = event_services(0xe2);
+        let initial = aster_mesh::CustodySample {
+            clock_id: [0xd1; 16],
+            tick_ms: 100,
+        };
+        let transfer = {
+            let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+            let transfer =
+                accept_local_finite_event(&store, &mut services, 2, b"reopen", 20, initial);
+            let reanchor = aster_mesh::CustodySample {
+                clock_id: [0xd2; 16],
+                tick_ms: 5_000,
+            };
+            let transition = store.collect_custody_garbage_observed(
+                Some(reanchor),
+                store
+                    .custody_policy_revision()
+                    .expect("pre-re-anchor revision"),
+                1,
+            );
+            assert!(matches!(
+                transition.into_result(),
+                Err(StoreError::Custody(CustodyStoreError::PolicyChanged))
+            ));
+            let report = store
+                .collect_custody_garbage(
+                    Some(reanchor),
+                    store.custody_policy_revision().expect("re-anchor revision"),
+                    1,
+                )
+                .expect("re-anchor");
+            assert_eq!(report.examined_expirations, 0);
+            assert!(report.marked.is_empty());
+            transfer
+        };
+
+        Store::inspect_existing(&file.0).expect("inspect re-anchored store");
+        let store = Store::open_for_mission(&file.0, services.authority).expect("reopen");
+        let key = CustodyObjectKey::event(transfer);
+        let before = aster_mesh::CustodySample {
+            clock_id: [0xd2; 16],
+            tick_ms: 5_019,
+        };
+        assert!(
+            store
+                .collect_custody_garbage(
+                    Some(before),
+                    store.custody_policy_revision().expect("before revision"),
+                    1,
+                )
+                .expect("before expiry")
+                .marked
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .custody_age_status(key, Some(before))
+                .expect("withheld before expiry"),
+            Some(CustodyAgeStatus::WithheldUnknownAge)
+        );
+        let due = aster_mesh::CustodySample {
+            clock_id: [0xd2; 16],
+            tick_ms: 5_020,
+        };
+        let report = store
+            .collect_custody_garbage(
+                Some(due),
+                store.custody_policy_revision().expect("due revision"),
+                1,
+            )
+            .expect("expiry after reopen");
+        assert_eq!(report.marked, vec![key]);
+        assert_eq!(report.retired, vec![key]);
+    }
+
+    #[test]
+    fn custody_reanchors_more_than_one_page_transactionally_across_reopen() {
+        let file = TestFile::new("custody multi-page re-anchor survives reopen");
+        let mut services = event_services(0xed);
+        let initial = aster_mesh::CustodySample {
+            clock_id: [0xd3; 16],
+            tick_ms: 100,
+        };
+        let changed = aster_mesh::CustodySample {
+            clock_id: [0xd4; 16],
+            tick_ms: 5_000,
+        };
+        let item_count = MAX_CUSTODY_PAGE + 1;
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        seed_numbered_local_finite_event_group(&store, &mut services, item_count, 10_000, initial);
+        assert_eq!(custody_expiration_generation_count(&store, 1), item_count);
+
+        let transition = store.collect_custody_garbage_observed(
+            Some(changed),
+            store
+                .custody_policy_revision()
+                .expect("pre-transition revision"),
+            MAX_CUSTODY_PAGE,
+        );
+        assert_eq!(transition.writer_commits(), 1);
+        assert!(matches!(
+            transition.into_result(),
+            Err(StoreError::Custody(CustodyStoreError::PolicyChanged))
+        ));
+        assert_eq!(custody_expiration_generation_count(&store, 1), 1);
+        assert_eq!(
+            custody_expiration_generation_count(&store, 2),
+            MAX_CUSTODY_PAGE
+        );
+        drop(store);
+
+        Store::inspect_existing(&file.0).expect("inspect partially re-anchored store");
+        let store = Store::open_for_mission(&file.0, services.authority).expect("reopen store");
+        let final_page = store
+            .collect_custody_garbage(
+                Some(changed),
+                store.custody_policy_revision().expect("reopened revision"),
+                MAX_CUSTODY_PAGE,
+            )
+            .expect("finish re-anchor");
+        assert_eq!(final_page.examined_expirations, 1);
+        assert!(final_page.marked.is_empty());
+        assert_eq!(custody_expiration_generation_count(&store, 1), 0);
+        assert_eq!(custody_expiration_generation_count(&store, 2), item_count);
+        drop(store);
+
+        Store::inspect_existing(&file.0).expect("inspect fully re-anchored store");
+        Store::open_for_mission(&file.0, services.authority).expect("reopen completed store");
+    }
+
+    #[test]
+    fn custody_unknown_gap_is_never_counted() {
+        let file = TestFile::new("custody unknown gap is never counted");
+        let mut services = event_services(0xe3);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let transfer = accept_local_finite_event(
+            &store,
+            &mut services,
+            3,
+            b"unknown-gap",
+            100,
+            aster_mesh::CustodySample {
+                clock_id: [0xe1; 16],
+                tick_ms: 5,
+            },
+        );
+        let key = CustodyObjectKey::event(transfer);
+        let reanchor = aster_mesh::CustodySample {
+            clock_id: [0xe2; 16],
+            tick_ms: u64::MAX - 100,
+        };
+        let transition = store.collect_custody_garbage_observed(
+            Some(reanchor),
+            store
+                .custody_policy_revision()
+                .expect("pre-gap transition revision"),
+            1,
+        );
+        assert!(matches!(
+            transition.into_result(),
+            Err(StoreError::Custody(CustodyStoreError::PolicyChanged))
+        ));
+        store
+            .collect_custody_garbage(
+                Some(reanchor),
+                store.custody_policy_revision().expect("re-anchor revision"),
+                1,
+            )
+            .expect("large unknown gap");
+        assert_eq!(
+            store
+                .custody_age_status(key, Some(reanchor))
+                .expect("post-gap status"),
+            Some(CustodyAgeStatus::WithheldUnknownAge)
+        );
+        assert!(store.get_event(transfer).expect("retained Event").is_some());
+    }
+
     #[test]
     fn custody_garbage_collection_examines_only_due_rows() {
         let file = TestFile::new("indexed custody garbage collection");
@@ -41814,6 +42315,110 @@ mod tests {
                     "custody expiration index differs from live items"
                 )))
             ));
+        }
+    }
+
+    #[test]
+    fn legacy_lost_custody_rows_are_canonicalized_before_strict_audit() {
+        for retain_generation in [true, false] {
+            let file = TestFile::new(if retain_generation {
+                "legacy lost custody retained generation"
+            } else {
+                "legacy lost custody zero generation"
+            });
+            let mut services = event_services(if retain_generation { 0xe7 } else { 0xe8 });
+            let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+            let transfer = accept_local_finite_event(
+                &store,
+                &mut services,
+                0,
+                b"legacy-lost",
+                100,
+                aster_mesh::CustodySample {
+                    clock_id: [0x67; 16],
+                    tick_ms: 1_000,
+                },
+            );
+            let key = CustodyObjectKey::event(transfer);
+            let mut encoded_key = [0u8; 33];
+            encoded_key[0] = CustodyObjectClass::Event as u8;
+            encoded_key[1..].copy_from_slice(transfer.as_bytes());
+
+            let write = store.database.begin_write().expect("legacy shape write");
+            let encoded_item = write
+                .open_table(custody::CUSTODY_ITEMS)
+                .expect("custody items")
+                .get(encoded_key.as_slice())
+                .expect("read custody item")
+                .expect("finite custody item")
+                .value()
+                .to_vec();
+            let legacy_item =
+                custody::reencode_legacy_lost_item_for_test(&encoded_item, retain_generation)
+                    .expect("encode legacy lost row");
+            write
+                .open_table(custody::CUSTODY_ITEMS)
+                .expect("custody items")
+                .insert(encoded_key.as_slice(), legacy_item.as_slice())
+                .expect("write legacy lost row");
+            let expiration_keys = write
+                .open_table(custody::CUSTODY_EXPIRATIONS)
+                .expect("custody expirations")
+                .iter()
+                .expect("expiration rows")
+                .map(|row| row.map(|(key, _)| key.value().to_vec()))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect expiration keys");
+            let mut expirations = write
+                .open_table(custody::CUSTODY_EXPIRATIONS)
+                .expect("custody expirations");
+            for expiration_key in expiration_keys {
+                expirations
+                    .remove(expiration_key.as_slice())
+                    .expect("remove legacy-omitted expiration");
+            }
+            drop(expirations);
+            write.commit().expect("commit legacy lost shape");
+            drop(store);
+
+            assert!(matches!(
+                Store::inspect_existing(&file.0),
+                Err(ref error) if error.is_read_only_repair_required()
+            ));
+            let reopened = Store::open_for_mission(&file.0, services.authority)
+                .expect("canonicalize legacy lost custody row");
+            assert_eq!(
+                reopened
+                    .custody_age_status(key, None)
+                    .expect("legacy lost status"),
+                Some(CustodyAgeStatus::WithheldUnknownAge)
+            );
+            drop(reopened);
+
+            Store::inspect_existing(&file.0).expect("inspect canonicalized custody row");
+            let database = Database::open(&file.0).expect("inspect canonical storage");
+            let read = database.begin_read().expect("canonical read");
+            let canonical_item = read
+                .open_table(custody::CUSTODY_ITEMS)
+                .expect("custody items")
+                .get(encoded_key.as_slice())
+                .expect("read canonical item")
+                .expect("canonical custody item")
+                .value()
+                .to_vec();
+            let expected_expiration = custody::custody_expiration_key_for_test(
+                encoded_key.as_slice(),
+                canonical_item.as_slice(),
+            )
+            .expect("derive canonical expiration")
+            .expect("canonical sentinel");
+            assert!(
+                read.open_table(custody::CUSTODY_EXPIRATIONS)
+                    .expect("custody expirations")
+                    .get(expected_expiration.as_slice())
+                    .expect("read canonical sentinel")
+                    .is_some()
+            );
         }
     }
 
@@ -45091,6 +45696,17 @@ mod tests {
             .expect("custody items")
             .insert(encoded_key.as_slice(), tampered_item.as_slice())
             .expect("tamper custody metadata");
+        let expiration_key = custody::custody_expiration_key_for_test(
+            encoded_key.as_slice(),
+            tampered_item.as_slice(),
+        )
+        .expect("derive coherent custody expiration")
+        .expect("finite custody sentinel");
+        write
+            .open_table(custody::CUSTODY_EXPIRATIONS)
+            .expect("custody expirations")
+            .insert(expiration_key.as_slice(), &[][..])
+            .expect("insert coherent custody expiration");
         write.commit().expect("commit coherent metadata tamper");
         drop(store);
 

@@ -160,42 +160,21 @@ impl CustodyAge {
         self.continuity = CustodyContinuity::Lost;
     }
 
-    /// Computes current cumulative age with checked arithmetic.
+    /// Accounts the current cumulative age with checked arithmetic.
     ///
-    /// A missing sample, changed clock identifier, tick rollback, or overflow
-    /// marks continuity lost before returning an error.
+    /// Exact continuity returns the updated age.  Once continuity is lost, the
+    /// method still persists provable same-domain intervals as a conservative
+    /// lower bound but returns [`CustodyError::ContinuityUnavailable`].  A
+    /// missing sample clears the old anchor; a changed domain or tick rollback
+    /// installs the supplied sample as a new zero-delta anchor.  Overflow
+    /// saturates the lower bound and returns [`CustodyError::AgeOverflow`].
     pub fn effective_age(&mut self, current: Option<CustodySample>) -> Result<u64, CustodyError> {
-        if !self.is_continuous() {
-            return Err(CustodyError::ContinuityUnavailable);
-        }
-        let (Some(checkpoint), Some(current)) = (self.checkpoint, current) else {
-            self.mark_continuity_lost();
-            return Err(CustodyError::ContinuityUnavailable);
-        };
-        if checkpoint.clock_id != current.clock_id || current.tick_ms < checkpoint.tick_ms {
-            self.mark_continuity_lost();
-            return Err(CustodyError::ContinuityUnavailable);
-        }
-        let elapsed = current
-            .tick_ms
-            .checked_sub(checkpoint.tick_ms)
-            .ok_or(CustodyError::ContinuityUnavailable)?;
-        match self.cumulative_age_ms.checked_add(elapsed) {
-            Some(age) => Ok(age),
-            None => {
-                self.mark_continuity_lost();
-                Err(CustodyError::AgeOverflow)
-            }
-        }
+        self.account_current(current, false)
     }
 
     /// Accounts elapsed time and persists `current` as the new checkpoint.
     pub fn checkpoint(&mut self, current: Option<CustodySample>) -> Result<u64, CustodyError> {
-        let age = self.effective_age(current)?;
-        let current = current.ok_or(CustodyError::ContinuityUnavailable)?;
-        self.cumulative_age_ms = age;
-        self.checkpoint = Some(current);
-        Ok(age)
+        self.account_current(current, false)
     }
 
     /// Merges an authenticated duplicate without ever decreasing age.
@@ -207,12 +186,62 @@ impl CustodyAge {
         received_age_ms: u64,
         current: Option<CustodySample>,
     ) -> Result<u64, CustodyError> {
-        let local_age = self.effective_age(current)?;
-        let current = current.ok_or(CustodyError::ContinuityUnavailable)?;
-        let merged = local_age.max(received_age_ms);
+        match self.account_current(current, true) {
+            Ok(_) | Err(CustodyError::ContinuityUnavailable) => {}
+            Err(error) => return Err(error),
+        }
+        let merged = self.cumulative_age_ms.max(received_age_ms);
         self.cumulative_age_ms = merged;
-        self.checkpoint = Some(current);
         Ok(merged)
+    }
+
+    fn account_current(
+        &mut self,
+        current: Option<CustodySample>,
+        preserve_same_domain_rollback: bool,
+    ) -> Result<u64, CustodyError> {
+        let Some(current) = current else {
+            self.mark_continuity_lost();
+            self.checkpoint = None;
+            return Err(CustodyError::ContinuityUnavailable);
+        };
+
+        let Some(checkpoint) = self.checkpoint else {
+            self.mark_continuity_lost();
+            self.checkpoint = Some(current);
+            return Err(CustodyError::ContinuityUnavailable);
+        };
+
+        if checkpoint.clock_id != current.clock_id {
+            self.mark_continuity_lost();
+            self.checkpoint = Some(current);
+            return Err(CustodyError::ContinuityUnavailable);
+        }
+        if current.tick_ms < checkpoint.tick_ms {
+            self.mark_continuity_lost();
+            if !preserve_same_domain_rollback {
+                self.checkpoint = Some(current);
+            }
+            return Err(CustodyError::ContinuityUnavailable);
+        }
+
+        let elapsed = current.tick_ms - checkpoint.tick_ms;
+        self.checkpoint = Some(current);
+        match self.cumulative_age_ms.checked_add(elapsed) {
+            Some(age) => {
+                self.cumulative_age_ms = age;
+                if self.is_continuous() {
+                    Ok(age)
+                } else {
+                    Err(CustodyError::ContinuityUnavailable)
+                }
+            }
+            None => {
+                self.cumulative_age_ms = u64::MAX;
+                self.mark_continuity_lost();
+                Err(CustodyError::AgeOverflow)
+            }
+        }
     }
 }
 
@@ -271,11 +300,12 @@ pub fn evaluate_custody(
             age_ms: age.cumulative_age_ms(),
         };
     }
-    let Ok(age_ms) = age.effective_age(current) else {
-        return CustodyDisposition::Indeterminate;
-    };
+    let exact_age = age.checkpoint(current);
+    let age_ms = age.cumulative_age_ms();
     if age_ms >= ttl_ms {
         CustodyDisposition::Expired { age_ms }
+    } else if exact_age.is_err() {
+        CustodyDisposition::Indeterminate
     } else {
         CustodyDisposition::LiveFinite {
             age_ms,
@@ -762,12 +792,15 @@ mod tests {
     use super::*;
 
     const CLOCK: [u8; 16] = [0x11; 16];
+    const CLOCK_B: [u8; 16] = [0x22; 16];
+    const CLOCK_C: [u8; 16] = [0x33; 16];
 
     fn sample(tick_ms: u64) -> CustodySample {
-        CustodySample {
-            clock_id: CLOCK,
-            tick_ms,
-        }
+        sample_in(CLOCK, tick_ms)
+    }
+
+    fn sample_in(clock_id: [u8; 16], tick_ms: u64) -> CustodySample {
+        CustodySample { clock_id, tick_ms }
     }
 
     fn claims(ttl_ms: Option<u64>) -> CustodyClaims {
@@ -874,7 +907,7 @@ mod tests {
         assert_eq!(age.continuity(), CustodyContinuity::Lost);
         assert_eq!(
             evaluate_custody(Some(u64::MAX), false, &mut age, Some(sample(2))),
-            CustodyDisposition::Indeterminate
+            CustodyDisposition::Expired { age_ms: u64::MAX }
         );
 
         let mut expired_lower_bound = CustodyAge::unknown(u64::MAX);
@@ -895,6 +928,132 @@ mod tests {
         assert_eq!(age.merge_authenticated_age(110, Some(sample(20))), Ok(110));
         assert_eq!(age.merge_authenticated_age(150, Some(sample(25))), Ok(150));
         assert_eq!(age.cumulative_age_ms(), 150);
+    }
+
+    #[test]
+    fn lost_age_reanchors_without_counting_unknown_gap() {
+        let mut age = CustodyAge::new(10, sample_in(CLOCK, 100));
+
+        assert_eq!(
+            evaluate_custody(Some(30), false, &mut age, Some(sample_in(CLOCK_B, 9_000)),),
+            CustodyDisposition::Indeterminate
+        );
+        assert_eq!(age.cumulative_age_ms(), 10);
+        assert_eq!(age.checkpoint_sample(), Some(sample_in(CLOCK_B, 9_000)));
+        assert_eq!(
+            evaluate_custody(Some(30), false, &mut age, Some(sample_in(CLOCK_B, 9_020)),),
+            CustodyDisposition::Expired { age_ms: 30 }
+        );
+        assert_eq!(age.continuity(), CustodyContinuity::Lost);
+    }
+
+    #[test]
+    fn lost_age_accumulates_later_same_domain_intervals() {
+        let mut age = CustodyAge::unknown(5);
+
+        assert_eq!(
+            age.checkpoint(Some(sample_in(CLOCK_B, 100))),
+            Err(CustodyError::ContinuityUnavailable)
+        );
+        assert_eq!(age.cumulative_age_ms(), 5);
+        assert_eq!(
+            age.checkpoint(Some(sample_in(CLOCK_B, 112))),
+            Err(CustodyError::ContinuityUnavailable)
+        );
+        assert_eq!(age.cumulative_age_ms(), 17);
+        assert_eq!(age.checkpoint_sample(), Some(sample_in(CLOCK_B, 112)));
+        assert_eq!(age.continuity(), CustodyContinuity::Lost);
+    }
+
+    #[test]
+    fn multiple_lost_domains_accumulate_only_proven_intervals() {
+        let mut age = CustodyAge::new(10, sample_in(CLOCK, 100));
+
+        assert_eq!(
+            age.checkpoint(Some(sample_in(CLOCK_B, 1_000))),
+            Err(CustodyError::ContinuityUnavailable)
+        );
+        assert_eq!(
+            age.checkpoint(Some(sample_in(CLOCK_B, 1_010))),
+            Err(CustodyError::ContinuityUnavailable)
+        );
+        assert_eq!(
+            age.checkpoint(Some(sample_in(CLOCK_C, 5_000))),
+            Err(CustodyError::ContinuityUnavailable)
+        );
+        assert_eq!(
+            age.checkpoint(Some(sample_in(CLOCK_C, 5_007))),
+            Err(CustodyError::ContinuityUnavailable)
+        );
+
+        assert_eq!(age.cumulative_age_ms(), 27);
+        assert_eq!(age.checkpoint_sample(), Some(sample_in(CLOCK_C, 5_007)));
+        assert_eq!(age.continuity(), CustodyContinuity::Lost);
+    }
+
+    #[test]
+    fn lost_duplicate_merge_never_rejuvenates() {
+        let mut age = CustodyAge::new(10, sample_in(CLOCK, 100));
+        assert_eq!(
+            age.checkpoint(Some(sample_in(CLOCK_B, 1_000))),
+            Err(CustodyError::ContinuityUnavailable)
+        );
+
+        assert_eq!(
+            age.merge_authenticated_age(8, Some(sample_in(CLOCK_B, 1_010))),
+            Ok(20)
+        );
+        assert_eq!(
+            age.merge_authenticated_age(50, Some(sample_in(CLOCK_B, 1_015))),
+            Ok(50)
+        );
+        assert_eq!(
+            age.merge_authenticated_age(7, Some(sample_in(CLOCK_B, 1_014))),
+            Ok(50)
+        );
+        assert_eq!(age.cumulative_age_ms(), 50);
+        assert_eq!(age.checkpoint_sample(), Some(sample_in(CLOCK_B, 1_015)));
+        assert_eq!(age.continuity(), CustodyContinuity::Lost);
+    }
+
+    #[test]
+    fn missing_sample_discards_the_old_anchor() {
+        let mut age =
+            CustodyAge::from_parts(20, Some(sample_in(CLOCK, 100)), CustodyContinuity::Lost)
+                .expect("lost state may retain an anchor");
+
+        assert_eq!(
+            age.checkpoint(None),
+            Err(CustodyError::ContinuityUnavailable)
+        );
+        assert_eq!(age.checkpoint_sample(), None);
+        assert_eq!(
+            age.checkpoint(Some(sample_in(CLOCK, 1_000))),
+            Err(CustodyError::ContinuityUnavailable)
+        );
+        assert_eq!(age.cumulative_age_ms(), 20);
+        assert_eq!(
+            age.checkpoint(Some(sample_in(CLOCK, 1_009))),
+            Err(CustodyError::ContinuityUnavailable)
+        );
+        assert_eq!(age.cumulative_age_ms(), 29);
+    }
+
+    #[test]
+    fn overflow_saturates_the_proven_lower_bound() {
+        let mut age = CustodyAge::new(u64::MAX - 1, sample(0));
+
+        assert_eq!(
+            age.checkpoint(Some(sample(2))),
+            Err(CustodyError::AgeOverflow)
+        );
+        assert_eq!(age.cumulative_age_ms(), u64::MAX);
+        assert_eq!(age.checkpoint_sample(), Some(sample(2)));
+        assert_eq!(age.continuity(), CustodyContinuity::Lost);
+        assert_eq!(
+            evaluate_custody(Some(u64::MAX), false, &mut age, Some(sample(3))),
+            CustodyDisposition::Expired { age_ms: u64::MAX }
+        );
     }
 
     #[test]

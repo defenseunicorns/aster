@@ -137,6 +137,7 @@ pub(super) fn snapshot_table(read: &redb::ReadTransaction, name: &str) -> Logica
     try_table!(&str, &[u8]);
     try_table!(&str, u64);
     try_table!(u64, &[u8]);
+    try_table!(u8, &[u8]);
     panic!("unexpected fixture table type: {name}");
 }
 

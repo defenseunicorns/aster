@@ -81,10 +81,20 @@ frontier, ordered control effects, policy/selector snapshots, at-least-once Even
 Event representations, and the terminal zeroization marker. State, Record, and
 Blob operation rows have separate dedicated count/byte ceilings and also
 participate in aggregate store quotas; no unbounded idempotency table is
-implied. Blob ciphertext is stored outside redb under separate committed-byte,
-chunk, and variant ceilings, while redb remains the authority for exact
-publication and committed-file markers. On its first successful open, redb
-persists a domain-separated commitment over a random owner token, canonical
+implied. Blob lifecycle authority is separately non-evictable and capacity-
+bounded: permanent physical-lineage fences and accepted-publication replay
+fences have independent row/encoded-byte limits, while publication lifecycle
+rows have their own row limit. The selected defaults are 65,536 rows and 16 MiB
+for each fence class and 65,536 publication lifecycle rows. Exact typed
+references distinguish publication roots from pending-source roots for each
+depot variant. These lifecycle limits are not retention durations and cannot be
+reclaimed by pressure eviction.
+
+Blob ciphertext is stored outside redb under separate committed-byte, chunk,
+and variant ceilings, while redb remains the authority for exact publication,
+reference, fence, accounting, and committed-file markers. On its first
+successful open, redb persists a domain-separated commitment over a random
+owner token, canonical
 database path, and Unix device/inode when available. The fixed sibling depot’s
 private marker must carry the same binding before any chunk/variant scan or
 reclaim. The first database to initialize a parent’s depot wins; another cannot
@@ -124,6 +134,18 @@ The sender's persisted per-peer,
 per-priority cursor rotates attempts only within the same priority tier and is
 never delivery evidence. Its allocation and the sender page-packing target are
 local implementation details, not wire limits.
+
+Event/RouteEvent finite lifetime uses one shared lower-bound custody state
+machine in core and redb. Exact continuity permits normal forwarding. Once
+continuity is lost, forwarding remains permanently disabled for that row, while
+valid later clock domains are used only to accumulate provable same-domain
+intervals. The redb expiration index doubles as a bounded re-anchor queue:
+unanchored rows use a sentinel, older generations are processed before current
+deadlines, and every age/checkpoint/index change commits atomically. This avoids
+both wall-clock reconstruction and an unbounded restart scan. Reaching TTL on
+the conservative lower bound feeds the existing marked-then-retired Event
+lifecycle, including lease drain. Wire claims and durable item encoding do not
+change. Blob finite lifetime and Blob route-only custody remain later work.
 
 Each mission-authenticated contact runs class-separated State and Record
 Negentropy/fetch lanes after its control and Event lanes. A receiver supplies
@@ -343,6 +365,30 @@ new signed publication while reusing the same immutable completed variant in
 one content group and epoch. Rekey creates a distinct encrypted variant even
 when object identity is unchanged.
 
+The durable Blob lifecycle schema wraps live publications and operation rows,
+counts publication and exact typed variant-reference roots, and retains two
+separately bounded permanent security fences. A lineage fence binds each depot
+variant to its accepted physical lineage and depot-owner binding. A replay fence
+binds each accepted publisher dot to the exact semantic publication, transfer,
+source length, and source digest. Local publication admits the replay fence,
+publication lifecycle row, publication reference, ordinary publication indexes,
+causal rows, and operation result in one redb transaction. Network staging
+admits the lineage fence, pending reference, pending source, depot plan, and
+accounting atomically; promotion atomically replaces that pending reference with
+a publication reference while installing replay/publication/causal authority and
+removing pending rows; abort atomically removes only the pending source and its
+reference. The lineage fence and depot import remain after abort.
+
+Opening a predecessor store reconstructs and audits the complete lifecycle
+image, checks all configured lifecycle capacities and the paired physical depot,
+and then commits wrappers, fences, references, counters, and maintenance cursors
+together.
+Any audit or injected failure leaves the predecessor untouched. Read-only
+inspection reconstructs predecessor state only in memory. Once current, every
+open strictly checks exact bidirectional correspondence among base rows,
+lifecycle rows, typed references, permanent fences, accounting, and cursor
+shape; it does not repair a partial or contradictory current schema.
+
 Under semantic v5, a content-capable receiver reconciles exact Blob source IDs
 before requesting only missing, peer-neutral 16-KiB carrier prefixes. Every
 source and range send requires the authenticated peer's current exact content
@@ -367,6 +413,24 @@ cryptographic shredding, not Blob-file deletion or physical sanitization.
 Current code has a durable metadata-only exact-publication Blob delivery
 ledger. Its local counts do not grant authority and are neither peer nor
 convergence status.
+
+Blob maintenance persists one cursor for each of six ordered classes plus the
+next class: expired publications/pending sources, invalid pending work,
+unreferenced local import staging, unreferenced completed variants, expired
+retirement records, and manifest-backed physical deletion. One turn selects one
+class, scans a wrapping page, advances to the next class, and commits the class
+cursor and rotation together. The selected runtime requires nonzero row, file,
+and byte budgets and uses 16 rows, one file, and 2 MiB per turn. It runs one turn
+after the strict startup audit before Blob command admission, then schedules at
+most one background turn after operational application/control work on each
+periodic actor tick; the actor remains available while that blocking page runs.
+
+This scheduler is discovery and structural validation only in this increment.
+Unreferenced staging/completed-variant candidates are reported, leave their
+cursor revisitable, and set the later-handler boundary; no row or file is
+deleted. The other future destructive classes likewise have no expiry or
+deletion handler. Retention/retirement expiry, physical reclamation and deletion
+manifests, pressure eviction, and finite Blob TTL are not implemented.
 
 ## Live application command and status flow
 

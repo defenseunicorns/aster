@@ -303,6 +303,16 @@ are recorded separately in the
   session-record AAD, bind the exact transfer/source fields, exchange, nonzero
   policy revision, session ID, and checked cumulative age, and are
   replay-checked before store admission.
+- Exact custody-clock continuity loss is sticky. Finite Event/RouteEvent data
+  stays non-forwardable below TTL, but later same-domain monotonic intervals
+  continue increasing a durable conservative lower bound. Unknown intervals
+  contribute zero, authenticated duplicates cannot rejuvenate data, and
+  arithmetic overflow saturates the lower bound. Once that lower bound reaches
+  TTL, expiry is certain and the existing bounded retirement path is safe.
+  Lost unanchored and prior-generation rows remain present in the audited
+  expiration index, so restart cannot strand them outside bounded maintenance.
+  This is a local storage/lifecycle change with no new wire evidence; Blob does
+  not gain finite lifecycle or route-only custody in this change.
 - Protected v3-format Event interests used in v3/v4/v5/v6/v7 `LegacyV6` bind an opaque receiver
   selector generation.
   Receipts suppress only that generation; `Satisfied` hides Carry versus
@@ -614,6 +624,17 @@ byte, chunk, and variant caps. Exact-lineage retry may resume it; a missing
 physical lineage is corruption, and another lineage at the same numeric epoch
 still conflicts.
 
+The lineage witness is a permanent, non-evictable fence with its own row and
+encoded-byte cap. A separate permanent replay fence binds every accepted Blob
+publisher dot to the exact semantic ID, transfer ID, source length, and source
+digest under an independent row/byte cap. Live publication lifecycle rows have
+a third row cap, and exact variant references carry a typed publication or
+pending-source owner. Selected defaults are 65,536 rows and 16 MiB for each
+fence class, plus 65,536 publication lifecycle rows. Capacity exhaustion fails
+admission without removing an older fence or publication. These fences preserve
+durable replay and same-epoch lineage safety; they do not define retention time
+or authorize reclamation.
+
 The source envelope and complete manifest plan are authenticated and staged
 before any carrier range is requested. Prefix progress is durable under the
 exact `(source transfer ID, carrier ObjectID)` and is not owned by a peer or
@@ -662,6 +683,13 @@ network tables may be added to the prior nine-table Blob schema only when the
 group is wholly absent and owner attribution is valid; read-only and partial-
 group opens never create or repair tables.
 
+Lifecycle migration follows the same fail-closed rule. Before changing a
+predecessor store, the implementation reconstructs all wrappers, typed roots,
+lineage and replay fences, accounting, and cursors; audits the base schema and
+physical depot; and preflights every lifecycle cap. Only one transaction makes
+that image authoritative. Current-schema open requires exact bidirectional
+agreement and never repairs a partial or contradictory lifecycle image.
+
 The application boundary uses the same authority rather than a second Blob
 store. `RunningNode::selected_blobs()` returns a cloneable handle whose publish
 operation accepts ownership only of a nonempty regular file positioned at byte
@@ -704,6 +732,24 @@ Normal and `AtLeast` run this lane because `AtLeast` is Event-only;
 `ReceiveOnly` sends, requests, stages, promotes, and counts zero Blob work.
 The local delivery-ledger counts are not Blob peer, contact, transfer-progress,
 or convergence status.
+
+Local publication, network staging, promotion, and abort update their ordinary
+Blob rows, causal authority, lifecycle accounting, permanent fences, and typed
+references within the corresponding redb transaction. Promotion moves an exact
+pending-source reference to a publication reference; abort removes the pending
+reference while retaining its lineage fence and depot import. No observer can
+see a publication without its replay/root authority or a pending source without
+its exact lineage/root authority after a successful commit.
+
+The persistent maintenance scheduler rotates fairly over six classes with
+independent nonzero row, file, and byte budgets. Startup runs one bounded turn;
+periodic turns run one at a time in a background worker only after operational
+actor work has had an opportunity to proceed. Before cursor advance, each page
+validates the lifecycle/accounting evidence it depends on and fails closed on a
+contradiction. Candidate discovery is not deletion authority: an unreferenced
+staging or completed variant remains durable and revisitable when no destructive
+handler exists. Retention/retirement expiry, physical reclamation and deletion
+manifests, pressure eviction, and finite Blob TTL are not implemented.
 
 ### Selected semantic-v6 Event-bridge isolation
 

@@ -5943,6 +5943,40 @@ mod tests {
     }
 
     #[test]
+    fn lower_bound_runtime_age_stays_withheld_until_certain_expiry() {
+        let clock = [0x45; 16];
+        let mut age = runtime_custody_age(10, true, Some(clock), Some(1_000), true);
+
+        assert_eq!(
+            crate::custody::evaluate_custody(
+                Some(30),
+                false,
+                &mut age,
+                Some(CustodySample {
+                    clock_id: clock,
+                    tick_ms: 1_019,
+                }),
+            ),
+            crate::custody::CustodyDisposition::Indeterminate
+        );
+        assert_eq!(age.cumulative_age_ms(), 29);
+        assert_eq!(age.continuity(), CustodyContinuity::Lost);
+        assert_eq!(
+            crate::custody::evaluate_custody(
+                Some(30),
+                false,
+                &mut age,
+                Some(CustodySample {
+                    clock_id: clock,
+                    tick_ms: 1_020,
+                }),
+            ),
+            crate::custody::CustodyDisposition::Expired { age_ms: 30 }
+        );
+        assert_eq!(age.continuity(), CustodyContinuity::Lost);
+    }
+
+    #[test]
     fn restart_progress_never_downgrades_an_ambiguous_source_partial() {
         let source = |origin_semantic_version| RuntimeTransferProgress {
             object_id: ObjectId::new(ObjectKind::SourceEnvelope, [0x31; 32]),
