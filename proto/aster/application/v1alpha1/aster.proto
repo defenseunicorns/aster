@@ -100,6 +100,7 @@ message GetStatusResponse {
   StoreCapacityStatus store_capacity = 9;
   PublishOperationCapacityStatus publish_operation_capacity = 10;
   DeliveryCapacityStatus delivery_capacity = 11;
+  bytes credential_generation = 12;
 }
 
 enum EmissionMode {

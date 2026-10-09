@@ -1,0 +1,272 @@
+name: "Build: Compose images"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-compose-images-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  package:
+    name: Package Compose images (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+
+      - name: Set up pinned OCI-capable Buildx builder
+        id: buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          driver: docker-container
+          driver-opts: |
+            image=moby/buildkit:buildx-stable-1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+
+      - name: Install repository toolchain
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: 2026.4.28
+          cache: false
+
+      - name: Install pinned CycloneDX tools
+        timeout-minutes: 10
+        run: |
+          cargo install --locked --version 0.5.9 cargo-cyclonedx --root "$RUNNER_TEMP/sbom-cargo"
+          python3 -m venv "$RUNNER_TEMP/sbom-python"
+          "$RUNNER_TEMP/sbom-python/bin/pip" install cyclonedx-editor-validator==0.34.0
+          echo "$RUNNER_TEMP/sbom-cargo/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/sbom-python/bin" >> "$GITHUB_PATH"
+
+      - name: Acquire locked Rust dependencies
+        run: cargo fetch --locked
+
+      - name: Build OCI evidence and Docker-loadable archives
+        timeout-minutes: 35
+        run: |
+          mkdir -p target/compose-release
+          docker buildx build --builder ${{ steps.buildx.outputs.name }} --pull=false --platform ${{ matrix.platform }} --provenance=mode=max \
+            --build-arg SOURCE_DATE_EPOCH=946684800 \
+            --secret id=aster_build_ca,src=/etc/ssl/certs/ca-certificates.crt \
+            --file docker/compose-agent/Dockerfile.agent \
+            --tag "aster-compose-agent:${GITHUB_SHA}-${{ matrix.arch }}" \
+            --metadata-file target/compose-release/agent-build-metadata.json \
+            --output type=oci,oci-artifact=true,dest=target/compose-release/aster-compose-agent-${{ matrix.arch }}.oci .
+          docker buildx build --builder ${{ steps.buildx.outputs.name }} --pull=false --platform ${{ matrix.platform }} --provenance=false \
+            --build-arg SOURCE_DATE_EPOCH=946684800 \
+            --secret id=aster_build_ca,src=/etc/ssl/certs/ca-certificates.crt \
+            --file docker/compose-agent/Dockerfile.agent \
+            --tag "aster-compose-agent:${GITHUB_SHA}-${{ matrix.arch }}" \
+            --output type=docker,dest=target/compose-release/aster-compose-agent-${{ matrix.arch }}.docker.tar .
+          docker buildx build --builder ${{ steps.buildx.outputs.name }} --pull=false --platform ${{ matrix.platform }} --provenance=mode=max \
+            --build-arg SOURCE_DATE_EPOCH=946684800 \
+            --secret id=aster_build_ca,src=/etc/ssl/certs/ca-certificates.crt \
+            --file docker/compose-agent/Dockerfile.admin \
+            --tag "aster-compose-admin:${GITHUB_SHA}-${{ matrix.arch }}" \
+            --metadata-file target/compose-release/admin-build-metadata.json \
+            --output type=oci,oci-artifact=true,dest=target/compose-release/aster-compose-admin-${{ matrix.arch }}.oci .
+          docker buildx build --builder ${{ steps.buildx.outputs.name }} --pull=false --platform ${{ matrix.platform }} --provenance=false \
+            --build-arg SOURCE_DATE_EPOCH=946684800 \
+            --secret id=aster_build_ca,src=/etc/ssl/certs/ca-certificates.crt \
+            --file docker/compose-agent/Dockerfile.admin \
+            --tag "aster-compose-admin:${GITHUB_SHA}-${{ matrix.arch }}" \
+            --output type=docker,dest=target/compose-release/aster-compose-admin-${{ matrix.arch }}.docker.tar .
+
+      - name: Inspect OCI images and retain authenticated results
+        timeout-minutes: 5
+        run: |
+          agent_digest=$(jq -er '."containerimage.digest"' target/compose-release/agent-build-metadata.json)
+          admin_digest=$(jq -er '."containerimage.digest"' target/compose-release/admin-build-metadata.json)
+          agent_config_digest=$(tar -xOf target/compose-release/aster-compose-agent-${{ matrix.arch }}.docker.tar manifest.json | jq -er 'if length == 1 and (.[0].Config | test("^blobs/sha256/[0-9a-f]{64}$")) then (.[0].Config | sub("^blobs/sha256/"; "sha256:")) else error("invalid Docker archive manifest") end')
+          admin_config_digest=$(tar -xOf target/compose-release/aster-compose-admin-${{ matrix.arch }}.docker.tar manifest.json | jq -er 'if length == 1 and (.[0].Config | test("^blobs/sha256/[0-9a-f]{64}$")) then (.[0].Config | sub("^blobs/sha256/"; "sha256:")) else error("invalid Docker archive manifest") end')
+          python3 tools/inspect_aster_compose_oci.py \
+            --profile agent \
+            --architecture "${{ matrix.arch }}" \
+            --archive target/compose-release/aster-compose-agent-${{ matrix.arch }}.oci \
+            --expected-digest "$agent_digest" \
+            --expected-config-digest "$agent_config_digest" \
+            --result-file target/compose-release/agent-inspection.json
+          python3 tools/inspect_aster_compose_oci.py \
+            --profile admin \
+            --architecture "${{ matrix.arch }}" \
+            --archive target/compose-release/aster-compose-admin-${{ matrix.arch }}.oci \
+            --expected-digest "$admin_digest" \
+            --expected-config-digest "$admin_config_digest" \
+            --result-file target/compose-release/admin-inspection.json
+
+      - name: Load Docker archives and bind exact image IDs
+        run: |
+          docker image load --input target/compose-release/aster-compose-agent-${{ matrix.arch }}.docker.tar
+          agent_image_id=$(docker image inspect --format '{{.Id}}' "aster-compose-agent:${GITHUB_SHA}-${{ matrix.arch }}")
+          agent_config_digest=$(jq -er '.config_digest' target/compose-release/agent-inspection.json)
+          agent_manifest_digest=$(jq -er '.manifest_digest' target/compose-release/agent-inspection.json)
+          case "$agent_image_id" in
+            "$agent_config_digest"|"$agent_manifest_digest") ;;
+            *) exit 1 ;;
+          esac
+          printf '%s\n' "$agent_image_id" > "$RUNNER_TEMP/agent-image-id"
+          docker image load --input target/compose-release/aster-compose-admin-${{ matrix.arch }}.docker.tar
+          admin_image_id=$(docker image inspect --format '{{.Id}}' "aster-compose-admin:${GITHUB_SHA}-${{ matrix.arch }}")
+          admin_config_digest=$(jq -er '.config_digest' target/compose-release/admin-inspection.json)
+          admin_manifest_digest=$(jq -er '.manifest_digest' target/compose-release/admin-inspection.json)
+          case "$admin_image_id" in
+            "$admin_config_digest"|"$admin_manifest_digest") ;;
+            *) exit 1 ;;
+          esac
+          printf '%s\n' "$admin_image_id" > "$RUNNER_TEMP/admin-image-id"
+
+      - name: Generate and validate binary-level CycloneDX SBOM sets
+        timeout-minutes: 10
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          cargo cyclonedx --format json --spec-version 1.5 --describe binaries \
+            --manifest-path crates/aster-compose-credentials/Cargo.toml
+          agent_digest=$(jq -er '."containerimage.digest"' target/compose-release/agent-build-metadata.json)
+          admin_digest=$(jq -er '."containerimage.digest"' target/compose-release/admin-build-metadata.json)
+          install -m 0444 crates/aster-compose-credentials/aster-compose-agent_bin.cdx.json target/compose-release/
+          install -m 0444 crates/aster-compose-credentials/aster-compose-healthcheck_bin.cdx.json target/compose-release/
+          install -m 0444 crates/aster-compose-credentials/aster-compose-credential-admin_bin.cdx.json target/compose-release/
+          install -m 0444 crates/aster-compose-credentials/aster-compose-verify_bin.cdx.json target/compose-release/
+          bind_sbom() {
+            sbom=$1
+            binary=$2
+            digest=$3
+            jq --arg binary "$binary" --arg digest "$digest" --arg architecture "${{ matrix.platform }}" \
+              '.metadata.properties = ((.metadata.properties // []) + [{"name":"aster:oci-digest","value":$digest},{"name":"aster:architecture","value":$architecture}]) |
+               if .metadata.component.name == $binary then . else error("binary component identity mismatch") end' \
+              "$sbom" > "$sbom.tmp"
+            mv "$sbom.tmp" "$sbom"
+            cdx-ev validate "$sbom" --schema-type default
+            jq -e '
+              def has_license:
+                ((.licenses // []) | length > 0) and
+                ((.licenses // []) | all((.license.id? // .license.name? // .expression?) != null));
+              ([.metadata.component] + (.components // [])) | all(has_license)
+            ' "$sbom" > /dev/null
+          }
+          bind_sbom target/compose-release/aster-compose-agent_bin.cdx.json aster-compose-agent "$agent_digest"
+          bind_sbom target/compose-release/aster-compose-healthcheck_bin.cdx.json aster-compose-healthcheck "$agent_digest"
+          bind_sbom target/compose-release/aster-compose-credential-admin_bin.cdx.json aster-compose-credential-admin "$admin_digest"
+          bind_sbom target/compose-release/aster-compose-verify_bin.cdx.json aster-compose-verify "$admin_digest"
+          cp LICENSE THIRD_PARTY_NOTICES.md target/compose-release/
+
+      - name: Record release inputs, builder versions, and Compose digest
+        run: |
+          cp docker/compose-agent/compose.yaml target/compose-release/compose.yaml
+          cp docker/compose-agent/agent.example.json target/compose-release/agent.example.json
+          compose_digest=$(sha256sum docker/compose-agent/compose.yaml | cut -d' ' -f1)
+          {
+            printf 'schema=aster-compose-image-release/v2\n'
+            printf 'source_revision=%s\n' "$GITHUB_SHA"
+            printf 'architecture=%s\n' "${{ matrix.platform }}"
+            printf 'runner_architecture=%s\n' "$RUNNER_ARCH"
+            printf 'compose_sha256=%s\n' "$compose_digest"
+            docker version --format 'docker_client={{.Client.Version}}'
+            docker buildx version
+            rustc -Vv
+            cargo --version
+            cargo cyclonedx --version
+            cdx-ev --version
+          } > target/compose-release/BUILD-PROVENANCE.txt
+
+      - name: Record v2 release manifest and checksums
+        run: |
+          compose_digest=$(sha256sum docker/compose-agent/compose.yaml | cut -d' ' -f1)
+          config_template_digest=$(sha256sum docker/compose-agent/agent.example.json | cut -d' ' -f1)
+          agent_tag="aster-compose-agent:${GITHUB_SHA}-${{ matrix.arch }}"
+          admin_tag="aster-compose-admin:${GITHUB_SHA}-${{ matrix.arch }}"
+          jq -n \
+            --arg schema 'aster-compose-image-release/v2' \
+            --arg source_revision "$GITHUB_SHA" \
+            --arg architecture "${{ matrix.platform }}" \
+            --arg agent_oci_digest "$(jq -er '.oci_digest' target/compose-release/agent-inspection.json)" \
+            --arg agent_manifest_digest "$(jq -er '.manifest_digest' target/compose-release/agent-inspection.json)" \
+            --arg agent_config_digest "$(jq -er '.config_digest' target/compose-release/agent-inspection.json)" \
+            --arg agent_docker_image_id "$(cat "$RUNNER_TEMP/agent-image-id")" \
+            --arg agent_tag "$agent_tag" \
+            --arg admin_oci_digest "$(jq -er '.oci_digest' target/compose-release/admin-inspection.json)" \
+            --arg admin_manifest_digest "$(jq -er '.manifest_digest' target/compose-release/admin-inspection.json)" \
+            --arg admin_config_digest "$(jq -er '.config_digest' target/compose-release/admin-inspection.json)" \
+            --arg admin_docker_image_id "$(cat "$RUNNER_TEMP/admin-image-id")" \
+            --arg admin_tag "$admin_tag" \
+            --arg compose_sha256 "$compose_digest" \
+            --arg config_template_sha256 "$config_template_digest" \
+            --arg arch "${{ matrix.arch }}" \
+            '{schema:$schema,source_revision:$source_revision,architecture:$architecture,images:{agent:{oci_index_digest:$agent_oci_digest,manifest_digest:$agent_manifest_digest,config_digest:$agent_config_digest,docker_image_id:$agent_docker_image_id,transport_tag:$agent_tag,oci:("aster-compose-agent-"+$arch+".oci"),docker:("aster-compose-agent-"+$arch+".docker.tar"),sbom_set:["aster-compose-agent_bin.cdx.json","aster-compose-healthcheck_bin.cdx.json"]},admin:{oci_index_digest:$admin_oci_digest,manifest_digest:$admin_manifest_digest,config_digest:$admin_config_digest,docker_image_id:$admin_docker_image_id,transport_tag:$admin_tag,oci:("aster-compose-admin-"+$arch+".oci"),docker:("aster-compose-admin-"+$arch+".docker.tar"),sbom_set:["aster-compose-credential-admin_bin.cdx.json","aster-compose-verify_bin.cdx.json"]}},compose:{file:"compose.yaml",sha256:$compose_sha256,config_template:{file:"agent.example.json",sha256:$config_template_sha256}}}' \
+            > target/compose-release/release-manifest.json
+          cd target/compose-release
+          sha256sum ./* > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Final credential-canary-scan of retained evidence
+        timeout-minutes: 5
+        run: |
+          agent_digest=$(jq -er '.images.agent.oci_index_digest' target/compose-release/release-manifest.json)
+          admin_digest=$(jq -er '.images.admin.oci_index_digest' target/compose-release/release-manifest.json)
+          agent_config_digest=$(jq -er '.images.agent.config_digest' target/compose-release/release-manifest.json)
+          admin_config_digest=$(jq -er '.images.admin.config_digest' target/compose-release/release-manifest.json)
+          artifact_args=()
+          for artifact in \
+            target/compose-release/agent-build-metadata.json \
+            target/compose-release/admin-build-metadata.json \
+            target/compose-release/aster-compose-agent_bin.cdx.json \
+            target/compose-release/aster-compose-healthcheck_bin.cdx.json \
+            target/compose-release/aster-compose-credential-admin_bin.cdx.json \
+            target/compose-release/aster-compose-verify_bin.cdx.json \
+            target/compose-release/LICENSE \
+            target/compose-release/THIRD_PARTY_NOTICES.md \
+            target/compose-release/compose.yaml \
+            target/compose-release/agent.example.json \
+            target/compose-release/agent-inspection.json \
+            target/compose-release/admin-inspection.json \
+            target/compose-release/release-manifest.json \
+            target/compose-release/BUILD-PROVENANCE.txt \
+            target/compose-release/SHA256SUMS
+          do
+            artifact_args+=(--scan-artifact "$artifact")
+          done
+          python3 tools/inspect_aster_compose_oci.py \
+            --profile agent \
+            --architecture "${{ matrix.arch }}" \
+            --archive target/compose-release/aster-compose-agent-${{ matrix.arch }}.oci \
+            --expected-digest "$agent_digest" \
+            --expected-config-digest "$agent_config_digest" \
+            "${artifact_args[@]}"
+          python3 tools/inspect_aster_compose_oci.py \
+            --profile admin \
+            --architecture "${{ matrix.arch }}" \
+            --archive target/compose-release/aster-compose-admin-${{ matrix.arch }}.oci \
+            --expected-digest "$admin_digest" \
+            --expected-config-digest "$admin_config_digest" \
+            "${artifact_args[@]}"
+
+      - name: Upload OCI and Docker archives, SBOMs, provenance, and manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: aster-compose-images-${{ matrix.arch }}-${{ github.sha }}
+          path: target/compose-release/
+          if-no-files-found: error
+          retention-days: 14

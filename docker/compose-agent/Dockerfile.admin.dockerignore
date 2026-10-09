@@ -1,0 +1,8 @@
+**
+!Cargo.toml
+!Cargo.lock
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+!crates/**
+!proto/**
+!third-party/**

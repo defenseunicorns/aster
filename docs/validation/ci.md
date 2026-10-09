@@ -5,6 +5,40 @@ commands on pushes to `main`, pull requests targeting `main`, merge queues, and
 manual dispatches. Configure branch protection or a ruleset to require the
 single stable check name **`CI / required`**.
 
+## Compose-provider checks
+
+The Compose-provider checks are daemon-free: normal CI runs
+`python3 tools/test_aster_compose_delivery.py` and
+`python3 tools/test_inspect_aster_compose_oci.py` to validate the canonical
+model, generation descriptors, immutable image-reference form,
+manual-delivery/release policy, deterministic redacted plan, and synthetic OCI
+archive safety boundaries. These checks do not call the Docker CLI,
+connect to a Docker socket, execute a lifecycle, clean up Docker resources, or
+produce a host-qualification receipt.
+
+Because the manual packaging workflow intentionally has one fixed shape and
+the repository does not pin a YAML or shell AST dependency for this check, the
+validator also binds its exact reviewed bytes to a checked SHA-256 constant.
+Any workflow edit therefore requires an intentional constant update plus
+renewed policy-test and reviewer scrutiny; semantic checks remain independent
+defense in depth.
+
+This statement is intentionally scoped to the Compose-provider checks. Other
+repository jobs, including the existing path-lab jobs, use Docker for their own
+unrelated evaluation boundaries and are unchanged.
+
+`.github/workflows/build-compose-images.yml` is a manual-only
+`workflow_dispatch` packaging workflow. Native `ubuntu-24.04` `amd64` and
+`ubuntu-24.04-arm` `arm64` jobs each produce one architecture-bound artifact
+with OCI and Docker-loadable archives. Before upload, each job loads both
+Docker archives and compares their local image IDs with authenticated OCI
+config or selected-manifest digests;
+it also retains architecture-bound SBOM, notice, digest, checksum, and
+provenance evidence. This packaging validation does not start Aster or qualify
+a Docker Engine, Compose implementation, filesystem, mount, user namespace, or
+mandatory-access-control profile. The manual operator procedure is
+[`docs/release/docker-compose.md`](../release/docker-compose.md).
+
 ## Find a section
 
 | Need | Read |
@@ -250,6 +284,14 @@ host's hard limit. For the same direct workspace runs, use:
 sh tools/with-test-resources.sh cargo nextest run --locked --workspace --all-features --no-fail-fast --test-threads 2
 sh tools/with-test-resources.sh cargo test --locked --workspace --all-features --doc
 ```
+
+Because the systemd and Compose packages intentionally both deliver a binary
+named `aster-agent`, this exact wrapper grammar (also with a pinned `+toolchain`
+and optional `--offline`/`--no-run`) executes two package selections with
+distinct target directories. The first excludes `aster-compose-credentials`;
+the second tests it directly. This prevents Cargo's shared output filename from
+making either package inspect the other package's binary. Other wrapper command
+shapes are executed unchanged.
 
 These tests keep exact data and zero-contact-error assertions. Blob waiting
 tracks committed carrier prefixes. State/Record waiting counts each expected

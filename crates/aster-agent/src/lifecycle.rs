@@ -11,6 +11,18 @@ use std::{
 
 use tokio::sync::watch;
 
+use crate::credentials::CredentialGeneration;
+
+pub(crate) fn credential_generation_hex(generation: CredentialGeneration) -> String {
+    const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in generation.as_bytes() {
+        encoded.push(char::from(LOWER_HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(LOWER_HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
 /// The lifecycle phase of one agent process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]

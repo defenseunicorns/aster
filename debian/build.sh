@@ -16,6 +16,7 @@ sha256sum Cargo.lock > "$stage/Cargo.lock.sha256"
 python3 tools/check-netlink-packet-core-patch.py
 cargo build --frozen --release --target "$target" \
     -p aster-node -p aster-agent -p asterctl -p aster-systemd-credentials \
+    --features aster-agent/systemd-provider \
     --bin aster --bin aster-agent --bin asterctl --bin aster-credential-admin
 cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$target"
 sha256sum -c "$stage/Cargo.lock.sha256"

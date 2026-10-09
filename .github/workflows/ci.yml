@@ -131,6 +131,12 @@ jobs:
         timeout-minutes: 5
         run: python3 tools/test-aster-agent-process.py
 
+      - name: Validate Compose-provider delivery policy without Docker
+        timeout-minutes: 2
+        run: |
+          python3 tools/test_aster_compose_delivery.py
+          python3 tools/test_inspect_aster_compose_oci.py
+
       - name: Run formatting, policy, traceability, and receipt checks
         env:
           CARGO_NET_OFFLINE: "true"

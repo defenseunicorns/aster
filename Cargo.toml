@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+  "crates/aster-compose-credentials",
   "crates/aster-profile",
   "crates/aster-redb-store",
   "crates/aster-negentropy",

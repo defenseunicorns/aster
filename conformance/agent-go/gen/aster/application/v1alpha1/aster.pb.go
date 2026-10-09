@@ -912,6 +912,7 @@ type GetStatusResponse struct {
 	StoreCapacity            *StoreCapacityStatus            `protobuf:"bytes,9,opt,name=store_capacity,json=storeCapacity,proto3" json:"store_capacity,omitempty"`
 	PublishOperationCapacity *PublishOperationCapacityStatus `protobuf:"bytes,10,opt,name=publish_operation_capacity,json=publishOperationCapacity,proto3" json:"publish_operation_capacity,omitempty"`
 	DeliveryCapacity         *DeliveryCapacityStatus         `protobuf:"bytes,11,opt,name=delivery_capacity,json=deliveryCapacity,proto3" json:"delivery_capacity,omitempty"`
+	CredentialGeneration     []byte                          `protobuf:"bytes,12,opt,name=credential_generation,json=credentialGeneration,proto3" json:"credential_generation,omitempty"`
 	unknownFields            protoimpl.UnknownFields
 	sizeCache                protoimpl.SizeCache
 }
@@ -1019,6 +1020,13 @@ func (x *GetStatusResponse) GetPublishOperationCapacity() *PublishOperationCapac
 func (x *GetStatusResponse) GetDeliveryCapacity() *DeliveryCapacityStatus {
 	if x != nil {
 		return x.DeliveryCapacity
+	}
+	return nil
+}
+
+func (x *GetStatusResponse) GetCredentialGeneration() []byte {
+	if x != nil {
+		return x.CredentialGeneration
 	}
 	return nil
 }
@@ -3680,7 +3688,7 @@ const file_aster_application_v1alpha1_aster_proto_rawDesc = "" +
 	"\x05scope\x18\x03 \x01(\tR\x05scope\x12:\n" +
 	"\x19include_descendant_scopes\x18\x04 \x01(\bR\x17includeDescendantScopes\x12#\n" +
 	"\roperation_key\x18\x05 \x01(\fR\foperationKey\"\x12\n" +
-	"\x10GetStatusRequest\"\xbe\x06\n" +
+	"\x10GetStatusRequest\"\xf3\x06\n" +
 	"\x11GetStatusResponse\x12\x1a\n" +
 	"\bidentity\x18\x01 \x01(\fR\bidentity\x12+\n" +
 	"\x11mission_authority\x18\x02 \x01(\fR\x10missionAuthority\x12:\n" +
@@ -3693,7 +3701,8 @@ const file_aster_application_v1alpha1_aster_proto_rawDesc = "" +
 	"\x0estore_capacity\x18\t \x01(\v2/.aster.application.v1alpha1.StoreCapacityStatusR\rstoreCapacity\x12x\n" +
 	"\x1apublish_operation_capacity\x18\n" +
 	" \x01(\v2:.aster.application.v1alpha1.PublishOperationCapacityStatusR\x18publishOperationCapacity\x12_\n" +
-	"\x11delivery_capacity\x18\v \x01(\v22.aster.application.v1alpha1.DeliveryCapacityStatusR\x10deliveryCapacity\"\x9d\x01\n" +
+	"\x11delivery_capacity\x18\v \x01(\v22.aster.application.v1alpha1.DeliveryCapacityStatusR\x10deliveryCapacity\x123\n" +
+	"\x15credential_generation\x18\f \x01(\fR\x14credentialGeneration\"\x9d\x01\n" +
 	"\x13StoreCapacityStatus\x12\x14\n" +
 	"\x05items\x18\x01 \x01(\x04R\x05items\x12\x1d\n" +
 	"\n" +

@@ -1,0 +1,211 @@
+{
+  "x-aster-metadata": {
+    "copyright": "Copyright 2026 Defense Unicorns, Inc.",
+    "license": "SPDX-License-Identifier: Apache-2.0",
+    "qualified_source": "canonical-json-form-yaml/v1"
+  },
+  "services": {
+    "preflight": {
+      "user": "${ASTER_UID:?required}:${ASTER_GID:?required}",
+      "read_only": true,
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "pids_limit": 256,
+      "tmpfs": [
+        "/tmp:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=${ASTER_UID:?required},gid=${ASTER_GID:?required}"
+      ],
+      "restart": "no",
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "3"
+        }
+      },
+      "image": "${ASTER_AGENT_IMAGE_DIGEST:?required}",
+      "pull_policy": "never",
+      "environment": {
+        "ASTER_AGENT_CONFIG_SHA256": "${ASTER_AGENT_CONFIG_SHA256:?required}"
+      },
+      "network_mode": "none",
+      "command": [
+        "--check-config",
+        "/etc/aster/agent.json"
+      ],
+      "configs": [
+        {
+          "source": "aster-agent-config",
+          "target": "/etc/aster/agent.json",
+          "mode": 292
+        }
+      ],
+      "secrets": [
+        {
+          "source": "aster-client-token",
+          "target": "/run/secrets/aster-client-token"
+        },
+        {
+          "source": "aster-mission-activation",
+          "target": "/run/secrets/aster-mission-activation"
+        },
+        {
+          "source": "aster-provisioning-bundle",
+          "target": "/run/secrets/aster-provisioning-bundle"
+        }
+      ]
+    },
+    "aster-agent": {
+      "user": "${ASTER_UID:?required}:${ASTER_GID:?required}",
+      "read_only": true,
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "pids_limit": 256,
+      "tmpfs": [
+        "/tmp:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=${ASTER_UID:?required},gid=${ASTER_GID:?required}"
+      ],
+      "restart": "on-failure:3",
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "3"
+        }
+      },
+      "image": "${ASTER_AGENT_IMAGE_DIGEST:?required}",
+      "pull_policy": "never",
+      "environment": {
+        "ASTER_AGENT_CONFIG_SHA256": "${ASTER_AGENT_CONFIG_SHA256:?required}"
+      },
+      "command": [
+        "--config",
+        "/etc/aster/agent.json"
+      ],
+      "configs": [
+        {
+          "source": "aster-agent-config",
+          "target": "/etc/aster/agent.json",
+          "mode": 292
+        }
+      ],
+      "secrets": [
+        {
+          "source": "aster-client-token",
+          "target": "/run/secrets/aster-client-token"
+        },
+        {
+          "source": "aster-mission-activation",
+          "target": "/run/secrets/aster-mission-activation"
+        },
+        {
+          "source": "aster-provisioning-bundle",
+          "target": "/run/secrets/aster-provisioning-bundle"
+        }
+      ],
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "${ASTER_STATE_DIR:?required}",
+          "target": "/var/lib/aster"
+        }
+      ],
+      "expose": [
+        "8183/udp"
+      ],
+      "stop_signal": "SIGTERM",
+      "stop_grace_period": "40s",
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "/usr/local/bin/aster-compose-healthcheck"
+        ],
+        "interval": "5s",
+        "timeout": "3s",
+        "retries": 12,
+        "start_period": "5s"
+      },
+      "depends_on": {
+        "preflight": {
+          "condition": "service_completed_successfully"
+        }
+      }
+    },
+    "verify": {
+      "user": "${ASTER_UID:?required}:${ASTER_GID:?required}",
+      "read_only": true,
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "pids_limit": 256,
+      "tmpfs": [
+        "/tmp:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=${ASTER_UID:?required},gid=${ASTER_GID:?required}"
+      ],
+      "restart": "no",
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "3"
+        }
+      },
+      "image": "${ASTER_ADMIN_IMAGE_DIGEST:?required}",
+      "pull_policy": "never",
+      "network_mode": "service:aster-agent",
+      "command": [
+        "/usr/local/bin/aster-compose-verify"
+      ],
+      "configs": [
+        {
+          "source": "aster-agent-config",
+          "target": "/etc/aster/agent.json",
+          "mode": 292
+        }
+      ],
+      "secrets": [
+        {
+          "source": "aster-client-token",
+          "target": "/run/secrets/aster-client-token"
+        }
+      ],
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "${ASTER_CREDENTIAL_GENERATION_DIR:?required}/manifest.json",
+          "target": "/run/aster-generation/manifest.json",
+          "read_only": true
+        }
+      ],
+      "depends_on": {
+        "aster-agent": {
+          "condition": "service_healthy"
+        }
+      }
+    }
+  },
+  "configs": {
+    "aster-agent-config": {
+      "file": "${ASTER_AGENT_CONFIG_FILE:?required}"
+    }
+  },
+  "secrets": {
+    "aster-client-token": {
+      "file": "${ASTER_CREDENTIAL_GENERATION_DIR:?required}/aster-client-token"
+    },
+    "aster-mission-activation": {
+      "file": "${ASTER_CREDENTIAL_GENERATION_DIR:?required}/aster-mission-activation"
+    },
+    "aster-provisioning-bundle": {
+      "file": "${ASTER_CREDENTIAL_GENERATION_DIR:?required}/aster-provisioning-bundle"
+    }
+  }
+}

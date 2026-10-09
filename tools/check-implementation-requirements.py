@@ -698,6 +698,18 @@ PROFILE_EVIDENCE = (
     "adapter only through an explicit exact-digest conversion"
 )
 
+COMPOSE_PROVIDER_SLICE = (
+    "crates/aster-compose-credentials; docker/compose-agent/compose.yaml; "
+    "tools/aster_compose_delivery.py; tools/test_aster_compose_delivery.py; "
+    "docs/release/docker-compose.md; "
+    "docs/reference/aster-agent-config-v2.md; "
+    "docs/decisions/0044-compose-file-secret-provider.md"
+)
+COMPOSE_RELEASE_SLICE = (
+    ".github/workflows/build-compose-images.yml; LICENSE; "
+    "THIRD_PARTY_NOTICES.md; docs/release/docker-compose.md"
+)
+
 # Exact selected-lane mappings supported by current code or bounded receipts.
 # An entry is not a full requirement pass; each remaining gap preserves the
 # untested predicates. DM-8-05 intentionally remains open.
@@ -727,10 +739,22 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "This is one Rust control family, not generalized key-policy governance: no production SecretStore/protection backend, protected stock CLI or bindings, cross-process admin IPC, registry/credential issuance, automatic or atomic revoke-plus-rekey workflow, recovery policy, or additional key-management mechanism is shipped.",
     ),
     "DM-3-11": selected_claim(
-        "open",
-        "deployment owner + aster-core + aster-node",
-        f"{PROTECTED_RUNTIME_SLICE}; caller-provided Rust NodeConfig validates bounded options and terminal state before one provider/loader call and state creation, accepts a protected artifact or opaque provider reference, and binds recovered credentials to the checked absolute lexical state pathname; stopped Event/admin opens accept the same sources",
-        "The mechanism is not an operational pre-mission provisioning window. The stock CLI still requires an unprotected-reference bundle, and no production provider or SecretStore backend, identity/key issuance ceremony, unattended-start policy, backup/recovery procedure, inode/symlink/rename/rollback binding, selected-node binding, or retained operational receipt is delivered.",
+        "implemented-uncredited",
+        "deployment owner + aster-compose-credentials + aster-agent",
+        f"{PROTECTED_RUNTIME_SLICE}; {COMPOSE_PROVIDER_SLICE}; the statically composed Compose provider implements one bounded pre-mission generation creation, validation, and startup path, while stopped Event/admin opens retain their existing protected-source seams",
+        "No Docker-host lifecycle receipt, identity/key issuance ceremony, general production custody backend, independent review, broad-platform support, selected-node binding, coordinated destruction, or production authorization is delivered.",
+    ),
+    "DM-8-12": selected_claim(
+        "implemented-uncredited",
+        "release engineering",
+        f"{COMPOSE_RELEASE_SLICE}; manually triggered packaging is configured to emit digest-bound OCI archives and four binary-rooted CycloneDX dependency inventories grouped transparently into agent and administration image sets",
+        "No generated Compose-image SBOM, retained release bundle, reproducibility observation, or release authorization is included in this change.",
+    ),
+    "DM-8-13": selected_claim(
+        "implemented-uncredited",
+        "release engineering",
+        f"{COMPOSE_RELEASE_SLICE}; packaging policy requires license-complete binary-rooted dependency inventories and retained project license and notices",
+        "No generated Compose-image license inventory, legal review receipt, retained release bundle, or release authorization is included in this change.",
     ),
     "DM-3-12": selected_claim(
         "observed-bounded",
@@ -1281,8 +1305,8 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-6-14": selected_claim(
         "observed-bounded",
         "aster-core + aster-node",
-        f"{MISSION_RECEIPT}; {PROTECTED_RUNTIME_SLICE}; the retained runtime requires a bounded owner-only unprotected-reference bundle before state or sockets; current Rust NodeConfig additionally validates options and terminal state before exactly one protected-artifact/provider-reference load, binds one absolute lexical state pathname, and emits only a coarse non-identifying provisioning origin",
-        "The observed retained runtime path remains unprotected-reference; protected live startup is current fixture automation only, and the lexical witness is not inode, parent-directory, symlink/rename, or rollback binding. Deliver an admitted production backend, protected stock CLI and bindings, persistent custody plus install/coordinated-destroy workflow, platform-complete zeroization assurance, rollback handling, and operational recovery.",
+        f"{MISSION_RECEIPT}; {PROTECTED_RUNTIME_SLICE}; {COMPOSE_PROVIDER_SLICE}; the retained runtime requires a bounded owner-only unprotected-reference bundle before state or sockets; current Rust NodeConfig validates one protected source before state, while the Compose provider adds fixed-path generation-bound startup with daemon-free implementation tests",
+        "The observed retained runtime path remains unprotected-reference; Compose adds no Docker lifecycle observation or host qualification. Deliver an admitted general production backend, protected stock CLI and bindings, persistent custody plus install/coordinated-destroy workflow, platform-complete zeroization assurance, rollback handling, operational recovery, and independent review.",
     ),
     "DM-6-18": selected_claim(
         "observed-bounded", "aster-core + aster-node",
@@ -1482,15 +1506,15 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     ),
     "DM-11-18": selected_claim(
         "open",
-        "deployment owner + aster-node",
-        f"{MISSION_RECEIPT}; {PROTECTED_RUNTIME_SLICE}; unique mission identities exist and current caller-provided Rust NodeConfig/start_node plus stopped Event/admin facades can authenticate protected or provider-referenced provisioning",
-        "The complete MVP, identity issuance and recovery workflow, protected stock CLI and selected-node bindings, production backend, operational receipt, and release gates remain absent; current protected live startup is fixture automation only.",
+        "deployment owner + aster-compose-credentials + aster-node",
+        f"{MISSION_RECEIPT}; {PROTECTED_RUNTIME_SLICE}; {COMPOSE_PROVIDER_SLICE}; unique mission identities exist and one bounded Compose identity/provisioning mechanism now exists",
+        "The complete MVP, identity issuance and recovery workflow, general production custody backend, selected-node bindings, retained Docker-host execution, independent review, broad-platform support, and release gates remain absent.",
     ),
     "DM-11-19": selected_claim(
         "open",
-        "deployment owner + aster-core + aster-node",
-        f"{PROTECTED_RUNTIME_SLICE}; caller-provided live Rust NodeConfig and stopped Event/admin facades can ingest protected or provider-referenced scope/content/control key material through bounded capabilities",
-        "The complete MVP, production SecretStore/protection backend, stock CLI and binding composition, unattended-start and recovery policy, coordinated destruction, FIPS/admitted-module decision, retained operational receipt, and release gates remain absent.",
+        "deployment owner + aster-compose-credentials + aster-core + aster-node",
+        f"{PROTECTED_RUNTIME_SLICE}; {COMPOSE_PROVIDER_SLICE}; one bounded generation-bound Compose key-ingestion mechanism exists alongside the protected-source seams",
+        "The complete MVP, general production custody backend, identity/key issuance, recovery, coordinated destruction, FIPS/admitted-module decision, retained Docker-host execution, independent review, broad-platform support, and release gates remain absent.",
     ),
     "DM-11-20": selected_claim(
         "implemented-uncredited",
@@ -1527,6 +1551,12 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
         "aster-iroh + aster-node",
         f"{CONTROLLED_RELAY_SLICE}; {LAN_DISCOVERY_SLICE}; aster-iroh exposes bounded direct, default-off rostered and rosterless mDNS, and singleton controlled-relay IP endpoints; aster-node composes them into NodeConfig and the selected CLI without treating discovered carrier identity as mission authority and with no hosted lookup, public relay fallback, or port mapping",
         "Tracked source and current tests exist, but this is not a versioned production release artifact. Supported-target packaging and stability, physical IP and NAT acceptance, mixed implementation, dependency/license admission and SBOM disposition, retained acceptance, and release authorization remain open.",
+    ),
+    "DM-13-11": selected_claim(
+        "implemented-uncredited",
+        "release engineering",
+        f"{COMPOSE_RELEASE_SLICE}; docs/decisions/0044-compose-file-secret-provider.md records the bounded buy-versus-build decision and five-SBOM image-set packaging policy",
+        "No generated Compose-image dependency/license SBOM, retained OCI release bundle, independent review, or production release authorization is included in this change.",
     ),
 }
 

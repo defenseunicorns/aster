@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1.7
+# Copyright 2026 Defense Unicorns, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+ARG ASTER_RUST_BASE_IMAGE=rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97
+
+FROM ${ASTER_RUST_BASE_IMAGE} AS build
+WORKDIR /work
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY proto ./proto
+COPY third-party ./third-party
+COPY LICENSE THIRD_PARTY_NOTICES.md ./
+ENV RUSTFLAGS="-C target-feature=+crt-static"
+RUN --mount=type=secret,id=aster_build_ca,target=/etc/ssl/certs/ca-certificates.crt,required=true \
+    target="$(rustc -vV | sed -n 's/^host: //p')" \
+    && cargo build --locked --release --target "$target" \
+    -p aster-compose-credentials \
+    --bin aster-compose-agent \
+    --bin aster-compose-healthcheck \
+    && install -d -m 0755 /out/rootfs/usr/local/bin /out/rootfs/usr/share/licenses/aster \
+    && install -m 0555 "target/$target/release/aster-compose-agent" \
+        /out/rootfs/usr/local/bin/aster-agent \
+    && install -m 0555 "target/$target/release/aster-compose-healthcheck" \
+        /out/rootfs/usr/local/bin/aster-compose-healthcheck \
+    && install -m 0444 LICENSE /out/rootfs/usr/share/licenses/aster/LICENSE \
+    && install -m 0444 THIRD_PARTY_NOTICES.md \
+        /out/rootfs/usr/share/licenses/aster/THIRD_PARTY_NOTICES.md \
+    # The scratch profile has no systemd. Disable netdev's otherwise inert
+    # systemd-networkd fallback probes and enforce the image-review boundary.
+    && sed -i 's#/run/systemd/#/run/no-sysd/#g' /out/rootfs/usr/local/bin/aster-agent \
+    && ! grep -a -i -q 'systemd' /out/rootfs/usr/local/bin/aster-agent
+
+FROM scratch AS runtime
+COPY --from=build /out/rootfs /
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/aster-agent"]
+HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=12 CMD ["/usr/local/bin/aster-compose-healthcheck"]

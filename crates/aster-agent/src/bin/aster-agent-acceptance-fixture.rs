@@ -477,13 +477,7 @@ async fn run_client_command(options: &ClientArguments) -> Result<(), FixtureErro
         .await
         .map_err(|_| FixtureError::Local)?
         .shared(32);
-    let client = api::AsterApplicationServiceClient::new(
-        connection,
-        ClientConfig::new(uri).with_default_header(
-            "authorization",
-            format!("Bearer {}", String::from_utf8_lossy(&token)),
-        ),
-    );
+    let client = api::AsterApplicationServiceClient::new(connection, client_config(uri, &token));
     match options.command.as_str() {
         "status" => client_status(&client).await,
         "publish" => client_publish(&client).await,
@@ -497,6 +491,15 @@ async fn run_client_command(options: &ClientArguments) -> Result<(), FixtureErro
 }
 
 type Client = api::AsterApplicationServiceClient<connectrpc::client::SharedHttp2Connection>;
+
+fn client_config(uri: http::Uri, token: &[u8]) -> ClientConfig {
+    ClientConfig::new(uri)
+        .with_protocol(connectrpc::Protocol::Grpc)
+        .with_default_header(
+            "authorization",
+            format!("Bearer {}", String::from_utf8_lossy(token)),
+        )
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -538,6 +541,9 @@ fn emission_mode_name(
 }
 
 fn status_evidence(response: &api::GetStatusResponse) -> Result<serde_json::Value, FixtureError> {
+    if !matches!(response.credential_generation.len(), 0 | 32) {
+        return Err(FixtureError::Local);
+    }
     let configured = emission_mode_name(response.configured_emission_mode)?;
     let effective = emission_mode_name(response.effective_emission_mode)?;
     let store = response
@@ -585,7 +591,7 @@ fn status_evidence(response: &api::GetStatusResponse) -> Result<serde_json::Valu
     {
         return Err(FixtureError::Local);
     }
-    Ok(json!({
+    let mut evidence = json!({
         "status": "ok",
         "configured_emission_mode": configured,
         "effective_emission_mode": effective,
@@ -615,7 +621,24 @@ fn status_evidence(response: &api::GetStatusResponse) -> Result<serde_json::Valu
         "operation_audit_total": operations.audit.as_option().ok_or(FixtureError::Local)?.total,
         "pending_deliveries": deliveries.pending,
         "delivery_profile_saturated": deliveries.profile_saturated,
-    }))
+    });
+    if !response.credential_generation.is_empty() {
+        evidence.as_object_mut().ok_or(FixtureError::Local)?.insert(
+            "credential_generation".to_owned(),
+            lower_hex(&response.credential_generation).into(),
+        );
+    }
+    Ok(evidence)
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(LOWER_HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(LOWER_HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 fn operation_health(
@@ -1091,6 +1114,16 @@ fn read_owner_only_token(_path: &Path) -> Result<Vec<u8>, FixtureError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn preconnected_http2_client_selects_grpc_protocol() {
+        let config = client_config(
+            "http://127.0.0.1:8181".parse().expect("client URI"),
+            INITIAL_TOKEN,
+        );
+
+        assert_eq!(config.protocol(), connectrpc::Protocol::Grpc);
+    }
+
     fn representative_event() -> api::Event {
         api::Event {
             id: vec![1; 32],
@@ -1158,7 +1191,48 @@ mod tests {
 
     #[test]
     fn status_evidence_requires_profile_modes_and_capacity_contract() {
-        let valid = api::GetStatusResponse {
+        let valid = valid_status_response();
+
+        let evidence = status_evidence(&valid).expect("valid profile status");
+        assert_eq!(evidence["configured_emission_mode"], "normal");
+        assert_eq!(evidence["effective_emission_mode"], "receive_only");
+        assert_eq!(evidence["operation_ledger_mode"], "legacy");
+        assert_eq!(evidence["operation_ordinary_remaining"], 990_000);
+        assert_eq!(evidence["operation_audit_state"], "pending");
+
+        let mut invalid = valid;
+        invalid
+            .publish_operation_capacity
+            .get_or_insert_default()
+            .profile_boundary = 2_048;
+        assert!(status_evidence(&invalid).is_err());
+    }
+
+    #[test]
+    fn status_evidence_accepts_only_absent_or_exact_generation_bytes() {
+        // Break caught: verifier evidence accepts a malformed generation or
+        // emits a noncanonical representation that cannot match a manifest.
+        let empty = valid_status_response();
+        let empty_evidence = status_evidence(&empty).expect("empty generation is valid");
+        assert!(empty_evidence.get("credential_generation").is_none());
+
+        let mut exact = valid_status_response();
+        exact.credential_generation = (0_u8..32).collect();
+        let exact_evidence = status_evidence(&exact).expect("32-byte generation is valid");
+        assert_eq!(
+            exact_evidence["credential_generation"],
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        );
+
+        for length in [31, 33] {
+            let mut malformed = valid_status_response();
+            malformed.credential_generation = vec![0xab; length];
+            assert!(status_evidence(&malformed).is_err(), "length {length}");
+        }
+    }
+
+    fn valid_status_response() -> api::GetStatusResponse {
+        api::GetStatusResponse {
             configured_emission_mode: api::EmissionMode::Normal.into(),
             effective_emission_mode: api::EmissionMode::ReceiveOnly.into(),
             store_capacity: api::StoreCapacityStatus {
@@ -1191,21 +1265,7 @@ mod tests {
             }
             .into(),
             ..Default::default()
-        };
-
-        let evidence = status_evidence(&valid).expect("valid profile status");
-        assert_eq!(evidence["configured_emission_mode"], "normal");
-        assert_eq!(evidence["effective_emission_mode"], "receive_only");
-        assert_eq!(evidence["operation_ledger_mode"], "legacy");
-        assert_eq!(evidence["operation_ordinary_remaining"], 990_000);
-        assert_eq!(evidence["operation_audit_state"], "pending");
-
-        let mut invalid = valid;
-        invalid
-            .publish_operation_capacity
-            .get_or_insert_default()
-            .profile_boundary = 2_048;
-        assert!(status_evidence(&invalid).is_err());
+        }
     }
 
     #[test]

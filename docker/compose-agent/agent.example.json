@@ -1,0 +1,25 @@
+{
+  "schema_version": 2,
+  "state": {"directory": "/var/lib/aster"},
+  "application": {"listen": "127.0.0.1:8181"},
+  "health": {"listen": "127.0.0.1:8182"},
+  "mesh": {
+    "bind": "0.0.0.0:8183",
+    "sync_interval_ms": 500,
+    "emission_policy": "normal",
+    "peers": []
+  },
+  "credentials": {
+    "client_token_file": "/run/secrets/aster-client-token",
+    "mission_activation_file": "/run/secrets/aster-mission-activation"
+  },
+  "storage": {
+    "max_items": 10000,
+    "max_payload_bytes": 67108864,
+    "operations": {
+      "max_records": 1000000,
+      "max_logical_bytes": 201326592,
+      "emergency_reserve": 10000
+    }
+  }
+}

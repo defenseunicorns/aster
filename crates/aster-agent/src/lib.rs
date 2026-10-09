@@ -87,6 +87,7 @@ impl BoundAgent {
         let service = event_service::application_service(
             events,
             aster_node::EventEmissionPolicy::Normal,
+            None,
             shutdown.clone(),
         );
         let status = lifecycle::ServiceStatus::starting();

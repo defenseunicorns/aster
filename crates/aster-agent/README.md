@@ -1,5 +1,12 @@
 ## Checked Rust API examples
 
+The Debian/package binary statically selects the systemd credential provider
+and configuration schema v1. The separate Docker binary is built by
+`aster-compose-credentials`, is also named `aster-agent`, and statically selects
+the dedicated Compose provider with schema v2. There is no runtime provider
+selector. See the [schema v2 reference](../../docs/reference/aster-agent-config-v2.md)
+and [manual Compose operator procedure](../../docs/release/docker-compose.md).
+
 These examples target the loopback-only live Event/status API. Call the
 async functions from a Tokio runtime. The client examples require the `client`
 feature and an already running agent at `127.0.0.1:8181`; pass its provisioned
@@ -10,7 +17,10 @@ client token (without the `Bearer ` prefix). See the
 
 `view()` borrows fields from the response buffer. Keep the response alive while
 using them. Aster status has byte-valued `identity` and `mission_authority`
-fields, not a `name` field.
+fields, not a `name` field. Compose startup also returns the public
+`credential_generation` as exactly 32 bytes; systemd and legacy startup return
+that field empty. The generation is observability metadata only and is not an
+authorization value, state key, mesh value, or provisioning-bundle input.
 
 ```no_run
 # #[cfg(feature = "client")]

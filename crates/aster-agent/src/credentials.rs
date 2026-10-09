@@ -13,7 +13,7 @@ use aster_mesh::{
 use aster_node::{NodeBootstrapError, NodeConfig};
 use zeroize::Zeroizing;
 
-use crate::config::{CredentialPaths, ValidatedAgentConfig};
+use crate::config::{CredentialPaths, ValidatedRuntimeConfig};
 
 const MIN_CLIENT_TOKEN_BYTES: usize = 32;
 const MAX_CLIENT_TOKEN_BYTES: usize = 256;
@@ -191,26 +191,79 @@ impl ReloadableClientToken {
     }
 }
 
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct CredentialGeneration([u8; 32]);
+
+impl CredentialGeneration {
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CredentialGeneration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CredentialGeneration([REDACTED])")
+    }
+}
+
 pub struct StartupCredentials {
-    pub token: ReloadableClientToken,
-    pub mission_ref: ProvisioningSecretRef,
-    pub mission_load: ProvisioningLoadId,
+    token: ReloadableClientToken,
+    mission_ref: ProvisioningSecretRef,
+    mission_load: ProvisioningLoadId,
+    generation: Option<CredentialGeneration>,
+}
+
+impl StartupCredentials {
+    pub fn new(
+        token: ClientToken,
+        mission_ref: ProvisioningSecretRef,
+        mission_load: ProvisioningLoadId,
+        generation: Option<CredentialGeneration>,
+    ) -> Self {
+        Self {
+            token: ReloadableClientToken::new(token),
+            mission_ref,
+            mission_load,
+            generation,
+        }
+    }
+
+    pub(crate) fn token(&self) -> &ReloadableClientToken {
+        &self.token
+    }
+
+    pub const fn mission_reference(&self) -> &ProvisioningSecretRef {
+        &self.mission_ref
+    }
+
+    pub const fn mission_load(&self) -> ProvisioningLoadId {
+        self.mission_load
+    }
+
+    pub const fn generation(&self) -> Option<CredentialGeneration> {
+        self.generation
+    }
 }
 
 pub fn load_startup_credentials(
     paths: &CredentialPaths,
 ) -> Result<StartupCredentials, CredentialError> {
-    let token = ReloadableClientToken::new(ClientToken::load(paths.client_token_file())?);
+    let token = ClientToken::load(paths.client_token_file())?;
     let mission_ref = load_mission_reference(paths.mission_secret_ref_file())?;
-    Ok(StartupCredentials {
+    Ok(StartupCredentials::new(
         token,
         mission_ref,
-        mission_load: paths.mission_load_id(),
-    })
+        paths.mission_load_id(),
+        None,
+    ))
 }
 
 pub fn open_node_config<L>(
-    config: &ValidatedAgentConfig,
+    config: &ValidatedRuntimeConfig,
     credentials: &StartupCredentials,
     loader: &mut L,
 ) -> Result<NodeConfig, NodeBootstrapError>

@@ -10,11 +10,13 @@ use aster_node::{
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
-    config::{ConfigReason, ValidatedAgentConfig},
-    credentials::{CredentialReason, load_startup_credentials, open_node_config},
+    config::{ConfigReason, ValidatedRuntimeConfig, ValidatedSystemdAgentConfig},
+    credentials::{
+        CredentialReason, StartupCredentials, load_startup_credentials, open_node_config,
+    },
     event_service::application_service,
     health::BoundHealth,
-    lifecycle::{FailureReason, LifecycleState, ServiceStatus},
+    lifecycle::{FailureReason, LifecycleState, ServiceStatus, credential_generation_hex},
     server::{BoundAgent, ServerStop},
 };
 
@@ -27,6 +29,20 @@ pub enum AgentSignal {
     Hangup,
     /// Begin or force process shutdown.
     Terminate,
+}
+
+pub enum TokenReloadPolicy {
+    Disabled,
+    ReloadFrom(PathBuf),
+}
+
+impl fmt::Debug for TokenReloadPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Disabled => formatter.write_str("Disabled"),
+            Self::ReloadFrom(_) => formatter.write_str("ReloadFrom([REDACTED])"),
+        }
+    }
 }
 
 /// Bounded process outcome returned to the customer binary.
@@ -67,9 +83,9 @@ impl Error for AgentRuntimeError {}
 /// Runs one protected customer agent until a translated terminal signal or a
 /// bounded fatal task transition.
 pub async fn run_customer_agent<L>(
-    config: ValidatedAgentConfig,
+    config: ValidatedSystemdAgentConfig,
     loader: &mut L,
-    mut signals: mpsc::Receiver<AgentSignal>,
+    signals: mpsc::Receiver<AgentSignal>,
 ) -> Result<AgentExit, AgentRuntimeError>
 where
     L: ProvisioningSecretLoader + ?Sized,
@@ -79,10 +95,32 @@ where
     let credentials = load_startup_credentials(config.credential_paths())
         .map_err(|error| AgentRuntimeError::Credential(error.reason()))?;
     let token_path = PathBuf::from(config.credential_paths().client_token_file());
+    let (runtime, _) = config.into_parts();
+    run_customer_agent_with_credentials(
+        runtime,
+        credentials,
+        loader,
+        signals,
+        TokenReloadPolicy::ReloadFrom(token_path),
+    )
+    .await
+}
+
+pub async fn run_customer_agent_with_credentials<L>(
+    config: ValidatedRuntimeConfig,
+    credentials: StartupCredentials,
+    loader: &mut L,
+    mut signals: mpsc::Receiver<AgentSignal>,
+    reload: TokenReloadPolicy,
+) -> Result<AgentExit, AgentRuntimeError>
+where
+    L: ProvisioningSecretLoader + ?Sized,
+{
     let application_address = config.application();
     let health_address = config.health();
     let forwarding = config.forwarding();
     let configured_emission_policy = config.emission_policy();
+    let credential_generation = credentials.generation();
     let limits = *config.limits();
     let node_config = open_node_config(&config, &credentials, loader)
         .map_err(|error| AgentRuntimeError::Bootstrap(error.kind()))?;
@@ -123,10 +161,15 @@ where
     let monitored_events = events.clone();
     let (stream_stop_send, stream_stop_receive) = tokio::sync::watch::channel(false);
     let (server_stop_send, server_stop_receive) = tokio::sync::watch::channel(ServerStop::Run);
-    let service = application_service(events, configured_emission_policy, stream_stop_receive);
+    let service = application_service(
+        events,
+        configured_emission_policy,
+        credential_generation,
+        stream_stop_receive,
+    );
     let mut server_task = tokio::spawn(application.serve(
         service,
-        credentials.token.clone(),
+        credentials.token().clone(),
         status.clone(),
         limits,
         server_stop_receive,
@@ -144,7 +187,7 @@ where
         fail_startup(&status, &health_stop_send, &mut health_task).await;
         return Err(AgentRuntimeError::Lifecycle(FailureReason::Startup));
     }
-    emit_lifecycle(LifecycleState::Ready, "readiness", "ready", false, 200);
+    emit_ready_lifecycle(credential_generation);
 
     let mut node_monitor = tokio::spawn(async move {
         loop {
@@ -164,13 +207,14 @@ where
         tokio::select! {
             signal = signals.recv() => match signal {
                 Some(AgentSignal::Hangup) => {
-                    let succeeded = credentials.token.reload_from(&token_path).is_ok();
+                    let (reason, retryable, response_code) =
+                        apply_token_reload(&reload, &credentials);
                     emit_lifecycle(
                         LifecycleState::Ready,
                         "token_reload",
-                        if succeeded { "reloaded" } else { "rejected" },
-                        !succeeded,
-                        if succeeded { 200 } else { 503 },
+                        reason,
+                        retryable,
+                        response_code,
                     );
                 }
                 Some(AgentSignal::Terminate) => break RunningTransition::Drain,
@@ -222,6 +266,22 @@ where
                 stop_health(health_stop_send, health_task).await;
             }
             Ok(AgentExit::Failed(FailureReason::Runtime))
+        }
+    }
+}
+
+fn apply_token_reload(
+    policy: &TokenReloadPolicy,
+    credentials: &StartupCredentials,
+) -> (&'static str, bool, u16) {
+    match policy {
+        TokenReloadPolicy::Disabled => ("unsupported", false, 501),
+        TokenReloadPolicy::ReloadFrom(token_path) => {
+            if credentials.token().reload_from(token_path).is_ok() {
+                ("reloaded", false, 200)
+            } else {
+                ("rejected", true, 503)
+            }
         }
     }
 }
@@ -422,6 +482,20 @@ fn emit_lifecycle(
     );
 }
 
+fn emit_ready_lifecycle(generation: Option<crate::credentials::CredentialGeneration>) {
+    let mut record = lifecycle_record(LifecycleState::Ready, "readiness", "ready", false, 200);
+    if let Some(generation) = generation {
+        record
+            .as_object_mut()
+            .expect("lifecycle record is an object")
+            .insert(
+                "credential_generation".to_owned(),
+                credential_generation_hex(generation).into(),
+            );
+    }
+    println!("{record}");
+}
+
 fn lifecycle_json(
     state: LifecycleState,
     operation: &'static str,
@@ -429,6 +503,16 @@ fn lifecycle_json(
     retryable: bool,
     response_code: u16,
 ) -> String {
+    lifecycle_record(state, operation, reason, retryable, response_code).to_string()
+}
+
+fn lifecycle_record(
+    state: LifecycleState,
+    operation: &'static str,
+    reason: &'static str,
+    retryable: bool,
+    response_code: u16,
+) -> serde_json::Value {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -443,7 +527,6 @@ fn lifecycle_json(
         "latency_bucket": "not_applicable",
         "correlation_id": "agent-lifecycle",
     })
-    .to_string()
 }
 
 const fn lifecycle_state_name(state: LifecycleState) -> &'static str {
@@ -459,6 +542,28 @@ const fn lifecycle_state_name(state: LifecycleState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_reload_has_one_fixed_unsupported_outcome() {
+        let token = crate::ClientToken::from_bytes(b"0123456789abcdef0123456789abcdef".to_vec())
+            .expect("test token");
+        let credentials = crate::credentials::StartupCredentials::new(
+            token,
+            aster_mesh::ProvisioningSecretRef::from_opaque(b"reference".to_vec())
+                .expect("test reference"),
+            aster_mesh::ProvisioningLoadId::new([7; 32]),
+            None,
+        );
+        assert_eq!(
+            apply_token_reload(&TokenReloadPolicy::Disabled, &credentials),
+            ("unsupported", false, 501)
+        );
+        assert!(
+            credentials
+                .token()
+                .authorizes(Some(b"Bearer 0123456789abcdef0123456789abcdef"))
+        );
+    }
 
     #[test]
     fn customer_output_boundary_selects_silent_node_and_fixed_agent_records() {

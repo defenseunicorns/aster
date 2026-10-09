@@ -8,11 +8,17 @@ license.workspace = true
 publish = false
 
 [features]
-default = ["server"]
+default = ["server", "systemd-provider"]
 nearby-discovery = ["aster-node/nearby-discovery"]
 server = ["connectrpc/server"]
 client = ["connectrpc/client"]
+systemd-provider = ["dep:aster-systemd-credentials"]
 acceptance-test-provider = []
+
+[[bin]]
+name = "aster-agent"
+path = "src/main.rs"
+required-features = ["server", "systemd-provider"]
 
 [[bin]]
 name = "aster-agent-acceptance-fixture"
@@ -24,7 +30,7 @@ aster-mesh = { package = "aster-core", path = "../aster-core", default-features 
 aster-iroh = { path = "../aster-iroh" }
 aster-node = { path = "../aster-node" }
 aster-redb-store = { path = "../aster-redb-store" }
-aster-systemd-credentials = { path = "../aster-systemd-credentials" }
+aster-systemd-credentials = { path = "../aster-systemd-credentials", optional = true }
 buffa.workspace = true
 bytes.workspace = true
 connectrpc = { workspace = true, features = ["json"] }

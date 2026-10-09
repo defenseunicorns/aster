@@ -8,6 +8,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use aster_agent::config::{ValidatedSystemdAgentConfig, load_and_validate_config};
 use aster_mesh::ProvisioningSecretRef;
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -38,6 +39,68 @@ fn customer_binary_statically_selects_the_systemd_provider() {
             .is_none(),
         "provider construction failure must not create durable state"
     );
+}
+
+#[test]
+fn systemd_binary_accepts_only_schema_v1_and_has_no_compose_contract() {
+    // Break caught: admitting schema v2 or linking the Compose provider would
+    // turn provider choice into a runtime/configuration property.
+    let fixture = BinaryFixture::new();
+    let v2 = fixture.root.join("agent-v2.json");
+    fs::write(&v2, fixture.compose_config()).expect("write schema-v2 config");
+    let output = Command::new(env!("CARGO_BIN_EXE_aster-agent"))
+        .arg("--check-config")
+        .arg(&v2)
+        .output()
+        .expect("run systemd binary with schema v2");
+    assert!(!output.status.success());
+    assert!(
+        !String::from_utf8(output.stderr)
+            .expect("UTF-8 stderr")
+            .is_empty()
+    );
+
+    let validated = load_and_validate_config(&fixture.config).expect("schema-v1 config");
+    fn assert_systemd_config(_: &ValidatedSystemdAgentConfig) {}
+    assert_systemd_config(&validated);
+    let _ = validated.runtime();
+
+    let binary = fs::read(env!("CARGO_BIN_EXE_aster-agent")).expect("read systemd binary");
+    assert!(!contains(&binary, b"aster-compose-secret-store/v1"));
+    assert!(!contains(&binary, b"/run/secrets/aster-mission-activation"));
+    assert!(!contains(&binary, b"ComposeProvisioningLoader"));
+    assert!(!contains(&binary, b"aster_compose_credentials"));
+}
+
+#[test]
+fn systemd_binary_has_no_runtime_provider_selector() {
+    // Break caught: a CLI or environment selector could switch the packaged
+    // binary away from its statically linked provider.
+    let fixture = BinaryFixture::new();
+    let output = Command::new(env!("CARGO_BIN_EXE_aster-agent"))
+        .args(["--provider", "compose", "--config"])
+        .arg(&fixture.config)
+        .output()
+        .expect("run forbidden provider selector");
+    assert!(!output.status.success());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster-agent"))
+        .arg("--config")
+        .arg(&fixture.config)
+        .env("ASTER_CREDENTIAL_PROVIDER", "compose")
+        .env_remove("CREDENTIALS_DIRECTORY")
+        .output()
+        .expect("run with ignored provider environment");
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("UTF-8 stderr"),
+        "ERROR provisioning secret store is unavailable\n"
+    );
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 struct BinaryFixture {
@@ -87,6 +150,13 @@ impl BinaryFixture {
             config,
             state,
         }
+    }
+
+    fn compose_config(&self) -> String {
+        format!(
+            r#"{{"schema_version":2,"state":{{"directory":"{}"}},"application":{{"listen":"127.0.0.1:41831"}},"health":{{"listen":"127.0.0.1:41832"}},"mesh":{{"bind":"127.0.0.1:0","sync_interval_ms":500,"emission_policy":"normal","peers":[]}},"credentials":{{"client_token_file":"/run/secrets/aster-client-token","mission_activation_file":"/run/secrets/aster-mission-activation"}},"storage":{{"max_items":10000,"max_payload_bytes":67108864,"operations":{{"max_records":1000000,"max_logical_bytes":201326592,"emergency_reserve":10000}}}}}}"#,
+            self.state.display(),
+        )
     }
 }
 

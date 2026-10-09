@@ -311,6 +311,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-compose-credentials"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "aster-agent",
+ "aster-core",
+ "connectrpc",
+ "getrandom 0.4.3",
+ "libc",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "aster-conformance"
 version = "0.1.0-alpha.1"
 dependencies = [

@@ -197,6 +197,7 @@ fn connect_client_uses_the_real_live_event_authority() {
             .into_owned();
         assert_eq!(status.identity.len(), 32);
         assert_eq!(status.mission_authority.len(), 32);
+        assert!(status.credential_generation.is_empty());
 
         // Exercise the generated Connect client with authentication as well as
         // the gRPC client above. Borrow actual Aster fields before consuming
@@ -220,11 +221,13 @@ fn connect_client_uses_the_real_live_event_authority() {
             let authority: &[u8] = view.mission_authority;
             assert_eq!(identity, status.identity);
             assert_eq!(authority, status.mission_authority);
+            assert!(view.credential_generation.is_empty());
         }
         let owned: api::GetStatusResponse = response.into_owned();
         drop(connect_client);
         assert_eq!(owned.identity, status.identity);
         assert_eq!(owned.mission_authority, status.mission_authority);
+        assert!(owned.credential_generation.is_empty());
 
         // Tracer exercises the real route independently of generated types.
         {

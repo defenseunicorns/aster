@@ -21,6 +21,7 @@ use futures::StreamExt as _;
 
 use crate::{
     MAX_AGENT_RESPONSE_PROTO_BYTES, MAX_STREAM_BACKOFF_MS, MIN_STREAM_BACKOFF_MS, api,
+    credentials::CredentialGeneration,
     error::{
         PublicOperation, connect_application_error, public_application_error_detail, public_error,
         public_error_detail,
@@ -40,6 +41,7 @@ const PUBLISH_EVENTS_WINDOW: usize = 8;
 pub(crate) struct AsterConnectService {
     events: SelectedEventHandle,
     configured_emission_policy: EventEmissionPolicy,
+    credential_generation: Option<CredentialGeneration>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 }
 
@@ -48,11 +50,13 @@ impl AsterConnectService {
     pub(crate) fn new(
         events: SelectedEventHandle,
         configured_emission_policy: EventEmissionPolicy,
+        credential_generation: Option<CredentialGeneration>,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
         Self {
             events,
             configured_emission_policy,
+            credential_generation,
             shutdown,
         }
     }
@@ -66,10 +70,17 @@ impl AsterConnectService {
 pub(crate) fn application_service(
     events: SelectedEventHandle,
     configured_emission_policy: EventEmissionPolicy,
+    credential_generation: Option<CredentialGeneration>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> connectrpc::ConnectRpcService<connectrpc::Router> {
     configured_service(
-        AsterConnectService::new(events, configured_emission_policy, shutdown).router(),
+        AsterConnectService::new(
+            events,
+            configured_emission_policy,
+            credential_generation,
+            shutdown,
+        )
+        .router(),
     )
 }
 
@@ -225,6 +236,7 @@ impl api::AsterApplicationService for AsterConnectService {
                 self.events.identity(),
                 self.events.mission_authority(),
                 self.configured_emission_policy,
+                self.credential_generation,
                 status,
             ),
             PublicOperation::GetStatus,
@@ -984,6 +996,7 @@ fn status_response(
     identity: [u8; 32],
     mission_authority: [u8; 32],
     configured_emission_policy: EventEmissionPolicy,
+    credential_generation: Option<CredentialGeneration>,
     status: SelectedEventStatus,
 ) -> api::GetStatusResponse {
     let operations = status.event_operation_capacity;
@@ -1062,6 +1075,9 @@ fn status_response(
             ..Default::default()
         }
         .into(),
+        credential_generation: credential_generation
+            .map(|generation| generation.as_bytes().to_vec())
+            .unwrap_or_default(),
         ..Default::default()
     }
 }
@@ -1549,6 +1565,7 @@ mod tests {
             [0x11; 32],
             [0x22; 32],
             EventEmissionPolicy::Normal,
+            None,
             SelectedEventStatus {
                 event_operation_audit: Default::default(),
                 sync: NodeEventSyncStatus::Offline,
@@ -1666,6 +1683,7 @@ mod tests {
                 [0x11; 32],
                 [0x22; 32],
                 EventEmissionPolicy::Normal,
+                None,
                 SelectedEventStatus {
                     event_operation_audit: EventOperationAuditStatus {
                         state,

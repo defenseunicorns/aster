@@ -1,0 +1,36 @@
+[package]
+name = "aster-compose-credentials"
+description = "Docker Compose credential store provider for Aster provisioning"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "aster-compose-agent"
+path = "src/bin/aster-agent.rs"
+
+[[bin]]
+name = "aster-compose-healthcheck"
+path = "src/bin/aster-compose-healthcheck.rs"
+
+[[bin]]
+name = "aster-compose-verify"
+path = "src/bin/aster-compose-verify.rs"
+
+[dependencies]
+aster-core = { version = "=0.1.0-alpha.1", path = "../aster-core", default-features = false, features = ["reference-session"] }
+aster-agent = { path = "../aster-agent", default-features = false, features = ["client", "server"] }
+connectrpc = { workspace = true, features = ["client"] }
+getrandom.workspace = true
+libc.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

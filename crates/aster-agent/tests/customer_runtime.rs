@@ -11,10 +11,17 @@ use std::{
 };
 
 use aster_agent::{
+    ClientToken,
     config::{check_config, load_and_validate_config},
-    credentials::{load_startup_credentials, open_node_config},
+    credentials::{
+        CredentialGeneration, StartupCredentials, load_startup_credentials, open_node_config,
+    },
     lifecycle::FailureReason,
-    runtime::{AgentExit, AgentRuntimeError, AgentSignal, run_customer_agent},
+    proto::aster::application::v1alpha1 as api,
+    runtime::{
+        AgentExit, AgentRuntimeError, AgentSignal, TokenReloadPolicy, run_customer_agent,
+        run_customer_agent_with_credentials,
+    },
 };
 use aster_mesh::{
     ProvisioningLoadId, ProvisioningLoadReceipt, ProvisioningSecretLoader, ProvisioningSecretRef,
@@ -168,6 +175,220 @@ async fn receive_only_starts_ready_and_accepts_local_publication() {
     running.stop_clean().await;
 }
 
+#[test]
+fn compose_generation_is_reported_only_by_authenticated_status_and_ready_lifecycle() {
+    // Break caught: dropping, reshaping, or over-sharing the public generation
+    // prevents operators from verifying one exact Compose activation.
+    const CHILD: &str = "ASTER_TEST_COMPOSE_GENERATION_CHILD";
+    const GENERATION: [u8; 32] = [0x3a; 32];
+    const GENERATION_HEX: &str = "3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "compose_generation_is_reported_only_by_authenticated_status_and_ready_lifecycle",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("start Compose generation test process");
+        assert!(
+            output.status.success(),
+            "child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8 child output");
+        for forbidden in [
+            "customer-provider-capability",
+            "/client-token",
+            "/mission-reference",
+            "0123456789abcdef0123456789abcdef",
+            "LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL",
+        ] {
+            assert!(!stdout.contains(forbidden), "lifecycle exposed {forbidden}");
+        }
+        let records = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|record| record.get("lifecycle_state").is_some())
+            .collect::<Vec<_>>();
+        let generation_records = records
+            .iter()
+            .filter(|record| record.get("credential_generation").is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["operation"] == "readiness")
+                .count(),
+            1,
+            "{records:?}"
+        );
+        assert_eq!(generation_records.len(), 1, "{records:?}");
+        assert_eq!(generation_records[0]["lifecycle_state"], "ready");
+        assert_eq!(generation_records[0]["operation"], "readiness");
+        assert_eq!(
+            generation_records[0]["credential_generation"],
+            GENERATION_HEX
+        );
+        assert_eq!(
+            generation_records[0]["credential_generation"]
+                .as_str()
+                .expect("generation string")
+                .len(),
+            64
+        );
+        assert!(
+            GENERATION_HEX
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        return;
+    }
+
+    assert!(socket_access_available(), "child requires loopback sockets");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let fixture = CustomerFixture::new();
+        let config = load_and_validate_config(fixture.config_path()).expect("validated config");
+        let (runtime, _) = config.into_parts();
+        let credentials = StartupCredentials::new(
+            ClientToken::from_bytes(fixture.token_bytes().to_vec()).expect("test token"),
+            fixture.reference(),
+            ProvisioningLoadId::new([b'L'; 32]),
+            Some(CredentialGeneration::new(GENERATION)),
+        );
+        let (signals, receiver) = tokio::sync::mpsc::channel(4);
+        let task = tokio::spawn(async move {
+            let mut loader = RecordingLoader::new();
+            run_customer_agent_with_credentials(
+                runtime,
+                credentials,
+                &mut loader,
+                receiver,
+                TokenReloadPolicy::Disabled,
+            )
+            .await
+        });
+        wait_until_ready(&fixture).await;
+        let status = authenticated_status(fixture.application(), fixture.token_bytes()).await;
+        assert_eq!(status.credential_generation, GENERATION);
+        assert_eq!(status.credential_generation.len(), 32);
+        let encoded_status = status.encode_to_vec();
+        let token_path = fixture.token.display().to_string();
+        let reference_path = fixture.mission_reference.display().to_string();
+        for forbidden in [
+            fixture.token_bytes(),
+            b"customer-provider-capability".as_slice(),
+            b"LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL".as_slice(),
+            token_path.as_bytes(),
+            reference_path.as_bytes(),
+        ] {
+            assert!(
+                !encoded_status
+                    .windows(forbidden.len())
+                    .any(|window| window == forbidden),
+                "status exposed credential-adjacent bytes"
+            );
+        }
+        signals
+            .send(AgentSignal::Terminate)
+            .await
+            .expect("clean stop");
+        assert_eq!(finish_runtime(task).await, AgentExit::Clean);
+    });
+}
+
+#[test]
+fn absent_generation_is_empty_in_status_and_omitted_from_every_lifecycle_record() {
+    // Break caught: compatibility startup accidentally serializes an empty or
+    // synthetic generation instead of preserving the absent-generation shape.
+    const CHILD: &str = "ASTER_TEST_ABSENT_GENERATION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "absent_generation_is_empty_in_status_and_omitted_from_every_lifecycle_record",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("start absent-generation test process");
+        assert!(
+            output.status.success(),
+            "child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let records = String::from_utf8(output.stdout)
+            .expect("UTF-8 child output")
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|record| record.get("lifecycle_state").is_some())
+            .collect::<Vec<_>>();
+        assert!(!records.is_empty());
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["operation"] == "readiness")
+                .count(),
+            1,
+            "{records:?}"
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.get("credential_generation").is_none()),
+            "{records:?}"
+        );
+        return;
+    }
+
+    assert!(socket_access_available(), "child requires loopback sockets");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let fixture = CustomerFixture::new();
+        let config = load_and_validate_config(fixture.config_path()).expect("validated config");
+        let (runtime, _) = config.into_parts();
+        let credentials = StartupCredentials::new(
+            ClientToken::from_bytes(fixture.token_bytes().to_vec()).expect("test token"),
+            fixture.reference(),
+            ProvisioningLoadId::new([b'N'; 32]),
+            None,
+        );
+        let token_path = fixture.token.clone();
+        let (signals, receiver) = tokio::sync::mpsc::channel(4);
+        let task = tokio::spawn(async move {
+            let mut loader = RecordingLoader::new();
+            run_customer_agent_with_credentials(
+                runtime,
+                credentials,
+                &mut loader,
+                receiver,
+                TokenReloadPolicy::ReloadFrom(token_path),
+            )
+            .await
+        });
+        wait_until_ready(&fixture).await;
+        let status = authenticated_status(fixture.application(), fixture.token_bytes()).await;
+        assert!(status.credential_generation.is_empty());
+        signals
+            .send(AgentSignal::Terminate)
+            .await
+            .expect("clean stop");
+        assert_eq!(finish_runtime(task).await, AgentExit::Clean);
+    });
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn customer_operation_limits_process_preserves_over_limit_reopen() {
     // Break caught: customer startup defaults the selected quota, consumes its
@@ -303,6 +524,55 @@ async fn successful_hangup_reloads_only_the_client_token_atomically() {
     );
     assert_eq!(health_status(fixture.health(), "/readyz").await, 200);
     running.stop_clean().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_hangup_retains_the_current_token() {
+    // Break caught: the Compose runtime must not reopen or replace a bind-
+    // mounted token on SIGHUP, but must remain ready with the original token.
+    if !socket_access_available() {
+        return;
+    }
+    let fixture = CustomerFixture::new();
+    let old_token = fixture.token_bytes().to_vec();
+    let config = load_and_validate_config(fixture.config_path()).expect("validated config");
+    let (runtime, paths) = config.into_parts();
+    let credentials = load_startup_credentials(&paths).expect("startup credentials");
+    let (signals, receiver) = tokio::sync::mpsc::channel(4);
+    let task = tokio::spawn(async move {
+        let mut loader = RecordingLoader::new();
+        run_customer_agent_with_credentials(
+            runtime,
+            credentials,
+            &mut loader,
+            receiver,
+            TokenReloadPolicy::Disabled,
+        )
+        .await
+    });
+    wait_until_ready(&fixture).await;
+
+    let replacement = b"replacement-client-token-00000002";
+    fixture.write_token(replacement);
+    signals
+        .send(AgentSignal::Hangup)
+        .await
+        .expect("send hangup");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        application_status(fixture.application(), &old_token).await,
+        200
+    );
+    assert_eq!(
+        application_status(fixture.application(), replacement).await,
+        401
+    );
+    assert_eq!(health_status(fixture.health(), "/readyz").await, 200);
+    signals
+        .send(AgentSignal::Terminate)
+        .await
+        .expect("stop runtime");
+    assert_eq!(finish_runtime(task).await, AgentExit::Clean);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -477,7 +747,7 @@ fn config_check_validates_files_without_a_provider_and_bootstrap_uses_exact_refe
     let config = load_and_validate_config(fixture.config_path()).expect("validated config");
     let credentials =
         load_startup_credentials(config.credential_paths()).expect("startup credentials");
-    open_node_config(&config, &credentials, &mut loader).expect("protected node config");
+    open_node_config(config.runtime(), &credentials, &mut loader).expect("protected node config");
     assert_eq!(loader.calls(), 1);
     assert_eq!(loader.last_reference(), Some(&expected_reference));
     assert_eq!(loader.last_operation(), Some(expected_operation));
@@ -493,7 +763,7 @@ fn bootstrap_failure_redacts_the_provider_reference() {
         load_startup_credentials(config.credential_paths()).expect("startup credentials");
     let mut loader = RejectingLoader;
 
-    let error = open_node_config(&config, &credentials, &mut loader)
+    let error = open_node_config(config.runtime(), &credentials, &mut loader)
         .expect_err("provider rejection must not become a node configuration");
     let rendered = format!("{error:?} {error}");
     assert_eq!(error.kind(), aster_node::NodeBootstrapErrorKind::Rejected);
@@ -796,6 +1066,33 @@ async fn application_status(address: SocketAddr, token: &[u8]) -> u16 {
         .as_bytes(),
     )
     .await
+}
+
+async fn authenticated_status(address: SocketAddr, token: &[u8]) -> api::GetStatusResponse {
+    let response = http_response(
+        address,
+        format!(
+            "POST /aster.application.v1alpha1.AsterApplicationService/GetStatus HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/proto\r\nConnect-Protocol-Version: 1\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            String::from_utf8_lossy(token),
+        )
+        .as_bytes(),
+    )
+    .await;
+    assert_eq!(http_response_status(&response), 200);
+    let offset = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("HTTP response body")
+        + 4;
+    let body = if String::from_utf8_lossy(&response[..offset])
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        chunked_response_body(&response)
+    } else {
+        response[offset..].to_vec()
+    };
+    api::GetStatusResponse::decode_from_slice(&body).expect("protobuf status response")
 }
 
 async fn publish_event_status(address: SocketAddr, token: &[u8]) -> u16 {

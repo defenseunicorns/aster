@@ -1,6 +1,6 @@
 # Production implementation requirements status
 
-- Status date: 2026-09-15
+- Status date: 2026-10-08
 - Requirements authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Requirements SHA-256: `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
 - Planning view: [`capability-roadmap.md`](capability-roadmap.md)
@@ -88,6 +88,24 @@ the stated retained execution receipt. Neither class implies release evidence.
 Use the capability roadmap for planning and merge review. The rows below are an
 exhaustive evidence trace, not a flat backlog, a completion denominator, or a
 release score.
+
+### Compose credential-provider implementation evidence
+
+The Compose increment adds a statically composed provider, immutable
+generation administration, schema v2, hardened image/Compose definitions,
+daemon-free policy validation, a manual operator procedure, and a manually
+triggered release-artifact workflow. This adds implementation evidence for
+`DM-3-11`, `DM-6-14`, `DM-8-12`, `DM-8-13`, `DM-11-18`, `DM-11-19`, and
+`DM-13-11` only within the boundaries recorded in the exhaustive CSV.
+
+`DM-3-11`, `DM-8-12`, `DM-8-13`, and `DM-13-11` are
+`implemented-uncredited`; no Docker lifecycle receipt or generated Compose
+release bundle is retained. `DM-6-14` keeps its prior `observed-bounded` status
+and does not receive new observation credit from Compose tests. `DM-11-18` and
+`DM-11-19` remain `open` complete-MVP obligations. Identity issuance and
+recovery, a general production custody backend, independent review, broad
+platform support, host qualification, retained SBOM/license artifacts, and
+production authorization remain incomplete.
 
 ## Trace vocabulary
 

@@ -23,7 +23,11 @@ use serde::Deserialize;
 
 use crate::{MAX_AGENT_MESSAGE_BYTES, credentials::load_startup_credentials};
 
-const SUPPORTED_SCHEMA_VERSION: u32 = 1;
+const SYSTEMD_SCHEMA_VERSION: u32 = 1;
+const COMPOSE_SCHEMA_VERSION: u32 = 2;
+const COMPOSE_CLIENT_TOKEN_PATH: &str = "/run/secrets/aster-client-token";
+const COMPOSE_MISSION_ACTIVATION_PATH: &str = "/run/secrets/aster-mission-activation";
+const COMPOSE_STATE_PATH: &str = "/var/lib/aster";
 const MAX_CONFIGURED_PEERS: usize = 256;
 const MAX_SYNC_INTERVAL_MS: u64 = 60_000;
 const MAX_APPLICATION_CONNECTIONS: usize = 64;
@@ -52,6 +56,7 @@ pub enum ConfigReason {
     LoopbackListenerRequired,
     MissingField,
     StorageTooSmall,
+    StateBoundary,
     SyncIntervalOutOfRange,
     Syntax,
     TooManyPeers,
@@ -81,6 +86,7 @@ impl ConfigReason {
             Self::LoopbackListenerRequired => "configuration listener must be loopback",
             Self::MissingField => "configuration is missing a required field",
             Self::StorageTooSmall => "configuration storage cannot preserve required reserves",
+            Self::StateBoundary => "configuration state boundary is invalid",
             Self::SyncIntervalOutOfRange => {
                 "configuration synchronization interval is out of range"
             }
@@ -193,19 +199,18 @@ impl AgentLimits {
     }
 }
 
-pub struct ValidatedAgentConfig {
+pub struct ValidatedRuntimeConfig {
     state: PathBuf,
     application: SocketAddr,
     health: SocketAddr,
     mesh_bind: SocketAddr,
     peers: Vec<MissionExpectedPeer>,
     forwarding: SelectedForwardingConfig,
-    credentials: CredentialPaths,
     limits: AgentLimits,
     sync_interval: Duration,
 }
 
-impl ValidatedAgentConfig {
+impl ValidatedRuntimeConfig {
     pub fn node_options(&self) -> NodeConfigOptions {
         NodeConfigOptions::new(self.mesh_bind, self.sync_interval).with_peers(self.peers.clone())
     }
@@ -216,10 +221,6 @@ impl ValidatedAgentConfig {
 
     pub const fn emission_policy(&self) -> EventEmissionPolicy {
         self.forwarding.emission_policy()
-    }
-
-    pub fn credential_paths(&self) -> &CredentialPaths {
-        &self.credentials
     }
 
     pub fn limits(&self) -> &AgentLimits {
@@ -239,15 +240,56 @@ impl ValidatedAgentConfig {
     }
 }
 
+pub struct ValidatedSystemdAgentConfig {
+    runtime: ValidatedRuntimeConfig,
+    credentials: CredentialPaths,
+}
+
+impl ValidatedSystemdAgentConfig {
+    pub const fn runtime(&self) -> &ValidatedRuntimeConfig {
+        &self.runtime
+    }
+
+    pub const fn credential_paths(&self) -> &CredentialPaths {
+        &self.credentials
+    }
+
+    pub fn into_parts(self) -> (ValidatedRuntimeConfig, CredentialPaths) {
+        (self.runtime, self.credentials)
+    }
+}
+
+impl std::ops::Deref for ValidatedSystemdAgentConfig {
+    type Target = ValidatedRuntimeConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.runtime
+    }
+}
+
+pub struct ValidatedComposeAgentConfig {
+    runtime: ValidatedRuntimeConfig,
+}
+
+impl ValidatedComposeAgentConfig {
+    pub const fn runtime(&self) -> &ValidatedRuntimeConfig {
+        &self.runtime
+    }
+
+    pub fn into_runtime(self) -> ValidatedRuntimeConfig {
+        self.runtime
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawAgentConfig {
+struct RawAgentConfig<C> {
     schema_version: u32,
     state: RawState,
     application: RawListener,
     health: RawListener,
     mesh: RawMesh,
-    credentials: RawCredentials,
+    credentials: C,
     storage: RawStorage,
     #[serde(default)]
     limits: RawLimits,
@@ -330,10 +372,17 @@ enum RawRelayRoutePolicy {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawCredentials {
+struct RawSystemdCredentials {
     client_token_file: PathBuf,
     mission_secret_ref_file: PathBuf,
     mission_load_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawComposeCredentials {
+    client_token_file: PathBuf,
+    mission_activation_file: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -369,10 +418,26 @@ struct RawLimits {
     shutdown_grace_ms: Option<u64>,
 }
 
-pub fn load_and_validate_config(path: &Path) -> Result<ValidatedAgentConfig, ConfigError> {
+pub fn load_and_validate_config(path: &Path) -> Result<ValidatedSystemdAgentConfig, ConfigError> {
     let bytes = std::fs::read(path).map_err(|_| ConfigError::new(ConfigReason::FileAccess))?;
-    let raw: RawAgentConfig = serde_json::from_slice(&bytes).map_err(classify_json_error)?;
-    validate(raw)
+    let raw: RawAgentConfig<RawSystemdCredentials> =
+        serde_json::from_slice(&bytes).map_err(classify_json_error)?;
+    validate_systemd(raw)
+}
+
+pub fn load_and_validate_compose_config(
+    path: &Path,
+) -> Result<ValidatedComposeAgentConfig, ConfigError> {
+    let bytes = std::fs::read(path).map_err(|_| ConfigError::new(ConfigReason::FileAccess))?;
+    validate_compose_config_bytes(&bytes)
+}
+
+pub fn validate_compose_config_bytes(
+    bytes: &[u8],
+) -> Result<ValidatedComposeAgentConfig, ConfigError> {
+    let raw: RawAgentConfig<RawComposeCredentials> =
+        serde_json::from_slice(bytes).map_err(classify_json_error)?;
+    validate_compose(raw)
 }
 
 pub fn check_config(path: &Path) -> Result<(), ConfigError> {
@@ -398,33 +463,60 @@ fn classify_json_error(error: serde_json::Error) -> ConfigError {
     ConfigError::new(reason)
 }
 
-fn validate(raw: RawAgentConfig) -> Result<ValidatedAgentConfig, ConfigError> {
-    if raw.schema_version != SUPPORTED_SCHEMA_VERSION {
+fn validate_systemd(
+    raw: RawAgentConfig<RawSystemdCredentials>,
+) -> Result<ValidatedSystemdAgentConfig, ConfigError> {
+    if raw.schema_version != SYSTEMD_SCHEMA_VERSION {
         return Err(ConfigError::new(ConfigReason::UnsupportedSchemaVersion));
     }
-    require_absolute(&raw.state.directory)?;
     require_absolute(&raw.credentials.client_token_file)?;
     require_absolute(&raw.credentials.mission_secret_ref_file)?;
+    let credentials = CredentialPaths {
+        client_token_file: raw.credentials.client_token_file.clone(),
+        mission_secret_ref_file: raw.credentials.mission_secret_ref_file.clone(),
+        mission_load_id: parse_mission_load_id(&raw.credentials.mission_load_id)?,
+    };
+    Ok(ValidatedSystemdAgentConfig {
+        runtime: validate_runtime(raw)?,
+        credentials,
+    })
+}
+
+fn validate_compose(
+    raw: RawAgentConfig<RawComposeCredentials>,
+) -> Result<ValidatedComposeAgentConfig, ConfigError> {
+    if raw.schema_version != COMPOSE_SCHEMA_VERSION {
+        return Err(ConfigError::new(ConfigReason::UnsupportedSchemaVersion));
+    }
+    if raw.credentials.client_token_file != Path::new(COMPOSE_CLIENT_TOKEN_PATH)
+        || raw.credentials.mission_activation_file != Path::new(COMPOSE_MISSION_ACTIVATION_PATH)
+    {
+        return Err(ConfigError::new(ConfigReason::CredentialBoundary));
+    }
+    if raw.state.directory != Path::new(COMPOSE_STATE_PATH) {
+        return Err(ConfigError::new(ConfigReason::StateBoundary));
+    }
+    Ok(ValidatedComposeAgentConfig {
+        runtime: validate_runtime(raw)?,
+    })
+}
+
+fn validate_runtime<C>(raw: RawAgentConfig<C>) -> Result<ValidatedRuntimeConfig, ConfigError> {
+    require_absolute(&raw.state.directory)?;
     validate_listeners(raw.application.listen, raw.health.listen)?;
     let sync_interval = validate_sync_interval(raw.mesh.sync_interval_ms)?;
     let peers = validate_peers(raw.mesh.peers)?;
     let forwarding =
         validate_forwarding(raw.storage, raw.mesh.emission_policy.into(), raw.mesh.relay)?;
-    let credentials = CredentialPaths {
-        client_token_file: raw.credentials.client_token_file,
-        mission_secret_ref_file: raw.credentials.mission_secret_ref_file,
-        mission_load_id: parse_mission_load_id(&raw.credentials.mission_load_id)?,
-    };
     let limits = validate_limits(raw.limits)?;
 
-    Ok(ValidatedAgentConfig {
+    Ok(ValidatedRuntimeConfig {
         state: raw.state.directory,
         application: raw.application.listen,
         health: raw.health.listen,
         mesh_bind: raw.mesh.bind,
         peers,
         forwarding,
-        credentials,
         limits,
         sync_interval,
     })
@@ -702,6 +794,28 @@ mod tests {
             17_891_328
         );
         let _options = config.node_options();
+    }
+
+    #[test]
+    fn v2_accepts_only_the_compose_state_mount() {
+        let accepted = validate_compose_json(compose_config_with_state("/var/lib/aster"))
+            .expect("exact Compose state mount");
+        assert_eq!(
+            accepted.into_runtime().state(),
+            std::path::Path::new("/var/lib/aster")
+        );
+
+        for state in [
+            "/tmp/aster",
+            "/var/lib/aster/../aster",
+            "/var/lib/aster-agent",
+        ] {
+            let error = rejected(
+                validate_compose_json(compose_config_with_state(state)),
+                "alternate Compose state path must be rejected",
+            );
+            assert_eq!(error.reason(), ConfigReason::StateBoundary, "state {state}");
+        }
     }
 
     #[test]
@@ -1028,7 +1142,9 @@ mod tests {
         validate_json(config_with_storage(items, bytes)).map(|_| ())
     }
 
-    fn validate_json(json: String) -> Result<super::ValidatedAgentConfig, super::ConfigError> {
+    fn validate_json(
+        json: String,
+    ) -> Result<super::ValidatedSystemdAgentConfig, super::ConfigError> {
         let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
             "aster-agent-config-test-{}-{sequence}.json",
@@ -1038,6 +1154,26 @@ mod tests {
         let result = load_and_validate_config(&path);
         fs::remove_file(&path).expect("remove configuration fixture");
         result
+    }
+
+    fn validate_compose_json(
+        json: String,
+    ) -> Result<super::ValidatedComposeAgentConfig, super::ConfigError> {
+        let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "aster-compose-config-test-{}-{sequence}.json",
+            std::process::id()
+        ));
+        fs::write(&path, json).expect("write Compose configuration fixture");
+        let result = super::load_and_validate_compose_config(&path);
+        fs::remove_file(&path).expect("remove Compose configuration fixture");
+        result
+    }
+
+    fn compose_config_with_state(state: &str) -> String {
+        format!(
+            r#"{{"schema_version":2,"state":{{"directory":"{state}"}},"application":{{"listen":"127.0.0.1:8181"}},"health":{{"listen":"127.0.0.1:8182"}},"mesh":{{"bind":"127.0.0.1:8183","sync_interval_ms":500,"emission_policy":"normal","peers":[]}},"credentials":{{"client_token_file":"/run/secrets/aster-client-token","mission_activation_file":"/run/secrets/aster-mission-activation"}},"storage":{{"max_items":10000,"max_payload_bytes":67108864,"operations":{{"max_records":1000000,"max_logical_bytes":201326592,"emergency_reserve":10000}}}}}}"#
+        )
     }
 
     fn config_with_storage(max_items: u64, max_payload_bytes: u64) -> String {
