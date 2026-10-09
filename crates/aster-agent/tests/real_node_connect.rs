@@ -948,13 +948,33 @@ async fn optional_event_ttl_is_enforced_by_the_live_agent() {
                 .deliveries
                 .is_empty()
         );
+        // Expiry retires content, but the unacknowledged numbered result
+        // must still replay the original receipt without publishing again.
+        let retired_retry = client
+            .publish_numbered_event(request.clone())
+            .await
+            .unwrap()
+            .into_owned();
+        assert!(!retired_retry.inserted);
+        let retired_result = retired_retry.result.as_option().unwrap();
         assert_eq!(
-            client
-                .publish_numbered_event(request.clone())
-                .await
-                .unwrap_err()
-                .code,
-            ErrorCode::NotFound
+            retired_result.receipt.as_option().unwrap(),
+            published
+                .result
+                .as_option()
+                .unwrap()
+                .receipt
+                .as_option()
+                .unwrap()
+        );
+        assert_eq!(
+            retired_result.operation_sequence,
+            request.operation_sequence
+        );
+        assert_eq!(retired_result.content, api::CommittedContentStatus::Retired);
+        assert_eq!(
+            retired_result.retirement_reason,
+            Some(api::RetirementReason::Expired.into())
         );
         let empty = client
             .get_status(api::GetStatusRequest::default())
@@ -969,14 +989,14 @@ async fn optional_event_ttl_is_enforced_by_the_live_agent() {
             empty.store_capacity.as_option().unwrap().payload_bytes
                 < full.store_capacity.as_option().unwrap().payload_bytes
         );
+        let operations = empty.publish_operation_capacity.as_option().unwrap();
         assert_eq!(
-            empty
-                .publish_operation_capacity
-                .as_option()
-                .unwrap()
-                .retired_rows,
-            1
+            operations.ledger_mode,
+            api::PublishOperationLedgerMode::Numbered
         );
+        assert_eq!(operations.retired_rows, 0);
+        assert_eq!(operations.numbered_outstanding_results, 1);
+        assert_eq!(operations.numbered_reverse_rows, 0);
     }
     request.operation_sequence = if cfg!(target_os = "linux") { 2 } else { 1 };
     request.ttl_ms = None;
