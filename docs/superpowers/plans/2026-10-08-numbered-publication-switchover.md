@@ -76,6 +76,12 @@ model transition. Ambiguous transport or postcommit failure always requires
 recovery rather than abandonment. A failure-isolation claim must state this
 per-client sequence boundary.
 
+The three considered policies, their tradeoffs and implementation status are
+recorded in [Decision 0044's rejection-policy alternatives](../../decisions/0044-pipeline-durable-event-publication.md#rejected-numbered-publication-options-and-chosen-policy).
+SDK abandon-and-continue remains a possible opt-in policy; durable server-side
+terminal rejection was considered but is not implemented. The future PR should
+link that decision rather than serve as its only record.
+
 Bound first-admission ordering in the SDK and service rather than depending on
 response ordering alone. If later inputs arrive ahead of an unresolved earlier
 input, return a sequence-gap outcome without mutation and retry only after the
