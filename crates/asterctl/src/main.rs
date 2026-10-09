@@ -1,6 +1,7 @@
 mod args;
 mod auth;
 mod client;
+mod journal;
 mod operation_key;
 mod output;
 mod publish;
@@ -8,11 +9,7 @@ mod query;
 mod subscribe;
 mod validation;
 
-mod proto {
-    connectrpc::include_generated!();
-}
-
-use proto::aster::application::v1alpha1 as api;
+use aster_agent::proto::aster::application::v1alpha1 as api;
 use std::{
     io::{self, IsTerminal, Write},
     net::SocketAddr,
@@ -89,6 +86,13 @@ fn run() -> Result<(), (u8, String)> {
         }
         args::Command::Publish(options, publication) => {
             let rpc = RpcContext::new(options)?;
+            let sdk = client::publication_sdk(
+                rpc.address,
+                &rpc.token,
+                rpc.timeout,
+                &publication.identity,
+            )
+            .map_err(|e| (1, e))?;
             let stdin = io::stdin();
             if publication.reads_stdin() && stdin.is_terminal() {
                 let mut stderr = io::stderr().lock();
@@ -102,21 +106,60 @@ fn run() -> Result<(), (u8, String)> {
                         )
                     })?;
             }
-            let (request, key) = publication
+            let (request, _identity) = publication
                 .into_request(stdin.lock())
                 .map_err(|e| (1, e.to_owned()))?;
-            announce_key(&key)?;
-            let response = rpc
-                .runtime
-                .block_on(client::publish(
-                    rpc.address,
-                    &rpc.token,
-                    request,
-                    rpc.timeout,
-                ))
-                .map_err(|e| (1, e.describe("PublishEvent", &key)))?;
-            output::publish(&response, &key.value, rpc.json)
-                .map_err(|_| (1, "cannot format PublishEvent response".to_owned()))?
+            let result = rpc.runtime.block_on(async {
+                let report = sdk.recover().await.map_err(journal::describe_error)?;
+                if report.operations.iter().any(|operation| operation.state == aster_agent::sdk::RecoveredState::Pending) {
+                    return Err("journal contains pending work; use publication-recover, then publication-retry or publication-abandon before publishing a new intent".to_owned());
+                }
+                let sequence = sdk.journal_publication(request).map_err(journal::describe_error)?;
+                writeln!(io::stderr().lock(), "asterctl: operation-sequence={sequence}").and_then(|()| io::stderr().lock().flush()).map_err(|_| format!("cannot announce sequence {sequence}; intent remains journaled and was not sent"))?;
+                sdk.publish_journaled_outcome(sequence).await.map_err(|error| format!("{}; sequence {sequence} remains journaled; use publication-recover before retrying", journal::describe_error(error)))
+            }).map_err(|e| (1, e))?;
+            output::numbered_publish_response(&result, rpc.json)
+                .map_err(|_| (1, "cannot format committed publication result".to_owned()))?
+        }
+        args::Command::PublicationInitialize(identity) => {
+            identity.initialize().map_err(|e| (1, e))?;
+            "Publication journal initialized.\n".to_owned()
+        }
+        args::Command::PublicationAction(options, identity, action, sequence) => {
+            let rpc = RpcContext::new(options)?;
+            let sdk = client::publication_sdk(rpc.address, &rpc.token, rpc.timeout, &identity)
+                .map_err(|e| (1, e))?;
+            rpc.runtime.block_on(async {
+                if action == journal::Action::Show {
+                    let intent = sdk.journaled_intent(sequence.expect("validated sequence")).map_err(journal::describe_error)?.ok_or_else(|| "sequence has no retained journaled intent".to_owned())?;
+                    return serde_json::to_string_pretty(&intent).map(|text| text + "\n").map_err(|_| "cannot format journaled intent".to_owned());
+                }
+                let report = sdk.recover().await.map_err(journal::describe_error)?;
+                match action {
+                    journal::Action::Recover => {
+                        let operations = report.operations.into_iter().map(|operation| match operation.state {
+                            aster_agent::sdk::RecoveredState::Pending => serde_json::json!({"operationSequence": operation.sequence.to_string(), "state": "pending"}),
+                            aster_agent::sdk::RecoveredState::Committed(result) => serde_json::json!({"operationSequence": operation.sequence.to_string(), "state": "committed", "result": result}),
+                            aster_agent::sdk::RecoveredState::Retired => serde_json::json!({"operationSequence": operation.sequence.to_string(), "state": "retired"}),
+                        }).collect::<Vec<_>>();
+                        serde_json::to_string_pretty(&serde_json::json!({"session": report.session.to_string(), "allocatedThrough": report.allocated_through.to_string(), "operations": operations})).map(|text| text + "\n").map_err(|_| "cannot format recovery report".to_owned())
+                    }
+                    journal::Action::Retry => {
+                        let result = sdk.publish_journaled(sequence.expect("validated sequence")).await.map_err(journal::describe_error)?;
+                        output::numbered_publication(&result, rpc.json).map_err(|_| "cannot format committed publication result".to_owned())
+                    }
+                    journal::Action::Abandon => {
+                        sdk.abandon(sequence.expect("validated sequence")).await.map_err(journal::describe_error)?;
+                        Ok("Unadmitted sequence permanently abandoned.\n".to_owned())
+                    }
+                    journal::Action::Acknowledge => {
+                        sdk.acknowledge(sequence.expect("validated sequence")).await.map_err(journal::describe_error)?;
+                        Ok("Committed publication result acknowledged.\n".to_owned())
+                    }
+                    journal::Action::Show => unreachable!("local inspection already returned"),
+                    journal::Action::Initialize => unreachable!("initialization does not use RPC"),
+                }
+            }).map_err(|e| (1, e))?
         }
         args::Command::Query(options, query) => {
             let rpc = RpcContext::new(options)?;

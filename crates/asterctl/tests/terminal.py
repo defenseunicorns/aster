@@ -7,10 +7,13 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 
 
 def check(extra, terminal, expect_hint):
-    with socket.socket() as listener:
+    with tempfile.TemporaryDirectory(prefix="asterctl-terminal-") as temporary, socket.socket() as listener:
+        journal = os.path.join(temporary, "publication.redb")
+        subprocess.run([sys.argv[1], "publication-init", "--journal", journal, "--client-id", "terminal-test"], check=True, capture_output=True)
         listener.bind(("127.0.0.1", 0))
         listener.listen()
         master, slave = pty.openpty()
@@ -19,7 +22,7 @@ def check(extra, terminal, expect_hint):
             process = subprocess.Popen(
                 [sys.argv[1], "--token", "asterctl-test-token-00000000000000",
                  "--port", str(listener.getsockname()[1]), "publish", "--topic=x",
-                 "--scope=x", "--operation-key=terminal-test", *extra],
+                 "--scope=x", "--journal", journal, "--client-id", "terminal-test", *extra],
                 stdin=slave if terminal else subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )

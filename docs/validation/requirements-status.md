@@ -1459,7 +1459,7 @@ bindings. Validate the retained receipt with a source repository containing the
 signed commit object and the reviewer's configured trusted signer:
 
 ```sh
-python3 tools/check-selected-iroh-nat-receipt.py \
+python3 tools/check-selected-iroh-nat-receipt.py --historical-v1 \
   --raw-root /private/tmp/aster-selected-iroh-nat.zFpaqB/20260826T143559Z-selected-iroh-nat-50726015670670e9 \
   --source . \
   docs/validation/evidence/selected-iroh-nat-15f4e0b.json
@@ -1605,12 +1605,12 @@ projection_a="$(mktemp -d /private/tmp/aster-live-event-projection-a.XXXXXX)"
 projection_b="$(mktemp -d /private/tmp/aster-live-event-projection-b.XXXXXX)"
 chmod 700 "$projection_a" "$projection_b"
 
-python3 tools/check-selected-live-event-receipt.py - \
+python3 tools/check-selected-live-event-receipt.py --historical-v1 - \
   --raw-root /path/to/retained-owner-only-raw-root \
   --source /path/to/aster-source-worktree-detached-at-c464129d58c250dea2ecbf5f51d7ece0e5aab6d0 \
   --output "$projection_a/selected-live-event-receipt.json"
 
-python3 tools/check-selected-live-event-receipt.py - \
+python3 tools/check-selected-live-event-receipt.py --historical-v1 - \
   --raw-root /path/to/retained-owner-only-raw-root \
   --source /path/to/aster-source-worktree-detached-at-c464129d58c250dea2ecbf5f51d7ece0e5aab6d0 \
   --output "$projection_b/selected-live-event-receipt.json"
@@ -1621,7 +1621,7 @@ cmp "$projection_a/selected-live-event-receipt.json" \
   docs/validation/evidence/selected-live-event-c464129.json
 shasum -a 256 "$projection_a/selected-live-event-receipt.json"
 
-python3 tools/check-selected-live-event-receipt.py \
+python3 tools/check-selected-live-event-receipt.py --historical-v1 \
   --raw-root /path/to/retained-owner-only-raw-root \
   --source /path/to/aster-source-worktree-detached-at-c464129d58c250dea2ecbf5f51d7ece0e5aab6d0 \
   docs/validation/evidence/selected-live-event-c464129.json
@@ -2509,7 +2509,7 @@ source commit because this evidence/documentation commit is a descendant. With
 the retained raw root available, replay the checked-in receipt byte-for-byte:
 
 ```sh
-python3 tools/check-selected-linux-event-custody-receipt.py \
+python3 tools/check-selected-linux-event-custody-receipt.py --historical-v1 \
   --raw-root /path/to/retained-owner-only-raw-root \
   --source /path/to/aster-source-worktree-detached-at-ade6ee1839997e14f479463d724e208a89ec8b89 \
   docs/validation/evidence/selected-linux-event-custody-ade6ee1.json

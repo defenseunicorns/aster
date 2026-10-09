@@ -883,6 +883,7 @@ pub(crate) fn cleanup_retired_event_operations_write(
 
 /// Adds one previously unseen operation and its bounded reverse edge in the
 /// caller's Event transaction. No ordinary Event-storage quota is charged.
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn admit_active_event_operation_write(
     write: &redb::WriteTransaction,
     authority: &[u8; 32],
@@ -940,6 +941,7 @@ pub(crate) fn admit_active_event_operation_write(
 
 /// Fences a previously unseen key replaying an already-retired Event. This is
 /// ordinary publication admission and adds no Event pointer or reverse edge.
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn admit_retired_event_operation_write(
     write: &redb::WriteTransaction,
     authority: &[u8; 32],

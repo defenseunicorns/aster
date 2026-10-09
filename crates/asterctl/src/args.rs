@@ -11,13 +11,21 @@ use std::{
 
 pub const HELP: &str =
     "Usage: asterctl (--token TOKEN | --token-file PATH) [OPTIONS] [COMMAND [ARGS...]]
+       asterctl publication-init --journal PATH --client-id ID
        asterctl --help
 
 Introspect and control Aster nodes through a running Aster agent.
 
 COMMANDS:
   status            Display node status (default)
-  publish           Publish an Event
+  publish           Publish a journaled numbered Event
+  publication-init  Create a new journal; --journal PATH --client-id ID
+  publication-recover  Recover journaled operations
+  publication-show  Inspect one original journaled intent; --sequence N
+  publication-retry Retry a journaled intent; --sequence N
+  publication-abandon  Explicitly consume an unadmitted sequence; --sequence N
+  publication-ack   Compact an applied committed result; --sequence N
+                    Recovery/retry/abandon/ack require --journal PATH --client-id ID
   query             Query stored Events
   subscribe         Create an Event subscription
   subscriptions     List Event subscriptions
@@ -61,6 +69,13 @@ pub enum Command {
     Subscriptions(Options),
     Unsubscribe(Options, Vec<u8>),
     Publish(Options, Box<Publication>),
+    PublicationInitialize(crate::journal::Identity),
+    PublicationAction(
+        Options,
+        crate::journal::Identity,
+        crate::journal::Action,
+        Option<u64>,
+    ),
     Query(Options, Query),
     Subscribe(Options, Subscription),
 }
@@ -76,6 +91,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     let mut unsubscribe = false;
     let mut subscription_id = None;
     let mut publication: Option<Publication> = None;
+    let mut journal_action = None;
+    let mut journal_identity = crate::journal::Identity::default();
+    let mut sequence = None;
     let mut query: Option<Query> = None;
     let mut subscription: Option<Subscription> = None;
     let mut positional = false;
@@ -83,6 +101,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let arg = arg.to_str().ok_or("invalid argument; see --help")?;
+        if journal_action.is_some() && !arg.starts_with('-') {
+            return Err("publication journal commands accept options only; see --help".into());
+        }
         if unsubscribe && !arg.starts_with('-') {
             if subscription_id.is_some() {
                 return Err("unsubscribe accepts exactly one SUBSCRIPTION_ID".into());
@@ -126,6 +147,59 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                 } else {
                     Command::Help
                 });
+            }
+            "publication-init"
+            | "publication-show"
+            | "publication-recover"
+            | "publication-retry"
+            | "publication-abandon"
+            | "publication-ack"
+                if inline.is_none()
+                    && !status
+                    && !subscriptions
+                    && !unsubscribe
+                    && publication.is_none()
+                    && query.is_none()
+                    && subscription.is_none()
+                    && journal_action.is_none() =>
+            {
+                journal_action = Some(match name {
+                    "publication-init" => crate::journal::Action::Initialize,
+                    "publication-recover" => crate::journal::Action::Recover,
+                    "publication-show" => crate::journal::Action::Show,
+                    "publication-retry" => crate::journal::Action::Retry,
+                    "publication-abandon" => crate::journal::Action::Abandon,
+                    "publication-ack" => crate::journal::Action::Acknowledge,
+                    _ => unreachable!(),
+                });
+            }
+            "--journal" | "--client-id" if journal_action.is_some() => {
+                if !command_options.insert(name.to_owned()) {
+                    return Err(format!("{name} must not be repeated"));
+                }
+                if name == "--journal" {
+                    let value = option_value(name, inline, &mut args)?;
+                    if value.is_empty() {
+                        return Err("publication journal path must not be empty".into());
+                    }
+                    journal_identity.path = value.into();
+                } else {
+                    journal_identity
+                        .set_option(name, text_option_value(name, inline, &mut args)?)?;
+                }
+            }
+            "--sequence" if journal_action.is_some() => {
+                if sequence.is_some() {
+                    return Err("--sequence must not be repeated".into());
+                }
+                let value = text_option_value(name, inline, &mut args)?;
+                sequence = Some(
+                    value
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|n| *n > 0 && value.bytes().all(|b| b.is_ascii_digit()))
+                        .ok_or("sequence must be a positive integer")?,
+                );
             }
             "unsubscribe"
                 if inline.is_none()
@@ -204,7 +278,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                 }
             }
             "--topic" | "--scope" | "--priority" | "--logical-key" | "--predecessor"
-            | "--ttl-ms" | "--tombstone" | "--operation-key"
+            | "--ttl-ms" | "--tombstone" | "--journal" | "--client-id"
                 if publication.is_some() =>
             {
                 if !command_options.insert(name.to_owned()) {
@@ -216,6 +290,12 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                         return Err("--tombstone does not take a value".into());
                     }
                     publication.request.tombstone = true;
+                } else if name == "--journal" {
+                    let value = option_value(name, inline, &mut args)?;
+                    if value.is_empty() {
+                        return Err("publication journal path must not be empty".into());
+                    }
+                    publication.identity.path = value.into();
                 } else {
                     let value = text_option_value(name, inline, &mut args)?;
                     publication.set_option(name, value)?;
@@ -260,6 +340,22 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     if unsubscribe && subscription_id.is_none() {
         return Err("SUBSCRIPTION_ID is required; see unsubscribe --help".into());
     }
+    if let Some(action) = journal_action {
+        journal_identity.validate()?;
+        if matches!(
+            action,
+            crate::journal::Action::Initialize | crate::journal::Action::Recover
+        ) {
+            if sequence.is_some() {
+                return Err("this publication command does not take --sequence".into());
+            }
+        } else if sequence.is_none() {
+            return Err("--sequence is required".into());
+        }
+        if action == crate::journal::Action::Initialize {
+            return Ok(Command::PublicationInitialize(journal_identity));
+        }
+    }
     let options = Options {
         host,
         port,
@@ -267,7 +363,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         json,
         token: token.ok_or("specify --token or --token-file; see --help")?,
     };
-    Ok(if let Some(publication) = publication {
+    Ok(if let Some(action) = journal_action {
+        Command::PublicationAction(options, journal_identity, action, sequence)
+    } else if let Some(publication) = publication {
         Command::Publish(options, Box::new(publication))
     } else if let Some(query) = query {
         Command::Query(options, query)
@@ -456,7 +554,7 @@ mod tests {
         for (option, valid, invalid) in [
             ("--topic", "a".repeat(128), "a".repeat(129)),
             ("--scope", "a".repeat(128), "a".repeat(129)),
-            ("--operation-key", "ї".repeat(128), "ї".repeat(129)),
+            ("--client-id", "ї".repeat(32), "ї".repeat(33)),
             ("--logical-key", "ї".repeat(2048), "ї".repeat(2049)),
         ] {
             for (value, accepted) in [(valid, true), (invalid, false)] {
@@ -467,8 +565,9 @@ mod tests {
                 if option != "--scope" {
                     args.push("--scope=x");
                 }
-                if option != "--operation-key" {
-                    args.push("--operation-key=test");
+                args.push("--journal=/tmp/asterctl-unit-journal");
+                if option != "--client-id" {
+                    args.push("--client-id=test");
                 }
                 args.extend([option, &value]);
                 assert_eq!(arguments(&args).is_ok(), accepted, "{option}");
@@ -494,7 +593,8 @@ mod tests {
                 "publish",
                 "--topic=x",
                 "--scope=mission-1/team/alpha_2",
-                "--operation-key=test",
+                "--journal=/tmp/asterctl-unit-journal",
+                "--client-id=test",
                 "--priority",
                 priority,
                 "--ttl-ms=18446744073709551615",

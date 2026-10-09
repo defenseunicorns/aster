@@ -10,6 +10,8 @@
 //! Runtime `READY`/`CONTACT`/`STOP` records and narrowly scoped
 //! `LINUX_CUSTODY_CHILD` coordination records remain visible as they occur.
 
+use aster_node::publication_journal as numbered;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
@@ -31,9 +33,9 @@ use aster_node::{
     NodeApplication, NodeConfig, NodeIdentity, NodeReceipt, SelectedForwardingConfig,
     application::{
         ApplicationError, ContactSyncStatus, EventDeliveryPage, EventItem, EventPollRequest,
-        EventPublishOptions, EventPublishRequest, EventPublishResult, EventQuery, EventQueryPage,
-        EventSubscription, EventSubscriptionRequest, EventSyncStatus, PeerAuthorization, Priority,
-        Scope, SelectedEventHandle, SelectedEventStatus, Topic,
+        EventPublishResult, EventQuery, EventQueryPage, EventSubscription,
+        EventSubscriptionRequest, EventSyncStatus, PeerAuthorization, Priority, Scope,
+        SelectedEventHandle, SelectedEventStatus, Topic,
     },
     format_node_id,
     mission::UnprotectedReferenceMission,
@@ -50,7 +52,7 @@ use tokio::{
 };
 use zeroize::Zeroize as _;
 
-const TRANSCRIPT_SCHEMA: &str = "aster-linux-event-custody-transcript/v1";
+const TRANSCRIPT_SCHEMA: &str = "aster-linux-event-custody-transcript/v2";
 const CLAIM: &str = "linux-boottime-finite-ttl-priority-quota-route-only-store-and-forward-receive-only-zero-disclosure";
 const STORE_FILE: &str = "mesh.redb";
 const TOPIC: &str = "opaque.custody";
@@ -59,13 +61,6 @@ const LOGICAL_KEY: &[u8] = b"acceptance/linux-event-custody/stream";
 const RELAY_SELECTOR_KEY: &[u8] = b"acceptance/linux-event-custody/relay-carry";
 const RECEIVER_SELECTOR_KEY: &[u8] = b"acceptance/linux-event-custody/receiver-consume";
 const RECEIVER_SUBSCRIPTION_OPERATION: &[u8] = b"acceptance/linux-event-custody/receiver-consume";
-
-const ALREADY_EXPIRED_OPERATION: &[u8] = b"acceptance/linux-custody/already-expired";
-const RELAY_EXPIRING_OPERATION: &[u8] = b"acceptance/linux-custody/relay-expiring";
-const LIVE_FLASH_OPERATION: &[u8] = b"acceptance/linux-custody/live-flash";
-const LIVE_IMMEDIATE_OPERATION: &[u8] = b"acceptance/linux-custody/live-immediate";
-const LIVE_PRIORITY_OPERATION: &[u8] = b"acceptance/linux-custody/live-priority";
-const ROUTINE_OPERATION: &[u8] = b"acceptance/linux-custody/routine";
 
 const ALREADY_EXPIRED_PAYLOAD: &[u8] = b"expired before first authenticated contact";
 const RELAY_EXPIRING_PAYLOAD: &[u8] = b"expires while retained by route-only relay";
@@ -120,7 +115,6 @@ struct Participant {
 #[derive(Clone, Copy)]
 struct PublicationSpec {
     label: &'static str,
-    operation: &'static [u8],
     payload: &'static [u8],
     priority: Priority,
     ttl_ms: Option<u64>,
@@ -241,6 +235,9 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
     validate_seeded_selector(&relay_seeded)?;
     validate_seeded_selector(&receiver_seeded)?;
 
+    let journal_path = origin.state.join("linux-custody-publication.redb");
+    numbered::Journal::initialize(&journal_path, b"native.linux-custody.v1")?;
+    let mut journal = numbered::Journal::open(&journal_path, b"native.linux-custody.v1")?;
     let peerless = start_participant(
         &origin,
         SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -250,15 +247,18 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
     .await?;
     let peerless_events = peerless.selected_events();
     validate_handle(&origin, &peerless_events)?;
+    journal
+        .recover(&mut numbered::Backend::Live(&peerless_events))
+        .await?;
 
     let already_expired = publish_spec(
+        &mut journal,
         &peerless_events,
         &origin,
         &topic,
         &scope,
         PublicationSpec {
             label: "already_expired",
-            operation: ALREADY_EXPIRED_OPERATION,
             payload: ALREADY_EXPIRED_PAYLOAD,
             priority: Priority::Flash,
             ttl_ms: Some(ALREADY_EXPIRED_TTL_MS),
@@ -268,13 +268,13 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
     .await?;
     let relay_published_at = Instant::now();
     let relay_expiring = publish_spec(
+        &mut journal,
         &peerless_events,
         &origin,
         &topic,
         &scope,
         PublicationSpec {
             label: "relay_expiring",
-            operation: RELAY_EXPIRING_OPERATION,
             payload: RELAY_EXPIRING_PAYLOAD,
             priority: Priority::Flash,
             ttl_ms: Some(RELAY_EXPIRING_TTL_MS),
@@ -283,13 +283,13 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
     )
     .await?;
     let live_flash = publish_spec(
+        &mut journal,
         &peerless_events,
         &origin,
         &topic,
         &scope,
         PublicationSpec {
             label: "live_flash",
-            operation: LIVE_FLASH_OPERATION,
             payload: LIVE_FLASH_PAYLOAD,
             priority: Priority::Flash,
             ttl_ms: None,
@@ -298,13 +298,13 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
     )
     .await?;
     let live_immediate = publish_spec(
+        &mut journal,
         &peerless_events,
         &origin,
         &topic,
         &scope,
         PublicationSpec {
             label: "live_immediate",
-            operation: LIVE_IMMEDIATE_OPERATION,
             payload: LIVE_IMMEDIATE_PAYLOAD,
             priority: Priority::Immediate,
             ttl_ms: None,
@@ -313,13 +313,13 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
     )
     .await?;
     let live_priority = publish_spec(
+        &mut journal,
         &peerless_events,
         &origin,
         &topic,
         &scope,
         PublicationSpec {
             label: "live_priority",
-            operation: LIVE_PRIORITY_OPERATION,
             payload: LIVE_PRIORITY_PAYLOAD,
             priority: Priority::Priority,
             ttl_ms: None,
@@ -328,13 +328,13 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
     )
     .await?;
     let routine = publish_spec(
+        &mut journal,
         &peerless_events,
         &origin,
         &topic,
         &scope,
         PublicationSpec {
             label: "routine",
-            operation: ROUTINE_OPERATION,
             payload: ROUTINE_PAYLOAD,
             priority: Priority::Routine,
             ttl_ms: None,
@@ -342,6 +342,20 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
         6,
     )
     .await?;
+    let publication_status = peerless_events.status().await?;
+    require(
+        publication_status
+            .event_operation_capacity
+            .numbered_stats
+            .clients
+            == 1
+            && publication_status
+                .event_operation_capacity
+                .numbered_stats
+                .outstanding_results
+                == 0,
+        "bounded numbered publication clients and acknowledged results",
+    )?;
     let publications = Publications {
         already_expired,
         relay_expiring,
@@ -524,6 +538,7 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
 }
 
 async fn publish_spec(
+    journal: &mut numbered::Journal,
     events: &SelectedEventHandle,
     origin: &Participant,
     topic: &Topic,
@@ -531,21 +546,19 @@ async fn publish_spec(
     spec: PublicationSpec,
     sequence: u64,
 ) -> Result<EventPublishResult, DynError> {
-    let request = EventPublishRequest {
-        operation_key: spec.operation.to_vec(),
+    let intent = numbered::Intent {
         predecessor: None,
-        topic: topic.clone(),
-        scope: scope.clone(),
-        priority: spec.priority,
+        topic: topic.as_str().into(),
+        scope: scope.as_str().into(),
+        priority: spec.priority as u8,
         logical_key: LOGICAL_KEY.to_vec(),
         payload: spec.payload.to_vec(),
         tombstone: false,
+        ttl_ms: spec.ttl_ms,
     };
-    let options = match spec.ttl_ms {
-        Some(ttl_ms) => EventPublishOptions::finite_ttl_ms(ttl_ms)?,
-        None => EventPublishOptions::durable(),
-    };
-    let publication = events.publish_with_options(request, options).await?;
+    let publication = journal
+        .publish_metadata(&mut numbered::Backend::Live(events), intent)
+        .await?;
     require(
         publication.inserted
             && publication.publisher == origin.mission_id
@@ -556,6 +569,9 @@ async fn publish_spec(
             && publication.acceptance_marker == sequence,
         spec.label,
     )?;
+    journal
+        .acknowledge(&mut numbered::Backend::Live(events))
+        .await?;
     Ok(publication)
 }
 
@@ -1962,6 +1978,7 @@ fn emit_transcript(
             ),
             ("participants", "3".to_owned()),
             ("contacts", "2".to_owned()),
+            ("publication_model", "numbered-v1".to_owned()),
         ],
     )?;
     for participant in participants {

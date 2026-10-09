@@ -1,33 +1,47 @@
+use crate::ComposeCredentialGeneration;
+use std::{error::Error, fmt, path::Path};
+
+#[cfg(target_os = "linux")]
 use crate::{
-    ComposeCredentialGeneration, ComposeCredentialReason, PROVIDER_CONTRACT, encode_activation,
-    encode_client_token, encode_provisioning_envelope, provisioning_secret_ref,
+    ComposeCredentialReason, PROVIDER_CONTRACT, encode_activation, encode_client_token,
+    encode_provisioning_envelope, provisioning_secret_ref,
 };
+#[cfg(target_os = "linux")]
 use aster_mesh::{MAX_UNPROTECTED_PROVISIONING_BYTES, ProvisioningLoadId, UnprotectedProvisioning};
+#[cfg(target_os = "linux")]
 use serde::Serialize;
+#[cfg(target_os = "linux")]
 use sha2::{Digest as _, Sha256};
+#[cfg(target_os = "linux")]
 use std::{
     collections::BTreeMap,
-    error::Error,
-    fmt,
     fs::File,
     io::{Read as _, Write as _},
-    path::{Component, Path},
+    path::Component,
     time::{SystemTime, UNIX_EPOCH},
 };
+#[cfg(target_os = "linux")]
 use zeroize::{Zeroize as _, Zeroizing};
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 
+#[cfg(target_os = "linux")]
 const MANIFEST_SCHEMA: &str = "aster-compose-secret-generation/v1";
+#[cfg(target_os = "linux")]
 const TOKEN_FILE: &str = "aster-client-token";
+#[cfg(target_os = "linux")]
 const ACTIVATION_FILE: &str = "aster-mission-activation";
+#[cfg(target_os = "linux")]
 const ENVELOPE_FILE: &str = "aster-provisioning-bundle";
+#[cfg(target_os = "linux")]
 const MANIFEST_FILE: &str = "manifest.json";
+#[cfg(target_os = "linux")]
 const MAX_MANIFEST_BYTES: usize = 4 * 1024;
+#[cfg(target_os = "linux")]
 const MAX_CLIENT_TOKEN_INPUT_BYTES: usize = 258;
 
 /// Fixed, non-sensitive reason for generation creation failure.
@@ -370,6 +384,7 @@ fn validate_generation_parent(
     Ok(stat)
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Serialize)]
 struct GenerationManifest<'a> {
     schema: &'static str,
@@ -380,12 +395,14 @@ struct GenerationManifest<'a> {
     files: BTreeMap<&'static str, FileEvidence>,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Serialize)]
 struct FileEvidence {
     size: usize,
     sha256: String,
 }
 
+#[cfg(target_os = "linux")]
 fn evidence(bytes: &[u8]) -> FileEvidence {
     FileEvidence {
         size: bytes.len(),
@@ -393,6 +410,7 @@ fn evidence(bytes: &[u8]) -> FileEvidence {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn read_bundle(
     mut input: impl std::io::Read,
 ) -> Result<UnprotectedProvisioning, GenerationCreateError> {
@@ -403,7 +421,7 @@ fn read_bundle(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn read_bundle_with_observer(
     mut input: impl std::io::Read,
     observer: Arc<SecretDropObserver>,
@@ -411,6 +429,7 @@ fn read_bundle_with_observer(
     read_bundle_inner(&mut input, Some(observer))
 }
 
+#[cfg(target_os = "linux")]
 fn read_bundle_inner(
     mut input: impl std::io::Read,
     #[cfg(test)] observer: Option<Arc<SecretDropObserver>>,
@@ -432,12 +451,14 @@ fn read_bundle_inner(
         .map_err(|_| error(GenerationCreateReason::InvalidBundle))
 }
 
+#[cfg(target_os = "linux")]
 struct SensitiveInputBuffer {
     bytes: Vec<u8>,
     #[cfg(test)]
     observer: Option<Arc<SecretDropObserver>>,
 }
 
+#[cfg(target_os = "linux")]
 impl SensitiveInputBuffer {
     fn new(capacity: usize, #[cfg(test)] observer: Option<Arc<SecretDropObserver>>) -> Self {
         Self {
@@ -452,6 +473,7 @@ impl SensitiveInputBuffer {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for SensitiveInputBuffer {
     fn drop(&mut self) {
         #[cfg(test)]
@@ -472,7 +494,7 @@ impl Drop for SensitiveInputBuffer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 #[derive(Default)]
 struct SecretDropObserver {
     zeroized: AtomicBool,
@@ -683,6 +705,7 @@ fn validate_file(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn validate_absolute_path(path: &Path) -> Result<(), GenerationCreateError> {
     if !path.is_absolute()
         || path
@@ -694,6 +717,7 @@ fn validate_absolute_path(path: &Path) -> Result<(), GenerationCreateError> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn random_nonzero() -> Result<[u8; 32], GenerationCreateError> {
     loop {
         let mut bytes = [0_u8; 32];
@@ -704,6 +728,7 @@ fn random_nonzero() -> Result<[u8; 32], GenerationCreateError> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn utc_timestamp(seconds: u64) -> Result<String, GenerationCreateError> {
     let seconds = i64::try_from(seconds).map_err(|_| error(GenerationCreateReason::Publication))?;
     let days = seconds.div_euclid(86_400);
@@ -720,6 +745,7 @@ fn utc_timestamp(seconds: u64) -> Result<String, GenerationCreateError> {
     ))
 }
 
+#[cfg(target_os = "linux")]
 fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
     let shifted = days_since_epoch + 719_468;
     let era = shifted.div_euclid(146_097);

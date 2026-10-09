@@ -9,7 +9,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY proto ./proto
 COPY third-party ./third-party
-RUN cargo build --locked --release -p aster-node -p aster-agent
+RUN cargo build --locked --release -p aster-node -p aster-agent -p asterctl
 
 FROM ${ASTER_PATH_DELIVERY_BASE_IMAGE} AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 HOME=/tmp
@@ -22,6 +22,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /work/target/release/aster /usr/local/bin/aster
 COPY --from=build /work/target/release/aster-agent /usr/local/bin/aster-agent
+COPY --from=build /work/target/release/asterctl /usr/local/bin/asterctl
 COPY tools/aster_path_delivery.py /usr/local/libexec/aster/aster_path_delivery.py
 COPY tools/aster_lan_mvp.py /usr/local/libexec/aster/aster_lan_mvp.py
 COPY docker/path-lab/delivery-provision.py /usr/local/libexec/aster/delivery-provision.py
@@ -29,7 +30,7 @@ COPY docker/path-lab/delivery-network-init.py /usr/local/libexec/aster/delivery-
 COPY docker/path-lab/delivery-agent.py /usr/local/libexec/aster/delivery-agent.py
 COPY docker/path-lab/delivery-wan.py /usr/local/libexec/aster/delivery-wan.py
 COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/licenses/aster/
-RUN chmod 0755 /usr/local/bin/aster /usr/local/bin/aster-agent \
+RUN chmod 0755 /usr/local/bin/aster /usr/local/bin/aster-agent /usr/local/bin/asterctl \
     /usr/local/libexec/aster/*.py
 WORKDIR /opt/aster
 USER 10001:10001

@@ -94,7 +94,8 @@ fn missing_option_values_identify_the_option_in_every_command() {
                 "--logical-key",
                 "--predecessor",
                 "--ttl-ms",
-                "--operation-key",
+                "--journal",
+                "--client-id",
             ][..],
         ),
         (
@@ -159,8 +160,8 @@ fn other_invalid_values_are_not_reported_as_missing_arguments() {
             "predecessor",
         ),
         (
-            vec!["publish", "--topic=x", "--scope=x", "--operation-key="],
-            "operation key",
+            vec!["publish", "--topic=x", "--scope=x", "--client-id="],
+            "client ID",
         ),
         (vec!["query", "--publisher=invalid"], "publisher"),
         (vec!["query", "--limit=-1"], "limit"),

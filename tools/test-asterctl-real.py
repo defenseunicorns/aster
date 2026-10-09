@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -67,20 +68,29 @@ class RealAgentTest(unittest.TestCase):
                     self.assertTrue(cli("status").stdout)
                     self.assertEqual(cli("subscriptions").stdout, b"")
                     self.assertEqual(json.loads(cli("subscriptions", "--json").stdout), [])
-                    publish = ["--json", "publish", "--topic", "chat.events",
-                               "--scope", "mission/team/alpha", "--operation-key", "cli-smoke-publish",
-                               "--ttl-ms", "60000", "asterctl upstream smoke"]
+                    publication = ["--journal", str(root / "publication.redb"), "--client-id", "cli-smoke-source"]
+                    cli("publication-init", *publication)
+                    publish = ["--json", "publish", *publication, "--topic", "chat.events",
+                               "--scope", "mission/team/alpha"]
+                    finite = sys.platform == "linux"
+                    if finite:
+                        publish += ["--ttl-ms", "60000"]
+                    publish += ["asterctl upstream smoke"]
                     first = json.loads(cli(*publish).stdout)
-                    replay = json.loads(cli(*publish).stdout)
+                    replay = json.loads(cli("--json", "publication-retry", *publication, "--sequence", "1").stdout)
                     self.assertTrue(first["inserted"])
-                    self.assertFalse(replay["inserted"])
-                    self.assertEqual(first["id"], replay["id"])
-                    self.assertEqual(first["ttlMs"], "60000")
-                    self.assertEqual(first["operation_key"], "cli-smoke-publish")
+                    self.assertEqual(first["result"], replay)
+                    self.assertEqual(first["result"]["operationSequence"], "1")
                     events = json.loads(cli("--json", "query", "--topic", "chat.events",
                                             "--scope", "mission/team/*", "--limit", "1").stdout)
                     self.assertEqual(len(events), 1)
+                    self.assertEqual(first["result"]["receipt"]["eventId"], events[0]["id"])
+                    if finite:
+                        self.assertEqual(events[0]["ttlMs"], "60000")
+                    else:
+                        self.assertNotIn("ttlMs", events[0])
                     self.assertEqual(base64.b64decode(events[0]["payload"]), b"asterctl upstream smoke")
+                    cli("publication-ack", *publication, "--sequence", "1")
                     subscription = ["--json", "subscribe", "--scope", "mission/team/alpha",
                                     "--operation-key", "cli-smoke-subscribe", "chat.events"]
                     created = json.loads(cli(*subscription).stdout)

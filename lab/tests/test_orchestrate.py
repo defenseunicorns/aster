@@ -1675,7 +1675,7 @@ index\tserial\tnode_id
                 )
 
         destroyed = (
-            "SELECTED_NAT_CANARY_DESTROY status=pass version=1 "
+            "SELECTED_NAT_CANARY_DESTROY status=pass version=2 publication_journals_destroyed=2 "
             "artifact_destroyed=true global_secret_destruction=false "
             "target=private/canary.bin previous_bytes=32 previous_mode=0600 "
             f"owner_uid={os.getuid()} overwrite=zero sync=file+directory unlinked=true "

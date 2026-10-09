@@ -3,15 +3,17 @@ use std::{env, error::Error, net::SocketAddr, path::PathBuf, time::Duration};
 use aster_node::{
     NodeApplication, NodeConfig,
     application::{
-        EventGapQuery, EventPollRequest, EventPublishRequest, EventQuery, EventSubscriptionRequest,
-        Priority, Scope, Topic,
+        EventGapQuery, EventPollRequest, EventQuery, EventSubscriptionRequest, Priority, Scope,
+        Topic,
     },
     mission::UnprotectedReferenceMission,
     start_node,
 };
 
+use aster_node::publication_journal as numbered;
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut arguments = env::args_os();
     let program = arguments
         .next()
@@ -29,9 +31,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let Some(topic) = arguments.next().and_then(|value| value.into_string().ok()) else {
         return Err(usage(&program).into());
     };
+    let initialize = match arguments.next() {
+        None => false,
+        Some(value) if value == "--initialize-publication-journal" => true,
+        Some(_) => {
+            return Err("unknown argument; expected --initialize-publication-journal".into());
+        }
+    };
     if arguments.next().is_some() {
         return Err(usage(&program).into());
     }
+    let journal_path = state.join("live_event_application-publication.redb");
+    if initialize {
+        numbered::Journal::initialize(&journal_path, b"native.live-event-application.v1")?;
+    }
+    let mut journal = numbered::Journal::open(&journal_path, b"native.live-event-application.v1")?;
     let scope = Scope::new(scope)?;
     let topic = Topic::new(topic)?;
     let mission = UnprotectedReferenceMission::load(mission_bundle)?;
@@ -47,6 +61,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     })
     .await?;
     let events = running.selected_events();
+    journal
+        .recover(&mut numbered::Backend::Live(&events))
+        .await?;
 
     let subscription = events
         .subscribe(EventSubscriptionRequest {
@@ -56,18 +73,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
             include_descendant_scopes: false,
         })
         .await?;
-    let publication = events
-        .publish(EventPublishRequest {
-            operation_key: b"aster.example.live/publish".to_vec(),
-            predecessor: None,
-            topic: topic.clone(),
-            scope: scope.clone(),
-            priority: Priority::Priority,
-            logical_key: b"hello".to_vec(),
-            payload: b"hello from the live selected Event API".to_vec(),
-            tombstone: false,
-        })
+    let intent = numbered::Intent {
+        predecessor: None,
+        topic: topic.as_str().into(),
+        scope: scope.as_str().into(),
+        priority: Priority::Priority as u8,
+        logical_key: b"hello".to_vec(),
+        payload: b"hello from the live selected Event API".to_vec(),
+        tombstone: false,
+        ttl_ms: None,
+    };
+    if let Some((_, pending)) = journal.pending()
+        && pending != &intent
+    {
+        return Err("retained intent differs; explicit repair is required".into());
+    }
+    let outcome = journal
+        .publish(&mut numbered::Backend::Live(&events), intent.clone())
         .await?;
+    let publication = numbered::Backend::Live(&events)
+        .metadata(&intent, &outcome)
+        .await?;
+
     let page = events
         .query(EventQuery {
             publisher: Some(events.identity()),
@@ -110,13 +137,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         status.sync,
     );
     events.unsubscribe(subscription.id).await?;
+    journal
+        .acknowledge(&mut numbered::Backend::Live(&events))
+        .await?;
     running.shutdown().await?;
     Ok(())
 }
 
 fn usage(program: &str) -> String {
     format!(
-        "usage: {program} STATE_DIRECTORY MISSION_BUNDLE SCOPE TOPIC\n\
+        "usage: {program} STATE_DIRECTORY MISSION_BUNDLE SCOPE TOPIC [--initialize-publication-journal]\n\
          example: cargo run -p aster-node --example live_event_application -- \
          /tmp/aster-live node.bundle mission/apps ops.alpha"
     )

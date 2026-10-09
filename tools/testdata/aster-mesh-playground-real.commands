@@ -6,4 +6,8 @@ assert-unseen m1 2
 stop 0
 rejoin 2
 wait-seen m1 2 30
+# Resume the same numbered client after source-process replacement.
+start 0
+send 0 smoke-after-source-restart
+wait-seen m2 0,1,2 30
 quit

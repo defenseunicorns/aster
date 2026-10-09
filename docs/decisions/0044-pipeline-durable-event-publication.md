@@ -9,6 +9,50 @@
   [Decision 0030](0030-event-first-local-connect-agent.md), and
   [Decision 0042](0042-adopt-linux-event-mvp-evaluation-profile-v0-1.md)
 
+## Numbered publication amendment — 2026-10-08
+
+The current application surface is numbered-only. `PublishNumberedEvent` and
+`PublishNumberedEvents` replace the ordinary publishing RPCs; the historical decision below records
+the original PR #34/#54 pipeline. Its actor FIFO, fairness, compatible grouped
+commits, ordered fallback, Flash urgency, bounded HTTP/2 window, and healthy
+rotation remain. The SDK now journals complete intents and persists results
+before freeing slots. Exact replay uses client/session/sequence. A failed next
+sequence blocks that client until explicit repair or abandonment; independent
+configured clients continue. Browsers use ordered unary numbered calls.
+Nonempty old Event publication ledgers require fresh state and remain available
+for read-only inspection. This amendment changes application publication
+ownership, not v7 mesh page semantics or historical performance evidence.
+
+
+### Rejected numbered publication: options and chosen policy
+
+Recorded 2026-10-09. A known precommit rejection of the next sequence does not
+advance `allocated_through`. Later first admissions from that client therefore
+remain blocked, while independent clients can continue. Three policies were
+considered:
+
+| Policy | Status | Consequences |
+|---|---|---|
+| Preserve the intent; repair the cause and retry, or explicitly abandon it | Implemented default | Retains application control over whether work is skipped. The SDK stops the pipeline and preserves failed and later journaled intents. The application must resolve the blocked sequence before continuing. |
+| SDK abandons rejected work and continues | Deferred possible opt-in policy | Could let an application tolerate selected failures, using the existing abandonment operation. It requires explicit application authorization and a documented rejection classification; it must not silently discard work or treat an ambiguous outcome as proof of noncommit. |
+| Server records a terminal rejection and advances the frontier | Considered, not implemented | Would make a defined rejection a durable numbered outcome. It requires explicit terminal-versus-retryable rules, atomic recording, recovery representation and bounded result acknowledgement/compaction. Temporary authorization, policy or capacity failures must not become permanent skips merely because a request failed. |
+
+The default preserves work because publication failure alone does not establish
+that the application wants to discard it. Repair means resolving the cause and
+retrying the original journaled intent; it does not authorize replacing a
+retained intent under the same sequence. If that intent should not be published,
+the application may explicitly abandon an uncommitted sequence and allocate
+replacement work separately.
+
+A transport interruption or postcommit failure can leave the commit unknown.
+Recover or replay the original intent to resolve it before considering
+abandonment. Already committed work uses result acknowledgement after durable
+application progress, not abandonment. Neither a rejection nor a disconnect
+silently advances the frontier. The deferred alternatives are separate policy
+and protocol decisions, not unfinished requirements of this switchover.
+
+The future PR should link this section and state the implemented default. This
+record supplies the lasting rationale independently of the PR discussion.
 ## Context
 
 Aster separates local publication from mesh synchronization. An application

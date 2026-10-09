@@ -153,31 +153,18 @@ pub async fn status(
     Ok(response.into_owned())
 }
 
-pub async fn publish(
+pub fn publication_sdk(
     address: SocketAddr,
     token: &Token,
-    request: api::PublishEventRequest,
     timeout: Duration,
-) -> Result<api::PublishEventResponse, MutationError> {
-    let ttl_ms = request.ttl_ms;
+    identity: &crate::journal::Identity,
+) -> Result<aster_agent::sdk::NumberedEventSdk<HttpClient>, String> {
     let client = api::AsterApplicationServiceClient::new(
         HttpClient::plaintext(),
         config(address, token, timeout),
     );
-    let response = tokio::time::timeout(timeout, client.publish_event(request))
-        .await
-        .map_err(|_| MutationError::rpc(connectrpc::ErrorCode::DeadlineExceeded))?
-        .map_err(|error| MutationError::rpc(error.code))?;
-    let response = response.into_owned();
-    if response.id.len() != 32 || response.publisher.len() != 32 {
-        return Err(MutationError::unknown("invalid publication receipt"));
-    }
-    if ttl_ms.is_some() && response.ttl_ms != ttl_ms {
-        return Err(MutationError::unknown(
-            "agent did not confirm the requested TTL",
-        ));
-    }
-    Ok(response)
+    aster_agent::sdk::NumberedEventSdk::open(client, &identity.path, &identity.client_id)
+        .map_err(crate::journal::describe_error)
 }
 
 pub async fn unsubscribe(

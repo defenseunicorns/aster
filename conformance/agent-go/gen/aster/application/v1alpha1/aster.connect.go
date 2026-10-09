@@ -35,12 +35,6 @@ const (
 	// AsterApplicationServiceGetStatusProcedure is the fully-qualified name of the
 	// AsterApplicationService's GetStatus RPC.
 	AsterApplicationServiceGetStatusProcedure = "/aster.application.v1alpha1.AsterApplicationService/GetStatus"
-	// AsterApplicationServicePublishEventProcedure is the fully-qualified name of the
-	// AsterApplicationService's PublishEvent RPC.
-	AsterApplicationServicePublishEventProcedure = "/aster.application.v1alpha1.AsterApplicationService/PublishEvent"
-	// AsterApplicationServicePublishEventsProcedure is the fully-qualified name of the
-	// AsterApplicationService's PublishEvents RPC.
-	AsterApplicationServicePublishEventsProcedure = "/aster.application.v1alpha1.AsterApplicationService/PublishEvents"
 	// AsterApplicationServiceBeginEventPublicationSessionProcedure is the fully-qualified name of the
 	// AsterApplicationService's BeginEventPublicationSession RPC.
 	AsterApplicationServiceBeginEventPublicationSessionProcedure = "/aster.application.v1alpha1.AsterApplicationService/BeginEventPublicationSession"
@@ -50,6 +44,9 @@ const (
 	// AsterApplicationServicePublishNumberedEventProcedure is the fully-qualified name of the
 	// AsterApplicationService's PublishNumberedEvent RPC.
 	AsterApplicationServicePublishNumberedEventProcedure = "/aster.application.v1alpha1.AsterApplicationService/PublishNumberedEvent"
+	// AsterApplicationServicePublishNumberedEventsProcedure is the fully-qualified name of the
+	// AsterApplicationService's PublishNumberedEvents RPC.
+	AsterApplicationServicePublishNumberedEventsProcedure = "/aster.application.v1alpha1.AsterApplicationService/PublishNumberedEvents"
 	// AsterApplicationServiceAbandonEventPublicationProcedure is the fully-qualified name of the
 	// AsterApplicationService's AbandonEventPublication RPC.
 	AsterApplicationServiceAbandonEventPublicationProcedure = "/aster.application.v1alpha1.AsterApplicationService/AbandonEventPublication"
@@ -87,16 +84,14 @@ const (
 type AsterApplicationServiceClient interface {
 	// GetStatus returns a bounded local synchronization snapshot.
 	GetStatus(context.Context, *connect.Request[GetStatusRequest]) (*connect.Response[GetStatusResponse], error)
-	// PublishEvent durably accepts an idempotent offline-first publication.
-	PublishEvent(context.Context, *connect.Request[PublishEventRequest]) (*connect.Response[PublishEventResponse], error)
-	// PublishEvents pipelines ordered independent publications over native HTTP/2.
-	PublishEvents(context.Context) *connect.BidiStreamForClient[PublishEventsRequest, PublishEventsResponse]
 	// BeginEventPublicationSession fences the prior publisher and returns one complete recovery image.
 	BeginEventPublicationSession(context.Context, *connect.Request[BeginEventPublicationSessionRequest]) (*connect.Response[BeginEventPublicationSessionResponse], error)
 	// CompleteEventPublicationRecovery authorizes mutations for the exact recovered revision.
 	CompleteEventPublicationRecovery(context.Context, *connect.Request[CompleteEventPublicationRecoveryRequest]) (*connect.Response[CompleteEventPublicationRecoveryResponse], error)
 	// PublishNumberedEvent admits exactly allocated_through + 1 or resolves an exact retry.
 	PublishNumberedEvent(context.Context, *connect.Request[PublishNumberedEventRequest]) (*connect.Response[PublishNumberedEventResponse], error)
+	// Ordered numbered publications over bounded native HTTP/2 streams.
+	PublishNumberedEvents(context.Context) *connect.BidiStreamForClient[PublishNumberedEventsRequest, PublishNumberedEventsResponse]
 	// AbandonEventPublication permanently consumes the next unadmitted sequence.
 	AbandonEventPublication(context.Context, *connect.Request[AbandonEventPublicationRequest]) (*connect.Response[AbandonEventPublicationResponse], error)
 	// AcknowledgeEventPublicationResult compacts one sparse committed result.
@@ -137,18 +132,6 @@ func NewAsterApplicationServiceClient(httpClient connect.HTTPClient, baseURL str
 			connect.WithSchema(asterApplicationServiceMethods.ByName("GetStatus")),
 			connect.WithClientOptions(opts...),
 		),
-		publishEvent: connect.NewClient[PublishEventRequest, PublishEventResponse](
-			httpClient,
-			baseURL+AsterApplicationServicePublishEventProcedure,
-			connect.WithSchema(asterApplicationServiceMethods.ByName("PublishEvent")),
-			connect.WithClientOptions(opts...),
-		),
-		publishEvents: connect.NewClient[PublishEventsRequest, PublishEventsResponse](
-			httpClient,
-			baseURL+AsterApplicationServicePublishEventsProcedure,
-			connect.WithSchema(asterApplicationServiceMethods.ByName("PublishEvents")),
-			connect.WithClientOptions(opts...),
-		),
 		beginEventPublicationSession: connect.NewClient[BeginEventPublicationSessionRequest, BeginEventPublicationSessionResponse](
 			httpClient,
 			baseURL+AsterApplicationServiceBeginEventPublicationSessionProcedure,
@@ -165,6 +148,12 @@ func NewAsterApplicationServiceClient(httpClient connect.HTTPClient, baseURL str
 			httpClient,
 			baseURL+AsterApplicationServicePublishNumberedEventProcedure,
 			connect.WithSchema(asterApplicationServiceMethods.ByName("PublishNumberedEvent")),
+			connect.WithClientOptions(opts...),
+		),
+		publishNumberedEvents: connect.NewClient[PublishNumberedEventsRequest, PublishNumberedEventsResponse](
+			httpClient,
+			baseURL+AsterApplicationServicePublishNumberedEventsProcedure,
+			connect.WithSchema(asterApplicationServiceMethods.ByName("PublishNumberedEvents")),
 			connect.WithClientOptions(opts...),
 		),
 		abandonEventPublication: connect.NewClient[AbandonEventPublicationRequest, AbandonEventPublicationResponse](
@@ -233,11 +222,10 @@ func NewAsterApplicationServiceClient(httpClient connect.HTTPClient, baseURL str
 // asterApplicationServiceClient implements AsterApplicationServiceClient.
 type asterApplicationServiceClient struct {
 	getStatus                         *connect.Client[GetStatusRequest, GetStatusResponse]
-	publishEvent                      *connect.Client[PublishEventRequest, PublishEventResponse]
-	publishEvents                     *connect.Client[PublishEventsRequest, PublishEventsResponse]
 	beginEventPublicationSession      *connect.Client[BeginEventPublicationSessionRequest, BeginEventPublicationSessionResponse]
 	completeEventPublicationRecovery  *connect.Client[CompleteEventPublicationRecoveryRequest, CompleteEventPublicationRecoveryResponse]
 	publishNumberedEvent              *connect.Client[PublishNumberedEventRequest, PublishNumberedEventResponse]
+	publishNumberedEvents             *connect.Client[PublishNumberedEventsRequest, PublishNumberedEventsResponse]
 	abandonEventPublication           *connect.Client[AbandonEventPublicationRequest, AbandonEventPublicationResponse]
 	acknowledgeEventPublicationResult *connect.Client[AcknowledgeEventPublicationResultRequest, AcknowledgeEventPublicationResultResponse]
 	queryEvents                       *connect.Client[QueryEventsRequest, QueryEventsResponse]
@@ -253,16 +241,6 @@ type asterApplicationServiceClient struct {
 // GetStatus calls aster.application.v1alpha1.AsterApplicationService.GetStatus.
 func (c *asterApplicationServiceClient) GetStatus(ctx context.Context, req *connect.Request[GetStatusRequest]) (*connect.Response[GetStatusResponse], error) {
 	return c.getStatus.CallUnary(ctx, req)
-}
-
-// PublishEvent calls aster.application.v1alpha1.AsterApplicationService.PublishEvent.
-func (c *asterApplicationServiceClient) PublishEvent(ctx context.Context, req *connect.Request[PublishEventRequest]) (*connect.Response[PublishEventResponse], error) {
-	return c.publishEvent.CallUnary(ctx, req)
-}
-
-// PublishEvents calls aster.application.v1alpha1.AsterApplicationService.PublishEvents.
-func (c *asterApplicationServiceClient) PublishEvents(ctx context.Context) *connect.BidiStreamForClient[PublishEventsRequest, PublishEventsResponse] {
-	return c.publishEvents.CallBidiStream(ctx)
 }
 
 // BeginEventPublicationSession calls
@@ -281,6 +259,12 @@ func (c *asterApplicationServiceClient) CompleteEventPublicationRecovery(ctx con
 // aster.application.v1alpha1.AsterApplicationService.PublishNumberedEvent.
 func (c *asterApplicationServiceClient) PublishNumberedEvent(ctx context.Context, req *connect.Request[PublishNumberedEventRequest]) (*connect.Response[PublishNumberedEventResponse], error) {
 	return c.publishNumberedEvent.CallUnary(ctx, req)
+}
+
+// PublishNumberedEvents calls
+// aster.application.v1alpha1.AsterApplicationService.PublishNumberedEvents.
+func (c *asterApplicationServiceClient) PublishNumberedEvents(ctx context.Context) *connect.BidiStreamForClient[PublishNumberedEventsRequest, PublishNumberedEventsResponse] {
+	return c.publishNumberedEvents.CallBidiStream(ctx)
 }
 
 // AbandonEventPublication calls
@@ -343,16 +327,14 @@ func (c *asterApplicationServiceClient) QueryEventGaps(ctx context.Context, req 
 type AsterApplicationServiceHandler interface {
 	// GetStatus returns a bounded local synchronization snapshot.
 	GetStatus(context.Context, *connect.Request[GetStatusRequest]) (*connect.Response[GetStatusResponse], error)
-	// PublishEvent durably accepts an idempotent offline-first publication.
-	PublishEvent(context.Context, *connect.Request[PublishEventRequest]) (*connect.Response[PublishEventResponse], error)
-	// PublishEvents pipelines ordered independent publications over native HTTP/2.
-	PublishEvents(context.Context, *connect.BidiStream[PublishEventsRequest, PublishEventsResponse]) error
 	// BeginEventPublicationSession fences the prior publisher and returns one complete recovery image.
 	BeginEventPublicationSession(context.Context, *connect.Request[BeginEventPublicationSessionRequest]) (*connect.Response[BeginEventPublicationSessionResponse], error)
 	// CompleteEventPublicationRecovery authorizes mutations for the exact recovered revision.
 	CompleteEventPublicationRecovery(context.Context, *connect.Request[CompleteEventPublicationRecoveryRequest]) (*connect.Response[CompleteEventPublicationRecoveryResponse], error)
 	// PublishNumberedEvent admits exactly allocated_through + 1 or resolves an exact retry.
 	PublishNumberedEvent(context.Context, *connect.Request[PublishNumberedEventRequest]) (*connect.Response[PublishNumberedEventResponse], error)
+	// Ordered numbered publications over bounded native HTTP/2 streams.
+	PublishNumberedEvents(context.Context, *connect.BidiStream[PublishNumberedEventsRequest, PublishNumberedEventsResponse]) error
 	// AbandonEventPublication permanently consumes the next unadmitted sequence.
 	AbandonEventPublication(context.Context, *connect.Request[AbandonEventPublicationRequest]) (*connect.Response[AbandonEventPublicationResponse], error)
 	// AcknowledgeEventPublicationResult compacts one sparse committed result.
@@ -388,18 +370,6 @@ func NewAsterApplicationServiceHandler(svc AsterApplicationServiceHandler, opts 
 		connect.WithSchema(asterApplicationServiceMethods.ByName("GetStatus")),
 		connect.WithHandlerOptions(opts...),
 	)
-	asterApplicationServicePublishEventHandler := connect.NewUnaryHandler(
-		AsterApplicationServicePublishEventProcedure,
-		svc.PublishEvent,
-		connect.WithSchema(asterApplicationServiceMethods.ByName("PublishEvent")),
-		connect.WithHandlerOptions(opts...),
-	)
-	asterApplicationServicePublishEventsHandler := connect.NewBidiStreamHandler(
-		AsterApplicationServicePublishEventsProcedure,
-		svc.PublishEvents,
-		connect.WithSchema(asterApplicationServiceMethods.ByName("PublishEvents")),
-		connect.WithHandlerOptions(opts...),
-	)
 	asterApplicationServiceBeginEventPublicationSessionHandler := connect.NewUnaryHandler(
 		AsterApplicationServiceBeginEventPublicationSessionProcedure,
 		svc.BeginEventPublicationSession,
@@ -416,6 +386,12 @@ func NewAsterApplicationServiceHandler(svc AsterApplicationServiceHandler, opts 
 		AsterApplicationServicePublishNumberedEventProcedure,
 		svc.PublishNumberedEvent,
 		connect.WithSchema(asterApplicationServiceMethods.ByName("PublishNumberedEvent")),
+		connect.WithHandlerOptions(opts...),
+	)
+	asterApplicationServicePublishNumberedEventsHandler := connect.NewBidiStreamHandler(
+		AsterApplicationServicePublishNumberedEventsProcedure,
+		svc.PublishNumberedEvents,
+		connect.WithSchema(asterApplicationServiceMethods.ByName("PublishNumberedEvents")),
 		connect.WithHandlerOptions(opts...),
 	)
 	asterApplicationServiceAbandonEventPublicationHandler := connect.NewUnaryHandler(
@@ -482,16 +458,14 @@ func NewAsterApplicationServiceHandler(svc AsterApplicationServiceHandler, opts 
 		switch r.URL.Path {
 		case AsterApplicationServiceGetStatusProcedure:
 			asterApplicationServiceGetStatusHandler.ServeHTTP(w, r)
-		case AsterApplicationServicePublishEventProcedure:
-			asterApplicationServicePublishEventHandler.ServeHTTP(w, r)
-		case AsterApplicationServicePublishEventsProcedure:
-			asterApplicationServicePublishEventsHandler.ServeHTTP(w, r)
 		case AsterApplicationServiceBeginEventPublicationSessionProcedure:
 			asterApplicationServiceBeginEventPublicationSessionHandler.ServeHTTP(w, r)
 		case AsterApplicationServiceCompleteEventPublicationRecoveryProcedure:
 			asterApplicationServiceCompleteEventPublicationRecoveryHandler.ServeHTTP(w, r)
 		case AsterApplicationServicePublishNumberedEventProcedure:
 			asterApplicationServicePublishNumberedEventHandler.ServeHTTP(w, r)
+		case AsterApplicationServicePublishNumberedEventsProcedure:
+			asterApplicationServicePublishNumberedEventsHandler.ServeHTTP(w, r)
 		case AsterApplicationServiceAbandonEventPublicationProcedure:
 			asterApplicationServiceAbandonEventPublicationHandler.ServeHTTP(w, r)
 		case AsterApplicationServiceAcknowledgeEventPublicationResultProcedure:
@@ -525,14 +499,6 @@ func (UnimplementedAsterApplicationServiceHandler) GetStatus(context.Context, *c
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("aster.application.v1alpha1.AsterApplicationService.GetStatus is not implemented"))
 }
 
-func (UnimplementedAsterApplicationServiceHandler) PublishEvent(context.Context, *connect.Request[PublishEventRequest]) (*connect.Response[PublishEventResponse], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("aster.application.v1alpha1.AsterApplicationService.PublishEvent is not implemented"))
-}
-
-func (UnimplementedAsterApplicationServiceHandler) PublishEvents(context.Context, *connect.BidiStream[PublishEventsRequest, PublishEventsResponse]) error {
-	return connect.NewError(connect.CodeUnimplemented, errors.New("aster.application.v1alpha1.AsterApplicationService.PublishEvents is not implemented"))
-}
-
 func (UnimplementedAsterApplicationServiceHandler) BeginEventPublicationSession(context.Context, *connect.Request[BeginEventPublicationSessionRequest]) (*connect.Response[BeginEventPublicationSessionResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("aster.application.v1alpha1.AsterApplicationService.BeginEventPublicationSession is not implemented"))
 }
@@ -543,6 +509,10 @@ func (UnimplementedAsterApplicationServiceHandler) CompleteEventPublicationRecov
 
 func (UnimplementedAsterApplicationServiceHandler) PublishNumberedEvent(context.Context, *connect.Request[PublishNumberedEventRequest]) (*connect.Response[PublishNumberedEventResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("aster.application.v1alpha1.AsterApplicationService.PublishNumberedEvent is not implemented"))
+}
+
+func (UnimplementedAsterApplicationServiceHandler) PublishNumberedEvents(context.Context, *connect.BidiStream[PublishNumberedEventsRequest, PublishNumberedEventsResponse]) error {
+	return connect.NewError(connect.CodeUnimplemented, errors.New("aster.application.v1alpha1.AsterApplicationService.PublishNumberedEvents is not implemented"))
 }
 
 func (UnimplementedAsterApplicationServiceHandler) AbandonEventPublication(context.Context, *connect.Request[AbandonEventPublicationRequest]) (*connect.Response[AbandonEventPublicationResponse], error) {

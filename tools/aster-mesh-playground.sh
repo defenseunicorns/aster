@@ -9,6 +9,7 @@ playground="$script_dir/aster_mesh_playground.py"
 view_mode="${ASTER_PLAYGROUND_VIEW:-auto}"
 aster_bin="${ASTER_PLAYGROUND_ASTER_BIN:-}"
 agent_bin="${ASTER_PLAYGROUND_AGENT_BIN:-}"
+cli_bin="${ASTER_PLAYGROUND_CLI_BIN:-}"
 
 view_value_pending=0
 for playground_argument in "$@"; do
@@ -18,8 +19,8 @@ for playground_argument in "$@"; do
     continue
   fi
   case "$playground_argument" in
-    --aster|--aster=*|--agent|--agent=*)
-      echo "--aster and --agent are wrapper-managed options" >&2
+    --aster|--aster=*|--agent|--agent=*|--cli|--cli=*)
+      echo "--aster, --agent and --cli are wrapper-managed options" >&2
       exit 2
       ;;
     --view) view_value_pending=1 ;;
@@ -85,7 +86,7 @@ if [ -z "$aster_bin" ] || [ -z "$agent_bin" ]; then
     --stdout-receipt "$build_receipt" \
     --stderr-receipt "$build_stderr" -- \
     cargo build --locked --manifest-path "$repo_root/Cargo.toml" \
-      -p aster-node -p aster-agent --bins \
+      -p aster-node -p aster-agent -p asterctl --bins \
       --features aster-agent/nearby-discovery --message-format=json; then
     :
   else
@@ -112,6 +113,17 @@ if [ -z "$aster_bin" ] || [ -z "$agent_bin" ]; then
       exit "$extract_status"
     fi
   fi
+  if [ -z "$cli_bin" ]; then
+    cli_bin="$(extract_binary "$build_receipt" asterctl)"
+  fi
+fi
+
+if [ -z "$cli_bin" ]; then
+  cli_bin="$(dirname "$agent_bin")/asterctl"
+fi
+if [ ! -x "$cli_bin" ]; then
+  echo "ASTER_PLAYGROUND_CLI_BIN is not executable: $cli_bin" >&2
+  exit 2
 fi
 
 if [ ! -x "$aster_bin" ]; then
@@ -133,5 +145,6 @@ agent_bin="$agent_bin_dir/$(basename -- "$agent_bin")"
 exec python3 "$playground" \
   --aster "$aster_bin" \
   --agent "$agent_bin" \
+  --cli "$cli_bin" \
   --view "$view_mode" \
   "$@"

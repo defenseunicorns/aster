@@ -13,10 +13,10 @@ use aster_mesh::{
 use aster_node::{
     NodeIdentity,
     application::{
-        EventAcknowledgement, EventId, EventPollRequest, EventPublishRequest, EventQuery,
-        EventSubscriptionId, EventSubscriptionRequest, Priority, SelectedEventNode,
+        EventAcknowledgement, EventId, EventPollRequest, EventQuery, EventSubscriptionId,
+        EventSubscriptionRequest, Priority, SelectedEventNode,
     },
-    format_node_id, format_path_field, parse_node_id,
+    format_node_id, format_path_field, parse_node_id, publication_journal as numbered,
 };
 use iroh::EndpointId;
 use rcgen::{
@@ -51,7 +51,7 @@ const CANARY_LOGICAL_KEY: &[u8] = b"selected-nat/v1/canary-sha256";
 const UNSUPPORTED_PLATFORM: &str =
     "selected NAT commands require Linux/Android /proc/self/fd descriptor paths";
 
-type Result<T> = std::result::Result<T, Box<dyn Error>>;
+type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 fn main() -> ExitCode {
     match run() {
@@ -381,6 +381,10 @@ fn prepare(options: &Options) -> Result<()> {
         drop(identity);
         state_directory.sync_all()?;
 
+        numbered::Journal::initialize(
+            &descriptor_child_path(&state_directory, "publication.redb")?,
+            publication_client(name).as_bytes(),
+        )?;
         let mut selected = SelectedEventNode::open_unprotected_reference(&state, &mission_path)?;
         retained_bundle.require_unchanged()?;
         retained_bundle.require_pathname(&tree.private, &mission_filename)?;
@@ -476,13 +480,7 @@ fn publish(options: &Options) -> Result<()> {
     let canary = load_private_canary(&tree, &manifest)?;
     let canary_text = hex(&manifest.canary_sha256);
     let expected = manifest.node(name)?;
-    let request = publication_request(
-        name,
-        &manifest.scope,
-        &manifest.topic,
-        &canary,
-        manifest.canary_sha256,
-    );
+    let request = publication_request(&manifest.scope, &manifest.topic, &canary);
     let state_directory =
         open_owned_directory_at(&tree.root, &state_filename(name), "selected NAT node state")?;
     let state = descriptor_path(&state_directory)?;
@@ -494,6 +492,8 @@ fn publish(options: &Options) -> Result<()> {
         0o600,
     )?;
     let mission = descriptor_child_path(&tree.private, &mission_name)?;
+    let journal_path = descriptor_child_path(&state_directory, "publication.redb")?;
+    let mut journal = numbered::Journal::open(&journal_path, publication_client(name).as_bytes())?;
     let mut selected = SelectedEventNode::open_unprotected_reference(&state, &mission)?;
     retained_bundle.require_unchanged()?;
     retained_bundle.require_pathname(&tree.private, &mission_name)?;
@@ -507,13 +507,14 @@ fn publish(options: &Options) -> Result<()> {
             "publisher mission authority does not match manifest",
         ));
     }
-    let publication = selected.publish(request.clone())?;
+    journal.recover_stopped(&mut selected)?;
+    let publication = journal.publish_metadata_stopped(&mut selected, request.clone())?;
     if !publication.inserted || publication.publisher != expected.mission_id {
         return Err(invalid(
             "fresh selected NAT publication was not inserted exactly once",
         ));
     }
-    let replay = selected.publish(request)?;
+    let replay = journal.publish_metadata_stopped(&mut selected, request)?;
     if replay.inserted || replay.id != publication.id || replay.publisher_counter != 1 {
         return Err(invalid(
             "selected NAT publication replay was not an exact no-op",
@@ -536,6 +537,8 @@ fn publish(options: &Options) -> Result<()> {
         &canary,
         publication.id,
     )?;
+    journal.acknowledge_stopped(&mut selected)?;
+    drop(journal);
     drop(selected);
     retained_bundle.require_unchanged()?;
     retained_bundle.require_pathname(&tree.private, &mission_name)?;
@@ -543,7 +546,7 @@ fn publish(options: &Options) -> Result<()> {
     tree.require_stable()?;
     let payload_sha256 = Sha256::digest(&*canary);
     println!(
-        "SELECTED_NAT_PUBLISH status=pass version=1 node={} event_id={} publisher={} sequence={} inserted=true replay_publish=noop pre_inventory_events=0 post_inventory_events=1 canary_sha256={} payload_sha256={} payload_bytes=32 sealed_sha256=not-exposed-by-production-api exact_query=true",
+        "SELECTED_NAT_PUBLISH status=pass version=2 publication_model=numbered-v1 node={} event_id={} publisher={} sequence={} inserted=true replay_publish=noop pre_inventory_events=0 post_inventory_events=1 canary_sha256={} payload_sha256={} payload_bytes=32 sealed_sha256=not-exposed-by-production-api exact_query=true",
         name,
         publication.id,
         format_node_id(publication.publisher),
@@ -764,9 +767,25 @@ fn relay_material_destroy(options: &Options) -> Result<()> {
 fn canary_destroy(options: &Options) -> Result<()> {
     options.reject_except(&["root"])?;
     let root = options.required_path("root")?;
+    // The journals retained the full canary intent, including pages freed by
+    // result acknowledgement. Retire those owned plaintext files at the same
+    // explicit terminal cleanup boundary as the original private canary.
+    let tree = SecurePrivateTree::open(&root)?;
+    for name in NODE_NAMES {
+        let state_directory =
+            open_owned_directory_at(&tree.root, &state_filename(name), "selected NAT node state")?;
+        destroy_bounded_file_at(
+            &state_directory,
+            "publication.redb",
+            1,
+            32 * 1024 * 1024,
+            || tree.require_stable(),
+        )?;
+    }
+    drop(tree);
     let destroyed = destroy_private_artifact(&root, "canary.bin", CANARY_BYTES, CANARY_BYTES)?;
     println!(
-        "SELECTED_NAT_CANARY_DESTROY status=pass version=1 artifact_destroyed=true global_secret_destruction=false target=private/canary.bin previous_bytes={} previous_mode={:04o} owner_uid={} overwrite=zero sync=file+directory unlinked=true assurance=bounded-software physical_sanitization=not-claimed",
+        "SELECTED_NAT_CANARY_DESTROY status=pass version=2 publication_journals_destroyed=2 artifact_destroyed=true global_secret_destruction=false target=private/canary.bin previous_bytes={} previous_mode={:04o} owner_uid={} overwrite=zero sync=file+directory unlinked=true assurance=bounded-software physical_sanitization=not-claimed",
         destroyed.bytes, destroyed.mode, destroyed.owner,
     );
     Ok(())
@@ -1327,12 +1346,24 @@ fn destroy_private_artifact_unix(
     minimum: usize,
     maximum: usize,
 ) -> Result<DestroyedArtifact> {
-    use std::os::unix::fs::MetadataExt as _;
-
     let tree = SecurePrivateTree::open(root)?;
     tree.require_stable()?;
+    destroy_bounded_file_at(&tree.private, filename, minimum, maximum, || {
+        tree.require_stable()
+    })
+}
+
+#[cfg(unix)]
+fn destroy_bounded_file_at(
+    directory: &File,
+    filename: &str,
+    minimum: usize,
+    maximum: usize,
+    require_stable: impl Fn() -> Result<()>,
+) -> Result<DestroyedArtifact> {
+    use std::os::unix::fs::MetadataExt as _;
     let descriptor = rustix::fs::openat(
-        &tree.private,
+        directory,
         filename,
         rustix::fs::OFlags::RDWR
             | rustix::fs::OFlags::NOFOLLOW
@@ -1361,10 +1392,10 @@ fn destroy_private_artifact_unix(
     let zeros = Zeroizing::new(vec![0u8; length]);
     file.write_all(&zeros)?;
     file.sync_all()?;
-    tree.require_stable()?;
+    require_stable()?;
 
     let pathname_descriptor = rustix::fs::openat(
-        &tree.private,
+        directory,
         filename,
         rustix::fs::OFlags::RDONLY
             | rustix::fs::OFlags::NOFOLLOW
@@ -1385,11 +1416,11 @@ fn destroy_private_artifact_unix(
     }
     drop(pathname_file);
 
-    rustix::fs::unlinkat(&tree.private, filename, rustix::fs::AtFlags::empty())?;
-    tree.private.sync_all()?;
-    tree.require_stable()?;
+    rustix::fs::unlinkat(directory, filename, rustix::fs::AtFlags::empty())?;
+    directory.sync_all()?;
+    require_stable()?;
     match rustix::fs::openat(
-        &tree.private,
+        directory,
         filename,
         rustix::fs::OFlags::RDONLY
             | rustix::fs::OFlags::NOFOLLOW
@@ -1422,26 +1453,19 @@ fn subscription_request(name: &str, scope: &Scope, topic: &Topic) -> EventSubscr
     }
 }
 
-fn publication_request(
-    name: &str,
-    scope: &Scope,
-    topic: &Topic,
-    canary: &[u8],
-    canary_sha256: [u8; 32],
-) -> EventPublishRequest {
-    EventPublishRequest {
-        operation_key: format!(
-            "selected-nat/v1/node-{name}/publish/{}",
-            hex(&canary_sha256)
-        )
-        .into_bytes(),
+fn publication_client(name: &str) -> String {
+    format!("selected-nat/node-{name}/v1")
+}
+fn publication_request(scope: &Scope, topic: &Topic, canary: &[u8]) -> numbered::Intent {
+    numbered::Intent {
         predecessor: None,
-        topic: topic.clone(),
-        scope: scope.clone(),
-        priority: Priority::Priority,
+        topic: topic.as_str().into(),
+        scope: scope.as_str().into(),
+        priority: Priority::Priority as u8,
         logical_key: CANARY_LOGICAL_KEY.to_vec(),
         payload: canary.to_vec(),
         tombstone: false,
+        ttl_ms: None,
     }
 }
 
@@ -1741,7 +1765,7 @@ fn hex(bytes: &[u8]) -> String {
     output
 }
 
-fn invalid(message: impl Into<String>) -> Box<dyn Error> {
+fn invalid(message: impl Into<String>) -> Box<dyn Error + Send + Sync> {
     io::Error::new(io::ErrorKind::InvalidInput, message.into()).into()
 }
 

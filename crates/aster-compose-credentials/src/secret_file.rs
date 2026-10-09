@@ -27,6 +27,7 @@ struct FileMetadata {
     changed_nanoseconds: u64,
 }
 
+#[cfg(any(test, target_os = "linux"))]
 pub(super) fn normalize_link_count<T: Into<u64>>(links: T) -> u64 {
     links.into()
 }

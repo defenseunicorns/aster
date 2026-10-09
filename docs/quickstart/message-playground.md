@@ -109,12 +109,21 @@ application payloads, not trusted terminal control sequences.
 The controller creates a fresh temporary root, prints its exact location, and
 retains it after normal exit, failure, or interruption. It contains the
 independent node stores, disposable unprotected-reference mission bundles,
-owner-only local API tokens, a bounded rotating controller journal, and
-bounded rotating recent agent output under `<root>/logs`. The numbered log
+owner-only local API tokens, one durable numbered-publication journal per
+node, a bounded rotating presentation log, and bounded rotating recent agent output under `<root>/logs`. The numbered log
 segments are inspection tails, not complete per-process acceptance receipts.
-The journal and each node's stdout/stderr retain four 256 KiB segments; journal
-rotation preserves complete JSON Lines records, while agent segments preserve
+The presentation log and each node's stdout/stderr retain four 256 KiB segments;
+presentation-log rotation preserves complete JSON Lines records, while agent segments preserve
 the bounded byte tail.
+
+The wrapper builds `asterctl` alongside the node and agent. Each node keeps a
+stable publication identity and `publication.redb` journal across its process
+restarts and topology changes. The controller recovers pending or committed
+work using its original journaled payload, updates the message view
+idempotently, and acknowledges the result afterward. A transport failure never
+silently abandons an operation. Missing or corrupt journals require explicit
+repair; restarting a node does not recreate them. Subscription and observation
+commands retain their existing behavior.
 
 Ctrl-C and ordinary exit stop and reap the processes before returning status
 to the shell; retention is intentional so failures can be inspected. The root

@@ -89,32 +89,75 @@ The RPC timeout does not limit time spent entering a payload on stdin.
 
 ## Publish
 
+Initialize one journal for a stable application identity, then reuse it across
+CLI invocations:
+
 ```sh
+asterctl publication-init --journal ./publisher.redb --client-id chat-controller
 asterctl --token-file ./client.token publish \
-    --topic chat.events --scope mission/team/alpha \
-    --operation-key auto "Hello, Aster!"
+    --journal ./publisher.redb --client-id chat-controller \
+    --topic chat.events --scope mission/team/alpha "Hello, Aster!"
 
 cat image.png | asterctl --token-file ./client.token publish \
-    --topic chat.events --scope mission/team/alpha --operation-key image-001
+    --journal ./publisher.redb --client-id chat-controller \
+    --topic chat.events --scope mission/team/alpha
 ```
+
+Journal initialization is local and requires no token. It refuses an existing
+file. Keep the journal in a protected directory: it contains complete plaintext
+intents and payloads. Opening a missing, corrupt, already-open, or differently
+configured journal fails before reading stdin or contacting the agent. Do not
+delete and recreate an established journal or choose a new client ID to retry
+an uncertain operation. Lost-journal recovery is outside this increment.
 
 Supply one `MSG` argument or read the payload from stdin until EOF. When stdin
 is a terminal, the CLI prints instructions to stderr before reading: finish
 with Ctrl-D on an empty line, or cancel with Ctrl-C. Piped input, an explicit
 `MSG`, and tombstone publications do not print these instructions. Payload
 bytes are preserved, including NUL bytes and newlines from stdin; no newline is
-added to `MSG`. Use `--` before a message beginning with `-`.
-The complete encoded request, including metadata, must fit within 1 MiB.
+added to `MSG`. Use `--` before a message beginning with `-`. The complete
+encoded request, including space for the largest session and sequence fields,
+must fit within 1 MiB.
 
-See `asterctl publish --help` or [asterctl-publish(1)](asterctl-publish.1)
-for all publication options. `--operation-key KEY|auto` is required.
-Reuse the same key with an identical request for an idempotent retry;
-see [Operation keys and manual recovery](#operation-keys-and-manual-recovery).
+Fresh publish JSON contains the numbered `result` and the service's transient
+`inserted` observation. Recovery/retry JSON contains the retained committed
+result; that receipt does not retain an insertion observation.
 
-This command uses the arbitrary-key `PublishEvent` RPC provided by the agent.
-For finite Events, the CLI checks that the receipt confirms the requested
-TTL. If an older agent omits it, the command reports failure; the Event may
-already have been published without the requested lifetime.
+The CLI recovers its fenced publication session, assigns a positive operation
+sequence durably, and announces that sequence before `PublishNumberedEvent`.
+It saves the committed result before displaying it. A failed publication stays
+journaled; new publication is blocked while an earlier intent remains pending.
+After an uncertain outcome, recover using the same journal and identity:
+
+```sh
+asterctl --token-file ./client.token --json publication-recover \
+    --journal ./publisher.redb --client-id chat-controller
+asterctl --token-file ./client.token --json publication-retry \
+    --journal ./publisher.redb --client-id chat-controller --sequence 1
+```
+
+`publication-show --sequence N` inspects one retained original intent locally;
+it does not contact the agent. This supports applying a recovered result using
+the exact original payload after process replacement.
+
+`publication-retry` sends the original journaled intent or displays its recovered
+committed receipt. Apply the result idempotently, then reclaim its journal and
+server result rows explicitly:
+
+```sh
+asterctl --token-file ./client.token publication-ack \
+    --journal ./publisher.redb --client-id chat-controller --sequence 1
+```
+
+`publication-abandon` with the same identity and `--sequence N` permanently
+consumes the next unadmitted sequence. It cannot undo a committed Event. Use it
+only when deliberately discarding that pending operation. Transport errors do
+not trigger abandonment. TTL cleanup may retire Event content while its
+committed receipt remains recoverable until acknowledgement.
+
+See `asterctl publish --help` or [asterctl-publish(1)](asterctl-publish.1) for
+publication options. Subscription creation retains its existing operation-key
+model until the separate client-ownership increment.
 
 ## Query
 
@@ -199,10 +242,9 @@ See [asterctl-unsubscribe(1)](asterctl-unsubscribe.1).
 
 ## Operation keys and manual recovery
 
-Both `publish` and `subscribe` require `--operation-key KEY|auto`.
+`subscribe` requires `--operation-key KEY|auto`.
 `--operation-key auto` and `--operation-key=auto` are equivalent. An omitted
-key is an argument error (exit code `2`), detected before reading a publication
-payload from stdin or sending an RPC:
+key is an argument error (exit code `2`), detected before sending an RPC:
 
 ```text
 asterctl: --operation-key is required; specify a key or 'auto'
@@ -219,7 +261,7 @@ asterctl: operation-key=8f129cd0e346a27b9014fe6c72a583bd
 ```
 
 If writing or flushing that message fails, the command exits with code `1`
-without sending the RPC. `publish` and `subscribe` JSON results
+without sending the RPC. Subscription JSON results
 also include `operation_key`, for both explicit and generated keys.
 
 A timeout, lost connection, or unusable response can leave the operation's
@@ -228,11 +270,11 @@ command exits with code `1` and reports the key and recovery instruction on
 stderr, for example:
 
 ```text
-asterctl: PublishEvent outcome unknown: deadline_exceeded
+asterctl: CreateEventSubscription outcome unknown: deadline_exceeded
 retry the identical request with --operation-key=8f129cd0e346a27b9014fe6c72a583bd
 ```
 
-Subscription diagnostics use `CreateEventSubscription`. Request rejections
+Request rejections
 such as `invalid_argument` or `aborted` are reported as failures. Codes that
 also represent lost or unusable responses, including `resource_exhausted`,
 are conservatively reported as unknown outcomes.
@@ -240,7 +282,8 @@ are conservatively reported as unknown outcomes.
 To recover, repeat the request against the same agent with the printed key
 and identical parameters and payload. For stdin, retain and reuse the original
 bytes. Do not use `auto` for that retry: every invocation generates a new key.
-No automatic retry is performed. The CLI keeps no persistent journal; printing
+No automatic subscription retry is performed. Subscription creation keeps no
+persistent journal; printing
 and flushing a key does not guarantee durable storage. Automation should save
 an explicit key and the request before invoking the command.
 
@@ -255,10 +298,11 @@ booleans display `Yes` or `No`; enum names display as readable words (for
 example, `Last contact complete`). Unknown enum values display as `Unknown (N)`.
 Identities remain full standard padded base64.
 
-Publication receipts show the Event ID, publisher, counters, priority,
-acceptance marker, and TTL. The result is `Published locally` for a new Event
-or `Already published` for an idempotent retry; both succeed. TTL displays its
-original duration, including milliseconds, or `None` for no expiry.
+Publication results show the client operation sequence, committed Event and
+transfer IDs, original acceptance marker, and current content status. Retired
+content retains its committed identity and includes a retirement reason in
+JSON. Use query to inspect source counters, priority, or TTL while content is
+available. Printing a result does not acknowledge or erase it.
 
 Storage sizes use binary units (`B`, `KiB`, `MiB`, and so on), rounded to at most
 two decimal places. Durations use days, hours, minutes, and seconds, such as

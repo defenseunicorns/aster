@@ -28,9 +28,9 @@ from types import ModuleType
 from typing import Any, Iterable
 
 
-SCHEMA = "aster-selected-linux-event-custody-receipt/v1"
-RAW_SCHEMA = "aster-selected-linux-event-custody-raw/v1"
-TRANSCRIPT_SCHEMA = "aster-linux-event-custody-transcript/v1"
+SCHEMA = "aster-selected-linux-event-custody-receipt/v2"
+RAW_SCHEMA = "aster-selected-linux-event-custody-raw/v2"
+TRANSCRIPT_SCHEMA = "aster-linux-event-custody-transcript/v2"
 CLAIM = "linux-boottime-finite-ttl-priority-quota-route-only-store-and-forward-receive-only-zero-disclosure"
 RAW_CLAIM = "selected-linux-arm64-event-custody-ttl-quota-receive-only-acceptance"
 RECEIPT_NAME = "selected-linux-event-custody-receipt.json"
@@ -68,6 +68,9 @@ ADMITTED_SOURCE_PATHS = tuple(
             "crates/aster-core/src/crypto/reference.rs", "crates/aster-core/src/lib.rs",
             "crates/aster-core/src/source_event.rs", "crates/aster-iroh/Cargo.toml",
             "crates/aster-iroh/src/lib.rs", "crates/aster-node/Cargo.toml",
+            "crates/aster-node/src/publication_journal.rs",
+            "tools/historical/check-selected-live-event-receipt.py",
+            "tools/historical/check-selected-linux-event-custody-receipt.py",
             "crates/aster-node/src/application.rs", "crates/aster-node/src/frame.rs",
             "crates/aster-node/src/identity.rs", "crates/aster-node/src/lib.rs",
             "crates/aster-node/src/mission.rs", "crates/aster-node/src/runtime.rs",
@@ -110,6 +113,7 @@ SECRET_FILES = {
     for participant in PARTICIPANTS
     for relative in ("mission.bundle", "state/identity.key", "state/mesh.redb")
 }
+SECRET_FILES["participants/origin/state/linux-custody-publication.redb"] = 0o600
 HEX32 = re.compile(r"[0-9a-f]{64}\Z")
 CONTAINER_ID = re.compile(r"[0-9a-f]{64}\Z")
 BOOT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
@@ -117,7 +121,7 @@ SOCKET = re.compile(r"127\.0\.0\.1:([1-9][0-9]{0,4})\Z")
 FIELD = re.compile(r"[a-z][a-z0-9_]*\Z")
 
 RECORD_KEYS = {
-    "META": ("schema", "claim", "platform", "custody_clock", "participants", "contacts"),
+    "META": ("schema", "claim", "platform", "custody_clock", "participants", "contacts", "publication_model"),
     "PARTICIPANT": ("participant", "access", "carrier", "mission", "authority", "provisioning"),
     "SELECTOR": ("participant", "mode", "seeded_while", "topic", "scope", "inspection"),
     "QUOTA": ("participant", "phase", "scope", "max_items", "max_bytes", "exact_scope"),
@@ -240,7 +244,7 @@ def validate_transcript(data: bytes) -> dict[str, Any]:
     if len(lines) != TRANSCRIPT_RECORDS:
         fail("transcript has the wrong exact record count")
     records = [parse_record(line, expected, index) for index, (line, expected) in enumerate(zip(lines, EXPECTED_SEQUENCE))]
-    require_fields(records[0], {"schema": TRANSCRIPT_SCHEMA, "claim": CLAIM, "platform": "linux", "custody_clock": "clock_boottime_suspend_inclusive", "participants": "3", "contacts": "2"}, "META")
+    require_fields(records[0], {"schema": TRANSCRIPT_SCHEMA, "claim": CLAIM, "platform": "linux", "custody_clock": "clock_boottime_suspend_inclusive", "participants": "3", "contacts": "2", "publication_model": "numbered-v1"}, "META")
 
     actors = records[1:4]
     expected_access = {"origin": "member", "relay": "route_only", "receiver": "member"}
@@ -414,8 +418,7 @@ def validate_stdout(data: bytes, transcript: bytes, runtime_facts: bytes, transc
 
 def validate_stderr(data: bytes, transcript_facts: dict[str, Any]) -> dict[str, Any]:
     del transcript_facts
-    if data:
-        fail("captured stderr is nonempty and therefore not a passing run")
+    BASE.validate_publication_diagnostics(data, inserted=4, retries=0, failures=0)
     return {"contacts": 0, "sensitive": set()}
 
 
@@ -473,6 +476,9 @@ def validate_inventory(root_descriptor: int) -> dict[str, dict[str, os.stat_resu
         store = files[f"participants/{participant}/state/mesh.redb"]
         if not 0 < mission.st_size <= MISSION_MAX_BYTES or identity.st_size != IDENTITY_BYTES or not 0 < store.st_size <= STORE_MAX_BYTES:
             fail("participant secret artifact metadata differs from bounds")
+    journal = files["participants/origin/state/linux-custody-publication.redb"]
+    if not 0 < journal.st_size <= STORE_MAX_BYTES:
+        fail("publication journal violates its metadata-only size bound")
     return {"directories": directories, "files": files}
 
 
@@ -811,7 +817,7 @@ def validate_raw_root(raw_root: Path, source: Path, authority: dict[str, Any]) -
             fail("raw root path vanished during terminal validation")
         if (final_path.st_dev, final_path.st_ino) != (final_root.st_dev, final_root.st_ino):
             fail("raw root path changed identity during validation")
-        return {"run": run, "transcript": transcript, "facts": facts, "terminal": terminal_stdout, "retention": {"directories": len(EXPECTED_DIRECTORIES), "files": len(PUBLIC_FILES) + len(SECRET_FILES), "participants": 3, "mission_artifacts": 3, "identity_artifacts": 3, "store_artifacts": 3, "secret_contents": "metadata-only-not-opened-read-or-hashed"}}
+        return {"run": run, "transcript": transcript, "facts": facts, "terminal": terminal_stdout, "retention": {"directories": len(EXPECTED_DIRECTORIES), "files": len(PUBLIC_FILES) + len(SECRET_FILES), "participants": 3, "mission_artifacts": 3, "identity_artifacts": 3, "store_artifacts": 3, "publication_journal_artifacts": 1, "secret_contents": "metadata-only-not-opened-read-or-hashed"}}
     finally:
         os.close(root_descriptor)
 
@@ -996,6 +1002,7 @@ def project(source: Path, raw_root: Path) -> bytes:
 
 def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--historical-v1", action="store_true", help="verify or project the unchanged historical v1 format")
     parser.add_argument("receipt", nargs="?", default="-", help="receipt to validate, or '-' to project")
     parser.add_argument("--raw-root", required=True, type=Path)
     parser.add_argument("--source", required=True, type=Path)
@@ -1007,7 +1014,19 @@ def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(arguments: list[str] | None = None) -> None:
-    options = parse_args(arguments)
+    selected_arguments = list(sys.argv[1:] if arguments is None else arguments)
+    if "--historical-v1" in selected_arguments:
+        import importlib.util
+        selected_arguments.remove("--historical-v1")
+        path = Path(__file__).parent / "historical" / Path(__file__).name
+        spec = importlib.util.spec_from_file_location("aster_historical_receipt", path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("historical receipt validator unavailable")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.main(selected_arguments)
+        return
+    options = parse_args(selected_arguments)
     try:
         source = Path(os.path.abspath(os.fspath(options.source)))
         raw_root = Path(os.path.abspath(os.fspath(options.raw_root)))

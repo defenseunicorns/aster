@@ -26,9 +26,6 @@ fn command(kind: &str, port: u16, key: Option<&str>) -> Command {
         kind,
         "--scope=x",
     ]);
-    if kind == "publish" {
-        command.arg("--topic=x");
-    }
     if let Some(key) = key {
         command.args(["--operation-key", key]);
     }
@@ -111,222 +108,186 @@ fn request(stream: &mut TcpStream) -> Vec<u8> {
     body
 }
 
-fn key_from_request(kind: &str, body: &[u8]) -> String {
-    let key = if kind == "publish" {
-        api::PublishEventRequest::decode_from_slice(body)
-            .unwrap()
-            .operation_key
-    } else {
+fn key_from_request(_kind: &str, body: &[u8]) -> String {
+    String::from_utf8(
         api::CreateEventSubscriptionRequest::decode_from_slice(body)
             .unwrap()
-            .operation_key
-    };
-    String::from_utf8(key).unwrap()
+            .operation_key,
+    )
+    .unwrap()
 }
 
-fn respond(stream: &mut TcpStream, kind: &str, inserted: bool) {
-    let body = if kind == "publish" {
-        api::PublishEventResponse {
-            id: vec![1; 32],
-            publisher: vec![2; 32],
-            inserted,
-            ..Default::default()
-        }
-        .encode_to_vec()
-    } else {
-        api::CreateEventSubscriptionResponse {
-            subscription_id: vec![1; 32],
-            inserted,
-            ..Default::default()
-        }
-        .encode_to_vec()
-    };
+fn respond(stream: &mut TcpStream, _kind: &str, inserted: bool) {
+    let body = api::CreateEventSubscriptionResponse {
+        subscription_id: vec![1; 32],
+        inserted,
+        ..Default::default()
+    }
+    .encode_to_vec();
     write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/proto\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
     stream.write_all(&body).unwrap();
 }
 
 #[test]
 fn missing_key_fails_before_stdin_or_rpc() {
-    for kind in ["publish", "subscribe"] {
-        let listener = listener();
-        let child = command(kind, listener.local_addr().unwrap().port(), None)
-            .spawn()
-            .unwrap();
-        let output = finish(child);
-        assert_eq!(output.status.code(), Some(2));
-        assert!(output.stdout.is_empty());
-        assert_eq!(
-            String::from_utf8(output.stderr).unwrap(),
-            "asterctl: --operation-key is required; specify a key or 'auto'\n"
-        );
-        assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
-    }
+    let kind = "subscribe";
+    let listener = listener();
+    let child = command(kind, listener.local_addr().unwrap().port(), None)
+        .spawn()
+        .unwrap();
+    let output = finish(child);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "asterctl: --operation-key is required; specify a key or 'auto'\n"
+    );
+    assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
 }
 
 #[test]
 fn auto_key_is_available_before_rpc_response_and_matches_json_and_request() {
-    for kind in ["publish", "subscribe"] {
-        let listener = listener();
-        let mut cmd = command(kind, listener.local_addr().unwrap().port(), Some("auto"));
-        if kind == "publish" {
-            cmd.arg("payload");
-        }
-        let mut child = cmd.spawn().unwrap();
-        let stderr = child.stderr.take().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let reader = thread::spawn(move || {
-            let mut line = String::new();
-            BufReader::new(stderr).read_line(&mut line).unwrap();
-            tx.send(line).unwrap();
-        });
-        let line = rx.recv_timeout(Duration::from_secs(2));
-        if line.is_err() {
-            child.kill().unwrap();
-            child.wait().unwrap();
-        }
-        let line = line.expect("auto key must be flushed before waiting for the agent");
-        let mut stream = accept(&listener);
-        let key = key_from_request(kind, &request(&mut stream));
-        assert_eq!(key.len(), 32);
-        assert!(
-            key.bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        );
-        assert_eq!(line, format!("asterctl: operation-key={key}\n"));
-        respond(&mut stream, kind, true);
-        let output = finish(child);
-        reader.join().unwrap();
-        assert!(output.status.success());
-        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(value["operation_key"], key);
+    let kind = "subscribe";
+    let listener = listener();
+    let mut cmd = command(kind, listener.local_addr().unwrap().port(), Some("auto"));
+    let mut child = cmd.spawn().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut line = String::new();
+        BufReader::new(stderr).read_line(&mut line).unwrap();
+        tx.send(line).unwrap();
+    });
+    let line = rx.recv_timeout(Duration::from_secs(2));
+    if line.is_err() {
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
+    let line = line.expect("auto key must be flushed before waiting for the agent");
+    let mut stream = accept(&listener);
+    let key = key_from_request(kind, &request(&mut stream));
+    assert_eq!(key.len(), 32);
+    assert!(
+        key.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    );
+    assert_eq!(line, format!("asterctl: operation-key={key}\n"));
+    respond(&mut stream, kind, true);
+    let output = finish(child);
+    reader.join().unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["operation_key"], key);
 }
 
 #[test]
 fn explicit_keys_are_preserved_and_json_escaped() {
-    for kind in ["publish", "subscribe"] {
-        let listener = listener();
-        let key = "читач\t\n'\"$()`\\";
-        let mut cmd = command(kind, listener.local_addr().unwrap().port(), Some(key));
-        if kind == "publish" {
-            cmd.arg("payload");
-        }
-        let child = cmd.spawn().unwrap();
-        let mut stream = accept(&listener);
-        assert_eq!(key_from_request(kind, &request(&mut stream)), key);
-        respond(&mut stream, kind, true);
-        let output = finish(child);
-        assert!(output.status.success());
-        assert!(output.stderr.is_empty());
-        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(value["operation_key"], key);
-    }
+    let kind = "subscribe";
+    let listener = listener();
+    let key = "читач\t\n'\"$()`\\";
+    let mut cmd = command(kind, listener.local_addr().unwrap().port(), Some(key));
+    let child = cmd.spawn().unwrap();
+    let mut stream = accept(&listener);
+    assert_eq!(key_from_request(kind, &request(&mut stream)), key);
+    respond(&mut stream, kind, true);
+    let output = finish(child);
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["operation_key"], key);
 }
 
 #[test]
 fn lost_response_allows_manual_retry_with_identical_request_and_key() {
-    for kind in ["publish", "subscribe"] {
+    let kind = "subscribe";
+    let listener = listener();
+    let port = listener.local_addr().unwrap().port();
+    let mut cmd = command(kind, port, Some("auto"));
+    let child = cmd.spawn().unwrap();
+    let mut stream = accept(&listener);
+    let original = request(&mut stream);
+    let key = key_from_request(kind, &original);
+    // The agent committed the mutation, but the response was lost.
+    drop(stream);
+    let output = finish(child);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("outcome unknown"), "{error}");
+    assert!(
+        error.contains(&format!(
+            "retry the identical request with --operation-key={key}"
+        )),
+        "{error}"
+    );
+    assert!(!error.contains(TOKEN));
+    assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+    let mut cmd = command(kind, port, Some(&key));
+    let child = cmd.spawn().unwrap();
+    let mut stream = accept(&listener);
+    assert_eq!(request(&mut stream), original);
+    respond(&mut stream, kind, false);
+    let output = finish(child);
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["operation_key"], key);
+    assert_eq!(value["inserted"], false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn auto_does_not_send_rpc_if_stderr_write_fails() {
+    let kind = "subscribe";
+    let listener = listener();
+    let mut cmd = command(kind, listener.local_addr().unwrap().port(), Some("auto"));
+    cmd.stderr(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap(),
+    );
+    let output = finish(cmd.spawn().unwrap());
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+}
+
+#[test]
+fn unusable_receipts_keep_the_key_and_report_unknown_outcomes() {
+    let kind = "subscribe";
+    for body in [vec![], vec![0x0a, 0xff], vec![0; 4 * 1024 * 1024 + 1]] {
         let listener = listener();
-        let port = listener.local_addr().unwrap().port();
-        let mut cmd = command(kind, port, Some("auto"));
+        let mut cmd = command(
+            kind,
+            listener.local_addr().unwrap().port(),
+            Some("saved-key"),
+        );
         if kind == "publish" {
             cmd.arg("payload");
         }
         let child = cmd.spawn().unwrap();
         let mut stream = accept(&listener);
-        let original = request(&mut stream);
-        let key = key_from_request(kind, &original);
-        // The agent committed the mutation, but the response was lost.
-        drop(stream);
+        request(&mut stream);
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/proto\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+        stream.write_all(&body).unwrap();
         let output = finish(child);
         assert_eq!(output.status.code(), Some(1));
         assert!(output.stdout.is_empty());
         let error = String::from_utf8(output.stderr).unwrap();
         assert!(error.contains("outcome unknown"), "{error}");
         assert!(
-            error.contains(&format!(
-                "retry the identical request with --operation-key={key}"
-            )),
+            error.contains("retry the identical request with --operation-key=saved-key"),
             "{error}"
         );
-        assert!(!error.contains(TOKEN));
-        assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
-        let mut cmd = command(kind, port, Some(&key));
-        if kind == "publish" {
-            cmd.arg("payload");
-        }
-        let child = cmd.spawn().unwrap();
-        let mut stream = accept(&listener);
-        assert_eq!(request(&mut stream), original);
-        respond(&mut stream, kind, false);
-        let output = finish(child);
-        assert!(output.status.success());
-        assert!(output.stderr.is_empty());
-        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(value["operation_key"], key);
-        assert_eq!(value["inserted"], false);
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn auto_does_not_send_rpc_if_stderr_write_fails() {
-    for kind in ["publish", "subscribe"] {
-        let listener = listener();
-        let mut cmd = command(kind, listener.local_addr().unwrap().port(), Some("auto"));
-        if kind == "publish" {
-            cmd.arg("payload");
-        }
-        cmd.stderr(
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open("/dev/full")
-                .unwrap(),
-        );
-        let output = finish(cmd.spawn().unwrap());
-        assert_eq!(output.status.code(), Some(1));
-        assert!(output.stdout.is_empty());
-        assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
-    }
-}
-
-#[test]
-fn unusable_receipts_keep_the_key_and_report_unknown_outcomes() {
-    for kind in ["publish", "subscribe"] {
-        for body in [vec![], vec![0x0a, 0xff], vec![0; 4 * 1024 * 1024 + 1]] {
-            let listener = listener();
-            let mut cmd = command(
-                kind,
-                listener.local_addr().unwrap().port(),
-                Some("saved-key"),
-            );
-            if kind == "publish" {
-                cmd.arg("payload");
-            }
-            let child = cmd.spawn().unwrap();
-            let mut stream = accept(&listener);
-            request(&mut stream);
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/proto\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
-            stream.write_all(&body).unwrap();
-            let output = finish(child);
-            assert_eq!(output.status.code(), Some(1));
-            assert!(output.stdout.is_empty());
-            let error = String::from_utf8(output.stderr).unwrap();
-            assert!(error.contains("outcome unknown"), "{error}");
-            assert!(
-                error.contains("retry the identical request with --operation-key=saved-key"),
-                "{error}"
-            );
-        }
     }
 }
 
 #[test]
 fn timeouts_preserve_the_generated_key_without_retrying() {
-    let cases: Vec<_> = ["publish", "subscribe"].into_iter().map(|kind| thread::spawn(move || {
+    let cases: Vec<_> = ["subscribe"].into_iter().map(|kind| thread::spawn(move || {
         let listener = listener();
         let mut cmd = command(kind, listener.local_addr().unwrap().port(), Some("auto"));
-        if kind == "publish" { cmd.arg("payload"); }
         let child = cmd.spawn().unwrap();
         let mut stream = accept(&listener);
         let key = key_from_request(kind, &request(&mut stream));

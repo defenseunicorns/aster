@@ -26,9 +26,10 @@ use aster_mesh::{
     ReferenceProvisioner, Scope, SelectedBridgeAuthorizationPolicy, SelectedBridgeNarrowingPolicy,
     SelectedEventBridgeAdapter, Topic,
 };
-use aster_node::application::EventPublishRequest;
+use aster_node::application::{EventId, EventQuery, SelectedEventHandle};
 use aster_node::bridge_runtime::{SelectedEventBridgeConfig, SelectedEventBridgeEdge};
 use aster_node::mission::UnprotectedReferenceMission;
+use aster_node::publication_journal as numbered;
 use aster_node::{
     EventEmissionPolicy, NodeApplication, NodeConfig, SelectedForwardingConfig, StoreLimits,
     format_node_id, format_receipt_field, start_node_with_forwarding,
@@ -45,6 +46,9 @@ const ROLES: [&str; 5] = [
 const MISSION_FILE: &str = "mission.unprotected-reference.bundle";
 const FIRST_AUTHORIZATION_FILE: &str = "bridge-authorization-1.bin";
 const SECOND_AUTHORIZATION_FILE: &str = "bridge-authorization-2.bin";
+const PUBLICATION_JOURNAL_FILE: &str = "publication.redb";
+const PUBLICATION_CLIENT: &[u8] = b"native.hierarchy-source.v1";
+const SCALE_PUBLICATION_CLIENT: &[u8] = b"native.hierarchy-scale-source.v1";
 const COMPLETE_FILE: &str = ".hierarchy-provisioned-v1";
 const SCALE_COMPLETE_FILE: &str = ".hierarchy-scale-provisioned-v1";
 const SCALE_AUTHORIZATION_COUNT_FILE: &str = ".bridge-authorization-count-v1";
@@ -501,6 +505,10 @@ fn provision(root: &Path) -> DemoResult<()> {
             authorization_two.exact_bytes(),
         )?;
     }
+    numbered::Journal::initialize(
+        &root.join("publisher").join(PUBLICATION_JOURNAL_FILE),
+        PUBLICATION_CLIENT,
+    )?;
     for (_, path) in &role_roots {
         write_owner_only(&path.join(COMPLETE_FILE), b"aster-hierarchy-demo/v1\n")?;
         File::open(path)?.sync_all()?;
@@ -764,6 +772,12 @@ fn provision_scale(root: &Path, publishers_per_leaf: u8) -> DemoResult<()> {
         }
     }
     for (role, path) in &role_roots {
+        if matches!(Role::parse(role)?, Role::ScalePublisher(_)) {
+            numbered::Journal::initialize(
+                &path.join(PUBLICATION_JOURNAL_FILE),
+                SCALE_PUBLICATION_CLIENT,
+            )?;
+        }
         write_owner_only(
             &path.join(SCALE_COMPLETE_FILE),
             &scale_complete_bytes(role, publishers_per_leaf),
@@ -798,6 +812,12 @@ fn validate_existing_scale_provisioning(
     publishers_per_leaf: u8,
 ) -> DemoResult<()> {
     for (role, path) in role_roots {
+        if matches!(Role::parse(role)?, Role::ScalePublisher(_)) {
+            drop(numbered::Journal::open(
+                &path.join(PUBLICATION_JOURNAL_FILE),
+                SCALE_PUBLICATION_CLIENT,
+            )?);
+        }
         if !path.join(MISSION_FILE).is_file() {
             return Err(format!("{role} scale provisioning is incomplete").into());
         }
@@ -828,6 +848,12 @@ fn validate_existing_scale_provisioning(
 
 fn validate_existing_provisioning(role_roots: &[(&str, PathBuf)]) -> DemoResult<()> {
     for (role, path) in role_roots {
+        if *role == "publisher" {
+            drop(numbered::Journal::open(
+                &path.join(PUBLICATION_JOURNAL_FILE),
+                PUBLICATION_CLIENT,
+            )?);
+        }
         if !path.join(MISSION_FILE).is_file() {
             return Err(format!("{role} provisioning is incomplete").into());
         }
@@ -978,6 +1004,17 @@ async fn run_role(command: Command) -> DemoResult<()> {
     if scale_state.is_none() && (role.is_scale_only() || !state.join(COMPLETE_FILE).is_file()) {
         return Err("hierarchy state is not initialized for this role".into());
     }
+    let mut publication_journal = match role {
+        Role::Publisher => Some(numbered::Journal::open(
+            &state.join(PUBLICATION_JOURNAL_FILE),
+            PUBLICATION_CLIENT,
+        )?),
+        Role::ScalePublisher(_) => Some(numbered::Journal::open(
+            &state.join(PUBLICATION_JOURNAL_FILE),
+            SCALE_PUBLICATION_CLIENT,
+        )?),
+        _ => None,
+    };
     let mission = UnprotectedReferenceMission::load(state.join(MISSION_FILE))?;
     let mission_id = mission.identity();
     let mission_authority = mission.mission_authority_id();
@@ -1017,11 +1054,25 @@ async fn run_role(command: Command) -> DemoResult<()> {
             "disabled"
         },
     );
+    if let Some(journal) = &mut publication_journal {
+        journal
+            .recover(&mut numbered::Backend::Live(&running.selected_events()))
+            .await?;
+    }
     if role == Role::Publisher {
-        publish_fixtures(&running.selected_events()).await?;
+        publish_fixtures(
+            &running.selected_events(),
+            publication_journal
+                .as_mut()
+                .ok_or("publisher journal missing")?,
+        )
+        .await?;
     } else if let Role::ScalePublisher(index) = role {
         publish_scale_fixtures(
             &running.selected_events(),
+            publication_journal
+                .as_mut()
+                .ok_or("scale publisher journal missing")?,
             index,
             scale_state.ok_or("scale publisher did not load scale state")?,
         )
@@ -1031,34 +1082,109 @@ async fn run_role(command: Command) -> DemoResult<()> {
     Ok(())
 }
 
-async fn publish_fixtures(events: &aster_node::application::SelectedEventHandle) -> DemoResult<()> {
-    for fixture in FIXTURES {
-        let published = events
-            .publish(EventPublishRequest {
-                operation_key: format!("hierarchy/publish/{}", fixture.case).into_bytes(),
-                predecessor: None,
-                topic: topic(fixture.topic)?,
-                scope: scope(ALPHA_SCOPE)?,
-                priority: fixture.priority,
-                logical_key: format!("hierarchy/{}", fixture.case).into_bytes(),
-                payload: fixture.payload.to_vec(),
-                tombstone: false,
-            })
+async fn publish_planned(
+    events: &SelectedEventHandle,
+    journal: &mut numbered::Journal,
+    index: usize,
+    intent: numbered::Intent,
+) -> DemoResult<EventId> {
+    let sequence = index as u64 + 1;
+    if sequence <= journal.completed_through() {
+        let mut query = EventQuery {
+            publisher: Some(events.identity()),
+            topic: Some(Topic::new(intent.topic.clone())?),
+            scope: Some(Scope::new(intent.scope.clone())?),
+            logical_key: Some(intent.logical_key.clone()),
+            limit: 128,
+            ..EventQuery::default()
+        };
+        let mut found = None;
+        loop {
+            let page = events.query(query.clone()).await?;
+            for event in page.items {
+                if found.replace(event).is_some() {
+                    return Err("completed hierarchy publication is ambiguous".into());
+                }
+            }
+            if !page.has_more {
+                break;
+            }
+            if page.scanned_through <= query.after_acceptance_marker {
+                return Err("hierarchy query did not advance".into());
+            }
+            query.after_acceptance_marker = page.scanned_through;
+        }
+        let event = found.ok_or("completed hierarchy publication is missing")?;
+        if event.payload != intent.payload
+            || event.priority as u8 != intent.priority
+            || event.tombstone != intent.tombstone
+            || event.ttl_ms != intent.ttl_ms
+        {
+            return Err("completed hierarchy publication differs from its fixed plan".into());
+        }
+        return Ok(event.id);
+    }
+    if journal.completed_through() + 1 != sequence {
+        return Err("hierarchy publication plan has a gap".into());
+    }
+    let result = journal
+        .publish(&mut numbered::Backend::Live(events), intent)
+        .await?;
+    Ok(EventId::from_bytes(
+        *result.result.receipt.semantic_id.as_bytes(),
+    ))
+}
+async fn finish_planned(
+    events: &SelectedEventHandle,
+    journal: &mut numbered::Journal,
+) -> DemoResult<()> {
+    if journal.pending().is_some() {
+        journal
+            .acknowledge(&mut numbered::Backend::Live(events))
             .await?;
-        println!(
-            "BRIDGE_SOURCE status=published case={} source_id={} topic={} priority={} payload_sha256={}",
-            fixture.case,
-            published.id,
-            fixture.topic,
-            fixture.priority_name,
-            format_node_id(Sha256::digest(fixture.payload).into()),
-        );
     }
     Ok(())
 }
-
+async fn publish_fixtures(
+    events: &SelectedEventHandle,
+    journal: &mut numbered::Journal,
+) -> DemoResult<()> {
+    if journal.completed_through() > FIXTURES.len() as u64 {
+        return Err("hierarchy publication plan frontier exceeds its bound".into());
+    }
+    for (index, fixture) in FIXTURES.iter().enumerate() {
+        let id = publish_planned(
+            events,
+            journal,
+            index,
+            numbered::Intent {
+                predecessor: None,
+                topic: topic(fixture.topic)?.as_str().into(),
+                scope: scope(ALPHA_SCOPE)?.as_str().into(),
+                priority: fixture.priority as u8,
+                logical_key: format!("hierarchy/{}", fixture.case).into_bytes(),
+                payload: fixture.payload.to_vec(),
+                tombstone: false,
+                ttl_ms: None,
+            },
+        )
+        .await?;
+        finish_planned(events, journal).await?;
+        println!(
+            "BRIDGE_SOURCE status=published case={} source_id={} topic={} priority={} payload_sha256={}",
+            fixture.case,
+            id,
+            fixture.topic,
+            fixture.priority_name,
+            format_node_id(Sha256::digest(fixture.payload).into())
+        );
+        std::io::stdout().flush()?;
+    }
+    Ok(())
+}
 async fn publish_scale_fixtures(
-    events: &aster_node::application::SelectedEventHandle,
+    events: &SelectedEventHandle,
+    journal: &mut numbered::Journal,
     publisher_index: u8,
     publishers_per_leaf: u8,
 ) -> DemoResult<()> {
@@ -1070,28 +1196,40 @@ async fn publish_scale_fixtures(
         return Err("scale publisher role is outside its leaf bound".into());
     }
     let role = format!("p{publisher_index:03}");
-    for (case, topic_name) in [("allowed", ALLOWED_TOPIC), ("denied", DENIED_TOPIC)] {
+    if journal.completed_through() > 2 {
+        return Err("hierarchy scale publication plan frontier exceeds its bound".into());
+    }
+    for (index, (case, topic_name)) in [("allowed", ALLOWED_TOPIC), ("denied", DENIED_TOPIC)]
+        .into_iter()
+        .enumerate()
+    {
         let payload = format!("HIERARCHY_SCALE_PAYLOAD_SENTINEL_{role}_{case}").into_bytes();
-        let published = events
-            .publish(EventPublishRequest {
-                operation_key: format!("hierarchy-scale/{role}/publish/{case}").into_bytes(),
+        let id = publish_planned(
+            events,
+            journal,
+            index,
+            numbered::Intent {
                 predecessor: None,
-                topic: topic(topic_name)?,
-                scope: scope(&scale_leaf_scope(leaf_index))?,
-                priority: Priority::Immediate,
+                topic: topic(topic_name)?.as_str().into(),
+                scope: scope(&scale_leaf_scope(leaf_index))?.as_str().into(),
+                priority: Priority::Immediate as u8,
                 logical_key: format!("hierarchy-scale/{role}/{case}").into_bytes(),
                 payload: payload.clone(),
                 tombstone: false,
-            })
-            .await?;
+                ttl_ms: None,
+            },
+        )
+        .await?;
+        finish_planned(events, journal).await?;
         println!(
             "HIERARCHY_SCALE_SOURCE status=published role={} case={} source_id={} topic={} priority=immediate payload_sha256={}",
             role,
             case,
-            published.id,
+            id,
             topic_name,
-            format_node_id(Sha256::digest(&payload).into()),
+            format_node_id(Sha256::digest(&payload).into())
         );
+        std::io::stdout().flush()?;
     }
     Ok(())
 }
@@ -1099,6 +1237,64 @@ async fn publish_scale_fixtures(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn completed_source_plan_reopens_without_new_events_or_legacy_rows() {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let suffix: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+        let root = std::env::temp_dir().join(format!("aster-numbered-hierarchy-test-{suffix}"));
+        fs::create_dir(&root).unwrap();
+        provision(&root).unwrap();
+        let state = root.join("publisher");
+        let path = state.join(PUBLICATION_JOURNAL_FILE);
+        let mut first_ids = None;
+        for _ in 0..2 {
+            let mission = UnprotectedReferenceMission::load(state.join(MISSION_FILE)).unwrap();
+            let running = aster_node::start_node(NodeConfig::new(
+                &state,
+                "127.0.0.1:0".parse().unwrap(),
+                mission,
+            ))
+            .await
+            .unwrap();
+            let events = running.selected_events();
+            let mut journal = numbered::Journal::open(&path, PUBLICATION_CLIENT).unwrap();
+            journal
+                .recover(&mut numbered::Backend::Live(&events))
+                .await
+                .unwrap();
+            publish_fixtures(&events, &mut journal).await.unwrap();
+            let page = events
+                .query(EventQuery {
+                    publisher: Some(events.identity()),
+                    ..EventQuery::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(page.items.len(), FIXTURES.len());
+            let ids: Vec<_> = page.items.into_iter().map(|event| event.id).collect();
+            if let Some(previous) = &first_ids {
+                assert_eq!(previous, &ids);
+            } else {
+                first_ids = Some(ids);
+            }
+            let status = events.status().await.unwrap();
+            assert_eq!(status.event_operation_capacity.numbered_stats.clients, 1);
+            assert_eq!(
+                status
+                    .event_operation_capacity
+                    .numbered_stats
+                    .outstanding_results,
+                0
+            );
+            assert_eq!(status.event_operation_capacity.stats.records_total, 0);
+            drop(journal);
+            drop(events);
+            running.shutdown().await.unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn parser_keeps_init_and_run_modes_bounded() {

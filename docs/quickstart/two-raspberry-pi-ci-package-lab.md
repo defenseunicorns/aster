@@ -406,6 +406,7 @@ This was a disposable local client, not a package component. It uses Python's st
 import base64
 import json
 import secrets
+import subprocess
 import sys
 import time
 import urllib.error
@@ -414,6 +415,9 @@ from pathlib import Path
 
 TOKEN = Path('/etc/aster/agent-credentials/client-token')
 SUBSCRIPTION = Path('/var/lib/aster-agent/lab-subscription-id')
+JOURNAL = Path('/var/lib/aster-agent/lab-publication.redb')
+CLIENT_ID = 'two-pi-lab-source'
+CTL = '/usr/bin/asterctl'
 ENDPOINT = 'http://127.0.0.1:8181/aster.application.v1alpha1.AsterApplicationService/'
 TOPIC = 'mesh.messages'
 SCOPE = 'demo/playground'
@@ -445,6 +449,8 @@ def rpc(method: str, body: dict) -> dict:
 def prepare() -> None:
     if SUBSCRIPTION.exists():
         raise RuntimeError('lab subscription already exists; inspect before reusing')
+    # Explicit fresh provisioning; existing or missing later journals are never replaced.
+    subprocess.run([CTL, 'publication-init', '--journal', str(JOURNAL), '--client-id', CLIENT_ID], check=True, timeout=10)
     result = rpc('CreateEventSubscription', {
         'operationKey': encoded(secrets.token_bytes(24)),
         'topic': TOPIC,
@@ -458,16 +464,16 @@ def prepare() -> None:
 
 
 def publish(message: str) -> None:
-    payload = message.encode('utf-8')
-    result = rpc('PublishEvent', {
-        'operationKey': encoded(secrets.token_bytes(24)),
-        'topic': TOPIC,
-        'scope': SCOPE,
-        'priority': 'PRIORITY_ROUTINE',
-        'logicalKey': encoded(secrets.token_bytes(16)),
-        'payload': encoded(payload),
-    })
-    print(f"published_id={result['id']}")
+    result = subprocess.run([
+        CTL, '--token-file', str(TOKEN), '--json', 'publish',
+        '--journal', str(JOURNAL), '--client-id', CLIENT_ID,
+        '--topic', TOPIC, '--scope', SCOPE, '--priority', 'routine',
+        '--logical-key', 'two-pi-message', message,
+    ], check=True, capture_output=True, text=True, timeout=15)
+    receipt = json.loads(result.stdout)['result']
+    print(f"published_id={receipt['receipt']['eventId']}")
+    # Save idempotent application progress before publication-ack. Retain an
+    # unapplied result for publication-recover/show/retry after interruption.
 
 
 def poll(message: str) -> None:

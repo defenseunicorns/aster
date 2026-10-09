@@ -1,9 +1,9 @@
-use crate::{api, operation_key, validation};
+use crate::{api, journal, validation};
 use buffa::Message;
 use std::io::Read;
 
 pub const HELP: &str = "Usage: asterctl (--token TOKEN | --token-file PATH) [OPTIONS] publish
-                --topic TOPIC --scope SCOPE --operation-key KEY|auto [PUBLISH-OPTIONS] [MSG]
+                --topic TOPIC --scope SCOPE --journal PATH --client-id ID [PUBLISH-OPTIONS] [MSG]
 
 Publish an Event through a running Aster agent.
 Use MSG as the payload, or read standard input until EOF.
@@ -17,11 +17,13 @@ PUBLISH OPTIONS:
       --predecessor ID          Predecessor Event ID in Base64
       --ttl-ms MILLISECONDS     Positive Event lifetime (default: no expiry)
       --tombstone               Publish a tombstone; requires an empty payload
-      --operation-key KEY|auto  Required UTF-8 key, 1–256 bytes; auto generates a key
+      --journal PATH           Existing publication journal (required)
+      --client-id ID           Stable UTF-8 application identity, 1–64 bytes (required)
       --help                    Show this help
 
 See asterctl --help for global options.
-Generated keys are printed to stderr before sending and included in JSON output.
+Initialize once with publication-init. Assigned sequences are printed before sending.
+Use publication-recover after an uncertain outcome; acknowledge results explicitly.
 ";
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -29,20 +31,20 @@ const SIZE_ERROR: &str = "publication request exceeds 1 MiB";
 
 #[derive(Debug, PartialEq)]
 pub struct Publication {
-    pub request: api::PublishEventRequest,
+    pub request: api::PublishNumberedEventRequest,
     message: Option<String>,
-    operation_key: Option<operation_key::Selection>,
+    pub identity: journal::Identity,
 }
 
 impl Default for Publication {
     fn default() -> Self {
         Self {
-            request: api::PublishEventRequest {
+            request: api::PublishNumberedEventRequest {
                 priority: api::Priority::PRIORITY_ROUTINE.into(),
                 ..Default::default()
             },
             message: None,
-            operation_key: None,
+            identity: journal::Identity::default(),
         }
     }
 }
@@ -71,9 +73,7 @@ impl Publication {
                 self.request.scope = value;
             }
             "--logical-key" => self.request.logical_key = value.into_bytes(),
-            "--operation-key" => {
-                self.operation_key = Some(operation_key::Selection::parse(value)?);
-            }
+            "--journal" | "--client-id" => self.identity.set_option(name, value)?,
             "--priority" => {
                 self.request.priority = match value.as_str() {
                     "routine" => api::Priority::PRIORITY_ROUTINE,
@@ -124,21 +124,14 @@ impl Publication {
                 "--tombstone requires an empty payload and cannot be combined with --ttl-ms",
             );
         }
-        if self.operation_key.is_none() {
-            return Err(operation_key::REQUIRED);
-        }
+        self.identity.validate()?;
         Ok(())
     }
 
     pub fn into_request(
         mut self,
         input: impl Read,
-    ) -> Result<(api::PublishEventRequest, operation_key::Key), &'static str> {
-        let key = self
-            .operation_key
-            .ok_or(operation_key::REQUIRED)?
-            .resolve()?;
-        self.request.operation_key = key.value.as_bytes().to_vec();
+    ) -> Result<(api::PublishNumberedEventRequest, journal::Identity), &'static str> {
         if let Some(message) = self.message {
             self.request.payload = message.into_bytes();
         } else if !self.request.tombstone {
@@ -147,11 +140,18 @@ impl Publication {
                 .read_to_end(&mut self.request.payload)
                 .map_err(|_| "cannot read payload from standard input")?;
         }
+        // Reserve enough wire space for the stable identity and any future
+        // positive session/sequence before assigning or sending the intent.
+        self.request.client_id.clone_from(&self.identity.client_id);
+        self.request.session = u64::MAX;
+        self.request.operation_sequence = u64::MAX;
         if self.request.payload.len() > MAX_REQUEST_BYTES
             || self.request.encoded_len() as usize > MAX_REQUEST_BYTES
         {
             return Err(SIZE_ERROR);
         }
-        Ok((self.request, key))
+        self.request.session = 0;
+        self.request.operation_sequence = 0;
+        Ok((self.request, self.identity))
     }
 }

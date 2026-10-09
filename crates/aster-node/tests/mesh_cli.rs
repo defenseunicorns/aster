@@ -18,8 +18,8 @@ use aster_mesh::{ProvisioningAccess, ReferenceEnvelopeSealer, ReferenceProvision
 use aster_node::{
     MissionExpectedPeer, NodeApplication, NodeConfig, NodeIdentity, SelectedForwardingConfig,
     application::{
-        EventAcknowledgement, EventPollRequest, EventPublishRequest, EventSubscriptionRequest,
-        EventSyncStatus, PeerAuthorization, Priority,
+        EventAcknowledgement, EventPollRequest, EventSubscriptionRequest, EventSyncStatus,
+        PeerAuthorization, Priority,
     },
     mission::UnprotectedReferenceMission,
     start_node, start_node_with_forwarding,
@@ -486,7 +486,7 @@ fn live_event_process_worker() {
     runtime.block_on(async move {
         let mission = UnprotectedReferenceMission::load(&mission_path).expect("worker mission");
         let config = NodeConfig {
-            state,
+            state: state.clone(),
             bind,
             mission,
             peers,
@@ -519,19 +519,17 @@ fn live_event_process_worker() {
 
         match role.as_str() {
             "offline-publisher" => {
-                let published = events
-                    .publish(EventPublishRequest {
-                        operation_key: b"process-offline-publish".to_vec(),
-                        predecessor: None,
-                        topic,
-                        scope,
-                        priority: Priority::Priority,
-                        logical_key: b"process-offline-key".to_vec(),
-                        payload: b"published before either peer was online".to_vec(),
-                        tombstone: false,
-                    })
-                    .await
-                    .expect("offline publish");
+                use aster_node::publication_journal::{Backend, Intent, Journal};
+                let journal_path = state.join("source-publication.redb");
+                Journal::initialize(&journal_path, b"process-offline-source").unwrap();
+                let mut journal = Journal::open(&journal_path, b"process-offline-source").unwrap();
+                let mut backend = Backend::Live(&events);
+                journal.recover(&mut backend).await.unwrap();
+                let published = journal.publish_metadata(&mut backend, Intent {
+                    predecessor: None, topic: topic.as_str().to_owned(), scope: scope.as_str().to_owned(), priority: Priority::Priority as u8,
+                    logical_key: b"process-offline-key".to_vec(), payload: b"published before either peer was online".to_vec(), tombstone: false, ttl_ms: None,
+                }).await.unwrap();
+                journal.acknowledge(&mut backend).await.unwrap();
                 let status = events.status().await.expect("offline status");
                 assert_eq!(status.sync, EventSyncStatus::Offline);
                 assert_eq!(status.authenticated_contacts, 0);
