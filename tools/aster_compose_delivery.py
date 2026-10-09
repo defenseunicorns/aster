@@ -757,7 +757,9 @@ def build_plan(compose_path: Path, environment: Mapping[str, str]) -> DeliveryPl
 
 def _example_environment() -> tuple[tempfile.TemporaryDirectory[str], dict[str, str]]:
     temporary = tempfile.TemporaryDirectory()
-    generation = Path(temporary.name) / ("generation-" + "0" * 64)
+    # Example artifacts must satisfy the same canonical-path checks as a deployment.
+    root = Path(temporary.name).resolve()
+    generation = root / ("generation-" + "0" * 64)
     generation.mkdir(mode=0o700)
     for name in GENERATION_FILES[:-1]:
         (generation / name).write_bytes(("non-secret-example-" + name).encode())
@@ -765,7 +767,7 @@ def _example_environment() -> tuple[tempfile.TemporaryDirectory[str], dict[str, 
     (generation / "manifest.json").write_text(json.dumps({"schema": GENERATION_SCHEMA}) + "\n")
     (generation / "manifest.json").chmod(0o600)
     generation.chmod(0o500)
-    state = Path(temporary.name) / "state"
+    state = root / "state"
     state.mkdir(mode=0o700)
     uid = os.getuid() or 65534
     gid = os.getgid() or 65534

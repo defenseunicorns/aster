@@ -170,7 +170,9 @@ class Fixture:
 class DeliveryTestCase(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.fixture = Fixture(Path(self.temporary.name))
+        # macOS temporary paths may use /var, an alias of /private/var.
+        # Valid fixtures must satisfy the production canonical-path boundary.
+        self.fixture = Fixture(Path(self.temporary.name).resolve())
 
     def tearDown(self):
         for child in Path(self.temporary.name).glob("generation-*"):
