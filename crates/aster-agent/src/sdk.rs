@@ -28,6 +28,7 @@ const JOURNAL_ENTRIES: TableDefinition<u64, &[u8]> =
     TableDefinition::new("aster.event-publication-journal.entries.v1");
 const STATE_KEY: &str = "state";
 const JOURNAL_VERSION: u32 = 1;
+const RECONSTRUCTED_JOURNAL_VERSION: u32 = 2;
 const CLAIM_NONCE_BYTES: usize = 32;
 /// Maximum retained intents, including committed results awaiting acknowledgement.
 pub const MAX_PUBLICATION_JOURNAL_ENTRIES: usize = 8;
@@ -373,6 +374,8 @@ fn record_no_progress_rotation(
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct JournalState {
+    #[serde(default)]
+    reconstructing: bool,
     version: u32,
     client_id: Vec<u8>,
     session: u64,
@@ -391,6 +394,8 @@ struct PendingClaim {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct JournalEntry {
+    #[serde(default)]
+    result_only: bool,
     intent: api::PublishNumberedEventRequest,
     result: Option<api::CommittedPublicationResult>,
     abandoned: bool,
@@ -452,6 +457,7 @@ impl PublicationJournal {
             .create_file(file)
             .map_err(|error| journal_error(path, "initialize", error))?;
         let state = JournalState {
+            reconstructing: false,
             version: JOURNAL_VERSION,
             client_id: client_id.to_vec(),
             session: 0,
@@ -497,7 +503,10 @@ impl PublicationJournal {
             .map_err(|error| journal_error(&path, "open exclusively", error))?;
         let journal = Self { database, path };
         let state = journal.read_state()?;
-        if state.version != JOURNAL_VERSION {
+        if !matches!(
+            state.version,
+            JOURNAL_VERSION | RECONSTRUCTED_JOURNAL_VERSION
+        ) {
             return Err(NumberedEventSdkError::Journal(format!(
                 "unsupported journal version {}",
                 state.version
@@ -575,6 +584,11 @@ impl PublicationJournal {
     }
 
     fn audit_entries(&self, state: &JournalState) -> Result<()> {
+        if state.reconstructing && state.version != RECONSTRUCTED_JOURNAL_VERSION {
+            return Err(NumberedEventSdkError::Journal(
+                "reconstruction requires journal version 2".to_owned(),
+            ));
+        }
         if state
             .next_sequence
             .is_some_and(|next| next == 0 || next <= state.allocated_through)
@@ -621,6 +635,10 @@ impl PublicationJournal {
                     .result
                     .as_ref()
                     .is_some_and(|result| result.operation_sequence != sequence)
+                || (entry.result_only
+                    && (state.version != RECONSTRUCTED_JOURNAL_VERSION
+                        || entry.result.is_none()
+                        || entry.abandoned))
                 || (entry.abandoned && entry.result.is_some())
             {
                 return Err(NumberedEventSdkError::Journal(format!(
@@ -800,6 +818,47 @@ where
             .into_owned())
     }
 
+    /// Explicit best-effort reconstruction into a NEW path after journal loss.
+    /// Only the server frontier and retained committed receipts survive. Unsent
+    /// intents, acknowledged receipts and application effects cannot be recovered.
+    /// This never overwrites a journal or republishes inferred work. If an RPC
+    /// fails after creation, open this new journal and resume ordinary recovery.
+    pub async fn reconstruct(
+        client: api::AsterApplicationServiceClient<T>,
+        path: impl AsRef<Path>,
+        client_id: &[u8],
+    ) -> Result<(Self, RecoveryReport)> {
+        validate_client_id(client_id)?;
+        let status = client
+            .get_event_client_status(api::GetEventClientStatusRequest {
+                client_id: client_id.to_vec(),
+                observed_session: None,
+                ..Default::default()
+            })
+            .await?
+            .into_owned();
+        let active = status.disposition == api::EventClientDisposition::Current
+            || status.disposition == api::EventClientDisposition::Fenced
+            || status.disposition == api::EventClientDisposition::RecoveryRequired;
+        if status.current_session.is_none_or(|session| session == 0) || !active {
+            return Err(NumberedEventSdkError::Protocol(
+                "client cannot be reconstructed".to_owned(),
+            ));
+        }
+        PublicationJournal::initialize(path.as_ref(), client_id)?;
+        let sdk = Self::open(client, path, client_id)?;
+        sdk.journal.update_state(|state| {
+            state.version = RECONSTRUCTED_JOURNAL_VERSION;
+            state.session = status
+                .current_session
+                .expect("validated registered session");
+            state.reconstructing = true;
+            Ok(())
+        })?;
+        let report = sdk.recover().await?;
+        Ok((sdk, report))
+    }
+
     pub fn journal_path(&self) -> &Path {
         self.journal.path()
     }
@@ -872,11 +931,15 @@ where
                 )));
             }
             validate_committed_result(result)?;
-            let entry = self.journal.entry(sequence)?.ok_or_else(|| {
-                NumberedEventSdkError::Protocol(format!(
-                    "agent returned unknown journal sequence {sequence}"
-                ))
-            })?;
+            let entry = match self.journal.entry(sequence)? {
+                Some(entry) => entry,
+                None if state.reconstructing => continue,
+                None => {
+                    return Err(NumberedEventSdkError::Protocol(format!(
+                        "agent returned unknown journal sequence {sequence}"
+                    )));
+                }
+            };
             if entry.abandoned {
                 return Err(NumberedEventSdkError::Protocol(format!(
                     "agent resurrected abandoned sequence {sequence}"
@@ -941,17 +1004,27 @@ where
             }
             for result in &response.outstanding {
                 let sequence = result.operation_sequence;
-                let value = entries
-                    .get(sequence)
-                    .map_err(|error| {
-                        journal_error(self.journal.path(), "get recovered entry", error)
-                    })?
-                    .ok_or_else(|| {
-                        NumberedEventSdkError::Protocol(format!(
+                let value = entries.get(sequence).map_err(|error| {
+                    journal_error(self.journal.path(), "get recovered entry", error)
+                })?;
+                let mut entry: JournalEntry = match value.as_ref() {
+                    Some(value) => decode_json(value.value(), "entry")?,
+                    None if journal_state.reconstructing => JournalEntry {
+                        result_only: true,
+                        intent: api::PublishNumberedEventRequest {
+                            client_id: journal_state.client_id.clone(),
+                            operation_sequence: sequence,
+                            ..Default::default()
+                        },
+                        result: None,
+                        abandoned: false,
+                    },
+                    None => {
+                        return Err(NumberedEventSdkError::Protocol(format!(
                             "agent returned unknown journal sequence {sequence}"
-                        ))
-                    })?;
-                let mut entry: JournalEntry = decode_json(value.value(), "entry")?;
+                        )));
+                    }
+                };
                 drop(value);
                 entry.result = Some(result.clone());
                 entry.abandoned = false;
@@ -986,6 +1059,7 @@ where
                     journal_error(self.journal.path(), "remove consumed entry", error)
                 })?;
             }
+            journal_state.reconstructing = false;
             journal_state.session = response.session;
             journal_state.allocated_through = response.allocated_through;
             journal_state.snapshot_revision = response.snapshot_revision;
@@ -1071,6 +1145,7 @@ where
             intent.session = state.session;
             intent.operation_sequence = assigned;
             let entry = JournalEntry {
+                result_only: false,
                 intent,
                 result: None,
                 abandoned: false,
@@ -1094,7 +1169,10 @@ where
         &self,
         sequence: u64,
     ) -> Result<Option<api::PublishNumberedEventRequest>> {
-        Ok(self.journal.entry(sequence)?.map(|entry| entry.intent))
+        Ok(self
+            .journal
+            .entry(sequence)?
+            .and_then(|entry| (!entry.result_only).then_some(entry.intent)))
     }
 
     /// Pipelines a contiguous range of journaled operations. Every successful
@@ -1184,7 +1262,7 @@ where
             let mut entry = self.journal.entry(sequence)?.ok_or_else(|| {
                 NumberedEventSdkError::Journal(format!("sequence {sequence} is not journaled"))
             })?;
-            if entry.abandoned || entry.result.is_some() {
+            if entry.result_only || entry.abandoned || entry.result.is_some() {
                 return Err(NumberedEventSdkError::Protocol(format!(
                     "sequence {sequence} is already resolved"
                 )));
@@ -1921,6 +1999,7 @@ mod tests {
         publication.operation_sequence = 1;
         publication.topic = "x".to_owned();
         let row = JournalEntry {
+            result_only: false,
             intent: publication.clone(),
             result: None,
             abandoned: false,
@@ -2045,6 +2124,7 @@ mod tests {
                         _ => {}
                     }
                     let mut encoded = serde_json::to_vec(&JournalEntry {
+                        result_only: false,
                         intent: publication,
                         result: None,
                         abandoned: false,
@@ -2679,6 +2759,7 @@ mod tests {
                 publication.operation_sequence = 1;
                 publication.session = 1;
                 let encoded = encode_json(&JournalEntry {
+                    result_only: false,
                     intent: publication,
                     result: saved,
                     abandoned,
@@ -2783,6 +2864,7 @@ mod tests {
                 publication.operation_sequence = 1;
                 publication.session = 1;
                 let encoded = encode_json(&JournalEntry {
+                    result_only: false,
                     intent: publication,
                     result: Some(result(1)),
                     abandoned: false,
@@ -3034,6 +3116,7 @@ mod tests {
                         publication.operation_sequence = sequence;
                         publication.session = 1;
                         let encoded = encode_json(&JournalEntry {
+                            result_only: false,
                             intent: publication,
                             result: saved_result,
                             abandoned: is_abandoned,
@@ -3286,6 +3369,7 @@ mod tests {
                     publication.operation_sequence = 1;
                     publication.session = 1;
                     let encoded = encode_json(&JournalEntry {
+                        result_only: false,
                         intent: publication,
                         result: Some(result(1)),
                         abandoned: false,
@@ -3418,6 +3502,171 @@ mod tests {
         assert!(sdk.journal.entry(1).expect("row lookup").is_none());
         drop(sdk);
         std::fs::remove_file(path).expect("remove journal");
+    }
+
+    fn client_status_step() -> Step {
+        step(
+            "/GetEventClientStatus",
+            api::GetEventClientStatusResponse {
+                current_session: Some(4),
+                disposition: api::EventClientDisposition::Current.into(),
+                ..Default::default()
+            },
+        )
+    }
+    #[tokio::test]
+    async fn explicit_reconstruction_preserves_receipts_and_never_invents_lost_intents() {
+        let path = journal_path("loss-reconstruction");
+        let (_, client) = scripted(vec![
+            client_status_step(),
+            begin(5, 100, vec![result(3), result(99)]),
+            complete(),
+        ]);
+        let (sdk, report) = NumberedEventSdk::reconstruct(client, &path, b"client")
+            .await
+            .unwrap();
+        assert_eq!(
+            sdk.journal.read_state().unwrap().version,
+            RECONSTRUCTED_JOURNAL_VERSION
+        );
+        assert_eq!(report.allocated_through, 100);
+        assert_eq!(report.operations.len(), 2);
+        assert!(
+            report
+                .operations
+                .iter()
+                .all(|o| matches!(o.state, RecoveredState::Committed(_)))
+        );
+        assert!(sdk.journaled_intent(3).unwrap().is_none());
+        assert!(sdk.journaled_intent(99).unwrap().is_none());
+        assert_eq!(sdk.journal_publication(intent()).unwrap(), 101);
+        let before = std::fs::read(&path).unwrap();
+        let (_, client) = scripted(vec![client_status_step()]);
+        assert!(
+            NumberedEventSdk::reconstruct(client, &path, b"client")
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(sdk);
+        let (_, client) = scripted(vec![begin(6, 100, vec![result(3), result(99)]), complete()]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").unwrap();
+        let report = sdk.recover().await.unwrap();
+        assert_eq!(report.operations[2].state, RecoveredState::Pending);
+        assert!(sdk.journaled_intent(3).unwrap().is_none());
+        drop(sdk);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[tokio::test]
+    async fn reconstruction_respects_the_journal_entry_limit_without_partial_receipts() {
+        for count in [
+            MAX_PUBLICATION_JOURNAL_ENTRIES,
+            MAX_PUBLICATION_JOURNAL_ENTRIES + 1,
+        ] {
+            let path = journal_path("loss-entry-budget");
+            let outstanding = (1..=count as u64).map(result).collect::<Vec<_>>();
+            let (transport, client) = scripted(vec![
+                client_status_step(),
+                begin(5, 100, outstanding.clone()),
+                complete(),
+            ]);
+            let reconstructed = NumberedEventSdk::reconstruct(client, &path, b"client").await;
+            if count == MAX_PUBLICATION_JOURNAL_ENTRIES {
+                let (sdk, report) = reconstructed.unwrap();
+                assert_eq!(report.operations.len(), count);
+                assert_eq!(journal_image(&sdk.journal).1.len(), count);
+                for sequence in 1..=count as u64 {
+                    assert!(sdk.journaled_intent(sequence).unwrap().is_none());
+                    assert!(sdk.journal.entry(sequence).unwrap().unwrap().result_only);
+                }
+                assert!(transport.0.lock().unwrap().is_empty());
+                drop(sdk);
+            } else {
+                let error = reconstructed.err().expect("over-limit snapshot is refused");
+                assert!(error.to_string().contains("capacity exceeded"));
+                assert_eq!(
+                    transport.0.lock().unwrap().len(),
+                    1,
+                    "recovery was not completed"
+                );
+                let (retry_transport, client) =
+                    scripted(vec![begin(5, 100, outstanding), complete()]);
+                let sdk = NumberedEventSdk::open(client, &path, b"client").unwrap();
+                let state = sdk.journal.read_state().unwrap();
+                assert!(state.reconstructing);
+                assert!(state.pending_claim.is_some());
+                assert!(!state.recovery_complete);
+                assert!(journal_image(&sdk.journal).1.is_empty());
+                let before = journal_image(&sdk.journal);
+                assert!(
+                    sdk.recover()
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("capacity exceeded")
+                );
+                assert_eq!(journal_image(&sdk.journal), before);
+                assert_eq!(retry_transport.0.lock().unwrap().len(), 1);
+                drop(sdk);
+            }
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn reconstruction_lost_claim_reply_resumes_from_the_new_journal() {
+        let path = journal_path("loss-claim-reply");
+        let (_, client) = scripted(vec![
+            client_status_step(),
+            lost("/BeginEventPublicationSession"),
+        ]);
+        assert!(
+            NumberedEventSdk::reconstruct(client, &path, b"client")
+                .await
+                .is_err()
+        );
+        let (_, client) = scripted(vec![
+            begin(5, 100, vec![result(3)]),
+            lost("/CompleteEventPublicationRecovery"),
+        ]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").unwrap();
+        assert!(sdk.recover().await.is_err());
+        assert!(sdk.journal.entry(3).unwrap().unwrap().result_only);
+        assert!(sdk.journal_publication(intent()).is_err());
+        drop(sdk);
+        let (_, client) = scripted(vec![begin(6, 100, vec![result(3)]), complete()]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").unwrap();
+        sdk.recover().await.unwrap();
+        assert_eq!(sdk.journal_publication(intent()).unwrap(), 101);
+        drop(sdk);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retired_or_unregistered_identity_does_not_create_a_loss_journal() {
+        for (session, disposition) in [
+            (Some(4), api::EventClientDisposition::Retired),
+            (None, api::EventClientDisposition::Unregistered),
+            (Some(0), api::EventClientDisposition::RecoveryRequired),
+            (None, api::EventClientDisposition::RecoveryRequired),
+            (Some(4), api::EventClientDisposition::Unspecified),
+        ] {
+            let path = journal_path("loss-refused");
+            let (_, client) = scripted(vec![step(
+                "/GetEventClientStatus",
+                api::GetEventClientStatusResponse {
+                    current_session: session,
+                    disposition: disposition.into(),
+                    ..Default::default()
+                },
+            )]);
+            assert!(
+                NumberedEventSdk::reconstruct(client, &path, b"client")
+                    .await
+                    .is_err()
+            );
+            assert!(!path.exists());
+        }
     }
 
     fn journal_path(name: &str) -> PathBuf {

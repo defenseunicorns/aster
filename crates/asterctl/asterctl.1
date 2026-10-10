@@ -41,6 +41,10 @@ Publish a local file as a Blob. See
 Read a Blob to a new local file. See
 .BR asterctl-blob-read (1)
 .TP
+.BI publication-reconstruct " --journal NEW_PATH --client-id ID"
+Explicit partial journal-loss recovery. Preserves retained receipts without
+inventing unsent intents or recovering application effects. Existing paths are refused.
+.TP
 .BI client-status " --journal PATH --client-id ID"
 Observe current Event ownership without recovery or takeover.
 .TP

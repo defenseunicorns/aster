@@ -47,6 +47,7 @@ pub enum Action {
     ClientStatus,
     Initialize,
     Recover,
+    Reconstruct,
     Show,
     Retry,
     Abandon,

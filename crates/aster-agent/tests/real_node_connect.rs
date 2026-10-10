@@ -2173,3 +2173,111 @@ async fn sdk_subscription_context_is_fenced_without_implicit_takeover() {
     server.await.unwrap().unwrap();
     node.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn lost_journal_reconstruction_recovers_receipts_without_replaying_unsent_work() {
+    let state = TestState::new();
+    let mission = UnprotectedReferenceMission::from_bytes(
+        include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle").to_vec(),
+    )
+    .unwrap();
+    let node = start_node(NodeConfig {
+        state: state.0.clone(),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        mission,
+        peers: Vec::new(),
+        mutable_interests: MutableSourceInterests::default(),
+        sync_interval: Duration::from_millis(50),
+        run_for: None,
+        application: NodeApplication::Relay,
+    })
+    .await
+    .unwrap();
+    let agent = BoundAgent::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let address = agent.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let token = ClientToken::from_bytes(TEST_TOKEN.to_vec()).unwrap();
+    let server = tokio::spawn(agent.serve(node.selected_events(), token, shutdown_rx));
+    let client = api::AsterApplicationServiceClient::new(
+        HttpClient::plaintext(),
+        ClientConfig::new(format!("http://{address}").parse().unwrap()).with_default_header(
+            "authorization",
+            format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+        ),
+    );
+    let path = state.0.join("lost-sdk.redb");
+    PublicationJournal::initialize(&path, b"lost-sdk").unwrap();
+    let sdk = NumberedEventSdk::open(client.clone(), &path, b"lost-sdk").unwrap();
+    sdk.recover().await.unwrap();
+    let intent = |key: &'static [u8]| api::PublishNumberedEventRequest {
+        topic: "chat.events".into(),
+        scope: "mission/team/alpha".into(),
+        priority: api::Priority::Routine.into(),
+        logical_key: key.to_vec(),
+        payload: b"recoverable receipt".to_vec(),
+        ..Default::default()
+    };
+    let (_, acknowledged) = sdk.publish(intent(b"acknowledged")).await.unwrap();
+    sdk.acknowledge(1).await.unwrap();
+    let (_, retained) = sdk.publish(intent(b"retained")).await.unwrap();
+    assert_eq!(sdk.journal_publication(intent(b"never-sent")).unwrap(), 3);
+    let subscription = sdk
+        .create_subscription(api::CreateEventSubscriptionRequest {
+            operation_key: b"reader".to_vec(),
+            topic: "chat.events".into(),
+            scope: "mission/team/alpha".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let old_context = sdk.client_context().unwrap();
+    drop(sdk);
+    // Simulated journal loss, deliberately outside the agent's store.
+    fs::remove_file(&path).unwrap();
+    let recovered_path = state.0.join("reconstructed-sdk.redb");
+    let (sdk, report) = NumberedEventSdk::reconstruct(client.clone(), &recovered_path, b"lost-sdk")
+        .await
+        .unwrap();
+    assert_eq!(report.allocated_through, 2);
+    assert_eq!(report.operations.len(), 1);
+    assert_eq!(
+        report.operations[0].state,
+        RecoveredState::Committed(retained.clone())
+    );
+    assert!(sdk.journaled_intent(2).unwrap().is_none());
+    assert!(sdk.journaled_intent(3).unwrap().is_none());
+    assert_eq!(sdk.client_status().await.unwrap().subscriptions, 1);
+    let stale = client
+        .poll_events(api::PollEventsRequest {
+            client: old_context.into(),
+            subscription_id: subscription.subscription_id.clone(),
+            delivery_limit: 8,
+            scan_limit: 8,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code, ErrorCode::Aborted);
+    let page = sdk
+        .poll_events(api::PollEventsRequest {
+            subscription_id: subscription.subscription_id,
+            delivery_limit: 8,
+            scan_limit: 8,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.deliveries.len(), 2);
+    assert_ne!(acknowledged, retained);
+    sdk.acknowledge(2).await.unwrap();
+    let (next, _) = sdk
+        .publish(intent(b"new-work-after-reconstruction"))
+        .await
+        .unwrap();
+    assert_eq!(next, 3);
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
+    node.shutdown().await.unwrap();
+}

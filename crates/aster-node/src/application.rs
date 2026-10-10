@@ -2862,9 +2862,8 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
             | NumberedEventOperationError::InvalidSequence
             | NumberedEventOperationError::ClientNotFound
             | NumberedEventOperationError::ResultNotFound => ApplicationErrorKind::InvalidRequest,
-            NumberedEventOperationError::SubscriptionOwnerMismatch => {
-                ApplicationErrorKind::RequestRejected
-            }
+            NumberedEventOperationError::SubscriptionOwnerMismatch
+            | NumberedEventOperationError::ClientRetired => ApplicationErrorKind::RequestRejected,
             NumberedEventOperationError::SessionFenced => ApplicationErrorKind::SessionFenced,
             NumberedEventOperationError::IntentConflict => ApplicationErrorKind::Conflict,
             NumberedEventOperationError::SequenceRetired => ApplicationErrorKind::SequenceRetired,

@@ -451,6 +451,33 @@ fn discard_output(output: blob_read::OutputFile, error: String) -> String {
     error
 }
 
+pub async fn reconstruct_publication(
+    address: SocketAddr,
+    token: &Token,
+    timeout: Duration,
+    identity: &crate::journal::Identity,
+) -> Result<String, String> {
+    let client = api::AsterApplicationServiceClient::new(
+        HttpClient::plaintext(),
+        config(address, token, timeout),
+    );
+    let (_, report) = aster_agent::sdk::NumberedEventSdk::reconstruct(
+        client,
+        &identity.path,
+        &identity.client_id,
+    )
+    .await
+    .map_err(crate::journal::describe_error)?;
+    let operations: Vec<_> = report.operations.into_iter().map(|operation| match operation.state {
+        aster_agent::sdk::RecoveredState::Committed(result) => serde_json::json!({"operationSequence": operation.sequence.to_string(), "result": result}),
+        _ => unreachable!("reconstruction contains retained committed results only"),
+    }).collect();
+    serde_json::to_string_pretty(&serde_json::json!({"partialReconstruction": true,
+        "session": report.session.to_string(), "allocatedThrough": report.allocated_through.to_string(),
+        "unrecoverable": ["unsent intents", "acknowledged receipts", "application effects"], "operations": operations}))
+        .map(|text| text + "\n").map_err(|_| "cannot format partial recovery report".to_owned())
+}
+
 pub async fn unsubscribe(
     address: SocketAddr,
     token: &Token,

@@ -91,8 +91,9 @@ These are current-code/local-test claims, not new physical acceptance receipts.
 The 348-row requirements baseline, exact mappings and retained historical
 receipts remain unchanged.
 
-Increment 3 remains separate: lost-journal reconstruction, administrative client
-retirement and client-ID reclamation. This increment does not alter the earlier
+Increment 3 was kept separate and now adds partial journal-loss reconstruction
+and administrative retirement in [decision 0046](0046-numbered-event-client-lifecycle.md).
+Client-ID and slot reclamation remain future work. This increment does not alter the earlier
 choice to repair and retry an unadmitted publication or explicitly abandon it;
 SDK abandonment policies and server-recorded terminal rejection remain alternate
 future paths, not automatic behavior of subscription ownership.
