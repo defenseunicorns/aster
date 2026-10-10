@@ -135,6 +135,18 @@ fn run() -> Result<(), (u8, String)> {
         }
         args::Command::PublicationAction(options, identity, action, sequence) => {
             let rpc = RpcContext::new(options)?;
+            if action == journal::Action::Reconstruct {
+                let output = rpc
+                    .runtime
+                    .block_on(client::reconstruct_publication(
+                        rpc.address,
+                        &rpc.token,
+                        rpc.timeout,
+                        &identity,
+                    ))
+                    .map_err(|e| (1, e))?;
+                return write_output(&output);
+            }
             let sdk = client::publication_sdk(rpc.address, &rpc.token, rpc.timeout, &identity)
                 .map_err(|e| (1, e))?;
             rpc.runtime.block_on(async {
@@ -170,6 +182,7 @@ fn run() -> Result<(), (u8, String)> {
                     }
                     journal::Action::Show => unreachable!("local inspection already returned"),
                     journal::Action::ClientStatus => unreachable!("read-only status already returned"),
+                    journal::Action::Reconstruct => unreachable!("explicit reconstruction already returned"),
                     journal::Action::Initialize => unreachable!("initialization does not use RPC"),
                 }
             }).map_err(|e| (1, e))?
