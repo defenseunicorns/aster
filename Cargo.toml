@@ -48,7 +48,7 @@ http = "=1.5.0"
 http-body-util = "=0.1.5"
 hyper = { version = "=1.11.1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "=0.1.20", features = ["http1", "http2", "server-auto", "server-graceful", "service", "tokio"] }
-libc = "=0.2.189"
+libc = "=0.2.190"
 ml-dsa = { version = "=0.1.1", default-features = false, features = ["alloc", "rand_core", "zeroize"] }
 ml-kem = { version = "=0.3.2", default-features = false, features = ["alloc", "hazmat", "zeroize"] }
 minicbor = { version = "=2.3.0", default-features = false }
