@@ -9,13 +9,15 @@ use std::{env, error::Error, net::SocketAddr, path::PathBuf, time::Duration};
 use aster_node::{
     CustodyQuota, EventEmissionPolicy, NodeApplication, NodeConfig, SelectedForwardingConfig,
     StoreLimits,
-    application::{EventPublishOptions, EventPublishRequest, Priority, Scope, Topic},
+    application::{EventPublishOptions, Priority, Scope, Topic},
     mission::UnprotectedReferenceMission,
     start_node_with_forwarding,
 };
 
+use aster_node::publication_journal as numbered;
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut arguments = env::args_os();
     let program = arguments
         .next()
@@ -33,10 +35,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let Some(topic) = arguments.next().and_then(|value| value.into_string().ok()) else {
         return Err(usage(&program).into());
     };
+    let initialize = match arguments.next() {
+        None => false,
+        Some(value) if value == "--initialize-publication-journal" => true,
+        Some(_) => {
+            return Err("unknown argument; expected --initialize-publication-journal".into());
+        }
+    };
     if arguments.next().is_some() {
         return Err(usage(&program).into());
     }
 
+    let journal_path = state.join("custody_application-publication.redb");
+    if initialize {
+        numbered::Journal::initialize(&journal_path, b"native.custody-application.v1")?;
+    }
+    let mut journal = numbered::Journal::open(&journal_path, b"native.custody-application.v1")?;
     let scope = Scope::new(scope)?;
     let topic = Topic::new(topic)?;
     let mission = UnprotectedReferenceMission::load(mission_bundle)?;
@@ -65,6 +79,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let (initial_policy, initial_revision) = running.event_emission_policy()?;
     let events = running.selected_events();
+    journal
+        .recover(&mut numbered::Backend::Live(&events))
+        .await?;
     let (options, ttl_status) = if cfg!(target_os = "linux") {
         (
             EventPublishOptions::finite_ttl_ms(60_000)?,
@@ -76,24 +93,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "finite_ttl=unsupported_on_this_platform,durable_fallback=true",
         )
     };
-    let publication = events
-        .publish_with_options(
-            EventPublishRequest {
-                operation_key: b"aster.example.custody/publish".to_vec(),
-                predecessor: None,
-                topic,
-                scope,
-                priority: Priority::Immediate,
-                logical_key: b"custody-example".to_vec(),
-                payload: b"selected semantic-v3 custody".to_vec(),
-                tombstone: false,
-            },
-            options,
-        )
+    let intent = numbered::Intent {
+        predecessor: None,
+        topic: topic.as_str().into(),
+        scope: scope.as_str().into(),
+        priority: Priority::Immediate as u8,
+        logical_key: b"custody-example".to_vec(),
+        payload: b"selected semantic-v3 custody".to_vec(),
+        tombstone: false,
+        ttl_ms: options.ttl_ms(),
+    };
+    if let Some((_, pending)) = journal.pending()
+        && pending != &intent
+    {
+        return Err("retained intent differs; explicit repair is required".into());
+    }
+    let outcome = journal
+        .publish(&mut numbered::Backend::Live(&events), intent.clone())
+        .await?;
+    let publication = numbered::Backend::Live(&events)
+        .metadata(&intent, &outcome)
         .await?;
 
     let updated_revision = running.set_event_emission_policy(EventEmissionPolicy::Normal)?;
     let (updated_policy, observed_revision) = running.event_emission_policy()?;
+    journal
+        .acknowledge(&mut numbered::Backend::Live(&events))
+        .await?;
     let receipt = running.shutdown().await?;
     println!(
         "CUSTODY_APPLICATION {ttl_status} id={} inserted={} authenticated_ttl_ms={:?} \
@@ -107,7 +133,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 fn usage(program: &str) -> String {
     format!(
-        "usage: {program} STATE_DIRECTORY MISSION_BUNDLE SCOPE TOPIC\n\
+        "usage: {program} STATE_DIRECTORY MISSION_BUNDLE SCOPE TOPIC [--initialize-publication-journal]\n\
          example: cargo run -p aster-node --example custody_application -- \
          /tmp/aster-custody node.bundle mission/apps ops.alpha"
     )

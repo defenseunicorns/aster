@@ -178,10 +178,14 @@ run_aster_agent
 In A's second terminal, publish one Event and capture its canonical base64 ID:
 
 ```sh
+python3 tools/aster_lan_mvp.py publication-init \
+  --token-file "$ASTER_NODE_ROOT/client.token" \
+  --journal "$ASTER_NODE_ROOT/publication.redb" --client-id lan-source-a
+
 ASTER_EVENT_ID="$(python3 tools/aster_lan_mvp.py publish \
   --token-file "$ASTER_NODE_ROOT/client.token" \
   --url "$ASTER_APP_URL" \
-  --operation-key demo/publish/1 \
+  --journal "$ASTER_NODE_ROOT/publication.redb" --client-id lan-source-a \
   --logical-key message/1 \
   --payload 'hello from isolated A' \
   --id-only)"
@@ -190,7 +194,12 @@ printf '%s\n' "$ASTER_EVENT_ID"
 
 Copy that Event ID into the operator shell on B and C for the later exact-ID
 checks. It is an application receipt, not peer discovery configuration. Stop A
-after publication.
+after publication. The application journal survives those agent restarts.
+Initialize it once and preserve it with the stable client ID. The helper leaves
+the numbered receipt retained; use `asterctl publication-recover`,
+`publication-retry --sequence 1`, and `publication-ack --sequence 1` with the
+same journal and identity to recover or finish the operation. A missing journal
+must be repaired explicitly; it is not a reason to invent another client ID.
 
 ## Phase 2: A meets B while C is absent
 

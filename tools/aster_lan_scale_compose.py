@@ -1178,6 +1178,7 @@ def run_case(
         )
         if service in outsiders:
             return None
+        compose.helper(service, ("publication-init", "--journal", "/state/publication.redb", "--client-id", "lan-scale-source"))
         logical_key = event_logical_key(service)
         payload = event_payload(service)
         event_id = canonical_event_id(
@@ -1185,8 +1186,8 @@ def run_case(
                 service,
                 (
                     "publish",
-                    "--operation-key",
-                    f"scale/publish/{service}/1",
+                    "--journal", "/state/publication.redb",
+                    "--client-id", "lan-scale-source",
                     "--logical-key",
                     logical_key,
                     "--payload",

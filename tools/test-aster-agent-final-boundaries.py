@@ -60,6 +60,19 @@ class ProcessBoundaries(unittest.TestCase):
         finally:
             conn.close()
 
+    def rpc(self, method, value):
+        connection = http.client.HTTPConnection(self.config["application"]["listen"], timeout=3)
+        try:
+            connection.request("POST", "/aster.application.v1alpha1.AsterApplicationService/" + method,
+                               json.dumps(value).encode(), {"Content-Type": "application/json",
+                               "Connect-Protocol-Version": "1", "Authorization": "Bearer " + self.token})
+            response = connection.getresponse()
+            body = response.read()
+            self.assertEqual(response.status, 200, "numbered client setup failed")
+            return json.loads(body)
+        finally:
+            connection.close()
+
     def wait_status(self, listener, path, expected):
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
@@ -115,8 +128,11 @@ class ProcessBoundaries(unittest.TestCase):
         # Break caught: node's independent ctrl_c handler closes Event admission
         # before the supervisor finishes the already-admitted request body.
         process = self.start()
+        client_id = base64.b64encode(b"sigint-publication-client").decode()
+        session = self.rpc("BeginEventPublicationSession", {"clientId": client_id, "expectedSession": "0", "claimNonce": base64.b64encode(b"sigint-claim").decode()})
+        self.rpc("CompleteEventPublicationRecovery", {"clientId": client_id, "session": session["session"], "snapshotRevision": session.get("snapshotRevision", "0")})
         body = json.dumps({
-            "operationKey": base64.b64encode(b"sigint-publication").decode(),
+            "clientId": client_id, "session": session["session"], "operationSequence": "1",
             "topic": "chat.events", "scope": "mission/team/alpha", "priority": "PRIORITY_IMMEDIATE",
             "logicalKey": base64.b64encode(b"sigint-message").decode(),
             "payload": base64.b64encode(b"accepted before SIGINT").decode(),
@@ -124,7 +140,7 @@ class ProcessBoundaries(unittest.TestCase):
         host, port = self.config["application"]["listen"].rsplit(":", 1)
         with socket.create_connection((host, int(port)), timeout=3) as connection:
             connection.sendall((
-                "POST /aster.application.v1alpha1.AsterApplicationService/PublishEvent HTTP/1.1\r\n"
+                "POST /aster.application.v1alpha1.AsterApplicationService/PublishNumberedEvent HTTP/1.1\r\n"
                 "Host: localhost\r\nContent-Type: application/json\r\n"
                 f"Authorization: Bearer {self.token}\r\nContent-Length: {len(body)}\r\n"
                 "Expect: 100-continue\r\nConnection: close\r\n\r\n").encode())

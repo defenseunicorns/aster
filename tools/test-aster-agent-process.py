@@ -204,24 +204,27 @@ class ProcessCheckerContractTests(unittest.TestCase):
                     raise checker.CheckerInterrupted("injected startup interrupt")
                 return agent
 
-            def recovery(agent, call):
+            def recovery(agent, call, **_kwargs):
                 self.assertIs(agent, agents[-1])
                 if failed_stage in ("recovery", "recovery-shutdown"):
                     raise checker.AcceptanceError("injected recovery failure")
-                ledgers.setdefault(agent.state, set()).add(checker.FIXED_PUBLISH_OPERATION.hex())
+                ledgers.setdefault(agent.state, set()).add(checker.FIXED_PUBLISH_CLIENT.hex())
                 history.append(("client-recovery", agent.state))
 
             def invoke(_captures, _registry, _client, command, _address, _token, _timeout,
                        request, **_kwargs):
+                if command == "publication-init":
+                    record = {"status": "ok"}
+                    return checker.ClientResult(0, json.dumps(record), "", record)
                 self.assertEqual(command, "publish")
                 state = agents[-1].state
                 operations = ledgers.setdefault(state, set())
-                inserted = request["operation_key_hex"] not in operations
+                inserted = request["client_id_hex"] not in operations
                 if inserted_override is not True:
                     inserted = inserted_override
-                operations.add(request["operation_key_hex"])
+                operations.add(request["client_id_hex"])
                 history.append(("publish", state, inserted))
-                record = {"status": "ok", "inserted": inserted, "event_id_hex": "01" * 32,
+                record = {"status": "ok", "operation_sequence": 1, "inserted": inserted, "event_id_hex": "01" * 32,
                           "publisher_id_hex": "02" * 32, "publisher_counter": 1,
                           "event_sequence": 1, "acceptance_marker": 1}
                 if inserted_override == "missing":
@@ -287,6 +290,9 @@ class ProcessCheckerContractTests(unittest.TestCase):
                           "quiet_polls": 11, "quiet_window_ms": 500, "retained_query_exact": True}
                 def call(command, request):
                     commands.append(command)
+                    if command == "publication-init":
+                        record = {"status": "ok"}
+                        return checker.ClientResult(0, json.dumps(record), "", record)
                     if command == "recovery-begin":
                         self.assertEqual(request["publish"], checker._publish_request())
                         self.assertNotEqual(request["subscription_operation_key_hex"], checker.FIXED_SUBSCRIBE_OPERATION.hex())
@@ -309,7 +315,7 @@ class ProcessCheckerContractTests(unittest.TestCase):
                 if fault is None:
                     receipt = run(agent, call)
                     self.assertEqual(receipt["agent_pid"], 100)
-                    self.assertEqual(commands, ["recovery-begin", "recovery-resume"])
+                    self.assertEqual(commands, ["publication-init", "recovery-begin", "recovery-resume"])
                 else:
                     with self.assertRaises(checker.AcceptanceError):
                         run(agent, call)

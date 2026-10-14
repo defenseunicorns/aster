@@ -70,69 +70,64 @@ async fn grpc_status(
 
 ### Pipelined durable Event publication
 
-Native Connect and gRPC clients over HTTP/2 can keep independent ordinary
-Event publications in flight with [`sdk::PipelinedEventPublisher`]. Each
-ordered published outcome is returned only after the running selected node's
-local durable authority has committed that Event and its operation-key mapping.
-A sanitized application failure is returned in order without claiming an Event
-commit. Neither outcome waits for mesh delivery: synchronization starts from a
-successfully published durable local object independently.
+Native Connect and gRPC over HTTP/2 use `PublishNumberedEvents`. The SDK journals
+complete intents before sending, persists each ordered result before freeing a
+window slot, and replays the exact unanswered sequences after a disconnect.
 
-Persist every operation key before calling the publisher. If a bounded stream
-session rotates or disconnects, the helper resends only sent requests without
-an observed response and keeps their original keys. The durable operation
-ledger resolves a commit whose response was lost. The retry budget passed to
-`new` bounds consecutive transport disconnects; healthy session rotation does
-not consume it.
+Initialize `path` once with `PublicationJournal::initialize(path, client_id)`
+during explicit fresh provisioning. Reopen it on subsequent process launches;
+a missing journal must be diagnosed rather than recreated.
 
 ```no_run
 # #[cfg(feature = "client")]
 async fn publish_telemetry(
     token: &str,
+    path: &std::path::Path,
+    mut apply: impl FnMut(u64, &aster_agent::proto::aster::application::v1alpha1::CommittedPublicationResult) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use aster_agent::{
-        proto::aster::application::v1alpha1 as api,
-        sdk::PipelinedEventPublisher,
-    };
+    use aster_agent::{proto::aster::application::v1alpha1 as api, sdk::{NumberedEventSdk, RecoveredState}};
     use connectrpc::{Protocol, client::{ClientConfig, Http2Connection}};
-
-    let uri = "http://127.0.0.1:8181".parse()?;
-    let connection = Http2Connection::connect_plaintext(uri).await?.shared(32);
+    let connection = Http2Connection::connect_plaintext("http://127.0.0.1:8181".parse()?).await?.shared(32);
     let config = ClientConfig::new("http://127.0.0.1:8181".parse()?)
         .with_protocol(Protocol::Connect)
         .with_default_header("authorization", format!("Bearer {token}"));
     let client = api::AsterApplicationServiceClient::new(connection, config);
-    let requests = (0_u8..4)
-        .map(|sample| api::PublishEventRequest {
-            operation_key: format!("sensor-a/{sample}").into_bytes(),
-            topic: "telemetry.temperature".to_owned(),
-            scope: "mission/team/alpha".to_owned(),
-            priority: api::Priority::Routine.into(),
-            logical_key: b"sensor-a".to_vec(),
-            payload: vec![sample],
-            ..Default::default()
-        })
-        .collect();
-    let outcomes = PipelinedEventPublisher::new(client, 3)
-        .publish_all(requests)
-        .await?;
-    assert_eq!(outcomes.len(), 4);
+    let sdk = NumberedEventSdk::open(client, path, b"sensor-a")?;
+    for operation in sdk.recover().await?.operations {
+        let result = match operation.state {
+            RecoveredState::Pending => Some(sdk.publish_journaled(operation.sequence).await?),
+            RecoveredState::Committed(result) => Some(result),
+            RecoveredState::Retired => None,
+        };
+        if let Some(result) = result {
+            apply(operation.sequence, &result)?; // durable, idempotent application progress
+            sdk.acknowledge(operation.sequence).await?;
+        }
+    }
+    let sequences = (0_u8..4).map(|sample| sdk.journal_publication(api::PublishNumberedEventRequest {
+        topic: "telemetry.temperature".to_owned(), scope: "mission/team/alpha".to_owned(),
+        priority: api::Priority::Routine.into(), logical_key: b"sensor-a".to_vec(), payload: vec![sample], ..Default::default()
+    })).collect::<Result<Vec<_>, _>>()?;
+    let results = sdk.publish_journaled_pipeline(&sequences, 3).await?;
+    for (sequence, result) in sequences.into_iter().zip(results) {
+        apply(sequence, &result)?;
+        sdk.acknowledge(sequence).await?;
+    }
     Ok(())
 }
 ```
 
-The helper's active window and session-rotation interval are bounded reference
-implementation choices, not protocol rate or batch limits. The stream keeps
-ordinary publications independent; it is not the atomic cryptographic batch
-API and does not accept numbered publication. gRPC-Web cannot stream request
-bodies, so browser clients must use a bounded application-selected window of
-concurrent unary `PublishEvent` calls with the same operation-key retry rule.
+The reference window is eight and healthy streams rotate after eight seconds,
+before the ten-second server deadline. These are implementation bounds, not
+validated rates. gRPC-Web uses ordered unary `PublishNumberedEvent` calls per
+client; different configured clients may proceed concurrently. The SDK stops
+at the first rejected sequence and preserves that intent and later journaled
+work for explicit repair or abandonment. It never abandons work automatically.
 
 ### Crash-safe numbered publication
 
 With the `client` feature, [`sdk::PublicationJournal`] and
-[`sdk::NumberedEventSdk`] implement the experimental numbered-publication
-profile. Journal creation is explicit. The journal contains plaintext publication
+[`sdk::NumberedEventSdk`] implement numbered Event publication. Journal creation is explicit. The journal contains plaintext publication
 intents and payloads: keep it in a protected directory. On Unix, creation uses
 mode `0600`, and opening rejects symlinks, non-regular files, files owned by
 another user, or group/other permissions. Existing journals with broader
@@ -155,6 +150,19 @@ and their payloads are removed from the journal. A `publish()` error exposes
 retain that sequence for recovery after an uncertain RPC outcome. See the
 [agent quickstart](../../docs/quickstart/connect-agent.md#use-crash-safe-numbered-publication)
 for an end-to-end example and the exact Increment 1 boundary.
+
+`publish_journaled_pipeline(&sequences, max_disconnect_retries)` sends a
+contiguous range beginning at the next first admission over native HTTP/2
+`PublishNumberedEvents`. Complete intents must already be journaled. It uses
+the existing eight-input window and rotates before the server's default
+stream deadline; each committed receipt is saved before the SDK releases a
+window slot. Disconnect replay preserves client ID, session, sequence, and
+intent. A rejected input stops this SDK pipeline and remains journaled, along
+with unresolved later inputs, for explicit repair or abandonment. Successful
+receipts already saved before a later error are available through recovery.
+The service returns ordered per-input numbered outcomes and rejects gRPC-Web
+request streaming; numbered unary calls remain available there. This addition
+does not migrate existing ordinary publishers or remove their public path.
 
 ### Serving a live node for development or migration
 

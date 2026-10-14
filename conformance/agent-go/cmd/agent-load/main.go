@@ -28,6 +28,7 @@ import (
 
 	"connectrpc.com/connect"
 	api "github.com/defenseunicorns/aster/conformance/agent-go/gen/aster/application/v1alpha1"
+	"github.com/defenseunicorns/aster/conformance/agent-go/internal/numbered"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -35,6 +36,8 @@ const maxSlots = 10_000_000
 const custodyCeiling = 262_144
 
 type options struct {
+	journalDir                                                                   string
+	initializeJournals                                                           bool
 	url, tokenFile, topic, scope, prefix, output, commit, binaryHash, configHash string
 	slots                                                                        uint64
 	sampleEvery                                                                  uint64
@@ -58,7 +61,7 @@ func parseOptions(args []string) (options, error) {
 		values[args[i]] = args[i+1]
 	}
 	allowed := map[string]bool{}
-	for _, k := range []string{"--url", "--token-file", "--count", "--duration-seconds", "--rate", "--payload-bytes", "--topic", "--scope", "--operation-prefix", "--concurrency", "--timeout-seconds", "--output", "--source-commit", "--binary-sha256", "--config-sha256", "--sample-every"} {
+	for _, k := range []string{"--url", "--token-file", "--count", "--duration-seconds", "--rate", "--payload-bytes", "--topic", "--scope", "--operation-prefix", "--concurrency", "--timeout-seconds", "--output", "--source-commit", "--binary-sha256", "--config-sha256", "--sample-every", "--journal-dir", "--initialize-journals"} {
 		allowed[k] = true
 	}
 	for k := range values {
@@ -75,6 +78,15 @@ func parseOptions(args []string) (options, error) {
 		return options{}, bad
 	}
 	o := options{url: values["--url"], tokenFile: values["--token-file"], topic: values["--topic"], scope: values["--scope"], prefix: values["--operation-prefix"], output: values["--output"], commit: values["--source-commit"], binaryHash: values["--binary-sha256"], configHash: values["--config-sha256"]}
+	o.journalDir = values["--journal-dir"]
+	if !filepath.IsAbs(o.journalDir) || filepath.Clean(o.journalDir) != o.journalDir || o.journalDir == o.output || o.journalDir == o.tokenFile {
+		return options{}, bad
+	}
+	if values["--initialize-journals"] != "true" && values["--initialize-journals"] != "false" {
+		return options{}, bad
+	}
+	o.initializeJournals = values["--initialize-journals"] == "true"
+
 	u, err := url.Parse(o.url)
 	// The agent is process-local. Literal loopback avoids DNS rebinding and
 	// accidental bearer disclosure to a remote plaintext endpoint.
@@ -148,26 +160,95 @@ func parseOptions(args []string) (options, error) {
 
 func digest(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToString(sum[:]) }
 
-// SHA-256("aster/agent-load/key/v1\0" || u16be(prefix length) || prefix || u64be(index)).
-// Only this algorithm label and the prefix digest are retained in receipts.
-func operationKey(prefix string, index uint64) []byte {
+// Stable namespace per configured bounded worker, independent of operations.
+func publisherID(prefix string, lane uint64) []byte {
 	h := sha256.New()
-	h.Write([]byte("aster/agent-load/key/v1\x00"))
-	var b [8]byte
-	binary.BigEndian.PutUint16(b[:2], uint16(len(prefix)))
-	h.Write(b[:2])
+	h.Write([]byte("aster/agent-load/client/v2\x00"))
 	h.Write([]byte(prefix))
-	binary.BigEndian.PutUint64(b[:], index)
-	h.Write(b[:])
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], lane)
+	h.Write(encoded[:])
 	return h.Sum(nil)
 }
-
-func publishRequest(o options, index uint64, token string) *connect.Request[api.PublishEventRequest] {
-	logical := append([]byte("agent-load/v1:"), make([]byte, 8)...)
+func publishRequest(o options, index uint64) *api.PublishNumberedEventRequest {
+	logical := append([]byte("agent-load/v2:"), make([]byte, 8)...)
 	binary.BigEndian.PutUint64(logical[len(logical)-8:], index)
-	req := connect.NewRequest(&api.PublishEventRequest{OperationKey: operationKey(o.prefix, index), Topic: o.topic, Scope: o.scope, Priority: api.Priority_PRIORITY_ROUTINE, LogicalKey: logical, Payload: bytes.Repeat([]byte{0x61}, o.payload)})
-	req.Header().Set("Authorization", "Bearer "+token)
-	return req
+	return &api.PublishNumberedEventRequest{Topic: o.topic, Scope: o.scope, Priority: api.Priority_PRIORITY_ROUTINE, LogicalKey: logical, Payload: bytes.Repeat([]byte{0x61}, o.payload)}
+}
+
+type publisherLane struct {
+	mu      sync.Mutex
+	journal *numbered.Journal
+}
+
+func openPublishers(ctx context.Context, o options, client api.AsterApplicationServiceClient, token string) ([]*publisherLane, error) {
+	if o.initializeJournals {
+		if err := os.Mkdir(o.journalDir, 0700); err != nil {
+			return nil, numbered.ErrJournal
+		}
+	}
+	info, err := os.Lstat(o.journalDir)
+	if err != nil || !info.IsDir() || info.Mode().Perm()&0077 != 0 {
+		return nil, numbered.ErrJournal
+	}
+	if !o.initializeJournals {
+		files, err := os.ReadDir(o.journalDir)
+		if err != nil || len(files) != 2*o.concurrency {
+			return nil, numbered.ErrJournal
+		}
+		expected := map[string]bool{}
+		for i := 0; i < o.concurrency; i++ {
+			name := fmt.Sprintf("worker-%02d.json", i)
+			expected[name] = true
+			expected[name+".lock"] = true
+		}
+		for _, file := range files {
+			if !expected[file.Name()] {
+				return nil, numbered.ErrJournal
+			}
+		}
+	}
+
+	lanes := make([]*publisherLane, 0, o.concurrency)
+	failed := true
+	defer func() {
+		if failed {
+			for _, lane := range lanes {
+				lane.journal.Close()
+			}
+		}
+	}()
+	for i := 0; i < o.concurrency; i++ {
+		path := filepath.Join(o.journalDir, fmt.Sprintf("worker-%02d.json", i))
+		id := publisherID(o.prefix, uint64(i))
+		if o.initializeJournals {
+			if err = numbered.Initialize(path, id); err != nil {
+				return nil, err
+			}
+		}
+		journal, err := numbered.Open(path, id, client, token)
+		if err != nil {
+			return nil, err
+		}
+		lanes = append(lanes, &publisherLane{journal: journal})
+		if err = journal.Recover(ctx); err != nil {
+			return nil, err
+		}
+		for _, entry := range journal.Entries() {
+			seq := entry.Intent.OperationSequence
+			if _, err = journal.Publish(ctx, seq); err != nil {
+				return nil, err
+			}
+			if err = journal.Apply(seq); err != nil {
+				return nil, err
+			}
+			if err = journal.Acknowledge(ctx, seq); err != nil {
+				return nil, err
+			}
+		}
+	}
+	failed = false
+	return lanes, nil
 }
 
 type result struct {
@@ -175,14 +256,14 @@ type result struct {
 	terminal, inserted bool
 	elapsed            time.Duration
 	measured           bool
-	original           *api.PublishEventResponse
+	original           *api.PublishNumberedEventResponse
 	probes             probeCounts
 	probeStop          string
 }
 
-func classify(response *connect.Response[api.PublishEventResponse], err error) result {
+func classify(response *connect.Response[api.PublishNumberedEventResponse], err error) result {
 	if err == nil {
-		if response == nil || response.Msg == nil || len(response.Msg.Id) != 32 || len(response.Msg.Publisher) != 32 || response.Msg.PublisherCounter == 0 || response.Msg.EventSequence == 0 || response.Msg.AcceptanceMarker == 0 || response.Msg.Priority != api.Priority_PRIORITY_ROUTINE {
+		if response == nil || response.Msg == nil || response.Msg.Result == nil || response.Msg.Result.OperationSequence == 0 || response.Msg.Result.Receipt == nil || len(response.Msg.Result.Receipt.EventId) != 32 || len(response.Msg.Result.Receipt.TransferId) != 32 || response.Msg.Result.Receipt.AcceptanceMarker == 0 || response.Msg.Result.Content != api.CommittedContentStatus_COMMITTED_CONTENT_STATUS_AVAILABLE {
 			return result{kind: "protocol", reason: "invalid_response", terminal: true}
 		}
 		return result{kind: "accepted", inserted: response.Msg.Inserted, original: response.Msg}
@@ -199,7 +280,7 @@ func classify(response *connect.Response[api.PublishEventResponse], err error) r
 				continue
 			}
 			// Never render server-provided strings, unknown enum values or error text.
-			names := []string{"unspecified", "malformed_input", "unsupported_value", "operation_key_conflict", "missing_durable_object", "failed_precondition", "deadline", "resource_exhaustion", "draining", "state_unavailable", "authentication_failed", "internal", "operation_capacity_exhausted"}
+			names := []string{"unspecified", "malformed_input", "unsupported_value", "operation_key_conflict", "missing_durable_object", "failed_precondition", "deadline", "resource_exhaustion", "draining", "state_unavailable", "authentication_failed", "internal", "operation_capacity_exhausted", "session_fenced", "sequence_gap", "sequence_retired", "recovery_required", "legacy_state_requires_fresh_store"}
 			n := int(detail.Reason)
 			if n < 1 || n >= len(names) {
 				return result{kind: "protocol", reason: "invalid_error_detail", terminal: true}
@@ -216,9 +297,24 @@ func classify(response *connect.Response[api.PublishEventResponse], err error) r
 	return result{kind: "transport", reason: "indeterminate_transport"}
 }
 
-func call(ctx context.Context, client api.AsterApplicationServiceClient, o options, index uint64, token string) result {
-	response, err := client.PublishEvent(ctx, publishRequest(o, index, token))
-	return classify(response, err)
+func call(ctx context.Context, lane *publisherLane, o options, index uint64) result {
+	sequence, err := lane.journal.Retain(publishRequest(o, index))
+	if err != nil {
+		return result{kind: "protocol", reason: "publication_journal", terminal: true}
+	}
+	response, err := lane.journal.Publish(ctx, sequence)
+	observed := classify(nil, err)
+	if err == nil {
+		observed = classify(connect.NewResponse(response), nil)
+	}
+	if observed.kind != "accepted" {
+		observed.terminal = true
+		return observed
+	}
+	if err = lane.journal.Apply(sequence); err != nil {
+		return result{kind: "protocol", reason: "publication_journal", terminal: true}
+	}
+	return observed
 }
 
 type probeCounts struct {
@@ -273,80 +369,112 @@ func sampleIndices(n uint64) []uint64 {
 // The registry contains at most four result objects and each snapshot at most
 // eight requests. Checkpoints are triggered by completed planned slot indices,
 // not by the number of accepted load publications.
-func publicWork(o options, c clock, client api.AsterApplicationServiceClient, token string) func(context.Context, uint64) result {
+// At most four sampled results remain retained for exact and changed-intent
+// probes. Unsampled results are acknowledged after durable application progress.
+func publicWork(o options, c clock, client api.AsterApplicationServiceClient, token string, lanes []*publisherLane) func(context.Context, uint64) result {
 	start := c.Now()
 	indices := sampleIndices(o.slots)
+	type sample struct {
+		lane     *publisherLane
+		sequence uint64
+		result   *api.PublishNumberedEventResponse
+	}
 	var mu sync.Mutex
-	originals := make(map[uint64]*api.PublishEventResponse)
+	originals := map[uint64]sample{}
 	return func(ctx context.Context, index uint64) result {
+		lane := lanes[index%uint64(len(lanes))]
 		began := c.Now()
-		v := call(ctx, client, o, index, token)
-		v.elapsed = c.Now().Sub(began)
-		v.measured = true
-		if o.sampleEvery == 0 || v.kind != "accepted" || !v.inserted {
-			return v
+		lane.mu.Lock()
+		value := call(ctx, lane, o, index)
+		value.elapsed = c.Now().Sub(began)
+		value.measured = true
+		if value.kind != "accepted" {
+			lane.mu.Unlock()
+			return value
 		}
-		mu.Lock()
-		for _, i := range indices {
-			if i == index {
-				originals[i] = proto.Clone(v.original).(*api.PublishEventResponse)
+		sampled := false
+		if o.sampleEvery > 0 {
+			for _, i := range indices {
+				sampled = sampled || i == index
 			}
 		}
-		snapshot := make(map[uint64]*api.PublishEventResponse)
+		sequence := value.original.Result.OperationSequence
+		if !sampled {
+			if err := lane.journal.Acknowledge(ctx, sequence); err != nil {
+				value.probeStop = "publication_acknowledgement_failed"
+				value.terminal = true
+			}
+		}
+		lane.mu.Unlock()
+		if o.sampleEvery == 0 {
+			return value
+		}
+		mu.Lock()
+		if sampled {
+			originals[index] = sample{lane: lane, sequence: sequence, result: proto.Clone(value.original).(*api.PublishNumberedEventResponse)}
+		}
+		snapshot := map[uint64]sample{}
 		if (index+1)%o.sampleEvery == 0 || index+1 == o.slots {
-			for i, original := range originals {
-				snapshot[i] = original
+			for i, item := range originals {
+				snapshot[i] = item
 			}
 		}
 		mu.Unlock()
-		v.probes.Scheduled = uint64(2 * len(snapshot))
+		value.probes.Scheduled = uint64(2 * len(snapshot))
 		for _, i := range indices {
-			original, ok := snapshot[i]
-			if !ok {
+			item, exists := snapshot[i]
+			if !exists {
 				continue
 			}
 			for _, changed := range []bool{false, true} {
-				if ctx.Err() != nil || (o.duration > 0 && c.Now().Sub(start) >= o.duration) {
-					v.probes.Skipped = v.probes.Scheduled - v.probes.Attempted
+				if ctx.Err() != nil || o.duration > 0 && c.Now().Sub(start) >= o.duration {
+					value.probes.Skipped = value.probes.Scheduled - value.probes.Attempted
 					if ctx.Err() != nil {
-						v.probeStop = "probe_deadline_or_cancelled"
+						value.probeStop = "probe_deadline_or_cancelled"
 					} else {
-						v.probeStop = "duration_elapsed"
+						value.probeStop = "duration_elapsed"
 					}
-					return v
+					return value
 				}
-				req := publishRequest(o, i, token)
-				if changed {
-					req.Msg.Payload[0] ^= 1
+				item.lane.mu.Lock()
+				message, err := item.lane.journal.Request(item.sequence)
+				if err == nil && changed {
+					message.Payload[0] ^= 1
 				}
-				v.probes.Attempted++
-				response, err := client.PublishEvent(ctx, req)
+				value.probes.Attempted++
+				var response *connect.Response[api.PublishNumberedEventResponse]
+				if err == nil {
+					req := connect.NewRequest(message)
+					req.Header().Set("Authorization", "Bearer "+token)
+					response, err = client.PublishNumberedEvent(ctx, req)
+				}
+				item.lane.mu.Unlock()
 				observed := classify(response, err)
-				v.probes.Completed++
+				value.probes.Completed++
 				if changed && observed.kind == "rejected" && observed.reason == "operation_key_conflict" {
-					v.probes.Conflict++
+					value.probes.Conflict++
 					continue
 				}
 				if !changed && observed.kind == "accepted" {
-					expected := proto.Clone(original).(*api.PublishEventResponse)
+					expected := proto.Clone(item.result).(*api.PublishNumberedEventResponse)
 					expected.Inserted = false
 					if proto.Equal(expected, observed.original) {
-						v.probes.Exact++
+						value.probes.Exact++
 						continue
 					}
 				}
 				if observed.kind == "transport" {
-					v.probes.Transport++
+					value.probes.Transport++
 				} else {
-					v.probes.Unexpected++
+					value.probes.Unexpected++
 				}
-				v.probes.Terminal++
-				v.probeStop = "probe_mismatch"
-				v.probes.Skipped = v.probes.Scheduled - v.probes.Attempted
-				return v
+				value.probes.Terminal++
+				value.probeStop = "probe_mismatch"
+				value.probes.Skipped = value.probes.Scheduled - value.probes.Attempted
+				return value
 			}
 		}
-		return v
+		return value
 	}
 }
 
@@ -481,8 +609,8 @@ func execute(ctx context.Context, o options, c clock, publish func(context.Conte
 	ctx, stopWorkers := context.WithCancel(ctx)
 	defer stopWorkers()
 	start := c.Now()
-	r := receipt{Schema: "aster-agent-load/v1", Claim: "public-connect-workload-observation", SourceCommit: o.commit, BinarySHA256: o.binaryHash, AgentConfigSHA256: o.configHash, Started: start.UTC().Format(time.RFC3339Nano), StopReason: "schedule_complete", LatencyRule: "completed new-load attempts only, excludes probes; nearest rank ceil(p*N/100); 1ms upper edges; >30999ms overflow returns 31000 sentinel; zero for no samples"}
-	r.Config = workloadConfig{o.slots, int64(o.duration), o.rate, int64(o.interval), o.payload, o.concurrency, int64(o.timeout), digest([]byte(o.url)), digest([]byte(o.topic)), digest([]byte(o.scope)), digest([]byte(o.prefix)), "sha256:aster/agent-load/key/v1:u16be-prefix-length:prefix:u64be-index", o.sampleEvery, "fixed first/middle/last/splitmix64(count); at most 4 original results; exact then changed; zero disables; final slot also samples; worker timeout includes probes", custodyCeiling}
+	r := receipt{Schema: "aster-agent-load/v2", Claim: "public-connect-workload-observation", SourceCommit: o.commit, BinarySHA256: o.binaryHash, AgentConfigSHA256: o.configHash, Started: start.UTC().Format(time.RFC3339Nano), StopReason: "schedule_complete", LatencyRule: "completed new-load attempts only, excludes probes; nearest rank ceil(p*N/100); 1ms upper edges; >30999ms overflow returns 31000 sentinel; zero for no samples"}
+	r.Config = workloadConfig{o.slots, int64(o.duration), o.rate, int64(o.interval), o.payload, o.concurrency, int64(o.timeout), digest([]byte(o.url)), digest([]byte(o.topic)), digest([]byte(o.scope)), digest([]byte(o.prefix)), "numbered:sha256:aster/agent-load/client/v2:prefix:u64be-worker; durable contiguous per-client sequence", o.sampleEvery, "fixed first/middle/last/splitmix64(count); at most 4 original results; exact then changed; zero disables; final slot also samples; worker timeout includes probes", custodyCeiling}
 	encoded, _ := json.Marshal(r.Config)
 	r.ConfigSHA256 = digest(encoded)
 	p := pacer{interval: o.interval, limit: o.slots}
@@ -789,13 +917,33 @@ func run(args []string) error {
 	transport := &http.Transport{Protocols: protocols, MaxConnsPerHost: 1}
 	defer transport.CloseIdleConnections()
 	client := api.NewAsterApplicationServiceClient(&http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, o.url, connect.WithGRPC(), connect.WithReadMaxBytes(1<<20))
-	r := execute(ctx, o, realClock{}, publicWork(o, realClock{}, client, token))
+	lanes, err := openPublishers(ctx, o, client, token)
+	if err != nil {
+		return errors.New("publication recovery failed")
+	}
+	defer func() {
+		for _, lane := range lanes {
+			lane.journal.Close()
+		}
+	}()
+	r := execute(ctx, o, realClock{}, publicWork(o, realClock{}, client, token, lanes))
 	encoded, err := json.Marshal(r)
 	if err != nil {
 		return errors.New("receipt encoding failed")
 	}
 	if err = output.finish(append(encoded, '\n')); err != nil {
 		return err
+	}
+	cleanup, stopCleanup := context.WithTimeout(context.Background(), o.timeout)
+	defer stopCleanup()
+	for _, lane := range lanes {
+		for _, entry := range lane.journal.Entries() {
+			if entry.Applied {
+				if err = lane.journal.Acknowledge(cleanup, entry.Intent.OperationSequence); err != nil {
+					return errors.New("publication acknowledgement incomplete")
+				}
+			}
+		}
 	}
 	if r.StopReason != "schedule_complete" || r.Counts.Rejected+r.Counts.Transport+r.Counts.Protocol+r.Counts.Skipped != 0 {
 		return errors.New("workload incomplete")

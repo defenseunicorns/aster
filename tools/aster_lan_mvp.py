@@ -17,6 +17,8 @@ import binascii
 import http.client
 import ipaddress
 import json
+import math
+import subprocess
 import os
 from pathlib import Path
 import re
@@ -298,35 +300,6 @@ class ConnectJsonClient:
             raise RpcError("CreateEventSubscription returned a malformed subscription ID") from error
         return response
 
-    def publish(
-        self,
-        operation_key: bytes,
-        logical_key: bytes,
-        payload: bytes,
-        topic: str,
-        scope: str,
-    ) -> Dict[str, object]:
-        response = self.call(
-            "PublishEvent",
-            {
-                "operationKey": _encode_b64(operation_key),
-                "topic": topic,
-                "scope": scope,
-                "priority": "PRIORITY_ROUTINE",
-                "logicalKey": _encode_b64(logical_key),
-                "payload": _encode_b64(payload),
-                "tombstone": False,
-            },
-        )
-        event_id = response.get("id")
-        if not isinstance(event_id, str):
-            raise RpcError("PublishEvent returned no Event ID")
-        try:
-            canonical_event_id(event_id)
-        except OperatorError as error:
-            raise RpcError("PublishEvent returned a malformed Event ID") from error
-        return response
-
     def query_events(
         self,
         topic: str,
@@ -431,6 +404,13 @@ def build_parser() -> argparse.ArgumentParser:
     token = commands.add_parser("token", help="create a new private client token")
     token.add_argument("--file", type=Path, required=True)
 
+    initialize = commands.add_parser("publication-init", help="explicitly create one numbered publication journal")
+    _add_connection_arguments(initialize)
+    _add_route_arguments(initialize)
+    initialize.add_argument("--journal", type=Path, required=True)
+    initialize.add_argument("--client-id", required=True)
+    initialize.add_argument("--cli", default="asterctl")
+
     status = commands.add_parser("status", help="read one local status snapshot")
     _add_connection_arguments(status)
 
@@ -442,7 +422,9 @@ def build_parser() -> argparse.ArgumentParser:
     publish = commands.add_parser("publish", help="publish one routine Event")
     _add_connection_arguments(publish)
     _add_route_arguments(publish)
-    publish.add_argument("--operation-key", required=True)
+    publish.add_argument("--journal", type=Path, required=True)
+    publish.add_argument("--client-id", required=True)
+    publish.add_argument("--cli", default="asterctl", help="journaled publication CLI")
     publish.add_argument("--logical-key", required=True)
     publish.add_argument("--payload", required=True)
     publish.add_argument(
@@ -493,10 +475,46 @@ def _print_json(value: Mapping[str, object]) -> None:
     print(json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True))
 
 
+def _numbered_cli(arguments: argparse.Namespace, *, initialize: bool = False) -> Dict[str, object]:
+    _bounded_utf8(arguments.client_id, "client ID", 64)
+    command = [arguments.cli]
+    if not initialize:
+        parsed = urlparse(arguments.url)
+        command.extend(["--host", str(parsed.hostname), "--port", str(parsed.port),
+                        "--token-file", str(arguments.token_file), "--timeout", str(max(1, math.ceil(arguments.timeout))), "--json"])
+    command.extend(["publication-init" if initialize else "publish", "--journal", str(arguments.journal), "--client-id", arguments.client_id])
+    payload = None
+    if not initialize:
+        topic, scope = _route_from_args(arguments)
+        _bounded_utf8(arguments.logical_key, "logical key", MAX_LOGICAL_KEY_BYTES, allow_empty=True)
+        payload = _bounded_utf8(arguments.payload, "payload", MAX_PAYLOAD_BYTES, allow_empty=True)
+        command.extend(["--topic", topic, "--scope", scope, "--priority", "routine", "--logical-key", arguments.logical_key])
+    try:
+        completed = subprocess.run(command, input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=35, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise OperatorError("numbered publication interrupted; original journal retained") from error
+    if completed.returncode != 0:
+        raise OperatorError("numbered publication failed; use asterctl publication-recover/retry with the original journal")
+    if initialize:
+        return {"initialized": True}
+    if len(completed.stdout) > MAX_RPC_RESPONSE_BYTES:
+        raise OperatorError("numbered publication response exceeded its bound")
+    try:
+        result = json.loads(completed.stdout)
+        canonical_event_id(result["result"]["receipt"]["eventId"])
+    except (ValueError, TypeError, KeyError, OperatorError) as error:
+        raise OperatorError("numbered publication returned an invalid committed receipt") from error
+    return result
+
+
 def run(arguments: argparse.Namespace) -> None:
     if arguments.command == "token":
         create_token_file(arguments.file)
         _print_json({"created": True, "tokenFile": str(arguments.file)})
+        return
+
+    if arguments.command == "publication-init":
+        _print_json(_numbered_cli(arguments, initialize=True))
         return
 
     client = _client_from_args(arguments)
@@ -514,26 +532,9 @@ def run(arguments: argparse.Namespace) -> None:
         _print_json(client.subscribe(operation_key, topic, scope))
         return
     if arguments.command == "publish":
-        operation_key = _bounded_utf8(
-            arguments.operation_key,
-            "operation key",
-            MAX_OPERATION_KEY_BYTES,
-        )
-        logical_key = _bounded_utf8(
-            arguments.logical_key,
-            "logical key",
-            MAX_LOGICAL_KEY_BYTES,
-            allow_empty=True,
-        )
-        payload = _bounded_utf8(
-            arguments.payload,
-            "payload",
-            MAX_PAYLOAD_BYTES,
-            allow_empty=True,
-        )
-        response = client.publish(operation_key, logical_key, payload, topic, scope)
+        response = _numbered_cli(arguments)
         if arguments.id_only:
-            print(response["id"])
+            print(response["result"]["receipt"]["eventId"])
         else:
             _print_json(response)
         return

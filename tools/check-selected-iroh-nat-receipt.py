@@ -29,7 +29,7 @@ from typing import Any, Callable, Sequence
 from urllib.parse import urlsplit
 
 
-SCHEMA = "aster-selected-iroh-nat-receipt/v1"
+SCHEMA = "aster-selected-iroh-nat-receipt/v2"
 CLAIM = "selected-iroh-one-host-namespace-nat-two-cell-acceptance"
 RECEIPT_MAX_BYTES = 128 * 1024
 MAX_BINARY_BYTES = 256 * 1024 * 1024
@@ -2977,7 +2977,8 @@ def validate_raw_event_logs(
     )
     publish_expected = {
         "status": "pass",
-        "version": "1",
+        "version": "2",
+        "publication_model": "numbered-v1",
         "node": "a",
         "event_id": event["event_id"],
         "publisher": event["publisher"],
@@ -6375,8 +6376,12 @@ def validate_raw_cleanup_authorities(
     canary = exact_raw_receipt(
         canary_text, "SELECTED_NAT_CANARY_DESTROY", f"{label}.canary_destroy_log"
     )
+    raw_equal(canary.get("version"), "2", f"{label}.canary_destroy_log.version")
+    raw_equal(canary.get("publication_journals_destroyed"), "2", f"{label}.publication_journals_destroyed")
+    legacy_destroy_fields = {key: value for key, value in canary.items() if key != "publication_journals_destroyed"}
+    legacy_destroy_fields["version"] = "1"
     validate_raw_destroy_marker(
-        canary,
+        legacy_destroy_fields,
         target="private/canary.bin",
         expected_bytes=32,
         label=f"{label}.canary_destroy_log",
@@ -7931,7 +7936,19 @@ def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(arguments: list[str] | None = None) -> None:
-    options = parse_args(arguments)
+    selected_arguments = list(sys.argv[1:] if arguments is None else arguments)
+    if "--historical-v1" in selected_arguments:
+        import importlib.util
+        selected_arguments.remove("--historical-v1")
+        path = Path(__file__).parent / "historical" / Path(__file__).name
+        spec = importlib.util.spec_from_file_location("aster_historical_nat_receipt", path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("historical NAT receipt validator unavailable")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.main(selected_arguments)
+        return
+    options = parse_args(selected_arguments)
     try:
         document = load_receipt(options.receipt)
         validate_receipt(document)

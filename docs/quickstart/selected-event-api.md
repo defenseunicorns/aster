@@ -45,7 +45,7 @@ cargo run --locked -p aster-node --bin aster -- \
 cargo run --locked -p aster-node --example live_event_application -- \
   "$ASTER_EVENT_ROOT/mesh/node-0" \
   "$ASTER_EVENT_ROOT/mesh/node-0/mission.unprotected-reference.bundle" \
-  demo/mesh mesh.ping-pong
+  demo/mesh mesh.ping-pong --initialize-publication-journal
 ```
 
 Among the runtime lifecycle lines, expect one application line shaped like:
@@ -59,12 +59,12 @@ already populated the topic. The example filters its query to the local
 publisher, acknowledges every returned delivery, reports only gaps anchored by
 freshly verified local observations, unsubscribes, and gracefully shuts down.
 
-Run the same example again. Its fixed publication operation key makes publish
-idempotent, so `inserted=false` and the original Event identity returns. Because
-the example deliberately unsubscribes at the end, the next subscribe is a new
-replacement selector with a new delivery ledger; existing matching Events can
-therefore be delivered again. This is replacement behavior, not a subscription
-update claim.
+For subsequent runs, omit `--initialize-publication-journal`. The example opens
+its existing private journal, fences the previous session, and recovers a pending
+full intent before new work. A failed or uncertain publication stays pending;
+repair it rather than deleting the journal or changing the client identity.
+Each completed run allocates the next sequence and publishes a new Event. The
+subscription still uses a stable selector key and is removed at shutdown.
 
 The fixture persists explicitly unprotected reference mission bundles. They are
 suitable for this disposable demonstration, not operational provisioning.
@@ -254,18 +254,19 @@ let subscription = events
     })
     .await?;
 
-let published = events
-    .publish(EventPublishRequest {
-        operation_key: b"my-app/asset-7/ready".to_vec(),
-        predecessor: None,
-        topic: topic.clone(),
-        scope: scope.clone(),
-        priority: Priority::Priority,
-        logical_key: b"asset-7".to_vec(),
-        payload: b"ready".to_vec(),
-        tombstone: false,
-    })
-    .await?;
+use aster_node::publication_journal::{Backend, Intent, Journal};
+// Initialize only during explicit fresh application provisioning.
+Journal::initialize(&journal_path, b"my-app-publisher")?;
+let mut journal = Journal::open(&journal_path, b"my-app-publisher")?;
+let mut backend = Backend::Live(&events);
+journal.recover(&mut backend).await?; // finish original pending work before new intents
+let published = journal.publish_metadata(&mut backend, Intent {
+    predecessor: None, topic: topic.as_str().to_owned(), scope: scope.as_str().to_owned(),
+    priority: Priority::Priority as u8, logical_key: b"asset-7".to_vec(),
+    payload: b"ready".to_vec(), tombstone: false, ttl_ms: None,
+}).await?;
+// Save the application's idempotent progress before compacting the result.
+journal.acknowledge(&mut backend).await?;
 
 let page = events
     .query(EventQuery {
@@ -304,16 +305,18 @@ events.unsubscribe(subscription.id).await?;
 running.shutdown().await?;
 ```
 
-Choose an operation key that identifies the application effect, not a random
-attempt. Reusing it with the same publish request returns the original commit;
-reusing it with different content fails closed. Topics and scopes must be
-authorized by current mission policy. Tombstones must have an empty payload.
-The selected Event slice authenticates and returns priority. Semantic-v3/v4/v5
-contacts use it for bounded transmission order and retry cadence, while the
-selected pressure policy fixes same-scope candidates ahead of off-scope rows
-when that exact scope is initially short, then retires expired rows and
-route-only rows before comparing priority within each cohort. The additive
-`publish_with_options` API accepts a positive
+Use a stable configured publisher client and retain its durable journal across
+process restarts. The journal assigns a positive contiguous sequence before
+sending and retains the complete original intent for uncertain outcomes.
+Missing or corrupt journals fail closed. Recover before new work; never assign
+a replacement sequence to hide an unknown result. Acknowledging an applied
+result frees sparse-result capacity while the client frontier prevents reuse.
+The native API also exposes explicit session/recovery/publication operations
+for applications that own their own durable protocol state.
+
+Topics and scopes remain subject to current mission policy; tombstones have an
+empty payload. Priority still controls bounded transmission order and custody
+pressure. `Intent::ttl_ms` optionally chooses a positive
 source-authenticated finite TTL on Linux; query, poll, and gap exposure withhold
 an Event at the exact expiry boundary. See [Selected Event custody and
 constrained operation](selected-custody-api.md) for configuration, clock,
@@ -487,3 +490,19 @@ Continue with the [capability tour](capability-tour.md) for a fast visible mesh,
 the [selected architecture](../architecture.md) for the complete authority
 split, and the [requirements status](../validation/requirements-status.md)
 for exact credited and open obligations.
+
+## Observe bounded numbered publication lifecycle
+
+`event_operation_ledger_scale` now emits `aster-event-operation-ledger-scale/v2`
+mechanism observations. It configures ten fixed producer slots with private
+journals, reuses result headroom after acknowledgement, preserves a rejected
+capacity probe for exact retry, exercises reserved tombstone admission, and
+reopens the same clients to recover retained receipts. It uses
+`--client-namespace` rather than a per-publication operation key.
+
+The `small-byte-capacity` mode uses durable Events and checks the byte boundary.
+The `small` mode additionally checks finite-TTL receipt retirement on Linux.
+The million-event modes still refuse before creating state because their
+unique-Event workload exceeds the custody ceiling. These observations remain
+local mechanism checks, with `qualification=false`; earlier v1 observations
+retain their original legacy-ledger meaning.

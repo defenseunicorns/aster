@@ -112,14 +112,14 @@ impl std::error::Error for PublicationError {
 }
 type Result<T> = std::result::Result<T, NumberedEventSdkError>;
 
-struct PipelinedPublicationState {
-    pending: VecDeque<api::PublishEventRequest>,
+struct NumberedPipelinedPublicationState {
+    pending: VecDeque<api::PublishNumberedEventRequest>,
     sent: usize,
-    responses: Vec<api::PublishEventsResponse>,
+    responses: Vec<api::PublishNumberedEventsResponse>,
 }
 
-impl PipelinedPublicationState {
-    fn new(requests: Vec<api::PublishEventRequest>) -> Self {
+impl NumberedPipelinedPublicationState {
+    fn new(requests: Vec<api::PublishNumberedEventRequest>) -> Self {
         Self {
             pending: requests.into(),
             sent: 0,
@@ -127,7 +127,7 @@ impl PipelinedPublicationState {
         }
     }
 
-    fn fill_window(&mut self, window: usize) -> Vec<api::PublishEventRequest> {
+    fn fill_window(&mut self, window: usize) -> Vec<api::PublishNumberedEventRequest> {
         let count = window
             .saturating_sub(self.sent)
             .min(self.pending.len().saturating_sub(self.sent));
@@ -144,7 +144,7 @@ impl PipelinedPublicationState {
 
     fn accept_response(
         &mut self,
-        response: api::PublishEventsResponse,
+        response: api::PublishNumberedEventsResponse,
     ) -> std::result::Result<(), connectrpc::ConnectError> {
         if response.outcome.is_none() {
             return Err(connectrpc::ConnectError::internal(
@@ -169,25 +169,17 @@ impl PipelinedPublicationState {
         self.pending.is_empty()
     }
 
-    fn into_responses(self) -> Vec<api::PublishEventsResponse> {
+    fn into_responses(self) -> Vec<api::PublishNumberedEventsResponse> {
         self.responses
     }
 }
 
-/// Native HTTP/2 publisher that keeps ordinary Event publication pipelined.
-///
-/// Each result is returned in request order only after the agent reports the
-/// corresponding local durable outcome. Sessions rotate before the agent's
-/// ten-second default stream deadline. If an established stream disconnects,
-/// every sent request without a response is replayed with its original
-/// operation key, so the node's durable idempotency contract resolves whether
-/// it was committed before the disconnect.
-pub struct PipelinedEventPublisher<T> {
-    client: api::AsterApplicationServiceClient<T>,
+struct NumberedPipelinedEventPublisher<'a, T> {
+    client: &'a api::AsterApplicationServiceClient<T>,
     max_disconnect_retries: usize,
 }
 
-impl<T> PipelinedEventPublisher<T>
+impl<'a, T> NumberedPipelinedEventPublisher<'a, T>
 where
     T: ClientTransport,
     T::ResponseBody: Unpin,
@@ -198,7 +190,7 @@ where
     /// durable response. A bounded session that made progress may rotate
     /// without consuming this budget.
     pub fn new(
-        client: api::AsterApplicationServiceClient<T>,
+        client: &'a api::AsterApplicationServiceClient<T>,
         max_disconnect_retries: usize,
     ) -> Self {
         Self {
@@ -208,22 +200,29 @@ where
     }
 
     /// Publishes a finite ordered set over one or more bounded native streams.
-    pub async fn publish_all(
+    async fn publish_all<F>(
         &self,
-        requests: Vec<api::PublishEventRequest>,
-    ) -> std::result::Result<Vec<api::PublishEventsResponse>, connectrpc::ConnectError> {
-        let mut state = PipelinedPublicationState::new(requests);
+        requests: Vec<api::PublishNumberedEventRequest>,
+        mut persist: F,
+    ) -> Result<Vec<api::PublishNumberedEventsResponse>>
+    where
+        F: FnMut(
+            &api::PublishNumberedEventRequest,
+            &api::PublishNumberedEventsResponse,
+        ) -> Result<()>,
+    {
+        let mut state = NumberedPipelinedPublicationState::new(requests);
         let mut consecutive_disconnects = 0_usize;
         while !state.is_complete() {
             state.reconnect();
-            let mut stream = self.client.publish_events().await?;
+            let mut stream = self.client.publish_numbered_events().await?;
             let deadline = tokio::time::Instant::now() + PIPELINED_PUBLICATION_SESSION;
             let mut rotate = false;
             let mut session_made_progress = false;
 
             while !state.is_complete() && !rotate {
                 for request in state.fill_window(PIPELINED_PUBLICATION_WINDOW) {
-                    let send = stream.send(api::PublishEventsRequest {
+                    let send = stream.send(api::PublishNumberedEventsRequest {
                         publication: request.into(),
                         ..Default::default()
                     });
@@ -240,7 +239,7 @@ where
                         }
                         Ok(Err(error)) => {
                             if consecutive_disconnects >= self.max_disconnect_retries {
-                                return Err(error);
+                                return Err(error.into());
                             }
                             consecutive_disconnects += 1;
                             rotate = true;
@@ -254,7 +253,7 @@ where
 
                 match tokio::time::timeout_at(
                     deadline,
-                    stream.message::<api::PublishEventsResponse>(),
+                    stream.message::<api::PublishNumberedEventsResponse>(),
                 )
                 .await
                 {
@@ -267,7 +266,14 @@ where
                         rotate = true;
                     }
                     Ok(Ok(Some(response))) => {
-                        state.accept_response(response.to_owned_message())?;
+                        let response = response.to_owned_message();
+                        let request = state.pending.front().ok_or_else(|| {
+                            NumberedEventSdkError::Protocol(
+                                "unpaired publication response".to_owned(),
+                            )
+                        })?;
+                        persist(request, &response)?;
+                        state.accept_response(response)?;
                         session_made_progress = true;
                         consecutive_disconnects = 0;
                     }
@@ -276,14 +282,14 @@ where
                             "publication stream ended before every durable response",
                         );
                         if consecutive_disconnects >= self.max_disconnect_retries {
-                            return Err(error);
+                            return Err(error.into());
                         }
                         consecutive_disconnects += 1;
                         rotate = true;
                     }
                     Ok(Err(error)) => {
                         if consecutive_disconnects >= self.max_disconnect_retries {
-                            return Err(error);
+                            return Err(error.into());
                         }
                         consecutive_disconnects += 1;
                         rotate = true;
@@ -911,12 +917,159 @@ where
         Ok(assigned)
     }
 
+    /// Returns the original durable intent for application recovery. This is
+    /// a local read, not an admission or acknowledgement. Consumed operations
+    /// have no retained journal row and return `None`.
+    pub fn journaled_intent(
+        &self,
+        sequence: u64,
+    ) -> Result<Option<api::PublishNumberedEventRequest>> {
+        Ok(self.journal.entry(sequence)?.map(|entry| entry.intent))
+    }
+
+    /// Pipelines a contiguous range of journaled operations. Every successful
+    /// receipt is durably saved before releasing another slot. A rejected
+    /// operation stops the pipeline and remains journaled for explicit repair
+    /// or abandonment; uncertain transport outcomes are replayed unchanged.
+    pub async fn publish_journaled_pipeline(
+        &self,
+        sequences: &[u64],
+        max_disconnect_retries: usize,
+    ) -> Result<Vec<api::CommittedPublicationResult>>
+    where
+        T::ResponseBody: Unpin,
+    {
+        let state = self.journal.read_state()?;
+        require_recovered(&state)?;
+        let mut requests = Vec::with_capacity(sequences.len());
+        let mut expected = state.allocated_through.checked_add(1);
+        for &sequence in sequences {
+            if Some(sequence) != expected {
+                return Err(NumberedEventSdkError::Protocol(
+                    "pipeline must start at the next admission and contain contiguous sequences"
+                        .to_owned(),
+                ));
+            }
+            let mut entry = self.journal.entry(sequence)?.ok_or_else(|| {
+                NumberedEventSdkError::Journal(format!("sequence {sequence} is not journaled"))
+            })?;
+            if entry.abandoned || entry.result.is_some() {
+                return Err(NumberedEventSdkError::Protocol(format!(
+                    "sequence {sequence} is already resolved"
+                )));
+            }
+            entry.intent.client_id.clone_from(&state.client_id);
+            entry.intent.session = state.session;
+            requests.push(entry.intent);
+            expected = sequence.checked_add(1);
+        }
+        let publisher = NumberedPipelinedEventPublisher::new(&self.client, max_disconnect_retries);
+        let responses = publisher
+            .publish_all(requests, |request, response| {
+                let published = match &response.outcome {
+                    Some(api::publish_numbered_events_response::Outcome::Published(published)) => {
+                        published
+                    }
+                    Some(api::publish_numbered_events_response::Outcome::Failure(failure)) => {
+                        return Err(NumberedEventSdkError::Protocol(format!(
+                            "sequence {} was rejected: {:?}; intent remains journaled",
+                            request.operation_sequence, failure.reason
+                        )));
+                    }
+                    None => {
+                        return Err(NumberedEventSdkError::Protocol(
+                            "publication stream omitted its outcome".to_owned(),
+                        ));
+                    }
+                };
+                let result = published.result.as_option().ok_or_else(|| {
+                    NumberedEventSdkError::Protocol(
+                        "publication response omitted its committed result".to_owned(),
+                    )
+                })?;
+                validate_committed_result(result)?;
+                if result.operation_sequence != request.operation_sequence {
+                    return Err(NumberedEventSdkError::Protocol(
+                        "publication response returned a different sequence".to_owned(),
+                    ));
+                }
+                self.save_publication_result(state.session, result)
+            })
+            .await?;
+        Ok(responses
+            .into_iter()
+            .map(|response| match response.outcome {
+                Some(api::publish_numbered_events_response::Outcome::Published(published)) => {
+                    published
+                        .result
+                        .into_option()
+                        .expect("validated and journaled result")
+                }
+                _ => unreachable!("failed outcomes stop the pipeline"),
+            })
+            .collect())
+    }
+
+    fn save_publication_result(
+        &self,
+        session: u64,
+        result: &api::CommittedPublicationResult,
+    ) -> Result<()> {
+        let sequence = result.operation_sequence;
+        self.journal.write(|current, entries| {
+            require_recovered(current)?;
+            if current.session != session
+                || current.allocated_through.checked_add(1) != Some(sequence)
+            {
+                return Err(NumberedEventSdkError::Journal(
+                    "publication frontier changed while an RPC was in flight".to_owned(),
+                ));
+            }
+            let value = entries
+                .get(sequence)
+                .map_err(|error| journal_error(self.journal.path(), "get publication", error))?
+                .ok_or_else(|| {
+                    NumberedEventSdkError::Journal("publication disappeared".to_owned())
+                })?;
+            let mut saved: JournalEntry = decode_json(value.value(), "entry")?;
+            drop(value);
+            if saved.abandoned || saved.result.is_some() {
+                return Err(NumberedEventSdkError::Journal(
+                    "publication changed while an RPC was in flight".to_owned(),
+                ));
+            }
+            saved.result = Some(result.clone());
+            let encoded = encode_json(&saved)?;
+            entries
+                .insert(sequence, encoded.as_slice())
+                .map_err(|error| {
+                    journal_error(self.journal.path(), "store publication result", error)
+                })?;
+            current.allocated_through = sequence;
+            Ok(())
+        })
+    }
+
     /// Sends only a previously journaled intent and persists its result before
     /// exposing it to the caller.
     pub async fn publish_journaled(
         &self,
         sequence: u64,
     ) -> Result<api::CommittedPublicationResult> {
+        let outcome = self.publish_journaled_outcome(sequence).await?;
+        Ok(outcome
+            .result
+            .into_option()
+            .expect("validated and saved result"))
+    }
+
+    /// Returns the agent's transient insertion observation along with the
+    /// durable result. A result already recovered from the journal reports
+    /// `inserted = false`; insertion is not an additional durable receipt field.
+    pub async fn publish_journaled_outcome(
+        &self,
+        sequence: u64,
+    ) -> Result<api::PublishNumberedEventResponse> {
         let state = self.journal.read_state()?;
         require_recovered(&state)?;
         let mut entry = self.journal.entry(sequence)?.ok_or_else(|| {
@@ -928,7 +1081,11 @@ where
             )));
         }
         if let Some(result) = entry.result {
-            return Ok(result);
+            return Ok(api::PublishNumberedEventResponse {
+                result: result.into(),
+                inserted: false,
+                ..Default::default()
+            });
         }
         if sequence != state.allocated_through + 1 {
             return Err(NumberedEventSdkError::Protocol(format!(
@@ -952,32 +1109,9 @@ where
                 "publication response returned a different sequence".to_owned(),
             ));
         }
-        self.journal.write(|current, entries| {
-            require_recovered(current)?;
-            if current.session != state.session || current.allocated_through + 1 != sequence {
-                return Err(NumberedEventSdkError::Journal(
-                    "publication frontier changed while an RPC was in flight".to_owned(),
-                ));
-            }
-            let value = entries
-                .get(sequence)
-                .map_err(|error| journal_error(self.journal.path(), "get publication", error))?
-                .ok_or_else(|| {
-                    NumberedEventSdkError::Journal("publication disappeared".to_owned())
-                })?;
-            let mut saved: JournalEntry = decode_json(value.value(), "entry")?;
-            drop(value);
-            saved.result = Some(result.clone());
-            let encoded = encode_json(&saved)?;
-            entries
-                .insert(sequence, encoded.as_slice())
-                .map_err(|error| {
-                    journal_error(self.journal.path(), "store publication result", error)
-                })?;
-            current.allocated_through = sequence;
-            Ok(())
-        })?;
-        Ok(result)
+        validate_committed_result(&result)?;
+        self.save_publication_result(state.session, &result)?;
+        Ok(response)
     }
 
     pub async fn publish(
@@ -1327,9 +1461,9 @@ mod tests {
         (state, row)
     }
 
-    fn publication_outcome() -> api::PublishEventsResponse {
-        api::PublishEventsResponse {
-            outcome: Some(api::publish_events_response::Outcome::Published(
+    fn publication_outcome() -> api::PublishNumberedEventsResponse {
+        api::PublishNumberedEventsResponse {
+            outcome: Some(api::publish_numbered_events_response::Outcome::Published(
                 Box::default(),
             )),
             ..Default::default()
@@ -1337,15 +1471,15 @@ mod tests {
     }
 
     #[test]
-    fn publish_events_session_replays_every_sent_unanswered_operation_key() {
-        let request = |key: &[u8]| api::PublishEventRequest {
-            operation_key: key.to_vec(),
+    fn numbered_transport_session_replays_every_sent_unanswered_logical_key() {
+        let request = |key: &[u8]| api::PublishNumberedEventRequest {
+            logical_key: key.to_vec(),
             topic: "chat.events".to_owned(),
             scope: "mission/team/alpha".to_owned(),
             priority: api::Priority::Routine.into(),
             ..Default::default()
         };
-        let mut session = PipelinedPublicationState::new(vec![
+        let mut session = NumberedPipelinedPublicationState::new(vec![
             request(b"first"),
             request(b"second"),
             request(b"third"),
@@ -1355,7 +1489,7 @@ mod tests {
             session
                 .fill_window(2)
                 .iter()
-                .map(|request| request.operation_key.as_slice())
+                .map(|request| request.logical_key.as_slice())
                 .collect::<Vec<_>>(),
             vec![b"first".as_slice(), b"second".as_slice()]
         );
@@ -1366,7 +1500,7 @@ mod tests {
             session
                 .fill_window(2)
                 .iter()
-                .map(|request| request.operation_key.as_slice())
+                .map(|request| request.logical_key.as_slice())
                 .collect::<Vec<_>>(),
             vec![b"third".as_slice()]
         );
@@ -1376,21 +1510,21 @@ mod tests {
             session
                 .fill_window(2)
                 .iter()
-                .map(|request| request.operation_key.as_slice())
+                .map(|request| request.logical_key.as_slice())
                 .collect::<Vec<_>>(),
             vec![b"second".as_slice(), b"third".as_slice()]
         );
     }
 
     #[test]
-    fn publish_events_stalled_reader_never_advances_beyond_window() {
+    fn numbered_transport_stalled_reader_never_advances_beyond_window() {
         let requests = (0_u8..20)
-            .map(|key| api::PublishEventRequest {
-                operation_key: vec![key],
+            .map(|key| api::PublishNumberedEventRequest {
+                logical_key: vec![key],
                 ..Default::default()
             })
             .collect();
-        let mut session = PipelinedPublicationState::new(requests);
+        let mut session = NumberedPipelinedPublicationState::new(requests);
 
         assert_eq!(session.fill_window(PIPELINED_PUBLICATION_WINDOW).len(), 8);
         assert!(session.fill_window(PIPELINED_PUBLICATION_WINDOW).is_empty());
@@ -1402,30 +1536,28 @@ mod tests {
     }
 
     #[test]
-    fn publish_events_missing_outcome_does_not_advance_durable_frontier() {
-        let mut session = PipelinedPublicationState::new(vec![api::PublishEventRequest {
-            operation_key: b"unchanged".to_vec(),
-            ..Default::default()
-        }]);
+    fn numbered_transport_missing_outcome_does_not_advance_durable_frontier() {
+        let mut session =
+            NumberedPipelinedPublicationState::new(vec![api::PublishNumberedEventRequest {
+                logical_key: b"unchanged".to_vec(),
+                ..Default::default()
+            }]);
         assert_eq!(session.fill_window(1).len(), 1);
 
         session
-            .accept_response(api::PublishEventsResponse::default())
+            .accept_response(api::PublishNumberedEventsResponse::default())
             .expect_err("missing durable outcome must be rejected");
         session.reconnect();
-        assert_eq!(
-            session.fill_window(1)[0].operation_key,
-            b"unchanged".to_vec()
-        );
+        assert_eq!(session.fill_window(1)[0].logical_key, b"unchanged".to_vec());
     }
 
     #[cfg(feature = "server")]
     #[tokio::test]
-    async fn publish_events_transport_replays_only_sent_unanswered_keys_after_disconnect() {
+    async fn numbered_transport_transport_replays_only_sent_unanswered_keys_after_disconnect() {
         let sessions = Arc::new(Mutex::new(Vec::<Vec<Vec<u8>>>::new()));
         let captured = sessions.clone();
         let handler = connectrpc::bidi_streaming_handler_fn(
-            move |_ctx, requests: connectrpc::ServiceStream<api::PublishEventsRequest>| {
+            move |_ctx, requests: connectrpc::ServiceStream<api::PublishNumberedEventsRequest>| {
                 let captured = captured.clone();
                 async move {
                     let session = {
@@ -1439,7 +1571,7 @@ mod tests {
                             connectrpc::ConnectError::invalid_argument("missing publication")
                         })?;
                         captured.lock().expect("session capture")[session]
-                            .push(publication.operation_key);
+                            .push(publication.logical_key);
                         if (session == 0 && index == 0) || (session == 1 && index == 1) {
                             Err(connectrpc::ConnectError::unavailable(
                                 "deterministic mid-stream disconnect",
@@ -1454,28 +1586,28 @@ mod tests {
         );
         let router = connectrpc::Router::new().route_bidi_stream(
             api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
-            "PublishEvents",
+            "PublishNumberedEvents",
             handler,
         );
         let client = api::AsterApplicationServiceClient::new(
             ServiceTransport::new(crate::event_service::configured_service(router)),
             ClientConfig::new("http://localhost".parse().expect("URI")),
         );
-        let publisher = PipelinedEventPublisher::new(client, 1);
+        let publisher = NumberedPipelinedEventPublisher::new(&client, 1);
         let requests = [
             b"first".as_slice(),
             b"second".as_slice(),
             b"third".as_slice(),
         ]
         .into_iter()
-        .map(|key| api::PublishEventRequest {
-            operation_key: key.to_vec(),
+        .map(|key| api::PublishNumberedEventRequest {
+            logical_key: key.to_vec(),
             ..Default::default()
         })
         .collect();
 
         let responses = publisher
-            .publish_all(requests)
+            .publish_all(requests, |_, _| Ok(()))
             .await
             .expect("recover disconnected stream");
         assert_eq!(responses.len(), 3);
@@ -1491,11 +1623,11 @@ mod tests {
 
     #[cfg(feature = "server")]
     #[tokio::test(start_paused = true)]
-    async fn publish_events_transport_rotates_before_server_deadline_and_replays_unanswered() {
+    async fn numbered_transport_transport_rotates_before_server_deadline_and_replays_unanswered() {
         let sessions = Arc::new(Mutex::new(Vec::<Vec<Vec<u8>>>::new()));
         let captured = sessions.clone();
         let handler = connectrpc::bidi_streaming_handler_fn(
-            move |_ctx, requests: connectrpc::ServiceStream<api::PublishEventsRequest>| {
+            move |_ctx, requests: connectrpc::ServiceStream<api::PublishNumberedEventsRequest>| {
                 let captured = captured.clone();
                 async move {
                     let session = {
@@ -1526,7 +1658,7 @@ mod tests {
                             };
                             let session_requests = {
                                 let mut sessions = captured.lock().expect("session capture");
-                                sessions[session].push(publication.operation_key);
+                                sessions[session].push(publication.logical_key);
                                 sessions[session].len()
                             };
                             if session == 0 && session_requests > 1 {
@@ -1542,24 +1674,24 @@ mod tests {
         );
         let router = connectrpc::Router::new().route_bidi_stream(
             api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
-            "PublishEvents",
+            "PublishNumberedEvents",
             handler,
         );
         let client = api::AsterApplicationServiceClient::new(
             ServiceTransport::new(crate::event_service::configured_service(router)),
             ClientConfig::new("http://localhost".parse().expect("URI")),
         );
-        let publisher = PipelinedEventPublisher::new(client, 0);
+        let publisher = NumberedPipelinedEventPublisher::new(&client, 0);
         let requests = [b"first".as_slice(), b"second".as_slice()]
             .into_iter()
-            .map(|key| api::PublishEventRequest {
-                operation_key: key.to_vec(),
+            .map(|key| api::PublishNumberedEventRequest {
+                logical_key: key.to_vec(),
                 ..Default::default()
             })
             .collect();
 
         let responses = publisher
-            .publish_all(requests)
+            .publish_all(requests, |_, _| Ok(()))
             .await
             .expect("rotate healthy bounded session");
         assert_eq!(responses.len(), 2);
@@ -1574,18 +1706,18 @@ mod tests {
 
     #[cfg(feature = "server")]
     #[tokio::test(start_paused = true)]
-    async fn publish_events_transport_bounds_consecutive_no_progress_rotations() {
+    async fn numbered_transport_transport_bounds_consecutive_no_progress_rotations() {
         let sessions = Arc::new(Mutex::new(0_usize));
         let captured = sessions.clone();
         let handler = connectrpc::bidi_streaming_handler_fn(
-            move |_ctx, requests: connectrpc::ServiceStream<api::PublishEventsRequest>| {
+            move |_ctx, requests: connectrpc::ServiceStream<api::PublishNumberedEventsRequest>| {
                 let captured = captured.clone();
                 async move {
                     *captured.lock().expect("session capture") += 1;
                     let responses = requests.take(1).then(|_request| async {
                         futures::future::pending::<
                             std::result::Result<
-                                api::PublishEventsResponse,
+                                api::PublishNumberedEventsResponse,
                                 connectrpc::ConnectError,
                             >,
                         >()
@@ -1597,38 +1729,40 @@ mod tests {
         );
         let router = connectrpc::Router::new().route_bidi_stream(
             api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
-            "PublishEvents",
+            "PublishNumberedEvents",
             handler,
         );
         let client = api::AsterApplicationServiceClient::new(
             ServiceTransport::new(crate::event_service::configured_service(router)),
             ClientConfig::new("http://localhost".parse().expect("URI")),
         );
-        let publisher = PipelinedEventPublisher::new(client, 0);
-        let request = api::PublishEventRequest {
-            operation_key: b"stalled".to_vec(),
+        let publisher = NumberedPipelinedEventPublisher::new(&client, 0);
+        let request = api::PublishNumberedEventRequest {
+            logical_key: b"stalled".to_vec(),
             ..Default::default()
         };
 
         let error = tokio::time::timeout(
             PIPELINED_PUBLICATION_SESSION + Duration::from_secs(1),
-            publisher.publish_all(vec![request]),
+            publisher.publish_all(vec![request], |_, _| Ok(())),
         )
         .await
         .expect("publisher must stop after the bounded no-progress session")
         .expect_err("a session without any response must fail");
 
-        assert_eq!(error.code, connectrpc::ErrorCode::DeadlineExceeded);
+        assert!(
+            matches!(error, NumberedEventSdkError::Transport(ref error) if error.code == connectrpc::ErrorCode::DeadlineExceeded)
+        );
         assert_eq!(*sessions.lock().expect("session capture"), 1);
     }
 
     #[cfg(feature = "server")]
     #[tokio::test]
-    async fn publish_events_transport_stops_at_explicit_disconnect_retry_budget() {
+    async fn numbered_transport_transport_stops_at_explicit_disconnect_retry_budget() {
         let received = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let captured = received.clone();
         let handler = connectrpc::bidi_streaming_handler_fn(
-            move |_ctx, requests: connectrpc::ServiceStream<api::PublishEventsRequest>| {
+            move |_ctx, requests: connectrpc::ServiceStream<api::PublishNumberedEventsRequest>| {
                 let captured = captured.clone();
                 async move {
                     let responses = requests.take(1).map(move |request| {
@@ -1639,10 +1773,12 @@ mod tests {
                         captured
                             .lock()
                             .expect("request capture")
-                            .push(publication.operation_key);
-                        Err::<api::PublishEventsResponse, _>(connectrpc::ConnectError::unavailable(
-                            "deterministic unavailable stream",
-                        ))
+                            .push(publication.logical_key);
+                        Err::<api::PublishNumberedEventsResponse, _>(
+                            connectrpc::ConnectError::unavailable(
+                                "deterministic unavailable stream",
+                            ),
+                        )
                     });
                     connectrpc::Response::stream_ok(responses)
                 }
@@ -1650,27 +1786,209 @@ mod tests {
         );
         let router = connectrpc::Router::new().route_bidi_stream(
             api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
-            "PublishEvents",
+            "PublishNumberedEvents",
             handler,
         );
         let client = api::AsterApplicationServiceClient::new(
             ServiceTransport::new(crate::event_service::configured_service(router)),
             ClientConfig::new("http://localhost".parse().expect("URI")),
         );
-        let publisher = PipelinedEventPublisher::new(client, 1);
+        let publisher = NumberedPipelinedEventPublisher::new(&client, 1);
 
         let error = publisher
-            .publish_all(vec![api::PublishEventRequest {
-                operation_key: b"retry-budget".to_vec(),
-                ..Default::default()
-            }])
+            .publish_all(
+                vec![api::PublishNumberedEventRequest {
+                    logical_key: b"retry-budget".to_vec(),
+                    ..Default::default()
+                }],
+                |_, _| Ok(()),
+            )
             .await
             .expect_err("one retry must be exhausted by two disconnects");
-        assert_eq!(error.code, connectrpc::ErrorCode::Unavailable);
+        assert!(
+            matches!(error, NumberedEventSdkError::Transport(ref error) if error.code == connectrpc::ErrorCode::Unavailable)
+        );
         assert_eq!(
             *received.lock().expect("request capture"),
             vec![b"retry-budget".to_vec(), b"retry-budget".to_vec()]
         );
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn numbered_pipeline_persists_each_response_and_replays_unanswered_sequences() {
+        let path = journal_path("numbered-pipeline-replay");
+        PublicationJournal::initialize(&path, b"client").expect("initialize");
+        let sessions = Arc::new(Mutex::new(
+            Vec::<Vec<api::PublishNumberedEventRequest>>::new(),
+        ));
+        let captured = sessions.clone();
+        let handler = connectrpc::bidi_streaming_handler_fn(
+            move |_ctx, requests: connectrpc::ServiceStream<api::PublishNumberedEventsRequest>| {
+                let captured = captured.clone();
+                async move {
+                    let session = {
+                        let mut sessions = captured.lock().unwrap();
+                        sessions.push(Vec::new());
+                        sessions.len() - 1
+                    };
+                    let responses = requests.enumerate().map(move |(index, request)| {
+                        let publication = request?.publication.into_option().unwrap();
+                        captured.lock().unwrap()[session].push(publication.clone());
+                        if session == 0 && index == 1 {
+                            return Err(connectrpc::ConnectError::unavailable(
+                                "receipt lost after commit",
+                            ));
+                        }
+                        Ok(api::PublishNumberedEventsResponse {
+                            outcome: Some(
+                                api::publish_numbered_events_response::Outcome::Published(
+                                    Box::new(api::PublishNumberedEventResponse {
+                                        result: result(publication.operation_sequence).into(),
+                                        inserted: session == 0
+                                            || publication.operation_sequence != 2,
+                                        ..Default::default()
+                                    }),
+                                ),
+                            ),
+                            ..Default::default()
+                        })
+                    });
+                    connectrpc::Response::stream_ok(responses)
+                }
+            },
+        );
+        let router = connectrpc::Router::new().route_bidi_stream(
+            api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
+            "PublishNumberedEvents",
+            handler,
+        );
+        let client = api::AsterApplicationServiceClient::new(
+            ServiceTransport::new(crate::event_service::configured_service(router)),
+            ClientConfig::new("http://localhost".parse().unwrap()),
+        );
+        let sdk = NumberedEventSdk::open(client, &path, b"client").unwrap();
+        sdk.journal
+            .write(|state, _| {
+                state.session = 1;
+                state.recovery_complete = true;
+                Ok(())
+            })
+            .unwrap();
+        let sequences: Vec<_> = (0..3)
+            .map(|_| sdk.journal_publication(intent()).unwrap())
+            .collect();
+        assert_eq!(
+            sdk.publish_journaled_pipeline(&sequences, 1).await.unwrap(),
+            vec![result(1), result(2), result(3)]
+        );
+        assert_eq!(sdk.journal.read_state().unwrap().allocated_through, 3);
+        for sequence in sequences {
+            assert_eq!(
+                sdk.journal.entry(sequence).unwrap().unwrap().result,
+                Some(result(sequence))
+            );
+        }
+        let sent = sessions.lock().unwrap();
+        assert_eq!(
+            sent.iter()
+                .map(|requests| requests
+                    .iter()
+                    .map(|request| request.operation_sequence)
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![vec![1, 2], vec![2, 3]]
+        );
+        assert_eq!(
+            sent[0][1], sent[1][0],
+            "retry keeps session, sequence and complete intent"
+        );
+        drop(sent);
+        drop(sdk);
+        let journal = PublicationJournal::open(&path, b"client").unwrap();
+        assert_eq!(journal.entry(3).unwrap().unwrap().result, Some(result(3)));
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn numbered_pipeline_rejection_preserves_the_failed_and_later_intents() {
+        let path = journal_path("numbered-pipeline-rejection");
+        PublicationJournal::initialize(&path, b"client").unwrap();
+        let handler = connectrpc::bidi_streaming_handler_fn(
+            |_ctx, requests: connectrpc::ServiceStream<api::PublishNumberedEventsRequest>| async {
+                let responses = requests.map(|request| {
+                    let publication = request?.publication.into_option().unwrap();
+                    let outcome = if publication.operation_sequence == 1 {
+                        api::publish_numbered_events_response::Outcome::Published(Box::new(
+                            api::PublishNumberedEventResponse {
+                                result: result(1).into(),
+                                ..Default::default()
+                            },
+                        ))
+                    } else {
+                        api::publish_numbered_events_response::Outcome::Failure(Box::new(
+                            api::PublicErrorDetail {
+                                reason: api::PublicErrorReason::MalformedInput.into(),
+                                ..Default::default()
+                            },
+                        ))
+                    };
+                    Ok(api::PublishNumberedEventsResponse {
+                        outcome: Some(outcome),
+                        ..Default::default()
+                    })
+                });
+                connectrpc::Response::stream_ok(responses)
+            },
+        );
+        let router = connectrpc::Router::new().route_bidi_stream(
+            api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
+            "PublishNumberedEvents",
+            handler,
+        );
+        let client = api::AsterApplicationServiceClient::new(
+            ServiceTransport::new(crate::event_service::configured_service(router)),
+            ClientConfig::new("http://localhost".parse().unwrap()),
+        );
+        let sdk = NumberedEventSdk::open(client, &path, b"client").unwrap();
+        sdk.journal
+            .write(|state, _| {
+                state.session = 1;
+                state.recovery_complete = true;
+                Ok(())
+            })
+            .unwrap();
+        let sequences: Vec<_> = (0..3)
+            .map(|_| sdk.journal_publication(intent()).unwrap())
+            .collect();
+        assert!(matches!(
+            sdk.publish_journaled_pipeline(&sequences, 1).await,
+            Err(NumberedEventSdkError::Protocol(_))
+        ));
+        assert_eq!(sdk.journal.read_state().unwrap().allocated_through, 1);
+        assert_eq!(
+            sdk.journal.entry(1).unwrap().unwrap().result,
+            Some(result(1))
+        );
+        for sequence in [2, 3] {
+            let entry = sdk.journal.entry(sequence).unwrap().unwrap();
+            assert!(entry.result.is_none());
+            assert!(!entry.abandoned);
+        }
+        drop(sdk);
+        let (_, client) = scripted(vec![begin(2, 1, vec![result(1)]), complete()]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").unwrap();
+        let report = sdk.recover().await.unwrap();
+        assert!(matches!(
+            report.operations[0].state,
+            RecoveredState::Committed(_)
+        ));
+        assert_eq!(report.operations[1].state, RecoveredState::Pending);
+        assert_eq!(report.operations[2].state, RecoveredState::Pending);
+        drop(sdk);
+        std::fs::remove_file(path).unwrap();
     }
 
     fn seed_equal_revision_journal(

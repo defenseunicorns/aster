@@ -417,8 +417,8 @@ async fn customer_operation_limits_process_preserves_over_limit_reopen() {
         "this process test requires loopback sockets"
     );
     for (records, bytes, ordinary, lower_records, lower_bytes) in [
-        (6, 1_296, 4, 5, 1_296), // record quota, then retained count above the new maximum
-        (10, 648, 2, 10, 486),   // byte quota, then retained bytes above the new maximum
+        (8, 2_000, 4, 7, 2_000), // record quota, then retained count above the new maximum
+        (20, 828, 2, 20, 662),   // byte quota, then retained bytes above the new maximum
     ] {
         // This test exercises quota preservation, not the minimum shutdown
         // deadline. Leave enough grace for a loaded CI runner to flush the
@@ -427,44 +427,65 @@ async fn customer_operation_limits_process_preserves_over_limit_reopen() {
         let fixture = CustomerFixture::with_shutdown_grace(5_000);
         fixture.set_operation_limits(records, bytes, 2);
         let running = RunningFixture::start(&fixture).await;
+        for id in ["bw==", "ZQ=="] {
+            claim_publication_fixture(fixture.application(), fixture.token_bytes(), id, 0).await;
+        }
+        let mut session = 1;
         let mut originals = Vec::new();
         for key in 0..ordinary {
-            let (status, response) = publish_operation(&fixture, key, false, false).await;
+            let (status, response) =
+                publish_operation(&fixture, key, false, false, session, ordinary).await;
             assert_eq!(status, 200, "{response}");
             assert_eq!(response["inserted"], true);
             originals.push(response);
         }
-        let (status, response) = publish_operation(&fixture, 8, false, false).await;
+        let (status, response) =
+            publish_operation(&fixture, 8, false, false, session, ordinary).await;
         assert_eq!(status, 429, "{response}");
         assert_eq!(response["message"], "durable operation capacity exhausted");
         for key in ordinary..ordinary + 2 {
-            let (status, response) = publish_operation(&fixture, key, true, false).await;
+            let (status, response) =
+                publish_operation(&fixture, key, true, false, session, ordinary).await;
             assert_eq!(status, 200, "reserved tombstone: {response}");
             originals.push(response);
         }
-        let (status, response) = publish_operation(&fixture, 9, true, false).await;
+        let (status, response) =
+            publish_operation(&fixture, 9, true, false, session, ordinary).await;
         assert_eq!(status, 429, "{response}");
         assert_eq!(response["message"], "durable operation capacity exhausted");
         running.stop_clean().await;
 
         fixture.set_operation_limits(lower_records, lower_bytes, 2);
         let running = RunningFixture::start(&fixture).await;
+        for id in ["bw==", "ZQ=="] {
+            claim_publication_fixture(fixture.application(), fixture.token_bytes(), id, 1).await;
+        }
+        session = 2;
         for (key, original) in originals.iter().enumerate() {
-            let (status, response) = publish_operation(&fixture, key, key >= ordinary, false).await;
+            let (status, response) =
+                publish_operation(&fixture, key, key >= ordinary, false, session, ordinary).await;
             assert_eq!(status, 200, "exact retained retry: {response}");
-            assert_eq!(response["id"], original["id"]);
-            assert_eq!(response["acceptanceMarker"], original["acceptanceMarker"]);
+            assert_eq!(
+                response["result"]["receipt"]["eventId"],
+                original["result"]["receipt"]["eventId"]
+            );
+            assert_eq!(
+                response["result"]["receipt"]["acceptanceMarker"],
+                original["result"]["receipt"]["acceptanceMarker"]
+            );
             // Proto JSON omits the default false value.
             assert!(!response["inserted"].as_bool().unwrap_or(false));
         }
-        let (status, response) = publish_operation(&fixture, 0, false, true).await;
+        let (status, response) =
+            publish_operation(&fixture, 0, false, true, session, ordinary).await;
         assert_eq!(status, 409, "{response}");
         assert_eq!(
             response["message"],
             "operation key conflicts with an existing request"
         );
         for emergency in [false, true] {
-            let (status, response) = publish_operation(&fixture, 8, emergency, false).await;
+            let (status, response) =
+                publish_operation(&fixture, 8, emergency, false, session, ordinary).await;
             assert_eq!(status, 429, "{response}");
             assert_eq!(response["message"], "durable operation capacity exhausted");
         }
@@ -633,8 +654,11 @@ async fn admitted_publish_finishes_before_node_shutdown() {
 
     let fixture = CustomerFixture::with_shutdown_grace(2_000);
     let running = RunningFixture::start(&fixture).await;
-    let request = aster_agent::proto::aster::application::v1alpha1::PublishEventRequest {
-        operation_key: b"drain-admitted-publication".to_vec(),
+    claim_publication_fixture(fixture.application(), fixture.token_bytes(), "bw==", 0).await;
+    let request = aster_agent::proto::aster::application::v1alpha1::PublishNumberedEventRequest {
+        client_id: b"o".to_vec(),
+        session: 1,
+        operation_sequence: 1,
         topic: "chat.events".to_owned(),
         scope: "mission/team/alpha".to_owned(),
         priority: aster_agent::proto::aster::application::v1alpha1::Priority::Immediate.into(),
@@ -649,7 +673,7 @@ async fn admitted_publish_finishes_before_node_shutdown() {
     connection
         .write_all(
             format!(
-                "POST /aster.application.v1alpha1.AsterApplicationService/PublishEvent HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/proto\r\nConnect-Protocol-Version: 1\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+                "POST /aster.application.v1alpha1.AsterApplicationService/PublishNumberedEvent HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/proto\r\nConnect-Protocol-Version: 1\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
                 String::from_utf8_lossy(fixture.token_bytes()),
                 body.len(),
             )
@@ -701,7 +725,7 @@ async fn admitted_publish_finishes_before_node_shutdown() {
     );
     let response_body = chunked_response_body(&response);
     let published =
-        aster_agent::proto::aster::application::v1alpha1::PublishEventResponse::decode_from_slice(
+        aster_agent::proto::aster::application::v1alpha1::PublishNumberedEventResponse::decode_from_slice(
             &response_body,
         )
         .expect("decode admitted publish response");
@@ -1096,8 +1120,9 @@ async fn authenticated_status(address: SocketAddr, token: &[u8]) -> api::GetStat
 }
 
 async fn publish_event_status(address: SocketAddr, token: &[u8]) -> u16 {
+    claim_publication_fixture(address, token, "bw==", 0).await;
     let body = serde_json::to_vec(&serde_json::json!({
-        "operationKey": "cmVjZWl2ZS1vbmx5LWxvY2FsLXB1YmxpY2F0aW9u",
+        "clientId": "bw==", "session": "1", "operationSequence": "1",
         "topic": "chat.events",
         "scope": "mission/team/alpha",
         "priority": "PRIORITY_IMMEDIATE",
@@ -1108,7 +1133,7 @@ async fn publish_event_status(address: SocketAddr, token: &[u8]) -> u16 {
     http_status(
         address,
         format!(
-            "POST /aster.application.v1alpha1.AsterApplicationService/PublishEvent HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "POST /aster.application.v1alpha1.AsterApplicationService/PublishNumberedEvent HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             String::from_utf8_lossy(token),
             body.len(),
             String::from_utf8_lossy(&body),
@@ -1131,20 +1156,25 @@ async fn publish_operation(
     key: usize,
     tombstone: bool,
     changed: bool,
+    session: u64,
+    ordinary: usize,
 ) -> (u16, serde_json::Value) {
-    // Base64 encoding of one distinct byte per operation key (0 through 9).
+    // Two fixed producer identities with independent contiguous sequences; logical keys remain application data.
     let keys = [
         "AA==", "AQ==", "Ag==", "Aw==", "BA==", "BQ==", "Bg==", "Bw==", "CA==", "CQ==",
     ];
     let body = serde_json::json!({
-        "operationKey": keys[key], "topic": "chat.events", "scope": "mission/team/alpha",
+        "clientId": if tombstone { "ZQ==" } else { "bw==" },
+        "session": session.to_string(),
+        "operationSequence": (if key < ordinary { key + 1 } else if key < ordinary + 2 { key - ordinary + 1 } else if tombstone { 3 } else { ordinary + 1 }).to_string(),
+        "topic": "chat.events", "scope": "mission/team/alpha",
         "priority": "PRIORITY_IMMEDIATE", "logicalKey": keys[key],
         "payload": if tombstone { "" } else if changed { "dHdv" } else { "b25l" },
         "tombstone": tombstone,
     })
     .to_string();
     let request = format!(
-        "POST /aster.application.v1alpha1.AsterApplicationService/PublishEvent HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST /aster.application.v1alpha1.AsterApplicationService/PublishNumberedEvent HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         String::from_utf8_lossy(fixture.token_bytes()),
         body.len(),
         body,
@@ -1291,4 +1321,57 @@ impl ProvisioningSecretLoader for RejectingLoader {
     ) -> Result<ProvisioningLoadReceipt, ProvisioningSecretStoreError> {
         Err(ProvisioningSecretStoreError::Rejected)
     }
+}
+
+async fn claim_publication_fixture(
+    address: SocketAddr,
+    token: &[u8],
+    client_id: &str,
+    expected: u64,
+) {
+    let response = publication_rpc_json(address, token, "BeginEventPublicationSession", serde_json::json!({
+        "clientId": client_id, "expectedSession": expected.to_string(),
+        "claimNonce": if expected == 0 { "aW5pdGlhbC1jbGFpbQ==" } else { "cmVzdGFydC1jbGFpbQ==" },
+    })).await;
+    let session = response["session"].as_str().unwrap();
+    assert_eq!(session.parse::<u64>().unwrap(), expected + 1);
+    publication_rpc_json(address, token, "CompleteEventPublicationRecovery", serde_json::json!({
+        "clientId": client_id, "session": session, "snapshotRevision": response["snapshotRevision"],
+    })).await;
+}
+
+async fn publication_rpc_json(
+    address: SocketAddr,
+    token: &[u8],
+    operation: &str,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    let body = body.to_string();
+    let request = format!(
+        "POST /aster.application.v1alpha1.AsterApplicationService/{operation} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        String::from_utf8_lossy(token),
+        body.len(),
+        body
+    );
+    let response = http_response(address, request.as_bytes()).await;
+    assert_eq!(
+        http_response_status(&response),
+        200,
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    let offset = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let body = if String::from_utf8_lossy(&response[..offset])
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        chunked_response_body(&response)
+    } else {
+        response[offset..].to_vec()
+    };
+    serde_json::from_slice(&body).unwrap()
 }

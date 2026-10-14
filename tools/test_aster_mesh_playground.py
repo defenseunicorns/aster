@@ -262,6 +262,7 @@ class RenderingTests(unittest.TestCase):
             poll_seconds=0.01,
             process_factory=network.process_factory,
             client_factory=network.client_factory,
+            publisher_factory=network.publisher_factory,
             port_reservations=[FakeReservation(19800 + index) for index in range(2)],
         )
         controller.start()
@@ -365,8 +366,6 @@ class RpcFixture:
                     }
                 elif method == "CreateEventSubscription":
                     response = {"subscriptionId": base64.b64encode(b"s" * 32).decode("ascii"), "inserted": True}
-                elif method == "PublishEvent":
-                    response = {"id": event_one["id"], "inserted": True}
                 elif method == "QueryEvents":
                     marker = int(fixture.requests[-1][2].get("afterAcceptanceMarker", "0"))
                     if marker == 0:
@@ -663,6 +662,8 @@ class FakeNetwork:
         self.events = []
         self.commands = []
         self.processes = []
+        self.publication_results = {}
+        self.publication_frontiers = {}
 
     def process_factory(self, command, stdout_path, stderr_path):
         process = FakeProcess(command, stdout_path, stderr_path)
@@ -673,6 +674,48 @@ class FakeNetwork:
     def client_factory(self, url: str, _token: str):
         index = int(url.rsplit(":", 1)[-1]) - 18000
         return FakeClient(self, index)
+
+    def publisher_factory(self, cli, journal, client_id):
+        index = int(client_id.split("/")[1].split("-")[1])
+        return FakePublisher(self, index, journal)
+
+
+class FakePublisher:
+    def __init__(self, network, index, journal):
+        self.network, self.index, self.journal = network, index, journal
+        self.pending = None
+        self.next_sequence = 1
+
+    def initialize(self):
+        with self.journal.open("xb") as stream:
+            stream.write(b"test publication journal")
+
+    def connect(self, url, token_path):
+        self.client = FakeClient(self.network, self.index)
+
+    def recover(self, apply):
+        if self.pending is not None:
+            sequence, logical_key, payload = self.pending
+            response = self._send(sequence, logical_key, payload)
+            apply({"payload": base64.b64encode(payload).decode("ascii")}, response["result"], True, None)
+            self.network.publication_results.pop((self.index, sequence))
+            self.pending = None
+
+    def _send(self, sequence, logical_key, payload):
+        return self.client.publish_numbered(sequence, logical_key, payload)
+
+    def publish(self, logical_key, payload, apply):
+        if not self.journal.exists():
+            raise playground.RpcError("publication journal is missing")
+        self.recover(apply)
+        sequence = self.next_sequence
+        self.next_sequence += 1
+        self.pending = (sequence, logical_key, payload)
+        response = self._send(sequence, logical_key, payload)
+        alias = apply({"payload": base64.b64encode(payload).decode("ascii")}, response["result"], False, response["inserted"])
+        self.network.publication_results.pop((self.index, sequence))
+        self.pending = None
+        return alias
 
 
 class FakeClient:
@@ -691,7 +734,16 @@ class FakeClient:
             "peers": [],
         }
 
-    def publish(self, _operation_key: bytes, _logical_key: bytes, payload: bytes) -> dict:
+    def publish_numbered(self, sequence: int, logical_key: bytes, payload: bytes) -> dict:
+        identity = (self.index, sequence)
+        retained = self.network.publication_results.get(identity)
+        if retained is not None:
+            intent, result = retained
+            if intent != (logical_key, payload):
+                raise playground.RpcError("conflicting numbered intent")
+            return {"result": result, "inserted": False}
+        if sequence != self.network.publication_frontiers.get(self.index, 0) + 1:
+            raise playground.RpcError("numbered sequence gap or retired sequence")
         event_id = hashlib.sha256(bytes([self.index]) + payload + bytes([len(self.network.events)])).digest()
         event = {
             "id": base64.b64encode(event_id).decode("ascii"),
@@ -702,7 +754,10 @@ class FakeClient:
             "payload": base64.b64encode(payload).decode("ascii"),
         }
         self.network.events.append(event)
-        return {"id": event["id"], "inserted": True}
+        result = {"operationSequence": str(sequence), "receipt": {"eventId": event["id"], "transferId": event["id"], "acceptanceMarker": str(len(self.network.events))}, "content": "COMMITTED_CONTENT_STATUS_AVAILABLE"}
+        self.network.publication_frontiers[self.index] = sequence
+        self.network.publication_results[identity] = ((logical_key, payload), result)
+        return {"result": result, "inserted": True}
 
     def query_events(self, after_marker: int):
         return list(self.network.events[after_marker:]), len(self.network.events)
@@ -729,6 +784,7 @@ class ControllerAndScriptTests(unittest.TestCase):
             poll_seconds=0.01,
             process_factory=network.process_factory,
             client_factory=network.client_factory,
+            publisher_factory=network.publisher_factory,
             port_reservations=[FakeReservation(19000 + index) for index in range(nodes)],
             hello=hello,
             network_provenance=network_provenance,
@@ -897,28 +953,36 @@ class ControllerAndScriptTests(unittest.TestCase):
             sink.close()
             temporary.cleanup()
 
-    def test_uncertain_publish_attempt_never_reuses_an_operation_key(self) -> None:
-        temporary, _network, _output, sink, controller = self.make_controller(2)
+    def test_uncertain_publish_recovers_the_original_sequence_before_allocating_new_work(self) -> None:
+        temporary, network, _output, sink, controller = self.make_controller(2)
         try:
-            client = controller.nodes[0].client
-            self.assertIsNotNone(client)
+            publisher = controller.nodes[0].publisher
             calls = []
-            original_publish = client.publish
+            original_send = publisher._send
 
-            def uncertain_once(operation_key, logical_key, payload):
-                calls.append((operation_key, logical_key))
+            def lose_first_reply(sequence, logical_key, payload):
+                calls.append((sequence, logical_key, payload))
+                response = original_send(sequence, logical_key, payload)
                 if len(calls) == 1:
-                    raise playground.RpcError("uncertain local reply")
-                return original_publish(operation_key, logical_key, payload)
+                    raise playground.RpcError("uncertain local reply after commit")
+                return response
 
-            client.publish = uncertain_once
+            publisher._send = lose_first_reply
             with self.assertRaisesRegex(playground.RpcError, "uncertain"):
                 controller.send(0, "first attempt")
+            self.assertIsNotNone(publisher.pending)
+            controller.stop_node(0)
+            controller.start_node(0)
+            self.assertIsNone(publisher.pending, "node replacement recovers the original publication")
+            self.assertEqual(len(network.events), 1)
             alias = controller.send(0, "second attempt")
-            self.assertEqual(alias, "m1")
-            self.assertEqual(len(calls), 2)
-            self.assertNotEqual(calls[0][0], calls[1][0])
-            self.assertNotEqual(calls[0][1], calls[1][1])
+            self.assertEqual(alias, "m2")
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(calls[0], calls[1], "recovery must replay the original sequence and complete intent")
+            self.assertEqual(calls[2][0], 2)
+            self.assertEqual(len(network.events), 2, "lost receipt must not duplicate the first Event")
+            self.assertIsNone(publisher.pending)
+            self.assertEqual(network.publication_results, {}, "results are acknowledged after application")
             controller._operation_counter = playground.MAX_TRACKED_MESSAGES
             with self.assertRaisesRegex(playground.PlaygroundError, "attempt limit"):
                 controller.send(0, "one too many")
@@ -1042,6 +1106,7 @@ class ControllerAndScriptTests(unittest.TestCase):
             poll_seconds=60,
             process_factory=process_factory,
             client_factory=network.client_factory,
+            publisher_factory=network.publisher_factory,
             port_reservations=[FakeReservation(19500 + index) for index in range(2)],
         )
         try:
@@ -1094,6 +1159,7 @@ class ControllerAndScriptTests(unittest.TestCase):
             poll_seconds=60,
             process_factory=process_factory,
             client_factory=network.client_factory,
+            publisher_factory=network.publisher_factory,
             port_reservations=[FakeReservation(19600 + index) for index in range(2)],
         )
         try:

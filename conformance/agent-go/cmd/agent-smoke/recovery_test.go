@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/defenseunicorns/aster/conformance/agent-go/internal/numbered"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -19,33 +21,42 @@ import (
 // Actual process recovery is exercised separately by the process checker.
 type recoveryPeer struct {
 	api.UnimplementedAsterApplicationServiceHandler
-	published                                              *api.PublishEventRequest
+	published                                              *api.PublishNumberedEventRequest
 	event                                                  *api.Event
 	publishes, subscriptions, attempt, quietPolls, queries int
 	acknowledged                                           bool
 	fault                                                  string
 }
 
-func (s *recoveryPeer) PublishEvent(_ context.Context, r *connect.Request[api.PublishEventRequest]) (*connect.Response[api.PublishEventResponse], error) {
+func (s *recoveryPeer) PublishNumberedEvent(_ context.Context, r *connect.Request[api.PublishNumberedEventRequest]) (*connect.Response[api.PublishNumberedEventResponse], error) {
 	s.publishes++
 	if s.publishes == 1 {
-		s.published = proto.Clone(r.Msg).(*api.PublishEventRequest)
+		s.published = proto.Clone(r.Msg).(*api.PublishNumberedEventRequest)
 		s.event = &api.Event{Id: bytes.Repeat([]byte{1}, 32), Publisher: bytes.Repeat([]byte{2}, 32), PublisherCounter: 3, EventSequence: 4, Topic: r.Msg.Topic, Scope: r.Msg.Scope, Priority: r.Msg.Priority, LogicalKey: r.Msg.LogicalKey, Payload: r.Msg.Payload, AcceptanceMarker: 5}
 	} else if !proto.Equal(s.published, r.Msg) {
 		return nil, fmt.Errorf("publication request changed")
 	}
-	response := &api.PublishEventResponse{Id: s.event.Id, Publisher: s.event.Publisher, PublisherCounter: s.event.PublisherCounter, EventSequence: s.event.EventSequence, Priority: s.event.Priority, AcceptanceMarker: s.event.AcceptanceMarker, Inserted: s.publishes == 1}
+	response := &api.PublishNumberedEventResponse{Result: &api.CommittedPublicationResult{OperationSequence: r.Msg.OperationSequence, Receipt: &api.CommittedEventReceipt{EventId: s.event.Id, TransferId: bytes.Repeat([]byte{4}, 32), AcceptanceMarker: s.event.AcceptanceMarker}, Content: api.CommittedContentStatus_COMMITTED_CONTENT_STATUS_AVAILABLE}, Inserted: s.publishes == 1}
 	if s.publishes == 2 {
 		switch s.fault {
 		case "retry-receipt":
-			response.AcceptanceMarker++
+			response.Result.Receipt.AcceptanceMarker++
 		case "retry-inserted":
 			response.Inserted = true
 		case "retry-priority":
-			response.Priority = api.Priority_PRIORITY_FLASH
+			response.Result.Content = api.CommittedContentStatus_COMMITTED_CONTENT_STATUS_UNSPECIFIED
 		}
 	}
 	return connect.NewResponse(response), nil
+}
+func (s *recoveryPeer) BeginEventPublicationSession(_ context.Context, _ *connect.Request[api.BeginEventPublicationSessionRequest]) (*connect.Response[api.BeginEventPublicationSessionResponse], error) {
+	return connect.NewResponse(&api.BeginEventPublicationSessionResponse{Session: 1}), nil
+}
+func (s *recoveryPeer) CompleteEventPublicationRecovery(_ context.Context, _ *connect.Request[api.CompleteEventPublicationRecoveryRequest]) (*connect.Response[api.CompleteEventPublicationRecoveryResponse], error) {
+	return connect.NewResponse(&api.CompleteEventPublicationRecoveryResponse{}), nil
+}
+func (s *recoveryPeer) AcknowledgeEventPublicationResult(_ context.Context, _ *connect.Request[api.AcknowledgeEventPublicationResultRequest]) (*connect.Response[api.AcknowledgeEventPublicationResultResponse], error) {
+	return connect.NewResponse(&api.AcknowledgeEventPublicationResultResponse{}), nil
 }
 func (s *recoveryPeer) CreateEventSubscription(_ context.Context, r *connect.Request[api.CreateEventSubscriptionRequest]) (*connect.Response[api.CreateEventSubscriptionResponse], error) {
 	s.subscriptions++
@@ -93,6 +104,10 @@ func (s *recoveryPeer) AcknowledgeEvent(_ context.Context, r *connect.Request[ap
 	return connect.NewResponse(&api.AcknowledgeEventResponse{AlreadyAcknowledged: s.fault == "old-ack"}), nil
 }
 func (s *recoveryPeer) QueryEvents(_ context.Context, r *connect.Request[api.QueryEventsRequest]) (*connect.Response[api.QueryEventsResponse], error) {
+	if r.Msg.Limit == 1 && r.Msg.AfterAcceptanceMarker == s.event.AcceptanceMarker-1 && bytes.Equal(r.Msg.LogicalKey, s.event.LogicalKey) {
+		s.queries++
+		return connect.NewResponse(&api.QueryEventsResponse{Events: []*api.Event{proto.Clone(s.event).(*api.Event)}}), nil
+	}
 	s.queries++
 	if !s.acknowledged || r.Msg.GetTopic() != s.event.Topic || r.Msg.GetScope() != s.event.Scope || r.Msg.Limit != 2 {
 		return nil, fmt.Errorf("wrong retained query")
@@ -106,9 +121,20 @@ func (s *recoveryPeer) QueryEvents(_ context.Context, r *connect.Request[api.Que
 	}
 	return connect.NewResponse(&api.QueryEventsResponse{Events: []*api.Event{event}, HasMore: s.fault == "query-has-more"}), nil
 }
-func recoveryTestInput() map[string]any {
-	return map[string]any{"publish": publishInput{OperationKeyHex: "746573742d7075626c697368", Topic: "test-topic", Scope: "test-scope", Priority: "immediate", LogicalKeyHex: "6b6579", PayloadHex: "7061796c6f6164"}, "subscription_operation_key_hex": "746573742d737562736372696265"}
+func recoveryTestInput(t *testing.T) map[string]any {
+	t.Helper()
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "publication.json")
+	id := []byte("go-recovery-example-publisher")
+	if err = numbered.Initialize(path, id); err != nil {
+		t.Fatal(err)
+	}
+	return map[string]any{"publish": publishInput{ClientIDHex: hex.EncodeToString(id), JournalPath: path, Topic: "test-topic", Scope: "test-scope", Priority: "immediate", LogicalKeyHex: "6b6579", PayloadHex: "7061796c6f6164"}, "subscription_operation_key_hex": "746573742d737562736372696265"}
 }
+
 func runRecoveryTestCommand(ctx context.Context, client api.AsterApplicationServiceClient, command string, input any) (map[string]json.RawMessage, []byte, error) {
 	encoded, _ := json.Marshal(input)
 	var out bytes.Buffer
@@ -131,7 +157,7 @@ func TestRecoveryExample(t *testing.T) {
 	client := api.NewAsterApplicationServiceClient(server.Client(), server.URL)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	first, _, err := runRecoveryTestCommand(ctx, client, "recovery-begin", recoveryTestInput())
+	first, _, err := runRecoveryTestCommand(ctx, client, "recovery-begin", recoveryTestInput(t))
 	if err != nil {
 		t.Fatalf("begin failed: %v", err)
 	}
@@ -143,7 +169,7 @@ func TestRecoveryExample(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resume failed: %v", err)
 	}
-	if peer.subscriptions != 1 || peer.publishes != 2 || peer.attempt != 2 || !peer.acknowledged || peer.quietPolls < 2 || peer.queries != 1 {
+	if peer.subscriptions != 1 || peer.publishes != 2 || peer.attempt != 2 || !peer.acknowledged || peer.quietPolls < 2 || peer.queries != 2 {
 		t.Fatalf("incorrect recovery phases: %+v", peer)
 	}
 	if string(second["attempt"]) != "2" || string(second["exact_match"]) != "true" {
@@ -165,7 +191,7 @@ func TestRecoveryExampleFailsClosed(t *testing.T) {
 			if beginFault {
 				peer.fault = fault
 			}
-			first, output, err := runRecoveryTestCommand(ctx, client, "recovery-begin", recoveryTestInput())
+			first, output, err := runRecoveryTestCommand(ctx, client, "recovery-begin", recoveryTestInput(t))
 			if beginFault {
 				if err == nil || len(output) != 0 || peer.acknowledged {
 					t.Fatal("invalid retry accepted")

@@ -31,48 +31,39 @@ func recoveryBegin(ctx context.Context, client api.AsterApplicationServiceClient
 	if err := decodeInput(input, &value); err != nil {
 		return err
 	}
-	key, err := decodeOperationKeyHex(value.Publish.OperationKeyHex)
-	if err != nil {
-		return err
-	}
 	subscriptionKey, err := decodeOperationKeyHex(value.SubscriptionOperationKeyHex)
 	if err != nil {
 		return err
 	}
-	logicalKey, err := decodeHex(value.Publish.LogicalKeyHex)
+	journal, err := openPublication(ctx, client, token, value.Publish)
 	if err != nil {
 		return err
 	}
-	payload, err := decodeHex(value.Publish.PayloadHex)
+	defer journal.Close()
+	sequence, err := retainPublication(journal, value.Publish)
 	if err != nil {
 		return err
 	}
-	p, err := priority(value.Publish.Priority)
+	first, err := journal.Publish(ctx, sequence)
 	if err != nil {
 		return err
 	}
-	message := &api.PublishEventRequest{OperationKey: key, Topic: value.Publish.Topic, Scope: value.Publish.Scope, Priority: p, LogicalKey: logicalKey, Payload: payload}
-	first, err := client.PublishEvent(ctx, request(message, token))
+	message, err := journal.Request(sequence)
 	if err != nil {
 		return err
 	}
-	second, err := client.PublishEvent(ctx, request(proto.Clone(message).(*api.PublishEventRequest), token))
+	second, err := client.PublishNumberedEvent(ctx, request(message, token))
 	if err != nil {
 		return err
 	}
-	if first == nil || first.Msg == nil || second == nil || second.Msg == nil || !first.Msg.Inserted || second.Msg.Inserted {
-		return errors.New("publication retry insertion transition was invalid")
+	if first == nil || first.Result == nil || second == nil || second.Msg == nil || !first.Inserted || second.Msg.Inserted || !proto.Equal(first.Result, second.Msg.Result) {
+		return errors.New("publication retry changed committed result")
 	}
-	replay := proto.Clone(first.Msg).(*api.PublishEventResponse)
-	replay.Inserted = false
-	if !proto.Equal(replay, second.Msg) {
-		return errors.New("publication retry changed durable receipt")
+	event, err := publicationEvent(ctx, client, token, message, first.Result)
+	if err != nil {
+		return err
 	}
-	receipt := first.Msg
-	if len(receipt.Id) != 32 || len(receipt.Publisher) != 32 || receipt.PublisherCounter == 0 || receipt.EventSequence == 0 || receipt.AcceptanceMarker == 0 || receipt.Priority != p {
-		return errors.New("invalid publication receipt")
-	}
-	expected := expectedEventInput{IDHex: hex.EncodeToString(receipt.Id), PublisherHex: hex.EncodeToString(receipt.Publisher), PublisherCounter: receipt.PublisherCounter, EventSequence: receipt.EventSequence, Topic: message.Topic, Scope: message.Scope, Priority: value.Publish.Priority, LogicalKeyHex: value.Publish.LogicalKeyHex, PayloadHex: value.Publish.PayloadHex, AcceptanceMarker: receipt.AcceptanceMarker}
+	expected := expectedEventInput{IDHex: hex.EncodeToString(event.Id), PublisherHex: hex.EncodeToString(event.Publisher), PublisherCounter: event.PublisherCounter, EventSequence: event.EventSequence, Topic: message.Topic, Scope: message.Scope, Priority: value.Publish.Priority, LogicalKeyHex: value.Publish.LogicalKeyHex, PayloadHex: value.Publish.PayloadHex, AcceptanceMarker: event.AcceptanceMarker}
 	subscription, err := client.CreateEventSubscription(ctx, request(&api.CreateEventSubscriptionRequest{OperationKey: subscriptionKey, Topic: message.Topic, Scope: message.Scope}, token))
 	if err != nil {
 		return err
@@ -87,7 +78,13 @@ func recoveryBegin(ctx context.Context, client api.AsterApplicationServiceClient
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return writeResult(output, result{"status": "ok", "client_pid": os.Getpid(), "subscription_id_hex": hex.EncodeToString(id), "event_id_hex": expected.IDHex, "publisher_id_hex": expected.PublisherHex, "publisher_counter": expected.PublisherCounter, "event_sequence": expected.EventSequence, "acceptance_marker": expected.AcceptanceMarker, "attempt": 1, "exact_match": true, "retry_same_effect": true, "first_inserted": true, "retry_inserted": false})
+	if err = writeResult(output, result{"status": "ok", "client_pid": os.Getpid(), "subscription_id_hex": hex.EncodeToString(id), "event_id_hex": expected.IDHex, "publisher_id_hex": expected.PublisherHex, "publisher_counter": expected.PublisherCounter, "event_sequence": expected.EventSequence, "acceptance_marker": expected.AcceptanceMarker, "attempt": 1, "exact_match": true, "retry_same_effect": true, "first_inserted": true, "retry_inserted": false}); err != nil {
+		return err
+	}
+	if err = journal.Apply(sequence); err != nil {
+		return err
+	}
+	return journal.Acknowledge(ctx, sequence)
 }
 
 func recoveryDelivery(ctx context.Context, client api.AsterApplicationServiceClient, token string, id []byte, expected expectedEventInput, attempt uint64) error {

@@ -1521,7 +1521,8 @@ def semantic_raw_artifacts(
 
         canary_destroy = {
             "status": "pass",
-            "version": "1",
+            "version": "2",
+            "publication_journals_destroyed": "2",
             "artifact_destroyed": "true",
             "global_secret_destruction": "false",
             "target": "private/canary.bin",
@@ -1536,7 +1537,8 @@ def semantic_raw_artifacts(
         }
         relay_destroy = (
             {
-                **canary_destroy,
+                **{key: value for key, value in canary_destroy.items() if key != "publication_journals_destroyed"},
+                "version": "1",
                 "target": "private/server.key.pkcs8.der",
                 "previous_bytes": "128",
             }
@@ -1627,7 +1629,8 @@ def semantic_raw_artifacts(
         event = receipt_cell["event"]
         publish = {
             "status": "pass",
-            "version": "1",
+            "version": "2",
+            "publication_model": "numbered-v1",
             "node": "a",
             "event_id": event["event_id"],
             "publisher": event["publisher"],

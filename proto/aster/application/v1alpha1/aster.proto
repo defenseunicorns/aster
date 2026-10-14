@@ -39,16 +39,14 @@ message PublicErrorDetail {
 service AsterApplicationService {
   // GetStatus returns a bounded local synchronization snapshot.
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
-  // PublishEvent durably accepts an idempotent offline-first publication.
-  rpc PublishEvent(PublishEventRequest) returns (PublishEventResponse);
-  // PublishEvents pipelines ordered independent publications over native HTTP/2.
-  rpc PublishEvents(stream PublishEventsRequest) returns (stream PublishEventsResponse);
   // BeginEventPublicationSession fences the prior publisher and returns one complete recovery image.
   rpc BeginEventPublicationSession(BeginEventPublicationSessionRequest) returns (BeginEventPublicationSessionResponse);
   // CompleteEventPublicationRecovery authorizes mutations for the exact recovered revision.
   rpc CompleteEventPublicationRecovery(CompleteEventPublicationRecoveryRequest) returns (CompleteEventPublicationRecoveryResponse);
   // PublishNumberedEvent admits exactly allocated_through + 1 or resolves an exact retry.
   rpc PublishNumberedEvent(PublishNumberedEventRequest) returns (PublishNumberedEventResponse);
+  // Ordered numbered publications over bounded native HTTP/2 streams.
+  rpc PublishNumberedEvents(stream PublishNumberedEventsRequest) returns (stream PublishNumberedEventsResponse);
   // AbandonEventPublication permanently consumes the next unadmitted sequence.
   rpc AbandonEventPublication(AbandonEventPublicationRequest) returns (AbandonEventPublicationResponse);
   // AcknowledgeEventPublicationResult compacts one sparse committed result.
@@ -213,40 +211,13 @@ enum ContactStatus {
   CONTACT_STATUS_POLICY_CHANGED_SINCE_CONTACT = 3;
 }
 
-message PublishEventRequest {
-  bytes operation_key = 1;
-  optional bytes predecessor_id = 2;
-  string topic = 3;
-  string scope = 4;
-  Priority priority = 5;
-  bytes logical_key = 6;
-  bytes payload = 7;
-  bool tombstone = 8;
-  // Optional positive lifetime in milliseconds, authenticated by the publisher.
-  // Omitted means durable. Zero and finite tombstones are rejected.
-  // Requires a Linux server; this is a duration, not a wall-clock timestamp.
-  optional uint64 ttl_ms = 9;
+message PublishNumberedEventsRequest {
+  PublishNumberedEventRequest publication = 1;
 }
 
-message PublishEventResponse {
-  bytes id = 1;
-  bytes publisher = 2;
-  uint64 publisher_counter = 3;
-  uint64 event_sequence = 4;
-  Priority priority = 5;
-  uint64 acceptance_marker = 6;
-  bool inserted = 7;
-  // Exact source-authenticated duration; omitted for durable Events.
-  optional uint64 ttl_ms = 8;
-}
-
-message PublishEventsRequest {
-  PublishEventRequest publication = 1;
-}
-
-message PublishEventsResponse {
+message PublishNumberedEventsResponse {
   oneof outcome {
-    PublishEventResponse published = 1;
+    PublishNumberedEventResponse published = 1;
     PublicErrorDetail failure = 2;
   }
 }

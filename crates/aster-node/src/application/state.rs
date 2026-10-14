@@ -1730,7 +1730,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::application::{EventPublishRequest, EventQuery, SelectedEventNode};
+    use crate::application::{EventQuery, SelectedEventNode};
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -2873,24 +2873,30 @@ mod tests {
     fn event_and_state_share_publisher_counters_but_not_event_positions() {
         let root = TestRoot::new("shared-ledger");
         persist_mission(&root);
-        let event_request = |operation: &[u8], payload: &[u8]| EventPublishRequest {
-            operation_key: operation.to_vec(),
+        use crate::publication_journal::{Intent, Journal};
+        let path = root.path().join("event-publication.redb");
+        Journal::initialize(&path, b"interleaved-event-fixture").unwrap();
+        let event_request = |payload: &[u8]| Intent {
             predecessor: None,
-            topic: Topic::new("ops.events").expect("topic"),
-            scope: Scope::new("mission/apps").expect("scope"),
-            priority: Priority::Routine,
+            topic: "ops.events".to_owned(),
+            scope: "mission/apps".to_owned(),
+            priority: Priority::Routine as u8,
             logical_key: b"asset-7".to_vec(),
             payload: payload.to_vec(),
             tombstone: false,
+            ttl_ms: None,
         };
-
         let first_event = {
             let mut events =
                 SelectedEventNode::open_unprotected_reference(root.path(), root.mission_path())
                     .expect("open Event node");
-            events
-                .publish(event_request(b"event/first", b"first"))
-                .expect("first Event")
+            let mut journal = Journal::open(&path, b"interleaved-event-fixture").unwrap();
+            journal.recover_stopped(&mut events).unwrap();
+            let result = journal
+                .publish_metadata_stopped(&mut events, event_request(b"first"))
+                .unwrap();
+            journal.acknowledge_stopped(&mut events).unwrap();
+            result
         };
         assert_eq!(first_event.publisher_counter, 1);
         assert_eq!(first_event.event_sequence, 1);
@@ -2906,9 +2912,11 @@ mod tests {
         let mut events =
             SelectedEventNode::open_unprotected_reference(root.path(), root.mission_path())
                 .expect("reopen Event node");
-        let second_event = events
-            .publish(event_request(b"event/second", b"second"))
-            .expect("second Event");
+        let mut journal = Journal::open(&path, b"interleaved-event-fixture").unwrap();
+        journal.recover_stopped(&mut events).unwrap();
+        let second_event = journal
+            .publish_metadata_stopped(&mut events, event_request(b"second"))
+            .unwrap();
         assert_eq!(second_event.publisher_counter, 3);
         assert_eq!(second_event.event_sequence, 2);
         let page = events.query(EventQuery::default()).expect("Event page");

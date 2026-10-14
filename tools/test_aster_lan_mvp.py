@@ -109,7 +109,7 @@ class ClientTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.patcher.stop()
 
-    def test_status_publish_subscribe_and_paginated_query_use_connect_json(self) -> None:
+    def test_status_subscribe_and_paginated_query_use_connect_json(self) -> None:
         query_calls = 0
 
         def responder(request):
@@ -120,8 +120,6 @@ class ClientTests(unittest.TestCase):
                 return FakeResponse(200, {"authenticatedContacts": "2"})
             if method == "CreateEventSubscription":
                 return FakeResponse(200, {"subscriptionId": event_id(8), "inserted": True})
-            if method == "PublishEvent":
-                return FakeResponse(200, {"id": event_id(7), "inserted": True})
             if method == "QueryEvents":
                 query_calls += 1
                 marker = int(payload["afterAcceptanceMarker"])
@@ -140,10 +138,6 @@ class ClientTests(unittest.TestCase):
         client = client_module.ConnectJsonClient("http://127.0.0.1:8181", TOKEN)
         self.assertEqual(client.status()["authenticatedContacts"], "2")
         self.assertTrue(client.subscribe(b"sub-op", "mesh.messages", "demo/playground")["inserted"])
-        self.assertEqual(
-            client.publish(b"pub-op", b"message/1", b"hello", "mesh.messages", "demo/playground")["id"],
-            event_id(7),
-        )
         events, marker = client.query_events("mesh.messages", "demo/playground")
         self.assertEqual([event["id"] for event in events], [event_id(1), event_id(2)])
         self.assertEqual(marker, 2)
@@ -157,10 +151,6 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(
             all(request[3]["Authorization"] == "Bearer " + TOKEN for request in FakeConnection.requests)
         )
-        publish_request = next(
-            request for request in FakeConnection.requests if request[1].endswith("/PublishEvent")
-        )
-        self.assertEqual(base64.b64decode(publish_request[2]["payload"]), b"hello")
 
     def test_client_rejects_non_loopback_or_ambiguous_urls(self) -> None:
         for url in (
@@ -234,14 +224,29 @@ class WaitTests(unittest.TestCase):
         with self.assertRaisesRegex(client_module.OperatorError, "1..=256"):
             client_module._bounded_utf8("x" * 257, "operation key", 256)
 
+    def test_publish_delegates_to_durable_cli_without_bearer_arguments(self) -> None:
+        arguments = client_module.build_parser().parse_args([
+            "publish", "--token-file", "/tmp/example.token", "--journal", "/tmp/publication.redb",
+            "--client-id", "lan-source", "--logical-key", "message/1", "--payload", "hello", "--id-only"])
+        response = {"result": {"operationSequence": "1", "receipt": {"eventId": event_id(7)}}, "inserted": True}
+        completed = type("Completed", (), {"returncode": 0, "stdout": json.dumps(response).encode(), "stderr": b""})()
+        with mock.patch.object(client_module.subprocess, "run", return_value=completed) as execute:
+            observed = client_module._numbered_cli(arguments)
+        self.assertEqual(observed, response)
+        command = execute.call_args.args[0]
+        self.assertIn("--journal", command)
+        self.assertIn("--client-id", command)
+        self.assertNotIn(TOKEN, command)
+        self.assertEqual(execute.call_args.kwargs["input"], b"hello")
+
     def test_publish_has_stable_id_only_capture_flag(self) -> None:
         arguments = client_module.build_parser().parse_args(
             [
                 "publish",
                 "--token-file",
                 "/tmp/example.token",
-                "--operation-key",
-                "demo/publish/1",
+                "--journal", "/tmp/publication.redb",
+                "--client-id", "lan-source",
                 "--logical-key",
                 "message/1",
                 "--payload",

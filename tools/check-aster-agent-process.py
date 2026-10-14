@@ -40,7 +40,7 @@ MAX_AGGREGATE_CAPTURE_BYTES = 16 * 1024 * 1024
 MAX_AGGREGATE_CAPTURE_CHUNKS = 4_096
 MAX_TOKEN_FILE_BYTES = 258
 MAX_HEALTH_RESPONSE_BYTES = 8 * 1024
-FIXED_PUBLISH_OPERATION = b"aster-agent-process-publish-v1"
+FIXED_PUBLISH_CLIENT = b"aster-agent-process-publisher-v2"
 FIXED_SUBSCRIBE_OPERATION = b"aster-agent-process-subscribe-v1"
 CANARY_TOPIC = "chat.events"
 CANARY_SCOPE = "mission/team/alpha"
@@ -1383,9 +1383,11 @@ def _peer_canaries(peer: str) -> tuple[str, ...]:
     return (peer, carrier, identity, socket_address, mission)
 
 
-def _publish_request(payload: bytes = CANARY_PAYLOAD) -> dict[str, Any]:
+def _publish_request(payload: bytes = CANARY_PAYLOAD, *, journal_path: str = "", operation_sequence: int = 0) -> dict[str, Any]:
     return {
-        "operation_key_hex": FIXED_PUBLISH_OPERATION.hex(),
+        "client_id_hex": FIXED_PUBLISH_CLIENT.hex(),
+        "journal_path": journal_path,
+        "operation_sequence": operation_sequence,
         "topic": CANARY_TOPIC,
         "scope": CANARY_SCOPE,
         "priority": "immediate",
@@ -1448,7 +1450,7 @@ def require_operation_key_conflict(record: dict[str, Any]) -> None:
         raise AcceptanceError("operation-key conflict was not rejected")
 
 
-def run_client_only_recovery(agent: ManagedProcess, call: Any) -> dict[str, Any]:
+def run_client_only_recovery(agent: ManagedProcess, call: Any, *, journal_path: str = "") -> dict[str, Any]:
     """Reap client one before starting client two on the same live agent.
 
     The existing call boundary waits, joins bounded captures and reaps each
@@ -1473,7 +1475,10 @@ def run_client_only_recovery(agent: ManagedProcess, call: Any) -> dict[str, Any]
         return record
 
     require_live_agent()
-    publication = _publish_request()
+    publication = _publish_request(journal_path=journal_path)
+    initialized = call("publication-init", {"client_id_hex": FIXED_PUBLISH_CLIENT.hex(), "journal_path": journal_path})
+    if initialized.record.get("status") != "ok":
+        raise AcceptanceError("publication journal initialization failed")
     first_result = call("recovery-begin", {
         "publish": publication,
         "subscription_operation_key_hex": b"aster-agent-client-only-subscribe-v1".hex(),
@@ -1694,13 +1699,17 @@ def run_acceptance_with_token(
             agent = start_agent(recovery_config)
             # On failure the directory scope reaps all owned children before
             # deleting any state, without replacing the original exception.
-            run_client_only_recovery(agent, call)
+            run_client_only_recovery(agent, call, journal_path=str(temporary_path.resolve() / "client-recovery-publication.json"))
             stop_agent(agent, signal.SIGTERM, 0)
             receipt_names.append("generated-go-client-only-recovery")
             agent = start_agent()
-            publish_request = _publish_request()
+            journal_path = str(temporary_path.resolve() / "crash-publication.json")
+            initialized = call("publication-init", {"client_id_hex": FIXED_PUBLISH_CLIENT.hex(), "journal_path": journal_path})
+            if initialized.record.get("status") != "ok":
+                raise AcceptanceError("publication journal initialization failed")
+            publish_request = _publish_request(journal_path=journal_path)
             published = call("publish", publish_request).record
-            if published.get("inserted") is not True:
+            if published.get("inserted") is not True or type(published.get("operation_sequence")) is not int or published["operation_sequence"] != 1:
                 raise AcceptanceError("crash-boundary publication was not newly inserted")
             expected_event = _expected_recovered_event(published, publish_request)
             event_id = expected_event["id_hex"]
@@ -1714,10 +1723,13 @@ def run_acceptance_with_token(
             require_exact_recovery_evidence(queried)
             conflict = call(
                 "publish",
-                _publish_request(CANARY_PAYLOAD + b"-changed"),
+                _publish_request(CANARY_PAYLOAD + b"-changed", journal_path=journal_path, operation_sequence=published["operation_sequence"]),
                 expect_failure=True,
             )
             require_operation_key_conflict(conflict.record)
+            acknowledged_publication = call("publication-ack", {"client_id_hex": FIXED_PUBLISH_CLIENT.hex(), "journal_path": journal_path, "operation_sequence": published["operation_sequence"]})
+            if acknowledged_publication.record.get("status") != "ok":
+                raise AcceptanceError("numbered publication acknowledgement failed")
             subscription = call(
                 "subscribe",
                 {

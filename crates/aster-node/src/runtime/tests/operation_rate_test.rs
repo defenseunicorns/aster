@@ -19,7 +19,7 @@ fn operation_rate_sample_ping_pong_counts_new_records_and_excludes_replay() {
         (NodeApplication::PongResponder, 2.0 / 60.0),
         (NodeApplication::Relay, 2.0 / 60.0),
     ] {
-        // Reset cursors to force durable retry paths, as after restart.
+        // Reopen the durable application checkpoint, as after restart.
         drive_sample_application(
             role,
             SampleApplicationContext {
@@ -29,7 +29,7 @@ fn operation_rate_sample_ping_pong_counts_new_records_and_excludes_replay() {
                 custody_clock: &clock,
                 event_route_cache: &cache,
             },
-            &mut 0,
+            &mut None,
             &mut false,
             &mut tracker,
         )
@@ -42,7 +42,10 @@ fn operation_rate_sample_ping_pong_counts_new_records_and_excludes_replay() {
             expected_rate
         );
     }
-    assert_eq!(store.event_operation_stats().unwrap().records_total, 2);
+    assert_eq!(store.event_operation_stats().unwrap().records_total, 0);
+    let stats = store.numbered_event_operation_stats().unwrap();
+    assert_eq!(stats.clients, 2);
+    assert_eq!(stats.outstanding_results, 0);
     drop(store);
     fs::remove_dir_all(state).unwrap();
 }

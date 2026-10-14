@@ -40,8 +40,13 @@ cargo run --locked -p aster-node --bin aster -- \
 cargo run --locked -p aster-node --example custody_application -- \
   "$ASTER_CUSTODY_ROOT/mesh/node-0" \
   "$ASTER_CUSTODY_ROOT/mesh/node-0/mission.unprotected-reference.bundle" \
-  demo/mesh mesh.ping-pong
+  demo/mesh mesh.ping-pong --initialize-publication-journal
 ```
+
+Initialize the private application journal once with the flag above. On later
+runs, omit the flag and retain the same state directory and journal. Recovery
+precedes publication; failed or uncertain work retains its full intent. A
+completed run advances the numbered sequence without adding a client identity.
 
 On Linux, the output reports `finite_ttl_ms=60000` and
 `authenticated_ttl_ms=Some(60000)`. On other platforms the example states the
@@ -104,38 +109,31 @@ applied policy.
 ## Publish a finite Event
 
 ```rust,no_run
-use aster_node::application::{
-    EventPublishOptions, EventPublishRequest, Priority, Scope, SelectedEventHandle,
-    Topic,
-};
+use aster_node::application::{Priority, Scope, SelectedEventHandle, Topic};
+use aster_node::publication_journal::{Backend, Intent, Journal};
 
-# async fn publish(events: &SelectedEventHandle, topic: Topic, scope: Scope) -> Result<(), Box<dyn std::error::Error>> {
-let result = events
-    .publish_with_options(
-        EventPublishRequest {
-            operation_key: b"example/finite-reading/v1".to_vec(),
-            predecessor: None,
-            topic,
-            scope,
-            priority: Priority::Immediate,
-            logical_key: b"sensor-7".to_vec(),
-            payload: b"ready".to_vec(),
-            tombstone: false,
-        },
-        EventPublishOptions::finite_ttl_ms(30_000)?,
-    )
-    .await?;
-
+# async fn publish(events: &SelectedEventHandle, topic: Topic, scope: Scope, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+// Initialize `path` once during explicit fresh provisioning; this opens existing state.
+let mut journal = Journal::open(path, b"sensor-publisher")?;
+let mut backend = Backend::Live(events);
+journal.recover(&mut backend).await?;
+let result = journal.publish_metadata(&mut backend, Intent {
+    predecessor: None, topic: topic.as_str().to_owned(), scope: scope.as_str().to_owned(),
+    priority: Priority::Immediate as u8, logical_key: b"sensor-7".to_vec(),
+    payload: b"ready".to_vec(), tombstone: false, ttl_ms: Some(30_000),
+}).await?;
 assert_eq!(result.priority, Priority::Immediate);
 assert_eq!(result.ttl_ms, Some(30_000));
+// Apply and durably record the result before acknowledging it.
+journal.acknowledge(&mut backend).await?;
 # Ok(())
 # }
 ```
 
-`publish` remains the durable shorthand. `publish_with_options` adds an exact
-positive TTL in milliseconds; zero is rejected. The TTL and priority are
-inside the source-authenticated Event header. A relay or receiver cannot raise
-priority, reset age, or extend lifetime without invalidating the object.
+Omit `Intent::ttl_ms` for durable publication. A positive TTL and priority remain
+source authenticated; forwarding cannot reset age or extend lifetime. Exact
+numbered replay returns the immutable receipt with content availability even
+after retirement, until application acknowledgement compacts that result.
 
 Finite custody is enabled only on Linux, where the selected runtime uses the
 suspend-inclusive boot clock. Other targets continue to support durable

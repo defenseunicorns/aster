@@ -1,7 +1,7 @@
 .\" Copyright 2026 Defense Unicorns, Inc.
 .\" SPDX-License-Identifier: Apache-2.0
 .\" Clean Room — Privileged
-.TH ASTERCTL-PUBLISH 1 "2026-09-28" "Aster" "User Commands"
+.TH ASTERCTL-PUBLISH 1 "2026-10-08" "Aster" "User Commands"
 .SH NAME
 asterctl-publish \- publish an Event to Aster
 .SH SYNOPSIS
@@ -10,7 +10,8 @@ asterctl-publish \- publish an Event to Aster
 .B publish
 .BI \-\-topic " TOPIC"
 .BI \-\-scope " SCOPE"
-.BI \-\-operation\-key " KEY|auto"
+.BI \-\-journal " PATH"
+.BI \-\-client\-id " ID"
 .RI [ PUBLISH-OPTIONS ]
 .RI [ MSG ]
 .YS
@@ -26,7 +27,8 @@ When standard input is a terminal, instructions are printed to stderr before
 reading. Press Ctrl-D on an empty line to send, or Ctrl-C to cancel.
 No input instructions are printed for a pipe, an explicit MSG, or a tombstone.
 .PP
-The agent assigns the Event ID, publisher identity, and sequence numbers.
+The CLI durably assigns a client operation sequence before sending.
+The agent assigns the Event identity and mesh source counters.
 .PP
 The payload may contain text, JSON, or arbitrary binary data.
 The agent limits the complete publication request to 1 MiB.
@@ -101,19 +103,25 @@ Requires an empty payload and cannot be combined with
 .IP
 Default: false.
 .TP
-.BI \-\-operation\-key " KEY|auto"
-Use a UTF-8 key of 1\(en256 bytes, or
-.B auto
-to generate a new key.
-.IP
-For retries, use the actual key from the previous attempt and the same
-payload and publication parameters.
+.BI \-\-journal " PATH"
+Required. Open an existing durable publication journal.
+Create it once using publication-init with the same journal path and client ID.
+Missing, corrupt, or differently configured journals fail closed.
+.TP
+.BI \-\-client\-id " ID"
+Required. Stable UTF-8 application identity of 1\(en64 bytes.
+Reuse the journal and identity across process restarts.
+.SH RECOVERY
+Use publication-recover to reconcile uncertain operations.
+Use publication-retry with \-\-sequence N to resume the original intent.
+After applying a committed result, use publication-ack with \-\-sequence N.
+Publication-abandon permanently consumes the next unadmitted sequence and
+cannot undo a committed Event. Transport failure never triggers abandonment.
 .SH OUTPUT
-Prints the publication receipt to stdout.
-With \-\-json, the receipt also includes
-.BR operation_key .
-.PP
-Generated operation keys are also printed to stderr before sending the request.
+Prints the committed numbered result to stdout.
+With \-\-json, uses ProtoJSON with exact uint64 strings and Base64 identities.
+The assigned operation sequence is printed to stderr before sending.
+Expired content retains its committed receipt until result acknowledgement.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -125,14 +133,15 @@ Command failed or the operation's outcome is unknown.
 .B 2
 Invalid or missing arguments.
 .SH EXAMPLES
-Publish text:
+Initialize once with asterctl publication-init \-\-journal ./publisher.redb
+\-\-client\-id chat-controller. Then publish text:
 .PP
 .nf
 .RS
 asterctl \-\-token\-file ./client.token publish \e
     \-\-topic chat.events \e
     \-\-scope mission/team/alpha \e
-    \-\-operation\-key auto \e
+    \-\-journal ./publisher.redb \-\-client\-id chat-controller \e
     "Hello, Aster!"
 .RE
 .fi
@@ -144,7 +153,7 @@ Publish a file:
 cat "file.json" | asterctl \-\-token\-file ./client.token publish \e
     \-\-topic chat.events \e
     \-\-scope mission/team/alpha \e
-    \-\-operation\-key file-001
+    \-\-journal ./publisher.redb \-\-client\-id chat-controller
 .RE
 .fi
 .SH SEE ALSO

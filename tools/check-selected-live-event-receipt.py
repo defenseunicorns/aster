@@ -30,9 +30,9 @@ import sys
 from typing import Any, Iterable, Sequence
 
 
-SCHEMA = "aster-selected-live-event-receipt/v1"
-RAW_SCHEMA = "aster-selected-live-event-raw/v1"
-TRANSCRIPT_SCHEMA = "aster-selected-live-event-transcript/v1"
+SCHEMA = "aster-selected-live-event-receipt/v2"
+RAW_SCHEMA = "aster-selected-live-event-raw/v2"
+TRANSCRIPT_SCHEMA = "aster-selected-live-event-transcript/v2"
 CLAIM = (
     "selected-live-event-one-host-direct-iroh-priority-withheld-authenticated-gap-"
     "forced-receiver-process-termination-durable-redelivery-gap-closure-acceptance"
@@ -76,6 +76,10 @@ ADMITTED_SOURCE_PATHS = tuple(
             "crates/aster-core/src/lib.rs",
             "crates/aster-core/src/source_event.rs",
             "crates/aster-node/Cargo.toml",
+            "crates/aster-node/src/publication_journal.rs",
+            "tools/historical/check-selected-live-event-receipt.py",
+            "tools/historical/check-selected-linux-event-custody-receipt.py",
+
             "crates/aster-node/src/application.rs",
             "crates/aster-node/src/frame.rs",
             "crates/aster-node/src/identity.rs",
@@ -131,6 +135,7 @@ EXPECTED_FILES = {
     "participants/receiver/state/identity.key": 0o600,
     "participants/receiver/state/mesh.redb": 0o600,
 }
+EXPECTED_FILES["participants/publisher/state/live-acceptance-publication.redb"] = 0o600
 SECRET_FILES = {
     "participants/publisher/mission.bundle",
     "participants/publisher/state/identity.key",
@@ -140,10 +145,12 @@ SECRET_FILES = {
     "participants/receiver/state/mesh.redb",
 }
 
+SECRET_FILES.add("participants/publisher/state/live-acceptance-publication.redb")
+
 RUN_KEYS = (
     "schema", "claim", "participants", "actor_lifetimes",
     "maximum_concurrent_actors", "topic", "beta_topic", "scope",
-    "stream_events", "authorized_unsubscribed_events",
+    "stream_events", "authorized_unsubscribed_events", "publication_model",
 )
 PARTICIPANT_KEYS = (
     "participant", "carrier_id", "mission_id", "mission_authority", "provisioning",
@@ -792,6 +799,14 @@ def validate_inventory(root_descriptor: int) -> dict[str, dict[str, os.stat_resu
             fail(f"{participant} identity artifact has the wrong metadata-only byte count")
         if not 0 < store.st_size <= STORE_MAX_BYTES:
             fail(f"{participant} state artifact violates its metadata-only size bound")
+    # Shared state-subscription support supplies its own exact inventory and
+    # has no Event publication journal. Event v2 still requires this file via
+    # EXPECTED_FILES before the metadata-only check below.
+    journal_path = "participants/publisher/state/live-acceptance-publication.redb"
+    if journal_path in EXPECTED_FILES:
+        journal = observed_files[journal_path]
+        if not 0 < journal.st_size <= STORE_MAX_BYTES:
+            fail("publication journal violates its metadata-only size bound")
     return {"directories": directory_metadata, "files": observed_files}
 
 
@@ -952,6 +967,7 @@ def validate_transcript(data: bytes) -> dict[str, Any]:
         records[0],
         {
             "schema": TRANSCRIPT_SCHEMA,
+            "publication_model": "numbered-v1",
             "claim": CLAIM,
             "participants": "2",
             "actor_lifetimes": "7",
@@ -1099,7 +1115,7 @@ def validate_transcript(data: bytes) -> dict[str, Any]:
             "original_payload_sha256": PAYLOAD_HASHES["first"],
             "changed_payload_sha256": PAYLOAD_HASHES["changed_first"],
             "error_kind": "conflict",
-            "operation": "publish",
+            "operation": "publish_numbered",
             "sanitized": "true",
             "publication_preserved": "true",
         },
@@ -1992,6 +2008,40 @@ def validate_terminal_stdout(
 
 
 
+def validate_publication_diagnostics(data: bytes, *, inserted: int, retries: int, failures: int) -> None:
+    keys = ("group_sequence", "collected", "cohorts", "custody_writer_commits", "event_writer_commits",
+            "total_writer_commits", "accepted_new", "exact_retries", "failures", "max_cohort_size", "singleton_fallbacks")
+    if len(data) > STDERR_MAX_BYTES or not data.endswith(b"\n"):
+        fail("publication diagnostics are missing or exceed their bound")
+    totals = [0, 0, 0]
+    try:
+        lines = data.decode("ascii", errors="strict").splitlines()
+    except UnicodeError:
+        fail("publication diagnostics are not canonical ASCII")
+    if len(lines) != inserted + retries + failures:
+        fail("publication diagnostic count differs from the sequential producer")
+    for sequence, line in enumerate(lines, 1):
+        fields = line.split(" ")
+        if fields[0] != "event_publication_group" or len(fields) != len(keys) + 1:
+            fail("stderr contains an unclassified diagnostic")
+        values = {}
+        for key, field in zip(keys, fields[1:]):
+            name, separator, value = field.partition("=")
+            if name != key or separator != "=" or re.fullmatch(r"0|[1-9][0-9]{0,19}", value) is None or int(value) >= 2**64:
+                fail("publication diagnostic field is noncanonical")
+            values[key] = int(value)
+        if (values["group_sequence"] != sequence or values["collected"] != 1 or values["cohorts"] != 1
+                or values["max_cohort_size"] != 1 or values["singleton_fallbacks"] != 1
+                or values["total_writer_commits"] != values["custody_writer_commits"] + values["event_writer_commits"]
+                or values["accepted_new"] + values["exact_retries"] + values["failures"] != 1
+                or (values["accepted_new"] and not values["event_writer_commits"])):
+            fail("publication diagnostic accounting differs from its admitted outcome")
+        for index, key in enumerate(("accepted_new", "exact_retries", "failures")):
+            totals[index] += values[key]
+    if totals != [inserted, retries, failures]:
+        fail("publication diagnostic outcomes differ from the producer scenario")
+
+
 def validate_artifact_record(
     value: Any,
     label: str,
@@ -2229,7 +2279,9 @@ def validate_raw_root(root: Path, source_authority: dict[str, Any]) -> dict[str,
                 fail(f"public artifact {relative} changed after inventory inspection")
         if not binary:
             fail("copied release executable is empty")
-        if stderr != b"":
+        if SCHEMA == "aster-selected-live-event-receipt/v2":
+            validate_publication_diagnostics(stderr, inserted=3, retries=1, failures=1)
+        elif stderr:
             fail("captured stderr is nonempty and has no selected acceptance classification")
         transcript_facts = validate_transcript(transcript)
         terminal_facts = validate_terminal_stdout(stdout, transcript, root, transcript_facts)
@@ -2303,6 +2355,9 @@ def validate_raw_root(root: Path, source_authority: dict[str, Any]) -> dict[str,
                 "mission_artifacts": len(PARTICIPANTS),
                 "identity_artifacts": len(PARTICIPANTS),
                 "store_artifacts": len(PARTICIPANTS),
+                **({"publication_journal_artifacts": 1} if
+                   "participants/publisher/state/live-acceptance-publication.redb"
+                   in EXPECTED_FILES else {}),
                 "secret_artifact_contents": "metadata-only-not-opened-read-or-hashed",
                 "file_links": "all-one",
                 "inventory_aliases": "none",
@@ -2707,7 +2762,7 @@ def build_receipt(source: dict[str, Any], evidence: dict[str, Any]) -> dict[str,
             "stderr": {
                 "bytes": run["artifacts"]["stderr"]["bytes"],
                 "sha256": run["artifacts"]["stderr"]["sha256"],
-                "classification": "exact-empty",
+                "classification": "exact-bounded-numbered-publication-diagnostics",
             },
             "transcript": {
                 "records": transcript["records"],
@@ -2977,6 +3032,7 @@ def write_receipt(path: Path | None, data: bytes) -> None:
 
 def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--historical-v1", action="store_true", help="verify or project the unchanged historical v1 format")
     parser.add_argument(
         "receipt",
         nargs="?",
@@ -2997,7 +3053,19 @@ def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(arguments: list[str] | None = None) -> None:
-    options = parse_args(arguments)
+    selected_arguments = list(sys.argv[1:] if arguments is None else arguments)
+    if "--historical-v1" in selected_arguments:
+        import importlib.util
+        selected_arguments.remove("--historical-v1")
+        path = Path(__file__).parent / "historical" / Path(__file__).name
+        spec = importlib.util.spec_from_file_location("aster_historical_receipt", path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("historical receipt validator unavailable")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.main(selected_arguments)
+        return
+    options = parse_args(selected_arguments)
     try:
         raw_root = Path(os.path.abspath(os.fspath(options.raw_root)))
         source = Path(os.path.abspath(os.fspath(options.source)))

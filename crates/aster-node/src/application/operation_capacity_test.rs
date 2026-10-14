@@ -47,7 +47,7 @@ fn operation_capacity_uses_record_and_byte_headroom_and_exact_thresholds() {
             logical_bytes: active * 162 + retired * 67,
         };
         let limits = EventOperationLimits::new(records, bytes, reserve).unwrap();
-        let capacity = EventOperationCapacity::new(stats, limits);
+        let capacity = EventOperationCapacity::from_legacy_inspection(stats, limits);
         assert_eq!(capacity.stats, stats);
         assert_eq!(capacity.limits, limits);
         assert_eq!(
@@ -74,7 +74,7 @@ fn operation_capacity_threshold_comparison_does_not_overflow_u64() {
         ..Default::default()
     };
     assert_eq!(
-        EventOperationCapacity::new(stats, limits).warning,
+        EventOperationCapacity::from_legacy_inspection(stats, limits).warning,
         EventOperationCapacityWarning::Warning
     );
 }

@@ -16,10 +16,10 @@
 //! or control namespace. Semantic mutation requires a live strong capability from
 //! `aster-core`, while persisted decoded metadata is only structurally audited.
 //! [`StoreLimits`] bound aggregate redb rows and encoded bytes across the
-//! accounted logical namespaces. Permanent schema-v3 Event operations are
-//! excluded from that ordinary quota and bounded by [`EventOperationLimits`],
-//! while legacy Event-operation rows remain ordinary-accounted until atomic
-//! migration makes v3 authoritative. Both quotas remain part of deployment's
+//! accounted logical namespaces. Numbered Event client and sparse-result rows
+//! are separately bounded by [`EventOperationLimits`]. Normal nodes refuse
+//! nonempty legacy Event publication ledgers before repair or migration; their
+//! inspection and writer fixtures remain available for historical evidence. Both quotas remain part of deployment's
 //! total logical state-allocation calculation. Selector/delivery/custody ledgers
 //! have separate caps, while accepted-dot and causal-frontier aggregate
 //! retirement remains an explicit open boundary. [`BlobDepotLimits`] separately
@@ -1259,7 +1259,9 @@ impl EventPublicationIntent {
     }
 }
 
+/// Historical opaque-key writer fixture; unavailable in normal store builds.
 /// Exact borrowed inputs for one atomic idempotent Event commit.
+#[cfg(any(test, feature = "test-utils"))]
 pub struct EventOperationRequest<'a> {
     operation: &'a EventOperationKey,
     intent: &'a EventPublicationIntent,
@@ -1319,6 +1321,7 @@ impl LocalCustodyCheckpoint {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl<'a> EventOperationRequest<'a> {
     /// Binds an operation key, stable intent, exact plaintext, and optional
     /// authenticated reaction predecessor.
@@ -2913,6 +2916,7 @@ impl EventOnceCommitAttempt {
 
 /// One already-reserved, source-verified ordinary Event operation prepared for
 /// an ordered durable group commit.
+#[cfg(any(test, feature = "test-utils"))]
 pub struct ReservedEventOnceCommit<'a> {
     request: &'a EventOperationRequest<'a>,
     reservation: &'a EventReservation,
@@ -2920,6 +2924,7 @@ pub struct ReservedEventOnceCommit<'a> {
     sealed: &'a [u8],
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl<'a> ReservedEventOnceCommit<'a> {
     /// Binds one operation request to its exact reservation and verified bytes.
     pub const fn new(
@@ -2939,11 +2944,13 @@ impl<'a> ReservedEventOnceCommit<'a> {
 
 /// Ordered outcomes and exact redb writer-commit count for one Event cohort.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(any(test, feature = "test-utils"))]
 pub struct EventGroupCommitOutcome {
     outcomes: Vec<EventOnceOutcome>,
     writer_commits: u64,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl EventGroupCommitOutcome {
     /// Returns outcomes in the same order as the submitted cohort.
     pub fn outcomes(&self) -> &[EventOnceOutcome] {
@@ -2957,6 +2964,56 @@ impl EventGroupCommitOutcome {
 
     /// Consumes the group result and returns its ordered per-Event outcomes.
     pub fn into_outcomes(self) -> Vec<EventOnceOutcome> {
+        self.outcomes
+    }
+}
+
+/// One already-reserved, source-verified numbered Event operation prepared for
+/// an ordered durable group commit.
+pub struct ReservedNumberedEventCommit<'a> {
+    request: &'a NumberedEventOperationRequest<'a>,
+    reservation: &'a EventReservation,
+    event: &'a ContentVerifiedEventEnvelope,
+    sealed: &'a [u8],
+}
+
+impl<'a> ReservedNumberedEventCommit<'a> {
+    /// Binds one operation request to its exact reservation and verified bytes.
+    pub const fn new(
+        request: &'a NumberedEventOperationRequest<'a>,
+        reservation: &'a EventReservation,
+        event: &'a ContentVerifiedEventEnvelope,
+        sealed: &'a [u8],
+    ) -> Self {
+        Self {
+            request,
+            reservation,
+            event,
+            sealed,
+        }
+    }
+}
+
+/// Ordered outcomes and exact redb writer-commit count for one Event cohort.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NumberedEventGroupCommitOutcome {
+    outcomes: Vec<NumberedEventPublishOutcome>,
+    writer_commits: u64,
+}
+
+impl NumberedEventGroupCommitOutcome {
+    /// Returns outcomes in the same order as the submitted cohort.
+    pub fn outcomes(&self) -> &[NumberedEventPublishOutcome] {
+        &self.outcomes
+    }
+
+    /// Returns the exact number of redb writer transactions committed.
+    pub const fn writer_commits(&self) -> u64 {
+        self.writer_commits
+    }
+
+    /// Consumes the group result and returns its ordered per-Event outcomes.
+    pub fn into_outcomes(self) -> Vec<NumberedEventPublishOutcome> {
         self.outcomes
     }
 }
@@ -4879,6 +4936,7 @@ struct PendingRecordOperation<'a> {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(any(test, feature = "test-utils"))]
 struct PendingOperation<'a> {
     key: &'a EventOperationKey,
     predecessor: Option<EventSemanticId>,
@@ -4887,6 +4945,7 @@ struct PendingOperation<'a> {
 
 #[derive(Clone, Copy)]
 enum PendingEventOperation<'a> {
+    #[cfg(any(test, feature = "test-utils"))]
     Legacy(PendingOperation<'a>),
     Numbered(numbered_event_operation::PendingNumberedEventOperation<'a>),
 }
@@ -4894,6 +4953,7 @@ enum PendingEventOperation<'a> {
 impl PendingEventOperation<'_> {
     const fn predecessor(self) -> Option<EventSemanticId> {
         match self {
+            #[cfg(any(test, feature = "test-utils"))]
             Self::Legacy(operation) => operation.predecessor,
             Self::Numbered(operation) => operation.predecessor,
         }
@@ -4910,6 +4970,7 @@ struct PendingEventCustody {
 enum EventCommitResult {
     Retained(EventCommit),
     RetiredOperation {
+        #[cfg(any(test, feature = "test-utils"))]
         reason: CustodyRetirementReason,
     },
     Numbered {
@@ -4943,14 +5004,25 @@ pub struct NumberedEventPublishOutcome {
     pub inserted: bool,
 }
 
+/// One numbered publication attempt, including writer commits made before an error.
+pub struct NumberedEventCommitAttempt {
+    pub result: Result<NumberedEventPublishOutcome, StoreError>,
+    pub writer_commits: u64,
+}
+
 struct EventCommit {
+    #[cfg(any(test, feature = "test-utils"))]
     transfer_id: EventTransferId,
+    #[cfg(any(test, feature = "test-utils"))]
     semantic_id: EventSemanticId,
     apply: ApplyOutcome,
+    #[cfg(any(test, feature = "test-utils"))]
     operation_existing: bool,
+    #[cfg(any(test, feature = "test-utils"))]
     retirement: Option<CustodyRetirementReason>,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn event_once_outcome(result: EventCommitResult) -> Result<EventOnceOutcome, StoreError> {
     let committed = match result {
         EventCommitResult::Retained(committed) => committed,
@@ -5347,6 +5419,34 @@ fn open_existing_store_backing(path: &Path) -> Result<OpenedStoreBacking, StoreE
     validate_nonempty_store_backing(open_store_backing_file(path, false, false)?)
 }
 
+struct PublicationPreflightTemporary(Option<PathBuf>);
+
+impl Drop for PublicationPreflightTemporary {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn reject_legacy_publication_read(read: &redb::ReadTransaction) -> Result<(), StoreError> {
+    let names = read
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    for definition in [
+        EVENT_OPERATIONS,
+        EVENT_OPERATION_WITNESSES,
+        event_operation::EVENT_OPERATION_LEDGER_V3,
+        event_operation::ACTIVE_OPERATION_BY_EVENT_V1,
+    ] {
+        if names.contains(definition.name()) && read.open_table(definition)?.len()? != 0 {
+            return Err(NumberedEventOperationError::LegacyStoreRequiresFreshState.into());
+        }
+    }
+    Ok(())
+}
+
 fn open_read_only_store_backing(path: &Path) -> Result<OpenedStoreBacking, StoreError> {
     validate_nonempty_store_backing(open_store_backing_file(path, false, true)?)
 }
@@ -5605,6 +5705,7 @@ impl Store {
             EventOperationLimits::DEFAULT,
             Some(binding.mission_authority),
             Some(expectation),
+            false,
         )?;
         debug_assert_eq!(store.mission_authority, Some(binding.mission_authority));
         Ok(store)
@@ -5684,9 +5785,98 @@ impl Store {
             operation_limits,
             Some(mission_authority),
             None,
+            false,
         )?;
         debug_assert_eq!(store.mission_authority, Some(mission_authority));
         Ok(store)
+    }
+
+    /// Normal numbered-only node open. Read-only preflight precedes repair or migration,
+    /// and the exact acquired writer repeats the legacy-table refusal before any mutation.
+    pub fn open_numbered_for_mission(
+        path: impl AsRef<Path>,
+        limits: StoreLimits,
+        blob_depot_limits: BlobDepotLimits,
+        operation_limits: EventOperationLimits,
+        mission_authority: NodeId,
+    ) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        Self::require_numbered_publication_compatible(path)?;
+        Self::open_with_limits_internal(
+            path,
+            limits,
+            blob_depot_limits,
+            operation_limits,
+            Some(mission_authority),
+            None,
+            true,
+        )
+    }
+
+    /// Refuses pre-numbered Event publication ledgers without modifying their bytes.
+    /// Call before a normal node open, schema migration, maintenance, identity or network startup.
+    /// Historical stores remain available to the explicit read-only inspection APIs.
+    pub fn require_numbered_publication_compatible(
+        path: impl AsRef<Path>,
+    ) -> Result<(), StoreError> {
+        let path = path.as_ref();
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(StoreError::StorePath(error)),
+            Ok(_) => {}
+        }
+        let mut backing = open_read_only_store_backing(path)?;
+        match redb::Builder::new().open_read_only(path) {
+            Ok(database) => reject_legacy_publication_read(&database.begin_read()?)?,
+            Err(error) => {
+                let error = StoreError::from(error);
+                if !error.is_read_only_repair_required() {
+                    return Err(error);
+                }
+                // An unclean redb allocator cannot be inspected through a read-only
+                // handle. Repair an owner-only disposable copy, never the original,
+                // so crash recovery does not bypass the legacy refusal boundary.
+                let mut nonce = [0_u8; 16];
+                getrandom::fill(&mut nonce).map_err(|_| {
+                    StoreError::StoreBackingInvariant(
+                        "publication preflight random source unavailable",
+                    )
+                })?;
+                let suffix = nonce
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                let temporary_path =
+                    std::env::temp_dir().join(format!("aster-publication-preflight-{suffix}.redb"));
+                let mut temporary = open_store_backing_file(&temporary_path, true, false)?;
+                let mut cleanup = PublicationPreflightTemporary(Some(temporary_path.clone()));
+                #[cfg(unix)]
+                {
+                    std::fs::remove_file(&temporary_path).map_err(StoreError::StorePath)?;
+                    cleanup.0 = None;
+                }
+                let copied = std::io::copy(
+                    &mut std::io::Read::take(&mut backing.file, backing.length.saturating_add(1)),
+                    &mut temporary.file,
+                )
+                .map_err(StoreError::StorePath)?;
+                if copied != backing.length {
+                    return Err(StoreError::StoreBackingInvariant(
+                        "publication preflight source length changed",
+                    ));
+                }
+                let database = redb::Builder::new().create_file(temporary.file)?;
+                reject_legacy_publication_read(&database.begin_read()?)?;
+                drop(database);
+                drop(cleanup);
+            }
+        }
+        if backing.identity != open_read_only_store_backing(path)?.identity {
+            return Err(StoreError::StoreBackingInvariant(
+                "publication preflight backing identity changed",
+            ));
+        }
+        Ok(())
     }
 
     /// Opens and audits an existing store without creating, repairing, or writing it.
@@ -5786,6 +5976,7 @@ impl Store {
             EventOperationLimits::DEFAULT,
             None,
             None,
+            false,
         )
     }
 
@@ -5796,6 +5987,7 @@ impl Store {
         operation_limits: EventOperationLimits,
         expected_mission_authority: Option<NodeId>,
         expected_security_profile_policy: Option<SecurityProfilePolicyExpectation>,
+        numbered_publication_only: bool,
     ) -> Result<Self, StoreError> {
         let path = std::path::absolute(path).map_err(StoreError::StorePath)?;
         if path.exists() {
@@ -5812,6 +6004,22 @@ impl Store {
         let (database, backing_identity) = open_or_create_store_database(&path)?;
 
         let write = database.begin_write()?;
+        if numbered_publication_only {
+            let names = write
+                .list_tables()?
+                .map(|table| table.name().to_owned())
+                .collect::<std::collections::BTreeSet<_>>();
+            for definition in [
+                EVENT_OPERATIONS,
+                EVENT_OPERATION_WITNESSES,
+                event_operation::EVENT_OPERATION_LEDGER_V3,
+                event_operation::ACTIVE_OPERATION_BY_EVENT_V1,
+            ] {
+                if names.contains(definition.name()) && write.open_table(definition)?.len()? != 0 {
+                    return Err(NumberedEventOperationError::LegacyStoreRequiresFreshState.into());
+                }
+            }
+        }
         // Recheck under the exact writer transaction before opening any table.
         // This closes the gap between the read-only startup check and migration.
         enforce_live_write(&write)?;
@@ -9746,7 +9954,9 @@ impl Store {
         .and_then(EventCommitResult::into_apply)
     }
 
+    /// Historical raw local-publication fixture; unavailable in normal store builds.
     /// Commits one locally sealed Event against its optimistic durable reservation.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_reserved_event(
         &self,
         reservation: &EventReservation,
@@ -9765,7 +9975,9 @@ impl Store {
         .and_then(EventCommitResult::into_apply)
     }
 
+    /// Historical raw local-publication fixture; unavailable in normal store builds.
     /// Commits a reserved local Event only if its captured policy remains exact.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_reserved_event_with_policy(
         &self,
         policy: &ControlPolicySnapshot,
@@ -9794,6 +10006,7 @@ impl Store {
     /// Event and the reservation context must observe its authenticated dot.
     /// The operation row, source envelope, semantic ledgers, reconciliation
     /// item, and acceptance marker are committed in the same redb transaction.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_reserved_event_once(
         &self,
         request: &EventOperationRequest<'_>,
@@ -9815,6 +10028,7 @@ impl Store {
     }
 
     /// Commits one idempotent local Event operation under an exact settled policy.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_reserved_event_once_with_policy(
         &self,
         policy: &ControlPolicySnapshot,
@@ -9835,6 +10049,7 @@ impl Store {
 
     /// Commits one idempotent local Event operation and reports every writer
     /// transaction, including one that commits before returning an error.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_reserved_event_once_with_policy_observed(
         &self,
         policy: &ControlPolicySnapshot,
@@ -9870,6 +10085,7 @@ impl Store {
     /// Atomically commits one local finite Event operation and establishes its
     /// age-zero custody checkpoint. Source bytes, permanent operation/causal
     /// fences, quota accounting, and custody state share one redb commit.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_reserved_event_once_with_custody_policy(
         &self,
         policy: &ControlPolicySnapshot,
@@ -9893,6 +10109,7 @@ impl Store {
     /// Commits one finite local Event operation and reports every writer
     /// transaction, including a continuity transition or retirement fence
     /// committed before the returned error.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_reserved_event_once_with_custody_policy_observed(
         &self,
         policy: &ControlPolicySnapshot,
@@ -9932,6 +10149,7 @@ impl Store {
     }
 
     /// Atomically commits an ordered cohort of durable ordinary Event operations.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_reserved_event_group_once_with_policy(
         &self,
         policy: &ControlPolicySnapshot,
@@ -9942,6 +10160,7 @@ impl Store {
 
     /// Atomically commits an ordered cohort of finite ordinary Event operations
     /// under one common commit-adjacent custody checkpoint.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn commit_reserved_event_group_once_with_custody_policy(
         &self,
         policy: &ControlPolicySnapshot,
@@ -9959,6 +10178,7 @@ impl Store {
         )
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     fn commit_reserved_event_group_once_internal(
         &self,
         policy: &ControlPolicySnapshot,
@@ -10035,6 +10255,111 @@ impl Store {
         })
     }
 
+    /// Atomically commits an ordered cohort of durable numbered Event operations.
+    pub fn commit_reserved_numbered_event_group_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        commits: &[ReservedNumberedEventCommit<'_>],
+    ) -> Result<NumberedEventGroupCommitOutcome, StoreError> {
+        self.commit_reserved_numbered_event_group_internal(policy, None, commits)
+    }
+
+    /// Atomically commits an ordered cohort of finite numbered Event operations
+    /// under one common commit-adjacent custody checkpoint.
+    pub fn commit_reserved_numbered_event_group_with_custody_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        custody: LocalCustodyCheckpoint,
+        commits: &[ReservedNumberedEventCommit<'_>],
+    ) -> Result<NumberedEventGroupCommitOutcome, StoreError> {
+        self.commit_reserved_numbered_event_group_internal(
+            policy,
+            Some(PendingEventCustody {
+                expected_policy: custody.policy_revision,
+                authenticated_age_ms: 0,
+                sample: Some(custody.sample),
+            }),
+            commits,
+        )
+    }
+
+    fn commit_reserved_numbered_event_group_internal(
+        &self,
+        policy: &ControlPolicySnapshot,
+        custody: Option<PendingEventCustody>,
+        commits: &[ReservedNumberedEventCommit<'_>],
+    ) -> Result<NumberedEventGroupCommitOutcome, StoreError> {
+        self.require_live()?;
+        let first = commits.first().ok_or(StoreError::InvalidSemanticEvent(
+            "Event commit group is empty",
+        ))?;
+        let cohort = (
+            first.reservation.publisher,
+            &first.reservation.topic,
+            &first.reservation.scope,
+        );
+        let mut prepared = Vec::with_capacity(commits.len());
+        for item in commits {
+            if policy != &item.reservation.control_policy {
+                return Err(StoreError::ControlPolicyChanged);
+            }
+            if item.reservation.publisher != cohort.0
+                || &item.reservation.topic != cohort.1
+                || &item.reservation.scope != cohort.2
+            {
+                return Err(StoreError::InvalidSemanticEvent(
+                    "Event commit group crosses a publisher, topic, or scope boundary",
+                ));
+            }
+            let event = match custody {
+                Some(_) => PreparedEvent::from_verified_with_custody(
+                    item.event,
+                    item.sealed,
+                    EventOrigin::Local,
+                )?,
+                None => PreparedEvent::from_verified(item.event, item.sealed, EventOrigin::Local)?,
+            };
+            self.require_mission_authority(event.mission_authority)?;
+            let operation =
+                prepare_numbered_event_operation(item.request, item.event, &event.header)?;
+            prepared.push((event, operation, item.reservation));
+        }
+
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        let mut outcomes = Vec::with_capacity(prepared.len());
+        let mut commit_required = false;
+        for (event, operation, reservation) in &prepared {
+            match self.stage_prepared_event(
+                &write,
+                event,
+                Some(reservation),
+                Some(PendingEventOperation::Numbered(*operation)),
+                EventAdmissionGuard::Control(policy),
+                custody,
+            )? {
+                PreparedEventStage::NoCommit(outcome) => {
+                    outcomes.push(numbered_event_outcome(outcome)?);
+                }
+                PreparedEventStage::Commit(outcome) => {
+                    commit_required = true;
+                    outcomes.push(numbered_event_outcome(outcome)?);
+                }
+                PreparedEventStage::CommitError(error) => return Err(error),
+            }
+        }
+        let writer_commits = if commit_required {
+            write.commit()?;
+            1
+        } else {
+            0
+        };
+        Ok(NumberedEventGroupCommitOutcome {
+            outcomes,
+            writer_commits,
+        })
+    }
+
     /// Atomically commits one numbered local Event and its recoverable result.
     pub fn commit_reserved_numbered_event_with_policy(
         &self,
@@ -10044,19 +10369,46 @@ impl Store {
         event: &ContentVerifiedEventEnvelope,
         sealed: &[u8],
     ) -> Result<NumberedEventPublishOutcome, StoreError> {
-        self.require_live()?;
-        if policy != &reservation.control_policy {
-            return Err(StoreError::ControlPolicyChanged);
+        self.commit_reserved_numbered_event_with_policy_observed(
+            policy,
+            request,
+            reservation,
+            event,
+            sealed,
+        )
+        .result
+    }
+
+    /// Reports durable writer commits even when the numbered attempt fails.
+    pub fn commit_reserved_numbered_event_with_policy_observed(
+        &self,
+        policy: &ControlPolicySnapshot,
+        request: &NumberedEventOperationRequest<'_>,
+        reservation: &EventReservation,
+        event: &ContentVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> NumberedEventCommitAttempt {
+        let mut writer_commits = 0;
+        let result = (|| {
+            self.require_live()?;
+            if policy != &reservation.control_policy {
+                return Err(StoreError::ControlPolicyChanged);
+            }
+            let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Local)?;
+            let operation = prepare_numbered_event_operation(request, event, &prepared.header)?;
+            numbered_event_outcome(self.commit_prepared_event_counted(
+                &prepared,
+                Some(reservation),
+                Some(PendingEventOperation::Numbered(operation)),
+                EventAdmissionGuard::Control(policy),
+                None,
+                &mut writer_commits,
+            )?)
+        })();
+        NumberedEventCommitAttempt {
+            result,
+            writer_commits,
         }
-        let prepared = PreparedEvent::from_verified(event, sealed, EventOrigin::Local)?;
-        let operation = prepare_numbered_event_operation(request, event, &prepared.header)?;
-        numbered_event_outcome(self.commit_prepared_event(
-            &prepared,
-            Some(reservation),
-            Some(PendingEventOperation::Numbered(operation)),
-            EventAdmissionGuard::Control(policy),
-            None,
-        )?)
     }
 
     /// Atomically commits one finite numbered Event, its age checkpoint, and result.
@@ -10069,28 +10421,58 @@ impl Store {
         event: &ContentVerifiedEventEnvelope,
         sealed: &[u8],
     ) -> Result<NumberedEventPublishOutcome, StoreError> {
-        self.require_live()?;
-        if policy != &reservation.control_policy {
-            return Err(StoreError::ControlPolicyChanged);
+        self.commit_reserved_numbered_event_with_custody_policy_observed(
+            policy,
+            custody,
+            request,
+            reservation,
+            event,
+            sealed,
+        )
+        .result
+    }
+
+    /// Reports durable writer commits even when the numbered attempt fails.
+    pub fn commit_reserved_numbered_event_with_custody_policy_observed(
+        &self,
+        policy: &ControlPolicySnapshot,
+        custody: LocalCustodyCheckpoint,
+        request: &NumberedEventOperationRequest<'_>,
+        reservation: &EventReservation,
+        event: &ContentVerifiedEventEnvelope,
+        sealed: &[u8],
+    ) -> NumberedEventCommitAttempt {
+        let mut writer_commits = 0;
+        let result = (|| {
+            self.require_live()?;
+            if policy != &reservation.control_policy {
+                return Err(StoreError::ControlPolicyChanged);
+            }
+            let prepared =
+                PreparedEvent::from_verified_with_custody(event, sealed, EventOrigin::Local)?;
+            let operation = prepare_numbered_event_operation(request, event, &prepared.header)?;
+            numbered_event_outcome(self.commit_prepared_event_counted(
+                &prepared,
+                Some(reservation),
+                Some(PendingEventOperation::Numbered(operation)),
+                EventAdmissionGuard::Control(policy),
+                Some(PendingEventCustody {
+                    expected_policy: custody.policy_revision,
+                    authenticated_age_ms: 0,
+                    sample: Some(custody.sample),
+                }),
+                &mut writer_commits,
+            )?)
+        })();
+        NumberedEventCommitAttempt {
+            result,
+            writer_commits,
         }
-        let prepared =
-            PreparedEvent::from_verified_with_custody(event, sealed, EventOrigin::Local)?;
-        let operation = prepare_numbered_event_operation(request, event, &prepared.header)?;
-        numbered_event_outcome(self.commit_prepared_event(
-            &prepared,
-            Some(reservation),
-            Some(PendingEventOperation::Numbered(operation)),
-            EventAdmissionGuard::Control(policy),
-            Some(PendingEventCustody {
-                expected_policy: custody.policy_revision,
-                authenticated_age_ms: 0,
-                sample: Some(custody.sample),
-            }),
-        )?)
     }
 
     /// Compares a request with its mission-bound commitment before resolving
     /// any Event bytes, in one read transaction. Commit rechecks authority.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn event_operation_resolution_for_request(
         &self,
         request: &EventOperationRequest<'_>,
@@ -10866,6 +11248,7 @@ impl Store {
                         }));
                     }
                 }
+                #[cfg(any(test, feature = "test-utils"))]
                 PendingEventOperation::Legacy(operation) => {
                     numbered_event_operation::legacy_operation_allowed_write(write)?;
                     let fingerprint = event_operation::event_operation_fingerprint(
@@ -10893,7 +11276,10 @@ impl Store {
                                     return Err(StoreError::EventOperationConflict);
                                 }
                                 return Ok(PreparedEventStage::NoCommit(
-                                    EventCommitResult::RetiredOperation { reason },
+                                    EventCommitResult::RetiredOperation {
+                                        #[cfg(any(test, feature = "test-utils"))]
+                                        reason,
+                                    },
                                 ));
                             }
                         };
@@ -10903,7 +11289,10 @@ impl Store {
                         match custody::event_custody_authority_write(write, transfer_id)? {
                             custody::EventCustodyAuthority::Retired { reason, .. } => {
                                 return Ok(PreparedEventStage::NoCommit(
-                                    EventCommitResult::RetiredOperation { reason },
+                                    EventCommitResult::RetiredOperation {
+                                        #[cfg(any(test, feature = "test-utils"))]
+                                        reason,
+                                    },
                                 ));
                             }
                             custody::EventCustodyAuthority::Live { .. } => {}
@@ -10914,12 +11303,16 @@ impl Store {
                         if let Some(stored) = load_event_from_write(write, transfer_id)? {
                             return Ok(PreparedEventStage::NoCommit(EventCommitResult::Retained(
                                 EventCommit {
+                                    #[cfg(any(test, feature = "test-utils"))]
                                     transfer_id,
+                                    #[cfg(any(test, feature = "test-utils"))]
                                     semantic_id: stored.semantic_id,
                                     apply: ApplyOutcome::Duplicate {
                                         acceptance_marker: stored.acceptance_marker,
                                     },
+                                    #[cfg(any(test, feature = "test-utils"))]
                                     operation_existing: true,
+                                    #[cfg(any(test, feature = "test-utils"))]
                                     retirement: None,
                                 },
                             )));
@@ -10932,10 +11325,14 @@ impl Store {
                             )?;
                         return Ok(PreparedEventStage::NoCommit(EventCommitResult::Retained(
                             EventCommit {
+                                #[cfg(any(test, feature = "test-utils"))]
                                 transfer_id,
+                                #[cfg(any(test, feature = "test-utils"))]
                                 semantic_id,
                                 apply: ApplyOutcome::Duplicate { acceptance_marker },
+                                #[cfg(any(test, feature = "test-utils"))]
                                 operation_existing: true,
+                                #[cfg(any(test, feature = "test-utils"))]
                                 retirement: Some(reason),
                             },
                         )));
@@ -11071,15 +11468,22 @@ impl Store {
                             result,
                             inserted: false,
                         },
-                        None => EventCommitResult::RetiredOperation { reason },
+                        None => EventCommitResult::RetiredOperation {
+                            #[cfg(any(test, feature = "test-utils"))]
+                            reason,
+                        },
                     }));
                 }
                 return Ok(PreparedEventStage::Commit(EventCommitResult::Retained(
                     EventCommit {
+                        #[cfg(any(test, feature = "test-utils"))]
                         transfer_id: accepted,
+                        #[cfg(any(test, feature = "test-utils"))]
                         semantic_id,
                         apply: ApplyOutcome::Duplicate { acceptance_marker },
+                        #[cfg(any(test, feature = "test-utils"))]
                         operation_existing: false,
+                        #[cfg(any(test, feature = "test-utils"))]
                         retirement: Some(reason),
                     },
                 )));
@@ -11145,12 +11549,16 @@ impl Store {
             }
             return Ok(PreparedEventStage::Commit(EventCommitResult::Retained(
                 EventCommit {
+                    #[cfg(any(test, feature = "test-utils"))]
                     transfer_id: accepted,
+                    #[cfg(any(test, feature = "test-utils"))]
                     semantic_id: prepared.semantic_id,
                     apply: ApplyOutcome::Duplicate {
                         acceptance_marker: stored.acceptance_marker,
                     },
+                    #[cfg(any(test, feature = "test-utils"))]
                     operation_existing: false,
+                    #[cfg(any(test, feature = "test-utils"))]
                     retirement: None,
                 },
             )));
@@ -11401,12 +11809,16 @@ impl Store {
         }
         Ok(PreparedEventStage::Commit(EventCommitResult::Retained(
             EventCommit {
+                #[cfg(any(test, feature = "test-utils"))]
                 transfer_id: prepared.transfer_id,
+                #[cfg(any(test, feature = "test-utils"))]
                 semantic_id: prepared.semantic_id,
                 apply: ApplyOutcome::Inserted {
                     acceptance_marker: marker,
                 },
+                #[cfg(any(test, feature = "test-utils"))]
                 operation_existing: false,
+                #[cfg(any(test, feature = "test-utils"))]
                 retirement: None,
             },
         )))
@@ -20502,6 +20914,7 @@ fn validate_event_publication_intent(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 fn prepare_event_operation<'a>(
     request: &'a EventOperationRequest<'a>,
     event: &ContentVerifiedEventEnvelope,
@@ -20539,7 +20952,7 @@ fn prepare_numbered_event_operation<'a>(
 
 fn admit_pending_event_operation_write(
     write: &redb::WriteTransaction,
-    mission_authority: &NodeId,
+    _mission_authority: &NodeId,
     operation: PendingEventOperation<'_>,
     receipt: CommittedEventReceipt,
     content: CommittedEventContent,
@@ -20547,12 +20960,13 @@ fn admit_pending_event_operation_write(
     tombstone: bool,
 ) -> Result<Option<NumberedEventResult>, StoreError> {
     match operation {
+        #[cfg(any(test, feature = "test-utils"))]
         PendingEventOperation::Legacy(operation) => {
             match content {
                 CommittedEventContent::Available => {
                     event_operation::admit_active_event_operation_write(
                         write,
-                        mission_authority,
+                        _mission_authority,
                         operation.key,
                         operation.intent_digest,
                         receipt.transfer_id,
@@ -20563,7 +20977,7 @@ fn admit_pending_event_operation_write(
                 CommittedEventContent::Retired(reason) => {
                     event_operation::admit_retired_event_operation_write(
                         write,
-                        mission_authority,
+                        _mission_authority,
                         operation.key,
                         operation.intent_digest,
                         reason,
@@ -24280,6 +24694,132 @@ mod tests {
     static NEXT_TEST_PATH: AtomicU64 = AtomicU64::new(0);
     const ABRUPT_STORE_PATH: &str = "ASTER_REDB_TEST_ABRUPT_STORE_PATH";
     const ABRUPT_STORE_MODE: &str = "ASTER_REDB_TEST_ABRUPT_STORE_MODE";
+
+    #[test]
+    fn numbered_startup_recovers_unclean_stores_but_preserves_unclean_legacy_bytes() {
+        const CHILD_PATH: &str = "ASTER_NUMBERED_PREFLIGHT_CHILD_PATH";
+        const CHILD_LEGACY: &str = "ASTER_NUMBERED_PREFLIGHT_CHILD_LEGACY";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let store = Store::open_numbered_for_mission(
+                PathBuf::from(path),
+                StoreLimits::default(),
+                BlobDepotLimits::DEFAULT,
+                EventOperationLimits::DEFAULT,
+                [1; 32],
+            )
+            .unwrap();
+            let write = store.database.begin_write().unwrap();
+            if std::env::var_os(CHILD_LEGACY).is_some() {
+                write
+                    .open_table(event_operation::EVENT_OPERATION_LEDGER_V3)
+                    .unwrap()
+                    .insert(b"old-key".as_slice(), b"old-value".as_slice())
+                    .unwrap();
+            } else {
+                write
+                    .open_table(METADATA)
+                    .unwrap()
+                    .insert("unclean_publication_fixture", 1)
+                    .unwrap();
+            }
+            write.commit().unwrap();
+            std::process::exit(0); // deliberately skip redb's clean-close allocator receipt
+        }
+        for legacy in [false, true] {
+            let file = TestFile::new("unclean-numbered-preflight");
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", "tests::numbered_startup_recovers_unclean_stores_but_preserves_unclean_legacy_bytes", "--nocapture"]).env(CHILD_PATH, &file.0);
+            if legacy {
+                child.env(CHILD_LEGACY, "1");
+            }
+            assert!(child.status().unwrap().success());
+            let before = std::fs::read(&file.0).unwrap();
+            assert!(matches!(
+                redb::Builder::new().open_read_only(&file.0),
+                Err(redb::DatabaseError::RepairAborted)
+            ));
+            let result = Store::require_numbered_publication_compatible(&file.0);
+            if legacy {
+                assert!(matches!(
+                    result,
+                    Err(StoreError::NumberedEventOperation(
+                        NumberedEventOperationError::LegacyStoreRequiresFreshState
+                    ))
+                ));
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(
+                std::fs::read(&file.0).unwrap(),
+                before,
+                "preflight must never repair the original"
+            );
+            if !legacy {
+                let store = Store::open_numbered_for_mission(
+                    &file.0,
+                    StoreLimits::default(),
+                    BlobDepotLimits::DEFAULT,
+                    EventOperationLimits::DEFAULT,
+                    [1; 32],
+                )
+                .unwrap();
+                assert_eq!(
+                    store.numbered_event_operation_stats().unwrap(),
+                    NumberedEventOperationStats::default()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn numbered_startup_refuses_every_nonempty_legacy_table_without_mutation() {
+        for definition in [
+            EVENT_OPERATIONS,
+            EVENT_OPERATION_WITNESSES,
+            event_operation::EVENT_OPERATION_LEDGER_V3,
+            event_operation::ACTIVE_OPERATION_BY_EVENT_V1,
+        ] {
+            let file = TestFile::new("legacy-numbered-startup-refusal");
+            let database = redb::Database::create(&file.0).unwrap();
+            let write = database.begin_write().unwrap();
+            write
+                .open_table(definition)
+                .unwrap()
+                .insert(b"historical-key".as_slice(), b"historical-value".as_slice())
+                .unwrap();
+            write.commit().unwrap();
+            drop(database);
+            let before = std::fs::read(&file.0).unwrap();
+            assert!(matches!(
+                Store::require_numbered_publication_compatible(&file.0),
+                Err(StoreError::NumberedEventOperation(
+                    NumberedEventOperationError::LegacyStoreRequiresFreshState
+                ))
+            ));
+            assert!(matches!(
+                Store::open_numbered_for_mission(
+                    &file.0,
+                    StoreLimits::default(),
+                    BlobDepotLimits::DEFAULT,
+                    EventOperationLimits::DEFAULT,
+                    [1; 32]
+                ),
+                Err(StoreError::NumberedEventOperation(
+                    NumberedEventOperationError::LegacyStoreRequiresFreshState
+                ))
+            ));
+            assert_eq!(std::fs::read(&file.0).unwrap(), before);
+        }
+        let absent = TestFile::new("absent-numbered-startup-preflight");
+        Store::require_numbered_publication_compatible(&absent.0).unwrap();
+        assert!(!absent.0.exists());
+        let empty = TestFile::new("empty-numbered-startup-preflight");
+        let store = Store::open(&empty.0).unwrap();
+        drop(store);
+        let before = std::fs::read(&empty.0).unwrap();
+        Store::require_numbered_publication_compatible(&empty.0).unwrap();
+        assert_eq!(std::fs::read(&empty.0).unwrap(), before);
+    }
 
     struct TestFile(PathBuf);
 

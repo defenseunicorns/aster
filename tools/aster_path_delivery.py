@@ -529,9 +529,11 @@ def _event_exec(docker: str, node: str, action: str, plan: dict[str, object], ev
     ]
     if action == "subscribe":
         argv.extend(["--operation-key", "path-delivery-subscription"])
+    elif action == "publication-init":
+        argv.extend(["--journal", "/clab/state/publication.redb", "--client-id", "path-delivery-source"])
     elif action == "publish":
         argv.extend([
-            "--operation-key", str(plan["operation_key"]),
+            "--journal", "/clab/state/publication.redb", "--client-id", "path-delivery-source",
             "--logical-key", str(plan["logical_key"]),
             "--payload", str(plan["payload"]),
             "--id-only",
@@ -648,6 +650,7 @@ def execute_direct(raw: bytes, *, docker: Path, ip: Path, run: Callable = _run_c
                 or len({row.get("interface") for row in observed}) != 2):
             raise ExecutionError("netem-readback")
         stage = "publish"
+        run(_event_exec(exe, nodes["node-a"], "publication-init", plan), 30)
         event_id = _canonical_event_id(run(_event_exec(exe, nodes["node-a"], "publish", plan), 30))
         stage = "event-oracle"
         event = _strict_json(run(_event_exec(exe, nodes["node-b"], "wait", plan, event_id), 60), "event")

@@ -138,27 +138,6 @@ pub(super) fn status(s: &api::GetStatusResponse) -> String {
     text
 }
 
-pub(super) fn publish(s: &api::PublishEventResponse) -> String {
-    let mut text = String::from("EVENT:\n");
-    field(
-        &mut text,
-        "Result",
-        if s.inserted {
-            "Published locally"
-        } else {
-            "Already published"
-        },
-    );
-    field(&mut text, "ID", scalar(Bytes(&s.id)));
-    field(&mut text, "Publisher", scalar(Bytes(&s.publisher)));
-    field(&mut text, "Publisher counter", count(s.publisher_counter));
-    field(&mut text, "Event sequence", count(s.event_sequence));
-    field(&mut text, "Priority", state(s.priority, "PRIORITY_"));
-    field(&mut text, "Acceptance marker", count(s.acceptance_marker));
-    field(&mut text, "TTL", ttl(s.ttl_ms));
-    text
-}
-
 pub(super) fn event(event: &api::Event) -> String {
     let mut text = String::from("EVENT:\n");
     field(&mut text, "ID", scalar(Bytes(&event.id)));

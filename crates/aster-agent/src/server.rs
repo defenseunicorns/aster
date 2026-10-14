@@ -866,8 +866,8 @@ mod tests {
             "GetStatus"
         );
         assert_unary_rejected!(
-            client.publish_event(api::PublishEventRequest::default()),
-            "PublishEvent"
+            client.publish_numbered_event(api::PublishNumberedEventRequest::default()),
+            "PublishNumberedEvent"
         );
         assert_unary_rejected!(
             client.query_events(api::QueryEventsRequest::default()),
@@ -990,35 +990,35 @@ mod tests {
                 "application/grpc+json",
                 "grpc-encoding",
                 "identity",
-                "PublishEvent",
+                "PublishNumberedEvent",
                 br#"{"priority":"SECRET_PRIORITY_CANARY"}"#.as_slice(),
             ),
             (
                 "application/grpc-web+json",
                 "grpc-encoding",
                 "identity",
-                "PublishEvent",
+                "PublishNumberedEvent",
                 br#"{"priority":"SECRET_PRIORITY_CANARY"}"#.as_slice(),
             ),
             (
                 "application/json",
                 "connect-protocol-version",
                 "1",
-                "PublishEvent",
+                "PublishNumberedEvent",
                 br#"{"priority":"SECRET_PRIORITY_CANARY"}"#.as_slice(),
             ),
             (
                 "application/grpc",
                 "grpc-encoding",
                 "SECRET_COMPRESSION_CANARY",
-                "PublishEvent",
+                "PublishNumberedEvent",
                 b"".as_slice(),
             ),
             (
                 "application/grpc-web",
                 "grpc-encoding",
                 "SECRET_COMPRESSION_CANARY",
-                "PublishEvent",
+                "PublishNumberedEvent",
                 b"".as_slice(),
             ),
             (
@@ -1046,10 +1046,10 @@ mod tests {
             };
             let router = Router::new().route(
                 api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
-                "PublishEvent",
-                handler_fn(|_ctx, _request: api::PublishEventRequest| async {
+                "PublishNumberedEvent",
+                handler_fn(|_ctx, _request: api::PublishNumberedEventRequest| async {
                     Ok(connectrpc::Response::new(
-                        api::PublishEventResponse::default(),
+                        api::PublishNumberedEventResponse::default(),
                     ))
                 }),
             );
@@ -1210,17 +1210,17 @@ mod tests {
 
     #[cfg(feature = "client")]
     #[tokio::test(start_paused = true)]
-    async fn publish_events_uses_the_existing_ten_second_default_stream_deadline() {
+    async fn publish_numbered_events_uses_the_existing_ten_second_default_stream_deadline() {
         let router = Router::new().route_bidi_stream(
             api::ASTER_APPLICATION_SERVICE_SERVICE_NAME,
-            "PublishEvents",
+            "PublishNumberedEvents",
             connectrpc::bidi_streaming_handler_fn(
-                |_ctx, _requests: connectrpc::ServiceStream<api::PublishEventsRequest>| async {
+                |_ctx, _requests: connectrpc::ServiceStream<api::PublishNumberedEventsRequest>| async {
                     Ok(connectrpc::Response::new(
                         Box::pin(futures::stream::pending::<
-                            Result<api::PublishEventsResponse, ConnectError>,
+                            Result<api::PublishNumberedEventsResponse, ConnectError>,
                         >())
-                            as connectrpc::ServiceStream<api::PublishEventsResponse>,
+                            as connectrpc::ServiceStream<api::PublishNumberedEventsResponse>,
                     ))
                 },
             ),
@@ -1240,14 +1240,14 @@ mod tests {
                 format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
             ),
         );
-        let mut stream = client.publish_events().await.unwrap();
+        let mut stream = client.publish_numbered_events().await.unwrap();
         stream
-            .send(api::PublishEventsRequest::default())
+            .send(api::PublishNumberedEventsRequest::default())
             .await
             .unwrap();
         let result = tokio::time::timeout(
             Duration::from_secs(11),
-            stream.message::<api::PublishEventsResponse>(),
+            stream.message::<api::PublishNumberedEventsResponse>(),
         )
         .await;
         assert!(result.is_ok(), "stream exceeded the default deadline");

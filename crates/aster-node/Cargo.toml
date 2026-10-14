@@ -25,6 +25,9 @@ aster-negentropy = { path = "../aster-negentropy" }
 aster-profile = { path = "../aster-profile" }
 aster-redb-store = { path = "../aster-redb-store" }
 getrandom.workspace = true
+redb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
@@ -36,7 +39,6 @@ rustix = { workspace = true, features = ["time"] }
 [dev-dependencies]
 aster-iroh = { path = "../aster-iroh", features = ["test-utils"] }
 aster-redb-store = { path = "../aster-redb-store", features = ["test-utils"] }
-redb.workspace = true
 
 [lints]
 workspace = true

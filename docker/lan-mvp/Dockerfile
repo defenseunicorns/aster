@@ -11,7 +11,7 @@ COPY crates ./crates
 COPY proto ./proto
 COPY third-party ./third-party
 RUN cargo build --locked --release \
-    -p aster-node -p aster-agent \
+    -p aster-node -p aster-agent -p asterctl \
     --features aster-node/nearby-discovery,aster-agent/nearby-discovery
 
 FROM ${ASTER_LAN_BASE_IMAGE} AS runtime
@@ -27,6 +27,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /work/target/release/aster /usr/local/bin/aster
 COPY --from=build /work/target/release/aster-agent /usr/local/bin/aster-agent
+COPY --from=build /work/target/release/asterctl /usr/local/bin/asterctl
 COPY tools/aster_lan_mvp.py /usr/local/libexec/aster/aster_lan_mvp.py
 COPY docker/lan-mvp/agent-entrypoint.sh /usr/local/libexec/aster/agent-entrypoint.sh
 COPY docker/lan-mvp/init-state.sh /usr/local/libexec/aster/init-state.sh
@@ -35,7 +36,7 @@ COPY LICENSE /usr/share/licenses/aster/LICENSE
 COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/aster/THIRD_PARTY_NOTICES.md
 RUN chmod 0755 \
     /usr/local/bin/aster \
-    /usr/local/bin/aster-agent \
+    /usr/local/bin/aster-agent /usr/local/bin/asterctl \
     /usr/local/libexec/aster/aster_lan_mvp.py \
     /usr/local/libexec/aster/agent-entrypoint.sh \
     /usr/local/libexec/aster/init-state.sh \

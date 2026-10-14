@@ -38,9 +38,9 @@ if RUNNER_SPEC is None or RUNNER_SPEC.loader is None:
 RUNNER = importlib.util.module_from_spec(RUNNER_SPEC)
 RUNNER_SPEC.loader.exec_module(RUNNER)
 
-ORACLE_RECEIPT_SCHEMA = "aster-selected-live-event-receipt/v1"
-ORACLE_RAW_SCHEMA = "aster-selected-live-event-raw/v1"
-ORACLE_TRANSCRIPT_SCHEMA = "aster-selected-live-event-transcript/v1"
+ORACLE_RECEIPT_SCHEMA = "aster-selected-live-event-receipt/v2"
+ORACLE_RAW_SCHEMA = "aster-selected-live-event-raw/v2"
+ORACLE_TRANSCRIPT_SCHEMA = "aster-selected-live-event-transcript/v2"
 ORACLE_CLAIM = (
     "selected-live-event-one-host-direct-iroh-priority-withheld-authenticated-gap-"
     "forced-receiver-process-termination-durable-redelivery-gap-closure-acceptance"
@@ -68,6 +68,10 @@ ORACLE_ADMITTED_PATHS = tuple(
             "crates/aster-core/src/lib.rs",
             "crates/aster-core/src/source_event.rs",
             "crates/aster-node/Cargo.toml",
+            "crates/aster-node/src/publication_journal.rs",
+            "tools/historical/check-selected-live-event-receipt.py",
+            "tools/historical/check-selected-linux-event-custody-receipt.py",
+
             "crates/aster-node/examples/live_event_acceptance.rs",
             "crates/aster-node/src/application.rs",
             "crates/aster-node/src/frame.rs",
@@ -132,6 +136,7 @@ RUN_KEYS = (
     "scope",
     "stream_events",
     "authorized_unsubscribed_events",
+    "publication_model",
 )
 PARTICIPANT_KEYS = (
     "participant",
@@ -642,6 +647,13 @@ def child_tsv(kind: str, keys: tuple[str, ...], values: dict[str, str]) -> str:
     )
 
 
+def publication_diagnostics() -> bytes:
+    lines = []
+    for sequence, (inserted, retry, failure) in enumerate(((1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 0, 0), (1, 0, 0)), 1):
+        lines.append(f"event_publication_group group_sequence={sequence} collected=1 cohorts=1 custody_writer_commits=1 event_writer_commits={inserted} total_writer_commits={1+inserted} accepted_new={inserted} exact_retries={retry} failures={failure} max_cohort_size=1 singleton_fallbacks=1\n")
+    return "".join(lines).encode()
+
+
 class Fixture:
     def __init__(self, parent: Path) -> None:
         self.parent = parent
@@ -704,6 +716,7 @@ class Fixture:
         ):
             self._mkdir(relative)
         self._write("binary/aster-live-event-acceptance", self.binary, 0o700)
+        self._write("participants/publisher/state/live-acceptance-publication.redb", b"private journal fixture", 0o600)
         for participant in ("publisher", "receiver"):
             self._write(
                 f"participants/{participant}/mission.bundle",
@@ -942,6 +955,7 @@ class Fixture:
             RUN_KEYS,
             {
                 "schema": ORACLE_TRANSCRIPT_SCHEMA,
+                "publication_model": "numbered-v1",
                 "claim": ORACLE_CLAIM,
                 "participants": "2",
                 "actor_lifetimes": "7",
@@ -993,7 +1007,7 @@ class Fixture:
                 "original_payload_sha256": ORACLE_PAYLOAD_HASHES["first"],
                 "changed_payload_sha256": ORACLE_PAYLOAD_HASHES["changed_first"],
                 "error_kind": "conflict",
-                "operation": "publish",
+                "operation": "publish_numbered",
                 "sanitized": "true",
                 "publication_preserved": "true",
             },
@@ -1536,7 +1550,7 @@ class Fixture:
         return {
             "directories": directories,
             "public": [metadata(relative) for relative in public],
-            "participant_secret": [metadata(relative) for relative in secret],
+            "participant_secret": [metadata(relative) for relative in sorted((*secret, "participants/publisher/state/live-acceptance-publication.redb"))],
         }
 
     def refresh_public(self) -> None:
@@ -1546,7 +1560,7 @@ class Fixture:
         )
         self._write("transcript.tsv", transcript, 0o600)
         self._write("stdout.log", stdout, 0o600)
-        self._write("stderr.log", b"", 0o600)
+        self._write("stderr.log", publication_diagnostics(), 0o600)
         admitted = [
             {"path": path, **self.source["admitted"][path]}
             for path in ORACLE_ADMITTED_PATHS
@@ -1587,7 +1601,7 @@ class Fixture:
                     "binary/aster-live-event-acceptance", self.binary
                 ),
                 "stdout": self._artifact("stdout.log", stdout),
-                "stderr": self._artifact("stderr.log", b""),
+                "stderr": self._artifact("stderr.log", publication_diagnostics()),
                 "transcript": self._artifact("transcript.tsv", transcript),
             },
             "inventory": self.inventory_document(),
@@ -1640,6 +1654,29 @@ class SelectedLiveEventReceiptTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(dir=TEST_TEMP_PARENT)
         self.fixture = Fixture(Path(self.temporary.name))
+
+    def test_publication_diagnostics_reject_missing_extra_and_changed_accounting(self) -> None:
+        valid = publication_diagnostics()
+        CHECKER.validate_publication_diagnostics(valid, inserted=3, retries=1, failures=1)
+        for invalid in (b"", valid + b"\xff\n", valid + b"secret=leaked\n", valid.replace(b"accepted_new=1", b"accepted_new=2", 1), valid.replace(b"group_sequence=2", b"group_sequence=1", 1), valid.replace(b"event_writer_commits=1", b"event_writer_commits=0", 1)):
+            with self.assertRaises(CHECKER.ReceiptViolation):
+                CHECKER.validate_publication_diagnostics(invalid, inserted=3, retries=1, failures=1)
+
+    def test_historical_v1_transcript_stays_distinct_from_numbered_v2(self) -> None:
+        path = Path(__file__).parent / "historical/check-selected-live-event-receipt.py"
+        spec = importlib.util.spec_from_file_location("historical_live_event", path)
+        self.assertIsNotNone(spec)
+        historical = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(historical)
+        lines = list(self.fixture.transcript_lines)
+        fields = [field for field in lines[0].split("\t") if not field.startswith("publication_model=")]
+        lines[0] = "\t".join(fields).replace(ORACLE_TRANSCRIPT_SCHEMA, historical.TRANSCRIPT_SCHEMA)
+        data = ("\n".join(lines) + "\n").replace("operation=publish_numbered", "operation=publish").encode()
+        historical.validate_transcript(data)
+        with self.assertRaises(CHECKER.ReceiptViolation):
+            CHECKER.validate_transcript(data)
+        self.assertEqual(historical.SCHEMA, "aster-selected-live-event-receipt/v1")
+        self.assertNotIn("participants/publisher/state/live-acceptance-publication.redb", historical.SECRET_FILES)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -2296,7 +2333,7 @@ class SelectedLiveEventReceiptTests(unittest.TestCase):
     def test_checker_never_opens_secret_artifacts(self) -> None:
         original_open = os.open
         original_path_open = Path.open
-        secret_names = {"mission.bundle", "identity.key", "mesh.redb"}
+        secret_names = {"mission.bundle", "identity.key", "mesh.redb", "live-acceptance-publication.redb"}
         secret_paths = {
             self.fixture.root / "participants" / participant / relative
             for participant in ("publisher", "receiver")
@@ -2332,7 +2369,7 @@ class SelectedLiveEventReceiptTests(unittest.TestCase):
         held = self.fixture.parent / "held-run.json"
         run_json.rename(held)
         original_open = os.open
-        secret_names = {"mission.bundle", "identity.key", "mesh.redb"}
+        secret_names = {"mission.bundle", "identity.key", "mesh.redb", "live-acceptance-publication.redb"}
 
         def guarded_open(path, flags, mode=0o777, *, dir_fd=None):
             if os.path.basename(os.fsdecode(path)) in secret_names:
