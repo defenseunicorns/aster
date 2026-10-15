@@ -23,6 +23,38 @@ rustup toolchain install nightly-2026-08-18 --profile minimal
 mise run fuzz-smoke
 ```
 
+## Troubleshooting stale Cargo lockfiles
+
+If the `Cargo lockfiles` CI check reports that a lockfile needs updating but
+`--locked` was passed, inspect the failing manifest and the PR's dependency
+changes. A shared workspace pin can affect independently locked graphs, and a
+Dependabot update may leave one of their lockfiles stale.
+
+Use Cargo to update the affected resolution. For example, after the workspace
+pin moves from `aes-gcm` 0.11.0 to 0.11.1, a stale fuzz lockfile can be refreshed
+with:
+
+```sh
+cargo update --manifest-path fuzz/Cargo.toml -p aes-gcm@0.11.0 --precise 0.11.1
+```
+
+Adapt the manifest, currently locked package version, and target version to the
+actual update. Cargo manages the resolution and registry checksums; do not edit
+checksums by hand. A compiler or dependency-resolution conflict needs its own
+investigation rather than a lockfile-only repair. The Compose workflow policy
+hash is a separate mechanism.
+
+Review the affected lockfile diff, including transitive changes, then run:
+
+```sh
+sh tools/check-cargo-lockfiles.sh
+mise run check
+```
+
+Run focused tests for the updated dependency as well. Commit the affected
+lockfile with the manifest change or in the same dependency PR; independent
+graphs do not need identical dependency sets.
+
 ## Change discipline
 
 - Keep `Cargo.lock` and `fuzz/Cargo.lock` synchronized with intentional manifest
