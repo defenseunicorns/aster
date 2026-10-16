@@ -101,7 +101,7 @@ fn rendered_compose_model_enforces_the_hardened_service_boundaries() {
     let services = model["services"].as_object().expect("services object");
     assert_eq!(
         services.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["aster-agent", "preflight", "verify"]
+        ["aster-agent", "asterctl", "preflight", "verify"]
     );
 
     let runtime = &services["aster-agent"];
@@ -166,8 +166,43 @@ fn rendered_compose_model_enforces_the_hardened_service_boundaries() {
     assert_eq!(secret_targets(verify), ["/run/secrets/aster-client-token"]);
     assert_eq!(verify["configs"][0]["target"], "/etc/aster/agent.json");
 
+    let asterctl = &services["asterctl"];
+    assert_eq!(
+        asterctl["image"],
+        "registry.example/aster-admin@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    );
+    assert_eq!(asterctl["network_mode"], "service:aster-agent");
+    assert_eq!(
+        asterctl["entrypoint"],
+        serde_json::json!([
+            "/usr/local/bin/asterctl",
+            "--token-file",
+            "/run/secrets/aster-client-token"
+        ])
+    );
+    assert_eq!(asterctl["command"], serde_json::json!(["status"]));
+    assert_eq!(
+        asterctl["depends_on"]["aster-agent"]["condition"],
+        "service_healthy"
+    );
+    assert!(asterctl.get("configs").is_none());
+    assert_eq!(asterctl["secrets"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        asterctl["secrets"][0]["source"],
+        "aster-operator-client-token"
+    );
+    assert_eq!(
+        asterctl["secrets"][0]["target"],
+        "/run/secrets/aster-client-token"
+    );
+    assert_eq!(asterctl["volumes"].as_array().unwrap().len(), 1);
+    assert_eq!(asterctl["volumes"][0]["type"], "bind");
+    assert_eq!(asterctl["volumes"][0]["source"], "/srv/aster/transfer-test");
+    assert_eq!(asterctl["volumes"][0]["target"], "/transfer");
+    assert!(asterctl["volumes"][0].get("read_only").is_none());
+
     let secrets = model["secrets"].as_object().expect("top-level secrets");
-    assert_eq!(secrets.len(), 3);
+    assert_eq!(secrets.len(), 4);
     for (name, file) in [
         ("aster-client-token", "aster-client-token"),
         ("aster-mission-activation", "aster-mission-activation"),
@@ -179,6 +214,15 @@ fn rendered_compose_model_enforces_the_hardened_service_boundaries() {
         );
         assert!(secrets[name].get("environment").is_none());
     }
+    assert_eq!(
+        secrets["aster-operator-client-token"]["file"],
+        "/srv/aster/client-token-input"
+    );
+    assert!(
+        secrets["aster-operator-client-token"]
+            .get("environment")
+            .is_none()
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -200,6 +244,8 @@ fn render_compose_model(project: &str) -> Value {
         .env("ASTER_UID", "10001")
         .env("ASTER_GID", "10001")
         .env("ASTER_STATE_DIR", "/srv/aster/state-test")
+        .env("ASTER_TRANSFER_DIR", "/srv/aster/transfer-test")
+        .env("ASTER_TOKEN_INPUT", "/srv/aster/client-token-input")
         .env(
             "ASTER_AGENT_IMAGE_DIGEST",
             "registry.example/aster-agent@sha256:1111111111111111111111111111111111111111111111111111111111111111",

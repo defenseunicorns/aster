@@ -1,0 +1,9 @@
+{
+  "services": {
+    "aster-agent": {
+      "ports": [
+        "${ASTER_MESH_BIND_ADDRESS:?required}:${ASTER_MESH_PUBLISHED_PORT:-8183}:8183/udp"
+      ]
+    }
+  }
+}

@@ -9,6 +9,7 @@ import argparse
 import copy
 from dataclasses import dataclass
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -30,7 +31,7 @@ MAX_COMPOSE_BYTES = 256 * 1024
 MAX_CONFIG_BYTES = 256 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024
 COMPOSE_BUILD_WORKFLOW_SHA256 = (
-    "fdec504900629415e4e76f662d4f6d6b79fbde016f6257071651ea4ca1c816d1"
+    "dc5b706de7bed54cf236404e9e0150ce264b6f04d35a1ce8549dc02050c28980"
 )
 SETUP_BUILDX_ACTION = (
     "docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069"
@@ -203,6 +204,7 @@ def validate_workflow_policy(workflow: str, ci: str) -> None:
         "aster-compose-healthcheck_bin.cdx.json",
         "aster-compose-credential-admin_bin.cdx.json",
         "aster-compose-verify_bin.cdx.json",
+        "asterctl_bin.cdx.json",
     )
     required = (
         "--describe binaries",
@@ -229,6 +231,10 @@ def validate_workflow_policy(workflow: str, ci: str) -> None:
         "tar -xOf",
         "release-manifest.json",
         "SHA256SUMS",
+        "compose.remote-mesh.yaml",
+        "remote_mesh_override",
+        "aster_compose_delivery.py",
+        "validator_sha256",
         "agent.example.json",
         "credential-canary-scan",
         "python3 tools/inspect_aster_compose_oci.py",
@@ -257,7 +263,8 @@ def validate_workflow_policy(workflow: str, ci: str) -> None:
     if workflow.count("python3 tools/inspect_aster_compose_oci.py") != 4:
         raise ValidationError("compose-delivery-policy-invalid")
     if (
-        workflow.count("--builder ${{ steps.buildx.outputs.name }}") != 4
+        workflow.count("--describe binaries") != 2
+        or workflow.count("--builder ${{ steps.buildx.outputs.name }}") != 4
         or workflow.count("--platform ${{ matrix.platform }}") != 4
         or workflow.count("--provenance=mode=max") != 2
         or workflow.count("--provenance=false") != 2
@@ -275,6 +282,16 @@ def validate_workflow_policy(workflow: str, ci: str) -> None:
         raise ValidationError("compose-delivery-policy-invalid")
     if workflow.count("release-manifest.json") != 6 or workflow.count("SHA256SUMS") != 3:
         raise ValidationError("compose-delivery-policy-invalid")
+    if (
+        workflow.count("compose.remote-mesh.yaml") != 6
+        or workflow.count("remote_mesh_sha256") != 3
+    ):
+        raise ValidationError("compose-delivery-policy-invalid")
+    if (
+        workflow.count("aster_compose_delivery.py") != 6
+        or workflow.count("validator_sha256") != 3
+    ):
+        raise ValidationError("compose-delivery-policy-invalid")
     if workflow.count("agent.example.json") != 5:
         raise ValidationError("compose-delivery-policy-invalid")
     if (
@@ -290,7 +307,7 @@ def validate_runtime_dockerfiles(agent: str, admin: str) -> None:
 
     profiles = (
         (agent, ("aster-agent", "aster-compose-healthcheck")),
-        (admin, ("aster-compose-credential-admin", "aster-compose-verify")),
+        (admin, ("aster-compose-credential-admin", "aster-compose-verify", "asterctl")),
     )
     for source, binaries in profiles:
         if "\r" in source or "\t" in source:
@@ -348,6 +365,10 @@ def validate_repository_policy(repository: Path) -> None:
     validate_runtime_dockerfiles(
         (repository / "docker/compose-agent/Dockerfile.agent").read_text(),
         (repository / "docker/compose-agent/Dockerfile.admin").read_text(),
+    )
+    validate_remote_mesh_override(
+        repository / "docker/compose-agent/compose.remote-mesh.yaml",
+        {"ASTER_MESH_BIND_ADDRESS": "127.0.0.1"},
     )
 
 
@@ -443,6 +464,10 @@ def _expected_compose_model() -> dict[str, Any]:
         {"source": "aster-mission-activation", "target": "/run/secrets/aster-mission-activation"},
         {"source": "aster-provisioning-bundle", "target": "/run/secrets/aster-provisioning-bundle"},
     ]
+    operator_token = {
+        "source": "aster-operator-client-token",
+        "target": "/run/secrets/aster-client-token",
+    }
     config = [{"source": "aster-agent-config", "target": "/etc/aster/agent.json", "mode": 292}]
     config_digest = {
         "ASTER_AGENT_CONFIG_SHA256": "${ASTER_AGENT_CONFIG_SHA256:?required}"
@@ -451,6 +476,11 @@ def _expected_compose_model() -> dict[str, Any]:
         "type": "bind",
         "source": "${ASTER_STATE_DIR:?required}",
         "target": "/var/lib/aster",
+    }]
+    transfer_bind = [{
+        "type": "bind",
+        "source": "${ASTER_TRANSFER_DIR:?required}",
+        "target": "/transfer",
     }]
     return {
         "x-aster-metadata": {
@@ -509,6 +539,21 @@ def _expected_compose_model() -> dict[str, Any]:
                 }],
                 "depends_on": {"aster-agent": {"condition": "service_healthy"}},
             },
+            "asterctl": {
+                **copy.deepcopy(runtime),
+                "image": "${ASTER_ADMIN_IMAGE_DIGEST:?required}",
+                "pull_policy": "never",
+                "network_mode": "service:aster-agent",
+                "entrypoint": [
+                    "/usr/local/bin/asterctl",
+                    "--token-file",
+                    "/run/secrets/aster-client-token",
+                ],
+                "command": ["status"],
+                "secrets": [copy.deepcopy(operator_token)],
+                "volumes": transfer_bind,
+                "depends_on": {"aster-agent": {"condition": "service_healthy"}},
+            },
         },
         "configs": {
             "aster-agent-config": {"file": "${ASTER_AGENT_CONFIG_FILE:?required}"}
@@ -522,6 +567,9 @@ def _expected_compose_model() -> dict[str, Any]:
             },
             "aster-provisioning-bundle": {
                 "file": "${ASTER_CREDENTIAL_GENERATION_DIR:?required}/aster-provisioning-bundle"
+            },
+            "aster-operator-client-token": {
+                "file": "${ASTER_TOKEN_INPUT:?required}"
             },
         },
     }
@@ -541,12 +589,54 @@ def _load_compose_model(raw: bytes) -> dict[str, Any]:
         "aster-provisioning-bundle": {
             "file": "${ASTER_CREDENTIAL_GENERATION_DIR:?required}/aster-provisioning-bundle"
         },
+        "aster-operator-client-token": {
+            "file": "${ASTER_TOKEN_INPUT:?required}"
+        },
     }
     if model.get("secrets") != expected_sources:
         raise ValidationError("generation-sources-invalid")
     if model != _expected_compose_model():
         raise ValidationError("compose-model-semantics-invalid")
     return model
+
+
+def validate_remote_mesh_override(
+    override_path: Path, environment: Mapping[str, str]
+) -> None:
+    """Validate the exact opt-in host exposure and its explicit bind inputs."""
+
+    expected = {
+        "services": {
+            "aster-agent": {
+                "ports": [
+                    "${ASTER_MESH_BIND_ADDRESS:?required}:"
+                    "${ASTER_MESH_PUBLISHED_PORT:-8183}:8183/udp"
+                ]
+            }
+        }
+    }
+    try:
+        raw = override_path.resolve(strict=True).read_bytes()
+    except OSError as error:
+        raise ValidationError("mesh-override-unavailable") from error
+    if len(raw) > MAX_COMPOSE_BYTES:
+        raise ValidationError("mesh-override-noncanonical")
+    model = _strict_json(raw, "mesh-override-noncanonical")
+    if raw != _canonical_json(model) or model != expected:
+        raise ValidationError("mesh-override-noncanonical")
+
+    bind_address = environment.get("ASTER_MESH_BIND_ADDRESS", "")
+    if not bind_address:
+        raise ValidationError("mesh-bind-address-required")
+    try:
+        ipaddress.IPv4Address(bind_address)
+    except ipaddress.AddressValueError as error:
+        raise ValidationError("mesh-bind-address-invalid") from error
+    published_port = environment.get("ASTER_MESH_PUBLISHED_PORT", "8183")
+    if not re.fullmatch(r"[0-9]+", published_port):
+        raise ValidationError("mesh-published-port-invalid")
+    if not 1 <= int(published_port) <= 65535:
+        raise ValidationError("mesh-published-port-invalid")
 
 
 def _parse_identity(value: str | None) -> int:
@@ -582,6 +672,64 @@ def _capture_state_directory(raw_path: str | None, uid: int, gid: int) -> None:
         raise ValidationError("state-directory-ownership-invalid")
     if stat.S_IMODE(lexical.st_mode) != 0o700:
         raise ValidationError("state-directory-mode-invalid")
+
+
+def _capture_transfer_directory(raw_path: str | None, uid: int, gid: int) -> None:
+    if not raw_path:
+        raise ValidationError("transfer-directory-required")
+    supplied = Path(raw_path)
+    if not supplied.is_absolute():
+        raise ValidationError("transfer-directory-absolute")
+    try:
+        lexical = supplied.lstat()
+        resolved = supplied.resolve(strict=True)
+    except OSError as error:
+        raise ValidationError("transfer-directory-invalid") from error
+    if stat.S_ISLNK(lexical.st_mode) or resolved != supplied or not stat.S_ISDIR(lexical.st_mode):
+        raise ValidationError("transfer-directory-invalid")
+    if lexical.st_uid != uid or lexical.st_gid != gid:
+        raise ValidationError("transfer-directory-ownership-invalid")
+    if stat.S_IMODE(lexical.st_mode) != 0o700:
+        raise ValidationError("transfer-directory-mode-invalid")
+
+
+def _capture_operator_token(raw_path: str | None, uid: int, gid: int) -> None:
+    if not raw_path:
+        raise ValidationError("operator-token-required")
+    path = Path(raw_path)
+    if not path.is_absolute():
+        raise ValidationError("operator-token-absolute")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise ValidationError("operator-token-invalid")
+            if before.st_uid != uid or before.st_gid != gid:
+                raise ValidationError("operator-token-ownership-invalid")
+            if stat.S_IMODE(before.st_mode) not in (0o400, 0o600):
+                raise ValidationError("operator-token-mode-invalid")
+            if before.st_size > 258:
+                raise ValidationError("operator-token-contents-invalid")
+            token = _read_fd_bounded(descriptor, 258)
+            after = os.fstat(descriptor)
+            if _identity(before) != _identity(after):
+                raise ValidationError("operator-token-invalid")
+        finally:
+            os.close(descriptor)
+    except ValidationError:
+        raise
+    except OSError as error:
+        raise ValidationError("operator-token-invalid") from error
+    token = token.rstrip(b"\r\n")
+    if not 32 <= len(token) <= 256 or any(
+        not (byte in b"-._~" or chr(byte).isascii() and chr(byte).isalnum())
+        for byte in token
+    ):
+        raise ValidationError("operator-token-contents-invalid")
 
 
 def _identity(metadata: os.stat_result) -> FileIdentity:
@@ -734,7 +882,9 @@ def build_plan(compose_path: Path, environment: Mapping[str, str]) -> DeliveryPl
     _capture_generation(
         environment.get("ASTER_CREDENTIAL_GENERATION_DIR"), uid, gid,
     )
+    _capture_operator_token(environment.get("ASTER_TOKEN_INPUT"), uid, gid)
     _capture_state_directory(environment.get("ASTER_STATE_DIR"), uid, gid)
+    _capture_transfer_directory(environment.get("ASTER_TRANSFER_DIR"), uid, gid)
     agent_image = environment.get("ASTER_AGENT_IMAGE_DIGEST", "")
     admin_image = environment.get("ASTER_ADMIN_IMAGE_DIGEST", "")
     if not _immutable_image_reference(agent_image) or not _immutable_image_reference(
@@ -767,6 +917,11 @@ def _example_environment() -> tuple[tempfile.TemporaryDirectory[str], dict[str, 
     generation.chmod(0o500)
     state = Path(temporary.name) / "state"
     state.mkdir(mode=0o700)
+    transfer = Path(temporary.name) / "transfer"
+    transfer.mkdir(mode=0o700)
+    token_input = Path(temporary.name) / "client-token-input"
+    token_input.write_text("non-secret-example-client-token-00000000")
+    token_input.chmod(0o600)
     uid = os.getuid() or 65534
     gid = os.getgid() or 65534
     if os.getuid() == 0:
@@ -785,6 +940,8 @@ def _example_environment() -> tuple[tempfile.TemporaryDirectory[str], dict[str, 
         "ASTER_ADMIN_IMAGE_DIGEST": "example.invalid/aster-admin@sha256:" + "2" * 64,
         "ASTER_CREDENTIAL_GENERATION_DIR": str(generation),
         "ASTER_STATE_DIR": str(state),
+        "ASTER_TRANSFER_DIR": str(transfer),
+        "ASTER_TOKEN_INPUT": str(token_input),
     }
     environment["ASTER_AGENT_CONFIG_SHA256"] = hashlib.sha256(
         Path(environment["ASTER_AGENT_CONFIG_FILE"]).read_bytes()

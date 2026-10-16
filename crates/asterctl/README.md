@@ -114,17 +114,21 @@ source bytes. `--schema-id` is Base64;
 `18446744073709551615`. Omitting it selects durable publication.
 
 `blob-read` requires an exact Blob ID, topic, scope, and destination. On Linux,
-it writes to an anonymous temporary inode in the pinned destination directory,
-then publishes that exact open inode with an atomic no-replace descriptor link
-after synchronization. No named partial path exists. Closing the descriptor
-discards an incomplete read, and an existing or concurrently created
-destination is never overwritten. The command fails before contacting the
-agent on non-Linux platforms and when the destination filesystem cannot create
-the required anonymous temporary. If descriptor-link publication is
-unsupported, finalization fails without publishing an output path. Every
-streamed page must have contiguous offsets, stable authenticated metadata and
-TTL, and an exact complete length. Blob bytes go only to the destination;
-stdout contains metadata and never Blob plaintext.
+it requires a destination directory owned by the current user and not writable
+by group or other users. It writes to a randomly named mode-0600 sibling,
+synchronizes the complete verified stream, then atomically renames that exact
+inode with no-replace semantics and synchronizes the directory. The requested
+destination remains absent until publication, and an existing or concurrently
+created destination is never overwritten. Failure cleanup removes the sibling
+on a best-effort basis; filesystem errors or an abrupt process or host failure
+can leave that hidden owner-only file for operator cleanup. A post-publication
+directory-sync error says that the output exists and must be verified before
+retrying. The command fails before contacting the agent on non-Linux platforms
+and fails closed when the destination filesystem cannot provide named staging,
+atomic no-replace rename, or directory synchronization. Every streamed page
+must have contiguous offsets, stable authenticated metadata and TTL, and an
+exact complete length. Blob bytes go only to the output filesystem; stdout
+contains metadata and never Blob plaintext.
 
 Both text formats use exactly `TTL: durable` or `TTL: MILLISECONDS ms`. Finite
 JSON includes `"ttlMs": "MILLISECONDS"`; durable JSON omits `ttlMs`.

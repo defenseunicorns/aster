@@ -1,4 +1,6 @@
-use std::{env, net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration};
+use std::{
+    collections::BTreeSet, env, net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration,
+};
 
 use aster_agent::{
     BoundAgent, ClientToken,
@@ -16,6 +18,8 @@ use aster_node::{MissionNearbyPeer, SelectedForwardingConfig, start_node_with_fo
 use aster_systemd_credentials::SystemdCredentialLoader;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+const MAX_BLOB_INTERESTS: usize = 256;
 
 enum Invocation {
     CheckConfig(PathBuf),
@@ -127,16 +131,7 @@ async fn run_legacy(mut arguments: Arguments) -> Result<(), BoxError> {
         .transpose()?;
     #[cfg(feature = "nearby-discovery")]
     let discover_lan = arguments.switch("--discover-lan")?;
-    let state_interests = arguments
-        .repeated("--state-interest")?
-        .into_iter()
-        .map(|value| parse_source_interest(&value, "State"))
-        .collect::<Result<Vec<_>, _>>()?;
-    let record_interests = arguments
-        .repeated("--record-interest")?
-        .into_iter()
-        .map(|value| parse_source_interest(&value, "Record"))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mutable_interests = parse_legacy_mutable_interests(&mut arguments)?;
     let sync_interval = Duration::from_millis(
         arguments
             .optional("--sync-ms")?
@@ -163,7 +158,7 @@ async fn run_legacy(mut arguments: Arguments) -> Result<(), BoxError> {
         bind: mesh_bind,
         mission,
         peers,
-        mutable_interests: MutableSourceInterests::new(state_interests, record_interests),
+        mutable_interests,
         sync_interval,
         run_for: None,
         application: NodeApplication::Relay,
@@ -250,11 +245,46 @@ fn parse_source_interest(value: &str, class: &str) -> Result<SourceInterestSelec
     if scope.contains('@') {
         return Err(format!("{class} interest contains more than one separator").into());
     }
-    Ok(SourceInterestSelector::new(
-        Topic::new(topic)?,
-        Scope::new(scope)?,
-        false,
-    ))
+    let topic = match Topic::new(topic) {
+        Ok(topic) => topic,
+        Err(_) if class == "Blob" => return Err("Blob interest topic is invalid".into()),
+        Err(error) => return Err(error.into()),
+    };
+    let scope = match Scope::new(scope) {
+        Ok(scope) => scope,
+        Err(_) if class == "Blob" => return Err("Blob interest scope is invalid".into()),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(SourceInterestSelector::new(topic, scope, false))
+}
+
+fn parse_legacy_mutable_interests(
+    arguments: &mut Arguments,
+) -> Result<MutableSourceInterests, BoxError> {
+    let state_interests = arguments
+        .repeated("--state-interest")?
+        .into_iter()
+        .map(|value| parse_source_interest(&value, "State"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let record_interests = arguments
+        .repeated("--record-interest")?
+        .into_iter()
+        .map(|value| parse_source_interest(&value, "Record"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let raw_blob_interests = arguments.repeated("--blob-interest")?;
+    if raw_blob_interests.len() > MAX_BLOB_INTERESTS {
+        return Err(format!("Blob interest selector count exceeds {MAX_BLOB_INTERESTS}").into());
+    }
+    let mut exact_blob_interests = BTreeSet::new();
+    let mut blob_interests = Vec::with_capacity(raw_blob_interests.len());
+    for value in raw_blob_interests {
+        let selector = parse_source_interest(&value, "Blob")?;
+        if !exact_blob_interests.insert((selector.topic().clone(), selector.scope().clone())) {
+            return Err("Blob interest repeats an exact topic/scope selector".into());
+        }
+        blob_interests.push(selector);
+    }
+    Ok(MutableSourceInterests::new(state_interests, record_interests).with_blob(blob_interests))
 }
 
 #[cfg(feature = "nearby-discovery")]
@@ -308,14 +338,17 @@ Usage:
     [--nearby-peer CARRIER_ID=MISSION_NODE_ID_HEX64 ...] \
     [--discover-lan] [--nearby-window SECONDS] \
     [--state-interest TOPIC@SCOPE ...] \
-    [--record-interest TOPIC@SCOPE ...] [--sync-ms N]
+    [--record-interest TOPIC@SCOPE ...] \
+    [--blob-interest TOPIC@SCOPE ...] [--sync-ms N]
 
 The plaintext application listener is restricted to loopback and every RPC
 requires an owner-provisioned bearer token from an owner-only regular file.
 This makes the deployment unit suitable for a same-host process or Kubernetes
 sidecar, not a remotely exposed service. State and Record interests configure
 mesh carriage; their live application RPCs remain unavailable until
-handle-backed APIs exist. The explicitly named unprotected-reference mission
+handle-backed APIs exist. Blob interests are restart-only mesh receive configuration;
+they do not grant or configure application API access. The explicitly named
+unprotected-reference mission
 bundle is non-production provisioning and must remain owner-only on supported
 Unix platforms. Nearby flags are available only in explicitly discovery-enabled
 demo/evaluation builds; they publish carrier identity and direct address hints
@@ -401,12 +434,209 @@ impl Arguments {
 mod tests {
     use super::*;
 
+    fn blob_interest_arguments(interests: impl IntoIterator<Item = String>) -> Arguments {
+        Arguments::new(
+            interests
+                .into_iter()
+                .flat_map(|interest| ["--blob-interest".to_owned(), interest]),
+        )
+    }
+
     #[test]
     fn discover_lan_help_names_identity_free_authorized_mode() {
         assert!(HELP.contains("[--discover-lan]"));
         assert!(HELP.contains("takes no peer identity or address"));
         assert!(HELP.contains("cannot be combined with --peer or\n--nearby-peer"));
         assert!(HELP.contains("authenticates it and current mission authorization succeeds"));
+    }
+
+    #[test]
+    fn help_distinguishes_blob_mesh_receive_interest_from_application_api_access() {
+        assert!(HELP.contains("[--blob-interest TOPIC@SCOPE ...]"));
+        assert!(HELP.contains("Blob interests are restart-only mesh receive configuration"));
+        assert!(HELP.contains("do not grant or configure application API access"));
+    }
+
+    #[test]
+    fn legacy_cli_accepts_repeatable_blob_interests_without_changing_state_or_record() {
+        let mut arguments = Arguments::new(
+            [
+                "--blob-interest",
+                "imagery@mission/alpha",
+                "--state-interest",
+                "sensors@mission/bravo",
+                "--blob-interest",
+                "documents@mission/charlie",
+                "--record-interest",
+                "audit@mission/delta",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+
+        let interests =
+            parse_legacy_mutable_interests(&mut arguments).expect("parse legacy interests");
+        arguments.finish().expect("consume all interest flags");
+
+        assert_eq!(
+            interests,
+            MutableSourceInterests::new(
+                vec![SourceInterestSelector::new(
+                    Topic::new("sensors").expect("literal topic"),
+                    Scope::new("mission/bravo").expect("literal scope"),
+                    false,
+                )],
+                vec![SourceInterestSelector::new(
+                    Topic::new("audit").expect("literal topic"),
+                    Scope::new("mission/delta").expect("literal scope"),
+                    false,
+                )],
+            )
+            .with_blob(vec![
+                SourceInterestSelector::new(
+                    Topic::new("imagery").expect("literal topic"),
+                    Scope::new("mission/alpha").expect("literal scope"),
+                    false,
+                ),
+                SourceInterestSelector::new(
+                    Topic::new("documents").expect("literal topic"),
+                    Scope::new("mission/charlie").expect("literal scope"),
+                    false,
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn legacy_cli_rejects_malformed_blob_interest_with_fixed_class_without_echoing_value() {
+        let canary = "blob-interest-secret-canary";
+        let mut arguments =
+            Arguments::new(["--blob-interest", canary].into_iter().map(str::to_owned));
+
+        let error = parse_legacy_mutable_interests(&mut arguments)
+            .expect_err("malformed Blob interest must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "Blob interest must use exact TOPIC@SCOPE syntax"
+        );
+        assert!(!error.to_string().contains(canary));
+    }
+
+    #[test]
+    fn legacy_cli_rejects_duplicate_blob_interests_without_echoing_value() {
+        let canary = "duplicate-secret-canary@mission/alpha";
+        let mut arguments = blob_interest_arguments([canary, canary].map(str::to_owned));
+
+        let error = parse_legacy_mutable_interests(&mut arguments)
+            .expect_err("duplicate Blob interests must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "Blob interest repeats an exact topic/scope selector"
+        );
+        assert!(!error.to_string().contains(canary));
+    }
+
+    #[test]
+    fn legacy_cli_accepts_exactly_256_unique_blob_interests() {
+        let mut arguments =
+            blob_interest_arguments((0..256).map(|index| format!("blob-{index}@mission/alpha")));
+
+        parse_legacy_mutable_interests(&mut arguments).expect("exactly 256 unique Blob interests");
+        arguments.finish().expect("consume all interest flags");
+    }
+
+    #[test]
+    fn legacy_cli_rejects_257_blob_interests_without_echoing_values() {
+        let mut arguments = blob_interest_arguments(
+            (0..257).map(|index| format!("excess-secret-canary-{index}@mission/alpha")),
+        );
+
+        let error = parse_legacy_mutable_interests(&mut arguments)
+            .expect_err("257 Blob interests must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "Blob interest selector count exceeds 256"
+        );
+        assert!(!error.to_string().contains("excess-secret-canary"));
+    }
+
+    #[test]
+    fn legacy_cli_rejects_invalid_blob_topic_with_fixed_value_free_diagnostic() {
+        let canary = "invalid topic secret@mission/alpha";
+        let mut arguments = blob_interest_arguments([canary.to_owned()]);
+
+        let error = parse_legacy_mutable_interests(&mut arguments)
+            .expect_err("invalid Blob topic must fail");
+
+        assert_eq!(error.to_string(), "Blob interest topic is invalid");
+        assert!(!error.to_string().contains(canary));
+    }
+
+    #[test]
+    fn legacy_cli_rejects_invalid_blob_scope_with_fixed_value_free_diagnostic() {
+        let canary = "imagery@mission//invalid-scope-secret";
+        let mut arguments = blob_interest_arguments([canary.to_owned()]);
+
+        let error = parse_legacy_mutable_interests(&mut arguments)
+            .expect_err("invalid Blob scope must fail");
+
+        assert_eq!(error.to_string(), "Blob interest scope is invalid");
+        assert!(!error.to_string().contains(canary));
+    }
+
+    #[test]
+    fn legacy_cli_rejects_empty_blob_components_with_fixed_value_free_diagnostics() {
+        for (selector, expected) in [
+            ("@mission/alpha", "Blob interest topic is invalid"),
+            ("imagery@", "Blob interest scope is invalid"),
+        ] {
+            let mut arguments = blob_interest_arguments([selector.to_owned()]);
+            let error = parse_legacy_mutable_interests(&mut arguments)
+                .expect_err("empty Blob component must fail");
+            assert_eq!(error.to_string(), expected);
+            assert!(!error.to_string().contains(selector));
+        }
+    }
+
+    #[test]
+    fn legacy_cli_rejects_overlength_blob_components_with_fixed_value_free_diagnostics() {
+        let oversized = "x".repeat(129);
+        for (selector, expected) in [
+            (
+                format!("{oversized}@mission/alpha"),
+                "Blob interest topic is invalid",
+            ),
+            (
+                format!("imagery@{oversized}"),
+                "Blob interest scope is invalid",
+            ),
+        ] {
+            let mut arguments = blob_interest_arguments([selector]);
+            let error = parse_legacy_mutable_interests(&mut arguments)
+                .expect_err("overlength Blob component must fail");
+            assert_eq!(error.to_string(), expected);
+            assert!(!error.to_string().contains(&oversized));
+        }
+    }
+
+    #[test]
+    fn state_and_record_name_diagnostics_remain_unchanged() {
+        let state_error = parse_source_interest("invalid topic@mission/alpha", "State")
+            .expect_err("invalid State topic must fail");
+        assert_eq!(
+            state_error.to_string(),
+            "name contains a non-canonical character"
+        );
+
+        let record_error = parse_source_interest("audit@mission//alpha", "Record")
+            .expect_err("invalid Record scope must fail");
+        assert_eq!(
+            record_error.to_string(),
+            "scope must contain canonical non-empty path segments"
+        );
     }
 
     #[test]

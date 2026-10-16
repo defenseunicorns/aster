@@ -16,7 +16,9 @@ outside that validation boundary.
 The host generation files must already be owned by the invoking user's nonzero
 runtime UID/GID and mode `0400` or `0600`. Compose does not enforce `uid`, `gid`,
 or `mode` for file-backed secrets. The generation directory and exact
-user-owned `ASTER_STATE_DIR` remain in the site's custody boundary. Use a unique
+user-owned `ASTER_STATE_DIR` remain in the site's custody boundary. A separate
+user-owned `ASTER_TRANSFER_DIR` is mounted at `/transfer` only in the one-shot
+CLI service for Blob input and output. Use a unique
 Compose project name for each isolated deployment; the validator requires and
 records that name but does not create persistent host paths.
 One project deploys exactly one agent; it is not valid to scale the service or
@@ -30,6 +32,9 @@ No Docker host profile is qualified. Rootless Docker, Docker Desktop, remote
 contexts, user namespace remapping, and other host variants are unqualified;
 there is no runtime harness that automatically accepts or rejects them. Docker
 Swarm is excluded. See the complete [manual operator procedure](../../docs/release/docker-compose.md).
+The CI artifact includes this Compose model, its remote-mesh override,
+configuration template, and daemon-free validator; operator use requires no
+source checkout or local image build.
 
 ## Example image build commands
 
@@ -67,8 +72,8 @@ filesystem must contain only `aster-agent`, `aster-compose-healthcheck`, the
 license, and notices. It must not contain `/bin/sh`, a package database,
 systemd units or libraries, `aster-compose-credential-admin`, a compiler, a
 Cargo cache, or credential fixtures. The admin image contains only its two
-commands plus the same notices; neither image may contain generation files or
-secret fixtures.
+administration helpers, `asterctl`, and the same notices; neither image may
+contain generation files or secret fixtures.
 
 ## Render and operate
 
@@ -76,7 +81,7 @@ Copy `agent.example.json` to a deployment-owned absolute path and set
 `ASTER_AGENT_CONFIG_FILE` to it. Record its SHA-256 and set the exact reviewed
 value as `ASTER_AGENT_CONFIG_SHA256`; preflight and the agent both fail closed
 if the mounted bytes differ. Also set `ASTER_UID`, `ASTER_GID`, `ASTER_STATE_DIR`,
-`ASTER_AGENT_IMAGE_DIGEST`, `ASTER_ADMIN_IMAGE_DIGEST`,
+`ASTER_TRANSFER_DIR`, `ASTER_AGENT_IMAGE_DIGEST`, `ASTER_ADMIN_IMAGE_DIGEST`,
 `ASTER_CREDENTIAL_GENERATION_DIR`, and a unique
 `COMPOSE_PROJECT_NAME`. The image
 variables must contain immutable digest references such as
@@ -89,7 +94,25 @@ docker compose -f docker/compose-agent/compose.yaml config --format json
 docker compose -f docker/compose-agent/compose.yaml run --rm preflight
 docker compose -f docker/compose-agent/compose.yaml up -d --force-recreate aster-agent
 docker compose -f docker/compose-agent/compose.yaml run --rm verify
+docker compose -f docker/compose-agent/compose.yaml run --rm asterctl --json status
 ```
+
+The default file publishes no host port. To accept mesh traffic from another
+device, set `ASTER_MESH_BIND_ADDRESS` to an explicit host IPv4 address and
+optionally set `ASTER_MESH_PUBLISHED_PORT` (default `8183`), then add the
+shipped override to every Compose command:
+
+```sh
+docker compose -f docker/compose-agent/compose.yaml \
+  -f docker/compose-agent/compose.remote-mesh.yaml config --format json
+```
+
+Configure the remote peer with that host address and published UDP port, and
+permit the port in applicable host firewall policy. Omitting the override
+keeps the default deployment closed to inbound host traffic.
+
+For copyable status, Event, durable Blob, finite-TTL Blob, agent-replacement,
+and physical-peer commands, use the [operator runbook](../../docs/operator-guide.md#3-docker-compose-runbook).
 
 Credential rotation always uses `up -d --force-recreate`. `docker compose
 restart` is not a supported rotation operation because it does not apply a new
@@ -98,6 +121,12 @@ shares only the agent network namespace, receives the generation-bound client
 token and selected non-secret manifest, and has no state-directory access.
 
 All services run as the invoking user's numeric UID/GID with every capability
-dropped. The operator creates `ASTER_STATE_DIR` with mode `0700`; the validator
-rejects missing, relative, symlinked, differently owned, or differently moded
-paths. No host root or `sudo` access is part of this profile.
+dropped. The operator creates `ASTER_STATE_DIR` and `ASTER_TRANSFER_DIR` with
+mode `0700`; the validator rejects missing, relative, symlinked, differently
+owned, or differently moded paths. It also validates the owner-only plaintext
+`ASTER_TOKEN_INPUT`; the CLI service mounts that input through the distinct
+`aster-operator-client-token` secret because the generation-bound token is a
+provider envelope. The CLI otherwise receives only the transfer bind, shares
+the agent network namespace, and prefixes each command with
+`asterctl --token-file /run/secrets/aster-client-token`. No host root or
+`sudo` access is part of this profile.

@@ -166,12 +166,17 @@ objects above 64 MiB. The shared agent deadline policy currently defaults to
 for longer. These values describe this implementation, not durable RPC
 semantics, supported large-file behavior, or performance qualification.
 
-`blob-read` currently requires Linux and a destination filesystem supporting
-`O_TMPFILE` plus descriptor-relative publication of the open inode. It creates
-a mode-0600 anonymous inode in the pinned destination directory, synchronizes
-the complete verified stream, then links that exact inode atomically without
-replacing an existing or concurrently created path. Unsupported platforms and
-filesystems fail closed, and an incomplete stream leaves no named partial.
+`blob-read` currently requires Linux, a destination directory owned by the
+current user and not writable by group or other users, and a filesystem that
+supports named staging, atomic no-replace rename, and directory synchronization.
+It creates one randomly named mode-0600 sibling, synchronizes the complete
+verified stream, then renames that exact inode atomically without replacing an
+existing or concurrently created path and synchronizes the directory. The
+requested destination remains absent until publication. Cleanup removes the
+sibling on a best-effort basis; filesystem errors or an abrupt process or host
+failure can leave that hidden owner-only file for operator cleanup. A reported
+post-publication directory-sync failure means the destination exists and must
+be verified before retrying. Unsupported platforms and filesystems fail closed.
 
 The caller's source file and completed output file remain outside node
 zeroization custody. Node zeroization does not erase them, and callers must

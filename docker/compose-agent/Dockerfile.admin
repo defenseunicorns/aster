@@ -16,13 +16,17 @@ RUN --mount=type=secret,id=aster_build_ca,target=/etc/ssl/certs/ca-certificates.
     target="$(rustc -vV | sed -n 's/^host: //p')" \
     && cargo build --locked --release --target "$target" \
     -p aster-compose-credentials \
+    -p asterctl \
     --bin aster-compose-credential-admin \
     --bin aster-compose-verify \
+    --bin asterctl \
     && install -d -m 0755 /out/rootfs/usr/local/bin /out/rootfs/usr/share/licenses/aster \
     && install -m 0555 "target/$target/release/aster-compose-credential-admin" \
         /out/rootfs/usr/local/bin/aster-compose-credential-admin \
     && install -m 0555 "target/$target/release/aster-compose-verify" \
         /out/rootfs/usr/local/bin/aster-compose-verify \
+    && install -m 0555 "target/$target/release/asterctl" \
+        /out/rootfs/usr/local/bin/asterctl \
     && install -m 0444 LICENSE /out/rootfs/usr/share/licenses/aster/LICENSE \
     && install -m 0444 THIRD_PARTY_NOTICES.md \
         /out/rootfs/usr/share/licenses/aster/THIRD_PARTY_NOTICES.md

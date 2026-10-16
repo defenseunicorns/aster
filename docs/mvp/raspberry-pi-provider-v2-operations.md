@@ -498,6 +498,7 @@ runtime evidence are in the [package candidate document](../release/ubuntu-24.04
 | --- | --- |
 | Service / account | `aster-agent.service` / `aster:aster` (system-assigned UID/GID) |
 | Agent / administration CLI | `/usr/bin/aster-agent` / `/usr/sbin/aster-credential-admin` |
+| Event/Blob operator client | `/usr/bin/asterctl` |
 | Configuration | `/etc/aster/agent.json`, `root:aster`, `0640` |
 | Bearer token | `/etc/aster/agent-credentials/client-token`, `aster:aster`, `0600` |
 | Service reference | `/etc/aster/agent-credentials/mission-reference`, `aster:aster`, `0600` |

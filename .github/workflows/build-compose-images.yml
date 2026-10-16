@@ -144,12 +144,15 @@ jobs:
         run: |
           cargo cyclonedx --format json --spec-version 1.5 --describe binaries \
             --manifest-path crates/aster-compose-credentials/Cargo.toml
+          cargo cyclonedx --format json --spec-version 1.5 --describe binaries \
+            --manifest-path crates/asterctl/Cargo.toml
           agent_digest=$(jq -er '."containerimage.digest"' target/compose-release/agent-build-metadata.json)
           admin_digest=$(jq -er '."containerimage.digest"' target/compose-release/admin-build-metadata.json)
           install -m 0444 crates/aster-compose-credentials/aster-compose-agent_bin.cdx.json target/compose-release/
           install -m 0444 crates/aster-compose-credentials/aster-compose-healthcheck_bin.cdx.json target/compose-release/
           install -m 0444 crates/aster-compose-credentials/aster-compose-credential-admin_bin.cdx.json target/compose-release/
           install -m 0444 crates/aster-compose-credentials/aster-compose-verify_bin.cdx.json target/compose-release/
+          install -m 0444 crates/asterctl/asterctl_bin.cdx.json target/compose-release/
           bind_sbom() {
             sbom=$1
             binary=$2
@@ -171,19 +174,26 @@ jobs:
           bind_sbom target/compose-release/aster-compose-healthcheck_bin.cdx.json aster-compose-healthcheck "$agent_digest"
           bind_sbom target/compose-release/aster-compose-credential-admin_bin.cdx.json aster-compose-credential-admin "$admin_digest"
           bind_sbom target/compose-release/aster-compose-verify_bin.cdx.json aster-compose-verify "$admin_digest"
+          bind_sbom target/compose-release/asterctl_bin.cdx.json asterctl "$admin_digest"
           cp LICENSE THIRD_PARTY_NOTICES.md target/compose-release/
 
       - name: Record release inputs, builder versions, and Compose digest
         run: |
           cp docker/compose-agent/compose.yaml target/compose-release/compose.yaml
+          cp docker/compose-agent/compose.remote-mesh.yaml target/compose-release/compose.remote-mesh.yaml
           cp docker/compose-agent/agent.example.json target/compose-release/agent.example.json
+          cp tools/aster_compose_delivery.py target/compose-release/aster_compose_delivery.py
           compose_digest=$(sha256sum docker/compose-agent/compose.yaml | cut -d' ' -f1)
+          remote_mesh_digest=$(sha256sum docker/compose-agent/compose.remote-mesh.yaml | cut -d' ' -f1)
+          validator_digest=$(sha256sum tools/aster_compose_delivery.py | cut -d' ' -f1)
           {
             printf 'schema=aster-compose-image-release/v2\n'
             printf 'source_revision=%s\n' "$GITHUB_SHA"
             printf 'architecture=%s\n' "${{ matrix.platform }}"
             printf 'runner_architecture=%s\n' "$RUNNER_ARCH"
             printf 'compose_sha256=%s\n' "$compose_digest"
+            printf 'remote_mesh_sha256=%s\n' "$remote_mesh_digest"
+            printf 'validator_sha256=%s\n' "$validator_digest"
             docker version --format 'docker_client={{.Client.Version}}'
             docker buildx version
             rustc -Vv
@@ -195,7 +205,9 @@ jobs:
       - name: Record v2 release manifest and checksums
         run: |
           compose_digest=$(sha256sum docker/compose-agent/compose.yaml | cut -d' ' -f1)
+          remote_mesh_digest=$(sha256sum docker/compose-agent/compose.remote-mesh.yaml | cut -d' ' -f1)
           config_template_digest=$(sha256sum docker/compose-agent/agent.example.json | cut -d' ' -f1)
+          validator_digest=$(sha256sum tools/aster_compose_delivery.py | cut -d' ' -f1)
           agent_tag="aster-compose-agent:${GITHUB_SHA}-${{ matrix.arch }}"
           admin_tag="aster-compose-admin:${GITHUB_SHA}-${{ matrix.arch }}"
           jq -n \
@@ -213,9 +225,11 @@ jobs:
             --arg admin_docker_image_id "$(cat "$RUNNER_TEMP/admin-image-id")" \
             --arg admin_tag "$admin_tag" \
             --arg compose_sha256 "$compose_digest" \
+            --arg remote_mesh_sha256 "$remote_mesh_digest" \
             --arg config_template_sha256 "$config_template_digest" \
+            --arg validator_sha256 "$validator_digest" \
             --arg arch "${{ matrix.arch }}" \
-            '{schema:$schema,source_revision:$source_revision,architecture:$architecture,images:{agent:{oci_index_digest:$agent_oci_digest,manifest_digest:$agent_manifest_digest,config_digest:$agent_config_digest,docker_image_id:$agent_docker_image_id,transport_tag:$agent_tag,oci:("aster-compose-agent-"+$arch+".oci"),docker:("aster-compose-agent-"+$arch+".docker.tar"),sbom_set:["aster-compose-agent_bin.cdx.json","aster-compose-healthcheck_bin.cdx.json"]},admin:{oci_index_digest:$admin_oci_digest,manifest_digest:$admin_manifest_digest,config_digest:$admin_config_digest,docker_image_id:$admin_docker_image_id,transport_tag:$admin_tag,oci:("aster-compose-admin-"+$arch+".oci"),docker:("aster-compose-admin-"+$arch+".docker.tar"),sbom_set:["aster-compose-credential-admin_bin.cdx.json","aster-compose-verify_bin.cdx.json"]}},compose:{file:"compose.yaml",sha256:$compose_sha256,config_template:{file:"agent.example.json",sha256:$config_template_sha256}}}' \
+            '{schema:$schema,source_revision:$source_revision,architecture:$architecture,images:{agent:{oci_index_digest:$agent_oci_digest,manifest_digest:$agent_manifest_digest,config_digest:$agent_config_digest,docker_image_id:$agent_docker_image_id,transport_tag:$agent_tag,oci:("aster-compose-agent-"+$arch+".oci"),docker:("aster-compose-agent-"+$arch+".docker.tar"),sbom_set:["aster-compose-agent_bin.cdx.json","aster-compose-healthcheck_bin.cdx.json"]},admin:{oci_index_digest:$admin_oci_digest,manifest_digest:$admin_manifest_digest,config_digest:$admin_config_digest,docker_image_id:$admin_docker_image_id,transport_tag:$admin_tag,oci:("aster-compose-admin-"+$arch+".oci"),docker:("aster-compose-admin-"+$arch+".docker.tar"),sbom_set:["aster-compose-credential-admin_bin.cdx.json","aster-compose-verify_bin.cdx.json","asterctl_bin.cdx.json"]}},compose:{file:"compose.yaml",sha256:$compose_sha256,remote_mesh_override:{file:"compose.remote-mesh.yaml",sha256:$remote_mesh_sha256},config_template:{file:"agent.example.json",sha256:$config_template_sha256},validator:{file:"aster_compose_delivery.py",sha256:$validator_sha256}}}' \
             > target/compose-release/release-manifest.json
           cd target/compose-release
           sha256sum ./* > SHA256SUMS
@@ -236,10 +250,13 @@ jobs:
             target/compose-release/aster-compose-healthcheck_bin.cdx.json \
             target/compose-release/aster-compose-credential-admin_bin.cdx.json \
             target/compose-release/aster-compose-verify_bin.cdx.json \
+            target/compose-release/asterctl_bin.cdx.json \
             target/compose-release/LICENSE \
             target/compose-release/THIRD_PARTY_NOTICES.md \
             target/compose-release/compose.yaml \
+            target/compose-release/compose.remote-mesh.yaml \
             target/compose-release/agent.example.json \
+            target/compose-release/aster_compose_delivery.py \
             target/compose-release/agent-inspection.json \
             target/compose-release/admin-inspection.json \
             target/compose-release/release-manifest.json \

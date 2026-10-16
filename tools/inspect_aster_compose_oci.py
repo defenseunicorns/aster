@@ -69,6 +69,7 @@ EXPECTED_FILES = {
     "admin": {
         "usr/local/bin/aster-compose-credential-admin": 0o555,
         "usr/local/bin/aster-compose-verify": 0o555,
+        "usr/local/bin/asterctl": 0o555,
         "usr/share/licenses/aster/LICENSE": 0o444,
         "usr/share/licenses/aster/THIRD_PARTY_NOTICES.md": 0o444,
     },

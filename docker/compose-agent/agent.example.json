@@ -7,6 +7,7 @@
     "bind": "0.0.0.0:8183",
     "sync_interval_ms": 500,
     "emission_policy": "normal",
+    "blob_interests": [],
     "peers": []
   },
   "credentials": {
@@ -16,6 +17,11 @@
   "storage": {
     "max_items": 10000,
     "max_payload_bytes": 67108864,
+    "blob_depot": {
+      "max_bytes": 67108864,
+      "max_chunks": 4096,
+      "max_variants": 64
+    },
     "operations": {
       "max_records": 1000000,
       "max_logical_bytes": 201326592,

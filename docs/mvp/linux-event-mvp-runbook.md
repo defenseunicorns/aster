@@ -6,6 +6,11 @@ This is the shortest operator path through the currently implemented portions
 of the Linux Event evaluation profile. It is for engineering evaluation; open
 qualification gates still prevent a profile or release claim.
 
+For a task-oriented packaged installation, authentication, `asterctl`, Event,
+and Blob walkthrough written for operators rather than developers, start with
+the [human operator guide](../operator-guide.md). This runbook remains the
+evidence-bounded Linux Event evaluation procedure.
+
 The 2026-09-15 through 2026-09-16 two-node activity is recorded in the
 [direct CI-package record](../validation/evidence/2026-09-15-cm4-ci-package-mvp-validation.md).
 Use that record for the exact pass, failure, and unavailable-check boundary;

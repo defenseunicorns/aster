@@ -13,6 +13,19 @@ feature and an already running agent at `127.0.0.1:8181`; pass its provisioned
 client token (without the `Bearer ` prefix). See the
 [agent quickstart](../../docs/quickstart/connect-agent.md) for local setup.
 
+Blob API access is independent of network receive policy. Strict schema v1/v2
+configuration defaults absent or empty `mesh.blob_interests` to receive none.
+A nonempty list accepts at most 256 unique canonical exact `TOPIC@SCOPE`
+selectors and requires explicit nonzero `storage.blob_depot.max_bytes`,
+`max_chunks`, and `max_variants`; all of these fields are restart-only. Mission
+route/content authorization remains authoritative, and authenticated peers can
+observe exact configured topic/scope interest metadata under the current
+policy. `receive_only` retains the selectors in configuration but performs
+zero Blob network work. Receiving through the mesh does not create an
+application subscription, and the agent does not expose the separate Rust Blob
+subscription surface. Older agents reject the new fields, so rollback must
+restore the older configuration shape as well as the executable.
+
 ### Connect client and borrowed response
 
 `view()` borrows fields from the response buffer. Keep the response alive while
@@ -121,24 +134,35 @@ protocol maximum. The current selected backend nevertheless admits at most
 and caps each stream at 30 seconds. Those are current implementation limits,
 not RPC compatibility guarantees or large-file performance claims.
 
-`blob-read` currently requires Linux plus destination-filesystem support for
-`O_TMPFILE` and descriptor-relative linking. It creates an anonymous mode-0600
-inode in the pinned destination directory, synchronizes it, and atomically
-links that exact open inode to the requested new path. Unsupported platforms or
-filesystems fail closed. The caller's publish source and completed read output
-remain caller-owned files outside node zeroization custody; zeroizing the node
-does not erase either file. The agent's upload staging is separate, private,
-unlinked before payload acceptance, and currently Linux-only. On Linux the
-configured state root (including an accepted symlink) is resolved once and the
-node start is verified against that exact device/inode before Blob staging uses
-the pinned descriptor; later path replacement cannot redirect either side. On
-other supported Unix platforms the existing Event and status service still
-starts, while Blob publish fails with a fixed unsupported response before
-consuming stream bytes.
+`blob-read` currently requires Linux, an owner-controlled destination directory
+(owned by the current user and not writable by group or other users), and a
+filesystem that supports named staging, atomic no-replace rename, and directory
+synchronization.
+It writes to a randomly named mode-0600 sibling, synchronizes the complete
+verified stream, atomically renames that exact inode without replacing an
+existing or concurrently created path, and synchronizes the directory. Failure
+cleanup is best-effort; filesystem errors or an abrupt process or host failure
+can leave the hidden owner-only file for operator cleanup. A post-publication
+directory-sync error says the output exists and must be verified before retrying.
+Unsupported platforms or filesystems fail closed. The caller's publish source
+and completed read output remain caller-owned files outside node zeroization
+custody; zeroizing the node does not erase either file. The agent's upload
+staging is separate, private, unlinked before payload acceptance, and currently
+Linux-only. On Linux the configured state root (including an accepted symlink)
+is resolved once and the node start is verified against that exact device/inode
+before Blob staging uses the pinned descriptor; later path replacement cannot
+redirect either side. On other supported Unix platforms the existing Event and
+status service still starts, while Blob publish fails with a fixed unsupported
+response before consuming stream bytes.
 
 This agent increment provides Blob publish and read only. Blob subscription,
 poll, acknowledgement, transfer-status commands, and Blob FFI lifetime fields
 remain outside this surface.
+
+The legacy binary flag `--blob-interest TOPIC@SCOPE` is repeatable but exists
+only for development/migration mode. Customer service deployments use strict
+schema v1 or v2 configuration; neither form grants public API access or creates
+an application subscription.
 
 ### Pipelined durable Event publication
 

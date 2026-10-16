@@ -9,7 +9,7 @@ across several documents.
 | Need | Use |
 |---|---|
 | Embed the selected runtime in Rust | The live and stopped [Event](quickstart/selected-event-api.md), [State](quickstart/selected-state-api.md), [Record](quickstart/selected-record-api.md), and [Blob](quickstart/selected-blob-api.md) APIs |
-| Call a running local service | The authenticated, Event-only [ConnectRPC agent](quickstart/connect-agent.md) |
+| Call a running local service | The authenticated Event and Blob [ConnectRPC/gRPC agent](quickstart/connect-agent.md) |
 | Use the broader language bindings | The [Rust, C, Go, and Python quickstarts](quickstart/README.md) |
 | Configure the local agent | The [agent configuration reference](reference/aster-agent-config-v1.md) |
 

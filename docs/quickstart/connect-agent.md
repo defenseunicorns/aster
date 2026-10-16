@@ -8,14 +8,17 @@ gRPC-Web on plaintext loopback TCP. On Linux, it additionally serves bounded
 Blob publish/read streams through native gRPC. On non-Linux hosts, `ReadBlob`
 remains available to a capable native-gRPC client, but `PublishBlob` is
 unsupported because secure upload staging is Linux-only; `asterctl blob-read`
-also requires Linux anonymous-file finalization. It does not expose keys,
+also requires Linux atomic no-replace output finalization in an owner-controlled
+directory. It does not expose keys,
 sealed content, carriers, transport choice, reconciliation messages, or
 mission provisioning over RPC.
 
-The customer profile is single-scope, accepts exact manual peers, and permits
-at most one customer-controlled pinned connectivity relay. The agent does not
-include State or Record operations, Blob subscription/status operations,
-automatic discovery, bridges, or multi-scope forwarding.
+The customer profile accepts exact manual peers, permits at most one
+customer-controlled pinned connectivity relay, and can configure exact Blob
+topic/scope selectors, each independently subject to mission authorization. It
+has no wildcard/descendant or generic multi-scope forwarding. The agent does
+not include State or Record operations, Blob subscription/status operations,
+automatic discovery, or bridges.
 
 ## Choose the correct runtime boundary
 
@@ -49,6 +52,65 @@ Exit `0` is silent success. A nonzero result contains only a fixed sanitized
 rule category. Validation reads the configuration, optional relay roots, and
 both credential files, but does not create/open state, bind sockets, or invoke
 a protected provider.
+
+## Configure optional Blob mesh receipt
+
+Blob application access and Blob network receipt are separate. The public agent
+API can publish and read locally authorized Blobs without a mesh receive
+interest. To receive matching Blob work from peers after restart, configure
+`mesh.blob_interests` with unique exact `TOPIC@SCOPE` values and configure all
+three nonzero `storage.blob_depot` limits. The version-one reference contains a
+complete copyable file; these are its relevant valid JSON objects:
+
+```json
+{
+  "mesh": {
+    "bind": "0.0.0.0:8183",
+    "emission_policy": "normal",
+    "sync_interval_ms": 500,
+    "blob_interests": [
+      "imagery.maps@mission/team/alpha"
+    ],
+    "peers": []
+  },
+  "storage": {
+    "max_items": 10000,
+    "max_payload_bytes": 67108864,
+    "blob_depot": {
+      "max_bytes": 67108864,
+      "max_chunks": 4096,
+      "max_variants": 64
+    },
+    "operations": {
+      "max_records": 1000000,
+      "max_logical_bytes": 201326592,
+      "emergency_reserve": 10000
+    }
+  }
+}
+```
+
+Absent or empty interests mean receive none. At most 256 are accepted;
+malformed selectors, descendant/wildcard intent, a repeated canonical pair, or
+a 257th selector fails validation without echoing its value. A nonempty list
+without explicit depot limits also fails. Depot limits may be configured with
+an empty list to bound local publication; their byte, chunk-row, and
+epoch-specific variant accounting is aggregate across active, unfinished, and
+deletion-owned depot work as described in the
+[configuration reference](../reference/aster-agent-config-v1.md#storage-reserve-calculation).
+
+The selector is receive policy, not authorization. Current mission
+route/content authorization, epoch, and revocation checks remain authoritative.
+The interest travels inside the authenticated contact, but authenticated peers
+can observe the exact configured topic/scope interest metadata under the current
+policy. Review that metadata exposure before enabling an interest.
+
+Changing Blob interests or depot limits requires restart. Older agents reject
+the new fields as unknown, so a binary rollback must also restore a
+configuration without them. Receiving network content still does not create an
+application Blob subscription: public Blob API access, static mesh receive
+interests, and the Rust-only application subscription surface are three
+independent controls.
 
 For the provider-composed artifact, the supported start interface is:
 
@@ -287,6 +349,9 @@ Receive-only is a zero-transfer mode for locally held application/control
 objects, not physical radio silence: the carrier may still receive traffic and
 the protocol may emit mandatory acknowledgements or other transport responses.
 Use deployment/network controls when a customer requires actual radio silence.
+Configured Blob selectors remain available for a later normal-mode restart,
+but `receive_only` advertises, requests, stages, promotes, and counts zero Blob
+network work.
 
 ## Exercise the repository development path
 
@@ -308,6 +373,7 @@ cargo run --locked -p aster-agent -- \
   --state "$ASTER_AGENT_ROOT/state" \
   --mesh-bind 127.0.0.1:0 \
   --listen 127.0.0.1:8181 \
+  --blob-interest imagery.maps@mission/team/alpha \
   --mission-bundle-unprotected-reference \
     "$ASTER_AGENT_ROOT/mission.unprotected-reference.bundle" \
   --client-token-file "$ASTER_AGENT_ROOT/client.token"
@@ -324,6 +390,11 @@ peer is configured, polls, and acknowledges the Event. Protobuf JSON encodes
 `bytes` fields as base64. This path is useful for API integration only; it does
 not exercise customer configuration, health, token reload, protected
 provisioning, or the customer supervisor.
+
+`--blob-interest` is repeatable and uses the same exact `TOPIC@SCOPE`, duplicate,
+and 256-selector rules, but it belongs only to this legacy development path.
+It is not the customer configuration interface and does not grant application
+API access or create an application subscription.
 
 ## Authenticate application calls
 

@@ -190,6 +190,57 @@
           "condition": "service_healthy"
         }
       }
+    },
+    "asterctl": {
+      "user": "${ASTER_UID:?required}:${ASTER_GID:?required}",
+      "read_only": true,
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "pids_limit": 256,
+      "tmpfs": [
+        "/tmp:rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=${ASTER_UID:?required},gid=${ASTER_GID:?required}"
+      ],
+      "restart": "no",
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "3"
+        }
+      },
+      "image": "${ASTER_ADMIN_IMAGE_DIGEST:?required}",
+      "pull_policy": "never",
+      "network_mode": "service:aster-agent",
+      "entrypoint": [
+        "/usr/local/bin/asterctl",
+        "--token-file",
+        "/run/secrets/aster-client-token"
+      ],
+      "command": [
+        "status"
+      ],
+      "secrets": [
+        {
+          "source": "aster-operator-client-token",
+          "target": "/run/secrets/aster-client-token"
+        }
+      ],
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "${ASTER_TRANSFER_DIR:?required}",
+          "target": "/transfer"
+        }
+      ],
+      "depends_on": {
+        "aster-agent": {
+          "condition": "service_healthy"
+        }
+      }
     }
   },
   "configs": {
@@ -206,6 +257,9 @@
     },
     "aster-provisioning-bundle": {
       "file": "${ASTER_CREDENTIAL_GENERATION_DIR:?required}/aster-provisioning-bundle"
+    },
+    "aster-operator-client-token": {
+      "file": "${ASTER_TOKEN_INPUT:?required}"
     }
   }
 }

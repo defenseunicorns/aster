@@ -1,7 +1,7 @@
 ." Copyright 2026 Defense Unicorns, Inc.
 ." SPDX-License-Identifier: Apache-2.0
 ." Clean Room — Privileged
-.TH ASTERCTL-BLOB-READ 1 "2026-10-15" "Aster" "User Commands"
+.TH ASTERCTL-BLOB-READ 1 "2026-10-16" "Aster" "User Commands"
 .SH NAME
 asterctl-blob-read \- read an authenticated Aster Blob to a new local file
 .SH SYNOPSIS
@@ -19,17 +19,20 @@ streams a Blob from a running Aster agent into a newly created local file.
 It validates contiguous offsets, bounded pages, stable immutable metadata and
 TTL, the authenticated completion marker, and the exact declared total length.
 .PP
-On Linux, bytes are written to an anonymous temporary inode in the pinned
-destination directory. After the complete file is synchronized, the command
-publishes that exact open inode with an atomic no-replace descriptor link. No
-named partial path exists, and closing the descriptor discards an incomplete
-read. The command never overwrites an existing or concurrently created
-destination.
+On Linux, the destination directory must be owner-controlled: owned by the
+current user and not writable by group or other users. Bytes are written to a
+randomly named mode-0600 sibling. After the complete file is synchronized, the
+command atomically renames that exact inode with no-replace semantics and
+synchronizes the directory. The command never overwrites an existing or
+concurrently created destination.
 .PP
 The command fails before contacting the agent on non-Linux platforms and when
-the destination filesystem cannot create the required anonymous temporary. If
-descriptor-link publication is unsupported, finalization fails without
-publishing an output path.
+the destination filesystem cannot provide named staging, atomic no-replace
+rename, or directory synchronization. Failure cleanup removes the sibling on a
+best-effort basis; filesystem errors or abrupt process or host failure can
+leave the hidden owner-only file for operator cleanup. If synchronization fails
+after publication, the error says that the output exists and must be verified
+before retrying.
 .SH OPTIONS
 .TP
 .BI \-\-id " ID"
@@ -63,7 +66,8 @@ durable JSON omits that field.
 The complete verified Blob was written.
 .TP
 .B 1
-Read or local-file handling failed; no partial output is retained.
+Read or local-file handling failed. The requested output remains absent before
+publication; staging cleanup is best-effort.
 .TP
 .B 2
 Invalid or missing arguments.

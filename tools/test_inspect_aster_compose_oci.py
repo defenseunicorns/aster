@@ -34,6 +34,7 @@ AGENT_FILES = {
 ADMIN_FILES = {
     "usr/local/bin/aster-compose-credential-admin": b"admin-binary",
     "usr/local/bin/aster-compose-verify": b"verify-binary",
+    "usr/local/bin/asterctl": b"asterctl-binary",
     "usr/share/licenses/aster/LICENSE": b"Apache-2.0",
     "usr/share/licenses/aster/THIRD_PARTY_NOTICES.md": b"notices",
 }

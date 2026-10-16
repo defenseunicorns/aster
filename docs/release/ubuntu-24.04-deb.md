@@ -128,8 +128,9 @@ probe nor an accepted metadata shape qualifies the v2 lifecycle on Ubuntu.
 
 ## Package composition
 
-- `/usr/bin/aster` and `/usr/bin/aster-agent` use package-default features;
-  no automatic discovery or acceptance-fixture binary.
+- `/usr/bin/aster`, `/usr/bin/aster-agent`, and `/usr/bin/asterctl` use
+  package-default features; no automatic discovery or acceptance-fixture
+  binary. `asterctl` supplies the loopback Event and Blob operator client.
 - `/usr/sbin/aster-credential-admin` is the stopped-service root admin tool.
 - `aster-agent.service` runs as a dedicated static `aster` user, with
   restrictive umask and no automatic activation on install or upgrade.
@@ -193,9 +194,9 @@ python3 tools/test_deb_package.py ../aster_*_$(dpkg --print-architecture).deb "$
 sha256sum ../aster_*.deb
 ```
 
-The build produces three schema-validated Cargo SBOMs in
+The build produces four schema-validated Cargo SBOMs in
 `target/deb-metadata`, outside the `.deb`, together with license/build records.
-`BINARY-SHA256SUMS` hashes the three packaged executables after stripping;
+`BINARY-SHA256SUMS` hashes the four packaged executables after stripping;
 verify these paths from `/` on an installed target. Preserve this metadata and
 external `.buildinfo` and `.changes` alongside the package. The CI artifact
 includes the metadata directory and an external checksum manifest.

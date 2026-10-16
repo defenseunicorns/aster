@@ -11,9 +11,10 @@ use std::{
 
 use aster_iroh::{PinnedRelay, RelayUrl};
 use aster_mesh::ProvisioningLoadId;
+use aster_node::application::{Scope, Topic};
 use aster_node::{
-    EventEmissionPolicy, MissionExpectedPeer, NodeConfigOptions, SelectedForwardingConfig,
-    StoreLimits,
+    BlobDepotLimits, EventEmissionPolicy, MissionExpectedPeer, MutableSourceInterests,
+    NodeConfigOptions, SelectedForwardingConfig, SourceInterestSelector, StoreLimits,
 };
 use aster_redb_store::{
     CUSTODY_EMERGENCY_BYTE_RESERVE, CUSTODY_EMERGENCY_ITEM_RESERVE, CustodyQuota,
@@ -29,6 +30,7 @@ const COMPOSE_CLIENT_TOKEN_PATH: &str = "/run/secrets/aster-client-token";
 const COMPOSE_MISSION_ACTIVATION_PATH: &str = "/run/secrets/aster-mission-activation";
 const COMPOSE_STATE_PATH: &str = "/var/lib/aster";
 const MAX_CONFIGURED_PEERS: usize = 256;
+const MAX_BLOB_INTERESTS: usize = 256;
 const MAX_SYNC_INTERVAL_MS: u64 = 60_000;
 const MAX_APPLICATION_CONNECTIONS: usize = 64;
 const MAX_UNAUTHENTICATED_APPLICATION_CONNECTIONS: usize = 8;
@@ -40,7 +42,9 @@ const MAX_SHUTDOWN_GRACE_MS: u64 = 30_000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigReason {
     AbsolutePathRequired,
+    BlobDepotRequired,
     DuplicateField,
+    DuplicateBlobInterest,
     DistinctListenersRequired,
     DuplicatePeerCarrier,
     DuplicatePeerMission,
@@ -48,6 +52,8 @@ pub enum ConfigReason {
     FileAccess,
     InvalidMissionLoadId,
     InvalidEmissionPolicy,
+    InvalidBlobDepot,
+    InvalidBlobInterest,
     InvalidPeer,
     InvalidRelay,
     InvalidStorage,
@@ -60,6 +66,7 @@ pub enum ConfigReason {
     SyncIntervalOutOfRange,
     Syntax,
     TooManyPeers,
+    TooManyBlobInterests,
     UnknownField,
     UnsupportedSchemaVersion,
 }
@@ -68,6 +75,8 @@ impl ConfigReason {
     const fn message(self) -> &'static str {
         match self {
             Self::AbsolutePathRequired => "configuration path must be absolute",
+            Self::BlobDepotRequired => "configuration Blob interests require explicit depot limits",
+            Self::DuplicateBlobInterest => "configuration contains a duplicate Blob interest",
             Self::DuplicateField => "configuration contains a duplicate field",
             Self::DistinctListenersRequired => "configuration listeners must be distinct",
             Self::DuplicatePeerCarrier => "configuration contains a duplicate peer carrier",
@@ -76,6 +85,8 @@ impl ConfigReason {
             Self::FileAccess => "configuration file cannot be read",
             Self::InvalidMissionLoadId => "configuration mission load id is invalid",
             Self::InvalidEmissionPolicy => "configuration emission policy is invalid",
+            Self::InvalidBlobDepot => "configuration Blob depot limits are invalid",
+            Self::InvalidBlobInterest => "configuration Blob interest is invalid",
             Self::InvalidPeer => "configuration peer is invalid",
             Self::InvalidRelay => "configuration relay is invalid",
             Self::InvalidStorage => "configuration storage limits are invalid",
@@ -92,6 +103,7 @@ impl ConfigReason {
             }
             Self::Syntax => "configuration syntax is invalid",
             Self::TooManyPeers => "configuration has too many peers",
+            Self::TooManyBlobInterests => "configuration has too many Blob interests",
             Self::UnknownField => "configuration contains an unknown field",
             Self::UnsupportedSchemaVersion => "configuration schema version is unsupported",
         }
@@ -205,6 +217,7 @@ pub struct ValidatedRuntimeConfig {
     health: SocketAddr,
     mesh_bind: SocketAddr,
     peers: Vec<MissionExpectedPeer>,
+    mutable_interests: MutableSourceInterests,
     forwarding: SelectedForwardingConfig,
     limits: AgentLimits,
     sync_interval: Duration,
@@ -212,7 +225,9 @@ pub struct ValidatedRuntimeConfig {
 
 impl ValidatedRuntimeConfig {
     pub fn node_options(&self) -> NodeConfigOptions {
-        NodeConfigOptions::new(self.mesh_bind, self.sync_interval).with_peers(self.peers.clone())
+        NodeConfigOptions::new(self.mesh_bind, self.sync_interval)
+            .with_peers(self.peers.clone())
+            .with_mutable_interests(self.mutable_interests.clone())
     }
 
     pub fn forwarding(&self) -> SelectedForwardingConfig {
@@ -315,6 +330,8 @@ struct RawMesh {
     emission_policy: RawEmissionPolicy,
     peers: Vec<String>,
     #[serde(default)]
+    blob_interests: Vec<String>,
+    #[serde(default)]
     relay: Option<RawRelay>,
 }
 
@@ -391,6 +408,16 @@ struct RawStorage {
     max_items: u64,
     max_payload_bytes: u64,
     operations: RawOperationStorage,
+    #[serde(default)]
+    blob_depot: Option<RawBlobDepot>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBlobDepot {
+    max_bytes: u64,
+    max_chunks: u64,
+    max_variants: u64,
 }
 
 #[derive(Deserialize)]
@@ -506,6 +533,11 @@ fn validate_runtime<C>(raw: RawAgentConfig<C>) -> Result<ValidatedRuntimeConfig,
     validate_listeners(raw.application.listen, raw.health.listen)?;
     let sync_interval = validate_sync_interval(raw.mesh.sync_interval_ms)?;
     let peers = validate_peers(raw.mesh.peers)?;
+    let blob_interests = validate_blob_interests(raw.mesh.blob_interests)?;
+    if !blob_interests.is_empty() && raw.storage.blob_depot.is_none() {
+        return Err(ConfigError::new(ConfigReason::BlobDepotRequired));
+    }
+    let mutable_interests = MutableSourceInterests::default().with_blob(blob_interests);
     let forwarding =
         validate_forwarding(raw.storage, raw.mesh.emission_policy.into(), raw.mesh.relay)?;
     let limits = validate_limits(raw.limits)?;
@@ -516,6 +548,7 @@ fn validate_runtime<C>(raw: RawAgentConfig<C>) -> Result<ValidatedRuntimeConfig,
         health: raw.health.listen,
         mesh_bind: raw.mesh.bind,
         peers,
+        mutable_interests,
         forwarding,
         limits,
         sync_interval,
@@ -607,11 +640,41 @@ fn validate_peers(raw_peers: Vec<String>) -> Result<Vec<MissionExpectedPeer>, Co
     Ok(peers)
 }
 
+fn validate_blob_interests(
+    raw_interests: Vec<String>,
+) -> Result<Vec<SourceInterestSelector>, ConfigError> {
+    if raw_interests.len() > MAX_BLOB_INTERESTS {
+        return Err(ConfigError::new(ConfigReason::TooManyBlobInterests));
+    }
+    let mut exact = BTreeSet::new();
+    let mut interests = Vec::with_capacity(raw_interests.len());
+    for raw_interest in raw_interests {
+        let (topic, scope) = raw_interest
+            .split_once('@')
+            .filter(|(_, scope)| !scope.contains('@'))
+            .ok_or_else(|| ConfigError::new(ConfigReason::InvalidBlobInterest))?;
+        let topic =
+            Topic::new(topic).map_err(|_| ConfigError::new(ConfigReason::InvalidBlobInterest))?;
+        let scope =
+            Scope::new(scope).map_err(|_| ConfigError::new(ConfigReason::InvalidBlobInterest))?;
+        if !exact.insert((topic.clone(), scope.clone())) {
+            return Err(ConfigError::new(ConfigReason::DuplicateBlobInterest));
+        }
+        interests.push(SourceInterestSelector::new(topic, scope, false));
+    }
+    Ok(interests)
+}
+
 fn validate_forwarding(
     raw_storage: RawStorage,
     emission_policy: EventEmissionPolicy,
     raw_relay: Option<RawRelay>,
 ) -> Result<SelectedForwardingConfig, ConfigError> {
+    let blob_depot_limits = match raw_storage.blob_depot {
+        Some(raw) => BlobDepotLimits::new(raw.max_bytes, raw.max_chunks, raw.max_variants)
+            .map_err(|_| ConfigError::new(ConfigReason::InvalidBlobDepot))?,
+        None => BlobDepotLimits::DEFAULT,
+    };
     let limits = StoreLimits::new(raw_storage.max_items, raw_storage.max_payload_bytes)
         .map_err(|_| ConfigError::new(ConfigReason::InvalidStorage))?;
     let minimum_items = MAX_CONTROL_ITEMS + CUSTODY_EMERGENCY_ITEM_RESERVE + 1;
@@ -633,7 +696,8 @@ fn validate_forwarding(
     let forwarding = SelectedForwardingConfig::default()
         .with_emission_policy(emission_policy)
         .with_store_limits(limits)
-        .with_operation_limits(operation_limits);
+        .with_operation_limits(operation_limits)
+        .with_blob_depot_limits(blob_depot_limits);
     let Some(raw_relay) = raw_relay else {
         return Ok(forwarding);
     };
@@ -751,7 +815,7 @@ mod tests {
         time::Duration,
     };
 
-    use aster_node::EventEmissionPolicy;
+    use aster_node::{BlobDepotLimits, EventEmissionPolicy};
     use aster_redb_store::{
         CUSTODY_EMERGENCY_BYTE_RESERVE, CUSTODY_EMERGENCY_ITEM_RESERVE, MAX_CONTROL_BYTES,
         MAX_CONTROL_ITEMS,
@@ -794,6 +858,165 @@ mod tests {
             17_891_328
         );
         let _options = config.node_options();
+    }
+
+    #[test]
+    fn legacy_v1_and_v2_configs_preserve_default_blob_depot_limits() {
+        // Break caught: making the new optional Blob configuration replace the
+        // established depot limits for existing systemd-v1 or Compose-v2 files.
+        let systemd = validate_json(config_with_storage(4_161, 17_891_328))
+            .expect("legacy systemd-v1 configuration");
+        let compose = validate_compose_json(compose_config_with_state("/var/lib/aster"))
+            .expect("legacy Compose-v2 configuration");
+        assert_eq!(
+            systemd.forwarding().blob_depot_limits(),
+            BlobDepotLimits::DEFAULT
+        );
+        assert_eq!(
+            compose.runtime().forwarding().blob_depot_limits(),
+            BlobDepotLimits::DEFAULT
+        );
+    }
+
+    #[test]
+    fn legacy_compose_v2_config_opens_with_no_blob_receive_interests() {
+        // Break caught: defaulting the new Compose-v2 field to an implicit
+        // receive selector would disclose and accept Blob identifiers for an
+        // existing deployment that never opted in.
+        let compose = validate_compose_json(compose_config_with_state("/var/lib/aster"))
+            .expect("legacy Compose-v2 configuration");
+        assert_eq!(
+            compose.runtime().mutable_interests,
+            aster_node::MutableSourceInterests::default()
+        );
+        let _options = compose.runtime().node_options();
+    }
+
+    #[test]
+    fn explicit_blob_depot_limits_reach_forwarding_configuration() {
+        // Break caught: validating operator limits but silently opening the
+        // selected forwarding stack with its compiled defaults.
+        let config = validate_json(config_with_blob(
+            vec!["imagery@alpha/team"],
+            Some(serde_json::json!({
+                "max_bytes": 33_554_432,
+                "max_chunks": 4_096,
+                "max_variants": 64,
+            })),
+        ))
+        .expect("explicit Blob receive configuration");
+        assert_eq!(
+            config.forwarding().blob_depot_limits(),
+            BlobDepotLimits::new(33_554_432, 4_096, 64).expect("literal nonzero limits")
+        );
+    }
+
+    #[test]
+    fn malformed_blob_interest_is_rejected_without_echoing_input() {
+        // Break caught: accepting ambiguous/non-canonical selector syntax or
+        // copying a customer selector into a diagnostic.
+        for canary in [
+            "blob-interest-canary",
+            "blob-interest-canary@",
+            "@blob-interest-canary",
+            "blob-interest-canary@alpha@bravo",
+            "blob interest canary@alpha",
+            "blob-interest-canary@alpha//bravo",
+        ] {
+            let error = rejected(
+                validate_json(config_with_blob(vec![canary], Some(valid_blob_depot()))),
+                "malformed Blob selector must be rejected",
+            );
+            assert_eq!(error.reason(), ConfigReason::InvalidBlobInterest);
+            assert!(!error.to_string().contains("blob-interest-canary"));
+        }
+    }
+
+    #[test]
+    fn duplicate_blob_interest_is_rejected_without_echoing_input() {
+        // Break caught: duplicate canonical selectors amplify work and make
+        // configured bounds differ from effective interests.
+        let error = rejected(
+            validate_json(config_with_blob(
+                vec!["duplicate-canary@alpha/team", "duplicate-canary@alpha/team"],
+                Some(valid_blob_depot()),
+            )),
+            "duplicate Blob selector must be rejected",
+        );
+        assert_eq!(error.reason(), ConfigReason::DuplicateBlobInterest);
+        assert!(!error.to_string().contains("duplicate-canary"));
+    }
+
+    #[test]
+    fn more_than_256_blob_interests_are_rejected_without_echoing_input() {
+        // Break caught: an unbounded public selector list consumes startup and
+        // contact resources outside the approved maximum.
+        let selectors = (0..257)
+            .map(|index| format!("blob-limit-canary-{index}@alpha/team"))
+            .collect::<Vec<_>>();
+        let error = rejected(
+            validate_json(config_with_blob(
+                selectors.iter().map(String::as_str).collect(),
+                Some(valid_blob_depot()),
+            )),
+            "oversized Blob selector set must be rejected",
+        );
+        assert_eq!(error.reason(), ConfigReason::TooManyBlobInterests);
+        assert!(!error.to_string().contains("blob-limit-canary"));
+    }
+
+    #[test]
+    fn exactly_256_unique_blob_interests_are_accepted() {
+        // Break caught: an off-by-one limit check rejects the approved maximum
+        // even though 257 selectors must fail closed.
+        let selectors = (0..256)
+            .map(|index| format!("blob-boundary-{index}@alpha/team"))
+            .collect::<Vec<_>>();
+        validate_json(config_with_blob(
+            selectors.iter().map(String::as_str).collect(),
+            Some(valid_blob_depot()),
+        ))
+        .expect("exactly 256 unique Blob selectors");
+    }
+
+    #[test]
+    fn zero_blob_depot_dimensions_are_rejected_without_echoing_input() {
+        // Break caught: a zero physical bound disables useful Blob receipt or
+        // causes an input-dependent lower-layer failure.
+        for (field, canary, selector) in [
+            ("max_bytes", "blob-bytes-canary", "blob-bytes-canary@alpha"),
+            (
+                "max_chunks",
+                "blob-chunks-canary",
+                "blob-chunks-canary@alpha",
+            ),
+            (
+                "max_variants",
+                "blob-variants-canary",
+                "blob-variants-canary@alpha",
+            ),
+        ] {
+            let mut depot = valid_blob_depot();
+            depot[field] = 0.into();
+            let error = rejected(
+                validate_json(config_with_blob(vec![selector], Some(depot))),
+                "zero Blob depot dimension must be rejected",
+            );
+            assert_eq!(error.reason(), ConfigReason::InvalidBlobDepot);
+            assert!(!error.to_string().contains(canary));
+        }
+    }
+
+    #[test]
+    fn nonempty_blob_interests_require_explicit_depot_limits() {
+        // Break caught: enabling Blob receive with implicit compiled capacity
+        // bypasses the operator's explicit physical-storage decision.
+        let error = rejected(
+            validate_json(config_with_blob(vec!["blob-depot-canary@alpha/team"], None)),
+            "Blob receive interests without depot limits must be rejected",
+        );
+        assert_eq!(error.reason(), ConfigReason::BlobDepotRequired);
+        assert!(!error.to_string().contains("blob-depot-canary"));
     }
 
     #[test]
@@ -1180,6 +1403,24 @@ mod tests {
         format!(
             r#"{{"schema_version":1,"state":{{"directory":"/var/lib/aster-agent"}},"application":{{"listen":"127.0.0.1:8181"}},"health":{{"listen":"127.0.0.1:8182"}},"mesh":{{"bind":"127.0.0.1:8183","sync_interval_ms":500,"emission_policy":"normal","peers":[]}},"credentials":{{"client_token_file":"/run/aster-agent/client-token","mission_secret_ref_file":"/run/aster-agent/mission-ref","mission_load_id":"1111111111111111111111111111111111111111111111111111111111111111"}},"storage":{{"max_items":{max_items},"max_payload_bytes":{max_payload_bytes},"operations":{{"max_records":1000000,"max_logical_bytes":201326592,"emergency_reserve":10000}}}}}}"#
         )
+    }
+
+    fn config_with_blob(interests: Vec<&str>, depot: Option<serde_json::Value>) -> String {
+        let mut config: serde_json::Value =
+            serde_json::from_str(&config_with_storage(4_161, 17_891_328)).unwrap();
+        config["mesh"]["blob_interests"] = serde_json::json!(interests);
+        if let Some(depot) = depot {
+            config["storage"]["blob_depot"] = depot;
+        }
+        config.to_string()
+    }
+
+    fn valid_blob_depot() -> serde_json::Value {
+        serde_json::json!({
+            "max_bytes": 33_554_432,
+            "max_chunks": 4_096,
+            "max_variants": 64,
+        })
     }
 
     fn valid_operations() -> serde_json::Value {

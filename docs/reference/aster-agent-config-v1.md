@@ -2,11 +2,14 @@
 
 > ****
 
-This reference describes the strict JSON accepted by the customer Event
-runtime. The profile is one Event-only, single-scope process with exact manual
-peers and at most one customer-controlled connectivity relay. It has no State,
-Record, Blob, automatic-discovery, bridge, or multi-scope forwarding fields.
-Unknown and duplicate fields are rejected at every object level.
+This reference describes the strict JSON accepted by the customer Event/Blob
+runtime. The profile has exact manual peers, at most one customer-controlled
+connectivity relay, and optional exact Blob receive interests. Each Blob
+selector independently names one topic and one scope; wildcard/descendant
+selection and generic multi-scope forwarding are absent. The profile also has
+no State or Record operations, Blob application subscriptions, automatic
+discovery, or bridge fields. Unknown and duplicate fields are rejected at every
+object level.
 
 The repository `aster-agent` binary can validate this document with
 `--check-config`. A customer runtime must statically compose the public
@@ -37,6 +40,7 @@ credential or provisioning reference.
     "bind": "0.0.0.0:8183",
     "emission_policy": "normal",
     "sync_interval_ms": 500,
+    "blob_interests": [],
     "peers": []
   },
   "credentials": {
@@ -47,6 +51,11 @@ credential or provisioning reference.
   "storage": {
     "max_items": 10000,
     "max_payload_bytes": 67108864,
+    "blob_depot": {
+      "max_bytes": 67108864,
+      "max_chunks": 4096,
+      "max_variants": 64
+    },
     "operations": {
       "max_records": 1000000,
       "max_logical_bytes": 201326592,
@@ -75,6 +84,44 @@ advance the approved evaluation workload boundary or constitute scale/rate
 qualification. Include this separate logical allocation plus backend overhead
 in deployment state sizing.
 
+The example's empty `blob_interests` receives no Blob work from the mesh. Its
+explicit `blob_depot` still bounds local Blob publication. Omitting both new
+fields also receives no Blob work and retains the compiled depot defaults; it
+is the compatibility behavior for an older configuration.
+
+To receive one exact Blob source lane, replace the empty array with a canonical
+`TOPIC@SCOPE` selector and keep explicit nonzero depot limits. For example, the
+following complete `mesh` and `storage` objects are valid JSON and select only
+`imagery.maps` in exactly `mission/team/alpha`:
+
+```json
+{
+  "mesh": {
+    "bind": "0.0.0.0:8183",
+    "emission_policy": "normal",
+    "sync_interval_ms": 500,
+    "blob_interests": [
+      "imagery.maps@mission/team/alpha"
+    ],
+    "peers": []
+  },
+  "storage": {
+    "max_items": 10000,
+    "max_payload_bytes": 67108864,
+    "blob_depot": {
+      "max_bytes": 67108864,
+      "max_chunks": 4096,
+      "max_variants": 64
+    },
+    "operations": {
+      "max_records": 1000000,
+      "max_logical_bytes": 201326592,
+      "emergency_reserve": 10000
+    }
+  }
+}
+```
+
 ## Field reference
 
 All fields below are required unless the Default column says otherwise.
@@ -89,6 +136,7 @@ Unsigned integer fields use their JSON integer representation.
 | `mesh.bind` | socket address | none | Valid IP socket address for the selected mesh carrier. It is not an application listener. |
 | `mesh.emission_policy` | string enum | none | `normal` or `receive_only`. The selection is applied at startup and changes require restart. Receive-only accepts authenticated inbound work but initiates no contacts and discloses no local Event/control inventory or objects; it is not physical radio silence. |
 | `mesh.sync_interval_ms` | integer | none | `1..=60000`. |
+| `mesh.blob_interests` | array of strings | `[]` | `0..=256` unique canonical exact selectors, each encoded as one `TOPIC@SCOPE`. Topic and scope use the normal canonical Aster name rules. Empty or omitted means receive no Blob network work. Descendant-scope and wildcard intent are not supported. Changing this restart-only field requires process restart. |
 | `mesh.peers` | array of strings | none | `0..=256` exact manual peers. Each is `CARRIER_ID@IP:PORT=MISSION_NODE_ID_HEX64`. Carrier identities must be unique and mission identities must be unique; distinct peers may share a socket address. |
 | `mesh.relay` | object or `null` | omitted/`null` | At most one controlled relay. See Relay below. |
 | `credentials.client_token_file` | string path | none | Absolute path to the owner-only bearer-token file. |
@@ -96,6 +144,10 @@ Unsigned integer fields use their JSON integer representation.
 | `credentials.mission_load_id` | string | none | Exactly 64 hexadecimal characters (case-insensitive), decoded as the provider load-operation ID. |
 | `storage.max_items` | integer | none | Aggregate logical store limit, `4161..=18446744073709551615`. |
 | `storage.max_payload_bytes` | integer | none | Aggregate logical retained-byte limit, `17891328..=18446744073709551615`. |
+| `storage.blob_depot` | object | compiled depot limits | Optional only while `mesh.blob_interests` is empty. A nonempty interest list requires this object with exactly the three nonzero `u64` limits below. It may also be supplied with empty interests to bound local Blob publication. |
+| `storage.blob_depot.max_bytes` | integer | none within object | Nonzero aggregate bytes reserved by active plus deletion-owned expected Blob chunk records, including each fixed file header. |
+| `storage.blob_depot.max_chunks` | integer | none within object | Nonzero aggregate active plus deletion-owned durable chunk-row limit, including unfinished staging. |
+| `storage.blob_depot.max_variants` | integer | none within object | Nonzero aggregate active plus deletion-owned epoch-specific variant limit, including public and unpublished variants. |
 | `storage.operations` | object | none | Required; exactly the three fields below. No implicit defaults in agent config v1. |
 | `storage.operations.max_records` | integer | none | Nonzero `u64` permanent-record ceiling, greater than `emergency_reserve`. |
 | `storage.operations.max_logical_bytes` | integer | none | Nonzero `u64` logical ledger-plus-reverse-index byte ceiling, at least `emergency_reserve * 162`. |
@@ -120,6 +172,22 @@ of connection age, new requests receive `Unavailable`; existing responses have
 at most 30 seconds of additional grace before closure. HTTP/2 keepalive runs
 every 30 seconds with a 20-second acknowledgement timeout. These compiled
 connection limits cannot be relaxed through version-one configuration.
+
+`mesh.blob_interests` is receive policy, not authorization. Every Blob send and
+read remains subject to current mission route/content authority, epoch, and
+revocation checks. During an eligible contact the selector is protected by the
+authenticated carrier, but authenticated peers can observe the exact configured
+topic/scope interest metadata under the current policy. Do not treat interest
+metadata as secret from authenticated peers under this policy.
+When `mesh.emission_policy` is `receive_only`, the validated selectors remain
+configured for a later normal-mode restart, but the running node advertises,
+requests, stages, promotes, and counts zero Blob network work.
+
+These interests are also independent of application access. The public agent
+API can publish and read locally authorized Blobs without a receive interest.
+Conversely, receiving a Blob through the mesh does not create a Blob
+application subscription; that Rust subscription surface is not exposed by the
+agent API.
 
 ## Relay
 
@@ -156,9 +224,16 @@ Therefore `max_items >= 4096 + 64 + 1 = 4161` and
 `max_payload_bytes >= 16777216 + 65536 + 1048576 = 17891328`.
 The ordinary global Event custody ceiling is derived, not independently
 configured: `max_items - 4160` and `max_payload_bytes - 16842752`. Version 1
-has no per-scope, bridge, or Blob-depot quota field and never raises a limit
-automatically. Saturation returns the sanitized public resource-exhaustion
-error; clients must back off or request a smaller valid page.
+has no per-scope or bridge quota and never raises a limit automatically.
+`storage.blob_depot` is separate aggregate physical-depot accounting: bytes
+cover active and deletion-owned expected chunk-file reservations, chunks cover
+durable chunk rows including unfinished staging, and variants cover active and
+deletion-owned epoch-specific imports whether public or unpublished. Logical
+retirement does not release those charges; successful physical finalization
+does. The limits do not cover redb allocation, directory blocks, snapshots,
+backups, swap, unrelated directory entries, or all filesystem overhead.
+Saturation returns the sanitized public resource-exhaustion error; clients must
+back off or request a smaller valid page.
 
 The permanent Event operation ledger uses the separate required `operations`
 quota, validated by the store's `EventOperationLimits` rules. One active record
@@ -259,8 +334,8 @@ deployment owner must provide the directory ownership and isolation boundary.
 
 `SIGHUP` rereads only `client_token_file`. A completely validated replacement
 atomically becomes active; a failed reload retains the previous token and
-readiness. Emission policy, mission reference, load ID, peers, relay, storage,
-and limits change only through restart.
+readiness. Emission policy, mission reference, load ID, peers, Blob interests,
+relay, storage, and limits change only through restart.
 
 ## Validation and diagnostics
 
@@ -282,13 +357,17 @@ Success is silent with exit code `0`. Failure is nonzero and contains only one
 of these fixed configuration reasons (the stock CLI prefixes it with `ERROR`):
 
 - `configuration path must be absolute`
+- `configuration Blob interests require explicit depot limits`
 - `configuration contains a duplicate field`
+- `configuration contains a duplicate Blob interest`
 - `configuration listeners must be distinct`
 - `configuration contains a duplicate peer carrier`
 - `configuration contains a duplicate peer mission`
 - `credential file boundary is invalid`
 - `configuration file cannot be read`
 - `configuration emission policy is invalid`
+- `configuration Blob depot limits are invalid`
+- `configuration Blob interest is invalid`
 - `configuration mission load id is invalid`
 - `configuration peer is invalid`
 - `configuration relay is invalid`
@@ -301,12 +380,18 @@ of these fixed configuration reasons (the stock CLI prefixes it with `ERROR`):
 - `configuration synchronization interval is out of range`
 - `configuration syntax is invalid`
 - `configuration has too many peers`
+- `configuration has too many Blob interests`
 - `configuration contains an unknown field`
 - `configuration schema version is unsupported`
 
 Diagnostics do not echo field values, paths, credentials, peer coordinates,
 provider text, or raw lower-level errors. Treat the reason as a rule category;
 inspect the configuration locally without copying sensitive values into logs.
+
+The schema is strict rather than forward-compatible: an older agent rejects
+`mesh.blob_interests` and `storage.blob_depot` as unknown fields. Rolling back
+the executable therefore also requires restoring a configuration without those
+fields; changing only the binary fails closed at configuration validation.
 
 ## Supported boundary
 

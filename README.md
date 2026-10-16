@@ -15,7 +15,7 @@ constrained, and disconnected operation.
 > [!IMPORTANT]
 > Aster is an evaluation-stage reference implementation, not a
 > production-authorized system. Event, State, Record, and Blob have live Rust
-> APIs; Event also has a local ConnectRPC API. Review the
+> APIs; Event and Blob also have a local agent API. Review the
 > [current implementation boundary](#current-implementation-boundary),
 > [security gates](docs/security.md), [conformance status](docs/validation/conformance.md),
 > and [requirements status](docs/validation/requirements-status.md) before
@@ -94,14 +94,16 @@ decision tree and worked examples.
 
 ## Integrate an application
 
-For new integrations, start with the local ConnectRPC agent. It exposes the
-live Event authority over Connect, gRPC, and gRPC-Web using a checked-in
-Protobuf schema and does not require a hosted Buf Schema Registry.
+For new integrations, start with the local agent. It exposes the live Event
+authority over Connect, gRPC, and gRPC-Web plus bounded Blob publish/read
+streams over native gRPC using a checked-in Protobuf schema and does not
+require a hosted Buf Schema Registry.
 
 | Integration | Start here | Current boundary |
 |---|---|---|
-| **Connect, gRPC, or gRPC-Web** | [ConnectRPC agent](docs/quickstart/connect-agent.md) | Live Event and local status; authenticated loopback process |
+| **Connect, gRPC, or gRPC-Web** | [Local agent](docs/quickstart/connect-agent.md) | Live Event and local status over Connect/gRPC/gRPC-Web; Blob publish/read over native gRPC; authenticated loopback process |
 | **Command line** | [asterctl](crates/asterctl/README.md) | CLI utility for introspecting and controlling Aster nodes |
+| **Human operator** | [Operator guide](docs/operator-guide.md) | Packaged installation, authentication, health, Event use, and Blob file transfer without developer tooling |
 | **Docker Compose deployment** | [Compose container delivery](docs/release/docker-compose.md) | Manual, no-Swarm container profile with a dedicated file-secret provider; no Docker host profile is qualified |
 | **Rust selected node** | [Selected Event API](docs/quickstart/selected-event-api.md) | Live Event publish, query, durable delivery, gaps, and status |
 | **State or Record in Rust** | [State](docs/quickstart/selected-state-api.md) and [Record](docs/quickstart/selected-record-api.md) | Cloneable live handles and exclusive stopped facades; direct-Iroh reconciliation; State latest-value and Record conflict-preserving delivery |
@@ -225,6 +227,7 @@ conventional database or broker will usually be simpler.
 | Implement compatible protocol bytes | [Protocol](docs/protocol.md), [wire grammar](docs/wire.cddl), and [security objects](docs/envelope.md) |
 | Assess progress or readiness | [Capability roadmap](docs/validation/capability-roadmap.md), [requirements status](docs/validation/requirements-status.md), [conformance](docs/validation/conformance.md), and [security](docs/security.md) |
 | Deploy the Compose container profile | [Compose operator procedure](docs/release/docker-compose.md) and [schema v2](docs/reference/aster-agent-config-v2.md) |
+| Install and operate a packaged node | [Human operator guide](docs/operator-guide.md) |
 | Browse current product documentation | [Documentation map](docs/README.md) |
 
 ## Repository map

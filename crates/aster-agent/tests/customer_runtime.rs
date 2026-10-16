@@ -27,6 +27,8 @@ use aster_mesh::{
     ProvisioningLoadId, ProvisioningLoadReceipt, ProvisioningSecretLoader, ProvisioningSecretRef,
     ProvisioningSecretStoreError, UnprotectedProvisioning,
 };
+use aster_node::application::{Scope, Topic};
+use aster_node::{MutableSourceInterests, SourceInterestSelector};
 use buffa::Message as _;
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
@@ -754,6 +756,50 @@ fn config_check_validates_files_without_a_provider_and_bootstrap_uses_exact_refe
 }
 
 #[test]
+fn blob_receive_selectors_reach_the_opened_node_config() {
+    // Break caught: configuration validation succeeds but protected bootstrap
+    // opens a node with the default empty Blob receive interests.
+    let fixture = CustomerFixture::new();
+    fixture.set_blob_receive(&["imagery@alpha/team", "maps@bravo"], 33_554_432, 4_096, 64);
+    let config = load_and_validate_config(fixture.config_path()).expect("validated config");
+    let credentials =
+        load_startup_credentials(config.credential_paths()).expect("startup credentials");
+    let mut loader = RecordingLoader::new();
+    let node = open_node_config(config.runtime(), &credentials, &mut loader)
+        .expect("protected node config");
+
+    assert_eq!(
+        node.mutable_interests,
+        MutableSourceInterests::default().with_blob(vec![
+            SourceInterestSelector::new(
+                Topic::new("imagery").expect("literal topic"),
+                Scope::new("alpha/team").expect("literal scope"),
+                false,
+            ),
+            SourceInterestSelector::new(
+                Topic::new("maps").expect("literal topic"),
+                Scope::new("bravo").expect("literal scope"),
+                false,
+            ),
+        ])
+    );
+}
+
+#[test]
+fn legacy_customer_config_opens_with_no_blob_receive_interests() {
+    // Break caught: the additive configuration change silently enables Blob
+    // receipt for an existing systemd-v1 customer file.
+    let fixture = CustomerFixture::new();
+    let config = load_and_validate_config(fixture.config_path()).expect("validated config");
+    let credentials =
+        load_startup_credentials(config.credential_paths()).expect("startup credentials");
+    let mut loader = RecordingLoader::new();
+    let node = open_node_config(config.runtime(), &credentials, &mut loader)
+        .expect("protected node config");
+    assert_eq!(node.mutable_interests, MutableSourceInterests::default());
+}
+
+#[test]
 fn bootstrap_failure_redacts_the_provider_reference() {
     // Break caught: forwarding provider detail or the opaque reference from a
     // failed bootstrap would expose a customer credential in diagnostics.
@@ -897,6 +943,24 @@ impl CustomerFixture {
             serde_json::from_slice(&fs::read(&self.config).unwrap()).unwrap();
         config["storage"]["operations"] = serde_json::json!({
             "max_records": records, "max_logical_bytes": bytes, "emergency_reserve": reserve,
+        });
+        fs::write(&self.config, serde_json::to_vec(&config).unwrap()).unwrap();
+    }
+
+    fn set_blob_receive(
+        &self,
+        interests: &[&str],
+        max_bytes: u64,
+        max_chunks: u64,
+        max_variants: u64,
+    ) {
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&self.config).unwrap()).unwrap();
+        config["mesh"]["blob_interests"] = serde_json::json!(interests);
+        config["storage"]["blob_depot"] = serde_json::json!({
+            "max_bytes": max_bytes,
+            "max_chunks": max_chunks,
+            "max_variants": max_variants,
         });
         fs::write(&self.config, serde_json::to_vec(&config).unwrap()).unwrap();
     }

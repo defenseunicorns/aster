@@ -2,13 +2,13 @@ use crate::{api, validation};
 use std::{fs::File, io::Write as _, path::PathBuf};
 
 #[cfg(target_os = "linux")]
-use std::{ffi::OsString, os::fd::AsRawFd as _, path::Path};
+use std::{ffi::OsString, path::Path};
 
 pub const HELP: &str = "Usage: asterctl (--token TOKEN | --token-file PATH) [OPTIONS] blob-read
                 --id ID --topic TOPIC --scope SCOPE --output PATH
 
 Read an authenticated Blob to a new local file without overwriting an existing path.
-Requires Linux and destination-filesystem support for anonymous temporary files and descriptor linking.
+Requires Linux, an owner-controlled destination directory, and filesystem support for atomic no-replace rename and directory synchronization.
 
 OPTIONS:
       --id ID          Blob ID as Base64-encoded 32 bytes (required)
@@ -214,6 +214,8 @@ pub(crate) struct OutputFile {
     directory: File,
     #[cfg(target_os = "linux")]
     destination_name: OsString,
+    #[cfg(target_os = "linux")]
+    temporary_name: Option<OsString>,
     file: File,
 }
 
@@ -231,11 +233,21 @@ impl OutputFile {
         let directory = rustix::fs::openat(
             rustix::fs::CWD,
             parent,
-            rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
             rustix::fs::Mode::empty(),
         )
         .map(File::from)
         .map_err(|_| "cannot open output directory")?;
+        let directory_metadata =
+            rustix::fs::fstat(&directory).map_err(|_| "cannot inspect output directory")?;
+        if directory_metadata.st_uid != rustix::process::geteuid().as_raw()
+            || directory_metadata.st_mode & 0o022 != 0
+        {
+            return Err("output directory must be owner-controlled");
+        }
         match rustix::fs::statat(
             &directory,
             &destination_name,
@@ -245,17 +257,12 @@ impl OutputFile {
             Err(rustix::io::Errno::NOENT) => {}
             Err(_) => return Err("cannot inspect output path"),
         }
-        let anonymous = rustix::fs::openat(
-            &directory,
-            ".",
-            rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::TMPFILE,
-            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-        )
-        .map_err(|_| "blob-read output is unsupported by the destination filesystem")?;
+        let (temporary_name, temporary) = create_temporary(&directory)?;
         Ok(Self {
             directory,
             destination_name,
-            file: File::from(anonymous),
+            temporary_name: Some(temporary_name),
+            file: File::from(temporary),
         })
     }
 
@@ -275,42 +282,84 @@ impl OutputFile {
             .sync_all()
             .map_err(|_| "cannot finish output file")?;
         #[cfg(target_os = "linux")]
-        return publish_open_file(&self.file, &self.directory, &self.destination_name);
+        return self.finish_with_directory_sync(|directory| directory.sync_all());
         #[cfg(not(target_os = "linux"))]
         Err("blob-read output is unsupported on this platform")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn finish_with_directory_sync(
+        &mut self,
+        sync_directory: impl FnOnce(&File) -> std::io::Result<()>,
+    ) -> Result<(), &'static str> {
+        let temporary_name = self
+            .temporary_name
+            .as_ref()
+            .expect("unfinished output has a temporary name");
+        match rustix::fs::renameat_with(
+            &self.directory,
+            temporary_name,
+            &self.directory,
+            &self.destination_name,
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::EXIST) => return Err("output path already exists"),
+            Err(_) => {
+                return Err(
+                    "blob-read output publication is unsupported by the destination filesystem",
+                );
+            }
+        }
+        self.temporary_name = None;
+        sync_directory(&self.directory).map_err(|_| {
+            "output published but cannot synchronize output directory; verify it before retrying"
+        })
     }
 }
 
 #[cfg(target_os = "linux")]
-fn publish_open_file(
-    file: &File,
-    directory: &File,
-    destination_name: &OsString,
-) -> Result<(), &'static str> {
-    let direct = rustix::fs::linkat(
-        file,
-        "",
-        directory,
-        destination_name,
-        rustix::fs::AtFlags::EMPTY_PATH,
-    );
-    match direct {
-        Ok(()) => return Ok(()),
-        Err(rustix::io::Errno::EXIST) => return Err("output path already exists"),
-        Err(_) => {}
+fn create_temporary(directory: &File) -> Result<(OsString, rustix::fd::OwnedFd), &'static str> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for _ in 0..16 {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(|_| "cannot generate output temporary name")?;
+        let mut name = String::with_capacity(56);
+        name.push_str(".asterctl-blob-");
+        for byte in random {
+            name.push(char::from(HEX[usize::from(byte >> 4)]));
+            name.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        name.push_str(".partial");
+        let name = OsString::from(name);
+        match rustix::fs::openat(
+            directory,
+            &name,
+            rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        ) {
+            Ok(file) => return Ok((name, file)),
+            Err(rustix::io::Errno::EXIST) => {}
+            Err(_) => return Err("cannot create output temporary file"),
+        }
     }
+    Err("cannot allocate output temporary name")
+}
 
-    let descriptor_path = format!("/proc/self/fd/{}", file.as_raw_fd());
-    match rustix::fs::linkat(
-        rustix::fs::CWD,
-        descriptor_path,
-        directory,
-        destination_name,
-        rustix::fs::AtFlags::SYMLINK_FOLLOW,
-    ) {
-        Ok(()) => Ok(()),
-        Err(rustix::io::Errno::EXIST) => Err("output path already exists"),
-        Err(_) => Err("blob-read output publication is unsupported by the destination filesystem"),
+#[cfg(target_os = "linux")]
+impl Drop for OutputFile {
+    fn drop(&mut self) {
+        if let Some(temporary_name) = self.temporary_name.as_ref() {
+            let _ = rustix::fs::unlinkat(
+                &self.directory,
+                temporary_name,
+                rustix::fs::AtFlags::empty(),
+            );
+        }
     }
 }
 
@@ -325,8 +374,20 @@ mod tests {
         OutputFile {
             directory: File::open(std::env::temp_dir()).unwrap(),
             destination_name: OsString::from("unused"),
+            temporary_name: None,
             file,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn private_test_directory(label: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory =
+            std::env::temp_dir().join(format!("asterctl-blob-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        directory
     }
 
     fn request() -> api::ReadBlobRequest {
@@ -413,9 +474,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn blob_read_removes_partial_output_unless_finish_succeeds() {
-        let path =
-            std::env::temp_dir().join(format!("asterctl-blob-partial-{}", std::process::id()));
-        let _ = fs::remove_file(&path);
+        let directory = private_test_directory("partial");
+        let path = directory.join("destination");
         {
             let mut output = OutputFile::create(path.clone()).unwrap();
             output.write_page(b"partial plaintext").unwrap();
@@ -427,17 +487,14 @@ mod tests {
             output.finish().unwrap();
         }
         assert_eq!(fs::read(&path).unwrap(), b"complete plaintext");
-        fs::remove_file(path).unwrap();
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn blob_read_finalization_never_replaces_a_destination_created_during_transfer() {
-        let path = std::env::temp_dir().join(format!(
-            "asterctl-blob-finalize-race-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_file(&path);
+        let directory = private_test_directory("finalize-race");
+        let path = directory.join("destination");
 
         let mut output = OutputFile::create(path.clone()).unwrap();
         output.write_page(b"downloaded bytes").unwrap();
@@ -447,17 +504,14 @@ mod tests {
         drop(output);
         assert_eq!(fs::read(&path).unwrap(), b"unrelated replacement");
 
-        fs::remove_file(path).unwrap();
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
     #[cfg(target_os = "linux")]
     fn blob_read_publishes_the_exact_open_inode_not_a_named_replacement() {
-        let directory =
-            std::env::temp_dir().join(format!("asterctl-blob-open-inode-{}", std::process::id()));
+        let directory = private_test_directory("open-inode");
         let path = directory.join("destination");
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir(&directory).unwrap();
 
         let mut output = OutputFile::create(path.clone()).unwrap();
         output.write_page(b"downloaded bytes").unwrap();
@@ -475,20 +529,46 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn blob_read_reports_directory_sync_failure_as_post_publication() {
+        let directory = private_test_directory("directory-sync-failure");
+        let path = directory.join("destination");
+        let mut output = OutputFile::create(path.clone()).unwrap();
+        output.write_page(b"downloaded bytes").unwrap();
+        output.file.sync_all().unwrap();
+
+        assert_eq!(
+            output.finish_with_directory_sync(|_| Err(std::io::Error::other("fixture"))),
+            Err(
+                "output published but cannot synchronize output directory; verify it before retrying"
+            )
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"downloaded bytes");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
-    fn blob_read_never_creates_a_named_partial_file() {
-        let directory = std::env::temp_dir().join(format!(
-            "asterctl-blob-anonymous-output-{}",
-            std::process::id()
-        ));
+    fn blob_read_stages_an_owner_only_sibling_until_atomic_publication() {
+        let directory = private_test_directory("sibling-output");
         let path = directory.join("destination");
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir(&directory).unwrap();
 
         let mut output = OutputFile::create(path.clone()).unwrap();
         output.write_page(b"partial plaintext").unwrap();
-        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        assert!(!path.exists());
+        let entries = fs::read_dir(&directory)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            entries[0].metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         drop(output);
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
 
@@ -497,14 +577,26 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn blob_read_fails_closed_when_the_filesystem_lacks_anonymous_temporaries() {
-        let path = PathBuf::from(format!(
-            "/proc/asterctl-blob-unsupported-{}",
-            std::process::id()
-        ));
+    fn blob_read_rejects_a_destination_directory_writable_by_other_users() {
+        let directory = private_test_directory("shared-output");
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
+
         assert_eq!(
-            OutputFile::create(path).err(),
-            Some("blob-read output is unsupported by the destination filesystem")
+            OutputFile::create(directory.join("destination")).err(),
+            Some("output directory must be owner-controlled")
+        );
+
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn blob_read_fails_closed_when_the_directory_cannot_stage_a_sibling() {
+        assert_eq!(
+            OutputFile::create(PathBuf::from("/proc/self/fd/asterctl-blob-output")).err(),
+            Some("cannot create output temporary file")
         );
     }
 

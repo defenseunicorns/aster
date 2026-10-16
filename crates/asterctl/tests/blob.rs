@@ -172,7 +172,12 @@ fn blob_publish_rejects_a_writerless_fifo_without_blocking_preflight() {
 #[cfg(target_os = "linux")]
 #[test]
 fn blob_read_rejects_an_existing_output_without_clobbering_it() {
-    let output_path = source(b"keep me");
+    use std::os::unix::fs::PermissionsExt as _;
+    let directory = TestPath::new("existing-output-directory");
+    fs::create_dir(directory.path()).unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let output_path = directory.path().join("destination");
+    fs::write(&output_path, b"keep me").unwrap();
     let output = cli([
         OsString::from("blob-read"),
         "--token".into(),
@@ -184,17 +189,18 @@ fn blob_read_rejects_an_existing_output_without_clobbering_it() {
         "--scope".into(),
         "mission/team/alpha".into(),
         "--output".into(),
-        output_path.path().as_os_str().to_owned(),
+        output_path.as_os_str().to_owned(),
         "--port".into(),
         "1".into(),
     ]);
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(fs::read(output_path.path()).unwrap(), b"keep me");
+    assert_eq!(fs::read(&output_path).unwrap(), b"keep me");
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
             .contains("output path already exists")
     );
+    fs::remove_file(output_path).unwrap();
 }
 
 #[cfg(not(target_os = "linux"))]

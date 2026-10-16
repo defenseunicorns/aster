@@ -25,10 +25,34 @@ The top-level object rejects unknown fields and contains:
 | `state.directory` | Fixed deployment value `/var/lib/aster` in the Compose profile. |
 | `application.listen` | Loopback application endpoint; the example uses `127.0.0.1:8181`. |
 | `health.listen` | Separate loopback lifecycle endpoint; the example uses `127.0.0.1:8182`. |
-| `mesh` | Mesh bind address, bounded synchronization interval, emission policy, and explicit peers. |
+| `mesh` | Mesh bind address, bounded synchronization interval, emission policy, optional exact `blob_interests`, and explicit peers. |
 | `credentials.client_token_file` | Exactly `/run/secrets/aster-client-token`. |
 | `credentials.mission_activation_file` | Exactly `/run/secrets/aster-mission-activation`. |
-| `storage` | Bounded item, payload, operation-record, logical-byte, and reserve limits. |
+| `storage` | Bounded item, payload, operation-record, logical-byte, reserve, and optional Blob-depot limits. |
+
+Schema v2 uses the same Blob receive and depot rules as
+[schema v1](aster-agent-config-v1.md): absent or empty
+`mesh.blob_interests` receives no Blob network work; a nonempty list accepts at
+most 256 unique canonical exact `TOPIC@SCOPE` selectors and requires explicit
+nonzero `storage.blob_depot.max_bytes`, `max_chunks`, and `max_variants`.
+Malformed, descendant/wildcard, duplicate canonical, and oversized selector
+sets fail validation. Supplying depot limits with empty interests is valid and
+bounds local Blob publication.
+
+Selectors are restart-only receive policy, not mission authority or application
+subscriptions. Mission route/content authorization remains authoritative, and
+authenticated peers can observe the exact configured topic/scope interest
+metadata under the current policy. `receive_only` retains the validated
+configuration for a later normal-mode restart but performs zero Blob network
+work. Public Blob API access, mesh receive interests, and the separate Rust
+application-subscription surface are independent.
+
+The canonical example deliberately uses an empty interest list and explicit
+depot limits. To opt in, replace that array with values such as
+`"imagery.maps@mission/team/alpha"` only after reviewing mission authorization
+and metadata exposure. Older Compose agents reject both new fields as unknown;
+rollback must restore the prior configuration bytes and update the reviewed
+`ASTER_AGENT_CONFIG_SHA256` together with the executable rollback.
 
 The provisioning envelope path is fixed by the Compose provider at
 `/run/secrets/aster-provisioning-bundle`; it is not configurable. All three

@@ -132,14 +132,16 @@ local tags above. Both registry digests and verified local image IDs are
 immutable deployment inputs; mutable tags remain invalid. The manually
 triggered `build-compose-images.yml` workflow is packaging automation, not
 runtime qualification. It retains architecture-specific Docker-loadable
-archives, digest-pinned OCI archives, and four binary-rooted CycloneDX SBOMs
-grouped as the two-binary agent image set and two-binary administration image
-set. Each
+archives, digest-pinned OCI archives, and five binary-rooted CycloneDX SBOMs
+grouped as the two-binary agent image set and three-binary administration image
+set, which includes `asterctl`. Each
 SBOM retains its binary component identity, carries the corresponding OCI
 digest as an explicit property, passes schema and root/dependency license
 checks, and is listed in the release manifest. The bundle also retains
-`LICENSE`, notices, `compose.yaml`, the `agent.example.json` configuration
-template, their digests, architecture, source revision, builder versions,
+`LICENSE`, notices, `compose.yaml`, the opt-in `compose.remote-mesh.yaml`, the
+`agent.example.json` configuration template, and
+`aster_compose_delivery.py` validator, their digests, architecture, source
+revision, builder versions,
 checksums, and build provenance. A repository-owned bounded static
 inspector selects the requested Linux `amd64` or Linux `arm64` image manifest
 instead of provenance attestations, checks the config and exact scratch
@@ -165,15 +167,21 @@ test "$ASTER_UID" -ne 0 && test "$ASTER_GID" -ne 0
 export ASTER_DEPLOYMENT_ROOT="$(pwd -P)/aster-site-a"
 export ASTER_GENERATION_PARENT="$ASTER_DEPLOYMENT_ROOT/credential-generations"
 export ASTER_STATE_DIR="$ASTER_DEPLOYMENT_ROOT/state"
+export ASTER_TRANSFER_DIR="$ASTER_DEPLOYMENT_ROOT/transfer"
 export ASTER_TOKEN_INPUT="$ASTER_DEPLOYMENT_ROOT/input/client-token"
 export ASTER_BUNDLE_INPUT="$ASTER_DEPLOYMENT_ROOT/input/mission.astpb03"
 install -d -m 0700 "$ASTER_DEPLOYMENT_ROOT" "$ASTER_GENERATION_PARENT" \
-  "$ASTER_STATE_DIR" "$ASTER_DEPLOYMENT_ROOT/input"
+  "$ASTER_STATE_DIR" "$ASTER_TRANSFER_DIR" "$ASTER_DEPLOYMENT_ROOT/input"
 chmod 0600 "$ASTER_TOKEN_INPUT" "$ASTER_BUNDLE_INPUT"
 ```
 
-Protect the bundle input under site policy. Confirm that both inputs belong to
-the intended issuance and authorization transaction before creation.
+Protect both inputs under site policy. The generation creator wraps the token
+for the provider-aware agent, while Compose mounts the owner-only plaintext
+`ASTER_TOKEN_INPUT` only into the one-shot `asterctl` service. The validator
+requires this input to be an absolute, singly linked, owner-matched regular
+file with mode `0400` or `0600` and valid token contents. Confirm that both
+inputs belong to the intended issuance and authorization transaction before
+creation.
 
 ## Create an immutable generation
 
@@ -201,8 +209,13 @@ Credential files must be exactly `0400` or `0600`, singly linked, and unchanged.
 
 ```sh
 export ASTER_CREDENTIAL_GENERATION_DIR="$ASTER_GENERATION_PARENT/generation-<64-hex>"
+chmod 0500 "$ASTER_CREDENTIAL_GENERATION_DIR"
 find "$ASTER_CREDENTIAL_GENERATION_DIR" -maxdepth 1 -printf '%u:%g %m %f\n'
 ```
+
+The host-side `chmod` is idempotent and closes the directory if a desktop
+bind-mount implementation did not preserve the creator container's final
+`0500` mode. Stop if ownership, file modes, or the validator still disagree.
 
 ## Configure and validate without a daemon lifecycle test
 
@@ -219,8 +232,8 @@ export ASTER_AGENT_CONFIG_SHA256='<reviewed-64-lowercase-hex>'
 : "${ASTER_AGENT_IMAGE_DIGEST:?set verified local image ID or registry digest}"
 : "${ASTER_ADMIN_IMAGE_DIGEST:?set verified local image ID or registry digest}"
 export COMPOSE_PROJECT_NAME=aster-site-a
-python3 tools/aster_compose_delivery.py docker/compose-agent/compose.yaml
-docker compose -f docker/compose-agent/compose.yaml config --format json \
+python3 ./aster_compose_delivery.py ./compose.yaml
+docker compose -f ./compose.yaml config --format json \
   > /tmp/aster-compose.rendered.json
 ```
 
@@ -232,24 +245,26 @@ closed if Compose later mounts different bytes. The validator also rejects a mis
 and records the name. The render command is `docker compose config --format json`;
 the explicit file option above selects the checked-in model. Confirm
 that the rendered state mount binds the exact reviewed `ASTER_STATE_DIR` to
-`/var/lib/aster` and that the rendered service and network names carry the same
-project prefix. These remain project-qualified Compose resources. Reusing a
+`/var/lib/aster`, the CLI transfer mount binds the exact reviewed
+`ASTER_TRANSFER_DIR` to `/transfer`, and the rendered service and network names
+carry the same project prefix. These remain project-qualified Compose resources. Reusing a
 project name means intentionally addressing that existing deployment; it never
 creates a second agent.
 
-Inspect the render for the two image digests, numeric identity, one exact state
-bind mount, and exactly three sources below the selected generation. It must not
+Inspect the render for the two image digests, numeric identity, the exact state
+and transfer bind mounts, and exactly three sources below the selected generation. It must not
 contain credential bytes, a Docker socket, host namespaces, extra capabilities,
 or Swarm `deploy` configuration.
 
 ## Run preflight
 
-The validator requires `ASTER_STATE_DIR` to be an absolute, non-symlinked
-directory owned by `ASTER_UID:ASTER_GID` with exact mode `0700`. No service runs
-as container root and no service receives an added capability.
+The validator requires `ASTER_STATE_DIR` and `ASTER_TRANSFER_DIR` to be
+absolute, non-symlinked directories owned by `ASTER_UID:ASTER_GID` with exact
+mode `0700`. No service runs as container root and no service receives an added
+capability.
 
 ```sh
-docker compose -f docker/compose-agent/compose.yaml run --rm preflight
+docker compose -f ./compose.yaml run --rm preflight
 ```
 
 The preflight has `network_mode: none`, no state mount, a read-only root
@@ -259,8 +274,9 @@ Do not proceed after any preflight failure.
 ## Activate and verify
 
 ```sh
-docker compose -f docker/compose-agent/compose.yaml up -d --force-recreate aster-agent
-docker compose -f docker/compose-agent/compose.yaml run --rm verify
+docker compose -f ./compose.yaml up -d --force-recreate aster-agent
+docker compose -f ./compose.yaml run --rm verify
+docker compose -f ./compose.yaml run --rm asterctl --json status
 ```
 
 The verify helper makes an authenticated status request and compares the
@@ -268,6 +284,36 @@ returned `credential_generation` with the selected manifest. `VERIFY
 status=pass` confirms that comparison; it does not authorize rollback or
 qualify the host. Never use plain `docker compose restart` for rotation because
 restart does not apply changed Compose configuration.
+
+The `asterctl` service uses the same admin image, shares the agent network
+namespace, and receives only the selected client token plus the operator-owned
+transfer directory. Arguments after the service name replace its default
+`status` command while retaining the fixed token-file entrypoint.
+See the [operator runbook](../operator-guide.md#3-docker-compose-runbook) for
+copyable Event, durable and finite-TTL Blob, and agent-replacement checks using
+only these downloaded artifacts.
+
+## Opt in to remote mesh traffic
+
+The default Compose file publishes no host port. For a reviewed physical-peer
+test, bind UDP 8183 only to the intended host IPv4 interface and add the shipped
+override to all lifecycle commands:
+
+```sh
+export ASTER_MESH_BIND_ADDRESS='<reviewed-host-ipv4>'
+export ASTER_MESH_PUBLISHED_PORT=8183
+docker compose -f compose.yaml -f compose.remote-mesh.yaml config --format json
+docker compose -f compose.yaml -f compose.remote-mesh.yaml run --rm preflight
+docker compose -f compose.yaml -f compose.remote-mesh.yaml \
+  up -d --force-recreate aster-agent
+docker compose -f compose.yaml -f compose.remote-mesh.yaml run --rm verify
+```
+
+The bind address is required and the published port must be in `1..65535`.
+Configure the other Aster node with the host address and published UDP port,
+and permit that UDP port in applicable host firewall policy. The override does
+not make ZeroTier or any other carrier trusted; Aster authentication remains
+required.
 
 ## Rotate, roll back, and retain
 
@@ -298,16 +344,16 @@ user-owned paths:
 ```sh
 export ASTER_BACKUP_DIR="$ASTER_DEPLOYMENT_ROOT/encrypted-backups/aster-site-a-20261008"
 install -d -m 0700 "$ASTER_BACKUP_DIR"
-docker compose -f docker/compose-agent/compose.yaml stop -t 40 aster-agent
-test -z "$(docker compose -f docker/compose-agent/compose.yaml ps --status running -q aster-agent)"
+docker compose -f ./compose.yaml stop -t 40 aster-agent
+test -z "$(docker compose -f ./compose.yaml ps --status running -q aster-agent)"
 umask 077
 tar --acls --xattrs -cpf "$ASTER_BACKUP_DIR/state.tar" -C "$ASTER_STATE_DIR" .
 tar --acls --xattrs -cpf "$ASTER_BACKUP_DIR/credential-generation.tar" \
   -C "$ASTER_GENERATION_PARENT" "$(basename "$ASTER_CREDENTIAL_GENERATION_DIR")"
 (cd "$ASTER_BACKUP_DIR" && \
   sha256sum state.tar credential-generation.tar > SHA256SUMS)
-docker compose -f docker/compose-agent/compose.yaml up -d --force-recreate aster-agent
-docker compose -f docker/compose-agent/compose.yaml run --rm verify
+docker compose -f ./compose.yaml up -d --force-recreate aster-agent
+docker compose -f ./compose.yaml run --rm verify
 ```
 
 Record the project name, image digests, configuration digest, selected
@@ -325,7 +371,7 @@ application-level recovery check succeeds:
 test ! -e "$ASTER_CREDENTIAL_GENERATION_DIR"
 tar --acls --xattrs --same-permissions -xpf \
   "$ASTER_BACKUP_DIR/credential-generation.tar" -C "$ASTER_GENERATION_PARENT"
-docker compose -f docker/compose-agent/compose.yaml down
+docker compose -f ./compose.yaml down
 test "$(dirname "$ASTER_STATE_DIR")" = "$ASTER_DEPLOYMENT_ROOT"
 export ASTER_PRE_RESTORE_STATE="$ASTER_STATE_DIR.before-restore"
 test ! -e "$ASTER_PRE_RESTORE_STATE"
@@ -333,9 +379,9 @@ mv -- "$ASTER_STATE_DIR" "$ASTER_PRE_RESTORE_STATE"
 install -d -m 0700 "$ASTER_STATE_DIR"
 tar --acls --xattrs --same-permissions -xpf "$ASTER_BACKUP_DIR/state.tar" \
   -C "$ASTER_STATE_DIR"
-docker compose -f docker/compose-agent/compose.yaml run --rm preflight
-docker compose -f docker/compose-agent/compose.yaml up -d --force-recreate aster-agent
-docker compose -f docker/compose-agent/compose.yaml run --rm verify
+docker compose -f ./compose.yaml run --rm preflight
+docker compose -f ./compose.yaml up -d --force-recreate aster-agent
+docker compose -f ./compose.yaml run --rm verify
 ```
 
 Successful preflight and generation verification do not replace an
@@ -357,7 +403,7 @@ decommissioning is a separate authorized action. Stop the exact project,
 inspect the exact user-owned path, and only then remove it:
 
 ```sh
-docker compose -f docker/compose-agent/compose.yaml down
+docker compose -f ./compose.yaml down
 test "$(dirname "$ASTER_STATE_DIR")" = "$ASTER_DEPLOYMENT_ROOT"
 find "$ASTER_STATE_DIR" -maxdepth 1 -printf '%u:%g %m %f\n'
 rm --one-file-system -r -- "$ASTER_STATE_DIR"
