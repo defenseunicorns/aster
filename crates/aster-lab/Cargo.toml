@@ -61,7 +61,7 @@ path = "src/selected_relay_main.rs"
 required-features = ["selected-nat"]
 
 [dev-dependencies]
-negentropy = "=0.5.1"
+negentropy = "=0.5.2"
 
 [lints]
 workspace = true
