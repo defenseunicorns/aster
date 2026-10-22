@@ -248,8 +248,35 @@ Successful abandon and acknowledgement, and validated recovery of consumed
 sequences, delete their full local rows and payloads.
 
 The journal is durable protocol state. A missing, corrupt, already-open, or
-wrong-client journal fails closed; `open` never recreates it. Initialization is
-a separate one-time operation:
+wrong-client journal fails closed; `open` never recreates it.
+
+On Unix, the Rust SDK and native example journals open the parent directory
+before exclusive, no-follow file creation and synchronize that same retained
+directory after the initial durable transaction. Parent components must not be
+symlinks or `..`. The native example can create private nested parents; it
+opens each child relative to the retained ancestor and synchronizes each child
+and parent before proceeding. The SDK requires existing parents. Rust journal
+filesystem operations fail as unsupported on non-Unix platforms; directory
+synchronization must also be supported by the filesystem.
+
+The Go acceptance journal is Linux-only and uses descriptor-relative operations:
+its lock, read, exclusive temporary creation, replacement, cleanup, and parent
+synchronization all use the same retained directory. Renaming or replacing an
+ancestor pathname does not redirect an already-open journal's writes. Rust
+updates remain on the preopened redb file and retain redb writer exclusion.
+Keep journal directories private: this is not protection against an authorized
+writer unlinking/replacing the journal or its lock inside the retained directory,
+nor does it reconstruct a renamed journal's location for the next process.
+
+A failed directory synchronization returns an error without deleting or
+reinitializing the valid written state. Preserve that file and its client ID;
+close and reopen it for recovery, rather than starting a new identity. A Go
+save failure disables further RPCs on that owner until close/reopen. Tests use
+deterministic directory replacement and injected synchronization failures on
+one Linux host; they do not qualify filesystem, device, or physical power-loss
+recovery and do not advance retained requirements evidence.
+
+Initialization is a separate one-time operation:
 
 ```no_run
 # #[cfg(feature = "client")]

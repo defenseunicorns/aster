@@ -6,11 +6,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"connectrpc.com/connect"
@@ -51,11 +53,14 @@ type state struct {
 // Journal has one owner; callers serialize its method calls.
 type Journal struct {
 	path      string
+	dir       *os.File
+	syncDir   func() error
 	lock      *os.File
 	state     state
 	client    Client
 	token     string
 	recovered bool
+	poisoned  bool
 }
 
 func request[T any](value *T, token string) *connect.Request[T] {
@@ -71,36 +76,41 @@ func regularOwned(file *os.File) bool {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	return ok && stat.Uid == uint32(os.Geteuid())
 }
-func openFile(path string, flags int) (*os.File, error) {
-	file, err := os.OpenFile(path, flags|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0600)
+func openFileAt(dir *os.File, name string, flags int) (*os.File, error) {
+	fd, err := syscall.Openat(int(dir.Fd()), name, flags|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0600)
 	if err != nil {
 		return nil, ErrJournal
 	}
+	file := os.NewFile(uintptr(fd), name)
 	if !regularOwned(file) {
 		file.Close()
 		return nil, ErrJournal
 	}
 	return file, nil
 }
-func validPath(path string) bool {
-	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
-		return false
-	}
-	for parent := filepath.Dir(path); ; parent = filepath.Dir(parent) {
-		info, err := os.Lstat(parent)
-		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return false
-		}
-		if parent == "/" {
-			return true
-		}
-	}
-}
-func lockJournal(path string) (*os.File, error) {
-	if !validPath(path) {
+func openParent(path string) (*os.File, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || filepath.Base(path) == "/" {
 		return nil, ErrJournal
 	}
-	lock, err := openFile(path+".lock", os.O_RDWR|os.O_CREATE)
+	dir, err := os.Open("/")
+	if err != nil {
+		return nil, ErrJournal
+	}
+	for _, part := range strings.Split(strings.TrimPrefix(filepath.Dir(path), "/"), "/") {
+		if part == "" {
+			continue
+		}
+		fd, err := syscall.Openat(int(dir.Fd()), part, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+		dir.Close()
+		if err != nil {
+			return nil, ErrJournal
+		}
+		dir = os.NewFile(uintptr(fd), part)
+	}
+	return dir, nil
+}
+func lockJournal(dir *os.File, name string) (*os.File, error) {
+	lock, err := openFileAt(dir, name+".lock", os.O_RDWR|os.O_CREATE)
 	if err != nil {
 		return nil, err
 	}
@@ -117,12 +127,20 @@ func Initialize(path string, id []byte) error {
 	if !validID(id) {
 		return ErrJournal
 	}
-	lock, err := lockJournal(path)
+	dir, err := openParent(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return initializeAt(dir, filepath.Base(path), id, dir.Sync)
+}
+func initializeAt(dir *os.File, name string, id []byte, syncDir func() error) error {
+	lock, err := lockJournal(dir, name)
 	if err != nil {
 		return err
 	}
 	defer lock.Close()
-	file, err := openFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
+	file, err := openFileAt(dir, name, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
 	if err != nil {
 		return err
 	}
@@ -134,15 +152,7 @@ func Initialize(path string, id []byte) error {
 	if _, err = file.Write(encoded); err != nil || file.Sync() != nil {
 		return ErrJournal
 	}
-	return syncParent(path)
-}
-func syncParent(path string) error {
-	dir, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return ErrJournal
-	}
-	defer dir.Close()
-	if dir.Sync() != nil {
+	if syncDir() != nil {
 		return ErrJournal
 	}
 	return nil
@@ -153,17 +163,23 @@ func Open(path string, id []byte, client Client, token string) (*Journal, error)
 	if !validID(id) {
 		return nil, ErrJournal
 	}
-	lock, err := lockJournal(path)
+	dir, err := openParent(path)
 	if err != nil {
+		return nil, err
+	}
+	lock, err := lockJournal(dir, filepath.Base(path))
+	if err != nil {
+		dir.Close()
 		return nil, err
 	}
 	success := false
 	defer func() {
 		if !success {
+			dir.Close()
 			lock.Close()
 		}
 	}()
-	file, err := openFile(path, os.O_RDONLY)
+	file, err := openFileAt(dir, filepath.Base(path), os.O_RDONLY)
 	if err != nil {
 		return nil, err
 	}
@@ -189,7 +205,7 @@ func Open(path string, id []byte, client Client, token string) (*Journal, error)
 		seen[entry.Intent.OperationSequence] = true
 	}
 	success = true
-	return &Journal{path: path, lock: lock, state: saved, client: client, token: token}, nil
+	return &Journal{path: path, dir: dir, syncDir: dir.Sync, lock: lock, state: saved, client: client, token: token}, nil
 }
 func (j *Journal) Close() error {
 	j.recovered = false
@@ -198,14 +214,15 @@ func (j *Journal) Close() error {
 	}
 	lock := j.lock
 	j.lock = nil
-	return lock.Close()
+	return errors.Join(lock.Close(), j.dir.Close())
 }
 func (j *Journal) save() (saveError error) {
-	if j.lock == nil {
+	if j.lock == nil || j.poisoned {
 		return ErrJournal
 	}
 	defer func() {
 		if saveError != nil {
+			j.poisoned = true
 			j.recovered = false
 		}
 	}()
@@ -213,12 +230,16 @@ func (j *Journal) save() (saveError error) {
 	if err != nil || len(encoded) > maxJournalBytes {
 		return ErrJournal
 	}
-	file, err := os.CreateTemp(filepath.Dir(j.path), ".numbered-journal-")
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return ErrJournal
+	}
+	name := ".numbered-journal-" + hex.EncodeToString(nonce[:])
+	file, err := openFileAt(j.dir, name, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
 	if err != nil {
 		return ErrJournal
 	}
-	name := file.Name()
-	defer os.Remove(name)
+	defer syscall.Unlinkat(int(j.dir.Fd()), name)
 	if file.Chmod(0600) != nil {
 		file.Close()
 		return ErrJournal
@@ -230,10 +251,13 @@ func (j *Journal) save() (saveError error) {
 	if file.Close() != nil {
 		return ErrJournal
 	}
-	if os.Rename(name, j.path) != nil {
+	if syscall.Renameat(int(j.dir.Fd()), name, int(j.dir.Fd()), filepath.Base(j.path)) != nil {
 		return ErrJournal
 	}
-	return syncParent(j.path)
+	if j.syncDir() != nil {
+		return ErrJournal
+	}
+	return nil
 }
 func validResult(result *api.CommittedPublicationResult) bool {
 	return result != nil && result.OperationSequence > 0 && result.Receipt != nil && len(result.Receipt.TransferId) == 32 && len(result.Receipt.EventId) == 32 && result.Receipt.AcceptanceMarker > 0 && (result.Content == api.CommittedContentStatus_COMMITTED_CONTENT_STATUS_AVAILABLE && result.RetirementReason == nil || result.Content == api.CommittedContentStatus_COMMITTED_CONTENT_STATUS_RETIRED && result.RetirementReason != nil && (*result.RetirementReason == api.RetirementReason_RETIREMENT_REASON_EXPIRED || *result.RetirementReason == api.RetirementReason_RETIREMENT_REASON_QUOTA_PRESSURE))
@@ -250,7 +274,7 @@ func (j *Journal) entry(sequence uint64) *Entry {
 // Recover fences the prior process and durably reconciles the complete snapshot.
 // Retained committed results remain available for application before ack.
 func (j *Journal) Recover(ctx context.Context) error {
-	if j.lock == nil {
+	if j.lock == nil || j.poisoned {
 		return ErrJournal
 	}
 	j.recovered = false

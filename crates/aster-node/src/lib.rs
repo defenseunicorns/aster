@@ -39,6 +39,8 @@ mod demo_publication;
 mod event_pages;
 mod frame;
 mod identity;
+#[doc(hidden)]
+pub mod journal_directory;
 pub mod mission;
 pub mod publication_journal;
 mod runtime;
