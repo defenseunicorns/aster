@@ -1,6 +1,12 @@
 use aster_redb_store::{EventClientId, EventPublicationSession, Store};
 use std::process::Command;
 
+fn random_claim_nonce() -> [u8; 32] {
+    let mut nonce = [0; 32];
+    getrandom::fill(&mut nonce).expect("test claim randomness");
+    nonce
+}
+
 #[test]
 fn offline_operator_limits_retirement_and_capacity_preserve_permanent_slots() {
     let mut nonce = [0; 16];
@@ -15,7 +21,7 @@ fn offline_operator_limits_retirement_and_capacity_preserve_permanent_slots() {
     let client = EventClientId::new(b"operator-client".to_vec()).unwrap();
     let store = Store::open_for_mission(&path, [0xb8; 32]).unwrap();
     store
-        .begin_event_publication_session(&client, 0, b"initial")
+        .begin_event_publication_session(&client, 0, &random_claim_nonce())
         .unwrap();
     drop(store);
     let run = |args: &[&str]| {
@@ -80,7 +86,7 @@ fn offline_operator_limits_retirement_and_capacity_preserve_permanent_slots() {
     let store = Store::open_for_mission(&path, [0xb8; 32]).unwrap();
     assert!(
         store
-            .begin_event_publication_session(&client, 1, b"reuse")
+            .begin_event_publication_session(&client, 1, &random_claim_nonce())
             .is_err()
     );
     assert!(

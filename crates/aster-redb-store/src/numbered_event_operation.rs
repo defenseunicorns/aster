@@ -2550,6 +2550,12 @@ mod tests {
         client
     }
 
+    fn random_claim_nonce() -> [u8; 32] {
+        let mut nonce = [0; 32];
+        getrandom::fill(&mut nonce).expect("test claim randomness");
+        nonce
+    }
+
     #[test]
     fn lifecycle_limits_reject_only_growth_and_retirement_releases_sparse_results() {
         let file = CorruptionFile::new("lifecycle-capacity");
@@ -2564,7 +2570,7 @@ mod tests {
         assert_eq!(before.outstanding_results, 1);
         // Saturation still permits takeover/recovery and individual acknowledgement.
         let claim = store
-            .begin_event_publication_session(&client, 1, b"takeover")
+            .begin_event_publication_session(&client, 1, &random_claim_nonce())
             .unwrap();
         store
             .complete_event_publication_recovery(&client, claim.session, claim.snapshot_revision)
@@ -2619,7 +2625,7 @@ mod tests {
                 .begin_event_publication_session(
                     &EventClientId::new(b"new".to_vec()).unwrap(),
                     0,
-                    b"claim"
+                    &random_claim_nonce()
                 )
                 .is_err()
         );
@@ -2656,7 +2662,7 @@ mod tests {
             assert_eq!(store.numbered_event_operation_stats().unwrap(), before);
         }
         let snapshot = store
-            .begin_event_publication_session(&client, 1, b"recovery-at-capacity")
+            .begin_event_publication_session(&client, 1, &random_claim_nonce())
             .unwrap();
         assert_eq!(snapshot.allocated_through, 0);
         store
