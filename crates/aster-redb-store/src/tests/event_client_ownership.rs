@@ -1,5 +1,11 @@
 use super::*;
 
+fn random_claim_nonce() -> [u8; 32] {
+    let mut nonce = [0; 32];
+    getrandom::fill(&mut nonce).expect("test claim randomness");
+    nonce
+}
+
 fn claim(
     store: &Store,
     name: &[u8],
@@ -7,10 +13,8 @@ fn claim(
     complete: bool,
 ) -> (EventClientContext, EventRecoverySnapshot) {
     let client_id = EventClientId::new(name.to_vec()).unwrap();
-    let mut nonce = [0; 32];
-    getrandom::fill(&mut nonce).unwrap();
     let snapshot = store
-        .begin_event_publication_session(&client_id, expected, &nonce)
+        .begin_event_publication_session(&client_id, expected, &random_claim_nonce())
         .unwrap();
     if complete {
         store
@@ -550,7 +554,7 @@ fn retirement_is_atomic_permanent_and_never_reclaims_the_client_slot() {
         assert_eq!(status.disposition, EventClientDisposition::Retired);
     }
     assert!(matches!(
-        store.begin_event_publication_session(&owner.client_id, 0, b"new"),
+        store.begin_event_publication_session(&owner.client_id, 0, &random_claim_nonce()),
         Err(StoreError::NumberedEventOperation(
             NumberedEventOperationError::ClientRetired
         ))
@@ -588,7 +592,7 @@ fn retirement_is_atomic_permanent_and_never_reclaims_the_client_slot() {
             .begin_event_publication_session(
                 &EventClientId::new(b"other".to_vec()).unwrap(),
                 0,
-                b"claim"
+                &random_claim_nonce()
             )
             .is_err()
     );
