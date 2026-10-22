@@ -609,6 +609,7 @@ impl api::AsterApplicationService for AsterConnectService {
                     EventClientDisposition::Unregistered => {
                         api::EventClientDisposition::Unregistered
                     }
+                    EventClientDisposition::Retired => api::EventClientDisposition::Retired,
                     EventClientDisposition::Current => api::EventClientDisposition::Current,
                     EventClientDisposition::Fenced => api::EventClientDisposition::Fenced,
                     EventClientDisposition::RecoveryRequired => {

@@ -144,6 +144,7 @@ enum EventClientDisposition {
   EVENT_CLIENT_DISPOSITION_FENCED = 2;
   EVENT_CLIENT_DISPOSITION_RECOVERY_REQUIRED = 3;
   EVENT_CLIENT_DISPOSITION_UNREGISTERED = 4;
+  EVENT_CLIENT_DISPOSITION_RETIRED = 5;
 }
 
 // Observation never claims a session or completes recovery.

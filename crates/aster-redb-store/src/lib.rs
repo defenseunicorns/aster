@@ -5671,6 +5671,160 @@ fn require_exact_writer_exclusion(
     }
 }
 
+fn remove_event_client_subscriptions_write(
+    write: &redb::WriteTransaction,
+    client: &EventClientId,
+) -> Result<(), StoreError> {
+    let table = write.open_table(EVENT_SUBSCRIPTIONS)?;
+    if table.len()? > MAX_EVENT_SUBSCRIPTIONS {
+        return Err(StoreError::SemanticInvariant(
+            "subscription safety cap exceeded",
+        ));
+    }
+    let mut ids = Vec::new();
+    for row in table.iter()? {
+        let (key, value) = row?;
+        if decode_event_subscription_record(value.value())?.owner == *client {
+            ids.push(parse_event_subscription_id(key.value())?);
+        }
+    }
+    drop(table);
+    for id in ids {
+        remove_event_subscription_write(write, id)?;
+    }
+    Ok(())
+}
+fn remove_event_subscription_write(
+    write: &redb::WriteTransaction,
+    id: EventSubscriptionId,
+) -> Result<(), StoreError> {
+    let subscription_count = write.open_table(EVENT_SUBSCRIPTIONS)?.len()?;
+    let pending_count = write.open_table(EVENT_SUBSCRIPTION_PENDING)?.len()?;
+    let acknowledgement_count = write.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?.len()?;
+    let (selector_generation, next_subscription_count) = {
+        let metadata = write.open_table(METADATA)?;
+        for (field, reconstructed) in [
+            (EVENT_SUBSCRIPTION_COUNT, subscription_count),
+            (EVENT_PENDING_DELIVERY_COUNT, pending_count),
+            (EVENT_ACKNOWLEDGEMENT_COUNT, acknowledgement_count),
+        ] {
+            let durable = metadata
+                .get(field)?
+                .ok_or(StoreError::MissingAccountingMetadata { field })?
+                .value();
+            if durable != reconstructed {
+                return Err(StoreError::AccountingMismatch {
+                    field,
+                    durable,
+                    reconstructed,
+                });
+            }
+        }
+        let generation = metadata
+            .get(EVENT_SELECTOR_REVISION)?
+            .ok_or(StoreError::MissingAccountingMetadata {
+                field: EVENT_SELECTOR_REVISION,
+            })?
+            .value();
+        validate_event_selector_generation(generation, subscription_count)?;
+        let next_count = subscription_count
+            .checked_sub(1)
+            .ok_or(StoreError::SemanticInvariant(
+                "Event subscription counter underflow",
+            ))?;
+        (generation, next_count)
+    };
+
+    let mut pending_removals = Vec::new();
+    {
+        let pending = write.open_table(EVENT_SUBSCRIPTION_PENDING)?;
+        for row in pending.iter()? {
+            let (key, value) = row?;
+            let key_bytes: [u8; 40] = key.value().try_into().map_err(|_| {
+                StoreError::SemanticInvariant("Event pending-delivery key has invalid length")
+            })?;
+            let (row_subscription, _) = parse_event_pending_delivery_key(&key_bytes)?;
+            if row_subscription == id {
+                let pending = decode_event_pending_delivery_record(value.value())?;
+                pending_removals.push((key_bytes, pending.semantic_id));
+            }
+        }
+    }
+    let mut acknowledgement_removals = Vec::new();
+    {
+        let acknowledgements = write.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?;
+        for row in acknowledgements.iter()? {
+            let (key, value) = row?;
+            let key_bytes: [u8; 64] = key.value().try_into().map_err(|_| {
+                StoreError::SemanticInvariant("Event acknowledgement key has invalid length")
+            })?;
+            let (row_subscription, semantic_id) = parse_event_acknowledgement_key(&key_bytes)?;
+            if row_subscription == id {
+                decode_event_acknowledgement_record(value.value())?;
+                acknowledgement_removals.push((key_bytes, semantic_id));
+            }
+        }
+    }
+    let removed_pending = u64::try_from(pending_removals.len())
+        .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+    let removed_acknowledgements = u64::try_from(acknowledgement_removals.len())
+        .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
+    let next_pending_count =
+        pending_count
+            .checked_sub(removed_pending)
+            .ok_or(StoreError::SemanticInvariant(
+                "Event pending-delivery counter underflow",
+            ))?;
+    let next_acknowledgement_count = acknowledgement_count
+        .checked_sub(removed_acknowledgements)
+        .ok_or(StoreError::SemanticInvariant(
+            "Event acknowledgement counter underflow",
+        ))?;
+    let next_generation = selector_generation
+        .checked_add(1)
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+
+    {
+        let mut pending = write.open_table(EVENT_SUBSCRIPTION_PENDING)?;
+        for (key, semantic_id) in &pending_removals {
+            pending.remove(key.as_slice())?;
+            custody::remove_event_pending_retirement_reference_write(
+                write,
+                *semantic_id,
+                key.as_slice(),
+            )?;
+        }
+    }
+    {
+        let mut acknowledgements = write.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?;
+        for (key, semantic_id) in &acknowledgement_removals {
+            acknowledgements.remove(key.as_slice())?;
+            custody::remove_event_acknowledgement_retirement_reference_write(
+                write,
+                *semantic_id,
+                key.as_slice(),
+            )?;
+        }
+    }
+    if write
+        .open_table(EVENT_SUBSCRIPTIONS)?
+        .remove(id.as_bytes().as_slice())?
+        .is_none()
+    {
+        return Err(StoreError::SemanticInvariant(
+            "Event subscription disappeared during its write transaction",
+        ));
+    }
+    {
+        let mut metadata = write.open_table(METADATA)?;
+        metadata.insert(EVENT_SUBSCRIPTION_COUNT, next_subscription_count)?;
+        metadata.insert(EVENT_PENDING_DELIVERY_COUNT, next_pending_count)?;
+        metadata.insert(EVENT_ACKNOWLEDGEMENT_COUNT, next_acknowledgement_count)?;
+        metadata.insert(EVENT_SELECTOR_REVISION, next_generation)?;
+    }
+    Ok(())
+}
+
 impl Store {
     /// Opens a store with conservative default admission limits.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
@@ -7179,131 +7333,7 @@ impl Store {
             ));
         }
 
-        let subscription_count = write.open_table(EVENT_SUBSCRIPTIONS)?.len()?;
-        let pending_count = write.open_table(EVENT_SUBSCRIPTION_PENDING)?.len()?;
-        let acknowledgement_count = write.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?.len()?;
-        let (selector_generation, next_subscription_count) = {
-            let metadata = write.open_table(METADATA)?;
-            for (field, reconstructed) in [
-                (EVENT_SUBSCRIPTION_COUNT, subscription_count),
-                (EVENT_PENDING_DELIVERY_COUNT, pending_count),
-                (EVENT_ACKNOWLEDGEMENT_COUNT, acknowledgement_count),
-            ] {
-                let durable = metadata
-                    .get(field)?
-                    .ok_or(StoreError::MissingAccountingMetadata { field })?
-                    .value();
-                if durable != reconstructed {
-                    return Err(StoreError::AccountingMismatch {
-                        field,
-                        durable,
-                        reconstructed,
-                    });
-                }
-            }
-            let generation = metadata
-                .get(EVENT_SELECTOR_REVISION)?
-                .ok_or(StoreError::MissingAccountingMetadata {
-                    field: EVENT_SELECTOR_REVISION,
-                })?
-                .value();
-            validate_event_selector_generation(generation, subscription_count)?;
-            let next_count =
-                subscription_count
-                    .checked_sub(1)
-                    .ok_or(StoreError::SemanticInvariant(
-                        "Event subscription counter underflow",
-                    ))?;
-            (generation, next_count)
-        };
-
-        let mut pending_removals = Vec::new();
-        {
-            let pending = write.open_table(EVENT_SUBSCRIPTION_PENDING)?;
-            for row in pending.iter()? {
-                let (key, value) = row?;
-                let key_bytes: [u8; 40] = key.value().try_into().map_err(|_| {
-                    StoreError::SemanticInvariant("Event pending-delivery key has invalid length")
-                })?;
-                let (row_subscription, _) = parse_event_pending_delivery_key(&key_bytes)?;
-                if row_subscription == id {
-                    let pending = decode_event_pending_delivery_record(value.value())?;
-                    pending_removals.push((key_bytes, pending.semantic_id));
-                }
-            }
-        }
-        let mut acknowledgement_removals = Vec::new();
-        {
-            let acknowledgements = write.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?;
-            for row in acknowledgements.iter()? {
-                let (key, value) = row?;
-                let key_bytes: [u8; 64] = key.value().try_into().map_err(|_| {
-                    StoreError::SemanticInvariant("Event acknowledgement key has invalid length")
-                })?;
-                let (row_subscription, semantic_id) = parse_event_acknowledgement_key(&key_bytes)?;
-                if row_subscription == id {
-                    decode_event_acknowledgement_record(value.value())?;
-                    acknowledgement_removals.push((key_bytes, semantic_id));
-                }
-            }
-        }
-        let removed_pending = u64::try_from(pending_removals.len())
-            .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
-        let removed_acknowledgements = u64::try_from(acknowledgement_removals.len())
-            .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
-        let next_pending_count =
-            pending_count
-                .checked_sub(removed_pending)
-                .ok_or(StoreError::SemanticInvariant(
-                    "Event pending-delivery counter underflow",
-                ))?;
-        let next_acknowledgement_count = acknowledgement_count
-            .checked_sub(removed_acknowledgements)
-            .ok_or(StoreError::SemanticInvariant(
-                "Event acknowledgement counter underflow",
-            ))?;
-        let next_generation = selector_generation
-            .checked_add(1)
-            .ok_or(StoreError::ItemCountAccountingOverflow)?;
-
-        {
-            let mut pending = write.open_table(EVENT_SUBSCRIPTION_PENDING)?;
-            for (key, semantic_id) in &pending_removals {
-                pending.remove(key.as_slice())?;
-                custody::remove_event_pending_retirement_reference_write(
-                    &write,
-                    *semantic_id,
-                    key.as_slice(),
-                )?;
-            }
-        }
-        {
-            let mut acknowledgements = write.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?;
-            for (key, semantic_id) in &acknowledgement_removals {
-                acknowledgements.remove(key.as_slice())?;
-                custody::remove_event_acknowledgement_retirement_reference_write(
-                    &write,
-                    *semantic_id,
-                    key.as_slice(),
-                )?;
-            }
-        }
-        if write
-            .open_table(EVENT_SUBSCRIPTIONS)?
-            .remove(id.as_bytes().as_slice())?
-            .is_none()
-        {
-            return Err(StoreError::SemanticInvariant(
-                "Event subscription disappeared during its write transaction",
-            ));
-        }
-        {
-            let mut metadata = write.open_table(METADATA)?;
-            metadata.insert(EVENT_SUBSCRIPTION_COUNT, next_subscription_count)?;
-            metadata.insert(EVENT_PENDING_DELIVERY_COUNT, next_pending_count)?;
-            metadata.insert(EVENT_ACKNOWLEDGEMENT_COUNT, next_acknowledgement_count)?;
-            metadata.insert(EVENT_SELECTOR_REVISION, next_generation)?;
-        }
+        remove_event_subscription_write(&write, id)?;
         write.commit()?;
         Ok(EventSubscriptionRemoveOutcome { id, removed: true })
     }

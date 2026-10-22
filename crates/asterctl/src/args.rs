@@ -23,6 +23,7 @@ COMMANDS:
   publish           Publish a journaled numbered Event
   publication-init  Create a new journal; --journal PATH --client-id ID
   client-status     Observe Event client ownership without takeover
+  publication-reconstruct  Explicit partial recovery into a new journal after loss
   publication-recover  Recover journaled operations
   publication-show  Inspect one original journaled intent; --sequence N
   publication-retry Retry a journaled intent; --sequence N
@@ -165,6 +166,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             }
             "publication-init"
             | "publication-show"
+            | "publication-reconstruct"
             | "publication-recover"
             | "publication-retry"
             | "publication-abandon"
@@ -184,6 +186,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                 journal_action = Some(match name {
                     "publication-init" => crate::journal::Action::Initialize,
                     "client-status" => crate::journal::Action::ClientStatus,
+                    "publication-reconstruct" => crate::journal::Action::Reconstruct,
                     "publication-recover" => crate::journal::Action::Recover,
                     "publication-show" => crate::journal::Action::Show,
                     "publication-retry" => crate::journal::Action::Retry,
@@ -499,6 +502,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         if matches!(
             action,
             crate::journal::Action::Initialize
+                | crate::journal::Action::Reconstruct
                 | crate::journal::Action::Recover
                 | crate::journal::Action::ClientStatus
         ) {

@@ -165,7 +165,21 @@ file. Keep the journal in a protected directory: it contains complete plaintext
 intents and payloads. Opening a missing, corrupt, already-open, or differently
 configured journal fails before reading stdin or contacting the agent. Do not
 delete and recreate an established journal or choose a new client ID to retry
-an uncertain operation. Lost-journal recovery is outside this increment.
+an uncertain operation. If the journal is lost, explicit partial reconstruction into a new path is
+available:
+
+```sh
+asterctl --token-file ./agent.token publication-reconstruct \
+    --journal ./reconstructed.redb --client-id chat-controller
+```
+
+This returns the agent frontier and retained committed receipts. It cannot
+recover unsent intents, acknowledged receipts or business effects, and never
+republishes guessed work. Reconcile application records before acknowledging
+these receipts. If an RPC fails after journal creation, resume
+`publication-recover` using the new path. Ordinary `open` still fails closed.
+A corrupt journal should be preserved for diagnosis; reconstruction never
+overwrites an existing path.
 
 Supply one `MSG` argument or read the payload from stdin until EOF. When stdin
 is a terminal, the CLI prints instructions to stderr before reading: finish

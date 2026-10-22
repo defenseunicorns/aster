@@ -312,8 +312,12 @@ deletion, and a numbered store refuses later arbitrary-key publications.
 Persistent Event subscriptions, polling, delivery cursors and acknowledgements
 now require the same stable client owner and recovered session as publication.
 Populated stores with unowned subscription records are also refused without
-modifying the original bytes. Lost-journal reconstruction, administrative client
-retirement and operator-tunable client limits remain later work.
+modifying the original bytes.
+Increment 3 adds explicit partial Rust SDK/CLI journal-loss
+reconstruction, permanent offline retirement and admission tuning. See
+[the lifecycle procedure](../decisions/0046-numbered-event-client-lifecycle.md).
+Neither reconstruction nor retirement recovers lost application effects or
+permits client-ID reuse.
 
 ## Select normal or receive-only operation
 
