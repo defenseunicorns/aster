@@ -9,10 +9,15 @@ asterctl-unsubscribe \- remove an Event subscription
 .RI [ GLOBAL-OPTIONS ]
 .B unsubscribe
 .I SUBSCRIPTION_ID
+.BI \-\-journal " PATH"
+.BI \-\-client\-id " CLIENT_ID"
 .YS
 .SH DESCRIPTION
 Remove an Event subscription. Use the subscription ID returned by subscribe
 or listed by subscriptions.
+.PP
+Require the owning stable client ID and its retained durable journal. Explicit
+recovery precedes mutation; a fenced incarnation cannot change subscriptions.
 .SH OUTPUT
 Prints "Subscription removed" or "Subscription already absent" to stdout.
 Both outcomes succeed.
@@ -33,7 +38,7 @@ Remove a subscription:
 .PP
 .nf
 .RS
-asterctl \-\-token\-file ./client.token unsubscribe "$SUBSCRIPTION_ID"
+asterctl \-\-token\-file ./client.token unsubscribe "$SUBSCRIPTION_ID" \-\-journal ./publisher.redb \-\-client\-id chat-controller
 .RE
 .fi
 .PP
@@ -41,7 +46,7 @@ Print the result as JSON:
 .PP
 .nf
 .RS
-asterctl \-\-token\-file ./client.token unsubscribe "$SUBSCRIPTION_ID" \-\-json
+asterctl \-\-token\-file ./client.token unsubscribe "$SUBSCRIPTION_ID" \-\-journal ./publisher.redb \-\-client\-id chat-controller \-\-json
 .RE
 .fi
 .SH SEE ALSO

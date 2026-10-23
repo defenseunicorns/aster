@@ -1497,7 +1497,7 @@ def run_client_only_recovery(agent: ManagedProcess, call: Any, *, journal_path: 
     for value in (expected["id_hex"], expected["publisher_hex"]):
         if any(c not in "0123456789abcdef" for c in value):
             raise AcceptanceError("client recovery identity was invalid")
-    second_result = call("recovery-resume", {"subscription_id_hex": subscription_id, "expected": expected})
+    second_result = call("recovery-resume", {"client_id_hex": FIXED_PUBLISH_CLIENT.hex(), "journal_path": journal_path, "subscription_id_hex": subscription_id, "expected": expected})
     require_live_agent()
     second = require_client(second_result)
     if (second_result.pid == first_result.pid
@@ -1593,6 +1593,8 @@ def run_acceptance_with_token(
         expect_failure: bool = False,
         attempt_timeout_seconds: float | None = None,
     ) -> ClientResult:
+        if command in {"subscribe", "poll", "stream", "ack"}:
+            request = dict(request or {}, client_id_hex=FIXED_PUBLISH_CLIENT.hex(), journal_path=journal_path)
         try:
             result = invoke_client_captured(
                 captures,
@@ -1770,6 +1772,7 @@ def run_acceptance_with_token(
             streamed = call(
                 "stream",
                 {
+                    "client_id_hex": FIXED_PUBLISH_CLIENT.hex(), "journal_path": journal_path,
                     "subscription_id_hex": subscription_id,
                     "delivery_limit": 1,
                     "scan_limit": 8,
@@ -1848,6 +1851,7 @@ def run_acceptance_with_token(
                 contract.token_file,
                 arguments.timeout_seconds,
                 {
+                    "client_id_hex": FIXED_PUBLISH_CLIENT.hex(), "journal_path": journal_path,
                     "subscription_id_hex": subscription_id,
                     "delivery_limit": 1,
                     "scan_limit": 8,

@@ -245,8 +245,16 @@ let running = start_node(NodeConfig {
 .await?;
 let events = running.selected_events();
 
+use aster_node::publication_journal::{Backend, Intent, Journal};
+// Initialize only during explicit fresh application provisioning.
+Journal::initialize(&journal_path, b"my-app-publisher")?;
+let mut journal = Journal::open(&journal_path, b"my-app-publisher")?;
+let mut backend = Backend::Live(&events);
+journal.recover(&mut backend).await?; // finish original pending work before new intents
+
 let subscription = events
     .subscribe(EventSubscriptionRequest {
+        client: journal.client_context()?,
         operation_key: b"my-app/ops/consume".to_vec(),
         topic: topic.clone(),
         scope: scope.clone(),
@@ -254,12 +262,6 @@ let subscription = events
     })
     .await?;
 
-use aster_node::publication_journal::{Backend, Intent, Journal};
-// Initialize only during explicit fresh application provisioning.
-Journal::initialize(&journal_path, b"my-app-publisher")?;
-let mut journal = Journal::open(&journal_path, b"my-app-publisher")?;
-let mut backend = Backend::Live(&events);
-journal.recover(&mut backend).await?; // finish original pending work before new intents
 let published = journal.publish_metadata(&mut backend, Intent {
     predecessor: None, topic: topic.as_str().to_owned(), scope: scope.as_str().to_owned(),
     priority: Priority::Priority as u8, logical_key: b"asset-7".to_vec(),
@@ -279,6 +281,7 @@ let page = events
 
 let deliveries = events
     .poll(EventPollRequest {
+        client: journal.client_context()?,
         subscription: subscription.id,
         delivery_limit: 128,
         scan_limit: 128,
@@ -286,7 +289,7 @@ let deliveries = events
     .await?;
 for delivery in deliveries.deliveries {
     events
-        .acknowledge(subscription.id, delivery.event.id)
+        .acknowledge(journal.client_context()?, subscription.id, delivery.event.id)
         .await?;
 }
 
@@ -301,7 +304,7 @@ let gaps = events
     })
     .await?;
 
-events.unsubscribe(subscription.id).await?;
+events.unsubscribe(journal.client_context()?, subscription.id).await?;
 running.shutdown().await?;
 ```
 
@@ -342,6 +345,13 @@ make that metadata trusted: each candidate is freshly authenticated, checked
 against its stored metadata and the query, and subject to current authorization
 and TTL checks before return. With no filters, all candidates still undergo
 these checks.
+
+A subscription operation key is scoped to its stable owning client ID. Every
+create, poll, delivery acknowledgement and delete requires the current recovered
+`EventClientContext`; obtain it from the same retained journal used for publishing.
+Takeover fences the prior incarnation while preserving selectors, cursors and
+pending deliveries. `client_status`, queries, gaps and subscription listing remain
+read-only and available to a fenced caller.
 
 A subscription operation key identifies one durable Consume selector. Reusing
 the key with the same topic/scope contract returns the same subscription;

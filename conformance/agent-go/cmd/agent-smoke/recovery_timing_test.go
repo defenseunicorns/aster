@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 
+	"github.com/defenseunicorns/aster/conformance/agent-go/internal/numbered"
+	"os"
+	"path/filepath"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -21,6 +24,12 @@ type recoveryTimingClient struct {
 	cancelPhase  string
 }
 
+func (c *recoveryTimingClient) BeginEventPublicationSession(ctx context.Context, r *connect.Request[api.BeginEventPublicationSessionRequest]) (*connect.Response[api.BeginEventPublicationSessionResponse], error) {
+	return c.peer.BeginEventPublicationSession(ctx, r)
+}
+func (c *recoveryTimingClient) CompleteEventPublicationRecovery(ctx context.Context, r *connect.Request[api.CompleteEventPublicationRecoveryRequest]) (*connect.Response[api.CompleteEventPublicationRecoveryResponse], error) {
+	return c.peer.CompleteEventPublicationRecovery(ctx, r)
+}
 func (c *recoveryTimingClient) PollEvents(ctx context.Context, r *connect.Request[api.PollEventsRequest]) (*connect.Response[api.PollEventsResponse], error) {
 	if !c.peer.acknowledged {
 		return c.peer.PollEvents(ctx, r)
@@ -58,7 +67,18 @@ func timingRecovery(t *testing.T, delay int) (*recoveryTimingClient, map[string]
 		t.Fatal(err)
 	}
 	peer.attempt = 1
-	return &recoveryTimingClient{peer: peer, delayPoll: delay}, map[string]any{"subscription_id_hex": "0303030303030303030303030303030303030303030303030303030303030303", "expected": expectedForPeer(peer)}
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "consumer.json")
+	if err := numbered.Initialize(path, []byte("timing-consumer")); err != nil {
+		t.Fatal(err)
+	}
+	return &recoveryTimingClient{peer: peer, delayPoll: delay}, map[string]any{"journal_path": path, "client_id_hex": "74696d696e672d636f6e73756d6572", "subscription_id_hex": "0303030303030303030303030303030303030303030303030303030303030303", "expected": expectedForPeer(peer)}
 }
 func TestRecoveryExampleDelayedFirstQuietPoll(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {

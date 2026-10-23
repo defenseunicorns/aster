@@ -11,6 +11,8 @@ asterctl-subscribe \- create an Event subscription
 .BI \-\-scope " SCOPE"
 .BI \-\-operation\-key " KEY|auto"
 .I TOPIC
+.BI \-\-journal " PATH"
+.BI \-\-client\-id " CLIENT_ID"
 .YS
 .SH DESCRIPTION
 Create a persistent Event subscription for TOPIC. Subscriptions remain active
@@ -27,6 +29,9 @@ to generate a new key.
 .IP
 For retries, use the actual key from the previous attempt and the same
 subscription parameters.
+.PP
+Require the owning stable client ID and its retained durable journal. Explicit
+recovery precedes mutation; a fenced incarnation cannot change subscriptions.
 .SH OUTPUT
 Prints the Base64 subscription ID to stdout.
 .PP
@@ -55,6 +60,7 @@ Create a subscription with a generated key:
 .nf
 .RS
 asterctl \-\-token\-file ./client.token subscribe \e
+    \-\-journal ./publisher.redb \-\-client\-id chat-controller \e
     \-\-scope mission/team/alpha \e
     \-\-operation\-key auto \e
     chat.events
@@ -66,6 +72,7 @@ Use an explicit key and include sub-scopes:
 .nf
 .RS
 asterctl \-\-token\-file ./client.token subscribe \e
+    \-\-journal ./publisher.redb \-\-client\-id chat-controller \e
     \-\-scope 'mission/team/*' \e
     \-\-operation\-key chat-reader \e
     chat.events

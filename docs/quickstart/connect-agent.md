@@ -336,10 +336,11 @@ snapshot revision after a lost response.
 This profile requires a fresh store boundary. A store containing the older
 arbitrary-key Event publication ledger is refused without migration or
 deletion, and a numbered store refuses later arbitrary-key publications.
-Increment 1 does not claim session ownership for subscriptions, polling,
-delivery cursors, or delivery acknowledgements; lost-journal reconstruction,
-administrative client retirement, and operator-tunable client limits are also
-later work.
+Persistent Event subscriptions, polling, delivery cursors and acknowledgements
+now require the same stable client owner and recovered session as publication.
+Populated stores with unowned subscription records are also refused without
+modifying the original bytes. Lost-journal reconstruction, administrative client
+retirement and operator-tunable client limits remain later work.
 
 ## Select normal or receive-only operation
 
@@ -473,14 +474,19 @@ marker. Keep the same upper bound when continuing from `scanned_through`.
 
 `ListEventSubscriptions` takes an empty request and returns `subscriptions`, a
 full list of this node's Consume subscriptions ordered by subscription ID. Each row
-contains `subscription_id`, `topic`, `scope`, `include_descendant_scopes`, and
+contains `subscription_id`, `owner_client_id`, `topic`, `scope`,
+`include_descendant_scopes`, and
 the `operation_key` bytes (including non-UTF-8 keys; Protobuf
 JSON represents bytes as base64).
 
 ## Commit before acknowledging
 
 `CreateEventSubscription` creates or replays an immutable durable selector by
-operation key. `PollEvents` and `StreamEvents` use the same durable ledger and
+the pair of owning client ID and operation key. Create, poll, stream, acknowledgement
+and delete require `client: {clientId, session}` from a recovered durable journal.
+`GetEventClientStatus` reads the current session, caller disposition and bounded
+owned subscription/delivery counts without taking over. Queries, gaps and listing
+remain read-only while fenced. `PollEvents` and `StreamEvents` use the same durable ledger and
 deliver at least once until acknowledgement succeeds:
 
 1. Receive an Event and its delivery attempt.
@@ -494,6 +500,11 @@ redelivery. After restart, an unacknowledged Event is returned with a higher
 attempt count. The attempt count is observability, not a deduplication key;
 deduplicate application work by stable Event identity. An acknowledged Event
 remains complete across restart.
+
+`StreamEvents` revalidates the session before each buffered delivery and each
+new poll. Takeover terminates subsequent delivery with the session-fenced error.
+A delivery already authorized and in flight can arrive after takeover; the
+application must still commit effects idempotently.
 
 `StreamEvents` is sequential bounded polling convenience. It never
 acknowledges implicitly and does not provide exactly-once application effects.

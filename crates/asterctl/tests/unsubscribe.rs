@@ -8,6 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod support;
+
 mod proto {
     connectrpc::include_generated!();
 }
@@ -17,11 +19,15 @@ const TOKEN: &str = "asterctl-test-token-00000000000000";
 const ID: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
 
 fn cli(args: &[&str]) -> Output {
+    cli_with_stdout(args, Stdio::piped())
+}
+
+fn cli_with_stdout(args: &[&str], stdout: Stdio) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_asterctl"))
         .args(args)
         // Keep stdin open: deleting subscriptions must not wait for input.
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdout(stdout)
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
@@ -38,7 +44,44 @@ fn cli(args: &[&str]) -> Output {
 }
 
 fn run(port: u16, args: &[&str]) -> Output {
-    cli(&[&["--token", TOKEN, "--port", &port.to_string()][..], args].concat())
+    run_with_stdout(port, args, Stdio::piped())
+}
+
+fn run_with_stdout(port: u16, args: &[&str], stdout: Stdio) -> Output {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "asterctl-owned-fixture-{}-{}-unsubscribe.redb",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let journal = path.to_str().unwrap();
+    assert!(
+        cli(&[
+            "publication-init",
+            "--journal",
+            journal,
+            "--client-id",
+            "fixture-client"
+        ])
+        .status
+        .success()
+    );
+    let split = args
+        .iter()
+        .position(|arg| *arg == "--")
+        .unwrap_or(args.len());
+    let output = cli_with_stdout(
+        &[
+            &["--token", TOKEN, "--port", &port.to_string()][..],
+            &args[..split],
+            &["--journal", journal, "--client-id", "fixture-client"],
+            &args[split..],
+        ]
+        .concat(),
+        stdout,
+    );
+    let _ = std::fs::remove_file(path);
+    output
 }
 
 fn serve(
@@ -61,57 +104,90 @@ fn serve(
     let (sender, receiver) = mpsc::channel();
     let server = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut connection = loop {
-            match listener.accept() {
-                Ok((connection, _)) => break connection,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && Instant::now() < deadline =>
-                {
-                    thread::sleep(Duration::from_millis(5));
+        loop {
+            let mut connection = loop {
+                match listener.accept() {
+                    Ok((connection, _)) => break connection,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("no subscription request: {error}"),
                 }
-                Err(error) => panic!("no subscription request: {error}"),
+            };
+            // Accepted sockets inherit nonblocking mode on macOS/BSD.
+            connection.set_nonblocking(false).unwrap();
+            connection
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            connection
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                connection.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+                assert!(header.len() <= 8192);
             }
-        };
-        // Accepted sockets inherit nonblocking mode on macOS/BSD.
-        connection.set_nonblocking(false).unwrap();
-        connection
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        connection
-            .set_write_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        let mut header = Vec::new();
-        while !header.ends_with(b"\r\n\r\n") {
-            let mut byte = [0];
-            connection.read_exact(&mut byte).unwrap();
-            header.push(byte[0]);
-            assert!(header.len() <= 8192);
-        }
-        let header = String::from_utf8(header).unwrap().to_ascii_lowercase();
-        assert!(header.starts_with(
+            let header = String::from_utf8(header).unwrap().to_ascii_lowercase();
+            if header.contains("/begineventpublicationsession ")
+                || header.contains("/completeeventpublicationrecovery ")
+            {
+                let length: usize = header
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap();
+                let mut body = vec![0; length];
+                connection.read_exact(&mut body).unwrap();
+                let response = if header.contains("/begineventpublicationsession ") {
+                    let claim =
+                        api::BeginEventPublicationSessionRequest::decode_from_slice(&body).unwrap();
+                    assert_eq!(claim.client_id, b"fixture-client");
+                    assert_eq!(claim.expected_session, 0);
+                    assert_eq!(claim.claim_nonce.len(), 32);
+                    api::BeginEventPublicationSessionResponse {
+                        session: 1,
+                        snapshot_revision: 1,
+                        ..Default::default()
+                    }
+                    .encode_to_vec()
+                } else {
+                    api::CompleteEventPublicationRecoveryResponse::default().encode_to_vec()
+                };
+                write!(connection, "HTTP/1.1 200 OK\r\nContent-Type: application/proto\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+                connection.write_all(&response).unwrap();
+                continue;
+            }
+            assert!(header.starts_with(
             "post /aster.application.v1alpha1.asterapplicationservice/deleteeventsubscription http/1.1\r\n"
         ));
-        assert!(header.contains(&format!("authorization: bearer {TOKEN}\r\n")));
-        assert!(header.contains("content-type: application/proto\r\n"));
-        assert!(header.contains("connect-timeout-ms:"));
-        let length: usize = header
-            .lines()
-            .find_map(|line| line.strip_prefix("content-length: "))
-            .unwrap_or("0")
-            .parse()
-            .unwrap();
-        assert!(length <= 1024);
-        let mut body = vec![0; length];
-        connection.read_exact(&mut body).unwrap();
-        sender
-            .send(api::DeleteEventSubscriptionRequest::decode_from_slice(&body).unwrap())
-            .unwrap();
-        if !drop_response {
-            connection.write_all(reply.as_bytes()).unwrap();
-            let _ = connection.write_all(&response);
+            assert!(header.contains(&format!("authorization: bearer {TOKEN}\r\n")));
+            assert!(header.contains("content-type: application/proto\r\n"));
+            assert!(header.contains("connect-timeout-ms:"));
+            let length: usize = header
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .unwrap_or("0")
+                .parse()
+                .unwrap();
+            assert!(length <= 1024);
+            let mut body = vec![0; length];
+            connection.read_exact(&mut body).unwrap();
+            sender
+                .send(api::DeleteEventSubscriptionRequest::decode_from_slice(&body).unwrap())
+                .unwrap();
+            if !drop_response {
+                connection.write_all(reply.as_bytes()).unwrap();
+                let _ = connection.write_all(&response);
+            }
+            drop(connection);
+            break;
         }
-        drop(connection);
         // Keep the listener alive long enough to detect automatic retries.
         thread::sleep(Duration::from_millis(100));
         assert_eq!(
@@ -275,18 +351,7 @@ fn closed_stdout_succeeds_and_other_output_errors_fail() {
                     .unwrap(),
             )
         };
-        let output = Command::new(env!("CARGO_BIN_EXE_asterctl"))
-            .args([
-                "--token",
-                TOKEN,
-                "--port",
-                &address.port().to_string(),
-                "unsubscribe",
-                ID,
-            ])
-            .stdout(stdout)
-            .output()
-            .unwrap();
+        let output = run_with_stdout(address.port(), &["unsubscribe", ID], stdout);
         assert_eq!(output.status.code(), Some(if broken_pipe { 0 } else { 1 }));
         requests.recv_timeout(Duration::from_secs(1)).unwrap();
         server.join().unwrap();
@@ -295,9 +360,11 @@ fn closed_stdout_succeeds_and_other_output_errors_fail() {
 
 #[test]
 fn token_io_failure_does_not_connect() {
+    let journal = support::Journal::new();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
-    let output = cli(&[
+    let mut command = Command::new(env!("CARGO_BIN_EXE_asterctl"));
+    command.args([
         "--token-file",
         "/no-such-asterctl-token",
         "--port",
@@ -305,6 +372,8 @@ fn token_io_failure_does_not_connect() {
         "unsubscribe",
         ID,
     ]);
+    journal.configure(&mut command);
+    let output = command.output().unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     assert_eq!(

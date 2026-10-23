@@ -863,10 +863,11 @@ class ConnectJsonClient:
     def get_status(self) -> Dict[str, object]:
         return self.call("GetStatus", {})
 
-    def create_subscription(self, operation_key: bytes) -> Dict[str, object]:
+    def create_subscription(self, operation_key: bytes, client: Mapping[str, object]) -> Dict[str, object]:
         return self.call(
             "CreateEventSubscription",
             {
+                "client": dict(client),
                 "operationKey": encode_b64(operation_key),
                 "topic": TOPIC,
                 "scope": SCOPE,
@@ -970,6 +971,9 @@ class NumberedPublisher:
         if not isinstance(value, dict):
             raise RpcError("numbered publication returned a malformed result")
         return value
+
+    def create_subscription(self, operation_key: bytes) -> Dict[str, object]:
+        return self._run("subscribe", ["--operation-key", operation_key.decode("ascii"), "--scope", SCOPE, TOPIC], json_response=True)
 
     def recover(self, apply: Callable[[Mapping[str, Any], Mapping[str, Any], bool, Optional[bool]], str]) -> None:
         report = self._run("publication-recover", json_response=True)
@@ -1462,15 +1466,15 @@ class PlaygroundController:
         try:
             url = node.process.wait_ready(self.startup_timeout)
             client = self.client_factory(url, node.token)
-            response = client.create_subscription(
+            if node.publisher is None:
+                raise PlaygroundError("node has no numbered publication journal")
+            node.publisher.connect(url, node.token_path)
+            response = node.publisher.create_subscription(
                 ("aster-playground/subscription/node-%d/v1" % index).encode("ascii")
             )
             subscription = decode_b64(response.get("subscriptionId"), "subscription ID", 32)
             if not subscription:
                 raise PlaygroundError("agent returned an empty subscription identity")
-            if node.publisher is None:
-                raise PlaygroundError("node has no numbered publication journal")
-            node.publisher.connect(url, node.token_path)
         except BaseException as error:
             interrupted = isinstance(error, (KeyboardInterrupt, SystemExit))
             node.status = "stopping" if interrupted else "failed"

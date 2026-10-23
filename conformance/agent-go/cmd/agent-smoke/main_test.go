@@ -18,6 +18,7 @@ import (
 	"connectrpc.com/connect"
 
 	applicationv1alpha1 "github.com/defenseunicorns/aster/conformance/agent-go/gen/aster/application/v1alpha1"
+	"github.com/defenseunicorns/aster/conformance/agent-go/internal/numbered"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -27,6 +28,12 @@ type deliveryServer struct {
 	attempt uint64
 }
 
+func (s deliveryServer) BeginEventPublicationSession(_ context.Context, _ *connect.Request[applicationv1alpha1.BeginEventPublicationSessionRequest]) (*connect.Response[applicationv1alpha1.BeginEventPublicationSessionResponse], error) {
+	return connect.NewResponse(&applicationv1alpha1.BeginEventPublicationSessionResponse{Session: 1}), nil
+}
+func (s deliveryServer) CompleteEventPublicationRecovery(_ context.Context, _ *connect.Request[applicationv1alpha1.CompleteEventPublicationRecoveryRequest]) (*connect.Response[applicationv1alpha1.CompleteEventPublicationRecoveryResponse], error) {
+	return connect.NewResponse(&applicationv1alpha1.CompleteEventPublicationRecoveryResponse{}), nil
+}
 func (s deliveryServer) StreamEvents(_ context.Context, _ *connect.Request[applicationv1alpha1.StreamEventsRequest], stream *connect.ServerStream[applicationv1alpha1.StreamEventsResponse]) error {
 	return stream.Send(&applicationv1alpha1.StreamEventsResponse{Event: s.event, Attempt: s.attempt})
 }
@@ -62,7 +69,19 @@ func TestStreamEvidenceRequiresExactEventAndIncreasingAttempt(t *testing.T) {
 			server := httptest.NewServer(handler)
 			defer server.Close()
 			client := applicationv1alpha1.NewAsterApplicationServiceClient(server.Client(), server.URL)
+			directory, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(directory, 0700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(directory, "stream-journal.json")
+			if err := numbered.Initialize(path, []byte("stream-fixture")); err != nil {
+				t.Fatal(err)
+			}
 			input, err := json.Marshal(map[string]any{
+				"journal_path": path, "client_id_hex": "73747265616d2d66697874757265",
 				"subscription_id_hex": strings.Repeat("05", 32), "delivery_limit": 1,
 				"scan_limit": 8, "poll_backoff_ms": 100, "count": 1,
 				"expected": expected, "after_attempt": 2,

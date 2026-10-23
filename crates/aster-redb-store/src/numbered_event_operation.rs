@@ -87,6 +87,33 @@ impl EventPublicationSession {
     }
 }
 
+/// One cooperating application incarnation; local bearer access is a separate authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventClientContext {
+    pub client_id: EventClientId,
+    pub session: EventPublicationSession,
+}
+
+/// Read-only disposition of a caller's client session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventClientDisposition {
+    Unregistered,
+    Current,
+    Fenced,
+    RecoveryRequired,
+}
+
+/// Bounded, local application ownership observation, not an operating-system process identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventClientStatus {
+    pub current_session: Option<EventPublicationSession>,
+    pub disposition: EventClientDisposition,
+    pub subscriptions: u64,
+    pub pending_deliveries: u64,
+    pub acknowledged_deliveries: u64,
+    pub ownership_metadata_bytes: u64,
+}
+
 /// Positive, never-reused application publication sequence.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct EventOperationSequence(u64);
@@ -171,6 +198,7 @@ pub enum NumberedEventOperationError {
     LegacyStoreRequiresFreshState,
     LegacyOperationDisabled,
     ClientNotFound,
+    SubscriptionOwnerMismatch,
     SessionFenced,
     RecoveryRequired,
     RecoveryRevisionChanged,
@@ -204,6 +232,7 @@ impl fmt::Display for NumberedEventOperationError {
             Self::LegacyOperationDisabled => {
                 "legacy Event operation publication is disabled for this store"
             }
+            Self::SubscriptionOwnerMismatch => "Event subscription belongs to another client",
             Self::ClientNotFound => "publication client was not found",
             Self::SessionFenced => "publication session was fenced by another claimant",
             Self::RecoveryRequired => "publication recovery must complete before mutation",
@@ -2022,6 +2051,145 @@ pub fn recovery_snapshot_proto_len(snapshot: &EventRecoverySnapshot) -> usize {
                 1 + varint_len(length as u64) + length
             })
             .sum::<usize>()
+}
+
+pub(crate) fn require_client_context_write(
+    write: &redb::WriteTransaction,
+    context: &EventClientContext,
+) -> Result<(), StoreError> {
+    require_mutating_session(
+        load_client_write(write, &context.client_id)?,
+        context.session,
+    )
+}
+
+pub(crate) fn require_owner_registered_write(
+    write: &redb::WriteTransaction,
+    owner: &EventClientId,
+) -> Result<(), StoreError> {
+    load_client_write(write, owner).map(|_| ())
+}
+
+pub(crate) fn require_owner_registered_read(
+    read: &redb::ReadTransaction,
+    owner: &EventClientId,
+) -> Result<(), StoreError> {
+    load_client_read(read, owner).map(|_| ())
+}
+
+fn load_client_read(
+    read: &redb::ReadTransaction,
+    client: &EventClientId,
+) -> Result<ClientRecord, StoreError> {
+    read.open_table(CLIENTS)?
+        .get(client.as_bytes())?
+        .map(|value| decode_client(value.value()))
+        .transpose()?
+        .ok_or_else(|| NumberedEventOperationError::ClientNotFound.into())
+}
+
+pub(crate) fn client_disposition_read(
+    read: &redb::ReadTransaction,
+    client: &EventClientId,
+    observed_session: Option<EventPublicationSession>,
+) -> Result<(Option<EventPublicationSession>, EventClientDisposition), StoreError> {
+    if !read
+        .list_tables()?
+        .any(|table| table.name() == CLIENTS.name())
+    {
+        return Ok((None, EventClientDisposition::Unregistered));
+    }
+    let record = read
+        .open_table(CLIENTS)?
+        .get(client.as_bytes())?
+        .map(|value| decode_client(value.value()))
+        .transpose()?;
+    let Some(record) = record else {
+        return Ok((None, EventClientDisposition::Unregistered));
+    };
+    let disposition = if observed_session.is_some_and(|session| record.session != session.get()) {
+        EventClientDisposition::Fenced
+    } else if observed_session.is_none()
+        || record.completed_session != record.session
+        || record.completed_revision != record.snapshot_revision
+    {
+        EventClientDisposition::RecoveryRequired
+    } else {
+        EventClientDisposition::Current
+    };
+    Ok((
+        Some(EventPublicationSession::new(record.session)?),
+        disposition,
+    ))
+}
+
+pub(crate) fn require_client_context_read(
+    read: &redb::ReadTransaction,
+    context: &EventClientContext,
+) -> Result<(), StoreError> {
+    require_mutating_session(load_client_read(read, &context.client_id)?, context.session)
+}
+
+impl Store {
+    /// Read-only validation; mutation callers must still revalidate in their writer transaction.
+    pub fn require_event_client_context(
+        &self,
+        context: &EventClientContext,
+    ) -> Result<(), StoreError> {
+        self.require_live()?;
+        require_client_context_read(&self.database.begin_read()?, context)
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl Store {
+    /// Next sequence for recovered test fixtures; production clients must journal assignment.
+    pub fn test_next_event_operation_sequence(
+        &self,
+        context: &EventClientContext,
+    ) -> Result<EventOperationSequence, StoreError> {
+        let read = self.database.begin_read()?;
+        let record = load_client_read(&read, &context.client_id)?;
+        require_mutating_session(record, context.session)?;
+        EventOperationSequence::new(
+            record
+                .allocated_through
+                .checked_add(1)
+                .ok_or(NumberedEventOperationError::InvalidSequence)?,
+        )
+        .map_err(StoreError::from)
+    }
+
+    /// Registers one recovered client for subscription-only regression fixtures.
+    pub fn test_event_client_context(&self) -> Result<EventClientContext, StoreError> {
+        let client_id = EventClientId::new(b"test.subscription-owner".to_vec())?;
+        let read = self.database.begin_read()?;
+        match load_client_read(&read, &client_id) {
+            Ok(record) => {
+                return Ok(EventClientContext {
+                    client_id,
+                    session: EventPublicationSession::new(record.session)?,
+                });
+            }
+            Err(StoreError::NumberedEventOperation(
+                NumberedEventOperationError::ClientNotFound,
+            )) => {}
+            Err(error) => return Err(error),
+        }
+        drop(read);
+        let mut claim = [0; 32];
+        getrandom::fill(&mut claim).expect("test claim randomness");
+        let snapshot = self.begin_event_publication_session(&client_id, 0, &claim)?;
+        self.complete_event_publication_recovery(
+            &client_id,
+            snapshot.session,
+            snapshot.snapshot_revision,
+        )?;
+        Ok(EventClientContext {
+            client_id,
+            session: snapshot.session,
+        })
+    }
 }
 
 #[cfg(test)]

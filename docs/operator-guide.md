@@ -226,6 +226,17 @@ sudo systemctl enable aster-agent.service
 
 The bundle must authorize `chat.events@mission/team/alpha`.
 
+Initialize a durable client journal once on receiving Node B:
+
+```sh
+sudo install -d -o aster -g aster -m 0700 /var/lib/aster-operator
+sudo -u aster /usr/bin/asterctl publication-init \
+  --journal /var/lib/aster-operator/reader.redb --client-id operator-reader
+```
+
+Keep this journal and identity across invocations. Subscription commands recover
+the journal before mutation; a missing established journal fails closed.
+
 Before publication, create the durable subscription on receiving Node B. Allow
 at least one successful authenticated contact after creating it so the route is
 available to Node A:
@@ -234,6 +245,7 @@ available to Node A:
 sudo -u aster /usr/bin/asterctl \
   --token-file /etc/aster/agent-credentials/client-token \
   subscribe --scope mission/team/alpha \
+  --journal /var/lib/aster-operator/reader.redb --client-id operator-reader \
   --operation-key operator-chat-reader-001 chat.events
 ```
 
@@ -344,10 +356,14 @@ site policy after moving required output into approved custody.
 
 ### Manage additional Event subscriptions
 
+Use the receiving node journal initialized in Step 7. Keep the owning client ID
+for later deletion; listing remains read-only.
+
 ```sh
 sudo -u aster /usr/bin/asterctl \
   --token-file /etc/aster/agent-credentials/client-token \
   subscribe --scope mission/team/alpha \
+  --journal /var/lib/aster-operator/reader.redb --client-id operator-reader \
   --operation-key operator-chat-reader-001 chat.events
 
 sudo -u aster /usr/bin/asterctl \
@@ -355,7 +371,8 @@ sudo -u aster /usr/bin/asterctl \
 
 sudo -u aster /usr/bin/asterctl \
   --token-file /etc/aster/agent-credentials/client-token \
-  unsubscribe '<SUBSCRIPTION_ID>'
+  unsubscribe '<SUBSCRIPTION_ID>' \
+  --journal /var/lib/aster-operator/reader.redb --client-id operator-reader
 ```
 
 Cross-node Event transfer requires a matching durable subscription on the

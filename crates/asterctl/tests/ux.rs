@@ -13,7 +13,7 @@ const TOKEN: &str = "asterctl-test-token-00000000000000";
 fn command(kind: &str, port: u16) -> (Command, Option<support::Journal>) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_asterctl"));
     command.args(["--token", TOKEN, "--port", &port.to_string(), kind]);
-    let journal = (kind == "publish").then(support::Journal::new);
+    let journal = matches!(kind, "publish" | "subscribe").then(support::Journal::new);
     if let Some(journal) = &journal {
         journal.configure(&mut command);
     }

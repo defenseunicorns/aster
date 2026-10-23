@@ -1,11 +1,14 @@
 use crate::{api, operation_key, validation};
 
 pub const HELP: &str = "Usage: asterctl (--token TOKEN | --token-file PATH) [OPTIONS] subscribe
+                --journal PATH --client-id ID
                 --scope SCOPE --operation-key KEY|auto [SUBSCRIBE-OPTIONS] TOPIC
 
 Create a persistent Event subscription and print its ID.
 
 SUBSCRIBE OPTIONS:
+      --journal PATH            Required existing durable client journal
+      --client-id ID            Required stable owning client identity
       --scope SCOPE             Required Event scope; append '/*' to include all sub-scopes
       --operation-key KEY|auto  Required UTF-8 key, 1–256 bytes; auto generates a key
       --help                    Show this help
@@ -17,6 +20,7 @@ An identical existing subscription returns its ID with exit code 0.
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Subscription {
+    pub identity: crate::journal::Identity,
     pub request: api::CreateEventSubscriptionRequest,
     operation_key: Option<operation_key::Selection>,
 }

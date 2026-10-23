@@ -353,6 +353,18 @@ impl Journal {
     fn client(&self) -> Result<EventClientId> {
         Ok(EventClientId::new(self.state.client.clone())?)
     }
+    /// Recovered client context for subscription and delivery mutations.
+    pub fn client_context(&self) -> Result<aster_redb_store::EventClientContext> {
+        self.ensure_usable()?;
+        if self.state.claim.is_some() || self.state.session == 0 {
+            return Err("client recovery is incomplete".into());
+        }
+        Ok(aster_redb_store::EventClientContext {
+            client_id: self.client()?,
+            session: EventPublicationSession::new(self.state.session)?,
+        })
+    }
+
     /// Durable application progress for a fixed, ordered publication plan.
     /// An assigned-but-unapplied pending operation is excluded.
     pub fn completed_through(&self) -> u64 {

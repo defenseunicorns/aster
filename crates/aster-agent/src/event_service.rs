@@ -8,14 +8,15 @@ use std::{
 use aster_node::EventEmissionPolicy;
 use aster_node::application::{
     AuthenticatedPeerStatus, CommittedEventContent, ContactSyncStatus as NodeContactSyncStatus,
-    EventAcknowledgement, EventClientId, EventDelivery as NodeEventDelivery,
-    EventGap as NodeEventGap, EventGapQuery, EventId, EventItem, EventOperationAbandonment,
-    EventOperationAuditState, EventOperationCapacityWarning, EventOperationLedgerMode,
-    EventOperationSequence, EventPollRequest, EventPublicationSession, EventPublishOptions,
-    EventQuery, EventResultAcknowledgement, EventSubscriptionId, EventSubscriptionRequest,
-    EventSyncStatus as NodeEventSyncStatus, EventUnsubscribe, NumberedEventPublishRequest,
-    NumberedEventResult, PeerAuthorization as NodePeerAuthorization, Priority as NodePriority,
-    Scope, SelectedBlobHandle, SelectedEventHandle, SelectedEventStatus, Topic,
+    EventAcknowledgement, EventClientContext, EventClientDisposition, EventClientId,
+    EventDelivery as NodeEventDelivery, EventGap as NodeEventGap, EventGapQuery, EventId,
+    EventItem, EventOperationAbandonment, EventOperationAuditState, EventOperationCapacityWarning,
+    EventOperationLedgerMode, EventOperationSequence, EventPollRequest, EventPublicationSession,
+    EventPublishOptions, EventQuery, EventResultAcknowledgement, EventSubscriptionId,
+    EventSubscriptionRequest, EventSyncStatus as NodeEventSyncStatus, EventUnsubscribe,
+    NumberedEventPublishRequest, NumberedEventResult, PeerAuthorization as NodePeerAuthorization,
+    Priority as NodePriority, Scope, SelectedBlobHandle, SelectedEventHandle, SelectedEventStatus,
+    Topic,
 };
 use aster_redb_store::{CustodyRetirementReason, MAX_EVENT_PENDING_DELIVERIES};
 use connectrpc::{
@@ -215,6 +216,11 @@ pub(crate) fn rejection_router() -> connectrpc::Router {
                 api::CreateEventSubscriptionRequest,
                 api::CreateEventSubscriptionResponse,
             >(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "GetEventClientStatus",
+            rejection_handler::<api::GetEventClientStatusRequest, api::GetEventClientStatusResponse>(),
         )
         .route_bidi_stream(
             APPLICATION_SERVICE_NAME,
@@ -564,6 +570,7 @@ impl api::AsterApplicationService for AsterConnectService {
                 subscriptions: subscriptions
                     .into_iter()
                     .map(|row| api::EventSubscription {
+                        owner_client_id: row.owner.as_bytes().to_vec(),
                         subscription_id: row.id.as_bytes().to_vec(),
                         topic: row.topic.as_str().to_owned(),
                         scope: row.scope.as_str().to_owned(),
@@ -578,6 +585,47 @@ impl api::AsterApplicationService for AsterConnectService {
         )
     }
 
+    async fn get_event_client_status(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, api::GetEventClientStatusRequest>,
+    ) -> ServiceResult<api::GetEventClientStatusResponse> {
+        let request = request.to_owned_message();
+        let operation = PublicOperation::GetEventClientStatus;
+        let client = parse_client_id(request.client_id, operation)?;
+        let observed_session = request
+            .observed_session
+            .map(|session| parse_publication_session(session, operation))
+            .transpose()?;
+        let status = self
+            .events
+            .client_status(client, observed_session)
+            .await
+            .map_err(connect_application_error)?;
+        bounded_response(
+            api::GetEventClientStatusResponse {
+                current_session: status.current_session.map(EventPublicationSession::get),
+                disposition: match status.disposition {
+                    EventClientDisposition::Unregistered => {
+                        api::EventClientDisposition::Unregistered
+                    }
+                    EventClientDisposition::Current => api::EventClientDisposition::Current,
+                    EventClientDisposition::Fenced => api::EventClientDisposition::Fenced,
+                    EventClientDisposition::RecoveryRequired => {
+                        api::EventClientDisposition::RecoveryRequired
+                    }
+                }
+                .into(),
+                subscriptions: status.subscriptions,
+                pending_deliveries: status.pending_deliveries,
+                acknowledged_deliveries: status.acknowledged_deliveries,
+                ownership_metadata_bytes: status.ownership_metadata_bytes,
+                ..Default::default()
+            },
+            operation,
+        )
+    }
+
     async fn create_event_subscription(
         &self,
         _ctx: RequestContext,
@@ -588,6 +636,7 @@ impl api::AsterApplicationService for AsterConnectService {
         let subscription = self
             .events
             .subscribe(EventSubscriptionRequest {
+                client: parse_client_context(request.client.as_option(), operation)?,
                 operation_key: request.operation_key,
                 topic: parse_topic(request.topic, operation)?,
                 scope: parse_scope(request.scope, operation)?,
@@ -615,6 +664,7 @@ impl api::AsterApplicationService for AsterConnectService {
         let page = self
             .events
             .poll(poll_request(
+                parse_client_context(request.client.as_option(), operation)?,
                 request.subscription_id,
                 request.delivery_limit,
                 request.scan_limit,
@@ -649,12 +699,18 @@ impl api::AsterApplicationService for AsterConnectService {
             ));
         }
         let poll = poll_request(
+            parse_client_context(request.client.as_option(), operation)?,
             request.subscription_id,
             request.delivery_limit,
             request.scan_limit,
             operation,
         )?;
+        self.events
+            .require_client_context(poll.client.clone())
+            .await
+            .map_err(connect_application_error)?;
         let state = EventStreamState {
+            client: poll.client,
             events: self.events.clone(),
             subscription: poll.subscription,
             delivery_limit: poll.delivery_limit,
@@ -678,6 +734,7 @@ impl api::AsterApplicationService for AsterConnectService {
         let result = self
             .events
             .acknowledge(
+                parse_client_context(request.client.as_option(), operation)?,
                 parse_subscription_id(&request.subscription_id, operation)?,
                 parse_event_id(&request.event_id, operation)?,
             )
@@ -701,7 +758,10 @@ impl api::AsterApplicationService for AsterConnectService {
         let operation = PublicOperation::DeleteEventSubscription;
         let result = self
             .events
-            .unsubscribe(parse_subscription_id(&request.subscription_id, operation)?)
+            .unsubscribe(
+                parse_client_context(request.client.as_option(), operation)?,
+                parse_subscription_id(&request.subscription_id, operation)?,
+            )
             .await
             .map_err(connect_application_error)?;
         bounded_response(
@@ -744,6 +804,7 @@ impl api::AsterApplicationService for AsterConnectService {
 }
 
 struct EventStreamState {
+    client: EventClientContext,
     events: SelectedEventHandle,
     subscription: EventSubscriptionId,
     delivery_limit: usize,
@@ -764,6 +825,19 @@ async fn next_stream_delivery(
     loop {
         if state.stopped || *state.shutdown.borrow() {
             return None;
+        }
+        if !state.pending.is_empty() {
+            // Linearization point: a delivery authorized here may already be
+            // in flight when takeover commits. Later checks must fence it.
+            if let Err(error) = state
+                .events
+                .require_client_context(state.client.clone())
+                .await
+            {
+                state.pending.clear();
+                state.stopped = true;
+                return Some((Err(connect_application_error(error)), state));
+            }
         }
         if let Some(mut delivery) = state.pending.pop_front() {
             // A slow stream can retain a polled page beyond its Events' TTL.
@@ -815,6 +889,7 @@ async fn next_stream_delivery(
         }
 
         let poll = state.events.poll(EventPollRequest {
+            client: state.client.clone(),
             subscription: state.subscription,
             delivery_limit: state.delivery_limit,
             scan_limit: state.scan_limit,
@@ -941,12 +1016,14 @@ fn query_request(request: api::QueryEventsRequest) -> Result<EventQuery, Connect
 }
 
 fn poll_request(
+    client: EventClientContext,
     subscription_id: Vec<u8>,
     delivery_limit: u32,
     scan_limit: u32,
     operation: PublicOperation,
 ) -> Result<EventPollRequest, ConnectError> {
     Ok(EventPollRequest {
+        client,
         subscription: parse_subscription_id(&subscription_id, operation)?,
         delivery_limit: parse_limit(delivery_limit, operation)?,
         scan_limit: parse_limit(scan_limit, operation)?,
@@ -1275,6 +1352,25 @@ fn bounded_message<M: buffa::Message>(
         ));
     }
     Ok(message)
+}
+
+fn parse_client_context(
+    context: Option<&api::EventClientContext>,
+    operation: PublicOperation,
+) -> Result<EventClientContext, ConnectError> {
+    let context = context.ok_or_else(|| {
+        public_error(
+            ErrorCode::InvalidArgument,
+            api::PublicErrorReason::MalformedInput,
+            operation,
+            false,
+            None,
+        )
+    })?;
+    Ok(EventClientContext {
+        client_id: parse_client_id(context.client_id.clone(), operation)?,
+        session: parse_publication_session(context.session, operation)?,
+    })
 }
 
 #[cfg(test)]
@@ -1624,8 +1720,15 @@ mod tests {
         .await
         .unwrap();
         let events = node.selected_events();
+        use aster_node::publication_journal::{Backend, Intent, Journal};
+        let path = state.0.join("slow-stream-publication.redb");
+        Journal::initialize(&path, b"slow-stream-fixture").unwrap();
+        let mut journal = Journal::open(&path, b"slow-stream-fixture").unwrap();
+        let mut backend = Backend::Live(&events);
+        journal.recover(&mut backend).await.unwrap();
         let subscription = events
             .subscribe(EventSubscriptionRequest {
+                client: journal.client_context().unwrap(),
                 operation_key: b"slow-stream-subscription".to_vec(),
                 topic: Topic::new("chat.events").unwrap(),
                 scope: Scope::new("mission/team/alpha").unwrap(),
@@ -1633,12 +1736,6 @@ mod tests {
             })
             .await
             .unwrap();
-        use aster_node::publication_journal::{Backend, Intent, Journal};
-        let path = state.0.join("slow-stream-publication.redb");
-        Journal::initialize(&path, b"slow-stream-fixture").unwrap();
-        let mut journal = Journal::open(&path, b"slow-stream-fixture").unwrap();
-        let mut backend = Backend::Live(&events);
-        journal.recover(&mut backend).await.unwrap();
         let mut publication = Intent {
             predecessor: None,
             topic: "chat.events".to_owned(),
@@ -1662,6 +1759,7 @@ mod tests {
             .unwrap();
         let page = events
             .poll(EventPollRequest {
+                client: journal.client_context().unwrap(),
                 subscription: subscription.id,
                 delivery_limit: 8,
                 scan_limit: 8,
@@ -1671,6 +1769,7 @@ mod tests {
         assert_eq!(page.deliveries.len(), 2);
         let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
         let stream = EventStreamState {
+            client: journal.client_context().unwrap(),
             events,
             subscription: subscription.id,
             delivery_limit: 8,
@@ -1686,6 +1785,175 @@ mod tests {
         assert_eq!(
             message.unwrap().event.as_option().unwrap().id,
             durable.id.as_bytes()
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    #[cfg(all(feature = "client", feature = "server"))]
+    #[tokio::test]
+    async fn takeover_fences_buffered_stream_items_and_empty_poll_backoff() {
+        use aster_node::publication_journal::{Backend, Intent, Journal};
+        let state = TestState::new();
+        let mission = UnprotectedReferenceMission::from_bytes(
+            include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle")
+                .to_vec(),
+        )
+        .unwrap();
+        let node = start_node(NodeConfig {
+            state: state.0.clone(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            mission,
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(50),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .unwrap();
+        let events = node.selected_events();
+        let path = state.0.join("stream-owner.redb");
+        Journal::initialize(&path, b"stream-owner").unwrap();
+        let mut journal = Journal::open(&path, b"stream-owner").unwrap();
+        let mut backend = Backend::Live(&events);
+        journal.recover(&mut backend).await.unwrap();
+        let old = journal.client_context().unwrap();
+        let subscription = events
+            .subscribe(EventSubscriptionRequest {
+                client: old.clone(),
+                operation_key: b"feed".to_vec(),
+                topic: Topic::new("chat.events").unwrap(),
+                scope: Scope::new("mission/team/alpha").unwrap(),
+                include_descendant_scopes: false,
+            })
+            .await
+            .unwrap();
+        for payload in [b"first".as_slice(), b"second".as_slice()] {
+            journal
+                .publish(
+                    &mut backend,
+                    Intent {
+                        predecessor: None,
+                        topic: "chat.events".into(),
+                        scope: "mission/team/alpha".into(),
+                        priority: NodePriority::Routine as u8,
+                        logical_key: b"message".to_vec(),
+                        payload: payload.to_vec(),
+                        tombstone: false,
+                        ttl_ms: None,
+                    },
+                )
+                .await
+                .unwrap();
+            journal.acknowledge(&mut backend).await.unwrap();
+        }
+        let page = events
+            .poll(EventPollRequest {
+                client: old.clone(),
+                subscription: subscription.id,
+                delivery_limit: 8,
+                scan_limit: 8,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.deliveries.len(), 2);
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        let stream = EventStreamState {
+            client: old.clone(),
+            events: events.clone(),
+            subscription: subscription.id,
+            delivery_limit: 8,
+            scan_limit: 8,
+            backoff: Duration::from_millis(1),
+            pending: page.deliveries.into(),
+            backoff_before_poll: false,
+            shutdown: shutdown.clone(),
+            stopped: false,
+        };
+        let (first, stream) = next_stream_delivery(stream).await.unwrap();
+        assert!(first.is_ok());
+        let mut nonce = vec![0; 32];
+        getrandom::fill(&mut nonce).unwrap();
+        let takeover = events
+            .begin_publication_session(old.client_id.clone(), old.session.get(), nonce)
+            .await
+            .unwrap();
+        let before = events
+            .client_status(old.client_id.clone(), Some(old.session))
+            .await
+            .unwrap();
+        assert_eq!(
+            before.disposition,
+            aster_node::application::EventClientDisposition::Fenced
+        );
+        let (second, stream) = next_stream_delivery(stream).await.unwrap();
+        assert_eq!(second.unwrap_err().code, ErrorCode::Aborted);
+        assert!(stream.pending.is_empty());
+        assert!(next_stream_delivery(stream).await.is_none());
+        assert_eq!(
+            events
+                .client_status(old.client_id.clone(), Some(old.session))
+                .await
+                .unwrap(),
+            before
+        );
+        let empty = EventStreamState {
+            client: old.clone(),
+            events: events.clone(),
+            subscription: subscription.id,
+            delivery_limit: 8,
+            scan_limit: 8,
+            backoff: Duration::from_millis(1),
+            pending: VecDeque::new(),
+            backoff_before_poll: true,
+            shutdown,
+            stopped: false,
+        };
+        assert_eq!(
+            next_stream_delivery(empty)
+                .await
+                .unwrap()
+                .0
+                .unwrap_err()
+                .code,
+            ErrorCode::Aborted
+        );
+        assert_eq!(
+            events
+                .query(EventQuery::default())
+                .await
+                .unwrap()
+                .items
+                .len(),
+            2
+        );
+        events
+            .complete_publication_recovery(
+                old.client_id.clone(),
+                takeover.session,
+                takeover.snapshot_revision,
+            )
+            .await
+            .unwrap();
+        let current = aster_node::application::EventClientContext {
+            client_id: old.client_id,
+            session: takeover.session,
+        };
+        let resumed = events
+            .poll(EventPollRequest {
+                client: current,
+                subscription: subscription.id,
+                delivery_limit: 8,
+                scan_limit: 8,
+            })
+            .await
+            .unwrap();
+        assert_eq!(resumed.deliveries.len(), 2);
+        assert!(
+            resumed
+                .deliveries
+                .iter()
+                .all(|delivery| delivery.attempt == 2)
         );
         node.shutdown().await.unwrap();
     }
@@ -1759,6 +2027,7 @@ mod tests {
     fn subscription_listing_maximum_fits_response_budget_and_oversize_fails_closed() {
         use buffa::Message as _;
         let row = api::EventSubscription {
+            owner_client_id: vec![0xff; aster_redb_store::MAX_EVENT_CLIENT_ID_BYTES],
             subscription_id: vec![0xff; 32],
             topic: "t".repeat(aster_profile::MAX_TOPIC_BYTES),
             scope: "s".repeat(aster_profile::MAX_SCOPE_BYTES),

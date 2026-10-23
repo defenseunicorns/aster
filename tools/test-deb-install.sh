@@ -112,17 +112,22 @@ def rpc(method, data):
     with opener.open(req, timeout=10) as response:
         return json.load(response)
 rpc("GetStatus", {})
-sub = rpc("CreateEventSubscription", {"operationKey": "ZGViaWFuLXN1YnNjcmlwdGlvbg==",
-    "topic": "chat.events", "scope": "mission/team/alpha"})["subscriptionId"]
 journal = ["--journal", "/var/lib/aster-agent/debian-publication.redb", "--client-id", "debian-install-smoke"]
 subprocess.run(["asterctl", "publication-init", *journal], check=True, capture_output=True)
+sub_response = subprocess.run(["asterctl", "--json", "--token-file", "/etc/aster/agent-credentials/client-token",
+    "--host", "127.0.0.1", "--port", "8181", "subscribe", *journal,
+    "--operation-key", "debian-subscription", "--scope", "mission/team/alpha", "chat.events"], check=True, capture_output=True)
+sub = json.loads(sub_response.stdout)["subscriptionId"]
 publication = subprocess.run(["asterctl", "--json", "--token-file", "/etc/aster/agent-credentials/client-token",
     "--host", "127.0.0.1", "--port", "8181", "publish", *journal, "--topic", "chat.events",
     "--scope", "mission/team/alpha", "--logical-key", "asset-7", "ready"], check=True, capture_output=True)
 event_id = json.loads(publication.stdout)["result"]["receipt"]["eventId"]
-page = rpc("PollEvents", {"subscriptionId": sub, "deliveryLimit": 8, "scanLimit": 32})
+recovered = subprocess.run(["asterctl", "--json", "--token-file", "/etc/aster/agent-credentials/client-token",
+    "--host", "127.0.0.1", "--port", "8181", "publication-recover", *journal], check=True, capture_output=True)
+client = json.loads(recovered.stdout)["client"]
+page = rpc("PollEvents", {"client": client, "subscriptionId": sub, "deliveryLimit": 8, "scanLimit": 32})
 assert any(d["event"]["id"] == event_id for d in page["deliveries"])
-rpc("AcknowledgeEvent", {"subscriptionId": sub, "eventId": event_id})
+rpc("AcknowledgeEvent", {"client": client, "subscriptionId": sub, "eventId": event_id})
 subprocess.run(["asterctl", "--token-file", "/etc/aster/agent-credentials/client-token", "--host", "127.0.0.1",
     "--port", "8181", "publication-ack", *journal, "--sequence", "1"], check=True, capture_output=True)
 print("Protected local Event publish/delivery/ack: OK")

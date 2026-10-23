@@ -12,6 +12,7 @@ const PUBLIC_ERROR_DETAIL_TYPE: &str = "aster.application.v1alpha1.PublicErrorDe
 pub enum PublicOperation {
     Unspecified,
     GetStatus,
+    GetEventClientStatus,
     PublishNumberedEvents,
     BeginEventPublicationSession,
     CompleteEventPublicationRecovery,
@@ -35,6 +36,7 @@ impl PublicOperation {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Unspecified => "unspecified",
+            Self::GetEventClientStatus => "get_event_client_status",
             Self::GetStatus => "get_status",
             Self::PublishNumberedEvents => "publish_numbered_events",
             Self::BeginEventPublicationSession => "begin_event_publication_session",
@@ -57,6 +59,7 @@ impl PublicOperation {
 
     const fn from_application(operation: &str) -> Option<Self> {
         match operation.as_bytes() {
+            b"client_status" => Some(Self::GetEventClientStatus),
             b"status" => Some(Self::GetStatus),
             b"publish" => Some(Self::PublishNumberedEvent),
             b"begin_publication_session" => Some(Self::BeginEventPublicationSession),

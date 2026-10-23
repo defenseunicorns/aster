@@ -222,14 +222,16 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
         RELAY_SELECTOR_KEY,
         &topic,
         &scope,
-    )?;
+    )
+    .await?;
     seed_selector(
         &receiver,
         EventSubscriptionMode::Consume,
         RECEIVER_SELECTOR_KEY,
         &topic,
         &scope,
-    )?;
+    )
+    .await?;
     let relay_seeded = inspect_participant(&relay)?;
     let receiver_seeded = inspect_participant(&receiver)?;
     validate_seeded_selector(&relay_seeded)?;
@@ -756,8 +758,15 @@ async fn run_phase_two_receiver_child(arguments: &[OsString]) -> Result<(), DynE
     let events = running.selected_events();
     let topic = Topic::new(TOPIC)?;
     let scope = Scope::new(SCOPE)?;
+    let journal_path = state.join("custody-consumer.redb");
+    let mut journal = numbered::Journal::open(&journal_path, b"native.linux-custody.consumer.v1")?;
+    journal
+        .recover(&mut numbered::Backend::Live(&events))
+        .await?;
+    let client = journal.client_context()?;
     let subscription = events
         .subscribe(EventSubscriptionRequest {
+            client: client.clone(),
             operation_key: RECEIVER_SUBSCRIPTION_OPERATION.to_vec(),
             topic: topic.clone(),
             scope: scope.clone(),
@@ -777,7 +786,7 @@ async fn run_phase_two_receiver_child(arguments: &[OsString]) -> Result<(), DynE
     let status = wait_for_contact(&events, relay).await?;
     let query = query_stream(&events, origin, &topic, &scope).await?;
     validate_receiver_items(&query.items, &expected_ids)?;
-    let poll = poll_subscription(&events, subscription).await?;
+    let poll = poll_subscription(&events, subscription, &client).await?;
     validate_receiver_deliveries(&poll, &expected_ids)?;
     let receipt = running.shutdown().await?;
     validate_receipt(&receipt, 1, 2, 2, 0, 0, 2, 2)?;
@@ -963,9 +972,11 @@ async fn query_stream(
 async fn poll_subscription(
     events: &SelectedEventHandle,
     subscription: EventSubscription,
+    client: &aster_node::application::EventClientContext,
 ) -> Result<EventDeliveryPage, ApplicationError> {
     events
         .poll(EventPollRequest {
+            client: client.clone(),
             subscription: subscription.id,
             delivery_limit: 8,
             scan_limit: 8,
@@ -1349,13 +1360,26 @@ fn inspect_participant(participant: &Participant) -> Result<StoreInspection, Dyn
     Ok(inspection)
 }
 
-fn seed_selector(
+async fn seed_selector(
     participant: &Participant,
     mode: EventSubscriptionMode,
     key: &[u8],
     topic: &Topic,
     scope: &Scope,
 ) -> Result<(), DynError> {
+    let journal_path = participant.state.join("custody-consumer.redb");
+    let client_id = b"native.linux-custody.consumer.v1";
+    numbered::Journal::initialize(&journal_path, client_id)?;
+    let mut journal = numbered::Journal::open(&journal_path, client_id)?;
+    let mut node = aster_node::application::SelectedEventNode::open_unprotected_reference(
+        &participant.state,
+        &participant.mission_path,
+    )?;
+    journal
+        .recover(&mut numbered::Backend::Stopped(&mut node))
+        .await?;
+    let client = journal.client_context()?;
+    drop(node);
     let store = Store::open_for_mission(
         participant.state.join(STORE_FILE),
         participant.mission_authority,
@@ -1363,6 +1387,7 @@ fn seed_selector(
     store.require_process_exclusive_lock()?;
     let policy = store.control_policy_snapshot()?;
     let outcome = store.create_event_subscription_with_policy(
+        &client,
         &policy,
         &EventSubscriptionKey::new(key.to_vec())?,
         EventSubscriptionSpec {

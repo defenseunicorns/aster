@@ -361,9 +361,12 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
     ))
     .await?;
     let normal_receiver_events = normal_receiver.selected_events();
+    let consumer_journal =
+        recover_consumer(&receiver.state, &normal_receiver_events, false).await?;
+    let client = consumer_journal.client_context()?;
     validate_handle(&receiver, &normal_receiver_events)?;
     let reopened_subscription = normal_receiver_events
-        .subscribe(subscription_request(&topic, &scope))
+        .subscribe(subscription_request(&client, &topic, &scope))
         .await?;
     require(
         !reopened_subscription.inserted,
@@ -371,7 +374,7 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
     )?;
     let before_normal = normal_receiver_events.status().await?;
     validate_awaiting_status(&before_normal)?;
-    let before_normal_poll = poll(&normal_receiver_events, reopened_subscription).await?;
+    let before_normal_poll = poll(&normal_receiver_events, reopened_subscription, &client).await?;
     require(
         before_normal_poll.deliveries.is_empty() && !before_normal_poll.has_more,
         "normal pre-contact poll",
@@ -410,7 +413,8 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
         .gaps(gap_query(publisher.mission_id, &topic, &scope))
         .await?;
     validate_closed_gap(&closed_gap)?;
-    let second_delivery_page = poll(&normal_receiver_events, reopened_subscription).await?;
+    let second_delivery_page =
+        poll(&normal_receiver_events, reopened_subscription, &client).await?;
     require(
         second_delivery_page.deliveries.len() == 1 && !second_delivery_page.has_more,
         "gap-closing delivery count",
@@ -418,17 +422,17 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
     let second_delivery = &second_delivery_page.deliveries[0];
     validate_delivery(second_delivery, &second, SECOND_PAYLOAD, 1)?;
     let second_ack = normal_receiver_events
-        .acknowledge(reopened_subscription.id, second.id)
+        .acknowledge(client.clone(), reopened_subscription.id, second.id)
         .await?;
     let second_reack = normal_receiver_events
-        .acknowledge(reopened_subscription.id, second.id)
+        .acknowledge(client.clone(), reopened_subscription.id, second.id)
         .await?;
     require(
         second_ack == EventAcknowledgement::Acknowledged
             && second_reack == EventAcknowledgement::AlreadyAcknowledged,
         "gap-closing acknowledgement",
     )?;
-    let normal_empty = poll(&normal_receiver_events, reopened_subscription).await?;
+    let normal_empty = poll(&normal_receiver_events, reopened_subscription, &client).await?;
     require(
         normal_empty.deliveries.is_empty() && !normal_empty.has_more,
         "normal empty poll",
@@ -456,6 +460,7 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
     validate_query_page(&normal_beta_query, 0, 3, false, "receiver beta query")?;
     let beta_subscription = normal_receiver_events
         .subscribe(EventSubscriptionRequest {
+            client: client.clone(),
             operation_key: BETA_SUBSCRIPTION_OPERATION.to_vec(),
             topic: beta_topic.clone(),
             scope: scope.clone(),
@@ -471,10 +476,10 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
         EventSyncStatus::PolicyChangedSinceContact,
     )?;
     let beta_removed = normal_receiver_events
-        .unsubscribe(beta_subscription.id)
+        .unsubscribe(client.clone(), beta_subscription.id)
         .await?;
     let beta_removed_again = normal_receiver_events
-        .unsubscribe(beta_subscription.id)
+        .unsubscribe(client.clone(), beta_subscription.id)
         .await?;
     require(
         beta_removed == EventUnsubscribe::Removed
@@ -498,11 +503,14 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
         retained_normal_receiver,
     ));
 
+    drop(consumer_journal); // release the journal before the next explicit incarnation
     let final_receiver = start_peerless(&receiver).await?;
     let final_events = final_receiver.selected_events();
+    let final_journal = recover_consumer(&receiver.state, &final_events, false).await?;
+    let client = final_journal.client_context()?;
     validate_handle(&receiver, &final_events)?;
     let final_subscription = final_events
-        .subscribe(subscription_request(&topic, &scope))
+        .subscribe(subscription_request(&client, &topic, &scope))
         .await?;
     require(
         !final_subscription.inserted,
@@ -514,7 +522,7 @@ async fn run_parent(arguments: &[OsString]) -> Result<(), DynError> {
         .gaps(gap_query(publisher.mission_id, &topic, &scope))
         .await?;
     validate_closed_gap(&final_gap)?;
-    let final_empty = poll(&final_events, final_subscription).await?;
+    let final_empty = poll(&final_events, final_subscription, &client).await?;
     require(
         final_empty.deliveries.is_empty() && !final_empty.has_more,
         "final empty poll",
@@ -762,8 +770,13 @@ fn publication_request(spec: PublicationSpec, topic: &Topic, scope: &Scope) -> n
     }
 }
 
-fn subscription_request(topic: &Topic, scope: &Scope) -> EventSubscriptionRequest {
+fn subscription_request(
+    client: &aster_node::application::EventClientContext,
+    topic: &Topic,
+    scope: &Scope,
+) -> EventSubscriptionRequest {
     EventSubscriptionRequest {
+        client: client.clone(),
         operation_key: SUBSCRIPTION_OPERATION.to_vec(),
         topic: topic.clone(),
         scope: scope.clone(),
@@ -784,9 +797,11 @@ fn gap_query(publisher: [u8; 32], topic: &Topic, scope: &Scope) -> EventGapQuery
 async fn poll(
     handle: &SelectedEventHandle,
     subscription: EventSubscription,
+    client: &aster_node::application::EventClientContext,
 ) -> Result<aster_node::application::EventDeliveryPage, ApplicationError> {
     handle
         .poll(EventPollRequest {
+            client: client.clone(),
             subscription: subscription.id,
             delivery_limit: 8,
             scan_limit: 8,
@@ -1153,7 +1168,7 @@ async fn run_attempt_one_child(arguments: &[OsString]) -> Result<(), DynError> {
     let receiver_id = mission.identity();
     let receiver_authority = mission.mission_authority_id();
     let running = start_node(NodeConfig {
-        state,
+        state: state.clone(),
         bind,
         mission,
         peers: vec![MissionExpectedPeer {
@@ -1170,6 +1185,8 @@ async fn run_attempt_one_child(arguments: &[OsString]) -> Result<(), DynError> {
     })
     .await?;
     let events = running.selected_events();
+    let consumer_journal = recover_consumer(&state, &events, true).await?;
+    let client = consumer_journal.client_context()?;
     require(
         events.identity() == receiver_id && events.mission_authority() == receiver_authority,
         "attempt-one child handle binding",
@@ -1177,7 +1194,7 @@ async fn run_attempt_one_child(arguments: &[OsString]) -> Result<(), DynError> {
     let topic = Topic::new(TOPIC)?;
     let scope = Scope::new(SCOPE)?;
     let subscription = events
-        .subscribe(subscription_request(&topic, &scope))
+        .subscribe(subscription_request(&client, &topic, &scope))
         .await?;
     require(subscription.inserted, "attempt-one subscription creation")?;
     let awaiting = events.status().await?;
@@ -1219,7 +1236,7 @@ async fn run_attempt_one_child(arguments: &[OsString]) -> Result<(), DynError> {
         .gaps(gap_query(remote_mission, &topic, &scope))
         .await?;
     validate_open_gap(&gaps, remote_mission)?;
-    let page = poll(&events, subscription).await?;
+    let page = poll(&events, subscription, &client).await?;
     require(
         page.deliveries.len() == 2 && !page.has_more,
         "attempt-one delivery count",
@@ -1301,7 +1318,7 @@ async fn run_attempt_two_child(arguments: &[OsString]) -> Result<(), DynError> {
     let publisher = parse_node_id(&arguments[2])?;
     let mission = UnprotectedReferenceMission::load(&mission_path)?;
     let running = start_node(NodeConfig {
-        state,
+        state: state.clone(),
         bind: SocketAddr::from(([127, 0, 0, 1], 0)),
         mission,
         peers: Vec::new(),
@@ -1312,17 +1329,19 @@ async fn run_attempt_two_child(arguments: &[OsString]) -> Result<(), DynError> {
     })
     .await?;
     let events = running.selected_events();
+    let consumer_journal = recover_consumer(&state, &events, false).await?;
+    let client = consumer_journal.client_context()?;
     let topic = Topic::new(TOPIC)?;
     let scope = Scope::new(SCOPE)?;
     let subscription = events
-        .subscribe(subscription_request(&topic, &scope))
+        .subscribe(subscription_request(&client, &topic, &scope))
         .await?;
     require(!subscription.inserted, "attempt-two subscription replay")?;
     let status = events.status().await?;
     validate_offline_status(&status)?;
     let gaps = events.gaps(gap_query(publisher, &topic, &scope)).await?;
     validate_open_gap(&gaps, publisher)?;
-    let page = poll(&events, subscription).await?;
+    let page = poll(&events, subscription, &client).await?;
     require(
         page.deliveries.len() == 2 && !page.has_more,
         "attempt-two delivery count",
@@ -1335,16 +1354,16 @@ async fn run_attempt_two_child(arguments: &[OsString]) -> Result<(), DynError> {
         "attempt-two publisher consistency",
     )?;
     let first_ack = events
-        .acknowledge(subscription.id, deliveries[0].event.id)
+        .acknowledge(client.clone(), subscription.id, deliveries[0].event.id)
         .await?;
     let first_reack = events
-        .acknowledge(subscription.id, deliveries[0].event.id)
+        .acknowledge(client.clone(), subscription.id, deliveries[0].event.id)
         .await?;
     let third_ack = events
-        .acknowledge(subscription.id, deliveries[1].event.id)
+        .acknowledge(client.clone(), subscription.id, deliveries[1].event.id)
         .await?;
     let third_reack = events
-        .acknowledge(subscription.id, deliveries[1].event.id)
+        .acknowledge(client.clone(), subscription.id, deliveries[1].event.id)
         .await?;
     require(
         first_ack == EventAcknowledgement::Acknowledged
@@ -1353,7 +1372,7 @@ async fn run_attempt_two_child(arguments: &[OsString]) -> Result<(), DynError> {
             && third_reack == EventAcknowledgement::AlreadyAcknowledged,
         "attempt-two acknowledgements",
     )?;
-    let empty = poll(&events, subscription).await?;
+    let empty = poll(&events, subscription, &client).await?;
     require(
         empty.deliveries.is_empty() && !empty.has_more,
         "attempt-two empty poll",
@@ -2709,4 +2728,21 @@ fn emit(record: &str, fields: &[(&str, String)]) {
         print!("\t{key}={value}");
     }
     println!();
+}
+
+async fn recover_consumer(
+    state: &Path,
+    events: &SelectedEventHandle,
+    initialize: bool,
+) -> Result<numbered::Journal, DynError> {
+    let path = state.join("live-acceptance-consumer.redb");
+    let id = b"native.live-acceptance.consumer.v1";
+    if initialize {
+        numbered::Journal::initialize(&path, id)?;
+    }
+    let mut journal = numbered::Journal::open(&path, id)?;
+    journal
+        .recover(&mut numbered::Backend::Live(events))
+        .await?;
+    Ok(journal)
 }

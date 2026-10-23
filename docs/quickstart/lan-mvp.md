@@ -154,12 +154,18 @@ run_aster_agent
 After `AGENT status=ready`, use another terminal on that host to create the
 subscription. First repeat that node's `ASTER_NODE_ROOT` and `ASTER_APP_URL`
 assignments in the new terminal. Give each node its own stable operation key
-by replacing `A` below with `B`, `C`, or `D` as appropriate:
+by replacing `A` below with `B`, `C`, or `D` as appropriate, including the
+consumer client ID. Initialize the consumer journal only on fresh provisioning:
 
 ```sh
+python3 tools/aster_lan_mvp.py publication-init \
+  --token-file "$ASTER_NODE_ROOT/client.token" \
+  --journal "$ASTER_NODE_ROOT/consumer.redb" --client-id "lan-consumer-A"
+
 python3 tools/aster_lan_mvp.py subscribe \
   --token-file "$ASTER_NODE_ROOT/client.token" \
   --url "$ASTER_APP_URL" \
+  --journal "$ASTER_NODE_ROOT/consumer.redb" --client-id "lan-consumer-A" \
   --operation-key "demo/consume/A"
 ```
 

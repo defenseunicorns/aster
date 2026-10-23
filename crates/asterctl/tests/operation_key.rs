@@ -25,6 +25,34 @@ fn command_with_timeout(
     key: Option<&str>,
     timeout_seconds: Option<&str>,
 ) -> Command {
+    let directory = std::env::temp_dir().join(format!(
+        "asterctl-key-owner-{}-{}",
+        std::process::id(),
+        port
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let path = directory.join("journal.redb");
+    if !path.exists() {
+        assert!(
+            Command::new(env!("CARGO_BIN_EXE_asterctl"))
+                .args([
+                    "publication-init",
+                    "--journal",
+                    path.to_str().unwrap(),
+                    "--client-id",
+                    "key-fixture"
+                ])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
     let mut command = Command::new(env!("CARGO_BIN_EXE_asterctl"));
     command.args(["--token", TOKEN, "--port", &port.to_string(), "--json"]);
     if let Some(timeout_seconds) = timeout_seconds {
@@ -37,6 +65,12 @@ fn command_with_timeout(
     if kind == "subscribe" {
         command.arg("x");
     }
+    command.args([
+        "--journal",
+        path.to_str().unwrap(),
+        "--client-id",
+        "key-fixture",
+    ]);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -83,6 +117,39 @@ fn accept(listener: &TcpListener) -> TcpStream {
                 stream
                     .set_write_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
+                // Claim/recovery are explicit control calls preceding each CLI mutation.
+                let mut stream = stream;
+                let header = read_header(&mut stream);
+                let size: usize = header
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let mut body = vec![0; size];
+                stream.read_exact(&mut body).unwrap();
+                if header.contains("/begineventpublicationsession ")
+                    || header.contains("/completeeventpublicationrecovery ")
+                {
+                    let body = if header.contains("/begineventpublicationsession ") {
+                        let claim =
+                            api::BeginEventPublicationSessionRequest::decode_from_slice(&body)
+                                .unwrap();
+                        api::BeginEventPublicationSessionResponse {
+                            session: claim.expected_session + 1,
+                            snapshot_revision: 1,
+                            ..Default::default()
+                        }
+                        .encode_to_vec()
+                    } else {
+                        api::CompleteEventPublicationRecoveryResponse::default().encode_to_vec()
+                    };
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/proto\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                    stream.write_all(&body).unwrap();
+                    continue;
+                }
+                // Keep the parsed mutation available to the original request assertions.
+                REQUESTS.with(|saved| *saved.borrow_mut() = Some(body));
                 return stream;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline => {
@@ -93,7 +160,11 @@ fn accept(listener: &TcpListener) -> TcpStream {
     }
 }
 
-fn request(stream: &mut TcpStream) -> Vec<u8> {
+thread_local! { static REQUESTS: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) }; }
+fn request(_stream: &mut TcpStream) -> Vec<u8> {
+    REQUESTS.with(|saved| saved.borrow_mut().take().unwrap())
+}
+fn read_header(stream: &mut TcpStream) -> String {
     let mut header = Vec::new();
     while !header.ends_with(b"\r\n\r\n") {
         let mut byte = [0];
@@ -101,16 +172,7 @@ fn request(stream: &mut TcpStream) -> Vec<u8> {
         header.push(byte[0]);
         assert!(header.len() <= 8192);
     }
-    let header = String::from_utf8(header).unwrap().to_ascii_lowercase();
-    let size = header
-        .lines()
-        .find_map(|line| line.strip_prefix("content-length: "))
-        .unwrap()
-        .parse()
-        .unwrap();
-    let mut body = vec![0; size];
-    stream.read_exact(&mut body).unwrap();
-    body
+    String::from_utf8(header).unwrap().to_ascii_lowercase()
 }
 
 fn key_from_request(_kind: &str, body: &[u8]) -> String {
@@ -230,7 +292,12 @@ fn lost_response_allows_manual_retry_with_identical_request_and_key() {
     let mut cmd = command(kind, port, Some(&key));
     let child = cmd.spawn().unwrap();
     let mut stream = accept(&listener);
-    assert_eq!(request(&mut stream), original);
+    let retry = request(&mut stream);
+    let mut old = api::CreateEventSubscriptionRequest::decode_from_slice(&original).unwrap();
+    let mut new = api::CreateEventSubscriptionRequest::decode_from_slice(&retry).unwrap();
+    old.client = Default::default();
+    new.client = Default::default();
+    assert_eq!(old, new);
     respond(&mut stream, kind, false);
     let output = finish(child);
     assert!(output.status.success());
@@ -313,4 +380,118 @@ fn timeouts_preserve_the_generated_key_without_retrying() {
     for case in cases {
         case.join().unwrap();
     }
+}
+
+#[test]
+fn client_status_after_publication_init_omits_unissued_session() {
+    let listener = listener();
+    let port = listener.local_addr().unwrap().port();
+    let root = std::env::temp_dir().join(format!(
+        "asterctl-fresh-status-{}-{port}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let path = root.join("journal.redb");
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_asterctl"))
+            .args([
+                "publication-init",
+                "--journal",
+                path.to_str().unwrap(),
+                "--client-id",
+                "fresh-status",
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let child = Command::new(env!("CARGO_BIN_EXE_asterctl"))
+        .args([
+            "--token",
+            TOKEN,
+            "--port",
+            &port.to_string(),
+            "client-status",
+            "--journal",
+            path.to_str().unwrap(),
+            "--client-id",
+            "fresh-status",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(5))
+            }
+            Err(error) => panic!("status connection failed: {error}"),
+        }
+    };
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let header = read_header(&mut stream);
+    assert!(
+        header.contains("/geteventclientstatus "),
+        "status must not claim or recover: {header}"
+    );
+    let size: usize = header
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length: "))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut body = vec![0; size];
+    stream.read_exact(&mut body).unwrap();
+    let request = api::GetEventClientStatusRequest::decode_from_slice(&body).unwrap();
+    assert_eq!(request.client_id, b"fresh-status");
+    assert_eq!(request.observed_session, None);
+    let response = api::GetEventClientStatusResponse {
+        disposition: api::EventClientDisposition::Unregistered.into(),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/proto\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+    stream.write_all(&response).unwrap();
+    drop(stream);
+    let output = finish(child);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        status["disposition"],
+        "EVENT_CLIENT_DISPOSITION_UNREGISTERED"
+    );
+    // redb may update file bookkeeping on open; publication state stays untouched.
+    let sdk = aster_agent::sdk::NumberedEventSdk::open(
+        aster_agent::proto::aster::application::v1alpha1::AsterApplicationServiceClient::new(
+            connectrpc::client::HttpClient::plaintext(),
+            connectrpc::client::ClientConfig::new(
+                format!("http://127.0.0.1:{port}").parse().unwrap(),
+            ),
+        ),
+        &path,
+        b"fresh-status",
+    )
+    .unwrap();
+    assert_eq!(sdk.session().unwrap(), 0);
+    assert!(sdk.client_context().is_err());
+    drop(sdk);
+    std::fs::remove_dir_all(root).unwrap();
 }

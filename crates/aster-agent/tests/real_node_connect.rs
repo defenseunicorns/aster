@@ -730,6 +730,7 @@ fn connect_client_uses_the_real_live_event_authority() {
         assert_authentication_error(&error, api::PublicErrorDetail::FULL_NAME);
         let mut unauthenticated_stream = unauthenticated_client
             .stream_events(api::StreamEventsRequest {
+                    client: api::EventClientContext { client_id: b"rpc-fixture".to_vec(), session: 1, ..Default::default() }.into(),
                 subscription_id: vec![0; 32],
                 delivery_limit: 1,
                 scan_limit: 1,
@@ -832,8 +833,10 @@ fn connect_client_uses_the_real_live_event_authority() {
             assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         }
 
+        claim_rpc_fixture(&client).await;
         let subscription = client
             .create_event_subscription(api::CreateEventSubscriptionRequest {
+                    client: api::EventClientContext { client_id: b"rpc-fixture".to_vec(), session: 1, ..Default::default() }.into(),
                 operation_key: b"connect-real-subscription".to_vec(),
                 topic: "chat.events".to_owned(),
                 scope: "mission/team/alpha".to_owned(),
@@ -853,7 +856,6 @@ fn connect_client_uses_the_real_live_event_authority() {
         assert_eq!(row.scope, "mission/team/alpha");
         assert!(!row.include_descendant_scopes);
 
-        claim_rpc_fixture(&client).await;
         let published = client
             .publish_numbered_event(api::PublishNumberedEventRequest {
                 client_id: b"rpc-fixture".to_vec(), session: 1, operation_sequence: 1,
@@ -872,6 +874,7 @@ fn connect_client_uses_the_real_live_event_authority() {
 
         let page = client
             .poll_events(api::PollEventsRequest {
+                    client: api::EventClientContext { client_id: b"rpc-fixture".to_vec(), session: 1, ..Default::default() }.into(),
                 subscription_id: subscription.subscription_id.clone(),
                 delivery_limit: 8,
                 scan_limit: 32,
@@ -891,6 +894,7 @@ fn connect_client_uses_the_real_live_event_authority() {
 
         let acknowledgement = client
             .acknowledge_event(api::AcknowledgeEventRequest {
+                    client: api::EventClientContext { client_id: b"rpc-fixture".to_vec(), session: 1, ..Default::default() }.into(),
                 subscription_id: subscription.subscription_id.clone(),
                 event_id: published.result.as_option().unwrap().receipt.as_option().unwrap().event_id.clone(),
                 ..Default::default()
@@ -902,6 +906,7 @@ fn connect_client_uses_the_real_live_event_authority() {
 
         let mut stream = client
             .stream_events(api::StreamEventsRequest {
+                    client: api::EventClientContext { client_id: b"rpc-fixture".to_vec(), session: 1, ..Default::default() }.into(),
                 subscription_id: subscription.subscription_id.clone(),
                 delivery_limit: 8,
                 scan_limit: 32,
@@ -938,6 +943,7 @@ fn connect_client_uses_the_real_live_event_authority() {
 
         let redelivery = client
             .poll_events(api::PollEventsRequest {
+                    client: api::EventClientContext { client_id: b"rpc-fixture".to_vec(), session: 1, ..Default::default() }.into(),
                 subscription_id: subscription.subscription_id.clone(),
                 delivery_limit: 8,
                 scan_limit: 32,
@@ -958,6 +964,7 @@ fn connect_client_uses_the_real_live_event_authority() {
         );
         client
             .acknowledge_event(api::AcknowledgeEventRequest {
+                    client: api::EventClientContext { client_id: b"rpc-fixture".to_vec(), session: 1, ..Default::default() }.into(),
                 subscription_id: subscription.subscription_id,
                 event_id: streamed_publication.result.as_option().unwrap().receipt.as_option().unwrap().event_id.clone(),
                 ..Default::default()
@@ -1267,12 +1274,19 @@ async fn subscription_listing_survives_restart_with_binary_keys_and_distinct_sel
             .into_owned();
         assert_eq!(before.subscriptions, expected);
         if generation == 0 {
+            claim_rpc_fixture(&client).await;
             for key in [
                 vec![0xff, 0, 0x80],
                 vec![0xfe; aster_redb_store::MAX_EVENT_SUBSCRIPTION_KEY_BYTES],
                 vec![0xfd, 0],
             ] {
                 let request = api::CreateEventSubscriptionRequest {
+                    client: api::EventClientContext {
+                        client_id: b"rpc-fixture".to_vec(),
+                        session: 1,
+                        ..Default::default()
+                    }
+                    .into(),
                     operation_key: key.clone(),
                     topic: "chat.events".to_owned(),
                     scope: "mission/team/alpha".to_owned(),
@@ -1292,6 +1306,7 @@ async fn subscription_listing_survives_restart_with_binary_keys_and_distinct_sel
                 assert!(!replay.inserted);
                 assert_eq!(replay.subscription_id, created.subscription_id);
                 expected.push(api::EventSubscription {
+                    owner_client_id: b"rpc-fixture".to_vec(),
                     subscription_id: created.subscription_id,
                     topic: "chat.events".to_owned(),
                     scope: "mission/team/alpha".to_owned(),
@@ -1305,6 +1320,12 @@ async fn subscription_listing_survives_restart_with_binary_keys_and_distinct_sel
             let removed = expected.remove(1);
             client
                 .delete_event_subscription(api::DeleteEventSubscriptionRequest {
+                    client: api::EventClientContext {
+                        client_id: b"rpc-fixture".to_vec(),
+                        session: 1,
+                        ..Default::default()
+                    }
+                    .into(),
                     subscription_id: removed.subscription_id,
                     ..Default::default()
                 })
@@ -1441,6 +1462,12 @@ async fn platform_compat_optional_event_ttl_is_enforced_by_the_live_agent() {
     {
         let subscription = client
             .create_event_subscription(api::CreateEventSubscriptionRequest {
+                client: api::EventClientContext {
+                    client_id: b"rpc-fixture".to_vec(),
+                    session: 1,
+                    ..Default::default()
+                }
+                .into(),
                 operation_key: b"ttl-subscription".to_vec(),
                 topic: request.topic.clone(),
                 scope: request.scope.clone(),
@@ -1502,6 +1529,12 @@ async fn platform_compat_optional_event_ttl_is_enforced_by_the_live_agent() {
         assert_eq!(page.events.len(), 1);
         assert_eq!(page.events[0].ttl_ms, request.ttl_ms);
         let poll = api::PollEventsRequest {
+            client: api::EventClientContext {
+                client_id: b"rpc-fixture".to_vec(),
+                session: 1,
+                ..Default::default()
+            }
+            .into(),
             subscription_id: subscription.subscription_id,
             delivery_limit: 16,
             scan_limit: 16,
@@ -1848,10 +1881,12 @@ where
     T::ResponseBody: Unpin,
     <T::ResponseBody as connectrpc::http_body::Body>::Error: std::fmt::Display,
 {
+    let mut claim = [0; 32];
+    getrandom::fill(&mut claim).unwrap();
     let snapshot = client
         .begin_event_publication_session(api::BeginEventPublicationSessionRequest {
             client_id: b"rpc-fixture".to_vec(),
-            claim_nonce: b"fixture-initial-claim".to_vec(),
+            claim_nonce: claim.to_vec(),
             ..Default::default()
         })
         .await
@@ -1867,4 +1902,277 @@ where
         })
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn sdk_subscription_context_is_fenced_without_implicit_takeover() {
+    let state = TestState::new();
+    let mission = UnprotectedReferenceMission::from_bytes(
+        include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle").to_vec(),
+    )
+    .unwrap();
+    let node = start_node(NodeConfig {
+        state: state.0.clone(),
+        bind: "127.0.0.1:0".parse().unwrap(),
+        mission,
+        peers: Vec::new(),
+        mutable_interests: MutableSourceInterests::default(),
+        sync_interval: Duration::from_millis(50),
+        run_for: None,
+        application: NodeApplication::Relay,
+    })
+    .await
+    .unwrap();
+    let agent = BoundAgent::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let address = agent.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let token = ClientToken::from_bytes(TEST_TOKEN.to_vec()).unwrap();
+    let server = tokio::spawn(agent.serve(node.selected_events(), token, shutdown_rx));
+    let client = api::AsterApplicationServiceClient::new(
+        HttpClient::plaintext(),
+        ClientConfig::new(format!("http://{address}").parse().unwrap()).with_default_header(
+            "authorization",
+            format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+        ),
+    );
+    let path = state.0.join("owned-sdk.redb");
+    PublicationJournal::initialize(&path, b"owned-sdk").unwrap();
+    let sdk = NumberedEventSdk::open(client.clone(), &path, b"owned-sdk").unwrap();
+    assert!(sdk.client_context().is_err());
+    let initial_capacity = client
+        .get_status(api::GetStatusRequest::default())
+        .await
+        .unwrap()
+        .into_owned()
+        .publish_operation_capacity;
+    for _ in 0..2 {
+        let initial = sdk.client_status().await.unwrap();
+        assert_eq!(
+            initial.disposition,
+            api::EventClientDisposition::Unregistered
+        );
+        assert_eq!(initial.current_session, None);
+        assert_eq!(
+            (
+                initial.subscriptions,
+                initial.pending_deliveries,
+                initial.acknowledged_deliveries,
+                initial.ownership_metadata_bytes
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(sdk.session().unwrap(), 0);
+        assert!(sdk.client_context().is_err());
+    }
+    assert_eq!(
+        client
+            .get_status(api::GetStatusRequest::default())
+            .await
+            .unwrap()
+            .into_owned()
+            .publish_operation_capacity,
+        initial_capacity
+    );
+    for invalid in [
+        api::GetEventClientStatusRequest {
+            client_id: b"owned-sdk".to_vec(),
+            observed_session: Some(0),
+            ..Default::default()
+        },
+        api::GetEventClientStatusRequest::default(),
+        api::GetEventClientStatusRequest {
+            client_id: vec![1; 65],
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(
+            client
+                .get_event_client_status(invalid)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidArgument
+        );
+    }
+    sdk.recover().await.unwrap();
+    let old = sdk.client_context().unwrap();
+    assert_eq!(
+        old.session, 1,
+        "status did not register or claim the client"
+    );
+    assert_eq!(
+        sdk.client_status().await.unwrap().disposition,
+        api::EventClientDisposition::Current
+    );
+    let unobserved = client
+        .get_event_client_status(api::GetEventClientStatusRequest {
+            client_id: old.client_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_owned();
+    assert_eq!(unobserved.current_session, Some(old.session));
+    assert_eq!(
+        unobserved.disposition,
+        api::EventClientDisposition::RecoveryRequired
+    );
+    let request = api::CreateEventSubscriptionRequest {
+        operation_key: b"reader".to_vec(),
+        topic: "chat.events".into(),
+        scope: "mission/team/alpha".into(),
+        ..Default::default()
+    };
+    // The public wire requires context; the SDK fills it from recovered state.
+    for invalid in [
+        request.clone(),
+        api::CreateEventSubscriptionRequest {
+            client: api::EventClientContext {
+                client_id: old.client_id.clone(),
+                session: 0,
+                ..Default::default()
+            }
+            .into(),
+            ..request.clone()
+        },
+    ] {
+        assert_eq!(
+            client
+                .create_event_subscription(invalid)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidArgument
+        );
+    }
+    let subscription = sdk.create_subscription(request.clone()).await.unwrap();
+    assert!(subscription.inserted);
+    assert_eq!(sdk.client_status().await.unwrap().subscriptions, 1);
+    let mut nonce = vec![0; 32];
+    getrandom::fill(&mut nonce).unwrap();
+    let takeover = client
+        .begin_event_publication_session(api::BeginEventPublicationSessionRequest {
+            client_id: old.client_id.clone(),
+            expected_session: old.session,
+            claim_nonce: nonce,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_owned();
+    let current = api::EventClientContext {
+        client_id: old.client_id.clone(),
+        session: takeover.session,
+        ..Default::default()
+    };
+    let status = sdk.client_status().await.unwrap();
+    assert_eq!(status.disposition, api::EventClientDisposition::Fenced);
+    assert_eq!(status.current_session, Some(takeover.session));
+    for error in [
+        sdk.create_subscription(request.clone()).await.unwrap_err(),
+        sdk.poll_events(api::PollEventsRequest {
+            subscription_id: subscription.subscription_id.clone(),
+            delivery_limit: 8,
+            scan_limit: 8,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err(),
+        sdk.acknowledge_delivery(api::AcknowledgeEventRequest {
+            subscription_id: subscription.subscription_id.clone(),
+            event_id: vec![0; 32],
+            ..Default::default()
+        })
+        .await
+        .unwrap_err(),
+        sdk.delete_subscription(api::DeleteEventSubscriptionRequest {
+            subscription_id: subscription.subscription_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err(),
+    ] {
+        assert!(
+            matches!(error, aster_agent::sdk::NumberedEventSdkError::Transport(error) if error.code == ErrorCode::Aborted)
+        );
+    }
+    let recovering = client
+        .get_event_client_status(api::GetEventClientStatusRequest {
+            client_id: old.client_id.clone(),
+            observed_session: Some(takeover.session),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_owned();
+    assert_eq!(
+        recovering.disposition,
+        api::EventClientDisposition::RecoveryRequired
+    );
+    let blocked = client
+        .poll_events(api::PollEventsRequest {
+            client: current.clone().into(),
+            subscription_id: subscription.subscription_id.clone(),
+            delivery_limit: 8,
+            scan_limit: 8,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(blocked.code, ErrorCode::FailedPrecondition);
+    let listed = client
+        .list_event_subscriptions(api::ListEventSubscriptionsRequest::default())
+        .await
+        .unwrap()
+        .into_owned();
+    assert_eq!(listed.subscriptions.len(), 1);
+    assert_eq!(listed.subscriptions[0].owner_client_id, old.client_id);
+    assert!(
+        client
+            .query_events(api::QueryEventsRequest {
+                limit: 8,
+                ..Default::default()
+            })
+            .await
+            .is_ok()
+    );
+    assert_eq!(sdk.client_status().await.unwrap(), status);
+    client
+        .complete_event_publication_recovery(api::CompleteEventPublicationRecoveryRequest {
+            client_id: old.client_id.clone(),
+            session: takeover.session,
+            snapshot_revision: takeover.snapshot_revision,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let replay = client
+        .create_event_subscription(api::CreateEventSubscriptionRequest {
+            client: current.clone().into(),
+            ..request
+        })
+        .await
+        .unwrap()
+        .into_owned();
+    assert!(!replay.inserted);
+    assert_eq!(replay.subscription_id, subscription.subscription_id);
+    client
+        .delete_event_subscription(api::DeleteEventSubscriptionRequest {
+            client: current.into(),
+            subscription_id: subscription.subscription_id,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        sdk.client_status().await.unwrap().ownership_metadata_bytes,
+        0
+    );
+    // No SDK mutation above silently advanced or repaired this fenced journal.
+    assert_eq!(sdk.client_context().unwrap(), old);
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
+    node.shutdown().await.unwrap();
 }

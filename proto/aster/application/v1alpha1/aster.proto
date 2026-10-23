@@ -56,6 +56,8 @@ service AsterApplicationService {
   rpc QueryEvents(QueryEventsRequest) returns (QueryEventsResponse);
   // CreateEventSubscription creates or replays a durable receive selector.
   rpc CreateEventSubscription(CreateEventSubscriptionRequest) returns (CreateEventSubscriptionResponse);
+  // Observe this client without reclaiming its session; fenced callers remain read-only.
+  rpc GetEventClientStatus(GetEventClientStatusRequest) returns (GetEventClientStatusResponse);
   // ListEventSubscriptions returns all local Consume subscriptions, ordered by raw ID.
   rpc ListEventSubscriptions(ListEventSubscriptionsRequest) returns (ListEventSubscriptionsResponse);
   // PollEvents returns one bounded page of at-least-once deliveries.
@@ -129,6 +131,40 @@ message ReadBlobResponse {
   bool complete = 14;
 }
 
+// Required for every application-owned subscription/delivery mutation.
+// This coordinates cooperating processes, not callers sharing a bearer credential.
+message EventClientContext {
+  bytes client_id = 1;
+  uint64 session = 2;
+}
+
+enum EventClientDisposition {
+  EVENT_CLIENT_DISPOSITION_UNSPECIFIED = 0;
+  EVENT_CLIENT_DISPOSITION_CURRENT = 1;
+  EVENT_CLIENT_DISPOSITION_FENCED = 2;
+  EVENT_CLIENT_DISPOSITION_RECOVERY_REQUIRED = 3;
+  EVENT_CLIENT_DISPOSITION_UNREGISTERED = 4;
+}
+
+// Observation never claims a session or completes recovery.
+message GetEventClientStatusRequest {
+  reserved 1;
+  reserved "client";
+  bytes client_id = 2;
+  // Omit before the journal has observed an issued session; if present, positive.
+  optional uint64 observed_session = 3;
+}
+
+message GetEventClientStatusResponse {
+  // Absent for an unregistered client.
+  optional uint64 current_session = 1;
+  EventClientDisposition disposition = 2;
+  uint64 subscriptions = 3;
+  uint64 pending_deliveries = 4;
+  uint64 acknowledged_deliveries = 5;
+  uint64 ownership_metadata_bytes = 6;
+}
+
 message ListEventSubscriptionsRequest {}
 
 message ListEventSubscriptionsResponse {
@@ -137,6 +173,7 @@ message ListEventSubscriptionsResponse {
 
 // One local Event subscription.
 message EventSubscription {
+  bytes owner_client_id = 6;
   bytes subscription_id = 1;
   string topic = 2;
   string scope = 3;
@@ -402,6 +439,7 @@ message Event {
 }
 
 message CreateEventSubscriptionRequest {
+  EventClientContext client = 5;
   bytes operation_key = 1;
   string topic = 2;
   string scope = 3;
@@ -414,6 +452,7 @@ message CreateEventSubscriptionResponse {
 }
 
 message PollEventsRequest {
+  EventClientContext client = 4;
   bytes subscription_id = 1;
   uint32 delivery_limit = 2;
   uint32 scan_limit = 3;
@@ -425,6 +464,7 @@ message PollEventsResponse {
 }
 
 message StreamEventsRequest {
+  EventClientContext client = 5;
   bytes subscription_id = 1;
   uint32 delivery_limit = 2;
   uint32 scan_limit = 3;
@@ -443,6 +483,7 @@ message EventDelivery {
 }
 
 message AcknowledgeEventRequest {
+  EventClientContext client = 3;
   bytes subscription_id = 1;
   bytes event_id = 2;
 }
@@ -452,6 +493,7 @@ message AcknowledgeEventResponse {
 }
 
 message DeleteEventSubscriptionRequest {
+  EventClientContext client = 2;
   bytes subscription_id = 1;
 }
 

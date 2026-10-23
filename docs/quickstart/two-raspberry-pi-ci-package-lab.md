@@ -451,11 +451,11 @@ def prepare() -> None:
         raise RuntimeError('lab subscription already exists; inspect before reusing')
     # Explicit fresh provisioning; existing or missing later journals are never replaced.
     subprocess.run([CTL, 'publication-init', '--journal', str(JOURNAL), '--client-id', CLIENT_ID], check=True, timeout=10)
-    result = rpc('CreateEventSubscription', {
-        'operationKey': encoded(secrets.token_bytes(24)),
-        'topic': TOPIC,
-        'scope': SCOPE,
-    })
+    result = subprocess.run([CTL, '--token-file', str(TOKEN), '--json', 'subscribe',
+        '--journal', str(JOURNAL), '--client-id', CLIENT_ID,
+        '--operation-key', secrets.token_hex(24), '--scope', SCOPE, TOPIC],
+        check=True, capture_output=True, text=True, timeout=15)
+    result = json.loads(result.stdout)
     subscription_id = result['subscriptionId']
     with SUBSCRIPTION.open('x', encoding='ascii') as output:
         output.write(subscription_id + '\n')
@@ -479,9 +479,13 @@ def publish(message: str) -> None:
 def poll(message: str) -> None:
     expected = message.encode('utf-8')
     subscription_id = SUBSCRIPTION.read_text(encoding='ascii').strip()
+    recovered = subprocess.run([CTL, '--token-file', str(TOKEN), '--json', 'publication-recover',
+        '--journal', str(JOURNAL), '--client-id', CLIENT_ID], check=True, capture_output=True, text=True, timeout=15)
+    client = json.loads(recovered.stdout)['client']
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         result = rpc('PollEvents', {
+            'client': client,
             'subscriptionId': subscription_id,
             'deliveryLimit': 8,
             'scanLimit': 32,
@@ -494,6 +498,7 @@ def poll(message: str) -> None:
             if event['topic'] != TOPIC or event['scope'] != SCOPE:
                 raise RuntimeError('matching payload arrived with wrong selector')
             rpc('AcknowledgeEvent', {
+                'client': client,
                 'subscriptionId': subscription_id,
                 'eventId': event['id'],
             })

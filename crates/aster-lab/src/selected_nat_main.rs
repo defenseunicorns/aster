@@ -403,7 +403,14 @@ fn prepare(options: &Options) -> Result<()> {
             Some(_) => {}
             None => mission_authority = Some(selected.mission_authority()),
         }
-        let subscription = selected.subscribe(subscription_request(name, &scope, &topic))?;
+        let mut journal = numbered::Journal::open(
+            &descriptor_child_path(&state_directory, "publication.redb")?,
+            publication_client(name).as_bytes(),
+        )?;
+        journal.recover_stopped(&mut selected)?;
+        let client = journal.client_context()?;
+        let subscription =
+            selected.subscribe(subscription_request(&client, name, &scope, &topic))?;
         if !subscription.inserted {
             return Err(invalid(
                 "fresh subscription was unexpectedly already present",
@@ -610,8 +617,18 @@ fn verify(options: &Options) -> Result<()> {
             "receiver mission authority does not match manifest",
         ));
     }
-    let replay_subscription =
-        selected.subscribe(subscription_request(name, &manifest.scope, &manifest.topic))?;
+    let mut journal = numbered::Journal::open(
+        &descriptor_child_path(&state_directory, "publication.redb")?,
+        publication_client(name).as_bytes(),
+    )?;
+    journal.recover_stopped(&mut selected)?;
+    let client = journal.client_context()?;
+    let replay_subscription = selected.subscribe(subscription_request(
+        &client,
+        name,
+        &manifest.scope,
+        &manifest.topic,
+    ))?;
     if replay_subscription.inserted || replay_subscription.id != expected.subscription_id {
         return Err(invalid(
             "durable subscription replay was not an exact no-op",
@@ -619,6 +636,7 @@ fn verify(options: &Options) -> Result<()> {
     }
 
     let page = selected.poll(EventPollRequest {
+        client: client.clone(),
         subscription: expected.subscription_id,
         delivery_limit: 16,
         scan_limit: 16,
@@ -641,12 +659,13 @@ fn verify(options: &Options) -> Result<()> {
     if attempt != 1 {
         return Err(invalid("fresh canary delivery attempt was not one"));
     }
-    if selected.acknowledge(expected.subscription_id, event_id)?
+    if selected.acknowledge(client.clone(), expected.subscription_id, event_id)?
         != EventAcknowledgement::Acknowledged
     {
         return Err(invalid("first canary acknowledgement was not committed"));
     }
     let empty = selected.poll(EventPollRequest {
+        client: client.clone(),
         subscription: expected.subscription_id,
         delivery_limit: 16,
         scan_limit: 16,
@@ -656,7 +675,7 @@ fn verify(options: &Options) -> Result<()> {
             "canary subscription was not empty after acknowledgement",
         ));
     }
-    if selected.acknowledge(expected.subscription_id, event_id)?
+    if selected.acknowledge(client.clone(), expected.subscription_id, event_id)?
         != EventAcknowledgement::AlreadyAcknowledged
     {
         return Err(invalid("repeated canary acknowledgement was not a no-op"));
@@ -1448,8 +1467,14 @@ fn destroy_bounded_file_at(
     })
 }
 
-fn subscription_request(name: &str, scope: &Scope, topic: &Topic) -> EventSubscriptionRequest {
+fn subscription_request(
+    client: &aster_node::application::EventClientContext,
+    name: &str,
+    scope: &Scope,
+    topic: &Topic,
+) -> EventSubscriptionRequest {
     EventSubscriptionRequest {
+        client: client.clone(),
         operation_key: format!("selected-nat/v1/node-{name}/consume").into_bytes(),
         topic: topic.clone(),
         scope: scope.clone(),

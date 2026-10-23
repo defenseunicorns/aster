@@ -34,11 +34,12 @@ use aster_redb_store::{
     StoreLimits, StoredEvent, StoredEventTransfer,
 };
 pub use aster_redb_store::{
-    CommittedEventContent, CommittedEventReceipt, EventClientId, EventOperationAbandonment,
-    EventOperationAuditState, EventOperationAuditStatus, EventOperationLimits,
-    EventOperationSequence, EventOperationStats, EventPublicationSession, EventRecoverySnapshot,
-    EventResultAcknowledgement, NumberedEventOperationError, NumberedEventOperationStats,
-    NumberedEventPublishOutcome, NumberedEventResult,
+    CommittedEventContent, CommittedEventReceipt, EventClientContext, EventClientDisposition,
+    EventClientId, EventClientStatus, EventOperationAbandonment, EventOperationAuditState,
+    EventOperationAuditStatus, EventOperationLimits, EventOperationSequence, EventOperationStats,
+    EventPublicationSession, EventRecoverySnapshot, EventResultAcknowledgement,
+    NumberedEventOperationError, NumberedEventOperationStats, NumberedEventPublishOutcome,
+    NumberedEventResult,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -513,6 +514,7 @@ impl fmt::Display for EventSubscriptionId {
 /// independently permit both route verification and content opening.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventSubscriptionRequest {
+    pub client: EventClientContext,
     pub operation_key: Vec<u8>,
     pub topic: Topic,
     pub scope: Scope,
@@ -522,6 +524,7 @@ pub struct EventSubscriptionRequest {
 /// Snapshot of one local Consume subscription.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventSubscriptionSnapshot {
+    pub owner: EventClientId,
     pub id: EventSubscriptionId,
     pub operation_key: Vec<u8>,
     pub topic: Topic,
@@ -541,8 +544,9 @@ pub struct EventSubscription {
 /// `scan_limit` bounds all pending and accepted rows freshly source-verified,
 /// not only matching rows returned. An empty page can therefore report
 /// `has_more=true`; poll again to continue from the durable internal cursor.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventPollRequest {
+    pub client: EventClientContext,
     pub subscription: EventSubscriptionId,
     pub delivery_limit: usize,
     pub scan_limit: usize,
@@ -1010,7 +1014,38 @@ impl SelectedEventHandle {
         .await
     }
 
-    /// Lists local Consume subscriptions without polling them.
+    /// Observes client registration and ownership without claiming a session.
+    pub async fn client_status(
+        &self,
+        client: EventClientId,
+        observed_session: Option<EventPublicationSession>,
+    ) -> Result<EventClientStatus, ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedEventCommand::ClientStatus {
+                client,
+                observed_session,
+                response,
+            },
+            received,
+            "client_status",
+        )
+        .await
+    }
+
+    pub async fn require_client_context(
+        &self,
+        client: EventClientContext,
+    ) -> Result<(), ApplicationError> {
+        let (response, received) = oneshot::channel();
+        self.send(
+            SelectedEventCommand::RequireClientContext { client, response },
+            received,
+            "client_status",
+        )
+        .await
+    }
+
     pub async fn list_subscriptions(
         &self,
     ) -> Result<Vec<EventSubscriptionSnapshot>, ApplicationError> {
@@ -1051,12 +1086,14 @@ impl SelectedEventHandle {
 
     pub async fn acknowledge(
         &self,
+        client: EventClientContext,
         subscription: EventSubscriptionId,
         event: EventId,
     ) -> Result<EventAcknowledgement, ApplicationError> {
         let (response, received) = oneshot::channel();
         self.send(
             SelectedEventCommand::Acknowledge {
+                client,
                 subscription,
                 event,
                 response,
@@ -1069,11 +1106,13 @@ impl SelectedEventHandle {
 
     pub async fn unsubscribe(
         &self,
+        client: EventClientContext,
         subscription: EventSubscriptionId,
     ) -> Result<EventUnsubscribe, ApplicationError> {
         let (response, received) = oneshot::channel();
         self.send(
             SelectedEventCommand::Unsubscribe {
+                client,
                 subscription,
                 response,
             },
@@ -1125,6 +1164,15 @@ pub(crate) fn actor_unavailable(operation: &'static str) -> ApplicationError {
 }
 
 pub(crate) enum SelectedEventCommand {
+    ClientStatus {
+        client: EventClientId,
+        observed_session: Option<EventPublicationSession>,
+        response: oneshot::Sender<Result<EventClientStatus, ApplicationError>>,
+    },
+    RequireClientContext {
+        client: EventClientContext,
+        response: oneshot::Sender<Result<(), ApplicationError>>,
+    },
     ListSubscriptions {
         response: oneshot::Sender<Result<Vec<EventSubscriptionSnapshot>, ApplicationError>>,
     },
@@ -1176,11 +1224,13 @@ pub(crate) enum SelectedEventCommand {
         response: oneshot::Sender<Result<EventDeliveryPage, ApplicationError>>,
     },
     Acknowledge {
+        client: EventClientContext,
         subscription: EventSubscriptionId,
         event: EventId,
         response: oneshot::Sender<Result<EventAcknowledgement, ApplicationError>>,
     },
     Unsubscribe {
+        client: EventClientContext,
         subscription: EventSubscriptionId,
         response: oneshot::Sender<Result<EventUnsubscribe, ApplicationError>>,
     },
@@ -1233,6 +1283,12 @@ impl SelectedEventCommand {
             Self::Gaps { response, .. } => _ = response.send(Err(actor_unavailable("gaps"))),
             Self::ListSubscriptions { response } => {
                 _ = response.send(Err(actor_unavailable("list_subscriptions")))
+            }
+            Self::ClientStatus { response, .. } => {
+                _ = response.send(Err(actor_unavailable("client_status")))
+            }
+            Self::RequireClientContext { response, .. } => {
+                _ = response.send(Err(actor_unavailable("client_status")))
             }
             Self::Status { response } => _ = response.send(Err(actor_unavailable("status"))),
         }
@@ -1541,6 +1597,7 @@ impl SelectedEventNode {
         request: EventSubscriptionRequest,
     ) -> Result<EventSubscription, ApplicationError> {
         let EventSubscriptionRequest {
+            client,
             operation_key,
             topic,
             scope,
@@ -1565,6 +1622,7 @@ impl SelectedEventNode {
         let outcome = self
             .store
             .create_event_subscription_with_policy(
+                &client,
                 &policy,
                 &key,
                 EventSubscriptionSpec {
@@ -1581,13 +1639,33 @@ impl SelectedEventNode {
         })
     }
 
-    /// Lists all local Consume subscriptions in raw subscription-ID order.
+    /// Observes client registration and ownership without changing recovery state.
+    pub fn client_status(
+        &self,
+        client: &EventClientId,
+        observed_session: Option<EventPublicationSession>,
+    ) -> Result<EventClientStatus, ApplicationError> {
+        self.store
+            .event_client_status(client, observed_session)
+            .map_err(|error| application_error("client_status", error.into()))
+    }
+
+    pub fn require_client_context(
+        &self,
+        client: &EventClientContext,
+    ) -> Result<(), ApplicationError> {
+        self.store
+            .require_event_client_context(client)
+            .map_err(|error| application_error("client_status", error.into()))
+    }
+
     pub fn list_subscriptions(&self) -> Result<Vec<EventSubscriptionSnapshot>, ApplicationError> {
         self.store
             .list_event_subscriptions()
             .map(|rows| {
                 rows.into_iter()
                     .map(|row| EventSubscriptionSnapshot {
+                        owner: row.owner,
                         id: EventSubscriptionId::from_store(row.id),
                         operation_key: row.operation_key.as_bytes().to_vec(),
                         topic: row.spec.topic,
@@ -1610,6 +1688,7 @@ impl SelectedEventNode {
         &mut self,
         request: EventPollRequest,
     ) -> Result<EventDeliveryPage, ApplicationError> {
+        self.require_client_context(&request.client)?;
         self.maintain_custody_for("poll")?;
         let request = request.validate()?;
         for _ in 0..MAX_SELECTED_EVENT_PLAN_RETRIES {
@@ -1617,6 +1696,7 @@ impl SelectedEventNode {
             let plan = self
                 .store
                 .prepare_event_subscription_poll_with_policy(
+                    &request.client,
                     &policy,
                     request.subscription.into_store(),
                     request.delivery_limit,
@@ -1706,6 +1786,7 @@ impl SelectedEventNode {
     /// Idempotently acknowledges one semantic Event delivery.
     pub fn acknowledge(
         &mut self,
+        client: EventClientContext,
         subscription: EventSubscriptionId,
         event: EventId,
     ) -> Result<EventAcknowledgement, ApplicationError> {
@@ -1713,6 +1794,7 @@ impl SelectedEventNode {
         match self
             .store
             .acknowledge_event_delivery_with_policy(
+                &client,
                 &policy,
                 subscription.into_store(),
                 event.into_store(),
@@ -1729,12 +1811,13 @@ impl SelectedEventNode {
     /// Idempotently withdraws one durable receive selector and its delivery ledger.
     pub fn unsubscribe(
         &mut self,
+        client: EventClientContext,
         subscription: EventSubscriptionId,
     ) -> Result<EventUnsubscribe, ApplicationError> {
         let policy = self.current_policy("unsubscribe")?;
         let EventSubscriptionRemoveOutcome { removed, .. } = self
             .store
-            .remove_event_subscription_with_policy(&policy, subscription.into_store())
+            .remove_event_subscription_with_policy(&client, &policy, subscription.into_store())
             .map_err(|error| application_error("unsubscribe", error.into()))?;
         Ok(if removed {
             EventUnsubscribe::Removed
@@ -2779,6 +2862,9 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
             | NumberedEventOperationError::InvalidSequence
             | NumberedEventOperationError::ClientNotFound
             | NumberedEventOperationError::ResultNotFound => ApplicationErrorKind::InvalidRequest,
+            NumberedEventOperationError::SubscriptionOwnerMismatch => {
+                ApplicationErrorKind::RequestRejected
+            }
             NumberedEventOperationError::SessionFenced => ApplicationErrorKind::SessionFenced,
             NumberedEventOperationError::IntentConflict => ApplicationErrorKind::Conflict,
             NumberedEventOperationError::SequenceRetired => ApplicationErrorKind::SequenceRetired,
@@ -4271,8 +4357,48 @@ mod tests {
         .expect("capacity reused after acknowledgement");
     }
 
-    fn subscription_request(operation: &[u8], topic: &str) -> EventSubscriptionRequest {
+    fn publish_owned_fixture(
+        node: &mut SelectedEventNode,
+        sequence: u64,
+        request: EventPublishRequest,
+        options: EventPublishOptions,
+    ) -> Result<EventPublishResult, ApplicationError> {
+        let context = node.store.test_event_client_context().unwrap();
+        let outcome = node.publish_numbered(
+            NumberedEventPublishRequest {
+                client_id: context.client_id,
+                session: context.session,
+                sequence: EventOperationSequence::new(sequence).unwrap(),
+                predecessor: None,
+                topic: request.topic,
+                scope: request.scope,
+                priority: request.priority,
+                logical_key: request.logical_key,
+                payload: request.payload,
+                tombstone: request.tombstone,
+            },
+            options,
+        )?;
+        let receipt = outcome.result.receipt;
+        Ok(EventPublishResult {
+            id: EventId::from_store(receipt.semantic_id),
+            publisher: node.identity(),
+            publisher_counter: sequence,
+            event_sequence: 1,
+            priority: request.priority,
+            ttl_ms: options.ttl_ms(),
+            acceptance_marker: receipt.acceptance_marker,
+            inserted: outcome.inserted,
+        })
+    }
+
+    fn subscription_request(
+        node: &SelectedEventNode,
+        operation: &[u8],
+        topic: &str,
+    ) -> EventSubscriptionRequest {
         EventSubscriptionRequest {
+            client: node.store.test_event_client_context().unwrap(),
             operation_key: operation.to_vec(),
             topic: Topic::new(topic).expect("topic"),
             scope: Scope::new("mission/apps").expect("scope"),
@@ -4642,18 +4768,24 @@ mod tests {
         let mut poll_node = selected_node(&poll_root);
         let poll_clock_id = [0x9b; 16];
         poll_node.custody_clock = NodeCustodyClock::injected(poll_clock_id, 0, 0);
-        poll_node
-            .publish_with_options(
-                request(b"ops/finite", "ops.alpha", b"asset-ttl", b"brief"),
-                EventPublishOptions::finite_ttl_ms(10).expect("positive TTL"),
-            )
-            .expect("publish finite poll Event");
+        publish_owned_fixture(
+            &mut poll_node,
+            1,
+            request(b"ops/finite", "ops.alpha", b"asset-ttl", b"brief"),
+            EventPublishOptions::finite_ttl_ms(10).expect("positive TTL"),
+        )
+        .expect("publish finite poll Event");
         let subscription = poll_node
-            .subscribe(subscription_request(b"subscriptions/finite", "ops.alpha"))
+            .subscribe(subscription_request(
+                &poll_node,
+                b"subscriptions/finite",
+                "ops.alpha",
+            ))
             .expect("subscribe finite Event");
         poll_node.custody_clock = NodeCustodyClock::injected(poll_clock_id, 9, 1);
         let polled = poll_node
             .poll(EventPollRequest {
+                client: poll_node.store.test_event_client_context().unwrap(),
                 subscription: subscription.id,
                 delivery_limit: 8,
                 scan_limit: 8,
@@ -5146,21 +5278,34 @@ mod tests {
                 .unwrap();
             let event_id = EventId::from_store(outcome.result.receipt.semantic_id);
             let subscription = node
-                .subscribe(subscription_request(b"subscriptions/alpha", "ops.alpha"))
+                .subscribe(subscription_request(
+                    &node,
+                    b"subscriptions/alpha",
+                    "ops.alpha",
+                ))
                 .expect("subscribe");
             assert!(subscription.inserted);
             let replayed = node
-                .subscribe(subscription_request(b"subscriptions/alpha", "ops.alpha"))
+                .subscribe(subscription_request(
+                    &node,
+                    b"subscriptions/alpha",
+                    "ops.alpha",
+                ))
                 .expect("replay subscribe");
             assert!(!replayed.inserted);
             assert_eq!(replayed.id, subscription.id);
             let conflict = node
-                .subscribe(subscription_request(b"subscriptions/alpha", "ops.beta"))
+                .subscribe(subscription_request(
+                    &node,
+                    b"subscriptions/alpha",
+                    "ops.beta",
+                ))
                 .expect_err("subscription operation mismatch must fail");
             assert_eq!(conflict.kind(), ApplicationErrorKind::Conflict);
 
             let first = node
                 .poll(EventPollRequest {
+                    client: node.store.test_event_client_context().unwrap(),
                     subscription: subscription.id,
                     delivery_limit: 8,
                     scan_limit: 8,
@@ -5180,6 +5325,7 @@ mod tests {
         .expect("reopen selected Event node");
         let repeated = reopened
             .poll(EventPollRequest {
+                client: reopened.store.test_event_client_context().unwrap(),
                 subscription: subscription_id,
                 delivery_limit: 8,
                 scan_limit: 8,
@@ -5191,19 +5337,28 @@ mod tests {
 
         assert_eq!(
             reopened
-                .acknowledge(subscription_id, event_id)
+                .acknowledge(
+                    reopened.store.test_event_client_context().unwrap(),
+                    subscription_id,
+                    event_id
+                )
                 .expect("acknowledge"),
             EventAcknowledgement::Acknowledged
         );
         assert_eq!(
             reopened
-                .acknowledge(subscription_id, event_id)
+                .acknowledge(
+                    reopened.store.test_event_client_context().unwrap(),
+                    subscription_id,
+                    event_id
+                )
                 .expect("idempotent acknowledge"),
             EventAcknowledgement::AlreadyAcknowledged
         );
         assert!(
             reopened
                 .poll(EventPollRequest {
+                    client: reopened.store.test_event_client_context().unwrap(),
                     subscription: subscription_id,
                     delivery_limit: 8,
                     scan_limit: 8,
@@ -5218,22 +5373,31 @@ mod tests {
     fn subscription_scan_advances_over_verified_nonmatching_events() {
         let root = TestRoot::new("subscription-selective-scan");
         let mut node = selected_node(&root);
-        node.publish(request(
-            b"ops/alpha-first",
-            "ops.alpha",
-            b"asset-7",
-            b"alpha",
-        ))
+        publish_owned_fixture(
+            &mut node,
+            1,
+            request(b"ops/alpha-first", "ops.alpha", b"asset-7", b"alpha"),
+            EventPublishOptions::durable(),
+        )
         .expect("publish alpha");
-        let beta = node
-            .publish(request(b"ops/beta-second", "ops.beta", b"asset-8", b"beta"))
-            .expect("publish beta");
+        let beta = publish_owned_fixture(
+            &mut node,
+            2,
+            request(b"ops/beta-second", "ops.beta", b"asset-8", b"beta"),
+            EventPublishOptions::durable(),
+        )
+        .expect("publish beta");
         let subscription = node
-            .subscribe(subscription_request(b"subscriptions/beta", "ops.beta"))
+            .subscribe(subscription_request(
+                &node,
+                b"subscriptions/beta",
+                "ops.beta",
+            ))
             .expect("subscribe beta");
 
         let first = node
             .poll(EventPollRequest {
+                client: node.store.test_event_client_context().unwrap(),
                 subscription: subscription.id,
                 delivery_limit: 1,
                 scan_limit: 1,
@@ -5244,6 +5408,7 @@ mod tests {
 
         let second = node
             .poll(EventPollRequest {
+                client: node.store.test_event_client_context().unwrap(),
                 subscription: subscription.id,
                 delivery_limit: 1,
                 scan_limit: 1,
@@ -5341,6 +5506,7 @@ mod tests {
         let mut node = selected_node(&root);
         let denied_subscription = node
             .subscribe(subscription_request(
+                &node,
                 b"subscriptions/denied",
                 "ops.unprovisioned",
             ))
@@ -5365,9 +5531,13 @@ mod tests {
             assert!(!rendered.contains("ops.unprovisioned"));
             assert!(!rendered.contains("transfer"));
         }
-        let accepted = node
-            .publish(request(b"ops/accepted", "ops.alpha", b"asset", b"accepted"))
-            .expect("authorized Event");
+        let accepted = publish_owned_fixture(
+            &mut node,
+            1,
+            request(b"ops/accepted", "ops.alpha", b"asset", b"accepted"),
+            EventPublishOptions::durable(),
+        )
+        .expect("authorized Event");
         assert_eq!(accepted.publisher_counter, 1);
         assert_eq!(accepted.event_sequence, 1);
         assert_eq!(accepted.acceptance_marker, 1);

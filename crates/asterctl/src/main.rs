@@ -39,7 +39,7 @@ fn run() -> Result<(), (u8, String)> {
         }
         args::Command::UnsubscribeHelp => {
             return write_output(
-                "Usage: asterctl (--token TOKEN | --token-file PATH) [OPTIONS] unsubscribe SUBSCRIPTION_ID\n\nRemove an Event subscription using its Base64 32-byte ID.\nGlobal options: see asterctl --help.\n",
+                "Usage: asterctl (--token TOKEN | --token-file PATH) [OPTIONS] unsubscribe SUBSCRIPTION_ID --journal PATH --client-id CLIENT_ID\n\nRemove an Event subscription using its Base64 32-byte ID.\nGlobal options: see asterctl --help.\n",
             );
         }
         args::Command::Help => return write_output(args::HELP),
@@ -70,7 +70,7 @@ fn run() -> Result<(), (u8, String)> {
                 )
             })?
         }
-        args::Command::Unsubscribe(options, subscription_id) => {
+        args::Command::Unsubscribe(options, subscription_id, identity) => {
             let rpc = RpcContext::new(options)?;
             let response = rpc
                 .runtime
@@ -78,6 +78,7 @@ fn run() -> Result<(), (u8, String)> {
                     rpc.address,
                     &rpc.token,
                     subscription_id,
+                    &identity,
                     rpc.timeout,
                 ))
                 .map_err(|e| (1, e.describe_unsubscribe()))?;
@@ -138,6 +139,10 @@ fn run() -> Result<(), (u8, String)> {
                     let intent = sdk.journaled_intent(sequence.expect("validated sequence")).map_err(journal::describe_error)?.ok_or_else(|| "sequence has no retained journaled intent".to_owned())?;
                     return serde_json::to_string_pretty(&intent).map(|text| text + "\n").map_err(|_| "cannot format journaled intent".to_owned());
                 }
+                if action == journal::Action::ClientStatus {
+                    let status = sdk.client_status().await.map_err(journal::describe_error)?;
+                    return serde_json::to_string_pretty(&status).map(|text| text + "\n").map_err(|_| "cannot format client status".to_owned());
+                }
                 let report = sdk.recover().await.map_err(journal::describe_error)?;
                 match action {
                     journal::Action::Recover => {
@@ -146,7 +151,7 @@ fn run() -> Result<(), (u8, String)> {
                             aster_agent::sdk::RecoveredState::Committed(result) => serde_json::json!({"operationSequence": operation.sequence.to_string(), "state": "committed", "result": result}),
                             aster_agent::sdk::RecoveredState::Retired => serde_json::json!({"operationSequence": operation.sequence.to_string(), "state": "retired"}),
                         }).collect::<Vec<_>>();
-                        serde_json::to_string_pretty(&serde_json::json!({"session": report.session.to_string(), "allocatedThrough": report.allocated_through.to_string(), "operations": operations})).map(|text| text + "\n").map_err(|_| "cannot format recovery report".to_owned())
+                        serde_json::to_string_pretty(&serde_json::json!({"client": sdk.client_context().map_err(journal::describe_error)?, "session": report.session.to_string(), "allocatedThrough": report.allocated_through.to_string(), "operations": operations})).map(|text| text + "\n").map_err(|_| "cannot format recovery report".to_owned())
                     }
                     journal::Action::Retry => {
                         let result = sdk.publish_journaled(sequence.expect("validated sequence")).await.map_err(journal::describe_error)?;
@@ -161,6 +166,7 @@ fn run() -> Result<(), (u8, String)> {
                         Ok("Committed publication result acknowledged.\n".to_owned())
                     }
                     journal::Action::Show => unreachable!("local inspection already returned"),
+                    journal::Action::ClientStatus => unreachable!("read-only status already returned"),
                     journal::Action::Initialize => unreachable!("initialization does not use RPC"),
                 }
             }).map_err(|e| (1, e))?
@@ -220,6 +226,7 @@ fn run() -> Result<(), (u8, String)> {
         }
         args::Command::Subscribe(options, subscription) => {
             let rpc = RpcContext::new(options)?;
+            let identity = subscription.identity.clone();
             let (request, key) = subscription.into_request().map_err(|e| (1, e.to_owned()))?;
             announce_key(&key)?;
             let response = rpc
@@ -228,6 +235,7 @@ fn run() -> Result<(), (u8, String)> {
                     rpc.address,
                     &rpc.token,
                     request,
+                    &identity,
                     rpc.timeout,
                 ))
                 .map_err(|e| (1, e.describe("CreateEventSubscription", &key)))?;

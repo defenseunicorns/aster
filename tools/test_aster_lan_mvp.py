@@ -137,7 +137,7 @@ class ClientTests(unittest.TestCase):
         FakeConnection.responder = responder
         client = client_module.ConnectJsonClient("http://127.0.0.1:8181", TOKEN)
         self.assertEqual(client.status()["authenticatedContacts"], "2")
-        self.assertTrue(client.subscribe(b"sub-op", "mesh.messages", "demo/playground")["inserted"])
+        self.assertTrue(client.subscribe(b"sub-op", "mesh.messages", "demo/playground", {"clientId": "dGVzdA==", "session": "1"})["inserted"])
         events, marker = client.query_events("mesh.messages", "demo/playground")
         self.assertEqual([event["id"] for event in events], [event_id(1), event_id(2)])
         self.assertEqual(marker, 2)

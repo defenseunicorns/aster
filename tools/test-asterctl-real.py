@@ -140,7 +140,7 @@ class RealAgentTest(unittest.TestCase):
                         self.assertNotIn("ttlMs", events[0])
                     self.assertEqual(base64.b64decode(events[0]["payload"]), b"asterctl upstream smoke")
                     cli("publication-ack", *publication, "--sequence", "1")
-                    subscription = ["--json", "subscribe", "--scope", "mission/team/alpha",
+                    subscription = ["--json", "subscribe", *publication, "--scope", "mission/team/alpha",
                                     "--operation-key", "cli-smoke-subscribe", "chat.events"]
                     created = json.loads(cli(*subscription).stdout)
                     repeated = json.loads(cli(*subscription).stdout)
@@ -150,7 +150,7 @@ class RealAgentTest(unittest.TestCase):
                     self.assertEqual(len(base64.b64decode(created["subscriptionId"])), 32)
                     self.assertEqual(created["operation_key"], "cli-smoke-subscribe")
                     descendant = json.loads(cli(
-                        "subscribe", "chat.events", "--scope=mission/team/alpha/*",
+                        "subscribe", *publication, "chat.events", "--scope=mission/team/alpha/*",
                         "--operation-key=cli-smoke-descendant", "--json").stdout)
                     listed = json.loads(cli("subscriptions", "--json").stdout)
                     expected = [
@@ -171,22 +171,22 @@ class RealAgentTest(unittest.TestCase):
                     self.assertIn('"cli-smoke-descendant"', text)
                     for row in expected:
                         self.assertIn(row["subscriptionId"], text)
-                    removed = cli("unsubscribe", created["subscriptionId"])
+                    removed = cli("unsubscribe", *publication, created["subscriptionId"])
                     self.assertEqual(removed.stdout, b"Subscription removed\n")
                     remaining = json.loads(cli("subscriptions", "--json").stdout)
                     self.assertEqual(remaining, [row for row in expected
                                                 if row["subscriptionId"] != created["subscriptionId"]])
-                    self.assertEqual(json.loads(cli("unsubscribe", created["subscriptionId"],
+                    self.assertEqual(json.loads(cli("unsubscribe", *publication, created["subscriptionId"],
                                                     "--json").stdout), {"alreadyAbsent": True})
-                    self.assertEqual(json.loads(cli("unsubscribe", descendant["subscriptionId"],
+                    self.assertEqual(json.loads(cli("unsubscribe", *publication, descendant["subscriptionId"],
                                                     "--json").stdout), {"alreadyAbsent": False})
-                    self.assertEqual(cli("unsubscribe", descendant["subscriptionId"]).stdout,
+                    self.assertEqual(cli("unsubscribe", *publication, descendant["subscriptionId"]).stdout,
                                      b"Subscription already absent\n")
                     self.assertEqual(json.loads(cli("subscriptions", "--json").stdout), [])
                     # Replace only the temporary fixture token file, not the agent's in-memory token.
                     Path(config["credentials"]["client_token_file"]).write_text("incorrect-test-token-" * 3)
                     for arguments in (("status",), ("subscriptions",),
-                                      ("unsubscribe", created["subscriptionId"])):
+                                      ("unsubscribe", *publication, created["subscriptionId"])):
                         denied = cli(*arguments, success=False)
                         self.assertEqual(denied.returncode, 1)
                         self.assertEqual(denied.stdout, b"")

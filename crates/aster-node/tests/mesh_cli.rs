@@ -900,8 +900,15 @@ fn live_event_process_worker() {
                 );
             }
             "sync-receiver" => {
+                let path = state.join("consumer-journal.redb");
+                let id = b"test.mesh.consumer.v1";
+                if true { aster_node::publication_journal::Journal::initialize(&path, id).unwrap(); }
+                let mut journal = aster_node::publication_journal::Journal::open(&path, id).unwrap();
+                journal.recover(&mut aster_node::publication_journal::Backend::Live(&events)).await.unwrap();
+                let client = journal.client_context().unwrap();
                 let subscription = events
                     .subscribe(EventSubscriptionRequest {
+                        client: client.clone(),
                         operation_key: b"process-later-sync-subscription".to_vec(),
                         topic,
                         scope,
@@ -918,6 +925,7 @@ fn live_event_process_worker() {
                 while Instant::now() < receiver_deadline {
                     let page = events
                         .poll(EventPollRequest {
+                            client: client.clone(),
                             subscription: subscription.id,
                             delivery_limit: 8,
                             scan_limit: 8,
@@ -937,7 +945,7 @@ fn live_event_process_worker() {
                 );
                 assert_eq!(
                     events
-                        .acknowledge(subscription.id, delivery.event.id)
+                        .acknowledge(client.clone(), subscription.id, delivery.event.id)
                         .await
                         .expect("receiver acknowledge"),
                     EventAcknowledgement::Acknowledged
@@ -945,6 +953,7 @@ fn live_event_process_worker() {
                 assert!(
                     events
                         .poll(EventPollRequest {
+                            client: client.clone(),
                             subscription: subscription.id,
                             delivery_limit: 8,
                             scan_limit: 8,
@@ -988,8 +997,15 @@ fn live_event_process_worker() {
                 );
             }
             "restart-receiver" => {
+                let path = state.join("consumer-journal.redb");
+                let id = b"test.mesh.consumer.v1";
+                if false { aster_node::publication_journal::Journal::initialize(&path, id).unwrap(); }
+                let mut journal = aster_node::publication_journal::Journal::open(&path, id).unwrap();
+                journal.recover(&mut aster_node::publication_journal::Backend::Live(&events)).await.unwrap();
+                let client = journal.client_context().unwrap();
                 let subscription = events
                     .subscribe(EventSubscriptionRequest {
+                        client: client.clone(),
                         operation_key: b"process-later-sync-subscription".to_vec(),
                         topic,
                         scope,
@@ -1001,6 +1017,7 @@ fn live_event_process_worker() {
                 assert!(
                     events
                         .poll(EventPollRequest {
+                            client: client.clone(),
                             subscription: subscription.id,
                             delivery_limit: 8,
                             scan_limit: 8,
@@ -2974,8 +2991,27 @@ fn public_binary_relay_secrecy_and_consumer_ack_survive_reopen() {
             let store =
                 Store::open_for_mission(state.join("mesh.redb"), mission.mission_authority_id())
                     .unwrap();
+            let client_id =
+                aster_redb_store::EventClientId::new(b"compact-selector-owner".to_vec()).unwrap();
+            let mut claim_nonce = [0; 32];
+            getrandom::fill(&mut claim_nonce).unwrap();
+            let recovery = store
+                .begin_event_publication_session(&client_id, 0, &claim_nonce)
+                .unwrap();
+            store
+                .complete_event_publication_recovery(
+                    &client_id,
+                    recovery.session,
+                    recovery.snapshot_revision,
+                )
+                .unwrap();
+            let client = aster_redb_store::EventClientContext {
+                client_id,
+                session: recovery.session,
+            };
             store
                 .create_event_subscription_with_policy(
+                    &client,
                     &store.control_policy_snapshot().unwrap(),
                     &EventSubscriptionKey::new(b"compact-selector".to_vec()).unwrap(),
                     EventSubscriptionSpec {
@@ -3131,8 +3167,11 @@ fn public_binary_relay_secrecy_and_consumer_ack_survive_reopen() {
     assert_eq!(items[0].id, published.id);
     assert_eq!(items[0].payload, payload);
     assert_eq!(items[0].logical_key, b"compact-key");
+    let client =
+        recover_test_event_client(&mut destination, &nodes[2].0.join("consumer-journal.redb"));
     let subscription = destination
         .subscribe(EventSubscriptionRequest {
+            client: client.clone(),
             operation_key: b"compact-public-consumer".to_vec(),
             topic,
             scope,
@@ -3140,25 +3179,38 @@ fn public_binary_relay_secrecy_and_consumer_ack_survive_reopen() {
         })
         .unwrap();
     let poll = EventPollRequest {
+        client: client.clone(),
         subscription: subscription.id,
         delivery_limit: 8,
         scan_limit: 8,
     };
-    let deliveries = destination.poll(poll).unwrap().deliveries;
+    let deliveries = destination.poll(poll.clone()).unwrap().deliveries;
     assert_eq!(deliveries.len(), 1);
     assert_eq!(deliveries[0].event.id, published.id);
     assert_eq!(deliveries[0].event.payload, payload);
     assert_eq!(
         destination
-            .acknowledge(subscription.id, published.id)
+            .acknowledge(client.clone(), subscription.id, published.id)
             .unwrap(),
         EventAcknowledgement::Acknowledged
     );
-    assert!(destination.poll(poll).unwrap().deliveries.is_empty());
+    assert!(
+        destination
+            .poll(poll.clone())
+            .unwrap()
+            .deliveries
+            .is_empty()
+    );
     drop(destination);
     let mut destination =
         SelectedEventNode::open_unprotected_reference(&nodes[2].0, &nodes[2].1).unwrap();
-    assert!(destination.poll(poll).unwrap().deliveries.is_empty());
+    assert!(
+        destination
+            .poll(poll.clone())
+            .unwrap()
+            .deliveries
+            .is_empty()
+    );
     assert_eq!(
         destination.query(EventQuery::default()).unwrap().items[0].payload,
         payload
@@ -3394,8 +3446,11 @@ fn four_real_processes_default_to_ping_pong_and_restart_cleanly() {
         .iter()
         .find(|item| item.payload == b"ASTER_SAMPLE_PING_V1")
         .expect("exact delivered Ping");
+    let client =
+        recover_test_event_client(&mut consumer, &state.join("relay-consumer-journal.redb"));
     let subscription = consumer
         .subscribe(EventSubscriptionRequest {
+            client: client.clone(),
             operation_key: b"relay-public-consumer".to_vec(),
             topic: ping.topic.clone(),
             scope: ping.scope.clone(),
@@ -3403,11 +3458,12 @@ fn four_real_processes_default_to_ping_pong_and_restart_cleanly() {
         })
         .expect("subscribe destination");
     let poll = EventPollRequest {
+        client: client.clone(),
         subscription: subscription.id,
         delivery_limit: 8,
         scan_limit: 8,
     };
-    let deliveries = consumer.poll(poll).expect("poll forwarded Events");
+    let deliveries = consumer.poll(poll.clone()).expect("poll forwarded Events");
     assert_eq!(deliveries.deliveries.len(), 2);
     assert!(
         deliveries
@@ -3418,14 +3474,14 @@ fn four_real_processes_default_to_ping_pong_and_restart_cleanly() {
     for delivery in deliveries.deliveries {
         assert_eq!(
             consumer
-                .acknowledge(subscription.id, delivery.event.id)
+                .acknowledge(client.clone(), subscription.id, delivery.event.id)
                 .expect("ack forwarded Event"),
             EventAcknowledgement::Acknowledged
         );
     }
     assert!(
         consumer
-            .poll(poll)
+            .poll(poll.clone())
             .expect("poll after ack")
             .deliveries
             .is_empty()
@@ -3435,7 +3491,7 @@ fn four_real_processes_default_to_ping_pong_and_restart_cleanly() {
         .expect("reopen acknowledged consumer");
     assert!(
         consumer
-            .poll(poll)
+            .poll(poll.clone())
             .expect("poll persisted ack")
             .deliveries
             .is_empty()
@@ -3809,4 +3865,19 @@ fn four_real_processes_propagate_controls_without_authority_and_exclude_captured
         assert!(!captured.contains("status=pass"));
     }
     std::fs::remove_dir_all(&root).expect("remove successful controlled demo root");
+}
+
+#[cfg(unix)]
+fn recover_test_event_client(
+    node: &mut aster_node::application::SelectedEventNode,
+    path: &std::path::Path,
+) -> aster_node::application::EventClientContext {
+    use aster_node::publication_journal::Journal;
+    let id = b"test.mesh.consumer.v1";
+    if !path.exists() {
+        Journal::initialize(path, id).unwrap();
+    }
+    let mut journal = Journal::open(path, id).unwrap();
+    journal.recover_stopped(node).unwrap();
+    journal.client_context().unwrap()
 }

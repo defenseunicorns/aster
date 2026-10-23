@@ -52,6 +52,9 @@ fn list_event_subscriptions_preserves_distinct_binary_keys_excludes_carry_and_re
     assert!(store.list_event_subscriptions().unwrap().is_empty());
     let carry = store
         .create_event_subscription_with_policy(
+            &store
+                .test_event_client_context()
+                .expect("recovered subscription fixture"),
             &policy,
             &EventSubscriptionKey::new(b"carry".to_vec()).unwrap(),
             subscription_spec(EventSubscriptionMode::Carry),
@@ -70,15 +73,30 @@ fn list_event_subscriptions_preserves_distinct_binary_keys_excludes_carry_and_re
         bytes[..8].copy_from_slice(&index.to_be_bytes());
         let key = EventSubscriptionKey::new(bytes).unwrap();
         let created = store
-            .create_event_subscription_with_policy(&policy, &key, spec.clone())
+            .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                &key,
+                spec.clone(),
+            )
             .unwrap();
         assert!(created.inserted);
         let replay = store
-            .create_event_subscription_with_policy(&policy, &key, spec.clone())
+            .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                &key,
+                spec.clone(),
+            )
             .unwrap();
         assert!(!replay.inserted);
         assert_eq!(replay.id, created.id);
         expected.push(EventSubscriptionSnapshot {
+            owner: EventClientId::new(b"test.subscription-owner".to_vec()).unwrap(),
             id: created.id,
             operation_key: key,
             spec: spec.clone(),
@@ -88,13 +106,27 @@ fn list_event_subscriptions_preserves_distinct_binary_keys_excludes_carry_and_re
     assert_eq!(store.list_event_subscriptions().unwrap(), expected);
     assert_listing_does_not_mutate_delivery(&store);
     store
-        .remove_event_subscription_with_policy(&policy, carry.id)
+        .remove_event_subscription_with_policy(
+            &store
+                .test_event_client_context()
+                .expect("recovered subscription fixture"),
+            &policy,
+            carry.id,
+        )
         .unwrap();
     let key = EventSubscriptionKey::new(vec![0xfe; MAX_EVENT_SUBSCRIPTION_KEY_BYTES]).unwrap();
     let created = store
-        .create_event_subscription_with_policy(&policy, &key, spec.clone())
+        .create_event_subscription_with_policy(
+            &store
+                .test_event_client_context()
+                .expect("recovered subscription fixture"),
+            &policy,
+            &key,
+            spec.clone(),
+        )
         .unwrap();
     expected.push(EventSubscriptionSnapshot {
+        owner: EventClientId::new(b"test.subscription-owner".to_vec()).unwrap(),
         id: created.id,
         operation_key: key,
         spec,
@@ -108,7 +140,13 @@ fn list_event_subscriptions_preserves_distinct_binary_keys_excludes_carry_and_re
     let policy = store.control_policy_snapshot().unwrap();
     let removed = expected.remove(0);
     store
-        .remove_event_subscription_with_policy(&policy, removed.id)
+        .remove_event_subscription_with_policy(
+            &store
+                .test_event_client_context()
+                .expect("recovered subscription fixture"),
+            &policy,
+            removed.id,
+        )
         .unwrap();
     assert_eq!(store.list_event_subscriptions().unwrap(), expected);
 }
@@ -122,9 +160,17 @@ fn list_event_subscriptions_does_not_audit_unrelated_delivery_rows() {
     let key = EventSubscriptionKey::new(vec![0, 0xff, 0x80]).unwrap();
     let spec = subscription_spec(EventSubscriptionMode::Consume);
     let created = store
-        .create_event_subscription_with_policy(&policy, &key, spec.clone())
+        .create_event_subscription_with_policy(
+            &store
+                .test_event_client_context()
+                .expect("recovered subscription fixture"),
+            &policy,
+            &key,
+            spec.clone(),
+        )
         .unwrap();
     let expected = vec![EventSubscriptionSnapshot {
+        owner: EventClientId::new(b"test.subscription-owner".to_vec()).unwrap(),
         id: created.id,
         operation_key: key,
         spec,
@@ -159,6 +205,9 @@ fn list_event_subscriptions_validates_stored_mission_binding() {
     let policy = store.control_policy_snapshot().unwrap();
     store
         .create_event_subscription_with_policy(
+            &store
+                .test_event_client_context()
+                .expect("recovered subscription fixture"),
             &policy,
             &EventSubscriptionKey::new(b"bound".to_vec()).unwrap(),
             subscription_spec(EventSubscriptionMode::Consume),
@@ -196,9 +245,17 @@ fn list_event_subscriptions_rejects_corrupt_rows_and_cursor_metadata() {
             EventSubscriptionMode::Consume
         });
         let created = store
-            .create_event_subscription_with_policy(&policy, &key, spec.clone())
+            .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &policy,
+                &key,
+                spec.clone(),
+            )
             .unwrap();
         let mut record = EventSubscriptionRecord {
+            owner: EventClientId::new(b"test.subscription-owner".to_vec()).unwrap(),
             operation_key: key,
             spec,
             discovered_through: 0,

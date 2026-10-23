@@ -687,6 +687,82 @@ where
         })
     }
 
+    /// Context for this journal's current recovered incarnation. Never silently takes over.
+    pub fn client_context(&self) -> Result<api::EventClientContext> {
+        let state = self.journal.read_state()?;
+        require_recovered(&state)?;
+        Ok(api::EventClientContext {
+            client_id: state.client_id,
+            session: state.session,
+            ..Default::default()
+        })
+    }
+
+    /// Read-only observation remains available even before local recovery completes.
+    pub async fn client_status(&self) -> Result<api::GetEventClientStatusResponse> {
+        let state = self.journal.read_state()?;
+        Ok(self
+            .client
+            .get_event_client_status(api::GetEventClientStatusRequest {
+                client_id: state.client_id,
+                observed_session: (state.session != 0).then_some(state.session),
+                ..Default::default()
+            })
+            .await?
+            .into_owned())
+    }
+
+    pub async fn create_subscription(
+        &self,
+        mut request: api::CreateEventSubscriptionRequest,
+    ) -> Result<api::CreateEventSubscriptionResponse> {
+        request.client = self.client_context()?.into();
+        Ok(self
+            .client
+            .create_event_subscription(request)
+            .await?
+            .into_owned())
+    }
+
+    pub async fn poll_events(
+        &self,
+        mut request: api::PollEventsRequest,
+    ) -> Result<api::PollEventsResponse> {
+        request.client = self.client_context()?.into();
+        Ok(self.client.poll_events(request).await?.into_owned())
+    }
+
+    /// Opens a stream under the already recovered session; never takes over automatically.
+    pub async fn stream_events(
+        &self,
+        mut request: api::StreamEventsRequest,
+    ) -> Result<
+        connectrpc::client::ServerStream<T::ResponseBody, api::StreamEventsResponseView<'static>>,
+    > {
+        request.client = self.client_context()?.into();
+        Ok(self.client.stream_events(request).await?)
+    }
+
+    pub async fn acknowledge_delivery(
+        &self,
+        mut request: api::AcknowledgeEventRequest,
+    ) -> Result<api::AcknowledgeEventResponse> {
+        request.client = self.client_context()?.into();
+        Ok(self.client.acknowledge_event(request).await?.into_owned())
+    }
+
+    pub async fn delete_subscription(
+        &self,
+        mut request: api::DeleteEventSubscriptionRequest,
+    ) -> Result<api::DeleteEventSubscriptionResponse> {
+        request.client = self.client_context()?.into();
+        Ok(self
+            .client
+            .delete_event_subscription(request)
+            .await?
+            .into_owned())
+    }
+
     pub fn journal_path(&self) -> &Path {
         self.journal.path()
     }

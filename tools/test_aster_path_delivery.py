@@ -24,6 +24,11 @@ assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
+LAN_SPEC = importlib.util.spec_from_file_location("aster_lan_mvp", MODULE_PATH.with_name("aster_lan_mvp.py"))
+assert LAN_SPEC is not None and LAN_SPEC.loader is not None
+LAN = importlib.util.module_from_spec(LAN_SPEC)
+LAN_SPEC.loader.exec_module(LAN)
+
 
 def load_script(name: str):
     path = MODULE_PATH.parents[1] / "docker/path-lab" / name
@@ -92,12 +97,23 @@ class FakeDocker:
         self.calls = []
         self.roles = {}
         self.ids = []
+        self.journals = {}
         self.event_id = base64.b64encode(bytes(range(32))).decode()
 
     def __call__(self, argv, timeout):
         argv = unpin(argv)
         self.calls.append(argv)
         assert 0 < timeout <= 90
+        client = "/usr/local/libexec/aster/aster_lan_mvp.py"
+        if client in argv:
+            args = LAN.build_parser().parse_args(argv[argv.index(client) + 1:])
+            if args.command in ("publication-init", "subscribe", "publish"):
+                key = (argv[4], str(args.journal))
+                if args.command == "publication-init":
+                    assert key not in self.journals, "journal already initialized"
+                    self.journals[key] = args.client_id
+                else:
+                    assert self.journals.get(key) == args.client_id, "client journal must be initialized on this node"
         if argv[1:3] == ["network", "create"]:
             return ("d" if "10.77.1.0/29" in argv else "e").encode() * 64
         if argv[1] == "create":
@@ -924,6 +940,10 @@ class PathDeliveryControllerTests(unittest.TestCase):
         self.assertFalse(any(c[1:3] == ["network", "create"] for c in fake.calls),
                          "Docker bridge firewall still owns the routed path")
         self.assertEqual(receipt["event_id"], fake.event_id)
+        self.assertEqual(fake.journals, {
+            (fake.roles["node-b"], "/clab/state/subscription.redb"): "path-delivery-receiver",
+            (fake.roles["node-a"], "/clab/state/publication.redb"): "path-delivery-source",
+        })
         self.assertEqual(receipt["capabilities"], "pass")
         self.assertEqual(receipt["cleanup"], "pass")
         self.assertEqual(receipt["not_run"], ["recovery", "resource", "physical", "measured-latency", "actual-loss"])

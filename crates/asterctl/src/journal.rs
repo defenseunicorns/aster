@@ -44,6 +44,7 @@ impl Identity {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Action {
+    ClientStatus,
     Initialize,
     Recover,
     Show,

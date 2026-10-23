@@ -67,6 +67,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let subscription = events
         .subscribe(EventSubscriptionRequest {
+            client: journal.client_context()?,
             operation_key: b"aster.example.live/receive".to_vec(),
             topic: topic.clone(),
             scope: scope.clone(),
@@ -106,6 +107,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .await?;
     let deliveries = events
         .poll(EventPollRequest {
+            client: journal.client_context()?,
             subscription: subscription.id,
             delivery_limit: 16,
             scan_limit: 16,
@@ -113,7 +115,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .await?;
     for delivery in &deliveries.deliveries {
         events
-            .acknowledge(subscription.id, delivery.event.id)
+            .acknowledge(
+                journal.client_context()?,
+                subscription.id,
+                delivery.event.id,
+            )
             .await?;
     }
     let gaps = events
@@ -136,7 +142,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         gaps.scanned_through_sequence,
         status.sync,
     );
-    events.unsubscribe(subscription.id).await?;
+    events
+        .unsubscribe(journal.client_context()?, subscription.id)
+        .await?;
     journal
         .acknowledge(&mut numbered::Backend::Live(&events))
         .await?;

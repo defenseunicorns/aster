@@ -455,12 +455,23 @@ pub async fn unsubscribe(
     address: SocketAddr,
     token: &Token,
     subscription_id: Vec<u8>,
+    identity: &crate::journal::Identity,
     timeout: Duration,
 ) -> Result<api::DeleteEventSubscriptionResponse, MutationError> {
     let client = query_client(address, token, timeout);
+    let sdk = publication_sdk(address, token, timeout, identity)
+        .map_err(|_| MutationError::unknown("client journal unavailable"))?;
+    sdk.recover().await.map_err(|error| match error {
+        aster_agent::sdk::NumberedEventSdkError::Transport(error) => MutationError::rpc(error.code),
+        _ => MutationError::unknown("client recovery failed"),
+    })?;
+    let context = sdk
+        .client_context()
+        .map_err(|_| MutationError::unknown("client context unavailable"))?;
     let response = tokio::time::timeout(
         timeout,
         client.delete_event_subscription(api::DeleteEventSubscriptionRequest {
+            client: context.into(),
             subscription_id,
             ..Default::default()
         }),
@@ -503,13 +514,24 @@ pub async fn subscriptions(
 pub async fn subscribe(
     address: SocketAddr,
     token: &Token,
-    request: api::CreateEventSubscriptionRequest,
+    mut request: api::CreateEventSubscriptionRequest,
+    identity: &crate::journal::Identity,
     timeout: Duration,
 ) -> Result<api::CreateEventSubscriptionResponse, MutationError> {
     let client = api::AsterApplicationServiceClient::new(
         HttpClient::plaintext(),
         config(address, token, timeout),
     );
+    let sdk = publication_sdk(address, token, timeout, identity)
+        .map_err(|_| MutationError::unknown("client journal unavailable"))?;
+    sdk.recover().await.map_err(|error| match error {
+        aster_agent::sdk::NumberedEventSdkError::Transport(error) => MutationError::rpc(error.code),
+        _ => MutationError::unknown("client recovery failed"),
+    })?;
+    request.client = sdk
+        .client_context()
+        .map_err(|_| MutationError::unknown("client context unavailable"))?
+        .into();
     let response = tokio::time::timeout(timeout, client.create_event_subscription(request))
         .await
         .map_err(|_| MutationError::rpc(connectrpc::ErrorCode::DeadlineExceeded))?

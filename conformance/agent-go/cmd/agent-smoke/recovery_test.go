@@ -49,8 +49,12 @@ func (s *recoveryPeer) PublishNumberedEvent(_ context.Context, r *connect.Reques
 	}
 	return connect.NewResponse(response), nil
 }
-func (s *recoveryPeer) BeginEventPublicationSession(_ context.Context, _ *connect.Request[api.BeginEventPublicationSessionRequest]) (*connect.Response[api.BeginEventPublicationSessionResponse], error) {
-	return connect.NewResponse(&api.BeginEventPublicationSessionResponse{Session: 1}), nil
+func (s *recoveryPeer) BeginEventPublicationSession(_ context.Context, request *connect.Request[api.BeginEventPublicationSessionRequest]) (*connect.Response[api.BeginEventPublicationSessionResponse], error) {
+	through := uint64(0)
+	if s.published != nil && bytes.Equal(s.published.ClientId, request.Msg.ClientId) {
+		through = s.published.OperationSequence
+	}
+	return connect.NewResponse(&api.BeginEventPublicationSessionResponse{Session: request.Msg.ExpectedSession + 1, AllocatedThrough: through}), nil
 }
 func (s *recoveryPeer) CompleteEventPublicationRecovery(_ context.Context, _ *connect.Request[api.CompleteEventPublicationRecoveryRequest]) (*connect.Response[api.CompleteEventPublicationRecoveryResponse], error) {
 	return connect.NewResponse(&api.CompleteEventPublicationRecoveryResponse{}), nil
@@ -157,14 +161,15 @@ func TestRecoveryExample(t *testing.T) {
 	client := api.NewAsterApplicationServiceClient(server.Client(), server.URL)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	first, _, err := runRecoveryTestCommand(ctx, client, "recovery-begin", recoveryTestInput(t))
+	initial := recoveryTestInput(t)
+	first, _, err := runRecoveryTestCommand(ctx, client, "recovery-begin", initial)
 	if err != nil {
 		t.Fatalf("begin failed: %v", err)
 	}
 	if peer.publishes != 2 || peer.subscriptions != 1 || peer.attempt != 1 || peer.acknowledged {
 		t.Fatal("begin did not retry and leave exact first delivery unacknowledged")
 	}
-	resume := map[string]any{"subscription_id_hex": first["subscription_id_hex"], "expected": expectedForPeer(peer)}
+	resume := map[string]any{"client_id_hex": initial["publish"].(publishInput).ClientIDHex, "journal_path": initial["publish"].(publishInput).JournalPath, "subscription_id_hex": first["subscription_id_hex"], "expected": expectedForPeer(peer)}
 	second, _, err := runRecoveryTestCommand(ctx, client, "recovery-resume", resume)
 	if err != nil {
 		t.Fatalf("resume failed: %v", err)
@@ -191,7 +196,8 @@ func TestRecoveryExampleFailsClosed(t *testing.T) {
 			if beginFault {
 				peer.fault = fault
 			}
-			first, output, err := runRecoveryTestCommand(ctx, client, "recovery-begin", recoveryTestInput(t))
+			initial := recoveryTestInput(t)
+			first, output, err := runRecoveryTestCommand(ctx, client, "recovery-begin", initial)
 			if beginFault {
 				if err == nil || len(output) != 0 || peer.acknowledged {
 					t.Fatal("invalid retry accepted")
@@ -202,7 +208,7 @@ func TestRecoveryExampleFailsClosed(t *testing.T) {
 				t.Fatal(err)
 			}
 			peer.fault = fault
-			_, output, err = runRecoveryTestCommand(ctx, client, "recovery-resume", map[string]any{"subscription_id_hex": first["subscription_id_hex"], "expected": expectedForPeer(peer)})
+			_, output, err = runRecoveryTestCommand(ctx, client, "recovery-resume", map[string]any{"client_id_hex": initial["publish"].(publishInput).ClientIDHex, "journal_path": initial["publish"].(publishInput).JournalPath, "subscription_id_hex": first["subscription_id_hex"], "expected": expectedForPeer(peer)})
 			if err == nil || len(output) != 0 {
 				t.Fatalf("fault emitted success: %s", output)
 			}

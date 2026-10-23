@@ -440,3 +440,11 @@ func (j *Journal) Acknowledge(ctx context.Context, sequence uint64) error {
 	}
 	return j.save()
 }
+
+// ClientContext supplies the already recovered incarnation without claiming ownership.
+func (j *Journal) ClientContext() (*api.EventClientContext, error) {
+	if j.lock == nil || !j.recovered {
+		return nil, errors.New("client recovery required")
+	}
+	return &api.EventClientContext{ClientId: bytes.Clone(j.state.ClientID), Session: j.state.Session}, nil
+}

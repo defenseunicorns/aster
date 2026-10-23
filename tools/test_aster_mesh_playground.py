@@ -420,7 +420,7 @@ class RpcTests(unittest.TestCase):
             client = playground.ConnectJsonClient(fixture.url, "exact-token-value-000000000000")
             status = client.get_status()
             self.assertEqual(status["authenticatedContacts"], "4")
-            subscription = client.create_subscription(b"operation")
+            subscription = client.create_subscription(b"operation", {"clientId": "dGVzdA==", "session": "1"})
             self.assertEqual(len(playground.decode_b64(subscription["subscriptionId"], "id")), 32)
             events, marker = client.query_events(0)
             self.assertEqual(marker, 2)
@@ -692,6 +692,9 @@ class FakePublisher:
 
     def connect(self, url, token_path):
         self.client = FakeClient(self.network, self.index)
+
+    def create_subscription(self, operation_key):
+        return self.client.create_subscription(operation_key)
 
     def recover(self, apply):
         if self.pending is not None:

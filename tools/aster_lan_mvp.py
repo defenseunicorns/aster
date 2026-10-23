@@ -281,10 +281,11 @@ class ConnectJsonClient:
     def status(self) -> Dict[str, object]:
         return self.call("GetStatus", {})
 
-    def subscribe(self, operation_key: bytes, topic: str, scope: str) -> Dict[str, object]:
+    def subscribe(self, operation_key: bytes, topic: str, scope: str, client: Dict[str, object]) -> Dict[str, object]:
         response = self.call(
             "CreateEventSubscription",
             {
+                "client": dict(client),
                 "operationKey": _encode_b64(operation_key),
                 "topic": topic,
                 "scope": scope,
@@ -418,6 +419,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_connection_arguments(subscribe)
     _add_route_arguments(subscribe)
     subscribe.add_argument("--operation-key", required=True)
+    subscribe.add_argument("--journal", type=Path, required=True)
+    subscribe.add_argument("--client-id", required=True)
+    subscribe.add_argument("--cli", default="asterctl")
 
     publish = commands.add_parser("publish", help="publish one routine Event")
     _add_connection_arguments(publish)
@@ -482,13 +486,16 @@ def _numbered_cli(arguments: argparse.Namespace, *, initialize: bool = False) ->
         parsed = urlparse(arguments.url)
         command.extend(["--host", str(parsed.hostname), "--port", str(parsed.port),
                         "--token-file", str(arguments.token_file), "--timeout", str(max(1, math.ceil(arguments.timeout))), "--json"])
-    command.extend(["publication-init" if initialize else "publish", "--journal", str(arguments.journal), "--client-id", arguments.client_id])
+    command.extend(["publication-init" if initialize else arguments.command, "--journal", str(arguments.journal), "--client-id", arguments.client_id])
     payload = None
-    if not initialize:
+    if not initialize and arguments.command == "publish":
         topic, scope = _route_from_args(arguments)
         _bounded_utf8(arguments.logical_key, "logical key", MAX_LOGICAL_KEY_BYTES, allow_empty=True)
         payload = _bounded_utf8(arguments.payload, "payload", MAX_PAYLOAD_BYTES, allow_empty=True)
         command.extend(["--topic", topic, "--scope", scope, "--priority", "routine", "--logical-key", arguments.logical_key])
+    if arguments.command == "subscribe":
+        topic, scope = _route_from_args(arguments)
+        command.extend(["--operation-key", arguments.operation_key, "--scope", scope, topic])
     try:
         completed = subprocess.run(command, input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=35, check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
@@ -501,7 +508,7 @@ def _numbered_cli(arguments: argparse.Namespace, *, initialize: bool = False) ->
         raise OperatorError("numbered publication response exceeded its bound")
     try:
         result = json.loads(completed.stdout)
-        canonical_event_id(result["result"]["receipt"]["eventId"])
+        canonical_event_id(result["subscriptionId"] if arguments.command == "subscribe" else result["result"]["receipt"]["eventId"])
     except (ValueError, TypeError, KeyError, OperatorError) as error:
         raise OperatorError("numbered publication returned an invalid committed receipt") from error
     return result
@@ -529,7 +536,7 @@ def run(arguments: argparse.Namespace) -> None:
             "operation key",
             MAX_OPERATION_KEY_BYTES,
         )
-        _print_json(client.subscribe(operation_key, topic, scope))
+        _print_json(_numbered_cli(arguments))
         return
     if arguments.command == "publish":
         response = _numbered_cli(arguments)

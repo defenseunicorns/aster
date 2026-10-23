@@ -2,12 +2,12 @@
 
 **** This is a bounded integration example, not a
 production application or an exactly-once delivery guarantee. It uses the
-checked-in generated Go client and the unchanged alpha Event API. No runtime,
-provider, schema, or generated-code changes are needed.
+checked-in generated Go client and the current alpha Event API. Subscription mutations carry the recovered client
+context from the same durable journal as publication.
 
 ## What the two processes demonstrate
 
-1. `recovery-begin` publishes one fixed operation key, retries the identical
+1. `recovery-begin` publishes one fixed numbered operation, retries the identical
    request, and compares every durable protobuf receipt field. The per-call
    `inserted` flag must change from `true` to `false`; the full responses are
    **not** byte-identical.
@@ -32,7 +32,7 @@ old operation keys, missing subscriptions, incomplete pages, unexpected
 attempts, RPC failures, cancellation, or deadline expiry fail closed and emit
 no success receipt. Do not use retrying this entire acceptance scenario as an
 application recovery strategy: `recovery-begin` requires a fresh first insert.
-Normal application retries retain their original operation key and request.
+Normal application retries retain their original client, sequence, journal and request.
 
 ## Run against an already ready agent
 
@@ -57,7 +57,8 @@ synthetic demonstration):
 ```json
 {
   "publish": {
-    "operation_key_hex": "6578616d706c652d7265636f766572792d7631",
+    "client_id_hex": "6578616d706c652d7265636f766572792d7631",
+    "journal_path": "/absolute/private/path/publication.json",
     "topic": "chat.events",
     "scope": "mission/team/alpha",
     "priority": "immediate",
@@ -67,6 +68,10 @@ synthetic demonstration):
   "subscription_operation_key_hex": "6578616d706c652d7375627363726962652d7631"
 }
 ```
+
+Set `journal_path` to an absolute path without symlink parents, then explicitly
+initialize that journal with `publication-init` using its `client_id_hex` and
+`journal_path` JSON fields. Initialize only once.
 
 Run client one synchronously so it has exited before client two starts:
 
@@ -89,7 +94,9 @@ expected = {k: p[k] for k in ('topic', 'scope', 'priority', 'logical_key_hex', '
 expected.update(id_hex=r['event_id_hex'], publisher_hex=r['publisher_id_hex'],
                 publisher_counter=r['publisher_counter'], event_sequence=r['event_sequence'],
                 acceptance_marker=r['acceptance_marker'], tombstone=False)
+identity = json.loads(Path('begin.json').read_text())['publish']
 Path('resume.json').write_text(json.dumps(dict(
+    journal_path=identity['journal_path'], client_id_hex=identity['client_id_hex'],
     subscription_id_hex=r['subscription_id_hex'], expected=expected)))
 PY
 "$HOME/agent-smoke" recovery-resume --url "$AGENT_URL" \

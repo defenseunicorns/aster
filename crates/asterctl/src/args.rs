@@ -22,6 +22,7 @@ COMMANDS:
   status            Display node status (default)
   publish           Publish a journaled numbered Event
   publication-init  Create a new journal; --journal PATH --client-id ID
+  client-status     Observe Event client ownership without takeover
   publication-recover  Recover journaled operations
   publication-show  Inspect one original journaled intent; --sequence N
   publication-retry Retry a journaled intent; --sequence N
@@ -73,7 +74,7 @@ pub enum Command {
     UnsubscribeHelp,
     Status(Options),
     Subscriptions(Options),
-    Unsubscribe(Options, Vec<u8>),
+    Unsubscribe(Options, Vec<u8>, crate::journal::Identity),
     Publish(Options, Box<Publication>),
     PublicationInitialize(crate::journal::Identity),
     PublicationAction(
@@ -168,6 +169,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             | "publication-retry"
             | "publication-abandon"
             | "publication-ack"
+            | "client-status"
                 if inline.is_none()
                     && !status
                     && !subscriptions
@@ -181,6 +183,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
             {
                 journal_action = Some(match name {
                     "publication-init" => crate::journal::Action::Initialize,
+                    "client-status" => crate::journal::Action::ClientStatus,
                     "publication-recover" => crate::journal::Action::Recover,
                     "publication-show" => crate::journal::Action::Show,
                     "publication-retry" => crate::journal::Action::Retry,
@@ -189,7 +192,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     _ => unreachable!(),
                 });
             }
-            "--journal" | "--client-id" if journal_action.is_some() => {
+            "--journal" | "--client-id"
+                if journal_action.is_some() || subscription.is_some() || unsubscribe =>
+            {
                 if !command_options.insert(name.to_owned()) {
                     return Err(format!("{name} must not be repeated"));
                 }
@@ -481,6 +486,10 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     }
     if let Some(subscription) = &subscription {
         subscription.validate()?;
+        journal_identity.validate()?;
+    }
+    if unsubscribe {
+        journal_identity.validate()?;
     }
     if unsubscribe && subscription_id.is_none() {
         return Err("SUBSCRIPTION_ID is required; see unsubscribe --help".into());
@@ -489,7 +498,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         journal_identity.validate()?;
         if matches!(
             action,
-            crate::journal::Action::Initialize | crate::journal::Action::Recover
+            crate::journal::Action::Initialize
+                | crate::journal::Action::Recover
+                | crate::journal::Action::ClientStatus
         ) {
             if sequence.is_some() {
                 return Err("this publication command does not take --sequence".into());
@@ -518,10 +529,11 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         Command::BlobRead(options, read)
     } else if let Some(query) = query {
         Command::Query(options, query)
-    } else if let Some(subscription) = subscription {
+    } else if let Some(mut subscription) = subscription {
+        subscription.identity = journal_identity;
         Command::Subscribe(options, subscription)
     } else if let Some(id) = subscription_id {
-        Command::Unsubscribe(options, id)
+        Command::Unsubscribe(options, id, journal_identity)
     } else if subscriptions {
         Command::Subscriptions(options)
     } else {

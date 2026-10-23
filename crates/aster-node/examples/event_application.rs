@@ -92,12 +92,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     let subscription = node.subscribe(EventSubscriptionRequest {
+        client: journal.client_context()?,
         operation_key: b"example/mesh-ping-pong/consume".to_vec(),
         topic,
         scope,
         include_descendant_scopes: false,
     })?;
     let deliveries = node.poll(EventPollRequest {
+        client: journal.client_context()?,
         subscription: subscription.id,
         delivery_limit: 128,
         scan_limit: 128,
@@ -107,11 +109,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         if delivery.event.id == published.id {
             published_delivery = Some(delivery.attempt);
         }
-        node.acknowledge(subscription.id, delivery.event.id)?;
+        node.acknowledge(
+            journal.client_context()?,
+            subscription.id,
+            delivery.event.id,
+        )?;
     }
     let disposition = match published_delivery {
         Some(attempt) => format!("delivered-attempt-{attempt}"),
-        None => format!("{:?}", node.acknowledge(subscription.id, published.id)?),
+        None => format!(
+            "{:?}",
+            node.acknowledge(journal.client_context()?, subscription.id, published.id)?
+        ),
     };
     println!(
         "subscription id={} inserted={} published_event={disposition}",

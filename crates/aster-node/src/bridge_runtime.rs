@@ -616,9 +616,34 @@ impl SelectedEventBridgeRuntime {
         }
         let mut carry_subscriptions_inserted = 0usize;
         let mut carry_subscriptions_existing = 0usize;
+        let client = if carry_plans.is_empty() {
+            None
+        } else {
+            let journal = crate::demo_publication::Journal::open(
+                &store,
+                aster_redb_store::EventClientId::new(
+                    b"aster.native.bridge-subscriptions.v1".to_vec(),
+                )
+                .map_err(|_| SelectedEventBridgeRuntimeError::state("Carry client"))?,
+            )
+            .map_err(|_| SelectedEventBridgeRuntimeError::state("Carry client recovery"))?;
+            Some(aster_redb_store::EventClientContext {
+                client_id: journal.client.clone(),
+                session: journal
+                    .session()
+                    .map_err(|_| SelectedEventBridgeRuntimeError::state("Carry client session"))?,
+            })
+        };
         for (key, spec) in carry_plans {
             let outcome = store
-                .create_event_subscription_with_policy(&policy, &key, spec)
+                .create_event_subscription_with_policy(
+                    client
+                        .as_ref()
+                        .ok_or_else(|| SelectedEventBridgeRuntimeError::state("Carry client"))?,
+                    &policy,
+                    &key,
+                    spec,
+                )
                 .map_err(|_| SelectedEventBridgeRuntimeError::state("Carry subscription"))?;
             if outcome.inserted {
                 carry_subscriptions_inserted += 1;
@@ -1870,8 +1895,19 @@ mod tests {
             .expect("collision policy");
         let collision_key =
             bridge_carry_key(authorizations.first, &topic("ops")).expect("reserved Carry key");
+        let collision_journal = crate::demo_publication::Journal::open(
+            &collision_store,
+            aster_redb_store::EventClientId::new(b"aster.native.bridge-subscriptions.v1".to_vec())
+                .unwrap(),
+        )
+        .unwrap();
+        let collision_client = aster_redb_store::EventClientContext {
+            client_id: collision_journal.client.clone(),
+            session: collision_journal.session().unwrap(),
+        };
         collision_store
             .create_event_subscription_with_policy(
+                &collision_client,
                 &collision_policy,
                 &collision_key,
                 EventSubscriptionSpec {

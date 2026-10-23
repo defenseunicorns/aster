@@ -20,6 +20,7 @@ type recoveryBeginInput struct {
 	SubscriptionOperationKeyHex string       `json:"subscription_operation_key_hex"`
 }
 type recoveryResumeInput struct {
+	publicationIdentity
 	SubscriptionIDHex string             `json:"subscription_id_hex"`
 	Expected          expectedEventInput `json:"expected"`
 }
@@ -64,7 +65,11 @@ func recoveryBegin(ctx context.Context, client api.AsterApplicationServiceClient
 		return err
 	}
 	expected := expectedEventInput{IDHex: hex.EncodeToString(event.Id), PublisherHex: hex.EncodeToString(event.Publisher), PublisherCounter: event.PublisherCounter, EventSequence: event.EventSequence, Topic: message.Topic, Scope: message.Scope, Priority: value.Publish.Priority, LogicalKeyHex: value.Publish.LogicalKeyHex, PayloadHex: value.Publish.PayloadHex, AcceptanceMarker: event.AcceptanceMarker}
-	subscription, err := client.CreateEventSubscription(ctx, request(&api.CreateEventSubscriptionRequest{OperationKey: subscriptionKey, Topic: message.Topic, Scope: message.Scope}, token))
+	owner, err := journal.ClientContext()
+	if err != nil {
+		return err
+	}
+	subscription, err := client.CreateEventSubscription(ctx, request(&api.CreateEventSubscriptionRequest{Client: owner, OperationKey: subscriptionKey, Topic: message.Topic, Scope: message.Scope}, token))
 	if err != nil {
 		return err
 	}
@@ -72,7 +77,7 @@ func recoveryBegin(ctx context.Context, client api.AsterApplicationServiceClient
 		return errors.New("expected fresh durable subscription")
 	}
 	id := subscription.Msg.SubscriptionId
-	if err := recoveryDelivery(ctx, client, token, id, expected, 1); err != nil {
+	if err := recoveryDelivery(ctx, client, token, owner, id, expected, 1); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
@@ -87,8 +92,8 @@ func recoveryBegin(ctx context.Context, client api.AsterApplicationServiceClient
 	return journal.Acknowledge(ctx, sequence)
 }
 
-func recoveryDelivery(ctx context.Context, client api.AsterApplicationServiceClient, token string, id []byte, expected expectedEventInput, attempt uint64) error {
-	response, err := client.PollEvents(ctx, request(&api.PollEventsRequest{SubscriptionId: id, DeliveryLimit: 1, ScanLimit: 8}, token))
+func recoveryDelivery(ctx context.Context, client api.AsterApplicationServiceClient, token string, owner *api.EventClientContext, id []byte, expected expectedEventInput, attempt uint64) error {
+	response, err := client.PollEvents(ctx, request(&api.PollEventsRequest{Client: owner, SubscriptionId: id, DeliveryLimit: 1, ScanLimit: 8}, token))
 	if err != nil {
 		return err
 	}
@@ -108,6 +113,15 @@ func recoveryResume(ctx context.Context, client api.AsterApplicationServiceClien
 	if err := decodeInput(input, &value); err != nil {
 		return err
 	}
+	journal, err := openPublication(ctx, client, token, publishInput{JournalPath: value.JournalPath, ClientIDHex: value.ClientIDHex})
+	if err != nil {
+		return err
+	}
+	defer journal.Close()
+	owner, err := journal.ClientContext()
+	if err != nil {
+		return err
+	}
 	id, err := decodeFixedHex(value.SubscriptionIDHex, 32)
 	if err != nil {
 		return err
@@ -120,10 +134,10 @@ func recoveryResume(ctx context.Context, client api.AsterApplicationServiceClien
 	if err != nil {
 		return err
 	}
-	if err := recoveryDelivery(ctx, client, token, id, value.Expected, 2); err != nil {
+	if err := recoveryDelivery(ctx, client, token, owner, id, value.Expected, 2); err != nil {
 		return err
 	}
-	ack, err := client.AcknowledgeEvent(ctx, request(&api.AcknowledgeEventRequest{SubscriptionId: id, EventId: eventID}, token))
+	ack, err := client.AcknowledgeEvent(ctx, request(&api.AcknowledgeEventRequest{Client: owner, SubscriptionId: id, EventId: eventID}, token))
 	if err != nil {
 		return err
 	}
@@ -137,7 +151,7 @@ func recoveryResume(ctx context.Context, client api.AsterApplicationServiceClien
 	polls := 0
 	for {
 		pollStarted := time.Now()
-		response, err := client.PollEvents(ctx, request(&api.PollEventsRequest{SubscriptionId: id, DeliveryLimit: 1, ScanLimit: 8}, token))
+		response, err := client.PollEvents(ctx, request(&api.PollEventsRequest{Client: owner, SubscriptionId: id, DeliveryLimit: 1, ScanLimit: 8}, token))
 		if err != nil {
 			return err
 		}

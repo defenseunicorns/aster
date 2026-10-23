@@ -249,10 +249,25 @@ See [asterctl-query(1)](asterctl-query.1) for the command reference.
 
 ```sh
 asterctl --token-file ./client.token subscribe \
+    --journal ./publisher.redb --client-id chat-controller \
     --scope mission/team/alpha --operation-key=auto chat.events
 asterctl --token-file ./client.token --json subscribe \
+    --journal ./publisher.redb --client-id chat-controller \
     --scope 'mission/team/*' --operation-key chat-reader chat.events
 ```
+
+`subscribe` and `unsubscribe` require `--journal` and `--client-id` for the
+subscription owner. Initialize once as shown under Publish, then retain that
+journal across restarts. These CLI commands explicitly recover before mutation.
+`client-status --journal PATH --client-id ID` observes the journal caller
+without recovery or takeover, including immediately after `publication-init`.
+A client absent from the server returns unregistered status, no current session,
+and zero ownership counts. The journal retains session zero until recovery;
+the status request omits that unissued session. A registered client with no
+observed session reports recovery-required; a positive observed session can
+report current, fenced, or recovery-required. Status preserves the journal and
+never claims a session. Mutation commands retain their existing recovery checks. `publication-recover` also returns the recovered
+`client` context for direct JSON calls.
 
 `TOPIC` is a required positional argument; `--scope` is also required.
 The scope wildcard has the same meaning as in `query`. Use `--` before a
@@ -289,8 +304,10 @@ in JSON. See [asterctl-subscriptions(1)](asterctl-subscriptions.1).
 ## Unsubscribe
 
 ```sh
-asterctl --token-file ./client.token unsubscribe "$SUBSCRIPTION_ID"
-asterctl --token-file ./client.token --json unsubscribe "$SUBSCRIPTION_ID"
+asterctl --token-file ./client.token unsubscribe "$SUBSCRIPTION_ID" \
+    --journal ./publisher.redb --client-id chat-controller
+asterctl --token-file ./client.token --json unsubscribe "$SUBSCRIPTION_ID" \
+    --journal ./publisher.redb --client-id chat-controller
 ```
 
 Removes an Event subscription and its delivery ledger. Use the ID returned by

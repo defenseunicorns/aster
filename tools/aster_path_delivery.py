@@ -513,7 +513,8 @@ def _validate_status(raw: bytes) -> dict[str, object]:
     return document
 
 
-def _event_exec(docker: str, node: str, action: str, plan: dict[str, object], event_id: str | None = None) -> list[str]:
+def _event_exec(docker: str, node: str, action: str, plan: dict[str, object], event_id: str | None = None,
+                *, journal: tuple[str, str] = ("/clab/state/publication.redb", "path-delivery-source")) -> list[str]:
     argv = [
         docker,
         "exec",
@@ -530,13 +531,12 @@ def _event_exec(docker: str, node: str, action: str, plan: dict[str, object], ev
         "--scope",
         "demo/playground",
     ]
+    if action in ("publication-init", "subscribe", "publish"):
+        argv.extend(["--journal", journal[0], "--client-id", journal[1]])
     if action == "subscribe":
         argv.extend(["--operation-key", "path-delivery-subscription"])
-    elif action == "publication-init":
-        argv.extend(["--journal", "/clab/state/publication.redb", "--client-id", "path-delivery-source"])
     elif action == "publish":
         argv.extend([
-            "--journal", "/clab/state/publication.redb", "--client-id", "path-delivery-source",
             "--logical-key", str(plan["logical_key"]),
             "--payload", str(plan["payload"]),
             "--id-only",
@@ -638,8 +638,10 @@ def execute_direct(raw: bytes, *, docker: Path, ip: Path, run: Callable = _run_c
             if run([exe, "exec", "--user", "10001:10001", cid,
                     lib + "delivery-agent.py", "verify", role], 5) != b"CAPABILITIES status=pass\n":
                 raise ExecutionError("capability-mismatch")
+        receiver_journal = ("/clab/state/subscription.redb", "path-delivery-receiver")
         stage = "subscribe"
-        run(_event_exec(exe, nodes["node-b"], "subscribe", plan), 30)
+        run(_event_exec(exe, nodes["node-b"], "publication-init", plan, journal=receiver_journal), 30)
+        run(_event_exec(exe, nodes["node-b"], "subscribe", plan, journal=receiver_journal), 30)
         stage = "netem"
         observed = _strict_json(transient("wan-setup", ["--network", "container:" + wan],
                                [lib + "delivery-wan.py", "configure"], "NET_ADMIN"), "netem")
