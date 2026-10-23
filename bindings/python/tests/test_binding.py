@@ -21,8 +21,8 @@ class BindingTests(unittest.TestCase):
     def test_version_surfaces_distinguish_wire_from_semantics(self):
         self.assertEqual(PROTOCOL_VERSION, 1)
         self.assertEqual(REPLICATION_WIRE_VERSION, 1)
-        self.assertEqual(DEFAULT_SEMANTIC_VERSION, 8)
-        self.assertEqual(HIGHEST_SUPPORTED_SEMANTIC_VERSION, 8)
+        self.assertEqual(DEFAULT_SEMANTIC_VERSION, 9)
+        self.assertEqual(HIGHEST_SUPPORTED_SEMANTIC_VERSION, 9)
 
     def test_format_three_bundle_opens_and_legacy_format_two_is_rejected(self):
         self.assertEqual(BUNDLE[:8], b"ASTRPB03")

@@ -510,15 +510,16 @@ Code received over the mesh is never executed.
 
 ### 8.4 Blob
 
-A Blob manifest contains total length, media/schema metadata, chunk size, ordered
-SHA-256 chunk digests, and a full-content digest. Default chunk size is 16 KiB,
-configurable from 4–64 KiB. Chunks use independently derived keys/nonces and are
-verified and committed while streaming. A complete blob digest is verified before
-delivery. The canonical manifest is at most 1 MiB and is independently
-implementable from [envelope.md](envelope.md). The current durable Blob service
-can resume local chunk production and reading without whole-Blob RAM growth.
+A semantic-v9 Blob stream commits total length, media/schema metadata, ordered
+segment authentication, plaintext/ciphertext Merkle roots, and a full-content
+identity. The selected profile maps plaintext in 1-MiB segments into append-only
+`ASTRBS02` records with independently derived keys/nonces. Records are verified
+and committed while streaming, and terminal roots are verified before
+promotion. The 8-GiB ceiling permits 8,192 native segments. Local upload and
+peer transfer resume from durable pack checkpoints without whole-Blob RAM
+growth.
 
-The selected node's application profile fixes canonical chunks at 64 KiB. A
+The selected node's legacy application profile fixes canonical chunks at 64 KiB. A
 stopped `SelectedBlobNode` retains synchronous streaming, while
 `RunningNode::selected_blobs()` returns a cloneable live handle. Live publish
 takes ownership of a nonempty regular file positioned at byte zero and admits
@@ -534,6 +535,15 @@ depot capability, or post-commit verification is `FatalBlobCoherence` and
 terminates the actor after closing application admission; it is not downgraded
 to an ordinary per-request error.
 
+The semantic-v9 application Blob stream admits an object from zero through 8
+GiB and carries offset-bearing RPC frames of at most 512 KiB into a bounded map,
+ordered sink, and durable-checkpoint pipeline. Two finalization workers and two
+queued jobs bound terminal verification. Upload, storage, and transfer use the
+same native pack records; finalization does not repack or re-encrypt the Blob.
+Provisional records, pending network prefixes, and completed content all
+consume configured Blob depot capacity. An 8-GiB logical limit is therefore not
+an 8-GiB filesystem sizing promise.
+
 Durable Blob lifecycle authority is local and wire-neutral. Permanent physical-
 lineage fences and accepted-publication replay fences are independently bounded
 by row and canonical encoded-byte caps; publication lifecycle rows have a
@@ -547,9 +557,11 @@ state, retention and TTL deadlines, and conservative custody age. This adds no
 public application GC operation; selected lifecycle maintenance remains a
 bounded internal store/runtime responsibility.
 
-The manifest is the payload of a source-authenticated envelope whose signed
-header commits BlobID, nonzero chunk count, and a route Merkle root. Encrypted
-chunks travel as canonical `ASTRBT01` objects under kind-`2` typed ObjectIDs and
+For the historical semantic-v7/v8 profile-4 compatibility path, the manifest
+is the payload of a source-authenticated envelope whose signed
+header commits BlobID, nonzero chunk count, and a route Merkle root. On that
+historical Profile-4 path, encrypted chunks travel as canonical `ASTRBT01`
+objects under kind-`2` typed ObjectIDs and
 use ordinary WANT/DATA/RECEIPT ranges; Blob DATA has no custody wrapper. A
 route-only relay verifies the source association, ciphertext hash/length, and
 Merkle proof without a content key. A content reader additionally matches the
@@ -563,9 +575,11 @@ source envelope and requires the exact authenticated route commitment and exact
 manifest bytes; BlobID or manifest equality alone cannot substitute a different
 route root or chunk count.
 
-Empty manifests are canonical local objects, but envelope format 2 requires a
-nonzero route chunk count, so a zero-byte Blob is not publishable in this network
-profile. A manifest has at most 14,543 chunks and 1 MiB of bytes.
+Empty packs are canonical semantic-v9/profile-5 objects. They have zero
+segments and complete through an authenticated terminal EOF; profile 4 cannot
+represent them. Nonempty profile-5 packs have at most 8,192 native segments.
+The historical semantic-v7/v8/profile-4 compatibility path remains
+limited to nonempty 64-MiB/1,024-chunk publications.
 The composite per-contact inventory is capped at 100,000 ObjectIDs with source
 envelopes inserted before Blob carriers. A source-envelope selection that alone
 exceeds the cap is rejected rather than silently truncated. Content-authorized nodes retain both a
@@ -676,13 +690,13 @@ protocol receipt state.
 ### 9.1 Selected semantic-v4 State and Record reconciliation
 
 The selected mechanics profile adds State and Record when the authenticated
-mission session selects semantic version `4`, `5`, `6`, `7`, or `8`. Semantic
+mission session selects semantic version `4`, `5`, `6`, `7`, `8`, or `9`. Semantic
 versions `1`, `2`, and `3` retain their Event compatibility behavior and MUST
 NOT send, accept, reserve, or count mutable frames. The current default semantic
-offer is `[8, 7, 6, 5, 4, 3, 2, 1]`; stable replication-wire/profile, handshake
+offer is `[9, 8, 7, 6, 5, 4, 3, 2, 1]`; stable replication-wire/profile, handshake
 framing, source envelopes, and suite remain version `1`. Semantic v5 inherits
 these State/Record mechanics unchanged and adds the separate Blob mechanics in
-§9.2; semantic v6, v7, and v8 inherit both ordinary lanes unchanged.
+§9.2; semantic v6, v7, v8, and v9 inherit both ordinary lanes unchanged.
 
 State and Record are independent classes (`State = 1`, `Record = 2`). Each has
 two receiver-directed lanes, so every contact has four independent reconciliation
@@ -762,11 +776,15 @@ Semantic version `5` inherits the exact Event behavior of versions `1` through
 `4` and the semantic-v4 State/Record mechanics above. It additionally allocates
 one selected Blob source class (`MutableClass = 3`) and one Blob carrier lane.
 Semantic versions `6`, `7`, and `8` inherit that complete v5 ordinary-lane
-behavior unchanged. The current default descending offer is
-`[8, 7, 6, 5, 4, 3, 2, 1]`.
-Stable replication-wire and ABI version `1`, handshake framing,
+behavior; semantic version `9` retains it outside the versioned Blob profile.
+The current default descending
+offer is `[9, 8, 7, 6, 5, 4, 3, 2, 1]`.
+For the historical semantic-v7/v8 Profile-4 path, stable replication-wire and
+ABI version `1`, handshake framing,
 `ASTRENV2`/`ASTRENV3` source formats, `ASTRBT01` carriers, typed ObjectIDs, and
-the registered cryptographic suite do not change. A semantic-v1, v2, v3, or v4
+the registered cryptographic suite do not change. Semantic-v9 Profile-5 instead
+uses the native length-prefixed `ASTRBS02` pack record defined above. A
+semantic-v1, v2, v3, or v4
 session MUST emit, accept, reserve, and count zero Blob interest, Blob-class
 mutable, Blob range, and Blob carrier finish frames. State and Record retain
 their semantic-v4 behavior in v5 through v8.
@@ -877,7 +895,7 @@ authenticates any concurrent exact restage, and only then reinstalls its claim.
 No interleaving may leave an orphan claim or a durable pending source without
 its authenticated claim.
 
-Selected network admission rejects a Blob over 64 MiB of plaintext or 1,024
+Profile-4 compatibility admission rejects a Blob over 64 MiB of plaintext or 1,024
 chunks, an exact source over 1 MiB, or one canonical carrier over 128 KiB.
 Pending Blob source, manifest-record, and carrier-prefix metadata share a hard
 10,000-row staging ceiling, and staged carrier-prefix bytes share a hard 64-MiB
@@ -887,8 +905,9 @@ evicting accepted publications or existing pending progress; malformed,
 unauthorized, stale-lineage, conflicting-prefix, and integrity failures remain
 fatal for the affected exact work.
 
-Carrier completion still does not publish a Blob. The receiver verifies every
-complete canonical `ASTRBT01` carrier into the encrypted depot, requires the
+On that historical profile-4 path, carrier completion still does not publish a Blob. The historical
+Profile-4 receiver verifies every complete canonical `ASTRBT01` carrier into
+the encrypted depot, requires the
 exact depot completion marker, freshly streams and decrypts every exact
 manifest chunk, verifies every AEAD tag and per-chunk plaintext digest, verifies
 the whole BlobID, and obtains a nonconstructible content-completion proof. It
@@ -1004,7 +1023,7 @@ content-authorized target delivery may open the committed payload, and the
 selected runtime emits only its length and SHA-256 digest.
 
 
-### 9.4 Selected semantic-v7/v8 transfer profiles and receipt-free Event pages
+### 9.4 Selected semantic-v7/v8/v9 transfer profiles and receipt-free Event pages
 
 Semantic version `7` inherits every semantic-v6 source object and mechanics lane
 without changing v1-v6 bytes. Semantic version `8` inherits every v7 source
@@ -1013,28 +1032,183 @@ Blob mechanics. Immediately after the four-flight handshake, the
 initiator sends and the responder returns one protected canonical
 `TransferProfileOfferV1`. Known lane IDs are `1` Event, `2` State, `3` Record,
 `4` Blob, and `5` EventBridge. Known profile IDs are `1` `LegacyV6`, `2`
-`EventPagesV1`, `3` reserved for `BlobCustodyV1` (not implemented), and `4` `BlobRangesStreamV1`. Lanes and profiles are strictly
+`EventPagesV1`, `3` reserved for `BlobCustodyV1` (not implemented), `4`
+`BlobRangesStreamV1`, and `5` `BlobStreamV1`. Lanes and profiles are strictly
 descending and unique. Event, State, Record, and EventBridge MUST offer
-`LegacyV6`. Blob offers MUST contain `LegacyV6` or `BlobRangesStreamV1`;
-the selected runtime offers only `BlobRangesStreamV1`. Only Event may offer
-`EventPagesV1`, and only Blob may offer `BlobRangesStreamV1`. Unknown
+`LegacyV6`. Blob offers MUST contain `LegacyV6`, `BlobRangesStreamV1`, or
+`BlobStreamV1`;
+semantic v7/v8 offers only `BlobRangesStreamV1`, while semantic v9 offers only
+`BlobStreamV1`. Only Event may offer `EventPagesV1`, and only Blob may offer
+`BlobRangesStreamV1` or `BlobStreamV1`. Unknown
 IDs with bit `0x8000` set are critical and fail the contact; other unknown IDs
 remain canonical digest input but are not selected.
+
+Blob profile registry: semantic v7/v8 select profile 4; semantic v9 selects profile 5.
+Profile 4 limits: 67,108,864 object bytes; 1,024 canonical chunks; 1,048,576 authenticated-source bytes.
+Profile 5 limits: 8,589,934,592 plaintext bytes; 8,192 native segments; 16,777,216 authenticated-source bytes.
+Profile 5 size classes: 1,048,576 plaintext segment bytes; 1,048,706 encoded ASTRBS02 record bytes; 1,048,710 length-prefixed DATA-body bytes; 134,217,728 checkpoint bytes; 2,097,152 Iroh frame bytes.
+`StreamOpenV1.total_len` is the native pack wire length, not the plaintext
+object length. Its exact maximum for the profile-5 maximum shape is
+8,591,032,320 bytes; the 8-GiB plaintext bound remains on the authenticated
+stream-open fields.
 
 Both peers compute the same highest common profile independently for each lane
 and bind the complete canonical offers plus intersections into
 `transfer_profile_digest`. The current offer selects `EventPagesV1` for Event
-when both peers support it, `BlobRangesStreamV1` for Blob when both peers offer
-it, and `LegacyV6` for State, Record, and EventBridge. Blob has no legacy
-fallback: an authenticated peer without profile 4 fails profile intersection;
-semantic-v5/v6 Blob carrier attempts are explicitly rejected before carrier IO.
-This is the selected-runtime compatibility break, not a reinterpretation of old
-frame bytes. Historical codecs/vectors remain readable but do not enable legacy
-Blob transfer. No other data class changes its profile or grammar. Semantic v7
-uses profile 4 with durable-only policy; semantic v8 uses the same stream with
-authenticated finite-TTL custody. See [receipt-free Blob ranges](blob-ranges-stream.md)
-for the versioned profile contract. A missing required profile, empty
-intersection, digest mismatch, or profile substitution fails closed.
+when both peers support it, `BlobRangesStreamV1` for Blob at semantic v7/v8,
+`BlobStreamV1` for Blob at semantic v9, and `LegacyV6` for State, Record, and
+EventBridge. Blob has no legacy or cross-profile fallback: an authenticated peer
+without the profile required by the selected semantic version fails profile
+intersection, and semantic-v5/v6 Blob carrier attempts are rejected before
+carrier IO. This is the selected-runtime compatibility break, not a
+reinterpretation of old frame bytes. Historical codecs/vectors remain readable
+but do not enable legacy Blob transfer. No other data class changes its profile
+or grammar. Semantic v7 uses profile 4 with durable-only policy; semantic v8
+uses profile 4 with authenticated finite-TTL custody; semantic v9 uses the
+native completed-pack pipeline defined by profile 5. See
+[receipt-free Blob ranges](blob-ranges-stream.md) for the retained v7/v8
+profile-4 contract. A missing required profile, empty
+intersection, digest mismatch, semantic/profile substitution, or profile-5
+selection before v9 fails closed. A v9/v8 or v9/v7 peer pair first negotiates
+the lower semantic version and then uses that version's exact profile-4 offer;
+an active profile-5 attempt is never downgraded into profile 4.
+
+Profile 5 order: PLAN -> OPEN -> SOURCE -> ACCEPT -> ASTRBS02 pack DATA -> CHECKPOINT -> FINISH -> RESULT -> ACK.
+Profile 5 exact empty transfer: OPEN -> SOURCE -> ACCEPT -> FINISH(final_offset=0) -> RESULT -> ACK, with no DATA or CHECKPOINT.
+
+Semantic v9 reserves mechanics tags `0xd6` `StreamOpenV1`, `0xd7`
+`StreamAcceptV1`, `0xd8` `StreamDataV1`, `0xd9` `StreamCheckpointV1`, `0xda`
+`StreamFinishV1`, `0xdb` `StreamResultV1`, `0xdc` `StreamResultAckV1`, and
+`0xdd` `StreamSourceV1` for profile 5. The bounded grammar and runtime driver
+are implemented. After an
+authenticated v9/profile-5 selection, the contact exchanges a signed stream
+plan and opens one bounded control/data stream pair for the selected direction;
+framing, authentication, checkpoint, terminal-root, lifecycle, or settlement
+failure fails the attempt closed. Tags `0xd1..0xd5` and every semantic-v7/v8
+byte retain their existing meanings.
+
+The profile-5 mechanics prefix is `"ASM\x01" || tag`. All integers are
+unsigned big-endian. The attempt tuple used after `StreamOpenV1` is
+`transfer_id[32] || attempt_nonce[32] || sequence u64`. A zero attempt nonce,
+unknown class/direction/result value, truncation, trailing bytes, arithmetic
+overflow, or a record decoded outside semantic v9/profile 5 fails closed.
+
+The StreamSource payload is one canonical `ASTRPS02` object. It separates the
+signed semantic publication from the exact physical pack used by this transfer:
+
+```text
+ASTRBP02 body =
+    "ASTRBP02" || format_version u16 = 2 ||
+    semantic_open_len u32 || semantic_open[semantic_open_len] ||
+    blob_id[32] || final_custody_present u8 ||
+    final_custody[24] iff present || physical_lineage[32]
+
+ASTRPP02 =
+    "ASTRPP02" || format_version u16 = 2 ||
+    authenticated_physical_open_len u32 ||
+    authenticated_physical_open[authenticated_physical_open_len] ||
+    authenticated_commitment_len u32 ||
+    authenticated_commitment[authenticated_commitment_len]
+
+ASTRPS02 =
+    "ASTRPS02" || format_version u16 = 2 ||
+    authenticated_publication_len u32 ||
+    authenticated_ASTRBP02[authenticated_publication_len] ||
+    physical_source_len u32 || ASTRPP02[physical_source_len]
+```
+
+`authenticated_ASTRBP02`, the physical OPEN, and the physical commitment are
+complete source-protocol signature envelopes. The semantic OPEN owns the
+publisher operation, causal dot/context, route policy, priority, TTL, metadata,
+and BlobID binding. ASTRPP02 owns the exact encrypted pack identity, native
+segment stream, roots, and terminal commitment. Verification requires equal
+BlobID, content group, content epoch, metadata, total plaintext length, and
+physical lineage across those authorities. FINISH MUST byte-equal the signed
+physical commitment nested in ASTRPS02.
+
+`transfer_id = SHA-256(ASTRPS02)` and `source_digest` is the same hash;
+`publication_id = SHA-256(authenticated_ASTRBP02)`. `variant_id` remains the
+domain-separated `(BlobID, content_group, content_epoch)` identity. A receiver
+that already owns an independently encoded but equivalent physical pack MAY
+promote the signed semantic publication over that local pack. The inbound
+transfer/custody identity remains the received ASTRPS02; the stored transfer
+identity is recomputed from the same authenticated ASTRBP02 and the selected
+local ASTRPP02. RESULT/ACK settle the inbound attempt, and a retry MAY finish
+with zero DATA after the stored semantic publication and local pack are
+verified. Substitution never permits changing semantic publication bytes,
+BlobID, variant, lineage, or plaintext metadata.
+
+The canonical record bodies are:
+
+| Tag | Body after prefix and tag |
+| --- | --- |
+| `0xd6` StreamOpenV1 | `class u8 || direction u8 || semantic_version u16 = 9 || profile_id u16 = 5 || session_transcript[32] || exchange_id u64 || transfer_id[32] || source_transfer_id[32] || publication_id[32] || variant_id[32] || total_len u64 || attempt_nonce[32] || checkpoint_generation u64 || custody_present u8 || custody_digest[32] iff present || source_len u32 || source_digest[32]` |
+| `0xdd` StreamSourceV1 | `attempt tuple || source_offset u32 || source_total_len u32 || source_chunk_len u32 || source_chunk[source_chunk_len]` |
+| `0xd7` StreamAcceptV1 | `attempt tuple || durable_offset u64 || checkpoint_generation u64 || absolute_receive_limit u64 || max_extent_bytes u32 || checkpoint_batch_bytes u32` |
+| `0xd8` StreamDataV1 | `attempt tuple || offset u64 || extent_len u32 || ASTRBS02_record[extent_len]` |
+| `0xd9` StreamCheckpointV1 | `attempt tuple || durable_offset u64 || checkpoint_generation u64 || absolute_receive_limit u64` |
+| `0xda` StreamFinishV1 | `attempt tuple || final_offset u64 || semantic_commitment_len u32 || semantic_commitment[semantic_commitment_len]` |
+| `0xdb` StreamResultV1 | `attempt tuple || final_offset u64 || result_code u8 || result_digest[32]` |
+| `0xdc` StreamResultAckV1 | `attempt tuple || result_digest[32]` |
+
+`class = 1` is Blob. Result codes are `1` Promoted, `2` AlreadyPresent, `3`
+DeferredCapacity, `4` RetiredExpired, `5` RejectedPolicy, and `6`
+IntegrityFailure. SOURCE chunks are independently nonempty and at most
+1,048,576 bytes; authenticated source totals are at most 401,902 bytes, derived
+from the maximum signed ASTRBP02, physical OPEN, and physical commitment
+envelopes plus canonical ASTRPS02/ASTRPP02 framing. Each DATA body
+contains one complete append-only `ASTRBS02` record preceded by its four-byte
+length. The maximum record is 1,048,706 bytes and the maximum length-prefixed
+body is 1,048,710 bytes. Record magic, stream identity, segment index, offsets,
+lengths, AEAD authentication, and trailing bytes are checked before durable
+credit advances. Checkpoint batches are nonzero and
+at most 128 MiB. A reader MUST consume and
+validate the fixed 89-byte StreamData header, reserve the exact declared body
+against the global streaming budget, and only then read or allocate the body.
+Credit is an absolute offset and never decreases within an attempt. Durable
+offsets and checkpoint generations never move backward. Reopen uses a fresh
+nonce and resumes only from the receiver's durable offset. Duplicate terminal
+records replay the same digest-bound result or acknowledgement and never repeat
+promotion. Receiver checkpoints bind the canonical publication and are not
+owned by a peer, connection, adapter, or IP address; a fresh attempt nonce can
+resume the durable offset through another eligible ordered reliable adapter.
+
+Finite profile-5 work uses `BlobCustodyClaimV2[208]`. Its field widths and age
+semantics are identical to `BlobCustodyClaimV1`, but its fixed header is
+`"ASTRBL09" || format_version u16 = 2 || semantic_version u16 = 9 ||
+profile_id u16 = 5`. Lane ID 4 is bound by the record context rather than
+duplicated in the fixed claim body. Each protected control record and each
+protected StreamData header authenticates
+`"ASTER/v9-lane-record/v1\0" || semantic_version u16 ||
+transfer_profile_digest[32] || lane u16 || profile u16 || direction u8 ||
+attempt_nonce[32] || record_sequence u64`. A custody contact capability also
+binds the session transcript and exact claim digest under
+`"ASTER/v9-blob-custody-contact/v2\0"`. These send/contact capabilities are
+non-clone, exact-context values; decoding raw claim bytes grants no Store
+authority. Semantic-v8 claim bytes and domains remain unchanged.
+
+Profile-5 control frames are complete mission-protected records. StreamData is
+one composite native-pack message:
+
+```text
+"ASD1" || protected_header_len u32 || protected_header || record_len u32 || ASTRBS02_record
+```
+
+`protected_header` is a mission-protected record whose plaintext is exactly the
+canonical fixed 89-byte `StreamDataV1` header through `record_len`; its encoded
+length is nonzero and bounded at 2,048 bytes. The adjacent native record is not
+wrapped in a second mission AEAD because `ASTRBS02` is already independently
+authenticated and bound to the stream and segment position. The receiver first
+authenticates the protected header, requires the adjacent length-prefixed record
+to match the authenticated `record_len`, rejects fragmented or coalesced pack
+records, and then verifies that segment before durable credit advances. A changed,
+substituted, truncated, replayed, or
+cross-stream record therefore fails source authentication or native segment
+validation. The same ASTRBS02 bytes are used for upload staging, completed
+storage, and semantic-v9 wire DATA. This avoids repacking, re-encrypting, and
+copying every large record through two independent
+record layers while retaining mission authorization for the attempt metadata
+and end-to-end source authentication for the content.
 
 For each admitted Blob direction, profile 4 sends one protected `ABRS || 0x01`
 schedule containing at most 64 canonical `BlobRangeFetchV5` tuples and receives
@@ -1572,9 +1746,9 @@ The key schedule uses exact concatenation of the 32-byte P-256 ECDH result and
 direction/protection/confirmation labels. The stable handshake framing,
 credential/envelope encoding, cryptographic profile, and replication wire
 profile remain version `1`. Inside that framing, a default initiator offers
-semantic versions `[8, 7, 6, 5, 4, 3, 2, 1]`; an honest current responder selects
-the highest common value, so current peers select `8`, a v7-only peer selects
-`7`, a v6-only peer selects
+semantic versions `[9, 8, 7, 6, 5, 4, 3, 2, 1]`; an honest current responder selects
+the highest common value, so current peers select `9`, a v8-only peer selects
+`8`, a v7-only peer selects `7`, a v6-only peer selects
 `6`, a v5-only peer selects `5`, a v4-only peer selects `4`, a v3-only peer
 selects `3`, a v2-only peer selects `2`, and a v1-only peer selects `1`. The
 selected semantic version is bound into the public transcript, key schedule,
@@ -1952,11 +2126,11 @@ version, cryptographic suite ID, and object/data-class registries are separate.
 A transport addition changes none of them. `PROTOCOL_VERSION` and the legacy C
 `aster_protocol_version()` report stable replication-wire/profile version `1`;
 the unambiguous replication-wire surfaces also report `1`, while the default and
-highest-supported semantic-version surfaces report `8`.
-The default semantic offer is `[8, 7, 6, 5, 4, 3, 2, 1]`.
+highest-supported semantic-version surfaces report `9`.
+The default semantic offer is `[9, 8, 7, 6, 5, 4, 3, 2, 1]`.
 
-The current handshake negotiates semantic versions `8`, `7`, `6`, `5`, `4`,
-`3`, `2`, and `1` and the complete suite `0x0001`. Offers are nonempty, nonzero,
+The current handshake negotiates semantic versions `9`, `8`, `7`, `6`, `5`,
+`4`, `3`, `2`, and `1` and the complete suite `0x0001`. Offers are nonempty, nonzero,
 duplicate-free canonical descending lists of at most 16 values. The responder selects the highest common semantic
 version and its locally preferred complete common suite; the initiator requires
 both selections to have been offered and to be locally supported.
@@ -1973,6 +2147,7 @@ The semantic-version inheritance registry is normative:
 | `6` | v5 ordinary lanes byte-for-byte | Event bridge transfer |
 | `7` | v6 byte-for-byte | per-lane profiles, receipt-free Event pages, and durable Blob range streams |
 | `8` | v7 byte-for-byte except the lane AAD domain and Blob custody fields | authenticated finite Blob custody over `BlobRangesStreamV1` |
+| `9` | v8 fixed lanes byte-for-byte except the Blob transfer profile and Blob chunk kind | independently authenticated Blob streams over `BlobStreamV1` |
 
 An inherited version retains every earlier stable encoding and selected-lane
 rule unless the registry names an additional mechanic. In particular, semantic
@@ -2097,10 +2272,12 @@ outbound, and replay limits:
 | combined pending logical bytes | 16 MiB | checked before every retry insert/refresh, outbox insert, and handshake replacement |
 | selected mutable object | 1 MiB | oversized State/Record bytes fail before durable admission; malformed or unauthorized bytes remain fatal |
 | semantic-v8 Blob custody claim | exactly 208 bytes; source field at most 211 bytes and result/ack field at most 33 bytes | wrong presence, length, context, digest, duplicate, truncation, trailing bytes, or age overflow fail closed; a verified exact-context capability is required for finite admission and every lifecycle boundary |
+| semantic-v9 Blob custody claim | exactly 208 bytes plus fixed-size attempt/record AAD | v8/v9 domain substitution, zero nonce, wrong sequence/profile/lane/direction/digest, replay, or younger age fails closed before finite admission |
 | selected mutable class | 4,096 rows and 16 MiB encoded source bytes, independently for State and Record | an otherwise valid new object receives `DeferredCapacity`; no existing mutable row is pruned |
 | mutable fairness cursor | 256 configured mission peers, 4 peer/class/local-mode rows each, 1,024 rows total | startup rejects an overbound configured set and prunes rows for peers no longer configured; ordinary data quota cannot consume the reserve |
 | live application command lane | 32 commands shared by Event, State, Record, and Blob; one queued command for the joined Blob worker | a full Blob worker queue returns explicit `ResourceLimit`; shutdown and zeroization close both admissions and join the worker |
 | live Blob publication | one owned nonempty regular file at byte-zero cursor, at most 64 MiB and 1,024 fixed 64-KiB chunks | invalid shape is rejected; overbound input returns `ResourceLimit`; a source changed across the two passes returns conflict and cannot silently rebind the operation |
+| streamed Blob publication | zero through 8 GiB and at most 8,192 native 1-MiB `ASTRBS02` segments | one bounded map/reorder/sink pipeline writes the same authenticated pack records later carried by DATA; provisional bytes remain charged until atomic lifecycle promotion; exact operation retry recovers durable local progress |
 | live Blob plaintext page | `1..=64 KiB`, spanning at most two canonical chunks | zero or overbound requests are rejected; the returned allocation zeroizes on drop; durable/cache/depot coherence loss is actor-fatal |
 | logical sends per pump | 128 | remaining due work keeps its monotonic deadline |
 | UDP datagrams examined per adapter poll | 64 | yields `None`; a later poll may continue queued input |

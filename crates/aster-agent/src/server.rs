@@ -1189,7 +1189,7 @@ mod tests {
                 16 * 1024,
             )),
             ClientConfig::new("http://localhost".parse().unwrap())
-                .with_default_timeout(Duration::from_secs(120))
+                .with_default_timeout(Duration::from_secs(20 * 60))
                 .with_default_header(
                     http::header::AUTHORIZATION,
                     format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
@@ -1200,10 +1200,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(permits.available_permits(), 0);
-        let result = tokio::time::timeout(Duration::from_secs(31), stream.message()).await;
+        let result = tokio::time::timeout(Duration::from_secs(15 * 60 + 1), stream.message()).await;
         assert!(
             result.is_ok(),
-            "stream exceeded the server's 30-second deadline"
+            "stream exceeded the server's 15-minute deadline"
         );
         assert_eq!(
             result.unwrap().unwrap_err().code,

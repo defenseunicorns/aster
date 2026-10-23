@@ -22,7 +22,10 @@ use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Smallest interoperable chunk size.
@@ -31,14 +34,19 @@ pub const MIN_BLOB_CHUNK_SIZE: u32 = 4 * 1024;
 pub const MAX_BLOB_CHUNK_SIZE: u32 = 64 * 1024;
 /// Canonical chunk size required by the selected Blob application profile.
 pub const SELECTED_BLOB_CHUNK_SIZE: u32 = MAX_BLOB_CHUNK_SIZE;
-/// Maximum exact canonical manifest size, including every per-chunk integrity record.
-pub const MAX_BLOB_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MANIFEST_RECORD_LEN: u64 = 72;
 const MANIFEST_FIXED_LEN: u64 = 141;
 const MAX_ENCODED_METADATA_LEN: u64 = 2 + MAX_MEDIA_TYPE_LEN as u64 + MAX_SCHEMA_ID_LEN as u64;
-/// Maximum selected chunk count that keeps the exact canonical manifest within 1 MiB.
-pub const MAX_BLOB_CHUNKS: u64 =
-    (MAX_BLOB_MANIFEST_BYTES - MANIFEST_FIXED_LEN - MAX_ENCODED_METADATA_LEN) / MANIFEST_RECORD_LEN;
+/// Maximum selected chunk count needed by the public 8-GiB streaming ceiling.
+///
+/// `8 GiB / 64 KiB = 131,072` canonical chunks. The manifest remains bounded,
+/// but the bound follows that existing public payload ceiling rather than an
+/// unrelated 1-MiB carrier size.
+pub const MAX_BLOB_CHUNKS: u64 = (8 * 1024 * 1024 * 1024) / MAX_BLOB_CHUNK_SIZE as u64;
+/// Maximum exact canonical manifest size, including fixed framing, maximum
+/// metadata, and all 131,072 encoded 72-byte chunk records.
+pub const MAX_BLOB_MANIFEST_BYTES: u64 =
+    MANIFEST_FIXED_LEN + MAX_ENCODED_METADATA_LEN + MAX_BLOB_CHUNKS * MANIFEST_RECORD_LEN;
 const MAX_MEDIA_TYPE_LEN: usize = 255;
 const MAX_SCHEMA_ID_LEN: usize = 1024;
 /// Maximum UTF-8 bytes in selected Blob media-type identity metadata.
@@ -68,7 +76,7 @@ const BLOB_TRANSFER_ID_DOMAIN: &[u8] = b"aster/blob-transfer-object/v1";
 const ROUTE_TREE_MAGIC: &[u8; 8] = b"ASTRRT01";
 const ROUTE_TREE_FILE: &str = "route-tree.bin";
 const TRANSFER_FIXED_LEN: usize = 8 + 2 + 32 + 32 + 8 + 32 + 4 + 1;
-const MAX_ROUTE_PROOF_HASHES: usize = 16;
+const MAX_ROUTE_PROOF_HASHES: usize = 17;
 /// Exact maximum encoded size of one canonical `ASTRBT01` Blob transfer object.
 ///
 /// This is a carrier bound, not a transport-frame recommendation. Ranged transports
@@ -204,7 +212,7 @@ pub struct PreparedBlob {
     chunk_count: u64,
     whole_plaintext_sha256: [u8; 32],
     metadata: BlobMetadata,
-    plaintext_digests: Zeroizing<Vec<[u8; 32]>>,
+    plaintext_digests: Arc<Zeroizing<Vec<[u8; 32]>>>,
 }
 
 impl fmt::Debug for PreparedBlob {
@@ -245,6 +253,51 @@ impl PreparedBlob {
     /// Identity metadata committed by [`Self::id`].
     pub const fn metadata(&self) -> &BlobMetadata {
         &self.metadata
+    }
+
+    /// Reconstructs the canonical preparation result from a durable ordered
+    /// digest artifact and its incrementally retained whole-plaintext digest.
+    /// No plaintext is retained by this value.
+    pub fn from_retained_digests(
+        total_len: u64,
+        chunk_size: u32,
+        metadata: BlobMetadata,
+        whole_plaintext_sha256: Zeroizing<[u8; 32]>,
+        plaintext_digests: Zeroizing<Vec<[u8; 32]>>,
+    ) -> Result<Self, BlobError> {
+        validate_chunk_size(chunk_size)?;
+        let chunk_count = chunk_count(total_len, chunk_size)?;
+        if chunk_count > MAX_BLOB_CHUNKS
+            || usize::try_from(chunk_count).ok() != Some(plaintext_digests.len())
+        {
+            return Err(BlobError::InvalidManifest);
+        }
+        let mut id_hasher = domain_hasher(BLOB_ID_DOMAIN);
+        encode_blob_identity_prefix(
+            &mut id_hasher,
+            total_len,
+            chunk_size,
+            chunk_count,
+            &metadata,
+        );
+        for digest in plaintext_digests.iter() {
+            id_hasher.update(digest);
+        }
+        id_hasher.update(*whole_plaintext_sha256);
+        Ok(Self {
+            id: BlobId(finalize_sha256(id_hasher)),
+            total_len,
+            chunk_size,
+            chunk_count,
+            whole_plaintext_sha256: *whole_plaintext_sha256,
+            metadata,
+            plaintext_digests: Arc::new(plaintext_digests),
+        })
+    }
+
+    /// Shares the single zeroizing digest allocation with bounded map workers.
+    pub fn retained_digests(&self) -> Arc<Zeroizing<Vec<[u8; 32]>>> {
+        Arc::clone(&self.plaintext_digests)
     }
 }
 
@@ -313,7 +366,7 @@ pub fn prepare_blob<R: Read + Seek>(
             chunk_count,
             whole_plaintext_sha256,
             metadata,
-            plaintext_digests,
+            plaintext_digests: Arc::new(plaintext_digests),
         })
     })();
     let restored = source.seek(SeekFrom::Start(original));
@@ -448,7 +501,7 @@ pub struct BlobRouteCommitment {
 }
 
 impl BlobRouteCommitment {
-    /// Reconstructs a persisted nonempty selected route commitment.
+    /// Reconstructs a persisted selected route commitment.
     ///
     /// Source authenticity still requires a [`crate::ContentVerifiedBlobEnvelope`];
     /// this constructor checks only context-free structural bounds.
@@ -457,7 +510,7 @@ impl BlobRouteCommitment {
         chunk_count: u64,
         root: [u8; 32],
     ) -> Result<Self, BlobError> {
-        if chunk_count == 0 || chunk_count > MAX_BLOB_CHUNKS || root == [0_u8; 32] {
+        if chunk_count > MAX_BLOB_CHUNKS || root == [0_u8; 32] {
             return Err(BlobError::InvalidManifest);
         }
         Ok(Self {
@@ -612,11 +665,21 @@ impl BuiltBlobTransferObject {
 ///
 /// Fields and construction are private so parsing a structurally valid
 /// `ASTRBT01` object alone cannot mint this capability.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct VerifiedBlobTransferObject {
     object: BlobTransferObject,
     expected_record: BlobChunkRecord,
+    #[cfg(any(test, feature = "test-utils"))]
+    zeroize_observer: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
+
+impl PartialEq for VerifiedBlobTransferObject {
+    fn eq(&self, other: &Self) -> bool {
+        self.object == other.object && self.expected_record == other.expected_record
+    }
+}
+
+impl Eq for VerifiedBlobTransferObject {}
 
 impl VerifiedBlobTransferObject {
     pub const fn object_id(&self) -> BlobCarrierId {
@@ -641,6 +704,28 @@ impl VerifiedBlobTransferObject {
 
     pub fn ciphertext(&self) -> &[u8] {
         &self.object.ciphertext
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn observe_zeroize_for_test(
+        mut self,
+        observer: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.zeroize_observer = Some(observer);
+        self
+    }
+}
+
+impl Drop for VerifiedBlobTransferObject {
+    fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-utils"))]
+        let had_ciphertext = !self.object.ciphertext.is_empty();
+        self.object.ciphertext.zeroize();
+        #[cfg(any(test, feature = "test-utils"))]
+        if had_ciphertext && let Some(observer) = self.zeroize_observer.take() {
+            observer.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -1078,6 +1163,28 @@ pub struct FinishedBlob {
     route_commitment: BlobRouteCommitment,
 }
 
+/// Heap ownership observed while constructing a finished manifest and route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobFinishMemory {
+    peak_owned_bytes: usize,
+    retained_manifest_bytes: usize,
+    route_working_bytes: usize,
+}
+
+impl BlobFinishMemory {
+    pub const fn peak_owned_bytes(self) -> usize {
+        self.peak_owned_bytes
+    }
+
+    pub const fn retained_manifest_bytes(self) -> usize {
+        self.retained_manifest_bytes
+    }
+
+    pub const fn route_working_bytes(self) -> usize {
+        self.route_working_bytes
+    }
+}
+
 impl fmt::Debug for FinishedBlob {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter
@@ -1180,9 +1287,7 @@ pub(crate) fn inspect_selected_blob_manifest(
     let mut input = io::Cursor::new(bytes);
     let (inspected, route) = inspect_manifest_route(&mut input)?;
     validate_selected_manifest(inspected.manifest())?;
-    if route.chunk_count == 0
-        || route.blob_id != inspected.manifest.id
-        || route.chunk_count != inspected.manifest.chunk_count
+    if route.blob_id != inspected.manifest.id || route.chunk_count != inspected.manifest.chunk_count
     {
         return Err(BlobError::InvalidManifest);
     }
@@ -1636,6 +1741,8 @@ impl VerifiedBlobTransferPlan {
         Ok(VerifiedBlobTransferObject {
             object,
             expected_record,
+            #[cfg(any(test, feature = "test-utils"))]
+            zeroize_observer: None,
         })
     }
 
@@ -2692,14 +2799,12 @@ impl<S: BlobStore> ReferenceBlobService<S> {
     /// Installs a store-independent preparation result into this exact
     /// provider-owned scope/topic/epoch service.
     ///
-    /// The selected application seam rejects empty content and requires the
-    /// canonical 64 KiB chunk size. Repeating an identical installation is
+    /// The selected application seam requires the canonical 64 KiB chunk
+    /// size. Repeating an identical installation is
     /// idempotent when the backing store follows [`BlobStore`]'s contract.
     pub fn install_prepared(&mut self, prepared: &PreparedBlob) -> Result<BlobManifest, BlobError> {
         self.ensure_live()?;
-        if prepared.total_len == 0
-            || prepared.chunk_count == 0
-            || prepared.chunk_size != SELECTED_BLOB_CHUNK_SIZE
+        if prepared.chunk_size != SELECTED_BLOB_CHUNK_SIZE
             || usize::try_from(prepared.chunk_count).ok() != Some(prepared.plaintext_digests.len())
         {
             return Err(BlobError::InvalidManifest);
@@ -2751,6 +2856,16 @@ impl<S: BlobStore> ReferenceBlobService<S> {
 
     /// Finalizes an exact caller-held manifest through any provider-bound store.
     pub fn finish_manifest(&mut self, manifest: &BlobManifest) -> Result<FinishedBlob, BlobError> {
+        self.finish_manifest_measured(manifest)
+            .map(|(finished, _)| finished)
+    }
+
+    /// Finalizes while reporting every heap buffer owned by manifest/route
+    /// construction. Route leaves are moved into the level tree, not cloned.
+    pub fn finish_manifest_measured(
+        &mut self,
+        manifest: &BlobManifest,
+    ) -> Result<(FinishedBlob, BlobFinishMemory), BlobError> {
         let encoded_len = manifest_encoded_len(manifest)?;
         let mut manifest_bytes = Vec::with_capacity(
             usize::try_from(encoded_len).map_err(|_| BlobError::LengthOverflow)?,
@@ -2773,22 +2888,50 @@ impl<S: BlobStore> ReferenceBlobService<S> {
                 record.ciphertext_len,
             ));
         }
+        let levels = build_route_levels(leaves)?;
+        let route_working_bytes = levels
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Vec<[u8; 32]>>())
+            .saturating_add(
+                levels
+                    .iter()
+                    .map(|level| level.capacity().saturating_mul(32))
+                    .sum::<usize>(),
+            );
+        let route_root = if levels.is_empty() {
+            empty_route_root(manifest.id)
+        } else {
+            levels
+                .last()
+                .and_then(|level| level.first())
+                .copied()
+                .ok_or(BlobError::InvalidManifest)?
+        };
         let route_commitment = BlobRouteCommitment {
             blob_id: manifest.id,
             chunk_count: manifest.chunk_count,
-            root: route_root(manifest.id, &leaves)?,
+            root: route_root,
         };
         if manifest_bytes.len() as u64 != encoded_len
             || manifest_bytes.len() as u64 > MAX_BLOB_MANIFEST_BYTES
         {
             return Err(BlobError::InvalidManifest);
         }
-        Ok(FinishedBlob {
-            id: manifest.id,
-            manifest_bytes,
-            manifest_digest,
-            route_commitment,
-        })
+        let retained_manifest_bytes = manifest_bytes.capacity();
+        let memory = BlobFinishMemory {
+            peak_owned_bytes: retained_manifest_bytes.saturating_add(route_working_bytes),
+            retained_manifest_bytes,
+            route_working_bytes,
+        };
+        Ok((
+            FinishedBlob {
+                id: manifest.id,
+                manifest_bytes,
+                manifest_digest,
+                route_commitment,
+            },
+            memory,
+        ))
     }
 
     /// Legacy authenticated-marker reader entry point, generalized over the
@@ -3450,7 +3593,7 @@ impl<'a, S: BlobStore> BlobWriter<'a, S> {
         manifest: &BlobManifest,
         max_new_chunks: u64,
     ) -> Result<BlobWriteProgress, BlobError> {
-        if max_new_chunks == 0 {
+        if max_new_chunks == 0 && manifest.chunk_count != 0 {
             return Err(BlobError::WorkLimitZero);
         }
         self.validate_access(manifest)?;
@@ -3937,10 +4080,7 @@ fn validate_manifest(manifest: &BlobManifest) -> Result<(), BlobError> {
 
 fn validate_selected_manifest(manifest: &BlobManifest) -> Result<(), BlobError> {
     validate_manifest(manifest)?;
-    if manifest.total_len == 0
-        || manifest.chunk_count == 0
-        || manifest.chunk_size != SELECTED_BLOB_CHUNK_SIZE
-    {
+    if manifest.chunk_size != SELECTED_BLOB_CHUNK_SIZE {
         return Err(BlobError::InvalidManifest);
     }
     Ok(())
@@ -4652,6 +4792,34 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn verified_transfer_object_zeroizes_ciphertext_on_drop() {
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ciphertext = vec![0xa5; 17];
+        let digest: [u8; 32] = Sha256::digest(&ciphertext).into();
+        let record =
+            BlobChunkRecord::from_parts([0x11; 32], digest, 1, 17).expect("bounded chunk record");
+        let verified = VerifiedBlobTransferObject {
+            object: BlobTransferObject {
+                object_id: ObjectId::new(crate::wire::ObjectKind::BlobChunk, [0x12; 32]),
+                source_envelope: EnvelopeId::from_bytes([0x13; 32]),
+                blob_id: BlobId([0x14; 32]),
+                index: 0,
+                ciphertext_sha256: digest,
+                ciphertext_len: 17,
+                proof: Vec::new(),
+                ciphertext,
+            },
+            expected_record: record,
+            zeroize_observer: None,
+        }
+        .observe_zeroize_for_test(std::sync::Arc::clone(&observed));
+
+        drop(verified);
+
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+    }
 
     #[derive(Debug)]
     struct GeneratedSource {
@@ -5653,7 +5821,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_cap_boundary_is_at_most_one_mibibyte() {
+    fn manifest_cap_boundary_represents_eight_gibibytes() {
         let metadata = BlobMetadata::new(
             Some("a".repeat(MAX_MEDIA_TYPE_LEN)),
             vec![9; MAX_SCHEMA_ID_LEN],
@@ -5671,8 +5839,10 @@ mod tests {
         };
         let encoded = manifest_encoded_len(&at_limit)
             .unwrap_or_else(|error| panic!("manifest length failed: {error}"));
-        assert!(encoded <= MAX_BLOB_MANIFEST_BYTES);
-        assert!(MAX_BLOB_MANIFEST_BYTES - encoded < MANIFEST_RECORD_LEN);
+        assert_eq!(MAX_BLOB_CHUNKS, 131_072);
+        assert_eq!(MAX_BLOB_MANIFEST_BYTES, 9_438_606);
+        assert_eq!(at_limit.total_len, 8 * 1024 * 1024 * 1024);
+        assert_eq!(encoded, MAX_BLOB_MANIFEST_BYTES);
         validate_manifest(&at_limit)
             .unwrap_or_else(|error| panic!("boundary manifest failed: {error}"));
 
@@ -5682,5 +5852,42 @@ mod tests {
             ..at_limit
         };
         assert!(validate_manifest(&above_limit).is_err());
+    }
+
+    #[test]
+    fn canonical_manifest_finalizes_above_one_gib_without_payload_bytes() {
+        // Break caught: a canonical upload above the former ~953-MiB manifest
+        // ceiling must be finalizable without requiring a payload-sized test.
+        const TOTAL_LEN: u64 = 1024 * 1024 * 1024 + 64 * 1024;
+        const CHUNK_COUNT: u64 = 16_385;
+        let access = access(0x9a, 7);
+        let manifest = BlobManifest {
+            id: BlobId([0x51; 32]),
+            total_len: TOTAL_LEN,
+            chunk_size: SELECTED_BLOB_CHUNK_SIZE,
+            chunk_count: CHUNK_COUNT,
+            whole_plaintext_sha256: [0x52; 32],
+            metadata: BlobMetadata::new(Some("application/octet-stream".into()), Vec::new())
+                .expect("metadata"),
+            content_group: access.content_group,
+            content_epoch: access.epoch,
+        };
+        let record = BlobChunkRecord::from_parts(
+            [0x53; 32],
+            [0x54; 32],
+            SELECTED_BLOB_CHUNK_SIZE,
+            SELECTED_BLOB_CHUNK_SIZE + GCM_TAG_LEN as u32,
+        )
+        .expect("full canonical record");
+        let mut store = FileStore::new().expect("synthetic canonical store");
+        store.manifest = Some(manifest.clone());
+        store.records = vec![Some(record); CHUNK_COUNT as usize];
+        let mut encoded = Vec::new();
+        BlobWriter::new(&mut store, access)
+            .write_manifest(&manifest, &mut encoded)
+            .expect("finalize >1-GiB canonical manifest");
+        assert_eq!(encoded.len() as u64, 1_179_887);
+        assert_eq!(store.chunks.metadata().expect("payload metadata").len(), 0);
+        assert!(store.finalized.is_some());
     }
 }

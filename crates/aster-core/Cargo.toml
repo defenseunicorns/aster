@@ -27,6 +27,8 @@ adapter-sdk = ["sqlite-store"]
 # Proven reference provisioning, hybrid-authenticated session, and protected
 # frame surface without the legacy SQLite-backed runtime composition.
 reference-session = []
+# Deterministic authenticated-session fixtures used only by the separate fuzz crate.
+fuzzing = ["reference-session"]
 # Non-default compatibility seams used only by downstream authenticated
 # transport tests. Production callers cannot select session semantics.
 test-utils = ["reference-session"]

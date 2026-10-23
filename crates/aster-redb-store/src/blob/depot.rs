@@ -14,7 +14,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, MutexGuard};
+use std::sync::{Arc, RwLockReadGuard, RwLockWriteGuard};
 
 use aster_mesh::{
     BlobChunkRecord, BlobManifest, BlobMetadata as CoreBlobMetadata, BlobPhysicalLineage,
@@ -25,6 +25,7 @@ use redb::{ReadableTable, ReadableTableMetadata};
 use super::*;
 
 const DEPOT_DIRECTORY: &str = "blob-depot-v1";
+const BLOB_PACK_DIRECTORY: &str = "stream-packs-v2";
 const DEPOT_OWNER_FILE: &str = ".aster-store-owner-v1";
 const DEPOT_OWNER_TEMP_PREFIX: &str = ".aster-store-owner-tmp-";
 const DEPOT_PENDING_PREFIX: &str = ".aster-blob-depot-pending-v1-";
@@ -48,6 +49,7 @@ const CANONICAL_SUITE_ID: u16 = 1;
 const CANONICAL_MANIFEST_DIGEST_DOMAIN: &[u8] = b"aster/blob-manifest/v1";
 const CANONICAL_ROUTE_LEAF_DOMAIN: &[u8] = b"aster/blob-route-leaf/v1";
 const CANONICAL_ROUTE_NODE_DOMAIN: &[u8] = b"aster/blob-route-node/v1";
+const CANONICAL_ROUTE_EMPTY_DOMAIN: &[u8] = b"aster/blob-route-empty/v1";
 const CANONICAL_TRANSFER_ID_DOMAIN: &[u8] = b"aster/blob-transfer-object/v1";
 const CANONICAL_TRANSFER_FIXED_LEN: u64 = (8 + 2 + 32 + 32 + 8 + 32 + 4 + 1) as u64;
 const TEMP_PREFIX: &str = ".aster-blob-tmp-";
@@ -260,6 +262,37 @@ pub(super) fn blob_source_shape_read(
     route_chunk_count: u64,
     completed: bool,
 ) -> Result<BlobSourceShape, StoreError> {
+    if let Some(encoded) = read
+        .open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?
+        .get(variant_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+    {
+        if !completed {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "provisional retained source cannot reference an active Profile-5 pack",
+            )));
+        }
+        let owner_binding = depot_owner_binding_if_present_read(read)?.ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Profile-5 pack exists without depot owner binding",
+            ))
+        })?;
+        let (total_len, segment_count) = super::pack_lifecycle::source_shape_evidence(
+            &encoded,
+            variant_id,
+            blob_id,
+            epoch,
+            manifest_digest,
+            route_chunk_count,
+            physical_lineage,
+            owner_binding,
+        )?;
+        return Ok(BlobSourceShape {
+            total_len,
+            chunk_size: aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u32,
+            chunk_count: segment_count,
+        });
+    }
     let import = load_import_read(read, variant_id)?.ok_or_else(|| {
         blob_error(BlobStoreError::SchemaInvariant(
             "retained Blob source is missing its exact depot import",
@@ -278,9 +311,7 @@ pub(super) fn blob_source_shape_read(
         || import.blob_id != blob_id
         || import.epoch != epoch
         || import.physical_lineage != Some(physical_lineage)
-        || import.total_len == 0
         || import.chunk_size != SELECTED_BLOB_CHUNK_SIZE
-        || import.chunk_count == 0
         || import.chunk_count != route_chunk_count
         || expected_chunks != Some(import.chunk_count)
         || (completed && import.finalized_manifest_digest != Some(manifest_digest))
@@ -311,6 +342,37 @@ pub(super) fn blob_source_shape_write(
     route_chunk_count: u64,
     completed: bool,
 ) -> Result<BlobSourceShape, StoreError> {
+    if let Some(encoded) = write
+        .open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?
+        .get(variant_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+    {
+        if !completed {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "provisional retained source cannot reference an active Profile-5 pack",
+            )));
+        }
+        let owner_binding = depot_owner_binding_if_present_write(write)?.ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Profile-5 pack exists without depot owner binding",
+            ))
+        })?;
+        let (total_len, segment_count) = super::pack_lifecycle::source_shape_evidence(
+            &encoded,
+            variant_id,
+            blob_id,
+            epoch,
+            manifest_digest,
+            route_chunk_count,
+            physical_lineage,
+            owner_binding,
+        )?;
+        return Ok(BlobSourceShape {
+            total_len,
+            chunk_size: aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u32,
+            chunk_count: segment_count,
+        });
+    }
     let import = load_import_write(write, variant_id)?.ok_or_else(|| {
         blob_error(BlobStoreError::SchemaInvariant(
             "retained Blob source is missing its exact depot import",
@@ -329,9 +391,7 @@ pub(super) fn blob_source_shape_write(
         || import.blob_id != blob_id
         || import.epoch != epoch
         || import.physical_lineage != Some(physical_lineage)
-        || import.total_len == 0
         || import.chunk_size != SELECTED_BLOB_CHUNK_SIZE
-        || import.chunk_count == 0
         || import.chunk_count != route_chunk_count
         || expected_chunks != Some(import.chunk_count)
         || (completed && import.finalized_manifest_digest != Some(manifest_digest))
@@ -520,9 +580,7 @@ impl ImportRecord {
         manifest: &BlobManifest,
         physical_lineage: Option<BlobPhysicalLineage>,
     ) -> Result<Self, StoreError> {
-        if manifest.total_len() == 0
-            || manifest.chunk_size() != SELECTED_BLOB_CHUNK_SIZE
-            || manifest.chunk_count() == 0
+        if manifest.chunk_size() != SELECTED_BLOB_CHUNK_SIZE
             || manifest.chunk_count() > MAX_SELECTED_BLOB_CHUNKS
             || manifest.content_epoch() == 0
         {
@@ -668,13 +726,20 @@ impl BlobDepotCompletion {
 }
 
 /// Borrowed, single-owner adapter from the generic core Blob engine to this Store.
+#[allow(dead_code)] // Variant payloads are held solely for their RAII lock lifetime.
+enum BlobDepotGuard<'a> {
+    Read(RwLockReadGuard<'a, ()>),
+    Write(RwLockWriteGuard<'a, ()>),
+}
+
 pub struct BlobDepot<'a> {
     store: &'a Store,
-    _guard: MutexGuard<'a, ()>,
+    _guard: BlobDepotGuard<'a>,
     _lease: Option<Arc<super::lease::BlobLeaseHandle>>,
     root: OwnedDirectory,
     active: Option<ActiveImport>,
     read_authorized_variant: Option<BlobVariantId>,
+    upload_credit: Option<super::upload::BlobUploadCreditClaim>,
 }
 
 /// Capability-gated, mutation-incapable adapter for one finalized Blob variant.
@@ -903,7 +968,7 @@ impl<'a> BlobDepot<'a> {
     pub(super) fn open(store: &'a Store) -> Result<Self, StoreError> {
         let guard = store
             .blob_depot_lock
-            .lock()
+            .write()
             .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
         // Close the precheck/lock race with terminal entry, which flips the
         // live gate before waiting for this same adapter lock.
@@ -943,11 +1008,12 @@ impl<'a> BlobDepot<'a> {
         };
         Ok(Self {
             store,
-            _guard: guard,
+            _guard: BlobDepotGuard::Write(guard),
             _lease: None,
             root,
             active: None,
             read_authorized_variant: None,
+            upload_credit: None,
         })
     }
 
@@ -962,7 +1028,7 @@ impl<'a> BlobDepot<'a> {
     ) -> Result<Self, StoreError> {
         let guard = store
             .blob_depot_lock
-            .lock()
+            .write()
             .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
         store.require_live()?;
         let read = store.database.begin_read()?;
@@ -993,12 +1059,23 @@ impl<'a> BlobDepot<'a> {
         };
         Ok(Self {
             store,
-            _guard: guard,
+            _guard: BlobDepotGuard::Write(guard),
             _lease: None,
             root,
             active: None,
             read_authorized_variant: None,
+            upload_credit: None,
         })
+    }
+
+    pub(super) fn open_upload_mutation(
+        store: &'a Store,
+        reservation: &super::upload::BlobUploadReservation,
+    ) -> Result<Self, StoreError> {
+        let claim = super::upload::upload_credit_claim(store, reservation)?;
+        let mut depot = Self::open_network_mutation(store, true)?;
+        depot.upload_credit = Some(claim);
+        Ok(depot)
     }
 
     /// Opens an exact finalized variant for a capability-authorized read
@@ -1019,7 +1096,7 @@ impl<'a> BlobDepot<'a> {
         completion: &BlobDepotCompletion,
         lease_kind: super::lease::BlobLeaseKind,
     ) -> Result<AuthenticatedBlobReadDepot<'a>, StoreError> {
-        Self::open_authenticated_read_internal(store, completion, Some(lease_kind), None)
+        Self::open_authenticated_read_internal(store, completion, Some(lease_kind), None, None)
     }
 
     /// Opens the same mutation-denying authenticated adapter without consuming
@@ -1031,7 +1108,7 @@ impl<'a> BlobDepot<'a> {
         source: BlobTransferId,
         completion: &BlobDepotCompletion,
     ) -> Result<AuthenticatedBlobReadDepot<'a>, StoreError> {
-        Self::open_authenticated_read_internal(store, completion, None, Some(source))
+        Self::open_authenticated_read_internal(store, completion, None, Some(source), None)
     }
 
     fn open_authenticated_read_internal(
@@ -1039,11 +1116,17 @@ impl<'a> BlobDepot<'a> {
         completion: &BlobDepotCompletion,
         lease_kind: Option<super::lease::BlobLeaseKind>,
         required_pending: Option<BlobTransferId>,
+        existing_lease: Option<Arc<super::lease::BlobLeaseHandle>>,
     ) -> Result<AuthenticatedBlobReadDepot<'a>, StoreError> {
-        let guard = store
-            .blob_depot_lock
-            .lock()
-            .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
+        let guard = if lease_kind.is_some() || existing_lease.is_some() {
+            BlobDepotGuard::Read(store.blob_depot_lock.read().map_err(|_| {
+                blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned"))
+            })?)
+        } else {
+            BlobDepotGuard::Write(store.blob_depot_lock.write().map_err(|_| {
+                blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned"))
+            })?)
+        };
         store.require_live()?;
         if !Arc::ptr_eq(&completion.authority, &store.blob_completion_authority)
             || completion.backing_identity != store.backing_identity
@@ -1087,23 +1170,28 @@ impl<'a> BlobDepot<'a> {
             root,
             active: None,
             read_authorized_variant: Some(completion.variant_id),
+            upload_credit: None,
         };
         let import = depot.exact_completion_import(&read, completion)?;
         super::deletion::require_variant_available_read(&read, completion.variant_id)?;
         drop(read);
-        depot._lease = lease_kind
-            .map(|kind| {
-                store
-                    .blob_lease_registry
-                    .acquire(
-                        store.blob_depot_owner_binding,
-                        super::lease::BlobLeaseTarget::Variant(completion.variant_id),
-                        kind,
-                    )
-                    .map(|guard| Arc::new(super::lease::BlobLeaseHandle::new(guard)))
-                    .map_err(super::lease::store_error)
-            })
-            .transpose()?;
+        depot._lease = if let Some(existing) = existing_lease {
+            Some(existing)
+        } else {
+            lease_kind
+                .map(|kind| {
+                    store
+                        .blob_lease_registry
+                        .acquire(
+                            store.blob_depot_owner_binding,
+                            super::lease::BlobLeaseTarget::Variant(completion.variant_id),
+                            kind,
+                        )
+                        .map(|guard| Arc::new(super::lease::BlobLeaseHandle::new(guard)))
+                        .map_err(super::lease::store_error)
+                })
+                .transpose()?
+        };
         depot.active = Some(active_from_import(&import));
         #[cfg(test)]
         store
@@ -1174,6 +1262,52 @@ impl<'a> BlobDepot<'a> {
         })();
         self.active = previous_active;
         result
+    }
+
+    /// Mints physical completion for canonical content before its semantic
+    /// source envelope receives a final causal identity.
+    pub fn completed_prepared_blob(
+        &mut self,
+        manifest: &BlobManifest,
+        manifest_digest: [u8; 32],
+    ) -> Result<BlobDepotCompletion, StoreError> {
+        self.store.require_live()?;
+        let variant_id = blob_variant_id(
+            manifest.id(),
+            manifest.content_group(),
+            manifest.content_epoch(),
+        );
+        let read = self.store.database.begin_read()?;
+        super::deletion::require_variant_available_read(&read, variant_id)?;
+        let import = load_import_read(&read, variant_id)?
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        let physical_lineage = import
+            .physical_lineage
+            .ok_or_else(|| blob_error(BlobStoreError::CompletionMismatch))?;
+        if !import.matches_manifest(manifest)
+            || import.blob_id != manifest.id()
+            || import.content_group != *manifest.content_group()
+            || import.epoch != manifest.content_epoch()
+            || import.finalized_manifest_digest != Some(manifest_digest)
+        {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        verify_import_files_read(&read, &self.root, &import)?;
+        let import_fingerprint = Sha256::digest(encode_import(&import)?).into();
+        Ok(BlobDepotCompletion {
+            authority: Arc::clone(&self.store.blob_completion_authority),
+            backing_identity: self.store.backing_identity,
+            variant_id,
+            blob_id: manifest.id(),
+            content_group: *manifest.content_group(),
+            epoch: manifest.content_epoch(),
+            physical_lineage,
+            manifest_digest,
+            total_len: manifest.total_len(),
+            chunk_size: manifest.chunk_size(),
+            chunk_count: manifest.chunk_count(),
+            import_fingerprint,
+        })
     }
 
     /// Rechecks a previously minted exact completion against the current
@@ -1340,12 +1474,7 @@ impl<'a> BlobDepot<'a> {
             .map(|value| decode_chunk_state(value.value()))
             .transpose()?;
         let admission_usage = depot_admission_usage_write(&write)?;
-        if existing.is_none() && admission_usage.chunks >= self.store.blob_depot_limits.max_chunks {
-            return Err(blob_error(BlobStoreError::DepotChunkLimitExceeded {
-                current: admission_usage.chunks,
-                limit: self.store.blob_depot_limits.max_chunks,
-            }));
-        }
+        let incoming_chunk = u64::from(existing.is_none());
         let previous = existing.unwrap_or_default();
         let next = mutation(previous)?;
         let previous_reserved = previous
@@ -1354,6 +1483,42 @@ impl<'a> BlobDepot<'a> {
             .transpose()?
             .unwrap_or(0);
         let next_reserved = next.expected.map(chunk_file_len).transpose()?.unwrap_or(0);
+        let incoming_bytes = next_reserved
+            .checked_sub(previous_reserved)
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "Blob depot mutation unexpectedly releases reserved bytes",
+                ))
+            })?;
+        let consumed = if let Some(claim) = self.upload_credit.as_ref() {
+            let consume = super::upload::BlobUploadCapacity {
+                bytes: incoming_bytes,
+                chunks: incoming_chunk,
+                variants: 0,
+            };
+            super::upload::bind_and_consume_upload_credit_write(
+                &write,
+                self.store,
+                claim,
+                active.variant_id,
+                None,
+                consume,
+            )?;
+            consume
+        } else {
+            super::upload::BlobUploadCapacity::default()
+        };
+        let updated_chunks = admission_usage
+            .chunks
+            .checked_sub(consumed.chunks)
+            .and_then(|value| value.checked_add(incoming_chunk))
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        if updated_chunks > self.store.blob_depot_limits.max_chunks {
+            return Err(blob_error(BlobStoreError::DepotChunkLimitExceeded {
+                current: admission_usage.chunks,
+                limit: self.store.blob_depot_limits.max_chunks,
+            }));
+        }
         if previous_reserved != next_reserved {
             let mut depot = write.open_table(BLOB_DEPOT_METADATA)?;
             let durable_reserved = depot
@@ -1377,8 +1542,8 @@ impl<'a> BlobDepot<'a> {
                 .ok_or(StoreError::PayloadByteAccountingOverflow)?;
             let updated_admission = admission_usage
                 .reserved_bytes
-                .checked_sub(previous_reserved)
-                .and_then(|value| value.checked_add(next_reserved))
+                .checked_sub(consumed.bytes)
+                .and_then(|value| value.checked_add(incoming_bytes))
                 .ok_or_else(|| {
                     blob_error(BlobStoreError::SchemaInvariant(
                         "Blob depot admission-byte counter cannot cover its active chunk",
@@ -1387,7 +1552,7 @@ impl<'a> BlobDepot<'a> {
             if updated_admission > self.store.blob_depot_limits.max_bytes {
                 return Err(blob_error(BlobStoreError::DepotByteLimitExceeded {
                     current: admission_usage.reserved_bytes,
-                    incoming: next_reserved.saturating_sub(previous_reserved),
+                    incoming: incoming_bytes,
                     limit: self.store.blob_depot_limits.max_bytes,
                 }));
             }
@@ -1456,6 +1621,15 @@ impl<'a> BlobDepot<'a> {
                 ));
             }
             Some(_) => {
+                if let Some(claim) = self.upload_credit.as_ref() {
+                    super::upload::bind_upload_credit_to_existing_write(
+                        &write,
+                        self.store,
+                        claim,
+                        incoming.variant_id,
+                        manifest,
+                    )?;
+                }
                 if let (Some(physical_lineage), Some(owner_binding)) =
                     (incoming.physical_lineage, owner_binding)
                 {
@@ -1468,10 +1642,33 @@ impl<'a> BlobDepot<'a> {
                 }
             }
             None => {
-                let current = depot_admission_usage_write(&write)?.variants;
-                if current >= self.store.blob_depot_limits.max_variants {
+                let usage = depot_admission_usage_write(&write)?;
+                let consumed = if let Some(claim) = self.upload_credit.as_ref() {
+                    let consume = super::upload::BlobUploadCapacity {
+                        bytes: 0,
+                        chunks: 0,
+                        variants: 1,
+                    };
+                    super::upload::bind_and_consume_upload_credit_write(
+                        &write,
+                        self.store,
+                        claim,
+                        incoming.variant_id,
+                        Some(manifest),
+                        consume,
+                    )?;
+                    consume
+                } else {
+                    super::upload::BlobUploadCapacity::default()
+                };
+                let updated = usage
+                    .variants
+                    .checked_sub(consumed.variants)
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or(StoreError::ItemCountAccountingOverflow)?;
+                if updated > self.store.blob_depot_limits.max_variants {
                     return Err(blob_error(BlobStoreError::DepotVariantLimitExceeded {
-                        current,
+                        current: usage.variants,
                         limit: self.store.blob_depot_limits.max_variants,
                     }));
                 }
@@ -1509,6 +1706,13 @@ impl<'a> BlobDepot<'a> {
         self.active = Some(active_from_import(&incoming));
         Ok(())
     }
+}
+
+/// Opens the owner-bound directory used by append-only stream packs.
+/// The returned capability remains descriptor-backed on Unix.
+pub(super) fn open_blob_pack_root(store: &Store) -> Result<OwnedDirectory, StoreError> {
+    let depot = BlobDepot::open_network_mutation(store, true)?;
+    depot.root.open_child_directory(BLOB_PACK_DIRECTORY, true)
 }
 
 impl CoreBlobStore for BlobDepot<'_> {
@@ -2193,6 +2397,9 @@ pub(super) fn deletion_import_projection(
     key: &[u8],
     value: &[u8],
 ) -> Result<DeletionImportProjection, StoreError> {
+    if super::pack_lifecycle::is_pack_evidence(value) {
+        return super::pack_lifecycle::deletion_projection(key, value);
+    }
     let variant = parse_variant_id(key)?;
     let import = decode_import(value)?;
     let audited = lifecycle_import_from_record(variant, import.clone())?;
@@ -2270,6 +2477,166 @@ pub(super) struct DepotAdmissionUsage {
     pub(super) reserved_bytes: u64,
 }
 
+fn blob_upload_capacity_with_staging(
+    total_len: u64,
+    staging: u64,
+) -> Result<super::upload::BlobUploadCapacity, StoreError> {
+    let chunks = if total_len == 0 {
+        0
+    } else {
+        total_len
+            .checked_add(u64::from(super::SELECTED_BLOB_CHUNK_SIZE) - 1)
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?
+            / u64::from(super::SELECTED_BLOB_CHUNK_SIZE)
+    };
+    if chunks > super::MAX_SELECTED_BLOB_CHUNKS {
+        return Err(blob_error(BlobStoreError::InvalidPublication(
+            "Blob upload exceeds the selected manifest chunk bound",
+        )));
+    }
+    let conversion_overhead = chunks
+        .checked_mul(
+            CHUNK_FILE_HEADER_BYTES
+                .checked_add(u64::from(BLOB_CHUNK_TAG_BYTES))
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+        )
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    Ok(super::upload::BlobUploadCapacity {
+        bytes: staging
+            .checked_add(total_len)
+            .and_then(|value| value.checked_add(conversion_overhead))
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+        chunks,
+        variants: 1,
+    })
+}
+
+pub(super) fn blob_upload_capacity(
+    total_len: u64,
+) -> Result<super::upload::BlobUploadCapacity, StoreError> {
+    blob_upload_capacity_with_staging(total_len, blob_upload_staging_charge(total_len)?)
+}
+
+pub(super) fn legacy_blob_upload_capacity(
+    total_len: u64,
+) -> Result<super::upload::BlobUploadCapacity, StoreError> {
+    blob_upload_capacity_with_staging(total_len, legacy_blob_upload_staging_charge(total_len)?)
+}
+
+pub(super) fn blob_upload_staging_charge(total_len: u64) -> Result<u64, StoreError> {
+    super::pack::reserved_upload_pack_bytes(total_len)?
+        .checked_add(super::pack::upload_digest_reserved_bytes(total_len)?)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)
+}
+
+pub(super) fn legacy_blob_upload_staging_charge(total_len: u64) -> Result<u64, StoreError> {
+    super::pack::reserved_upload_pack_bytes(total_len)
+}
+
+pub(super) fn blob_upload_conversion_overhead(total_len: u64) -> Result<u64, StoreError> {
+    let total = blob_upload_capacity(total_len)?.bytes;
+    total
+        .checked_sub(blob_upload_staging_charge(total_len)?)
+        .and_then(|value| value.checked_sub(total_len))
+        .ok_or(StoreError::PayloadByteAccountingOverflow)
+}
+
+fn reconstruct_upload_capacity_tables(
+    imports: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    chunks: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    variant: super::BlobVariantId,
+    total_len: u64,
+    epoch: u64,
+    media_type: Option<&str>,
+    schema_id: &[u8],
+) -> Result<super::upload::BlobUploadCapacity, StoreError> {
+    let import = imports
+        .get(variant.as_bytes().as_slice())?
+        .map(|value| decode_import(value.value()))
+        .transpose()?
+        .ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Blob upload credit is bound to a missing canonical import",
+            ))
+        })?;
+    if import.variant_id != variant
+        || import.total_len != total_len
+        || import.epoch != epoch
+        || import.media_type.as_deref() != media_type
+        || import.schema_id != schema_id
+    {
+        return Err(blob_error(BlobStoreError::SchemaInvariant(
+            "Blob upload credit differs from its canonical import",
+        )));
+    }
+    let mut capacity = super::upload::BlobUploadCapacity {
+        bytes: 0,
+        chunks: 0,
+        variants: 1,
+    };
+    for row in chunks.iter()? {
+        let (key, value) = row?;
+        let (chunk_variant, index) = parse_chunk_key(key.value())?;
+        if chunk_variant != variant {
+            continue;
+        }
+        if index >= import.chunk_count {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob upload credit chunk lies outside its canonical import",
+            )));
+        }
+        let state = decode_chunk_state(value.value())?;
+        validate_chunk_state_lengths(&import, index, state)?;
+        capacity.chunks = capacity
+            .chunks
+            .checked_add(1)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?;
+        capacity.bytes = capacity
+            .bytes
+            .checked_add(state.expected.map(chunk_file_len).transpose()?.unwrap_or(0))
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+    }
+    Ok(capacity)
+}
+
+pub(super) fn reconstruct_upload_capacity_write(
+    write: &redb::WriteTransaction,
+    variant: super::BlobVariantId,
+    total_len: u64,
+    epoch: u64,
+    media_type: Option<&str>,
+    schema_id: &[u8],
+) -> Result<super::upload::BlobUploadCapacity, StoreError> {
+    reconstruct_upload_capacity_tables(
+        &write.open_table(BLOB_IMPORTS)?,
+        &write.open_table(BLOB_CHUNKS)?,
+        variant,
+        total_len,
+        epoch,
+        media_type,
+        schema_id,
+    )
+}
+
+pub(super) fn reconstruct_upload_capacity_read(
+    read: &redb::ReadTransaction,
+    variant: super::BlobVariantId,
+    total_len: u64,
+    epoch: u64,
+    media_type: Option<&str>,
+    schema_id: &[u8],
+) -> Result<super::upload::BlobUploadCapacity, StoreError> {
+    reconstruct_upload_capacity_tables(
+        &read.open_table(BLOB_IMPORTS)?,
+        &read.open_table(BLOB_CHUNKS)?,
+        variant,
+        total_len,
+        epoch,
+        media_type,
+        schema_id,
+    )
+}
+
 /// Capacity admission retains every physical resource through resumable
 /// unlink and deletion-manifest finalization.
 pub(super) fn depot_admission_usage_write(
@@ -2295,12 +2662,22 @@ pub(super) fn depot_admission_usage_write(
                 "Blob deletion chunk-row counter is missing",
             ))
         })?;
+    let upload = super::upload::upload_capacity_usage_write(write)?;
+    let packs = super::pack_lifecycle::active_capacity_usage_write(write)?;
     Ok(DepotAdmissionUsage {
-        variants: imports,
+        variants: imports
+            .checked_add(packs.variants)
+            .and_then(|value| value.checked_add(upload.variants))
+            .ok_or(StoreError::ItemCountAccountingOverflow)?,
         chunks: active_chunks
             .checked_add(deletion_chunks)
+            .and_then(|value| value.checked_add(packs.chunks))
+            .and_then(|value| value.checked_add(upload.chunks))
             .ok_or(StoreError::ItemCountAccountingOverflow)?,
-        reserved_bytes,
+        reserved_bytes: reserved_bytes
+            .checked_add(packs.bytes)
+            .and_then(|value| value.checked_add(upload.bytes))
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?,
     })
 }
 
@@ -2327,12 +2704,22 @@ pub(super) fn depot_admission_usage_read(
                 "Blob deletion chunk-row counter is missing",
             ))
         })?;
+    let upload = super::upload::upload_capacity_usage_read(read)?;
+    let packs = super::pack_lifecycle::active_capacity_usage_read(read)?;
     Ok(DepotAdmissionUsage {
-        variants: imports,
+        variants: imports
+            .checked_add(packs.variants)
+            .and_then(|value| value.checked_add(upload.variants))
+            .ok_or(StoreError::ItemCountAccountingOverflow)?,
         chunks: active_chunks
             .checked_add(deletion_chunks)
+            .and_then(|value| value.checked_add(packs.chunks))
+            .and_then(|value| value.checked_add(upload.chunks))
             .ok_or(StoreError::ItemCountAccountingOverflow)?,
-        reserved_bytes,
+        reserved_bytes: reserved_bytes
+            .checked_add(packs.bytes)
+            .and_then(|value| value.checked_add(upload.bytes))
+            .ok_or(StoreError::PayloadByteAccountingOverflow)?,
     })
 }
 
@@ -2343,6 +2730,20 @@ pub(super) fn validate_deletion_manifest_root(
     records: &[BlobChunkRecord],
     expected: Option<[u8; 32]>,
 ) -> Result<(), StoreError> {
+    if super::pack_lifecycle::is_pack_evidence(import_value) {
+        let projection = super::pack_lifecycle::deletion_projection(
+            // The exact key is already validated by deletion admission; the
+            // variant is encoded in the retained row and reconstructed here.
+            super::pack_lifecycle::encoded_variant_id(import_value)?.as_bytes(),
+            import_value,
+        )?;
+        if !records.is_empty() || projection.finalized_root != expected {
+            return Err(blob_error(BlobStoreError::SchemaInvariant(
+                "Blob pack deletion commitment differs from retained evidence",
+            )));
+        }
+        return Ok(());
+    }
     let import = decode_import(import_value)?;
     if import.finalized_manifest_digest != expected {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
@@ -2366,7 +2767,7 @@ pub(super) fn audited_lifecycle_imports_write(
     write: &redb::WriteTransaction,
 ) -> Result<Vec<AuditedLifecycleImport>, StoreError> {
     let imports = write.open_table(BLOB_IMPORTS)?;
-    imports
+    let mut audited = imports
         .iter()?
         .map(|row| {
             let (key, value) = row?;
@@ -2375,7 +2776,11 @@ pub(super) fn audited_lifecycle_imports_write(
                 decode_import(value.value())?,
             )
         })
-        .collect()
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    audited.extend(super::pack_lifecycle::audited_lifecycle_imports_write(
+        write,
+    )?);
+    Ok(audited)
 }
 
 /// Read-only counterpart to [`audited_lifecycle_imports_write`].
@@ -2383,7 +2788,7 @@ pub(super) fn audited_lifecycle_imports_read(
     read: &redb::ReadTransaction,
 ) -> Result<Vec<AuditedLifecycleImport>, StoreError> {
     let imports = read.open_table(BLOB_IMPORTS)?;
-    imports
+    let mut audited = imports
         .iter()?
         .map(|row| {
             let (key, value) = row?;
@@ -2392,7 +2797,9 @@ pub(super) fn audited_lifecycle_imports_read(
                 decode_import(value.value())?,
             )
         })
-        .collect()
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    audited.extend(super::pack_lifecycle::audited_lifecycle_imports_read(read)?);
+    Ok(audited)
 }
 
 pub(crate) fn depot_owner_token_write(
@@ -2420,9 +2827,18 @@ pub(crate) fn prepare_depot_owner_token_write(
     store_path: &Path,
 ) -> Result<(), StoreError> {
     let blob_tables = blob_table_names();
-    if write
+    let multimap_tables = write
         .list_multimap_tables()?
-        .any(|table| blob_tables.contains(&table.name()))
+        .map(|table| table.name().to_owned())
+        .collect::<BTreeSet<_>>();
+    if multimap_tables.contains(OBSOLETE_PROFILE5_RECEIPT_TABLE_NAME) {
+        return Err(blob_error(
+            BlobStoreError::UnsupportedLegacyProfile5ReceiptSchema,
+        ));
+    }
+    if multimap_tables
+        .iter()
+        .any(|table| blob_tables.contains(&table.as_str()))
     {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "mission-scoped Blob schema has the wrong table kind",
@@ -2432,6 +2848,11 @@ pub(crate) fn prepare_depot_owner_token_write(
         .list_tables()?
         .map(|table| table.name().to_owned())
         .collect::<BTreeSet<_>>();
+    if existing.contains(OBSOLETE_PROFILE5_RECEIPT_TABLE_NAME) {
+        return Err(blob_error(
+            BlobStoreError::UnsupportedLegacyProfile5ReceiptSchema,
+        ));
+    }
     if !existing.contains(BLOB_DEPOT_METADATA.name()) {
         if OwnedDirectory::open_root_if_present(store_path)?.is_some() {
             return Err(blob_error(BlobStoreError::DepotIntegrity(
@@ -2446,7 +2867,10 @@ pub(crate) fn prepare_depot_owner_token_write(
         .iter()
         .filter(|table| existing.contains(**table))
         .count();
-    if legacy.iter().any(|table| !existing.contains(*table)) || !matches!(network_present, 0 | 4) {
+    let network_current = network_present == network.len();
+    if legacy.iter().any(|table| !existing.contains(*table))
+        || !(network_present == 0 || network_current)
+    {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "mission-scoped Blob schema group is incomplete",
         )));
@@ -2477,7 +2901,7 @@ pub(crate) fn prepare_depot_owner_token_write(
         || write.open_table(BLOB_OPERATIONS)?.len()? != 0
         || write.open_table(BLOB_IMPORTS)?.len()? != 0
         || write.open_table(BLOB_CHUNKS)?.len()? != 0
-        || (network_present == network.len()
+        || (network_current
             && (write.open_table(BLOB_PENDING_SOURCES)?.len()? != 0
                 || write.open_table(BLOB_CARRIER_PREFIXES)?.len()? != 0
                 || write.open_table(BLOB_CARRIER_FETCH_CURSORS)?.len()? != 0));
@@ -2805,11 +3229,21 @@ pub(crate) fn audit_depot_write(
     let owner_binding =
         require_depot_owner_binding_write(write, store_path, backing_identity, owner_token)?;
     let deletion = super::deletion::audit_blob_deletion_write(write, Some(owner_binding))?;
+    let mut upload_packs = super::upload::upload_pack_expectations_write(write)?;
+    upload_packs.extend(super::pack_lifecycle::active_pack_expectations_write(
+        write,
+    )?);
     if expected == BlobStoreStats::default() {
         if let Some(root) = OwnedDirectory::open_root_if_present(store_path)? {
             match root.read_owner_marker()? {
                 Some(_) => {
                     root.require_store_binding(store_path, backing_identity, owner_token)?;
+                    let completed = super::pack::audit_upload_packs_write(&root, &upload_packs)?;
+                    if !completed.is_empty() {
+                        return Err(blob_error(BlobStoreError::DepotIntegrity(
+                            "Blob upload cleanup was not recovered before accounting audit",
+                        )));
+                    }
                     reclaim_unmarked_artifacts(write, &root, &BTreeMap::new(), &deletion)?;
                 }
                 None => {
@@ -2818,6 +3252,10 @@ pub(crate) fn audit_depot_write(
                     )));
                 }
             }
+        } else if !upload_packs.is_empty() {
+            return Err(blob_error(BlobStoreError::DepotIntegrity(
+                "durable Blob upload depot root is missing",
+            )));
         }
         return Ok(());
     }
@@ -2827,12 +3265,76 @@ pub(crate) fn audit_depot_write(
         ))
     })?;
     root.require_store_binding(store_path, backing_identity, owner_token)?;
+    let completed = super::pack::audit_upload_packs_write(&root, &upload_packs)?;
+    if !completed.is_empty() {
+        return Err(blob_error(BlobStoreError::DepotIntegrity(
+            "Blob upload cleanup was not recovered before accounting audit",
+        )));
+    }
     audit_deletion_storage(&root, &deletion, false)?;
     let mut committed = committed_chunk_map_write(write)?;
     let deletion_variants = protect_queued_deletion_chunks(&mut committed, &deletion)?;
     verify_all_marked_files_write(write, &root, &committed, &deletion_variants)?;
     reclaim_unmarked_artifacts(write, &root, &committed, &deletion)?;
     audit_deletion_storage(&root, &deletion, true)
+}
+
+pub(crate) fn recover_upload_pack_transitions_write(
+    write: &redb::WriteTransaction,
+    store_path: &Path,
+    backing_identity: StoreBackingIdentity,
+) -> Result<(), StoreError> {
+    if !write
+        .list_tables()?
+        .any(|table| table.name() == super::BLOB_UPLOADS.name())
+    {
+        return Ok(());
+    }
+    let mut expected = super::upload::upload_pack_expectations_write(write)?;
+    expected.extend(super::pack_lifecycle::active_pack_expectations_write(
+        write,
+    )?);
+    let Some(root) = OwnedDirectory::open_root_if_present(store_path)? else {
+        if expected.is_empty() {
+            return Ok(());
+        }
+        return Err(blob_error(BlobStoreError::DepotIntegrity(
+            "durable Blob upload depot root is missing",
+        )));
+    };
+    let owner_token = depot_owner_token_write(write)?;
+    root.require_store_binding(store_path, backing_identity, owner_token)?;
+    let completed = super::pack::audit_upload_packs_write(&root, &expected)?;
+    super::upload::finish_upload_cleanups_write(write, &completed)
+}
+
+pub(crate) fn reclaim_upload_cleanup_markers_after_commit(
+    write: &redb::WriteTransaction,
+    store_path: &Path,
+    backing_identity: StoreBackingIdentity,
+    owner_token: [u8; 32],
+) -> Result<(), StoreError> {
+    if !write
+        .list_tables()?
+        .any(|table| table.name() == super::BLOB_UPLOADS.name())
+    {
+        return Ok(());
+    }
+    let mut expected = super::upload::upload_pack_expectations_write(write)?;
+    expected.extend(super::pack_lifecycle::active_pack_expectations_write(
+        write,
+    )?);
+    let Some(root) = OwnedDirectory::open_root_if_present(store_path)? else {
+        return if expected.is_empty() {
+            Ok(())
+        } else {
+            Err(blob_error(BlobStoreError::DepotIntegrity(
+                "durable Blob upload depot root is missing",
+            )))
+        };
+    };
+    root.require_store_binding(store_path, backing_identity, owner_token)?;
+    super::pack::reclaim_row_absent_cleanup_markers(&root, &expected)
 }
 
 pub(crate) fn audit_depot_read(
@@ -2845,8 +3347,10 @@ pub(crate) fn audit_depot_read(
     let owner_binding =
         require_depot_owner_binding_read(read, store_path, backing_identity, owner_token)?;
     let deletion = super::deletion::inspect_blob_deletion_read(read, Some(owner_binding))?;
+    let mut upload_packs = super::upload::upload_pack_expectations_read(read)?;
+    upload_packs.extend(super::pack_lifecycle::active_pack_expectations_read(read)?);
     let Some(root) = OwnedDirectory::open_root_if_present(store_path)? else {
-        if expected.variants == 0 {
+        if expected.variants == 0 && upload_packs.is_empty() {
             return Ok(());
         }
         return Err(blob_error(BlobStoreError::DepotIntegrity(
@@ -2854,6 +3358,7 @@ pub(crate) fn audit_depot_read(
         )));
     };
     root.require_store_binding(store_path, backing_identity, owner_token)?;
+    super::pack::audit_upload_packs_read(&root, &upload_packs)?;
     audit_deletion_storage(&root, &deletion, true)?;
     let mut committed = committed_chunk_map_read(read)?;
     let deletion_variants = protect_queued_deletion_chunks(&mut committed, &deletion)?;
@@ -2916,6 +3421,27 @@ pub(super) fn audit_publication_import_write(
     chunk_count: u64,
     physical_lineage: Option<[u8; 32]>,
 ) -> Result<(), StoreError> {
+    if let Some(pack) = write
+        .open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?
+        .get(variant_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+    {
+        let owner_binding = depot_owner_binding_if_present_write(write)?.ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Profile-5 pack exists without depot owner binding",
+            ))
+        })?;
+        return super::pack_lifecycle::audit_publication_evidence(
+            &pack,
+            variant_id,
+            blob_id,
+            epoch,
+            manifest_digest,
+            chunk_count,
+            physical_lineage,
+            owner_binding,
+        );
+    }
     let import = load_import_write(write, variant_id)?.ok_or_else(|| {
         blob_error(BlobStoreError::SchemaInvariant(
             "accepted Blob publication is missing its depot import",
@@ -2962,6 +3488,27 @@ pub(super) fn audit_publication_import_read(
     chunk_count: u64,
     physical_lineage: Option<[u8; 32]>,
 ) -> Result<(), StoreError> {
+    if let Some(pack) = read
+        .open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?
+        .get(variant_id.as_bytes().as_slice())?
+        .map(|value| value.value().to_vec())
+    {
+        let owner_binding = depot_owner_binding_if_present_read(read)?.ok_or_else(|| {
+            blob_error(BlobStoreError::SchemaInvariant(
+                "Profile-5 pack exists without depot owner binding",
+            ))
+        })?;
+        return super::pack_lifecycle::audit_publication_evidence(
+            &pack,
+            variant_id,
+            blob_id,
+            epoch,
+            manifest_digest,
+            chunk_count,
+            physical_lineage,
+            owner_binding,
+        );
+    }
     let import = load_import_read(read, variant_id)?.ok_or_else(|| {
         blob_error(BlobStoreError::SchemaInvariant(
             "accepted Blob publication is missing its depot import",
@@ -3073,11 +3620,23 @@ pub(super) fn audit_pending_network_plan(
         )));
     }
     let levels = exact_pending_route_levels(blob_id, &records)?;
-    if levels
-        .last()
-        .and_then(|level| level.first())
-        .is_none_or(|root| root != route.root())
-    {
+    let exact_root = if records.is_empty() {
+        let mut digest = audit_domain_hasher(CANONICAL_ROUTE_EMPTY_DOMAIN);
+        digest.update(CANONICAL_PROTOCOL_VERSION.to_be_bytes());
+        digest.update(blob_id.as_bytes());
+        digest.update(0_u64.to_be_bytes());
+        digest.finalize().into()
+    } else {
+        *levels
+            .last()
+            .and_then(|level| level.first())
+            .ok_or_else(|| {
+                blob_error(BlobStoreError::SchemaInvariant(
+                    "pending Blob route tree is empty",
+                ))
+            })?
+    };
+    if &exact_root != route.root() {
         return Err(blob_error(BlobStoreError::SchemaInvariant(
             "pending Blob source differs from its exact route commitment",
         )));
@@ -3612,8 +4171,22 @@ pub(super) fn delete_manifest_variant_directory(
     store_path: &Path,
     backing_identity: StoreBackingIdentity,
     owner_token: [u8; 32],
-    variant: BlobVariantId,
+    manifest: &super::deletion::BlobDeletionManifestHeader,
 ) -> Result<(), ManifestDeletionError> {
+    if super::pack_lifecycle::is_pack_evidence(&manifest.original_import) {
+        let identity = super::pack_lifecycle::deletion_identity(&manifest.original_import)?;
+        deletion_stage(
+            super::pack::remove_lifecycle_pack(
+                store_path,
+                backing_identity,
+                owner_token,
+                &identity,
+            ),
+            super::deletion::BlobDeletionFailureCategory::VariantDirectoryRemove,
+        )?;
+        return Ok(());
+    }
+    let variant = manifest.variant_id;
     let root = deletion_stage(
         OwnedDirectory::open_root_if_present(store_path),
         super::deletion::BlobDeletionFailureCategory::VariantDirectoryAccess,
@@ -3879,6 +4452,11 @@ fn reclaim_unmarked_artifacts(
         if name == "." || name == ".." || name == DEPOT_OWNER_FILE {
             continue;
         }
+        if name == BLOB_PACK_DIRECTORY {
+            // Packs have separate redb reservation/publication authority and
+            // must never be interpreted or reclaimed as legacy variants.
+            continue;
+        }
         let Some(raw) = decode_hex32(&name) else {
             // Only known temporary files are reclaimable at the root. Unknown
             // artifacts fail closed rather than broadening cleanup authority.
@@ -3986,6 +4564,7 @@ fn audit_unmarked_artifacts_read(
     }
     for name in root.entry_names()? {
         if name == DEPOT_OWNER_FILE
+            || name == BLOB_PACK_DIRECTORY
             || name.starts_with(TEMP_PREFIX)
             || name.starts_with(DEPOT_OWNER_TEMP_PREFIX)
         {
@@ -4217,17 +4796,27 @@ pub(super) fn stage_verified_plan_write(
     write: &redb::WriteTransaction,
     limits: BlobDepotLimits,
     plan: &VerifiedBlobTransferPlan,
+    max_total_len: u64,
+    max_chunks: u64,
 ) -> Result<(), StoreError> {
     let manifest = plan.manifest();
-    let incoming = ImportRecord::from_manifest(manifest, Some(plan.physical_lineage()))?;
-    if incoming.total_len > MAX_NETWORK_BLOB_BYTES
-        || incoming.chunk_count > MAX_NETWORK_BLOB_CHUNKS
+    let mut incoming = ImportRecord::from_manifest(manifest, Some(plan.physical_lineage()))?;
+    if incoming.total_len > max_total_len
+        || incoming.chunk_count > max_chunks
         || usize::try_from(incoming.chunk_count).ok() != Some(plan.chunk_records().len())
     {
         return Err(blob_error(BlobStoreError::NetworkBlobTooLarge {
             total_len: incoming.total_len,
             chunk_count: incoming.chunk_count,
+            max_total_len,
+            max_chunks,
         }));
+    }
+    if incoming.chunk_count == 0 {
+        // The canonical empty Blob has no DATA carrier whose commit could
+        // otherwise finalize the import. The authenticated manifest plan is
+        // itself the complete physical proof for the exact `(0, 0)` shape.
+        incoming.finalized_manifest_digest = Some(*plan.manifest_digest());
     }
 
     let existing_import = load_import_write(write, incoming.variant_id)?;
@@ -4894,13 +5483,9 @@ fn decode_import(bytes: &[u8]) -> Result<ImportRecord, StoreError> {
     let schema_len = usize::from(cursor.u16()?);
     let schema_id = cursor.take(schema_len)?.to_vec();
     cursor.finish()?;
-    let canonical_chunk_count = total_len
-        .checked_sub(1)
-        .map(|last| 1 + last / u64::from(SELECTED_BLOB_CHUNK_SIZE));
+    let canonical_chunk_count = Some(total_len.div_ceil(u64::from(SELECTED_BLOB_CHUNK_SIZE)));
     let metadata_valid = CoreBlobMetadata::new(media_type.clone(), schema_id.clone()).is_ok();
-    if total_len == 0
-        || chunk_size != SELECTED_BLOB_CHUNK_SIZE
-        || chunk_count == 0
+    if chunk_size != SELECTED_BLOB_CHUNK_SIZE
         || Some(chunk_count) != canonical_chunk_count
         || chunk_count > MAX_SELECTED_BLOB_CHUNKS
         || epoch == 0
@@ -5258,7 +5843,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
-struct OwnedDirectory {
+pub(super) struct OwnedDirectory {
     path: PathBuf,
     created_by_open: bool,
     #[cfg(unix)]
@@ -5424,7 +6009,21 @@ fn read_manifest_deletion_file(
 }
 
 impl OwnedDirectory {
-    fn open_root_if_present(store_path: &Path) -> Result<Option<Self>, StoreError> {
+    #[cfg(test)]
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(super) fn read_private_file_if_present(
+        &self,
+        name: &str,
+        max_len: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        self.read_private_regular_file_if_present(name, max_len)
+            .map_err(|error| error.error)
+    }
+
+    pub(super) fn open_root_if_present(store_path: &Path) -> Result<Option<Self>, StoreError> {
         Self::open_root_internal(store_path)
     }
 
@@ -5643,7 +6242,7 @@ impl OwnedDirectory {
         Ok(root)
     }
 
-    fn require_store_binding(
+    pub(super) fn require_store_binding(
         &self,
         store_path: &Path,
         backing_identity: StoreBackingIdentity,
@@ -6346,7 +6945,21 @@ impl OwnedDirectory {
     }
 
     #[cfg(unix)]
-    fn open_child_directory(&self, name: &str, create: bool) -> Result<Self, StoreError> {
+    pub(super) fn open_child_directory(
+        &self,
+        name: &str,
+        create: bool,
+    ) -> Result<Self, StoreError> {
+        self.open_child_directory_observed(name, create, None)
+    }
+
+    #[cfg(unix)]
+    fn open_child_directory_observed(
+        &self,
+        name: &str,
+        create: bool,
+        _observed_store: Option<&Store>,
+    ) -> Result<Self, StoreError> {
         let mut created = false;
         let descriptor = match rustix::fs::openat(
             &self.file,
@@ -6399,7 +7012,11 @@ impl OwnedDirectory {
     }
 
     #[cfg(not(unix))]
-    fn open_child_directory(&self, name: &str, create: bool) -> Result<Self, StoreError> {
+    pub(super) fn open_child_directory(
+        &self,
+        name: &str,
+        create: bool,
+    ) -> Result<Self, StoreError> {
         let path = self.path.join(name);
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if !metadata.is_dir() => {
@@ -6419,8 +7036,33 @@ impl OwnedDirectory {
         })
     }
 
+    pub(super) fn open_child_directory_if_present(
+        &self,
+        name: &str,
+    ) -> Result<Option<Self>, StoreError> {
+        match self.open_child_directory(name, false) {
+            Ok(directory) => Ok(Some(directory)),
+            Err(StoreError::Blob(BlobStoreError::Io(error)))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     #[cfg(unix)]
-    fn write_atomic(&self, final_name: &str, bytes: &[u8]) -> Result<(), StoreError> {
+    pub(super) fn write_atomic(&self, final_name: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        self.write_atomic_observed(final_name, bytes, None)
+    }
+
+    #[cfg(unix)]
+    fn write_atomic_observed(
+        &self,
+        final_name: &str,
+        bytes: &[u8],
+        _observed_store: Option<&Store>,
+    ) -> Result<(), StoreError> {
         let temp_name = format!(
             "{TEMP_PREFIX}{}-{}",
             std::process::id(),
@@ -6459,7 +7101,17 @@ impl OwnedDirectory {
     }
 
     #[cfg(not(unix))]
-    fn write_atomic(&self, final_name: &str, bytes: &[u8]) -> Result<(), StoreError> {
+    pub(super) fn write_atomic(&self, final_name: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        self.write_atomic_observed(final_name, bytes, None)
+    }
+
+    #[cfg(not(unix))]
+    fn write_atomic_observed(
+        &self,
+        final_name: &str,
+        bytes: &[u8],
+        _observed_store: Option<&Store>,
+    ) -> Result<(), StoreError> {
         let temp = self.path.join(format!(
             "{TEMP_PREFIX}{}-{}",
             std::process::id(),
@@ -6478,6 +7130,159 @@ impl OwnedDirectory {
         File::open(&self.path)?.sync_all()?;
         maybe_inject_fault(&self.path, DepotFaultPoint::DirectorySynced)?;
         Ok(())
+    }
+
+    pub(super) fn open_private_rw_file(
+        &self,
+        name: &str,
+        create_new: bool,
+    ) -> Result<File, StoreError> {
+        require_relative_leaf_name(name)?;
+        #[cfg(unix)]
+        {
+            let mut flags = rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC;
+            if create_new {
+                flags |= rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL;
+            }
+            let descriptor = rustix::fs::openat(
+                &self.file,
+                name,
+                flags,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )
+            .map_err(|error| {
+                if error == rustix::io::Errno::LOOP
+                    || error == rustix::io::Errno::ISDIR
+                    || error == rustix::io::Errno::NOTDIR
+                {
+                    blob_error(BlobStoreError::DepotIntegrity(
+                        "Blob pack file was replaced by another filesystem type",
+                    ))
+                } else {
+                    blob_error(BlobStoreError::Io(error.into()))
+                }
+            })?;
+            let file = File::from(descriptor);
+            validate_private_pack_file(&file)?;
+            Ok(file)
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.path.join(name);
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create_new(create_new);
+            let file = options.open(path)?;
+            if !file.metadata()?.is_file() {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "Blob pack file is not regular",
+                )));
+            }
+            Ok(file)
+        }
+    }
+
+    pub(super) fn open_private_rw_file_if_present(
+        &self,
+        name: &str,
+    ) -> Result<Option<File>, StoreError> {
+        require_relative_leaf_name(name)?;
+        #[cfg(unix)]
+        {
+            let descriptor = match rustix::fs::openat(
+                &self.file,
+                name,
+                rustix::fs::OFlags::RDWR
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            ) {
+                Ok(descriptor) => descriptor,
+                Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+                Err(error)
+                    if error == rustix::io::Errno::LOOP
+                        || error == rustix::io::Errno::ISDIR
+                        || error == rustix::io::Errno::NOTDIR =>
+                {
+                    return Err(blob_error(BlobStoreError::DepotIntegrity(
+                        "Blob pack file was replaced by another filesystem type",
+                    )));
+                }
+                Err(error) => return Err(blob_error(BlobStoreError::Io(error.into()))),
+            };
+            let file = File::from(descriptor);
+            validate_private_pack_file(&file)?;
+            Ok(Some(file))
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.path.join(name);
+            let file = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(blob_error(BlobStoreError::Io(error))),
+            };
+            if !file.metadata()?.is_file() {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "Blob pack file is not regular",
+                )));
+            }
+            Ok(Some(file))
+        }
+    }
+
+    pub(super) fn open_private_read_file_if_present(
+        &self,
+        name: &str,
+    ) -> Result<Option<File>, StoreError> {
+        require_relative_leaf_name(name)?;
+        #[cfg(unix)]
+        {
+            let descriptor = match rustix::fs::openat(
+                &self.file,
+                name,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            ) {
+                Ok(descriptor) => descriptor,
+                Err(error) if error == rustix::io::Errno::NOENT => return Ok(None),
+                Err(error)
+                    if error == rustix::io::Errno::LOOP
+                        || error == rustix::io::Errno::ISDIR
+                        || error == rustix::io::Errno::NOTDIR =>
+                {
+                    return Err(blob_error(BlobStoreError::DepotIntegrity(
+                        "Blob pack file was replaced by another filesystem type",
+                    )));
+                }
+                Err(error) => return Err(blob_error(BlobStoreError::Io(error.into()))),
+            };
+            let file = File::from(descriptor);
+            validate_private_pack_file(&file)?;
+            Ok(Some(file))
+        }
+        #[cfg(not(unix))]
+        {
+            match File::open(self.path.join(name)) {
+                Ok(file) => {
+                    if !file.metadata()?.is_file() {
+                        return Err(blob_error(BlobStoreError::DepotIntegrity(
+                            "Blob pack file is not regular",
+                        )));
+                    }
+                    Ok(Some(file))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(blob_error(BlobStoreError::Io(error))),
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -6694,7 +7499,7 @@ impl OwnedDirectory {
     }
 
     #[cfg(unix)]
-    fn entry_names(&self) -> Result<Vec<String>, StoreError> {
+    pub(super) fn entry_names(&self) -> Result<Vec<String>, StoreError> {
         let directory = rustix::fs::Dir::read_from(&self.file)
             .map_err(|error| blob_error(BlobStoreError::Io(error.into())))?;
         directory
@@ -6711,7 +7516,7 @@ impl OwnedDirectory {
     }
 
     #[cfg(not(unix))]
-    fn entry_names(&self) -> Result<Vec<String>, StoreError> {
+    pub(super) fn entry_names(&self) -> Result<Vec<String>, StoreError> {
         std::fs::read_dir(&self.path)?
             .map(|entry| {
                 entry
@@ -6728,7 +7533,7 @@ impl OwnedDirectory {
     }
 
     #[cfg(unix)]
-    fn remove_if_exists(&self, name: &str, directory: bool) -> Result<(), StoreError> {
+    pub(super) fn remove_if_exists(&self, name: &str, directory: bool) -> Result<(), StoreError> {
         let flags = if directory {
             rustix::fs::AtFlags::REMOVEDIR
         } else {
@@ -6781,7 +7586,7 @@ impl OwnedDirectory {
     }
 
     #[cfg(not(unix))]
-    fn remove_if_exists(&self, name: &str, directory: bool) -> Result<(), StoreError> {
+    pub(super) fn remove_if_exists(&self, name: &str, directory: bool) -> Result<(), StoreError> {
         let result = if directory {
             std::fs::remove_dir(self.path.join(name))
         } else {
@@ -6794,7 +7599,7 @@ impl OwnedDirectory {
         }
     }
 
-    fn sync(&self) -> Result<(), StoreError> {
+    pub(super) fn sync(&self) -> Result<(), StoreError> {
         #[cfg(unix)]
         self.file
             .sync_all()
@@ -6803,6 +7608,34 @@ impl OwnedDirectory {
         File::open(&self.path)?.sync_all()?;
         Ok(())
     }
+}
+
+fn require_relative_leaf_name(name: &str) -> Result<(), StoreError> {
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+        return Err(blob_error(BlobStoreError::DepotIntegrity(
+            "Blob pack filename is not a relative leaf",
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_private_pack_file(file: &File) -> Result<(), StoreError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| blob_error(BlobStoreError::Io(error)))?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(blob_error(BlobStoreError::DepotIntegrity(
+            "Blob pack type, ownership, mode, or link count mismatches",
+        )));
+    }
+    Ok(())
 }
 
 fn read_exact_chunk_file_parts(

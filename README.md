@@ -21,6 +21,24 @@ constrained, and disconnected operation.
 > and [requirements status](docs/validation/requirements-status.md) before
 > planning a deployment.
 
+The current public Blob capability boundary is machine checked:
+
+<!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+```json
+{
+  "schema": 1,
+  "surface": "readme",
+  "local_publish_waits_for_peer": false,
+  "rust_agent_asterctl_publish_read": "implemented",
+  "blob_status_scope": "receiver_local_durable_state",
+  "blob_status_reports_remote_delivery_peer_or_convergence": false,
+  "cli_download_resume": "post_merge"
+}
+```
+<!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+Local Blob publication commits without waiting for a peer. Rust, the native-gRPC agent, and asterctl implement bounded Blob publication and authenticated reads. blob-status reports receiver-local durable state, not remote delivery, peer status, or convergence. CLI download resume is post-merge work; an interrupted download restarts at byte zero.
+<!-- ASTER-BLOB-CAPABILITY:END -->
+
 ## See it work
 
 Start with **Aster Field Notes**. It opens with no processes running, asks you
@@ -107,7 +125,7 @@ require a hosted Buf Schema Registry.
 | **Docker Compose deployment** | [Compose container delivery](docs/release/docker-compose.md) | Manual, no-Swarm container profile with a dedicated file-secret provider; no Docker host profile is qualified |
 | **Rust selected node** | [Selected Event API](docs/quickstart/selected-event-api.md) | Live Event publish, query, durable delivery, gaps, and status |
 | **State or Record in Rust** | [State](docs/quickstart/selected-state-api.md) and [Record](docs/quickstart/selected-record-api.md) | Cloneable live handles and exclusive stopped facades; direct-Iroh reconciliation; State latest-value and Record conflict-preserving delivery |
-| **Blob in Rust** | [Blob](docs/quickstart/selected-blob-api.md) | Cloneable `RunningNode::selected_blobs()` handle for durable or finite-TTL file publication, bounded pages, tagged content/retirement delivery, and local durable transfer progress, plus an exclusive stopped facade; selected network transfer requires semantic v7/v8 profile 4, with durable-only behavior in v7 and authenticated finite-TTL custody in v8 |
+| **Blob in Rust** | [Blob](docs/quickstart/selected-blob-api.md) | Cloneable `RunningNode::selected_blobs()` handle for durable or finite-TTL file publication, bounded pages, tagged content/retirement delivery, and local durable transfer progress, plus an exclusive stopped facade; semantic v9/profile 5 provides bounded checkpointed large-object streaming, while v7/v8 profile 4 remains the compatibility path |
 | **Rust semantic API** | [Rust quickstart](docs/quickstart/rust.md) | Broader proven semantic surface used as the migration source |
 | **Python, Go, or C** | [Language quickstarts](docs/quickstart/README.md) | Offline semantic API through the current C ABI, not the selected live node |
 
@@ -143,18 +161,35 @@ provisioning remain open work.
 | **Event** | Source-authenticated reconciliation over direct Iroh or one operator-pinned controlled Iroh connectivity relay; semantic-v7 receipt-free ordered pages with full-page receiver validation, receiver-local batched commits for consecutive content-capable durable/finite/mixed entries, and receipt-free route-only and blind ReceiveOnly Event traffic; semantic-v6 compatibility fallback; live Rust and local ConnectRPC APIs; client-owned durable consume/carry selectors and at-least-once delivery fenced by recovered sessions; numbered-only crash-safe publication with durable application journals and sparse result compaction | Physical performance/resource validation of v7 pages and receiver batching, lost-journal recovery and client retirement, atomic subscription update, production automatic/hosted discovery, public relay selection, and broader physical-network acceptance |
 | **State** | Live or stopped publication/query, causal latest-value projection, direct-Iroh reconciliation under explicit interests, durable positive-current-version delivery, and local delivery-ledger status | Peer/contact/convergence status, synthetic withdrawals, dynamic network interests, selected-node bindings, finite TTL, relay support, expiry, and garbage collection |
 | **Record** | Live or stopped conflict-preserving publication/query, exact-sibling guarded resolution, direct-Iroh reconciliation, durable whole-key active-head delivery, and local delivery-ledger status | Peer/contact/convergence status, selected-node bindings, automatic merge execution, finite TTL, relay support, expiry, and garbage collection |
-| **Blob** | Live or stopped durable/finite immutable publication, bounded authenticated reads, tagged content/retirement delivery, local durable transfer progress, local ConnectRPC and `asterctl` publish/read with durable or finite TTL, semantic-v7/v8 receipt-free Blob range streams with resumable staging, authenticated semantic-v8 finite-TTL custody, bounded pressure recovery of strictly lower-priority Blob work, crash-resumable manifest-authorized reclamation, bounded invalid-work maintenance, and expiry of retained retirement records after 45 days of accumulated conservative lower-bound age | Peer/convergence status, route-only relay/custody, arbitrary-peer recovery, public GC controls, and Blob lifetime fields in the FFI surface |
+| **Blob** | Live or stopped durable/finite immutable publication, bounded authenticated reads, tagged content/retirement delivery, node durable transfer progress, local ConnectRPC and `asterctl` publish/read through 8 GiB, semantic-v9/profile-5 bounded checkpointed streaming with lifecycle-owned provisional state and a native pack checkpoint journal, semantic-v7/v8 profile-4 compatibility, authenticated finite-TTL custody, bounded pressure recovery, crash-resumable reclamation, and bounded maintenance | Network-wide visibility, route-only relay/custody, cross-transport failover, public GC controls, and Blob lifetime fields in the FFI surface |
 | **Static Event hierarchy** | Profile-`0x0001` authenticated directed edges, topic/priority narrowing, route-only nested wrappers, durable candidates, and semantic-v6 runtime integration | Supported bridge administration, live join/leave, complete quotas, dynamic policy, revocation/rekey lifecycle, and cross-class bridge custody |
 | **Security profiles** | Stock hybrid-PQ profile `0x0001`; additive P-256 Event/control profile `0x0002` with an exporter-bound two-node Iroh path | Stock runtime/CLI selection for `0x0002`, general negotiation, complete classical data/lifecycle coverage, and rollback policy |
 | **Operations** | Manually admitted direct addresses, one operator-pinned controlled relay, default-off time-windowed mDNS with bounded Aster admission, reference provisioning, and same-UID Unix software zeroization | Protected operational provisioning, hostile-LAN discovery, public/default relay selection, BTLE integration, and physical sanitization |
 
+Blob has one canonical publication authority. Provisional local uploads,
+lifecycle-owned provisional network sources, and completed native packs share
+the configured Blob depot limits; profile 5 does not create a separate capacity pool or
+publication representation. Semantic-v9 publication creates the native
+`ASTRBS02` pack used directly by both storage and transfer. This unreleased
+format has no migration promise: a depot containing an incompatible
+experimental Profile-5 pack fails on open with instructions to reset the
+development depot or reimport its Blob data. Semantic-v7/v8 contacts retain
+profile 4 only for their historical wire protocol. The machine-checked
+capability block above is authoritative for publication, status, and download
+behavior.
+
+The provisional source or upload state plus the native pack checkpoint journal
+own durable Profile-5 resume. Atomic promotion precedes RESULT; RESULT_ACK or
+EOF settles only the transport attempt and owns no durable resume state.
+
 Semantic v7 changes the network mechanics for Event synchronization,
 not publication semantics: a successful publish remains a local durable commit
 and never waits for a peer. State, Record, and EventBridge negotiate their
-existing mechanics through mandatory `LegacyV6`. Blob requires
-`BlobRangesStreamV1` on both peers and has no legacy fallback; incompatible
-peers are rejected rather than sent another Blob grammar. Stored source and
-partial-prefix formats remain unchanged. Exact differences and bounded blind ReceiveOnly traffic
+existing mechanics through mandatory `LegacyV6`. Semantic v9 Blob contacts use
+`BlobStreamV1`; semantic v7/v8 compatibility contacts require
+`BlobRangesStreamV1`. Blob has no legacy fallback, and an active profile-5
+attempt is not downgraded in place to profile 4. Incompatible peers are
+rejected rather than sent another Blob grammar. Exact differences and bounded blind ReceiveOnly traffic
 use pages; finite-TTL entries carry authenticated cumulative age without
 creating peer receipt, lease, suppression, or retry state. Page attempts and
 contact completion are not remote delivery evidence. The sender uses distinct

@@ -275,7 +275,7 @@ pub(crate) fn deletion_manifest_resume_position(variant: super::BlobVariantId) -
 }
 
 const RETIREMENT_AGE_VERSION: u8 = 1;
-const RETIREMENT_AGE_ENCODED_BYTES: usize = 43;
+pub(crate) const RETIREMENT_AGE_ENCODED_BYTES: usize = 43;
 const RETIRED_PUBLICATION_STATE_BYTES: usize = 2 + 8 + RETIREMENT_AGE_ENCODED_BYTES;
 
 /// Stable reason retained after one Blob publication leaves live state.
@@ -1442,7 +1442,7 @@ impl RetirementAge {
         self.retain_for_ms
     }
 
-    fn encode(self) -> [u8; RETIREMENT_AGE_ENCODED_BYTES] {
+    pub(crate) fn encode(self) -> [u8; RETIREMENT_AGE_ENCODED_BYTES] {
         let mut encoded = [0u8; RETIREMENT_AGE_ENCODED_BYTES];
         encoded[0] = RETIREMENT_AGE_VERSION;
         encoded[1..9].copy_from_slice(&self.retain_for_ms.to_be_bytes());
@@ -1456,7 +1456,7 @@ impl RetirementAge {
         encoded
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, BlobStoreError> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, BlobStoreError> {
         let bytes: [u8; RETIREMENT_AGE_ENCODED_BYTES] = bytes.try_into().map_err(|_| {
             BlobStoreError::SchemaInvariant("Blob retirement age has an invalid canonical length")
         })?;
@@ -3220,6 +3220,36 @@ pub(crate) fn admit_publication_row(
     set_lifecycle_counter(write, BLOB_PUBLICATION_ROWS, required_rows)
 }
 
+/// Reserves publication-lifecycle headroom before a new upload is admitted.
+///
+/// Provisional uploads do not increment the live-publication counter, but
+/// every one can promote into exactly one publication. Counting those rows in
+/// the preflight prevents a caller from consuming a source only to discover at
+/// promotion that lifecycle capacity was already exhausted.
+pub(crate) fn require_publication_reservation_capacity(
+    write: &redb::WriteTransaction,
+    limits: BlobLifecycleLimits,
+) -> Result<(), StoreError> {
+    if !admission_schema_is_current(write)? {
+        return Ok(());
+    }
+    let current = lifecycle_counter(write, BLOB_PUBLICATION_ROWS)?;
+    let provisional = write.open_table(super::BLOB_UPLOADS)?.len()?;
+    let required_rows = current
+        .checked_add(provisional)
+        .and_then(|rows| rows.checked_add(1))
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
+    if required_rows > limits.max_publication_rows() {
+        return Err(StoreError::Blob(
+            BlobStoreError::PublicationLifecycleCapacity {
+                required_rows,
+                max_rows: limits.max_publication_rows(),
+            },
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn require_publication_row(write: &redb::WriteTransaction) -> Result<(), StoreError> {
     if admission_schema_is_current(write)? && lifecycle_counter(write, BLOB_PUBLICATION_ROWS)? == 0
     {
@@ -3443,7 +3473,7 @@ fn validate_retirement_resolver(
         RetentionDeadlineOwner::Operation(digest)
             if !value.is_empty() && Sha256::digest(value).as_slice() == digest =>
         {
-            super::BlobOperationKey::new(value.to_vec())?;
+            super::validate_blob_operation_storage_key(value)?;
             Ok(())
         }
         _ => Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
@@ -3529,6 +3559,63 @@ pub(crate) fn retirement_operation_key_write(
         )))?;
     validate_retirement_resolver(owner, &value)?;
     Ok(value)
+}
+
+pub(crate) fn replace_operation_retirement_authority(
+    write: &redb::WriteTransaction,
+    old_digest: [u8; 32],
+    old_operation_key: &[u8],
+    new_digest: [u8; 32],
+    new_operation_key: &[u8],
+    deadline: Option<CustodySample>,
+) -> Result<(), StoreError> {
+    let old_owner = RetentionDeadlineOwner::Operation(old_digest);
+    let new_owner = RetentionDeadlineOwner::Operation(new_digest);
+    validate_retirement_resolver(old_owner, old_operation_key)?;
+    validate_retirement_resolver(new_owner, new_operation_key)?;
+    let old_resolver_key = retirement_resolver_key(old_owner);
+    let new_resolver_key = retirement_resolver_key(new_owner);
+    let mut resolvers = write.open_table(BLOB_RETIREMENT_RESOLVERS)?;
+    let removed = resolvers
+        .remove(old_resolver_key.as_slice())?
+        .map(|value| value.value().to_vec())
+        .ok_or(StoreError::Blob(BlobStoreError::SchemaInvariant(
+            "Blob operation retirement resolver is missing",
+        )))?;
+    if removed != old_operation_key {
+        return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+            "retired Blob operation resolver differs from its predecessor key",
+        )));
+    }
+    if resolvers
+        .insert(new_resolver_key.as_slice(), new_operation_key)?
+        .is_some()
+    {
+        return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+            "Blob operation retirement resolver replacement collides",
+        )));
+    }
+    drop(resolvers);
+
+    if let Some(deadline) = deadline {
+        let old_deadline_key = retention_deadline_key(deadline, old_owner);
+        let new_deadline_key = retention_deadline_key(deadline, new_owner);
+        let mut deadlines = write.open_table(BLOB_RETENTION_DEADLINES)?;
+        if deadlines.remove(old_deadline_key.as_slice())?.is_none() {
+            return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "Blob retention deadline is missing",
+            )));
+        }
+        if deadlines
+            .insert(new_deadline_key.as_slice(), &[][..])?
+            .is_some()
+        {
+            return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
+                "Blob operation retention deadline replacement collides",
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn require_publication_retirement_resolver_write(
@@ -4759,7 +4846,7 @@ fn reconstruct_expected_image(
     for row in operations.iter()? {
         let (key, value) = row?;
         let encoded = value.value();
-        super::BlobOperationKey::new(key.value().to_vec())?;
+        super::validate_blob_operation_storage_key(key.value())?;
         if matches!(
             schema,
             LifecycleSchemaState::V2
@@ -5550,7 +5637,7 @@ pub(crate) fn stage_blob_lifecycle_migration_write(
             let operation_rows = u64::try_from(expected.operations.len())
                 .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
             if operation_rows > super::MAX_BLOB_OPERATIONS
-                || expected.operation_bytes > super::MAX_BLOB_OPERATION_BYTES
+                || expected.operation_bytes > super::MAX_BLOB_OWNED_OPERATION_BYTES
             {
                 return Err(StoreError::Blob(BlobStoreError::SchemaInvariant(
                     "wrapped Blob operation usage exceeds its durable safety caps",
@@ -6148,7 +6235,7 @@ fn validate_class_position(class: BlobMaintenanceClass, position: &[u8]) -> Resu
         BlobMaintenanceClass::UnreferencedLocalImportStaging
         | BlobMaintenanceClass::UnreferencedCompletedVariants => position.len() == 32,
         BlobMaintenanceClass::ExpiredRetirementRecords => {
-            !position.is_empty() && position.len() <= super::MAX_BLOB_OPERATION_KEY_BYTES
+            !position.is_empty() && position.len() <= super::MAX_BLOB_OPERATION_STORAGE_KEY_BYTES
         }
         BlobMaintenanceClass::ManifestBackedPhysicalDeletion => {
             (position.len() == 33

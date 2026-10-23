@@ -428,11 +428,15 @@ impl BlobDeletionManifest {
         self.retry.validate()?;
         self.age.validate()?;
         if self.totals.chunks > MAX_SELECTED_BLOB_CHUNKS
-            || self.totals.charged_variants != 1
+            || self.totals.charged_variants
+                != u64::from(!super::pack_lifecycle::is_pack_evidence(
+                    &self.original_import,
+                ))
             || self.totals.charged_files > self.totals.chunks
             || self.totals.charged_committed_bytes > self.totals.charged_reserved_bytes
             || u64::try_from(self.chunks.len()).ok() != Some(self.totals.chunks)
             || (self.finalized_root.is_some()
+                && !super::pack_lifecycle::is_pack_evidence(&self.original_import)
                 && (self.totals.chunks == 0 || self.totals.charged_files != self.totals.chunks))
         {
             return Err(invariant("Blob deletion manifest totals are not canonical"));
@@ -1224,6 +1228,7 @@ struct BlobDeletionAdmissionChunkPlan {
 pub(crate) struct BlobDeletionAdmissionPlan {
     variant: BlobVariantId,
     chunks: Vec<BlobDeletionAdmissionChunkPlan>,
+    pack_active: Option<Vec<u8>>,
     encoded_manifest: Vec<u8>,
     encoded_continuity: Option<Vec<u8>>,
     metadata_updates: Vec<(&'static str, u64)>,
@@ -1266,21 +1271,33 @@ pub(crate) fn plan_variant_admission_write(
         return Ok(None);
     }
     drop(manifests);
-    let imports = write.open_table(super::BLOB_IMPORTS)?;
-    let original_import = imports
-        .get(variant.as_bytes().as_slice())?
-        .ok_or_else(|| invariant("Blob manifest admission import is missing"))?;
-    if !charge_pressure_admission_row(
-        &mut pressure_charge,
-        variant.as_bytes(),
-        original_import.value().len(),
-    )? {
-        return Ok(None);
-    }
-    let encoded_import = original_import.value().to_vec();
-    drop(original_import);
-    drop(imports);
-    let original_import = encoded_import;
+    let pack_active = if super::pack_lifecycle::is_pack_evidence(expected_import) {
+        let encoded = super::pack_lifecycle::encoded_active_write(write, variant)?
+            .ok_or_else(|| invariant("Blob pack manifest admission authority is missing"))?;
+        if !charge_pressure_admission_row(&mut pressure_charge, variant.as_bytes(), encoded.len())?
+        {
+            return Ok(None);
+        }
+        Some(encoded)
+    } else {
+        None
+    };
+    let original_import = if let Some(encoded) = pack_active.as_ref() {
+        encoded.clone()
+    } else {
+        let imports = write.open_table(super::BLOB_IMPORTS)?;
+        let original_import = imports
+            .get(variant.as_bytes().as_slice())?
+            .ok_or_else(|| invariant("Blob manifest admission import is missing"))?;
+        if !charge_pressure_admission_row(
+            &mut pressure_charge,
+            variant.as_bytes(),
+            original_import.value().len(),
+        )? {
+            return Ok(None);
+        }
+        original_import.value().to_vec()
+    };
     if original_import != expected_import {
         return Err(invariant(
             "Blob manifest admission import changed after discovery",
@@ -1532,7 +1549,7 @@ pub(crate) fn plan_variant_admission_write(
             chunks: chunk_count,
             queued,
             deleted,
-            charged_variants: 1,
+            charged_variants: u64::from(pack_active.is_none()),
             charged_files,
             charged_reserved_bytes,
             charged_committed_bytes,
@@ -1614,7 +1631,7 @@ pub(crate) fn plan_variant_admission_write(
             BLOB_DELETION_CHARGED_VARIANTS,
             existing_stats
                 .charged_variants
-                .checked_add(1)
+                .checked_add(manifest.totals.charged_variants)
                 .ok_or(StoreError::ItemCountAccountingOverflow)?,
         ),
         (
@@ -1681,6 +1698,7 @@ pub(crate) fn plan_variant_admission_write(
     Ok(Some(BlobDeletionAdmissionPlan {
         variant,
         chunks,
+        pack_active,
         encoded_manifest,
         encoded_continuity,
         metadata_updates,
@@ -1692,6 +1710,10 @@ pub(crate) fn apply_variant_admission_plan_write(
     plan: BlobDeletionAdmissionPlan,
 ) -> Result<(), StoreError> {
     begin_manifest_admission_mutations();
+    if let Some(expected) = plan.pack_active.as_deref() {
+        super::pack_lifecycle::mark_deletion_pending_write(write, plan.variant, expected)?;
+        manifest_admission_mutation_boundary()?;
+    }
     let mut active_chunks = write.open_table(super::BLOB_CHUNKS)?;
     for chunk in &plan.chunks {
         let removed = active_chunks
@@ -1883,6 +1905,7 @@ fn preflight_allocation_bounds(
     manifests: &impl ReadableTable<&'static [u8], &'static [u8]>,
     deletion_chunks: &impl ReadableTable<&'static [u8], &'static [u8]>,
     imports: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    packs: &impl ReadableTable<&'static [u8], &'static [u8]>,
 ) -> Result<BlobDeletionAllocationBounds, StoreError> {
     if metadata.len()? != DELETION_METADATA_FIELDS.len() as u64
         || required_deletion_counter(metadata, BLOB_DELETION_SCHEMA_VERSION_FIELD)?
@@ -1903,7 +1926,39 @@ fn preflight_allocation_bounds(
             "Blob deletion table cardinality disagrees with durable accounting",
         ));
     }
-    if bounds.manifest_rows > imports.len()? {
+    let mut deletion_pack_rows = 0u64;
+    let mut deletion_pack_manifest_bytes = 0u64;
+    for row in packs.iter()? {
+        let (key, value) = row?;
+        if let Some((variant, evidence_len)) =
+            super::pack_lifecycle::deletion_pending_projection(value.value())?
+        {
+            if key.value() != variant.as_bytes() {
+                return Err(invariant("Blob deletion pack key is not canonical"));
+            }
+            deletion_pack_rows = deletion_pack_rows
+                .checked_add(1)
+                .ok_or(StoreError::ItemCountAccountingOverflow)?;
+            deletion_pack_manifest_bytes = deletion_pack_manifest_bytes
+                .checked_add(
+                    u64::try_from(
+                        32usize
+                            .checked_add(MANIFEST_FIXED_BYTES)
+                            .and_then(|bytes| bytes.checked_add(MAX_LINEAGE_FENCE_EVIDENCE_BYTES))
+                            .and_then(|bytes| bytes.checked_add(evidence_len))
+                            .ok_or(StoreError::PayloadByteAccountingOverflow)?,
+                    )
+                    .map_err(|_| StoreError::PayloadByteAccountingOverflow)?,
+                )
+                .ok_or(StoreError::PayloadByteAccountingOverflow)?;
+        }
+    }
+    if bounds.manifest_rows
+        > imports
+            .len()?
+            .checked_add(deletion_pack_rows)
+            .ok_or(StoreError::ItemCountAccountingOverflow)?
+    {
         return Err(invariant(
             "Blob deletion manifest rows exceed their exact import bound",
         ));
@@ -1930,6 +1985,9 @@ fn preflight_allocation_bounds(
             .checked_add(import.chunk_count)
             .ok_or(StoreError::ItemCountAccountingOverflow)?;
     }
+    max_manifest_bytes = max_manifest_bytes
+        .checked_add(deletion_pack_manifest_bytes)
+        .ok_or(StoreError::PayloadByteAccountingOverflow)?;
     if bounds.manifest_bytes > max_manifest_bytes {
         return Err(invariant(
             "Blob deletion manifest bytes exceed their exact import bound",
@@ -1992,12 +2050,14 @@ fn audit_blob_deletion_rows(
     deletion_chunks: &impl ReadableTable<&'static [u8], &'static [u8]>,
     continuity: &impl ReadableTable<u8, &'static [u8]>,
     imports: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    packs: &impl ReadableTable<&'static [u8], &'static [u8]>,
     active_chunks: &impl ReadableTable<&'static [u8], &'static [u8]>,
     variant_references: &impl ReadableTable<&'static [u8], &'static [u8]>,
     lineage_fences: &impl ReadableTable<&'static [u8], &'static [u8]>,
     owner_binding: Option<[u8; 32]>,
 ) -> Result<BlobDeletionAudit, StoreError> {
-    let allocation = preflight_allocation_bounds(metadata, manifests, deletion_chunks, imports)?;
+    let allocation =
+        preflight_allocation_bounds(metadata, manifests, deletion_chunks, imports, packs)?;
     let continuity_state = audited_continuity_state(continuity)?;
     let maintenance_turn = metadata
         .get(BLOB_DELETION_MAINTENANCE_TURN)?
@@ -2175,16 +2235,28 @@ fn audit_blob_deletion_rows(
         },
     };
     for (variant, header) in headers {
-        let import = imports
-            .get(variant.as_bytes().as_slice())?
-            .ok_or_else(|| invariant("Blob deletion manifest import is missing"))?;
-        if import.value() != header.original_import.as_slice() {
-            return Err(invariant(
-                "Blob deletion manifest import evidence is not exact",
-            ));
-        }
+        let import_bytes = if super::pack_lifecycle::is_pack_evidence(&header.original_import) {
+            let pack = packs
+                .get(variant.as_bytes().as_slice())?
+                .ok_or_else(|| invariant("Blob deletion manifest pack is missing"))?;
+            super::pack_lifecycle::validate_deletion_pending(
+                pack.value(),
+                &header.original_import,
+            )?;
+            header.original_import.clone()
+        } else {
+            let import = imports
+                .get(variant.as_bytes().as_slice())?
+                .ok_or_else(|| invariant("Blob deletion manifest import is missing"))?;
+            if import.value() != header.original_import.as_slice() {
+                return Err(invariant(
+                    "Blob deletion manifest import evidence is not exact",
+                ));
+            }
+            import.value().to_vec()
+        };
         let import_projection =
-            super::depot::deletion_import_projection(variant.as_bytes(), import.value())?;
+            super::depot::deletion_import_projection(variant.as_bytes(), &import_bytes)?;
         if import_projection.variant_id != variant
             || import_projection.blob_id != header.blob_id
             || import_projection.content_group != header.content_group
@@ -2336,6 +2408,7 @@ pub(crate) fn audit_blob_deletion_write(
         &chunks,
         &continuity,
         &write.open_table(super::BLOB_IMPORTS)?,
+        &write.open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?,
         &write.open_table(super::BLOB_CHUNKS)?,
         &write.open_table(super::lifecycle::BLOB_VARIANT_REFERENCES)?,
         &write.open_table(super::lifecycle::BLOB_LINEAGE_FENCES)?,
@@ -2373,6 +2446,7 @@ pub(crate) fn audit_blob_deletion_read(
         &chunks,
         &continuity,
         &read.open_table(super::BLOB_IMPORTS)?,
+        &read.open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?,
         &read.open_table(super::BLOB_CHUNKS)?,
         &read.open_table(super::lifecycle::BLOB_VARIANT_REFERENCES)?,
         &read.open_table(super::lifecycle::BLOB_LINEAGE_FENCES)?,
@@ -3042,12 +3116,21 @@ pub(crate) fn finalize_manifest_write(
         &manifest.lineage_fence,
     )?;
     manifest_finalization_mutation_boundary()?;
-    let removed_import = write
-        .open_table(super::BLOB_IMPORTS)?
-        .remove(manifest.variant_id.as_bytes().as_slice())?
-        .ok_or_else(|| invariant("Blob deletion finalization import is missing"))?
-        .value()
-        .to_vec();
+    let removed_import = if super::pack_lifecycle::is_pack_evidence(&manifest.original_import) {
+        super::pack_lifecycle::finalize_deletion_write(
+            write,
+            manifest.variant_id,
+            &manifest.original_import,
+        )?;
+        manifest.original_import.clone()
+    } else {
+        write
+            .open_table(super::BLOB_IMPORTS)?
+            .remove(manifest.variant_id.as_bytes().as_slice())?
+            .ok_or_else(|| invariant("Blob deletion finalization import is missing"))?
+            .value()
+            .to_vec()
+    };
     manifest_finalization_mutation_boundary()?;
     if removed_import != manifest.original_import {
         return Err(invariant("Blob deletion finalization import changed"));

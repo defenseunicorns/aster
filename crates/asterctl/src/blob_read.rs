@@ -1,4 +1,4 @@
-use crate::{api, validation};
+use crate::{api, progress::ProgressMode, validation};
 use std::{fs::File, io::Write as _, path::PathBuf};
 
 #[cfg(target_os = "linux")]
@@ -15,24 +15,39 @@ OPTIONS:
       --topic TOPIC    Exact Blob topic (required)
       --scope SCOPE    Exact Blob scope (required)
       --output PATH    New destination path (required)
+      --progress MODE  auto, always, or never (default: auto)
       --help           Show this help
 
 See asterctl --help for global options.
 Blob bytes are written only to --output; stdout contains metadata only.
+Interrupted downloads restart from byte zero; download resume is not yet supported.
 ";
 
 /// Stable native gRPC Blob response-page size owned by the CLI protocol layer.
-pub(crate) const RPC_PAGE_BYTES: usize = 64 * 1024;
+pub(crate) const RPC_PAGE_BYTES: usize = 512 * 1024;
 const MAX_PAGE_BYTES: usize = RPC_PAGE_BYTES;
 const MAX_MEDIA_TYPE_BYTES: usize = 255;
 const MAX_SCHEMA_ID_BYTES: usize = 1024;
 
-#[derive(Debug, PartialEq, Default)]
+#[derive(Debug, PartialEq)]
 pub struct Read {
     id: Vec<u8>,
     topic: String,
     scope: String,
     output: Option<PathBuf>,
+    progress: ProgressMode,
+}
+
+impl Default for Read {
+    fn default() -> Self {
+        Self {
+            id: Vec::new(),
+            topic: String::new(),
+            scope: String::new(),
+            output: None,
+            progress: ProgressMode::Auto,
+        }
+    }
 }
 
 impl Read {
@@ -58,6 +73,7 @@ impl Read {
                 validation::scope(&value)?;
                 self.scope = value;
             }
+            "--progress" => self.progress = ProgressMode::parse(&value)?,
             _ => unreachable!("Blob read option"),
         }
         Ok(())
@@ -79,7 +95,7 @@ impl Read {
         Ok(())
     }
 
-    pub fn into_parts(self) -> (api::ReadBlobRequest, PathBuf) {
+    pub fn into_parts(self) -> (api::ReadBlobRequest, PathBuf, ProgressMode) {
         (
             api::ReadBlobRequest {
                 id: self.id,
@@ -88,6 +104,7 @@ impl Read {
                 ..Default::default()
             },
             self.output.expect("validated output path"),
+            self.progress,
         )
     }
 }
@@ -130,6 +147,7 @@ pub(crate) struct Validator {
     metadata: Option<Metadata>,
     next_offset: u64,
     complete: bool,
+    max_page_bytes: usize,
 }
 
 impl Validator {
@@ -139,7 +157,17 @@ impl Validator {
             metadata: None,
             next_offset: 0,
             complete: false,
+            max_page_bytes: MAX_PAGE_BYTES,
         }
+    }
+
+    pub(crate) fn with_max_page_bytes(mut self, max_page_bytes: usize) -> Self {
+        assert!(
+            max_page_bytes > 0 && max_page_bytes <= MAX_PAGE_BYTES,
+            "Blob read page bound must be within the production limit"
+        );
+        self.max_page_bytes = max_page_bytes;
+        self
     }
 
     pub fn accept(&mut self, page: &api::ReadBlobResponse) -> Result<(), &'static str> {
@@ -158,7 +186,6 @@ impl Validator {
                 .priority
                 .as_known()
                 .is_none_or(|priority| priority == api::Priority::Unspecified)
-            || observed.total_len == 0
             || observed
                 .media_type
                 .as_ref()
@@ -178,7 +205,13 @@ impl Validator {
         if page.offset != self.next_offset {
             return Err("ReadBlob failed: noncontiguous page offset");
         }
-        if page.chunk.is_empty() || page.chunk.len() > MAX_PAGE_BYTES {
+        let terminal_empty = page.chunk.is_empty()
+            && page.offset == 0
+            && observed.total_len == 0
+            && page.complete
+            && self.next_offset == 0
+            && self.metadata.is_none();
+        if (page.chunk.is_empty() && !terminal_empty) || page.chunk.len() > self.max_page_bytes {
             return Err("ReadBlob failed: invalid page length");
         }
         let page_len =
@@ -369,6 +402,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::fs::{self, OpenOptions};
 
+    const TEST_PAGE_BYTES: usize = 4;
+
     #[cfg(target_os = "linux")]
     fn output_around(file: File) -> OutputFile {
         OutputFile {
@@ -408,7 +443,7 @@ mod tests {
             scope: "mission/team/alpha".into(),
             priority: api::Priority::Immediate.into(),
             ttl_ms: Some(u64::MAX),
-            total_len: 65_537,
+            total_len: TEST_PAGE_BYTES as u64 + 1,
             media_type: Some("application/octet-stream".into()),
             schema_id: b"schema".to_vec(),
             acceptance_marker: 4,
@@ -420,50 +455,104 @@ mod tests {
     }
 
     #[test]
-    fn blob_read_requires_contiguous_bounded_pages_and_exact_completion() {
-        let mut validator = Validator::new(request());
-        validator
-            .accept(&page(0, vec![7; MAX_PAGE_BYTES], false))
-            .unwrap();
-        assert!(validator.accept(&page(65_535, vec![8], true)).is_err());
+    fn blob_read_page_size_is_a_stable_protocol_contract() {
+        assert_eq!(RPC_PAGE_BYTES, 512 * 1024);
+    }
 
-        let mut validator = Validator::new(request());
+    #[test]
+    #[should_panic(expected = "Blob read page bound must be within the production limit")]
+    fn blob_read_rejects_zero_injected_page_bound() {
+        let _ = Validator::new(request()).with_max_page_bytes(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Blob read page bound must be within the production limit")]
+    fn blob_read_rejects_injected_page_bound_above_production() {
+        let _ = Validator::new(request()).with_max_page_bytes(RPC_PAGE_BYTES + 1);
+    }
+
+    #[test]
+    fn blob_read_requires_contiguous_bounded_pages_and_exact_completion() {
+        let mut validator = Validator::new(request()).with_max_page_bytes(TEST_PAGE_BYTES);
         validator
-            .accept(&page(0, vec![7; MAX_PAGE_BYTES], false))
+            .accept(&page(0, vec![7; TEST_PAGE_BYTES], false))
             .unwrap();
-        validator.accept(&page(65_536, vec![8], true)).unwrap();
+        assert!(
+            validator
+                .accept(&page(TEST_PAGE_BYTES as u64 - 1, vec![8], true))
+                .is_err()
+        );
+
+        let mut validator = Validator::new(request()).with_max_page_bytes(TEST_PAGE_BYTES);
+        validator
+            .accept(&page(0, vec![7; TEST_PAGE_BYTES], false))
+            .unwrap();
+        validator
+            .accept(&page(TEST_PAGE_BYTES as u64, vec![8], true))
+            .unwrap();
         assert_eq!(validator.finish().unwrap().ttl_ms, Some(u64::MAX));
     }
 
     #[test]
-    fn blob_read_rejects_metadata_or_ttl_changes_on_later_pages() {
+    fn blob_read_accepts_exactly_one_empty_terminal_page() {
+        let mut empty = page(0, Vec::new(), true);
+        empty.total_len = 0;
         let mut validator = Validator::new(request());
+        validator.accept(&empty).expect("accept empty terminal EOF");
+        assert_eq!(validator.finish().expect("finish empty Blob").total_len, 0);
+
+        let mut nonterminal = empty.clone();
+        nonterminal.complete = false;
+        assert!(Validator::new(request()).accept(&nonterminal).is_err());
+
+        let mut wrong_offset = empty;
+        wrong_offset.offset = 1;
+        assert!(Validator::new(request()).accept(&wrong_offset).is_err());
+    }
+
+    #[test]
+    fn blob_read_rejects_metadata_changes_on_later_pages() {
+        let mut validator = Validator::new(request()).with_max_page_bytes(TEST_PAGE_BYTES);
         validator
-            .accept(&page(0, vec![7; MAX_PAGE_BYTES], false))
+            .accept(&page(0, vec![7; TEST_PAGE_BYTES], false))
             .unwrap();
-        let mut changed = page(65_536, vec![8], true);
+        let mut changed = page(TEST_PAGE_BYTES as u64, vec![8], true);
         changed.ttl_ms = None;
         assert!(validator.accept(&changed).is_err());
+    }
 
+    #[test]
+    fn blob_read_rejects_zero_publisher_counter() {
         let mut invalid = page(0, vec![7], false);
         invalid.publisher_counter = 0;
         assert!(Validator::new(request()).accept(&invalid).is_err());
-        invalid.publisher_counter = 3;
+    }
+
+    #[test]
+    fn blob_read_rejects_zero_acceptance_marker() {
+        let mut invalid = page(0, vec![7], false);
         invalid.acceptance_marker = 0;
         assert!(Validator::new(request()).accept(&invalid).is_err());
-        invalid.acceptance_marker = 4;
+    }
+
+    #[test]
+    fn blob_read_rejects_zero_ttl() {
+        let mut invalid = page(0, vec![7], false);
         invalid.ttl_ms = Some(0);
         assert!(Validator::new(request()).accept(&invalid).is_err());
     }
 
     #[test]
-    fn blob_read_rejects_early_end_and_pages_after_completion() {
-        let mut early = Validator::new(request());
+    fn blob_read_rejects_early_stream_end() {
+        let mut early = Validator::new(request()).with_max_page_bytes(TEST_PAGE_BYTES);
         early
-            .accept(&page(0, vec![7; MAX_PAGE_BYTES], false))
+            .accept(&page(0, vec![7; TEST_PAGE_BYTES], false))
             .unwrap();
         assert!(early.finish().is_err());
+    }
 
+    #[test]
+    fn blob_read_rejects_pages_after_completion() {
         let mut complete = Validator::new(request());
         let mut one = page(0, vec![7], true);
         one.total_len = 1;

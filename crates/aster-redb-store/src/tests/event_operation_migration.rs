@@ -831,12 +831,15 @@ fn migration_missing_physical_depot_marker_preserves_the_complete_legacy_image()
     let error = Store::open_for_mission(&file.0, services.authority)
         .err()
         .expect("missing owner marker must reject open");
-    assert!(matches!(
-        error,
-        StoreError::Blob(BlobStoreError::DepotIntegrity(
-            "fixed Blob depot root is missing its owner marker"
-        ))
-    ));
+    assert!(
+        matches!(
+            &error,
+            StoreError::Blob(BlobStoreError::DepotIntegrity(
+                "Blob depot owner marker is missing"
+            ))
+        ),
+        "unexpected missing-marker error: {error:?}"
+    );
     assert!(
         !marker.exists(),
         "failed open must not repair the owner marker"

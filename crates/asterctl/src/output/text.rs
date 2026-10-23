@@ -135,12 +135,60 @@ pub(super) fn status(s: &api::GetStatusResponse) -> String {
         field(&mut text, "Profile boundary", count(s.profile_boundary));
         field(&mut text, "Profile saturated", yes_no(s.profile_saturated));
     }
+    if let Some(s) = s.blob_capacity.as_option() {
+        text.push_str("\nBLOB CAPACITY (OBSERVED PREFLIGHT):\n");
+        field(
+            &mut text,
+            "Reserved bytes",
+            format!("{} / {}", size(s.reserved_bytes), size(s.byte_limit)),
+        );
+        field(
+            &mut text,
+            "Byte remaining",
+            size(s.byte_limit.saturating_sub(s.reserved_bytes)),
+        );
+        field(
+            &mut text,
+            "Variants",
+            format!("{} / {}", count(s.variants), count(s.variant_limit)),
+        );
+        field(
+            &mut text,
+            "Variant remaining",
+            count(s.variant_limit.saturating_sub(s.variants)),
+        );
+        field(
+            &mut text,
+            "Expected chunks",
+            format!("{} / {}", count(s.expected_chunks), count(s.chunk_limit)),
+        );
+        field(
+            &mut text,
+            "Chunk remaining",
+            count(s.chunk_limit.saturating_sub(s.expected_chunks)),
+        );
+        field(&mut text, "Pending sources", count(s.pending_sources));
+        field(&mut text, "Network staging", size(s.network_staging_bytes));
+        field(&mut text, "Bytes exhausted", yes_no(s.bytes_exhausted));
+        field(
+            &mut text,
+            "Variants exhausted",
+            yes_no(s.variants_exhausted),
+        );
+        field(&mut text, "Chunks exhausted", yes_no(s.chunks_exhausted));
+    }
     text
 }
 
-pub(super) fn publish_blob(blob: &api::PublishBlobResponse) -> String {
+pub(super) fn publish_blob(blob: &api::PublishBlobReceipt, operation_key: &str) -> String {
     let mut text = String::from("BLOB:\n");
     field(&mut text, "ID", scalar(Bytes(&blob.id)));
+    field(
+        &mut text,
+        "Publication ID",
+        scalar(Bytes(&blob.publication_id)),
+    );
+    field(&mut text, "Operation key", operation_key);
     field(&mut text, "Publisher", scalar(Bytes(&blob.publisher)));
     field(
         &mut text,
@@ -164,6 +212,51 @@ pub(super) fn publish_blob(blob: &api::PublishBlobResponse) -> String {
     );
     field(&mut text, "Inserted", yes_no(blob.inserted));
     writeln!(text, "  TTL: {}", blob_ttl(blob.ttl_ms)).expect("write to string");
+    text
+}
+
+pub(super) fn blob_status(status: &api::InspectBlobPublicationResponse) -> String {
+    let mut text = String::from("BLOB PUBLICATION:\n");
+    field(
+        &mut text,
+        "Publication ID",
+        scalar(Bytes(&status.publication_id)),
+    );
+    field(
+        &mut text,
+        "State",
+        state(status.phase, "BLOB_PUBLICATION_PHASE_"),
+    );
+    field(
+        &mut text,
+        "Plaintext bytes",
+        format!(
+            "{} / {} bytes",
+            count(status.durable_plaintext_bytes),
+            count(status.plaintext_total_bytes)
+        ),
+    );
+    field(
+        &mut text,
+        "Authenticated transfer bytes",
+        format!(
+            "{} / {} bytes",
+            count(status.durable_transfer_bytes),
+            count(status.transfer_total_bytes)
+        ),
+    );
+    field(
+        &mut text,
+        "Durable units",
+        format!(
+            "{} / {}",
+            count(status.durable_units),
+            count(status.total_units)
+        ),
+    );
+    if let Some(blob_id) = &status.blob_id {
+        field(&mut text, "Blob ID", scalar(Bytes(blob_id)));
+    }
     text
 }
 
@@ -264,7 +357,12 @@ fn ttl(ttl_ms: Option<u64>) -> String {
 }
 
 fn field(text: &mut String, label: &str, value: impl Display) {
-    writeln!(text, "  {:<25}{value}", format!("{label}:")).expect("write to string");
+    let label = format!("{label}:");
+    if label.len() >= 25 {
+        writeln!(text, "  {label} {value}").expect("write to string");
+    } else {
+        writeln!(text, "  {label:<25}{value}").expect("write to string");
+    }
 }
 
 fn scalar(value: impl serde::Serialize) -> String {

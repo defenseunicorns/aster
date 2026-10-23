@@ -13,6 +13,13 @@ use crate::{
         VerifiedBlobManifest, VerifiedBlobTransferPlan, content_group_id,
         inspect_selected_blob_manifest, verify_source_authenticated_store_completion,
     },
+    blob_stream::{
+        BlobStreamFinalCommitment, BlobStreamOpen, BlobStreamPublication,
+        BlobStreamPublicationSource, BlobStreamSegmentOpener, BlobStreamSegmentSealer,
+        BlobUploadDescriptor, BlobUploadSegmentOpener, BlobUploadSegmentSealer,
+        VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen, VerifiedBlobStreamPublication,
+        VerifiedBlobStreamPublicationSource,
+    },
     crypto::ReferenceEnvelopeSealer,
     envelope::{EnvelopeError, EnvelopeHeader, EnvelopeSealer, SealRequest, SealedEnvelope},
     model::{DataClass, Dot, ItemId, NodeId, Priority, Scope, Topic, VersionVector},
@@ -21,6 +28,38 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 use std::io;
+
+/// Unforgeable module-private witness for provider-authenticated stream capabilities.
+pub(crate) struct BlobStreamProviderSeal(pub(crate) ());
+
+/// Provider-authenticated route and physical lineage for one exact Profile-5
+/// stream open. These opaque bindings carry no key material and let durable
+/// lifecycle state reject same-epoch grant replacement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobStreamLineage {
+    route: SourceRouteLineage,
+    physical: BlobPhysicalLineage,
+}
+
+impl BlobStreamLineage {
+    pub const fn route(self) -> SourceRouteLineage {
+        self.route
+    }
+
+    pub const fn physical(self) -> BlobPhysicalLineage {
+        self.physical
+    }
+}
+
+const BLOB_STREAM_OPEN_SIGNATURE_DOMAIN: &[u8] = b"ASTER/blob-stream/signed-open/v2\0";
+const BLOB_STREAM_COMMITMENT_SIGNATURE_DOMAIN: &[u8] = b"ASTER/blob-stream/signed-commitment/v2\0";
+const BLOB_STREAM_PUBLICATION_SIGNATURE_DOMAIN: &[u8] =
+    b"ASTER/blob-stream/signed-publication/v2\0";
+const MAX_BLOB_STREAM_OPEN_BODY_BYTES: usize = crate::blob_stream::MAX_BLOB_STREAM_OPEN_BYTES;
+const MAX_BLOB_STREAM_COMMITMENT_BODY_BYTES: usize =
+    crate::blob_stream::MAX_BLOB_STREAM_COMMITMENT_BODY_BYTES;
+const MAX_BLOB_STREAM_PUBLICATION_BODY_BYTES: usize =
+    crate::blob_stream::MAX_BLOB_STREAM_PUBLICATION_BODY_BYTES;
 
 /// Route- and source-authenticated metadata for one exact selected Blob envelope.
 ///
@@ -513,6 +552,288 @@ impl std::fmt::Debug for BlobContentVerification {
 }
 
 impl ReferenceEnvelopeSealer {
+    /// Mints the node-protected provisional-upload codec for one immutable
+    /// reservation without creating signed source or causal authority.
+    pub fn blob_upload_segment_sealer(
+        &self,
+        scope: &Scope,
+        topic: &Topic,
+        upload: &BlobUploadDescriptor,
+    ) -> Result<BlobUploadSegmentSealer, EnvelopeError> {
+        let seed = self
+            .blob_stream_content_grant_seed(scope, topic, upload.content_epoch())
+            .ok_or_else(|| blob_stream_authentication_error(BlobError::AuthenticationFailed))?;
+        BlobStreamSegmentSealer::from_upload_provider(upload, seed, BlobStreamProviderSeal(()))
+            .map_err(blob_stream_authentication_error)
+    }
+
+    /// Opens only records bound to the exact provisional upload reservation.
+    pub fn blob_upload_segment_opener(
+        &self,
+        scope: &Scope,
+        topic: &Topic,
+        upload: &BlobUploadDescriptor,
+    ) -> Result<BlobUploadSegmentOpener, EnvelopeError> {
+        let seed = self
+            .blob_stream_content_grant_seed(scope, topic, upload.content_epoch())
+            .ok_or_else(|| blob_stream_authentication_error(BlobError::AuthenticationFailed))?;
+        BlobStreamSegmentOpener::from_upload_provider(upload, seed, BlobStreamProviderSeal(()))
+            .map_err(blob_stream_authentication_error)
+    }
+
+    pub fn blob_stream_authorization_digest(
+        &self,
+        scope: &Scope,
+        content_epoch: u64,
+    ) -> Option<[u8; 32]> {
+        self.current_source_route_grant_commitment(scope, content_epoch)
+    }
+
+    /// Mints opaque lifecycle lineage only for an open which is still bound to
+    /// this provider's exact current route and content grants.
+    pub fn blob_stream_lineage(
+        &self,
+        open: &VerifiedBlobStreamOpen,
+    ) -> Result<BlobStreamLineage, EnvelopeError> {
+        if open.mission_authority_id() != self.mission_authority_id()
+            || self.current_source_route_grant_commitment(
+                open.open().scope(),
+                open.open().content_epoch(),
+            ) != Some(*open.open().authorization_digest())
+        {
+            return Err(blob_stream_authentication_error(
+                BlobError::AuthenticationFailed,
+            ));
+        }
+        let physical = self
+            .current_blob_physical_lineage(
+                open.open().scope(),
+                open.open().topic(),
+                open.open().content_epoch(),
+            )
+            .ok_or_else(|| blob_stream_authentication_error(BlobError::AuthenticationFailed))?;
+        Ok(BlobStreamLineage {
+            route: SourceRouteLineage::from_commitment(*open.open().authorization_digest()),
+            physical,
+        })
+    }
+
+    pub fn seal_blob_stream_open(&self, open: &BlobStreamOpen) -> Result<Vec<u8>, EnvelopeError> {
+        if open.publisher() != self.identity()
+            || open.mission_id() != &self.mission_authority_id()
+            || self.current_source_route_grant_commitment(open.scope(), open.content_epoch())
+                != Some(*open.authorization_digest())
+        {
+            return Err(EnvelopeError(
+                "Blob stream open is outside the current source authority".into(),
+            ));
+        }
+        self.seal_source_protocol_object(
+            BLOB_STREAM_OPEN_SIGNATURE_DOMAIN,
+            &open.encode(),
+            MAX_BLOB_STREAM_OPEN_BODY_BYTES,
+        )
+    }
+
+    pub fn verify_blob_stream_open(
+        &self,
+        signed_open: &[u8],
+    ) -> Result<VerifiedBlobStreamOpen, EnvelopeError> {
+        let (publisher, encoded) = self.verify_source_protocol_object(
+            BLOB_STREAM_OPEN_SIGNATURE_DOMAIN,
+            signed_open,
+            MAX_BLOB_STREAM_OPEN_BODY_BYTES,
+        )?;
+        let open = BlobStreamOpen::decode(&encoded).map_err(blob_stream_authentication_error)?;
+        if open.publisher() != publisher
+            || open.mission_id() != &self.mission_authority_id()
+            || self.current_source_route_grant_commitment(open.scope(), open.content_epoch())
+                != Some(*open.authorization_digest())
+        {
+            return Err(blob_stream_authentication_error(
+                BlobError::AuthenticationFailed,
+            ));
+        }
+        Ok(VerifiedBlobStreamOpen::from_provider(
+            open,
+            self.mission_authority_id(),
+            signed_open.to_vec(),
+            BlobStreamProviderSeal(()),
+        ))
+    }
+
+    pub fn seal_blob_stream_commitment(
+        &self,
+        commitment: &BlobStreamFinalCommitment,
+    ) -> Result<Vec<u8>, EnvelopeError> {
+        self.seal_source_protocol_object(
+            BLOB_STREAM_COMMITMENT_SIGNATURE_DOMAIN,
+            &commitment.encode(),
+            MAX_BLOB_STREAM_COMMITMENT_BODY_BYTES,
+        )
+    }
+
+    pub fn verify_blob_stream_commitment(
+        &self,
+        open: &VerifiedBlobStreamOpen,
+        signed_commitment: &[u8],
+    ) -> Result<VerifiedBlobStreamFinalCommitment, EnvelopeError> {
+        let (publisher, encoded) = self.verify_source_protocol_object(
+            BLOB_STREAM_COMMITMENT_SIGNATURE_DOMAIN,
+            signed_commitment,
+            MAX_BLOB_STREAM_COMMITMENT_BODY_BYTES,
+        )?;
+        let commitment = BlobStreamFinalCommitment::decode(&encoded)
+            .map_err(blob_stream_authentication_error)?;
+        if publisher != open.open().publisher()
+            || commitment.open_digest() != &open.open().digest()
+            || commitment.stream_id() != open.open().stream_id()
+        {
+            return Err(blob_stream_authentication_error(
+                BlobError::AuthenticationFailed,
+            ));
+        }
+        Ok(VerifiedBlobStreamFinalCommitment::from_provider(
+            commitment,
+            signed_commitment.to_vec(),
+            BlobStreamProviderSeal(()),
+        ))
+    }
+
+    pub fn seal_blob_stream_publication(
+        &self,
+        publication: &BlobStreamPublication,
+    ) -> Result<Vec<u8>, EnvelopeError> {
+        let open = publication.open();
+        let lineage = self
+            .current_blob_physical_lineage(open.scope(), open.topic(), open.content_epoch())
+            .ok_or_else(|| blob_stream_authentication_error(BlobError::AuthenticationFailed))?;
+        if open.publisher() != self.identity()
+            || open.mission_id() != &self.mission_authority_id()
+            || self.current_source_route_grant_commitment(open.scope(), open.content_epoch())
+                != Some(*open.authorization_digest())
+            || publication.physical_lineage() != lineage.binding()
+        {
+            return Err(blob_stream_authentication_error(
+                BlobError::AuthenticationFailed,
+            ));
+        }
+        self.seal_source_protocol_object(
+            BLOB_STREAM_PUBLICATION_SIGNATURE_DOMAIN,
+            &publication.encode(),
+            MAX_BLOB_STREAM_PUBLICATION_BODY_BYTES,
+        )
+    }
+
+    pub fn verify_blob_stream_publication(
+        &self,
+        authenticated: &[u8],
+    ) -> Result<VerifiedBlobStreamPublication, EnvelopeError> {
+        let (publisher, encoded) = self.verify_source_protocol_object(
+            BLOB_STREAM_PUBLICATION_SIGNATURE_DOMAIN,
+            authenticated,
+            MAX_BLOB_STREAM_PUBLICATION_BODY_BYTES,
+        )?;
+        let publication =
+            BlobStreamPublication::decode(&encoded).map_err(blob_stream_authentication_error)?;
+        let open = publication.open();
+        let lineage = self
+            .current_blob_physical_lineage(open.scope(), open.topic(), open.content_epoch())
+            .ok_or_else(|| blob_stream_authentication_error(BlobError::AuthenticationFailed))?;
+        if open.publisher() != publisher
+            || open.mission_id() != &self.mission_authority_id()
+            || self.current_source_route_grant_commitment(open.scope(), open.content_epoch())
+                != Some(*open.authorization_digest())
+            || publication.physical_lineage() != lineage.binding()
+        {
+            return Err(blob_stream_authentication_error(
+                BlobError::AuthenticationFailed,
+            ));
+        }
+        Ok(VerifiedBlobStreamPublication::from_provider(
+            publication,
+            authenticated.to_vec(),
+            BlobStreamProviderSeal(()),
+        ))
+    }
+
+    pub fn verify_blob_stream_publication_source(
+        &self,
+        encoded: &[u8],
+    ) -> Result<VerifiedBlobStreamPublicationSource, EnvelopeError> {
+        let source = BlobStreamPublicationSource::decode(encoded)
+            .map_err(blob_stream_authentication_error)?;
+        let publication =
+            self.verify_blob_stream_publication(source.authenticated_publication())?;
+        let physical_open = self.verify_blob_stream_open(source.authenticated_open())?;
+        let physical_commitment =
+            self.verify_blob_stream_commitment(&physical_open, source.authenticated_commitment())?;
+        let semantic = publication.publication();
+        let open = semantic.open();
+        let physical = physical_open.open();
+        let lineage = self.blob_stream_lineage(&physical_open)?;
+        if semantic.blob_id() != physical_commitment.commitment().blob_id()
+            || semantic.physical_lineage() != lineage.physical().binding()
+            || open.total_len() != physical.total_len()
+            || open.content_epoch() != physical.content_epoch()
+            || open.metadata() != physical.metadata()
+            || open.content_group() != physical.content_group()
+        {
+            return Err(blob_stream_authentication_error(
+                BlobError::AuthenticationFailed,
+            ));
+        }
+        Ok(VerifiedBlobStreamPublicationSource::from_provider(
+            source,
+            publication,
+            physical_open,
+            physical_commitment,
+            BlobStreamProviderSeal(()),
+        ))
+    }
+
+    pub fn blob_stream_segment_sealer(
+        &self,
+        open: &VerifiedBlobStreamOpen,
+    ) -> Result<BlobStreamSegmentSealer, EnvelopeError> {
+        if open.open().publisher() != self.identity()
+            || open.mission_authority_id() != self.mission_authority_id()
+        {
+            return Err(blob_stream_authentication_error(
+                BlobError::AuthenticationFailed,
+            ));
+        }
+        let seed = self
+            .blob_stream_content_grant_seed(
+                open.open().scope(),
+                open.open().topic(),
+                open.open().content_epoch(),
+            )
+            .ok_or_else(|| blob_stream_authentication_error(BlobError::AuthenticationFailed))?;
+        BlobStreamSegmentSealer::from_provider(open, seed, BlobStreamProviderSeal(()))
+            .map_err(blob_stream_authentication_error)
+    }
+
+    pub fn blob_stream_segment_opener(
+        &self,
+        open: &VerifiedBlobStreamOpen,
+    ) -> Result<BlobStreamSegmentOpener, EnvelopeError> {
+        if open.mission_authority_id() != self.mission_authority_id() {
+            return Err(blob_stream_authentication_error(
+                BlobError::AuthenticationFailed,
+            ));
+        }
+        let seed = self
+            .blob_stream_content_grant_seed(
+                open.open().scope(),
+                open.open().topic(),
+                open.open().content_epoch(),
+            )
+            .ok_or_else(|| blob_stream_authentication_error(BlobError::AuthenticationFailed))?;
+        BlobStreamSegmentOpener::from_provider(open, seed, BlobStreamProviderSeal(()))
+            .map_err(blob_stream_authentication_error)
+    }
+
     /// Reports whether this node owns the exact route capability for a Blob scope epoch.
     pub fn can_route_blob(&self, scope: &Scope, epoch: u64) -> bool {
         self.can_route_event(scope, epoch)
@@ -533,6 +854,19 @@ impl ReferenceEnvelopeSealer {
         lineage: BlobPhysicalLineage,
     ) -> bool {
         self.current_blob_physical_lineage(scope, topic, epoch) == Some(lineage)
+    }
+
+    /// Tests a persisted one-way physical-lineage binding without exposing a
+    /// provider-minted capability or any content-key material.
+    pub fn is_current_blob_physical_lineage_binding(
+        &self,
+        scope: &Scope,
+        topic: &Topic,
+        epoch: u64,
+        binding: &[u8; 32],
+    ) -> bool {
+        self.current_blob_physical_lineage(scope, topic, epoch)
+            .is_some_and(|lineage| lineage.binding() == binding)
     }
 
     /// Mints the semantic-v5 request proof for this node's exact current Blob
@@ -706,6 +1040,10 @@ impl ReferenceEnvelopeSealer {
     }
 }
 
+fn blob_stream_authentication_error(_error: BlobError) -> EnvelopeError {
+    EnvelopeError("Blob stream authentication failed".into())
+}
+
 impl<S: BlobStore> ReferenceBlobService<S> {
     /// Installs the exact provider-verified canonical manifest into the durable adapter.
     pub fn install_verified_manifest(
@@ -813,7 +1151,6 @@ fn validate_selected_blob_header(header: &EnvelopeHeader) -> Result<(), Envelope
         || header.ttl_ms == Some(0)
         || header.content_len == 0
         || header.content_len > MAX_BLOB_MANIFEST_BYTES
-        || route.chunk_count() == 0
         || header.logical_key.as_slice() != route.blob_id().as_bytes()
     {
         return Err(EnvelopeError(
@@ -982,7 +1319,9 @@ mod tests {
         }
 
         fn finalize_blob(&mut self, id: BlobId, manifest_digest: [u8; 32]) -> io::Result<()> {
-            let _ = self.slot(id, 0)?;
+            if self.manifest.as_ref().map(BlobManifest::id) != Some(id) {
+                return Err(io::Error::other("Blob key outside manifest"));
+            }
             if self
                 .finalized
                 .is_some_and(|existing| existing != manifest_digest)
@@ -1071,6 +1410,189 @@ mod tests {
             .issue_node(1, &[full_access()])
             .and_then(ReferenceEnvelopeSealer::open)
             .expect("wrong mission reader")
+    }
+
+    #[test]
+    fn blob_stream_provider_authenticates_open_segments_and_finish() {
+        let Services {
+            publisher,
+            reader,
+            relay,
+            other,
+            ..
+        } = services();
+        let authorization = publisher
+            .blob_stream_authorization_digest(&scope(), 1)
+            .expect("authorization");
+        let open = BlobStreamOpen::new(
+            crate::blob_stream::BlobPublicationStreamId::from_bytes([0x11; 32]).expect("stream ID"),
+            publisher.identity(),
+            b"provider-test".to_vec(),
+            publisher.mission_authority_id(),
+            1,
+            VersionVector::default(),
+            topic(),
+            scope(),
+            BlobMetadata::new(Some("application/octet-stream".into()), b"schema".to_vec())
+                .expect("metadata"),
+            Priority::Immediate,
+            None,
+            None,
+            7,
+            1,
+            1,
+            authorization,
+            [0x66; 32],
+        )
+        .expect("open");
+        let signed_open = publisher.seal_blob_stream_open(&open).expect("sign open");
+        let verified = reader
+            .verify_blob_stream_open(&signed_open)
+            .expect("verify open");
+        let publisher_lineage = publisher
+            .blob_stream_lineage(&verified)
+            .expect("publisher stream lineage");
+        assert_eq!(
+            reader
+                .blob_stream_lineage(&verified)
+                .expect("reader stream lineage"),
+            publisher_lineage
+        );
+        assert!(relay.blob_stream_lineage(&verified).is_err());
+        let sealer = publisher
+            .blob_stream_segment_sealer(&verified)
+            .expect("segment sealer");
+        let opener = reader
+            .blob_stream_segment_opener(&verified)
+            .expect("segment opener");
+        assert!(relay.blob_stream_segment_opener(&verified).is_err());
+        let partition = crate::blob_stream::BlobStreamPlainPartition::new(
+            [0x11; 32],
+            open.digest(),
+            1,
+            0,
+            0,
+            7,
+            b"payload".to_vec(),
+        )
+        .expect("partition");
+        let (encrypted, _) = sealer.seal(partition).expect("seal segment");
+        assert_eq!(
+            opener.open(&encrypted).expect("open segment").0.as_slice(),
+            b"payload"
+        );
+        let commitment = BlobStreamFinalCommitment::new(&verified, [0x71; 32], [0x72; 32], 1, None)
+            .expect("commitment");
+        let signed_finish = publisher
+            .seal_blob_stream_commitment(&commitment)
+            .expect("sign finish");
+        reader
+            .verify_blob_stream_commitment(&verified, &signed_finish)
+            .expect("verify finish");
+        let publication = BlobStreamPublication::new(
+            open.clone(),
+            commitment.blob_id(),
+            commitment.final_custody(),
+            *publisher_lineage.physical().binding(),
+        )
+        .expect("publication binding");
+        let signed_publication = publisher
+            .seal_blob_stream_publication(&publication)
+            .expect("sign publication binding");
+        let verified_publication = reader
+            .verify_blob_stream_publication(&signed_publication)
+            .expect("verify publication binding");
+        assert_eq!(verified_publication.publication(), &publication);
+        assert_eq!(
+            verified_publication.authenticated_bytes(),
+            signed_publication
+        );
+        let source = BlobStreamPublicationSource::new(
+            signed_publication.clone(),
+            signed_open.clone(),
+            signed_finish.clone(),
+        )
+        .and_then(|source| source.encode())
+        .expect("encode publication source");
+        let verified_source = reader
+            .verify_blob_stream_publication_source(&source)
+            .expect("verify publication source");
+        assert_eq!(
+            verified_source.publication().authenticated_bytes(),
+            signed_publication
+        );
+        assert_eq!(
+            verified_source.physical_commitment().authenticated_bytes(),
+            signed_finish
+        );
+
+        // The semantic publication may be paired with an independently
+        // encoded equivalent physical pack from another authorized publisher.
+        let other_authorization = other
+            .blob_stream_authorization_digest(&scope(), 1)
+            .expect("other authorization");
+        let other_open = BlobStreamOpen::new(
+            crate::blob_stream::BlobPublicationStreamId::from_bytes([0x12; 32])
+                .expect("other stream ID"),
+            other.identity(),
+            b"provider-equivalent-pack".to_vec(),
+            other.mission_authority_id(),
+            1,
+            VersionVector::default(),
+            topic(),
+            scope(),
+            open.metadata().clone(),
+            Priority::Immediate,
+            None,
+            None,
+            7,
+            1,
+            1,
+            other_authorization,
+            [0x67; 32],
+        )
+        .expect("equivalent physical open");
+        let other_signed_open = other
+            .seal_blob_stream_open(&other_open)
+            .expect("sign equivalent physical open");
+        let other_verified_open = reader
+            .verify_blob_stream_open(&other_signed_open)
+            .expect("verify equivalent physical open");
+        let other_commitment =
+            BlobStreamFinalCommitment::new(&other_verified_open, [0x71; 32], [0x73; 32], 1, None)
+                .expect("equivalent physical commitment");
+        assert_eq!(other_commitment.blob_id(), commitment.blob_id());
+        let other_signed_finish = other
+            .seal_blob_stream_commitment(&other_commitment)
+            .expect("sign equivalent physical commitment");
+        let equivalent_source = BlobStreamPublicationSource::new(
+            signed_publication.clone(),
+            other_signed_open,
+            other_signed_finish,
+        )
+        .and_then(|source| source.encode())
+        .expect("encode equivalent publication source");
+        reader
+            .verify_blob_stream_publication_source(&equivalent_source)
+            .expect("semantic publication accepts equivalent physical pack");
+
+        let mut tampered_source = source;
+        *tampered_source.last_mut().expect("source byte") ^= 1;
+        assert!(
+            reader
+                .verify_blob_stream_publication_source(&tampered_source)
+                .is_err()
+        );
+        let mut tampered = signed_finish;
+        *tampered.last_mut().expect("signed byte") ^= 1;
+        assert!(
+            reader
+                .verify_blob_stream_commitment(&verified, &tampered)
+                .is_err()
+        );
+        let mut tampered = signed_publication;
+        *tampered.last_mut().expect("signed byte") ^= 1;
+        assert!(reader.verify_blob_stream_publication(&tampered).is_err());
     }
 
     struct Fixture {
@@ -1506,7 +2028,15 @@ mod tests {
         let mut selected_service = publisher
             .blob_service_with_store(&scope(), &topic(), 1, TestBlobStore::default())
             .expect("selected service");
-        assert!(selected_service.install_prepared(&empty).is_err());
+        let empty_manifest = selected_service
+            .install_prepared(&empty)
+            .expect("selected empty manifest");
+        let empty_finished = selected_service
+            .finish_manifest(&empty_manifest)
+            .expect("finish selected empty manifest");
+        assert_eq!(empty_manifest.total_len(), 0);
+        assert_eq!(empty_manifest.chunk_count(), 0);
+        assert!(!empty_finished.manifest_bytes().is_empty());
 
         let noncanonical = prepare_blob(
             &mut Cursor::new(vec![1_u8; 4097]),

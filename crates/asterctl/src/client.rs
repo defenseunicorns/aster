@@ -1,12 +1,89 @@
-use crate::{api, auth::Token, blob_publish, blob_read, operation_key::Key};
+#[cfg(test)]
+use crate::progress::NoProgress;
+use crate::{
+    api,
+    auth::Token,
+    blob_publish, blob_read,
+    operation_key::Key,
+    progress::{ProgressEvent, ProgressSink, ProgressSnapshot},
+};
 use buffa::Message as _;
 use connectrpc::{
     Protocol,
     client::{ClientConfig, Http2Connection, HttpClient, SharedHttp2Connection},
 };
-use std::{fs::File, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    cell::RefCell,
+    fs::File,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
+#[derive(Clone)]
+struct PublishProgress {
+    sent: Arc<AtomicU64>,
+    accepted: Arc<AtomicU64>,
+    durable: Arc<AtomicU64>,
+    total: u64,
+}
+
+impl PublishProgress {
+    fn new(offset: u64, total: u64) -> Self {
+        Self {
+            sent: Arc::new(AtomicU64::new(offset)),
+            accepted: Arc::new(AtomicU64::new(offset)),
+            durable: Arc::new(AtomicU64::new(offset)),
+            total,
+        }
+    }
+
+    fn snapshot(&self) -> ProgressSnapshot {
+        ProgressSnapshot {
+            sent: self.sent.load(Ordering::Acquire),
+            accepted: self.accepted.load(Ordering::Acquire),
+            durable: self.durable.load(Ordering::Acquire),
+            written: 0,
+            total: self.total,
+        }
+    }
+
+    fn report<P: ProgressSink>(
+        &self,
+        sink: &RefCell<P>,
+        event: ProgressEvent,
+    ) -> Result<(), MutationError> {
+        sink.borrow_mut()
+            .report(event, self.snapshot())
+            .map_err(|_| MutationError::unknown("cannot write Blob progress; transfer cancelled"))
+    }
+}
+
+pub struct BlobPublishFailure {
+    error: MutationError,
+    pub progress: ProgressSnapshot,
+}
+
+impl BlobPublishFailure {
+    pub fn describe(&self, key: &Key) -> String {
+        let description = self.error.describe("PublishBlob", key);
+        let progress = format!(
+            "progress before failure: sent={} accepted={} durable={} total={}",
+            self.progress.sent, self.progress.accepted, self.progress.durable, self.progress.total,
+        );
+        if let Some((reason, retry)) = description.rsplit_once("\nretry the identical request") {
+            return format!("{reason}\n{progress}\nretry the identical request{retry}");
+        }
+        format!("{description}\n{progress}")
+    }
+}
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const BLOB_TRANSFER_DEFAULT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 fn rpc_hint(code: connectrpc::ErrorCode) -> &'static str {
     use connectrpc::ErrorCode::*;
@@ -370,6 +447,85 @@ pub async fn status(
     Ok(response.into_owned())
 }
 
+pub async fn inspect_blob_publication(
+    client: &api::AsterApplicationServiceClient<HttpClient>,
+    request: api::InspectBlobPublicationRequest,
+) -> Result<api::InspectBlobPublicationResponse, String> {
+    let expected_id = request.publication_id.clone();
+    let response = client
+        .inspect_blob_publication(request)
+        .await
+        .map_err(|error| describe_rpc_error("InspectBlobPublication", error.code))?
+        .into_owned();
+    if !blob_inspection_is_valid(&expected_id, &response) {
+        return Err("InspectBlobPublication failed: invalid status response".to_owned());
+    }
+    Ok(response)
+}
+
+fn blob_inspection_is_valid(
+    expected_id: &[u8],
+    response: &api::InspectBlobPublicationResponse,
+) -> bool {
+    let Some(phase) = response.phase.as_known() else {
+        return false;
+    };
+    if response.publication_id != expected_id
+        || response.publication_id.len() != 32
+        || !response.publication_id.iter().any(|byte| *byte != 0)
+        || response.durable_plaintext_bytes > response.plaintext_total_bytes
+        || response.durable_transfer_bytes > response.transfer_total_bytes
+        || response.durable_units > response.total_units
+        || response
+            .blob_id
+            .as_ref()
+            .is_some_and(|blob_id| blob_id.len() != 32)
+    {
+        return false;
+    }
+    let empty = response.plaintext_total_bytes == 0
+        && response.durable_plaintext_bytes == 0
+        && response.transfer_total_bytes == 0
+        && response.durable_transfer_bytes == 0
+        && response.total_units == 0
+        && response.durable_units == 0
+        && response.blob_id.is_none();
+    let totals_consistent = if response.plaintext_total_bytes == 0 {
+        response.transfer_total_bytes == 0 && response.total_units == 0
+    } else {
+        response.transfer_total_bytes != 0 && response.total_units != 0
+    };
+    let complete = response.durable_plaintext_bytes == response.plaintext_total_bytes
+        && response.durable_transfer_bytes == response.transfer_total_bytes
+        && response.durable_units == response.total_units;
+    match phase {
+        api::BlobPublicationPhase::Unspecified => false,
+        api::BlobPublicationPhase::Missing | api::BlobPublicationPhase::ExpiredOrRetired => empty,
+        api::BlobPublicationPhase::AwaitingData => {
+            totals_consistent
+                && response.durable_plaintext_bytes == 0
+                && response.durable_transfer_bytes == 0
+                && response.durable_units == 0
+                && response.blob_id.is_none()
+        }
+        api::BlobPublicationPhase::Receiving => {
+            totals_consistent
+                && response.plaintext_total_bytes != 0
+                && !complete
+                && (response.durable_plaintext_bytes != 0
+                    || response.durable_transfer_bytes != 0
+                    || response.durable_units != 0)
+                && response.blob_id.is_none()
+        }
+        api::BlobPublicationPhase::ReadyToFinalize => {
+            totals_consistent && complete && response.blob_id.is_none()
+        }
+        api::BlobPublicationPhase::Available => {
+            totals_consistent && complete && response.blob_id.is_some()
+        }
+    }
+}
+
 pub fn publication_sdk(
     address: SocketAddr,
     token: &Token,
@@ -384,33 +540,211 @@ pub fn publication_sdk(
         .map_err(crate::journal::describe_error)
 }
 
+#[cfg(test)]
 pub async fn publish_blob(
     address: SocketAddr,
     token: &Token,
     metadata: api::PublishBlobMetadata,
     file: File,
     timeout: Duration,
-) -> Result<api::PublishBlobResponse, MutationError> {
-    let requested = metadata.clone();
-    let (frames, reader) = blob_publish::stream_file(metadata, file);
-    let result = blob_client(address, token, timeout)
-        .publish_blob(frames)
-        .await;
-    let read_result = reader.await.map_err(|_| {
-        MutationError::unknown("source reader failed while request may have been sent")
-    })?;
-    if let Err(reason) = read_result {
-        return Err(MutationError::unknown(reason));
-    }
-    let response = result
-        .map_err(|error| MutationError::rpc_error(&error, "publish_blob"))?
-        .into_owned();
-    if !blob_publish::receipt_matches(&requested, &response) {
-        return Err(MutationError::unknown("invalid publication receipt"));
-    }
-    Ok(response)
+) -> Result<api::PublishBlobReceipt, MutationError> {
+    let progress = RefCell::new(NoProgress);
+    publish_blob_with_progress(address, token, metadata, file, timeout, &progress)
+        .await
+        .map_err(|failure| failure.error)
 }
 
+pub async fn publish_blob_with_progress<P: ProgressSink>(
+    address: SocketAddr,
+    token: &Token,
+    metadata: api::PublishBlobMetadata,
+    file: File,
+    timeout: Duration,
+    progress: &RefCell<P>,
+) -> Result<api::PublishBlobReceipt, BlobPublishFailure> {
+    publish_blob_with_progress_and_chunk_bytes(
+        address,
+        token,
+        metadata,
+        file,
+        timeout,
+        progress,
+        blob_publish::CHUNK_BYTES,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_blob_with_progress_and_chunk_bytes<P: ProgressSink>(
+    address: SocketAddr,
+    token: &Token,
+    metadata: api::PublishBlobMetadata,
+    file: File,
+    timeout: Duration,
+    progress: &RefCell<P>,
+    chunk_bytes: usize,
+) -> Result<api::PublishBlobReceipt, BlobPublishFailure> {
+    assert!(
+        chunk_bytes > 0 && chunk_bytes <= blob_publish::CHUNK_BYTES,
+        "Blob publish chunk bound must be within the production limit"
+    );
+    let progress_state = PublishProgress::new(0, metadata.total_len);
+    let failure_state = progress_state.clone();
+    let transfer = async {
+        let requested = metadata.clone();
+        let total_len = metadata.total_len;
+        let mut rpc = blob_client(address, token, timeout)
+            .publish_blob()
+            .await
+            .map_err(|error| MutationError::rpc_error(&error, "publish_blob"))?;
+        rpc.send(api::PublishBlobRequest {
+            frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
+                metadata,
+            ))),
+            ..Default::default()
+        })
+        .await
+        .map_err(|error| MutationError::rpc_error(&error, "publish_blob"))?;
+        let accepted = rpc
+            .message::<api::PublishBlobResponse>()
+            .await
+            .map_err(|error| MutationError::rpc_error(&error, "publish_blob"))?
+            .ok_or_else(|| MutationError::unknown("agent ended Blob upload before acceptance"))?
+            .to_owned_message();
+        let api::publish_blob_response::Frame::Accepted(accepted) = accepted
+            .frame
+            .ok_or_else(|| MutationError::unknown("agent omitted Blob acceptance"))?
+        else {
+            return Err(MutationError::unknown(
+                "agent sent Blob progress before acceptance",
+            ));
+        };
+        if accepted.accepted_offset != accepted.durable_offset
+            || accepted.canonical_frame_bytes != chunk_bytes as u32
+            || accepted.publication_id.len() != 32
+            || !accepted.publication_id.iter().any(|byte| *byte != 0)
+            || accepted.durable_offset > total_len
+            || (accepted.durable_offset != total_len
+                && !accepted.durable_offset.is_multiple_of(chunk_bytes as u64))
+        {
+            return Err(MutationError::unknown(
+                "agent returned an invalid Blob resume offset",
+            ));
+        }
+        let publication_id = accepted.publication_id.clone();
+        let resume_offset = accepted.durable_offset;
+        progress_state.sent.store(resume_offset, Ordering::Release);
+        progress_state
+            .accepted
+            .store(resume_offset, Ordering::Release);
+        progress_state
+            .durable
+            .store(resume_offset, Ordering::Release);
+        progress_state.report(progress, ProgressEvent::Initial)?;
+        let (mut send, mut receive) = rpc.into_split();
+        let (mut frames, reader) =
+            blob_publish::stream_file_with_chunk_bytes(file, total_len, resume_offset, chunk_bytes);
+        let sender_progress = progress_state.clone();
+        let sender = async move {
+            while let Some(frame) = frames.next().await {
+                let end = match frame.frame.as_ref() {
+                    Some(api::publish_blob_request::Frame::Data(data)) => data
+                        .offset
+                        .checked_add(data.bytes.len() as u64)
+                        .ok_or_else(|| MutationError::unknown("Blob request offset overflow"))?,
+                    _ => return Err(MutationError::unknown("invalid local Blob data frame")),
+                };
+                send.send(frame)
+                    .await
+                    .map_err(|error| MutationError::rpc_error(&error, "publish_blob"))?;
+                sender_progress.sent.store(end, Ordering::Release);
+                sender_progress.report(progress, ProgressEvent::Periodic)?;
+            }
+            send.send(api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Finish(Box::default())),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| MutationError::rpc_error(&error, "publish_blob"))?;
+            send.close_send();
+            reader
+                .await
+                .map_err(|_| {
+                    MutationError::unknown("source reader failed while request may have been sent")
+                })?
+                .map_err(MutationError::unknown)
+        };
+        let receiver_progress = progress_state.clone();
+        let receiver = async move {
+            let mut accepted_offset = resume_offset;
+            let mut durable_offset = resume_offset;
+            let mut receipt = None;
+            while let Some(response) = receive
+                .message::<api::PublishBlobResponse>()
+                .await
+                .map_err(|error| MutationError::rpc_error(&error, "publish_blob"))?
+            {
+                match response.to_owned_message().frame {
+                    Some(api::publish_blob_response::Frame::Checkpoint(checkpoint))
+                        if receipt.is_none()
+                            && blob_publish::checkpoint_is_valid(
+                                &checkpoint,
+                                accepted_offset,
+                                durable_offset,
+                                receiver_progress.sent.load(Ordering::Acquire),
+                                total_len,
+                            ) =>
+                    {
+                        accepted_offset = checkpoint.accepted_offset;
+                        durable_offset = checkpoint.durable_offset;
+                        receiver_progress
+                            .sent
+                            .fetch_max(accepted_offset, Ordering::AcqRel);
+                        receiver_progress
+                            .accepted
+                            .store(accepted_offset, Ordering::Release);
+                        receiver_progress
+                            .durable
+                            .store(durable_offset, Ordering::Release);
+                        receiver_progress.report(progress, ProgressEvent::Checkpoint)?;
+                    }
+                    Some(api::publish_blob_response::Frame::Complete(complete))
+                        if receipt.is_none() =>
+                    {
+                        receipt = Some(*complete);
+                    }
+                    _ => {
+                        return Err(MutationError::unknown(
+                            "agent returned an invalid Blob progress sequence",
+                        ));
+                    }
+                }
+            }
+            receipt.ok_or_else(|| MutationError::unknown("agent omitted Blob completion"))
+        };
+        let ((), response) = tokio::try_join!(sender, receiver)?;
+        if response.publication_id != publication_id
+            || !blob_publish::receipt_matches(&requested, &response)
+        {
+            return Err(MutationError::unknown("invalid publication receipt"));
+        }
+        progress_state.sent.store(total_len, Ordering::Release);
+        progress_state.accepted.store(total_len, Ordering::Release);
+        progress_state.durable.store(total_len, Ordering::Release);
+        progress_state.report(progress, ProgressEvent::Terminal)?;
+        Ok(response)
+    };
+    let result = tokio::time::timeout(timeout, transfer)
+        .await
+        .map_err(|_| MutationError::rpc(connectrpc::ErrorCode::DeadlineExceeded))
+        .and_then(|result| result);
+    result.map_err(|error| BlobPublishFailure {
+        error,
+        progress: failure_state.snapshot(),
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
 pub async fn read_blob(
     address: SocketAddr,
     token: &Token,
@@ -418,9 +752,49 @@ pub async fn read_blob(
     output_path: PathBuf,
     timeout: Duration,
 ) -> Result<blob_read::Metadata, String> {
+    let mut progress = NoProgress;
+    read_blob_with_progress(address, token, request, output_path, timeout, &mut progress).await
+}
+
+pub async fn read_blob_with_progress<P: ProgressSink>(
+    address: SocketAddr,
+    token: &Token,
+    request: api::ReadBlobRequest,
+    output_path: PathBuf,
+    timeout: Duration,
+    progress: &mut P,
+) -> Result<blob_read::Metadata, String> {
+    read_blob_with_progress_and_page_bytes(
+        address,
+        token,
+        request,
+        output_path,
+        timeout,
+        progress,
+        blob_read::RPC_PAGE_BYTES,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_blob_with_progress_and_page_bytes<P: ProgressSink>(
+    address: SocketAddr,
+    token: &Token,
+    request: api::ReadBlobRequest,
+    output_path: PathBuf,
+    timeout: Duration,
+    progress: &mut P,
+    page_bytes: usize,
+) -> Result<blob_read::Metadata, String> {
+    assert!(
+        page_bytes > 0 && page_bytes <= blob_read::RPC_PAGE_BYTES,
+        "Blob read page bound must be within the production limit"
+    );
     let mut output = blob_read::OutputFile::create(output_path).map_err(str::to_owned)?;
-    let mut validator = blob_read::Validator::new(request.clone());
-    let transfer = async {
+    let mut validator = blob_read::Validator::new(request.clone()).with_max_page_bytes(page_bytes);
+    let mut written = 0_u64;
+    let mut started = false;
+    let transfer: Result<blob_read::Metadata, String> = async {
         let mut stream = blob_client(address, token, timeout)
             .read_blob(request)
             .await
@@ -432,9 +806,49 @@ pub async fn read_blob(
         {
             let page = page.to_owned_message();
             validator.accept(&page).map_err(str::to_owned)?;
+            if !started {
+                progress
+                    .report(
+                        ProgressEvent::Initial,
+                        ProgressSnapshot {
+                            total: page.total_len,
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(|_| "cannot write Blob progress; read cancelled".to_owned())?;
+                started = true;
+            }
             output.write_page(&page.chunk).map_err(str::to_owned)?;
+            written = written
+                .checked_add(page.chunk.len() as u64)
+                .ok_or_else(|| "ReadBlob failed: written byte count overflow".to_owned())?;
+            progress
+                .report(
+                    if page.complete {
+                        ProgressEvent::Checkpoint
+                    } else {
+                        ProgressEvent::Periodic
+                    },
+                    ProgressSnapshot {
+                        written,
+                        total: page.total_len,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|_| "cannot write Blob progress; read cancelled".to_owned())?;
         }
-        validator.finish().map_err(str::to_owned)
+        let metadata = validator.finish().map_err(str::to_owned)?;
+        progress
+            .report(
+                ProgressEvent::Terminal,
+                ProgressSnapshot {
+                    written,
+                    total: metadata.total_len,
+                    ..Default::default()
+                },
+            )
+            .map_err(|_| "cannot write Blob progress; read cancelled".to_owned())?;
+        Ok(metadata)
     }
     .await;
     match transfer {
@@ -442,7 +856,12 @@ pub async fn read_blob(
             Ok(()) => Ok(metadata),
             Err(error) => Err(discard_output(output, error.to_owned())),
         },
-        Err(error) => Err(discard_output(output, error)),
+        Err(error) => Err(discard_output(
+            output,
+            format!(
+                "{error}; discarded {written} authenticated bytes; destination was not published"
+            ),
+        )),
     }
 }
 
@@ -546,10 +965,69 @@ pub async fn subscribe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blob_status_rejects_contradictory_or_regressed_counters() {
+        let publication_id = vec![7; 32];
+        let valid = api::InspectBlobPublicationResponse {
+            publication_id: publication_id.clone(),
+            phase: api::BlobPublicationPhase::Receiving.into(),
+            plaintext_total_bytes: 10,
+            durable_plaintext_bytes: 5,
+            transfer_total_bytes: 12,
+            durable_transfer_bytes: 6,
+            total_units: 2,
+            durable_units: 1,
+            ..Default::default()
+        };
+        assert!(blob_inspection_is_valid(&publication_id, &valid));
+        for invalid in [
+            api::InspectBlobPublicationResponse {
+                durable_plaintext_bytes: 11,
+                ..valid.clone()
+            },
+            api::InspectBlobPublicationResponse {
+                phase: api::BlobPublicationPhase::Available.into(),
+                durable_plaintext_bytes: 10,
+                durable_transfer_bytes: 12,
+                durable_units: 2,
+                ..valid.clone()
+            },
+            api::InspectBlobPublicationResponse {
+                phase: api::BlobPublicationPhase::Missing.into(),
+                ..valid
+            },
+        ] {
+            assert!(!blob_inspection_is_valid(&publication_id, &invalid));
+        }
+    }
+
+    #[test]
+    fn blob_status_accepts_available_empty_publication() {
+        let publication_id = vec![7; 32];
+        assert!(blob_inspection_is_valid(
+            &publication_id,
+            &api::InspectBlobPublicationResponse {
+                publication_id: publication_id.clone(),
+                phase: api::BlobPublicationPhase::Available.into(),
+                blob_id: Some(vec![9; 32]),
+                ..Default::default()
+            }
+        ));
+    }
     use std::{
         future::poll_fn,
+        io,
         sync::{Arc, Mutex},
     };
+
+    struct FailingProgress;
+
+    impl ProgressSink for FailingProgress {
+        fn report(&mut self, _event: ProgressEvent, _snapshot: ProgressSnapshot) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "fixture"))
+        }
+    }
 
     const SERVICE: &str = "aster.application.v1alpha1.AsterApplicationService";
 
@@ -605,8 +1083,9 @@ mod tests {
         }
     }
 
-    fn receipt(metadata: &api::PublishBlobMetadata) -> api::PublishBlobResponse {
-        api::PublishBlobResponse {
+    fn receipt(metadata: &api::PublishBlobMetadata) -> api::PublishBlobReceipt {
+        api::PublishBlobReceipt {
+            publication_id: vec![3; 32],
             id: vec![1; 32],
             publisher: vec![2; 32],
             publisher_counter: 3,
@@ -621,7 +1100,12 @@ mod tests {
         }
     }
 
-    fn read_page(offset: u64, chunk: Vec<u8>, complete: bool) -> api::ReadBlobResponse {
+    fn read_page(
+        total_len: u64,
+        offset: u64,
+        chunk: Vec<u8>,
+        complete: bool,
+    ) -> api::ReadBlobResponse {
         api::ReadBlobResponse {
             id: vec![1; 32],
             publisher: vec![2; 32],
@@ -630,7 +1114,7 @@ mod tests {
             scope: "mission/team/alpha".into(),
             priority: api::Priority::Immediate.into(),
             ttl_ms: Some(60_000),
-            total_len: (blob_publish::CHUNK_BYTES + 1) as u64,
+            total_len,
             media_type: Some("application/octet-stream".into()),
             schema_id: b"schema".to_vec(),
             acceptance_marker: 4,
@@ -848,29 +1332,70 @@ mod tests {
 
     #[tokio::test]
     async fn blob_native_http2_fixture_covers_multi_page_publish_and_read_clients() {
-        let payload = vec![0x5a; blob_publish::CHUNK_BYTES + 1];
+        const TEST_FRAME_BYTES: usize = 4;
+        const TEST_TOTAL_BYTES: usize = TEST_FRAME_BYTES + 1;
+        let payload = vec![0x5a; TEST_TOTAL_BYTES];
         let metadata = publish_metadata(payload.len() as u64);
         let expected_receipt = receipt(&metadata);
         let observed = Arc::new(Mutex::new(Vec::new()));
         let observed_by_handler = Arc::clone(&observed);
         let publish_response = expected_receipt.clone();
         let router = connectrpc::Router::new()
-            .route_client_stream(
+            .route_bidi_stream(
                 SERVICE,
                 "PublishBlob",
-                connectrpc::client_streaming_handler_fn(
-                    move |_ctx, mut requests: connectrpc::ServiceStream<api::PublishBlobRequest>| {
+                connectrpc::bidi_streaming_handler_fn(
+                    move |_ctx, requests: connectrpc::ServiceStream<api::PublishBlobRequest>| {
                         let observed = Arc::clone(&observed_by_handler);
                         let response = publish_response.clone();
                         async move {
-                            let mut frames = Vec::new();
-                            while let Some(frame) =
-                                poll_fn(|context| requests.as_mut().poll_next(context)).await
-                            {
-                                frames.push(frame?);
-                            }
-                            *observed.lock().unwrap() = frames;
-                            Ok::<_, connectrpc::ConnectError>(connectrpc::Response::new(response))
+                            let responses = futures::stream::try_unfold(
+                                (requests, observed, response, 0_u8),
+                                |(mut requests, observed, response, phase)| async move {
+                                    match phase {
+                                        0 => Ok(Some((
+                                            api::PublishBlobResponse {
+                                                frame: Some(
+                                                    api::publish_blob_response::Frame::Accepted(
+                                                        Box::new(api::PublishBlobAccepted {
+                                                            canonical_frame_bytes: TEST_FRAME_BYTES
+                                                                as u32,
+                                                            publication_id: vec![3; 32],
+                                                            ..Default::default()
+                                                        }),
+                                                    ),
+                                                ),
+                                                ..Default::default()
+                                            },
+                                            (requests, observed, response, 1),
+                                        ))),
+                                        1 => {
+                                            let mut frames = Vec::new();
+                                            while let Some(frame) = poll_fn(|context| {
+                                                requests.as_mut().poll_next(context)
+                                            })
+                                            .await
+                                            {
+                                                frames.push(frame?);
+                                            }
+                                            *observed.lock().unwrap() = frames;
+                                            Ok(Some((
+                                                api::PublishBlobResponse {
+                                                    frame: Some(
+                                                        api::publish_blob_response::Frame::Complete(
+                                                            Box::new(response.clone()),
+                                                        ),
+                                                    ),
+                                                    ..Default::default()
+                                                },
+                                                (requests, observed, response, 2),
+                                            )))
+                                        }
+                                        _ => Ok(None),
+                                    }
+                                },
+                            );
+                            connectrpc::Response::stream_ok(responses)
                         }
                     },
                 ),
@@ -882,11 +1407,17 @@ mod tests {
                     |_ctx, _request: api::ReadBlobRequest| async move {
                         connectrpc::Response::stream_ok(connectrpc::stream_iter([
                             Ok(read_page(
+                                TEST_TOTAL_BYTES as u64,
                                 0,
-                                vec![0x5a; blob_publish::CHUNK_BYTES],
+                                vec![0x5a; TEST_FRAME_BYTES],
                                 false,
                             )),
-                            Ok(read_page(blob_publish::CHUNK_BYTES as u64, vec![0x5a], true)),
+                            Ok(read_page(
+                                TEST_TOTAL_BYTES as u64,
+                                TEST_FRAME_BYTES as u64,
+                                vec![0x5a],
+                                true,
+                            )),
                         ]))
                     },
                 ),
@@ -900,19 +1431,22 @@ mod tests {
         let _ = std::fs::remove_file(&source);
         std::fs::write(&source, &payload).unwrap();
 
-        let response = match publish_blob(
+        let progress = RefCell::new(NoProgress);
+        let response = match publish_blob_with_progress_and_chunk_bytes(
             fixture.address,
             &token(),
             metadata,
             File::open(&source).unwrap(),
             Duration::from_secs(2),
+            &progress,
+            TEST_FRAME_BYTES,
         )
         .await
         {
             Ok(response) => response,
-            Err(error) => panic!(
+            Err(failure) => panic!(
                 "{}",
-                error.describe(
+                failure.error.describe(
                     "PublishBlob",
                     &crate::operation_key::Selection::Explicit("native-http2-fixture".to_owned())
                         .resolve()
@@ -923,19 +1457,24 @@ mod tests {
         assert_eq!(response, expected_receipt);
         {
             let frames = observed.lock().unwrap();
-            assert_eq!(frames.len(), 3);
+            assert_eq!(frames.len(), 4);
             assert!(matches!(
                 frames[0].frame,
                 Some(api::publish_blob_request::Frame::Metadata(_))
             ));
             assert!(matches!(
                 frames[1].frame.as_ref(),
-                Some(api::publish_blob_request::Frame::Chunk(chunk))
-                    if chunk.len() == blob_publish::CHUNK_BYTES
+                Some(api::publish_blob_request::Frame::Data(chunk))
+                    if chunk.offset == 0 && chunk.bytes.len() == TEST_FRAME_BYTES
             ));
             assert!(matches!(
                 frames[2].frame.as_ref(),
-                Some(api::publish_blob_request::Frame::Chunk(chunk)) if chunk.len() == 1
+                Some(api::publish_blob_request::Frame::Data(chunk))
+                    if chunk.offset == TEST_FRAME_BYTES as u64 && chunk.bytes.len() == 1
+            ));
+            assert!(matches!(
+                frames[3].frame,
+                Some(api::publish_blob_request::Frame::Finish(_))
             ));
         }
 
@@ -947,12 +1486,15 @@ mod tests {
                 scope: "mission/team/alpha".into(),
                 ..Default::default()
             };
-            let read = read_blob(
+            let mut progress = NoProgress;
+            let read = read_blob_with_progress_and_page_bytes(
                 fixture.address,
                 &token(),
                 request,
                 destination.clone(),
                 Duration::from_secs(2),
+                &mut progress,
+                TEST_FRAME_BYTES,
             )
             .await
             .unwrap();
@@ -967,13 +1509,20 @@ mod tests {
     }
 
     async fn publish_error(error: connectrpc::ConnectError) -> MutationError {
-        let router = connectrpc::Router::new().route_client_stream(
+        let router = connectrpc::Router::new().route_bidi_stream(
             SERVICE,
             "PublishBlob",
-            connectrpc::client_streaming_handler_fn(
+            connectrpc::bidi_streaming_handler_fn(
                 move |_ctx, _requests: connectrpc::ServiceStream<api::PublishBlobRequest>| {
                     let error = error.clone();
-                    async move { Err::<connectrpc::Response<api::PublishBlobResponse>, _>(error) }
+                    async move {
+                        connectrpc::Response::stream_ok(connectrpc::stream_iter([Err::<
+                            api::PublishBlobResponse,
+                            _,
+                        >(
+                            error
+                        )]))
+                    }
                 },
             ),
         );
@@ -1071,16 +1620,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blob_native_http2_fixture_classifies_client_deadline_as_unknown() {
-        let router = connectrpc::Router::new().route_client_stream(
+    async fn publish_timeout_reports_sent_accepted_durable_total_and_retry() {
+        let router = connectrpc::Router::new().route_bidi_stream(
             SERVICE,
             "PublishBlob",
-            connectrpc::client_streaming_handler_fn(
+            connectrpc::bidi_streaming_handler_fn(
                 |_ctx, _requests: connectrpc::ServiceStream<api::PublishBlobRequest>| async move {
-                    std::future::pending::<()>().await;
-                    Ok::<_, connectrpc::ConnectError>(connectrpc::Response::new(
-                        api::PublishBlobResponse::default(),
-                    ))
+                    let responses = futures::stream::try_unfold(false, |accepted| async move {
+                        if !accepted {
+                            return Ok(Some((
+                                api::PublishBlobResponse {
+                                    frame: Some(api::publish_blob_response::Frame::Accepted(
+                                        Box::new(api::PublishBlobAccepted {
+                                            canonical_frame_bytes: blob_publish::CHUNK_BYTES as u32,
+                                            publication_id: vec![3; 32],
+                                            ..Default::default()
+                                        }),
+                                    )),
+                                    ..Default::default()
+                                },
+                                true,
+                            )));
+                        }
+                        std::future::pending::<()>().await;
+                        Ok(None)
+                    });
+                    connectrpc::Response::stream_ok(responses)
                 },
             ),
         );
@@ -1088,34 +1653,97 @@ mod tests {
         let source = test_path("deadline-source");
         let _ = std::fs::remove_file(&source);
         std::fs::write(&source, b"x").unwrap();
-        let error = publish_blob(
+        let progress = RefCell::new(NoProgress);
+        let error = publish_blob_with_progress(
             fixture.address,
             &token(),
             publish_metadata(1),
             File::open(&source).unwrap(),
             Duration::from_millis(20),
+            &progress,
         )
         .await
         .unwrap_err();
         let key = crate::operation_key::Selection::Explicit("blob-key".into())
             .resolve()
             .unwrap();
-        let description = error.describe("PublishBlob", &key);
+        let description = error.describe(&key);
         assert!(description.contains("PublishBlob outcome unknown: deadline_exceeded"));
         assert!(description.contains("--operation-key=blob-key"));
+        assert!(
+            description.contains("sent=1 accepted=0 durable=0 total=1"),
+            "{description}"
+        );
+        fixture.stop().await;
+        std::fs::remove_file(source).unwrap();
+    }
+
+    #[tokio::test]
+    async fn broken_publish_stderr_prevents_success() {
+        let router = connectrpc::Router::new().route_bidi_stream(
+            SERVICE,
+            "PublishBlob",
+            connectrpc::bidi_streaming_handler_fn(
+                |_ctx, _requests: connectrpc::ServiceStream<api::PublishBlobRequest>| async move {
+                    connectrpc::Response::stream_ok(connectrpc::stream_iter([Ok(
+                        api::PublishBlobResponse {
+                            frame: Some(api::publish_blob_response::Frame::Accepted(Box::new(
+                                api::PublishBlobAccepted {
+                                    canonical_frame_bytes: blob_publish::CHUNK_BYTES as u32,
+                                    publication_id: vec![3; 32],
+                                    ..Default::default()
+                                },
+                            ))),
+                            ..Default::default()
+                        },
+                    )]))
+                },
+            ),
+        );
+        let fixture = Fixture::start(router).await;
+        let source = test_path("broken-publish-progress-source");
+        let _ = std::fs::remove_file(&source);
+        std::fs::write(&source, b"x").unwrap();
+        let progress = RefCell::new(FailingProgress);
+        let error = publish_blob_with_progress(
+            fixture.address,
+            &token(),
+            publish_metadata(1),
+            File::open(&source).unwrap(),
+            Duration::from_secs(2),
+            &progress,
+        )
+        .await
+        .unwrap_err();
+        let key = crate::operation_key::Selection::Explicit("blob-key".into())
+            .resolve()
+            .unwrap();
+        let description = error.describe(&key);
+        assert!(
+            description.contains("cannot write Blob progress"),
+            "{description}"
+        );
+        assert!(description.contains("sent=0 accepted=0 durable=0 total=1"));
+
         fixture.stop().await;
         std::fs::remove_file(source).unwrap();
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn blob_native_http2_read_error_discards_staged_partial_output() {
+    async fn read_interruption_reports_discarded_bytes() {
+        const TEST_PAGE_BYTES: usize = 4;
         let router = connectrpc::Router::new().route_server_stream(
             SERVICE,
             "ReadBlob",
             connectrpc::streaming_handler_fn(|_ctx, _request: api::ReadBlobRequest| async move {
                 connectrpc::Response::stream_ok(connectrpc::stream_iter([
-                    Ok(read_page(0, vec![0x5a; blob_publish::CHUNK_BYTES], false)),
+                    Ok(read_page(
+                        (TEST_PAGE_BYTES + 1) as u64,
+                        0,
+                        vec![0x5a; TEST_PAGE_BYTES],
+                        false,
+                    )),
                     Err(connectrpc::ConnectError::unavailable(
                         "secret fixture detail",
                     )),
@@ -1131,18 +1759,71 @@ mod tests {
             scope: "mission/team/alpha".into(),
             ..Default::default()
         };
-        let error = read_blob(
+        let mut progress = NoProgress;
+        let error = read_blob_with_progress_and_page_bytes(
             fixture.address,
             &token(),
             request,
             destination.clone(),
             Duration::from_secs(2),
+            &mut progress,
+            TEST_PAGE_BYTES,
         )
         .await
         .unwrap_err();
         assert!(error.contains("ReadBlob failed: unavailable"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "discarded {} authenticated bytes",
+                TEST_PAGE_BYTES
+            )),
+            "{error}"
+        );
+        assert!(error.contains("destination was not published"), "{error}");
         assert!(!error.contains("secret fixture detail"), "{error}");
         assert!(!destination.exists());
+        fixture.stop().await;
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn broken_read_stderr_does_not_publish_destination() {
+        let router = connectrpc::Router::new().route_server_stream(
+            SERVICE,
+            "ReadBlob",
+            connectrpc::streaming_handler_fn(|_ctx, _request: api::ReadBlobRequest| async move {
+                connectrpc::Response::stream_ok(connectrpc::stream_iter([Ok(read_page(
+                    b"authenticated".len() as u64 + 1,
+                    0,
+                    b"authenticated".to_vec(),
+                    false,
+                ))]))
+            }),
+        );
+        let fixture = Fixture::start(router).await;
+        let directory = private_test_directory("broken-progress-directory");
+        let destination = directory.join("destination");
+        let request = api::ReadBlobRequest {
+            id: vec![1; 32],
+            topic: "imagery.maps".into(),
+            scope: "mission/team/alpha".into(),
+            ..Default::default()
+        };
+        let error = read_blob_with_progress(
+            fixture.address,
+            &token(),
+            request,
+            destination.clone(),
+            Duration::from_secs(2),
+            &mut FailingProgress,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("progress"), "{error}");
+        assert!(error.contains("discarded 0 authenticated bytes"), "{error}");
+        assert!(!destination.exists());
+
         fixture.stop().await;
         std::fs::remove_dir(directory).unwrap();
     }

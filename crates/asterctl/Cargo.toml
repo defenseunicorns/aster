@@ -30,6 +30,7 @@ connectrpc-build.workspace = true
 
 [dev-dependencies]
 connectrpc = { workspace = true, features = ["client", "json", "server"] }
+futures.workspace = true
 
 [lints]
 workspace = true

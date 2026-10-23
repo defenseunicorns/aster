@@ -19,9 +19,28 @@
 //! zeroize-on-drop plaintext pages. The corresponding stopped facades retain
 //! exclusive maintenance/application access and streaming Blob I/O. State and
 //! Record additionally use class-specific, explicitly interested reconciliation
-//! lanes. Blob transfer is selected only for semantic v7/v8 profile 4: v7 is
-//! durable-only and v8 adds authenticated finite custody. Semantic v5/v6 Blob
-//! intent fails instead of falling back to a historical carrier path.
+//! lanes. The selected Blob profile and map-unit contract is machine checked:
+//!
+//! <!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+//! ```json
+//! {
+//!   "schema": 1,
+//!   "surface": "node_api",
+//!   "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
+//!   "semantic_v9_profile": "5:BlobStreamV1",
+//!   "map_unit": "1048576-byte native plaintext segment",
+//!   "record": "ASTRBS02, at most 1048706 bytes",
+//!   "data_body": "4-byte length prefix plus one ASTRBS02 record, at most 1048710 bytes"
+//! }
+//! ```
+//! <!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+//! Semantic v7/v8 selects profile 4 BlobRangesStreamV1; semantic v9 selects profile 5 BlobStreamV1. Profile 5 maps 1,048,576-byte plaintext segments into append-only ASTRBS02 records of at most 1,048,706 bytes and sends one complete length-prefixed record per DATA body, at most 1,048,710 bytes, without repacking or re-encryption.
+//! <!-- ASTER-BLOB-CAPABILITY:END -->
+//!
+//! Profile 5 uses receiver-authoritative checkpoints; profile 4 keeps its
+//! historical bounds, v7 is durable-only, and v8 adds authenticated finite
+//! custody. Semantic v5/v6 Blob intent fails instead of falling back to a
+//! historical carrier path.
 //! Shutdown and zeroization close live application
 //! admission before releasing the actor's store authority, so retained handles
 //! fail closed with [`application::ApplicationErrorKind::StateUnavailable`].
@@ -42,6 +61,14 @@ mod identity;
 pub mod mission;
 pub mod publication_journal;
 mod runtime;
+pub mod stream_pipeline;
+#[allow(dead_code)] // Includes validation-only profile-5 codec and state helpers.
+mod stream_transfer;
+#[allow(dead_code)] // Includes adapter probes used only by focused validation.
+mod stream_transport;
+#[doc(hidden)]
+#[cfg(feature = "device-validation")]
+pub mod stream_validation;
 
 pub use aster_redb_store::{BlobDepotLimits, CustodyQuota, StoreLimits};
 pub use control_admin::{
@@ -315,6 +342,13 @@ pub fn fuzz_decode_mechanics_frame_for_semantic_version(
         frame
     );
     true
+}
+
+/// Exercises semantic-v9/profile-5 stream decoding and pure transitions.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_stream_transfer_decode(input: &[u8]) {
+    stream_transfer::fuzz_decode(input);
 }
 
 #[cfg(test)]

@@ -77,20 +77,23 @@ async fn blob_ranges_stream_saturated_six_mutable_directions() {
         event_transfer_capacity(&PeerReceipt::default(), Some(SEMANTIC_PROTOCOL_V7)).unwrap();
     assert_eq!(production_event_capacity, MAX_CONTACT_ITEMS - 9);
     let preaccounted = production_event_capacity - 2;
-    let contact = blob_contact_test_pair_with_caches(
-        stores[0].clone(),
-        a.credentials,
-        interests(),
-        a_cache,
-        stores[1].clone(),
-        b.credentials,
-        interests(),
-        b_cache,
-        None,
-        None,
-        None,
-        None,
-        preaccounted,
+    let contact = with_test_semantic_version(
+        SEMANTIC_PROTOCOL_V7,
+        blob_contact_test_pair_with_caches(
+            stores[0].clone(),
+            a.credentials,
+            interests(),
+            a_cache,
+            stores[1].clone(),
+            b.credentials,
+            interests(),
+            b_cache,
+            None,
+            None,
+            None,
+            None,
+            preaccounted,
+        ),
     );
     let (left, right) = contact.await;
     for receipt in [&left, &right] {

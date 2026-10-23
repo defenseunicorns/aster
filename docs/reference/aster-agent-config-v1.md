@@ -162,7 +162,7 @@ Unsigned integer fields use their JSON integer representation.
 
 The server also retains compiled, non-configurable bounds: 1 MiB encoded
 request/message, 4 MiB protobuf element memory, 2 MiB encoded protobuf
-response, RPC deadlines of 10 ms through 30 seconds (10-second default), 32
+response, RPC deadlines of 10 ms through 15 minutes (10-second default), 32
 HTTP/2 streams per connection, and streaming poll backoff of 100 through
 60,000 ms. Event query, delivery, and scan pages are each `1..=1024`.
 
@@ -188,6 +188,13 @@ API can publish and read locally authorized Blobs without a receive interest.
 Conversely, receiving a Blob through the mesh does not create a Blob
 application subscription; that Rust subscription surface is not exposed by the
 agent API.
+
+When both peers negotiate semantic v9, these exact selectors feed the
+profile-5 Blob streaming lane. Publication through the local agent commits
+independently of peer availability. A later eligible contact transfers bounded
+authenticated segments, and interruption resumes only from the receiver's
+durable checkpoint. Semantic-v7/v8 profile 4 remains the compatibility path;
+one profile-5 attempt does not fall back in place to profile 4.
 
 ## Relay
 

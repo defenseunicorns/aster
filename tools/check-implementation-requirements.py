@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import json
 import re
 import subprocess
 import sys
@@ -52,6 +53,225 @@ FIELDS = (
 VALID_SELECTED_STATES = frozenset(
     {"observed-bounded", "implemented-uncredited", "open"}
 )
+
+_TOTALS_BLOCK = re.compile(
+    r"<!-- ASTER-REQUIREMENTS-TOTALS:BEGIN -->\s*(.*?)\s*"
+    r"<!-- ASTER-REQUIREMENTS-TOTALS:END -->",
+    re.DOTALL,
+)
+
+
+def _requirement_family(requirement_id: str) -> str:
+    return requirement_id.split("-", 2)[1].split(".", 1)[0]
+
+
+def render_requirements_totals(
+    rows: list[dict[str, str]], mapping_count: int
+) -> str:
+    statuses = Counter(row["selected_status"] for row in rows)
+    by_family: dict[str, Counter[str]] = {}
+    for row in rows:
+        family = _requirement_family(row["id"])
+        by_family.setdefault(family, Counter())[row["selected_status"]] += 1
+    lines = [
+        "<!-- ASTER-REQUIREMENTS-TOTALS:BEGIN -->",
+        (
+            "Generated selected-status totals: "
+            f"implemented-uncredited={statuses['implemented-uncredited']}; "
+            f"observed-bounded={statuses['observed-bounded']}; "
+            f"open={statuses['open']}; exact-selected-mappings={mapping_count}."
+        ),
+        "",
+        "| Requirement family | Implemented, not fully credited | Observed, bounded | Open | Total |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for family in sorted(by_family, key=int):
+        counts = by_family[family]
+        total = sum(counts.values())
+        lines.append(
+            f"| DM-{family} | {counts['implemented-uncredited']} | "
+            f"{counts['observed-bounded']} | {counts['open']} | {total} |"
+        )
+    lines.extend(
+        [
+            (
+                f"| **Total** | **{statuses['implemented-uncredited']}** | "
+                f"**{statuses['observed-bounded']}** | **{statuses['open']}** | "
+                f"**{len(rows)}** |"
+            ),
+            "<!-- ASTER-REQUIREMENTS-TOTALS:END -->",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def validate_requirements_totals(
+    text: str, rows: list[dict[str, str]], mapping_count: int
+) -> None:
+    matches = list(_TOTALS_BLOCK.finditer(text))
+    if len(matches) != 1:
+        raise ValueError(
+            f"requirements totals block must occur exactly one time; found {len(matches)}"
+        )
+    actual = " ".join(matches[0].group(1).split())
+    expected_block = render_requirements_totals(rows, mapping_count)
+    expected_match = _TOTALS_BLOCK.search(expected_block)
+    assert expected_match is not None
+    expected = " ".join(expected_match.group(1).split())
+    if actual != expected:
+        actual_header = actual.split("| Requirement family", 1)[0]
+        expected_header = expected.split("| Requirement family", 1)[0]
+        label = "totals"
+        if "exact-selected-mappings" in actual_header and actual_header != expected_header:
+            label = "mapping" if all(
+                f"{state}={Counter(row['selected_status'] for row in rows)[state]}"
+                in actual_header
+                for state in VALID_SELECTED_STATES
+            ) else "totals"
+        elif actual_header == expected_header:
+            label = "family"
+        raise ValueError(f"requirements {label} render differs from generated trace")
+
+
+def validate_blob_capability_documentation(text: str) -> None:
+    """Keep current Blob claims separate from explicitly open capabilities."""
+    block = re.compile(
+        r"<!-- ASTER-BLOB-CAPABILITY:BEGIN -->\s*```json\s*(.*?)\s*```\s*"
+        r"<!-- ASTER-BLOB-CAPABILITY:RENDERED -->\s*(.*?)\s*"
+        r"<!-- ASTER-BLOB-CAPABILITY:END -->",
+        re.DOTALL,
+    )
+    matches = list(block.finditer(text))
+    if len(matches) != 1:
+        raise ValueError("Blob capability documentation typed capability declaration is missing")
+    expected = {
+        "schema": 1,
+        "surface": "capability_roadmap",
+        "local_publish_waits_for_peer": False,
+        "rust_agent_asterctl_publish_read": "implemented",
+        "blob_status_scope": "receiver_local_durable_state",
+        "blob_status_reports_remote_delivery_peer_or_convergence": False,
+        "cli_download_resume": "post_merge",
+    }
+    try:
+        actual = json.loads(matches[0].group(1))
+    except json.JSONDecodeError as error:
+        raise ValueError("Blob capability documentation typed capability is malformed") from error
+    if actual != expected:
+        raise ValueError("Blob capability documentation typed capability differs")
+    rendered = (
+        "Local Blob publication commits without waiting for a peer. Rust, the "
+        "native-gRPC agent, and asterctl implement bounded Blob publication and "
+        "authenticated reads. blob-status reports receiver-local durable state, "
+        "not remote delivery, peer status, or convergence. CLI download resume is "
+        "post-merge work; an interrupted download restarts at byte zero."
+    )
+    if " ".join(matches[0].group(2).split()) != " ".join(rendered.split()):
+        raise ValueError("Blob capability documentation rendered capability differs")
+    normalized = " ".join((text[: matches[0].start()] + text[matches[0].end() :]).split())
+    requirements = (
+        ("BLE boundary", "BLE is not implemented"),
+        (
+            "CM4 evidence boundary",
+            "Three-CM4 validation of this candidate has not yet run",
+        ),
+    )
+    for label, statement in requirements:
+        if " ".join(statement.split()) not in normalized:
+            raise ValueError(f"Blob capability documentation {label} declaration is missing")
+
+
+def validate_profile5_native_pack_path(
+    *,
+    active_sources: dict[str, str] | None = None,
+    active_documentation: dict[str, str] | None = None,
+) -> None:
+    """Prevent semantic-v9 Profile-5 from regaining the legacy carrier path."""
+    # The core Blob module still defines the v7/v8 carrier used by retained
+    # compatibility profiles. Guard only the selected semantic-v9 production
+    # path so that shared historical definitions cannot be mistaken for an
+    # active Profile-5 fallback.
+    active_source_paths = (
+        "crates/aster-core/src/blob_stream.rs",
+        "crates/aster-core/src/lib.rs",
+        "crates/aster-core/src/transfer_profile.rs",
+        "crates/aster-node/src/application/blob.rs",
+        "crates/aster-node/src/runtime.rs",
+        "crates/aster-node/src/runtime/blob_stream.rs",
+        "crates/aster-node/src/stream_transfer.rs",
+        "crates/aster-redb-store/src/blob.rs",
+        "crates/aster-redb-store/src/blob/depot.rs",
+        "crates/aster-redb-store/src/blob/stream.rs",
+    )
+    active_documentation_paths = (
+        "README.md",
+        "crates/aster-agent/README.md",
+        "docs/application-recipes.md",
+        "docs/protocol.md",
+        "docs/quickstart/selected-blob-api.md",
+        "docs/transports.md",
+        "docs/validation/blob-streaming-engineering-runbook.md",
+        "docs/validation/blob-streaming-performance.md",
+        "docs/validation/requirements-status.md",
+        "docs/wire.cddl",
+    )
+    forbidden = (
+        "ABX1",
+        "ASTRBT01",
+        "Profile5CanonicalCheckpoint",
+        "Profile5CanonicalWireShape",
+        "profile5_canonical_wire_shape",
+        "PROFILE5_CANONICAL_",
+        "BlobProfile5Receipt",
+        "reserve_profile5_receipt",
+        "checkpoint_profile5_receipt",
+        "resume_profile5_receipt",
+        "complete_profile5_receipt",
+        "begin_profile5_sender_carrier",
+        "begin_profile5_sender_read",
+        "read_profile5_sender_carrier",
+        "commit_verified_profile5_batch_with_policy",
+        "apply_verified_profile5_blob_with_policy",
+    )
+    if active_sources is None:
+        active_sources = {
+            path: (ROOT / path).read_text(encoding="utf-8")
+            for path in active_source_paths
+        }
+    if active_documentation is None:
+        active_documentation = {
+            path: (ROOT / path).read_text(encoding="utf-8")
+            for path in active_documentation_paths
+        }
+
+    escaped: list[str] = []
+    for path, text in active_sources.items():
+        for token in forbidden:
+            if token in text:
+                escaped.append(f"{path}:{token}")
+    profile4_context = re.compile(
+        r"\bprofile[- ]4\b|\bsemantic[- ]v(?:7|8)\b|\bv7/v8\b",
+        re.IGNORECASE,
+    )
+    for path, text in active_documentation.items():
+        for paragraph in re.split(r"\n\s*\n", text):
+            normalized = " ".join(paragraph.split())
+            for claim in re.split(r"(?<=[.!?;])\s+", normalized):
+                clauses = re.split(
+                    r",\s*(?=(?:while|whereas|but|unlike|semantic[- ]v9|profile[- ]5)\b)"
+                    r"|\b(?:while|whereas)\b",
+                    claim,
+                    flags=re.IGNORECASE,
+                )
+                for clause in clauses:
+                    for token in ("ABX1", "ASTRBT01"):
+                        if token in clause and profile4_context.search(clause) is None:
+                            escaped.append(f"{path}:{token}")
+    if escaped:
+        raise ValueError(
+            "semantic-v9 Profile-5 legacy carrier concepts remain active: "
+            + ", ".join(escaped)
+        )
 
 RECEIPT = "docs/validation/requirements-status.md#reproducible-receipt"
 MISSION_RECEIPT = (
@@ -294,8 +514,12 @@ BLOB_NETWORK_SLICE = (
     "crates/aster-core/src/crypto/reference.rs; crates/aster-core/src/store.rs; "
     "crates/aster-redb-store/src/blob.rs; "
     "crates/aster-redb-store/src/blob/depot.rs; "
+    "crates/aster-redb-store/src/blob/stream.rs; "
     "crates/aster-redb-store/src/lib.rs; crates/aster-node/src/frame.rs; "
     "crates/aster-node/src/runtime.rs; "
+    "crates/aster-node/src/runtime/blob_stream.rs; "
+    "crates/aster-node/src/stream_transfer.rs; "
+    "crates/aster-node/src/stream_transport.rs; "
     "fuzz/fuzz_targets/selected_frame_decode.rs; "
     "crates/aster-core/src/source_blob.rs::tests::"
     "blob_peer_content_proof_is_exact_current_and_identity_bound; "
@@ -351,7 +575,13 @@ BLOB_NETWORK_SLICE = (
 BLOB_LIVE_SLICE = (
     "crates/aster-node/src/application.rs; "
     "crates/aster-node/src/application/blob.rs; "
+    "crates/aster-node/src/application/blob_stream.rs; "
+    "crates/aster-redb-store/src/blob/upload.rs; "
     "crates/aster-node/src/runtime.rs; crates/aster-node/src/lib.rs; "
+    "proto/aster/application/v1alpha1/aster.proto; "
+    "crates/aster-agent/src/blob_service.rs; "
+    "crates/asterctl/src/blob_publish.rs; crates/asterctl/src/blob_read.rs; "
+    "crates/asterctl/src/blob_status.rs; "
     "crates/aster-node/src/application/blob.rs::tests::"
     "live_blob_page_is_bounded_exact_and_rejects_invalid_ranges; "
     "crates/aster-node/src/application/blob.rs::tests::"
@@ -1429,7 +1659,7 @@ SELECTED_OVERRIDES: dict[str, dict[str, str]] = {
     "DM-8-05": selected_claim(
         "open",
         "dependency-policy owner",
-        f"{DEPENDENCY_GATE}; Decision 0028 records stakeholder-approved exact-package deviations, and deny.toml pins CDLA-Permissive-2.0 exceptions to webpki-roots 1.0.9 and webpki-root-certs 1.0.9 plus Unlicense exceptions to async_io_stream 0.3.3, pharos 0.5.3, and ws_stream_wasm 0.7.5; neither license enters the general allowlist and coordinate drift fails closed",
+        f"{DEPENDENCY_GATE}; Decision 0028 records exact-package deviations, and deny.toml pins CDLA-Permissive-2.0 exceptions to webpki-roots 1.0.10 and webpki-root-certs 1.0.10 plus Unlicense exceptions to async_io_stream 0.3.3, pharos 0.5.3, and ws_stream_wasm 0.7.5; neither license enters the general allowlist, coordinate drift fails closed, and the earlier 1.0.9 evaluation approval does not approve the replacement coordinates",
         "The frozen requirement literally requires OSI-approved licenses only, so the two CDLA data-package deviations are not counted as normative DM-8-05 compliance. The requirement owner must expressly revise or disposition that rule, or the implementation must use an approved alternative; supported-target, SBOM, packaging, and release admission remain open.",
     ),
     "DM-9-13": selected_claim(
@@ -2096,10 +2326,17 @@ def main() -> int:
     try:
         verify_authority_hashes()
         verify_mapped_source_paths()
+        validate_blob_capability_documentation(
+            (ROOT / "docs/validation/capability-roadmap.md").read_text()
+        )
+        validate_profile5_native_pack_path()
         expected = expected_rows(read_matrix())
         if args.write:
             write_trace(expected)
         errors = validate_trace(expected)
+        validate_requirements_totals(
+            LEDGER.read_text(encoding="utf-8"), expected, len(SELECTED_OVERRIDES)
+        )
     except (OSError, csv.Error, ValueError) as error:
         print(f"requirements trace validation failed: {error}", file=sys.stderr)
         return 1

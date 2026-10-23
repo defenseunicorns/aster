@@ -57,12 +57,34 @@ whole-key active-head queue. Neither application selector mutates its separately
 configured network receive interest. The runtime also
 exposes a cloneable live Blob handle: publish accepts an already-open regular
 file at cursor zero, bounded to 64 MiB and 1,024 canonical 64-KiB chunks, and a
-live read returns at most 64 KiB of plaintext per zeroize-on-drop page. Under
-semantic v7/v8 profile 4, the same selected runtime automatically reconciles
-Blob sources and transfers peer-neutral contiguous carrier ranges of at most
-16 KiB directly between content-capable peers. V7 is durable-only. V8 also
-implements authenticated finite-TTL custody and bounded lower-priority pressure
-recovery internally. The broader
+live read returns at most 64 KiB of plaintext per zeroize-on-drop page. The
+selected Blob profile and map-unit contract is machine checked:
+
+<!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+```json
+{
+  "schema": 1,
+  "surface": "transports",
+  "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
+  "semantic_v9_profile": "5:BlobStreamV1",
+  "map_unit": "1048576-byte native plaintext segment",
+  "record": "ASTRBS02, at most 1048706 bytes",
+  "data_body": "4-byte length prefix plus one ASTRBS02 record, at most 1048710 bytes"
+}
+```
+<!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+Semantic v7/v8 selects profile 4 BlobRangesStreamV1; semantic v9 selects profile 5 BlobStreamV1. Profile 5 maps 1,048,576-byte plaintext segments into append-only ASTRBS02 records of at most 1,048,706 bytes and sends one complete length-prefixed record per DATA body, at most 1,048,710 bytes, without repacking or re-encryption.
+<!-- ASTER-BLOB-CAPABILITY:END -->
+
+Profile 5 resumes from lifecycle-owned provisional source or upload state plus
+the native pack checkpoint journal. Atomic promotion precedes RESULT;
+RESULT_ACK or EOF settles only the attempt and owns no durable resume state.
+Profile 4 remains the
+compatibility path for peer-neutral contiguous carrier ranges of at most 16 KiB;
+v7 is durable-only,
+while v8 also implements
+authenticated finite-TTL custody and bounded lower-priority pressure recovery
+internally. The broader
 semantic implementation remains the migration source for behavior that has not
 yet moved into this composition.
 
@@ -73,7 +95,7 @@ yet moved into this composition.
 | Selected direct Iroh | Manually admitted exact endpoint ID and socket, authenticated direct UDP/QUIC, and bounded exchange | Carrier identity is separate from mission and data authorization; no address discovery, port mapping, dynamic-NAT policy, or multi-carrier failover |
 | Selected nearby Iroh discovery | Feature-gated Iroh mDNS lookup using an exact roster or mission-authenticated `--discover-lan`; each window is at most 30 seconds | Default off; upstream observations are not globally capped, so this is not a hostile-LAN or production discovery service |
 | Selected controlled Iroh relay | One operator-pinned HTTPS relay with explicit trust, alongside an initial direct locator or with IP disabled | No public/default relay selection; the relay is transport infrastructure rather than an Aster mission or payload-blind application relay |
-| Selected node and CLI | Networked Event, State, and Record reconciliation; semantic-v7/v8 profile-4 direct Blob transfer, with v7 durable-only and v8 authenticated finite-TTL custody plus bounded lower-priority pressure recovery; live and stopped Rust APIs; bounded application delivery; payload-blind Event relay; restart/idempotency; Unix zeroization | Reference provisioning; no dynamic application-driven network interests, automatic Record merge, route-only Blob custody, finite State/Record TTL, public Blob lifecycle controls, generalized control administration, or production authorization |
+| Selected node and CLI | Networked Event, State, and Record reconciliation; semantic-v9/profile-5 checkpointed Blob streaming plus semantic-v7/v8 profile-4 compatibility; live and stopped Rust APIs; bounded application delivery; payload-blind Event relay; restart/idempotency; Unix zeroization | Reference provisioning; no cross-transport failover, dynamic application-driven network interests, automatic Record merge, route-only Blob custody, finite State/Record TTL, public Blob lifecycle controls, generalized control administration, or production authorization |
 | Current semantic in-memory link | High-level host contact, authentication, reconciliation, resume, and failure behavior | Reference carrier; not wired to the selected composition |
 | Current semantic UDP/IP | Nonblocking link, manual endpoint mapping, protected local discovery, rendezvous helpers, opaque relay components | Migration onto the selected node; full host acceptance on physical or operational networks |
 | Current semantic NAT/rendezvous and relay | Bounded rendezvous, endpoint-punching, and opaque-relay helpers | Not integrated into the selected node |
@@ -379,20 +401,54 @@ core owns fragmentation, handshake, replay defense, exact reconciliation,
 source verification, and reducers.
 
 Use the `Link` trait and existing IP/BTLE adapters as semantic and test migration
-sources. The selected node does not yet expose the final multi-carrier adapter
-contract, so a new production adapter must not create a second persistence,
-reconciliation, authentication, or scheduling authority. Use the
+sources. The selected node now has an adapter-neutral stream registry and
+deterministic selector, while `IrohQuicV1` remains the only adapter registered
+by the shipped production composition. Each adapter owns its connection state
+and attempt creation. Implementing another adapter, or using it as the single
+contact-agreed adapter, does not require changing the Blob stream codec,
+pipeline, persistence, or selector. Candidate support
+and locators must come from local configuration, provisioned peer data, or
+authenticated discovery before `StreamOpen`; peer-supplied ranking is never
+accepted. The composition supplies that authenticated support plus local policy
+and configured priority to the registry. The selector filters those values and
+the stream contract, then orders adapter-reported health, configured priority,
+and stable adapter ID. Exactly one adapter carries a logical attempt. Iroh
+direct versus relay remains an Iroh-local path observation, not two selectable
+Aster transports.
+
+Fake adapters validate multi-registration ranking, requirement and policy
+filtering, adapter-owned attempt creation, retry, cancellation, terminal
+outcomes, and checkpoint carry-forward, but they are not product transport
+support. This milestone claims automatic selection of the sole shipped Iroh
+adapter and authenticated Iroh reopen. It does not claim best-available
+cross-transport selection or failover because no second production adapter or
+physical cross-transport scenario has been validated. Until a later protocol
+increment coordinates adapter choice across peers, production composition must
+make exactly one contact-agreed adapter eligible; local multi-registration tests
+are extension-seam evidence, not permission to enable competing adapters on a
+contact. When another adapter is implemented, it uses the same registry and
+must not create a second persistence, reconciliation, authentication, or
+scheduling authority. Use the
 [binding pattern](bindings/pattern.md) for a language API.
 
 ## Semantic protocol versions you may see
 
 Aster separates stable bytes from negotiated behavior. The current selected
-implementation offers semantic versions `[8, 7, 6, 5, 4, 3, 2, 1]` in that
+implementation offers semantic versions `[9, 8, 7, 6, 5, 4, 3, 2, 1]` in that
 descending order:
 
 - **Replication wire/profile version 1** identifies the current encoding and
   fixed security-object family.
-- **Semantic version 8** is offered first. It inherits semantic-v7 profile
+- **Semantic version 9** is offered first. It preserves v1-v8 stable bytes and
+  selects Blob profile 5 `BlobStreamV1`. Profile 5 is a distinct allocation,
+  never a reinterpretation or in-attempt downgrade of profile 4. Its
+  `0xd6..0xdc` records, v9 custody/record protection, concurrent Iroh
+  data/control pair, adapter-neutral registry and selector, bounded parallel
+  segment verification, durable pack checkpoints, resume, and lifecycle
+  promotion are implemented. The shipped production registry currently
+  contains only `IrohQuicV1`; automatic selection therefore does not yet mean
+  cross-transport failover.
+- **Semantic version 8** inherits semantic-v7 profile
   negotiation and receipt-free Event pages, while profile 4 adds authenticated
   finite-TTL Blob custody and bounded lower-priority pressure recovery.
 - **Semantic version 7** remains a compatibility option. After the four-flight mission

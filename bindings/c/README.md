@@ -13,8 +13,8 @@ Version reporting separates stable encoding from negotiated behavior.
 `aster_protocol_version()` remains a compatibility alias for
 `aster_replication_wire_version()` and returns wire/profile version `1`.
 `aster_default_semantic_version()` and
-`aster_highest_supported_semantic_version()` both return `7` for this build;
-authenticated sessions retain semantic versions 6, 5, 4, 3, 2, and 1 for
+`aster_highest_supported_semantic_version()` both return `9` for this build;
+authenticated sessions retain semantic versions 8, 7, 6, 5, 4, 3, 2, and 1 for
 compatibility. Semantic v6 preserves every v5 ordinary lane and adds the
 selected node's mutually enabled Event-bridge frame lane; it does not change
 ABI or replication-wire version `1`.

@@ -392,6 +392,8 @@ pub enum MutableTransferCursorClass {
     Record,
     /// Immutable selected Blob source transfers.
     Blob,
+    /// Completed semantic-v9/profile-5 Blob stream publications.
+    BlobStream,
 }
 
 impl MutableTransferCursorClass {
@@ -400,6 +402,7 @@ impl MutableTransferCursorClass {
             Self::State => 1,
             Self::Record => 2,
             Self::Blob => 3,
+            Self::BlobStream => 4,
         }
     }
 
@@ -408,6 +411,7 @@ impl MutableTransferCursorClass {
             1 => Ok(Self::State),
             2 => Ok(Self::Record),
             3 => Ok(Self::Blob),
+            4 => Ok(Self::BlobStream),
             _ => Err(StoreError::MutableTransferCursorInvariant(
                 "mutable-transfer cursor key has an invalid class tag",
             )),
@@ -5318,7 +5322,7 @@ pub struct Store {
     blob_lifecycle_limits: BlobLifecycleLimits,
     mission_authority: Option<NodeId>,
     live: AtomicBool,
-    blob_depot_lock: std::sync::Mutex<()>,
+    blob_depot_lock: std::sync::RwLock<()>,
     blob_completion_authority: std::sync::Arc<()>,
     blob_depot_owner_token: [u8; 32],
     blob_depot_owner_binding: [u8; 32],
@@ -6291,6 +6295,7 @@ impl Store {
         // additive Blob migration. A foreign/pre-marker physical root blocks
         // migration while this exact writer transaction can still roll back.
         blob::depot::prepare_depot_owner_token_write(&write, &path)?;
+        blob::depot::recover_upload_pack_transitions_write(&write, &path, backing_identity)?;
         let operation_migration =
             event_operation::stage_legacy_event_operations_write(&write, operation_limits)?;
         // Audit all retained metadata, predecessor relations, witnesses and
@@ -6427,6 +6432,23 @@ impl Store {
             physical.commit()?;
         }
 
+        // Cleanup markers must outlive the transaction that removes their
+        // upload rows. Reclaim them only from a fresh writer after that row
+        // absence is durable; the writer lock prevents a concurrent retry
+        // from creating a row while its marker is being removed.
+        if let Some(authority) = mission_authority {
+            let cleanup = database.begin_write()?;
+            enforce_live_write(&cleanup)?;
+            check_expected_mission_binding(&cleanup, authority)?;
+            blob::depot::reclaim_upload_cleanup_markers_after_commit(
+                &cleanup,
+                &path,
+                backing_identity,
+                blob_depot_owner_token,
+            )?;
+            cleanup.commit()?;
+        }
+
         Ok(Self {
             database,
             path,
@@ -6438,7 +6460,7 @@ impl Store {
             blob_lifecycle_limits,
             mission_authority,
             live: AtomicBool::new(true),
-            blob_depot_lock: std::sync::Mutex::new(()),
+            blob_depot_lock: std::sync::RwLock::new(()),
             blob_completion_authority: std::sync::Arc::new(()),
             blob_depot_owner_token,
             blob_depot_owner_binding,
@@ -7977,7 +7999,7 @@ impl Store {
         // Drain the one borrowed physical-depot adapter after closing its live
         // gate. The terminal transaction cannot commit while ciphertext I/O is
         // in flight, and every adapter method also observes the closed gate.
-        let _depot_guard = self.blob_depot_lock.lock().map_err(|_| {
+        let _depot_guard = self.blob_depot_lock.write().map_err(|_| {
             StoreError::Blob(BlobStoreError::DepotIntegrity("depot lock is poisoned"))
         })?;
         let mut write = self.database.begin_write()?;

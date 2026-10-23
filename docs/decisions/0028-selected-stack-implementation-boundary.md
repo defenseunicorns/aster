@@ -71,6 +71,19 @@ uncredited against the frozen baseline unless its owner expressly revises that
 normative rule; the deviation remains visible rather than being counted as
 requirements compliance.
 
+## Security maintenance update — 2026-10-20
+
+The selected stack now pins `webpki-roots` and `webpki-root-certs` 1.0.10 in
+response to RUSTSEC-2026-0381 and RUSTSEC-2026-0383. Both packages retain
+`CDLA-Permissive-2.0`; `deny.toml` moves the two package-scoped exceptions to
+the replacement exact versions rather than adding the license to the general
+allowlist. `THIRD_PARTY_NOTICES.md` records the replacement archive checksums.
+
+This implementation-policy update does not extend the 2026-09-08 Linux Event
+v0.1 evaluation approval, which remains an immutable record for the 1.0.9
+tuples. That evaluation gate is reopened for the replacement coordinates;
+production `DM-8-05` remains open and no release authorization is granted.
+
 Iroh endpoint authentication is carrier evidence only. The hybrid-PQ session,
 protected envelopes, source authentication, data classes, causality,
 custody/TTL, scopes, and authorization already implemented and tested in

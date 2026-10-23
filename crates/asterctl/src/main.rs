@@ -2,10 +2,12 @@ mod args;
 mod auth;
 mod blob_publish;
 mod blob_read;
+mod blob_status;
 mod client;
 mod journal;
 mod operation_key;
 mod output;
+mod progress;
 mod publish;
 mod query;
 mod subscribe;
@@ -46,6 +48,7 @@ fn run() -> Result<(), (u8, String)> {
         args::Command::PublishHelp => return write_output(publish::HELP),
         args::Command::BlobPublishHelp => return write_output(blob_publish::HELP),
         args::Command::BlobReadHelp => return write_output(blob_read::HELP),
+        args::Command::BlobStatusHelp => return write_output(blob_status::HELP),
         args::Command::QueryHelp => return write_output(query::HELP),
         args::Command::SubscribeHelp => return write_output(subscribe::HELP),
         args::Command::Status(options) => {
@@ -177,34 +180,85 @@ fn run() -> Result<(), (u8, String)> {
                 .prepare()
                 .map_err(|error| (1, error.to_owned()))?;
             announce_key(&upload.key)?;
+            let stderr = io::stderr();
+            let progress = std::cell::RefCell::new(progress::ProgressReporter::new(
+                stderr.lock(),
+                upload.progress,
+                stderr.is_terminal(),
+                progress::ProgressKind::Publish,
+                progress::SystemClock::start(),
+            ));
             let response = rpc
                 .runtime
-                .block_on(client::publish_blob(
+                .block_on(client::publish_blob_with_progress(
                     rpc.address,
                     &rpc.token,
                     upload.metadata,
                     upload.file,
                     rpc.timeout,
+                    &progress,
                 ))
-                .map_err(|error| (1, error.describe("PublishBlob", &upload.key)))?;
+                .map_err(|error| (1, error.describe(&upload.key)))?;
             output::publish_blob(&response, &upload.key.value, rpc.json)
                 .map_err(|_| (1, "cannot format PublishBlob response".to_owned()))?
         }
         args::Command::BlobRead(options, read) => {
             let rpc = RpcContext::new(options)?;
-            let (request, output_path) = read.into_parts();
+            let (request, output_path, progress_mode) = read.into_parts();
+            let stderr = io::stderr();
+            let mut progress = progress::ProgressReporter::new(
+                stderr.lock(),
+                progress_mode,
+                stderr.is_terminal(),
+                progress::ProgressKind::Read,
+                progress::SystemClock::start(),
+            );
             let metadata = rpc
                 .runtime
-                .block_on(client::read_blob(
+                .block_on(client::read_blob_with_progress(
                     rpc.address,
                     &rpc.token,
                     request,
                     output_path,
                     rpc.timeout,
+                    &mut progress,
                 ))
                 .map_err(|error| (1, error))?;
             output::read_blob(&metadata, rpc.json)
                 .map_err(|_| (1, "cannot format ReadBlob response".to_owned()))?
+        }
+        args::Command::BlobStatus(options, status) => {
+            let rpc = RpcContext::new(options)?;
+            let (request, wait, poll) = status.into_parts();
+            let result = rpc.runtime.block_on(blob_status::run(
+                rpc.address,
+                &rpc.token,
+                request,
+                wait,
+                poll,
+                rpc.timeout,
+            ));
+            let response = match result {
+                Ok(response) => response,
+                Err(error) => {
+                    if let Some(last) = error.last() {
+                        let text = output::blob_status(last, rpc.json).map_err(|_| {
+                            (
+                                1,
+                                "cannot format InspectBlobPublication response".to_owned(),
+                            )
+                        })?;
+                        write_output(&text)?;
+                    }
+                    return Err((1, error.message().to_owned()));
+                }
+            };
+            output::blob_status(&response, rpc.json).map_err(|_| {
+                (
+                    1,
+                    "cannot format InspectBlobPublication response".to_owned(),
+                )
+            })?
         }
         args::Command::Query(options, query) => {
             let rpc = RpcContext::new(options)?;
