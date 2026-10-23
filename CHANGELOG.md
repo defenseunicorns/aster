@@ -73,6 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Updated ctutils to 0.4.4 to address RUSTSEC-2026-0385.
 - Created Unix publication journals with owner-only permissions and rejected insecure existing journal files.
 
 - Restricted `asterctl` plaintext RPC to loopback addresses before credential or payload loading.
