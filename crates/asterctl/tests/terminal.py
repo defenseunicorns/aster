@@ -12,7 +12,7 @@ import tempfile
 
 def check(extra, terminal, expect_hint):
     with tempfile.TemporaryDirectory(prefix="asterctl-terminal-") as temporary, socket.socket() as listener:
-        journal = os.path.join(temporary, "publication.redb")
+        journal = os.path.join(os.path.realpath(temporary), "publication.redb")
         subprocess.run([sys.argv[1], "publication-init", "--journal", journal, "--client-id", "terminal-test"], check=True, capture_output=True)
         listener.bind(("127.0.0.1", 0))
         listener.listen()

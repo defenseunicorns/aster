@@ -444,10 +444,14 @@ impl PublicationJournal {
     fn initialize_with_parent_sync(
         path: &Path,
         client_id: &[u8],
-        sync_parent: impl FnOnce(&Path) -> Result<()>,
+        sync_parent: impl FnOnce(&aster_node::journal_directory::JournalDirectory) -> Result<()>,
     ) -> Result<()> {
         validate_client_id(client_id)?;
-        let file = open_journal_file(path, true)?;
+        let directory = aster_node::journal_directory::JournalDirectory::open(path, false)
+            .map_err(|error| journal_error(path, "open parent directory", error))?;
+        let file = directory
+            .file(path, true)
+            .map_err(|error| journal_error(path, "create journal", error))?;
         let database = redb::Builder::new()
             .create_file(file)
             .map_err(|error| journal_error(path, "initialize", error))?;
@@ -481,7 +485,7 @@ impl PublicationJournal {
         write
             .commit()
             .map_err(|error| journal_error(path, "commit initialization", error))?;
-        sync_parent(path)
+        sync_parent(&directory)
     }
 
     /// Opens an existing journal and acquires redb's exclusive writer lock.
@@ -647,57 +651,16 @@ impl PublicationJournal {
     }
 }
 
-// Like the Go and native journals, resolve the parent by pathname here.
-// Retaining the exact directory used for creation is separate hardening.
-fn sync_journal_parent(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    std::fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| journal_error(path, "sync parent directory", error))
+fn sync_journal_parent(directory: &aster_node::journal_directory::JournalDirectory) -> Result<()> {
+    directory
+        .sync()
+        .map_err(|error| NumberedEventSdkError::Journal(format!("sync parent directory: {error}")))
 }
 
 fn open_journal_file(path: &Path, create: bool) -> Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create_new(create);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = options
-        .open(path)
-        .map_err(|error| journal_error(path, "open journal", error))?;
-    #[cfg(unix)]
-    if create {
-        use std::os::unix::fs::PermissionsExt as _;
-        // Creation mode is filtered by umask. Restore owner read/write on the
-        // same descriptor before initializing the journal, without granting
-        // group/other access or changing permissions on existing journals.
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|error| journal_error(path, "set journal permissions", error))?;
-    }
-    let metadata = file
-        .metadata()
-        .map_err(|error| journal_error(path, "inspect journal", error))?;
-    if !metadata.is_file() || (!create && metadata.len() == 0) {
-        return Err(NumberedEventSdkError::Journal("journal must be a regular, nonempty existing file; explicit initialization is required".to_owned()));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
-            return Err(NumberedEventSdkError::Journal(
-                "journal must be owned by the current user with no group or other permissions"
-                    .to_owned(),
-            ));
-        }
-    }
-    Ok(file)
+    aster_node::journal_directory::JournalDirectory::open(path, false)
+        .and_then(|directory| directory.file(path, create))
+        .map_err(|error| journal_error(path, "open journal", error))
 }
 
 /// A generated Connect client paired with its durable numbered-operation journal.
@@ -3421,11 +3384,65 @@ mod tests {
     }
 
     fn journal_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "aster-numbered-journal-{name}-{}-{:?}.redb",
-            std::process::id(),
-            std::thread::current().id()
-        ))
+        // Resolve the test environment only, not intentional journal symlinks.
+        std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temporary directory")
+            .join(format!(
+                "aster-numbered-journal-{name}-{}-{:?}.redb",
+                std::process::id(),
+                std::thread::current().id()
+            ))
+    }
+
+    #[test]
+    fn journal_parent_sync_survives_directory_rename() {
+        let root = journal_path("retained-parent");
+        std::fs::create_dir(&root).unwrap();
+        let parent = root.join("parent");
+        let moved = root.join("moved");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("journal.redb");
+        PublicationJournal::initialize_with_parent_sync(&path, b"client", |directory| {
+            std::fs::rename(&parent, &moved).unwrap();
+            sync_journal_parent(directory)
+        })
+        .unwrap();
+        let journal = PublicationJournal::open(moved.join("journal.redb"), b"client").unwrap();
+        assert_eq!(journal.read_state().unwrap().next_sequence, Some(1));
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn journal_updates_and_writer_lock_survive_parent_replacement() {
+        let root = journal_path("retained-updates");
+        std::fs::create_dir(&root).unwrap();
+        let parent = root.join("parent");
+        let moved = root.join("moved");
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("journal.redb");
+        PublicationJournal::initialize(&path, b"client").unwrap();
+        let journal = PublicationJournal::open(&path, b"client").unwrap();
+        std::fs::rename(&parent, &moved).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        PublicationJournal::initialize(&path, b"replacement").unwrap();
+        let replacement = std::fs::read(&path).unwrap();
+        journal
+            .update_state(|state| {
+                state.session = 17;
+                Ok(())
+            })
+            .unwrap();
+        let retained = moved.join("journal.redb");
+        assert!(PublicationJournal::open(&retained, b"client").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), replacement);
+        drop(journal);
+        assert!(PublicationJournal::open(&retained, b"replacement").is_err());
+        let reopened = PublicationJournal::open(&retained, b"client").unwrap();
+        assert_eq!(reopened.read_state().unwrap().session, 17);
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3434,11 +3451,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut synced = false;
         PublicationJournal::initialize_with_parent_sync(&path, b"client", |created| {
-            assert_eq!(created, path);
+            // The callback receives the retained directory, not a pathname.
             // Inspect a separate copy while initialization still holds its
             // writer lock: the initial transaction must already be committed.
             let snapshot = journal_path("parent-sync-snapshot");
-            std::fs::copy(created, &snapshot).unwrap();
+            std::fs::copy(&path, &snapshot).unwrap();
             let journal = PublicationJournal::open(&snapshot, b"client").unwrap();
             assert_eq!(journal.read_state().unwrap().next_sequence, Some(1));
             drop(journal);
@@ -3459,10 +3476,10 @@ mod tests {
     fn journal_initialization_propagates_parent_sync_failure_and_retains_state() {
         let path = journal_path("parent-sync-failure");
         let _ = std::fs::remove_file(&path);
-        let error = PublicationJournal::initialize_with_parent_sync(&path, b"client", |created| {
-            // A file cannot be opened as a directory parent. Exercise the real
-            // helper's I/O error mapping without changing process permissions.
-            sync_journal_parent(&created.join("not-a-directory/child"))
+        let error = PublicationJournal::initialize_with_parent_sync(&path, b"client", |_| {
+            Err(NumberedEventSdkError::Journal(
+                "sync parent directory: injected I/O failure".into(),
+            ))
         })
         .unwrap_err();
         assert!(error.to_string().contains("sync parent directory"));
