@@ -2885,7 +2885,9 @@ def choose_root(value: Optional[Path]) -> Path:
         if not root.parent.is_dir():
             raise PlaygroundError("playground root parent does not exist")
         return root
-    parent = Path(tempfile.mkdtemp(prefix="aster-playground."))
+    # Resolve only our generated root: TMPDIR may be an alias, but journal
+    # paths intentionally reject symlink ancestors. Explicit --root stays intact.
+    parent = Path(tempfile.mkdtemp(prefix="aster-playground.")).resolve()
     os.chmod(parent, 0o700)
     return parent / "mesh"
 

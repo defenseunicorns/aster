@@ -1323,6 +1323,31 @@ class ControllerAndScriptTests(unittest.TestCase):
 
 
 class ArgumentAndModeTests(unittest.TestCase):
+    def test_automatic_root_resolves_symlinked_temp_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            real = Path(temporary).resolve() / "real"
+            real.mkdir()
+            alias = real.with_name("alias")
+            alias.symlink_to(real, target_is_directory=True)
+            # tempfile caches TMPDIR; override its cache to exercise the real
+            # allocation under an alias regardless of the test runner's TMPDIR.
+            with mock.patch.object(tempfile, "tempdir", str(alias)):
+                root = playground.choose_root(None)
+            self.assertEqual(root, root.resolve())
+            self.assertEqual(root.parent.parent, real)
+            self.assertEqual(root.parent.stat().st_mode & 0o777, 0o700)
+            self.assertFalse(root.exists())
+
+    def test_explicit_root_preserves_symlinked_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            real = Path(temporary).resolve() / "real"
+            real.mkdir()
+            alias = real.with_name("alias")
+            alias.symlink_to(real, target_is_directory=True)
+            requested = alias / "mesh"
+            self.assertEqual(playground.choose_root(requested), requested)
+            self.assertNotEqual(requested, requested.resolve())
+
     def test_parser_exposes_stable_controller_contract(self) -> None:
         arguments = playground.build_parser().parse_args(
             [

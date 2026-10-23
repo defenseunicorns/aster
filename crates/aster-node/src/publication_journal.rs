@@ -542,7 +542,11 @@ mod tests {
             let mut nonce = [0; 16];
             getrandom::fill(&mut nonce).unwrap();
             let name: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
-            let path = std::env::temp_dir().join(format!("aster-native-publication-{name}"));
+            // Resolve the test environment only; keep journal symlink checks intact.
+            let path = std::env::temp_dir()
+                .canonicalize()
+                .expect("canonical temporary directory")
+                .join(format!("aster-native-publication-{name}"));
             std::fs::create_dir(&path).unwrap();
             #[cfg(unix)]
             {

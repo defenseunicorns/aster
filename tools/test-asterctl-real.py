@@ -35,7 +35,7 @@ class RealAgentTest(unittest.TestCase):
         self.assertTrue(CLI.is_file(), "build asterctl first")
         self.assertTrue(FIXTURE.is_file(), "build the test-only agent fixture first")
         with tempfile.TemporaryDirectory(prefix="asterctl-real-") as directory:
-            root = Path(directory)
+            root = Path(directory).resolve(strict=True)
             subprocess.run(
                 [str(FIXTURE), "prepare", "--root", str(root)],
                 check=True, capture_output=True, timeout=30,

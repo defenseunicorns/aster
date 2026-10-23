@@ -39119,7 +39119,10 @@ mod tests {
     }
 
     fn root(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("aster-node-{name}-{}", std::process::id()));
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temporary directory")
+            .join(format!("aster-node-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         path
     }

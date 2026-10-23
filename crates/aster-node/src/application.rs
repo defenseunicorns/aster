@@ -3298,10 +3298,13 @@ mod tests {
     impl TestRoot {
         fn new(label: &str) -> Self {
             let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "aster-selected-event-{}-{sequence}-{label}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .canonicalize()
+                .expect("canonical temporary directory")
+                .join(format!(
+                    "aster-selected-event-{}-{sequence}-{label}",
+                    std::process::id()
+                ));
             fs::create_dir(&path).expect("create test root");
             Self(path)
         }

@@ -37,10 +37,13 @@ struct TestState(PathBuf);
 impl TestState {
     fn new() -> Self {
         let sequence = NEXT_PATH.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "aster-agent-real-node-{}-{sequence}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temporary directory")
+            .join(format!(
+                "aster-agent-real-node-{}-{sequence}",
+                std::process::id()
+            ));
         fs::create_dir(&path).expect("create isolated state root");
         #[cfg(unix)]
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700))

@@ -3308,11 +3308,15 @@ mod tests {
     }
 
     fn journal_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "aster-numbered-journal-{name}-{}-{:?}.redb",
-            std::process::id(),
-            std::thread::current().id()
-        ))
+        // Resolve the test environment only, not intentional journal symlinks.
+        std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temporary directory")
+            .join(format!(
+                "aster-numbered-journal-{name}-{}-{:?}.redb",
+                std::process::id(),
+                std::thread::current().id()
+            ))
     }
 
     #[test]

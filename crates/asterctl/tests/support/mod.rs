@@ -10,11 +10,14 @@ pub struct Journal {
 impl Journal {
     pub fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "asterctl-numbered-{}-{}.redb",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temporary directory")
+            .join(format!(
+                "asterctl-numbered-{}-{}.redb",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
         aster_agent::sdk::PublicationJournal::initialize(&path, b"asterctl-test").unwrap();
         Self { path }
     }
