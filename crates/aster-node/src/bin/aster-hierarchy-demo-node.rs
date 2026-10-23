@@ -1243,7 +1243,10 @@ mod tests {
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).unwrap();
         let suffix: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
-        let root = std::env::temp_dir().join(format!("aster-numbered-hierarchy-test-{suffix}"));
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temporary directory")
+            .join(format!("aster-numbered-hierarchy-test-{suffix}"));
         fs::create_dir(&root).unwrap();
         provision(&root).unwrap();
         let state = root.join("publisher");

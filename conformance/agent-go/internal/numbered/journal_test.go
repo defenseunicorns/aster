@@ -63,7 +63,11 @@ func TestJournalRejectsSymlinksAndPublicFiles(t *testing.T) {
 }
 
 func TestInitializeRetainedDirectoryAndSyncFailure(t *testing.T) {
-	root := t.TempDir()
+	// Resolve the fixture root only; journal paths must still reject symlinks.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	parent := filepath.Join(root, "parent")
 	if err := os.Mkdir(parent, 0700); err != nil {
 		t.Fatal(err)
@@ -117,7 +121,11 @@ func TestInitializeRetainedDirectoryAndSyncFailure(t *testing.T) {
 }
 
 func TestInitializeSyncAfterParentRename(t *testing.T) {
-	root := t.TempDir()
+	// Resolve the fixture root only; journal paths must still reject symlinks.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	parent := filepath.Join(root, "parent")
 	if err := os.Mkdir(parent, 0700); err != nil {
 		t.Fatal(err)

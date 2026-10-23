@@ -125,7 +125,11 @@ mod tests {
     fn creation_uses_retained_parent_after_path_replacement() {
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).unwrap();
-        let root = std::env::temp_dir().join(format!("aster-journal-directory-{nonce:x?}"));
+        // Resolve the test environment only; journal paths must still reject symlinks.
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temporary directory")
+            .join(format!("aster-journal-directory-{nonce:x?}"));
         std::fs::create_dir(&root).unwrap();
         let parent = root.join("parent");
         std::fs::create_dir(&parent).unwrap();
