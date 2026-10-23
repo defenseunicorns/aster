@@ -16080,6 +16080,12 @@ impl BlobMaintenanceTestGate {
 }
 
 #[cfg(all(test, unix))]
+struct InboundAdmissionTestGate {
+    launched: oneshot::Sender<AbortHandle>,
+    release: oneshot::Receiver<()>,
+}
+
+#[cfg(all(test, unix))]
 struct RunNodeActorTestControl {
     allow_legacy_publication_fixture: bool,
     event_operation_audit: Option<EventOperationAuditTestControl>,
@@ -16092,6 +16098,7 @@ struct RunNodeActorTestControl {
     event_group_execution_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     outbound_contact: Option<ActorOutboundContactTestHook>,
     contact_lifecycle: Option<ActorContactLifecycleTestHook>,
+    inbound_admission_gate: Option<InboundAdmissionTestGate>,
     initial_peer_contact_activity: Vec<(EndpointId, Instant)>,
 }
 
@@ -17071,6 +17078,7 @@ async fn run_node_actor_inner(
         blob_final_read_gate,
         outbound_contact_test_hook,
         contact_lifecycle_test_hook,
+        mut inbound_admission_gate,
         initial_peer_contact_activity,
         mut event_group_execution_gate,
         mut event_operation_audit_control,
@@ -17084,6 +17092,7 @@ async fn run_node_actor_inner(
             control.blob_final_read_gate,
             control.outbound_contact,
             control.contact_lifecycle,
+            control.inbound_admission_gate,
             control.initial_peer_contact_activity,
             control.event_group_execution_gate,
             control.event_operation_audit,
@@ -17093,6 +17102,7 @@ async fn run_node_actor_inner(
             None,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -18072,140 +18082,10 @@ async fn run_node_actor_inner(
                     tokio::task::yield_now().await;
                 }
             }
-            accepted = accepted_receiver.recv(), if accept_task.is_some() && inbound.len() < MAX_INBOUND_CONTACTS => {
-                control_yield_required = false;
-                discovery_yield_required = false;
-                application_tick_yield_required = false;
-                let yield_for_network =
-                    account_network_event(&mut network_events_since_application);
-                match accepted {
-                    Some(Ok(connection)) => {
-                        let peer = connection.remote_id();
-                        if peer_contact_activity.contains_key(&peer)
-                            || automatic_candidates.contains(&peer)
-                        {
-                            peer_contact_activity.insert(peer, Instant::now());
-                        }
-                        if inbound_peers.contains(&peer) {
-                            connection.close();
-                            receipt.contact_errors += 1;
-                            node_stderr!("CONTACT direction=in carrier_peer={peer} status=error error=duplicate_concurrent_carrier_contact");
-                            if yield_for_network {
-                                tokio::task::yield_now().await;
-                            }
-                            continue;
-                        }
-                        if let Some((task, abort)) = outbound_abort_handles
-                            .get(&peer)
-                            .map(|(task, abort)| (*task, abort.clone()))
-                        {
-                            match inbound_contact_collision(local_id, peer) {
-                                InboundContactCollision::KeepPreferredOutbound => {
-                                    connection.close();
-                                    println!("CONTACT direction=in carrier_peer={peer} status=collision-resolved resolution=keep-preferred-outbound");
-                                    if yield_for_network {
-                                        tokio::task::yield_now().await;
-                                    }
-                                    continue;
-                                }
-                                InboundContactCollision::YieldFallbackOutbound => {
-                                    collision_aborted_outbound.insert(task);
-                                    abort.abort();
-                                    println!("CONTACT direction=out carrier_peer={peer} status=collision-resolved resolution=yield-fallback-to-preferred-inbound");
-                                }
-                            }
-                        }
-                        let inserted = inbound_peers.insert(peer);
-                        debug_assert!(inserted, "duplicate inbound peer was rejected above");
-                        let store = store.clone();
-                        let policy_lock = policy_lock.clone();
-                        let emission_policy = emission_policy.clone();
-                        let custody_clock = custody_clock.clone();
-                        let event_route_cache = event_route_cache.clone();
-                        let event_bridge = event_bridge.clone();
-                        let mission = config.mission.clone();
-                        let mutable_interests = config.mutable_interests.clone();
-                        let expected_peer = peer_missions
-                            .get(&peer)
-                            .copied()
-                            .map(|mission| MissionPeerBinding::new(peer, mission));
-                        #[cfg(feature = "nearby-discovery")]
-                        debug_assert!(automatic_nearby || expected_peer.is_some());
-                        #[cfg(not(feature = "nearby-discovery"))]
-                        debug_assert!(expected_peer.is_some());
-                        #[cfg(feature = "nearby-discovery")]
-                        let automatic_admission = automatic_admission.clone();
-                        #[cfg(all(test, unix))]
-                        let contact_lifecycle_test_hook = contact_lifecycle_test_hook.clone();
-                        let event_inserted = Arc::new(AtomicBool::new(false));
-                        let task_event_inserted = event_inserted.clone();
-                        let task = inbound.spawn(inherit_node_output(CONTACT_EVENT_INSERTED.scope(
-                            task_event_inserted,
-                            async move {
-                                #[cfg(all(test, unix))]
-                                if let Some(hook) = contact_lifecycle_test_hook
-                                    && hook.handles(ActorContactDirection::Inbound, peer)
-                                {
-                                    let mission_peer = expected_peer
-                                        .expect("configured lifecycle-test inbound peer")
-                                        .mission_id();
-                                    return (
-                                        peer,
-                                        hook.contact(
-                                            ActorContactDirection::Inbound,
-                                            peer,
-                                            mission_peer,
-                                            &store,
-                                        )
-                                        .await,
-                                    );
-                                }
-                                (
-                                    peer,
-                                    serve_connection_with_forwarding(InboundContact {
-                                        store,
-                                        connection,
-                                        mission,
-                                        expected_peer,
-                                        #[cfg(feature = "nearby-discovery")]
-                                        automatic_admission,
-                                        policy_lock,
-                                        emission_policy,
-                                        custody_clock,
-                                        event_route_cache,
-                                        event_bridge,
-                                        mutable_interests,
-                                    })
-                                    .await,
-                                )
-                            },
-                        )));
-                        inbound_tasks.insert(
-                            task.id(),
-                            ContactTaskMetadata::inbound(peer, event_inserted),
-                        );
-                        #[cfg(test)]
-                        contact_activity.launched();
-                    }
-                    Some(Err(error)) => {
-                        receipt.contact_errors += 1;
-                        node_stderr!("CONTACT direction=in status=error error={}", format_receipt_field(&error.to_string()));
-                    }
-                    None => {
-                        // Disable this select arm permanently. A closed channel
-                        // is immediately ready and would otherwise hot-spin and
-                        // log-flood until shutdown.
-                        if let Some(task) = accept_task.take() {
-                            let _ = task.await;
-                        }
-                        receipt.contact_errors += 1;
-                        node_stderr!("CONTACT direction=in status=error error=accept_task_stopped");
-                    }
-                }
-                if yield_for_network {
-                    tokio::task::yield_now().await;
-                }
-            }
+            // Retire completed inbound ownership before admitting another
+            // connection. The peer can reconnect after the completion close,
+            // before this actor has harvested its task. Accept-first ordering
+            // in this biased select misclassifies that reconnect as concurrent.
             completed = inbound.join_next_with_id(), if !inbound.is_empty() => {
                 control_yield_required = false;
                 discovery_yield_required = false;
@@ -18367,6 +18247,152 @@ async fn run_node_actor_inner(
                     Err(error) => {
                         fatal_error = Some(error);
                         break;
+                    }
+                }
+                if yield_for_network {
+                    tokio::task::yield_now().await;
+                }
+            }
+            accepted = accepted_receiver.recv(), if accept_task.is_some() && inbound.len() < MAX_INBOUND_CONTACTS => {
+                control_yield_required = false;
+                discovery_yield_required = false;
+                application_tick_yield_required = false;
+                let yield_for_network =
+                    account_network_event(&mut network_events_since_application);
+                match accepted {
+                    Some(Ok(connection)) => {
+                        let peer = connection.remote_id();
+                        if peer_contact_activity.contains_key(&peer)
+                            || automatic_candidates.contains(&peer)
+                        {
+                            peer_contact_activity.insert(peer, Instant::now());
+                        }
+                        if inbound_peers.contains(&peer) {
+                            connection.close();
+                            receipt.contact_errors += 1;
+                            node_stderr!("CONTACT direction=in carrier_peer={peer} status=error error=duplicate_concurrent_carrier_contact");
+                            if yield_for_network {
+                                tokio::task::yield_now().await;
+                            }
+                            continue;
+                        }
+                        if let Some((task, abort)) = outbound_abort_handles
+                            .get(&peer)
+                            .map(|(task, abort)| (*task, abort.clone()))
+                        {
+                            match inbound_contact_collision(local_id, peer) {
+                                InboundContactCollision::KeepPreferredOutbound => {
+                                    connection.close();
+                                    println!("CONTACT direction=in carrier_peer={peer} status=collision-resolved resolution=keep-preferred-outbound");
+                                    if yield_for_network {
+                                        tokio::task::yield_now().await;
+                                    }
+                                    continue;
+                                }
+                                InboundContactCollision::YieldFallbackOutbound => {
+                                    collision_aborted_outbound.insert(task);
+                                    abort.abort();
+                                    println!("CONTACT direction=out carrier_peer={peer} status=collision-resolved resolution=yield-fallback-to-preferred-inbound");
+                                }
+                            }
+                        }
+                        let inserted = inbound_peers.insert(peer);
+                        debug_assert!(inserted, "duplicate inbound peer was rejected above");
+                        let store = store.clone();
+                        let policy_lock = policy_lock.clone();
+                        let emission_policy = emission_policy.clone();
+                        let custody_clock = custody_clock.clone();
+                        let event_route_cache = event_route_cache.clone();
+                        let event_bridge = event_bridge.clone();
+                        let mission = config.mission.clone();
+                        let mutable_interests = config.mutable_interests.clone();
+                        let expected_peer = peer_missions
+                            .get(&peer)
+                            .copied()
+                            .map(|mission| MissionPeerBinding::new(peer, mission));
+                        #[cfg(feature = "nearby-discovery")]
+                        debug_assert!(automatic_nearby || expected_peer.is_some());
+                        #[cfg(not(feature = "nearby-discovery"))]
+                        debug_assert!(expected_peer.is_some());
+                        #[cfg(feature = "nearby-discovery")]
+                        let automatic_admission = automatic_admission.clone();
+                        #[cfg(all(test, unix))]
+                        let contact_lifecycle_test_hook = contact_lifecycle_test_hook.clone();
+                        let event_inserted = Arc::new(AtomicBool::new(false));
+                        let task_event_inserted = event_inserted.clone();
+                        let task = inbound.spawn(inherit_node_output(CONTACT_EVENT_INSERTED.scope(
+                            task_event_inserted,
+                            async move {
+                                #[cfg(all(test, unix))]
+                                if let Some(hook) = contact_lifecycle_test_hook
+                                    && hook.handles(ActorContactDirection::Inbound, peer)
+                                {
+                                    let mission_peer = expected_peer
+                                        .expect("configured lifecycle-test inbound peer")
+                                        .mission_id();
+                                    return (
+                                        peer,
+                                        hook.contact(
+                                            ActorContactDirection::Inbound,
+                                            peer,
+                                            mission_peer,
+                                            &store,
+                                        )
+                                        .await,
+                                    );
+                                }
+                                (
+                                    peer,
+                                    serve_connection_with_forwarding(InboundContact {
+                                        store,
+                                        connection,
+                                        mission,
+                                        expected_peer,
+                                        #[cfg(feature = "nearby-discovery")]
+                                        automatic_admission,
+                                        policy_lock,
+                                        emission_policy,
+                                        custody_clock,
+                                        event_route_cache,
+                                        event_bridge,
+                                        mutable_interests,
+                                    })
+                                    .await,
+                                )
+                            },
+                        )));
+                        inbound_tasks.insert(
+                            task.id(),
+                            ContactTaskMetadata::inbound(peer, event_inserted),
+                        );
+                        #[cfg(test)]
+                        contact_activity.launched();
+                        #[cfg(all(test, unix))]
+                        if let Some(gate) = inbound_admission_gate.take() {
+                            let _ = gate.launched.send(task);
+                            gate.release.await.expect("release inbound admission gate");
+                            // The acceptor is independent of this paused actor.
+                            // Wait for its bounded queue, not a scheduling delay.
+                            timeout(Duration::from_secs(5), async {
+                                while accepted_receiver.is_empty() {
+                                    tokio::task::yield_now().await;
+                                }
+                            }).await.expect("queued reconnect deadline");
+                        }
+                    }
+                    Some(Err(error)) => {
+                        receipt.contact_errors += 1;
+                        node_stderr!("CONTACT direction=in status=error error={}", format_receipt_field(&error.to_string()));
+                    }
+                    None => {
+                        // Disable this select arm permanently. A closed channel
+                        // is immediately ready and would otherwise hot-spin and
+                        // log-flood until shutdown.
+                        if let Some(task) = accept_task.take() {
+                            let _ = task.await;
+                        }
+                        receipt.contact_errors += 1;
+                        node_stderr!("CONTACT direction=in status=error error=accept_task_stopped");
                     }
                 }
                 if yield_for_network {
@@ -32163,6 +32189,7 @@ mod tests {
                     event_group_execution_gate: None,
                     outbound_contact: None,
                     contact_lifecycle: None,
+                    inbound_admission_gate: None,
                     initial_peer_contact_activity: Vec::new(),
                 }),
             },
@@ -32380,6 +32407,7 @@ mod tests {
                     event_group_execution_gate: None,
                     outbound_contact: None,
                     contact_lifecycle: None,
+                    inbound_admission_gate: None,
                     initial_peer_contact_activity: Vec::new(),
                 }),
             },
@@ -32489,6 +32517,7 @@ mod tests {
                     event_group_execution_gate: None,
                     outbound_contact: None,
                     contact_lifecycle: None,
+                    inbound_admission_gate: None,
                     initial_peer_contact_activity: Vec::new(),
                 }),
             },
@@ -36542,6 +36571,253 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn inbound_reconnect_harvests_completed_contact_before_admission() {
+        run_inbound_admission_case(InboundAdmissionPriorContact::Completed).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inbound_reconnect_preserves_prior_contact_failure() {
+        run_inbound_admission_case(InboundAdmissionPriorContact::Failed).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inbound_reconnect_rejects_genuinely_active_contact() {
+        run_inbound_admission_case(InboundAdmissionPriorContact::Active).await;
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum InboundAdmissionPriorContact {
+        Completed,
+        Failed,
+        Active,
+    }
+
+    #[cfg(unix)]
+    async fn run_inbound_admission_case(prior: InboundAdmissionPriorContact) {
+        // Pause only the actor: the real inbound task and independent acceptor
+        // keep running. Resume with BOTH a completed task and a queued reconnect.
+        // No interval or timing sleep determines the select ordering under test.
+        let state = root(&format!("inbound-reconnect-admission-{prior:?}"));
+        fs::create_dir_all(&state).unwrap();
+        let server_id = NodeIdentity::load_or_create(&state).unwrap().id();
+        let client_state = root(&format!("inbound-reconnect-client-{prior:?}"));
+        fs::create_dir_all(&client_state).unwrap();
+        let mut missions = issue_missions(2);
+        let server_mission = missions.remove(0);
+        let client_mission = missions.remove(0);
+        let client = Endpoint::bind(
+            aster_iroh::SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+        let client_store = Arc::new(
+            Store::open_for_mission(
+                client_state.join(STORE_FILE),
+                client_mission.credentials.mission_authority_id(),
+            )
+            .unwrap(),
+        );
+        let (application_sender, application_receiver) =
+            mpsc::channel(APPLICATION_COMMAND_CAPACITY);
+        let admission = Arc::new(AtomicBool::new(true));
+        let events = SelectedEventHandle::new(
+            application_sender,
+            admission.clone(),
+            server_mission.identity,
+            server_mission.credentials.mission_authority_id(),
+        );
+        let (_control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
+        let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let (before_loop_ready, before_loop_reached) = oneshot::channel();
+        let (before_loop_release, release_loop) = oneshot::channel();
+        let (zeroization_queued, _zeroization_observer) = oneshot::channel();
+        let (launched, first_launched) = oneshot::channel();
+        let (release, resume) = oneshot::channel();
+        let forwarding = SelectedForwardingConfig::default()
+            .with_emission_policy(EventEmissionPolicy::ReceiveOnly);
+        let actor = tokio::spawn(run_node_actor_inner(
+            NodeConfig {
+                state: state.clone(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                mission: server_mission.credentials,
+                peers: vec![MissionExpectedPeer {
+                    carrier: ExpectedPeer {
+                        id: client.id(),
+                        address: loopback(&client),
+                    },
+                    mission: client_mission.identity,
+                }],
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            forwarding,
+            Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
+            NodeActorChannels {
+                handle_sigint: false,
+                application_receiver,
+                application_admission: admission,
+                control_receiver,
+                shutdown_receiver,
+                ready: ready_sender,
+                contact_activity: Arc::new(ContactActivityProbe::default()),
+                test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
+                    event_operation_audit: None,
+                    before_loop_ready,
+                    before_loop_release: release_loop,
+                    zeroization_queued,
+                    blob_worker_fatal_on_shutdown: false,
+                    blob_maintenance_gate: None,
+                    blob_final_read_gate: None,
+                    event_group_execution_gate: None,
+                    outbound_contact: None,
+                    contact_lifecycle: None,
+                    inbound_admission_gate: Some(InboundAdmissionTestGate {
+                        launched,
+                        release: resume,
+                    }),
+                    initial_peer_contact_activity: Vec::new(),
+                }),
+            },
+        ));
+        let ready = timeout(Duration::from_secs(10), ready_receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        before_loop_reached.await.unwrap();
+        before_loop_release.send(()).unwrap();
+        let peer = MissionExpectedPeer {
+            carrier: ExpectedPeer {
+                id: server_id,
+                address: ready
+                    .bound_sockets
+                    .iter()
+                    .copied()
+                    .find(SocketAddr::is_ipv4)
+                    .unwrap(),
+            },
+            mission: server_mission.identity,
+        };
+        let first = if prior == InboundAdmissionPriorContact::Completed {
+            Some(tokio::spawn({
+                let client = client.clone();
+                let store = client_store.clone();
+                let mission = client_mission.credentials.clone();
+                async move { sync_once(store, &client, mission, peer).await }
+            }))
+        } else {
+            None
+        };
+        let unfinished = if first.is_none() {
+            Some(client.connect(peer.carrier).await.unwrap())
+        } else {
+            None
+        };
+        let first_task = timeout(Duration::from_secs(5), first_launched)
+            .await
+            .unwrap()
+            .unwrap();
+        if let Some(first) = first {
+            timeout(Duration::from_secs(10), first)
+                .await
+                .unwrap()
+                .unwrap()
+                .expect("first authenticated contact");
+        }
+        if prior == InboundAdmissionPriorContact::Failed {
+            unfinished.as_ref().unwrap().close();
+        }
+        if prior != InboundAdmissionPriorContact::Active {
+            timeout(Duration::from_secs(5), async {
+                while !first_task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("first inbound task completed while actor paused");
+        } else {
+            assert!(!first_task.is_finished(), "first handshake still pending");
+        }
+        let second = tokio::spawn({
+            let client = client.clone();
+            let store = client_store.clone();
+            async move { sync_once(store, &client, client_mission.credentials, peer).await }
+        });
+        release.send(()).unwrap();
+        let second_result = timeout(Duration::from_secs(10), second)
+            .await
+            .unwrap()
+            .unwrap();
+        let status = events.status().await.unwrap();
+        if prior == InboundAdmissionPriorContact::Active {
+            assert!(
+                !first_task.is_finished(),
+                "duplicate did not replace active ownership"
+            );
+            unfinished.as_ref().unwrap().close();
+            timeout(Duration::from_secs(5), async {
+                while !first_task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("failed handshake completion");
+            // A status command runs after terminal bookkeeping in the actor.
+            assert_eq!(events.status().await.unwrap().failed_contact_attempts, 2);
+        }
+        shutdown_sender.send(()).await.unwrap();
+        let receipt = timeout(Duration::from_secs(10), actor)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        client.close().await;
+        drop(client_store);
+        fs::remove_dir_all(state).unwrap();
+        fs::remove_dir_all(client_state).unwrap();
+        match prior {
+            InboundAdmissionPriorContact::Completed => {
+                assert_eq!(
+                    status.failed_contact_attempts, 0,
+                    "completed contact is not concurrent"
+                );
+                second_result.expect("queued authenticated reconnect succeeds");
+                assert_eq!(receipt.contact_errors, 0);
+                assert_eq!(receipt.contacts, 2);
+            }
+            InboundAdmissionPriorContact::Failed => {
+                assert_eq!(
+                    status.failed_contact_attempts, 1,
+                    "retain genuine handshake failure"
+                );
+                second_result.expect("reconnect after failed contact succeeds");
+                assert_eq!(receipt.contact_errors, 1);
+                assert_eq!(receipt.contacts, 1);
+            }
+            InboundAdmissionPriorContact::Active => {
+                assert_eq!(
+                    status.failed_contact_attempts, 1,
+                    "count genuine duplicate rejection"
+                );
+                assert!(
+                    second_result.is_err(),
+                    "concurrent contact must not be admitted"
+                );
+                assert_eq!(receipt.contact_errors, 2);
+                assert_eq!(receipt.contacts, 0);
+            }
+        }
+    }
+
+    #[cfg(unix)]
     async fn run_event_insertion_actor_terminal_case(
         direction: ActorContactDirection,
         scenario: ActorContactTerminalScenario,
@@ -36652,6 +36928,7 @@ mod tests {
                     event_group_execution_gate: None,
                     outbound_contact: None,
                     contact_lifecycle: Some(lifecycle),
+                    inbound_admission_gate: None,
                     initial_peer_contact_activity: vec![
                         (carrying_peer, old_activity),
                         (eligible_peer, old_activity),
@@ -36891,6 +37168,7 @@ mod tests {
                     event_group_execution_gate: None,
                     outbound_contact: Some(contact_hook),
                     contact_lifecycle: None,
+                    inbound_admission_gate: None,
                     initial_peer_contact_activity: vec![(peer_id, initial_activity)],
                 }),
             },
@@ -39870,6 +40148,7 @@ mod tests {
                     blob_final_read_gate: None,
                     outbound_contact: None,
                     contact_lifecycle: None,
+                    inbound_admission_gate: None,
                     initial_peer_contact_activity: Vec::new(),
                     event_group_execution_gate: None,
                 }),
@@ -40018,6 +40297,7 @@ mod tests {
                     event_operation_audit: None,
                     outbound_contact: None,
                     contact_lifecycle: None,
+                    inbound_admission_gate: None,
                     initial_peer_contact_activity: Vec::new(),
                 }),
             },
@@ -40541,6 +40821,7 @@ mod tests {
                     event_group_execution_gate: None,
                     outbound_contact: None,
                     contact_lifecycle: None,
+                    inbound_admission_gate: None,
                     initial_peer_contact_activity: Vec::new(),
                 }),
             },
@@ -40703,6 +40984,7 @@ mod tests {
                     )),
                     outbound_contact: None,
                     contact_lifecycle: None,
+                    inbound_admission_gate: None,
                     initial_peer_contact_activity: Vec::new(),
                 }),
             },
@@ -40863,6 +41145,7 @@ mod tests {
                     )),
                     outbound_contact: None,
                     contact_lifecycle: None,
+                    inbound_admission_gate: None,
                     initial_peer_contact_activity: Vec::new(),
                 }),
             },
@@ -42321,6 +42604,7 @@ mod tests {
                     event_operation_audit: Some(audit_control),
                     outbound_contact: None,
                     contact_lifecycle: None,
+                    inbound_admission_gate: None,
                     initial_peer_contact_activity: Vec::new(),
                 }),
             },
@@ -46555,6 +46839,7 @@ mod tests {
                     event_operation_audit: None,
                     outbound_contact: None,
                     contact_lifecycle: None,
+                    inbound_admission_gate: None,
                     initial_peer_contact_activity: Vec::new(),
                 }),
             },

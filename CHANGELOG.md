@@ -45,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Fixed reconnects being rejected while completed contacts awaited cleanup.
 - Removed `MeshService` and updated tests.
 - Restored runtime-volume diagnostics using Aster/Iroh.
 
