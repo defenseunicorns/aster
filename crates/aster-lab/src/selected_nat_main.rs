@@ -403,8 +403,9 @@ fn prepare(options: &Options) -> Result<()> {
             Some(_) => {}
             None => mission_authority = Some(selected.mission_authority()),
         }
-        let mut journal = numbered::Journal::open(
-            &descriptor_child_path(&state_directory, "publication.redb")?,
+        let mut journal = numbered::Journal::open_at(
+            &state_directory,
+            Path::new("publication.redb"),
             publication_client(name).as_bytes(),
         )?;
         journal.recover_stopped(&mut selected)?;
@@ -617,8 +618,9 @@ fn verify(options: &Options) -> Result<()> {
             "receiver mission authority does not match manifest",
         ));
     }
-    let mut journal = numbered::Journal::open(
-        &descriptor_child_path(&state_directory, "publication.redb")?,
+    let mut journal = numbered::Journal::open_at(
+        &state_directory,
+        Path::new("publication.redb"),
         publication_client(name).as_bytes(),
     )?;
     journal.recover_stopped(&mut selected)?;
