@@ -520,11 +520,14 @@ fn audit_expected_upload_pack(
         && projected.pack_len() == PACK_HEADER_LEN
         && projected.frontier().ciphertext_commitment()
             == frontier.checkpoint().ciphertext_commitment();
+    // Bytes after the store-authoritative checkpoint are an unacknowledged
+    // append, which may have torn anywhere in its record. Resume truncates
+    // that tail; even a read-only audit must not give it durable authority.
     while data
         .stream_position()
         .map_err(BlobStoreError::Io)
         .map_err(blob_error)?
-        < data_len
+        < projected.pack_len()
     {
         let mut length = [0; 4];
         data.read_exact(&mut length)
@@ -657,9 +660,57 @@ fn audit_upload_packs(
     }) {
         let directory = pack_root.open_child_directory(&name, false)?;
         let Some(marker) = directory.read_private_file_if_present(UPLOAD_MARKER, 80)? else {
-            return Err(blob_error(BlobStoreError::DepotIntegrity(
-                "Blob upload pack marker is missing",
-            )));
+            // mkdir precedes the initial marker; cleanup unlinks the marker
+            // before rmdir. Only an empty directory and exact external
+            // transition authority can identify either interrupted operation.
+            let durable = expected
+                .iter()
+                .find(|expected| name == hex32(expected.identity.upload_id.as_bytes()));
+            let transition = cleanup
+                .values()
+                .chain(reservations.values())
+                .find(|identity| name == hex32(identity.upload_id.as_bytes()));
+            let identity = transition
+                .copied()
+                .or_else(|| {
+                    durable
+                        .filter(|pack| pack.may_be_absent)
+                        .map(|pack| pack.identity)
+                })
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::DepotIntegrity(
+                        "Blob upload pack marker is missing",
+                    ))
+                })?;
+            let cleaning = cleanup.get(identity.upload_id.as_bytes()) == Some(&identity);
+            let reserving = reservations.get(identity.upload_id.as_bytes()) == Some(&identity);
+            if !directory.entry_names()?.is_empty()
+                || durable.is_some_and(|pack| pack.identity != identity)
+                || cleanup
+                    .get(identity.upload_id.as_bytes())
+                    .is_some_and(|marker| marker != &identity)
+                || reservations
+                    .get(identity.upload_id.as_bytes())
+                    .is_some_and(|marker| marker != &identity)
+                || !(cleaning
+                    || (reserving && durable.is_none())
+                    || durable.is_some_and(|pack| pack.may_be_absent))
+            {
+                return Err(blob_error(BlobStoreError::DepotIntegrity(
+                    "markerless Blob upload directory lacks exact transition authority",
+                )));
+            }
+            if recover {
+                drop(directory);
+                remove_upload_pack_directory(&pack_root, &identity)?;
+            }
+            if durable.is_some() {
+                seen.insert(*identity.upload_id.as_bytes());
+                if cleaning {
+                    completed.push(identity);
+                }
+            }
+            continue;
         };
         let identity = decode_upload_marker(&marker).map_err(pack_marker_store_error)?;
         if name != hex32(identity.upload_id.as_bytes()) {

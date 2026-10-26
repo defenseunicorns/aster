@@ -4391,6 +4391,315 @@ mod tests {
     }
 
     #[test]
+    fn upload_reopen_discards_torn_unprojected_pack_tails() {
+        // Audit must stop at durable progress; the next append may have torn at
+        // either its length prefix or ciphertext, before any new checkpoint.
+        for projected in [false, true] {
+            for tail in [&[0][..], &[0, 0, 0][..], &[0, 0, 0, 64, 1, 2][..]] {
+                let fixture = fixture("torn-pack-tail", 0x61, BlobDepotLimits::DEFAULT);
+                let request = request(&fixture, b"torn-pack-tail", 2_097_152);
+                let policy = fixture.store.control_policy_snapshot().expect("policy");
+                let (reservation, initial) = fixture
+                    .store
+                    .reserve_blob_upload_with_policy(&policy, &request)
+                    .expect("reserve");
+                let identity = reservation.pack_identity();
+                let root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
+                let checkpoint = if projected {
+                    let mut writer =
+                        BlobPackWriter::open_projected_upload_pinned(&root, &identity, None)
+                            .expect("initial writer");
+                    let sealer = BlobStreamSegmentSealer::from_test_key(
+                        *identity.upload_id().as_bytes(),
+                        *identity.request_digest(),
+                        reservation.content_epoch(),
+                        [0x91; 32],
+                        [0x92; 12],
+                    );
+                    let (segment, leaves) = sealer
+                        .seal(
+                            BlobStreamPlainPartition::new(
+                                *identity.upload_id().as_bytes(),
+                                *identity.request_digest(),
+                                reservation.content_epoch(),
+                                0,
+                                0,
+                                request.total_len,
+                                vec![0x5a; aster_mesh::BLOB_STREAM_SEGMENT_BYTES],
+                            )
+                            .expect("first full partition"),
+                        )
+                        .expect("seal first segment");
+                    writer
+                        .append(&segment, leaves)
+                        .expect("append first segment");
+                    let durable = writer.checkpoint().expect("sync first segment");
+                    fixture
+                        .store
+                        .checkpoint_blob_upload(&policy, &reservation, initial, durable)
+                        .expect("project first segment")
+                } else {
+                    initial
+                };
+                let pack_path = root.test_upload_path(&identity);
+                let data_path = pack_path.join("segments.pack");
+                let prefix = fs::read(&data_path).expect("committed prefix");
+                let mut data = OpenOptions::new()
+                    .append(true)
+                    .open(&data_path)
+                    .expect("pack");
+                data.write_all(tail).expect("torn append");
+                data.sync_all().expect("sync torn tail");
+                drop(data);
+                drop(root);
+                let authority = fixture.publisher.mission_authority_id();
+                drop(fixture.store);
+                let before = upload_artifact_snapshot(&pack_path);
+                Store::inspect_existing(fixture.root.database())
+                    .expect("read-only audit ignores unprojected torn tail");
+                assert_eq!(upload_artifact_snapshot(&pack_path), before);
+                let reopened = Store::open_for_mission(fixture.root.database(), authority)
+                    .expect("torn unprojected append cannot prevent reopen");
+                let (resumed, exact) = reopened
+                    .resume_blob_upload(&request.owner)
+                    .expect("resume")
+                    .expect("durable upload remains");
+                assert_eq!(
+                    exact, checkpoint,
+                    "tail cannot invent acknowledged progress"
+                );
+                let root = PinnedBlobPackRoot::open(&reopened).expect("reopened root");
+                let writer = BlobPackWriter::open_projected_upload_pinned(
+                    &root,
+                    &resumed.pack_identity(),
+                    exact.durable_pack_checkpoint(),
+                )
+                .expect("resume truncates only unprojected tail");
+                assert_eq!(
+                    writer.plaintext_offset(),
+                    checkpoint.durable_plaintext_offset()
+                );
+                assert_eq!(fs::read(data_path).expect("resumed pack"), prefix);
+            }
+        }
+    }
+
+    fn empty_upload_pack_directory(path: &Path) {
+        for entry in fs::read_dir(path).expect("pack entries") {
+            fs::remove_file(entry.expect("entry").path()).expect("unlink pack artifact");
+        }
+        fs::File::open(path)
+            .expect("directory")
+            .sync_all()
+            .expect("sync empty directory");
+    }
+
+    #[test]
+    fn upload_reopen_recovers_empty_cleanup_directory() {
+        let fixture = fixture("empty-cleanup-directory", 0x62, BlobDepotLimits::DEFAULT);
+        let request = request(&fixture, b"empty-cleanup-directory", 1_024);
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        let (reservation, _) = fixture
+            .store
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .expect("reserve");
+        let root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
+        let identity = reservation.pack_identity();
+        let pack_path = root.test_upload_path(&identity);
+        super::super::pack::stage_upload_pack_cleanup(&root, &identity)
+            .expect("durable abort cleanup intent");
+        // Crash after the last synced unlink, before rmdir/row removal.
+        empty_upload_pack_directory(&pack_path);
+        drop(root);
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        let before = upload_pack_tree_snapshot(&fixture.root);
+        Store::inspect_existing(fixture.root.database()).expect("inspect cleanup gap");
+        assert_eq!(upload_pack_tree_snapshot(&fixture.root), before);
+        let reopened = Store::open_for_mission(fixture.root.database(), authority)
+            .expect("exact cleanup intent recovers empty directory");
+        assert!(!pack_path.exists());
+        assert!(
+            reopened
+                .resume_blob_upload(&request.owner)
+                .expect("resume")
+                .is_none()
+        );
+        assert_eq!(
+            cleanup_marker_count(&upload_pack_root_snapshot(&fixture.root)),
+            0
+        );
+        reopened
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .expect("same operation can reserve a fresh pack after completed abort");
+    }
+
+    #[test]
+    fn upload_reopen_recovers_empty_reservation_directory() {
+        let fixture = fixture(
+            "empty-reservation-directory",
+            0x63,
+            BlobDepotLimits::DEFAULT,
+        );
+        let request = request(&fixture, b"empty-reservation-directory", 1_024);
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        inject_test_fault(&fixture.store, UploadFaultPoint::ReservationPackSynced);
+        fixture
+            .store
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .expect_err("crash before upload row commits");
+        let digest = request_digest_for(&request).expect("request digest");
+        let identity = BlobPackIdentity::new(
+            upload_id_for(&request.owner, digest).expect("upload ID"),
+            digest,
+            request.total_len,
+        );
+        let root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
+        let pack_path = root.test_upload_path(&identity);
+        // Same physical state as a crash after mkdir and before marker install.
+        empty_upload_pack_directory(&pack_path);
+        drop(root);
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        let before = upload_pack_tree_snapshot(&fixture.root);
+        Store::inspect_existing(fixture.root.database()).expect("inspect reservation gap");
+        assert_eq!(upload_pack_tree_snapshot(&fixture.root), before);
+        let reopened = Store::open_for_mission(fixture.root.database(), authority)
+            .expect("exact reservation intent recovers empty directory");
+        assert!(!pack_path.exists());
+        let (reservation, _) = reopened
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .expect("reservation retry succeeds");
+        assert_eq!(reservation.pack_identity(), identity);
+    }
+
+    #[test]
+    fn upload_reopen_accepts_empty_lifecycle_deletion_directory() {
+        let fixture = fixture("empty-lifecycle-directory", 0x65, BlobDepotLimits::DEFAULT);
+        let request = request(&fixture, b"empty-lifecycle-directory", 1_024);
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        let (reservation, initial, open) = reserve_profile5(&fixture, &request);
+        let completed =
+            complete_profile5_pack(&fixture, &policy, &reservation, initial, &open, 0x5a);
+        let publication = profile5_publication(&fixture, &open, &completed);
+        let outcome = fixture
+            .store
+            .commit_profile5_publication_once_with_policy(
+                &policy,
+                &reservation,
+                &completed,
+                &publication,
+                publication.publication().final_custody(),
+            )
+            .expect("promote native pack");
+        let variant = outcome.blob().variant_id;
+        let budget = super::super::lifecycle::BlobMaintenanceBudget::new(256, 8, 32 * 1024 * 1024)
+            .expect("maintenance budget");
+        for turn in 0..64 {
+            fixture
+                .store
+                .run_blob_maintenance_turn_with_sample(
+                    budget,
+                    (turn == 0).then_some(CustodySample {
+                        clock_id: [0x31; 16],
+                        tick_ms: 100_100,
+                    }),
+                )
+                .expect("retire finite publication");
+            if matches!(
+                fixture
+                    .store
+                    .blob_for_owner_with_policy(&policy, &request.owner),
+                Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+            ) {
+                break;
+            }
+        }
+        fixture
+            .store
+            .test_admit_blob_deletion_manifest(variant)
+            .expect("admit native pack deletion");
+        let root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
+        let pack_path = root.test_upload_path(&reservation.pack_identity());
+        empty_upload_pack_directory(&pack_path);
+        drop(root);
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        let before = upload_pack_tree_snapshot(&fixture.root);
+        Store::inspect_existing(fixture.root.database()).expect("inspect lifecycle deletion gap");
+        assert_eq!(upload_pack_tree_snapshot(&fixture.root), before);
+        let reopened = Store::open_for_mission(fixture.root.database(), authority)
+            .expect("durable deletion manifest authorizes empty pack directory");
+        // Deletion keeps its exact durable evidence until maintenance finalizes.
+        let report = reopened
+            .run_blob_capacity_gc(budget, None)
+            .expect("finish physical deletion");
+        assert_eq!(report.manifests_finalized, 1);
+        assert!(!pack_path.exists());
+    }
+
+    #[test]
+    fn upload_reopen_rejects_unauthorized_markerless_directories() {
+        for damage in [
+            "no-authority",
+            "wrong-cleanup",
+            "wrong-reservation",
+            "foreign-file",
+            "live-reservation",
+        ] {
+            let fixture = fixture(damage, 0x64, BlobDepotLimits::DEFAULT);
+            let request = request(&fixture, damage.as_bytes(), 1_024);
+            let policy = fixture.store.control_policy_snapshot().expect("policy");
+            let (reservation, _) = fixture
+                .store
+                .reserve_blob_upload_with_policy(&policy, &request)
+                .expect("reserve");
+            let root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
+            let identity = reservation.pack_identity();
+            let pack_path = root.test_upload_path(&identity);
+            empty_upload_pack_directory(&pack_path);
+            match damage {
+                "no-authority" => {}
+                "wrong-cleanup" => {
+                    let wrong =
+                        BlobPackIdentity::new(identity.upload_id(), [0x99; 32], request.total_len);
+                    super::super::pack::stage_upload_pack_cleanup(&root, &wrong)
+                        .expect("wrong cleanup");
+                }
+                "wrong-reservation" => {
+                    let wrong =
+                        BlobPackIdentity::new(identity.upload_id(), [0x99; 32], request.total_len);
+                    super::super::pack::stage_upload_pack_reservation(&root, &wrong)
+                        .expect("wrong reservation");
+                }
+                "foreign-file" => {
+                    super::super::pack::stage_upload_pack_cleanup(&root, &identity)
+                        .expect("cleanup");
+                    fs::write(pack_path.join("foreign"), b"preserve").expect("foreign file");
+                }
+                "live-reservation" => {
+                    super::super::pack::stage_upload_pack_reservation(&root, &identity)
+                        .expect("reservation");
+                }
+                _ => unreachable!(),
+            }
+            drop(root);
+            let authority = fixture.publisher.mission_authority_id();
+            drop(fixture.store);
+            let before = upload_pack_tree_snapshot(&fixture.root);
+            assert!(
+                Store::inspect_existing(fixture.root.database()).is_err(),
+                "{damage}"
+            );
+            assert!(
+                Store::open_for_mission(fixture.root.database(), authority).is_err(),
+                "{damage}"
+            );
+            assert_eq!(upload_pack_tree_snapshot(&fixture.root), before, "{damage}");
+        }
+    }
+
+    #[test]
     fn upload_pack_audit_is_bidirectional_exact_and_non_mutating() {
         for damage in [
             "absent-directory",
