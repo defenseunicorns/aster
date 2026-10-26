@@ -20,7 +20,7 @@ use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use zeroize::Zeroizing;
 
 use super::blob::{
@@ -196,9 +196,28 @@ pub struct BlobPublishProgress {
     pub durable_offset: u64,
 }
 
+pub(crate) struct BlobPublishStreamSession {
+    cleanup: Arc<Notify>,
+}
+
+impl BlobPublishStreamSession {
+    pub(super) fn new(cleanup: Arc<Notify>) -> Self {
+        Self { cleanup }
+    }
+}
+
+impl Drop for BlobPublishStreamSession {
+    fn drop(&mut self) {
+        // A stored wake permit survives both a full command queue and the
+        // interval between the worker cleanup sweep and its next wait.
+        self.cleanup.notify_one();
+    }
+}
+
 pub struct SelectedBlobPublishStream {
     commands: mpsc::Sender<SelectedApplicationCommand>,
     token: [u8; 32],
+    session: Arc<BlobPublishStreamSession>,
     durable_offset: u64,
 }
 
@@ -207,10 +226,12 @@ impl SelectedBlobPublishStream {
         commands: mpsc::Sender<SelectedApplicationCommand>,
         token: [u8; 32],
         progress: BlobPublishProgress,
+        session: Arc<BlobPublishStreamSession>,
     ) -> Self {
         Self {
             commands,
             token,
+            session,
             durable_offset: progress.durable_offset,
         }
     }
@@ -234,6 +255,7 @@ impl SelectedBlobPublishStream {
             .send(SelectedApplicationCommand::Blob(
                 SelectedBlobCommand::AppendPublishStream {
                     token: self.token,
+                    session: Arc::clone(&self.session),
                     offset,
                     bytes,
                     response,
@@ -254,6 +276,7 @@ impl SelectedBlobPublishStream {
             .send(SelectedApplicationCommand::Blob(
                 SelectedBlobCommand::FinishPublishStream {
                     token: self.token,
+                    session: Arc::clone(&self.session),
                     response,
                 },
             ))

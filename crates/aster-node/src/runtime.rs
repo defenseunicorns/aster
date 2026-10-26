@@ -15764,12 +15764,11 @@ async fn run_selected_blob_worker(
     // before returning plaintext. The selected runtime makes no bounded-
     // latency claim for non-local/non-regular File providers; it never detaches
     // the worker or erases key-bearing state while that ownership remains live.
-    #[cfg(all(test, unix))]
     let runtime = tokio::runtime::Handle::current();
     let worker_admission = Arc::clone(&admission);
     let joined = tokio::task::spawn_blocking(move || {
         let mut application = application;
-        while let Some(command) = commands.blocking_recv() {
+        while let Some(command) = runtime.block_on(application.next_live_command(&mut commands)) {
             if !worker_admission.load(Ordering::Acquire) {
                 command.reject();
                 continue;

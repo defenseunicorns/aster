@@ -17,7 +17,7 @@ use std::{
     io::{Read, Seek, Write},
     path::Path,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
@@ -56,9 +56,10 @@ use tokio::sync::{mpsc, oneshot};
 use zeroize::{Zeroize as _, Zeroizing};
 
 use super::blob_stream::{
-    BlobPublishProgress, BlobPublishStreamRequest, LocalBlobPublishStream, OpenedBlobPublishStream,
-    SelectedBlobPublishStream, blob_pack_application_error, blob_stream_map_pool,
-    blob_stream_pipeline_error, sink_mapped_stream_partitions, take_zeroizing_bytes,
+    BlobPublishProgress, BlobPublishStreamRequest, BlobPublishStreamSession,
+    LocalBlobPublishStream, OpenedBlobPublishStream, SelectedBlobPublishStream,
+    blob_pack_application_error, blob_stream_map_pool, blob_stream_pipeline_error,
+    sink_mapped_stream_partitions, take_zeroizing_bytes,
 };
 use super::{
     ApplicationError, ApplicationErrorKind, SelectedApplicationCommand, actor_unavailable,
@@ -957,6 +958,11 @@ impl SelectedBlobHandle {
 
     /// Opens or resumes one bounded single-pass Blob publication stream.
     ///
+    /// Dropping the returned handle releases its runtime workers and discards
+    /// uncheckpointed bytes, while retaining the durable upload for exact resume.
+    /// Reopening the same operation replaces its prior live handle; writes and
+    /// finalization through that older handle are rejected.
+    ///
     /// `total_len == 0` is valid for semantic-v9/profile-5. Such a stream accepts
     /// no data writes and is finalized directly; a later read at offset zero
     /// returns the authenticated empty terminal page documented by
@@ -973,7 +979,7 @@ impl SelectedBlobHandle {
             ));
         }
         let (response, received) = oneshot::channel();
-        let opened = self
+        let (opened, session) = self
             .send(
                 SelectedBlobCommand::OpenPublishStream { request, response },
                 received,
@@ -984,6 +990,7 @@ impl SelectedBlobHandle {
             self.commands.clone(),
             opened.token,
             opened.progress,
+            session,
         ))
     }
 
@@ -1177,16 +1184,20 @@ pub(crate) enum SelectedBlobCommand {
     },
     OpenPublishStream {
         request: BlobPublishStreamRequest,
-        response: oneshot::Sender<Result<OpenedBlobPublishStream, ApplicationError>>,
+        response: oneshot::Sender<
+            Result<(OpenedBlobPublishStream, Arc<BlobPublishStreamSession>), ApplicationError>,
+        >,
     },
     AppendPublishStream {
         token: [u8; 32],
+        session: Arc<BlobPublishStreamSession>,
         offset: u64,
         bytes: Zeroizing<Vec<u8>>,
         response: oneshot::Sender<Result<BlobPublishProgress, ApplicationError>>,
     },
     FinishPublishStream {
         token: [u8; 32],
+        session: Arc<BlobPublishStreamSession>,
         response: oneshot::Sender<Result<BlobPublishFinalization, ApplicationError>>,
     },
     ReadPage {
@@ -2229,6 +2240,8 @@ pub struct SelectedBlobNode {
     source_route_cache: Arc<AuthenticatedEventRouteCache>,
     custody_clock: NodeCustodyClock,
     publish_streams: BTreeMap<[u8; 32], LocalBlobPublishStream>,
+    live_publish_sessions: BTreeMap<[u8; 32], Weak<BlobPublishStreamSession>>,
+    publish_stream_cleanup: Arc<tokio::sync::Notify>,
     completed_publish_streams: BTreeMap<[u8; 32], CompletedBlobPublishStream>,
     read_cache: Option<LocalBlobReadCache>,
     #[cfg(test)]
@@ -2356,6 +2369,8 @@ impl SelectedBlobNode {
             source_route_cache,
             custody_clock,
             publish_streams: BTreeMap::new(),
+            live_publish_sessions: BTreeMap::new(),
+            publish_stream_cleanup: Arc::new(tokio::sync::Notify::new()),
             completed_publish_streams: BTreeMap::new(),
             read_cache: None,
             #[cfg(test)]
@@ -2408,6 +2423,8 @@ impl SelectedBlobNode {
             source_route_cache,
             custody_clock,
             publish_streams: BTreeMap::new(),
+            live_publish_sessions: BTreeMap::new(),
+            publish_stream_cleanup: Arc::new(tokio::sync::Notify::new()),
             completed_publish_streams: BTreeMap::new(),
             read_cache: None,
             #[cfg(test)]
@@ -2499,6 +2516,7 @@ impl SelectedBlobNode {
             command.reject();
             return Ok(());
         }
+        self.cleanup_abandoned_publish_streams();
         match command {
             SelectedBlobCommand::Publish {
                 request,
@@ -2523,7 +2541,14 @@ impl SelectedBlobNode {
                 }
             }
             SelectedBlobCommand::OpenPublishStream { request, response } => {
-                let result = self.open_publish_stream_inner(request);
+                let result = self.open_publish_stream_inner(request).map(|opened| {
+                    let session = Arc::new(BlobPublishStreamSession::new(Arc::clone(
+                        &self.publish_stream_cleanup,
+                    )));
+                    self.live_publish_sessions
+                        .insert(opened.token, Arc::downgrade(&session));
+                    (opened, session)
+                });
                 finish_live_blob_ledger_command(
                     result,
                     response,
@@ -2534,11 +2559,14 @@ impl SelectedBlobNode {
             }
             SelectedBlobCommand::AppendPublishStream {
                 token,
+                session,
                 offset,
                 bytes,
                 response,
             } => {
-                let result = self.append_publish_stream_inner(token, offset, bytes);
+                let result = self
+                    .require_publish_session(token, &session, "blob stream write")
+                    .and_then(|()| self.append_publish_stream_inner(token, offset, bytes));
                 finish_live_blob_ledger_command(
                     result,
                     response,
@@ -2547,8 +2575,14 @@ impl SelectedBlobNode {
                     "live Blob stream write failed a durable invariant",
                 )
             }
-            SelectedBlobCommand::FinishPublishStream { token, response } => {
-                let result = self.schedule_publish_stream_finalization(token);
+            SelectedBlobCommand::FinishPublishStream {
+                token,
+                session,
+                response,
+            } => {
+                let result = self
+                    .require_publish_session(token, &session, "blob stream finish")
+                    .and_then(|()| self.schedule_publish_stream_finalization(token));
                 finish_live_blob_ledger_command(
                     result,
                     response,
@@ -2665,6 +2699,52 @@ impl SelectedBlobNode {
                     "live Blob capacity status failed a durable invariant",
                 )
             }
+        }
+    }
+
+    /// Waits for work while releasing abandoned runtime uploads even when idle.
+    /// The durable reservation and checkpoint remain available for exact resume.
+    pub(crate) async fn next_live_command<T>(
+        &mut self,
+        commands: &mut mpsc::Receiver<T>,
+    ) -> Option<T> {
+        loop {
+            self.cleanup_abandoned_publish_streams();
+            tokio::select! {
+                command = commands.recv() => return command,
+                () = self.publish_stream_cleanup.notified() => {}
+            }
+        }
+    }
+
+    fn cleanup_abandoned_publish_streams(&mut self) {
+        self.live_publish_sessions.retain(|token, session| {
+            if session.strong_count() != 0 {
+                return true;
+            }
+            self.publish_streams.remove(token);
+            self.completed_publish_streams.remove(token);
+            false
+        });
+    }
+
+    fn require_publish_session(
+        &self,
+        token: [u8; 32],
+        session: &Arc<BlobPublishStreamSession>,
+        operation: &'static str,
+    ) -> Result<(), ApplicationError> {
+        if self
+            .live_publish_sessions
+            .get(&token)
+            .is_some_and(|current| current.ptr_eq(&Arc::downgrade(session)))
+        {
+            Ok(())
+        } else {
+            Err(ApplicationError::new(
+                ApplicationErrorKind::NotFound,
+                operation,
+            ))
         }
     }
 
@@ -4015,35 +4095,11 @@ impl SelectedBlobNode {
         request: BlobPublicationInspectionRequest,
     ) -> Result<BlobPublicationInspection, ApplicationError> {
         let policy = self.current_policy("blob publication status")?;
-        let token = *request.publication_id.as_bytes();
-        if let Some(completed) = self.completed_publish_streams.get(&token) {
-            if completed.request.publication.topic != request.topic
-                || completed.request.publication.scope != request.scope
-            {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::NotFound,
-                    "blob publication status",
-                ));
-            }
-            let transfer_total_bytes = profile5_transfer_total_bytes(completed.result.total_len)?;
-            return Ok(BlobPublicationInspection {
-                publication_id: request.publication_id,
-                phase: BlobPublicationPhase::Available,
-                plaintext_total_bytes: completed.result.total_len,
-                durable_plaintext_bytes: completed.result.total_len,
-                transfer_total_bytes,
-                durable_transfer_bytes: transfer_total_bytes,
-                total_units: completed
-                    .result
-                    .total_len
-                    .div_ceil(BLOB_STREAM_SEGMENT_BYTES as u64),
-                durable_units: completed
-                    .result
-                    .total_len
-                    .div_ceil(BLOB_STREAM_SEGMENT_BYTES as u64),
-                blob_id: Some(completed.result.id),
-            });
-        }
+        let source_route_cache = Arc::clone(&self.source_route_cache);
+        let _lifecycle = source_route_cache
+            .lock_blob_lifecycle()
+            .map_err(|error| application_error("blob publication status", error))?;
+        self.observe_current_blob_custody_sample("blob publication status")?;
         // A lifecycle operation is authoritative even while cleanup authority
         // for its provisional pack remains durably charged after a crash.
         let local_publication = match self
@@ -4121,40 +4177,6 @@ impl SelectedBlobNode {
                     return Err(application_error("blob publication status", error.into()));
                 }
             }
-        }
-        if let Some(upload) = self.publish_streams.get(&token) {
-            if upload.request.topic != request.topic || upload.request.scope != request.scope {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::NotFound,
-                    "blob publication status",
-                ));
-            }
-            let durable_plaintext = upload.checkpoint.durable_plaintext_offset();
-            let transfer_total_bytes = profile5_transfer_total_bytes(upload.total_len)?;
-            let durable_units = upload
-                .checkpoint
-                .durable_pack_checkpoint()
-                .map_or(0, |checkpoint| checkpoint.next_index());
-            return Ok(BlobPublicationInspection {
-                publication_id: request.publication_id,
-                phase: if durable_plaintext == 0 {
-                    BlobPublicationPhase::AwaitingData
-                } else if durable_plaintext < upload.total_len {
-                    BlobPublicationPhase::Receiving
-                } else {
-                    BlobPublicationPhase::ReadyToFinalize
-                },
-                plaintext_total_bytes: upload.total_len,
-                durable_plaintext_bytes: durable_plaintext,
-                transfer_total_bytes,
-                durable_transfer_bytes: upload
-                    .checkpoint
-                    .durable_pack_checkpoint()
-                    .map_or(0, |checkpoint| checkpoint.payload_len()),
-                total_units: upload.total_len.div_ceil(BLOB_STREAM_SEGMENT_BYTES as u64),
-                durable_units,
-                blob_id: None,
-            });
         }
         if let Some((reservation, checkpoint)) = self
             .store
@@ -6053,6 +6075,304 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn publication_inspection_observes_elapsed_expiry_without_other_calls() {
+        let root = TestRoot::new("inspection-elapsed-expiry");
+        let mut node = selected_node(&root);
+        node.custody_clock = NodeCustodyClock::injected([0xcd; 16], 1_000, 0);
+        let published = node
+            .publish_with_options(
+                request(b"inspection/elapsed-expiry"),
+                BlobPublishOptions::finite_ttl_ms(50).unwrap(),
+                &mut Cursor::new(payload(53)),
+            )
+            .unwrap();
+        node.custody_clock.set_injected_tick(1_050).unwrap();
+        let status = node
+            .inspect_publication(BlobPublicationInspectionRequest {
+                publication_id: published.publication_id.unwrap(),
+                topic: blob_topic(),
+                scope: blob_scope(),
+            })
+            .unwrap();
+        assert_eq!(status.phase, BlobPublicationPhase::ExpiredOrRetired);
+    }
+
+    #[test]
+    fn publication_inspection_does_not_revive_expired_cached_completion() {
+        let root = TestRoot::new("inspection-cached-expiry");
+        let mut node = selected_node(&root);
+        node.custody_clock = NodeCustodyClock::injected([0xcc; 16], 1_000, 0);
+        let publication = request(b"inspection/cached-expiry");
+        let options = BlobPublishOptions::finite_ttl_ms(50).unwrap();
+        node.publish_with_options(publication.clone(), options, &mut Cursor::new(payload(53)))
+            .unwrap();
+        let opened = node
+            .open_publish_stream_inner(BlobPublishStreamRequest {
+                publication,
+                options,
+                total_len: 53,
+            })
+            .unwrap();
+        node.custody_clock.set_injected_tick(1_050).unwrap();
+        node.transfer_status().unwrap();
+        let status = node
+            .inspect_publication(BlobPublicationInspectionRequest {
+                publication_id: BlobStreamPublicationId::from_bytes(opened.token).unwrap(),
+                topic: blob_topic(),
+                scope: blob_scope(),
+            })
+            .unwrap();
+        assert_eq!(status.phase, BlobPublicationPhase::ExpiredOrRetired);
+    }
+
+    #[test]
+    fn publication_inspection_rechecks_policy_for_active_and_reopened_uploads() {
+        for reopen in [false, true] {
+            let root = TestRoot::new("inspection-upload-policy");
+            let mut services = persist_rekey_mission(&root);
+            let mut node = selected_node(&root);
+            let opened = node
+                .open_publish_stream_inner(BlobPublishStreamRequest {
+                    publication: request(b"inspection/upload-policy"),
+                    options: BlobPublishOptions::durable(),
+                    total_len: 2,
+                })
+                .unwrap();
+            apply_scope_rekey_to_store(&node.store, &mut services, 2, 1, false);
+            if reopen {
+                drop(node);
+                node = selected_node(&root);
+            }
+            let status = node.inspect_publication(BlobPublicationInspectionRequest {
+                publication_id: BlobStreamPublicationId::from_bytes(opened.token).unwrap(),
+                topic: blob_topic(),
+                scope: blob_scope(),
+            });
+            assert!(
+                status.is_err(),
+                "current policy must reject stale upload status, reopened={reopen}"
+            );
+        }
+    }
+
+    fn live_stream_test_actor(
+        mut node: SelectedBlobNode,
+    ) -> (
+        SelectedBlobHandle,
+        tokio::task::JoinHandle<SelectedBlobNode>,
+    ) {
+        let admission = Arc::new(AtomicBool::new(true));
+        let (commands, mut received) = mpsc::channel(1);
+        let handle = SelectedBlobHandle::new(
+            commands,
+            Arc::clone(&admission),
+            node.identity(),
+            node.mission_authority(),
+        );
+        let worker = tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Handle::current();
+            while let Some(command) = runtime.block_on(node.next_live_command(&mut received)) {
+                let SelectedApplicationCommand::Blob(command) = command else {
+                    panic!("unexpected command")
+                };
+                node.execute_live(command, &admission).unwrap();
+            }
+            node
+        });
+        (handle, worker)
+    }
+
+    fn open_live_test_stream(
+        node: &mut SelectedBlobNode,
+        commands: mpsc::Sender<SelectedApplicationCommand>,
+    ) -> SelectedBlobPublishStream {
+        let (response, received) = oneshot::channel();
+        node.execute_live(
+            SelectedBlobCommand::OpenPublishStream {
+                request: BlobPublishStreamRequest {
+                    publication: request(b"abandoned/live-session"),
+                    options: BlobPublishOptions::durable(),
+                    total_len: 2,
+                },
+                response,
+            },
+            &AtomicBool::new(true),
+        )
+        .unwrap();
+        let (opened, session) = received.blocking_recv().unwrap().unwrap();
+        SelectedBlobPublishStream::new(commands, opened.token, opened.progress, session)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoned_live_publish_stream_wakes_idle_worker_cleanup() {
+        let root = TestRoot::new("abandoned-idle-worker");
+        let mut node = selected_node(&root);
+        let (commands, mut received) = mpsc::channel::<SelectedApplicationCommand>(1);
+        let stream =
+            tokio::task::block_in_place(|| open_live_test_stream(&mut node, commands.clone()));
+        {
+            let wait = node.next_live_command(&mut received);
+            tokio::pin!(wait);
+            // Register the idle worker's wait before dropping the live API handle.
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(wait.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            drop(stream);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(30), &mut wait)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            node.publish_streams.is_empty(),
+            "idle cancellation must release worker pools without a follow-up command"
+        );
+        drop(commands);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoned_live_publish_stream_cleanup_survives_full_command_queue() {
+        let root = TestRoot::new("abandoned-full-queue");
+        let mut node = selected_node(&root);
+        let (commands, mut received) = mpsc::channel(1);
+        let stream =
+            tokio::task::block_in_place(|| open_live_test_stream(&mut node, commands.clone()));
+        let (response, _received) = oneshot::channel();
+        commands
+            .try_send(SelectedApplicationCommand::Blob(
+                SelectedBlobCommand::CapacityStatus { response },
+            ))
+            .unwrap_or_else(|_| panic!("fill command queue"));
+        assert_eq!(commands.capacity(), 0);
+        drop(stream);
+        let command = node.next_live_command(&mut received).await.unwrap();
+        assert!(
+            node.publish_streams.is_empty(),
+            "Drop must release runtime state even when the command queue is full"
+        );
+        let SelectedApplicationCommand::Blob(command) = command else {
+            panic!("unexpected command")
+        };
+        node.execute_live(command, &AtomicBool::new(true)).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoned_live_publish_stream_open_response_releases_runtime_state() {
+        let root = TestRoot::new("abandoned-open-response");
+        let mut node = selected_node(&root);
+        let (_commands, mut commands) = mpsc::channel::<SelectedApplicationCommand>(1);
+        let (response, received) = oneshot::channel();
+        drop(received);
+        node.execute_live(
+            SelectedBlobCommand::OpenPublishStream {
+                request: BlobPublishStreamRequest {
+                    publication: request(b"abandoned/open-response"),
+                    options: BlobPublishOptions::durable(),
+                    total_len: 1,
+                },
+                response,
+            },
+            &AtomicBool::new(true),
+        )
+        .unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(30),
+                node.next_live_command(&mut commands)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            node.publish_streams.is_empty(),
+            "cancelled open response must release native worker pools"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoned_live_publish_stream_does_not_close_replacement_or_lose_resume() {
+        let root = TestRoot::new("abandoned-replacement-resume");
+        let (handle, worker) = live_stream_test_actor(selected_node(&root));
+        let request = BlobPublishStreamRequest {
+            publication: request(b"abandoned/replacement"),
+            options: BlobPublishOptions::durable(),
+            total_len: 2,
+        };
+        let mut old = handle.open_publish_stream(request.clone()).await.unwrap();
+        old.write(0, Zeroizing::new(vec![1])).await.unwrap();
+        let mut replacement = handle.open_publish_stream(request.clone()).await.unwrap();
+        assert_eq!(
+            replacement.durable_offset(),
+            0,
+            "uncheckpointed prefix is discarded on resume"
+        );
+        assert_eq!(
+            old.write(0, Zeroizing::new(vec![3, 4]))
+                .await
+                .unwrap_err()
+                .kind(),
+            ApplicationErrorKind::NotFound
+        );
+        assert!(
+            old.finish().await.is_err(),
+            "stale finish must not consume the replacement"
+        );
+        replacement
+            .write(0, Zeroizing::new(vec![3, 4]))
+            .await
+            .unwrap();
+        drop(replacement);
+        let resumed = handle.open_publish_stream(request).await.unwrap();
+        assert_eq!(
+            resumed.durable_offset(),
+            2,
+            "durable checkpoint survives abandoned runtime cleanup"
+        );
+        let result = resumed.finish().await.unwrap();
+        let page = handle
+            .read_page(BlobReadPageRequest {
+                blob: BlobReadRequest {
+                    id: result.id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                },
+                offset: 0,
+                max_bytes: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.as_bytes(), &[3, 4]);
+        drop(handle);
+        let node = worker.await.unwrap();
+        assert!(node.publish_streams.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoned_live_publish_stream_releases_runtime_state() {
+        let root = TestRoot::new("abandoned-live-stream");
+        let (handle, worker) = live_stream_test_actor(selected_node(&root));
+        let stream = handle
+            .open_publish_stream(BlobPublishStreamRequest {
+                publication: request(b"abandoned/runtime"),
+                options: BlobPublishOptions::durable(),
+                total_len: 1,
+            })
+            .await
+            .unwrap();
+        drop(stream);
+        handle.capacity_status().await.unwrap();
+        drop(handle);
+        let node = worker.await.unwrap();
+        assert!(
+            node.publish_streams.is_empty(),
+            "abandoned streams must release map pools and writers"
+        );
+    }
+
+    #[test]
     fn transfer_status_observes_finite_expiry_without_maintenance() {
         let root = TestRoot::new("finite-status-observes-expiry");
         let mut node = selected_node(&root);
@@ -6900,12 +7220,28 @@ pub(crate) mod tests {
 
     async fn schedule_stream_pack_promotion_for_test(
         commands: &mpsc::Sender<SelectedApplicationCommand>,
-        token: [u8; 32],
+        request: BlobPublishStreamRequest,
     ) -> Result<BlobPackPromotionCompletion, ApplicationError> {
         let (response, received) = oneshot::channel();
         commands
             .send(SelectedApplicationCommand::Blob(
-                SelectedBlobCommand::FinishPublishStream { token, response },
+                SelectedBlobCommand::OpenPublishStream { request, response },
+            ))
+            .await
+            .expect("send live stream resume command");
+        let (opened, session) = received
+            .await
+            .expect("receive live stream resume")
+            .expect("resume ready stream");
+        let token = opened.token;
+        let (response, received) = oneshot::channel();
+        commands
+            .send(SelectedApplicationCommand::Blob(
+                SelectedBlobCommand::FinishPublishStream {
+                    token,
+                    session,
+                    response,
+                },
             ))
             .await
             .expect("send stream finish command");
@@ -7554,12 +7890,12 @@ pub(crate) mod tests {
 
         let mut completions = Vec::new();
         completions.push(
-            schedule_stream_pack_promotion_for_test(&direct, ready[0].0)
+            schedule_stream_pack_promotion_for_test(&direct, ready[0].1.clone())
                 .await
                 .expect("admit first active promotion worker"),
         );
         completions.push(
-            schedule_stream_pack_promotion_for_test(&direct, ready[1].0)
+            schedule_stream_pack_promotion_for_test(&direct, ready[1].1.clone())
                 .await
                 .expect("admit second active promotion worker"),
         );
@@ -7570,16 +7906,16 @@ pub(crate) mod tests {
         .await
         .expect("observe bounded active promotion workers");
         completions.push(
-            schedule_stream_pack_promotion_for_test(&direct, ready[2].0)
+            schedule_stream_pack_promotion_for_test(&direct, ready[2].1.clone())
                 .await
                 .expect("admit first queued promotion job"),
         );
         completions.push(
-            schedule_stream_pack_promotion_for_test(&direct, ready[3].0)
+            schedule_stream_pack_promotion_for_test(&direct, ready[3].1.clone())
                 .await
                 .expect("admit second queued promotion job"),
         );
-        let saturated = schedule_stream_pack_promotion_for_test(&direct, ready[4].0)
+        let saturated = schedule_stream_pack_promotion_for_test(&direct, ready[4].1.clone())
             .await
             .expect_err("fifth promotion job exceeds two workers plus two queued jobs");
         assert_eq!(saturated.kind(), ApplicationErrorKind::ResourceLimit);
@@ -7681,7 +8017,7 @@ pub(crate) mod tests {
             }
         });
 
-        let completion = schedule_stream_pack_promotion_for_test(&direct, token)
+        let completion = schedule_stream_pack_promotion_for_test(&direct, request.clone())
             .await
             .expect("actor schedules promotion before acknowledging");
         tokio::task::spawn_blocking(move || started_rx.recv().expect("promotion worker started"))
@@ -7780,10 +8116,10 @@ pub(crate) mod tests {
             }
         });
 
-        let first_completion = schedule_stream_pack_promotion_for_test(&direct, first.0)
+        let first_completion = schedule_stream_pack_promotion_for_test(&direct, first.1.clone())
             .await
             .expect("schedule first panicking promotion job");
-        let second_completion = schedule_stream_pack_promotion_for_test(&direct, second.0)
+        let second_completion = schedule_stream_pack_promotion_for_test(&direct, second.1.clone())
             .await
             .expect("schedule second panicking promotion job");
         for completion in [first_completion, second_completion] {
