@@ -779,6 +779,9 @@ impl BlobStreamFinalCommitment {
     pub const fn blob_id(&self) -> BlobId {
         self.blob_id
     }
+    pub(crate) fn matches_metadata(&self, metadata: &BlobMetadata) -> bool {
+        self.metadata_commitment == metadata_commitment(metadata)
+    }
     pub const fn open_digest(&self) -> &[u8; 32] {
         &self.open_digest
     }

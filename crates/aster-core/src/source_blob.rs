@@ -688,6 +688,7 @@ impl ReferenceEnvelopeSealer {
         if publisher != open.open().publisher()
             || commitment.open_digest() != &open.open().digest()
             || commitment.stream_id() != open.open().stream_id()
+            || !commitment.matches_metadata(open.open().metadata())
         {
             return Err(blob_stream_authentication_error(
                 BlobError::AuthenticationFailed,
@@ -1593,6 +1594,106 @@ mod tests {
         let mut tampered = signed_publication;
         *tampered.last_mut().expect("signed byte") ^= 1;
         assert!(reader.verify_blob_stream_publication(&tampered).is_err());
+    }
+
+    #[test]
+    fn blob_stream_commitment_rejects_metadata_from_another_open() {
+        let Services {
+            publisher, reader, ..
+        } = services();
+        let authorization = publisher
+            .blob_stream_authorization_digest(&scope(), 1)
+            .expect("authorization");
+        let make_open = |metadata| {
+            BlobStreamOpen::new(
+                crate::blob_stream::BlobPublicationStreamId::from_bytes([0x11; 32])
+                    .expect("stream ID"),
+                publisher.identity(),
+                b"metadata-binding".to_vec(),
+                publisher.mission_authority_id(),
+                1,
+                VersionVector::default(),
+                topic(),
+                scope(),
+                metadata,
+                Priority::Immediate,
+                None,
+                None,
+                7,
+                1,
+                1,
+                authorization,
+                [0x66; 32],
+            )
+            .expect("open")
+        };
+        let open = make_open(
+            BlobMetadata::new(Some("text/plain".into()), b"schema-a".to_vec()).expect("metadata"),
+        );
+        let other_open = make_open(
+            BlobMetadata::new(Some("application/json".into()), b"schema-b".to_vec())
+                .expect("other metadata"),
+        );
+        let signed_open = publisher.seal_blob_stream_open(&open).expect("sign open");
+        let verified = reader
+            .verify_blob_stream_open(&signed_open)
+            .expect("verify open");
+        let other_verified = reader
+            .verify_blob_stream_open(
+                &publisher
+                    .seal_blob_stream_open(&other_open)
+                    .expect("sign other open"),
+            )
+            .expect("verify other open");
+        let commitment = BlobStreamFinalCommitment::new(&verified, [0x71; 32], [0x72; 32], 1, None)
+            .expect("commitment");
+        let other_commitment =
+            BlobStreamFinalCommitment::new(&other_verified, [0x71; 32], [0x72; 32], 1, None)
+                .expect("other commitment");
+        assert_ne!(commitment.blob_id(), other_commitment.blob_id());
+
+        // Keep the other metadata commitment and its self-consistent BlobId,
+        // but bind the signed record to this OPEN. A valid source signature
+        // must not substitute for checking the OPEN's metadata identity.
+        let mut encoded = other_commitment.encode();
+        const OPEN_DIGEST_OFFSET: usize = 8 + 2 + 2;
+        encoded[OPEN_DIGEST_OFFSET..OPEN_DIGEST_OFFSET + 32].copy_from_slice(&open.digest());
+        let mismatched = BlobStreamFinalCommitment::decode(&encoded)
+            .expect("structurally valid commitment with different metadata");
+        let signed_commitment = publisher
+            .seal_blob_stream_commitment(&mismatched)
+            .expect("sign mismatched commitment");
+        assert!(
+            reader
+                .verify_blob_stream_commitment(&verified, &signed_commitment)
+                .is_err()
+        );
+
+        let publication = BlobStreamPublication::new(
+            open,
+            mismatched.blob_id(),
+            None,
+            *reader
+                .blob_stream_lineage(&verified)
+                .expect("lineage")
+                .physical()
+                .binding(),
+        )
+        .expect("publication");
+        let source = BlobStreamPublicationSource::new(
+            publisher
+                .seal_blob_stream_publication(&publication)
+                .expect("sign publication"),
+            signed_open,
+            signed_commitment,
+        )
+        .and_then(|source| source.encode())
+        .expect("encode source");
+        assert!(
+            reader
+                .verify_blob_stream_publication_source(&source)
+                .is_err()
+        );
     }
 
     struct Fixture {
