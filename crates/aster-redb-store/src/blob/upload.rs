@@ -992,13 +992,15 @@ fn upload_pack_expectations_table(
         .map(|row| {
             let (_, value) = row?;
             let upload = DurableBlobUpload::decode(Arc::new(()), value.value())?;
+            let discard_candidate = upload
+                .profile5_completion
+                .as_ref()
+                .is_some_and(BlobProfile5UploadCompletion::reuses_existing_pack);
             Ok(super::pack::ExpectedBlobUploadPack {
                 identity: upload.reservation.pack_identity(),
                 checkpoint: upload.checkpoint,
-                may_be_absent: upload
-                    .profile5_completion
-                    .as_ref()
-                    .is_some_and(BlobProfile5UploadCompletion::reuses_existing_pack),
+                may_be_absent: discard_candidate,
+                discard_candidate,
             })
         })
         .collect()
@@ -1677,15 +1679,18 @@ impl Store {
                     .insert(owner_key.as_slice(), existing.encode()?.as_slice())?;
                 write.commit()?;
             }
-            let verified = if let Some((initial_custody, _, build)) = profile5.as_mut() {
+            let verified = if let Some((_, _, build)) = profile5.as_mut() {
                 if existing.format_version != PROFILE5_UPLOAD_VERSION {
                     return Err(blob_error(BlobStoreError::OperationConflict));
                 }
                 let durable = existing.profile5_open.as_ref().ok_or_else(schema_error)?;
+                // A retry observes a later clock sample, but the reservation
+                // must retain the initial sample authenticated by its OPEN.
+                // Promotion separately checks current custody and expiry.
                 let semantic = profile5_reservation_from_open(
                     policy,
                     request,
-                    *initial_custody,
+                    durable.open.initial_custody(),
                     &durable.open,
                 )?;
                 let restored = build(&semantic, Some(durable))?;
@@ -2065,11 +2070,10 @@ impl Store {
             .insert(owner_key.as_slice(), upload.encode()?.as_slice())?;
         write.commit()?;
         if reused {
-            super::pack::stage_upload_pack_cleanup(&pack_root, &reservation.pack_identity())
-                .map_err(upload_pack_store_error)?;
+            // The committed reuse completion authorizes candidate removal.
+            // An upload-cleanup marker would instead authorize recovery to
+            // delete the still-pending semantic publication and its reservation.
             remove_upload_pack(&pack_root, &reservation.pack_identity())
-                .map_err(upload_pack_store_error)?;
-            super::pack::finish_upload_pack_cleanup(&pack_root, &reservation.pack_identity())
                 .map_err(upload_pack_store_error)?;
         }
         Ok(projection)
@@ -2983,6 +2987,18 @@ mod tests {
         verified_open: &VerifiedBlobStreamOpen,
         fill: u8,
     ) -> BlobUploadCheckpoint {
+        try_complete_profile5_pack(fixture, policy, reservation, initial, verified_open, fill)
+            .expect("install completion")
+    }
+
+    fn try_complete_profile5_pack(
+        fixture: &Fixture,
+        policy: &ControlPolicySnapshot,
+        reservation: &BlobUploadReservation,
+        initial: BlobUploadCheckpoint,
+        verified_open: &VerifiedBlobStreamOpen,
+        fill: u8,
+    ) -> Result<BlobUploadCheckpoint, StoreError> {
         let root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
         let mut writer = BlobPackWriter::open_projected_upload_pinned(
             &root,
@@ -3043,20 +3059,99 @@ mod tests {
                 completion.checkpoint().clone(),
             )
             .expect("project final checkpoint");
-        fixture
-            .store
-            .complete_profile5_upload_pack(
-                policy,
-                reservation,
-                projected,
-                completion,
-                &verified_commitment,
+        fixture.store.complete_profile5_upload_pack(
+            policy,
+            reservation,
+            projected,
+            completion,
+            &verified_commitment,
+            fixture
+                .publisher
+                .blob_stream_lineage(verified_open)
+                .expect("stream lineage"),
+        )
+    }
+
+    #[test]
+    fn reused_pack_cleanup_preserves_pending_publication_across_reopen() {
+        use super::super::pack::BlobPackFaultPoint;
+        for fault in [
+            None,
+            Some(BlobPackFaultPoint::CleanupEntryRemoved),
+            Some(BlobPackFaultPoint::CleanupDurable),
+        ] {
+            let fixture = fixture("reused-pack-cleanup", 0x65, BlobDepotLimits::DEFAULT);
+            let policy = fixture.store.control_policy_snapshot().expect("policy");
+            let first_request = request(&fixture, b"reused/first", 4096);
+            let (first, initial, open) = reserve_profile5(&fixture, &first_request);
+            let completed = complete_profile5_pack(&fixture, &policy, &first, initial, &open, 0x55);
+            let publication = profile5_publication(&fixture, &open, &completed);
+            fixture
+                .store
+                .commit_profile5_publication_once_with_policy(
+                    &policy,
+                    &first,
+                    &completed,
+                    &publication,
+                    publication.publication().final_custody(),
+                )
+                .expect("promote first publication");
+
+            let second_request = request(&fixture, b"reused/second", 4096);
+            let (second, initial, open) = reserve_profile5(&fixture, &second_request);
+            if let Some(fault) = fault {
+                let root = PinnedBlobPackRoot::open(&fixture.store).expect("root");
+                super::super::pack::inject_test_fault(&root, fault);
+            }
+            let completion =
+                try_complete_profile5_pack(&fixture, &policy, &second, initial, &open, 0x55);
+            assert_eq!(completion.is_err(), fault.is_some());
+            let (_, before) = fixture
+                .store
+                .resume_blob_upload(&second_request.owner)
+                .unwrap()
+                .expect("pending publication");
+            assert!(before.profile5_completion().unwrap().reuses_existing_pack());
+            assert_eq!(before.durable_plaintext_offset(), 4096);
+            assert!(
                 fixture
-                    .publisher
-                    .blob_stream_lineage(verified_open)
-                    .expect("stream lineage"),
-            )
-            .expect("install completion")
+                    .store
+                    .blob_for_owner_with_policy(&policy, &second_request.owner)
+                    .unwrap()
+                    .is_none()
+            );
+            let publication = profile5_publication(&fixture, &open, &before);
+            let authority = fixture.publisher.mission_authority_id();
+            drop(fixture.store);
+
+            let snapshot = upload_pack_tree_snapshot(&fixture.root);
+            Store::inspect_existing(fixture.root.database())
+                .expect("inspect interrupted candidate cleanup");
+            assert_eq!(upload_pack_tree_snapshot(&fixture.root), snapshot);
+            let reopened = Store::open_for_mission(fixture.root.database(), authority)
+                .expect("reopen preserves pending publication");
+            let (reservation, checkpoint) = reopened
+                .resume_blob_upload(&second_request.owner)
+                .unwrap()
+                .expect("resume exact publication");
+            assert_eq!(checkpoint, before);
+            let root = PinnedBlobPackRoot::open(&reopened).unwrap();
+            assert!(!root.test_upload_path(&reservation.pack_identity()).exists());
+            let outcome = reopened
+                .commit_profile5_publication_once_with_policy(
+                    &policy,
+                    &reservation,
+                    &checkpoint,
+                    &publication,
+                    publication.publication().final_custody(),
+                )
+                .expect("promote recovered publication");
+            assert!(outcome.inserted());
+            drop(root);
+            drop(reopened);
+            Store::open_for_mission(fixture.root.database(), authority)
+                .expect("reopen after promotion");
+        }
     }
 
     fn profile5_publication(
@@ -5713,6 +5808,7 @@ mod tests {
             identity: active.pack_identity(),
             checkpoint: None,
             may_be_absent: false,
+            discard_candidate: false,
         }];
         let before_reclaim = upload_pack_tree_snapshot(&fixture.root);
         let reclaim_order = [

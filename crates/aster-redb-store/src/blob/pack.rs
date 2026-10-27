@@ -58,6 +58,7 @@ pub(super) enum BlobPackFaultPoint {
     DataSynced,
     CheckpointZeroSynced,
     CheckpointOneSynced,
+    CleanupEntryRemoved,
     CleanupDurable,
 }
 
@@ -421,6 +422,9 @@ fn remove_upload_pack_directory(
         .filter(|entry| entry.as_str() != UPLOAD_MARKER)
     {
         directory.remove_if_exists(entry, false)?;
+        #[cfg(test)]
+        maybe_inject_fault(parent.path(), BlobPackFaultPoint::CleanupEntryRemoved)
+            .map_err(pack_marker_store_error)?;
     }
     directory.remove_if_exists(UPLOAD_MARKER, false)?;
     drop(directory);
@@ -443,6 +447,9 @@ pub(super) struct ExpectedBlobUploadPack {
     /// Deletion owns the durable identity while the physical directory may
     /// already be absent after a crash between unlink and redb finalization.
     pub(super) may_be_absent: bool,
+    /// A durable upload completion selected another pack. Remove only this
+    /// redundant candidate, keeping its pending semantic publication intact.
+    pub(super) discard_candidate: bool,
 }
 
 fn audit_expected_upload_pack(
@@ -757,6 +764,11 @@ fn audit_upload_packs(
                 remove_upload_pack_directory(&pack_root, &identity)?;
             }
             completed.push(identity);
+        } else if expected_pack.discard_candidate {
+            if recover {
+                drop(directory);
+                remove_upload_pack_directory(&pack_root, &identity)?;
+            }
         } else {
             audit_expected_upload_pack(&directory, &expected_pack)?;
             if recover && reservations.get(identity.upload_id.as_bytes()) == Some(&identity) {

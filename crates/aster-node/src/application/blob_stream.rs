@@ -41,7 +41,9 @@ pub(super) struct LocalBlobPublishStream {
     pub(super) reservation: BlobUploadReservation,
     pub(super) checkpoint: BlobUploadCheckpoint,
     pub(super) open: VerifiedBlobStreamOpen,
-    pub(super) writer: BlobPackWriter,
+    // Completed uploads retain only publication authority; their candidate
+    // pack may already have been removed in favor of a shared immutable pack.
+    pub(super) writer: Option<BlobPackWriter>,
     pub(super) request: BlobPublishRequest,
     pub(super) options: BlobPublishOptions,
     pub(super) total_len: u64,
@@ -69,10 +71,12 @@ impl LocalBlobPublishStream {
     }
 
     pub(super) fn durable_checkpoint_due(&self) -> bool {
-        self.writer
-            .plaintext_offset()
-            .saturating_sub(self.checkpoint.durable_plaintext_offset())
-            >= self.checkpoint_segments * BLOB_STREAM_SEGMENT_BYTES as u64
+        self.writer.as_ref().is_some_and(|writer| {
+            writer
+                .plaintext_offset()
+                .saturating_sub(self.checkpoint.durable_plaintext_offset())
+                >= self.checkpoint_segments * BLOB_STREAM_SEGMENT_BYTES as u64
+        })
     }
 
     #[cfg(test)]
@@ -140,21 +144,18 @@ pub(super) fn sink_mapped_stream_partitions(
     stream: &mut LocalBlobPublishStream,
     wait_for_all: bool,
 ) -> Result<(), ApplicationError> {
+    let Some(map_pool) = stream.map_pool.as_mut() else {
+        return Ok(());
+    };
     loop {
         let mapped = if wait_for_all && stream.mapped_segments < stream.next_map_index {
             Some(
-                stream
-                    .map_pool
-                    .as_mut()
-                    .expect("open stream map pool")
+                map_pool
                     .recv_mapped_blocking()
                     .map_err(blob_stream_pipeline_error)?,
             )
         } else {
-            stream
-                .map_pool
-                .as_mut()
-                .expect("open stream map pool")
+            map_pool
                 .try_recv_mapped()
                 .map_err(blob_stream_pipeline_error)?
         };
@@ -175,6 +176,8 @@ pub(super) fn sink_mapped_stream_partitions(
             let (segment, leaves) = mapped.into_value();
             stream
                 .writer
+                .as_mut()
+                .expect("incomplete stream writer")
                 .append(&segment, leaves)
                 .map_err(|error| blob_pack_application_error("blob stream write", error))?;
             stream.next_sink_index += 1;

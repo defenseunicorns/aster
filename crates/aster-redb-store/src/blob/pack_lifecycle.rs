@@ -541,6 +541,7 @@ fn active_pack_expectations(
                 identity: pack.completion.identity(),
                 checkpoint: Some(pack.completion.checkpoint().clone()),
                 may_be_absent: pack.deletion_pending(),
+                discard_candidate: false,
             });
         }
     }

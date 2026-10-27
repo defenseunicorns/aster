@@ -1761,7 +1761,7 @@ struct BlobPackPromotionJob {
     reservation: BlobUploadReservation,
     checkpoint: aster_redb_store::BlobUploadCheckpoint,
     open: VerifiedBlobStreamOpen,
-    writer: BlobPackWriter,
+    writer: Option<BlobPackWriter>,
     #[cfg(test)]
     gate: Option<BlobPackPromotionTestGate>,
 }
@@ -1972,7 +1972,7 @@ impl BlobPackPromotionPool {
         {
             debug_assert_eq!(report.plaintext_bytes_reprocessed, 0);
             debug_assert_eq!(report.ciphertext_bytes_rewritten, 0);
-            debug_assert_eq!(report.store_boundary_operations, 9);
+            debug_assert!(matches!(report.store_boundary_operations, 7 | 9));
         }
     }
 }
@@ -1992,7 +1992,7 @@ impl BlobPackPromotionJob {
         reservation: BlobUploadReservation,
         checkpoint: aster_redb_store::BlobUploadCheckpoint,
         open: VerifiedBlobStreamOpen,
-        writer: BlobPackWriter,
+        writer: Option<BlobPackWriter>,
     ) -> Self {
         let BlobPackPromotionAuthority {
             mission,
@@ -2087,9 +2087,6 @@ impl BlobPackPromotionJob {
             ));
         }
 
-        let (plaintext_root, ciphertext_root) = writer
-            .final_roots()
-            .map_err(|error| blob_pack_application_error("blob stream finish", error))?;
         let final_sample = if request.ttl_ms.is_some() {
             Some(
                 custody_clock
@@ -2099,45 +2096,70 @@ impl BlobPackPromotionJob {
         } else {
             None
         };
-        let segment_count = writer.next_index();
-        let commitment = BlobStreamFinalCommitment::new(
-            &open,
-            plaintext_root,
-            ciphertext_root,
-            segment_count,
-            final_sample,
-        )
-        .map_err(|error| blob_core_error("blob stream finish", error))?;
-        let authenticated_commitment = verifier
-            .seal_blob_stream_commitment(&commitment)
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let verified_commitment = verifier
-            .verify_blob_stream_commitment(&open, &authenticated_commitment)
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let lineage = verifier
-            .blob_stream_lineage(&open)
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let completion = writer
-            .finish_profile5(&verified_commitment)
-            .map_err(|error| blob_pack_application_error("blob stream finish", error))?;
-        let projected = store
-            .checkpoint_profile5_pack(
-                &policy,
-                &current,
-                current_checkpoint,
-                completion.checkpoint().clone(),
-            )
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
-        let completed = store
-            .complete_profile5_pack(
-                &policy,
-                &current,
-                projected,
-                completion,
-                &verified_commitment,
-                lineage,
-            )
-            .map_err(|error| application_error("blob stream finish", error.into()))?;
+        let (commitment, completed) =
+            if let Some(completion) = current_checkpoint.profile5_completion() {
+                // Recovery can remove a deduplicated candidate after recording
+                // this completion. Authenticate the retained finish authority and
+                // resume only semantic promotion, without reopening a writer.
+                let verified = verifier
+                    .verify_blob_stream_commitment(&open, completion.authenticated_commitment())
+                    .map_err(|error| application_error("blob stream finish", error.into()))?;
+                if verified.commitment() != completion.commitment() {
+                    return Err(ApplicationError::new(
+                        ApplicationErrorKind::Integrity,
+                        "blob stream finish",
+                    ));
+                }
+                (verified.commitment().clone(), current_checkpoint)
+            } else {
+                let writer = writer.ok_or_else(|| {
+                    ApplicationError::new(ApplicationErrorKind::Integrity, "blob stream finish")
+                })?;
+                let (plaintext_root, ciphertext_root) = writer
+                    .final_roots()
+                    .map_err(|error| blob_pack_application_error("blob stream finish", error))?;
+                let commitment = BlobStreamFinalCommitment::new(
+                    &open,
+                    plaintext_root,
+                    ciphertext_root,
+                    writer.next_index(),
+                    final_sample,
+                )
+                .map_err(|error| blob_core_error("blob stream finish", error))?;
+                let authenticated_commitment = verifier
+                    .seal_blob_stream_commitment(&commitment)
+                    .map_err(|error| application_error("blob stream finish", error.into()))?;
+                let verified_commitment = verifier
+                    .verify_blob_stream_commitment(&open, &authenticated_commitment)
+                    .map_err(|error| application_error("blob stream finish", error.into()))?;
+                let lineage = verifier
+                    .blob_stream_lineage(&open)
+                    .map_err(|error| application_error("blob stream finish", error.into()))?;
+                let completion = writer
+                    .finish_profile5(&verified_commitment)
+                    .map_err(|error| blob_pack_application_error("blob stream finish", error))?;
+                let projected = store
+                    .checkpoint_profile5_pack(
+                        &policy,
+                        &current,
+                        current_checkpoint,
+                        completion.checkpoint().clone(),
+                    )
+                    .map_err(|error| application_error("blob stream finish", error.into()))?;
+                let completed = store
+                    .complete_profile5_pack(
+                        &policy,
+                        &current,
+                        projected,
+                        completion,
+                        &verified_commitment,
+                        lineage,
+                    )
+                    .map_err(|error| application_error("blob stream finish", error.into()))?;
+                (commitment, completed)
+            };
+        #[cfg(test)]
+        let segment_count = commitment.segment_count();
         let physical_lineage = store
             .profile5_publication_binding(&current, &completed)
             .map_err(|error| application_error("blob stream finish", error.into()))?;
@@ -2890,24 +2912,28 @@ impl SelectedBlobNode {
             }
             Err(error) => return Err(application_error("blob stream open", error.into())),
         };
-        let identity = reservation.pack_identity();
-        let sealer = self
-            .verifier
-            .blob_stream_segment_sealer(&open)
-            .map_err(|error| application_error("blob stream open", error.into()))?;
-        let root = PinnedBlobPackRoot::open(&self.store)
-            .map_err(|error| application_error("blob stream open", error.into()))?;
-        let writer = BlobPackWriter::open_projected_upload_pinned(
-            &root,
-            &identity,
-            checkpoint.durable_pack_checkpoint(),
-        )
-        .map_err(|error| blob_pack_application_error("blob stream open", error))?;
+        let (writer, map_pool) = if checkpoint.profile5_completion().is_some() {
+            (None, None)
+        } else {
+            let identity = reservation.pack_identity();
+            let sealer = self
+                .verifier
+                .blob_stream_segment_sealer(&open)
+                .map_err(|error| application_error("blob stream open", error.into()))?;
+            let root = PinnedBlobPackRoot::open(&self.store)
+                .map_err(|error| application_error("blob stream open", error.into()))?;
+            let writer = BlobPackWriter::open_projected_upload_pinned(
+                &root,
+                &identity,
+                checkpoint.durable_pack_checkpoint(),
+            )
+            .map_err(|error| blob_pack_application_error("blob stream open", error))?;
+            (Some(writer), Some(blob_stream_map_pool(&open, &sealer)?))
+        };
         let durable_offset = checkpoint.durable_plaintext_offset();
         let next_segment_index = checkpoint
             .durable_pack_checkpoint()
             .map_or(0, |checkpoint| checkpoint.next_index());
-        let map_pool = blob_stream_map_pool(&open, &sealer)?;
         self.publish_streams.insert(
             token,
             LocalBlobPublishStream {
@@ -2920,7 +2946,7 @@ impl SelectedBlobNode {
                 total_len: request.total_len,
                 accepted_offset: durable_offset,
                 pending: Zeroizing::new(Vec::with_capacity(BLOB_STREAM_SEGMENT_BYTES)),
-                map_pool: Some(map_pool),
+                map_pool,
                 mapped: BTreeMap::new(),
                 next_map_index: next_segment_index,
                 next_sink_index: next_segment_index,
@@ -3118,9 +3144,18 @@ impl SelectedBlobNode {
             let checkpoint_due = stream.map_checkpoint_due();
             sink_mapped_stream_partitions(stream, end == stream.total_len || checkpoint_due)?;
         }
-        if stream.durable_checkpoint_due() || stream.writer.plaintext_offset() == stream.total_len {
+        if stream.durable_checkpoint_due()
+            || stream
+                .writer
+                .as_ref()
+                .expect("incomplete stream writer")
+                .plaintext_offset()
+                == stream.total_len
+        {
             let checkpoint = stream
                 .writer
+                .as_mut()
+                .expect("incomplete stream writer")
                 .checkpoint()
                 .map_err(|error| blob_pack_application_error("blob stream write", error))?;
             stream.checkpoint = self
@@ -3199,16 +3234,15 @@ impl SelectedBlobNode {
                 "blob stream finish",
             ));
         }
-        stream
-            .map_pool
-            .take()
-            .expect("open stream map pool")
-            .shutdown()
-            .map_err(blob_stream_pipeline_error)?;
+        if let Some(map_pool) = stream.map_pool.take() {
+            map_pool.shutdown().map_err(blob_stream_pipeline_error)?;
+        }
         if stream.checkpoint.durable_pack_checkpoint().is_none() {
             let policy = self.current_policy("blob stream finish")?;
             let durable = stream
                 .writer
+                .as_mut()
+                .expect("incomplete stream writer")
                 .checkpoint()
                 .map_err(|error| blob_pack_application_error("blob stream finish", error))?;
             stream.checkpoint = self
@@ -3516,39 +3550,47 @@ impl SelectedBlobNode {
             options,
             total_len,
         })?;
-        let mut offset = opened.progress.accepted_offset;
-        self.verify_native_publish_retry_prefix(opened.token, source, offset, admission)?;
-        source
-            .seek(std::io::SeekFrom::Start(offset))
-            .map_err(|error| application_error("blob publish", error.into()))?;
-        while offset < total_len {
-            if admission.is_some_and(|admission| !admission.load(Ordering::Acquire)) {
-                return Err(actor_unavailable("blob publish"));
-            }
-            let remaining = total_len - offset;
-            let read_len = usize::try_from(remaining.min(BLOB_STREAM_SEGMENT_BYTES as u64))
-                .expect("bounded native Blob segment length");
-            let mut bytes = Zeroizing::new(vec![0_u8; read_len]);
+        let result = (|| {
+            let mut offset = opened.progress.accepted_offset;
+            self.verify_native_publish_retry_prefix(opened.token, source, offset, admission)?;
             source
-                .read_exact(&mut bytes)
+                .seek(std::io::SeekFrom::Start(offset))
                 .map_err(|error| application_error("blob publish", error.into()))?;
-            let progress = self.append_publish_stream_inner(opened.token, offset, bytes)?;
-            offset = progress.accepted_offset;
-        }
-        let observed_len = source
-            .seek(std::io::SeekFrom::End(0))
-            .map_err(|error| application_error("blob publish", error.into()))?;
-        if observed_len != total_len
-            || admission.is_some_and(|admission| !admission.load(Ordering::Acquire))
-        {
-            return Err(if observed_len != total_len {
-                ApplicationError::new(ApplicationErrorKind::Conflict, "blob publish")
-            } else {
-                actor_unavailable("blob publish")
-            });
-        }
-        self.finish_publish_stream_inner(opened.token)
-            .map_err(|error| ApplicationError::new(error.kind(), "blob publish"))
+            while offset < total_len {
+                if admission.is_some_and(|admission| !admission.load(Ordering::Acquire)) {
+                    return Err(actor_unavailable("blob publish"));
+                }
+                let remaining = total_len - offset;
+                let read_len = usize::try_from(remaining.min(BLOB_STREAM_SEGMENT_BYTES as u64))
+                    .expect("bounded native Blob segment length");
+                let mut bytes = Zeroizing::new(vec![0_u8; read_len]);
+                source
+                    .read_exact(&mut bytes)
+                    .map_err(|error| application_error("blob publish", error.into()))?;
+                let progress = self.append_publish_stream_inner(opened.token, offset, bytes)?;
+                offset = progress.accepted_offset;
+            }
+            let observed_len = source
+                .seek(std::io::SeekFrom::End(0))
+                .map_err(|error| application_error("blob publish", error.into()))?;
+            if observed_len != total_len
+                || admission.is_some_and(|admission| !admission.load(Ordering::Acquire))
+            {
+                return Err(if observed_len != total_len {
+                    ApplicationError::new(ApplicationErrorKind::Conflict, "blob publish")
+                } else {
+                    actor_unavailable("blob publish")
+                });
+            }
+            self.finish_publish_stream_inner(opened.token)
+                .map_err(|error| ApplicationError::new(error.kind(), "blob publish"))
+        })();
+        // One-shot calls own their runtime state only for this call. The Store
+        // retains the reservation/checkpoint needed by an exact later retry.
+        self.publish_streams.remove(&opened.token);
+        self.completed_publish_streams.remove(&opened.token);
+        self.live_publish_sessions.remove(&opened.token);
+        result
     }
 
     /// Verifies bytes skipped by a resumed one-shot publication against the
@@ -7446,7 +7488,7 @@ pub(crate) mod tests {
             BlobUploadReservation,
             aster_redb_store::BlobUploadCheckpoint,
             VerifiedBlobStreamOpen,
-            BlobPackWriter,
+            Option<BlobPackWriter>,
         ) -> BlobPackPromotionJob;
 
         fn take_owned_store(job: BlobPackPromotionJob) -> BlobPackPromotionStore {
@@ -8331,6 +8373,8 @@ pub(crate) mod tests {
             .expect_err("changed one-shot source cannot reuse a durable prefix");
         assert_eq!(error.kind(), ApplicationErrorKind::Conflict);
         assert_eq!(error.operation(), "blob publish");
+        assert!(restarted.publish_streams.is_empty());
+        assert!(restarted.completed_publish_streams.is_empty());
         let opened = restarted
             .open_publish_stream_inner(stream_request)
             .expect("resume stream");
@@ -8348,6 +8392,284 @@ pub(crate) mod tests {
             .expect("finish resumed stream");
         assert!(result.inserted);
         assert_eq!(result.total_len, total_len as u64);
+    }
+
+    #[test]
+    fn completed_upload_resumes_publication_after_restart() {
+        for reuse in [true, false] {
+            for (total_len, ttl_ms) in [(4096, None), (0, None), (4096, Some(50))] {
+                let options = ttl_ms.map_or(BlobPublishOptions::durable(), |ttl| {
+                    BlobPublishOptions::finite_ttl_ms(ttl).unwrap()
+                });
+                let root = TestRoot::new("completed-upload-resume");
+                let bytes = payload(total_len);
+                let publication = request(b"blob/completed-upload/retry");
+                let mut node = selected_node(&root);
+                node.custody_clock = NodeCustodyClock::injected([0xcf; 16], 1_000, 0);
+                if reuse {
+                    let first = node
+                        .open_publish_stream_inner(BlobPublishStreamRequest {
+                            publication: request(b"blob/completed-upload/first"),
+                            options,
+                            total_len: total_len as u64,
+                        })
+                        .unwrap();
+                    if !bytes.is_empty() {
+                        node.append_publish_stream_inner(
+                            first.token,
+                            0,
+                            Zeroizing::new(bytes.clone()),
+                        )
+                        .unwrap();
+                    }
+                    node.finish_publish_stream_inner(first.token)
+                        .expect("publish reusable pack");
+                }
+                let opened = node
+                    .open_publish_stream_inner(BlobPublishStreamRequest {
+                        publication: publication.clone(),
+                        options,
+                        total_len: total_len as u64,
+                    })
+                    .expect("open pending publication");
+                if !bytes.is_empty() {
+                    node.append_publish_stream_inner(
+                        opened.token,
+                        0,
+                        Zeroizing::new(bytes.clone()),
+                    )
+                    .expect("append pending publication");
+                }
+                let PreparedBlobPublishFinalization::Pending(job) = node
+                    .prepare_publish_stream_finalization(opened.token)
+                    .expect("prepare physical completion")
+                else {
+                    panic!("publication must still be pending");
+                };
+                // Stop at the real durable boundary between pack completion
+                // (including dedup cleanup) and semantic publication.
+                let BlobPackPromotionJob {
+                    mission,
+                    store,
+                    reservation,
+                    checkpoint,
+                    open,
+                    writer,
+                    ..
+                } = *job;
+                drop((mission, store));
+                let writer = writer.expect("new upload writer");
+                let counter = open.open().publisher_counter();
+                let (plaintext_root, ciphertext_root) = writer.final_roots().unwrap();
+                node.custody_clock.set_injected_tick(1_005).unwrap();
+                let final_sample = ttl_ms.map(|_| node.custody_clock.sample().unwrap());
+                let commitment = BlobStreamFinalCommitment::new(
+                    &open,
+                    plaintext_root,
+                    ciphertext_root,
+                    writer.next_index(),
+                    final_sample,
+                )
+                .unwrap();
+                let authenticated = node
+                    .verifier
+                    .seal_blob_stream_commitment(&commitment)
+                    .unwrap();
+                let verified = node
+                    .verifier
+                    .verify_blob_stream_commitment(&open, &authenticated)
+                    .unwrap();
+                let lineage = node.verifier.blob_stream_lineage(&open).unwrap();
+                let completion = writer.finish_profile5(&verified).unwrap();
+                let policy = node.current_policy("test completion").unwrap();
+                let projected = node
+                    .store
+                    .checkpoint_blob_upload(
+                        &policy,
+                        &reservation,
+                        checkpoint,
+                        completion.checkpoint().clone(),
+                    )
+                    .unwrap();
+                let completed = node
+                    .store
+                    .complete_profile5_upload_pack(
+                        &policy,
+                        &reservation,
+                        projected,
+                        completion,
+                        &verified,
+                        lineage,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    completed
+                        .profile5_completion()
+                        .unwrap()
+                        .reuses_existing_pack(),
+                    reuse
+                );
+                let owner = reservation.request().owner.clone();
+                assert!(
+                    node.store
+                        .blob_for_owner_with_policy(&policy, &owner)
+                        .unwrap()
+                        .is_none()
+                );
+                drop(node);
+
+                let mut restarted = selected_node(&root);
+                restarted.custody_clock = NodeCustodyClock::injected([0xcf; 16], 1_020, 0);
+                let resumed = restarted
+                    .open_publish_stream_inner(BlobPublishStreamRequest {
+                        publication: publication.clone(),
+                        options,
+                        total_len: total_len as u64,
+                    })
+                    .expect("resume completed upload without reopening its candidate writer");
+                assert_eq!(resumed.token, opened.token);
+                assert_eq!(resumed.progress.durable_offset, total_len as u64);
+                if !bytes.is_empty() {
+                    let mut changed = bytes.clone();
+                    changed[0] ^= 0x80;
+                    let error = restarted
+                        .publish_with_options(
+                            publication.clone(),
+                            options,
+                            &mut Cursor::new(changed),
+                        )
+                        .expect_err(
+                            "completed upload still verifies retry content before publishing",
+                        );
+                    assert_eq!(error.kind(), ApplicationErrorKind::Conflict);
+                    let policy = restarted
+                        .current_policy("test pending publication")
+                        .unwrap();
+                    assert!(
+                        restarted
+                            .store
+                            .blob_for_owner_with_policy(&policy, &owner)
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+                let result = if bytes.is_empty() {
+                    restarted.finish_publish_stream_inner(resumed.token)
+                } else {
+                    restarted.publish_with_options(
+                        publication.clone(),
+                        options,
+                        &mut Cursor::new(bytes.clone()),
+                    )
+                }
+                .expect("retry promotes durable completion");
+                assert!(result.inserted);
+                let measured = restarted.pack_promotion_pool.last_report_for_test();
+                assert_eq!(measured.store_boundary_operations, 7);
+                assert_eq!(measured.plaintext_bytes_reprocessed, 0);
+                assert_eq!(measured.ciphertext_bytes_rewritten, 0);
+                let policy = restarted
+                    .current_policy("test resumed publication")
+                    .unwrap();
+                let stored = restarted
+                    .store
+                    .blob_for_owner_with_policy(&policy, &owner)
+                    .unwrap()
+                    .unwrap();
+                let (projection, retention) = restarted
+                    .completed_projection(&stored, "test resumed publication")
+                    .unwrap();
+                let verified = restarted
+                    .source_route_cache
+                    .authenticated_profile5_blob_source(&restarted.verifier, &projection, retention)
+                    .unwrap();
+                assert_eq!(
+                    verified.publication().publication().final_custody(),
+                    ttl_ms.map(|_| CustodySample {
+                        clock_id: [0xcf; 16],
+                        tick_ms: 1_020
+                    })
+                );
+                assert_eq!(result.publication_id.unwrap().as_bytes(), &opened.token);
+                assert_eq!(result.publisher_counter, counter);
+                assert!(
+                    restarted
+                        .store
+                        .resume_blob_upload(&owner)
+                        .unwrap()
+                        .is_none()
+                );
+                let reopened = restarted
+                    .open_publish_stream_inner(BlobPublishStreamRequest {
+                        publication,
+                        options,
+                        total_len: total_len as u64,
+                    })
+                    .unwrap();
+                let repeated = restarted
+                    .finish_publish_stream_inner(reopened.token)
+                    .expect("completed retry remains idempotent");
+                assert!(!repeated.inserted);
+                assert_eq!(repeated.publication_id, result.publication_id);
+                assert_eq!(repeated.acceptance_marker, result.acceptance_marker);
+            }
+        }
+    }
+
+    #[test]
+    fn one_shot_reader_failure_releases_runtime_and_retains_retry() {
+        struct FailingSource(Cursor<Vec<u8>>);
+        impl Read for FailingSource {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected source read failure"))
+            }
+        }
+        impl Seek for FailingSource {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                self.0.seek(position)
+            }
+        }
+        let root = TestRoot::new("one-shot-reader-failure");
+        let mut node = selected_node(&root);
+        let bytes = vec![7; 1024];
+        for index in 0..3 {
+            let request = request(format!("blob/reader-failure/{index}").as_bytes());
+            let owner = BlobOperationOwner::new(
+                node.identity(),
+                BlobOperationKey::new(request.operation_key.clone()).unwrap(),
+            );
+            let error = node
+                .publish(
+                    request.clone(),
+                    &mut FailingSource(Cursor::new(bytes.clone())),
+                )
+                .expect_err("source error is returned");
+            assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
+            assert!(
+                node.publish_streams.is_empty(),
+                "failed one-shot upload retained runtime workers"
+            );
+            assert!(node.completed_publish_streams.is_empty());
+            let (reservation, checkpoint) = node
+                .store
+                .resume_blob_upload(&owner)
+                .unwrap()
+                .expect("durable retry state");
+            assert_eq!(checkpoint.durable_plaintext_offset(), 0);
+            let publication = node
+                .publish(request, &mut Cursor::new(bytes.clone()))
+                .expect("exact retry succeeds");
+            assert!(publication.inserted);
+            assert_eq!(
+                publication
+                    .publication_id
+                    .expect("native publication")
+                    .as_bytes(),
+                reservation.pack_identity().upload_id().as_bytes()
+            );
+            assert!(node.publish_streams.is_empty());
+            assert!(node.completed_publish_streams.is_empty());
+        }
     }
 
     struct CountingCursor {
