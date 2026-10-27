@@ -133,7 +133,11 @@ impl<W: Write, C: Clock> ProgressReporter<W, C> {
                 current.saturating_sub(last_bytes) as f64 / seconds
             }
         });
-        let percentage = current as f64 * 100.0 / snapshot.total as f64;
+        let percentage = if snapshot.total == 0 {
+            100.0
+        } else {
+            current as f64 * 100.0 / snapshot.total as f64
+        };
         let line = match self.kind {
             ProgressKind::Publish => format!(
                 "Blob publish: sent={} accepted={} durable={} total={} {percentage:.1}% elapsed={:.1}s rate={rate:.0} B/s",
@@ -171,7 +175,7 @@ impl<W: Write, C: Clock> ProgressReporter<W, C> {
     }
 
     fn validate(&self, snapshot: ProgressSnapshot) -> io::Result<()> {
-        if snapshot.total == 0
+        if (snapshot.total == 0 && self.kind == ProgressKind::Publish)
             || snapshot.sent > snapshot.total
             || snapshot.accepted > snapshot.sent
             || snapshot.durable > snapshot.accepted
@@ -312,6 +316,64 @@ mod tests {
             reporter.report(event, snapshot(0)).unwrap();
         }
         assert!(reporter.into_inner().is_empty());
+    }
+
+    #[test]
+    fn empty_read_progress_reports_finite_completion() {
+        let mut reporter = ProgressReporter::new(
+            Vec::new(),
+            ProgressMode::Always,
+            false,
+            ProgressKind::Read,
+            FakeClock::new(),
+        );
+        for event in [ProgressEvent::Initial, ProgressEvent::Terminal] {
+            reporter.report(event, ProgressSnapshot::default()).unwrap();
+        }
+        let output = String::from_utf8(reporter.into_inner()).unwrap();
+        assert_eq!(output.lines().count(), 2);
+        assert!(
+            output
+                .lines()
+                .all(|line| line.contains("written=0 total=0 100.0%"))
+        );
+    }
+
+    #[test]
+    fn empty_read_progress_still_rejects_nonzero_counters() {
+        for snapshot in [
+            ProgressSnapshot {
+                written: 1,
+                ..Default::default()
+            },
+            ProgressSnapshot {
+                sent: 1,
+                ..Default::default()
+            },
+            ProgressSnapshot {
+                accepted: 1,
+                ..Default::default()
+            },
+            ProgressSnapshot {
+                durable: 1,
+                ..Default::default()
+            },
+        ] {
+            let mut reporter = ProgressReporter::new(
+                Vec::new(),
+                ProgressMode::Never,
+                false,
+                ProgressKind::Read,
+                FakeClock::new(),
+            );
+            assert_eq!(
+                reporter
+                    .report(ProgressEvent::Initial, snapshot)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
     }
 
     #[test]

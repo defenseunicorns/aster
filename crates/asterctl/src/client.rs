@@ -1876,4 +1876,57 @@ mod tests {
         fixture.stop().await;
         std::fs::remove_dir_all(directory).unwrap();
     }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn empty_blob_read_succeeds_with_every_progress_mode() {
+        use crate::progress::{ProgressKind, ProgressMode, ProgressReporter, SystemClock};
+        let router = connectrpc::Router::new().route_server_stream(
+            SERVICE,
+            "ReadBlob",
+            connectrpc::streaming_handler_fn(|_ctx, _request: api::ReadBlobRequest| async move {
+                connectrpc::Response::stream_ok(connectrpc::stream_iter([Ok(read_page(
+                    0,
+                    0,
+                    vec![],
+                    true,
+                ))]))
+            }),
+        );
+        let fixture = Fixture::start(router).await;
+        let directory = private_test_directory("empty-blob-progress");
+        let request = api::ReadBlobRequest {
+            id: vec![1; 32],
+            topic: "imagery.maps".into(),
+            scope: "mission/team/alpha".into(),
+            ..Default::default()
+        };
+        for mode in [
+            ProgressMode::Auto,
+            ProgressMode::Never,
+            ProgressMode::Always,
+        ] {
+            let destination = directory.join(format!("{mode:?}"));
+            let mut reporter = ProgressReporter::new(
+                Vec::new(),
+                mode,
+                false,
+                ProgressKind::Read,
+                SystemClock::start(),
+            );
+            read_blob_with_progress(
+                fixture.address,
+                &token(),
+                request.clone(),
+                destination.clone(),
+                Duration::from_secs(2),
+                &mut reporter,
+            )
+            .await
+            .expect("valid empty Blob is published to the destination");
+            assert_eq!(std::fs::read(destination).unwrap(), b"");
+        }
+        fixture.stop().await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }
