@@ -3072,6 +3072,118 @@ mod tests {
         )
     }
 
+    fn assert_profile5_abort_preserves_counter_across_reopen(
+        fault: Option<super::super::pack::BlobPackFaultPoint>,
+    ) {
+        let mut fixture = fixture("profile5-abort-counter", 0x66, BlobDepotLimits::DEFAULT);
+        let request = request(&fixture, b"profile5/abort-retry", 4096);
+        let (reservation, _, open) = reserve_profile5(&fixture, &request);
+        assert_eq!(open.open().publisher_counter(), 1);
+        if let Some(fault) = fault {
+            let root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
+            super::super::pack::inject_test_fault(&root, fault);
+        }
+        let aborted = fixture.store.abort_blob_upload(&reservation);
+        if fault.is_some() {
+            assert!(aborted.is_err(), "interrupt the durable abort cleanup");
+        } else {
+            assert!(aborted.expect("abort publication"));
+        }
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        Store::inspect_existing(fixture.root.database()).expect("inspect aborted publication");
+        fixture.store = Store::open_for_mission(fixture.root.database(), authority)
+            .expect("recover aborted publication");
+        assert!(
+            fixture
+                .store
+                .resume_blob_upload(&request.owner)
+                .expect("inspect recovered upload")
+                .is_none()
+        );
+
+        // The aborted dot stays allocated, even when no publication retains it.
+        let (retry, initial, open) = reserve_profile5(&fixture, &request);
+        assert_eq!(open.open().publisher_counter(), 2);
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        let completed = complete_profile5_pack(&fixture, &policy, &retry, initial, &open, 0x55);
+        let publication = profile5_publication(&fixture, &open, &completed);
+        let outcome = fixture
+            .store
+            .commit_profile5_publication_once_with_policy(
+                &policy,
+                &retry,
+                &completed,
+                &publication,
+                publication.publication().final_custody(),
+            )
+            .expect("publish after abort and restart");
+        assert!(outcome.inserted());
+        drop(fixture.store);
+        Store::inspect_existing(fixture.root.database()).expect("inspect publication after gap");
+        let reopened = Store::open_for_mission(fixture.root.database(), authority)
+            .expect("reopen publication after gap");
+        assert!(
+            reopened
+                .get_blob(outcome.blob().transfer_id)
+                .expect("read publication after gap")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn profile5_abort_preserves_counter_across_reopen() {
+        assert_profile5_abort_preserves_counter_across_reopen(None);
+    }
+
+    #[test]
+    fn profile5_interrupted_abort_preserves_counter_across_reopen() {
+        use super::super::pack::BlobPackFaultPoint;
+        for fault in [
+            BlobPackFaultPoint::CleanupEntryRemoved,
+            BlobPackFaultPoint::CleanupDurable,
+        ] {
+            assert_profile5_abort_preserves_counter_across_reopen(Some(fault));
+        }
+    }
+
+    #[test]
+    fn profile5_upload_audit_rejects_missing_or_regressed_publisher_counter() {
+        for replacement in [None, Some(0), Some(1)] {
+            let fixture = fixture("profile5-counter-floor", 0x67, BlobDepotLimits::DEFAULT);
+            let first = request(&fixture, b"counter/first", 4096);
+            reserve_profile5(&fixture, &first);
+            let second = request(&fixture, b"counter/second", 4096);
+            let (_, _, open) = reserve_profile5(&fixture, &second);
+            assert_eq!(open.open().publisher_counter(), 2);
+            let write = fixture.store.database.begin_write().expect("write counter");
+            {
+                let mut table = write.open_table(PUBLISHER_HIGH_WATER).expect("counters");
+                match replacement {
+                    Some(value) => {
+                        table
+                            .insert(first.owner.publisher.as_slice(), value)
+                            .expect("regress counter");
+                    }
+                    None => {
+                        table
+                            .remove(first.owner.publisher.as_slice())
+                            .expect("remove counter");
+                    }
+                }
+            }
+            write.commit().expect("commit corrupted counter");
+            let authority = fixture.publisher.mission_authority_id();
+            drop(fixture.store);
+            Store::inspect_existing(fixture.root.database())
+                .expect_err("inspection must reject a missing or regressed allocation");
+            assert!(
+                Store::open_for_mission(fixture.root.database(), authority).is_err(),
+                "open must reject a missing or regressed allocation"
+            );
+        }
+    }
+
     #[test]
     fn reused_pack_cleanup_preserves_pending_publication_across_reopen() {
         use super::super::pack::BlobPackFaultPoint;

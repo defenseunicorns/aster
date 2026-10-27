@@ -118,6 +118,7 @@ const ACCEPTED_EVENTS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("aster.accepted-events.v1");
 const CAUSAL_FRONTIER: TableDefinition<&[u8], u64> =
     TableDefinition::new("aster.causal-frontier.v1");
+// Allocation high-water: aborted uploads leave unused counters that must not be reissued.
 const PUBLISHER_HIGH_WATER: TableDefinition<&[u8], u64> =
     TableDefinition::new("aster.publisher-high-water.v1");
 const EVENT_HIGH_WATER: TableDefinition<&[u8], u64> =
@@ -19247,11 +19248,7 @@ fn audit_semantic_tables(
         }
     }
 
-    audit_exact_u64_index(
-        &publisher_high_water,
-        &expected_publisher_high,
-        "publisher high-water contains an orphan, missing, or inflated row",
-    )?;
+    audit_publisher_high_water(&publisher_high_water, &expected_publisher_high)?;
     audit_exact_u64_index(
         &event_high_water,
         &expected_event_high,
@@ -20412,6 +20409,34 @@ fn audit_or_initialize_counter(
             Ok(())
         }
     }
+}
+
+fn audit_publisher_high_water<T: ReadableTable<&'static [u8], u64>>(
+    table: &T,
+    retained: &std::collections::BTreeMap<Vec<u8>, u64>,
+) -> Result<(), StoreError> {
+    // Accepted dots and pending uploads establish a floor, not an exact index.
+    // An aborted upload no longer has a row, but its allocation remains durable.
+    for row in table.iter()? {
+        let (key, value) = row?;
+        parse_node_id("publisher high-water", key.value())?;
+        if value.value() == 0 {
+            return Err(StoreError::SemanticInvariant(
+                "publisher high-water contains a zero counter",
+            ));
+        }
+    }
+    for (publisher, minimum) in retained {
+        if table
+            .get(publisher.as_slice())?
+            .is_none_or(|value| value.value() < *minimum)
+        {
+            return Err(StoreError::SemanticInvariant(
+                "publisher high-water is missing or behind retained dots",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn audit_exact_u64_index(
@@ -24362,23 +24387,7 @@ fn inspect_semantic_readable(
             ));
         }
     }
-    if publisher_high_water.len()?
-        != u64::try_from(expected_publisher_high.len())
-            .map_err(|_| StoreError::ItemCountAccountingOverflow)?
-    {
-        return Err(StoreError::SemanticInvariant(
-            "publisher high-water contains an orphan, missing, or inflated row",
-        ));
-    }
-    for row in publisher_high_water.iter()? {
-        let (key, value) = row?;
-        parse_node_id("publisher high-water", key.value())?;
-        if value.value() == 0 || expected_publisher_high.get(key.value()) != Some(&value.value()) {
-            return Err(StoreError::SemanticInvariant(
-                "publisher high-water contains an orphan, missing, or inflated row",
-            ));
-        }
-    }
+    audit_publisher_high_water(&publisher_high_water, &expected_publisher_high)?;
     if event_high_water.len()?
         != u64::try_from(expected_event_high.len())
             .map_err(|_| StoreError::ItemCountAccountingOverflow)?
@@ -32068,7 +32077,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_inspection_rejects_partial_schema_and_inflated_high_water() {
+    fn read_only_inspection_rejects_partial_schema() {
         let partial = TestFile::new("inspect-partial-semantic-schema");
         {
             let store = Store::open(&partial.0).expect("create current schema");
@@ -32087,58 +32096,105 @@ mod tests {
                 "mission-scoped Event schema is incomplete"
             ))
         ));
+    }
 
-        let inflated = TestFile::new("inspect-inflated-high-water");
-        let mut services = event_services(0xa2);
-        {
-            let store =
-                Store::open_for_mission(&inflated.0, services.authority).expect("bound store");
-            let payload = b"audited";
-            let header = event_header(
-                services.publisher.identity(),
-                1,
-                1,
-                VersionVector::default(),
-                b"audit",
-                payload,
-                None,
+    #[test]
+    fn publisher_counter_audit_preserves_allocations_and_rejects_regression() {
+        for allocated in [None, Some(0), Some(1), Some(99), Some(u64::MAX)] {
+            let file = TestFile::new("inspect-publisher-allocation");
+            let mut services = event_services(0xa2);
+            let publisher = services.publisher.identity();
+            {
+                let store =
+                    Store::open_for_mission(&file.0, services.authority).expect("bound store");
+                let payload = b"audited";
+                let header = event_header(
+                    publisher,
+                    2,
+                    1,
+                    VersionVector::default(),
+                    b"audit",
+                    payload,
+                    None,
+                );
+                let sealed = services
+                    .publisher
+                    .seal_event(&header, payload)
+                    .expect("seal Event");
+                let event = content_event(&mut services.reader, &sealed.bytes);
+                store
+                    .apply_verified_event(&event, &sealed.bytes)
+                    .expect("accept Event");
+                let write = store.database.begin_write().expect("write allocation");
+                {
+                    let mut table = write.open_table(PUBLISHER_HIGH_WATER).expect("counters");
+                    match allocated {
+                        Some(value) => {
+                            table
+                                .insert(publisher.as_slice(), value)
+                                .expect("set allocation");
+                        }
+                        None => {
+                            table
+                                .remove(publisher.as_slice())
+                                .expect("remove allocation");
+                        }
+                    }
+                }
+                write.commit().expect("commit allocation");
+            }
+            let before = std::fs::read(&file.0).expect("read store before inspection");
+            let inspected = Store::inspect_existing(&file.0);
+            assert_eq!(
+                std::fs::read(&file.0).expect("inspection is read-only"),
+                before
             );
-            let sealed = services
-                .publisher
-                .seal_event(&header, payload)
-                .expect("seal audited Event");
-            let event = content_event(&mut services.reader, &sealed.bytes);
-            store
-                .apply_verified_event(&event, &sealed.bytes)
-                .expect("accept audited Event");
+            let reopened = Store::open_for_mission(&file.0, services.authority);
+            match allocated {
+                Some(99) | Some(u64::MAX) => {
+                    inspected.expect("inspect allocations ahead of accepted dots");
+                    let store = reopened.expect("preserve allocations on reopen");
+                    let reservation =
+                        store.reserve_event(publisher, &event_topic(), &event_scope());
+                    if allocated == Some(99) {
+                        let reservation = reservation.expect("reserve after unused allocations");
+                        assert_eq!(reservation.counter(), 100);
+                        assert_eq!(reservation.event_sequence(), 2);
+                    } else {
+                        assert!(
+                            matches!(reservation, Err(StoreError::InvalidSemanticEvent(_))),
+                            "counter exhaustion must not wrap or reuse a dot"
+                        );
+                    }
+                }
+                _ => {
+                    assert!(matches!(inspected, Err(StoreError::SemanticInvariant(_))));
+                    assert!(matches!(reopened, Err(StoreError::SemanticInvariant(_))));
+                }
+            }
         }
-        {
-            let database = Database::open(&inflated.0).expect("open raw database");
-            let write = database.begin_write().expect("begin high-water corruption");
-            write
-                .open_table(PUBLISHER_HIGH_WATER)
-                .expect("publisher high-water")
-                .insert(services.publisher.identity().as_slice(), 99)
-                .expect("inflate publisher high-water");
-            write.commit().expect("commit high-water corruption");
+    }
+
+    #[test]
+    fn publisher_counter_audit_rejects_invalid_allocation_rows() {
+        for (key, value) in [(vec![0x77; 32], 0), (vec![0x77; 31], 1)] {
+            let file = TestFile::new("invalid-publisher-allocation");
+            {
+                let store = Store::open_for_mission(&file.0, [0xa3; 32]).expect("bound store");
+                let write = store
+                    .database
+                    .begin_write()
+                    .expect("write invalid allocation");
+                write
+                    .open_table(PUBLISHER_HIGH_WATER)
+                    .expect("counters")
+                    .insert(key.as_slice(), value)
+                    .expect("insert invalid allocation");
+                write.commit().expect("commit invalid allocation");
+            }
+            assert!(Store::inspect_existing(&file.0).is_err());
+            assert!(Store::open_for_mission(&file.0, [0xa3; 32]).is_err());
         }
-        let corrupted = std::fs::read(&inflated.0).expect("read corrupted store");
-        assert!(matches!(
-            Store::inspect_existing(&inflated.0),
-            Err(StoreError::SemanticInvariant(
-                "publisher high-water contains an orphan, missing, or inflated row"
-            ))
-        ));
-        assert_eq!(
-            std::fs::read(&inflated.0).expect("failed inspection is read-only"),
-            corrupted
-        );
-        assert!(matches!(
-            Store::open_for_mission(&inflated.0, services.authority),
-            Err(StoreError::SemanticInvariant(
-                "publisher high-water contains an orphan, missing, or inflated row"
-            ))
-        ));
     }
 
     #[test]
