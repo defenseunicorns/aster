@@ -531,7 +531,13 @@ results to release headroom; a failed pending sequence may then be retried.
 
 `Unavailable` with `PUBLIC_ERROR_REASON_DRAINING` or
 `PUBLIC_ERROR_REASON_STATE_UNAVAILABLE` is retryable only after `/readyz`
-returns `200`. Authentication failures require credential refresh.
+returns `200`. A Ready agent can also return `STATE_UNAVAILABLE` while an earlier
+`PublishBlob` attempt for the same operation is still finalizing. Readiness
+does not mean that operation has finished: apply bounded backoff and retry the
+identical request with the same `operation_key`. The earlier attempt can still
+commit after the client disconnects. `asterctl` reports an unknown outcome and
+prints the exact retry key; it does not retry automatically.
+Authentication failures require credential refresh.
 Malformed input, unsupported values, operation-key conflicts, missing durable
 objects, and failed preconditions are not automatic-retry conditions.
 
@@ -555,7 +561,7 @@ request values or internal chains.
 | `PUBLIC_ERROR_REASON_RESOURCE_EXHAUSTION` | `ResourceExhausted` | yes | Back off, reduce a valid page, or wait for capacity recovery. |
 | `PUBLIC_ERROR_REASON_OPERATION_CAPACITY_EXHAUSTED` | `ResourceExhausted` | no | Stop new publication and escalate; preserve the original numbered intent. |
 | `PUBLIC_ERROR_REASON_DRAINING` | `Unavailable` | yes | Wait for a Ready process. |
-| `PUBLIC_ERROR_REASON_STATE_UNAVAILABLE` | `Unavailable` | yes | Wait for a Ready process. |
+| `PUBLIC_ERROR_REASON_STATE_UNAVAILABLE` | `Unavailable` | yes | Wait for a Ready process, then back off; Blob finalization can remain active under the same operation key. |
 | `PUBLIC_ERROR_REASON_AUTHENTICATION_FAILED` | `Unauthenticated` | no | Refresh credentials; do not repeat the same failed authorization. |
 | `PUBLIC_ERROR_REASON_INTERNAL` | `Internal` or `DataLoss` | no | Treat as a sanitized terminal request failure and investigate fixed operator telemetry. |
 

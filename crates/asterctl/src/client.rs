@@ -147,6 +147,12 @@ impl MutationError {
         let Some(detail) = public_error_detail(error, expected_operation) else {
             return classified;
         };
+        if expected_operation == "publish_blob"
+            && error.code == connectrpc::ErrorCode::Unavailable
+            && detail.reason.as_known() == Some(api::PublicErrorReason::StateUnavailable)
+        {
+            classified.hint = "\nThe agent reported temporarily unavailable state; an earlier publication attempt may still complete. Wait before retrying.";
+        }
         if is_definite_publish_rejection(error.code, detail.reason.as_known()) {
             classified.unknown = false;
             classified.retryable_rejection = detail.retryable;
@@ -1212,6 +1218,27 @@ mod tests {
                 .describe("PublishBlob", &key)
                 .starts_with("PublishBlob outcome unknown: unavailable")
         );
+    }
+
+    #[test]
+    fn typed_blob_temporary_state_preserves_unknown_outcome_without_connection_hint() {
+        // Break caught: a reachable agent returning temporary state (including
+        // an ongoing publication) must not be diagnosed as a bad host or port.
+        let key = crate::operation_key::Selection::Explicit("blob-key".into())
+            .resolve()
+            .unwrap();
+        let error = public_error(
+            connectrpc::ErrorCode::Unavailable,
+            api::PublicErrorReason::StateUnavailable,
+            "publish_blob",
+            true,
+        );
+        let rendered =
+            MutationError::rpc_error(&error, "publish_blob").describe("PublishBlob", &key);
+        assert!(rendered.starts_with("PublishBlob outcome unknown: unavailable"));
+        assert!(rendered.contains("retry the identical request with --operation-key=blob-key"));
+        assert!(!rendered.contains("--host"));
+        assert!(!rendered.contains("--port"));
     }
 
     #[test]

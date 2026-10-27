@@ -135,6 +135,15 @@ hostile filesystem syscall can delay the joined worker and therefore delay
 shutdown or zeroization; no bounded shutdown-latency claim is made for such a
 file provider.
 
+While a local stream's finalization is prepared, queued, or running, reopening
+the identical operation returns temporary `StateUnavailable`. The background
+job retains exclusive access to that operation's files even if its caller
+disconnects; a changed request under the same key remains a conflict. Back off
+and retry the identical operation to recover its saved result or resume its
+checkpoint. Other operations remain independently schedulable. Ownership is
+process-local and disappears on process exit; restart uses ordinary durable
+upload recovery. A timeout does not release a writer that may still be running.
+
 ## Use the local agent and `asterctl`
 
 The local `aster-agent` exposes native gRPC `PublishBlob` and `ReadBlob`

@@ -962,6 +962,10 @@ impl SelectedBlobHandle {
     /// uncheckpointed bytes, while retaining the durable upload for exact resume.
     /// Reopening the same operation replaces its prior live handle; writes and
     /// finalization through that older handle are rejected.
+    /// Once finalization is prepared, an exact reopen returns temporary
+    /// `StateUnavailable` until the job releases its writer. Retry the identical
+    /// operation after backoff to recover its durable result; dropping a caller
+    /// does not cancel a scheduled finalization.
     ///
     /// `total_len == 0` is valid for semantic-v9/profile-5. Such a stream accepts
     /// no data writes and is finalized directly; a later read at offset zero
@@ -1764,6 +1768,8 @@ struct BlobPackPromotionJob {
     writer: Option<BlobPackWriter>,
     #[cfg(test)]
     gate: Option<BlobPackPromotionTestGate>,
+    // Last field: rejection/drop closes the writer before releasing ownership.
+    finalizing: Arc<BlobPublishStreamRequest>,
 }
 
 struct BlobPackPromotionWork {
@@ -1993,6 +1999,7 @@ impl BlobPackPromotionJob {
         checkpoint: aster_redb_store::BlobUploadCheckpoint,
         open: VerifiedBlobStreamOpen,
         writer: Option<BlobPackWriter>,
+        finalizing: Arc<BlobPublishStreamRequest>,
     ) -> Self {
         let BlobPackPromotionAuthority {
             mission,
@@ -2011,6 +2018,7 @@ impl BlobPackPromotionJob {
             writer,
             #[cfg(test)]
             gate: None,
+            finalizing,
         }
     }
 
@@ -2023,6 +2031,13 @@ impl BlobPackPromotionJob {
     fn run_measured(
         self,
     ) -> Result<(BlobPublishResult, BlobPackPromotionMetrics), ApplicationError> {
+        // Hold ownership outside the frame which owns/moves the writer. This
+        // outlives all inner resources on success, error, and panic unwinding.
+        let _finalizing = Arc::clone(&self.finalizing);
+        self.run_owned()
+    }
+
+    fn run_owned(self) -> Result<(BlobPublishResult, BlobPackPromotionMetrics), ApplicationError> {
         let BlobPackPromotionJob {
             mission,
             store,
@@ -2034,12 +2049,8 @@ impl BlobPackPromotionJob {
             writer,
             #[cfg(test)]
             gate,
+            finalizing: _,
         } = self;
-        #[cfg(test)]
-        if let Some(gate) = &gate {
-            gate.enter();
-        }
-
         let mut verifier = store
             .replay_authority(&mission)
             .map_err(|error| application_error("blob stream finish", error))?;
@@ -2085,6 +2096,11 @@ impl BlobPackPromotionJob {
                 ApplicationErrorKind::Integrity,
                 "blob stream finish",
             ));
+        }
+
+        #[cfg(test)]
+        if let Some(gate) = &gate {
+            gate.enter();
         }
 
         let final_sample = if request.ttl_ms.is_some() {
@@ -2262,6 +2278,10 @@ pub struct SelectedBlobNode {
     source_route_cache: Arc<AuthenticatedEventRouteCache>,
     custody_clock: NodeCustodyClock,
     publish_streams: BTreeMap<[u8; 32], LocalBlobPublishStream>,
+    // The job owns the strong reference, never a client/session or this map.
+    // Admission prunes dead entries; only prepared, queued, or running work is
+    // retained. No busy state is persisted across process exit.
+    finalizing_publish_streams: BTreeMap<[u8; 32], Weak<BlobPublishStreamRequest>>,
     live_publish_sessions: BTreeMap<[u8; 32], Weak<BlobPublishStreamSession>>,
     publish_stream_cleanup: Arc<tokio::sync::Notify>,
     completed_publish_streams: BTreeMap<[u8; 32], CompletedBlobPublishStream>,
@@ -2391,6 +2411,7 @@ impl SelectedBlobNode {
             source_route_cache,
             custody_clock,
             publish_streams: BTreeMap::new(),
+            finalizing_publish_streams: BTreeMap::new(),
             live_publish_sessions: BTreeMap::new(),
             publish_stream_cleanup: Arc::new(tokio::sync::Notify::new()),
             completed_publish_streams: BTreeMap::new(),
@@ -2445,6 +2466,7 @@ impl SelectedBlobNode {
             source_route_cache,
             custody_clock,
             publish_streams: BTreeMap::new(),
+            finalizing_publish_streams: BTreeMap::new(),
             live_publish_sessions: BTreeMap::new(),
             publish_stream_cleanup: Arc::new(tokio::sync::Notify::new()),
             completed_publish_streams: BTreeMap::new(),
@@ -2795,6 +2817,22 @@ impl SelectedBlobNode {
             .map_err(|error| application_error("blob stream open", error.into()))?;
         let token =
             *local_blob_publication_stream_id(self.identity(), operation.as_bytes()).as_bytes();
+        self.finalizing_publish_streams
+            .retain(|_, job| job.strong_count() != 0);
+        if let Some(active) = self
+            .finalizing_publish_streams
+            .get(&token)
+            .and_then(Weak::upgrade)
+        {
+            return Err(ApplicationError::new(
+                if *active == request {
+                    ApplicationErrorKind::StateUnavailable
+                } else {
+                    ApplicationErrorKind::Conflict
+                },
+                "blob stream open",
+            ));
+        }
         if let Some(mut stream) = self.publish_streams.remove(&token) {
             if stream.request != request.publication
                 || stream.options != request.options
@@ -3217,6 +3255,14 @@ impl SelectedBlobNode {
         &mut self,
         token: [u8; 32],
     ) -> Result<PreparedBlobPublishFinalization, ApplicationError> {
+        self.finalizing_publish_streams
+            .retain(|_, job| job.strong_count() != 0);
+        if self.finalizing_publish_streams.contains_key(&token) {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::StateUnavailable,
+                "blob stream finish",
+            ));
+        }
         if let Some(completed) = self.completed_publish_streams.remove(&token) {
             return Ok(PreparedBlobPublishFinalization::Completed(completed.result));
         }
@@ -3255,6 +3301,13 @@ impl SelectedBlobNode {
                 )
                 .map_err(|error| application_error("blob stream finish", error.into()))?;
         }
+        let finalizing = Arc::new(BlobPublishStreamRequest {
+            publication: stream.request,
+            options: stream.options,
+            total_len: stream.total_len,
+        });
+        self.finalizing_publish_streams
+            .insert(token, Arc::downgrade(&finalizing));
         let job = BlobPackPromotionJob::new(
             BlobPackPromotionAuthority {
                 mission: self.mission.clone(),
@@ -3266,6 +3319,7 @@ impl SelectedBlobNode {
             stream.checkpoint,
             stream.open,
             stream.writer,
+            finalizing,
         );
         #[cfg(test)]
         let job = job.with_test_gate(self.stream_pack_promotion_gate.clone());
@@ -7489,6 +7543,7 @@ pub(crate) mod tests {
             aster_redb_store::BlobUploadCheckpoint,
             VerifiedBlobStreamOpen,
             Option<BlobPackWriter>,
+            Arc<BlobPublishStreamRequest>,
         ) -> BlobPackPromotionJob;
 
         fn take_owned_store(job: BlobPackPromotionJob) -> BlobPackPromotionStore {
@@ -7889,6 +7944,312 @@ pub(crate) mod tests {
         worker.await.expect("join live application actor");
     }
 
+    // Always release a paused real worker before dropping its joined pool, even
+    // when an assertion fails. This guard belongs only to the test harness.
+    struct ReleasePromotionGate(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+    impl Drop for ReleasePromotionGate {
+        fn drop(&mut self) {
+            let (released, wake) = &*self.0;
+            *released.lock().unwrap() = true;
+            wake.notify_all();
+        }
+    }
+
+    #[test]
+    fn stream_pack_promotion_prepared_job_excludes_retry_until_dropped() {
+        // Break caught: an owned but not-yet-scheduled job must retain the only
+        // writer, and dropping that job must permit recovery of the checkpoint.
+        let root = TestRoot::new("promotion-prepared-ownership");
+        let mut node = selected_node(&root);
+        let bytes = payload(31);
+        let (token, request) = prepare_ready_stream(&mut node, b"prepared-owner", &bytes);
+        let prepared = node.prepare_publish_stream_finalization(token).unwrap();
+        let retry = node.open_publish_stream_inner(request.clone());
+        assert!(
+            matches!(retry, Err(error) if error.kind() == ApplicationErrorKind::StateUnavailable)
+        );
+        let duplicate_finish = node.prepare_publish_stream_finalization(token);
+        assert!(
+            matches!(duplicate_finish, Err(error) if error.kind() == ApplicationErrorKind::StateUnavailable)
+        );
+        let mut changed = request.clone();
+        changed.total_len += 1;
+        assert!(
+            matches!(node.open_publish_stream_inner(changed), Err(error) if error.kind() == ApplicationErrorKind::Conflict)
+        );
+        drop(prepared);
+        let resumed = node.open_publish_stream_inner(request).unwrap();
+        assert_eq!(resumed.progress.durable_offset, 31);
+        let result = node.finish_publish_stream_inner(resumed.token).unwrap();
+        assert!(result.inserted);
+        let page = read_fixture_page(
+            &mut node,
+            BlobReadRequest {
+                id: result.id,
+                topic: blob_topic(),
+                scope: blob_scope(),
+            },
+            0,
+        )
+        .unwrap();
+        assert_eq!(page.as_bytes(), bytes);
+    }
+
+    #[test]
+    fn stream_pack_promotion_active_retry_preserves_committed_pack() {
+        // Break caught: reopening the same operation after worker preflight can
+        // restore/truncate its writer or overwrite its authenticated completion.
+        for ttl_ms in [None, Some(50_000)] {
+            let root = TestRoot::new("promotion-active-ownership");
+            let mut node = selected_node(&root);
+            node.custody_clock = NodeCustodyClock::injected([0xa3; 16], 1_000, 0);
+            let bytes = payload(31);
+            let request = BlobPublishStreamRequest {
+                publication: request(b"active-owner"),
+                options: ttl_ms.map_or(BlobPublishOptions::durable(), |ttl| {
+                    BlobPublishOptions::finite_ttl_ms(ttl).unwrap()
+                }),
+                total_len: 31,
+            };
+            let opened = node.open_publish_stream_inner(request.clone()).unwrap();
+            node.append_publish_stream_inner(opened.token, 0, Zeroizing::new(bytes.clone()))
+                .unwrap();
+            let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+            let (finished_tx, _finished_rx) = std::sync::mpsc::sync_channel(1);
+            let release = ReleasePromotionGate(Arc::new((
+                std::sync::Mutex::new(false),
+                std::sync::Condvar::new(),
+            )));
+            node.set_stream_pack_promotion_gate_for_test(
+                started_tx,
+                finished_tx,
+                Arc::clone(&release.0),
+            );
+            let BlobPublishFinalization::Scheduled(completion) = node
+                .schedule_publish_stream_finalization(opened.token)
+                .unwrap()
+            else {
+                panic!("fresh publication must be scheduled");
+            };
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            assert!(
+                matches!(node.open_publish_stream_inner(request.clone()), Err(error) if error.kind() == ApplicationErrorKind::StateUnavailable)
+            );
+            let one_shot = node.publish_native_reader(
+                request.publication.clone(),
+                request.options,
+                &mut Cursor::new(bytes.clone()),
+                31,
+                Some(31),
+                None,
+            );
+            assert!(
+                matches!(one_shot, Err(error) if error.kind() == ApplicationErrorKind::StateUnavailable)
+            );
+
+            // The other worker can publish a different operation while this
+            // one is held. Distinct content avoids unrelated dedup policy.
+            node.stream_pack_promotion_gate = None;
+            let (other, _) = prepare_ready_stream(&mut node, b"other-owner", &payload(37));
+            assert!(node.finish_publish_stream_inner(other).unwrap().inserted);
+            node.custody_clock.set_injected_tick(1_005).unwrap();
+            drop(release);
+            let result = completion.blocking_recv().unwrap().unwrap();
+            let blob = BlobReadRequest {
+                id: result.id,
+                topic: blob_topic(),
+                scope: blob_scope(),
+            };
+            assert_eq!(
+                read_fixture_page(&mut node, blob.clone(), 0)
+                    .unwrap()
+                    .as_bytes(),
+                bytes
+            );
+            drop(node);
+            let mut reopened = selected_node(&root);
+            reopened.custody_clock = NodeCustodyClock::injected([0xa3; 16], 1_006, 0);
+            assert_eq!(
+                read_fixture_page(&mut reopened, blob, 0)
+                    .unwrap()
+                    .as_bytes(),
+                bytes
+            );
+            let replay = reopened.open_publish_stream_inner(request).unwrap();
+            assert!(
+                !reopened
+                    .finish_publish_stream_inner(replay.token)
+                    .unwrap()
+                    .inserted
+            );
+        }
+    }
+
+    #[test]
+    fn stream_pack_promotion_error_releases_operation_for_retry() {
+        // Break caught: a normal early return from a worker must not retain a
+        // busy marker or allow its still-owned writer to overlap the retry.
+        let root = TestRoot::new("promotion-error-ownership");
+        let mut node = selected_node(&root);
+        node.custody_clock = NodeCustodyClock::injected([0xa4; 16], 1_000, 1);
+        let request = BlobPublishStreamRequest {
+            publication: request(b"error-owner"),
+            options: BlobPublishOptions::finite_ttl_ms(50_000).unwrap(),
+            total_len: 31,
+        };
+        let opened = node.open_publish_stream_inner(request.clone()).unwrap();
+        node.append_publish_stream_inner(opened.token, 0, Zeroizing::new(payload(31)))
+            .unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (finished_tx, _finished_rx) = std::sync::mpsc::sync_channel(1);
+        let release = ReleasePromotionGate(Arc::new((
+            std::sync::Mutex::new(false),
+            std::sync::Condvar::new(),
+        )));
+        node.set_stream_pack_promotion_gate_for_test(
+            started_tx,
+            finished_tx,
+            Arc::clone(&release.0),
+        );
+        let BlobPublishFinalization::Scheduled(completion) = node
+            .schedule_publish_stream_finalization(opened.token)
+            .unwrap()
+        else {
+            panic!("fresh publication must be scheduled");
+        };
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        // Existing injected clock fails its next sample, exercising a real
+        // fallible production operation without changing filesystem contents.
+        node.custody_clock.set_injected_tick(u64::MAX).unwrap();
+        drop(release);
+        assert!(completion.blocking_recv().unwrap().is_err());
+        node.stream_pack_promotion_gate = None;
+        node.custody_clock.set_injected_tick(1_005).unwrap();
+        let retry = node.open_publish_stream_inner(request).unwrap();
+        let result = node.finish_publish_stream_inner(retry.token).unwrap();
+        assert!(result.inserted);
+        let blob = BlobReadRequest {
+            id: result.id,
+            topic: blob_topic(),
+            scope: blob_scope(),
+        };
+        assert_eq!(
+            read_fixture_page(&mut node, blob, 0).unwrap().as_bytes(),
+            payload(31)
+        );
+    }
+
+    #[test]
+    fn stream_pack_promotion_process_exit_does_not_leave_busy_operation() {
+        // Break caught: a receiver process exits without running destructors;
+        // upload recovery must remain possible without a durable busy flag.
+        const CHILD_ROOT: &str = "ASTER_TEST_PROMOTION_EXIT_ROOT";
+        const CHILD_STAGE: &str = "ASTER_TEST_PROMOTION_EXIT_STAGE";
+        const TEST: &str = "application::blob::tests::stream_pack_promotion_process_exit_does_not_leave_busy_operation";
+        if let Some(path) = std::env::var_os(CHILD_ROOT) {
+            let root = std::mem::ManuallyDrop::new(TestRoot(PathBuf::from(path)));
+            let mut node = selected_node(&root);
+            let stage = std::env::var(CHILD_STAGE).unwrap();
+            let opened = node
+                .open_publish_stream_inner(BlobPublishStreamRequest {
+                    publication: request(b"process-exit-owner"),
+                    options: BlobPublishOptions::durable(),
+                    total_len: if stage == "upload" { 62 } else { 31 },
+                })
+                .unwrap();
+            let token = opened.token;
+            node.append_publish_stream_inner(token, 0, Zeroizing::new(payload(31)))
+                .unwrap();
+            match stage.as_str() {
+                "upload" => std::process::exit(73),
+                "prepared" => {
+                    let _job = node.prepare_publish_stream_finalization(token).unwrap();
+                    std::process::exit(73);
+                }
+                "running" => {
+                    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+                    let (finished_tx, _finished_rx) = std::sync::mpsc::sync_channel(1);
+                    let release = ReleasePromotionGate(Arc::new((
+                        std::sync::Mutex::new(false),
+                        std::sync::Condvar::new(),
+                    )));
+                    node.set_stream_pack_promotion_gate_for_test(
+                        started_tx,
+                        finished_tx,
+                        Arc::clone(&release.0),
+                    );
+                    let _completion = node.schedule_publish_stream_finalization(token).unwrap();
+                    started_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                    std::process::exit(73);
+                }
+                "committed" => {
+                    node.finish_publish_stream_inner(token).unwrap();
+                    std::process::exit(73);
+                }
+                _ => panic!("unknown process-exit stage"),
+            }
+        }
+        for stage in ["upload", "prepared", "running", "committed"] {
+            let root = TestRoot::new("promotion-process-exit");
+            drop(selected_node(&root));
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD_ROOT, root.path())
+                .env(CHILD_STAGE, stage)
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("process-exit child timed out at {stage}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            assert_eq!(status.code(), Some(73), "child reached {stage}");
+            let request = BlobPublishStreamRequest {
+                publication: request(b"process-exit-owner"),
+                options: BlobPublishOptions::durable(),
+                total_len: if stage == "upload" { 62 } else { 31 },
+            };
+            let mut reopened = selected_node(&root);
+            let retry = reopened.open_publish_stream_inner(request).unwrap();
+            assert_eq!(
+                retry.progress.durable_offset,
+                if stage == "upload" { 0 } else { 31 }
+            );
+            if retry.progress.durable_offset == 0 {
+                reopened
+                    .append_publish_stream_inner(retry.token, 0, Zeroizing::new(payload(62)))
+                    .unwrap();
+            }
+            let result = reopened.finish_publish_stream_inner(retry.token).unwrap();
+            assert_eq!(result.inserted, stage != "committed");
+            let blob = BlobReadRequest {
+                id: result.id,
+                topic: blob_topic(),
+                scope: blob_scope(),
+            };
+            assert_eq!(
+                read_fixture_page(&mut reopened, blob, 0)
+                    .unwrap()
+                    .as_bytes(),
+                payload(31)
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stream_pack_promotion_pool_bounds_active_and_queued_jobs_and_retry_after_saturation() {
         // Break caught: delegating each finish to Tokio's global blocking pool
@@ -8011,6 +8372,8 @@ pub(crate) mod tests {
             .finish_publish_stream_inner(token)
             .expect_err("closed pack promotion pool rejects admission");
         assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
+        node.open_publish_stream_inner(request.clone())
+            .expect("closed admission releases ownership without a restart");
         drop(node);
 
         let mut reopened = selected_node(&root);
@@ -8062,10 +8425,18 @@ pub(crate) mod tests {
         let completion = schedule_stream_pack_promotion_for_test(&direct, request.clone())
             .await
             .expect("actor schedules promotion before acknowledging");
+        let _release_on_failure = ReleasePromotionGate(Arc::clone(&release));
         tokio::task::spawn_blocking(move || started_rx.recv().expect("promotion worker started"))
             .await
             .expect("observe retained promotion job");
         drop(completion);
+        assert!(
+            matches!(
+                handle.open_publish_stream(request.clone()).await,
+                Err(error) if error.kind() == ApplicationErrorKind::StateUnavailable
+            ),
+            "dropping the caller and its session must not release the running writer"
+        );
         drop(handle);
         drop(direct);
         let mut worker = worker;
