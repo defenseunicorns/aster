@@ -16,7 +16,7 @@ pub(crate) const PROFILE5_PACK_SEGMENT_RECORD_BYTES: usize =
 pub(crate) const PROFILE5_PACK_TRANSPORT_FRAME_BYTES: usize =
     PROFILE5_PACK_RECORD_PREFIX_BYTES + PROFILE5_PACK_SEGMENT_RECORD_BYTES;
 pub(crate) const PROFILE5_MAX_PACK_SEGMENTS: usize =
-    aster_mesh::MAX_BLOB_STREAM_BYTES as usize / aster_mesh::BLOB_STREAM_SEGMENT_BYTES;
+    (aster_mesh::MAX_BLOB_STREAM_BYTES / aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64) as usize;
 pub(crate) const PROFILE5_MAX_PACK_WIRE_BYTES: u64 = aster_mesh::MAX_BLOB_STREAM_BYTES
     + PROFILE5_MAX_PACK_SEGMENTS as u64
         * (PROFILE5_PACK_RECORD_PREFIX_BYTES as u64
@@ -51,7 +51,7 @@ pub(crate) fn profile5_receive_limit(total: u64, durable: u64, checkpoint_batch:
     total.min(durable.saturating_add(window))
 }
 
-pub(crate) fn profile5_attempt_bounds(bytes: u64) -> Result<(usize, usize), StreamError> {
+pub(crate) fn profile5_attempt_bounds(bytes: u64) -> Result<(u64, u64), StreamError> {
     let extents = if bytes == 0 {
         0
     } else {
@@ -68,22 +68,20 @@ pub(crate) fn profile5_attempt_bounds(bytes: u64) -> Result<(usize, usize), Stre
 pub(crate) fn profile5_attempt_bounds_for_extents(
     bytes: u64,
     extents: usize,
-) -> Result<(usize, usize), StreamError> {
+) -> Result<(u64, u64), StreamError> {
     if extents > PROFILE5_MAX_PACK_SEGMENTS || (bytes == 0) != (extents == 0) {
         return Err(StreamError::invalid(
             "native pack record count is out of bounds",
         ));
     }
-    let data = usize::try_from(bytes)
-        .ok()
-        .and_then(|value| {
-            extents
-                .checked_mul(8 + MAX_PROTECTED_STREAM_DATA_HEADER_BYTES + 192)
-                .and_then(|overhead| value.checked_add(overhead))
-        })
+    let extents = extents as u64;
+    let data = extents
+        .checked_mul(8 + MAX_PROTECTED_STREAM_DATA_HEADER_BYTES as u64 + 192)
+        .and_then(|overhead| bytes.checked_add(overhead))
         .and_then(|value| {
             value.checked_add(
-                MAX_STREAM_AUTHENTICATED_OPEN_BYTES + MAX_STREAM_SEMANTIC_COMMITMENT_BYTES + 4096,
+                (MAX_STREAM_AUTHENTICATED_OPEN_BYTES + MAX_STREAM_SEMANTIC_COMMITMENT_BYTES + 4096)
+                    as u64,
             )
         })
         .ok_or_else(|| StreamError::invalid("data stream bound overflow"))?;
@@ -1707,7 +1705,7 @@ mod stream_frame_codec {
         let total = 8 * 1024 * 1024 * 1024_u64;
         let extents = total.div_ceil(aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64);
         let (_, control_bytes) = profile5_attempt_bounds(total).expect("attempt bounds");
-        assert!(control_bytes >= usize::try_from(extents).expect("extents") * 192 + 8192);
+        assert!(control_bytes >= extents * 192 + 8192);
     }
 
     #[test]
@@ -1716,10 +1714,14 @@ mod stream_frame_codec {
         let wire = PROFILE5_MAX_PACK_WIRE_BYTES;
         let (data, control) =
             profile5_attempt_bounds_for_extents(wire, segments).expect("maximum attempt bound");
+        assert_eq!(segments, 8192);
+        assert_eq!(wire, 8_591_032_320);
         let composite =
-            wire as usize + segments * (8 + MAX_PROTECTED_STREAM_DATA_HEADER_BYTES + 192);
-        assert!(data >= composite + MAX_STREAM_AUTHENTICATED_OPEN_BYTES);
-        assert!(control >= segments * 192);
+            wire + segments as u64 * (8 + MAX_PROTECTED_STREAM_DATA_HEADER_BYTES as u64 + 192);
+        assert!(data >= composite + MAX_STREAM_AUTHENTICATED_OPEN_BYTES as u64);
+        assert!(control >= segments as u64 * 192);
+        assert!(profile5_attempt_bounds_for_extents(u64::MAX, segments).is_err());
+        assert!(profile5_attempt_bounds_for_extents(wire, segments + 1).is_err());
     }
 
     #[test]

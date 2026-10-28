@@ -596,7 +596,7 @@ mod tests {
         (server, client, address)
     }
 
-    async fn assert_transfer(bytes: u64, checkpoint_batch: u32) {
+    async fn assert_transfer(bytes: u64, checkpoint_batch: u32) -> u64 {
         let (server, client, address) = endpoint_pair().await;
         let receiver = tokio::spawn({
             let server = server.clone();
@@ -627,20 +627,29 @@ mod tests {
         assert_eq!(received.checkpoints, sent.checkpoints);
         client.close().await;
         server.close().await;
+        sent.checkpoints
     }
 
     #[tokio::test]
     async fn native_profile5_driver_transfers_and_settles_over_selected_transport() {
-        assert_transfer(2 * 1024 * 1024, MAX_STREAM_CHECKPOINT_BATCH_BYTES).await;
+        assert_eq!(
+            assert_transfer(2 * 1024 * 1024, MAX_STREAM_CHECKPOINT_BATCH_BYTES).await,
+            1
+        );
     }
 
     #[tokio::test]
     async fn native_profile5_driver_crosses_credit_checkpoint_without_deadlock() {
-        const TEST_CHECKPOINT_BATCH: u32 = 8 * 1_048_576;
-        assert_transfer(
-            u64::from(TEST_CHECKPOINT_BATCH) + BLOB_STREAM_SEGMENT_BYTES as u64,
-            TEST_CHECKPOINT_BATCH,
-        )
-        .await;
+        // Two full records still require renewed credit, without making this
+        // correctness check a throughput gate for 32-bit debug cryptography.
+        const TEST_CHECKPOINT_BATCH: u32 = 1_048_576;
+        assert_eq!(
+            assert_transfer(
+                u64::from(TEST_CHECKPOINT_BATCH) + BLOB_STREAM_SEGMENT_BYTES as u64,
+                TEST_CHECKPOINT_BATCH,
+            )
+            .await,
+            2
+        );
     }
 }

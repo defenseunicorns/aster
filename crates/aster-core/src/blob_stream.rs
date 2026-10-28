@@ -1643,7 +1643,8 @@ fn hash_parts(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(domain);
     for part in parts {
-        hash.update((*part).len().to_be_bytes());
+        // Protocol lengths have the same eight-byte encoding on every host.
+        hash.update((part.len() as u64).to_be_bytes());
         hash.update(part);
     }
     hash.finalize().into()
@@ -2313,6 +2314,30 @@ mod tests {
     use crate::{BlobMetadata, Priority, Scope, Topic, VersionVector};
 
     const TEST_SEGMENT_BYTES: usize = 32;
+
+    #[test]
+    fn plaintext_identity_matches_fixed_width_hash_vectors() {
+        // Independent Python hashlib/struct('>Q') vectors catch platform-width
+        // length prefixes even when a same-platform seal/open round trip passes.
+        let hex = |bytes: [u8; 32]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let mut frontier = BlobStreamPlaintextFrontier::new();
+        frontier.append(0, 0, 13, b"portable blob").expect("append");
+        assert_eq!(
+            hex(frontier.finish(13).expect("nonempty identity")),
+            "000cfcedb19b25dfbb14a1f288c738f79dddd7f74db00af22efa4fa388ade53e"
+        );
+        assert_eq!(
+            hex(BlobStreamPlaintextFrontier::new()
+                .finish(0)
+                .expect("empty identity")),
+            "00992b4a0f149a4b552cc4540c22d8619e2c0ba8139922311f6e7083d8835d75"
+        );
+    }
 
     fn identities() -> ([u8; 32], [u8; 32], [u8; 32], [u8; 12]) {
         ([0x11; 32], [0x22; 32], [0x33; 32], [0x44; 12])

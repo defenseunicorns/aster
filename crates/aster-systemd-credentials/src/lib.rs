@@ -100,20 +100,21 @@ impl CredentialFileMetadata {
             owner: stat.st_uid,
             group: stat.st_gid,
             mode: stat.st_mode & 0o7777,
-            links: widen_link_count(stat.st_nlink),
+            links: widen_stat_field(stat.st_nlink),
             device: stat.st_dev,
             inode: stat.st_ino,
             size: stat.st_size,
             modified_seconds: stat.st_mtime,
-            modified_nanoseconds: stat.st_mtime_nsec,
+            modified_nanoseconds: widen_stat_field(stat.st_mtime_nsec),
             changed_seconds: stat.st_ctime,
-            changed_nanoseconds: stat.st_ctime_nsec,
+            changed_nanoseconds: widen_stat_field(stat.st_ctime_nsec),
         }
     }
 }
 
 #[cfg(target_os = "linux")]
-fn widen_link_count(value: impl Into<u64>) -> u64 {
+// Linux stat field widths vary by target ABI; preserve their full value.
+fn widen_stat_field(value: impl Into<u64>) -> u64 {
     value.into()
 }
 

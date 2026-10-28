@@ -966,7 +966,7 @@ def validate_executable_profile_contract(
     required_extent_fragments = (
         "MAX_STREAM_EXTENT_BYTES: usize = PROFILE5_PACK_TRANSPORT_FRAME_BYTES",
         "profile5_attempt_bounds_for_extents",
-        "8 + MAX_PROTECTED_STREAM_DATA_HEADER_BYTES + 192",
+        "8 + MAX_PROTECTED_STREAM_DATA_HEADER_BYTES as u64 + 192",
         "PROFILE5_PACK_TRANSPORT_FRAME_BYTES as u64",
     )
     if any(fragment not in stream_transfer for fragment in required_extent_fragments):

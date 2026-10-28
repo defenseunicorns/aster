@@ -424,8 +424,8 @@ impl AttemptCoordinator {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AttemptOpenRequest {
     pub deadline: Instant,
-    pub max_data_bytes: usize,
-    pub max_control_bytes: usize,
+    pub max_data_bytes: u64,
+    pub max_control_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
