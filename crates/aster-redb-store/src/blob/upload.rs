@@ -19,7 +19,7 @@ use aster_mesh::{
     BlobManifest, BlobMetadata, BlobPublicationStreamId, BlobStreamFinalCommitment,
     BlobStreamLineage, BlobStreamOpen, NodeId, VerifiedBlobCustodyClaimV2,
     VerifiedBlobStreamFinalCommitment, VerifiedBlobStreamOpen, VerifiedBlobStreamPublication,
-    local_blob_publication_stream_id,
+    VerifiedBlobStreamPublicationSource, local_blob_publication_stream_id,
 };
 use redb::{Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableHandle};
 use sha2::{Digest, Sha256};
@@ -1447,6 +1447,60 @@ fn extend_profile5_reserved_publisher_high(
     Ok(())
 }
 
+fn received_profile5_lifetime_write(
+    write: &redb::WriteTransaction,
+    publication: &VerifiedBlobStreamPublication,
+    source: &[u8],
+    admission: super::VerifiedFiniteBlobAdmission,
+) -> Result<super::BlobLifetime, StoreError> {
+    let open = publication.publication().open();
+    if admission.source_transfer_id
+        != *BlobTransferId::new(Sha256::digest(source).into()).as_bytes()
+        || admission.source_len
+            != u64::try_from(source.len()).map_err(|_| StoreError::PayloadByteAccountingOverflow)?
+        || admission.publication_id.as_slice()
+            != Sha256::digest(publication.authenticated_bytes()).as_slice()
+        || admission.blob_id != publication.publication().blob_id()
+        || admission.priority != open.priority()
+        || open.ttl_ms() != Some(admission.ttl_ms)
+    {
+        return Err(blob_error(BlobStoreError::PendingSourceConflict));
+    }
+    let origin_age_ms = match (
+        open.initial_custody(),
+        publication.publication().final_custody(),
+    ) {
+        (Some(initial), Some(final_sample))
+            if initial.clock_id == final_sample.clock_id
+                && final_sample.tick_ms >= initial.tick_ms =>
+        {
+            final_sample.tick_ms - initial.tick_ms
+        }
+        _ => return Err(blob_error(BlobStoreError::PendingSourceConflict)),
+    };
+    if admission.forwarding_age_ms < origin_age_ms {
+        return Err(blob_error(BlobStoreError::PendingSourceConflict));
+    }
+    if admission.forwarding_age_ms >= admission.ttl_ms {
+        return Err(blob_error(BlobStoreError::ExpiredOrRetired));
+    }
+    let continuity = super::custody::observe_continuity_write(write, admission.receiver_sample)?;
+    let forwarding_age_ms = admission.forwarding_age_at(continuity.sample())?;
+    if forwarding_age_ms >= admission.ttl_ms {
+        return Err(blob_error(BlobStoreError::ExpiredOrRetired));
+    }
+    Ok(super::BlobLifetime::Finite {
+        ttl_ms: admission.ttl_ms,
+        age: super::custody::LowerBoundAgeCheckpoint {
+            cumulative_age_ms: forwarding_age_ms,
+            checkpoint: Some(continuity.sample()),
+            continuity_generation: continuity.generation(),
+            continuity_lost: false,
+        },
+        provenance: admission.provenance,
+    })
+}
+
 impl Store {
     pub fn reserve_blob_upload_with_policy(
         &self,
@@ -2405,60 +2459,15 @@ impl Store {
             }
             Profile5PromotionLifetime::NetworkDurable => (super::BlobLifetime::Durable, None),
             Profile5PromotionLifetime::Network(admission) => {
-                let (transfer_id, semantic_id, _, source) =
-                    super::profile5_publication_source_identities(
-                        publication,
-                        &profile5.pack_open,
-                        &profile5.pack_authenticated,
-                        completion.commitment(),
-                        completion.authenticated_commitment(),
-                    )?;
-                if admission.source_transfer_id != *transfer_id.as_bytes()
-                    || admission.source_len
-                        != u64::try_from(source.len())
-                            .map_err(|_| StoreError::PayloadByteAccountingOverflow)?
-                    || admission.publication_id != *semantic_id.as_bytes()
-                    || admission.blob_id != completion.commitment().blob_id()
-                    || admission.priority != profile5.open.priority()
-                    || profile5.open.ttl_ms() != Some(admission.ttl_ms)
-                {
-                    return Err(blob_error(BlobStoreError::PendingSourceConflict));
-                }
-                let origin_age_ms = match (
-                    profile5.open.initial_custody(),
-                    publication.publication().final_custody(),
-                ) {
-                    (Some(initial), Some(final_sample))
-                        if initial.clock_id == final_sample.clock_id
-                            && final_sample.tick_ms >= initial.tick_ms =>
-                    {
-                        final_sample.tick_ms - initial.tick_ms
-                    }
-                    _ => return Err(blob_error(BlobStoreError::PendingSourceConflict)),
-                };
-                if admission.forwarding_age_ms < origin_age_ms {
-                    return Err(blob_error(BlobStoreError::PendingSourceConflict));
-                }
-                if admission.forwarding_age_ms >= admission.ttl_ms {
-                    return Err(blob_error(BlobStoreError::ExpiredOrRetired));
-                }
-                let continuity =
-                    super::custody::observe_continuity_write(&write, admission.receiver_sample)?;
-                let forwarding_age_ms = admission.forwarding_age_at(continuity.sample())?;
-                if forwarding_age_ms >= admission.ttl_ms {
-                    return Err(blob_error(BlobStoreError::ExpiredOrRetired));
-                }
+                let (_, _, _, source) = super::profile5_publication_source_identities(
+                    publication,
+                    &profile5.pack_open,
+                    &profile5.pack_authenticated,
+                    completion.commitment(),
+                    completion.authenticated_commitment(),
+                )?;
                 (
-                    super::BlobLifetime::Finite {
-                        ttl_ms: admission.ttl_ms,
-                        age: super::custody::LowerBoundAgeCheckpoint {
-                            cumulative_age_ms: forwarding_age_ms,
-                            checkpoint: Some(continuity.sample()),
-                            continuity_generation: continuity.generation(),
-                            continuity_lost: false,
-                        },
-                        provenance: admission.provenance,
-                    },
+                    received_profile5_lifetime_write(&write, publication, &source, admission)?,
                     None,
                 )
             }
@@ -2493,6 +2502,142 @@ impl Store {
             prepared,
             local_samples,
             true,
+        )
+    }
+
+    /// Accepts a new received publication using an already retained, leased
+    /// native pack. No duplicate upload, file, or capacity reservation is made.
+    #[doc(hidden)]
+    pub fn commit_received_existing_profile5_pack_with_policy(
+        &self,
+        policy: &ControlPolicySnapshot,
+        inbound: &VerifiedBlobStreamPublicationSource,
+        retained: &super::Profile5PackReadSession,
+        finite: Option<ReceivedProfile5FinitePromotion>,
+    ) -> Result<super::BlobOnceOutcome, StoreError> {
+        self.require_live()?;
+        let authority = self.require_bound_mission()?;
+        if !retained.is_bound_to(&self.blob_completion_authority) {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        let publication = inbound.publication();
+        let open = publication.publication().open();
+        let request = BlobUploadRequest {
+            owner: super::BlobOperationOwner::new(
+                open.publisher(),
+                super::BlobOperationKey::new(open.operation_key().to_vec())?,
+            ),
+            topic: open.topic().clone(),
+            scope: open.scope().clone(),
+            priority: open.priority(),
+            ttl_ms: open.ttl_ms(),
+            media_type: open.metadata().media_type().map(str::to_owned),
+            schema_id: open.metadata().schema_id().to_vec(),
+            total_len: open.total_len(),
+        };
+        validate_request(&request)?;
+        let owner_key = blob_operation_owner_key(&request.owner)?;
+        let (_, _, variant, source) = super::profile5_publication_source_identities(
+            publication,
+            inbound.physical_open().open(),
+            inbound.physical_open().authenticated_bytes(),
+            inbound.physical_commitment().commitment(),
+            inbound.physical_commitment().authenticated_bytes(),
+        )?;
+        let _depot_guard = self
+            .blob_depot_lock
+            .write()
+            .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
+        let mut write = self.database.begin_write()?;
+        write.set_durability(Durability::Immediate)?;
+        enforce_live_write(&write)?;
+        let epoch = require_upload_policy_write(
+            &write,
+            authority,
+            policy,
+            &request,
+            Some(open.content_epoch()),
+        )?;
+        validate_profile5_open_shape(&request, policy, epoch, open)?;
+        if write
+            .open_table(super::BLOB_UPLOADS)?
+            .get(owner_key.as_slice())?
+            .is_some()
+        {
+            return Err(blob_error(BlobStoreError::ReservationChanged));
+        }
+        let pack = super::pack_lifecycle::load_write(
+            &write,
+            variant,
+            Arc::clone(&self.blob_completion_authority),
+        )?
+        .ok_or_else(|| blob_error(BlobStoreError::NotFound))?;
+        if !pack.lifecycle_owned()
+            || pack.open() != retained.open()
+            || pack.authenticated_open() != retained.authenticated_open()
+            || pack.commitment() != retained.commitment()
+            || pack.authenticated_commitment() != retained.authenticated_commitment()
+            || pack.physical_lineage() != retained.physical_lineage()
+        {
+            return Err(blob_error(BlobStoreError::CompletionMismatch));
+        }
+        let lifetime = match (open.ttl_ms(), finite) {
+            (None, None) => super::BlobLifetime::Durable,
+            (Some(_), Some(finite)) => received_profile5_lifetime_write(
+                &write,
+                publication,
+                &source,
+                super::VerifiedFiniteBlobAdmission::from_verified_v2_elapsed(
+                    finite.verified,
+                    finite.received_sample,
+                    finite.promotion_sample,
+                )?,
+            )?,
+            _ => return Err(blob_error(BlobStoreError::CompletionMismatch)),
+        };
+        let prepared = super::PreparedBlobPublication::from_profile5_publication(
+            &pack,
+            publication,
+            lifetime,
+        )?;
+        if let Some(existing) = write
+            .open_table(BLOB_OPERATIONS)?
+            .get(owner_key.as_slice())?
+            .map(|value| decode_blob_operation_record(value.value()))
+            .transpose()?
+            && existing.transfer_id != prepared.transfer_id
+        {
+            return Err(blob_error(BlobStoreError::OperationConflict));
+        }
+        let intent = super::BlobPublicationIntent::new_with_ttl(
+            open.publisher(),
+            open.topic().clone(),
+            open.scope().clone(),
+            open.priority(),
+            publication.publication().blob_id(),
+            open.ttl_ms(),
+        )?;
+        let operation = super::BlobOperationRequest::new(&request.owner.operation, &intent);
+        let reservation =
+            profile5_reservation_from_open(policy, &request, open.initial_custody(), open)?;
+        super::validate_blob_reservation(&reservation, &prepared)?;
+        super::validate_blob_publication_intent(&intent, &prepared)?;
+        let high_water = write
+            .open_table(PUBLISHER_HIGH_WATER)?
+            .get(open.publisher().as_slice())?
+            .map_or(0, |value| value.value())
+            .max(open.publisher_counter());
+        write
+            .open_table(PUBLISHER_HIGH_WATER)?
+            .insert(open.publisher().as_slice(), high_water)?;
+        self.commit_prepared_blob_once_with_lifetime_write(
+            write,
+            policy,
+            &operation,
+            &reservation,
+            prepared,
+            None,
+            false,
         )
     }
 
@@ -3472,6 +3617,111 @@ mod tests {
             super::super::BlobOnceOutcome::Inserted { blob } => blob,
             _ => panic!("new received Profile-5 pack must insert"),
         }
+    }
+
+    #[test]
+    fn received_profile5_reuse_preserves_capacity_and_exact_operation() {
+        let mut fixture = fixture("received-reuse-admission", 0x72, BlobDepotLimits::DEFAULT);
+        let policy = fixture.store.control_policy_snapshot().unwrap();
+        let first = remote_profile5_pack(&fixture, &fixture.publisher, b"reuse/first", 0x53);
+        let (reservation, initial, _) = fixture
+            .store
+            .reserve_received_profile5_upload_with_policy(&policy, &first.publication, &first.open)
+            .unwrap();
+        let stored = promote_received_profile5_pack(
+            &fixture,
+            &fixture.publisher,
+            &policy,
+            &reservation,
+            initial,
+            &first,
+        );
+        let second = remote_profile5_pack(&fixture, &fixture.other, b"reuse/second", 0x53);
+        let source_for = |publication: &VerifiedBlobStreamPublication| {
+            let encoded = aster_mesh::BlobStreamPublicationSource::new(
+                publication.authenticated_bytes().to_vec(),
+                second.open.authenticated_bytes().to_vec(),
+                second.commitment.authenticated_bytes().to_vec(),
+            )
+            .unwrap()
+            .encode()
+            .unwrap();
+            fixture
+                .reader
+                .verify_blob_stream_publication_source(&encoded)
+                .unwrap()
+        };
+        let source = source_for(&second.publication);
+        let mut changed_open = second.publication.publication().open().encode();
+        let last = changed_open.len() - 1;
+        changed_open[last] ^= 1;
+        let changed_publication = aster_mesh::BlobStreamPublication::new(
+            BlobStreamOpen::decode(&changed_open).unwrap(),
+            second.publication.publication().blob_id(),
+            None,
+            *second.publication.publication().physical_lineage(),
+        )
+        .unwrap();
+        let changed_publication = fixture
+            .reader
+            .verify_blob_stream_publication(
+                &fixture
+                    .other
+                    .seal_blob_stream_publication(&changed_publication)
+                    .unwrap(),
+            )
+            .unwrap();
+        let changed_source = source_for(&changed_publication);
+        let before = fixture.store.blob_stats().unwrap();
+        // No spare room for a second file: reuse must not reserve one.
+        fixture.store.blob_depot_limits =
+            BlobDepotLimits::new(before.reserved_file_bytes, 1, 1).unwrap();
+        let retained = fixture
+            .store
+            .open_profile5_pack_transfer_read(stored.variant_id)
+            .unwrap();
+        let outcome = fixture
+            .store
+            .commit_received_existing_profile5_pack_with_policy(&policy, &source, &retained, None)
+            .unwrap();
+        assert!(outcome.inserted());
+        let after = fixture.store.blob_stats().unwrap();
+        assert_eq!(after.reserved_file_bytes, before.reserved_file_bytes);
+        assert_eq!(after.variants, before.variants);
+        let retry = fixture
+            .store
+            .commit_received_existing_profile5_pack_with_policy(&policy, &source, &retained, None)
+            .unwrap();
+        assert!(!retry.inserted());
+        assert_eq!(retry.blob().transfer_id, outcome.blob().transfer_id);
+        let conflicting = fixture
+            .store
+            .commit_received_existing_profile5_pack_with_policy(
+                &policy,
+                &changed_source,
+                &retained,
+                None,
+            );
+        assert!(
+            matches!(
+                conflicting,
+                Err(StoreError::Blob(BlobStoreError::OperationConflict))
+            ),
+            "a different signed publication cannot replay the same operation"
+        );
+        assert_eq!(fixture.store.blob_stats().unwrap(), after);
+        let foreign = self::fixture("received-reuse-foreign", 0x72, BlobDepotLimits::DEFAULT);
+        assert!(matches!(
+            foreign
+                .store
+                .commit_received_existing_profile5_pack_with_policy(
+                    &foreign.store.control_policy_snapshot().unwrap(),
+                    &source,
+                    &retained,
+                    None,
+                ),
+            Err(StoreError::Blob(BlobStoreError::CompletionMismatch))
+        ));
     }
 
     #[test]

@@ -52976,6 +52976,8 @@ mod tests {
         ttl_ms: Option<u64>,
         fail_after_receives: Option<usize>,
         preseed_equivalent_pack: bool,
+        completed_before_contact: bool,
+        pressure_before_promotion: bool,
         restart_before_retry: bool,
         expire_before_promotion: bool,
         revoke_before_promotion: bool,
@@ -53057,6 +53059,74 @@ mod tests {
                 },
             ),
         ));
+    }
+
+    #[test]
+    fn completed_native_profile5_upload_recovers_without_data() {
+        for (suffix, seed, preseed, ttl) in [
+            ("completed-dedup", 0xb0, true, None),
+            ("completed-finite-dedup", 0xb1, true, Some(600_000)),
+            ("completed-original", 0xb2, false, None),
+            ("completed-finite-original", 0xb3, false, Some(600_000)),
+        ] {
+            run_native_profile5_test(Box::pin(
+                assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
+                    NativeProfile5LifecycleScenario {
+                        preseed_equivalent_pack: preseed,
+                        completed_before_contact: true,
+                        ttl_ms: ttl,
+                        source_clock_tick_ms: 100,
+                        fixture_override: Some((suffix, seed)),
+                        ..Default::default()
+                    },
+                ),
+            ));
+        }
+    }
+
+    #[test]
+    fn native_profile5_reuse_holds_pack_lease_through_promotion() {
+        for (suffix, seed, completed) in [
+            ("retained-lease", 0xb7, false),
+            ("completed-lease", 0xb8, true),
+        ] {
+            run_native_profile5_test(Box::pin(
+                assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
+                    NativeProfile5LifecycleScenario {
+                        preseed_equivalent_pack: true,
+                        completed_before_contact: completed,
+                        pressure_before_promotion: true,
+                        source_clock_tick_ms: 100,
+                        fixture_override: Some((suffix, seed)),
+                        ..Default::default()
+                    },
+                ),
+            ));
+        }
+    }
+
+    #[test]
+    fn native_profile5_reuse_requires_finish_and_current_authority() {
+        for (suffix, seed, fail, expire, revoke) in [
+            ("reuse-finish", 0xb4, Some(3), false, false),
+            ("reuse-expiry", 0xb5, None, true, false),
+            ("reuse-revoke", 0xb6, None, false, true),
+        ] {
+            run_native_profile5_test(Box::pin(
+                assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
+                    NativeProfile5LifecycleScenario {
+                        preseed_equivalent_pack: true,
+                        ttl_ms: Some(if expire { 1_000 } else { 600_000 }),
+                        fail_after_receives: fail,
+                        expire_before_promotion: expire,
+                        revoke_before_promotion: revoke,
+                        source_clock_tick_ms: 100,
+                        fixture_override: Some((suffix, seed)),
+                        ..Default::default()
+                    },
+                ),
+            ));
+        }
     }
 
     #[test]
@@ -53177,6 +53247,8 @@ mod tests {
             ttl_ms,
             fail_after_receives,
             preseed_equivalent_pack,
+            completed_before_contact,
+            pressure_before_promotion,
             restart_before_retry,
             expire_before_promotion,
             revoke_before_promotion,
@@ -53262,12 +53334,84 @@ mod tests {
             .get_blob(publication)
             .expect("native source lookup")
             .expect("native source exists");
-        let source_session = source_store
+        let mut source_session = source_store
             .open_profile5_pack_transfer_read(stored.variant_id)
             .expect("native source transfer lease");
         let verified_source = source_verifier
             .verify_blob_stream_publication_source(&stored.sealed)
             .expect("verify native publication source");
+        if completed_before_contact {
+            // Recreate the durable boundary left by the old receiver after pack
+            // completion but before publication, then reconnect through production transport.
+            let policy = target_store
+                .control_policy_snapshot()
+                .expect("completion policy");
+            let (reservation, checkpoint, open) = target_store
+                .reserve_received_profile5_upload_with_policy(
+                    &policy,
+                    verified_source.publication(),
+                    verified_source.physical_open(),
+                )
+                .expect("reserve completed receiver fixture");
+            let root = aster_redb_store::pack::PinnedBlobPackRoot::open(&target_store)
+                .expect("completed receiver root");
+            let mut writer = aster_redb_store::pack::BlobPackWriter::open_projected_upload_pinned(
+                &root,
+                &reservation.pack_identity(),
+                None,
+            )
+            .expect("completed receiver writer");
+            let opener = source_verifier
+                .blob_stream_segment_opener(&open)
+                .expect("completed receiver segment opener");
+            while let Some(segment) = source_session
+                .next_segment()
+                .expect("completed receiver segment")
+            {
+                let (_, leaves) = opener
+                    .open(&segment)
+                    .expect("verify completed receiver segment");
+                writer
+                    .append(&segment, leaves)
+                    .expect("append completed receiver segment");
+            }
+            let completion = writer
+                .finish_profile5(verified_source.physical_commitment())
+                .expect("finish completed receiver pack");
+            let checkpoint = target_store
+                .checkpoint_blob_upload(
+                    &policy,
+                    &reservation,
+                    checkpoint,
+                    completion.checkpoint().clone(),
+                )
+                .expect("project completed receiver pack");
+            let checkpoint = target_store
+                .complete_profile5_upload_pack(
+                    &policy,
+                    &reservation,
+                    checkpoint,
+                    completion,
+                    verified_source.physical_commitment(),
+                    source_verifier
+                        .blob_stream_lineage(&open)
+                        .expect("completed receiver lineage"),
+                )
+                .expect("retain completed receiver authority");
+            assert_eq!(
+                checkpoint
+                    .profile5_completion()
+                    .unwrap()
+                    .reuses_existing_pack(),
+                preseed_equivalent_pack
+            );
+            drop(root);
+            drop(target_store);
+            target_store = Arc::new(
+                Store::open_for_mission(target_state.join(STORE_FILE), authority)
+                    .expect("reopen receiver between completion and publication"),
+            );
+        }
         let mut mismatched_projection = retained.source.clone();
         mismatched_projection.total_len = mismatched_projection
             .total_len
@@ -53448,102 +53592,122 @@ mod tests {
                 failed.0.is_err() && failed.1.is_err(),
                 "both peers must observe the interrupted adapter: {failed:?}"
             );
-            let interrupted_probe = pipeline_probe
-                .as_ref()
-                .expect("interrupted native receiver pipeline probe");
-            assert!(
-                interrupted_probe.peak_active_workers() > 0,
-                "interrupted native transfer must exercise map workers"
-            );
-            assert_eq!(
-                interrupted_probe.active_workers(),
-                0,
-                "interrupted native transfer must leave no map worker alive"
-            );
-            assert_eq!(
-                interrupted_probe.joined_workers(),
-                interrupted_probe.worker_exits(),
-                "interrupted native transfer must join every worker that exits"
-            );
-            assert!(
-                target_store
-                    .get_blob(publication)
-                    .expect("interrupted target lookup")
-                    .is_none(),
-                "interrupted native pack must remain invisible"
-            );
-            let (_, checkpoint) = target_store
-                .resume_blob_upload_by_publication_id(publication_stream_id)
-                .expect("load interrupted native upload")
-                .expect("interrupted native upload remains resumable");
-            let resumed = checkpoint
-                .durable_pack_checkpoint()
-                .expect("interrupted native pack has durable progress")
-                .payload_len();
-            let wire_len = crate::stream_transfer::blob_pack_wire_len(plaintext.len() as u64)
-                .expect("native pack wire length");
-            if fail_after_receives == 5 {
-                assert_eq!(resumed, wire_len);
-            } else {
-                assert!(resumed > 0 && resumed < wire_len);
-            }
-            let inspection_verifier = open_test_sealer(&services.other);
-            let inspection_cache =
-                Arc::new(AuthenticatedEventRouteCache::empty(&inspection_verifier));
-            let mut target_node = SelectedBlobNode::from_runtime(
-                services.other.clone(),
-                Arc::clone(&target_store),
-                inspection_verifier,
-                target_store
-                    .control_head()
-                    .expect("interrupted target control head"),
-                inspection_cache,
-                NodeCustodyClock::injected([0xe5; 16], 7_500, 0),
-            )
-            .expect("open public Blob status for interrupted native pack");
-            let inspection = target_node
-                .inspect_publication(crate::application::BlobPublicationInspectionRequest {
-                    publication_id: crate::application::BlobStreamPublicationId::from_bytes(
-                        *publication_stream_id.as_bytes(),
-                    )
-                    .expect("native publication identity"),
-                    topic: services.topic.clone(),
-                    scope: services.scope.clone(),
-                })
-                .expect("inspect interrupted native publication");
-            assert_eq!(
-                inspection.phase,
-                if fail_after_receives == 5 {
-                    crate::application::BlobPublicationPhase::ReadyToFinalize
-                } else {
-                    crate::application::BlobPublicationPhase::Receiving
-                }
-            );
-            assert!(inspection.durable_plaintext_bytes > 0);
-            assert!(inspection.durable_transfer_bytes > 0);
-            assert_eq!(inspection.blob_id, None);
-            drop(target_node);
-            if ttl_ms.is_some() {
-                drop(checkpoint);
-                drop(failed);
-                drop(target_store);
-                target_store = Arc::new(
-                    Store::open_for_mission(target_state.join(STORE_FILE), authority)
-                        .expect("reopen interrupted native target store"),
+            if preseed_equivalent_pack {
+                assert!(
+                    target_store
+                        .blob_for_owner_with_policy(&target_policy, &incoming_owner)
+                        .expect("failed FINISH owner lookup")
+                        .is_none()
                 );
-                let (_, reopened_checkpoint) = target_store
-                    .resume_blob_upload_by_publication_id(publication_stream_id)
-                    .expect("load restarted native upload")
-                    .expect("restarted native upload remains resumable");
+                assert!(
+                    target_store
+                        .resume_blob_upload(&incoming_owner)
+                        .expect("failed FINISH upload lookup")
+                        .is_none()
+                );
                 assert_eq!(
-                    reopened_checkpoint
-                        .durable_pack_checkpoint()
-                        .expect("restarted native pack durable progress")
-                        .payload_len(),
-                    resumed
+                    target_store.blob_stats().expect("failed FINISH stats"),
+                    target_stats_before
                 );
+                0
+            } else {
+                let interrupted_probe = pipeline_probe
+                    .as_ref()
+                    .expect("interrupted native receiver pipeline probe");
+                assert!(
+                    interrupted_probe.peak_active_workers() > 0,
+                    "interrupted native transfer must exercise map workers"
+                );
+                assert_eq!(
+                    interrupted_probe.active_workers(),
+                    0,
+                    "interrupted native transfer must leave no map worker alive"
+                );
+                assert_eq!(
+                    interrupted_probe.joined_workers(),
+                    interrupted_probe.worker_exits(),
+                    "interrupted native transfer must join every worker that exits"
+                );
+                assert!(
+                    target_store
+                        .get_blob(publication)
+                        .expect("interrupted target lookup")
+                        .is_none(),
+                    "interrupted native pack must remain invisible"
+                );
+                let (_, checkpoint) = target_store
+                    .resume_blob_upload_by_publication_id(publication_stream_id)
+                    .expect("load interrupted native upload")
+                    .expect("interrupted native upload remains resumable");
+                let resumed = checkpoint
+                    .durable_pack_checkpoint()
+                    .expect("interrupted native pack has durable progress")
+                    .payload_len();
+                let wire_len = crate::stream_transfer::blob_pack_wire_len(plaintext.len() as u64)
+                    .expect("native pack wire length");
+                if fail_after_receives == 5 {
+                    assert_eq!(resumed, wire_len);
+                } else {
+                    assert!(resumed > 0 && resumed < wire_len);
+                }
+                let inspection_verifier = open_test_sealer(&services.other);
+                let inspection_cache =
+                    Arc::new(AuthenticatedEventRouteCache::empty(&inspection_verifier));
+                let mut target_node = SelectedBlobNode::from_runtime(
+                    services.other.clone(),
+                    Arc::clone(&target_store),
+                    inspection_verifier,
+                    target_store
+                        .control_head()
+                        .expect("interrupted target control head"),
+                    inspection_cache,
+                    NodeCustodyClock::injected([0xe5; 16], 7_500, 0),
+                )
+                .expect("open public Blob status for interrupted native pack");
+                let inspection = target_node
+                    .inspect_publication(crate::application::BlobPublicationInspectionRequest {
+                        publication_id: crate::application::BlobStreamPublicationId::from_bytes(
+                            *publication_stream_id.as_bytes(),
+                        )
+                        .expect("native publication identity"),
+                        topic: services.topic.clone(),
+                        scope: services.scope.clone(),
+                    })
+                    .expect("inspect interrupted native publication");
+                assert_eq!(
+                    inspection.phase,
+                    if fail_after_receives == 5 {
+                        crate::application::BlobPublicationPhase::ReadyToFinalize
+                    } else {
+                        crate::application::BlobPublicationPhase::Receiving
+                    }
+                );
+                assert!(inspection.durable_plaintext_bytes > 0);
+                assert!(inspection.durable_transfer_bytes > 0);
+                assert_eq!(inspection.blob_id, None);
+                drop(target_node);
+                if ttl_ms.is_some() {
+                    drop(checkpoint);
+                    drop(failed);
+                    drop(target_store);
+                    target_store = Arc::new(
+                        Store::open_for_mission(target_state.join(STORE_FILE), authority)
+                            .expect("reopen interrupted native target store"),
+                    );
+                    let (_, reopened_checkpoint) = target_store
+                        .resume_blob_upload_by_publication_id(publication_stream_id)
+                        .expect("load restarted native upload")
+                        .expect("restarted native upload remains resumable");
+                    assert_eq!(
+                        reopened_checkpoint
+                            .durable_pack_checkpoint()
+                            .expect("restarted native pack durable progress")
+                            .payload_len(),
+                        resumed
+                    );
+                }
+                resumed
             }
-            resumed
         } else {
             0
         };
@@ -53583,18 +53747,20 @@ mod tests {
                     .expect("expiring native pack wire length");
             Some(Arc::new(move || {
                 hook_ran.store(true, Ordering::SeqCst);
-                let (_, checkpoint) = hook_store
-                    .resume_blob_upload_by_publication_id(publication_stream_id)
-                    .expect("load expiring native upload before promotion")
-                    .expect("expiring native upload remains provisional before promotion");
-                assert_eq!(
-                    checkpoint
-                        .durable_pack_checkpoint()
-                        .expect("expiring native upload has durable pack progress")
-                        .payload_len(),
-                    expected_wire_len,
-                    "expiry injection must run only after the complete pack is durable"
-                );
+                if !preseed_equivalent_pack {
+                    let (_, checkpoint) = hook_store
+                        .resume_blob_upload_by_publication_id(publication_stream_id)
+                        .expect("load expiring native upload before promotion")
+                        .expect("expiring native upload remains provisional before promotion");
+                    assert_eq!(
+                        checkpoint
+                            .durable_pack_checkpoint()
+                            .expect("expiring native upload has durable pack progress")
+                            .payload_len(),
+                        expected_wire_len,
+                        "expiry injection must run only after the complete pack is durable"
+                    );
+                }
                 hook_store
                     .test_observe_blob_custody_sample(CustodySample {
                         clock_id: [0xe5; 16],
@@ -53614,21 +53780,48 @@ mod tests {
                     .expect("revoked native pack wire length");
             Some(Arc::new(move || {
                 hook_ran.store(true, Ordering::SeqCst);
-                let (_, checkpoint) = revoke_store
-                    .resume_blob_upload_by_publication_id(publication_stream_id)
-                    .expect("load revoked native upload before promotion")
-                    .expect("revoked native upload remains provisional before promotion");
-                assert_eq!(
-                    checkpoint
-                        .durable_pack_checkpoint()
-                        .expect("revoked native upload has durable pack progress")
-                        .payload_len(),
-                    expected_wire_len,
-                    "revocation injection must run only after the complete pack is durable"
-                );
+                if !preseed_equivalent_pack {
+                    let (_, checkpoint) = revoke_store
+                        .resume_blob_upload_by_publication_id(publication_stream_id)
+                        .expect("load revoked native upload before promotion")
+                        .expect("revoked native upload remains provisional before promotion");
+                    assert_eq!(
+                        checkpoint
+                            .durable_pack_checkpoint()
+                            .expect("revoked native upload has durable pack progress")
+                            .payload_len(),
+                        expected_wire_len,
+                        "revocation injection must run only after the complete pack is durable"
+                    );
+                }
                 revoke_store
                     .test_revoke_blob_publisher_for_reclamation(publisher)
                     .expect("revoke native publisher before promotion");
+            }))
+        } else if pressure_before_promotion {
+            let hook_store = Arc::clone(&target_store);
+            let hook_ran = Arc::clone(&promotion_hook_ran);
+            Some(Arc::new(move || {
+                hook_ran.store(true, Ordering::SeqCst);
+                let recovery = hook_store
+                    .run_durable_blob_pressure_recovery_after_cleanup(
+                        &StoreError::ItemLimitExceeded {
+                            current: 1,
+                            limit: 1,
+                        },
+                        Priority::Flash,
+                        None,
+                        (0, 0),
+                        blob_capacity_recovery_budget(),
+                        None,
+                    )
+                    .expect("pressure at native reuse FINISH")
+                    .expect("typed pressure demand");
+                assert!(
+                    recovery.evicted_transfer_ids().is_empty(),
+                    "the active reuse lease must protect the last retained publication"
+                );
+                assert!(!recovery.deficit_met());
             }))
         } else {
             None
@@ -53956,9 +54149,10 @@ mod tests {
                 promotion_hook_ran.load(Ordering::SeqCst),
                 "rejection must happen after the pre-promotion hook"
             );
-            assert!(
-                !adapter.data_part_body_lengths().is_empty(),
-                "rejection must happen after native DATA records cross the adapter"
+            assert_eq!(
+                adapter.data_part_body_lengths().is_empty(),
+                preseed_equivalent_pack,
+                "retained content must require no DATA even when promotion is rejected"
             );
             assert!(
                 target_store
@@ -54012,8 +54206,25 @@ mod tests {
             received.expect("join native Profile-5 receiver");
         let received = received.expect("native Profile-5 receiver");
         target_verifier = returned_target_verifier;
+        if pressure_before_promotion {
+            assert!(promotion_hook_ran.load(Ordering::SeqCst));
+        }
         assert_eq!(sent.roots, received.roots);
         assert_eq!(sent.wire_bytes, received.wire_bytes);
+        if preseed_equivalent_pack || completed_before_contact {
+            assert!(
+                adapter.data_part_body_lengths().is_empty(),
+                "a new publication over retained content must send no DATA on its first attempt"
+            );
+            assert_eq!(sent.attempt_bytes, 0);
+            assert_eq!(received.attempt_bytes, 0);
+            assert!(received.pipeline.is_none());
+        }
+        let resumed_after_interruption = if preseed_equivalent_pack || completed_before_contact {
+            sent.wire_bytes
+        } else {
+            resumed_after_interruption
+        };
         assert_eq!(sent.resumed_from, resumed_after_interruption);
         assert_eq!(received.resumed_from, resumed_after_interruption);
         let target_incoming_transfer = if preseed_equivalent_pack {

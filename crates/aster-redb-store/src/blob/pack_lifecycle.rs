@@ -24,6 +24,10 @@ pub struct Profile5PackReadSession {
 }
 
 impl Profile5PackReadSession {
+    pub(super) fn is_bound_to(&self, authority: &Arc<()>) -> bool {
+        self.reader.checkpoint().is_bound_to(authority)
+    }
+
     pub const fn open(&self) -> &BlobStreamOpen {
         &self.open
     }

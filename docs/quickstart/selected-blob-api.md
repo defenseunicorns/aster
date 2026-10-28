@@ -601,6 +601,14 @@ variant even when the `BlobId` stays the same. Exact retry of an authorized old
 operation returns its historical publication without allocating a new variant;
 a new operation at the active epoch installs or reuses that epoch's variant.
 
+For semantic-v9/profile-5 contacts, a new publication can reuse an already
+retained, compatible native pack without transferring DATA again. The receiver
+holds a read lease through acceptance and still requires the authenticated
+FINISH and current publication-policy and finite-custody checks. Publication
+metadata remains distinct even when the physical content is shared. A completed
+provisional upload resumes from its durable completion after restart, including
+when deduplication has already removed its temporary duplicate.
+
 ## Durable storage and verification boundary
 
 Blob publication becomes authoritative only after private chunk files are

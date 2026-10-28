@@ -29,7 +29,7 @@ use aster_mesh::{
     BlobStreamFinalCommitment, ReferenceEnvelopeSealer, VerifiedBlobCustodyClaimV2,
     VerifiedBlobStreamOpen, VerifiedBlobStreamPublication, VerifiedBlobStreamPublicationSource,
 };
-use aster_redb_store::pack::{BlobPackWriter, PinnedBlobPackRoot};
+use aster_redb_store::pack::{BlobPackReader, BlobPackWriter, PinnedBlobPackRoot};
 use aster_redb_store::{
     BlobOperationKey, BlobOperationOwner, BlobSourceProjection, BlobSourceRetention,
     BlobStoreError, BlobTransferId, BlobUploadCheckpoint, BlobVariantId, ControlPolicySnapshot,
@@ -111,9 +111,9 @@ impl Drop for SenderDataCancellation {
 use crate::stream_transfer::{PROFILE5_ATTEMPT_TIMEOUT, profile5_attempt_bounds};
 #[cfg(any(test, feature = "device-validation"))]
 use aster_mesh::{BlobStreamOpen, BlobStreamSegmentOpener};
-use aster_redb_store::pack::BlobPackCheckpoint;
 #[cfg(any(test, feature = "device-validation"))]
-use aster_redb_store::{BlobStreamResume, pack::BlobPackReader};
+use aster_redb_store::BlobStreamResume;
+use aster_redb_store::pack::BlobPackCheckpoint;
 #[cfg(any(test, feature = "device-validation"))]
 use std::path::Path;
 
@@ -1664,9 +1664,24 @@ struct ExistingNativeProfile5Settlement<'a> {
     policy: &'a ControlPolicySnapshot,
 }
 
+enum NativeProfile5Completion {
+    Published {
+        blob: Box<StoredBlob>,
+        pack: Box<aster_redb_store::Profile5PackReadSession>,
+    },
+    Retained(Box<aster_redb_store::Profile5PackReadSession>),
+    Upload(Box<CompletedNativeProfile5Upload>),
+}
+
+struct CompletedNativeProfile5Upload {
+    reservation: aster_redb_store::BlobUploadReservation,
+    checkpoint: BlobUploadCheckpoint,
+    _reader: BlobPackReader,
+    _retained_lease: Option<aster_redb_store::Profile5PackReadSession>,
+}
+
 struct ExistingNativeProfile5Pack {
-    blob: StoredBlob,
-    pack: aster_redb_store::Profile5PackReadSession,
+    completion: NativeProfile5Completion,
     wire_len: u64,
     pending_custody: Option<(VerifiedBlobCustodyClaimV2, aster_mesh::CustodySample)>,
 }
@@ -1687,8 +1702,7 @@ async fn settle_existing_native_profile5_pack(
     let physical_open = authority.physical_open();
     let physical_commitment = authority.physical_commitment();
     let ExistingNativeProfile5Pack {
-        blob,
-        pack,
+        completion,
         wire_len,
         pending_custody,
     } = existing;
@@ -1737,38 +1751,116 @@ async fn settle_existing_native_profile5_pack(
     else {
         return Err("promoted native Profile-5 retry did not request settlement".into());
     };
-    if let Some((verified, received_sample)) = pending_custody {
-        let promotion_sample = super::contact_custody_sample()
-            .map_err(|error| {
-                lifecycle_failure("sample existing native receiver promotion clock", error)
-            })?
-            .ok_or_else(|| {
-                lifecycle_failure(
-                    "sample existing native receiver promotion clock",
-                    "clock unavailable",
-                )
+    run_native_profile5_prepromotion_hook();
+    let finite = pending_custody
+        .map(|(verified, received_sample)| {
+            let promotion_sample = super::contact_custody_sample()
+                .map_err(|error| {
+                    lifecycle_failure("sample existing native receiver promotion clock", error)
+                })?
+                .ok_or_else(|| {
+                    lifecycle_failure(
+                        "sample existing native receiver promotion clock",
+                        "clock unavailable",
+                    )
+                })?;
+            Ok::<_, BlobNetworkError>((verified, received_sample, promotion_sample))
+        })
+        .transpose()?;
+    let (blob, result_code) = match completion {
+        NativeProfile5Completion::Published { blob, pack } => {
+            if let Some((verified, received_sample, promotion_sample)) = finite {
+                store
+                    .admit_existing_finite_profile5_pack_with_policy(
+                        policy,
+                        &blob,
+                        authority,
+                        &pack,
+                        verified,
+                        received_sample,
+                        promotion_sample,
+                    )
+                    .map_err(|error| {
+                        lifecycle_failure("refresh existing native Profile-5 custody", error)
+                    })?;
+            }
+            (*blob, StreamResultCode::AlreadyPresent)
+        }
+        completion => {
+            let cache = super::contact_mutable_route_cache(verifier).map_err(|error| {
+                lifecycle_failure("bind completed native Profile-5 route cache", error)
             })?;
-        store
-            .admit_existing_finite_profile5_pack_with_policy(
-                policy,
-                &blob,
-                authority,
-                &pack,
-                verified,
-                received_sample,
-                promotion_sample,
+            let lifecycle = cache.lock_blob_lifecycle().map_err(|error| {
+                lifecycle_failure("lock completed native Profile-5 lifecycle", error)
+            })?;
+            let finite = finite.map(|(verified, received, promoted)| {
+                aster_redb_store::ReceivedProfile5FinitePromotion::new(verified, received, promoted)
+            });
+            let outcome = match &completion {
+                NativeProfile5Completion::Retained(pack) => store
+                    .commit_received_existing_profile5_pack_with_policy(
+                        policy, authority, pack, finite,
+                    ),
+                NativeProfile5Completion::Upload(upload) => {
+                    let reservation = &upload.reservation;
+                    let checkpoint = &upload.checkpoint;
+                    let promoted = match finite {
+                        Some(finite) => store.commit_received_profile5_upload_once_with_policy(
+                            policy,
+                            reservation,
+                            checkpoint,
+                            authority.publication(),
+                            finite,
+                        ),
+                        None => store.commit_received_durable_profile5_upload_once_with_policy(
+                            policy,
+                            reservation,
+                            checkpoint,
+                            authority.publication(),
+                        ),
+                    };
+                    if let Err(error) = &promoted
+                        && terminal_profile5_promotion_error(error)
+                    {
+                        store.abort_blob_upload(reservation).map_err(|error| {
+                            lifecycle_failure(
+                                "abort rejected completed native Profile-5 upload",
+                                error,
+                            )
+                        })?;
+                    }
+                    promoted
+                }
+                NativeProfile5Completion::Published { .. } => {
+                    unreachable!("handled existing publication")
+                }
+            }
+            .map_err(|error| {
+                lifecycle_failure("accept completed native Profile-5 publication", error)
+            })?;
+            super::cache_authenticated_profile5_blob_route_claim(
+                store,
+                &cache,
+                verifier,
+                outcome.blob(),
+                &lifecycle,
             )
             .map_err(|error| {
-                lifecycle_failure("refresh existing native Profile-5 custody", error)
+                lifecycle_failure("cache completed native Profile-5 publication", error)
             })?;
-    }
+            let code = if outcome.inserted() {
+                StreamResultCode::Promoted
+            } else {
+                StreamResultCode::AlreadyPresent
+            };
+            (outcome.blob().clone(), code)
+        }
+    };
     let roots = (
         *physical_commitment.commitment().blob_id().as_bytes(),
         Sha256::digest(physical_commitment.commitment().encode()).into(),
     );
-    if blob.blob_id != pack.commitment().blob_id()
-        || blob.blob_id != physical_commitment.commitment().blob_id()
-    {
+    if blob.blob_id != physical_commitment.commitment().blob_id() {
         return Err(authentication_failure(
             "bind promoted native Profile-5 roots",
             "retained publication differs from retained pack commitment",
@@ -1776,7 +1868,7 @@ async fn settle_existing_native_profile5_pack(
     }
     let digest = canonical_result_digest(&transfer_open, roots);
     let StreamAction::Send(result) = state
-        .promoted(StreamResultCode::AlreadyPresent, digest)
+        .promoted(result_code, digest)
         .map_err(|error| settlement_failure("settle promoted native Profile-5 retry", error))?
     else {
         return Err("promoted native Profile-5 retry did not produce RESULT".into());
@@ -1797,9 +1889,9 @@ async fn settle_existing_native_profile5_pack(
     };
     if !matches!(
         state
-            .result_ack(ack, StreamResultCode::AlreadyPresent)
+            .result_ack(ack, result_code)
             .map_err(|error| settlement_failure("acknowledge promoted Profile-5 retry", error))?,
-        StreamAction::Terminal(StreamResultCode::AlreadyPresent)
+        StreamAction::Terminal(code) if code == result_code
     ) {
         return Err("promoted native Profile-5 retry did not terminate".into());
     }
@@ -1950,13 +2042,66 @@ async fn receive_native_profile5_pack(
                 policy,
             },
             ExistingNativeProfile5Pack {
-                blob,
-                pack,
+                completion: NativeProfile5Completion::Published {
+                    blob: Box::new(blob),
+                    pack: Box::new(pack),
+                },
                 wire_len,
                 pending_custody,
             },
         )
         .await;
+    }
+    let incoming_owner = BlobOperationOwner::new(
+        open.publisher(),
+        BlobOperationKey::new(open.operation_key().to_vec())
+            .map_err(|error| authentication_failure("bind native Profile-5 owner", error))?,
+    );
+    if store
+        .resume_blob_upload(&incoming_owner)
+        .map_err(|error| lifecycle_failure("resolve native Profile-5 pending upload", error))?
+        .is_none()
+    {
+        match store.open_profile5_pack_transfer_read(variant) {
+            Ok(pack) => {
+                if pack.commitment().blob_id() != commitment.blob_id()
+                    || pack.open().total_len() != physical_open_value.total_len()
+                    || pack.open().content_group() != physical_open_value.content_group()
+                    || pack.open().content_epoch() != physical_open_value.content_epoch()
+                    || pack.open().metadata() != physical_open_value.metadata()
+                    || pack.physical_lineage() != lineage.physical().binding()
+                {
+                    return Err(authentication_failure(
+                        "bind retained native Profile-5 pack",
+                        "retained content differs from incoming publication",
+                    ));
+                }
+                return settle_existing_native_profile5_pack(
+                    attempt,
+                    codec,
+                    verifier,
+                    transfer_open,
+                    ExistingNativeProfile5Settlement {
+                        authority: &authority,
+                        store: &store,
+                        policy,
+                    },
+                    ExistingNativeProfile5Pack {
+                        completion: NativeProfile5Completion::Retained(Box::new(pack)),
+                        wire_len,
+                        pending_custody,
+                    },
+                )
+                .await;
+            }
+            Err(StoreError::Blob(BlobStoreError::NotFound)) => {}
+            Err(error) => {
+                return Err(durability_failure(
+                    "open retained native Profile-5 pack",
+                    error,
+                ));
+            }
+        }
     }
     let (reservation, initial_checkpoint, restored_open) = store
         .reserve_received_profile5_upload_with_policy(policy, &publication, &physical_open)
@@ -1966,6 +2111,51 @@ async fn receive_native_profile5_pack(
             "restore native Profile-5 receiver open",
             "durable authenticated open changed",
         ));
+    }
+    if let Some(completion) = initial_checkpoint.profile5_completion() {
+        if completion.commitment() != physical_commitment.commitment()
+            || completion.authenticated_commitment() != physical_commitment.authenticated_bytes()
+        {
+            return Err(authentication_failure(
+                "restore completed native Profile-5 upload",
+                "durable finish authority differs from incoming source",
+            ));
+        }
+        // A reused completion refers to a lifecycle-owned pack, whose last
+        // existing publication may otherwise be evicted while FINISH is pending.
+        let retained_lease = completion
+            .reuses_existing_pack()
+            .then(|| store.open_profile5_pack_transfer_read(variant))
+            .transpose()
+            .map_err(|error| durability_failure("lease completed native Profile-5 pack", error))?;
+        let root = PinnedBlobPackRoot::open(&store)
+            .map_err(|error| durability_failure("open completed native Profile-5 root", error))?;
+        let reader = BlobPackReader::open_completed_upload_pinned(&root, completion.pack())
+            .map_err(|error| durability_failure("open completed native Profile-5 pack", error))?;
+        return settle_existing_native_profile5_pack(
+            attempt,
+            codec,
+            verifier,
+            transfer_open,
+            ExistingNativeProfile5Settlement {
+                authority: &authority,
+                store: &store,
+                policy,
+            },
+            ExistingNativeProfile5Pack {
+                completion: NativeProfile5Completion::Upload(Box::new(
+                    CompletedNativeProfile5Upload {
+                        reservation,
+                        checkpoint: initial_checkpoint,
+                        _reader: reader,
+                        _retained_lease: retained_lease,
+                    },
+                )),
+                wire_len,
+                pending_custody,
+            },
+        )
+        .await;
     }
     let durable_pack = initial_checkpoint.durable_pack_checkpoint();
     let resumed_from = durable_pack.map_or(0, |checkpoint| checkpoint.payload_len());
