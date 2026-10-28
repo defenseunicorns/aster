@@ -53,10 +53,13 @@ fn fresh_root(test: &str) -> PathBuf {
         .expect("clock after epoch")
         .as_nanos();
     let sequence = ROOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "aster-selected-mesh-smoke-{test}-{}-{nonce}-{sequence}",
-        std::process::id(),
-    ))
+    std::env::temp_dir()
+        .canonicalize()
+        .expect("canonical temporary directory")
+        .join(format!(
+            "aster-selected-mesh-smoke-{test}-{}-{nonce}-{sequence}",
+            std::process::id(),
+        ))
 }
 
 #[cfg(unix)]
