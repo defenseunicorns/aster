@@ -73,6 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Updated ctutils to 0.4.5 and crypto-bigint to 0.7.9 to address RUSTSEC-2026-0385 and RUSTSEC-2026-0387.
 - Created Unix publication journals with owner-only permissions and rejected insecure existing journal files.
 
 - Restricted `asterctl` plaintext RPC to loopback addresses before credential or payload loading.
