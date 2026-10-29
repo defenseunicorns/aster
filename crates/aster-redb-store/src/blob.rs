@@ -2892,7 +2892,7 @@ impl Store {
                     "Blob import maintenance row has wrong evidence",
                 )));
             };
-            let import = depot::maintenance_import_projection(&row.key, &row.value)?;
+            let import = maintenance_physical_projection(&row.key, &row.value)?;
             lifecycle::validate_maintenance_lineage_evidence(
                 import.physical_lineage,
                 self.blob_depot_owner_binding,
@@ -3005,23 +3005,31 @@ impl Store {
                 "Blob maintenance cursor changed after discovery",
             )));
         }
-        let exact_import = write
-            .open_table(BLOB_IMPORTS)?
-            .get(candidate.variant.as_bytes().as_slice())?
-            .ok_or_else(|| {
+        let exact_import = if pack_lifecycle::is_pack_evidence(&candidate.import) {
+            pack_lifecycle::encoded_active_write(&write, candidate.variant)?.ok_or_else(|| {
                 blob_error(BlobStoreError::SchemaInvariant(
-                    "Blob manifest admission import disappeared",
+                    "Blob manifest admission Profile-5 pack disappeared",
                 ))
             })?
-            .value()
-            .to_vec();
+        } else {
+            write
+                .open_table(BLOB_IMPORTS)?
+                .get(candidate.variant.as_bytes().as_slice())?
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob manifest admission import disappeared",
+                    ))
+                })?
+                .value()
+                .to_vec()
+        };
         if exact_import != candidate.import {
             return Err(blob_error(BlobStoreError::SchemaInvariant(
-                "Blob manifest admission import changed after discovery",
+                "Blob manifest admission physical variant changed after discovery",
             )));
         }
         let exact_projection =
-            depot::maintenance_import_projection(candidate.variant.as_bytes(), &exact_import)?;
+            maintenance_physical_projection(candidate.variant.as_bytes(), &exact_import)?;
         if exact_projection.variant_id != candidate.variant
             || exact_projection.finalized != candidate.finalized
             || !matches!(
@@ -10847,13 +10855,41 @@ fn capture_any_maintenance_reference_read(
     })))
 }
 
+#[derive(Clone, Copy)]
+struct MaintenancePhysicalProjection {
+    variant_id: BlobVariantId,
+    physical_lineage: [u8; 32],
+    finalized: bool,
+}
+
+fn maintenance_physical_projection(
+    key: &[u8],
+    value: &[u8],
+) -> Result<MaintenancePhysicalProjection, StoreError> {
+    if pack_lifecycle::is_pack_evidence(value) {
+        let projection = pack_lifecycle::deletion_projection(key, value)?;
+        Ok(MaintenancePhysicalProjection {
+            variant_id: projection.variant_id,
+            physical_lineage: projection.physical_lineage,
+            finalized: true,
+        })
+    } else {
+        let projection = depot::maintenance_import_projection(key, value)?;
+        Ok(MaintenancePhysicalProjection {
+            variant_id: projection.variant_id,
+            physical_lineage: projection.physical_lineage,
+            finalized: projection.finalized,
+        })
+    }
+}
+
 fn capture_import_maintenance_evidence_read(
     read: &redb::ReadTransaction,
     key: &[u8],
     value: &[u8],
     charge: &mut MaintenanceCharge,
 ) -> Result<Option<MaintenanceEvidence>, StoreError> {
-    let import = depot::maintenance_import_projection(key, value)?;
+    let import = maintenance_physical_projection(key, value)?;
     let reference = match capture_any_maintenance_reference_read(read, import.variant_id, charge)? {
         Ok(reference) => reference,
         Err(()) => return Ok(None),
@@ -10866,7 +10902,7 @@ fn capture_import_maintenance_evidence_read(
         .get(import.variant_id.as_bytes().as_slice())?
         .ok_or_else(|| {
             blob_error(BlobStoreError::SchemaInvariant(
-                "retained Blob import is missing its lineage fence",
+                "retained Blob physical variant is missing its lineage fence",
             ))
         })?;
     if !charge.charge(import.variant_id.as_bytes(), lineage.value().len())? {
@@ -10889,7 +10925,17 @@ fn append_import_maintenance_range_read<'a>(
     charge: &mut MaintenanceCharge,
 ) -> Result<bool, StoreError> {
     let imports = read.open_table(BLOB_IMPORTS)?;
-    let mut range = imports.range::<&[u8]>((lower, upper))?;
+    let packs = read.open_table(pack_lifecycle::BLOB_PROFILE5_PACKS)?;
+    let mut import_range = imports.range::<&[u8]>((lower.clone(), upper.clone()))?;
+    let mut pack_range = packs.range::<&[u8]>((lower, upper))?;
+    let mut next_import = import_range
+        .next()
+        .transpose()?
+        .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()));
+    let mut next_pack = pack_range
+        .next()
+        .transpose()?
+        .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()));
     loop {
         if charge.rows >= charge.budget.rows
             || u64::try_from(rows.len()).map_err(|_| StoreError::ItemCountAccountingOverflow)?
@@ -10897,15 +10943,38 @@ fn append_import_maintenance_range_read<'a>(
         {
             return Ok(false);
         }
-        let Some(row) = range.next() else {
-            return Ok(true);
+        let take_import = match (&next_import, &next_pack) {
+            (None, None) => return Ok(true),
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (Some((import, _)), Some((pack, _))) => match import.cmp(pack) {
+                std::cmp::Ordering::Less => true,
+                std::cmp::Ordering::Greater => false,
+                std::cmp::Ordering::Equal => {
+                    return Err(blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob physical variant exists in both legacy and Profile-5 tables",
+                    )));
+                }
+            },
         };
-        let (key, value) = row?;
-        if !charge.charge(key.value(), value.value().len())? {
+        let (key, value) = if take_import {
+            let current = next_import.take().expect("selected legacy import");
+            next_import = import_range
+                .next()
+                .transpose()?
+                .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()));
+            current
+        } else {
+            let current = next_pack.take().expect("selected Profile-5 pack");
+            next_pack = pack_range
+                .next()
+                .transpose()?
+                .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()));
+            current
+        };
+        if !charge.charge(&key, value.len())? {
             return Ok(false);
         }
-        let key = key.value().to_vec();
-        let value = value.value().to_vec();
         let Some(evidence) = capture_import_maintenance_evidence_read(read, &key, &value, charge)?
         else {
             return Ok(false);
@@ -10924,7 +10993,14 @@ fn bounded_import_maintenance_page_read(
     after: Option<&[u8]>,
     budget: BlobMaintenanceBudget,
 ) -> Result<MaintenancePage, StoreError> {
-    let total_rows = read.open_table(BLOB_IMPORTS)?.len()?;
+    let total_rows = read
+        .open_table(BLOB_IMPORTS)?
+        .len()?
+        .checked_add(
+            read.open_table(pack_lifecycle::BLOB_PROFILE5_PACKS)?
+                .len()?,
+        )
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
     let mut rows = Vec::new();
     let mut charge = MaintenanceCharge::new(budget, 0, 0);
     let first_complete = append_import_maintenance_range_read(
@@ -10965,7 +11041,14 @@ fn bounded_capacity_import_page_read(
     after: Option<&[u8]>,
     budget: BlobMaintenanceBudget,
 ) -> Result<MaintenancePage, StoreError> {
-    let total_rows = read.open_table(BLOB_IMPORTS)?.len()?;
+    let total_rows = read
+        .open_table(BLOB_IMPORTS)?
+        .len()?
+        .checked_add(
+            read.open_table(pack_lifecycle::BLOB_PROFILE5_PACKS)?
+                .len()?,
+        )
+        .ok_or(StoreError::ItemCountAccountingOverflow)?;
     let mut rows = Vec::new();
     let mut charge = MaintenanceCharge::new(budget, 0, 0);
     let complete = append_import_maintenance_range_read(
@@ -11175,7 +11258,7 @@ impl Store {
                     "Blob capacity import row has wrong evidence",
                 )));
             };
-            let projection = depot::maintenance_import_projection(&row.key, &row.value)?;
+            let projection = maintenance_physical_projection(&row.key, &row.value)?;
             lifecycle::validate_maintenance_lineage_evidence(
                 projection.physical_lineage,
                 self.blob_depot_owner_binding,
@@ -13786,7 +13869,7 @@ impl Store {
                             "Blob import maintenance row has wrong evidence",
                         )));
                     };
-                    let import = depot::maintenance_import_projection(&row.key, &row.value)?;
+                    let import = maintenance_physical_projection(&row.key, &row.value)?;
                     lifecycle::validate_maintenance_lineage_evidence(
                         import.physical_lineage,
                         self.blob_depot_owner_binding,

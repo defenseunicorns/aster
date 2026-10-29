@@ -6664,9 +6664,28 @@ mod tests {
             ),
             Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
         ));
-        promote_profile5_fixture(
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        let replacement = remote_profile5_pack(
             &fixture,
+            &fixture.other,
             b"replacement-after-expired-native-profile5-reclamation",
+            0x62,
+        );
+        let (reservation, checkpoint, _) = fixture
+            .store
+            .reserve_received_profile5_upload_with_policy(
+                &policy,
+                &replacement.publication,
+                &replacement.open,
+            )
+            .expect("expired native pack must release depot capacity");
+        promote_received_profile5_pack(
+            &fixture,
+            &fixture.other,
+            &policy,
+            &reservation,
+            checkpoint,
+            &replacement,
         );
     }
 
