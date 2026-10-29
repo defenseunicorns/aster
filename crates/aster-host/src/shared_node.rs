@@ -32,6 +32,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::time::{Duration, Instant};
 
 type SharedContactDriver = RuntimeDriver<ReferenceSemanticRuntimeSession>;
+// This host still transfers Blob content through the semantic-v8/profile-4
+// BlobChunk lane. Advertising v9 would select profile 5 without composing its
+// sender or receiver.
+const SHARED_HOST_SEMANTIC_CEILING: u16 = 8;
 
 /// Fixed aggregate claims charged for each supervisor-owned lifecycle object.
 ///
@@ -1138,22 +1142,26 @@ impl SharedNodeContactSupervisor {
             .map_err(|_| ContactSupervisorError::Credential)?;
         let session = self.authority.session();
         let mut driver = match role {
-            ContactSessionRole::Initiator { peer_hint } => RuntimeDriver::initiator_with_limits(
-                bundle,
-                sync,
-                session,
-                start,
-                peer_hint,
-                self.config.runtime_limits,
-            ),
-            ContactSessionRole::Responder { peer_hint } => {
-                RuntimeDriver::responder_with_start_and_limits(
+            ContactSessionRole::Initiator { peer_hint } => {
+                RuntimeDriver::initiator_with_limits_and_semantic_ceiling(
                     bundle,
                     sync,
                     session,
                     start,
                     peer_hint,
                     self.config.runtime_limits,
+                    SHARED_HOST_SEMANTIC_CEILING,
+                )
+            }
+            ContactSessionRole::Responder { peer_hint } => {
+                RuntimeDriver::responder_with_start_and_limits_and_semantic_ceiling(
+                    bundle,
+                    sync,
+                    session,
+                    start,
+                    peer_hint,
+                    self.config.runtime_limits,
+                    SHARED_HOST_SEMANTIC_CEILING,
                 )
             }
         }

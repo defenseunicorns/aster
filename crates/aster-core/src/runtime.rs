@@ -909,6 +909,29 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         peer_hint: Option<NodeId>,
         semantic_ceiling: u16,
     ) -> Result<Self, RuntimeError> {
+        Self::initiator_with_limits_and_semantic_ceiling(
+            bundle,
+            sync,
+            backend,
+            start_request,
+            peer_hint,
+            RuntimeLimits::default(),
+            semantic_ceiling,
+        )
+    }
+
+    /// Opens a capability-limited initiator with explicit runtime bounds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn initiator_with_limits_and_semantic_ceiling(
+        bundle: ProvisioningBundle,
+        sync: SyncState,
+        backend: B,
+        start_request: StartRequest,
+        peer_hint: Option<NodeId>,
+        limits: RuntimeLimits,
+        semantic_ceiling: u16,
+    ) -> Result<Self, RuntimeError> {
+        limits.validate().map_err(RuntimeError::InvalidLimits)?;
         let semantic_versions = semantic_versions_through(semantic_ceiling)?;
         let (initiator, first_flight) =
             ReferenceSessionInitiator::start_with_semantic_versions(bundle, semantic_versions)
@@ -920,7 +943,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             backend,
             start_request,
             peer_hint,
-            RuntimeLimits::default(),
+            limits,
         )
     }
 
@@ -1067,13 +1090,35 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         peer_hint: Option<NodeId>,
         semantic_ceiling: u16,
     ) -> Result<Self, RuntimeError> {
+        Self::responder_with_start_and_limits_and_semantic_ceiling(
+            bundle,
+            sync,
+            backend,
+            start_request,
+            peer_hint,
+            RuntimeLimits::default(),
+            semantic_ceiling,
+        )
+    }
+
+    /// Opens a capability-limited responder with explicit runtime bounds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn responder_with_start_and_limits_and_semantic_ceiling(
+        bundle: ProvisioningBundle,
+        sync: SyncState,
+        backend: B,
+        start_request: StartRequest,
+        peer_hint: Option<NodeId>,
+        limits: RuntimeLimits,
+        semantic_ceiling: u16,
+    ) -> Result<Self, RuntimeError> {
         Self::responder_inner(
             bundle,
             sync,
             backend,
             Some(start_request),
             peer_hint,
-            RuntimeLimits::default(),
+            limits,
             Some(semantic_versions_through(semantic_ceiling)?),
         )
     }
