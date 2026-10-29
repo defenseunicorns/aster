@@ -88,6 +88,11 @@ internally. The broader
 semantic implementation remains the migration source for behavior that has not
 yet moved into this composition.
 
+The generic `aster-host` shared-runtime composition remains capped at semantic
+v8 because its Blob lane still uses profile 4 `BlobChunk` objects. The selected
+`aster-node` composition separately owns semantic-v9/profile-5 streaming; the
+shared-host ceiling does not reduce that selected capability.
+
 ## Capability boundary
 
 | Path | Implemented | Boundary |
