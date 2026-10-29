@@ -6536,4 +6536,158 @@ mod tests {
         assert!(Store::open_for_mission(fixture.root.database(), authority).is_err());
         assert_eq!(upload_artifact_snapshot(&pack_path), before);
     }
+
+    fn promote_profile5_fixture(
+        fixture: &Fixture,
+        operation: &[u8],
+    ) -> (BlobUploadRequest, StoredBlob) {
+        let request = request(fixture, operation, 4_096);
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        let (reservation, initial, open) = reserve_profile5(fixture, &request);
+        let completed =
+            complete_profile5_pack(fixture, &policy, &reservation, initial, &open, 0x55);
+        let publication = profile5_publication(fixture, &open, &completed);
+        let outcome = fixture
+            .store
+            .commit_profile5_publication_once_with_policy(
+                &policy,
+                &reservation,
+                &completed,
+                &publication,
+                publication.publication().final_custody(),
+            )
+            .expect("promote Profile-5 fixture");
+        (request, outcome.blob().clone())
+    }
+
+    #[test]
+    fn regression_duplicate_received_profile5_attempts_cannot_corrupt_the_shared_pack() {
+        let fixture = fixture(
+            "duplicate-received-profile5-writers",
+            0x72,
+            BlobDepotLimits::DEFAULT,
+        );
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        let remote = remote_profile5_pack(
+            &fixture,
+            &fixture.publisher,
+            b"duplicate-received-profile5-writers",
+            0x53,
+        );
+        let (first, first_checkpoint, _) = fixture
+            .store
+            .reserve_received_profile5_upload_with_policy(
+                &policy,
+                &remote.publication,
+                &remote.open,
+            )
+            .expect("reserve first receiver");
+        let (second, second_checkpoint, _) = fixture
+            .store
+            .reserve_received_profile5_upload_with_policy(
+                &policy,
+                &remote.publication,
+                &remote.open,
+            )
+            .expect("resume duplicate receiver");
+        assert_eq!(first.pack_identity(), second.pack_identity());
+        assert_eq!(first_checkpoint, second_checkpoint);
+
+        let root = PinnedBlobPackRoot::open(&fixture.store).expect("pack root");
+        let mut first_writer = BlobPackWriter::open_projected_upload_pinned(
+            &root,
+            &first.pack_identity(),
+            first_checkpoint.durable_pack_checkpoint(),
+        )
+        .expect("open first writer");
+        first_writer
+            .append(&remote.segment, remote.leaves)
+            .expect("append first receiver segment");
+
+        // A duplicate attempt reopens the same durable checkpoint while the
+        // first writer owns uncheckpointed bytes. It must not truncate them.
+        drop(
+            BlobPackWriter::open_projected_upload_pinned(
+                &root,
+                &second.pack_identity(),
+                second_checkpoint.durable_pack_checkpoint(),
+            )
+            .expect("duplicate writer must be serialized or harmless"),
+        );
+
+        let completion = first_writer
+            .finish_profile5(&remote.commitment)
+            .expect("finish first receiver");
+        let mut reader = BlobPackReader::open_completed_upload_pinned(&root, &completion)
+            .expect("open completed pack");
+        assert!(
+            reader
+                .next_record()
+                .expect("completed pack must contain a valid first record")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn regression_expired_native_profile5_pack_releases_capacity_for_next_publication() {
+        let fixture = fixture(
+            "expired-native-profile5-reclamation",
+            0x73,
+            BlobDepotLimits::new(1_000_000, 4, 1).expect("one-variant depot"),
+        );
+        let (request, _) =
+            promote_profile5_fixture(&fixture, b"expired-native-profile5-reclamation");
+        let budget =
+            super::super::lifecycle::BlobMaintenanceBudget::new(4_096, 8, 32 * 1024 * 1024)
+                .expect("maintenance budget");
+        let expired = CustodySample {
+            clock_id: [0x31; 16],
+            tick_ms: 100_100,
+        };
+
+        for turn in 0..128 {
+            fixture
+                .store
+                .run_blob_maintenance_turn_with_sample(budget, (turn == 0).then_some(expired))
+                .expect("run expiry maintenance");
+            fixture
+                .store
+                .run_blob_capacity_gc(budget, None)
+                .expect("run physical maintenance");
+        }
+
+        assert!(matches!(
+            fixture.store.blob_for_owner_with_policy(
+                &fixture.store.control_policy_snapshot().expect("policy"),
+                &request.owner,
+            ),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        promote_profile5_fixture(
+            &fixture,
+            b"replacement-after-expired-native-profile5-reclamation",
+        );
+    }
+
+    #[test]
+    fn regression_maximum_valid_operation_key_survives_blob_maintenance() {
+        let fixture = fixture(
+            "maximum-operation-key-maintenance",
+            0x74,
+            BlobDepotLimits::DEFAULT,
+        );
+        promote_profile5_fixture(&fixture, &[b'x'; 256]);
+        let budget =
+            super::super::lifecycle::BlobMaintenanceBudget::new(4_096, 8, 32 * 1024 * 1024)
+                .expect("maintenance budget");
+
+        for turn in 0..64 {
+            fixture
+                .store
+                .run_blob_maintenance_turn(budget)
+                .unwrap_or_else(|error| {
+                    panic!("valid 256-byte operation key failed maintenance turn {turn}: {error}")
+                });
+        }
+    }
 }
