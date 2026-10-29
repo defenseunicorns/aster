@@ -2848,7 +2848,7 @@ fn upload_pack_store_error(error: BlobPackError) -> StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::pack::{BlobPackReader, BlobPackWriter, PinnedBlobPackRoot};
+    use crate::blob::pack::{BlobPackError, BlobPackReader, BlobPackWriter, PinnedBlobPackRoot};
     use crate::{
         BlobDeliveryAck, BlobDepotLimits, BlobOperationKey, BlobOperationOwner,
         BlobOperationRequest, BlobPublicationIntent, BlobSubscriptionKey,
@@ -6607,15 +6607,16 @@ mod tests {
 
         // A duplicate attempt reopens the same durable checkpoint while the
         // first writer owns uncheckpointed bytes. It must not truncate them.
-        assert!(
+        assert!(matches!(
             BlobPackWriter::open_projected_upload_pinned(
                 &root,
                 &second.pack_identity(),
                 second_checkpoint.durable_pack_checkpoint(),
-            )
-            .is_err(),
-            "duplicate writer acquired concurrent ownership of one pack"
-        );
+            ),
+            Err(BlobPackError::Invalid(
+                "another Blob pack writer already owns this pack"
+            ))
+        ));
 
         let completion = first_writer
             .finish_profile5(&remote.commitment)
