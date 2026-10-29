@@ -6606,13 +6606,14 @@ mod tests {
 
         // A duplicate attempt reopens the same durable checkpoint while the
         // first writer owns uncheckpointed bytes. It must not truncate them.
-        drop(
+        assert!(
             BlobPackWriter::open_projected_upload_pinned(
                 &root,
                 &second.pack_identity(),
                 second_checkpoint.durable_pack_checkpoint(),
             )
-            .expect("duplicate writer must be serialized or harmless"),
+            .is_err(),
+            "duplicate writer acquired concurrent ownership of one pack"
         );
 
         let completion = first_writer

@@ -146,6 +146,16 @@ impl From<StoreError> for BlobPackError {
     }
 }
 
+fn acquire_pack_writer_lock(data: &File) -> Result<(), BlobPackError> {
+    match data.try_lock() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => Err(BlobPackError::Invalid(
+            "another Blob pack writer already owns this pack",
+        )),
+        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
 /// Store-owned capability for Blob pack placement. The directory remains
 /// descriptor-pinned on Unix so stream reopen never follows a replaced path.
 #[doc(hidden)]
@@ -1867,6 +1877,7 @@ impl BlobPackWriter {
 
     fn create_in(root: BlobPackRoot, identity: BlobPackIdentity) -> Result<Self, BlobPackError> {
         let mut data = root.open_data(true)?;
+        acquire_pack_writer_lock(&data)?;
         let open_digest = identity.request_digest;
         data.write_all(PACK_MAGIC)?;
         data.write_all(&PACK_VERSION.to_be_bytes())?;
@@ -1909,6 +1920,7 @@ impl BlobPackWriter {
 
     fn resume_in(root: BlobPackRoot, identity: BlobPackIdentity) -> Result<Self, BlobPackError> {
         let mut data = root.open_data(false)?;
+        acquire_pack_writer_lock(&data)?;
         validate_header(&mut data, identity)?;
         let checkpoint = recover_checkpoint(&root, identity, data.metadata()?.len())?;
         Self::restore(root, identity, data, checkpoint)
@@ -2016,6 +2028,7 @@ impl BlobPackWriter {
             }
             None => return Err(BlobPackError::Invalid("Blob pack data is unavailable")),
         };
+        acquire_pack_writer_lock(&data)?;
         validate_header(&mut data, identity)?;
         let data_len = data.metadata()?.len();
         let checkpoint = recover_checkpoints(&root, identity, data_len)?
