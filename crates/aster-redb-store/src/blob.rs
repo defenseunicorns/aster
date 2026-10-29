@@ -10926,7 +10926,7 @@ fn append_import_maintenance_range_read<'a>(
 ) -> Result<bool, StoreError> {
     let imports = read.open_table(BLOB_IMPORTS)?;
     let packs = read.open_table(pack_lifecycle::BLOB_PROFILE5_PACKS)?;
-    let mut import_range = imports.range::<&[u8]>((lower.clone(), upper.clone()))?;
+    let mut import_range = imports.range::<&[u8]>((lower, upper))?;
     let mut pack_range = packs.range::<&[u8]>((lower, upper))?;
     let mut next_import = import_range
         .next()
