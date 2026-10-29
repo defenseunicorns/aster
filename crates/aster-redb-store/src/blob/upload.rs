@@ -5331,6 +5331,7 @@ mod tests {
         assert_eq!(projected.generation(), durable.generation());
         assert_eq!(projected.durable_pack_len(), durable.pack_len());
 
+        drop(writer);
         drop(fixture.store);
         fixture.store = Store::open_for_mission(fixture.root.database(), authority)
             .expect("reopen projected upload");
