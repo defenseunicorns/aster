@@ -10806,7 +10806,7 @@ fn validate_maintenance_operation(
     value: &[u8],
     publication: &[u8],
 ) -> Result<(), StoreError> {
-    BlobOperationKey::new(key.to_vec())?;
+    validate_blob_operation_storage_key(key)?;
     let operation = decode_blob_operation_record(value)?;
     let publication = decode_blob_metadata(publication)?;
     if publication.transfer_id != operation.transfer_id {
