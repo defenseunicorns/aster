@@ -500,7 +500,7 @@ fn remove_upload_pack_directory(
     let Some(directory) = parent.open_child_directory_if_present(&name)? else {
         return Ok(());
     };
-    let entries = directory.entry_names()?;
+    let entries = directory.entry_names_reclaiming_atomic_temporaries(true)?;
     let Some(marker) = directory.read_private_file_if_present(UPLOAD_MARKER, 80)? else {
         if entries.is_empty() {
             drop(directory);
@@ -730,7 +730,7 @@ fn audit_upload_packs(
             )))
         };
     };
-    let entries = pack_root.entry_names()?;
+    let entries = pack_root.entry_names_reclaiming_atomic_temporaries(recover)?;
     let mut cleanup = std::collections::BTreeMap::new();
     for name in entries
         .iter()
@@ -783,6 +783,7 @@ fn audit_upload_packs(
         !name.starts_with(UPLOAD_CLEANUP_PREFIX) && !name.starts_with(UPLOAD_RESERVATION_PREFIX)
     }) {
         let directory = pack_root.open_child_directory(&name, false)?;
+        let directory_entries = directory.entry_names_reclaiming_atomic_temporaries(recover)?;
         let Some(marker) = directory.read_private_file_if_present(UPLOAD_MARKER, 80)? else {
             // mkdir precedes the initial marker; cleanup unlinks the marker
             // before rmdir. Only an empty directory and exact external
@@ -808,7 +809,7 @@ fn audit_upload_packs(
                 })?;
             let cleaning = cleanup.get(identity.upload_id.as_bytes()) == Some(&identity);
             let reserving = reservations.get(identity.upload_id.as_bytes()) == Some(&identity);
-            if !directory.entry_names()?.is_empty()
+            if !directory_entries.is_empty()
                 || durable.is_some_and(|pack| pack.identity != identity)
                 || cleanup
                     .get(identity.upload_id.as_bytes())

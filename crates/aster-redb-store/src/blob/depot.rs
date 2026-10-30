@@ -7568,6 +7568,26 @@ impl OwnedDirectory {
             .collect()
     }
 
+    /// Returns authoritative entries while treating interrupted atomic-write
+    /// temporaries as non-authoritative crash artifacts. Writable recovery
+    /// removes each temporary durably before callers interpret the namespace.
+    pub(super) fn entry_names_reclaiming_atomic_temporaries(
+        &self,
+        recover: bool,
+    ) -> Result<Vec<String>, StoreError> {
+        let mut authoritative = Vec::new();
+        for name in self.entry_names()? {
+            if name.starts_with(TEMP_PREFIX) {
+                if recover {
+                    self.remove_if_exists(&name, false)?;
+                }
+            } else {
+                authoritative.push(name);
+            }
+        }
+        Ok(authoritative)
+    }
+
     #[cfg(unix)]
     pub(super) fn remove_if_exists(&self, name: &str, directory: bool) -> Result<(), StoreError> {
         let flags = if directory {
