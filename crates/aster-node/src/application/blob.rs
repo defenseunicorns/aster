@@ -11992,6 +11992,50 @@ pub(crate) mod tests {
             }
         }
     }
+
+    #[test]
+    fn publication_status_hides_existence_across_authorized_selectors() {
+        let root = TestRoot::new("status-authorized-selector");
+        let other_topic = Topic::new("ops.other").unwrap();
+        let access = ProvisioningAccess::member(
+            blob_scope(),
+            vec![1],
+            vec![blob_topic(), other_topic.clone()],
+        )
+        .unwrap();
+        let mut provisioner = ReferenceProvisioner::from_seed([0xf1; 32]).unwrap();
+        let bytes = provisioner
+            .issue_node(1, &[access])
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        drop(UnprotectedReferenceMission::persist(root.mission_path(), bytes).unwrap());
+        let mut node = selected_node(&root);
+        let published = node
+            .publish(
+                request(b"status-authorized-selector"),
+                &mut Cursor::new(payload(17)),
+            )
+            .unwrap();
+
+        let absent = node
+            .inspect_publication(BlobPublicationInspectionRequest {
+                publication_id: BlobStreamPublicationId::from_bytes([0x92; 32]).unwrap(),
+                topic: other_topic.clone(),
+                scope: blob_scope(),
+            })
+            .unwrap();
+        assert_eq!(absent.phase, BlobPublicationPhase::Missing);
+        let hidden = node
+            .inspect_publication(BlobPublicationInspectionRequest {
+                publication_id: published.publication_id.unwrap(),
+                topic: other_topic,
+                scope: blob_scope(),
+            })
+            .expect("selector-invisible publication is indistinguishable from absent");
+        assert_eq!(hidden.phase, BlobPublicationPhase::Missing);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn end_to_end_review_abandoned_finite_upload_expires_before_new_admission() {
         let root = TestRoot::new("review-actor-expired-abandoned-capacity");
