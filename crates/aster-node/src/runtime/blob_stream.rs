@@ -3460,6 +3460,23 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn single_profile5_operation_may_use_its_idle_timeout() {
+        let result = super::super::with_authenticated_contact_progress_deadline(async {
+            await_authenticated_progress("slow valid operation", async {
+                tokio::time::sleep(
+                    super::super::CONTACT_DEADLINE + std::time::Duration::from_secs(1),
+                )
+                .await;
+                Ok::<_, StreamTransportError>(())
+            })
+            .await
+        })
+        .await;
+
+        assert!(matches!(result, Ok(Ok(()))));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn stalled_authenticated_transfer_times_out_retryably() {
         let error = await_authenticated_progress("stalled progress", async {
             std::future::pending::<Result<(), StreamTransportError>>().await
