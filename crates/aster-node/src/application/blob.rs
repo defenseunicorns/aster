@@ -550,6 +550,22 @@ pub struct BlobPublicationInspection {
     pub blob_id: Option<BlobId>,
 }
 
+fn missing_blob_publication_inspection(
+    publication_id: BlobStreamPublicationId,
+) -> BlobPublicationInspection {
+    BlobPublicationInspection {
+        publication_id,
+        phase: BlobPublicationPhase::Missing,
+        plaintext_total_bytes: 0,
+        durable_plaintext_bytes: 0,
+        transfer_total_bytes: 0,
+        durable_transfer_bytes: 0,
+        total_units: 0,
+        durable_units: 0,
+        blob_id: None,
+    }
+}
+
 fn retired_blob_publication_inspection(
     publication_id: BlobStreamPublicationId,
 ) -> BlobPublicationInspection {
@@ -4283,10 +4299,12 @@ impl SelectedBlobNode {
         self.observe_current_blob_custody_sample("blob publication status")?;
         // A lifecycle operation is authoritative even while cleanup authority
         // for its provisional pack remains durably charged after a crash.
-        let local_publication = match self
-            .store
-            .blob_for_local_publication_with_policy(&policy, request.publication_id.into_core())
-        {
+        let local_publication = match self.store.blob_for_local_publication_with_policy(
+            &policy,
+            request.publication_id.into_core(),
+            &request.topic,
+            &request.scope,
+        ) {
             Ok(stored) => stored,
             Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired)) => {
                 return Ok(retired_blob_publication_inspection(request.publication_id));
@@ -4296,12 +4314,6 @@ impl SelectedBlobNode {
             }
         };
         if let Some(stored) = local_publication {
-            if stored.header.topic != request.topic || stored.header.scope != request.scope {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::NotFound,
-                    "blob publication status",
-                ));
-            }
             let epoch = self.active_epoch(&request.scope, "blob publication status")?;
             self.require_blob_grants(
                 &request.topic,
@@ -4366,10 +4378,7 @@ impl SelectedBlobNode {
         {
             let upload = reservation.request();
             if upload.topic != request.topic || upload.scope != request.scope {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::NotFound,
-                    "blob publication status",
-                ));
+                return Ok(missing_blob_publication_inspection(request.publication_id));
             }
             if reservation.control_policy() != &policy {
                 return Err(ApplicationError::new(
@@ -4419,7 +4428,11 @@ impl SelectedBlobNode {
         // the only pre-publication progress authority.
         let profile5_source =
             aster_redb_store::BlobTransferId::new(*request.publication_id.as_bytes());
-        let received_publication = match self.store.get_blob(profile5_source) {
+        let received_publication = match self.store.blob_for_transfer_selector(
+            profile5_source,
+            &request.topic,
+            &request.scope,
+        ) {
             Ok(stored) => stored,
             Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired)) => {
                 return Ok(retired_blob_publication_inspection(request.publication_id));
@@ -4429,12 +4442,6 @@ impl SelectedBlobNode {
             }
         };
         if let Some(stored) = received_publication {
-            if stored.header.topic != request.topic || stored.header.scope != request.scope {
-                return Err(ApplicationError::new(
-                    ApplicationErrorKind::NotFound,
-                    "blob publication status",
-                ));
-            }
             let epoch = self.active_epoch(&request.scope, "blob publication status")?;
             self.require_blob_grants(
                 &request.topic,
@@ -4492,17 +4499,7 @@ impl SelectedBlobNode {
                 }
             }
         }
-        Ok(BlobPublicationInspection {
-            publication_id: request.publication_id,
-            phase: BlobPublicationPhase::Missing,
-            plaintext_total_bytes: 0,
-            durable_plaintext_bytes: 0,
-            transfer_total_bytes: 0,
-            durable_transfer_bytes: 0,
-            total_units: 0,
-            durable_units: 0,
-            blob_id: None,
-        })
+        Ok(missing_blob_publication_inspection(request.publication_id))
     }
 
     pub fn capacity_status(&mut self) -> Result<BlobCapacityStatus, ApplicationError> {

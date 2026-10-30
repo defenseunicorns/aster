@@ -3964,18 +3964,22 @@ impl Store {
     }
 
     /// Resolves the canonical publication associated with one stable local
-    /// application token without retaining a parallel publication ledger.
+    /// application token, withholding identities outside the exact selector.
     pub fn blob_for_local_publication_with_policy(
         &self,
         policy: &ControlPolicySnapshot,
         publication_id: BlobPublicationStreamId,
+        topic: &Topic,
+        scope: &Scope,
     ) -> Result<Option<StoredBlob>, StoreError> {
         self.require_live()?;
         let authority = self.require_bound_mission()?;
         let read = self.database.begin_read()?;
         require_control_policy_read(&read, authority, policy)?;
+        let operations = read.open_table(BLOB_OPERATIONS)?;
+        let publications = read.open_table(BLOB_PUBLICATIONS)?;
         let mut matched = None;
-        for row in read.open_table(BLOB_OPERATIONS)?.iter()? {
+        for row in operations.iter()? {
             let (key, value) = row?;
             let owner = decode_blob_operation_owner_key(key.value())?;
             if local_blob_publication_stream_id(owner.publisher, owner.operation.as_bytes())
@@ -3986,6 +3990,18 @@ impl Store {
             if matched.is_some() {
                 return Err(blob_error(BlobStoreError::OperationConflict));
             }
+            let operation = decode_blob_operation_record(value.value())?;
+            let publication = publications
+                .get(operation.transfer_id.as_bytes().as_slice())?
+                .ok_or_else(|| {
+                    blob_error(BlobStoreError::SchemaInvariant(
+                        "Blob operation publication is missing",
+                    ))
+                })?;
+            let metadata = decode_blob_metadata(publication.value())?;
+            if &metadata.header.topic != topic || &metadata.header.scope != scope {
+                return Ok(None);
+            }
             if control_principal_revoked_read(&read, owner.publisher)? {
                 return Err(blob_error(BlobStoreError::PublisherRevoked(
                     owner.publisher,
@@ -3994,7 +4010,7 @@ impl Store {
             if lifecycle::operation_record_is_retired(value.value()).map_err(blob_error)? {
                 return Err(blob_error(BlobStoreError::ExpiredOrRetired));
             }
-            matched = Some(decode_blob_operation_record(value.value())?.transfer_id);
+            matched = Some(operation.transfer_id);
         }
         matched
             .map(|transfer| load_blob_from_read(&read, transfer))
@@ -4107,6 +4123,28 @@ impl Store {
     pub fn get_blob(&self, transfer_id: BlobTransferId) -> Result<Option<StoredBlob>, StoreError> {
         self.require_bound_mission()?;
         let read = self.database.begin_read()?;
+        load_blob_from_read(&read, transfer_id)
+    }
+
+    /// Resolves one exact transfer only when its authenticated selector matches.
+    pub fn blob_for_transfer_selector(
+        &self,
+        transfer_id: BlobTransferId,
+        topic: &Topic,
+        scope: &Scope,
+    ) -> Result<Option<StoredBlob>, StoreError> {
+        self.require_bound_mission()?;
+        let read = self.database.begin_read()?;
+        let Some(publication) = read
+            .open_table(BLOB_PUBLICATIONS)?
+            .get(transfer_id.as_bytes().as_slice())?
+        else {
+            return Ok(None);
+        };
+        let metadata = decode_blob_metadata(publication.value())?;
+        if &metadata.header.topic != topic || &metadata.header.scope != scope {
+            return Ok(None);
+        }
         load_blob_from_read(&read, transfer_id)
     }
 
