@@ -8277,6 +8277,65 @@ mod tests {
         }
     }
     #[test]
+    fn abandoned_received_upload_releases_capacity_after_idle_retention() {
+        const RECEIVED_UPLOAD_IDLE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+
+        let capacity = profile5_upload_capacity(4_096).unwrap();
+        let limits =
+            BlobDepotLimits::new(capacity.bytes, capacity.chunks, capacity.variants).unwrap();
+        let mut fixture = fixture("terminal-abandoned-received", 0x93, limits);
+        let policy = fixture.store.control_policy_snapshot().unwrap();
+        let abandoned =
+            remote_profile5_pack(&fixture, &fixture.other, b"abandoned-received", 0x55);
+        fixture
+            .store
+            .reserve_received_profile5_upload_with_policy(
+                &policy,
+                &abandoned.publication,
+                &abandoned.open,
+            )
+            .unwrap();
+
+        let clock_id = [0x33; 16];
+        terminal_upload_turns(
+            &fixture,
+            Some(CustodySample {
+                clock_id,
+                tick_ms: 10,
+            }),
+            128,
+        );
+        terminal_upload_turns(
+            &fixture,
+            Some(CustodySample {
+                clock_id,
+                tick_ms: 10 + RECEIVED_UPLOAD_IDLE_RETENTION_MS,
+            }),
+            128,
+        );
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        fixture.store = Store::open_with_limits_and_blob_depot_limits_for_mission(
+            fixture.root.database(),
+            StoreLimits::default(),
+            limits,
+            authority,
+        )
+        .unwrap();
+
+        let replacement =
+            remote_profile5_pack(&fixture, &fixture.publisher, b"replacement-received", 0x56);
+        fixture
+            .store
+            .reserve_received_profile5_upload_with_policy(
+                &policy,
+                &replacement.publication,
+                &replacement.open,
+            )
+            .expect("idle received reservation must release depot capacity");
+    }
+
+    #[test]
     fn terminal_upload_preserves_received_finite_and_local_durable_authority() {
         let source = fixture("terminal-received-source", 0x88, BlobDepotLimits::DEFAULT);
         let req = request(&source, b"received-finite-authority", 4096);
