@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 pub(crate) const SEMANTIC_PROTOCOL_V7: u16 = 7;
 pub(crate) const SEMANTIC_PROTOCOL_V8: u16 = 8;
+pub(crate) const SEMANTIC_PROTOCOL_V9: u16 = 9;
 pub(crate) const MAX_CHANGE_PAGE_PROTECTED_BYTES: usize = aster_iroh::DEFAULT_MAX_EXCHANGE_BYTES;
 const MECHANICS_FRAME_OVERHEAD_BYTES: usize = crate::frame::MECHANICS_FRAME_PREFIX_BYTES;
 pub(crate) const MAX_CHANGE_PAGE_CODEC_BYTES: usize = MAX_CHANGE_PAGE_PROTECTED_BYTES

@@ -85,22 +85,6 @@ pub(super) struct Observer {
 }
 
 impl Observer {
-    pub(super) fn assert_carriers_complete(&self) {
-        let progress = self.progress.lock().expect("Blob progress");
-        assert!(
-            !progress.ranges.is_empty(),
-            "no durable Blob progress observed"
-        );
-        assert!(
-            progress
-                .ranges
-                .values()
-                .all(|(prefix, total)| prefix == total),
-            "application completed before observed carrier prefixes: {:?}",
-            progress.ranges
-        );
-    }
-
     pub(super) fn install(
         receiver: NodeId,
         publisher: NodeId,

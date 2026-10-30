@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PORTABLE = [
     "wire_decode", "fragment_decode", "envelope_inspect",
     "selected_frame_decode", "selected_negentropy", "classical_profile_decode",
-    "systemd_credential_decode",
+    "systemd_credential_decode", "stream_transfer_decode",
 ]
 LINUX_ONLY = ["systemd_admin_record_decode", "systemd_backup_decode"]
 
@@ -45,11 +45,12 @@ class FuzzSmokeTests(unittest.TestCase):
             self.assertFalse(list(root.glob("aster-fuzz-smoke.*")))
             return result, log.read_text().splitlines()
 
-    def test_linux_runs_all_nine_targets(self):
+    def test_linux_runs_all_ten_targets(self):
         result, calls = self.run_smoke("Linux")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, PORTABLE + LINUX_ONLY)
         self.assertNotIn("SKIP", result.stdout)
+        self.assertIn("-max_len=1052672", (ROOT / "tools/run-fuzz-smoke.sh").read_text())
 
     def test_macos_runs_portable_targets_and_reports_skips(self):
         result, calls = self.run_smoke("Darwin")

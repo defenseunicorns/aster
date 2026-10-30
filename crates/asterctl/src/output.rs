@@ -88,15 +88,16 @@ pub fn numbered_publication(
 }
 
 pub fn publish_blob(
-    response: &api::PublishBlobResponse,
+    response: &api::PublishBlobReceipt,
     operation_key: &str,
     json: bool,
 ) -> Result<String, serde_json::Error> {
     if !json {
-        return Ok(text::publish_blob(response));
+        return Ok(text::publish_blob(response, operation_key));
     }
     let mut fields = fields! {
         "id": Bytes(&response.id),
+        "publicationId": Bytes(&response.publication_id),
         "publisher": Bytes(&response.publisher),
         "publisherCounter": response.publisher_counter.to_string(),
         "priority": response.priority,
@@ -116,6 +117,32 @@ pub fn publish_blob(
         fields.extend(fields! { "ttlMs": ttl_ms.to_string() });
     }
     Ok(serde_json::to_string_pretty(&Output::Object(fields))? + "\n")
+}
+
+pub fn blob_status(
+    response: &api::InspectBlobPublicationResponse,
+    json: bool,
+) -> Result<String, serde_json::Error> {
+    if !json {
+        return Ok(text::blob_status(response));
+    }
+    let mut value = fields! {
+        "publicationId": Bytes(&response.publication_id),
+        "phase": response.phase,
+        "plaintextTotalBytes": response.plaintext_total_bytes.to_string(),
+        "durablePlaintextBytes": response.durable_plaintext_bytes.to_string(),
+        "transferTotalBytes": response.transfer_total_bytes.to_string(),
+        "durableTransferBytes": response.durable_transfer_bytes.to_string(),
+        "totalUnits": response.total_units.to_string(),
+        "durableUnits": response.durable_units.to_string(),
+    };
+    if let Some(blob_id) = &response.blob_id {
+        value.push((
+            "blobId",
+            Output::Scalar(serde_json::to_value(Bytes(blob_id))?),
+        ));
+    }
+    Ok(serde_json::to_string_pretty(&Output::Object(value))? + "\n")
 }
 
 pub fn read_blob(metadata: &blob_read::Metadata, json: bool) -> Result<String, serde_json::Error> {
@@ -345,12 +372,34 @@ fn status_fields(s: &api::GetStatusResponse) -> Fields {
             }),
         ));
     }
+    if let Some(s) = s.blob_capacity.as_option() {
+        value.push((
+            "blobCapacity",
+            Output::Object(fields! {
+                "reservedBytes": s.reserved_bytes.to_string(),
+                "byteLimit": s.byte_limit.to_string(),
+                "byteRemaining": s.byte_limit.saturating_sub(s.reserved_bytes).to_string(),
+                "variants": s.variants.to_string(),
+                "variantLimit": s.variant_limit.to_string(),
+                "variantRemaining": s.variant_limit.saturating_sub(s.variants).to_string(),
+                "expectedChunks": s.expected_chunks.to_string(),
+                "chunkLimit": s.chunk_limit.to_string(),
+                "chunkRemaining": s.chunk_limit.saturating_sub(s.expected_chunks).to_string(),
+                "pendingSources": s.pending_sources.to_string(),
+                "networkStagingBytes": s.network_staging_bytes.to_string(),
+                "bytesExhausted": s.bytes_exhausted,
+                "variantsExhausted": s.variants_exhausted,
+                "chunksExhausted": s.chunks_exhausted,
+            }),
+        ));
+    }
     value
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buffa::Enumeration as _;
     use serde_json::{Value, json};
 
     fn fixture() -> Value {
@@ -415,8 +464,9 @@ mod tests {
 
     #[test]
     fn blob_metadata_output_uses_exact_ttl_and_never_contains_plaintext() {
-        let response = api::PublishBlobResponse {
+        let response = api::PublishBlobReceipt {
             id: vec![1; 32],
+            publication_id: vec![3; 32],
             publisher: vec![2; 32],
             publisher_counter: u64::MAX,
             priority: api::Priority::Immediate.into(),
@@ -433,6 +483,10 @@ mod tests {
         assert_eq!(json["ttlMs"], u64::MAX.to_string());
         assert_eq!(json["totalLen"], "65537");
         assert_eq!(json["operation_key"], "blob-key");
+        assert_eq!(
+            json["publicationId"],
+            "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM="
+        );
         assert_eq!(json["inserted"], true);
         assert_eq!(json.get("chunk"), None);
         let text = publish_blob(&response, "blob-key", false).unwrap();
@@ -442,6 +496,11 @@ mod tests {
         );
         assert_eq!(text_value(&text, "TTL"), format!("{} ms", u64::MAX));
         assert_eq!(text_value(&text, "Inserted"), "Yes");
+        assert_eq!(text_value(&text, "Operation key"), "blob-key");
+        assert_eq!(
+            text_value(&text, "Publication ID"),
+            "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM="
+        );
 
         let metadata = blob_read::Metadata {
             id: response.id,
@@ -462,6 +521,107 @@ mod tests {
         let text = read_blob(&metadata, false).unwrap();
         assert!(text.lines().any(|line| line == "  TTL: durable"));
         assert_eq!(text_value(&text, "TTL"), "durable");
+    }
+
+    #[test]
+    fn blob_status_text_names_transfer_byte_domain() {
+        let response = api::InspectBlobPublicationResponse {
+            publication_id: vec![4; 32],
+            phase: api::BlobPublicationPhase::Receiving.into(),
+            plaintext_total_bytes: 800,
+            durable_plaintext_bytes: 400,
+            transfer_total_bytes: 1_000,
+            durable_transfer_bytes: 500,
+            total_units: 10,
+            durable_units: 5,
+            ..Default::default()
+        };
+        let text = blob_status(&response, false).unwrap();
+        assert_eq!(text_value(&text, "Plaintext bytes"), "400 / 800 bytes");
+        assert_eq!(
+            text_value(&text, "Authenticated transfer bytes"),
+            "500 / 1,000 bytes"
+        );
+    }
+
+    #[test]
+    fn blob_status_json_is_stable_for_all_states() {
+        for phase in [
+            api::BlobPublicationPhase::Missing,
+            api::BlobPublicationPhase::AwaitingData,
+            api::BlobPublicationPhase::Receiving,
+            api::BlobPublicationPhase::ReadyToFinalize,
+            api::BlobPublicationPhase::Available,
+            api::BlobPublicationPhase::ExpiredOrRetired,
+        ] {
+            let response = api::InspectBlobPublicationResponse {
+                publication_id: vec![4; 32],
+                phase: phase.into(),
+                plaintext_total_bytes: 8,
+                durable_plaintext_bytes: 4,
+                transfer_total_bytes: 10,
+                durable_transfer_bytes: 5,
+                total_units: 2,
+                durable_units: 1,
+                blob_id: (phase == api::BlobPublicationPhase::Available).then(|| vec![5; 32]),
+                ..Default::default()
+            };
+            let value: Value =
+                serde_json::from_str(&blob_status(&response, true).unwrap()).unwrap();
+            assert_eq!(
+                value["publicationId"],
+                "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ="
+            );
+            assert_eq!(value["phase"], phase.proto_name());
+            assert_eq!(value["plaintextTotalBytes"], "8");
+            assert_eq!(value["durablePlaintextBytes"], "4");
+            assert_eq!(value["transferTotalBytes"], "10");
+            assert_eq!(value["durableTransferBytes"], "5");
+            assert_eq!(value["totalUnits"], "2");
+            assert_eq!(value["durableUnits"], "1");
+            assert_eq!(
+                value.get("blobId").is_some(),
+                phase == api::BlobPublicationPhase::Available
+            );
+        }
+    }
+
+    #[test]
+    fn blob_status_missing_snapshot_succeeds() {
+        let response = api::InspectBlobPublicationResponse {
+            publication_id: vec![6; 32],
+            phase: api::BlobPublicationPhase::Missing.into(),
+            ..Default::default()
+        };
+        assert!(blob_status(&response, false).unwrap().contains("Missing"));
+        assert!(blob_status(&response, true).is_ok());
+    }
+
+    #[test]
+    fn status_capacity_uses_saturating_remaining_values() {
+        let response = api::GetStatusResponse {
+            blob_capacity: api::BlobCapacityStatus {
+                reserved_bytes: u64::MAX,
+                byte_limit: 1,
+                variants: 5,
+                variant_limit: 3,
+                expected_chunks: 7,
+                chunk_limit: 0,
+                bytes_exhausted: true,
+                variants_exhausted: true,
+                chunks_exhausted: true,
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        };
+        let value: Value = serde_json::from_str(&status(&response, true).unwrap()).unwrap();
+        assert_eq!(value["blobCapacity"]["byteRemaining"], "0");
+        assert_eq!(value["blobCapacity"]["variantRemaining"], "0");
+        assert_eq!(value["blobCapacity"]["chunkRemaining"], "0");
+        let text = status(&response, false).unwrap();
+        assert!(text.contains("BLOB CAPACITY (OBSERVED PREFLIGHT):"));
+        assert_eq!(text_value(&text, "Byte remaining"), "0 B");
     }
 
     #[test]

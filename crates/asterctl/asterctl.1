@@ -41,6 +41,10 @@ Publish a local file as a Blob. See
 Read a Blob to a new local file. See
 .BR asterctl-blob-read (1)
 .TP
+.B blob-status
+Inspect or wait for receiver-local durable Blob publication state. See
+.BR asterctl-blob-status (1)
+.TP
 .BI client-status " --journal PATH --client-id ID"
 Observe current Event ownership without recovery or takeover.
 .TP
@@ -82,9 +86,10 @@ Default: 8181.
 .TP
 .BI \-\-timeout " SECONDS"
 Set the client timeout for each RPC to an integer from 1 to 86400 seconds.
-Default: 10 seconds. Each query page gets its own deadline.
+Default: 10 seconds, or 15 minutes for Blob publish/read. Blob status wait uses
+one global client deadline. Each query page gets its own deadline.
 The agent may enforce a shorter deadline; the current aster-agent caps each
-RPC at 30 seconds, even when the client requests more.
+RPC at 15 minutes, even when the client requests more.
 This does not limit time spent reading a publication payload from stdin.
 .TP
 .B \-\-help
@@ -135,6 +140,7 @@ Invalid command-line arguments.
 .BR asterctl-publish (1),
 .BR asterctl-blob-publish (1),
 .BR asterctl-blob-read (1),
+.BR asterctl-blob-status (1),
 .BR asterctl-query (1),
 .BR asterctl-subscribe (1),
 .BR asterctl-subscriptions (1),

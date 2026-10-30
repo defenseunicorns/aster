@@ -28,20 +28,38 @@ def summarize(runs):
         groups.setdefault((run["variant"], result["bytes"]), []).append(result)
     rows = []
     for (variant, size), results in sorted(groups.items()):
-        ready = [r["transfer_until_ready_ns"] for r in results if r["status"] == "complete"]
-        rows.append(dict(variant=variant, bytes=size, samples=len(results), completed=len(ready),
-                         ready_median_ns=statistics.median(ready) if ready else None))
+        complete = [r for r in results if r["status"] == "complete"]
+        rows.append(dict(
+            variant=variant,
+            bytes=size,
+            samples=len(results),
+            completed=len(complete),
+            visible_median_ns=(
+                statistics.median(r["transfer_until_visible_ns"] for r in complete)
+                if complete else None
+            ),
+            settled_median_ns=(
+                statistics.median(r["transfer_until_ready_ns"] for r in complete)
+                if complete else None
+            ),
+            publish_to_visible_median_ns=(
+                statistics.median(r["publish_to_visible_ns"] for r in complete)
+                if complete else None
+            ),
+        ))
     return rows
 
 
 CAMPAIGN_SIZES = {
     "default": (16384, 65536, 262144, 1048576),
     "scale": (100 * 1024 * 1024,),
+    "profile5-1g": (1024 * 1024 * 1024,),
 }
 
 
 def campaign(profile="default"):
-    return [(f"{size}-1", size, 300) for size in CAMPAIGN_SIZES[profile]]
+    deadline = 900 if profile == "profile5-1g" else 300
+    return [(f"{size}-1", size, deadline) for size in CAMPAIGN_SIZES[profile]]
 
 
 def parse_records(text):
@@ -55,11 +73,21 @@ def parse_records(text):
         raise ValueError("expected exactly one result")
     result = results[0]
     if result.get("status") == "complete":
+        visible = result.get("transfer_until_visible_ns")
+        settled = result.get("transfer_until_ready_ns")
+        publish_to_visible = result.get("publish_to_visible_ns")
+        publish_to_settled = result.get("publish_to_settled_ns")
         if (result.get("verified_bytes") != result.get("bytes")
                 or not result.get("source_sha256")
                 or result.get("source_sha256") != result.get("receiver_sha256")
-                or not isinstance(result.get("transfer_until_ready_ns"), int)):
-            raise ValueError("completion requires full verified plaintext and readiness timing")
+                or not all(isinstance(value, int) for value in (
+                    visible, settled, publish_to_visible, publish_to_settled
+                ))
+                or visible > settled
+                or publish_to_visible > publish_to_settled):
+            raise ValueError(
+                "completion requires full verified plaintext and ordered visibility/settlement timing"
+            )
     elif result.get("status") not in ("transfer_timeout", "rejected_resource_limit"):
         raise ValueError("unknown result status")
     return records

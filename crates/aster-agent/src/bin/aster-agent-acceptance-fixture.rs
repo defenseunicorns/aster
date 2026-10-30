@@ -568,6 +568,10 @@ fn status_evidence(response: &api::GetStatusResponse) -> Result<serde_json::Valu
         .delivery_capacity
         .as_option()
         .ok_or(FixtureError::Local)?;
+    let blobs = response
+        .blob_capacity
+        .as_option()
+        .ok_or(FixtureError::Local)?;
     if store.item_limit != u64::from(TEST_STORAGE_MAX_ITEMS)
         || store.payload_byte_limit != TEST_STORAGE_MAX_PAYLOAD_BYTES
         || store.items > store.item_limit
@@ -590,6 +594,15 @@ fn status_evidence(response: &api::GetStatusResponse) -> Result<serde_json::Valu
         || deliveries.hard_limit != EVENT_DELIVERY_HARD_ROWS
         || deliveries.profile_saturated != (deliveries.pending >= EVENT_DELIVERY_PROFILE_ROWS)
         || deliveries.pending > deliveries.hard_limit
+    {
+        return Err(FixtureError::Local);
+    }
+    if blobs.reserved_bytes > blobs.byte_limit
+        || blobs.variants > blobs.variant_limit
+        || blobs.expected_chunks > blobs.chunk_limit
+        || blobs.bytes_exhausted != (blobs.reserved_bytes >= blobs.byte_limit)
+        || blobs.variants_exhausted != (blobs.variants >= blobs.variant_limit)
+        || blobs.chunks_exhausted != (blobs.expected_chunks >= blobs.chunk_limit)
     {
         return Err(FixtureError::Local);
     }
@@ -623,6 +636,17 @@ fn status_evidence(response: &api::GetStatusResponse) -> Result<serde_json::Valu
         "operation_audit_total": operations.audit.as_option().ok_or(FixtureError::Local)?.total,
         "pending_deliveries": deliveries.pending,
         "delivery_profile_saturated": deliveries.profile_saturated,
+        "blob_reserved_bytes": blobs.reserved_bytes,
+        "blob_byte_limit": blobs.byte_limit,
+        "blob_variants": blobs.variants,
+        "blob_variant_limit": blobs.variant_limit,
+        "blob_expected_chunks": blobs.expected_chunks,
+        "blob_chunk_limit": blobs.chunk_limit,
+        "blob_pending_sources": blobs.pending_sources,
+        "blob_network_staging_bytes": blobs.network_staging_bytes,
+        "blob_bytes_exhausted": blobs.bytes_exhausted,
+        "blob_variants_exhausted": blobs.variants_exhausted,
+        "blob_chunks_exhausted": blobs.chunks_exhausted,
     });
     if !response.credential_generation.is_empty() {
         evidence.as_object_mut().ok_or(FixtureError::Local)?.insert(
@@ -1410,6 +1434,13 @@ mod tests {
             delivery_capacity: api::DeliveryCapacityStatus {
                 profile_boundary: 256,
                 hard_limit: 262_144,
+                ..Default::default()
+            }
+            .into(),
+            blob_capacity: api::BlobCapacityStatus {
+                byte_limit: 1_000,
+                variant_limit: 10,
+                chunk_limit: 20,
                 ..Default::default()
             }
             .into(),

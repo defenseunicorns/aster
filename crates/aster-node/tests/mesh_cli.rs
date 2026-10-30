@@ -2557,6 +2557,19 @@ fn live_zeroization_stops_a_configured_protected_edge_and_blocks_recontact() {
         target_identity_bytes
     );
 
+    // The survivor must remain live for the complete assertion sequence rather
+    // than racing a short fixed runtime on loaded CI hosts. Stop it only after
+    // the terminal target has rejected recontact, while retaining a bounded
+    // watchdog for failures before this point.
+    let signal = Command::new("/bin/kill")
+        .args(["-INT", &survivor.id().to_string()])
+        .output()
+        .expect("signal survivor for graceful exit");
+    assert!(
+        signal.status.success(),
+        "signal survivor for graceful exit: {}",
+        String::from_utf8_lossy(&signal.stderr)
+    );
     let survivor_status = survivor.wait().expect("graceful survivor exit");
     let survivor_lines = survivor_reader.join().expect("join survivor reader");
     let survivor_errors = survivor_error_reader.join().expect("join survivor errors");

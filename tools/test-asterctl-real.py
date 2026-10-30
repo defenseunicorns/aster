@@ -15,6 +15,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -93,6 +94,23 @@ class RealAgentTest(unittest.TestCase):
                         self.assertFalse(durable_retry["inserted"])
                         self.assertEqual(durable_first["id"], durable_retry["id"])
                         self.assertNotIn("ttlMs", durable_first)
+                        durable_status = json.loads(cli(
+                            "--json", "blob-status",
+                            "--publication-id", durable_first["publicationId"],
+                            "--topic", "chat.events", "--scope", "mission/team/alpha").stdout)
+                        self.assertEqual(
+                            durable_status["publicationId"],
+                            durable_first["publicationId"],
+                        )
+                        self.assertEqual(
+                            durable_status["phase"],
+                            "BLOB_PUBLICATION_PHASE_AVAILABLE",
+                        )
+                        self.assertEqual(durable_status["blobId"], durable_first["id"])
+                        self.assertEqual(
+                            durable_status["durablePlaintextBytes"],
+                            str(len(blob_payload)),
+                        )
                         durable_output = root / "durable-output.bin"
                         durable_read = json.loads(cli(
                             "--json", "blob-read", "--id", durable_first["id"],
@@ -101,6 +119,29 @@ class RealAgentTest(unittest.TestCase):
                         self.assertEqual(durable_output.read_bytes(), blob_payload)
                         self.assertEqual(durable_read["id"], durable_first["id"])
                         self.assertNotIn("ttlMs", durable_read)
+
+                        interrupted_output = root / "interrupted-output.bin"
+                        agent.send_signal(signal.SIGSTOP)
+                        try:
+                            interrupted = cli(
+                                "blob-read", "--id", durable_first["id"],
+                                "--topic", "chat.events", "--scope", "mission/team/alpha",
+                                "--output", str(interrupted_output), success=False)
+                        finally:
+                            agent.send_signal(signal.SIGCONT)
+                        self.assertNotEqual(interrupted.returncode, 0)
+                        self.assertIn(b"discarded 0 authenticated bytes", interrupted.stderr)
+                        self.assertFalse(interrupted_output.exists())
+                        self.assertEqual(
+                            list(root.glob(".asterctl-blob-*.partial")),
+                            [],
+                        )
+                        resumed_read = json.loads(cli(
+                            "--json", "blob-read", "--id", durable_first["id"],
+                            "--topic", "chat.events", "--scope", "mission/team/alpha",
+                            "--output", str(interrupted_output)).stdout)
+                        self.assertEqual(interrupted_output.read_bytes(), blob_payload)
+                        self.assertEqual(resumed_read["id"], durable_first["id"])
 
                         finite_source = root / "finite-blob.bin"
                         finite_source.write_bytes(blob_payload + b"finite")

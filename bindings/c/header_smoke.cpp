@@ -5,8 +5,8 @@ static_assert(ASTER_BATCH_MIN_ITEMS == 2u && ASTER_BATCH_MAX_ITEMS == 64u,
               "batch bounds changed");
 static_assert(ASTER_ABI_VERSION == 1u, "smoke test targets ABI version 1");
 static_assert(ASTER_REPLICATION_WIRE_VERSION == 1u, "wire version must remain stable");
-static_assert(ASTER_DEFAULT_SEMANTIC_VERSION == 7u, "default semantic version changed");
-static_assert(ASTER_HIGHEST_SUPPORTED_SEMANTIC_VERSION == 7u,
+static_assert(ASTER_DEFAULT_SEMANTIC_VERSION == 9u, "default semantic version changed");
+static_assert(ASTER_HIGHEST_SUPPORTED_SEMANTIC_VERSION == 9u,
               "highest semantic version changed");
 
 int main() {

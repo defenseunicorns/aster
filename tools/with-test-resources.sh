@@ -18,6 +18,12 @@ export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 export CARGO_PROFILE_DEV_DEBUG="${CARGO_PROFILE_DEV_DEBUG:-0}"
 export CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG:-0}"
+# The all-feature node test binary contains several deliberately complete
+# end-to-end futures. Rust's platform-default 2-MiB test thread stack can
+# overflow while constructing or dropping those futures even though the same
+# cases pass in production worker threads. Keep one bounded shared test default
+# rather than wrapping individual tests or relying on CI-runner defaults.
+export RUST_MIN_STACK="${RUST_MIN_STACK:-8388608}"
 default_test_threads=4
 online_cpus=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
 case "$online_cpus" in

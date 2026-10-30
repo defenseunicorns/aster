@@ -12,7 +12,7 @@ use super::{
     MlKemDecapsulationKey, MlKemEncapsulationKey, MlKemKey, MlKemKeyExport, P256SecretKey,
     P256SigningKey, ResponderHandshake, ResponderHandshakePrepared, RustCryptoProvider,
     RustCryptoSigningKey, SealedBatchItem, SealedSourceBatch, Secret32, SecureChannel,
-    SequencedCiphertext, ServerFinished, ServerHello, ZeroizeKey, client_hello_hash,
+    SequencedCiphertext, ServerFinished, ServerHello, SessionKeys, ZeroizeKey, client_hello_hash,
 };
 use crate::batch;
 use crate::blob::{
@@ -22,6 +22,10 @@ use crate::blob::{
 use crate::blob_custody::{
     AuthenticatedBlobCustodyContactV1, BlobCustodyClaimV1, BlobCustodyDirectionV1,
     blob_custody_lane_record_context,
+};
+use crate::blob_custody_v2::{
+    ApplicationRecordContext, AuthenticatedBlobCustodyContactV2,
+    AuthenticatedBlobCustodySendContextV2, BlobCustodyClaimV2,
 };
 use crate::bridge::{
     self, AuthorizationEnvelope, BridgeAuthorization, BridgeOuterKind, BridgeRoute,
@@ -103,6 +107,7 @@ const SEMANTIC_PROTOCOL_V5: u16 = super::SEMANTIC_PROTOCOL_V5;
 const SEMANTIC_PROTOCOL_V6: u16 = super::SEMANTIC_PROTOCOL_V6;
 const SEMANTIC_PROTOCOL_V7: u16 = super::SEMANTIC_PROTOCOL_V7;
 const SEMANTIC_PROTOCOL_V8: u16 = super::SEMANTIC_PROTOCOL_V8;
+const SEMANTIC_PROTOCOL_V9: u16 = super::SEMANTIC_PROTOCOL_V9;
 const TRANSFER_PROFILE_OFFER_FRAME_PREFIX: &[u8; 5] = b"ASM\x01\xd1";
 const SUITE_ID: u16 = super::HYBRID_SUITE_ID;
 const PUBLIC_HEADER_LEN: usize = 44;
@@ -1612,6 +1617,69 @@ impl ReferenceEnvelopeSealer {
     ) -> Option<[u8; 32]> {
         self.route_grant(scope, epoch)
             .and_then(|grant| route_grant_commitment(&self.mission, grant).ok())
+    }
+
+    pub(crate) fn seal_source_protocol_object(
+        &self,
+        signature_domain: &'static [u8],
+        body: &[u8],
+        maximum_body_len: usize,
+    ) -> Result<Vec<u8>, EnvelopeError> {
+        self.ensure_live()?;
+        if body.len() > maximum_body_len {
+            return Err(invalid_envelope());
+        }
+        let digest = hash_domain(signature_domain, body);
+        let signature = self
+            .provider
+            .sign(&self.signing_key, &digest)
+            .map_err(envelope_crypto_error)?;
+        let mut encoded = Vec::new();
+        push_u32_bytes(&mut encoded, &self.credential.body)?;
+        encode_signature(&mut encoded, &self.credential.signature)?;
+        push_u32_bytes(&mut encoded, body)?;
+        encode_signature(&mut encoded, &signature)?;
+        Ok(encoded)
+    }
+
+    pub(crate) fn verify_source_protocol_object(
+        &self,
+        signature_domain: &'static [u8],
+        encoded: &[u8],
+        maximum_body_len: usize,
+    ) -> Result<(NodeId, Vec<u8>), EnvelopeError> {
+        self.ensure_live()?;
+        let mut reader = Reader::new(encoded);
+        let credential_body = reader.u32_bytes(16 * 1024)?.to_vec();
+        let credential_signature = decode_signature(&mut reader)?;
+        let credential = decode_credential(
+            credential_body,
+            credential_signature,
+            &self.mission,
+            &self.authority_verifying_key,
+            &self.provider,
+        )?;
+        let body = reader.u32_bytes(maximum_body_len)?.to_vec();
+        let signature = decode_signature(&mut reader)?;
+        reader.finish()?;
+        let digest = hash_domain(signature_domain, &body);
+        self.provider
+            .verify(&credential.verifying_key, &digest, &signature)
+            .map_err(envelope_crypto_error)?;
+        Ok((credential.identity, body))
+    }
+
+    pub(crate) fn blob_stream_content_grant_seed(
+        &self,
+        scope: &Scope,
+        topic: &Topic,
+        epoch: u64,
+    ) -> Option<[u8; 32]> {
+        if self.zeroized {
+            return None;
+        }
+        self.content_grant(scope, topic, epoch)
+            .map(|grant| *grant.key.expose())
     }
 
     pub(crate) fn current_event_route_grant_commitment(
@@ -4507,6 +4575,21 @@ impl ReferenceSessionInitiator {
         )
     }
 
+    /// Starts a session for an adapter that fully implements semantic versions
+    /// only through `semantic_ceiling`.
+    ///
+    /// This declares implementation capability; it is not an application
+    /// protocol preference or an in-session downgrade mechanism.
+    pub fn start_with_semantic_ceiling(
+        bundle: ProvisioningBundle,
+        semantic_ceiling: u16,
+    ) -> Result<(Self, Vec<u8>), EnvelopeError> {
+        if semantic_ceiling == 0 || semantic_ceiling > super::SEMANTIC_PROTOCOL_V9 {
+            return Err(invalid_envelope());
+        }
+        Self::start_with_semantic_versions(bundle, (1..=semantic_ceiling).rev().collect())
+    }
+
     /// Compatibility-only constructor for downstream authenticated transport
     /// tests representing an older implementation. This symbol is absent
     /// unless the non-default `test-utils` feature is selected.
@@ -4677,6 +4760,7 @@ impl ReferenceSessionAwaitingFinished {
 /// Initial responder state for the four-flight authenticated session.
 pub struct ReferenceSessionResponder {
     endpoint: SessionEndpoint,
+    supported_versions: Vec<u16>,
 }
 
 impl fmt::Debug for ReferenceSessionResponder {
@@ -4692,8 +4776,34 @@ impl fmt::Debug for ReferenceSessionResponder {
 impl ReferenceSessionResponder {
     /// Opens a responder from an opaque provisioning package.
     pub fn open(bundle: ProvisioningBundle) -> Result<Self, EnvelopeError> {
+        Self::open_with_semantic_versions(
+            bundle,
+            super::SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS.to_vec(),
+        )
+    }
+
+    /// Opens a responder for an adapter that fully implements semantic
+    /// versions only through `semantic_ceiling`.
+    ///
+    /// See [`ReferenceSessionInitiator::start_with_semantic_ceiling`].
+    pub fn open_with_semantic_ceiling(
+        bundle: ProvisioningBundle,
+        semantic_ceiling: u16,
+    ) -> Result<Self, EnvelopeError> {
+        if semantic_ceiling == 0 || semantic_ceiling > super::SEMANTIC_PROTOCOL_V9 {
+            return Err(invalid_envelope());
+        }
+        Self::open_with_semantic_versions(bundle, (1..=semantic_ceiling).rev().collect())
+    }
+
+    pub(crate) fn open_with_semantic_versions(
+        bundle: ProvisioningBundle,
+        supported_versions: Vec<u16>,
+    ) -> Result<Self, EnvelopeError> {
+        super::validate_version_offer(&supported_versions).map_err(handshake_error)?;
         Ok(Self {
             endpoint: SessionEndpoint::open(bundle)?,
+            supported_versions,
         })
     }
 
@@ -4733,11 +4843,14 @@ impl ReferenceSessionResponder {
             };
         // Mission proof verification deliberately precedes P-256 agreement and ML-KEM
         // encapsulation so unauthenticated probes cannot trigger the expensive response.
-        let prepared =
-            match ResponderHandshakePrepared::respond(&mut self.endpoint.provider, &hello) {
-                Ok(prepared) => prepared,
-                Err(error) => return Err((self, handshake_error(error))),
-            };
+        let prepared = match ResponderHandshakePrepared::respond_with_supported_versions(
+            &mut self.endpoint.provider,
+            &hello,
+            &self.supported_versions,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => return Err((self, handshake_error(error))),
+        };
         let (handshake, server_hello) = match prepared.seal_server_auth(
             &mut self.endpoint.provider,
             &self.endpoint.signing_key,
@@ -4877,6 +4990,83 @@ pub struct ReferenceAuthenticatedSession {
     transfer_profiles: TransferProfileNegotiationState,
 }
 
+/// Deterministic v9 authenticated sessions for corpus generation and fuzzing.
+/// This constructor is absent from ordinary production builds.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_reference_v9_session_pair() -> (
+    ReferenceAuthenticatedSession,
+    ReferenceAuthenticatedSession,
+    [u8; 32],
+) {
+    fn provider(prefix: [u8; 4]) -> RustCryptoProvider<SysRng> {
+        RustCryptoProvider {
+            rng: SysRng,
+            nonce_prefix: prefix,
+            nonce_counter: 1,
+            nonce_start: 1,
+            nonce_exhausted: false,
+        }
+    }
+    fn profiles() -> (TransferProfileNegotiationState, [u8; 32]) {
+        let offer = TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V9)
+            .expect("fixed v9 fuzz offer");
+        let negotiated =
+            negotiate_transfer_profiles_for_semantic_version(SEMANTIC_PROTOCOL_V9, &offer, &offer)
+                .expect("fixed v9 fuzz negotiation");
+        let digest = transfer_profile_digest(&offer, &offer, &negotiated);
+        (
+            TransferProfileNegotiationState {
+                local_offer: Some(offer.clone()),
+                authenticated_peer_offer: Some(offer),
+                authenticated: Some(AuthenticatedTransferProfiles { negotiated, digest }),
+            },
+            digest,
+        )
+    }
+    let session_id = [0x31; 32];
+    let (initiator_profiles, digest) = profiles();
+    let (responder_profiles, responder_digest) = profiles();
+    debug_assert_eq!(digest, responder_digest);
+    let initiator_keys = SessionKeys {
+        transmit: Secret32::new([0x41; 32]),
+        receive: Secret32::new([0x42; 32]),
+        transcript_hash: session_id,
+        selected_version: SEMANTIC_PROTOCOL_V9,
+        selected_suite: super::HYBRID_SUITE_ID,
+    };
+    let responder_keys = SessionKeys {
+        transmit: Secret32::new([0x42; 32]),
+        receive: Secret32::new([0x41; 32]),
+        transcript_hash: session_id,
+        selected_version: SEMANTIC_PROTOCOL_V9,
+        selected_suite: super::HYBRID_SUITE_ID,
+    };
+    (
+        ReferenceAuthenticatedSession {
+            provider: provider([0x51; 4]),
+            peer_identity: [0x61; 32],
+            peer_route_grant_commitments: Vec::new(),
+            semantic_version: SEMANTIC_PROTOCOL_V9,
+            session_id,
+            role: SessionRole::Initiator,
+            channel: initiator_keys.into_channel(),
+            transfer_profiles: initiator_profiles,
+        },
+        ReferenceAuthenticatedSession {
+            provider: provider([0x52; 4]),
+            peer_identity: [0x62; 32],
+            peer_route_grant_commitments: Vec::new(),
+            semantic_version: SEMANTIC_PROTOCOL_V9,
+            session_id,
+            role: SessionRole::Responder,
+            channel: responder_keys.into_channel(),
+            transfer_profiles: responder_profiles,
+        },
+        digest,
+    )
+}
+
 impl fmt::Debug for ReferenceAuthenticatedSession {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -4944,6 +5134,180 @@ impl ReferenceAuthenticatedSession {
                 finalization_charge_ms,
             ),
         )
+    }
+
+    /// Returns the authenticated semantic-v9 Blob record context for the next
+    /// outbound contextual record. The linear send authority is tied to that
+    /// exact sequence and cannot be cloned.
+    pub fn mint_blob_custody_send_context_v2(
+        &self,
+        direction: BlobCustodyDirectionV1,
+        exchange_id: u64,
+        attempt_nonce: [u8; 32],
+        finalization_charge_ms: u64,
+    ) -> Result<AuthenticatedBlobCustodySendContextV2, EnvelopeError> {
+        let expected_direction = match self.role {
+            SessionRole::Initiator => BlobCustodyDirectionV1::ToSessionResponder,
+            SessionRole::Responder => BlobCustodyDirectionV1::ToSessionInitiator,
+        };
+        let profiles = self
+            .transfer_profiles
+            .authenticated
+            .as_ref()
+            .ok_or_else(blob_custody_contact_unavailable)?;
+        if self.semantic_version != SEMANTIC_PROTOCOL_V9
+            || direction != expected_direction
+            || finalization_charge_ms == 0
+            || profiles.negotiated.profile(TransferLaneId::Blob)
+                != Some(TransferProfileId::BlobStreamV1)
+        {
+            return Err(blob_custody_contact_unavailable());
+        }
+        let sequence = self
+            .channel
+            .next_send_sequence()
+            .ok_or_else(blob_custody_contact_unavailable)?;
+        let context = ApplicationRecordContext::new_v9_blob(
+            profiles.digest,
+            direction,
+            attempt_nonce,
+            sequence,
+        )
+        .map_err(|_| blob_custody_contact_unavailable())?;
+        Ok(
+            AuthenticatedBlobCustodySendContextV2::from_authenticated_record(
+                self.session_id,
+                exchange_id,
+                context,
+                finalization_charge_ms,
+            ),
+        )
+    }
+
+    fn v9_blob_record_context(
+        &self,
+        transfer_profile_digest: [u8; 32],
+        direction: BlobCustodyDirectionV1,
+        attempt_nonce: [u8; 32],
+        record_sequence: u64,
+    ) -> Result<ApplicationRecordContext, EnvelopeError> {
+        let profiles = self
+            .transfer_profiles
+            .authenticated
+            .as_ref()
+            .ok_or_else(blob_custody_contact_unavailable)?;
+        if self.semantic_version != SEMANTIC_PROTOCOL_V9
+            || transfer_profile_digest != profiles.digest
+            || profiles.negotiated.profile(TransferLaneId::Blob)
+                != Some(TransferProfileId::BlobStreamV1)
+        {
+            return Err(blob_custody_contact_unavailable());
+        }
+        ApplicationRecordContext::new_v9_blob(
+            profiles.digest,
+            direction,
+            attempt_nonce,
+            record_sequence,
+        )
+        .map_err(|_| blob_custody_contact_unavailable())
+    }
+
+    /// Seals one bounded record in the v9/profile-5 attempt and sequence domain.
+    pub fn seal_v9_blob_application_frame(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        direction: BlobCustodyDirectionV1,
+        attempt_nonce: [u8; 32],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, EnvelopeError> {
+        let sequence = self
+            .channel
+            .next_send_sequence()
+            .ok_or_else(blob_custody_contact_unavailable)?;
+        let context = self.v9_blob_record_context(
+            transfer_profile_digest,
+            direction,
+            attempt_nonce,
+            sequence,
+        )?;
+        self.seal_frame_with_context(plaintext, &context.aad())
+    }
+
+    /// Opens one bounded record only in its exact v9/profile-5 attempt and
+    /// authenticated record-sequence domain.
+    pub fn open_v9_blob_application_frame(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        direction: BlobCustodyDirectionV1,
+        attempt_nonce: [u8; 32],
+        frame: &[u8],
+    ) -> Result<(Vec<u8>, u64), EnvelopeError> {
+        let record = decode_transport_frame(frame)?;
+        let context = self.v9_blob_record_context(
+            transfer_profile_digest,
+            direction,
+            attempt_nonce,
+            record.sequence,
+        )?;
+        let aad = transport_frame_context_aad(&context.aad())?;
+        let plaintext = self
+            .channel
+            .open_contextual(&self.provider, &record, &aad)
+            .map_err(handshake_error)?;
+        Ok((plaintext, record.sequence))
+    }
+
+    /// Seals one exact v2 custody claim at the sequence captured by its
+    /// authenticated send authority.
+    pub fn seal_blob_custody_frame_v2(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        direction: BlobCustodyDirectionV1,
+        attempt_nonce: [u8; 32],
+        claim: &BlobCustodyClaimV2,
+    ) -> Result<Vec<u8>, EnvelopeError> {
+        if claim.session_transcript() != self.session_id || claim.direction() != direction {
+            return Err(blob_custody_contact_unavailable());
+        }
+        self.seal_v9_blob_application_frame(
+            transfer_profile_digest,
+            direction,
+            attempt_nonce,
+            &claim.encode(),
+        )
+    }
+
+    /// Opens one exact v2 claim and returns its non-clone authenticated contact.
+    pub fn open_blob_custody_frame_v2(
+        &mut self,
+        transfer_profile_digest: [u8; 32],
+        direction: BlobCustodyDirectionV1,
+        attempt_nonce: [u8; 32],
+        frame: &[u8],
+    ) -> Result<(BlobCustodyClaimV2, AuthenticatedBlobCustodyContactV2), EnvelopeError> {
+        let record = decode_transport_frame(frame)?;
+        let context = self.v9_blob_record_context(
+            transfer_profile_digest,
+            direction,
+            attempt_nonce,
+            record.sequence,
+        )?;
+        let aad = transport_frame_context_aad(&context.aad())?;
+        let plaintext = self
+            .channel
+            .open_contextual(&self.provider, &record, &aad)
+            .map_err(handshake_error)?;
+        let claim = BlobCustodyClaimV2::decode(&plaintext)
+            .map_err(|_| blob_custody_contact_unavailable())?;
+        if claim.session_transcript() != self.session_id || claim.direction() != direction {
+            return Err(blob_custody_contact_unavailable());
+        }
+        let contact = AuthenticatedBlobCustodyContactV2::from_opened_record(
+            self.session_id,
+            context,
+            claim.digest(),
+        );
+        Ok((claim, contact))
     }
 
     /// Opaque, authority-signed route-grant commitments from the peer credential.
@@ -5403,7 +5767,7 @@ fn custody_version_unavailable() -> EnvelopeError {
 }
 
 fn blob_custody_contact_unavailable() -> EnvelopeError {
-    EnvelopeError("semantic-v8 Blob custody contact is unavailable".into())
+    EnvelopeError("authenticated Blob contact context is unavailable".into())
 }
 
 fn transfer_profile_negotiation_failed() -> EnvelopeError {
@@ -6779,6 +7143,7 @@ fn parse_batch_envelope(
             | super::SEMANTIC_PROTOCOL_V6
             | super::SEMANTIC_PROTOCOL_V7
             | super::SEMANTIC_PROTOCOL_V8
+            | super::SEMANTIC_PROTOCOL_V9
     ) {
         return Err(authentication_failed());
     }
@@ -7409,7 +7774,7 @@ fn validate_header_for_seal(
 ) -> Result<(), EnvelopeError> {
     let blob_route_valid = match (header.class, header.blob_route) {
         (DataClass::Blob, Some(route)) => {
-            route.chunk_count() > 0 && header.logical_key.as_slice() == route.blob_id().as_bytes()
+            header.logical_key.as_slice() == route.blob_id().as_bytes()
         }
         (DataClass::Blob, None) => false,
         (_, None) => true,
@@ -7499,9 +7864,7 @@ fn decode_header(reader: &mut Reader<'_>) -> Result<EnvelopeHeader, EnvelopeErro
     let tombstone = reader.boolean()?;
     let key_epoch = reader.u64()?;
     let blob_route_valid = match (class, blob_route) {
-        (DataClass::Blob, Some(route)) => {
-            route.chunk_count() > 0 && logical_key.as_slice() == route.blob_id().as_bytes()
-        }
+        (DataClass::Blob, Some(route)) => logical_key.as_slice() == route.blob_id().as_bytes(),
         (DataClass::Blob, None) => false,
         (_, None) => true,
         (_, Some(_)) => false,
@@ -10301,6 +10664,7 @@ mod tests {
             SEMANTIC_PROTOCOL_V6,
             SEMANTIC_PROTOCOL_V7,
             SEMANTIC_PROTOCOL_V8,
+            SEMANTIC_PROTOCOL_V9,
         ] {
             let mut provisioner = ReferenceProvisioner::from_seed([0x40 + version as u8; 32])
                 .unwrap_or_else(|error| panic!("v{version} provisioner failed: {error}"));
@@ -10316,7 +10680,7 @@ mod tests {
             assert_eq!(responder.semantic_version(), version);
         }
 
-        for unsupported in [0, SEMANTIC_PROTOCOL_V8 + 1] {
+        for unsupported in [0, SEMANTIC_PROTOCOL_V9 + 1] {
             let mut provisioner = ReferenceProvisioner::from_seed([0x50 + unsupported as u8; 32])
                 .unwrap_or_else(|error| panic!("v{unsupported} provisioner failed: {error}"));
             let initiator_bundle = provisioner
@@ -10378,7 +10742,7 @@ mod tests {
     }
 
     #[test]
-    fn mission_proof_rejects_stripping_v8_from_the_default_offer() {
+    fn mission_proof_rejects_stripping_v9_from_the_default_offer() {
         let mut provisioner = ReferenceProvisioner::from_seed([0x74; 32])
             .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
         let initiator_bundle = provisioner
@@ -10394,6 +10758,7 @@ mod tests {
         assert_eq!(
             hello.supported_versions,
             vec![
+                SEMANTIC_PROTOCOL_V9,
                 SEMANTIC_PROTOCOL_V8,
                 SEMANTIC_PROTOCOL_V7,
                 SEMANTIC_PROTOCOL_V6,
@@ -10408,6 +10773,7 @@ mod tests {
         assert_eq!(
             hello.supported_versions,
             vec![
+                SEMANTIC_PROTOCOL_V8,
                 SEMANTIC_PROTOCOL_V7,
                 SEMANTIC_PROTOCOL_V6,
                 SEMANTIC_PROTOCOL_V5,
@@ -10442,6 +10808,7 @@ mod tests {
         assert_eq!(
             default_hello.supported_versions,
             vec![
+                SEMANTIC_PROTOCOL_V9,
                 SEMANTIC_PROTOCOL_V8,
                 SEMANTIC_PROTOCOL_V7,
                 SEMANTIC_PROTOCOL_V6,
@@ -10470,8 +10837,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("server finished failed: {error}"));
         assert_eq!(initiator_session.peer_identity(), responder_id);
         assert_eq!(responder_session.peer_identity(), initiator_id);
-        assert_eq!(initiator_session.semantic_version(), SEMANTIC_PROTOCOL_V8);
-        assert_eq!(responder_session.semantic_version(), SEMANTIC_PROTOCOL_V8);
+        assert_eq!(initiator_session.semantic_version(), SEMANTIC_PROTOCOL_V9);
+        assert_eq!(responder_session.semantic_version(), SEMANTIC_PROTOCOL_V9);
 
         let frame = initiator_session
             .seal_frame(b"opaque replication frame")
@@ -10838,6 +11205,83 @@ mod tests {
                 .is_err(),
             "the authenticated sender role fixes the outbound direction"
         );
+    }
+
+    #[test]
+    fn blob_custody_v2_requires_v9_profile_five_attempt_context() {
+        let mut provisioner = ReferenceProvisioner::from_seed([0x85; 32]).unwrap();
+        let initiator = provisioner
+            .issue_node(1, &[member_access(vec![0])])
+            .unwrap();
+        let responder = provisioner
+            .issue_node(2, &[member_access(vec![0])])
+            .unwrap();
+        let (mut sender, mut receiver) =
+            complete_sessions_with_versions(initiator, responder, vec![SEMANTIC_PROTOCOL_V9]);
+        let offer =
+            crate::TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V9).unwrap();
+        let request = sender.seal_transfer_profile_offer(&offer).unwrap();
+        receiver.open_transfer_profile_offer(&request).unwrap();
+        let response = receiver.seal_transfer_profile_offer(&offer).unwrap();
+        sender.open_transfer_profile_offer(&response).unwrap();
+        let negotiated =
+            negotiate_transfer_profiles_for_semantic_version(SEMANTIC_PROTOCOL_V9, &offer, &offer)
+                .unwrap();
+        let digest = transfer_profile_digest(&offer, &offer, &negotiated);
+        let direction = BlobCustodyDirectionV1::ToSessionResponder;
+        let nonce = [0x91; 32];
+        let outbound = sender
+            .mint_blob_custody_send_context_v2(direction, 73, nonce, 41)
+            .expect("mint v2 send capability");
+        assert_eq!(outbound.session_transcript(), sender.session_id());
+        assert_eq!(outbound.context().semantic_version(), 9);
+        assert_eq!(outbound.context().profile(), 5);
+        assert_eq!(outbound.context().lane(), 4);
+        assert_eq!(outbound.context().attempt_nonce(), nonce);
+        assert_eq!(outbound.context().transfer_profile_digest(), digest);
+
+        let mut bytes = literal_blob_custody_claim_v2();
+        bytes[14..46].copy_from_slice(&sender.session_id);
+        bytes[54] = direction as u8;
+        let claim = crate::BlobCustodyClaimV2::decode(&bytes).unwrap();
+        let frame = sender
+            .seal_blob_custody_frame_v2(digest, direction, nonce, &claim)
+            .expect("seal v2 claim");
+
+        let mut wrong_digest = digest;
+        wrong_digest[0] ^= 1;
+        assert!(
+            receiver
+                .open_blob_custody_frame_v2(wrong_digest, direction, nonce, &frame,)
+                .is_err()
+        );
+        let mut wrong_nonce = nonce;
+        wrong_nonce[0] ^= 1;
+        assert!(
+            receiver
+                .open_blob_custody_frame_v2(digest, direction, wrong_nonce, &frame,)
+                .is_err()
+        );
+        let (opened, contact) = receiver
+            .open_blob_custody_frame_v2(digest, direction, nonce, &frame)
+            .expect("open exact v2 claim");
+        assert_eq!(opened, claim);
+        assert_eq!(contact.claim_digest(), claim.digest());
+        assert_eq!(contact.context().attempt_nonce(), nonce);
+        assert!(
+            receiver
+                .open_blob_custody_frame_v2(digest, direction, nonce, &frame,)
+                .is_err()
+        );
+    }
+
+    fn literal_blob_custody_claim_v2() -> [u8; crate::BLOB_CUSTODY_CLAIM_V2_BYTES] {
+        const HEX: &str = "41535452424c30390002000900051111111111111111111111111111111111111111111111111111111111111111000000000000000001222222222222222222222222222222222222222222222222222222222222222200000000000000013333333333333333333333333333333333333333333333333333333333333333444444444444444444444444444444444444444444444444444444444444444400000000000000000100000000000000005555555555555555555555555555555500000000000000000000000000000000";
+        let mut output = [0u8; crate::BLOB_CUSTODY_CLAIM_V2_BYTES];
+        for (index, byte) in output.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&HEX[index * 2..index * 2 + 2], 16).unwrap();
+        }
+        output
     }
 
     fn literal_blob_custody_claim() -> [u8; crate::BLOB_CUSTODY_CLAIM_V1_BYTES] {
@@ -13194,7 +13638,7 @@ mod tests {
     }
 
     #[test]
-    fn on_path_rewrite_of_an_offered_v7_selection_to_v5_fails_authentication() {
+    fn on_path_rewrite_of_an_offered_v9_selection_to_v5_fails_authentication() {
         let mut provisioner = ReferenceProvisioner::from_seed([0x8e; 32])
             .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
         let initiator_bundle = provisioner
@@ -13211,6 +13655,7 @@ mod tests {
         assert_eq!(
             hello.supported_versions,
             vec![
+                SEMANTIC_PROTOCOL_V9,
                 SEMANTIC_PROTOCOL_V8,
                 SEMANTIC_PROTOCOL_V7,
                 SEMANTIC_PROTOCOL_V6,
@@ -13228,7 +13673,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("client flight failed: {error}"));
         let mut server_hello = decode_server_flight(&second_flight)
             .unwrap_or_else(|error| panic!("server flight decode failed: {error}"));
-        assert_eq!(server_hello.selected_version, SEMANTIC_PROTOCOL_V8);
+        assert_eq!(server_hello.selected_version, SEMANTIC_PROTOCOL_V9);
 
         // Version 5 was genuinely offered, so membership checks alone would
         // accept it. The rewrite must still fail because selection is bound

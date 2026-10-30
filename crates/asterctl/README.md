@@ -1,5 +1,21 @@
 # asterctl
 
+<!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+```json
+{
+  "schema": 1,
+  "surface": "asterctl_readme",
+  "local_publish_waits_for_peer": false,
+  "rust_agent_asterctl_publish_read": "implemented",
+  "blob_status_scope": "receiver_local_durable_state",
+  "blob_status_reports_remote_delivery_peer_or_convergence": false,
+  "cli_download_resume": "post_merge"
+}
+```
+<!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+Local Blob publication commits without waiting for a peer. Rust, the native-gRPC agent, and asterctl implement bounded Blob publication and authenticated reads. blob-status reports receiver-local durable state, not remote delivery, peer status, or convergence. CLI download resume is post-merge work; an interrupted download restarts at byte zero.
+<!-- ASTER-BLOB-CAPABILITY:END -->
+
 Clean Room — Privileged
 
 `asterctl` is a command-line utility for introspecting and controlling Aster
@@ -10,7 +26,7 @@ agents require a local authenticated tunnel endpoint; `--host` cannot send
 bearer tokens or Event payloads directly over a remote plaintext connection.
 
 Currently it provides `status`, `publish`, `query`, `subscribe`,
-`subscriptions`, `unsubscribe`, `blob-publish`, and `blob-read`.
+`subscriptions`, `unsubscribe`, `blob-publish`, `blob-status`, and `blob-read`.
 
 See man page for usage details
 
@@ -52,7 +68,7 @@ asterctl --help
 | --- | --- |
 | `-h, --host IP` | Agent IPv4 or IPv6 address; default `127.0.0.1` |
 | `-p, --port PORT` | RPC port, 1–65535; default `8181` |
-| `--timeout SECONDS` | Client timeout for each RPC, 1–86400 whole seconds; default `10`; agent-side limits also apply |
+| `--timeout SECONDS` | Client timeout for each RPC, 1–86400 whole seconds; default `10`, Blob publish/read default `900`; agent-side limits also apply |
 | `-j, --json` | Pretty-printed JSON; RPC fields use ProtoJSON, with CLI operation metadata described below |
 | `-t, --token TOKEN` | Plain-text API token, without the `Bearer ` prefix |
 | `--token-file PATH` | Read that same token from a regular file |
@@ -81,30 +97,45 @@ Bearer authorization header. Blob transfers use native gRPC over HTTP/2 so
 request and response pages remain bounded; the Event commands retain their
 existing Connect protocol behavior. The current agent accepts loopback
 listeners; `--host` does not change that server restriction. There is no TLS.
-Each RPC has a configurable timeout (10 seconds by default), a 4-MiB response
-limit and a 4-MiB decoded-element budget.
+Each RPC has a configurable timeout (10 seconds by default; Blob publish/read
+use 15 minutes by default), a 4-MiB response limit and a 4-MiB decoded-element budget.
 Use `--timeout 30` or `--timeout=30` before or after the command to change the
 client deadline. The agent may enforce a shorter deadline: the current
-`aster-agent` caps each RPC at 30 seconds, even when the client requests more.
+`aster-agent` caps each RPC at 15 minutes, even when the client requests more.
 Query applies a fresh deadline to each page request, not to the whole query.
 The RPC timeout does not limit time spent entering a payload on stdin.
+It is also independent of the node-to-node profile-5 attempt. The two-minute
+authenticated-progress timeout is the shorter stall bound. The sender derives
+its hard deadline from exact canonical wire bytes; the receiver opens before
+authenticated OPEN and initially derives its hard deadline from the full
+profile wire ceiling. The legacy ten-minute constant is not a normal-success
+timeout.
 
 ## Publish and read Blobs
 
+The machine-checked capability block above is authoritative for publication,
+status, and download behavior. Node-to-node profile-5 transfer resumes from a
+receiver checkpoint independently of the CLI output path.
+
 ```sh
-asterctl --token-file ./client.token blob-publish \
+asterctl --token-file ./client.token --json blob-publish \
     --file ./map.bin --topic imagery.maps --scope mission/team/alpha \
-    --operation-key map-001 --media-type application/octet-stream
+    --operation-key map-001 --media-type application/octet-stream \
+    --progress auto
+
+asterctl --token-file ./client.token blob-status \
+    --publication-id "$PUBLICATION_ID" \
+    --topic imagery.maps --scope mission/team/alpha --wait
 
 asterctl --token-file ./client.token blob-read \
     --id "$BLOB_ID" --topic imagery.maps --scope mission/team/alpha \
     --output ./downloaded-map.bin
 ```
 
-`blob-publish` requires a nonempty regular source file. The path remains local
-and is never sent to the agent. The client sends metadata first, then streams
-canonical chunks of at most 64 KiB without buffering the whole Blob or treating
-the current backend size policy as a public maximum. The current agent may
+`blob-publish` requires a nonempty regular source file. The path remains local;
+its contents stream to the local agent. The client sends metadata first, then
+streams canonical chunks of at most 512 KiB without buffering the whole Blob
+or treating the current backend size policy as a public maximum. The current agent may
 reject a source above its configured backend limit. Keep the opened source
 file's contents and length unchanged until the command exits. Detectable size
 changes fail the command with an unknown publication outcome; in-place
@@ -112,6 +143,11 @@ same-length mutation is outside the command contract and can produce mixed
 source bytes. `--schema-id` is Base64;
 `--ttl-ms` accepts positive unsigned 64-bit milliseconds, including
 `18446744073709551615`. Omitting it selects durable publication.
+
+The file CLI intentionally rejects an empty source. Rust applications can
+publish the authenticated semantic-v9/profile-5 empty Blob by opening a stream
+with `total_len == 0`, writing no DATA, and finishing it; reading offset zero
+then returns the sole empty, complete terminal page.
 
 `blob-read` requires an exact Blob ID, topic, scope, and destination. On Linux,
 it requires a destination directory owned by the current user and not writable
@@ -130,9 +166,19 @@ must have contiguous offsets, stable authenticated metadata and TTL, and an
 exact complete length. Blob bytes go only to the output filesystem; stdout
 contains metadata and never Blob plaintext.
 
+`--progress auto|always|never` is available only on Blob publish/read and
+defaults to `auto`, which writes progress to stderr only on a terminal.
+`always` produces newline-delimited stderr records suitable for retained logs;
+stdout remains one text or JSON result. Publish progress distinguishes bytes
+sent, accepted, and durably staged. A failed read reports discarded staged
+bytes and leaves the requested destination absent. Downloads currently restart
+at byte zero; local-upload and peer-transfer resumes remain receiver-checkpointed.
+
 Both text formats use exactly `TTL: durable` or `TTL: MILLISECONDS ms`. Finite
 JSON includes `"ttlMs": "MILLISECONDS"`; durable JSON omits `ttlMs`.
-`blob-publish --json` also includes `operation_key`. A retry after an earlier
+`blob-publish --json` also includes `publicationId` and `operation_key`. Use
+that publication identity with `blob-status` on the node whose durable state
+is being inspected; `--wait` is an observation operation. A retry after an earlier
 commit returns `inserted: false`; a retry after a request that did not commit
 may return `inserted: true`. A retained publication that has expired or been
 retired is reported as expired/retired, while reuse of a key after its retained
@@ -141,7 +187,13 @@ If a publish result is unusable or its TTL does not exactly match the request,
 the outcome is unknown; retry the identical request using the same operation
 key.
 
-See [asterctl-blob-publish(1)](asterctl-blob-publish.1) and
+`asterctl status` also reports an observed, non-reserving Blob-capacity snapshot.
+Check it on both publisher and receiver before a large transfer, but allow
+filesystem, database, journal, and operational reserve beyond the logical byte
+count.
+
+See [asterctl-blob-publish(1)](asterctl-blob-publish.1),
+[asterctl-blob-status(1)](asterctl-blob-status.1), and
 [asterctl-blob-read(1)](asterctl-blob-read.1).
 
 ## Publish

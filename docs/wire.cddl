@@ -2,9 +2,9 @@
 ; Source envelopes, custody wrappers, handshakes, Blob manifests, and Blob
 ; chunk carriers use the separately specified bounded binary security profile
 ; in envelope.md. This CDDL defines only deterministic-CBOR messages.
-; Semantic-v2/v3/v4/v5/v6/v7/v8 ASTRENV3 batch proof/item bytes are the same fixed binary
+; Semantic-v2/v3/v4/v5/v6/v7/v8/v9 ASTRENV3 batch proof/item bytes are the same fixed binary
 ; profile in protocol.md section 6.1 and MUST NOT be decoded or normalized as
-; CBOR. Semantic versions 3 through 8 additionally carry semantic-v3-format custody
+; CBOR. Semantic versions 3 through 9 additionally carry semantic-v3-format custody
 ; in a distinct fixed binary session-record domain; they do not allocate another
 ; deterministic-CBOR kind.
 ; A receiver on semantic version 1 MUST reject raw input beginning "ASTRENV3"
@@ -26,7 +26,7 @@ extension-value = uint / nint / bytes / tstr / bool / null /
 
 ; object-id is exactly kind:u8 || digest:bytes .size 32.
 ; Semantic version 1 permits 1=stable source envelope and 2=Blob chunk carrier.
-; Semantic versions 2 through 8 additionally permit 3=source-batch proof,
+; Semantic versions 2 through 9 additionally permit 3=source-batch proof,
 ; 4=bridge authorization, and 5=bridge-route wrapper. A semantic-v1 reader
 ; suppresses those extended kinds before inventory construction and rejects
 ; them in every received Offer, Want, Data, and Receipt. Collections sort the
@@ -40,6 +40,7 @@ semantic-v5-object-kind = semantic-v4-object-kind
 semantic-v6-object-kind = semantic-v5-object-kind
 semantic-v7-object-kind = semantic-v6-object-kind
 semantic-v8-object-kind = semantic-v7-object-kind
+semantic-v9-object-kind = 1 / 3 / 4 / 5
 object-id = bytes .size 33
 hash-256 = bytes .size 32
 priority = 0..3
@@ -146,3 +147,21 @@ sync-message = interest / summary / probe / radix-node / offer / want / data / r
 ; order are specified in protocol.md section 9.4 and locked by the executable
 ; conformance/vectors/event-pages-v7.tsv corpus. They allocate no ObjectKind and
 ; do not change any sync-message encoding above.
+;
+; Semantic-v9/profile-5 Blob streaming is canonical fixed binary, not CBOR, so
+; an ordinary CDDL production would falsely describe its concatenated fields.
+; conformance/profile5-wire-schema.json is the machine-checkable structured
+; equivalent: it defines every tag, ordered field, width, enum, native ASTRBS02
+; record bound, ASD1 composite prefix, and empty/nonempty flow. The standalone
+; contract checker binds that schema to the Rust encoder/decoder and independent
+; oracle/vectors. These aliases are only a CDDL index into that complete schema.
+; stream-profile-v5 = stream-open-v1 / stream-source-v1 / stream-accept-v1 / stream-data-v1 / stream-checkpoint-v1 / stream-finish-v1 / stream-result-v1 / stream-result-ack-v1
+; stream-data-v1 = "ASM\x01\xd8" attempt-tuple offset-u64 record-len-u32 astrbs02-record
+; astrbs02-record = "ASTRBS02" authenticated-segment-header ciphertext-and-tag
+; The complete canonical ASTRPS02 SOURCE is <= 401,902 bytes and therefore one
+; SOURCE record is sufficient; every DATA body contains
+; one complete ASTRBS02 record of at most 1,048,706 bytes plus its four-byte
+; length prefix; checkpoint_batch_bytes
+; is in 1..134,217,728. Exact empty content has no DATA/CHECKPOINT record and
+; settles with FINISH(final_offset=0), RESULT, and ACK after authenticated OPEN,
+; SOURCE, and ACCEPT.

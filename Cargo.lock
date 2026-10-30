@@ -464,6 +464,7 @@ dependencies = [
  "redb",
  "rustix",
  "sha2 0.11.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -486,6 +487,7 @@ dependencies = [
  "bytes",
  "connectrpc",
  "connectrpc-build",
+ "futures",
  "getrandom 0.4.3",
  "http",
  "libc",

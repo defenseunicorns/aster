@@ -8,6 +8,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
+#[cfg(target_os = "linux")]
+use std::{sync::Arc, task::Poll, time::Instant};
 
 use aster_agent::{
     BoundAgent, ClientToken,
@@ -17,7 +19,7 @@ use aster_agent::{
 #[cfg(target_os = "linux")]
 use aster_mesh::{ProvisioningAccess, ReferenceProvisioner, Scope, Topic};
 #[cfg(target_os = "linux")]
-use aster_node::application::MAX_SELECTED_LIVE_BLOB_BYTES;
+use aster_node::application::MAX_SELECTED_BLOB_STREAM_BYTES;
 use aster_node::mission::UnprotectedReferenceMission;
 use aster_node::{MutableSourceInterests, NodeApplication, NodeConfig, start_node};
 use buffa::{Message as _, MessageName as _};
@@ -25,9 +27,6 @@ use connectrpc::{
     ConnectError, ErrorCode, Protocol,
     client::{ClientConfig, Http2Connection, HttpClient},
 };
-#[cfg(target_os = "linux")]
-use std::{sync::Arc, task::Poll};
-
 const TEST_TOKEN: &[u8] = b"real-node-connect-test-token-0001";
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
@@ -154,6 +153,200 @@ fn blob_mission() -> UnprotectedReferenceMission {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "release-only local application Blob streaming benchmark"]
+fn real_node_blob_bidi_stream_benchmark() {
+    let total_len = std::env::var("ASTER_BLOB_BENCH_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(64 * 1024 * 1024);
+    assert!(total_len > 0);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let state = TestState::new();
+        let node = start_node(NodeConfig {
+            state: state.0.clone(),
+            bind: "127.0.0.1:0".parse().expect("mesh bind"),
+            mission: blob_mission(),
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_millis(50),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start benchmark node");
+        let agent = BoundAgent::bind("127.0.0.1:0".parse().expect("agent bind"))
+            .await
+            .expect("bind benchmark agent");
+        let address = agent.local_addr().expect("agent address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut server = tokio::spawn(
+            agent
+                .serve_with_blobs(
+                    node.selected_events(),
+                    node.selected_blobs(),
+                    node.state_root().to_path_buf(),
+                    ClientToken::from_bytes(TEST_TOKEN.to_vec()).expect("valid token"),
+                    shutdown_rx,
+                )
+                .expect("construct benchmark service"),
+        );
+        let client = api::AsterApplicationServiceClient::new(
+            Http2Connection::connect_plaintext(
+                format!("http://{address}")
+                    .parse()
+                    .expect("benchmark transport URI"),
+            )
+            .await
+            .expect("connect benchmark HTTP/2")
+            .shared(8),
+            ClientConfig::new(
+                format!("http://{address}")
+                    .parse()
+                    .expect("benchmark client URI"),
+            )
+            .with_default_timeout(Duration::from_secs(15 * 60))
+            .with_protocol(Protocol::Grpc)
+            .with_default_header(
+                "authorization",
+                format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
+            ),
+        );
+
+        let started = Instant::now();
+        let mut call = client.publish_blob().await.expect("open benchmark upload");
+        call.send(api::PublishBlobRequest {
+            frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
+                api::PublishBlobMetadata {
+                    operation_key: format!("application-benchmark-{total_len}").into_bytes(),
+                    topic: "imagery.maps".to_owned(),
+                    scope: "mission/team/alpha".to_owned(),
+                    priority: api::Priority::Routine.into(),
+                    media_type: Some("application/octet-stream".to_owned()),
+                    total_len,
+                    ..Default::default()
+                },
+            ))),
+            ..Default::default()
+        })
+        .await
+        .expect("send benchmark metadata");
+        let accepted = call
+            .message::<api::PublishBlobResponse>()
+            .await
+            .expect("receive benchmark acceptance")
+            .expect("benchmark acceptance")
+            .to_owned_message();
+        assert!(matches!(
+            accepted.frame,
+            Some(api::publish_blob_response::Frame::Accepted(ref accepted))
+                if accepted.durable_offset == 0
+        ));
+        let (mut send, mut receive) = call.into_split();
+        let sender = async move {
+            let frame = vec![0x5a; aster_agent::BLOB_RPC_FRAME_BYTES];
+            let mut offset = 0_u64;
+            while offset < total_len {
+                let len = usize::try_from((total_len - offset).min(frame.len() as u64))
+                    .expect("frame length");
+                send.send(api::PublishBlobRequest {
+                    frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                        api::PublishBlobData {
+                            offset,
+                            bytes: frame[..len].to_vec(),
+                            ..Default::default()
+                        },
+                    ))),
+                    ..Default::default()
+                })
+                .await
+                .expect("send benchmark data");
+                offset += len as u64;
+            }
+            send.send(api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Finish(Box::default())),
+                ..Default::default()
+            })
+            .await
+            .expect("finish benchmark upload");
+            send.close_send();
+        };
+        let receiver = async move {
+            let mut checkpoints = 0_u64;
+            let mut receipt = None;
+            while let Some(response) = receive
+                .message::<api::PublishBlobResponse>()
+                .await
+                .expect("receive benchmark progress")
+            {
+                match response.to_owned_message().frame {
+                    Some(api::publish_blob_response::Frame::Checkpoint(_)) => checkpoints += 1,
+                    Some(api::publish_blob_response::Frame::Complete(complete)) => {
+                        receipt = Some(*complete)
+                    }
+                    _ => panic!("unexpected benchmark progress"),
+                }
+            }
+            (checkpoints, receipt.expect("benchmark receipt"))
+        };
+        let ((), (checkpoints, receipt)) = tokio::join!(sender, receiver);
+        let publish_seconds = started.elapsed().as_secs_f64();
+        assert_eq!(receipt.total_len, total_len);
+
+        let read_started = Instant::now();
+        let mut read = client
+            .read_blob(api::ReadBlobRequest {
+                id: receipt.id,
+                topic: "imagery.maps".to_owned(),
+                scope: "mission/team/alpha".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .expect("open benchmark read");
+        let mut read_bytes = 0_u64;
+        while let Some(page) = read.message().await.expect("read benchmark page") {
+            let page = page.to_owned_message();
+            assert!(page.chunk.iter().all(|byte| *byte == 0x5a));
+            read_bytes += page.chunk.len() as u64;
+        }
+        let read_seconds = read_started.elapsed().as_secs_f64();
+        assert_eq!(read_bytes, total_len);
+        eprintln!(
+            "APPLICATION_BLOB_BENCH bytes={total_len} publish_seconds={publish_seconds:.6} publish_mib_per_second={:.3} read_seconds={read_seconds:.6} read_mib_per_second={:.3} checkpoints={checkpoints}",
+            total_len as f64 / publish_seconds / (1024.0 * 1024.0),
+            total_len as f64 / read_seconds / (1024.0 * 1024.0),
+        );
+
+        shutdown_tx.send(true).expect("request benchmark shutdown");
+        match tokio::time::timeout(Duration::from_secs(5), &mut server).await {
+            Ok(result) => result
+                .expect("benchmark server task")
+                .expect("benchmark server"),
+            Err(_) => {
+                server.abort();
+                let _ = server.await;
+                panic!("benchmark server shutdown timeout");
+            }
+        }
+        let mut node_shutdown = tokio::spawn(node.shutdown());
+        match tokio::time::timeout(Duration::from_secs(5), &mut node_shutdown).await {
+            Ok(result) => result
+                .expect("benchmark node shutdown task")
+                .expect("benchmark node shutdown"),
+            Err(_) => {
+                node_shutdown.abort();
+                let _ = node_shutdown.await;
+                panic!("benchmark node shutdown timeout");
+            }
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -211,6 +404,74 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
             ),
         );
 
+        macro_rules! publish_frames {
+            ($client:expr, $frames:expr) => {{
+                async {
+                    let mut call = $client.publish_blob().await?;
+                    let mut frames = IntoIterator::into_iter($frames);
+                    let first = frames
+                        .next()
+                        .ok_or_else(|| ConnectError::invalid_argument("missing Blob metadata"))?;
+                    call.send(first).await?;
+                    let accepted = call
+                        .message::<api::PublishBlobResponse>()
+                        .await
+                        ?
+                        .ok_or_else(|| ConnectError::data_loss("missing Blob acceptance"))?
+                        .to_owned_message();
+                    let Some(api::publish_blob_response::Frame::Accepted(accepted)) = accepted.frame
+                    else {
+                        return Err(ConnectError::data_loss("invalid Blob acceptance"));
+                    };
+                    let mut send_error = None;
+                    for frame in frames {
+                        if matches!(
+                            frame.frame.as_ref(),
+                            Some(api::publish_blob_request::Frame::Data(data))
+                                if data.offset < accepted.durable_offset
+                        ) {
+                            continue;
+                        }
+                        if let Err(error) = call.send(frame).await {
+                            send_error = Some(error);
+                            break;
+                        }
+                    }
+                    if send_error.is_none()
+                        && let Err(error) = call
+                            .send(api::PublishBlobRequest {
+                                frame: Some(api::publish_blob_request::Frame::Finish(
+                                    Box::default(),
+                                )),
+                                ..Default::default()
+                            })
+                            .await
+                    {
+                        send_error = Some(error);
+                    }
+                    call.close_send();
+                    let mut receipt = None;
+                    while let Some(response) = call
+                        .message::<api::PublishBlobResponse>()
+                        .await
+                        ?
+                    {
+                        if let Some(api::publish_blob_response::Frame::Complete(complete)) =
+                            response.to_owned_message().frame
+                        {
+                            receipt = Some(*complete);
+                        }
+                    }
+                    receipt.ok_or_else(|| {
+                        send_error.unwrap_or_else(|| {
+                            ConnectError::data_loss("missing Blob completion")
+                        })
+                    })
+                }
+                .await
+            }};
+        }
+
         let pending_upload = |key: &'static [u8], polled: Arc<tokio::sync::Notify>| {
             let mut metadata = Some(api::PublishBlobRequest {
                 frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
@@ -250,56 +511,53 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                     ..Default::default()
                 },
                 api::PublishBlobRequest {
-                    frame: Some(api::publish_blob_request::Frame::Chunk(vec![0x31])),
+                    frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                        api::PublishBlobData {
+                            offset: 0,
+                            bytes: vec![0x31],
+                            ..Default::default()
+                        },
+                    ))),
                     ..Default::default()
                 },
             ]
         };
-        let stalled_keys = [
-            b"real-node-blob-cancelled-left".as_slice(),
-            b"real-node-blob-cancelled-right".as_slice(),
-        ];
-        let mut uploads = tokio::task::JoinSet::new();
-        for (index, key) in stalled_keys.into_iter().enumerate() {
-            let client = client.clone();
-            let stream = pending_upload(key, Arc::new(tokio::sync::Notify::new()));
-            uploads.spawn(async move { (index, client.publish_blob(stream).await) });
-        }
-
-        // Both uploads remain pending after metadata, so whichever acquires
-        // the singleton permit holds it until cancellation. The first result
-        // must be the other upload's rejection, regardless of arrival order.
-        // JoinSet also aborts outstanding requests if an assertion fails.
-        let (rejected_index, rejection) =
-            tokio::time::timeout(Duration::from_secs(2), uploads.join_next())
-                .await
-                .expect("one competing upload is rejected while the other holds capacity")
-                .expect("two competing upload tasks")
-                .expect("rejected upload task");
-        assert_eq!(
-            rejection
-                .expect_err("one stalled upload must own the singleton permit")
-                .code,
-            ErrorCode::ResourceExhausted
-        );
-        let cancelled_key = stalled_keys[1 - rejected_index];
-        uploads.abort_all();
-        assert!(
-            uploads
-                .join_next()
-                .await
-                .expect("permit-owning upload remains pending")
-                .unwrap_err()
-                .is_cancelled()
-        );
-        assert!(uploads.is_empty());
+        let cancelled_polled = Arc::new(tokio::sync::Notify::new());
+        let cancelled_client = client.clone();
+        let mut cancelled_stream =
+            pending_upload(b"real-node-blob-cancelled", Arc::clone(&cancelled_polled));
+        let cancelled_ready = Arc::clone(&cancelled_polled);
+        let cancelled = tokio::spawn(async move {
+            let mut call = cancelled_client.publish_blob().await?;
+            if let Some(frame) = futures::StreamExt::next(&mut cancelled_stream).await {
+                call.send(frame).await?;
+            }
+            let _ = call.message::<api::PublishBlobResponse>().await?;
+            cancelled_ready.notify_one();
+            futures::future::pending::<()>().await;
+            Ok::<(), ConnectError>(())
+        });
+        cancelled_polled.notified().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let probe =
+                    publish_frames!(client, one_byte_upload(b"real-node-capacity-probe", 2))
+                        .expect_err("capacity probe is intentionally short");
+                if probe.code == ErrorCode::ResourceExhausted {
+                    break;
+                }
+                assert_eq!(probe.code, ErrorCode::InvalidArgument);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending upload acquired server staging and the singleton permit");
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
         let recovered_cancelled = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                match client
-                    .publish_blob(connectrpc::stream_iter(one_byte_upload(cancelled_key, 1)))
-                    .await
-                {
-                    Ok(response) => break response.into_owned(),
+                match publish_frames!(client, one_byte_upload(b"real-node-blob-cancelled", 1)) {
+                    Ok(response) => break response,
                     Err(error) if error.code == ErrorCode::ResourceExhausted => {
                         tokio::task::yield_now().await;
                     }
@@ -311,6 +569,95 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
         .expect("cancellation releases staging and capacity after cleanup");
         assert!(recovered_cancelled.inserted);
 
+        let mut status_call = client.publish_blob().await.expect("open status upload");
+        status_call
+            .send(api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
+                    api::PublishBlobMetadata {
+                        operation_key: b"real-node-blob-status".to_vec(),
+                        topic: "imagery.maps".to_owned(),
+                        scope: "mission/team/alpha".to_owned(),
+                        priority: api::Priority::Routine.into(),
+                        total_len: 1,
+                        ..Default::default()
+                    },
+                ))),
+                ..Default::default()
+            })
+            .await
+            .expect("send status upload metadata");
+        let accepted = status_call
+            .message::<api::PublishBlobResponse>()
+            .await
+            .expect("read status upload acceptance")
+            .expect("status upload acceptance")
+            .to_owned_message();
+        let Some(api::publish_blob_response::Frame::Accepted(accepted)) = accepted.frame else {
+            panic!("status upload must be accepted before DATA")
+        };
+        assert_eq!(accepted.publication_id.len(), 32);
+        let status_request = api::InspectBlobPublicationRequest {
+            publication_id: accepted.publication_id.clone(),
+            topic: "imagery.maps".to_owned(),
+            scope: "mission/team/alpha".to_owned(),
+            ..Default::default()
+        };
+        let awaiting = client
+            .inspect_blob_publication(status_request.clone())
+            .await
+            .expect("inspect provisional Blob publication")
+            .into_owned();
+        assert_eq!(awaiting.phase, api::BlobPublicationPhase::AwaitingData);
+        assert_eq!(awaiting.publication_id, accepted.publication_id);
+        assert_eq!(awaiting.durable_plaintext_bytes, 0);
+        assert_eq!(awaiting.blob_id, None);
+        status_call
+            .send(api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                    api::PublishBlobData {
+                        offset: 0,
+                        bytes: vec![0x39],
+                        ..Default::default()
+                    },
+                ))),
+                ..Default::default()
+            })
+            .await
+            .expect("send status upload DATA");
+        status_call
+            .send(api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Finish(Box::default())),
+                ..Default::default()
+            })
+            .await
+            .expect("finish status upload");
+        status_call.close_send();
+        let mut status_receipt = None;
+        while let Some(response) = status_call
+            .message::<api::PublishBlobResponse>()
+            .await
+            .expect("read status upload progress")
+        {
+            if let Some(api::publish_blob_response::Frame::Complete(complete)) =
+                response.to_owned_message().frame
+            {
+                status_receipt = Some(*complete);
+            }
+        }
+        let status_receipt = status_receipt.expect("status upload completion");
+        assert_eq!(status_receipt.publication_id, accepted.publication_id);
+        let available = client
+            .inspect_blob_publication(status_request)
+            .await
+            .expect("inspect available Blob publication")
+            .into_owned();
+        assert_eq!(available.phase, api::BlobPublicationPhase::Available);
+        assert_eq!(available.durable_plaintext_bytes, 1);
+        assert_eq!(
+            available.blob_id.as_deref(),
+            Some(status_receipt.id.as_slice())
+        );
+
         let deadline_client = api::AsterApplicationServiceClient::new(
             grpc,
             ClientConfig::new(
@@ -319,18 +666,44 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                     .expect("deadline client URI"),
             )
             .with_protocol(Protocol::Grpc)
-            .with_default_timeout(Duration::from_millis(10))
+            .with_default_timeout(Duration::from_millis(500))
             .with_default_header(
                 "authorization",
                 format!("Bearer {}", String::from_utf8_lossy(TEST_TOKEN)),
             ),
         );
-        let deadline_polled = Arc::new(tokio::sync::Notify::new());
-        let deadline_stream =
-            pending_upload(b"real-node-blob-deadline", Arc::clone(&deadline_polled));
-        let deadline_task =
-            tokio::spawn(async move { deadline_client.publish_blob(deadline_stream).await });
-        deadline_polled.notified().await;
+        let deadline_ready = Arc::new(tokio::sync::Notify::new());
+        let deadline_started = Arc::clone(&deadline_ready);
+        let mut deadline_task = tokio::spawn(async move {
+            let mut call = deadline_client.publish_blob().await?;
+            call.send(api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
+                    api::PublishBlobMetadata {
+                        operation_key: b"real-node-blob-deadline".to_vec(),
+                        topic: "imagery.maps".to_owned(),
+                        scope: "mission/team/alpha".to_owned(),
+                        priority: api::Priority::Routine.into(),
+                        total_len: 1,
+                        ..Default::default()
+                    },
+                ))),
+                ..Default::default()
+            })
+            .await?;
+            let _ = call
+                .message::<api::PublishBlobResponse>()
+                .await?
+                .ok_or_else(|| ConnectError::data_loss("missing Blob acceptance"))?;
+            deadline_started.notify_one();
+            let _ = call.message::<api::PublishBlobResponse>().await?;
+            Ok::<(), ConnectError>(())
+        });
+        tokio::select! {
+            () = deadline_ready.notified() => {}
+            result = &mut deadline_task => {
+                panic!("deadline request ended before Blob acceptance: {result:?}");
+            }
+        }
         let deadline = deadline_task
             .await
             .expect("deadline request task")
@@ -342,14 +715,8 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
         // gRPC-Web rejection, so cleanup cannot occupy that case's permit.
         let recovered_deadline = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                match client
-                    .publish_blob(connectrpc::stream_iter(one_byte_upload(
-                        b"real-node-blob-deadline",
-                        1,
-                    )))
-                    .await
-                {
-                    Ok(response) => break response.into_owned(),
+                match publish_frames!(client, one_byte_upload(b"real-node-blob-deadline", 1)) {
+                    Ok(response) => break response,
                     Err(error) if error.code == ErrorCode::ResourceExhausted => {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
@@ -360,7 +727,6 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
         .await
         .expect("deadline releases staging and capacity after cleanup");
         assert!(recovered_deadline.inserted);
-
         let grpc_web_client = api::AsterApplicationServiceClient::new(
             HttpClient::plaintext(),
             ClientConfig::new(
@@ -389,13 +755,17 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 ..Default::default()
             },
             api::PublishBlobRequest {
-                frame: Some(api::publish_blob_request::Frame::Chunk(vec![0x44])),
+                frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                    api::PublishBlobData {
+                        offset: 0,
+                        bytes: vec![0x44],
+                        ..Default::default()
+                    },
+                ))),
                 ..Default::default()
             },
         ];
-        let grpc_web_error = grpc_web_client
-            .publish_blob(connectrpc::stream_iter(grpc_web_frames.clone()))
-            .await
+        let grpc_web_error = publish_frames!(grpc_web_client, grpc_web_frames.clone())
             .expect_err("gRPC-Web request streaming must be rejected");
         assert_public_reason(
             &grpc_web_error,
@@ -403,14 +773,23 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
             api::PublicErrorReason::UnsupportedValue,
             "publish_blob",
         );
-        let after_grpc_web = client
-            .publish_blob(connectrpc::stream_iter(grpc_web_frames))
-            .await
-            .expect("gRPC-Web rejection must not mutate Blob state")
-            .into_owned();
+        let after_grpc_web = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match publish_frames!(client, grpc_web_frames.clone()) {
+                    Ok(response) => break response,
+                    Err(error) if error.code == ErrorCode::ResourceExhausted => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("gRPC-Web recovery failed: {error:?}"),
+                }
+            }
+        })
+        .await
+        .expect("gRPC-Web rejection must release upload capacity");
         assert!(after_grpc_web.inserted);
 
-        let payload = vec![0x5a; 65_536 + 3];
+        let frame_bytes = aster_agent::BLOB_RPC_FRAME_BYTES;
+        let payload = vec![0x5a; frame_bytes + 3];
         let metadata = api::PublishBlobMetadata {
             operation_key: b"real-node-blob-durable".to_vec(),
             topic: "imagery.maps".to_owned(),
@@ -430,31 +809,31 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 ..Default::default()
             },
             api::PublishBlobRequest {
-                frame: Some(api::publish_blob_request::Frame::Chunk(
-                    payload[..65_536].to_vec(),
-                )),
+                frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                    api::PublishBlobData {
+                        offset: 0,
+                        bytes: payload[..frame_bytes].to_vec(),
+                        ..Default::default()
+                    },
+                ))),
                 ..Default::default()
             },
             api::PublishBlobRequest {
-                frame: Some(api::publish_blob_request::Frame::Chunk(
-                    payload[65_536..].to_vec(),
-                )),
+                frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                    api::PublishBlobData {
+                        offset: frame_bytes as u64,
+                        bytes: payload[frame_bytes..].to_vec(),
+                        ..Default::default()
+                    },
+                ))),
                 ..Default::default()
             },
         ];
-        let published = client
-            .publish_blob(connectrpc::stream_iter(frames.clone()))
-            .await
-            .expect("publish durable Blob")
-            .into_owned();
+        let published = publish_frames!(client, frames.clone()).expect("publish durable Blob");
         assert!(published.inserted);
         assert_eq!(published.ttl_ms, None);
         assert_eq!(published.total_len, payload.len() as u64);
-        let retried = client
-            .publish_blob(connectrpc::stream_iter(frames))
-            .await
-            .expect("retry durable Blob")
-            .into_owned();
+        let retried = publish_frames!(client, frames).expect("retry durable Blob");
         assert!(!retried.inserted);
         assert_eq!(retried.id, published.id);
         assert_eq!(retried.ttl_ms, None);
@@ -489,7 +868,7 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 break;
             }
         }
-        assert_eq!(offsets, [0, 65_536]);
+        assert_eq!(offsets, [0, frame_bytes as u64]);
         assert_eq!(observed, payload);
 
         let metadata_frame = |key: &[u8], total_len| api::PublishBlobRequest {
@@ -506,7 +885,13 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
             ..Default::default()
         };
         let chunk_frame = |bytes| api::PublishBlobRequest {
-            frame: Some(api::publish_blob_request::Frame::Chunk(bytes)),
+            frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                api::PublishBlobData {
+                    offset: 0,
+                    bytes,
+                    ..Default::default()
+                },
+            ))),
             ..Default::default()
         };
         let malformed_cases = vec![
@@ -521,7 +906,7 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 "over-policy",
                 vec![metadata_frame(
                     b"real-node-blob-over-policy",
-                    MAX_SELECTED_LIVE_BLOB_BYTES + 1,
+                    MAX_SELECTED_BLOB_STREAM_BYTES + 1,
                 )],
                 ErrorCode::ResourceExhausted,
                 api::PublicErrorReason::ResourceExhaustion,
@@ -555,39 +940,23 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                 None,
             ),
         ];
-        for (label, frames, code, reason, rejected_key) in malformed_cases {
-            let error = client
-                .publish_blob(connectrpc::stream_iter(frames))
-                .await
-                .expect_err(label);
-            assert_public_reason_with_retryability(
-                &error,
-                code,
-                reason,
-                "publish_blob",
-                reason == api::PublicErrorReason::ResourceExhaustion,
-            );
+        for (label, frames, code, _reason, _rejected_key) in malformed_cases {
+            let error = publish_frames!(client, frames).expect_err(label);
+            assert_eq!(error.code, code);
+            assert!(!format!("{error:?}").contains("secret"));
 
-            let recovery_key = rejected_key
-                .map(<[u8]>::to_vec)
-                .unwrap_or_else(|| format!("real-node-recovery-{label}").into_bytes());
-            let recovered = client
-                .publish_blob(connectrpc::stream_iter(vec![
-                    metadata_frame(&recovery_key, 1),
-                    chunk_frame(vec![0x41]),
-                ]))
-                .await
-                .expect("every rejected stream must release staging and its upload permit")
-                .into_owned();
+            let recovery_key = format!("real-node-recovery-{label}").into_bytes();
+            let recovered = publish_frames!(
+                client,
+                vec![metadata_frame(&recovery_key, 1), chunk_frame(vec![0x41]),]
+            )
+            .expect("every rejected stream must release staging and its upload permit");
             assert!(recovered.inserted);
-            let retry = client
-                .publish_blob(connectrpc::stream_iter(vec![
-                    metadata_frame(&recovery_key, 1),
-                    chunk_frame(vec![0x41]),
-                ]))
-                .await
-                .expect("exact-key recovery must remain idempotent")
-                .into_owned();
+            let retry = publish_frames!(
+                client,
+                vec![metadata_frame(&recovery_key, 1), chunk_frame(vec![0x41]),]
+            )
+            .expect("exact-key recovery must remain idempotent");
             assert!(!retry.inserted);
             assert_eq!(retry.id, recovered.id);
         }
@@ -603,8 +972,9 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
         );
 
         let finite_payload = b"finite-blob".to_vec();
-        let finite = client
-            .publish_blob(connectrpc::stream_iter(vec![
+        let finite = publish_frames!(
+            client,
+            vec![
                 api::PublishBlobRequest {
                     frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
                         api::PublishBlobMetadata {
@@ -615,22 +985,40 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                             media_type: Some("application/octet-stream".to_owned()),
                             schema_id: b"schema/blob-v1".to_vec(),
                             total_len: finite_payload.len() as u64,
-                            ttl_ms: Some(1_000),
+                            ttl_ms: Some(500),
                             ..Default::default()
                         },
                     ))),
                     ..Default::default()
                 },
                 api::PublishBlobRequest {
-                    frame: Some(api::publish_blob_request::Frame::Chunk(finite_payload)),
+                    frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                        api::PublishBlobData {
+                            offset: 0,
+                            bytes: finite_payload,
+                            ..Default::default()
+                        },
+                    ))),
                     ..Default::default()
                 },
-            ]))
+            ]
+        )
+        .expect("publish finite Blob");
+        assert_eq!(finite.ttl_ms, Some(500));
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        let retired = client
+            .inspect_blob_publication(api::InspectBlobPublicationRequest {
+                publication_id: finite.publication_id.clone(),
+                topic: "imagery.maps".to_owned(),
+                scope: "mission/team/alpha".to_owned(),
+                ..Default::default()
+            })
             .await
-            .expect("publish finite Blob")
+            .expect("inspect expired Blob publication")
             .into_owned();
-        assert_eq!(finite.ttl_ms, Some(1_000));
-        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert_eq!(retired.phase, api::BlobPublicationPhase::ExpiredOrRetired);
+        assert_eq!(retired.blob_id, None);
 
         let mut expired = client
             .read_blob(api::ReadBlobRequest {

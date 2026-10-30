@@ -40,12 +40,15 @@ async fn stream_prefix_conflict_cleanup(corrupt_source: bool) {
         true,
         StreamBoundary::PrefixConflict,
     );
-    let transfer = tokio::spawn(stream_prefix_conflict_contact(
-        a_store.clone(),
-        a,
-        b_store.clone(),
-        b.clone(),
-        interests,
+    let transfer = tokio::spawn(with_test_semantic_version(
+        SEMANTIC_PROTOCOL_V8,
+        stream_prefix_conflict_contact(
+            a_store.clone(),
+            a,
+            b_store.clone(),
+            b.clone(),
+            interests,
+        ),
     ));
     tokio::time::timeout(Duration::from_secs(10), async {
         fault.sender_paused.notified().await;

@@ -3921,8 +3921,8 @@ mod tests {
     fn version_surfaces_distinguish_wire_from_semantics() {
         assert_eq!(aster_protocol_version(), 1);
         assert_eq!(aster_replication_wire_version(), 1);
-        assert_eq!(aster_default_semantic_version(), 8);
-        assert_eq!(aster_highest_supported_semantic_version(), 8);
+        assert_eq!(aster_default_semantic_version(), 9);
+        assert_eq!(aster_highest_supported_semantic_version(), 9);
     }
 
     #[test]

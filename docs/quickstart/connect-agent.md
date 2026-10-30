@@ -4,12 +4,13 @@
 
 `aster-agent` is an out-of-process application boundary over the running
 selected Aster node. It serves Event operations through Connect, gRPC, and
-gRPC-Web on plaintext loopback TCP. On Linux, it additionally serves bounded
-Blob publish/read streams through native gRPC. On non-Linux hosts, `ReadBlob`
-remains available to a capable native-gRPC client, but `PublishBlob` is
-unsupported because secure upload staging is Linux-only; `asterctl blob-read`
-also requires Linux atomic no-replace output finalization in an owner-controlled
-directory. It does not expose keys,
+gRPC-Web on plaintext loopback TCP. It also serves bounded native-gRPC Blob
+publish/read streams on platforms supported by the selected node and store.
+`PublishBlob` uses node-owned durable upload staging and does not create an
+agent-owned plaintext staging file. Separately, `asterctl blob-read` requires
+Linux atomic no-replace output finalization in an owner-controlled qualifying
+directory; a capable native-gRPC client is not subject to that CLI destination
+filesystem rule. The agent does not expose keys,
 sealed content, carriers, transport choice, reconciliation messages, or
 mission provisioning over RPC.
 
@@ -406,6 +407,16 @@ authentication failure. Request/message, decode-memory, response, deadline,
 header, connection, HTTP/2 stream, and in-flight operation bounds remain in
 force; see the [configuration reference](../reference/aster-agent-config-v1.md).
 
+The current schema intentionally replaces the unreleased PR 95 `PublishBlob`
+client-streaming request/unary receipt with a bidirectional `v1alpha1` stream.
+There are no production deployments, so there is no deployed-client
+compatibility promise for the old shape. Stop old clients, upgrade the agent,
+regenerate bindings,
+and implement metadata/accepted/data/checkpoint/finish/complete handling before
+reconnecting. Preserve operation keys and exact intent for unknown-outcome
+recovery. No additive legacy upload method is retained because it would freeze
+a second mutation/recovery grammar without a deployed consumer.
+
 ## Publish and retry safely
 
 `PublishNumberedEvent` returns only after local durable acceptance. Use one
@@ -520,7 +531,13 @@ results to release headroom; a failed pending sequence may then be retried.
 
 `Unavailable` with `PUBLIC_ERROR_REASON_DRAINING` or
 `PUBLIC_ERROR_REASON_STATE_UNAVAILABLE` is retryable only after `/readyz`
-returns `200`. Authentication failures require credential refresh.
+returns `200`. A Ready agent can also return `STATE_UNAVAILABLE` while an earlier
+`PublishBlob` attempt for the same operation is still finalizing. Readiness
+does not mean that operation has finished: apply bounded backoff and retry the
+identical request with the same `operation_key`. The earlier attempt can still
+commit after the client disconnects. `asterctl` reports an unknown outcome and
+prints the exact retry key; it does not retry automatically.
+Authentication failures require credential refresh.
 Malformed input, unsupported values, operation-key conflicts, missing durable
 objects, and failed preconditions are not automatic-retry conditions.
 
@@ -544,7 +561,7 @@ request values or internal chains.
 | `PUBLIC_ERROR_REASON_RESOURCE_EXHAUSTION` | `ResourceExhausted` | yes | Back off, reduce a valid page, or wait for capacity recovery. |
 | `PUBLIC_ERROR_REASON_OPERATION_CAPACITY_EXHAUSTED` | `ResourceExhausted` | no | Stop new publication and escalate; preserve the original numbered intent. |
 | `PUBLIC_ERROR_REASON_DRAINING` | `Unavailable` | yes | Wait for a Ready process. |
-| `PUBLIC_ERROR_REASON_STATE_UNAVAILABLE` | `Unavailable` | yes | Wait for a Ready process. |
+| `PUBLIC_ERROR_REASON_STATE_UNAVAILABLE` | `Unavailable` | yes | Wait for a Ready process, then back off; Blob finalization can remain active under the same operation key. |
 | `PUBLIC_ERROR_REASON_AUTHENTICATION_FAILED` | `Unauthenticated` | no | Refresh credentials; do not repeat the same failed authorization. |
 | `PUBLIC_ERROR_REASON_INTERNAL` | `Internal` or `DataLoss` | no | Treat as a sanitized terminal request failure and investigate fixed operator telemetry. |
 

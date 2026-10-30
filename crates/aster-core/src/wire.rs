@@ -97,7 +97,10 @@ impl ObjectKind {
 
     pub(crate) const fn is_allowed_in_semantic_version(self, semantic_version: u16) -> bool {
         match self {
-            Self::SourceEnvelope | Self::BlobChunk => semantic_version >= SEMANTIC_PROTOCOL_V1,
+            Self::SourceEnvelope => semantic_version >= SEMANTIC_PROTOCOL_V1,
+            Self::BlobChunk => {
+                semantic_version >= SEMANTIC_PROTOCOL_V1 && semantic_version <= SEMANTIC_PROTOCOL_V8
+            }
             Self::SourceBatchProof | Self::BridgeAuthorization | Self::BridgeRouteWrapper => {
                 semantic_version >= SEMANTIC_PROTOCOL_V2
             }
@@ -120,6 +123,7 @@ pub(crate) const SEMANTIC_PROTOCOL_V5: u16 = 5;
 pub(crate) const SEMANTIC_PROTOCOL_V6: u16 = 6;
 pub(crate) const SEMANTIC_PROTOCOL_V7: u16 = 7;
 pub(crate) const SEMANTIC_PROTOCOL_V8: u16 = 8;
+pub(crate) const SEMANTIC_PROTOCOL_V9: u16 = 9;
 
 /// Typed identity in the reconciliation and ranged-transfer namespace.
 ///
@@ -1390,7 +1394,7 @@ pub(crate) fn validate_semantic_version(semantic_version: u16) -> Result<(), Wir
     match semantic_version {
         SEMANTIC_PROTOCOL_V1 | SEMANTIC_PROTOCOL_V2 | SEMANTIC_PROTOCOL_V3
         | SEMANTIC_PROTOCOL_V4 | SEMANTIC_PROTOCOL_V5 | SEMANTIC_PROTOCOL_V6
-        | SEMANTIC_PROTOCOL_V7 | SEMANTIC_PROTOCOL_V8 => Ok(()),
+        | SEMANTIC_PROTOCOL_V7 | SEMANTIC_PROTOCOL_V8 | SEMANTIC_PROTOCOL_V9 => Ok(()),
         _ => Err(WireError::UnsupportedSemanticVersion(semantic_version)),
     }
 }
@@ -1999,6 +2003,31 @@ mod tests {
                     message
                 );
             }
+        }
+    }
+
+    #[test]
+    fn semantic_v9_keeps_fixed_lane_objects_but_rejects_legacy_blob_chunks() {
+        let source = ObjectId::for_envelope(EnvelopeId::from_bytes([0x43; 32]));
+        for message in object_messages(source) {
+            let encoded =
+                encode_message_for_semantic_version(&message, SEMANTIC_PROTOCOL_V9, limits())
+                    .unwrap();
+            assert_eq!(
+                decode_message_for_semantic_version(&encoded, SEMANTIC_PROTOCOL_V9, limits(),)
+                    .unwrap(),
+                message
+            );
+        }
+
+        let legacy_blob = ObjectId::for_blob_chunk_digest([0x44; 32]);
+        for message in object_messages(legacy_blob) {
+            assert!(matches!(
+                encode_message_for_semantic_version(&message, SEMANTIC_PROTOCOL_V9, limits()),
+                Err(WireError::ObjectKindRequiresSemanticV2(
+                    ObjectKind::BlobChunk
+                ))
+            ));
         }
     }
 
