@@ -7225,11 +7225,7 @@ mod tests {
 
     #[test]
     fn upload_atomic_upload_marker_temporary_converges_on_reopen() {
-        let mut fixture = fixture(
-            "upload-marker-temporary",
-            0x95,
-            BlobDepotLimits::DEFAULT,
-        );
+        let mut fixture = fixture("upload-marker-temporary", 0x95, BlobDepotLimits::DEFAULT);
         let request = request(&fixture, b"upload-marker-temporary", 4_096);
         inject_test_fault(&fixture.store, UploadFaultPoint::ReservationIntentSynced);
         assert!(
@@ -8385,6 +8381,38 @@ mod tests {
                     .expect("viable upload retains writer admission"),
             );
         }
+    }
+
+    #[test]
+    fn terminal_upload_preserves_authority_after_clock_identity_reuse() {
+        let fixture = fixture(
+            "terminal-clock-identity-reuse",
+            0x96,
+            BlobDepotLimits::DEFAULT,
+        );
+        let req = request(&fixture, b"clock-identity-reuse", 4_096);
+        let (reservation, initial, open) = reserve_profile5(&fixture, &req);
+        let policy = fixture.store.control_policy_snapshot().unwrap();
+        complete_profile5_pack(&fixture, &policy, &reservation, initial, &open, 0x55);
+
+        terminal_upload_turns(
+            &fixture,
+            Some(CustodySample {
+                clock_id: [0x32; 16],
+                tick_ms: 20,
+            }),
+            128,
+        );
+        terminal_upload_turns(&fixture, Some(terminal_upload_sample()), 128);
+
+        assert!(
+            fixture
+                .store
+                .resume_blob_upload(&req.owner)
+                .unwrap()
+                .is_some(),
+            "clock continuity loss must remain sticky when an identity reappears"
+        );
     }
 
     #[test]
