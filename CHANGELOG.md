@@ -72,6 +72,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compatibility break; callers must match the tagged delivery item.
 
 ### Security
+- Bounded abandoned received Profile-5 uploads with a receiver-local 30-day
+  idle-retention lease refreshed by durable checkpoint progress, reclaimed
+  interrupted atomic pack-marker temporaries during writable recovery, and
+  bound local upload expiry to the exact custody-continuity generation. This
+  changes only the unreleased Profile-5 upload encoding; incompatible
+  development depots still require reset or Blob reimport.
+
 
 - Updated ctutils to 0.4.5 and crypto-bigint to 0.7.9 to address RUSTSEC-2026-0385 and RUSTSEC-2026-0387.
 - Created Unix publication journals with owner-only permissions and rejected insecure existing journal files.
