@@ -7187,6 +7187,90 @@ mod tests {
     }
 
     #[test]
+    fn upload_atomic_reservation_marker_temporary_converges_on_reopen() {
+        let mut fixture = fixture(
+            "reservation-marker-temporary",
+            0x94,
+            BlobDepotLimits::DEFAULT,
+        );
+        PinnedBlobPackRoot::open(&fixture.store).expect("initialize pack root");
+        super::super::depot::inject_test_fault(
+            &fixture.root.0,
+            super::super::depot::DepotFaultPoint::TempSynced,
+        );
+        let request = request(&fixture, b"reservation-marker-temporary", 4_096);
+        assert!(
+            try_reserve_profile5_on(
+                &fixture.store,
+                &fixture.publisher,
+                &fixture.reader,
+                &request,
+            )
+            .is_err(),
+            "injected crash boundary must retain the atomic temporary"
+        );
+
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        fixture.store = Store::open_for_mission(fixture.root.database(), authority)
+            .expect("writable reopen reclaims atomic marker temporaries");
+        assert!(
+            fixture
+                .store
+                .resume_blob_upload(&request.owner)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn upload_atomic_upload_marker_temporary_converges_on_reopen() {
+        let mut fixture = fixture(
+            "upload-marker-temporary",
+            0x95,
+            BlobDepotLimits::DEFAULT,
+        );
+        let request = request(&fixture, b"upload-marker-temporary", 4_096);
+        inject_test_fault(&fixture.store, UploadFaultPoint::ReservationIntentSynced);
+        assert!(
+            try_reserve_profile5_on(
+                &fixture.store,
+                &fixture.publisher,
+                &fixture.reader,
+                &request,
+            )
+            .is_err(),
+            "first crash leaves the exact reservation marker"
+        );
+        super::super::depot::inject_test_fault(
+            &fixture.root.0,
+            super::super::depot::DepotFaultPoint::TempSynced,
+        );
+        assert!(
+            try_reserve_profile5_on(
+                &fixture.store,
+                &fixture.publisher,
+                &fixture.reader,
+                &request,
+            )
+            .is_err(),
+            "second crash leaves the upload marker temporary"
+        );
+
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        fixture.store = Store::open_for_mission(fixture.root.database(), authority)
+            .expect("writable reopen reclaims upload marker temporaries");
+        assert!(
+            fixture
+                .store
+                .resume_blob_upload(&request.owner)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn upload_unexpected_pack_without_reservation_intent_still_fails_closed() {
         let fixture = fixture("unexpected-pack", 0x39, BlobDepotLimits::DEFAULT);
         let request = request(&fixture, b"unexpected-pack", 1_024);
