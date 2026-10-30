@@ -2126,6 +2126,10 @@ impl Store {
         let authority = self.require_bound_mission()?;
         let owner_key = validate_reservation_capability(self, reservation)?;
         let root = PinnedBlobPackRoot::open(self)?;
+        let _depot_guard = self
+            .blob_depot_lock
+            .read()
+            .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
         let mut write = self.database.begin_write()?;
         write.set_durability(Durability::Immediate)?;
         enforce_live_write(&write)?;
@@ -2156,6 +2160,17 @@ impl Store {
             || !durable.is_bound_to(&self.blob_completion_authority)
         {
             return Err(blob_error(BlobStoreError::ReservationChanged));
+        }
+        match BlobPackReader::open_projected_upload_pinned(
+            &root,
+            &reservation.pack_identity(),
+            &durable,
+        ) {
+            Ok(reader) => drop(reader),
+            Err(BlobPackError::Invalid(_)) => {
+                return Err(blob_error(BlobStoreError::ReservationChanged));
+            }
+            Err(error) => return Err(upload_pack_store_error(error)),
         }
         if let Some(current) = upload.checkpoint.as_ref() {
             if current == &durable {

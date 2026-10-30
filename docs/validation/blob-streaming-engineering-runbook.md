@@ -92,10 +92,12 @@ canonical-first: `blob-status` reports receiver-local durable publication
 state, not carrier connectivity or source-side intent. Lifecycle-owned
 provisional source or upload state binds the verified plan and depot/store
 authority; the native pack checkpoint journal records generation, segment
-index, plaintext offset, pack offset, and wire offset. A fresh instance or
-reopen of the same single contact-agreed adapter therefore resumes the same
-publication without translating durable state. RESULT_ACK or EOF settles only
-the transport attempt after atomic promotion and owns no durable resume state.
+index, plaintext offset, pack offset, and wire offset. Before redb publishes a
+checkpoint as resume authority, it reopens that exact journal checkpoint and
+rejects a physically superseded capability. A fresh instance or reopen of the
+same single contact-agreed adapter therefore resumes the same publication
+without translating durable state. RESULT_ACK or EOF settles only the transport
+attempt after atomic promotion and owns no durable resume state.
 Cross-transport selection and failover are not implemented.
 
 The current adapter is Iroh QUIC. The adapter interface is carrier-independent
