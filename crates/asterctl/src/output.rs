@@ -524,6 +524,23 @@ mod tests {
     }
 
     #[test]
+    fn blob_publish_text_escapes_operation_key_controls() {
+        let response = api::PublishBlobReceipt {
+            id: vec![1; 32],
+            publication_id: vec![2; 32],
+            publisher: vec![3; 32],
+            priority: api::Priority::Routine.into(),
+            ..Default::default()
+        };
+        let operation_key = "ok\nInjected: yes\u{1b}[2J";
+        let text = publish_blob(&response, operation_key, false).unwrap();
+
+        assert!(!text.contains("\nInjected: yes"));
+        assert!(!text.contains('\u{1b}'));
+        assert!(text.contains(r#"ok\nInjected: yes\u{1b}[2J"#));
+    }
+
+    #[test]
     fn blob_status_text_names_transfer_byte_domain() {
         let response = api::InspectBlobPublicationResponse {
             publication_id: vec![4; 32],
