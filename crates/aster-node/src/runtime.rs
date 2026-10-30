@@ -15768,43 +15768,59 @@ async fn run_selected_blob_worker(
     let worker_admission = Arc::clone(&admission);
     let joined = tokio::task::spawn_blocking(move || {
         let mut application = application;
-        while let Some(command) = runtime.block_on(application.next_live_command(&mut commands)) {
-            if !worker_admission.load(Ordering::Acquire) {
-                command.reject();
-                continue;
-            }
-            #[cfg(all(test, unix))]
-            if let Some(gate) = test_gate.as_ref() {
-                runtime.block_on(gate.enter_worker());
-            }
-            // A queued Blob command carries no actor policy guard. The facade
-            // replays the latest policy immediately before durable work and
-            // rechecks it before success, so controls can linearize during
-            // File or decryption work without disclosing stale-policy results.
-            let BlobWorkerCommand {
-                command,
-                _permit: permit,
-            } = command;
-            let result = application.execute_live(command, &worker_admission);
-            drop(permit);
-            if let Err(error) = result {
-                // `execute_live` returns a raw NodeError only for fatal internal
-                // coherence after a durable commit. Ordinary application
-                // errors have already been returned through the response.
-                worker_admission.store(false, Ordering::Release);
-                commands.close();
-                while let Ok(command) = commands.try_recv() {
+        let result = (|| {
+            while let Some(command) =
+                runtime.block_on(application.next_live_command(&mut commands))?
+            {
+                if !worker_admission.load(Ordering::Acquire) {
                     command.reject();
+                    continue;
                 }
-                return Err(error);
+                #[cfg(all(test, unix))]
+                if let Some(gate) = test_gate.as_ref() {
+                    runtime.block_on(gate.enter_worker());
+                }
+                // A queued Blob command carries no actor policy guard. The facade
+                // replays the latest policy immediately before durable work and
+                // rechecks it before success, so controls can linearize during
+                // File or decryption work without disclosing stale-policy results.
+                let BlobWorkerCommand {
+                    command,
+                    _permit: permit,
+                } = command;
+                let result = application.execute_live(command, &worker_admission);
+                drop(permit);
+                result?;
             }
+            Ok(())
+        })();
+        let mut reject_pending = || {
+            worker_admission.store(false, Ordering::Release);
+            commands.close();
+            while let Ok(command) = commands.try_recv() {
+                command.reject();
+            }
+        };
+        if result.is_err() {
+            reject_pending();
         }
-        if inject_fatal_on_shutdown {
-            return Err(NodeError::FatalBlobCoherence(
-                "injected worker failure during joined shutdown".into(),
-            ));
+        // EOF can race an owned promotion still running. Join before choosing
+        // success, and inspect the sticky fatal state after every job completes.
+        // An already-observed fatal closes admission before potentially slow joins.
+        let joined = application.join_live_promotions();
+        let result = result.and(joined).and_then(|()| {
+            if inject_fatal_on_shutdown {
+                Err(NodeError::FatalBlobCoherence(
+                    "injected worker failure during joined shutdown".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        if result.is_err() {
+            reject_pending();
         }
-        Ok(())
+        result
     })
     .await;
     match joined {
@@ -33264,6 +33280,303 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn promotion_integrity_rejects_dequeued_and_queued_commands() {
+        use crate::application::{
+            ApplicationErrorKind, BlobLiveWaitObservation, BlobPublishFinalization,
+        };
+        let fixture = tokio::task::block_in_place(|| {
+            crate::application::promotion_failure_fixture(ApplicationErrorKind::Integrity)
+        });
+        let admission = Arc::new(AtomicBool::new(true));
+        let priority = BlobOperationalPriorityGate::default();
+        let (sender, commands) = mpsc::channel(2);
+        let (worker_reached, mut reached) = mpsc::unbounded_channel();
+        let worker_release = Arc::new(tokio::sync::Notify::new());
+        let gate = BlobMaintenanceTestGate {
+            starts: Arc::new(AtomicUsize::new(0)),
+            first_block: None,
+            schedule_observations: None,
+            completed_progress: None,
+            block_periodic: false,
+            startup_page_entries: Arc::new(AtomicUsize::new(0)),
+            startup_pages: Arc::new(AtomicUsize::new(0)),
+            startup_before_worker: Arc::new(AtomicBool::new(false)),
+            worker_constructed: Arc::new(AtomicBool::new(false)),
+            worker_reached: Some(worker_reached),
+            worker_release: Some(worker_release.clone()),
+            retirement_deadline: None,
+        };
+        sender
+            .try_send(BlobWorkerCommand {
+                command: fixture.finish,
+                _permit: priority.acquire(),
+            })
+            .unwrap_or_else(|_| panic!("enqueue finish"));
+        let mut worker = tokio::spawn(run_selected_blob_worker(
+            fixture.node,
+            commands,
+            admission.clone(),
+            false,
+            Some(gate),
+        ));
+        reached.recv().await.unwrap();
+        worker_release.notify_one();
+        let BlobPublishFinalization::Scheduled(completion) =
+            fixture.scheduled.await.unwrap().unwrap()
+        else {
+            panic!("fresh stream must schedule promotion");
+        };
+        let mut waits = fixture.waits;
+        assert_eq!(waits.recv().await, Some(BlobLiveWaitObservation::Idle));
+        tokio::task::block_in_place(|| {
+            fixture
+                .started
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+        });
+        let (response, dequeued) = oneshot::channel();
+        sender
+            .try_send(BlobWorkerCommand {
+                command: SelectedBlobCommand::CapacityStatus { response },
+                _permit: priority.acquire(),
+            })
+            .unwrap_or_else(|_| panic!("enqueue command held before execution"));
+        reached.recv().await.unwrap();
+        let mut queued = Vec::new();
+        for _ in 0..2 {
+            let (response, received) = oneshot::channel();
+            sender
+                .try_send(BlobWorkerCommand {
+                    command: SelectedBlobCommand::CapacityStatus { response },
+                    _permit: priority.acquire(),
+                })
+                .unwrap_or_else(|_| panic!("fill command queue"));
+            queued.push(received);
+        }
+        assert_eq!(sender.capacity(), 0);
+        drop(completion);
+        *fixture.release.0.lock().unwrap() = true;
+        fixture.release.1.notify_all();
+        tokio::task::block_in_place(|| {
+            fixture
+                .finished
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+        });
+        worker_release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut worker).await;
+        if result.is_err() {
+            drop(sender);
+            for _ in 0..2 {
+                reached.recv().await.unwrap();
+                worker_release.notify_one();
+            }
+            worker.await.unwrap().unwrap();
+            panic!("promotion Integrity did not reject queued commands");
+        }
+        assert!(matches!(
+            result.unwrap().unwrap(),
+            Err(NodeError::FatalBlobCoherence(_))
+        ));
+        assert!(
+            dequeued.await.is_err(),
+            "command already dequeued must not execute after fatal"
+        );
+        for received in queued {
+            assert_eq!(
+                received.await.unwrap().unwrap_err().kind(),
+                ApplicationErrorKind::StateUnavailable
+            );
+        }
+        assert!(!admission.load(Ordering::Acquire));
+        assert!(sender.is_closed());
+        assert_eq!(priority.outstanding(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn promotion_ordinary_expiry_and_panic_keep_worker_available() {
+        use crate::application::{
+            ApplicationErrorKind, BlobLiveWaitObservation, BlobPublishFinalization,
+        };
+        // Break caught: treating all asynchronous errors as fatal would turn
+        // normal expiry or the existing panic classification into actor failure.
+        for expected in [
+            ApplicationErrorKind::ExpiredOrRetired,
+            ApplicationErrorKind::StateUnavailable,
+        ] {
+            let fixture = tokio::task::block_in_place(|| {
+                crate::application::promotion_failure_fixture(expected)
+            });
+            let admission = Arc::new(AtomicBool::new(true));
+            let priority = BlobOperationalPriorityGate::default();
+            let (sender, commands) = mpsc::channel(1);
+            sender
+                .try_send(BlobWorkerCommand {
+                    command: fixture.finish,
+                    _permit: priority.acquire(),
+                })
+                .unwrap_or_else(|_| panic!("enqueue finish"));
+            let mut worker = tokio::spawn(run_selected_blob_worker(
+                fixture.node,
+                commands,
+                admission.clone(),
+                false,
+                None,
+            ));
+            let mut waits = fixture.waits;
+            let BlobPublishFinalization::Scheduled(completion) =
+                fixture.scheduled.await.unwrap().unwrap()
+            else {
+                panic!("fresh stream must schedule promotion");
+            };
+            assert_eq!(waits.recv().await, Some(BlobLiveWaitObservation::Idle));
+            tokio::task::block_in_place(|| {
+                fixture
+                    .started
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+            });
+            fixture.custody_clock.set_injected_tick(151).unwrap();
+            *fixture.release.0.lock().unwrap() = true;
+            fixture.release.1.notify_all();
+            assert_eq!(completion.await.unwrap().unwrap_err().kind(), expected);
+            let (response, received) = oneshot::channel();
+            sender
+                .send(BlobWorkerCommand {
+                    command: SelectedBlobCommand::CapacityStatus { response },
+                    _permit: priority.acquire(),
+                })
+                .await
+                .unwrap_or_else(|_| panic!("ordinary failure keeps worker open"));
+            assert!(received.await.unwrap().is_ok());
+            assert!(admission.load(Ordering::Acquire));
+            drop(sender);
+            tokio::time::timeout(Duration::from_secs(5), &mut worker)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(priority.outstanding(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_promotion_integrity_stops_worker(drop_completion: bool, close_input: bool) {
+        // Break caught: only reporting a background Integrity to the caller
+        // leaves an idle actor alive, or loses a late error during joined shutdown.
+        use crate::application::{
+            ApplicationErrorKind, BlobLiveWaitObservation, BlobPublishFinalization,
+        };
+        let fixture = tokio::task::block_in_place(|| {
+            crate::application::promotion_failure_fixture(ApplicationErrorKind::Integrity)
+        });
+        let admission = Arc::new(AtomicBool::new(true));
+        let priority = BlobOperationalPriorityGate::default();
+        let (sender, commands) = mpsc::channel(2);
+        sender
+            .try_send(BlobWorkerCommand {
+                command: fixture.finish,
+                _permit: priority.acquire(),
+            })
+            .unwrap_or_else(|_| panic!("enqueue finish"));
+        let mut worker = tokio::spawn(run_selected_blob_worker(
+            fixture.node,
+            commands,
+            admission.clone(),
+            false,
+            None,
+        ));
+        let mut waits = fixture.waits;
+        let BlobPublishFinalization::Scheduled(completion) =
+            fixture.scheduled.await.unwrap().unwrap()
+        else {
+            panic!("fresh stream must schedule promotion");
+        };
+        tokio::task::block_in_place(|| {
+            fixture
+                .started
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+        });
+        assert_eq!(waits.recv().await, Some(BlobLiveWaitObservation::Idle));
+        let completion = if drop_completion {
+            drop(completion);
+            None
+        } else {
+            Some(completion)
+        };
+        let mut sender = Some(sender);
+        if close_input {
+            drop(sender.take());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match waits.recv().await.expect("worker wait observer stays open") {
+                        BlobLiveWaitObservation::Closed => break,
+                        BlobLiveWaitObservation::Idle => {}
+                    }
+                }
+            })
+            .await
+            .expect("worker observes channel close before promotion release");
+            assert!(
+                !worker.is_finished(),
+                "shutdown must still own the gated promotion"
+            );
+        }
+        *fixture.release.0.lock().unwrap() = true;
+        fixture.release.1.notify_all();
+        tokio::task::block_in_place(|| {
+            fixture
+                .finished
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+        });
+        if let Some(completion) = completion {
+            assert_eq!(
+                completion.await.unwrap().unwrap_err().kind(),
+                ApplicationErrorKind::Integrity
+            );
+        }
+        // Keep the sender open: neither a new command nor EOF may be required
+        // to deliver the background failure to an idle worker.
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut worker).await;
+        if result.is_err() {
+            drop(sender.take());
+            worker.await.unwrap().unwrap();
+            panic!("promotion Integrity did not wake and stop idle worker");
+        }
+        assert!(matches!(
+            result.unwrap().unwrap(),
+            Err(NodeError::FatalBlobCoherence(_))
+        ));
+        assert!(!admission.load(Ordering::Acquire));
+        assert_eq!(priority.outstanding(), 0);
+        if let Some(sender) = sender {
+            assert!(sender.is_closed());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn promotion_integrity_wakes_idle_worker_with_attached_completion() {
+        assert_promotion_integrity_stops_worker(false, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn promotion_integrity_wakes_idle_worker_with_dropped_completion() {
+        assert_promotion_integrity_stops_worker(true, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn promotion_integrity_during_channel_close_is_fatal_after_join() {
+        assert_promotion_integrity_stops_worker(true, true).await;
     }
 
     #[cfg(unix)]

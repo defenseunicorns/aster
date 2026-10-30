@@ -68,6 +68,10 @@ use crate::runtime::{
 use aster_redb_store::EventOperationKey;
 
 mod blob;
+#[cfg(all(test, unix))]
+pub(crate) use blob::{
+    BlobLiveWaitObservation, BlobPublishFinalization, tests::promotion_failure_fixture,
+};
 pub mod blob_stream;
 #[cfg(test)]
 #[path = "application/operation_capacity_test.rs"]

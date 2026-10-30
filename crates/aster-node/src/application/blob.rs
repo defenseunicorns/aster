@@ -1798,10 +1798,24 @@ struct BlobPackPromotionMetrics {
     store_boundary_trace: Vec<BlobPackPromotionStoreOperation>,
 }
 
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BlobLiveWaitObservation {
+    Idle,
+    Closed,
+}
+
+#[derive(Default)]
+struct BlobPackPromotionFailure {
+    integrity: AtomicBool,
+    wake: tokio::sync::Notify,
+}
+
 struct BlobPackPromotionPool {
     sender: Option<std::sync::mpsc::SyncSender<BlobPackPromotionWork>>,
     workers: Vec<std::thread::JoinHandle<()>>,
     counts: Arc<BlobPackPromotionCounts>,
+    failure: Arc<BlobPackPromotionFailure>,
 }
 
 #[cfg(test)]
@@ -1853,11 +1867,13 @@ impl BlobPackPromotionPool {
         );
         let receiver = Arc::new(std::sync::Mutex::new(receiver));
         let counts = Arc::new(BlobPackPromotionCounts::default());
+        let failure = Arc::new(BlobPackPromotionFailure::default());
         let mut workers: Vec<std::thread::JoinHandle<()>> =
             Vec::with_capacity(BLOB_PACK_PROMOTION_WORKERS);
         for worker_index in 0..BLOB_PACK_PROMOTION_WORKERS {
             let receiver = Arc::clone(&receiver);
             let counts = Arc::clone(&counts);
+            let failure = Arc::clone(&failure);
             let worker = match std::thread::Builder::new()
                 .name(format!("aster-blob-promote-{worker_index}"))
                 .spawn(move || {
@@ -1887,6 +1903,16 @@ impl BlobPackPromotionPool {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report);
                             result
                         });
+                        // Actor delivery cannot depend on a caller retaining or
+                        // awaiting its completion. Publish before that response,
+                        // and retain the fatal state across wakeups and shutdown.
+                        if result
+                            .as_ref()
+                            .is_err_and(|error| error.kind() == ApplicationErrorKind::Integrity)
+                        {
+                            failure.integrity.store(true, Ordering::Release);
+                            failure.wake.notify_one();
+                        }
                         counts.active.fetch_sub(1, Ordering::AcqRel);
                         counts.completed.fetch_add(1, Ordering::AcqRel);
                         #[cfg(test)]
@@ -1914,6 +1940,7 @@ impl BlobPackPromotionPool {
             sender: Some(sender),
             workers,
             counts,
+            failure,
         })
     }
 
@@ -1921,6 +1948,12 @@ impl BlobPackPromotionPool {
         &self,
         job: BlobPackPromotionJob,
     ) -> Result<BlobPackPromotionCompletion, ApplicationError> {
+        if self.failure.integrity.load(Ordering::Acquire) {
+            return Err(ApplicationError::new(
+                ApplicationErrorKind::Integrity,
+                "blob stream finish",
+            ));
+        }
         let (completion, received) = oneshot::channel();
         let work = BlobPackPromotionWork { job, completion };
         match self
@@ -1954,6 +1987,16 @@ impl BlobPackPromotionPool {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .expect("completed local pack promotion report")
+    }
+
+    fn check_fatal(&self) -> Result<(), NodeError> {
+        if self.failure.integrity.load(Ordering::Acquire) {
+            Err(NodeError::FatalBlobCoherence(
+                "live Blob pack promotion failed a durable invariant".into(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn shutdown(&mut self) {
@@ -2284,6 +2327,8 @@ pub struct SelectedBlobNode {
     finalizing_publish_streams: BTreeMap<[u8; 32], Weak<BlobPublishStreamRequest>>,
     live_publish_sessions: BTreeMap<[u8; 32], Weak<BlobPublishStreamSession>>,
     publish_stream_cleanup: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    live_command_wait_observer: Option<mpsc::UnboundedSender<BlobLiveWaitObservation>>,
     completed_publish_streams: BTreeMap<[u8; 32], CompletedBlobPublishStream>,
     read_cache: Option<LocalBlobReadCache>,
     #[cfg(test)]
@@ -2421,6 +2466,8 @@ impl SelectedBlobNode {
             #[cfg(test)]
             stream_pack_promotion_gate: None,
             #[cfg(test)]
+            live_command_wait_observer: None,
+            #[cfg(test)]
             live_operation_preflight_coherence_fault: false,
             #[cfg(test)]
             live_read_projection_coherence_fault: false,
@@ -2475,6 +2522,8 @@ impl SelectedBlobNode {
             final_read_gate: None,
             #[cfg(test)]
             stream_pack_promotion_gate: None,
+            #[cfg(test)]
+            live_command_wait_observer: None,
             #[cfg(test)]
             live_operation_preflight_coherence_fault: false,
             #[cfg(test)]
@@ -2556,6 +2605,7 @@ impl SelectedBlobNode {
         command: SelectedBlobCommand,
         admission: &AtomicBool,
     ) -> Result<(), NodeError> {
+        self.pack_promotion_pool.check_fatal()?;
         if !admission.load(Ordering::Acquire) {
             command.reject();
             return Ok(());
@@ -2746,19 +2796,47 @@ impl SelectedBlobNode {
         }
     }
 
-    /// Waits for work while releasing abandoned runtime uploads even when idle.
+    /// Waits for commands, abandoned-upload cleanup, or fatal promotion results.
     /// The durable reservation and checkpoint remain available for exact resume.
     pub(crate) async fn next_live_command<T>(
         &mut self,
         commands: &mut mpsc::Receiver<T>,
-    ) -> Option<T> {
+    ) -> Result<Option<T>, NodeError> {
         loop {
+            self.pack_promotion_pool.check_fatal()?;
             self.cleanup_abandoned_publish_streams();
+            let command = commands.recv();
+            tokio::pin!(command);
+            #[cfg(test)]
+            let command = std::future::poll_fn(|cx| {
+                let poll = std::future::Future::poll(command.as_mut(), cx);
+                if let Some(observer) = &self.live_command_wait_observer {
+                    match &poll {
+                        std::task::Poll::Pending => {
+                            _ = observer.send(BlobLiveWaitObservation::Idle);
+                        }
+                        std::task::Poll::Ready(None) => {
+                            _ = observer.send(BlobLiveWaitObservation::Closed);
+                        }
+                        _ => {}
+                    }
+                }
+                poll
+            });
             tokio::select! {
-                command = commands.recv() => return command,
+                command = command => {
+                    self.pack_promotion_pool.check_fatal()?;
+                    return Ok(command);
+                },
+                () = self.pack_promotion_pool.failure.wake.notified() => {},
                 () = self.publish_stream_cleanup.notified() => {}
             }
         }
+    }
+
+    pub(crate) fn join_live_promotions(&mut self) -> Result<(), NodeError> {
+        self.pack_promotion_pool.shutdown();
+        self.pack_promotion_pool.check_fatal()
     }
 
     fn cleanup_abandoned_publish_streams(&mut self) {
@@ -6296,7 +6374,10 @@ pub(crate) mod tests {
         );
         let worker = tokio::task::spawn_blocking(move || {
             let runtime = tokio::runtime::Handle::current();
-            while let Some(command) = runtime.block_on(node.next_live_command(&mut received)) {
+            while let Some(command) = runtime
+                .block_on(node.next_live_command(&mut received))
+                .unwrap()
+            {
                 let SelectedApplicationCommand::Blob(command) = command else {
                     panic!("unexpected command")
                 };
@@ -6373,7 +6454,11 @@ pub(crate) mod tests {
             .unwrap_or_else(|_| panic!("fill command queue"));
         assert_eq!(commands.capacity(), 0);
         drop(stream);
-        let command = node.next_live_command(&mut received).await.unwrap();
+        let command = node
+            .next_live_command(&mut received)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             node.publish_streams.is_empty(),
             "Drop must release runtime state even when the command queue is full"
@@ -7980,7 +8065,9 @@ pub(crate) mod tests {
     impl Drop for ReleasePromotionGate {
         fn drop(&mut self) {
             let (released, wake) = &*self.0;
-            *released.lock().unwrap() = true;
+            *released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
             wake.notify_all();
         }
     }
@@ -8118,9 +8205,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn stream_pack_promotion_error_releases_operation_for_retry() {
-        // Break caught: a normal early return from a worker must not retain a
-        // busy marker or allow its still-owned writer to overlap the retry.
+    fn stream_pack_promotion_integrity_releases_operation_for_retry_after_reopen() {
+        // Break caught: a fatal promotion must release owned resources so a
+        // fresh facade can resume the durable upload after the fault is repaired.
         let root = TestRoot::new("promotion-error-ownership");
         let mut node = selected_node(&root);
         node.custody_clock = NodeCustodyClock::injected([0xa4; 16], 1_000, 1);
@@ -8156,9 +8243,17 @@ pub(crate) mod tests {
         // fallible production operation without changing filesystem contents.
         node.custody_clock.set_injected_tick(u64::MAX).unwrap();
         drop(release);
-        assert!(completion.blocking_recv().unwrap().is_err());
-        node.stream_pack_promotion_gate = None;
-        node.custody_clock.set_injected_tick(1_005).unwrap();
+        assert_eq!(
+            completion.blocking_recv().unwrap().unwrap_err().kind(),
+            ApplicationErrorKind::Integrity
+        );
+        assert!(matches!(
+            node.join_live_promotions(),
+            Err(NodeError::FatalBlobCoherence(_))
+        ));
+        drop(node);
+        let mut node = selected_node(&root);
+        node.custody_clock = NodeCustodyClock::injected([0xa4; 16], 1_005, 1);
         let retry = node.open_publish_stream_inner(request).unwrap();
         let result = node.finish_publish_stream_inner(retry.token).unwrap();
         assert!(result.inserted);
@@ -11850,5 +11945,128 @@ pub(crate) mod tests {
         assert!(page.complete);
         drop(handle);
         drop(worker.await.unwrap());
+    }
+
+    #[test]
+    fn stream_promotion_integrity_stops_subsequent_live_commands() {
+        let root = TestRoot::new("review-stream-promotion-fatal-containment");
+        let mut node = selected_node(&root);
+        let (token, _) = prepare_ready_stream(
+            &mut node,
+            b"review/stream-promotion-fatal-containment",
+            &payload(53),
+        );
+        let session = Arc::new(BlobPublishStreamSession::new(Arc::clone(
+            &node.publish_stream_cleanup,
+        )));
+        node.live_publish_sessions
+            .insert(token, Arc::downgrade(&session));
+        let cache = Arc::clone(&node.source_route_cache);
+        assert!(std::thread::spawn(move || {
+            let _lifecycle = cache.lock_blob_lifecycle().unwrap();
+            panic!("deliberately poison live Blob lifecycle lock, same boundary as existing one-shot test");
+        }).join().is_err());
+        let admission = AtomicBool::new(true);
+        let (response, received) = oneshot::channel();
+        node.execute_live(
+            SelectedBlobCommand::FinishPublishStream {
+                token,
+                session,
+                response,
+            },
+            &admission,
+        )
+        .expect("stream scheduling does not observe worker error");
+        let BlobPublishFinalization::Scheduled(completion) =
+            received.blocking_recv().unwrap().unwrap()
+        else {
+            panic!("fresh stream must schedule");
+        };
+        let error = completion.blocking_recv().unwrap().unwrap_err();
+        assert_eq!(error.kind(), ApplicationErrorKind::Integrity);
+        let (response, received) = oneshot::channel();
+        let fatal = node
+            .execute_live(SelectedBlobCommand::CapacityStatus { response }, &admission)
+            .expect_err("promotion integrity must reach the actor before its next command");
+        assert!(matches!(fatal, NodeError::FatalBlobCoherence(_)));
+        assert!(received.blocking_recv().is_err());
+    }
+
+    #[cfg(unix)]
+    pub(crate) struct PromotionFailureFixture {
+        _release_on_drop: ReleasePromotionGate,
+        _root: TestRoot,
+        pub(crate) node: SelectedBlobNode,
+        pub(crate) custody_clock: NodeCustodyClock,
+        pub(crate) finish: SelectedBlobCommand,
+        pub(crate) scheduled: oneshot::Receiver<Result<BlobPublishFinalization, ApplicationError>>,
+        pub(crate) started: std::sync::mpsc::Receiver<()>,
+        pub(crate) finished: std::sync::mpsc::Receiver<()>,
+        pub(crate) release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        pub(crate) waits: mpsc::UnboundedReceiver<BlobLiveWaitObservation>,
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn promotion_failure_fixture(kind: ApplicationErrorKind) -> PromotionFailureFixture {
+        let root = TestRoot::new("promotion-worker-failure");
+        let mut node = selected_node(&root);
+        node.custody_clock = NodeCustodyClock::injected([0xee; 16], 100, 0);
+        let custody_clock = node.custody_clock.clone();
+        let opened = node
+            .open_publish_stream_inner(BlobPublishStreamRequest {
+                publication: request(b"promotion/worker-failure"),
+                options: if kind == ApplicationErrorKind::ExpiredOrRetired {
+                    BlobPublishOptions::finite_ttl_ms(50).unwrap()
+                } else {
+                    BlobPublishOptions::durable()
+                },
+                total_len: 53,
+            })
+            .unwrap();
+        let token = opened.token;
+        node.append_publish_stream_inner(token, 0, Zeroizing::new(payload(53)))
+            .unwrap();
+        let session = Arc::new(BlobPublishStreamSession::new(Arc::clone(
+            &node.publish_stream_cleanup,
+        )));
+        node.live_publish_sessions
+            .insert(token, Arc::downgrade(&session));
+        if kind == ApplicationErrorKind::Integrity {
+            let cache = Arc::clone(&node.source_route_cache);
+            assert!(
+                std::thread::spawn(move || {
+                    let _lifecycle = cache.lock_blob_lifecycle().unwrap();
+                    panic!("deliberately poison live Blob lifecycle lock");
+                })
+                .join()
+                .is_err()
+            );
+        }
+        let (started_tx, started) = std::sync::mpsc::sync_channel(1);
+        let (finished_tx, finished) = std::sync::mpsc::sync_channel(1);
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        node.set_stream_pack_promotion_gate_for_test(started_tx, finished_tx, release.clone());
+        if kind == ApplicationErrorKind::StateUnavailable {
+            node.panic_stream_pack_promotions_for_test(1);
+        }
+        let (observer, waits) = mpsc::unbounded_channel();
+        node.live_command_wait_observer = Some(observer);
+        let (response, scheduled) = oneshot::channel();
+        PromotionFailureFixture {
+            _release_on_drop: ReleasePromotionGate(release.clone()),
+            _root: root,
+            node,
+            custody_clock,
+            finish: SelectedBlobCommand::FinishPublishStream {
+                token,
+                session,
+                response,
+            },
+            scheduled,
+            started,
+            finished,
+            release,
+            waits,
+        }
     }
 }
