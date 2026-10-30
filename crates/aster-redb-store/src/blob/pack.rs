@@ -332,6 +332,89 @@ pub(super) fn stage_upload_pack_cleanup(
     }
 }
 
+/// The existing marker is also a fence against reopening a retiring writer.
+pub(super) fn upload_cleanup_started(
+    root: &PinnedBlobPackRoot,
+    identity: &BlobPackIdentity,
+) -> Result<bool, BlobPackError> {
+    match root
+        .directory
+        .read_private_file_if_present(&cleanup_marker_name(*identity), 80)?
+    {
+        Some(marker) if marker == encode_cleanup_marker(*identity) => Ok(true),
+        Some(_) => Err(BlobPackError::Invalid(
+            "Blob upload cleanup marker mismatch",
+        )),
+        None => Ok(false),
+    }
+}
+
+/// One physical entry per turn, with no payload reads or unbounded directory
+/// scan. The caller precharges 1024 bytes for markers and at most two names,
+/// holds the depot writer lock and retains the exact durable upload row until
+/// this returns complete. A complete unit reserves its one file for removing
+/// the cleanup marker after the redb commit.
+pub(super) fn remove_upload_pack_maintenance_unit(
+    root: &PinnedBlobPackRoot,
+    identity: &BlobPackIdentity,
+) -> Result<(u64, bool), BlobPackError> {
+    let started = upload_cleanup_started(root, identity)?;
+    let name = hex32(identity.upload_id.as_bytes());
+    let directory = root.directory.open_child_directory_if_present(&name)?;
+    let mut writer_guard = None;
+    if let Some(directory) = &directory {
+        let marker = directory.read_private_file_if_present(UPLOAD_MARKER, 80)?;
+        if marker.as_deref() != Some(encode_upload_marker(*identity).as_slice())
+            && !(started && marker.is_none() && directory.entry_names_bounded(1)?.is_empty())
+        {
+            return Err(BlobPackError::Invalid("Blob upload pack marker mismatch"));
+        }
+        if let Some(data) = directory.open_private_rw_file_if_present(PACK_FILE)? {
+            match data.try_lock() {
+                Ok(()) => writer_guard = Some(data),
+                Err(std::fs::TryLockError::WouldBlock) => return Ok((0, false)),
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
+    }
+    if !started {
+        stage_upload_pack_cleanup(root, identity)?;
+        return Ok((1, false));
+    }
+    let Some(directory) = directory else {
+        #[cfg(test)]
+        maybe_inject_fault(root.directory.path(), BlobPackFaultPoint::CleanupDurable)?;
+        return Ok((1, true));
+    };
+    let entries = directory.entry_names_bounded(2)?;
+    if let Some(entry) = entries.iter().find(|name| name.as_str() != UPLOAD_MARKER) {
+        if entry != PACK_FILE
+            && entry != UPLOAD_DIGEST_FILE
+            && entry != CHECKPOINT_ZERO
+            && entry != CHECKPOINT_ONE
+            && entry != COMPLETION_FILE
+            && !entry.starts_with(PACK_TEMP_PREFIX)
+        {
+            return Err(BlobPackError::Invalid(
+                "Blob upload pack contains a foreign artifact",
+            ));
+        }
+        directory.remove_if_exists(entry, false)?;
+        #[cfg(test)]
+        maybe_inject_fault(
+            root.directory.path(),
+            BlobPackFaultPoint::CleanupEntryRemoved,
+        )?;
+    } else if !entries.is_empty() {
+        directory.remove_if_exists(UPLOAD_MARKER, false)?;
+    } else {
+        drop(directory);
+        root.directory.remove_if_exists(&name, true)?;
+    }
+    drop(writer_guard);
+    Ok((1, false))
+}
+
 pub(super) fn finish_upload_pack_cleanup(
     root: &PinnedBlobPackRoot,
     identity: &BlobPackIdentity,

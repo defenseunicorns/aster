@@ -11748,4 +11748,107 @@ pub(crate) mod tests {
             }
         }
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn end_to_end_review_abandoned_finite_upload_expires_before_new_admission() {
+        let root = TestRoot::new("review-actor-expired-abandoned-capacity");
+        persist_member_mission(&root);
+        let options = SelectedBlobOptions {
+            depot_limits: BlobDepotLimits::new(1_000_000, 4, 1).unwrap(),
+        };
+        let mut node = SelectedBlobNode::open_unprotected_reference_with_options(
+            root.path(),
+            root.mission_path(),
+            options,
+        )
+        .unwrap();
+        node.custody_clock = NodeCustodyClock::injected([0xec; 16], 10, 0);
+        let publisher = node.identity();
+        let mut first = request(b"review/actor-expired-abandoned-capacity");
+        first.priority = Priority::Routine;
+        let owner = BlobOperationOwner::new(
+            publisher,
+            BlobOperationKey::new(first.operation_key.clone()).unwrap(),
+        );
+        let (handle, worker) = live_stream_test_actor(node);
+        let mut stream = handle
+            .open_publish_stream(BlobPublishStreamRequest {
+                publication: first,
+                options: BlobPublishOptions::finite_ttl_ms(90_000).unwrap(),
+                total_len: 4096,
+            })
+            .await
+            .unwrap();
+        let progress = stream.write(0, Zeroizing::new(payload(17))).await.unwrap();
+        assert_eq!(progress.accepted_offset, 17);
+        assert_eq!(progress.durable_offset, 0);
+        drop(stream);
+        let before_close = handle.capacity_status().await.unwrap();
+        println!(
+            "before close, capacity status committed variants={}",
+            before_close.variants
+        );
+        drop(handle);
+        let node = worker.await.unwrap();
+        assert!(
+            node.publish_streams.is_empty(),
+            "real handle drop released writer and map workers"
+        );
+        let (reserved, _) = node.store.resume_blob_upload(&owner).unwrap().unwrap();
+        assert_eq!(
+            reserved.reserved_variants(),
+            1,
+            "abandoned durable upload retains one admission reservation"
+        );
+        drop(node);
+
+        let mut reopened = SelectedBlobNode::open_unprotected_reference_with_options(
+            root.path(),
+            root.mission_path(),
+            options,
+        )
+        .unwrap();
+        reopened.custody_clock = NodeCustodyClock::injected([0xec; 16], 100_100, 0);
+        let expired = reopened.custody_clock.sample().unwrap();
+        let budget = BlobMaintenanceBudget::new(4096, 1, 32 * 1024 * 1024).unwrap();
+        for _ in 0..128 {
+            reopened
+                .store
+                .run_blob_maintenance_turn_with_sample(budget, Some(expired))
+                .unwrap();
+            reopened
+                .store
+                .run_blob_capacity_gc(budget, Some(expired))
+                .unwrap();
+        }
+        let mut replacement = request(b"review/actor-after-expired-abandoned");
+        replacement.priority = Priority::Flash;
+        let replacement_request = BlobPublishStreamRequest {
+            publication: replacement,
+            options: BlobPublishOptions::durable(),
+            total_len: 53,
+        };
+        let (handle, worker) = live_stream_test_actor(reopened);
+        let mut stream = handle
+            .open_publish_stream(replacement_request)
+            .await
+            .expect("expired abandoned upload automatically releases capacity");
+        stream.write(0, Zeroizing::new(payload(53))).await.unwrap();
+        let published = stream.finish().await.unwrap();
+        let page = handle
+            .read_page(BlobReadPageRequest {
+                blob: BlobReadRequest {
+                    id: published.id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                },
+                offset: 0,
+                max_bytes: 53,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.as_bytes(), payload(53).as_slice());
+        assert!(page.complete);
+        drop(handle);
+        drop(worker.await.unwrap());
+    }
 }

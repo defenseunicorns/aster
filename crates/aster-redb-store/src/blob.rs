@@ -13540,6 +13540,7 @@ impl Store {
         }
         let read = self.database.begin_read()?;
         let discovered_cursor = lifecycle::load_maintenance_cursor_read(&read)?;
+        let has_uploads = !read.open_table(BLOB_UPLOADS)?.is_empty()?;
         drop(read);
         if let Some(sample) = custody_sample {
             let write = self.database.begin_write()?;
@@ -13578,7 +13579,26 @@ impl Store {
         if discovered_cursor.class == BlobMaintenanceClass::ManifestBackedPhysicalDeletion {
             return self.run_blob_physical_deletion_turn(discovered_cursor, budget);
         }
-        let write = self.database.begin_write()?;
+        let upload_pack_root = if discovered_cursor.class
+            == BlobMaintenanceClass::ExpiredRetirementRecords
+            && has_uploads
+        {
+            Some(pack::PinnedBlobPackRoot::open(self)?)
+        } else {
+            None
+        };
+        // Upload cleanup and writer admission share depot -> redb lock order.
+        let _depot_guard = if upload_pack_root.is_some() {
+            Some(self.blob_depot_lock.write().map_err(|_| {
+                blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned"))
+            })?)
+        } else {
+            None
+        };
+        let mut write = self.database.begin_write()?;
+        if upload_pack_root.is_some() {
+            write.set_durability(Durability::Immediate)?;
+        }
         enforce_live_write(&write)?;
         lifecycle::require_maintenance_accounting(&write)?;
         let cursor = lifecycle::load_maintenance_cursor(&write)?;
@@ -13713,6 +13733,23 @@ impl Store {
                 class_has_more_work: true,
                 awaiting_later_handler: false,
             });
+        }
+        if cursor.class == BlobMaintenanceClass::ExpiredRetirementRecords
+            && let Some(root) = upload_pack_root.as_ref()
+            && let Some((progress, completed)) = self.maintain_terminal_upload_write(
+                &write,
+                &cursor,
+                budget,
+                effective_custody_sample,
+                root,
+            )?
+        {
+            write.commit()?;
+            if let Some(identity) = completed {
+                pack::finish_upload_pack_cleanup(root, &identity)
+                    .map_err(upload::upload_pack_store_error)?;
+            }
+            return Ok(progress);
         }
         if cursor.class == BlobMaintenanceClass::ExpiredRetirementRecords
             && let Some(sample) = effective_custody_sample
