@@ -169,12 +169,13 @@ bounds. Their exact current inputs and values are generated from the typed
 capability record at the top of this runbook.
 
 The node's general 30-second contact bound is a no-progress watchdog, not a
-maximum object-transfer duration. Only completion of an authenticated
-Profile-5 transport operation refreshes it; unauthenticated bytes do not.
-Profile 5 separately retains its 120-second operation-idle timeout and
-size-derived hard attempt deadline. This keeps a stalled contact bounded while
-allowing one healthy large-object contact to run to settlement without forced
-30-second resume churn.
+maximum object-transfer duration. While one Profile-5 transport operation is
+active, that outer watchdog temporarily follows the lane's 120-second
+authenticated-operation idle bound; completion restores the 30-second contact
+bound and refreshes its progress generation. Unauthenticated bytes do not
+refresh either bound. The size-derived hard attempt deadline remains absolute.
+This keeps a stalled contact bounded while allowing one healthy large-object
+operation to settle without forced 30-second resume churn.
 
 The legacy ten-minute attempt constant is not the normal-success deadline for
 profile 5. CLI/agent RPC deadlines are a separate local application concern;

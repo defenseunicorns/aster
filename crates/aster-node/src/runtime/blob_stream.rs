@@ -410,6 +410,7 @@ async fn await_authenticated_progress<T>(
     context: &'static str,
     future: impl Future<Output = Result<T, crate::stream_transport::StreamTransportError>>,
 ) -> Result<T, BlobNetworkError> {
+    let _contact_deadline = super::enter_authenticated_contact_idle_deadline(PROFILE5_IDLE_TIMEOUT);
     let value = tokio::time::timeout(PROFILE5_IDLE_TIMEOUT, future)
         .await
         .map_err(|_| transport_failure(context, "authenticated progress idle timeout"))?

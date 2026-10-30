@@ -497,10 +497,23 @@ const MUTABLE_V5_CONTACT_RESERVE_EXCHANGES: usize =
     3 + 6 * MUTABLE_LANE_FULL_GUARANTEE_EXCHANGES + 3 + BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES;
 const CONTACT_DEADLINE: Duration = Duration::from_secs(30);
 
-#[derive(Default)]
 struct AuthenticatedContactProgress {
     generation: AtomicU64,
+    idle_deadline_ms: AtomicU64,
     changed: Notify,
+}
+
+impl Default for AuthenticatedContactProgress {
+    fn default() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            idle_deadline_ms: AtomicU64::new(
+                u64::try_from(CONTACT_DEADLINE.as_millis())
+                    .expect("contact deadline milliseconds fit u64"),
+            ),
+            changed: Notify::new(),
+        }
+    }
 }
 
 tokio::task_local! {
@@ -514,6 +527,41 @@ pub(super) fn record_authenticated_contact_progress() {
     });
 }
 
+pub(super) struct AuthenticatedContactIdleDeadline {
+    progress: Option<Arc<AuthenticatedContactProgress>>,
+    previous_ms: u64,
+}
+
+impl Drop for AuthenticatedContactIdleDeadline {
+    fn drop(&mut self) {
+        if let Some(progress) = &self.progress {
+            progress
+                .idle_deadline_ms
+                .store(self.previous_ms, Ordering::Release);
+            progress.changed.notify_one();
+        }
+    }
+}
+
+pub(super) fn enter_authenticated_contact_idle_deadline(
+    deadline: Duration,
+) -> AuthenticatedContactIdleDeadline {
+    let progress = AUTHENTICATED_CONTACT_PROGRESS.try_with(Arc::clone).ok();
+    let previous_ms = progress.as_ref().map_or(0, |progress| {
+        let deadline_ms = u64::try_from(deadline.as_millis())
+            .expect("authenticated deadline milliseconds fit u64");
+        let previous = progress
+            .idle_deadline_ms
+            .swap(deadline_ms, Ordering::AcqRel);
+        progress.changed.notify_one();
+        previous
+    });
+    AuthenticatedContactIdleDeadline {
+        progress,
+        previous_ms,
+    }
+}
+
 async fn with_authenticated_contact_progress_deadline<T>(
     future: impl Future<Output = T>,
 ) -> Result<T, ()> {
@@ -523,10 +571,12 @@ async fn with_authenticated_contact_progress_deadline<T>(
             tokio::pin!(future);
             loop {
                 let observed = progress.generation.load(Ordering::Acquire);
+                let idle_deadline =
+                    Duration::from_millis(progress.idle_deadline_ms.load(Ordering::Acquire));
                 tokio::select! {
                     result = &mut future => return Ok(result),
                     _ = progress.changed.notified() => {},
-                    _ = sleep(CONTACT_DEADLINE) => {
+                    _ = sleep(idle_deadline) => {
                         if progress.generation.load(Ordering::Acquire) == observed {
                             return Err(());
                         }
