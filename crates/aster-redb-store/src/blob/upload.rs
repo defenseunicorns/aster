@@ -3257,13 +3257,16 @@ impl Store {
             let mut refreshed_idle_anchor = false;
             let terminal = upload.profile5_open.as_mut().is_some_and(|open| {
                 match &mut open.expiry_authority {
-                    Profile5UploadExpiryAuthority::Local { .. } => open
+                    Profile5UploadExpiryAuthority::Local {
+                        continuity_generation,
+                    } => open
                         .open
                         .ttl_ms()
                         .zip(open.open.initial_custody())
                         .zip(continuity)
                         .is_some_and(|((ttl, initial), current)| {
-                            current.sample.clock_id == initial.clock_id
+                            current.generation == *continuity_generation
+                                && current.sample.clock_id == initial.clock_id
                                 && current
                                     .sample
                                     .tick_ms
