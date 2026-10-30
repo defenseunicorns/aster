@@ -2118,8 +2118,11 @@ impl BlobPackPromotionJob {
                 &request,
                 open.open().initial_custody(),
                 |_, authenticated| {
+                    // This job only restores its existing upload authority.
+                    // Terminal cleanup can remove a completed upload while it
+                    // waits for promotion; absence is an ordinary lost reservation.
                     let authenticated = authenticated
-                        .ok_or_else(|| StoreError::Blob(BlobStoreError::CompletionMismatch))?;
+                        .ok_or_else(|| StoreError::Blob(BlobStoreError::ReservationChanged))?;
                     let verified =
                         verifier
                             .verify_blob_stream_open(authenticated)
@@ -8889,6 +8892,124 @@ pub(crate) mod tests {
         assert_eq!(result.total_len, total_len as u64);
     }
 
+    fn persist_completed_unpublished_upload(
+        root: &TestRoot,
+        stream_request: BlobPublishStreamRequest,
+        reuse: bool,
+    ) -> ([u8; 32], BlobOperationOwner, u64) {
+        let total_len = usize::try_from(stream_request.total_len).unwrap();
+        let bytes = payload(total_len);
+        let options = stream_request.options;
+        let ttl_ms = options.ttl_ms();
+        let publication = stream_request.publication;
+        let mut node = selected_node(root);
+        node.custody_clock = NodeCustodyClock::injected([0xcf; 16], 1_000, 0);
+        if reuse {
+            let first = node
+                .open_publish_stream_inner(BlobPublishStreamRequest {
+                    publication: request(b"blob/completed-upload/first"),
+                    options,
+                    total_len: total_len as u64,
+                })
+                .unwrap();
+            if !bytes.is_empty() {
+                node.append_publish_stream_inner(first.token, 0, Zeroizing::new(bytes.clone()))
+                    .unwrap();
+            }
+            node.finish_publish_stream_inner(first.token)
+                .expect("publish reusable pack");
+        }
+        let opened = node
+            .open_publish_stream_inner(BlobPublishStreamRequest {
+                publication: publication.clone(),
+                options,
+                total_len: total_len as u64,
+            })
+            .expect("open pending publication");
+        if !bytes.is_empty() {
+            node.append_publish_stream_inner(opened.token, 0, Zeroizing::new(bytes.clone()))
+                .expect("append pending publication");
+        }
+        let PreparedBlobPublishFinalization::Pending(job) = node
+            .prepare_publish_stream_finalization(opened.token)
+            .expect("prepare physical completion")
+        else {
+            panic!("publication must still be pending");
+        };
+        // Stop at the real durable boundary between pack completion
+        // (including dedup cleanup) and semantic publication.
+        let BlobPackPromotionJob {
+            mission,
+            store,
+            reservation,
+            checkpoint,
+            open,
+            writer,
+            ..
+        } = *job;
+        drop((mission, store));
+        let writer = writer.expect("new upload writer");
+        let counter = open.open().publisher_counter();
+        let (plaintext_root, ciphertext_root) = writer.final_roots().unwrap();
+        node.custody_clock.set_injected_tick(1_005).unwrap();
+        let final_sample = ttl_ms.map(|_| node.custody_clock.sample().unwrap());
+        let commitment = BlobStreamFinalCommitment::new(
+            &open,
+            plaintext_root,
+            ciphertext_root,
+            writer.next_index(),
+            final_sample,
+        )
+        .unwrap();
+        let authenticated = node
+            .verifier
+            .seal_blob_stream_commitment(&commitment)
+            .unwrap();
+        let verified = node
+            .verifier
+            .verify_blob_stream_commitment(&open, &authenticated)
+            .unwrap();
+        let lineage = node.verifier.blob_stream_lineage(&open).unwrap();
+        let completion = writer.finish_profile5(&verified).unwrap();
+        let policy = node.current_policy("test completion").unwrap();
+        let projected = node
+            .store
+            .checkpoint_blob_upload(
+                &policy,
+                &reservation,
+                checkpoint,
+                completion.checkpoint().clone(),
+            )
+            .unwrap();
+        let completed = node
+            .store
+            .complete_profile5_upload_pack(
+                &policy,
+                &reservation,
+                projected,
+                completion,
+                &verified,
+                lineage,
+            )
+            .unwrap();
+        assert_eq!(
+            completed
+                .profile5_completion()
+                .unwrap()
+                .reuses_existing_pack(),
+            reuse
+        );
+        let owner = reservation.request().owner.clone();
+        assert!(
+            node.store
+                .blob_for_owner_with_policy(&policy, &owner)
+                .unwrap()
+                .is_none()
+        );
+        drop(node);
+        (opened.token, owner, counter)
+    }
+
     #[test]
     fn completed_upload_resumes_publication_after_restart() {
         for reuse in [true, false] {
@@ -8899,119 +9020,15 @@ pub(crate) mod tests {
                 let root = TestRoot::new("completed-upload-resume");
                 let bytes = payload(total_len);
                 let publication = request(b"blob/completed-upload/retry");
-                let mut node = selected_node(&root);
-                node.custody_clock = NodeCustodyClock::injected([0xcf; 16], 1_000, 0);
-                if reuse {
-                    let first = node
-                        .open_publish_stream_inner(BlobPublishStreamRequest {
-                            publication: request(b"blob/completed-upload/first"),
-                            options,
-                            total_len: total_len as u64,
-                        })
-                        .unwrap();
-                    if !bytes.is_empty() {
-                        node.append_publish_stream_inner(
-                            first.token,
-                            0,
-                            Zeroizing::new(bytes.clone()),
-                        )
-                        .unwrap();
-                    }
-                    node.finish_publish_stream_inner(first.token)
-                        .expect("publish reusable pack");
-                }
-                let opened = node
-                    .open_publish_stream_inner(BlobPublishStreamRequest {
+                let (token, owner, counter) = persist_completed_unpublished_upload(
+                    &root,
+                    BlobPublishStreamRequest {
                         publication: publication.clone(),
                         options,
                         total_len: total_len as u64,
-                    })
-                    .expect("open pending publication");
-                if !bytes.is_empty() {
-                    node.append_publish_stream_inner(
-                        opened.token,
-                        0,
-                        Zeroizing::new(bytes.clone()),
-                    )
-                    .expect("append pending publication");
-                }
-                let PreparedBlobPublishFinalization::Pending(job) = node
-                    .prepare_publish_stream_finalization(opened.token)
-                    .expect("prepare physical completion")
-                else {
-                    panic!("publication must still be pending");
-                };
-                // Stop at the real durable boundary between pack completion
-                // (including dedup cleanup) and semantic publication.
-                let BlobPackPromotionJob {
-                    mission,
-                    store,
-                    reservation,
-                    checkpoint,
-                    open,
-                    writer,
-                    ..
-                } = *job;
-                drop((mission, store));
-                let writer = writer.expect("new upload writer");
-                let counter = open.open().publisher_counter();
-                let (plaintext_root, ciphertext_root) = writer.final_roots().unwrap();
-                node.custody_clock.set_injected_tick(1_005).unwrap();
-                let final_sample = ttl_ms.map(|_| node.custody_clock.sample().unwrap());
-                let commitment = BlobStreamFinalCommitment::new(
-                    &open,
-                    plaintext_root,
-                    ciphertext_root,
-                    writer.next_index(),
-                    final_sample,
-                )
-                .unwrap();
-                let authenticated = node
-                    .verifier
-                    .seal_blob_stream_commitment(&commitment)
-                    .unwrap();
-                let verified = node
-                    .verifier
-                    .verify_blob_stream_commitment(&open, &authenticated)
-                    .unwrap();
-                let lineage = node.verifier.blob_stream_lineage(&open).unwrap();
-                let completion = writer.finish_profile5(&verified).unwrap();
-                let policy = node.current_policy("test completion").unwrap();
-                let projected = node
-                    .store
-                    .checkpoint_blob_upload(
-                        &policy,
-                        &reservation,
-                        checkpoint,
-                        completion.checkpoint().clone(),
-                    )
-                    .unwrap();
-                let completed = node
-                    .store
-                    .complete_profile5_upload_pack(
-                        &policy,
-                        &reservation,
-                        projected,
-                        completion,
-                        &verified,
-                        lineage,
-                    )
-                    .unwrap();
-                assert_eq!(
-                    completed
-                        .profile5_completion()
-                        .unwrap()
-                        .reuses_existing_pack(),
-                    reuse
+                    },
+                    reuse,
                 );
-                let owner = reservation.request().owner.clone();
-                assert!(
-                    node.store
-                        .blob_for_owner_with_policy(&policy, &owner)
-                        .unwrap()
-                        .is_none()
-                );
-                drop(node);
 
                 let mut restarted = selected_node(&root);
                 restarted.custody_clock = NodeCustodyClock::injected([0xcf; 16], 1_020, 0);
@@ -9022,7 +9039,7 @@ pub(crate) mod tests {
                         total_len: total_len as u64,
                     })
                     .expect("resume completed upload without reopening its candidate writer");
-                assert_eq!(resumed.token, opened.token);
+                assert_eq!(resumed.token, token);
                 assert_eq!(resumed.progress.durable_offset, total_len as u64);
                 if !bytes.is_empty() {
                     let mut changed = bytes.clone();
@@ -9085,7 +9102,7 @@ pub(crate) mod tests {
                         tick_ms: 1_020
                     })
                 );
-                assert_eq!(result.publication_id.unwrap().as_bytes(), &opened.token);
+                assert_eq!(result.publication_id.unwrap().as_bytes(), &token);
                 assert_eq!(result.publisher_counter, counter);
                 assert!(
                     restarted
@@ -9109,6 +9126,138 @@ pub(crate) mod tests {
                 assert_eq!(repeated.acceptance_marker, result.acceptance_marker);
             }
         }
+    }
+
+    fn assert_completed_upload_cleanup_before_promotion_is_ordinary(prepare_before_cleanup: bool) {
+        // Break caught: a restore-only promotion must not recreate a removed
+        // completed upload, nor treat legitimate terminal cleanup as Integrity.
+        let root = TestRoot::new("completed-upload-cleanup-before-promotion");
+        let stream_request = BlobPublishStreamRequest {
+            publication: request(b"blob/completed-upload/expired-retry"),
+            options: BlobPublishOptions::finite_ttl_ms(50).unwrap(),
+            total_len: 4096,
+        };
+        let (token, owner, old_counter) =
+            persist_completed_unpublished_upload(&root, stream_request.clone(), false);
+        let mut restarted = selected_node(&root);
+        restarted.custody_clock = NodeCustodyClock::injected([0xcf; 16], 1_020, 0);
+        let resumed = restarted.open_publish_stream_inner(stream_request).unwrap();
+        assert_eq!(resumed.token, token);
+        assert_eq!(resumed.progress.durable_offset, 4096);
+        let stream = restarted.publish_streams.get(&token).unwrap();
+        assert!(stream.writer.is_none());
+        assert!(stream.checkpoint.profile5_completion().is_some());
+        let session = Arc::new(BlobPublishStreamSession::new(Arc::clone(
+            &restarted.publish_stream_cleanup,
+        )));
+        restarted
+            .live_publish_sessions
+            .insert(token, Arc::downgrade(&session));
+        let prepared = if prepare_before_cleanup {
+            let PreparedBlobPublishFinalization::Pending(job) = restarted
+                .prepare_publish_stream_finalization(token)
+                .unwrap()
+            else {
+                panic!("completed upload is still unpublished");
+            };
+            assert!(job.writer.is_none());
+            Some(job)
+        } else {
+            None
+        };
+        restarted.custody_clock.set_injected_tick(1_050).unwrap();
+        let expired = restarted.custody_clock.sample().unwrap();
+        let budget = BlobMaintenanceBudget::new(4096, 1, 32 * 1024 * 1024).unwrap();
+        for _ in 0..128 {
+            restarted
+                .store
+                .run_blob_maintenance_turn_with_sample(budget, Some(expired))
+                .unwrap();
+        }
+        assert!(
+            restarted
+                .store
+                .resume_blob_upload(&owner)
+                .unwrap()
+                .is_none()
+        );
+        let after_cleanup = restarted.capacity_status().unwrap();
+        assert_eq!(after_cleanup.reserved_bytes, 0);
+        assert_eq!(after_cleanup.variants, 0);
+        let admission = AtomicBool::new(true);
+        let completion = if let Some(job) = prepared {
+            restarted.pack_promotion_pool.try_submit(*job).unwrap()
+        } else {
+            let (response, received) = oneshot::channel();
+            restarted
+                .execute_live(
+                    SelectedBlobCommand::FinishPublishStream {
+                        token,
+                        session,
+                        response,
+                    },
+                    &admission,
+                )
+                .unwrap();
+            let BlobPublishFinalization::Scheduled(completion) =
+                received.blocking_recv().unwrap().unwrap()
+            else {
+                panic!("held resumed stream schedules its finalization");
+            };
+            completion
+        };
+        let error = completion.blocking_recv().unwrap().unwrap_err();
+        assert_eq!(
+            error.kind(),
+            ApplicationErrorKind::PolicyUnsettled,
+            "missing prior reservation must be an ordinary restore failure"
+        );
+        assert!(
+            restarted
+                .store
+                .resume_blob_upload(&owner)
+                .unwrap()
+                .is_none()
+        );
+        let policy = restarted
+            .current_policy("test expired publication")
+            .unwrap();
+        assert!(
+            restarted
+                .store
+                .blob_for_owner_with_policy(&policy, &owner)
+                .unwrap()
+                .is_none()
+        );
+        let (response, received) = oneshot::channel();
+        restarted
+            .execute_live(SelectedBlobCommand::CapacityStatus { response }, &admission)
+            .unwrap();
+        assert_eq!(received.blocking_recv().unwrap().unwrap(), after_cleanup);
+        assert!(admission.load(Ordering::Acquire));
+        let unrelated = restarted
+            .publish(
+                request(b"blob/completed-upload/after-cleanup"),
+                &mut Cursor::new(payload(1)),
+            )
+            .unwrap();
+        // Diagnostic only: counter gaps are allowed, so do not impose a
+        // contiguous-allocation contract when checking rollback of this failure.
+        println!(
+            "prepared={prepare_before_cleanup}, retired counter={old_counter}, next publication counter={}",
+            unrelated.publisher_counter
+        );
+        restarted.join_live_promotions().unwrap();
+    }
+
+    #[test]
+    fn completed_upload_cleanup_before_prepared_promotion_is_ordinary() {
+        assert_completed_upload_cleanup_before_promotion_is_ordinary(true);
+    }
+
+    #[test]
+    fn completed_upload_cleanup_before_live_finish_is_ordinary() {
+        assert_completed_upload_cleanup_before_promotion_is_ordinary(false);
     }
 
     #[test]
