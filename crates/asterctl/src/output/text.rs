@@ -188,7 +188,11 @@ pub(super) fn publish_blob(blob: &api::PublishBlobReceipt, operation_key: &str) 
         "Publication ID",
         scalar(Bytes(&blob.publication_id)),
     );
-    field(&mut text, "Operation key", operation_key);
+    field(
+        &mut text,
+        "Operation key",
+        operation_key.escape_default().to_string(),
+    );
     field(&mut text, "Publisher", scalar(Bytes(&blob.publisher)));
     field(
         &mut text,
