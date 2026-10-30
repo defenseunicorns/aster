@@ -8442,4 +8442,60 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn stale_physical_checkpoint_is_rejected_before_projection() {
+        let fixture = fixture("stale-physical-checkpoint", 0x92, BlobDepotLimits::DEFAULT);
+        let request = request(&fixture, b"stale-physical-checkpoint", 4_096);
+        let policy = fixture.store.control_policy_snapshot().unwrap();
+        let (reservation, initial, open) = reserve_profile5(&fixture, &request);
+        let sealer = fixture.publisher.blob_stream_segment_sealer(&open).unwrap();
+        let seal = |fill| {
+            sealer
+                .seal(
+                    BlobStreamPlainPartition::new(
+                        *open.open().stream_id().as_bytes(),
+                        open.open().digest(),
+                        open.open().content_epoch(),
+                        0,
+                        0,
+                        open.open().total_len(),
+                        vec![fill; open.open().total_len() as usize],
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+        };
+
+        let mut first = fixture
+            .store
+            .open_blob_upload_writer(&reservation, &initial)
+            .unwrap();
+        let (segment, leaves) = seal(0x41);
+        first.append(&segment, leaves).unwrap();
+        let stale = first.checkpoint().unwrap();
+        drop(first);
+
+        let mut second = fixture
+            .store
+            .open_blob_upload_writer(&reservation, &initial)
+            .unwrap();
+        let (segment, leaves) = seal(0x42);
+        second.append(&segment, leaves).unwrap();
+        let replacement = second.checkpoint().unwrap();
+        assert_eq!(stale.generation(), replacement.generation());
+        assert_ne!(stale, replacement);
+        drop(second);
+
+        let result = fixture
+            .store
+            .checkpoint_blob_upload(&policy, &reservation, initial, stale);
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::Blob(BlobStoreError::ReservationChanged))
+            ),
+            "physically superseded checkpoint was accepted: {result:?}"
+        );
+    }
 }
