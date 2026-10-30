@@ -2887,6 +2887,9 @@ impl Store {
         let mut candidate = None;
         let mut candidate_index = None;
         for (index, row) in page.rows.iter().enumerate() {
+            if matches!(row.evidence, MaintenanceEvidence::IneligiblePhysical) {
+                continue;
+            }
             let MaintenanceEvidence::Import(evidence) = &row.evidence else {
                 return Err(blob_error(BlobStoreError::SchemaInvariant(
                     "Blob import maintenance row has wrong evidence",
@@ -9119,6 +9122,7 @@ enum MaintenanceEvidence {
     Pending(MaintenancePendingEvidence),
     Carrier(MaintenanceCarrierEvidence),
     Import(MaintenanceImportEvidence),
+    IneligiblePhysical,
     Operation { publication: Vec<u8> },
     RetiredOperation,
 }
@@ -10889,7 +10893,22 @@ fn capture_import_maintenance_evidence_read(
     value: &[u8],
     charge: &mut MaintenanceCharge,
 ) -> Result<Option<MaintenanceEvidence>, StoreError> {
+    if pack_lifecycle::is_pack_evidence(value) && !pack_lifecycle::maintenance_eligible(key, value)?
+    {
+        // Keep the charged row and its position so bounded scans make progress
+        // through valid ineligible states, even when a page contains only these.
+        return Ok(Some(MaintenanceEvidence::IneligiblePhysical));
+    }
     let import = maintenance_physical_projection(key, value)?;
+    if let Some(reference) = upload::pending_pack_reference(
+        &read.open_table(upload::BLOB_UPLOAD_PACK_REFERENCES)?,
+        import.variant_id,
+    )? {
+        if !charge.charge(&reference, 0)? {
+            return Ok(None);
+        }
+        return Ok(Some(MaintenanceEvidence::IneligiblePhysical));
+    }
     let reference = match capture_any_maintenance_reference_read(read, import.variant_id, charge)? {
         Ok(reference) => reference,
         Err(()) => return Ok(None),
@@ -11130,6 +11149,9 @@ fn variant_has_valid_reference_write(
     write: &redb::WriteTransaction,
     variant: BlobVariantId,
 ) -> Result<bool, StoreError> {
+    if upload::pack_has_pending_upload_write(write, variant)? {
+        return Ok(true);
+    }
     let start = variant.as_bytes().as_slice();
     let evidence = {
         let references = write.open_table(lifecycle::BLOB_VARIANT_REFERENCES)?;
@@ -11253,6 +11275,9 @@ impl Store {
         )?;
         let mut candidates = Vec::new();
         for row in &page.rows {
+            if matches!(row.evidence, MaintenanceEvidence::IneligiblePhysical) {
+                continue;
+            }
             let MaintenanceEvidence::Import(evidence) = &row.evidence else {
                 return Err(blob_error(BlobStoreError::SchemaInvariant(
                     "Blob capacity import row has wrong evidence",
@@ -18131,6 +18156,7 @@ fn initialize_blob_schema(write: &redb::WriteTransaction) -> Result<(), StoreErr
     let _ = write.open_table(BLOB_ACCEPTANCE_MARKERS)?;
     let _ = write.open_table(BLOB_OPERATIONS)?;
     let _ = write.open_table(BLOB_UPLOADS)?;
+    let _ = write.open_table(upload::BLOB_UPLOAD_PACK_REFERENCES)?;
     let _ = write.open_table(pack_lifecycle::BLOB_PROFILE5_PACKS)?;
     let _ = write.open_table(BLOB_IMPORTS)?;
     let _ = write.open_table(BLOB_CHUNKS)?;

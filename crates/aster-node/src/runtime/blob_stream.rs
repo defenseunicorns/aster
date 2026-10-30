@@ -47,6 +47,25 @@ tokio::task_local! {
     static TEST_NATIVE_PROFILE5_PREPROMOTION_HOOK: Arc<dyn Fn() + Send + Sync>;
 }
 
+pub(super) type NativeProfile5Sink =
+    Arc<std::sync::Mutex<(BlobPackWriter, BlobUploadCheckpoint, u64)>>;
+
+pub(super) fn spawn_native_profile5_checkpoint(
+    sink: NativeProfile5Sink,
+    store: Arc<Store>,
+    policy: ControlPolicySnapshot,
+    reservation: aster_redb_store::BlobUploadReservation,
+    expected: BlobUploadCheckpoint,
+    durable: BlobPackCheckpoint,
+) -> tokio::task::JoinHandle<Result<BlobUploadCheckpoint, StoreError>> {
+    tokio::task::spawn_blocking(move || {
+        // A blocking commit survives cancellation of the receive future. Keep
+        // the physical writer owned until that commit has published its bytes.
+        let _ownership = sink;
+        store.checkpoint_blob_upload(&policy, &reservation, expected, durable)
+    })
+}
+
 fn native_profile5_checkpoint_batch_bytes() -> u32 {
     #[cfg(test)]
     if let Ok(bytes) = TEST_NATIVE_PROFILE5_CHECKPOINT_BATCH_BYTES.try_with(|bytes| *bytes) {
@@ -2159,14 +2178,9 @@ async fn receive_native_profile5_pack(
     }
     let durable_pack = initial_checkpoint.durable_pack_checkpoint();
     let resumed_from = durable_pack.map_or(0, |checkpoint| checkpoint.payload_len());
-    let root = PinnedBlobPackRoot::open(&store)
-        .map_err(|error| durability_failure("open native Profile-5 pack root", error))?;
-    let writer = BlobPackWriter::open_projected_upload_pinned(
-        &root,
-        &reservation.pack_identity(),
-        durable_pack,
-    )
-    .map_err(|error| durability_failure("restore native Profile-5 pack writer", error))?;
+    let writer = store
+        .open_blob_upload_writer(&reservation, &initial_checkpoint)
+        .map_err(|error| durability_failure("restore native Profile-5 pack writer", error))?;
     let opener = verifier
         .blob_stream_segment_opener(&physical_open)
         .map_err(|error| authentication_failure("open native Profile-5 segments", error))?;
@@ -2264,15 +2278,14 @@ async fn receive_native_profile5_pack(
                         }
                     };
                     if let Some((expected, durable)) = checkpoint {
-                        let expected_for_commit = expected.clone();
-                        let projected = tokio::task::spawn_blocking(move || {
-                            store.checkpoint_blob_upload(
-                                &sink_policy,
-                                &reservation,
-                                expected_for_commit,
-                                durable,
-                            )
-                        })
+                        let projected = spawn_native_profile5_checkpoint(
+                            Arc::clone(&sink),
+                            store,
+                            sink_policy,
+                            reservation,
+                            expected.clone(),
+                            durable,
+                        )
                         .await
                         .map_err(|error| PipelineError::SinkFailed(error.to_string()))?
                         .map_err(|error| PipelineError::SinkFailed(error.to_string()))?;

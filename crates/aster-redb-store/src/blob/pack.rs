@@ -265,6 +265,21 @@ pub(super) fn stage_upload_pack_reservation(
     root: &PinnedBlobPackRoot,
     identity: &BlobPackIdentity,
 ) -> Result<(), BlobPackError> {
+    // The filename is keyed by stream ID, while its contents bind the entire
+    // physical identity. Reject a conflicting existing directory before making
+    // recovery authority durable. The caller holds the Store depot write lock.
+    if let Some(directory) = root
+        .directory
+        .open_child_directory_if_present(&hex32(identity.upload_id.as_bytes()))?
+    {
+        let marker = directory.read_private_file_if_present(UPLOAD_MARKER, 80)?;
+        if marker
+            .as_deref()
+            .is_some_and(|marker| marker != encode_upload_marker(*identity))
+        {
+            return Err(BlobPackError::Invalid("Blob upload pack marker mismatch"));
+        }
+    }
     let name = reservation_marker_name(*identity);
     let expected = encode_reservation_marker(*identity);
     match root.directory.read_private_file_if_present(&name, 80)? {
@@ -321,6 +336,15 @@ pub(super) fn finish_upload_pack_cleanup(
     root: &PinnedBlobPackRoot,
     identity: &BlobPackIdentity,
 ) -> Result<(), BlobPackError> {
+    if let Some(marker) = root
+        .directory
+        .read_private_file_if_present(&cleanup_marker_name(*identity), 80)?
+        && marker != encode_cleanup_marker(*identity)
+    {
+        return Err(BlobPackError::Invalid(
+            "Blob upload cleanup marker mismatch",
+        ));
+    }
     root.directory
         .remove_if_exists(&cleanup_marker_name(*identity), false)?;
     Ok(())
@@ -1975,7 +1999,9 @@ impl BlobPackWriter {
 
     /// Reopens a provisional upload at exactly the checkpoint already
     /// projected into redb, discarding any later unprojected pack tail.
-    pub fn open_projected_upload_pinned(
+    /// The caller must serialize projection validation and acquisition; live
+    /// callers use Store::open_blob_upload_writer.
+    pub(crate) fn open_projected_upload_pinned(
         root: &PinnedBlobPackRoot,
         identity: &BlobPackIdentity,
         projected: Option<&BlobPackCheckpoint>,

@@ -1244,6 +1244,13 @@ pub(crate) fn plan_variant_admission_write(
     mut pressure_charge: Option<&mut MaintenanceCharge>,
 ) -> Result<Option<BlobDeletionAdmissionPlan>, StoreError> {
     manifest_admission_discovery_boundary()?;
+    if let Some(reference) = super::upload::pending_pack_reference(
+        &write.open_table(super::upload::BLOB_UPLOAD_PACK_REFERENCES)?,
+        variant,
+    )? {
+        let _ = charge_pressure_admission_row(&mut pressure_charge, &reference, 0)?;
+        return Ok(None);
+    }
     for field in DELETION_METADATA_FIELDS {
         if !charge_pressure_admission_row(
             &mut pressure_charge,

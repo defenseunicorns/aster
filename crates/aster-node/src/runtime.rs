@@ -49044,14 +49044,9 @@ mod tests {
                 },
             )
             .expect("reserve native Profile-5 upload");
-        let root = aster_redb_store::pack::PinnedBlobPackRoot::open(store)
-            .expect("native Profile-5 pack root");
-        let mut writer = aster_redb_store::pack::BlobPackWriter::open_projected_upload_pinned(
-            &root,
-            &reservation.pack_identity(),
-            checkpoint.durable_pack_checkpoint(),
-        )
-        .expect("native Profile-5 writer");
+        let mut writer = store
+            .open_blob_upload_writer(&reservation, &checkpoint)
+            .expect("native Profile-5 writer");
         let segment_sealer = sealer
             .blob_stream_segment_sealer(&open)
             .expect("native Profile-5 segment sealer");
@@ -52885,6 +52880,97 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_native_checkpoint_retains_writer_until_projection_finishes() {
+        let services = control_test_services([0xb7; 32]);
+        let state = root("native-checkpoint-cancel-ownership");
+        fs::create_dir_all(&state).unwrap();
+        let store = Arc::new(
+            Store::open_for_mission(
+                state.join(STORE_FILE),
+                services.member.mission_authority_id(),
+            )
+            .unwrap(),
+        );
+        let policy = store.control_policy_snapshot().unwrap();
+        let request = aster_redb_store::BlobUploadRequest {
+            owner: aster_redb_store::BlobOperationOwner::new(
+                services.member.identity(),
+                aster_redb_store::BlobOperationKey::new(b"checkpoint/cancel".to_vec()).unwrap(),
+            ),
+            topic: services.topic.clone(),
+            scope: services.scope.clone(),
+            priority: Priority::Routine,
+            ttl_ms: None,
+            media_type: None,
+            schema_id: Vec::new(),
+            total_len: 1,
+        };
+        let (reservation, checkpoint) = store
+            .reserve_blob_upload_with_policy(&policy, &request)
+            .unwrap();
+        let mut writer = store
+            .open_blob_upload_writer(&reservation, &checkpoint)
+            .unwrap();
+        let durable = writer.checkpoint().unwrap();
+        let sink = Arc::new(std::sync::Mutex::new((writer, checkpoint.clone(), 0)));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // Occupy the only blocking worker so projection is deterministically queued.
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            started_rx.await.unwrap();
+            let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+            let task_store = Arc::clone(&store);
+            let task_reservation = reservation.clone();
+            let task_checkpoint = checkpoint.clone();
+            let task_durable = durable.clone();
+            let receiver = tokio::spawn(async move {
+                let commit = blob_stream::spawn_native_profile5_checkpoint(
+                    sink,
+                    task_store,
+                    policy,
+                    task_reservation,
+                    task_checkpoint,
+                    task_durable,
+                );
+                queued_tx.send(()).unwrap();
+                commit.await
+            });
+            queued_rx.await.unwrap();
+            receiver.abort();
+            assert!(receiver.await.unwrap_err().is_cancelled());
+            let duplicate = store.open_blob_upload_writer(&reservation, &checkpoint);
+            // Always release the blocked worker, including on a failing assertion.
+            let duplicate_rejected = duplicate.is_err();
+            drop(duplicate);
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(
+                duplicate_rejected,
+                "cancelled receiver released the writer before its queued checkpoint"
+            );
+            let (_, restored) = store.resume_blob_upload(&request.owner).unwrap().unwrap();
+            assert_eq!(restored.durable_pack_checkpoint(), Some(&durable));
+            assert!(
+                store
+                    .open_blob_upload_writer(&reservation, &restored)
+                    .is_ok()
+            );
+        });
+        drop(store);
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
     fn finite_profile5_source_is_inventory_eligible_with_v9_custody_authority() {
         let services = control_test_services([0xa7; 32]);
         let state = root("canonical-profile5-finite-inventory");
@@ -53353,14 +53439,9 @@ mod tests {
                     verified_source.physical_open(),
                 )
                 .expect("reserve completed receiver fixture");
-            let root = aster_redb_store::pack::PinnedBlobPackRoot::open(&target_store)
-                .expect("completed receiver root");
-            let mut writer = aster_redb_store::pack::BlobPackWriter::open_projected_upload_pinned(
-                &root,
-                &reservation.pack_identity(),
-                None,
-            )
-            .expect("completed receiver writer");
+            let mut writer = target_store
+                .open_blob_upload_writer(&reservation, &checkpoint)
+                .expect("completed receiver writer");
             let opener = source_verifier
                 .blob_stream_segment_opener(&open)
                 .expect("completed receiver segment opener");
@@ -53405,7 +53486,6 @@ mod tests {
                     .reuses_existing_pack(),
                 preseed_equivalent_pack
             );
-            drop(root);
             drop(target_store);
             target_store = Arc::new(
                 Store::open_for_mission(target_state.join(STORE_FILE), authority)

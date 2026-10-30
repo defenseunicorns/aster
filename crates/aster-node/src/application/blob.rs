@@ -33,7 +33,7 @@ use aster_mesh::{
     VerifiedBlobStreamPublication, VerifiedBlobStreamPublicationSource,
     local_blob_publication_stream_id,
 };
-use aster_redb_store::pack::{BlobPackWriter, PinnedBlobPackRoot};
+use aster_redb_store::pack::BlobPackWriter;
 #[cfg(test)]
 use aster_redb_store::{BlobCapacityGcTarget, BlobMaintenanceBudget};
 use aster_redb_store::{
@@ -2953,19 +2953,14 @@ impl SelectedBlobNode {
         let (writer, map_pool) = if checkpoint.profile5_completion().is_some() {
             (None, None)
         } else {
-            let identity = reservation.pack_identity();
             let sealer = self
                 .verifier
                 .blob_stream_segment_sealer(&open)
                 .map_err(|error| application_error("blob stream open", error.into()))?;
-            let root = PinnedBlobPackRoot::open(&self.store)
+            let writer = self
+                .store
+                .open_blob_upload_writer(&reservation, &checkpoint)
                 .map_err(|error| application_error("blob stream open", error.into()))?;
-            let writer = BlobPackWriter::open_projected_upload_pinned(
-                &root,
-                &identity,
-                checkpoint.durable_pack_checkpoint(),
-            )
-            .map_err(|error| blob_pack_application_error("blob stream open", error))?;
             (Some(writer), Some(blob_stream_map_pool(&open, &sealer)?))
         };
         let durable_offset = checkpoint.durable_plaintext_offset();
@@ -4191,6 +4186,15 @@ impl SelectedBlobNode {
         request: BlobPublicationInspectionRequest,
     ) -> Result<BlobPublicationInspection, ApplicationError> {
         let policy = self.current_policy("blob publication status")?;
+        // Authorize the requested selector before looking up any identity,
+        // including absent, pending and retired publications.
+        let epoch = self.active_epoch(&request.scope, "blob publication status")?;
+        self.require_blob_grants(
+            &request.topic,
+            &request.scope,
+            epoch,
+            "blob publication status",
+        )?;
         let source_route_cache = Arc::clone(&self.source_route_cache);
         let _lifecycle = source_route_cache
             .lock_blob_lifecycle()
@@ -4731,6 +4735,9 @@ impl SelectedBlobNode {
         let result = self
             .read_profile5_cached_page(&request, &policy, epoch, &mut cache, admission, response);
         if result.as_ref().is_ok_and(|page| !page.complete) {
+            // The caller may never request another page. Keep bounded decoded
+            // pipeline state, but release the file and deletion lease now.
+            cache.reader = None;
             self.read_cache = Some(cache);
         } else {
             self.record_finished_read_cache(cache);
@@ -5155,6 +5162,28 @@ impl SelectedBlobNode {
         self.require_profile5_live_read_authority(policy, &cache.plan, &cache.selected)?;
         if live_blob_read_cancelled(admission, response) {
             return Err(actor_unavailable("blob read page"));
+        }
+
+        if cache.reader.is_none() && cache.submitted_index < cache.segment_count {
+            let reader = self
+                .store
+                .open_profile5_pack_application_read_at_segment(
+                    cache.selected.stored.variant_id,
+                    cache.submitted_index,
+                )
+                .map_err(|error| application_error("blob read page", error.into()))?;
+            if reader.authenticated_open() != cache.selected.physical_open.authenticated_bytes()
+                || reader.commitment() != &cache.selected.commitment
+                || reader.route_lineage()
+                    != cache.selected.physical_open.open().authorization_digest()
+                || reader.physical_lineage() != &cache.selected.projection.physical_lineage
+            {
+                return Err(ApplicationError::new(
+                    ApplicationErrorKind::Integrity,
+                    "blob read page",
+                ));
+            }
+            cache.reader = Some(reader);
         }
 
         let mut plaintext = Zeroizing::new(vec![0; page_len]);
@@ -9724,7 +9753,7 @@ pub(crate) mod tests {
     #[test]
     fn sequential_live_blob_pages_open_each_profile5_segment_once() {
         let root = TestRoot::new("live-page-pipeline-reuse");
-        let bytes = payload(BLOB_STREAM_SEGMENT_BYTES * 2 + 19);
+        let bytes = payload(BLOB_STREAM_SEGMENT_BYTES * 8 + 19);
         let mut node = selected_node(&root);
         let published = node
             .publish(
@@ -9747,8 +9776,8 @@ pub(crate) mod tests {
 
         assert_eq!(restored, bytes);
         assert_eq!(result.total_len, bytes.len() as u64);
-        assert_eq!(result.verified_chunks, 5);
-        assert_eq!(node.last_read_cache_opened_segments, 3);
+        assert_eq!(result.verified_chunks, 17);
+        assert_eq!(node.last_read_cache_opened_segments, 9);
         assert!(node.read_cache.is_none());
     }
 
@@ -11629,5 +11658,94 @@ pub(crate) mod tests {
         }
         packs.sort();
         packs.into_iter().next().expect("committed native pack")
+    }
+    #[test]
+    fn partial_read_cache_does_not_pin_expired_pack() {
+        let root = TestRoot::new("review-partial-cache-pin");
+        let mut node = selected_node(&root);
+        node.custody_clock = NodeCustodyClock::injected([0xe1; 16], 1000, 0);
+        let published = node
+            .publish_with_options(
+                request(b"review/cache-pin"),
+                BlobPublishOptions::finite_ttl_ms(50).unwrap(),
+                &mut Cursor::new(payload(4096)),
+            )
+            .unwrap();
+        let page = node
+            .read_page(BlobReadPageRequest {
+                blob: BlobReadRequest {
+                    id: published.id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                },
+                offset: 0,
+                max_bytes: 1,
+            })
+            .unwrap();
+        assert!(!page.complete);
+        drop(page); // The application accepted one page and requests no more.
+        node.custody_clock.set_injected_tick(1050).unwrap();
+        let sample = node.custody_clock.sample().unwrap();
+        let budget =
+            aster_redb_store::BlobMaintenanceBudget::new(4096, 8, 32 * 1024 * 1024).unwrap();
+        for turn in 0..128 {
+            node.store
+                .run_blob_maintenance_turn_with_sample(budget, (turn == 0).then_some(sample))
+                .unwrap();
+            node.store.run_blob_capacity_gc(budget, None).unwrap();
+        }
+        let pinned = node.capacity_status().unwrap().variants;
+        node.finish_read_cache();
+        for _ in 0..128 {
+            node.store.run_blob_maintenance_turn(budget).unwrap();
+            node.store.run_blob_capacity_gc(budget, None).unwrap();
+        }
+        let released = node.capacity_status().unwrap().variants;
+        println!(
+            "after expiry: cached={pinned} variants, after clearing cache={released} variants"
+        );
+        assert_eq!((pinned, released), (0, 0));
+    }
+
+    #[test]
+    fn publication_status_authorizes_before_identity_lookup() {
+        for phase in ["pending", "available", "expired"] {
+            let root = TestRoot::new(&format!("review-status-visibility-{phase}"));
+            let mut node = selected_node(&root);
+            node.custody_clock = NodeCustodyClock::injected([0xe2; 16], 1000, 0);
+            let publication = request(b"review/status-visible");
+            let options = BlobPublishOptions::finite_ttl_ms(50).unwrap();
+            if phase != "pending" {
+                node.publish_with_options(
+                    publication.clone(),
+                    options,
+                    &mut Cursor::new(payload(17)),
+                )
+                .unwrap();
+            }
+            let opened = node
+                .open_publish_stream_inner(BlobPublishStreamRequest {
+                    publication,
+                    options,
+                    total_len: 17,
+                })
+                .unwrap();
+            if phase == "expired" {
+                node.custody_clock.set_injected_tick(1050).unwrap();
+            }
+            let wrong_topic = Topic::new("ungranted-topic").unwrap();
+            for id in [opened.token, [0x92; 32]] {
+                let status = node.inspect_publication(BlobPublicationInspectionRequest {
+                    publication_id: BlobStreamPublicationId::from_bytes(id).unwrap(),
+                    topic: wrong_topic.clone(),
+                    scope: blob_scope(),
+                });
+                assert_eq!(
+                    status.unwrap_err().kind(),
+                    ApplicationErrorKind::RequestRejected,
+                    "{phase}"
+                );
+            }
+        }
     }
 }

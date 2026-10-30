@@ -60,6 +60,120 @@ fn maybe_inject_test_fault(store: &Store, point: UploadFaultPoint) -> Result<(),
     Ok(())
 }
 
+// Derived reverse index, bounded by MAX_UPLOADS. BLOB_UPLOADS remains the
+// durable authority; writable open builds this index for older stores and
+// audits existing indexes exactly. No pack or upload encoding changes.
+pub(super) const BLOB_UPLOAD_PACK_REFERENCES: redb::TableDefinition<&[u8], &[u8]> =
+    redb::TableDefinition::new("aster.blob-upload-pack-references.v1");
+
+fn pending_pack_reference_key(
+    owner: &[u8],
+    upload: &DurableBlobUpload,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    let Some(completion) = upload
+        .profile5_completion
+        .as_ref()
+        .filter(|c| c.reuses_existing_pack())
+    else {
+        return Ok(None);
+    };
+    let open = &upload
+        .profile5_open
+        .as_ref()
+        .ok_or_else(schema_error)?
+        .pack_open;
+    let variant = super::blob_variant_id(
+        completion.commitment.blob_id(),
+        &open.content_group(),
+        open.content_epoch(),
+    );
+    let mut key = variant.as_bytes().to_vec();
+    key.extend_from_slice(owner);
+    Ok(Some(key))
+}
+
+fn remove_pending_pack_reference_write(
+    write: &redb::WriteTransaction,
+    owner: &[u8],
+    upload: &DurableBlobUpload,
+) -> Result<(), StoreError> {
+    if let Some(key) = pending_pack_reference_key(owner, upload)? {
+        // Recovery runs before the startup audit rebuilds this derived index
+        // for an older store. Do not create an incomplete index while removing
+        // an interrupted upload; the audit will derive all surviving roots.
+        if !write
+            .list_tables()?
+            .any(|table| table.name() == BLOB_UPLOAD_PACK_REFERENCES.name())
+        {
+            return Ok(());
+        }
+        write
+            .open_table(BLOB_UPLOAD_PACK_REFERENCES)?
+            .remove(key.as_slice())?;
+    }
+    Ok(())
+}
+
+fn expected_pending_pack_references(
+    uploads: &impl ReadableTable<&'static [u8], &'static [u8]>,
+) -> Result<std::collections::BTreeSet<Vec<u8>>, StoreError> {
+    let mut expected = std::collections::BTreeSet::new();
+    for row in uploads.iter()? {
+        let (owner, value) = row?;
+        let upload = DurableBlobUpload::decode(Arc::new(()), value.value())?;
+        if let Some(key) = pending_pack_reference_key(owner.value(), &upload)? {
+            expected.insert(key);
+        }
+    }
+    Ok(expected)
+}
+
+fn audit_pending_pack_references(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    expected: std::collections::BTreeSet<Vec<u8>>,
+) -> Result<(), StoreError> {
+    let mut actual = std::collections::BTreeSet::new();
+    for row in table.iter()? {
+        let (key, value) = row?;
+        if !value.value().is_empty() {
+            return Err(schema_error());
+        }
+        actual.insert(key.value().to_vec());
+    }
+    if actual != expected {
+        return Err(schema_error());
+    }
+    Ok(())
+}
+
+pub(super) fn pending_pack_reference(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    variant: super::BlobVariantId,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    let Some((key, value)) = table
+        .range(variant.as_bytes().as_slice()..)?
+        .next()
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    if !key.value().starts_with(variant.as_bytes()) {
+        return Ok(None);
+    }
+    if !value.value().is_empty() {
+        return Err(schema_error());
+    }
+    super::decode_blob_operation_owner_key(&key.value()[32..])?;
+    Ok(Some(key.value().to_vec()))
+}
+
+pub(super) fn pack_has_pending_upload_write(
+    write: &redb::WriteTransaction,
+    variant: super::BlobVariantId,
+) -> Result<bool, StoreError> {
+    Ok(pending_pack_reference(&write.open_table(BLOB_UPLOAD_PACK_REFERENCES)?, variant)?.is_some())
+}
+
 const UPLOAD_MAGIC: &[u8; 8] = b"ASTRUP01";
 const LEGACY_UPLOAD_VERSION: u8 = 1;
 const UPLOAD_VERSION: u8 = 2;
@@ -1034,6 +1148,7 @@ pub(super) fn finish_upload_cleanups_write(
     let mut uploads = write.open_table(super::BLOB_UPLOADS)?;
     for (key, upload) in remove {
         remove_profile5_pack_write(write, &upload)?;
+        remove_pending_pack_reference_write(write, &key, &upload)?;
         uploads.remove(key.as_slice())?;
     }
     Ok(())
@@ -1255,6 +1370,7 @@ pub(super) fn finish_profile5_promotion_write(
     {
         return Err(schema_error());
     }
+    remove_pending_pack_reference_write(write, owner_key, &upload)?;
     write.open_table(super::BLOB_UPLOADS)?.remove(owner_key)?;
     Ok(())
 }
@@ -1305,7 +1421,8 @@ pub(super) fn audit_blob_uploads_write(write: &redb::WriteTransaction) -> Result
                 );
                 let pack = super::pack_lifecycle::load_write(write, variant, Arc::new(()))?
                     .ok_or_else(schema_error)?;
-                if pack.completion() != &completion.pack
+                if (completion.reuses_existing_pack() && !pack.lifecycle_owned())
+                    || pack.completion() != &completion.pack
                     || pack.commitment().blob_id() != completion.commitment.blob_id()
                     || pack.open().content_group() != profile5.pack_open.content_group()
                     || pack.open().content_epoch() != profile5.pack_open.content_epoch()
@@ -1333,6 +1450,18 @@ pub(super) fn audit_blob_uploads_write(write: &redb::WriteTransaction) -> Result
             if upload.bound_variant != Some(publication.variant_id) {
                 return Err(schema_error());
             }
+        }
+    }
+    let expected = expected_pending_pack_references(&uploads)?;
+    let present = write
+        .list_tables()?
+        .any(|table| table.name() == BLOB_UPLOAD_PACK_REFERENCES.name());
+    let mut references = write.open_table(BLOB_UPLOAD_PACK_REFERENCES)?;
+    if present {
+        audit_pending_pack_references(&references, expected)?;
+    } else {
+        for key in expected {
+            references.insert(key.as_slice(), &[][..])?;
         }
     }
     Ok(())
@@ -1383,7 +1512,8 @@ pub(super) fn audit_blob_uploads_read(read: &redb::ReadTransaction) -> Result<()
                 );
                 let pack = super::pack_lifecycle::load_read(read, variant, Arc::new(()))?
                     .ok_or_else(schema_error)?;
-                if pack.completion() != &completion.pack
+                if (completion.reuses_existing_pack() && !pack.lifecycle_owned())
+                    || pack.completion() != &completion.pack
                     || pack.commitment().blob_id() != completion.commitment.blob_id()
                     || pack.open().content_group() != profile5.pack_open.content_group()
                     || pack.open().content_epoch() != profile5.pack_open.content_epoch()
@@ -1412,6 +1542,15 @@ pub(super) fn audit_blob_uploads_read(read: &redb::ReadTransaction) -> Result<()
                 return Err(schema_error());
             }
         }
+    }
+    if read
+        .list_tables()?
+        .any(|table| table.name() == BLOB_UPLOAD_PACK_REFERENCES.name())
+    {
+        audit_pending_pack_references(
+            &read.open_table(BLOB_UPLOAD_PACK_REFERENCES)?,
+            expected_pending_pack_references(&uploads)?,
+        )?;
     }
     Ok(())
 }
@@ -1890,6 +2029,21 @@ impl Store {
             profile5_open,
             profile5_completion: None,
         };
+        // Physical directories may already be gone after interrupted cleanup
+        // or completed content reuse. The durable upload still owns its stream
+        // ID until its row is removed; another semantic owner must not reuse it.
+        if super::pack_lifecycle::owns_physical_id_write(&write, reservation.pack_identity)? {
+            return Err(blob_error(BlobStoreError::OperationConflict));
+        }
+        for row in write.open_table(super::BLOB_UPLOADS)?.iter()? {
+            let (_, value) = row?;
+            let existing = DurableBlobUpload::decode(Arc::new(()), value.value())?;
+            if existing.reservation.pack_identity.upload_id()
+                == reservation.pack_identity.upload_id()
+            {
+                return Err(blob_error(BlobStoreError::OperationConflict));
+            }
+        }
         // A previous crash may have committed removal of this deterministic
         // upload while leaving only its physical cleanup tombstone.  The row
         // absence checked above makes removing that tombstone safe before the
@@ -1916,6 +2070,47 @@ impl Store {
         super::pack::finish_upload_pack_reservation(&pack_root, &reservation.pack_identity())
             .map_err(upload_pack_store_error)?;
         Ok((reservation, upload.projection()?, verified))
+    }
+
+    /// Acquires exclusive physical ownership only while the supplied durable
+    /// projection is still current. The write transaction serializes validation
+    /// with checkpoint publication; the pack lock then excludes other writers.
+    /// A delayed retry must refresh its reservation instead of truncating bytes
+    /// already acknowledged by a previous attempt.
+    pub fn open_blob_upload_writer(
+        &self,
+        reservation: &BlobUploadReservation,
+        expected: &BlobUploadCheckpoint,
+    ) -> Result<super::pack::BlobPackWriter, StoreError> {
+        self.require_live()?;
+        self.require_bound_mission()?;
+        let owner_key = validate_reservation_capability(self, reservation)?;
+        let root = PinnedBlobPackRoot::open(self)?;
+        let _depot_guard = self
+            .blob_depot_lock
+            .read()
+            .map_err(|_| blob_error(BlobStoreError::DepotIntegrity("depot lock is poisoned")))?;
+        let write = self.database.begin_write()?;
+        enforce_live_write(&write)?;
+        let encoded = write
+            .open_table(super::BLOB_UPLOADS)?
+            .get(owner_key.as_slice())?
+            .map(|value| value.value().to_vec())
+            .ok_or_else(|| blob_error(BlobStoreError::ReservationChanged))?;
+        let upload =
+            DurableBlobUpload::decode(Arc::clone(&self.blob_completion_authority), &encoded)?;
+        if reservation_for_store(self, &upload) != *reservation
+            || upload.projection()? != *expected
+            || upload.profile5_completion.is_some()
+        {
+            return Err(blob_error(BlobStoreError::ReservationChanged));
+        }
+        super::pack::BlobPackWriter::open_projected_upload_pinned(
+            &root,
+            &reservation.pack_identity(),
+            upload.checkpoint.as_ref(),
+        )
+        .map_err(upload_pack_store_error)
     }
 
     pub fn checkpoint_blob_upload(
@@ -2118,6 +2313,11 @@ impl Store {
             return Err(blob_error(BlobStoreError::CompletionMismatch));
         }
         upload.profile5_completion = Some(candidate);
+        if let Some(key) = pending_pack_reference_key(&owner_key, &upload)? {
+            write
+                .open_table(BLOB_UPLOAD_PACK_REFERENCES)?
+                .insert(key.as_slice(), &[][..])?;
+        }
         let projection = upload.projection()?;
         write
             .open_table(super::BLOB_UPLOADS)?
@@ -2707,6 +2907,7 @@ impl Store {
         remove_upload_pack(&pack_root, &reservation.pack_identity())
             .map_err(upload_pack_store_error)?;
         remove_profile5_pack_write(&write, &upload)?;
+        remove_pending_pack_reference_write(&write, &owner_key, &upload)?;
         write
             .open_table(super::BLOB_UPLOADS)?
             .remove(owner_key.as_slice())?;
@@ -2749,6 +2950,7 @@ impl Store {
         remove_upload_pack(&pack_root, &reservation.pack_identity())
             .map_err(upload_pack_store_error)?;
         remove_profile5_pack_write(&write, &upload)?;
+        remove_pending_pack_reference_write(&write, &owner_key, &upload)?;
         write
             .open_table(super::BLOB_UPLOADS)?
             .remove(owner_key.as_slice())?;
@@ -6710,6 +6912,717 @@ mod tests {
                 .unwrap_or_else(|error| {
                     panic!("valid 256-byte operation key failed maintenance turn {turn}: {error}")
                 });
+        }
+    }
+    #[test]
+    fn maintenance_accepts_unpublished_completed_pack() {
+        let fixture = fixture(
+            "review-pending-pack-maintenance",
+            0x75,
+            BlobDepotLimits::DEFAULT,
+        );
+        let policy = fixture.store.control_policy_snapshot().unwrap();
+        let request = request(&fixture, b"review/pending-pack", 4096);
+        let (reservation, initial, open) = reserve_profile5(&fixture, &request);
+        let _completed =
+            complete_profile5_pack(&fixture, &policy, &reservation, initial, &open, 0x55);
+        let budget =
+            super::super::lifecycle::BlobMaintenanceBudget::new(4096, 8, 32 * 1024 * 1024).unwrap();
+        for turn in 0..64 {
+            fixture
+                .store
+                .run_blob_maintenance_turn(budget)
+                .unwrap_or_else(|error| {
+                    panic!("completed but unpublished pack blocks maintenance turn {turn}: {error}")
+                });
+        }
+    }
+
+    #[test]
+    fn writer_rechecks_checkpoint_after_lock_handoff() {
+        let fixture = fixture(
+            "review-stale-writer-handoff",
+            0x76,
+            BlobDepotLimits::DEFAULT,
+        );
+        let policy = fixture.store.control_policy_snapshot().unwrap();
+        let remote =
+            remote_profile5_pack(&fixture, &fixture.publisher, b"review/stale-writer", 0x53);
+        let (first, initial, _) = fixture
+            .store
+            .reserve_received_profile5_upload_with_policy(
+                &policy,
+                &remote.publication,
+                &remote.open,
+            )
+            .unwrap();
+        let (second, stale, _) = fixture
+            .store
+            .reserve_received_profile5_upload_with_policy(
+                &policy,
+                &remote.publication,
+                &remote.open,
+            )
+            .unwrap();
+        let root = PinnedBlobPackRoot::open(&fixture.store).unwrap();
+        let mut writer = fixture
+            .store
+            .open_blob_upload_writer(&first, &initial)
+            .unwrap();
+        writer.append(&remote.segment, remote.leaves).unwrap();
+        let projected = fixture
+            .store
+            .checkpoint_blob_upload(&policy, &first, initial, writer.checkpoint().unwrap())
+            .unwrap();
+        drop(writer); // The first attempt disconnects after acknowledging its durable checkpoint.
+        let delayed = fixture.store.open_blob_upload_writer(&second, &stale);
+        assert!(matches!(
+            delayed,
+            Err(StoreError::Blob(BlobStoreError::ReservationChanged))
+        ));
+        drop(delayed);
+        let result = BlobPackReader::open_projected_upload_pinned(
+            &root,
+            &first.pack_identity(),
+            projected.durable_pack_checkpoint().unwrap(),
+        );
+        assert!(
+            result.is_ok(),
+            "delayed duplicate damaged acknowledged checkpoint: {}",
+            result.err().unwrap()
+        );
+        let resumed = fixture
+            .store
+            .open_blob_upload_writer(&first, &projected)
+            .unwrap();
+        assert_eq!(resumed.next_index(), 1);
+    }
+    fn review_pack_with_stream_id(
+        fixture: &Fixture,
+        publisher: &ReferenceEnvelopeSealer,
+        operation: &[u8],
+        fill: u8,
+        stream_id: aster_mesh::BlobPublicationStreamId,
+    ) -> RemoteProfile5Pack {
+        const TOTAL_LEN: u64 = 4_096;
+        let policy = fixture.store.control_policy_snapshot().expect("policy");
+        let open = BlobStreamOpen::new(
+            stream_id,
+            publisher.identity(),
+            operation.to_vec(),
+            publisher.mission_authority_id(),
+            1,
+            VersionVector::default(),
+            fixture.topic.clone(),
+            fixture.scope.clone(),
+            BlobMetadata::new(Some("image/tiff".into()), b"geo-v4".to_vec())
+                .expect("remote metadata"),
+            Priority::Immediate,
+            None,
+            None,
+            TOTAL_LEN,
+            1,
+            policy.head().map_or(1, |(revision, _)| revision),
+            publisher
+                .blob_stream_authorization_digest(&fixture.scope, 1)
+                .expect("remote stream authorization"),
+            [fill; 32],
+        )
+        .expect("remote Profile-5 open");
+        let authenticated_open = publisher
+            .seal_blob_stream_open(&open)
+            .expect("seal remote Profile-5 open");
+        let open = fixture
+            .reader
+            .verify_blob_stream_open(&authenticated_open)
+            .expect("verify remote Profile-5 open");
+        let sealer = publisher
+            .blob_stream_segment_sealer(&open)
+            .expect("remote segment sealer");
+        let (segment, leaves) = sealer
+            .seal(
+                BlobStreamPlainPartition::new(
+                    *open.open().stream_id().as_bytes(),
+                    open.open().digest(),
+                    open.open().content_epoch(),
+                    0,
+                    0,
+                    TOTAL_LEN,
+                    vec![fill; TOTAL_LEN as usize],
+                )
+                .expect("remote partition"),
+            )
+            .expect("seal remote segment");
+        let mut frontier = BlobStreamFrontier::new();
+        frontier
+            .append(BlobStreamSubtree::leaf(0, leaves))
+            .expect("append remote segment leaves");
+        let roots = frontier.finish(TOTAL_LEN).expect("remote roots");
+        let commitment = BlobStreamFinalCommitment::new(&open, roots.0, roots.1, 1, None)
+            .expect("remote commitment");
+        let authenticated_commitment = publisher
+            .seal_blob_stream_commitment(&commitment)
+            .expect("seal remote commitment");
+        let commitment = fixture
+            .reader
+            .verify_blob_stream_commitment(&open, &authenticated_commitment)
+            .expect("verify remote commitment");
+        let lineage = publisher
+            .blob_stream_lineage(&open)
+            .expect("remote physical lineage");
+        let publication = BlobStreamPublication::new(
+            open.open().clone(),
+            commitment.commitment().blob_id(),
+            None,
+            *lineage.physical().binding(),
+        )
+        .expect("remote semantic publication");
+        let authenticated_publication = publisher
+            .seal_blob_stream_publication(&publication)
+            .expect("seal remote semantic publication");
+        let publication = fixture
+            .reader
+            .verify_blob_stream_publication(&authenticated_publication)
+            .expect("verify remote semantic publication");
+        RemoteProfile5Pack {
+            publication,
+            open,
+            commitment,
+            segment,
+            leaves,
+        }
+    }
+
+    #[test]
+    fn conflicting_stream_id_does_not_poison_restart() {
+        for interrupted_cleanup in [false, true] {
+            let fixture = fixture("review-conflicting-id", 0x77, BlobDepotLimits::DEFAULT);
+            let policy = fixture.store.control_policy_snapshot().unwrap();
+            let first =
+                remote_profile5_pack(&fixture, &fixture.publisher, b"review/first-id", 0x53);
+            let (first_reservation, _, _) = fixture
+                .store
+                .reserve_received_profile5_upload_with_policy(
+                    &policy,
+                    &first.publication,
+                    &first.open,
+                )
+                .unwrap();
+            if interrupted_cleanup {
+                let root = PinnedBlobPackRoot::open(&fixture.store).unwrap();
+                super::super::pack::inject_test_fault(
+                    &root,
+                    super::super::pack::BlobPackFaultPoint::CleanupDurable,
+                );
+                fixture
+                    .store
+                    .abort_blob_upload(&first_reservation)
+                    .expect_err("stop after physical cleanup before DB removal");
+            }
+            let conflicting = review_pack_with_stream_id(
+                &fixture,
+                &fixture.other,
+                b"review/other-id",
+                0x54,
+                first.open.open().stream_id(),
+            );
+            // Semantic publication ID remains canonical for the second publisher.
+            // Only the independently authenticated physical pack reuses the first ID.
+            let semantic = remote_profile5_pack(&fixture, &fixture.other, b"review/other-id", 0x54);
+            let lineage = fixture
+                .other
+                .blob_stream_lineage(&conflicting.open)
+                .unwrap();
+            let publication = BlobStreamPublication::new(
+                semantic.open.open().clone(),
+                conflicting.commitment.commitment().blob_id(),
+                None,
+                *lineage.physical().binding(),
+            )
+            .unwrap();
+            let authenticated = fixture
+                .other
+                .seal_blob_stream_publication(&publication)
+                .unwrap();
+            let publication = fixture
+                .reader
+                .verify_blob_stream_publication(&authenticated)
+                .unwrap();
+            let source = aster_mesh::BlobStreamPublicationSource::new(
+                authenticated,
+                conflicting.open.authenticated_bytes().to_vec(),
+                conflicting.commitment.authenticated_bytes().to_vec(),
+            )
+            .unwrap();
+            fixture
+                .reader
+                .verify_blob_stream_publication_source(&source.encode().unwrap())
+                .expect("complete network source authenticates");
+            let rejected = fixture.store.reserve_received_profile5_upload_with_policy(
+                &policy,
+                &publication,
+                &conflicting.open,
+            );
+            assert!(rejected.is_err());
+            println!(
+                "conflicting incoming reservation rejected: {:?}",
+                rejected.err()
+            );
+            let authority = fixture.publisher.mission_authority_id();
+            drop(fixture.store);
+            Store::open_for_mission(fixture.root.database(), authority)
+                .expect("rejected incoming reservation must not poison restart");
+        }
+    }
+
+    #[test]
+    fn pending_reuse_survives_restart_and_expiry_until_promoted_or_aborted() {
+        for rebuild_index in [false, true] {
+            for abort in [false, true] {
+                let mut fixture = fixture("pending-reuse-restart", 0x78, BlobDepotLimits::DEFAULT);
+                let (_, original) = promote_profile5_fixture(&fixture, b"reuse-original");
+                let policy = fixture.store.control_policy_snapshot().unwrap();
+                let mut second = request(&fixture, b"reuse-pending", 4096);
+                second.ttl_ms = Some(180_000);
+                let (reservation, initial, open) = reserve_profile5(&fixture, &second);
+                let completed =
+                    complete_profile5_pack(&fixture, &policy, &reservation, initial, &open, 0x55);
+                assert!(
+                    completed
+                        .profile5_completion()
+                        .unwrap()
+                        .reuses_existing_pack()
+                );
+                let publication = profile5_publication(&fixture, &open, &completed);
+                if rebuild_index {
+                    let write = fixture.store.database.begin_write().unwrap();
+                    write.delete_table(BLOB_UPLOAD_PACK_REFERENCES).unwrap();
+                    write.commit().unwrap();
+                }
+                let authority = fixture.publisher.mission_authority_id();
+                drop(fixture.store);
+                Store::inspect_existing(fixture.root.database())
+                    .expect("read-only old/current pending upload audit");
+                fixture.store =
+                    Store::open_for_mission(fixture.root.database(), authority).unwrap();
+                let (reservation, completed) = fixture
+                    .store
+                    .resume_blob_upload(&second.owner)
+                    .unwrap()
+                    .unwrap();
+                let expired = CustodySample {
+                    clock_id: [0x31; 16],
+                    tick_ms: 100_100,
+                };
+                let budget =
+                    super::super::lifecycle::BlobMaintenanceBudget::new(4096, 8, 32 * 1024 * 1024)
+                        .unwrap();
+                for turn in 0..128 {
+                    fixture
+                        .store
+                        .run_blob_maintenance_turn_with_sample(
+                            budget,
+                            (turn == 0).then_some(expired),
+                        )
+                        .unwrap();
+                    fixture.store.run_blob_capacity_gc(budget, None).unwrap();
+                }
+                drop(
+                    fixture
+                        .store
+                        .open_profile5_pack_application_read(original.variant_id)
+                        .expect("pending reuse protects original pack across reopen and expiry"),
+                );
+                if abort {
+                    fixture.store.abort_blob_upload(&reservation).unwrap();
+                } else {
+                    fixture
+                        .store
+                        .commit_profile5_publication_once_with_policy(
+                            &policy,
+                            &reservation,
+                            &completed,
+                            &publication,
+                            publication.publication().final_custody(),
+                        )
+                        .expect("promote pending reuse after original expires");
+                }
+                assert_eq!(
+                    fixture
+                        .store
+                        .database
+                        .begin_read()
+                        .unwrap()
+                        .open_table(BLOB_UPLOAD_PACK_REFERENCES)
+                        .unwrap()
+                        .len()
+                        .unwrap(),
+                    0
+                );
+                for _ in 0..128 {
+                    fixture.store.run_blob_maintenance_turn(budget).unwrap();
+                    fixture.store.run_blob_capacity_gc(budget, None).unwrap();
+                }
+                assert_eq!(
+                    fixture
+                        .store
+                        .open_profile5_pack_application_read(original.variant_id)
+                        .is_ok(),
+                    !abort
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pending_reuse_index_corruption_is_rejected_on_reopen() {
+        let fixture = fixture("pending-reuse-index-audit", 0x7a, BlobDepotLimits::DEFAULT);
+        promote_profile5_fixture(&fixture, b"reuse-original");
+        let policy = fixture.store.control_policy_snapshot().unwrap();
+        let second = request(&fixture, b"reuse-pending", 4096);
+        let (reservation, initial, open) = reserve_profile5(&fixture, &second);
+        complete_profile5_pack(&fixture, &policy, &reservation, initial, &open, 0x55);
+        let write = fixture.store.database.begin_write().unwrap();
+        write
+            .open_table(BLOB_UPLOAD_PACK_REFERENCES)
+            .unwrap()
+            .retain(|_, _| false)
+            .unwrap();
+        write.commit().unwrap();
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        assert!(Store::inspect_existing(fixture.root.database()).is_err());
+        assert!(Store::open_for_mission(fixture.root.database(), authority).is_err());
+    }
+    #[test]
+    fn maintenance_advances_past_deletion_pending_packs() {
+        let fixture = fixture(
+            "maintenance-deletion-pending",
+            0x7b,
+            BlobDepotLimits::DEFAULT,
+        );
+        let (_, original) = promote_profile5_fixture(&fixture, b"expire-original");
+        let budget =
+            super::super::lifecycle::BlobMaintenanceBudget::new(4096, 8, 32 * 1024 * 1024).unwrap();
+        let expired = CustodySample {
+            clock_id: [0x31; 16],
+            tick_ms: 100_100,
+        };
+        let mut saw_pending = false;
+        for turn in 0..128 {
+            fixture
+                .store
+                .run_blob_maintenance_turn_with_sample(budget, (turn == 0).then_some(expired))
+                .unwrap();
+            let read = fixture.store.database.begin_read().unwrap();
+            let pending =
+                super::super::pack_lifecycle::load_read(&read, original.variant_id, Arc::new(()))
+                    .unwrap()
+                    .is_some_and(|pack| pack.deletion_pending());
+            if pending {
+                saw_pending = true;
+                let tiny =
+                    super::super::lifecycle::BlobMaintenanceBudget::new(1, 1, 32 * 1024 * 1024)
+                        .unwrap();
+                let page =
+                    super::super::bounded_import_maintenance_page_read(&read, None, tiny).unwrap();
+                assert_eq!(page.rows.len(), 1);
+                assert!(matches!(
+                    page.rows[0].evidence,
+                    super::super::MaintenanceEvidence::IneligiblePhysical
+                ));
+            }
+        }
+        assert!(
+            saw_pending,
+            "fixture exercises the durable deletion-pending state"
+        );
+    }
+    #[test]
+    fn reused_candidate_identity_cannot_be_reallocated() {
+        let fixture = fixture(
+            "independent-absent-candidate",
+            0x7d,
+            BlobDepotLimits::DEFAULT,
+        );
+        promote_profile5_fixture(&fixture, b"original-active");
+        let policy = fixture.store.control_policy_snapshot().unwrap();
+        let second = request(&fixture, b"completed-pending", 4096);
+        let (reservation, initial, open) = reserve_profile5(&fixture, &second);
+        let completed =
+            complete_profile5_pack(&fixture, &policy, &reservation, initial, &open, 0x55);
+        assert!(
+            completed
+                .profile5_completion()
+                .unwrap()
+                .reuses_existing_pack()
+        );
+        let conflicting = review_pack_with_stream_id(
+            &fixture,
+            &fixture.other,
+            b"conflicting-physical-id",
+            0x54,
+            open.open().stream_id(),
+        );
+        let semantic =
+            remote_profile5_pack(&fixture, &fixture.other, b"conflicting-physical-id", 0x54);
+        let lineage = fixture
+            .other
+            .blob_stream_lineage(&conflicting.open)
+            .unwrap();
+        let publication = BlobStreamPublication::new(
+            semantic.open.open().clone(),
+            conflicting.commitment.commitment().blob_id(),
+            None,
+            *lineage.physical().binding(),
+        )
+        .unwrap();
+        let authenticated = fixture
+            .other
+            .seal_blob_stream_publication(&publication)
+            .unwrap();
+        let publication = fixture
+            .reader
+            .verify_blob_stream_publication(&authenticated)
+            .unwrap();
+        let source = aster_mesh::BlobStreamPublicationSource::new(
+            authenticated,
+            conflicting.open.authenticated_bytes().to_vec(),
+            conflicting.commitment.authenticated_bytes().to_vec(),
+        )
+        .unwrap();
+        fixture
+            .reader
+            .verify_blob_stream_publication_source(&source.encode().unwrap())
+            .unwrap();
+        let accepted = fixture.store.reserve_received_profile5_upload_with_policy(
+            &policy,
+            &publication,
+            &conflicting.open,
+        );
+        println!(
+            "conflicting absent-candidate reservation accepted={}",
+            accepted.is_ok()
+        );
+        let aborted = fixture.store.abort_blob_upload(&reservation);
+        println!("original pending abort: {:?}", aborted);
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        let reopen = Store::open_for_mission(fixture.root.database(), authority);
+        println!("reopen error: {:?}", reopen.as_ref().err());
+        assert!(
+            accepted.is_err(),
+            "durably owned physical candidate identity was reallocated"
+        );
+        assert!(aborted.unwrap());
+        assert!(reopen.is_ok(), "collision poisoned reopen");
+    }
+
+    #[test]
+    fn deleting_pack_identity_cannot_be_reallocated_after_unlink() {
+        let fixture = fixture("deleting-pack-identity", 0x7f, BlobDepotLimits::DEFAULT);
+        let (_, original) = promote_profile5_fixture(&fixture, b"deleting-original");
+        let budget =
+            super::super::lifecycle::BlobMaintenanceBudget::new(4096, 8, 32 * 1024 * 1024).unwrap();
+        let mut identity = None;
+        for turn in 0..128 {
+            fixture
+                .store
+                .run_blob_maintenance_turn_with_sample(
+                    budget,
+                    (turn == 0).then_some(CustodySample {
+                        clock_id: [0x31; 16],
+                        tick_ms: 100_100,
+                    }),
+                )
+                .unwrap();
+            let read = fixture.store.database.begin_read().unwrap();
+            if let Some(pack) =
+                super::super::pack_lifecycle::load_read(&read, original.variant_id, Arc::new(()))
+                    .unwrap()
+                && pack.deletion_pending()
+            {
+                identity = Some(pack.completion().identity());
+                break;
+            }
+        }
+        let identity = identity.expect("pack entered durable deletion-pending state");
+        // Model the supported crash boundary after unlink, before deletion's
+        // redb finalization. Its lifecycle row still owns the physical ID.
+        let root = PinnedBlobPackRoot::open(&fixture.store).unwrap();
+        super::super::pack::remove_upload_pack(&root, &identity).unwrap();
+        let conflicting = review_pack_with_stream_id(
+            &fixture,
+            &fixture.other,
+            b"conflicting-deleting-id",
+            0x54,
+            identity.upload_id(),
+        );
+        let semantic =
+            remote_profile5_pack(&fixture, &fixture.other, b"conflicting-deleting-id", 0x54);
+        let lineage = fixture
+            .other
+            .blob_stream_lineage(&conflicting.open)
+            .unwrap();
+        let publication = BlobStreamPublication::new(
+            semantic.open.open().clone(),
+            conflicting.commitment.commitment().blob_id(),
+            None,
+            *lineage.physical().binding(),
+        )
+        .unwrap();
+        let authenticated = fixture
+            .other
+            .seal_blob_stream_publication(&publication)
+            .unwrap();
+        let publication = fixture
+            .reader
+            .verify_blob_stream_publication(&authenticated)
+            .unwrap();
+        let source = aster_mesh::BlobStreamPublicationSource::new(
+            authenticated,
+            conflicting.open.authenticated_bytes().to_vec(),
+            conflicting.commitment.authenticated_bytes().to_vec(),
+        )
+        .unwrap();
+        fixture
+            .reader
+            .verify_blob_stream_publication_source(&source.encode().unwrap())
+            .unwrap();
+        let policy = fixture.store.control_policy_snapshot().unwrap();
+        let accepted = fixture.store.reserve_received_profile5_upload_with_policy(
+            &policy,
+            &publication,
+            &conflicting.open,
+        );
+        assert!(
+            accepted.is_err(),
+            "deletion-pending physical identity was reallocated"
+        );
+        let authority = fixture.publisher.mission_authority_id();
+        drop(root);
+        drop(fixture.store);
+        Store::open_for_mission(fixture.root.database(), authority)
+            .expect("collision must not poison deletion recovery");
+    }
+
+    #[test]
+    fn two_pending_roots_protect_pack_until_last_abort() {
+        let mut fixture = fixture("independent-two-roots", 0x7e, BlobDepotLimits::DEFAULT);
+        let (_, original) = promote_profile5_fixture(&fixture, b"original-two-roots");
+        let policy = fixture.store.control_policy_snapshot().unwrap();
+        let mut owners = Vec::new();
+        for op in [b"pending-a".as_slice(), b"pending-b".as_slice()] {
+            let mut req = request(&fixture, op, 4096);
+            req.ttl_ms = Some(180_000);
+            let (reservation, initial, open) = reserve_profile5(&fixture, &req);
+            let completed =
+                complete_profile5_pack(&fixture, &policy, &reservation, initial, &open, 0x55);
+            assert!(
+                completed
+                    .profile5_completion()
+                    .unwrap()
+                    .reuses_existing_pack()
+            );
+            owners.push(req.owner);
+        }
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        fixture.store = Store::open_for_mission(fixture.root.database(), authority).unwrap();
+        let budget =
+            super::super::lifecycle::BlobMaintenanceBudget::new(4096, 8, 32 * 1024 * 1024).unwrap();
+        for (index, owner) in owners.iter().enumerate() {
+            let (reservation, _) = fixture.store.resume_blob_upload(owner).unwrap().unwrap();
+            fixture.store.abort_blob_upload(&reservation).unwrap();
+            for turn in 0..128 {
+                fixture
+                    .store
+                    .run_blob_maintenance_turn_with_sample(
+                        budget,
+                        (turn == 0).then_some(CustodySample {
+                            clock_id: [0x31; 16],
+                            tick_ms: 100_100,
+                        }),
+                    )
+                    .unwrap();
+                fixture.store.run_blob_capacity_gc(budget, None).unwrap();
+            }
+            assert_eq!(
+                fixture
+                    .store
+                    .open_profile5_pack_application_read(original.variant_id)
+                    .is_ok(),
+                index == 0
+            );
+        }
+    }
+    #[test]
+    fn old_store_rebuilds_pending_index_after_interrupted_cleanup() {
+        let mut fixture = fixture("independent-two-roots", 0x7e, BlobDepotLimits::DEFAULT);
+        let (_, original) = promote_profile5_fixture(&fixture, b"original-two-roots");
+        let policy = fixture.store.control_policy_snapshot().unwrap();
+        let mut owners = Vec::new();
+        for op in [b"pending-a".as_slice(), b"pending-b".as_slice()] {
+            let mut req = request(&fixture, op, 4096);
+            req.ttl_ms = Some(180_000);
+            let (reservation, initial, open) = reserve_profile5(&fixture, &req);
+            let completed =
+                complete_profile5_pack(&fixture, &policy, &reservation, initial, &open, 0x55);
+            assert!(
+                completed
+                    .profile5_completion()
+                    .unwrap()
+                    .reuses_existing_pack()
+            );
+            owners.push(req.owner);
+        }
+        let write = fixture.store.database.begin_write().unwrap();
+        write.delete_table(BLOB_UPLOAD_PACK_REFERENCES).unwrap();
+        write.commit().unwrap();
+        let (first, _) = fixture
+            .store
+            .resume_blob_upload(&owners[0])
+            .unwrap()
+            .unwrap();
+        let pack_root = PinnedBlobPackRoot::open(&fixture.store).unwrap();
+        super::super::pack::inject_test_fault(
+            &pack_root,
+            super::super::pack::BlobPackFaultPoint::CleanupDurable,
+        );
+        fixture.store.abort_blob_upload(&first).unwrap_err();
+        let authority = fixture.publisher.mission_authority_id();
+        drop(fixture.store);
+        fixture.store = Store::open_for_mission(fixture.root.database(), authority).unwrap();
+        let budget =
+            super::super::lifecycle::BlobMaintenanceBudget::new(4096, 8, 32 * 1024 * 1024).unwrap();
+        for (index, owner) in owners.iter().enumerate() {
+            let reservation = fixture.store.resume_blob_upload(owner).unwrap();
+            if index == 0 {
+                assert!(reservation.is_none());
+            }
+            if let Some((reservation, _)) = reservation {
+                fixture.store.abort_blob_upload(&reservation).unwrap();
+            }
+            for turn in 0..128 {
+                fixture
+                    .store
+                    .run_blob_maintenance_turn_with_sample(
+                        budget,
+                        (turn == 0).then_some(CustodySample {
+                            clock_id: [0x31; 16],
+                            tick_ms: 100_100,
+                        }),
+                    )
+                    .unwrap();
+                fixture.store.run_blob_capacity_gc(budget, None).unwrap();
+            }
+            assert_eq!(
+                fixture
+                    .store
+                    .open_profile5_pack_application_read(original.variant_id)
+                    .is_ok(),
+                index == 0
+            );
         }
     }
 }

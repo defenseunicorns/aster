@@ -527,6 +527,23 @@ pub(super) fn active_pack_expectations_write(
     active_pack_expectations(&write.open_table(BLOB_PROFILE5_PACKS)?)
 }
 
+pub(super) fn owns_physical_id_write(
+    write: &redb::WriteTransaction,
+    identity: super::pack::BlobPackIdentity,
+) -> Result<bool, StoreError> {
+    // Deletion may have unlinked the directory while its durable manifest still
+    // owns the ID. Admission already scans pack capacity; keep this lookup on
+    // the admission path, never in a bounded maintenance turn.
+    for row in write.open_table(BLOB_PROFILE5_PACKS)?.iter()? {
+        let (_, value) = row?;
+        let pack = BlobPackVariant::decode(value.value(), Arc::new(()))?;
+        if pack.completion.identity().upload_id() == identity.upload_id() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) fn active_pack_expectations_read(
     read: &redb::ReadTransaction,
 ) -> Result<Vec<super::pack::ExpectedBlobUploadPack>, StoreError> {
@@ -663,6 +680,16 @@ pub(super) fn pressure_projection(
 
 pub(super) fn is_pack_evidence(encoded: &[u8]) -> bool {
     encoded.starts_with(PACK_VARIANT_MAGIC)
+}
+
+pub(super) fn maintenance_eligible(key: &[u8], encoded: &[u8]) -> Result<bool, StoreError> {
+    let pack = BlobPackVariant::decode(encoded, Arc::new(()))?;
+    if key != pack.variant_id.as_bytes() {
+        return Err(pack_schema_error());
+    }
+    // Provisional packs belong to uploads; deletion-pending packs already
+    // belong to a manifest. Neither is eligible for a new deletion manifest.
+    Ok(pack.state == PackLifecycleState::Active)
 }
 
 pub(super) fn encoded_variant_id(encoded: &[u8]) -> Result<BlobVariantId, StoreError> {
