@@ -1809,8 +1809,8 @@ def execute_static_checks(
                 "counts": {
                     "self.authority.session()": 1,
                     "RuntimeDriver::": 2,
-                    "RuntimeDriver::initiator_with_limits(": 1,
-                    "RuntimeDriver::responder_with_start_and_limits(": 1,
+                    "RuntimeDriver::initiator_with_limits_and_semantic_ceiling(": 1,
+                    "RuntimeDriver::responder_with_start_and_limits_and_semantic_ceiling(": 1,
                     ".require_external_admission()": 1,
                     ".admit_authenticated()": 1,
                     "managed.driver.pump(": 1,

@@ -1396,6 +1396,17 @@ impl PressureFraction {
     }
 }
 
+fn authenticated_progress_fraction(
+    numerator: u64,
+    denominator: u64,
+) -> Result<PressureFraction, StoreError> {
+    if numerator == 0 && denominator == 0 {
+        Ok(PressureFraction::ONE)
+    } else {
+        PressureFraction::new(numerator, denominator)
+    }
+}
+
 /// Exact progress ordering shared by pending-source and whole-variant selection.
 ///
 /// Both products are widened before multiplication; a product of two `u64`
@@ -3536,7 +3547,7 @@ fn pending_progress(
             .checked_add(prefix)
             .ok_or(StoreError::PayloadByteAccountingOverflow)?;
     }
-    PressureFraction::new(durable, total)
+    authenticated_progress_fraction(durable, total)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3546,6 +3557,7 @@ fn build_pressure_image(
     pending: &impl ReadableTable<&'static [u8], &'static [u8]>,
     carrier_prefixes: &impl ReadableTable<&'static [u8], &'static [u8]>,
     imports: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    packs: &impl ReadableTable<&'static [u8], &'static [u8]>,
     chunks: &impl ReadableTable<&'static [u8], &'static [u8]>,
     next_pending_acceptance_order: u64,
     publication_encoding: super::lifecycle::PublicationEncodingGeneration,
@@ -3708,6 +3720,21 @@ fn build_pressure_image(
         import_values.insert(fact.variant_id, value.value().to_vec());
         import_facts.insert(fact.variant_id, fact);
     }
+    let mut pack_facts = BTreeMap::<BlobVariantId, u64>::new();
+    for row in packs.iter()? {
+        note_full_scan_row();
+        let (key, value) = row?;
+        if let Some((variant, total_len)) =
+            super::pack_lifecycle::pressure_projection(value.value())?
+            && (key.value() != variant.as_bytes()
+                || import_facts.contains_key(&variant)
+                || pack_facts.insert(variant, total_len).is_some())
+        {
+            return Err(pressure_corruption(
+                "Blob pressure Profile-5 pack identity is contradictory",
+            ));
+        }
+    }
     let mut committed = BTreeMap::<BlobVariantId, u64>::new();
     for row in chunks.iter()? {
         note_full_scan_row();
@@ -3740,9 +3767,13 @@ fn build_pressure_image(
         }
     }
     for (variant, roots) in variant_roots {
-        let fact = import_facts
-            .get(&variant)
-            .ok_or_else(|| pressure_corruption("Blob pressure rooted variant lacks its import"))?;
+        let legacy_fact = import_facts.get(&variant);
+        let pack_total = pack_facts.get(&variant).copied();
+        if legacy_fact.is_none() == pack_total.is_none() {
+            return Err(pressure_corruption(
+                "Blob pressure rooted variant lacks one exact physical representation",
+            ));
+        }
         let effective_priority = roots
             .iter()
             .map(|(priority, _, _, _)| *priority)
@@ -3759,16 +3790,25 @@ fn build_pressure_image(
         let pending_roots =
             u64::try_from(roots.iter().filter(|(_, _, pending, _)| *pending).count())
                 .map_err(|_| StoreError::ItemCountAccountingOverflow)?;
-        let numerator = if fact.finalized_root.is_some() {
-            fact.total_len
+        let (numerator, denominator, finalized) = if let Some(fact) = legacy_fact {
+            (
+                if fact.finalized_root.is_some() {
+                    fact.total_len
+                } else {
+                    committed.get(&variant).copied().unwrap_or(0)
+                },
+                fact.total_len,
+                fact.finalized_root.is_some(),
+            )
         } else {
-            committed.get(&variant).copied().unwrap_or(0)
+            let total = pack_total.expect("checked exact physical representation");
+            (total, total, true)
         };
         let summary = PressureVariantSummary {
             effective_priority,
             minimum_root_acceptance_order,
-            committed_progress: PressureFraction::new(numerator, fact.total_len)?,
-            finalized: fact.finalized_root.is_some(),
+            committed_progress: authenticated_progress_fraction(numerator, denominator)?,
+            finalized,
             publication_roots,
             pending_roots,
             final_reference_expiry: roots
@@ -4333,6 +4373,7 @@ pub(crate) fn downgrade_pressure_v5_to_v4_for_test(
         &write.open_table(super::BLOB_PENDING_SOURCES)?,
         &write.open_table(super::BLOB_CARRIER_PREFIXES)?,
         &write.open_table(super::BLOB_IMPORTS)?,
+        &write.open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?,
         &write.open_table(super::BLOB_CHUNKS)?,
         next,
         super::lifecycle::publication_encoding_write(write)?,
@@ -4393,6 +4434,7 @@ fn audit_or_migrate_pressure_write_inner(
                 &write.open_table(super::BLOB_PENDING_SOURCES)?,
                 &write.open_table(super::BLOB_CARRIER_PREFIXES)?,
                 &write.open_table(super::BLOB_IMPORTS)?,
+                &write.open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?,
                 &write.open_table(super::BLOB_CHUNKS)?,
                 migrated_next.ok_or_else(|| {
                     pressure_corruption("predecessor pressure migration order is missing")
@@ -4420,6 +4462,7 @@ fn audit_or_migrate_pressure_write_inner(
                 &write.open_table(super::BLOB_PENDING_SOURCES)?,
                 &write.open_table(super::BLOB_CARRIER_PREFIXES)?,
                 &write.open_table(super::BLOB_IMPORTS)?,
+                &write.open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?,
                 &write.open_table(super::BLOB_CHUNKS)?,
                 next,
                 super::lifecycle::publication_encoding_write(write)?,
@@ -4452,6 +4495,7 @@ fn audit_or_migrate_pressure_write_inner(
                 &write.open_table(super::BLOB_PENDING_SOURCES)?,
                 &write.open_table(super::BLOB_CARRIER_PREFIXES)?,
                 &write.open_table(super::BLOB_IMPORTS)?,
+                &write.open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?,
                 &write.open_table(super::BLOB_CHUNKS)?,
                 next,
                 super::lifecycle::publication_encoding_write(write)?,
@@ -4474,6 +4518,7 @@ fn audit_or_migrate_pressure_write_inner(
                 &write.open_table(super::BLOB_PENDING_SOURCES)?,
                 &write.open_table(super::BLOB_CARRIER_PREFIXES)?,
                 &write.open_table(super::BLOB_IMPORTS)?,
+                &write.open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?,
                 &write.open_table(super::BLOB_CHUNKS)?,
                 next,
                 super::lifecycle::publication_encoding_write(write)?,
@@ -4534,6 +4579,7 @@ fn audit_or_migrate_pressure_write_inner(
                 &write.open_table(super::BLOB_PENDING_SOURCES)?,
                 &write.open_table(super::BLOB_CARRIER_PREFIXES)?,
                 &write.open_table(super::BLOB_IMPORTS)?,
+                &write.open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?,
                 &write.open_table(super::BLOB_CHUNKS)?,
                 next,
                 if version == PRESSURE_V4_SCHEMA_VERSION {
@@ -4555,6 +4601,7 @@ fn audit_or_migrate_pressure_write_inner(
                 &write.open_table(super::BLOB_PENDING_SOURCES)?,
                 &write.open_table(super::BLOB_CARRIER_PREFIXES)?,
                 &write.open_table(super::BLOB_IMPORTS)?,
+                &write.open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?,
                 &write.open_table(super::BLOB_CHUNKS)?,
                 next,
                 super::lifecycle::publication_encoding_write(write)?,
@@ -4615,6 +4662,7 @@ pub(crate) fn audit_or_migrate_pressure_after_lifecycle_write(
             &write.open_table(super::BLOB_PENDING_SOURCES)?,
             &write.open_table(super::BLOB_CARRIER_PREFIXES)?,
             &write.open_table(super::BLOB_IMPORTS)?,
+            &write.open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?,
             &write.open_table(super::BLOB_CHUNKS)?,
             next,
             publication_generation,
@@ -4677,6 +4725,7 @@ pub(crate) fn inspect_pressure_read(
             &read.open_table(super::BLOB_PENDING_SOURCES)?,
             &read.open_table(super::BLOB_CARRIER_PREFIXES)?,
             &read.open_table(super::BLOB_IMPORTS)?,
+            &read.open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?,
             &read.open_table(super::BLOB_CHUNKS)?,
             next,
             super::lifecycle::publication_encoding_read(read)?,
@@ -4735,6 +4784,7 @@ pub(crate) fn inspect_pressure_read(
         &read.open_table(super::BLOB_PENDING_SOURCES)?,
         &read.open_table(super::BLOB_CARRIER_PREFIXES)?,
         &read.open_table(super::BLOB_IMPORTS)?,
+        &read.open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?,
         &read.open_table(super::BLOB_CHUNKS)?,
         next,
         if version == ACTIVE_PRESSURE_SCHEMA_VERSION {
@@ -4773,6 +4823,10 @@ fn variant_progress_write(
     write: &redb::WriteTransaction,
     variant: BlobVariantId,
 ) -> Result<(PressureFraction, bool), StoreError> {
+    if let Some((committed, total)) = super::pack_lifecycle::variant_progress_write(write, variant)?
+    {
+        return Ok((authenticated_progress_fraction(committed, total)?, true));
+    }
     let import_value = write
         .open_table(super::BLOB_IMPORTS)?
         .get(variant.as_bytes().as_slice())?
@@ -4811,7 +4865,10 @@ fn variant_progress_write(
     }
     let finalized = fact.finalized_root.is_some();
     let numerator = if finalized { fact.total_len } else { committed };
-    Ok((PressureFraction::new(numerator, fact.total_len)?, finalized))
+    Ok((
+        authenticated_progress_fraction(numerator, fact.total_len)?,
+        finalized,
+    ))
 }
 
 pub(super) fn insert_pending_source_write(
@@ -5639,7 +5696,7 @@ fn bounded_pending_progress_write(
                 .ok_or(StoreError::PayloadByteAccountingOverflow)?;
         }
     }
-    PressureFraction::new(durable, total).map(Some)
+    authenticated_progress_fraction(durable, total).map(Some)
 }
 
 fn bounded_pending_root_write(
@@ -5735,6 +5792,27 @@ fn bounded_variant_progress_write(
     variant: BlobVariantId,
     charge: &mut super::MaintenanceCharge,
 ) -> Result<Option<(PressureFraction, bool)>, StoreError> {
+    let pack_len = write
+        .open_table(super::pack_lifecycle::BLOB_PROFILE5_PACKS)?
+        .get(variant.as_bytes().as_slice())?
+        .map(|pack| pack.value().len());
+    if let Some(pack_len) = pack_len {
+        if !charge.charge_row(
+            super::MaintenanceRowIdentity::new(
+                super::pack_lifecycle::BLOB_PROFILE5_PACKS.name(),
+                variant.as_bytes(),
+            ),
+            pack_len,
+        )? {
+            return Ok(None);
+        }
+        let (committed, total) = super::pack_lifecycle::variant_progress_write(write, variant)?
+            .ok_or_else(|| pressure_corruption("Blob pressure pack disappeared"))?;
+        return Ok(Some((
+            authenticated_progress_fraction(committed, total)?,
+            true,
+        )));
+    }
     let imports = write.open_table(super::BLOB_IMPORTS)?;
     let import = imports
         .get(variant.as_bytes().as_slice())?
@@ -5790,7 +5868,8 @@ fn bounded_variant_progress_write(
     }
     let finalized = fact.finalized_root.is_some();
     let numerator = if finalized { fact.total_len } else { committed };
-    PressureFraction::new(numerator, fact.total_len).map(|progress| Some((progress, finalized)))
+    authenticated_progress_fraction(numerator, fact.total_len)
+        .map(|progress| Some((progress, finalized)))
 }
 
 pub(crate) fn require_variant_with_references_bounded_write(

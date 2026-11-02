@@ -1763,16 +1763,17 @@ drifts, if either appears in the separately excluded fuzz graph, or if any
 `paste` version reappears. Any change to a package chain or advisory
 disposition requires a recorded pilot review.
 
-The selected Iroh graph carries five stakeholder-approved, exact-coordinate
-license exceptions recorded by Decision 0028: `webpki-root-certs` and
-`webpki-roots` 1.0.9 use `CDLA-Permissive-2.0`, while all-target browser-WASM
+The selected Iroh graph carries five exact-coordinate license exceptions
+recorded by Decision 0028: `webpki-root-certs` and `webpki-roots` 1.0.10 use
+`CDLA-Permissive-2.0`, while all-target browser-WASM
 packages `async_io_stream` 0.3.3, `pharos` 0.5.3, and `ws_stream_wasm` 0.7.5 use
 the OSI-approved `Unlicense`. Neither license is globally allowed. Package or
 version drift fails closed, and the project-license gate hash-pins the complete
 distribution notices and requires them in the lab image. The CDLA disposition
 is a visible stakeholder deviation from the frozen OSI-only requirement, not a
 claim of outside-counsel review or requirements credit. Passing this gate does
-not by itself authorize a release or declare browser-WASM supported.
+not by itself authorize a release, extend the earlier 1.0.9 evaluation
+approval to the replacement coordinates, or declare browser-WASM supported.
 
 [Decision 0045](../decisions/0045-remove-libp2p-test-oracle.md) supersedes
 Decision 0029's retention policy. The experimental provider and only its lab

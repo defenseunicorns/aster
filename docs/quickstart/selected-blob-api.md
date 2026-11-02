@@ -1,8 +1,24 @@
 # Selected Blob API quickstart
 
+<!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+```json
+{
+  "schema": 1,
+  "surface": "selected_blob_api",
+  "local_publish_waits_for_peer": false,
+  "rust_agent_asterctl_publish_read": "implemented",
+  "blob_status_scope": "receiver_local_durable_state",
+  "blob_status_reports_remote_delivery_peer_or_convergence": false,
+  "cli_download_resume": "post_merge"
+}
+```
+<!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+Local Blob publication commits without waiting for a peer. Rust, the native-gRPC agent, and asterctl implement bounded Blob publication and authenticated reads. blob-status reports receiver-local durable state, not remote delivery, peer status, or convergence. CLI download resume is post-merge work; an interrupted download restarts at byte zero.
+<!-- ASTER-BLOB-CAPABILITY:END -->
+
 This is the shortest path to Aster's **selected live Blob application surface**,
 its durable metadata-delivery queue, its exclusive stopped streaming facade,
-and the semantic-v7/v8 receipt-free streaming boundary for Blob transfer.
+and the semantic-v9/profile-5 streaming boundary for large Blob transfer.
 `RunningNode::selected_blobs()` returns a cloneable `SelectedBlobHandle`: an
 application may publish a durable or finite-TTL owned regular file while the
 node has no peers, read one freshly authenticated plaintext page at a time,
@@ -13,19 +29,30 @@ drop; each delivery is metadata only and carries no Blob plaintext.
 
 The live surface deliberately keeps application delivery separate from network
 replication. A Blob subscription is durable local intent, not a route/content
-grant or a dynamic network interest. The surface has no Blob peer or convergence
-status; `delivery_status` reports local selector/delivery-ledger counts, while
-`transfer_status` reports audited local durable storage and receive progress.
+grant or a dynamic network interest. `delivery_status` reports local
+selector/delivery-ledger counts, while `transfer_status` reports audited local
+durable storage and receive progress.
 The exclusive `SelectedBlobNode` remains available when no runtime owns the same
 store and provides the same delivery lifecycle plus synchronous seekable-source
-publication and streaming `read_into`. Separately, semantic v7/v8 profile 4
-reconciles Blob sources and direct carrier ranges between current
-content-capable peers. V7 admits durable work only; v8 also admits finite work
-with exact authenticated custody provenance. Both endpoints must support
-`BlobRangesStreamV1`; old Blob transfer has no fallback. Incompatible profile
-offers and v5/v6 carrier attempts fail before carrier IO. `EventPagesV1` is
-Event-only. The default semantic offer is `[8, 7, 6, 5, 4, 3, 2, 1]`; stable
-wire/ABI, source, manifest, and `ASTRBT01` formats remain version 1.
+publication and streaming `read_into`. Semantic v9 selects `BlobStreamV1`:
+1-MiB plaintext segments become append-only authenticated `ASTRBS02` records,
+and those same records move over ordered data/control streams without repacking
+or re-encryption. Lifecycle-owned provisional source or upload state plus the
+native pack checkpoint journal authorize resume. Semantic
+v7/v8 profile 4 remains a compatibility
+path for `BlobRangesStreamV1`; v7 admits durable work only and v8 also admits
+authenticated finite custody. A profile-5 attempt never falls back in place to
+profile 4. `EventPagesV1` is Event-only. The default semantic offer is
+`[9, 8, 7, 6, 5, 4, 3, 2, 1]`; profile-4 formats remain unchanged.
+
+Profile 5 uses one native pack representation for local upload, durable
+storage, and network transfer. A plaintext segment is 1,048,576 bytes, a
+maximum encoded `ASTRBS02` record is 1,048,706 bytes, and its length-prefixed
+DATA body is at most 1,048,710 bytes. One negotiated checkpoint batch is at
+most 134,217,728 bytes (128 MiB). Provisional uploads, lifecycle-owned
+provisional network sources, and completed native packs share the configured
+depot limits. Atomic promotion precedes RESULT; RESULT_ACK or EOF settles only
+the transport attempt and owns no durable resume state.
 
 ## Use the live actor API
 
@@ -81,11 +108,11 @@ loop {
 }
 ```
 
-The live publisher accepts a nonempty regular file of at most 64 MiB, with its
-cursor at exactly zero, and fixes the selected chunk size at 64 KiB. The file is
+The legacy live-file publisher accepts a nonempty regular file of at most 64 MiB,
+with its cursor at exactly zero, and fixes the selected chunk size at 64 KiB. The file is
 moved into a bounded, joined worker rather than cloned into the actor command.
-The 64-MiB ceiling is the current selected-backend policy, not a public RPC or
-wire-format guarantee.
+That 64-MiB ceiling belongs to the legacy profile-4 facade, not the resumable
+application streaming protocol described below.
 The returned publication is operation-key idempotent and echoes its original
 signed TTL (`None` means durable), never a remaining lifetime or deletion
 timestamp. `BlobPublishOptions::finite_ttl_ms(0)` returns `InvalidRequest` before
@@ -108,13 +135,25 @@ hostile filesystem syscall can delay the joined worker and therefore delay
 shutdown or zeroization; no bounded shutdown-latency claim is made for such a
 file provider.
 
+While a local stream's finalization is prepared, queued, or running, reopening
+the identical operation returns temporary `StateUnavailable`. The background
+job retains exclusive access to that operation's files even if its caller
+disconnects; a changed request under the same key remains a conflict. Back off
+and retry the identical operation to recover its saved result or resume its
+checkpoint. Other operations remain independently schedulable. Ownership is
+process-local and disappears on process exit; restart uses ordinary durable
+upload recovery. A timeout does not release a writer that may still be running.
+
 ## Use the local agent and `asterctl`
 
-On Linux, the local `aster-agent` exposes native gRPC `PublishBlob` and
-`ReadBlob` streams backed by the same running node authority. Its plaintext
-listener is loopback-only. On non-Linux hosts, `ReadBlob` remains available to
-a capable native-gRPC client, while secure agent upload staging and
-`asterctl blob-read` finalization are unsupported. Supply exactly one
+The local `aster-agent` exposes native gRPC `PublishBlob` and `ReadBlob`
+streams backed by the same running node authority on platforms supported by
+the selected node and store. `PublishBlob` writes directly into node-owned
+durable upload staging; the agent creates no separate plaintext upload file and
+has no Linux-only staging gate. Its plaintext listener is loopback-only.
+`asterctl blob-read` output finalization remains separately limited to Linux
+and qualifying filesystems, while a capable native-gRPC client may consume
+`ReadBlob` without that CLI filesystem boundary. Supply exactly one
 bearer-token source to `asterctl`; a protected token file avoids placing the
 token in the command line:
 
@@ -122,12 +161,13 @@ token in the command line:
 TOKEN_FILE=/run/aster/client.token
 
 # Durable publication.
-asterctl --token-file "$TOKEN_FILE" blob-publish \
+asterctl --token-file "$TOKEN_FILE" --json blob-publish \
   --file ./map.bin \
   --topic imagery.maps \
   --scope mission/team/alpha \
   --operation-key map-001 \
-  --media-type application/octet-stream
+  --media-type application/octet-stream \
+  --progress auto
 
 # Finite publication. The original 60000-ms TTL is echoed on every result.
 asterctl --token-file "$TOKEN_FILE" --json blob-publish \
@@ -136,6 +176,13 @@ asterctl --token-file "$TOKEN_FILE" --json blob-publish \
   --scope mission/team/alpha \
   --operation-key auto \
   --ttl-ms 60000
+
+# PUBLICATION_ID is publicationId from blob-publish, not the Blob content ID.
+asterctl --token-file "$TOKEN_FILE" blob-status \
+  --publication-id "$PUBLICATION_ID" \
+  --topic imagery.maps \
+  --scope mission/team/alpha \
+  --wait
 
 # Copy the returned Blob ID into BLOB_ID and read to a path that does not exist.
 asterctl --token-file "$TOKEN_FILE" blob-read \
@@ -154,17 +201,42 @@ the identical file bytes, metadata, TTL, and other options with
 `inserted: false`. A new key would describe a new application operation rather
 than recover the uncertain one.
 
+Native gRPC clients receive a stable nonzero `publication_id` in the initial
+`PublishBlobAccepted` response before sending data byte zero. Save it
+immediately: it identifies provisional status as well as the final result, and
+the completed receipt must return the same value. `asterctl blob-publish`
+prints that identity only with its terminal result because the command keeps
+stdout to one result. `blob-status` transfer counters measure exact native
+length-prefixed `ASTRBS02` pack payload bytes, not reserved storage bytes.
+
 Text metadata uses exactly `TTL: durable` or `TTL: 60000 ms`. Finite JSON uses
 exactly `"ttlMs": "60000"`; durable JSON omits `ttlMs`. The value is the
 original authenticated lifetime, never a countdown or deletion time. Blob
 plaintext is written only to the requested output and is never printed.
 
-The RPC and CLI use checked `u64` lengths and bounded 64-KiB frames/pages; they
-do not promise a fixed total-size ceiling. The current selected backend rejects
-objects above 64 MiB. The shared agent deadline policy currently defaults to
-10 seconds and caps a stream at 30 seconds, even if `asterctl --timeout` asks
-for longer. These values describe this implementation, not durable RPC
-semantics, supported large-file behavior, or performance qualification.
+Run `asterctl --token-file "$TOKEN_FILE" --json status` on both nodes before a
+large transfer. `blobCapacity` is an observed, non-reserving snapshot: it does
+not hold space for a later attempt and does not include filesystem, database,
+journal, temporary, or operational reserve. Run `blob-status` on the intended
+receiver to wait for `AVAILABLE`; it is an observation operation.
+
+The RPC and CLI use checked `u64` lengths and bounded 512-KiB application
+frames/pages. The resumable stream protocol has an explicit 8-GiB per-object
+ceiling, 1-MiB DATA/SOURCE record bounds, and a 128-MiB checkpoint maximum.
+Node-to-node profile-5 attempts use a two-minute authenticated-progress timeout
+as their shorter stall bound. The sender derives its hard deadline from exact
+canonical wire bytes. The receiver opens before authenticated OPEN, while PLAN
+still hides content size, and initially derives its hard deadline from the full
+profile wire ceiling. The legacy ten-minute bound is not a normal-success
+timeout. CLI and agent RPC deadlines are separate local application bounds. A
+timed-out local upload is retried with the same operation key; peer transfer
+resumes from the receiver's last durable checkpoint after a fresh instance or
+reopen of the same single contact-agreed adapter. Cross-transport selection and
+failover are not implemented.
+Publish/read progress is written only to stderr. `--progress auto` displays it
+on a terminal, `always` emits newline records, and `never` disables it. A
+download interruption discards its staged output and restarts from byte zero;
+network publication transfer resumes independently from its durable checkpoint.
 
 `blob-read` currently requires Linux, a destination directory owned by the
 current user and not writable by group or other users, and a filesystem that
@@ -180,17 +252,30 @@ be verified before retrying. Unsupported platforms and filesystems fail closed.
 
 The caller's source file and completed output file remain outside node
 zeroization custody. Node zeroization does not erase them, and callers must
-apply their own retention and sanitization policy. The agent separately stages
-an upload in one private allocated file under its pinned state root, unlinks it
-before accepting payload bytes, and currently requires Linux for that custody
-boundary. Keep the publish source contents and length unchanged until command
-exit; detectable size changes have an unknown publication outcome, while
-same-length in-place mutation is outside the command contract.
+apply their own retention and sanitization policy. Upload bytes pass through
+bounded agent frames into the node's durable upload pack and checkpoints; the
+agent does not allocate or unlink a separate whole-upload plaintext staging
+file. Keep the publish source contents and length unchanged until command exit;
+detectable size changes have an unknown publication outcome, while same-length
+in-place mutation is outside the command contract.
 
-The agent and CLI provide Blob publish and read, not Blob subscription, poll,
-acknowledgement, transfer status, peer/convergence status, or FFI lifetime
-controls. The Rust subscription API below remains a separate application
-surface.
+This branch intentionally replaces the unreleased PR 95 `v1alpha1`
+`PublishBlob` client-streaming/unary contract with the current bidirectional
+exchange. Regenerate clients from the repository schema and implement accepted
+offset, offset-bearing data, checkpoint, finish, and complete handling. There
+is no deployed-client compatibility promise and no additive legacy upload
+method; preserve the original operation key and exact intent when recovering an
+uncertain publication.
+
+The agent also provides capacity observation. Blob subscription, poll,
+acknowledgement, network-wide visibility, and FFI lifetime controls remain
+outside that surface. The Rust subscription API below remains separate.
+
+For 800-MiB through 1-GiB engineering runs, including upload and synchronization
+lifecycle, exact WLAN binding, checkpoint/credit semantics,
+pipeline receipt fields, capacity checks, raw baselines, and the ARM64 native
+ASTRBS02/profile-5 transport example, use the
+[Blob streaming engineering runbook](../validation/blob-streaming-engineering-runbook.md).
 
 ## Subscribe to immutable publication metadata
 
@@ -397,7 +482,7 @@ let read = blobs.read_into(
 assert_eq!(read.id, published.id);
 ```
 
-## Opt in to semantic-v7/v8 transfer
+## Opt in to Blob transfer
 
 The runtime does not infer Blob receive intent from State/Record interests. Add
 an exact Blob selector to `NodeConfig::mutable_interests`; descendant scope is
@@ -411,11 +496,17 @@ let mutable_interests = MutableSourceInterests::new(state, record).with_blob(vec
 
 This composes with peerless live publication rather than changing its success
 condition. A source may publish through `selected_blobs()` with no peers, shut
-down, and later restart with an exact configured peer. On a v7 or v8 profile-4
-contact, a content-capable interested receiver can durably stage the source and
-missing carrier ranges, promote only after whole-Blob verification, and read
-the Blob through its own live handle. The receiver's completed publication and
-page reads survive another peerless restart.
+down, and later restart with an exact configured peer. A semantic-v9/profile-5
+contact transfers authenticated canonical records through the
+bounded pipeline into lifecycle-owned provisional source state and the native
+pack checkpoint journal. It atomically promotes only after terminal-root
+verification and before RESULT. RESULT_ACK or EOF settles only the attempt and
+owns no durable resume state. Interrupted attempts resume from that provisional
+state and journal. Semantic-v7/v8 profile 4
+remains the compatibility path described below. The receiver's completed
+publication and page reads survive another peerless restart.
+
+### Semantic-v7/v8 profile-4 compatibility
 
 The provider turns that exact topic/scope and the current epoch into an opaque
 32-byte peer proof inside the protected v7/v8 contact. Every Blob inventory,
@@ -469,16 +560,15 @@ lexicographically greatest carrier ID, not the last manifest record.
 Normal and `AtLeast` run eligible v7/v8 profile-4 Blob work because `AtLeast`
 filters Event only.
 `ReceiveOnly` advertises, requests, stages, promotes, and counts zero Blob work.
-The live handle does not change those contact rules and reports no Blob peer or
-convergence status. On a host with a supported custody clock, the Rust
+The live handle does not change those contact rules. On a host with a supported custody clock, the Rust
 `publish_with_options` surface activates local finite Blob publication and
-expiry. Finite transfer between peers remains restricted to semantic v8 with
-profile 4; v7 transfers durable Blob work only. Bounded strictly-lower-priority
-pressure recovery remains internal.
+expiry. Semantic v9/profile 5 carries eligible durable or finite publications;
+on compatibility profile 4, v8 permits finite custody while v7 remains
+durable-only. Bounded strictly-lower-priority pressure recovery remains internal.
 Route-only Blob relay/custody, a metadata-independent whole-byte identity, and
 Blob TTL fields in the FFI surface are not implemented. The selected Linux
-local-agent and `asterctl` path exposes Blob publish/read TTL, but not the Rust
-Blob subscription or transfer-status operations.
+local-agent path exposes TTL controls but not application subscriptions or
+transfer-status operations.
 
 `publish` requires a seekable source because it makes two bounded passes. The
 first computes the whole-content and per-chunk digests with one bounded,
@@ -510,6 +600,14 @@ physical deduplication. A scope rekey also creates a distinct encrypted depot
 variant even when the `BlobId` stays the same. Exact retry of an authorized old
 operation returns its historical publication without allocating a new variant;
 a new operation at the active epoch installs or reuses that epoch's variant.
+
+For semantic-v9/profile-5 contacts, a new publication can reuse an already
+retained, compatible native pack without transferring DATA again. The receiver
+holds a read lease through acceptance and still requires the authenticated
+FINISH and current publication-policy and finite-custody checks. Publication
+metadata remains distinct even when the physical content is shared. A completed
+provisional upload resumes from its durable completion after restart, including
+when deduplication has already removed its temporary duplicate.
 
 ## Durable storage and verification boundary
 

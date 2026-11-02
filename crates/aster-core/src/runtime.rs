@@ -659,6 +659,15 @@ enum SessionPhase {
     Failed,
 }
 
+fn semantic_versions_through(semantic_ceiling: u16) -> Result<Vec<u16>, RuntimeError> {
+    if semantic_ceiling == 0 || semantic_ceiling > crate::HIGHEST_SUPPORTED_SEMANTIC_VERSION {
+        return Err(RuntimeError::Session(
+            "semantic capability ceiling is unsupported".into(),
+        ));
+    }
+    Ok((1..=semantic_ceiling).rev().collect())
+}
+
 #[derive(Clone)]
 struct Outbound {
     plaintext: Vec<u8>,
@@ -886,6 +895,58 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         )
     }
 
+    /// Opens an initiator whose implementation supports semantic versions only
+    /// through `semantic_ceiling`.
+    ///
+    /// This is a transport-adapter capability declaration, not an application
+    /// preference. Adapters must use the highest version whose negotiated lanes
+    /// they fully implement.
+    pub fn initiator_with_semantic_ceiling(
+        bundle: ProvisioningBundle,
+        sync: SyncState,
+        backend: B,
+        start_request: StartRequest,
+        peer_hint: Option<NodeId>,
+        semantic_ceiling: u16,
+    ) -> Result<Self, RuntimeError> {
+        Self::initiator_with_limits_and_semantic_ceiling(
+            bundle,
+            sync,
+            backend,
+            start_request,
+            peer_hint,
+            RuntimeLimits::default(),
+            semantic_ceiling,
+        )
+    }
+
+    /// Opens a capability-limited initiator with explicit runtime bounds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn initiator_with_limits_and_semantic_ceiling(
+        bundle: ProvisioningBundle,
+        sync: SyncState,
+        backend: B,
+        start_request: StartRequest,
+        peer_hint: Option<NodeId>,
+        limits: RuntimeLimits,
+        semantic_ceiling: u16,
+    ) -> Result<Self, RuntimeError> {
+        limits.validate().map_err(RuntimeError::InvalidLimits)?;
+        let semantic_versions = semantic_versions_through(semantic_ceiling)?;
+        let (initiator, first_flight) =
+            ReferenceSessionInitiator::start_with_semantic_versions(bundle, semantic_versions)
+                .map_err(|error| RuntimeError::Session(error.to_string()))?;
+        Self::initiator_from_started(
+            initiator,
+            first_flight,
+            sync,
+            backend,
+            start_request,
+            peer_hint,
+            limits,
+        )
+    }
+
     #[cfg(test)]
     fn initiator_with_semantic_versions(
         bundle: ProvisioningBundle,
@@ -974,7 +1035,7 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         peer_hint: Option<NodeId>,
         limits: RuntimeLimits,
     ) -> Result<Self, RuntimeError> {
-        Self::responder_inner(bundle, sync, backend, None, peer_hint, limits)
+        Self::responder_inner(bundle, sync, backend, None, peer_hint, limits, None)
     }
 
     /// Opens a responder that also advertises a local interest after receiving
@@ -1013,6 +1074,52 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
             Some(start_request),
             peer_hint,
             limits,
+            None,
+        )
+    }
+
+    /// Opens a responder whose implementation supports semantic versions only
+    /// through `semantic_ceiling` and advertises a local interest.
+    ///
+    /// See [`Self::initiator_with_semantic_ceiling`].
+    pub fn responder_with_start_and_semantic_ceiling(
+        bundle: ProvisioningBundle,
+        sync: SyncState,
+        backend: B,
+        start_request: StartRequest,
+        peer_hint: Option<NodeId>,
+        semantic_ceiling: u16,
+    ) -> Result<Self, RuntimeError> {
+        Self::responder_with_start_and_limits_and_semantic_ceiling(
+            bundle,
+            sync,
+            backend,
+            start_request,
+            peer_hint,
+            RuntimeLimits::default(),
+            semantic_ceiling,
+        )
+    }
+
+    /// Opens a capability-limited responder with explicit runtime bounds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn responder_with_start_and_limits_and_semantic_ceiling(
+        bundle: ProvisioningBundle,
+        sync: SyncState,
+        backend: B,
+        start_request: StartRequest,
+        peer_hint: Option<NodeId>,
+        limits: RuntimeLimits,
+        semantic_ceiling: u16,
+    ) -> Result<Self, RuntimeError> {
+        Self::responder_inner(
+            bundle,
+            sync,
+            backend,
+            Some(start_request),
+            peer_hint,
+            limits,
+            Some(semantic_versions_through(semantic_ceiling)?),
         )
     }
 
@@ -1023,10 +1130,16 @@ impl<B: RuntimeBackend> RuntimeDriver<B> {
         start_request: Option<StartRequest>,
         peer_hint: Option<NodeId>,
         limits: RuntimeLimits,
+        semantic_versions: Option<Vec<u16>>,
     ) -> Result<Self, RuntimeError> {
         limits.validate().map_err(RuntimeError::InvalidLimits)?;
-        let responder = ReferenceSessionResponder::open(bundle)
-            .map_err(|error| RuntimeError::Session(error.to_string()))?;
+        let responder = match semantic_versions {
+            Some(versions) => {
+                ReferenceSessionResponder::open_with_semantic_versions(bundle, versions)
+            }
+            None => ReferenceSessionResponder::open(bundle),
+        }
+        .map_err(|error| RuntimeError::Session(error.to_string()))?;
         let clock = Instant::now();
         Ok(Self {
             phase: SessionPhase::Responder(responder),
@@ -6681,7 +6794,7 @@ mod tests {
                     .receipts
                     .iter()
                     .any(|(_, version, receipt)| {
-                        *version == wire::SEMANTIC_PROTOCOL_V8
+                        *version == wire::SEMANTIC_PROTOCOL_V9
                             && receipt.object_id == object_id
                             && receipt.complete
                     })
@@ -6699,7 +6812,7 @@ mod tests {
                 .receipts
                 .iter()
                 .any(|(_, version, receipt)| {
-                    *version == wire::SEMANTIC_PROTOCOL_V8
+                    *version == wire::SEMANTIC_PROTOCOL_V9
                         && receipt.object_id == object_id
                         && receipt.complete
                 }),
@@ -11006,6 +11119,18 @@ mod tests {
             scopes: vec![scope.as_str().to_owned()],
             min_priority: Priority::Routine as u8,
         };
+        let legacy_blob_versions = || {
+            vec![
+                wire::SEMANTIC_PROTOCOL_V8,
+                wire::SEMANTIC_PROTOCOL_V7,
+                wire::SEMANTIC_PROTOCOL_V6,
+                wire::SEMANTIC_PROTOCOL_V5,
+                wire::SEMANTIC_PROTOCOL_V4,
+                wire::SEMANTIC_PROTOCOL_V3,
+                wire::SEMANTIC_PROTOCOL_V2,
+                wire::SEMANTIC_PROTOCOL_V1,
+            ]
+        };
 
         let mut producer_node = open_reference_node(
             &producer_db,
@@ -11103,12 +11228,13 @@ mod tests {
             ),
             None,
         );
-        let mut relay_driver = RuntimeDriver::initiator(
+        let mut relay_driver = RuntimeDriver::initiator_with_semantic_versions(
             restored_bundle(&relay_bundle_bytes),
             SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
             relay_backend,
             blob_start(201),
             None,
+            legacy_blob_versions(),
         )
         .unwrap();
         let mut producer_driver = RuntimeDriver::responder(
@@ -11265,12 +11391,13 @@ mod tests {
             ),
             None,
         );
-        let mut poisoned_consumer_driver = RuntimeDriver::initiator(
+        let mut poisoned_consumer_driver = RuntimeDriver::initiator_with_semantic_versions(
             restored_bundle(&consumer_bundle_bytes),
             SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
             poisoned_consumer_backend,
             blob_start(204),
             None,
+            legacy_blob_versions(),
         )
         .unwrap();
         let mut malicious_peer_driver = RuntimeDriver::responder(
@@ -11348,12 +11475,13 @@ mod tests {
             poisoned_consumer_node,
             BlobTransferStore::open_with_config(&poisoned_consumer_blob_dir, blob_config).unwrap(),
         );
-        let mut recovered_consumer_driver = RuntimeDriver::initiator(
+        let mut recovered_consumer_driver = RuntimeDriver::initiator_with_semantic_versions(
             restored_bundle(&consumer_bundle_bytes),
             SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
             poisoned_consumer_backend,
             blob_start(205),
             None,
+            legacy_blob_versions(),
         )
         .unwrap();
         let mut honest_relay_driver = RuntimeDriver::responder(
@@ -11446,12 +11574,13 @@ mod tests {
             consumer_node,
             BlobTransferStore::open_with_config(&consumer_blob_dir, blob_config).unwrap(),
         );
-        let mut consumer_driver = RuntimeDriver::initiator(
+        let mut consumer_driver = RuntimeDriver::initiator_with_semantic_versions(
             restored_bundle(&consumer_bundle_bytes),
             SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
             consumer_backend,
             blob_start(202),
             None,
+            legacy_blob_versions(),
         )
         .unwrap();
         let mut first_peer_driver = RuntimeDriver::responder(
@@ -11513,12 +11642,13 @@ mod tests {
             consumer_node,
             BlobTransferStore::open_with_config(&consumer_blob_dir, blob_config).unwrap(),
         );
-        let mut consumer_driver = RuntimeDriver::initiator(
+        let mut consumer_driver = RuntimeDriver::initiator_with_semantic_versions(
             restored_bundle(&consumer_bundle_bytes),
             SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
             consumer_backend,
             blob_start(203),
             None,
+            legacy_blob_versions(),
         )
         .unwrap();
         let mut relay_driver = RuntimeDriver::responder(

@@ -1,6 +1,7 @@
 use crate::auth::Token;
 use crate::blob_publish::Publication as BlobPublication;
 use crate::blob_read::Read as BlobRead;
+use crate::blob_status::Status as BlobStatus;
 use crate::publish::Publication;
 use crate::query::Query;
 use crate::subscribe::Subscription;
@@ -31,6 +32,7 @@ COMMANDS:
                     Recovery/retry/abandon/ack require --journal PATH --client-id ID
   blob-publish      Publish a file as a Blob
   blob-read         Read a Blob to a new file
+  blob-status       Inspect or wait for a local Blob publication
   query             Query stored Events
   subscribe         Create an Event subscription
   subscriptions     List Event subscriptions
@@ -39,8 +41,9 @@ COMMANDS:
 OPTIONS:
   -h, --host IP          Loopback agent IP address (default: 127.0.0.1)
   -p, --port PORT        Aster node RPC port (default: 8181)
-      --timeout SECONDS Client RPC timeout, 1–86400 seconds (default: 10)
-                        Agent-side deadlines may be shorter (currently at most 30s)
+      --timeout SECONDS Client RPC timeout, 1–86400 seconds
+                        Default: 10; Blob publish/read: 900
+                        Agent-side deadlines may be shorter (currently at most 15m)
   -j, --json             Print output in JSON (when possible)
   -t, --token TOKEN      Aster node API token as plain text
       --token-file PATH  Read the agent API token from a file
@@ -68,6 +71,7 @@ pub enum Command {
     PublishHelp,
     BlobPublishHelp,
     BlobReadHelp,
+    BlobStatusHelp,
     QueryHelp,
     SubscribeHelp,
     SubscriptionsHelp,
@@ -85,6 +89,7 @@ pub enum Command {
     ),
     BlobPublish(Options, Box<BlobPublication>),
     BlobRead(Options, BlobRead),
+    BlobStatus(Options, BlobStatus),
     Query(Options, Query),
     Subscribe(Options, Subscription),
 }
@@ -93,6 +98,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     let mut host = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let mut port = 8181;
     let mut timeout = crate::client::DEFAULT_TIMEOUT;
+    let mut timeout_explicit = false;
     let mut json = false;
     let mut token = None;
     let mut status = false;
@@ -105,6 +111,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     let mut sequence = None;
     let mut blob_publication: Option<BlobPublication> = None;
     let mut blob_read: Option<BlobRead> = None;
+    let mut blob_status: Option<BlobStatus> = None;
     let mut query: Option<Query> = None;
     let mut subscription: Option<Subscription> = None;
     let mut positional = false;
@@ -151,6 +158,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     Command::BlobPublishHelp
                 } else if blob_read.is_some() {
                     Command::BlobReadHelp
+                } else if blob_status.is_some() {
+                    Command::BlobStatusHelp
                 } else if query.is_some() {
                     Command::QueryHelp
                 } else if subscription.is_some() {
@@ -228,6 +237,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     && publication.is_none()
                     && blob_publication.is_none()
                     && blob_read.is_none()
+                    && blob_status.is_none()
                     && query.is_none()
                     && subscription.is_none()
                     && !subscriptions
@@ -241,6 +251,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     && publication.is_none()
                     && blob_publication.is_none()
                     && blob_read.is_none()
+                    && blob_status.is_none()
                     && query.is_none()
                     && subscription.is_none()
                     && !subscriptions
@@ -254,6 +265,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     && publication.is_none()
                     && blob_publication.is_none()
                     && blob_read.is_none()
+                    && blob_status.is_none()
                     && query.is_none()
                     && subscription.is_none()
                     && !subscriptions
@@ -267,6 +279,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     && publication.is_none()
                     && blob_publication.is_none()
                     && blob_read.is_none()
+                    && blob_status.is_none()
                     && query.is_none()
                     && subscription.is_none()
                     && !subscriptions
@@ -283,7 +296,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     && subscription.is_none()
                     && !subscriptions
                     && !unsubscribe
-                    && blob_read.is_none() =>
+                    && blob_read.is_none()
+                    && blob_status.is_none() =>
             {
                 blob_publication = Some(BlobPublication::default())
             }
@@ -296,9 +310,24 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     && subscription.is_none()
                     && !subscriptions
                     && !unsubscribe
-                    && blob_publication.is_none() =>
+                    && blob_publication.is_none()
+                    && blob_status.is_none() =>
             {
                 blob_read = Some(BlobRead::default())
+            }
+            "blob-status"
+                if inline.is_none()
+                    && !status
+                    && publication.is_none()
+                    && blob_publication.is_none()
+                    && blob_read.is_none()
+                    && blob_status.is_none()
+                    && query.is_none()
+                    && subscription.is_none()
+                    && !subscriptions
+                    && !unsubscribe =>
+            {
+                blob_status = Some(BlobStatus::default())
             }
             "query"
                 if inline.is_none()
@@ -306,6 +335,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     && publication.is_none()
                     && blob_publication.is_none()
                     && blob_read.is_none()
+                    && blob_status.is_none()
                     && query.is_none()
                     && subscription.is_none()
                     && !subscriptions
@@ -319,6 +349,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     && publication.is_none()
                     && blob_publication.is_none()
                     && blob_read.is_none()
+                    && blob_status.is_none()
                     && query.is_none()
                     && subscription.is_none()
                     && !subscriptions
@@ -360,6 +391,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                             .filter(|s| (1..=86400).contains(s))
                             .ok_or("timeout must be an integer from 1 to 86400 seconds")?;
                         timeout = Duration::from_secs(seconds);
+                        timeout_explicit = true;
                     }
                     _ => {
                         if token.is_some() {
@@ -413,7 +445,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     .set_file(value.into())?;
             }
             "--topic" | "--scope" | "--priority" | "--media-type" | "--schema-id" | "--ttl-ms"
-            | "--operation-key"
+            | "--operation-key" | "--progress"
                 if blob_publication.is_some() =>
             {
                 if !command_options.insert(name.to_owned()) {
@@ -435,7 +467,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                     .expect("Blob read command")
                     .set_output(value.into())?;
             }
-            "--id" | "--topic" | "--scope" if blob_read.is_some() => {
+            "--id" | "--topic" | "--scope" | "--progress" if blob_read.is_some() => {
                 if !command_options.insert(name.to_owned()) {
                     return Err(format!("{name} must not be repeated"));
                 }
@@ -443,6 +475,28 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                 blob_read
                     .as_mut()
                     .expect("Blob read command")
+                    .set_option(name, value)?;
+            }
+            "--wait" if blob_status.is_some() => {
+                if inline.is_some() {
+                    return Err("--wait does not take a value".into());
+                }
+                if !command_options.insert(name.to_owned()) {
+                    return Err("--wait must not be repeated".into());
+                }
+                blob_status
+                    .as_mut()
+                    .expect("Blob status command")
+                    .set_wait();
+            }
+            "--publication-id" | "--topic" | "--scope" | "--poll-ms" if blob_status.is_some() => {
+                if !command_options.insert(name.to_owned()) {
+                    return Err(format!("{name} must not be repeated"));
+                }
+                let value = text_option_value(name, inline, &mut args)?;
+                blob_status
+                    .as_mut()
+                    .expect("Blob status command")
                     .set_option(name, value)?;
             }
             "--topic" | "--scope" | "--publisher" | "--logical-key" | "--limit"
@@ -484,6 +538,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     if let Some(read) = &blob_read {
         read.validate()?;
     }
+    if let Some(status) = &blob_status {
+        status.validate()?;
+    }
     if let Some(subscription) = &subscription {
         subscription.validate()?;
         journal_identity.validate()?;
@@ -493,6 +550,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     }
     if unsubscribe && subscription_id.is_none() {
         return Err("SUBSCRIPTION_ID is required; see unsubscribe --help".into());
+    }
+    if !timeout_explicit && (blob_publication.is_some() || blob_read.is_some()) {
+        timeout = crate::client::BLOB_TRANSFER_DEFAULT_TIMEOUT;
     }
     if let Some(action) = journal_action {
         journal_identity.validate()?;
@@ -527,6 +587,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         Command::BlobPublish(options, Box::new(publication))
     } else if let Some(read) = blob_read {
         Command::BlobRead(options, read)
+    } else if let Some(status) = blob_status {
+        Command::BlobStatus(options, status)
     } else if let Some(query) = query {
         Command::Query(options, query)
     } else if let Some(mut subscription) = subscription {
@@ -610,6 +672,72 @@ mod tests {
                 }))
             );
         }
+    }
+
+    #[test]
+    fn blob_transfer_gets_a_long_bounded_default_but_honors_explicit_timeout() {
+        let parse_publish = |timeout: Option<&str>| {
+            let mut args = vec![
+                "blob-publish",
+                "--file=/tmp/blob",
+                "--topic=imagery.maps",
+                "--scope=mission/team/alpha",
+                "--operation-key=test",
+            ];
+            if let Some(timeout) = timeout {
+                args.extend(["--timeout", timeout]);
+            }
+            let Command::BlobPublish(options, _) = arguments(&args).unwrap() else {
+                panic!("Blob publish command")
+            };
+            options.timeout
+        };
+        assert_eq!(
+            parse_publish(None),
+            crate::client::BLOB_TRANSFER_DEFAULT_TIMEOUT
+        );
+        assert_eq!(parse_publish(Some("7")), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn blob_progress_defaults_to_auto_and_accepts_only_documented_modes() {
+        for (value, expected) in [
+            (None, crate::progress::ProgressMode::Auto),
+            (Some("auto"), crate::progress::ProgressMode::Auto),
+            (Some("always"), crate::progress::ProgressMode::Always),
+            (Some("never"), crate::progress::ProgressMode::Never),
+        ] {
+            let mut args = vec![
+                "blob-publish",
+                "--file=/tmp/blob",
+                "--topic=imagery.maps",
+                "--scope=mission/team/alpha",
+                "--operation-key=test",
+            ];
+            if let Some(value) = value {
+                args.extend(["--progress", value]);
+            }
+            let Command::BlobPublish(_, publication) = arguments(&args).unwrap() else {
+                panic!("Blob publish command")
+            };
+            assert_eq!(publication.progress, expected);
+        }
+
+        for value in ["", "sometimes", "ALWAYS"] {
+            assert!(
+                arguments(&[
+                    "blob-read",
+                    "--id=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                    "--topic=x",
+                    "--scope=x",
+                    "--output=/tmp/blob",
+                    "--progress",
+                    value,
+                ])
+                .is_err()
+            );
+        }
+        assert!(arguments(&["status", "--progress=always"]).is_err());
     }
 
     #[test]
@@ -819,5 +947,103 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn blob_status_requires_exact_selector() {
+        let valid = [
+            "blob-status",
+            "--publication-id=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "--topic=imagery.maps",
+            "--scope=mission/team/alpha",
+        ];
+        assert!(matches!(arguments(&valid), Ok(Command::BlobStatus(_, _))));
+
+        for omitted in ["--publication-id", "--topic", "--scope"] {
+            let args: Vec<_> = valid
+                .iter()
+                .copied()
+                .filter(|value| !value.starts_with(omitted))
+                .collect();
+            assert!(arguments(&args).is_err(), "accepted missing {omitted}");
+        }
+        assert!(
+            arguments(&[
+                "blob-status",
+                "--publication-id=AA==",
+                "--topic=imagery.maps",
+                "--scope=mission/team/alpha",
+            ])
+            .is_err()
+        );
+        assert!(
+            arguments(&[
+                "blob-status",
+                "--publication-id=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                "--topic=imagery.maps",
+                "--scope=mission/team/alpha",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn blob_status_poll_range_is_100_through_60000() {
+        for poll_ms in ["100", "60000"] {
+            assert!(
+                arguments(&[
+                    "blob-status",
+                    "--publication-id=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                    "--topic=imagery.maps",
+                    "--scope=mission/team/alpha",
+                    "--wait",
+                    "--poll-ms",
+                    poll_ms,
+                ])
+                .is_ok()
+            );
+        }
+        for poll_ms in ["0", "99", "60001", "invalid"] {
+            assert!(
+                arguments(&[
+                    "blob-status",
+                    "--publication-id=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                    "--topic=imagery.maps",
+                    "--scope=mission/team/alpha",
+                    "--wait",
+                    "--poll-ms",
+                    poll_ms,
+                ])
+                .is_err(),
+                "accepted poll interval {poll_ms}"
+            );
+        }
+        assert!(
+            arguments(&[
+                "blob-status",
+                "--publication-id=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                "--topic=imagery.maps",
+                "--scope=mission/team/alpha",
+                "--poll-ms=1000",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn blob_status_poll_defaults_to_1000() {
+        let Command::BlobStatus(_, status) = arguments(&[
+            "blob-status",
+            "--publication-id=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "--topic=imagery.maps",
+            "--scope=mission/team/alpha",
+            "--wait",
+        ])
+        .unwrap() else {
+            panic!("Blob status command")
+        };
+        let (_, wait, poll) = status.into_parts();
+        assert!(wait);
+        assert_eq!(poll, Duration::from_millis(1_000));
     }
 }

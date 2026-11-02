@@ -28,6 +28,7 @@ pub enum PublicOperation {
     DeleteEventSubscription,
     QueryEventGaps,
     PublishBlob,
+    InspectBlobPublication,
     ReadBlob,
 }
 
@@ -53,6 +54,7 @@ impl PublicOperation {
             Self::DeleteEventSubscription => "delete_event_subscription",
             Self::QueryEventGaps => "query_event_gaps",
             Self::PublishBlob => "publish_blob",
+            Self::InspectBlobPublication => "inspect_blob_publication",
             Self::ReadBlob => "read_blob",
         }
     }
@@ -74,6 +76,7 @@ impl PublicOperation {
             b"acknowledge" => Some(Self::AcknowledgeEvent),
             b"unsubscribe" => Some(Self::DeleteEventSubscription),
             b"gaps" => Some(Self::QueryEventGaps),
+            b"blob publication status" => Some(Self::InspectBlobPublication),
             _ => None,
         }
     }
@@ -561,6 +564,11 @@ mod tests {
                 "delete_event_subscription",
             ),
             ("gaps", PublicOperation::QueryEventGaps, "query_event_gaps"),
+            (
+                "blob publication status",
+                PublicOperation::InspectBlobPublication,
+                "inspect_blob_publication",
+            ),
         ];
 
         for (internal, operation, public) in cases {

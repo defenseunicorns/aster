@@ -40,6 +40,8 @@ message PublicErrorDetail {
 service AsterApplicationService {
   // GetStatus returns a bounded local synchronization snapshot.
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  // InspectBlobPublication returns Store-authoritative durable publication progress.
+  rpc InspectBlobPublication(InspectBlobPublicationRequest) returns (InspectBlobPublicationResponse);
   // BeginEventPublicationSession fences the prior publisher and returns one complete recovery image.
   rpc BeginEventPublicationSession(BeginEventPublicationSessionRequest) returns (BeginEventPublicationSessionResponse);
   // CompleteEventPublicationRecovery authorizes mutations for the exact recovered revision.
@@ -70,8 +72,9 @@ service AsterApplicationService {
   rpc DeleteEventSubscription(DeleteEventSubscriptionRequest) returns (DeleteEventSubscriptionResponse);
   // QueryEventGaps reports authenticated gaps in one exact publisher stream.
   rpc QueryEventGaps(QueryEventGapsRequest) returns (QueryEventGapsResponse);
-  // PublishBlob accepts one metadata frame followed by canonical plaintext chunks.
-  rpc PublishBlob(stream PublishBlobRequest) returns (PublishBlobResponse);
+  // PublishBlob negotiates a durable resume offset, then accepts offset-bearing
+  // plaintext chunks while reporting Store-authoritative durable checkpoints.
+  rpc PublishBlob(stream PublishBlobRequest) returns (stream PublishBlobResponse);
   // ReadBlob streams freshly authenticated bounded plaintext pages.
   rpc ReadBlob(ReadBlobRequest) returns (stream ReadBlobResponse);
 }
@@ -91,11 +94,32 @@ message PublishBlobMetadata {
 message PublishBlobRequest {
   oneof frame {
     PublishBlobMetadata metadata = 1;
-    bytes chunk = 2;
+    PublishBlobData data = 2;
+    PublishBlobFinish finish = 3;
   }
 }
 
-message PublishBlobResponse {
+message PublishBlobData {
+  uint64 offset = 1;
+  bytes bytes = 2;
+}
+
+message PublishBlobFinish {}
+
+message PublishBlobAccepted {
+  uint64 accepted_offset = 1;
+  uint64 durable_offset = 2;
+  uint32 canonical_frame_bytes = 3;
+  // Stable opaque identity for status inspection before upload completion.
+  bytes publication_id = 4;
+}
+
+message PublishBlobCheckpoint {
+  uint64 accepted_offset = 1;
+  uint64 durable_offset = 2;
+}
+
+message PublishBlobReceipt {
   bytes id = 1;
   bytes publisher = 2;
   uint64 publisher_counter = 3;
@@ -106,6 +130,16 @@ message PublishBlobResponse {
   bytes schema_id = 8;
   uint64 acceptance_marker = 9;
   bool inserted = 10;
+  // Stable opaque identifier used to inspect durable publication progress.
+  bytes publication_id = 11;
+}
+
+message PublishBlobResponse {
+  oneof frame {
+    PublishBlobAccepted accepted = 1;
+    PublishBlobCheckpoint checkpoint = 2;
+    PublishBlobReceipt complete = 3;
+  }
 }
 
 message ReadBlobRequest {
@@ -196,6 +230,7 @@ message GetStatusResponse {
   PublishOperationCapacityStatus publish_operation_capacity = 10;
   DeliveryCapacityStatus delivery_capacity = 11;
   bytes credential_generation = 12;
+  BlobCapacityStatus blob_capacity = 13;
 }
 
 enum EmissionMode {
@@ -521,4 +556,46 @@ message EventGap {
   string scope = 3;
   uint64 start_sequence = 4;
   uint64 end_sequence = 5;
+}
+
+enum BlobPublicationPhase {
+  BLOB_PUBLICATION_PHASE_UNSPECIFIED = 0;
+  BLOB_PUBLICATION_PHASE_MISSING = 1;
+  BLOB_PUBLICATION_PHASE_AWAITING_DATA = 2;
+  BLOB_PUBLICATION_PHASE_RECEIVING = 3;
+  BLOB_PUBLICATION_PHASE_READY_TO_FINALIZE = 4;
+  BLOB_PUBLICATION_PHASE_AVAILABLE = 5;
+  BLOB_PUBLICATION_PHASE_EXPIRED_OR_RETIRED = 6;
+}
+
+message InspectBlobPublicationRequest {
+  bytes publication_id = 1;
+  string topic = 2;
+  string scope = 3;
+}
+
+message InspectBlobPublicationResponse {
+  bytes publication_id = 1;
+  BlobPublicationPhase phase = 2;
+  uint64 plaintext_total_bytes = 3;
+  uint64 durable_plaintext_bytes = 4;
+  uint64 transfer_total_bytes = 5;
+  uint64 durable_transfer_bytes = 6;
+  uint64 total_units = 7;
+  uint64 durable_units = 8;
+  optional bytes blob_id = 9;
+}
+
+message BlobCapacityStatus {
+  uint64 reserved_bytes = 1;
+  uint64 byte_limit = 2;
+  uint64 variants = 3;
+  uint64 variant_limit = 4;
+  uint64 expected_chunks = 5;
+  uint64 chunk_limit = 6;
+  uint64 pending_sources = 7;
+  uint64 network_staging_bytes = 8;
+  bool bytes_exhausted = 9;
+  bool variants_exhausted = 10;
+  bool chunks_exhausted = 11;
 }

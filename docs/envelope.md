@@ -2,7 +2,7 @@
 
 - Specification version: 0.1.0-draft.2
 - Stable wire/cryptographic profile: `1`, suite `0x0001`
-- Negotiated semantic versions: default/highest `8`, compatibility `7`, `6`, `5`, `4`, `3`, `2`, and `1`
+- Negotiated semantic versions: default/highest `9`, compatibility `8`, `7`, `6`, `5`, `4`, `3`, `2`, and `1`
 - Status: normative for the implemented reference profile
 - Date: 2026-08-25
 
@@ -1075,6 +1075,7 @@ anonymous_mission_proof         AEAD with ciphertext exactly 16 bytes
 
 Both offer lists MUST be nonempty, nonzero, duplicate-free, and in strictly
 descending numeric order. The default semantic-version list is
+`[9, 8, 7, 6, 5, 4, 3, 2, 1]`; a v8-only compatibility initiator may send
 `[8, 7, 6, 5, 4, 3, 2, 1]`; a v7-only compatibility initiator may send
 `[7, 6, 5, 4, 3, 2, 1]`; a v6-only compatibility initiator may send
 `[6, 5, 4, 3, 2, 1]`, a v2 compatibility initiator may send `[2, 1]`, and a
@@ -1133,7 +1134,7 @@ cause a fresh response; deployments MUST rate-limit handshake work.
 After the kind-`2` prefix:
 
 ```text
-selected_semantic_version       u16 = 1, 2, 3, 4, 5, 6, 7, or 8
+selected_semantic_version       u16 = 1, 2, 3, 4, 5, 6, 7, 8, or 9
 selected_suite_id               u16 = 0x0001
 responder_nonce                 32 fresh random bytes
 responder_p256_ephemeral        b16(exactly 33 bytes)

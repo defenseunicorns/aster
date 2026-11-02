@@ -8,8 +8,9 @@ license.workspace = true
 publish = false
 
 [features]
-fuzzing = []
+fuzzing = ["aster-mesh/fuzzing"]
 nearby-discovery = ["aster-iroh/nearby-discovery"]
+device-validation = ["aster-mesh/test-utils"]
 
 [lib]
 name = "aster_node"
@@ -17,6 +18,10 @@ name = "aster_node"
 [[bin]]
 name = "aster"
 path = "src/main.rs"
+
+[[example]]
+name = "blob_stream_transport_benchmark"
+required-features = ["device-validation"]
 
 [dependencies]
 aster-iroh = { path = "../aster-iroh" }

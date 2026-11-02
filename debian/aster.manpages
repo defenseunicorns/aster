@@ -2,6 +2,7 @@ crates/asterctl/asterctl.1
 crates/asterctl/asterctl-publish.1
 crates/asterctl/asterctl-blob-publish.1
 crates/asterctl/asterctl-blob-read.1
+crates/asterctl/asterctl-blob-status.1
 crates/asterctl/asterctl-query.1
 crates/asterctl/asterctl-subscribe.1
 crates/asterctl/asterctl-subscriptions.1

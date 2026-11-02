@@ -4156,9 +4156,9 @@ mod tests {
         let hybrid_total: usize = hybrid_lengths.iter().sum();
         assert_eq!(classical_lengths, [259, 712, 499, 78]);
         assert_eq!(classical_total, 1_548);
-        // Semantic v8 adds one u16 version offer to the first hybrid flight.
-        assert_eq!(hybrid_lengths, [1_323, 11_337, 10_142, 78]);
-        assert_eq!(hybrid_total, 22_880);
+        // Semantic v9 adds another u16 version offer to the first hybrid flight.
+        assert_eq!(hybrid_lengths, [1_325, 11_337, 10_142, 78]);
+        assert_eq!(hybrid_total, 22_882);
         assert!(
             classical_total < hybrid_total,
             "classical flights {classical_lengths:?} total {classical_total} bytes; legacy hybrid flights {hybrid_lengths:?} total {hybrid_total} bytes"

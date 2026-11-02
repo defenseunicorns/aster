@@ -77,6 +77,7 @@ fn blob_help_exposes_flat_commands_and_required_paths() {
     let top = String::from_utf8(top.stdout).unwrap();
     assert!(top.contains("blob-publish"));
     assert!(top.contains("blob-read"));
+    assert!(top.contains("blob-status"));
 
     let publish = cli([OsString::from("blob-publish"), OsString::from("--help")]);
     assert!(publish.status.success());
@@ -96,6 +97,19 @@ fn blob_help_exposes_flat_commands_and_required_paths() {
     let read = String::from_utf8(read.stdout).unwrap();
     for option in ["--id", "--topic", "--scope", "--output"] {
         assert!(read.contains(option), "missing {option}: {read}");
+    }
+
+    let status = cli([OsString::from("blob-status"), OsString::from("--help")]);
+    assert!(status.status.success());
+    let status = String::from_utf8(status.stdout).unwrap();
+    for option in [
+        "--publication-id",
+        "--topic",
+        "--scope",
+        "--wait",
+        "--poll-ms",
+    ] {
+        assert!(status.contains(option), "missing {option}: {status}");
     }
 }
 
@@ -242,6 +256,7 @@ fn blob_commands_require_every_semantic_and_path_argument() {
     for args in [
         vec!["blob-publish", "--token", TOKEN],
         vec!["blob-read", "--token", TOKEN],
+        vec!["blob-status", "--token", TOKEN],
         vec![
             "blob-read",
             "--token",

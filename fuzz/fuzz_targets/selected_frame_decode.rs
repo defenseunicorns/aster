@@ -1,5 +1,6 @@
 #![no_main]
 
+use aster_fuzz::corpus_input;
 use aster_mesh::MAX_SELECTED_BRIDGE_WRAPPER_BYTES;
 use aster_redb_store::{BlobTransferId, ControlTransferId, EventTransferId};
 use libfuzzer_sys::fuzz_target;
@@ -300,27 +301,6 @@ fn payload_digest(payload: &[u8]) -> [u8; 32] {
     let copied = payload.len().min(digest.len());
     digest[..copied].copy_from_slice(&payload[..copied]);
     digest
-}
-
-fn corpus_input(input: &[u8]) -> Vec<u8> {
-    let Some(hexadecimal) = input.strip_prefix(b"HEX:") else {
-        return input.to_vec();
-    };
-    let Ok(hexadecimal) = std::str::from_utf8(hexadecimal) else {
-        return input.to_vec();
-    };
-    let hexadecimal = hexadecimal.trim();
-    if hexadecimal.len() % 2 != 0 {
-        return input.to_vec();
-    }
-    let mut decoded = Vec::with_capacity(hexadecimal.len() / 2);
-    for offset in (0..hexadecimal.len()).step_by(2) {
-        let Ok(byte) = u8::from_str_radix(&hexadecimal[offset..offset + 2], 16) else {
-            return input.to_vec();
-        };
-        decoded.push(byte);
-    }
-    decoded
 }
 
 fuzz_target!(|input: &[u8]| {

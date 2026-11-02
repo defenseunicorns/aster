@@ -29,6 +29,8 @@ pub use profile::{
     HYBRID_SECURITY_PROFILE_ID, SecurityProfile, SecurityProfileId, VerifiedSecurityProfile,
 };
 
+#[cfg(feature = "fuzzing")]
+pub use reference::fuzz_reference_v9_session_pair;
 pub(crate) use reference::{
     PendingBatchItem, VerifiedBatchItem, VerifiedBatchProof, VerifiedBridgeAuthorization,
     VerifiedBridgeSourceRoute, VerifiedBridgeWrapper,
@@ -86,6 +88,7 @@ pub(crate) const SEMANTIC_PROTOCOL_V5: u16 = 5;
 pub(crate) const SEMANTIC_PROTOCOL_V6: u16 = 6;
 pub(crate) const SEMANTIC_PROTOCOL_V7: u16 = 7;
 pub(crate) const SEMANTIC_PROTOCOL_V8: u16 = 8;
+pub(crate) const SEMANTIC_PROTOCOL_V9: u16 = 9;
 pub(crate) const HYBRID_SUITE_ID: u16 = 0x0001;
 
 const NONCE_LEN: usize = 12;
@@ -93,6 +96,7 @@ const HASH_LEN: usize = 32;
 const MAX_OFFERED_VERSIONS: usize = 16;
 const MAX_OFFERED_SUITES: usize = 16;
 pub(crate) const SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS: &[u16] = &[
+    SEMANTIC_PROTOCOL_V9,
     SEMANTIC_PROTOCOL_V8,
     SEMANTIC_PROTOCOL_V7,
     SEMANTIC_PROTOCOL_V6,
@@ -1683,15 +1687,26 @@ pub(crate) struct ResponderHandshakePrepared {
 }
 
 impl ResponderHandshakePrepared {
+    #[cfg(test)]
     pub(crate) fn respond<P: CryptoProvider>(
         provider: &mut P,
         client_hello: &ClientHello,
     ) -> Result<Self, CryptoError> {
-        validate_client_hello(client_hello)?;
-        let selected_version = select_highest_common_version(
-            &client_hello.supported_versions,
+        Self::respond_with_supported_versions(
+            provider,
+            client_hello,
             SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS,
-        )?;
+        )
+    }
+
+    pub(crate) fn respond_with_supported_versions<P: CryptoProvider>(
+        provider: &mut P,
+        client_hello: &ClientHello,
+        supported_versions: &[u16],
+    ) -> Result<Self, CryptoError> {
+        validate_client_hello(client_hello)?;
+        let selected_version =
+            select_highest_common_version(&client_hello.supported_versions, supported_versions)?;
         let selected_suite =
             select_preferred_common_suite(&client_hello.offered_suites, SUPPORTED_HYBRID_SUITES)?;
         // Parse/validate the classical key before performing expensive post-quantum work.
@@ -1929,6 +1944,14 @@ pub(crate) struct SendSequence {
 }
 
 impl SendSequence {
+    pub(crate) const fn next_value(&self) -> Option<u64> {
+        if self.exhausted {
+            None
+        } else {
+            Some(self.next)
+        }
+    }
+
     fn reserve(&mut self) -> Result<u64, CryptoError> {
         if self.exhausted {
             return Err(CryptoError::SequenceExhausted);
@@ -2013,6 +2036,10 @@ impl fmt::Debug for SecureChannel {
 }
 
 impl SecureChannel {
+    pub(crate) const fn next_send_sequence(&self) -> Option<u64> {
+        self.send_sequence.next_value()
+    }
+
     pub(crate) fn seal<P: CryptoProvider>(
         &mut self,
         provider: &mut P,
@@ -2504,7 +2531,7 @@ mod tests {
         assert!(matches!(
             InitiatorHandshake::start(
                 &mut initiator_provider,
-                vec![SEMANTIC_PROTOCOL_V8 + 1],
+                vec![SEMANTIC_PROTOCOL_V9 + 1],
                 vec![HYBRID_SUITE_ID]
             ),
             Err(CryptoError::UnsupportedProtocolVersion)
@@ -2536,7 +2563,7 @@ mod tests {
         assert_eq!(prepared.public_hello.selected_suite, HYBRID_SUITE_ID);
 
         let mut unsupported_version = hello.clone();
-        unsupported_version.supported_versions = vec![SEMANTIC_PROTOCOL_V8 + 1];
+        unsupported_version.supported_versions = vec![SEMANTIC_PROTOCOL_V9 + 1];
         assert!(matches!(
             ResponderHandshakePrepared::respond(&mut responder_provider, &unsupported_version),
             Err(CryptoError::UnsupportedProtocolVersion)
@@ -2564,11 +2591,18 @@ mod tests {
     }
 
     #[test]
-    fn semantic_v8_selects_v8_and_falls_back_to_a_v7_only_peer() {
+    fn semantic_v9_selects_v9_and_falls_back_to_v8_and_v7_peers() {
         assert_eq!(
             select_highest_common_version(
                 SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS,
                 SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS,
+            ),
+            Ok(SEMANTIC_PROTOCOL_V9)
+        );
+        assert_eq!(
+            select_highest_common_version(
+                SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS,
+                &[SEMANTIC_PROTOCOL_V8, SEMANTIC_PROTOCOL_V7],
             ),
             Ok(SEMANTIC_PROTOCOL_V8)
         );
@@ -2669,6 +2703,7 @@ mod tests {
             assert_eq!(
                 stripped_hello.supported_versions,
                 vec![
+                    SEMANTIC_PROTOCOL_V9,
                     SEMANTIC_PROTOCOL_V8,
                     SEMANTIC_PROTOCOL_V7,
                     SEMANTIC_PROTOCOL_V6,

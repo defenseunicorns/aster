@@ -328,20 +328,22 @@ fn finalized_batch_blobs_transfer_and_read_back_exact_plaintexts() {
         BlobTransferStore::open_with_config(&receiver_blobs, config).unwrap(),
     )
     .unwrap();
-    let mut sender = RuntimeDriver::initiator(
+    let mut sender = RuntimeDriver::initiator_with_semantic_ceiling(
         restored_bundle(&source_bundle),
         SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
         source,
         blob_start(302),
         None,
+        8,
     )
     .unwrap();
-    let mut recipient = RuntimeDriver::responder_with_start(
+    let mut recipient = RuntimeDriver::responder_with_start_and_semantic_ceiling(
         restored_bundle(&receiver_bundle),
         SyncState::new(Default::default(), SparseInventory::new()).unwrap(),
         receiver,
         blob_start(303),
         None,
+        8,
     )
     .unwrap();
     let ready = |backend: &mut ReferenceSemanticRuntimeBackend| {
@@ -365,6 +367,8 @@ fn finalized_batch_blobs_transfer_and_read_back_exact_plaintexts() {
     }
     assert_eq!(sender.authenticated_peer(), Some(receiver_id));
     assert_eq!(recipient.authenticated_peer(), Some(source_id));
+    assert_eq!(sender.authenticated_semantic_version(), Some(8));
+    assert_eq!(recipient.authenticated_semantic_version(), Some(8));
     let mut app = ApplicationNodeRef::new(recipient.backend_mut().node_mut());
     let received = app
         .query(Query {

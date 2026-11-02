@@ -1,0 +1,330 @@
+{
+  "format": "aster-profile5-fixed-binary-v1",
+  "magic": "41534d01",
+  "semantic_version": 9,
+  "profile_id": 5,
+  "byte_order": "big-endian",
+  "attempt_fields": [
+    [
+      "transfer_id",
+      "bytes32"
+    ],
+    [
+      "attempt_nonce",
+      "bytes32-nonzero"
+    ],
+    [
+      "sequence",
+      "u64"
+    ]
+  ],
+  "records": [
+    {
+      "name": "OPEN",
+      "tag": 214,
+      "fields": [
+        [
+          "class",
+          "u8-enum:1"
+        ],
+        [
+          "direction",
+          "u8-enum:1,2"
+        ],
+        [
+          "semantic_version",
+          "u16=9"
+        ],
+        [
+          "profile_id",
+          "u16=5"
+        ],
+        [
+          "session_transcript",
+          "bytes32"
+        ],
+        [
+          "exchange_id",
+          "u64"
+        ],
+        [
+          "transfer_id",
+          "bytes32"
+        ],
+        [
+          "source_transfer_id",
+          "bytes32"
+        ],
+        [
+          "publication_id",
+          "bytes32"
+        ],
+        [
+          "variant_id",
+          "bytes32"
+        ],
+        [
+          "total_len",
+          "u64-native-pack-wire<=8591032320"
+        ],
+        [
+          "attempt_nonce",
+          "bytes32-nonzero"
+        ],
+        [
+          "checkpoint_generation",
+          "u64"
+        ],
+        [
+          "custody_present",
+          "u8-enum:0,1"
+        ],
+        [
+          "custody_digest",
+          "bytes32-if-present"
+        ],
+        [
+          "source_len",
+          "u32:1..401902"
+        ],
+        [
+          "source_digest",
+          "bytes32"
+        ]
+      ]
+    },
+    {
+      "name": "SOURCE",
+      "tag": 221,
+      "fields": [
+        [
+          "attempt",
+          "attempt_fields"
+        ],
+        [
+          "source_offset",
+          "u32"
+        ],
+        [
+          "source_total_len",
+          "u32:1..401902"
+        ],
+        [
+          "source_chunk_len",
+          "u32:1..1048576"
+        ],
+        [
+          "source_chunk",
+          "bytes[source_chunk_len]"
+        ]
+      ]
+    },
+    {
+      "name": "ACCEPT",
+      "tag": 215,
+      "fields": [
+        [
+          "attempt",
+          "attempt_fields"
+        ],
+        [
+          "durable_offset",
+          "u64"
+        ],
+        [
+          "checkpoint_generation",
+          "u64"
+        ],
+        [
+          "absolute_receive_limit",
+          "u64>=durable_offset"
+        ],
+        [
+          "max_extent_bytes",
+          "u32:1..1048710"
+        ],
+        [
+          "checkpoint_batch_bytes",
+          "u32:1..134217728"
+        ]
+      ]
+    },
+    {
+      "name": "DATA",
+      "tag": 216,
+      "fields": [
+        [
+          "attempt",
+          "attempt_fields"
+        ],
+        [
+          "offset",
+          "u64"
+        ],
+        [
+          "extent_len",
+          "u32:1..1048710"
+        ],
+        [
+          "astrbs02_record",
+          "bytes[extent_len],length-prefixed-ASTRBS02"
+        ]
+      ]
+    },
+    {
+      "name": "CHECKPOINT",
+      "tag": 217,
+      "fields": [
+        [
+          "attempt",
+          "attempt_fields"
+        ],
+        [
+          "durable_offset",
+          "u64"
+        ],
+        [
+          "checkpoint_generation",
+          "u64"
+        ],
+        [
+          "absolute_receive_limit",
+          "u64>=durable_offset"
+        ]
+      ]
+    },
+    {
+      "name": "FINISH",
+      "tag": 218,
+      "fields": [
+        [
+          "attempt",
+          "attempt_fields"
+        ],
+        [
+          "final_offset",
+          "u64"
+        ],
+        [
+          "commitment_len",
+          "u32:1..65536"
+        ],
+        [
+          "semantic_commitment",
+          "bytes[commitment_len]"
+        ]
+      ]
+    },
+    {
+      "name": "RESULT",
+      "tag": 219,
+      "fields": [
+        [
+          "attempt",
+          "attempt_fields"
+        ],
+        [
+          "final_offset",
+          "u64"
+        ],
+        [
+          "result_code",
+          "u8-enum:1,2,3,4,5,6"
+        ],
+        [
+          "result_digest",
+          "bytes32"
+        ]
+      ]
+    },
+    {
+      "name": "ACK",
+      "tag": 220,
+      "fields": [
+        [
+          "attempt",
+          "attempt_fields"
+        ],
+        [
+          "result_digest",
+          "bytes32"
+        ]
+      ]
+    }
+  ],
+  "source_object": {
+    "magic": "4153545250533032",
+    "format_version": 2,
+    "max_encoded_bytes": 401902,
+    "semantic_publication": {
+      "magic": "4153545242503032",
+      "format_version": 2,
+      "authenticated": true,
+      "owns": "publisher-operation-causality-policy-priority-ttl-metadata-blob-id-physical-lineage"
+    },
+    "physical_source": {
+      "magic": "4153545250503032",
+      "format_version": 2,
+      "owns": "authenticated-physical-open-and-final-commitment"
+    },
+    "identity": {
+      "transfer_id": "sha256(ASTRPS02)",
+      "publication_id": "sha256(authenticated-ASTRBP02)",
+      "finish": "byte-equal-authenticated-physical-commitment"
+    }
+  },
+  "native_pack_record": {
+    "magic": "4153545242533032",
+    "max_encoded_bytes": 1048710,
+    "fields": [
+      [
+        "record_len",
+        "u32:1..1048706"
+      ],
+      [
+        "record",
+        "bytes[record_len],valid-ASTRBS02"
+      ]
+    ]
+  },
+  "composite": {
+    "magic": "41534431",
+    "max_encoded_bytes": 1050766,
+    "fields": [
+      [
+        "protected_header_len",
+        "u32:1..2048"
+      ],
+      [
+        "protected_header",
+        "bytes[protected_header_len],protected-ASTRFR01-DATA-header"
+      ],
+      [
+        "length_prefixed_astrbs02_record",
+        "bytes[record_len+4]"
+      ]
+    ]
+  },
+  "flow": {
+    "nonempty": [
+      "PLAN",
+      "OPEN",
+      "SOURCE",
+      "ACCEPT",
+      "DATA",
+      "CHECKPOINT",
+      "FINISH",
+      "RESULT",
+      "ACK"
+    ],
+    "empty": [
+      "PLAN",
+      "OPEN",
+      "SOURCE",
+      "ACCEPT",
+      "FINISH",
+      "RESULT",
+      "ACK"
+    ]
+  }
+}

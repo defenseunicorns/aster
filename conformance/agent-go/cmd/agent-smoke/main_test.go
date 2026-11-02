@@ -351,6 +351,9 @@ func TestStatusEvidenceRequiresProfileCapacityContract(t *testing.T) {
 		DeliveryCapacity: &applicationv1alpha1.DeliveryCapacityStatus{
 			Pending: 0, ProfileBoundary: 256, HardLimit: 262_144,
 		},
+		BlobCapacity: &applicationv1alpha1.BlobCapacityStatus{
+			ByteLimit: 1_000, VariantLimit: 10, ChunkLimit: 20,
+		},
 	}
 	receipt, err := statusEvidence(valid)
 	if err != nil {
@@ -367,7 +370,8 @@ func TestStatusEvidenceRequiresProfileCapacityContract(t *testing.T) {
 	}
 
 	for name, mutate := range map[string]func(*applicationv1alpha1.GetStatusResponse){
-		"missing-store": func(status *applicationv1alpha1.GetStatusResponse) { status.StoreCapacity = nil },
+		"missing-store":         func(status *applicationv1alpha1.GetStatusResponse) { status.StoreCapacity = nil },
+		"missing-blob-capacity": func(status *applicationv1alpha1.GetStatusResponse) { status.BlobCapacity = nil },
 		"wrong-operation-boundary": func(status *applicationv1alpha1.GetStatusResponse) {
 			status.PublishOperationCapacity.ProfileBoundary = 2_048
 		},

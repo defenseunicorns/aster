@@ -49,6 +49,10 @@ mod blob;
 mod blob;
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 mod blob_custody;
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+mod blob_custody_v2;
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+mod blob_stream;
 #[cfg(all(feature = "sqlite-store", feature = "adapter-sdk"))]
 pub mod causal;
 #[cfg(all(feature = "sqlite-store", not(feature = "adapter-sdk")))]
@@ -156,6 +160,25 @@ pub use blob_custody::{
     BLOB_CUSTODY_CLAIM_V1_BYTES, BlobCustodyClaimV1, BlobCustodyDirectionV1, BlobCustodyError,
     BlobCustodyTransferId, OpenedBlobSourceFrameV1, VerifiedBlobCustodyClaimV1,
 };
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+pub use blob_custody_v2::{
+    ApplicationRecordContext, AuthenticatedBlobCustodyContactV2,
+    AuthenticatedBlobCustodySendContextV2, BLOB_CUSTODY_CLAIM_V2_BYTES, BlobCustodyClaimV2,
+    VerifiedBlobCustodyClaimV2,
+};
+#[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
+pub use blob_stream::{
+    BLOB_STREAM_SEGMENT_BYTES, BLOB_STREAM_SEGMENT_ENCODED_OVERHEAD_BYTES, BlobPublicationStreamId,
+    BlobStreamCheckpoint, BlobStreamFinalCommitment, BlobStreamFrontier, BlobStreamOpen,
+    BlobStreamPlainPartition, BlobStreamPlaintextFrontier, BlobStreamPublication,
+    BlobStreamPublicationSource, BlobStreamSegmentLeaves, BlobStreamSegmentOpener,
+    BlobStreamSegmentSealer, BlobStreamSubtree, BlobUploadDescriptor, BlobUploadPlainPartition,
+    BlobUploadSegmentOpener, BlobUploadSegmentSealer, EncryptedBlobStreamSegment,
+    EncryptedBlobStreamSegmentHeader, MAX_BLOB_STREAM_BYTES,
+    MAX_BLOB_STREAM_PUBLICATION_SOURCE_BYTES, VerifiedBlobStreamFinalCommitment,
+    VerifiedBlobStreamOpen, VerifiedBlobStreamPublication, VerifiedBlobStreamPublicationSource,
+    local_blob_publication_stream_id,
+};
 #[cfg(feature = "reference-session")]
 pub use bridge_adapter::{
     BridgeAuthorizationLink, MAX_SELECTED_BRIDGE_WRAPPER_BYTES, SelectedBridgeAuthorizationPolicy,
@@ -163,6 +186,9 @@ pub use bridge_adapter::{
     SelectedEventBridgeAdapter, VerifiedSelectedBridgeAuthorization,
     VerifiedSelectedBridgeEnrollment, VerifiedSelectedBridgeEventRoute,
 };
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use crypto::fuzz_reference_v9_session_pair;
 #[cfg(all(feature = "sqlite-store", feature = "adapter-sdk"))]
 pub use crypto::{
     ApplicationProtection, AuthenticatedChannelBinding, CLASSICAL_SECURITY_PROFILE_ID,
@@ -222,8 +248,8 @@ pub use provisioning::{
 };
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 pub use source_blob::{
-    BlobContentVerification, BlobPeerContentProof, ContentVerifiedBlobEnvelope, CurrentBlobLineage,
-    RouteVerifiedBlobEnvelope,
+    BlobContentVerification, BlobPeerContentProof, BlobStreamLineage, ContentVerifiedBlobEnvelope,
+    CurrentBlobLineage, RouteVerifiedBlobEnvelope,
 };
 #[cfg(feature = "reference-session")]
 pub use source_control::{
@@ -249,7 +275,7 @@ pub use store::{BridgeFilter, EventGap, PeerSnapshot, QuotaUsage, SubscriptionId
 #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
 pub use transfer_profile::{
     NegotiatedTransferProfiles, TransferLaneId, TransferProfileError, TransferProfileId,
-    TransferProfileOfferV1, negotiate_transfer_profiles,
+    TransferProfileOfferV1, blob_profile_for_canonical_shape, negotiate_transfer_profiles,
     negotiate_transfer_profiles_for_semantic_version, transfer_profile_digest,
 };
 
@@ -264,10 +290,10 @@ pub const REPLICATION_WIRE_VERSION: u16 = 1;
 pub const PROTOCOL_VERSION: u16 = REPLICATION_WIRE_VERSION;
 
 /// Semantic replication version offered first by a default initiator.
-pub const DEFAULT_SEMANTIC_VERSION: u16 = 8;
+pub const DEFAULT_SEMANTIC_VERSION: u16 = 9;
 
 /// Highest semantic replication version implemented by this build.
-pub const HIGHEST_SUPPORTED_SEMANTIC_VERSION: u16 = 8;
+pub const HIGHEST_SUPPORTED_SEMANTIC_VERSION: u16 = 9;
 
 #[cfg(feature = "sqlite-store")]
 const _: () = assert!(batch::DATA_CLASS_EVENT == model::DataClass::Event as u8);
@@ -282,9 +308,9 @@ mod version_surface_tests {
         #[cfg(any(feature = "reference-session", feature = "sqlite-store"))]
         assert_eq!(
             crypto::SUPPORTED_SEMANTIC_PROTOCOL_VERSIONS,
-            &[8, 7, 6, 5, 4, 3, 2, 1]
+            &[9, 8, 7, 6, 5, 4, 3, 2, 1]
         );
-        assert_eq!(DEFAULT_SEMANTIC_VERSION, 8);
+        assert_eq!(DEFAULT_SEMANTIC_VERSION, 9);
         assert_eq!(HIGHEST_SUPPORTED_SEMANTIC_VERSION, DEFAULT_SEMANTIC_VERSION);
         #[cfg(feature = "sqlite-store")]
         assert_eq!(batch::DATA_CLASS_EVENT, DataClass::Event as u8);

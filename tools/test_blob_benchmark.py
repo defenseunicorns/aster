@@ -38,7 +38,8 @@ class MainPublication(unittest.TestCase):
             "size = int(sys.argv[2])\n"
             "print('BENCH_RESULT ' + json.dumps(dict(status='complete', bytes=size, "
             "verified_bytes=size, source_sha256='fixture', receiver_sha256='fixture', "
-            "transfer_until_ready_ns=123)))\n"
+            "transfer_until_visible_ns=100, transfer_until_ready_ns=123, "
+            "publish_to_visible_ns=200, publish_to_settled_ns=223)))\n"
         )
         if change_source:
             script += f"Path({str(self.example)!r}).write_text('// changed during run\\n')\n"
@@ -56,7 +57,9 @@ class MainPublication(unittest.TestCase):
         after = json.loads((self.output / "source-after.json").read_text())
         self.assertEqual(before, after)
         expected = [{"variant": "fixture", "bytes": 16384, "samples": 1,
-                     "completed": 1, "ready_median_ns": 123}]
+                     "completed": 1, "visible_median_ns": 100,
+                     "settled_median_ns": 123,
+                     "publish_to_visible_median_ns": 200}]
         self.assertEqual(json.loads((self.output / "summary.json").read_text()), expected)
         with (self.output / "summary.csv").open(newline="") as source:
             self.assertEqual(list(csv.DictReader(source)),
@@ -107,12 +110,19 @@ class Results(unittest.TestCase):
         size = 100 * 1024 * 1024
         self.assertEqual(campaign("scale"), [(f"{size}-1", size, 300)])
 
+    def test_profile5_campaign_is_exactly_one_gib_with_a_large_transfer_deadline(self):
+        size = 1024 * 1024 * 1024
+        self.assertEqual(campaign("profile5-1g"), [(f"{size}-1", size, 900)])
+
     def test_summary_counts_timeouts_but_never_pools_their_elapsed_time(self):
         runs = []
         for status, ns in [("complete", 30), ("complete", 10), ("transfer_timeout", 900)]:
-            runs.append({"variant": "baseline", "exit_code": 0, "records": [{"type": "BENCH_RESULT", "data": {"status": status, "bytes": 8, "transfer_until_ready_ns": ns}}]})
+            runs.append({"variant": "baseline", "exit_code": 0, "records": [{"type": "BENCH_RESULT", "data": {"status": status, "bytes": 8, "transfer_until_visible_ns": ns - 2, "transfer_until_ready_ns": ns, "publish_to_visible_ns": ns + 8}}]})
         rows = summarize(runs)
-        self.assertEqual(rows, [{"variant": "baseline", "bytes": 8, "samples": 3, "completed": 2, "ready_median_ns": 20}])
+        self.assertEqual(rows, [{"variant": "baseline", "bytes": 8, "samples": 3,
+                                "completed": 2, "visible_median_ns": 18,
+                                "settled_median_ns": 20,
+                                "publish_to_visible_median_ns": 28}])
 
     def test_missing_duplicate_and_unverified_results_fail_closed(self):
         for text in ["", 'BENCH_RESULT {"status":"transfer_timeout"}\n' * 2,

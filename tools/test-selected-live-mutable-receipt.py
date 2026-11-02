@@ -1946,7 +1946,7 @@ class SelectedLiveMutableReceiptTests(unittest.TestCase):
             raise AssertionError(arguments)
 
         with (
-            mock.patch.object(CHECKER.shutil, "which", return_value="/usr/bin/git"),
+            mock.patch.object(CHECKER, "system_executable", return_value="/usr/bin/git"),
             mock.patch.object(CHECKER, "reviewer_signature_options", return_value=[]),
             mock.patch.object(CHECKER, "run_git", side_effect=fake_git),
             self.assertRaisesRegex(CHECKER.ReceiptViolation, "outside the source checkout"),

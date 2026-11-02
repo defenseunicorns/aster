@@ -2,6 +2,18 @@
 ." SPDX-License-Identifier: Apache-2.0
 ." Clean Room — Privileged
 .TH ASTERCTL-BLOB-PUBLISH 1 "2026-10-15" "Aster" "User Commands"
+.\" <!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+.\" ```json
+.\" {
+.\"   "schema": 1,
+.\"   "surface": "blob_publish_man",
+.\"   "local_publish_waits_for_peer": false,
+.\"   "capacity_authority": "configured_blob_depot_limits"
+.\" }
+.\" ```
+.\" <!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+.\" Publication commits to the local canonical Blob authority without waiting for a peer, and all Blob states share configured depot limits.
+.\" <!-- ASTER-BLOB-CAPABILITY:END -->
 .SH NAME
 asterctl-blob-publish \- publish a local file as an immutable Aster Blob
 .SH SYNOPSIS
@@ -17,9 +29,9 @@ asterctl-blob-publish \- publish a local file as an immutable Aster Blob
 .SH DESCRIPTION
 .B asterctl blob-publish
 publishes one nonempty regular file through a running Aster agent.
-The local path is never sent to the agent. Metadata is sent first, followed by
+The path remains local; file contents stream to the local agent. Metadata is sent first, followed by
 canonical bounded file chunks over one native HTTP/2 stream. The complete Blob
-is not buffered in memory. Chunks are at most 64 KiB. The CLI and wire contract
+is not buffered in memory. Chunks are at most 512 KiB. The CLI and wire contract
 do not impose a total-size maximum; the agent may reject a source above its
 configured backend limit.
 .PP
@@ -61,6 +73,11 @@ Optional positive unsigned 64-bit lifetime. Omission means durable.
 .BI \-\-operation\-key " KEY|auto"
 Required UTF-8 key of 1\(en256 bytes, or auto to generate a new key.
 An idempotent retry must use the same key, file bytes, and publication options.
+.TP
+.BI \-\-progress " MODE"
+Progress policy: auto, always, or never. The default auto writes progress only
+when standard error is a terminal. always emits newline-delimited records when
+redirected; never disables progress. Progress never changes standard output.
 .SH OUTPUT
 Prints Blob ID, publisher, publisher counter, priority, total length, optional
 media type, schema ID, acceptance marker, inserted state, and original TTL.
@@ -74,9 +91,14 @@ durable JSON omits that field. JSON also includes
 .BR operation_key .
 Blob plaintext is never printed.
 .PP
+Progress on standard error distinguishes bytes sent to the local agent, bytes
+accepted by it, and bytes durably staged. Periodic output is limited to four
+updates per second; durable checkpoints and the terminal state are not hidden
+by that limit.
+.PP
 If the response or TTL echo is unusable, the outcome is unknown and the error
 prints exact guidance to retry the identical request with the same operation
-key.
+key. The error also reports the last sent, accepted, and durable byte counters.
 .SH EXIT STATUS
 .TP
 .B 0

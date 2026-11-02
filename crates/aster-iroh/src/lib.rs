@@ -597,7 +597,7 @@ pub enum CarrierError {
     /// local size or the smallest size proven by a bounded remote read.
     FrameTooLarge { actual: usize, maximum: usize },
     /// One length-delimited turn exceeded the caller-owned aggregate byte bound.
-    TurnTooLarge { actual: usize, maximum: usize },
+    TurnTooLarge { actual: u64, maximum: u64 },
 }
 
 impl fmt::Display for CarrierError {
@@ -2108,6 +2108,46 @@ pub struct ReceiveUniTurn {
     eof: bool,
 }
 
+const STREAM_DATA_MAGIC: &[u8; 8] = b"ASTRSD\x01\x01";
+const STREAM_CONTROL_MAGIC: &[u8; 8] = b"ASTRSC\x01\x01";
+
+/// Sender half of one bounded long-lived stream direction.
+pub struct BoundedSendStream {
+    stream: SendStream,
+    deadline: Instant,
+    magic: &'static [u8; 8],
+    max_frame_bytes: usize,
+    max_stream_bytes: u64,
+    written_bytes: u64,
+    started: bool,
+    complete: bool,
+}
+
+/// Receiver half of one bounded long-lived stream direction.
+pub struct BoundedReceiveStream {
+    stream: RecvStream,
+    deadline: Instant,
+    magic: &'static [u8; 8],
+    max_frame_bytes: usize,
+    max_stream_bytes: u64,
+    read_bytes: u64,
+    started: bool,
+    complete: bool,
+    eof: bool,
+}
+
+/// Initiator's concurrent data-send and control-receive pair.
+pub struct OpenedStreamPair {
+    pub data: BoundedSendStream,
+    pub control: BoundedReceiveStream,
+}
+
+/// Acceptor's concurrent data-receive and control-send pair.
+pub struct AcceptedStreamPair {
+    pub data: BoundedReceiveStream,
+    pub control: BoundedSendStream,
+}
+
 /// Authenticated, bounded opaque exchange channel.
 #[derive(Clone)]
 pub struct Connection {
@@ -2287,6 +2327,79 @@ impl Connection {
     /// Returns the exact protected-frame ceiling enforced for ordered uni turns.
     pub fn max_uni_frame_bytes(&self) -> usize {
         self.max_exchange_bytes.min(DEFAULT_MAX_EXCHANGE_BYTES)
+    }
+
+    /// Opens a long-lived data stream while concurrently accepting the reverse
+    /// control stream. These streams are independent of the legacy ordered-turn
+    /// state and remain open for the whole higher-layer attempt.
+    pub async fn open_stream_pair(
+        &self,
+        deadline: Instant,
+        max_data_bytes: u64,
+        max_control_bytes: u64,
+    ) -> Result<OpenedStreamPair, CarrierError> {
+        let send = timeout_at(deadline, self.inner.open_uni())
+            .await
+            .map_err(|_| CarrierError::Timeout("stream pair open"))?
+            .map_err(|error| CarrierError::Transport(error.to_string()))?;
+        let mut data = BoundedSendStream::new(
+            send,
+            deadline,
+            STREAM_DATA_MAGIC,
+            self.max_uni_frame_bytes(),
+            max_data_bytes,
+        );
+        data.ensure_started().await?;
+        let receive = timeout_at(deadline, self.inner.accept_uni())
+            .await
+            .map_err(|_| CarrierError::Timeout("stream pair open"))?
+            .map_err(|error| CarrierError::Transport(error.to_string()))?;
+        Ok(OpenedStreamPair {
+            data,
+            control: BoundedReceiveStream::new(
+                receive,
+                deadline,
+                STREAM_CONTROL_MAGIC,
+                self.max_uni_frame_bytes(),
+                max_control_bytes,
+            ),
+        })
+    }
+
+    /// Accepts the long-lived data stream while concurrently opening the
+    /// reverse control stream.
+    pub async fn accept_stream_pair(
+        &self,
+        deadline: Instant,
+        max_data_bytes: u64,
+        max_control_bytes: u64,
+    ) -> Result<AcceptedStreamPair, CarrierError> {
+        let send = timeout_at(deadline, self.inner.open_uni())
+            .await
+            .map_err(|_| CarrierError::Timeout("stream pair accept"))?
+            .map_err(|error| CarrierError::Transport(error.to_string()))?;
+        let mut control = BoundedSendStream::new(
+            send,
+            deadline,
+            STREAM_CONTROL_MAGIC,
+            self.max_uni_frame_bytes(),
+            max_control_bytes,
+        );
+        control.ensure_started().await?;
+        let receive = timeout_at(deadline, self.inner.accept_uni())
+            .await
+            .map_err(|_| CarrierError::Timeout("stream pair accept"))?
+            .map_err(|error| CarrierError::Transport(error.to_string()))?;
+        Ok(AcceptedStreamPair {
+            data: BoundedReceiveStream::new(
+                receive,
+                deadline,
+                STREAM_DATA_MAGIC,
+                self.max_uni_frame_bytes(),
+                max_data_bytes,
+            ),
+            control,
+        })
     }
 
     /// Opens the dialer-to-acceptor or acceptor-to-dialer unidirectional turn
@@ -2584,6 +2697,264 @@ impl Connection {
     }
 }
 
+impl BoundedSendStream {
+    fn new(
+        stream: SendStream,
+        deadline: Instant,
+        magic: &'static [u8; 8],
+        max_frame_bytes: usize,
+        max_stream_bytes: u64,
+    ) -> Self {
+        Self {
+            stream,
+            deadline,
+            magic,
+            max_frame_bytes,
+            max_stream_bytes,
+            written_bytes: 0,
+            started: false,
+            complete: false,
+        }
+    }
+
+    async fn ensure_started(&mut self) -> Result<(), CarrierError> {
+        if self.started {
+            return Ok(());
+        }
+        timeout_at(self.deadline, self.stream.write_all(self.magic))
+            .await
+            .map_err(|_| CarrierError::Timeout("stream pair send"))?
+            .map_err(|error| CarrierError::Transport(error.to_string()))?;
+        self.started = true;
+        Ok(())
+    }
+
+    pub async fn write_frame(&mut self, frame: &[u8]) -> Result<(), CarrierError> {
+        self.write_frame_parts(frame, &[]).await
+    }
+
+    pub async fn write_frame_parts(
+        &mut self,
+        prefix: &[u8],
+        body: &[u8],
+    ) -> Result<(), CarrierError> {
+        if self.complete {
+            return Err(CarrierError::Transport(
+                "stream direction is complete".into(),
+            ));
+        }
+        let frame_len =
+            prefix
+                .len()
+                .checked_add(body.len())
+                .ok_or(CarrierError::FrameTooLarge {
+                    actual: usize::MAX,
+                    maximum: self.max_frame_bytes,
+                })?;
+        ensure_frame_bound(frame_len, self.max_frame_bytes)?;
+        let encoded = 4_u64
+            .checked_add(frame_len as u64)
+            .ok_or(CarrierError::TurnTooLarge {
+                actual: u64::MAX,
+                maximum: self.max_stream_bytes,
+            })?;
+        let next = self
+            .written_bytes
+            .checked_add(encoded)
+            .ok_or(CarrierError::TurnTooLarge {
+                actual: u64::MAX,
+                maximum: self.max_stream_bytes,
+            })?;
+        if next > self.max_stream_bytes {
+            return Err(CarrierError::TurnTooLarge {
+                actual: next,
+                maximum: self.max_stream_bytes,
+            });
+        }
+        self.ensure_started().await?;
+        let length = u32::try_from(frame_len).map_err(|_| CarrierError::FrameTooLarge {
+            actual: frame_len,
+            maximum: u32::MAX as usize,
+        })?;
+        timeout_at(self.deadline, async {
+            self.stream.write_all(&length.to_be_bytes()).await?;
+            self.stream.write_all(prefix).await?;
+            self.stream.write_all(body).await
+        })
+        .await
+        .map_err(|_| CarrierError::Timeout("stream pair send"))?
+        .map_err(|error| CarrierError::Transport(error.to_string()))?;
+        self.written_bytes = next;
+        Ok(())
+    }
+
+    pub async fn finish(&mut self) -> Result<(), CarrierError> {
+        if self.complete {
+            return Err(CarrierError::Transport(
+                "stream direction is complete".into(),
+            ));
+        }
+        self.ensure_started().await?;
+        self.stream
+            .finish()
+            .map_err(|error| CarrierError::Transport(error.to_string()))?;
+        match timeout_at(self.deadline, self.stream.stopped())
+            .await
+            .map_err(|_| CarrierError::Timeout("stream pair finish"))?
+            .map_err(|error| CarrierError::Transport(error.to_string()))?
+        {
+            None => {
+                self.complete = true;
+                Ok(())
+            }
+            Some(code) => Err(CarrierError::Transport(format!(
+                "peer reset stream direction with code {code}"
+            ))),
+        }
+    }
+
+    pub fn reset(&mut self) -> Result<(), CarrierError> {
+        self.stream
+            .reset(2u8.into())
+            .map_err(|error| CarrierError::Transport(error.to_string()))?;
+        self.complete = true;
+        Ok(())
+    }
+}
+
+impl Drop for BoundedSendStream {
+    fn drop(&mut self) {
+        if !self.complete {
+            let _ = self.stream.reset(2u8.into());
+        }
+    }
+}
+
+impl BoundedReceiveStream {
+    fn new(
+        stream: RecvStream,
+        deadline: Instant,
+        magic: &'static [u8; 8],
+        max_frame_bytes: usize,
+        max_stream_bytes: u64,
+    ) -> Self {
+        Self {
+            stream,
+            deadline,
+            magic,
+            max_frame_bytes,
+            max_stream_bytes,
+            read_bytes: 0,
+            started: false,
+            complete: false,
+            eof: false,
+        }
+    }
+
+    async fn read_some(&mut self, output: &mut [u8]) -> Result<Option<usize>, CarrierError> {
+        timeout_at(self.deadline, self.stream.read(output))
+            .await
+            .map_err(|_| CarrierError::Timeout("stream pair receive"))?
+            .map_err(|error| CarrierError::Transport(error.to_string()))
+    }
+
+    async fn ensure_started(&mut self) -> Result<(), CarrierError> {
+        if self.started {
+            return Ok(());
+        }
+        let mut observed = [0u8; 8];
+        let mut offset = 0;
+        while offset < observed.len() {
+            let Some(read) = self.read_some(&mut observed[offset..]).await? else {
+                return Err(CarrierError::Transport(
+                    "truncated stream-pair preamble".into(),
+                ));
+            };
+            offset += read;
+        }
+        if &observed != self.magic {
+            return Err(CarrierError::Transport("stream-pair role mismatch".into()));
+        }
+        self.started = true;
+        Ok(())
+    }
+
+    pub async fn read_frame(&mut self) -> Result<Option<Vec<u8>>, CarrierError> {
+        if self.eof {
+            return Ok(None);
+        }
+        if self.complete {
+            return Err(CarrierError::Transport("stream direction failed".into()));
+        }
+        self.ensure_started().await?;
+        let mut length = [0u8; 4];
+        let mut offset = 0;
+        while offset < length.len() {
+            match self.read_some(&mut length[offset..]).await? {
+                None if offset == 0 => {
+                    self.eof = true;
+                    self.complete = true;
+                    return Ok(None);
+                }
+                None => {
+                    return Err(CarrierError::Transport(
+                        "truncated stream frame length".into(),
+                    ));
+                }
+                Some(read) => offset += read,
+            }
+        }
+        let frame_len = decode_uni_frame_length(length, self.max_frame_bytes)?;
+        let encoded = 4_u64
+            .checked_add(frame_len as u64)
+            .ok_or(CarrierError::TurnTooLarge {
+                actual: u64::MAX,
+                maximum: self.max_stream_bytes,
+            })?;
+        let next = self
+            .read_bytes
+            .checked_add(encoded)
+            .ok_or(CarrierError::TurnTooLarge {
+                actual: u64::MAX,
+                maximum: self.max_stream_bytes,
+            })?;
+        if next > self.max_stream_bytes {
+            return Err(CarrierError::TurnTooLarge {
+                actual: next,
+                maximum: self.max_stream_bytes,
+            });
+        }
+        let mut frame = vec![0u8; frame_len];
+        let mut offset = 0;
+        while offset < frame.len() {
+            let Some(read) = self.read_some(&mut frame[offset..]).await? else {
+                return Err(CarrierError::Transport(
+                    "truncated stream frame body".into(),
+                ));
+            };
+            offset += read;
+        }
+        self.read_bytes = next;
+        Ok(Some(frame))
+    }
+
+    pub fn stop(&mut self) -> Result<(), CarrierError> {
+        self.stream
+            .stop(2u8.into())
+            .map_err(|error| CarrierError::Transport(error.to_string()))?;
+        self.complete = true;
+        Ok(())
+    }
+}
+
+impl Drop for BoundedReceiveStream {
+    fn drop(&mut self) {
+        if !self.complete {
+            let _ = self.stream.stop(2u8.into());
+        }
+    }
+}
+
 impl SendUniTurn {
     /// Writes one nonempty length-delimited protected frame after a synchronous
     /// caller check. The metadata-free turn preamble is started first; a rejected
@@ -2612,8 +2983,8 @@ impl SendUniTurn {
             .checked_add(frame.len())
             .ok_or_else(|| {
                 E::from(CarrierError::TurnTooLarge {
-                    actual: usize::MAX,
-                    maximum: self.max_turn_bytes,
+                    actual: usize::MAX as u64,
+                    maximum: self.max_turn_bytes as u64,
                 })
             })?;
         let next_total = self
@@ -2621,14 +2992,14 @@ impl SendUniTurn {
             .checked_add(encoded_bytes)
             .ok_or_else(|| {
                 E::from(CarrierError::TurnTooLarge {
-                    actual: usize::MAX,
-                    maximum: self.max_turn_bytes,
+                    actual: usize::MAX as u64,
+                    maximum: self.max_turn_bytes as u64,
                 })
             })?;
         if next_total > self.max_turn_bytes {
             return Err(E::from(CarrierError::TurnTooLarge {
-                actual: next_total,
-                maximum: self.max_turn_bytes,
+                actual: next_total as u64,
+                maximum: self.max_turn_bytes as u64,
             }));
         }
         self.ensure_started().await.map_err(E::from)?;
@@ -2781,20 +3152,20 @@ impl ReceiveUniTurn {
             .checked_add(frame_len)
             .ok_or_else(|| {
                 self.fail_with(CarrierError::TurnTooLarge {
-                    actual: usize::MAX,
-                    maximum: self.max_turn_bytes,
+                    actual: usize::MAX as u64,
+                    maximum: self.max_turn_bytes as u64,
                 })
             })?;
         let next_total = self.read_bytes.checked_add(encoded_bytes).ok_or_else(|| {
             self.fail_with(CarrierError::TurnTooLarge {
-                actual: usize::MAX,
-                maximum: self.max_turn_bytes,
+                actual: usize::MAX as u64,
+                maximum: self.max_turn_bytes as u64,
             })
         })?;
         if next_total > self.max_turn_bytes {
             return Err(self.fail_with(CarrierError::TurnTooLarge {
-                actual: next_total,
-                maximum: self.max_turn_bytes,
+                actual: next_total as u64,
+                maximum: self.max_turn_bytes as u64,
             }));
         }
 
@@ -4937,6 +5308,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uni_turn_concurrent_stream_pair_keeps_reverse_control_live() {
+        let (server, client, receiver_connection, sender_connection) =
+            direct_connection_pair().await;
+        let receiver = tokio::spawn(async move {
+            let mut pair = receiver_connection
+                .accept_stream_pair(uni_deadline(), 64, 64)
+                .await
+                .expect("accept concurrent pair");
+            assert_eq!(
+                pair.data.read_frame().await.unwrap(),
+                Some(b"extent".to_vec())
+            );
+            pair.control.write_frame(b"checkpoint").await.unwrap();
+            pair.control.finish().await.unwrap();
+            assert_eq!(pair.data.read_frame().await.unwrap(), None);
+        });
+        let mut pair = sender_connection
+            .open_stream_pair(uni_deadline(), 64, 64)
+            .await
+            .expect("open concurrent pair");
+        pair.data.write_frame(b"extent").await.unwrap();
+        assert_eq!(
+            pair.control.read_frame().await.unwrap(),
+            Some(b"checkpoint".to_vec())
+        );
+        assert_eq!(pair.control.read_frame().await.unwrap(), None);
+        pair.data.finish().await.unwrap();
+        receiver.await.unwrap();
+        sender_connection.close();
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_stream_pair_writes_one_frame_from_two_owned_parts() {
+        let (server, client, receiver_connection, sender_connection) =
+            direct_connection_pair().await;
+        let receiver = tokio::spawn(async move {
+            let mut pair = receiver_connection
+                .accept_stream_pair(uni_deadline(), 64, 64)
+                .await
+                .expect("accept concurrent pair");
+            assert_eq!(
+                pair.data.read_frame().await.expect("read parts frame"),
+                Some(b"headerbody".to_vec())
+            );
+            assert_eq!(pair.data.read_frame().await.expect("exact EOF"), None);
+        });
+        let mut pair = sender_connection
+            .open_stream_pair(uni_deadline(), 64, 64)
+            .await
+            .expect("open concurrent pair");
+        pair.data
+            .write_frame_parts(b"header", b"body")
+            .await
+            .expect("write parts frame");
+        assert!(matches!(
+            pair.data.write_frame_parts(&[0; 40], &[0; 25]).await,
+            Err(CarrierError::TurnTooLarge {
+                actual: 83,
+                maximum: 64
+            })
+        ));
+        pair.data.finish().await.expect("finish data");
+        receiver.await.expect("receiver task");
+        sender_connection.close();
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_stream_pair_accounts_past_four_gib_and_rejects_overflow() {
+        // Seed cumulative accounting; exercise real framing without a 4-GiB transfer.
+        const PRIOR: u64 = u32::MAX as u64 - 2;
+        const LIMIT: u64 = PRIOR + 4 + 8;
+        let (server, client, receiver_connection, sender_connection) =
+            direct_connection_pair().await;
+        let receiver = tokio::spawn(async move {
+            let mut pair = receiver_connection
+                .accept_stream_pair(uni_deadline(), LIMIT, 64)
+                .await
+                .unwrap();
+            pair.data.read_bytes = PRIOR;
+            assert_eq!(
+                pair.data.read_frame().await.unwrap(),
+                Some(b"boundary".to_vec())
+            );
+            assert_eq!(pair.data.read_bytes, LIMIT);
+            assert_eq!(pair.data.read_frame().await.unwrap(), None);
+        });
+        let mut pair = sender_connection
+            .open_stream_pair(uni_deadline(), LIMIT, 64)
+            .await
+            .unwrap();
+        pair.data.written_bytes = PRIOR;
+        pair.data.write_frame_parts(b"boun", b"dary").await.unwrap();
+        assert_eq!(pair.data.written_bytes, LIMIT);
+        assert!(matches!(
+            pair.data.write_frame(b"x").await,
+            Err(CarrierError::TurnTooLarge { actual, maximum })
+                if actual == LIMIT + 5 && maximum == LIMIT
+        ));
+        assert_eq!(pair.data.written_bytes, LIMIT);
+        pair.data.max_stream_bytes = u64::MAX;
+        pair.data.written_bytes = u64::MAX - 4;
+        assert!(matches!(
+            pair.data.write_frame(b"x").await,
+            Err(CarrierError::TurnTooLarge {
+                actual: u64::MAX,
+                maximum: u64::MAX
+            })
+        ));
+        assert_eq!(pair.data.written_bytes, u64::MAX - 4);
+        pair.data.finish().await.unwrap();
+        receiver.await.unwrap();
+        sender_connection.close();
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_stream_pair_receive_rejects_wide_limit_and_overflow() {
+        const PRIOR: u64 = u32::MAX as u64 - 2;
+        for (prior, maximum, expected_actual) in [
+            (PRIOR, PRIOR + 11, PRIOR + 12),
+            (u64::MAX - 4, u64::MAX, u64::MAX),
+        ] {
+            let (server, client, receiver_connection, sender_connection) =
+                direct_connection_pair().await;
+            let receiver = tokio::spawn(async move {
+                let mut pair = receiver_connection
+                    .accept_stream_pair(uni_deadline(), maximum, 64)
+                    .await
+                    .unwrap();
+                pair.data.read_bytes = prior;
+                assert!(matches!(
+                    pair.data.read_frame().await,
+                    Err(CarrierError::TurnTooLarge { actual, maximum: bound })
+                        if actual == expected_actual && bound == maximum
+                ));
+                assert_eq!(pair.data.read_bytes, prior);
+                pair.data.stop().unwrap();
+            });
+            let mut pair = sender_connection
+                .open_stream_pair(uni_deadline(), 64, 64)
+                .await
+                .unwrap();
+            // The length alone must reject the frame before waiting for its body.
+            pair.data.ensure_started().await.unwrap();
+            pair.data
+                .stream
+                .write_all(&8_u32.to_be_bytes())
+                .await
+                .unwrap();
+            receiver.await.unwrap();
+            pair.data.reset().unwrap();
+            sender_connection.close();
+            client.close().await;
+            server.close().await;
+        }
+    }
+
+    #[tokio::test]
     async fn uni_turn_zero_frame_and_prewrite_rejection_emit_no_frame_bytes() {
         let (server, client, receiver_connection, sender_connection) =
             direct_connection_pair().await;
@@ -5400,5 +5934,94 @@ mod tests {
                 maximum: 8
             }
         ));
+    }
+
+    /// Measurement-only ceiling for the profile-5 long-lived data/control shape.
+    #[tokio::test]
+    #[ignore = "explicit 1 GiB loopback performance measurement"]
+    async fn concurrent_stream_ceiling_transfers_one_gib_with_reverse_checkpoints() {
+        const TOTAL: u64 = 1 << 30;
+        const EXTENT: usize = 1 << 20;
+        const CHECKPOINT: u64 = 8 << 20;
+
+        let (server, client, receiver, sender) = direct_connection_pair().await;
+        let receiver_inner = receiver.inner.clone();
+        let receive_task = tokio::spawn(async move {
+            let mut data = receiver_inner
+                .accept_uni()
+                .await
+                .expect("accept data stream");
+            let mut control = receiver_inner
+                .open_uni()
+                .await
+                .expect("open control stream");
+            let mut buffer = vec![0u8; EXTENT];
+            let mut received = 0u64;
+            let mut next_checkpoint = CHECKPOINT;
+            while received < TOTAL {
+                let count = data
+                    .read(&mut buffer)
+                    .await
+                    .expect("read data stream")
+                    .expect("data EOF after declared length");
+                received += u64::try_from(count).expect("read count fits u64");
+                if received >= next_checkpoint || received == TOTAL {
+                    control
+                        .write_all(&received.to_be_bytes())
+                        .await
+                        .expect("write checkpoint");
+                    next_checkpoint = received.saturating_add(CHECKPOINT);
+                }
+            }
+            assert_eq!(data.read(&mut buffer).await.expect("read EOF"), None);
+            control.finish().expect("finish control stream");
+            received
+        });
+
+        let started = std::time::Instant::now();
+        let mut data = sender.inner.open_uni().await.expect("open data stream");
+        let sender_inner = sender.inner.clone();
+        let checkpoint_task = tokio::spawn(async move {
+            let mut control = sender_inner
+                .accept_uni()
+                .await
+                .expect("accept control stream");
+            let mut buffer = [0u8; 8];
+            let mut observed = 0u64;
+            loop {
+                let mut filled = 0;
+                while filled < buffer.len() {
+                    match control
+                        .read(&mut buffer[filled..])
+                        .await
+                        .expect("read checkpoint")
+                    {
+                        Some(count) => filled += count,
+                        None if filled == 0 => return observed,
+                        None => panic!("checkpoint record was truncated"),
+                    }
+                }
+                observed = u64::from_be_bytes(buffer);
+            }
+        });
+        let extent = vec![0xa5; EXTENT];
+        for _ in 0..TOTAL / EXTENT as u64 {
+            data.write_all(&extent).await.expect("write extent");
+        }
+        data.finish().expect("finish data stream");
+        let received = receive_task.await.expect("receive task");
+        let checkpoint = checkpoint_task.await.expect("checkpoint task");
+        let elapsed = started.elapsed();
+        assert_eq!(received, TOTAL);
+        assert_eq!(checkpoint, TOTAL);
+        let mib_per_second = TOTAL as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+        eprintln!(
+            "stream_ceiling bytes={TOTAL} elapsed_ns={} mib_per_second={mib_per_second:.3}",
+            elapsed.as_nanos()
+        );
+
+        sender.close();
+        client.close().await;
+        server.close().await;
     }
 }

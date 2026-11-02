@@ -1,8 +1,29 @@
 # Aster operator runbook
 
+<!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+```json
+{
+  "schema": 1,
+  "surface": "operator_guide",
+  "local_publish_waits_for_peer": false,
+  "rust_agent_asterctl_publish_read": "implemented",
+  "blob_status_scope": "receiver_local_durable_state",
+  "blob_status_reports_remote_delivery_peer_or_convergence": false,
+  "cli_download_resume": "post_merge"
+}
+```
+<!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+Local Blob publication commits without waiting for a peer. Rust, the native-gRPC agent, and asterctl implement bounded Blob publication and authenticated reads. blob-status reports receiver-local durable state, not remote delivery, peer status, or convergence. CLI download resume is post-merge work; an interrupted download restarts at byte zero.
+<!-- ASTER-BLOB-CAPABILITY:END -->
+
 Use this runbook to install and operate Aster without building software or
 writing an application. Both packaged paths include `asterctl` for Event and
 Blob operations.
+
+For Blob operations, the machine-checked capability block above is
+authoritative for publication, status, and download behavior. Node-to-node
+profile 5 resumes from receiver checkpoints independently of the CLI output
+path.
 
 > [!IMPORTANT]
 > Aster is an evaluation-stage reference implementation, not a
@@ -158,7 +179,12 @@ Write `/etc/aster/agent.json` and replace the load-operation placeholder:
 }
 ```
 
-The capacity values are evaluation defaults, not production sizing guidance.
+The capacity values are evaluation defaults sized only for a small functional
+check, not production sizing guidance. Before publishing or receiving a large
+Blob, set `storage.blob_depot` from the retained-object inventory and ensure
+the state filesystem has room for the object plus database, journal,
+temporary, quota, and operational reserve. In particular, the 64-MiB example
+cannot admit an 800-MiB or 1-GiB object.
 
 Set permissions and validate:
 
@@ -203,6 +229,11 @@ node:
 The selector requests data; it does not grant authorization. Empty interests
 mean no Blob network receipt. Peer, interest, emission-policy, depot, and
 mission changes require a restart.
+
+With semantic v9 selected, the exact interest drives the bounded profile-5
+streaming lane. The sync scheduler transfers when the configured destination is
+available, and an interrupted attempt resumes from receiver-authoritative
+durable progress.
 
 ### Step 6: start and verify
 
@@ -314,18 +345,45 @@ Publish on Node A:
 
 ```sh
 sudo -u aster /usr/bin/asterctl \
+  --token-file /etc/aster/agent-credentials/client-token --json status
+
+sudo -u aster /usr/bin/asterctl \
   --token-file /etc/aster/agent-credentials/client-token \
-  --timeout 30 \
+  --timeout 900 \
   blob-publish \
   --file /run/aster-operator/map.bin \
   --topic imagery.maps \
   --scope mission/team/alpha \
   --priority routine \
   --media-type application/octet-stream \
-  --operation-key map-001
+  --operation-key map-001 \
+  --progress auto
 ```
 
-Record the Blob ID. For a one-hour Blob, add `--ttl-ms 3600000`.
+Record the Publication ID, Blob ID, and operation key. The capacity output is
+an observed preflight, not a reservation; retain filesystem/database/journal
+and operational reserve beyond the logical object size. For a one-hour Blob,
+add `--ttl-ms 3600000`.
+Publication success means the Blob is durable on Node A; it does not wait for
+Node B. Wait for a later eligible contact before reading on Node B. For a
+large-object engineering run, retain the pipeline receipt and follow the
+[Blob streaming engineering runbook](validation/blob-streaming-engineering-runbook.md).
+
+On Node B, inspect or wait for that exact publication before reading:
+
+```sh
+sudo -u aster /usr/bin/asterctl \
+  --token-file /etc/aster/agent-credentials/client-token \
+  --timeout 900 blob-status \
+  --publication-id '<PUBLICATION_ID_FROM_NODE_A>' \
+  --topic imagery.maps \
+  --scope mission/team/alpha \
+  --wait
+```
+
+This wait is receiver-local observation. It does not keep Node A's publication
+RPC open and does not coordinate contact. `AVAILABLE` supplies the Blob ID that
+Node B can read.
 
 Read on Node B:
 
@@ -333,7 +391,7 @@ Read on Node B:
 sudo install -d -o aster -g aster -m 0700 /run/aster-operator
 sudo -u aster /usr/bin/asterctl \
   --token-file /etc/aster/agent-credentials/client-token \
-  --timeout 30 \
+  --timeout 900 \
   blob-read \
   --id '<BLOB_ID_FROM_NODE_A>' \
   --topic imagery.maps \
@@ -493,8 +551,8 @@ prints `VERIFY status=pass`.
 ### Step 5: run Event and Blob checks
 
 The bundle must authorize `chat.events@mission/team/alpha` and
-`imagery.maps@mission/team/alpha`. A local publish/query needs no subscription;
-for a peer-transfer check, create the matching subscription on the receiving
+`imagery.maps@mission/team/alpha`. Work confined to one node needs no
+subscription; for a transfer check, create the matching subscription on the receiving
 node before publication and allow authenticated contact after creation. Publish
 and query an Event. Initialize the journal once in the persistent transfer
 bind mount, then retain it for later invocations:
@@ -522,16 +580,24 @@ Stage a nonempty file, publish it, and record the returned Blob ID:
 ```sh
 install -m 0600 /secure/input/map.bin "$ASTER_TRANSFER_DIR/map.bin"
 docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl \
-  --timeout 30 --json blob-publish --file /transfer/map.bin \
+  --json status
+docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl \
+  --timeout 900 --json blob-publish --file /transfer/map.bin \
   --topic imagery.maps --scope mission/team/alpha --priority routine \
-  --media-type application/octet-stream --operation-key compose-map-001
+  --media-type application/octet-stream --operation-key compose-map-001 \
+  --progress always
 ```
+
+Run the same `status` preflight on the receiving node. After eligible contact,
+wait there with `blob-status --publication-id '<PUBLICATION_ID>' --topic
+imagery.maps --scope mission/team/alpha --wait`; this local wait does not
+coordinate the publisher or select a carrier.
 
 Read to a new output path and compare the files:
 
 ```sh
 docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl \
-  --timeout 30 --json blob-read --id '<BLOB_ID>' \
+  --timeout 900 --json blob-read --id '<BLOB_ID>' \
   --topic imagery.maps --scope mission/team/alpha \
   --output /transfer/received-map.bin
 sha256sum "$ASTER_TRANSFER_DIR/map.bin" \
@@ -551,7 +617,7 @@ docker compose -f "$ASTER_COMPOSE_FILE" run --rm verify
 docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl --json query \
   --topic chat.events --scope mission/team/alpha
 docker compose -f "$ASTER_COMPOSE_FILE" run --rm asterctl \
-  --timeout 30 blob-read --id '<BLOB_ID>' \
+  --timeout 900 blob-read --id '<BLOB_ID>' \
   --topic imagery.maps --scope mission/team/alpha \
   --output /transfer/received-map-after-replace.bin
 sha256sum "$ASTER_TRANSFER_DIR/map.bin" \
@@ -564,21 +630,7 @@ objects; they do not prove peer transfer.
 ### Step 7: connect this Docker node to a test device
 
 Keep the default deployment closed unless a remote peer is required. For a
-reviewed ZeroTier test, bind the mesh port only to this host's ZeroTier IPv4:
-
-```sh
-export ASTER_MESH_BIND_ADDRESS='<THIS_HOST_ZEROTIER_IPV4>'
-export ASTER_MESH_PUBLISHED_PORT=8183
-docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
-  config --format json > /tmp/aster-compose.remote.rendered.json
-docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
-  run --rm preflight
-docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
-  up -d --force-recreate aster-agent
-docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
-  run --rm verify
-```
-
+reviewed ZeroTier test, edit both nodes before activating either change.
 Configure reciprocal authenticated peers and the exact Blob interest. In the
 Docker node's `agent.json`:
 
@@ -599,7 +651,38 @@ On the packaged test device:
 ```
 
 Restart the packaged device after its configuration change and permit UDP 8183
-in applicable host policy. Create the matching receiver subscriptions before
+in applicable host policy.
+
+Review the final Docker configuration, then refresh its digest. Do not reuse
+the digest from Step 4 after editing `agent.json`:
+
+```sh
+jq . "$ASTER_AGENT_CONFIG_FILE"
+sha256sum "$ASTER_AGENT_CONFIG_FILE"
+export ASTER_AGENT_CONFIG_SHA256='<reviewed-64-lowercase-hex>'
+```
+
+Bind the mesh port only to this host's ZeroTier IPv4. Validate the packaged
+Compose file, render the remote-mesh composition, run its preflight, and
+force-recreate the Docker agent so the edited configuration is active. Keep
+the override on every lifecycle command:
+
+```sh
+export ASTER_MESH_BIND_ADDRESS='<THIS_HOST_ZEROTIER_IPV4>'
+export ASTER_MESH_PUBLISHED_PORT=8183
+python3 "$ASTER_VALIDATOR" "$ASTER_COMPOSE_FILE"
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  config --format json > /tmp/aster-compose.remote.rendered.json
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  run --rm preflight
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  up -d --force-recreate aster-agent
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  run --rm verify
+```
+
+Proceed only after preflight passes and verification prints
+`VERIFY status=pass`. Create the matching receiver subscriptions before
 publishing. For Docker-to-device checks, every Docker command keeps the remote
 mesh override:
 
@@ -610,7 +693,7 @@ docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
   --journal /transfer/operator-events.redb --client-id compose-operator-events \
   "Docker to device check"
 docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
-  run --rm asterctl --timeout 30 --json blob-publish \
+  run --rm asterctl --timeout 900 --json blob-publish \
   --file /transfer/map.bin --topic imagery.maps \
   --scope mission/team/alpha --priority routine \
   --operation-key compose-peer-map-001
@@ -625,7 +708,11 @@ docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
   run --rm asterctl --json query \
   --topic chat.events --scope mission/team/alpha
 docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
-  run --rm asterctl --timeout 30 --json blob-read \
+  run --rm asterctl --timeout 900 --json blob-status \
+  --publication-id '<DEVICE_PUBLICATION_ID>' --topic imagery.maps \
+  --scope mission/team/alpha --wait
+docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
+  run --rm asterctl --timeout 900 --json blob-read \
   --id '<DEVICE_BLOB_ID>' --topic imagery.maps \
   --scope mission/team/alpha --output /transfer/device-map.bin
 ```
@@ -724,7 +811,7 @@ The Debian package also installs command-specific man pages, such as
 | --- | --- | --- |
 | Static config validation | Document and referenced files satisfy static rules | Credential loading or runtime readiness |
 | `/readyz` succeeds | Local durable authority and API accept work | Peer connectivity or convergence |
-| Local publish succeeds | The local node committed the object | A peer received it |
+| Commit succeeds | The local node committed the object | Another node received it |
 | Authenticated contact increases | A mission-authenticated contact occurred | A specific Event or Blob transferred |
 | Node B query finds an Event | Node B stored that Event | Every eligible node converged |
 | Node B reads and hashes a Blob | Node B returned the requested complete Blob | Production performance or arbitrary-peer recovery |

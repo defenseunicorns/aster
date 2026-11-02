@@ -10,6 +10,13 @@ const OFFER_CODEC_VERSION: u8 = 1;
 const CRITICAL_ID_MASK: u16 = 0x8000;
 const SEMANTIC_PROTOCOL_V7: u16 = 7;
 const SEMANTIC_PROTOCOL_V8: u16 = 8;
+const SEMANTIC_PROTOCOL_V9: u16 = 9;
+/// Historical semantic-v7/v8 profile-4 publication ceiling. This remains
+/// version-scoped even though v9/profile-5 can carry the full canonical Blob
+/// ceiling.
+pub const PROFILE4_MAX_CANONICAL_BLOB_BYTES: u64 = 64 * 1024 * 1024;
+pub const PROFILE4_MAX_CANONICAL_BLOB_CHUNKS: u64 = 1_024;
+pub const PROFILE5_MAX_CANONICAL_BLOB_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Fixed application transfer lanes covered by profile negotiation.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -51,6 +58,7 @@ pub enum TransferProfileId {
     EventPagesV1 = 2,
     // 3 remains reserved for the approved BlobCustodyV1 design.
     BlobRangesStreamV1 = 4,
+    BlobStreamV1 = 5,
 }
 
 impl TransferProfileId {
@@ -60,8 +68,48 @@ impl TransferProfileId {
             1 => Some(Self::LegacyV6),
             2 => Some(Self::EventPagesV1),
             4 => Some(Self::BlobRangesStreamV1),
+            5 => Some(Self::BlobStreamV1),
             _ => None,
         }
+    }
+}
+
+/// Selects the Blob profile which can represent one exact canonical
+/// publication for an already-authenticated semantic version.
+///
+/// This is sender inventory eligibility, not wire-format migration: a Blob
+/// above the historical profile-4 bound is withheld from v7/v8 peers while
+/// remaining eligible for v9/profile-5.
+#[doc(hidden)]
+pub fn blob_profile_for_canonical_shape(
+    semantic_version: u16,
+    total_len: u64,
+    chunk_size: u32,
+    chunk_count: u64,
+) -> Option<TransferProfileId> {
+    let selected_unit_bytes = match semantic_version {
+        SEMANTIC_PROTOCOL_V7 | SEMANTIC_PROTOCOL_V8 => crate::MAX_BLOB_CHUNK_SIZE,
+        SEMANTIC_PROTOCOL_V9 => crate::BLOB_STREAM_SEGMENT_BYTES as u32,
+        _ => return None,
+    };
+    if chunk_size != selected_unit_bytes
+        || chunk_count != total_len.div_ceil(u64::from(selected_unit_bytes))
+        || chunk_count > crate::MAX_BLOB_CHUNKS
+    {
+        return None;
+    }
+    match semantic_version {
+        SEMANTIC_PROTOCOL_V7 | SEMANTIC_PROTOCOL_V8
+            if total_len > 0
+                && total_len <= PROFILE4_MAX_CANONICAL_BLOB_BYTES
+                && chunk_count <= PROFILE4_MAX_CANONICAL_BLOB_CHUNKS =>
+        {
+            Some(TransferProfileId::BlobRangesStreamV1)
+        }
+        SEMANTIC_PROTOCOL_V9 if total_len <= PROFILE5_MAX_CANONICAL_BLOB_BYTES => {
+            Some(TransferProfileId::BlobStreamV1)
+        }
+        _ => None,
     }
 }
 
@@ -93,6 +141,7 @@ impl TransferProfileOfferV1 {
     pub fn for_semantic_version(semantic_version: u16) -> Result<Self, TransferProfileError> {
         match semantic_version {
             SEMANTIC_PROTOCOL_V7 | SEMANTIC_PROTOCOL_V8 => Ok(Self::current()),
+            SEMANTIC_PROTOCOL_V9 => Ok(Self::stream_v9()),
             _ => Err(TransferProfileError::invalid(
                 "transfer-profile exchange requires semantic v7 or v8",
             )),
@@ -110,6 +159,37 @@ impl TransferProfileOfferV1 {
                 (
                     TransferLaneId::Blob as u16,
                     vec![TransferProfileId::BlobRangesStreamV1 as u16],
+                ),
+                (
+                    TransferLaneId::Record as u16,
+                    vec![TransferProfileId::LegacyV6 as u16],
+                ),
+                (
+                    TransferLaneId::State as u16,
+                    vec![TransferProfileId::LegacyV6 as u16],
+                ),
+                (
+                    TransferLaneId::Event as u16,
+                    vec![
+                        TransferProfileId::EventPagesV1 as u16,
+                        TransferProfileId::LegacyV6 as u16,
+                    ],
+                ),
+            ],
+        }
+    }
+
+    /// Semantic-v9 offer; Blob uses the checkpointed data-mesh stream.
+    pub fn stream_v9() -> Self {
+        Self {
+            lanes: vec![
+                (
+                    TransferLaneId::EventBridge as u16,
+                    vec![TransferProfileId::LegacyV6 as u16],
+                ),
+                (
+                    TransferLaneId::Blob as u16,
+                    vec![TransferProfileId::BlobStreamV1 as u16],
                 ),
                 (
                     TransferLaneId::Record as u16,
@@ -217,7 +297,8 @@ impl TransferProfileOfferV1 {
             known_lanes.insert(lane);
             if !profiles.contains(&(TransferProfileId::LegacyV6 as u16))
                 && !(lane == TransferLaneId::Blob
-                    && profiles.contains(&(TransferProfileId::BlobRangesStreamV1 as u16)))
+                    && (profiles.contains(&(TransferProfileId::BlobRangesStreamV1 as u16))
+                        || profiles.contains(&(TransferProfileId::BlobStreamV1 as u16))))
             {
                 return Err(TransferProfileError::invalid(
                     "every fixed lane must offer LegacyV6",
@@ -235,6 +316,13 @@ impl TransferProfileOfferV1 {
             {
                 return Err(TransferProfileError::invalid(
                     "BlobRangesStreamV1 is valid only for the Blob lane",
+                ));
+            }
+            if lane != TransferLaneId::Blob
+                && profiles.contains(&(TransferProfileId::BlobStreamV1 as u16))
+            {
+                return Err(TransferProfileError::invalid(
+                    "BlobStreamV1 is valid only for the Blob lane",
                 ));
             }
         }
@@ -361,7 +449,7 @@ pub fn negotiate_transfer_profiles_for_semantic_version(
 ) -> Result<NegotiatedTransferProfiles, TransferProfileError> {
     if !matches!(
         semantic_version,
-        SEMANTIC_PROTOCOL_V7 | SEMANTIC_PROTOCOL_V8
+        SEMANTIC_PROTOCOL_V7 | SEMANTIC_PROTOCOL_V8 | SEMANTIC_PROTOCOL_V9
     ) {
         return Err(TransferProfileError::invalid(
             "transfer-profile exchange requires semantic v7 or v8",
@@ -459,6 +547,141 @@ impl<'a> OfferReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_profile5_blob_is_sender_eligible() {
+        // Mutation caught: reusing profile-4's 64-KiB chunk shape would reject
+        // the native one-MiB profile-5 pack selected by semantic v9.
+        assert_eq!(
+            blob_profile_for_canonical_shape(
+                9,
+                1024 * 1024,
+                crate::BLOB_STREAM_SEGMENT_BYTES as u32,
+                1,
+            ),
+            Some(TransferProfileId::BlobStreamV1)
+        );
+    }
+
+    #[test]
+    fn profile4_and_native_profile5_shapes_are_version_scoped() {
+        let total_len = 64 * 1024 * 1024;
+        let profile4_chunks = total_len / (64 * 1024);
+        let profile5_segments = total_len / crate::BLOB_STREAM_SEGMENT_BYTES as u64;
+        assert_eq!(
+            blob_profile_for_canonical_shape(8, total_len, 64 * 1024, profile4_chunks),
+            Some(TransferProfileId::BlobRangesStreamV1)
+        );
+        assert_eq!(
+            blob_profile_for_canonical_shape(
+                9,
+                total_len,
+                crate::BLOB_STREAM_SEGMENT_BYTES as u32,
+                profile5_segments,
+            ),
+            Some(TransferProfileId::BlobStreamV1)
+        );
+        assert_eq!(
+            blob_profile_for_canonical_shape(9, total_len, 64 * 1024, profile4_chunks),
+            None
+        );
+    }
+
+    #[test]
+    fn profile4_and_profile5_size_boundaries_are_version_scoped() {
+        let profile4_max = 64 * 1024 * 1024_u64;
+        let profile5_max = 8 * 1024 * 1024 * 1024_u64;
+        assert_eq!(
+            blob_profile_for_canonical_shape(
+                8,
+                profile4_max + 1,
+                64 * 1024,
+                (profile4_max + 1).div_ceil(64 * 1024),
+            ),
+            None
+        );
+        assert_eq!(
+            blob_profile_for_canonical_shape(
+                9,
+                profile4_max + 1,
+                crate::BLOB_STREAM_SEGMENT_BYTES as u32,
+                (profile4_max + 1).div_ceil(crate::BLOB_STREAM_SEGMENT_BYTES as u64),
+            ),
+            Some(TransferProfileId::BlobStreamV1)
+        );
+        assert_eq!(
+            blob_profile_for_canonical_shape(
+                9,
+                profile5_max,
+                crate::BLOB_STREAM_SEGMENT_BYTES as u32,
+                profile5_max / crate::BLOB_STREAM_SEGMENT_BYTES as u64,
+            ),
+            Some(TransferProfileId::BlobStreamV1)
+        );
+        assert_eq!(
+            blob_profile_for_canonical_shape(8, profile5_max, 64 * 1024, 131_072,),
+            None
+        );
+        assert_eq!(
+            blob_profile_for_canonical_shape(
+                9,
+                profile5_max + 1,
+                crate::BLOB_STREAM_SEGMENT_BYTES as u32,
+                (profile5_max + 1).div_ceil(crate::BLOB_STREAM_SEGMENT_BYTES as u64),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_canonical_blob_is_profile5_only() {
+        assert_eq!(
+            blob_profile_for_canonical_shape(
+                SEMANTIC_PROTOCOL_V9,
+                0,
+                crate::BLOB_STREAM_SEGMENT_BYTES as u32,
+                0,
+            ),
+            Some(TransferProfileId::BlobStreamV1)
+        );
+        assert_eq!(
+            blob_profile_for_canonical_shape(
+                SEMANTIC_PROTOCOL_V8,
+                0,
+                crate::BLOB_STREAM_SEGMENT_BYTES as u32,
+                0,
+            ),
+            None
+        );
+        assert_eq!(
+            blob_profile_for_canonical_shape(
+                SEMANTIC_PROTOCOL_V9,
+                0,
+                crate::MAX_BLOB_CHUNK_SIZE,
+                1,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn semantic_v9_blob_selection_requires_profile5() {
+        let offer = TransferProfileOfferV1::for_semantic_version(9).expect("v9 offer");
+        let blob = offer
+            .known_lanes()
+            .into_iter()
+            .find(|(lane, _)| *lane == TransferLaneId::Blob)
+            .expect("Blob lane")
+            .1;
+        assert_eq!(blob, vec![TransferProfileId::BlobStreamV1]);
+        let selected = negotiate_transfer_profiles_for_semantic_version(9, &offer, &offer)
+            .expect("v9 selection");
+        assert_eq!(
+            selected.profile(TransferLaneId::Blob),
+            Some(TransferProfileId::BlobStreamV1)
+        );
+        assert!(!selected.contains(TransferLaneId::Blob, TransferProfileId::BlobRangesStreamV1));
+    }
 
     #[test]
     fn semantic_blob_profile_four_is_resolved_by_authenticated_version() {

@@ -7,16 +7,16 @@ use std::{
 
 use aster_node::EventEmissionPolicy;
 use aster_node::application::{
-    AuthenticatedPeerStatus, CommittedEventContent, ContactSyncStatus as NodeContactSyncStatus,
-    EventAcknowledgement, EventClientContext, EventClientDisposition, EventClientId,
-    EventDelivery as NodeEventDelivery, EventGap as NodeEventGap, EventGapQuery, EventId,
-    EventItem, EventOperationAbandonment, EventOperationAuditState, EventOperationCapacityWarning,
-    EventOperationLedgerMode, EventOperationSequence, EventPollRequest, EventPublicationSession,
-    EventPublishOptions, EventQuery, EventResultAcknowledgement, EventSubscriptionId,
-    EventSubscriptionRequest, EventSyncStatus as NodeEventSyncStatus, EventUnsubscribe,
-    NumberedEventPublishRequest, NumberedEventResult, PeerAuthorization as NodePeerAuthorization,
-    Priority as NodePriority, Scope, SelectedBlobHandle, SelectedEventHandle, SelectedEventStatus,
-    Topic,
+    AuthenticatedPeerStatus, BlobCapacityStatus, CommittedEventContent,
+    ContactSyncStatus as NodeContactSyncStatus, EventAcknowledgement, EventClientContext,
+    EventClientDisposition, EventClientId, EventDelivery as NodeEventDelivery,
+    EventGap as NodeEventGap, EventGapQuery, EventId, EventItem, EventOperationAbandonment,
+    EventOperationAuditState, EventOperationCapacityWarning, EventOperationLedgerMode,
+    EventOperationSequence, EventPollRequest, EventPublicationSession, EventPublishOptions,
+    EventQuery, EventResultAcknowledgement, EventSubscriptionId, EventSubscriptionRequest,
+    EventSyncStatus as NodeEventSyncStatus, EventUnsubscribe, NumberedEventPublishRequest,
+    NumberedEventResult, PeerAuthorization as NodePeerAuthorization, Priority as NodePriority,
+    Scope, SelectedBlobHandle, SelectedEventHandle, SelectedEventStatus, Topic,
 };
 use aster_redb_store::{CustodyRetirementReason, MAX_EVENT_PENDING_DELIVERIES};
 use connectrpc::{
@@ -129,9 +129,12 @@ pub(crate) fn configured_service(
         .with_max_request_body_size(crate::MAX_AGENT_MESSAGE_BYTES)
         .with_max_message_size(crate::MAX_AGENT_MESSAGE_BYTES)
         .with_element_memory_limit(crate::MAX_AGENT_ELEMENT_MEMORY_BYTES);
+    // Large resumable streams must be able to outlive the ordinary RPC
+    // default. Admission and in-flight quotas remain bounded, and callers must
+    // explicitly request the longer whole-attempt window.
     let deadline = connectrpc::DeadlinePolicy::new()
         .with_min(Duration::from_millis(10))
-        .with_max(Duration::from_secs(30))
+        .with_max(Duration::from_secs(15 * 60))
         .with_default_timeout(Duration::from_secs(10))
         .with_enforce_on_streams(true);
     connectrpc::ConnectRpcService::new(router)
@@ -161,6 +164,14 @@ pub(crate) fn rejection_router() -> connectrpc::Router {
             APPLICATION_SERVICE_NAME,
             "GetStatus",
             rejection_handler::<api::GetStatusRequest, api::GetStatusResponse>(),
+        )
+        .route_bidi_stream(
+            APPLICATION_SERVICE_NAME,
+            "InspectBlobPublication",
+            rejection_handler::<
+                api::InspectBlobPublicationRequest,
+                api::InspectBlobPublicationResponse,
+            >(),
         )
         .route_bidi_stream(
             APPLICATION_SERVICE_NAME,
@@ -279,6 +290,12 @@ impl api::AsterApplicationService for AsterConnectService {
             .status()
             .await
             .map_err(connect_application_error)?;
+        let blob_capacity = match &self.blobs {
+            Some(blobs) => Some(blobs.capacity_status().await.map_err(|error| {
+                crate::error::connect_blob_application_error(error, PublicOperation::GetStatus)
+            })?),
+            None => None,
+        };
         bounded_response(
             status_response(
                 self.events.identity(),
@@ -286,16 +303,34 @@ impl api::AsterApplicationService for AsterConnectService {
                 self.configured_emission_policy,
                 self.credential_generation,
                 status,
+                blob_capacity,
             ),
             PublicOperation::GetStatus,
         )
+    }
+
+    async fn inspect_blob_publication(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, api::InspectBlobPublicationRequest>,
+    ) -> ServiceResult<api::InspectBlobPublicationResponse> {
+        let blobs = self.blobs.as_ref().ok_or_else(|| {
+            public_error(
+                ErrorCode::FailedPrecondition,
+                api::PublicErrorReason::FailedPrecondition,
+                PublicOperation::InspectBlobPublication,
+                false,
+                None,
+            )
+        })?;
+        blobs.inspect(request.to_owned_message()).await
     }
 
     async fn publish_blob(
         &self,
         ctx: RequestContext,
         requests: connectrpc::InboundStream<api::PublishBlobRequest>,
-    ) -> ServiceResult<api::PublishBlobResponse> {
+    ) -> ServiceResult<ServiceStream<api::PublishBlobResponse>> {
         let blobs = self.blobs.as_ref().ok_or_else(|| {
             public_error(
                 ErrorCode::FailedPrecondition,
@@ -1109,6 +1144,7 @@ fn status_response(
     configured_emission_policy: EventEmissionPolicy,
     credential_generation: Option<CredentialGeneration>,
     status: SelectedEventStatus,
+    blob_capacity: Option<BlobCapacityStatus>,
 ) -> api::GetStatusResponse {
     let operations = status.event_operation_capacity;
     let profile_remaining = PROFILE_EVENT_OPERATION_BOUNDARY.saturating_sub(operations.rows);
@@ -1189,6 +1225,24 @@ fn status_response(
         credential_generation: credential_generation
             .map(|generation| generation.as_bytes().to_vec())
             .unwrap_or_default(),
+        blob_capacity: blob_capacity.map(blob_capacity_message).into(),
+        ..Default::default()
+    }
+}
+
+fn blob_capacity_message(status: BlobCapacityStatus) -> api::BlobCapacityStatus {
+    api::BlobCapacityStatus {
+        reserved_bytes: status.reserved_bytes,
+        byte_limit: status.byte_limit,
+        variants: status.variants,
+        variant_limit: status.variant_limit,
+        expected_chunks: status.expected_chunks,
+        chunk_limit: status.chunk_limit,
+        pending_sources: status.pending_sources,
+        network_staging_bytes: status.network_staging_bytes,
+        bytes_exhausted: status.bytes_exhausted,
+        variants_exhausted: status.variants_exhausted,
+        chunks_exhausted: status.chunks_exhausted,
         ..Default::default()
     }
 }
@@ -1437,80 +1491,9 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "client", feature = "server", target_os = "linux"))]
-    #[tokio::test]
-    async fn combined_blob_staging_reopens_the_running_nodes_pinned_state_inode() {
-        use std::os::unix::fs::{MetadataExt as _, symlink};
-
-        let fixture = TestState::new();
-        let target = fixture.0.join("target");
-        let configured = fixture.0.join("configured-link");
-        let moved = fixture.0.join("moved-after-start");
-        fs::create_dir(&target).expect("state target");
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
-            .expect("protect state target");
-        symlink(&target, &configured).expect("configured state symlink");
-        let mission = UnprotectedReferenceMission::from_bytes(
-            include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle")
-                .to_vec(),
-        )
-        .expect("test mission");
-        let node = start_node(NodeConfig {
-            state: configured,
-            bind: "127.0.0.1:0".parse().expect("mesh bind"),
-            mission,
-            peers: Vec::new(),
-            mutable_interests: MutableSourceInterests::default(),
-            sync_interval: Duration::from_millis(50),
-            run_for: None,
-            application: NodeApplication::Relay,
-        })
-        .await
-        .expect("production node startup");
-        let pinned = fs::metadata(node.state_root()).expect("pinned state");
-        fs::rename(&target, &moved).expect("move pinned state");
-        fs::create_dir(&target).expect("replacement state");
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
-            .expect("protect replacement state");
-
-        let (_shutdown, shutdown) = tokio::sync::watch::channel(false);
-        let service = AsterConnectService::new(
-            node.selected_events(),
-            EventEmissionPolicy::Normal,
-            None,
-            shutdown,
-        )
-        .with_blobs(node.selected_blobs(), node.state_root())
-        .expect("construct combined service from running-node authority");
-        let staging = service
-            .blobs
-            .as_ref()
-            .expect("combined Blob service")
-            .staging_directory_identity()
-            .expect("staging descriptor identity")
-            .expect("Linux staging descriptor");
-        assert_eq!(staging, (pinned.dev(), pinned.ino()));
-        let replacement = fs::metadata(&target).expect("replacement state");
-        assert_ne!(staging, (replacement.dev(), replacement.ino()));
-        assert!(moved.join("mesh.redb").is_file());
-        assert!(
-            target
-                .read_dir()
-                .expect("replacement entries")
-                .next()
-                .is_none()
-        );
-
-        fs::remove_dir(&target).expect("remove empty replacement state");
-        fs::rename(&moved, &target).expect("restore pinned state for orderly shutdown");
-        node.shutdown().await.expect("node shutdown");
-    }
-
     #[cfg(all(feature = "client", feature = "server", not(target_os = "linux")))]
     #[tokio::test]
-    async fn combined_handler_keeps_event_status_and_rejects_blob_before_inbound_poll() {
-        use std::task::Poll;
-
+    async fn platform_compat_combined_handler_keeps_event_and_blob_paths_live() {
         use buffa::view::HasMessageView as _;
 
         let state = TestState::new();
@@ -1614,33 +1597,61 @@ mod tests {
         .expect("combined Event handler");
         assert!(event.body.inserted);
 
-        let polls = Arc::new(AtomicU64::new(0));
-        let observed = Arc::clone(&polls);
+        let payload = b"cross-platform Blob".to_vec();
+        let frames = [
+            api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Metadata(Box::new(
+                    api::PublishBlobMetadata {
+                        operation_key: b"non-linux-handler-blob".to_vec(),
+                        topic: "chat.events".to_owned(),
+                        scope: "mission/team/alpha".to_owned(),
+                        priority: api::Priority::Routine.into(),
+                        total_len: payload.len() as u64,
+                        ..Default::default()
+                    },
+                ))),
+                ..Default::default()
+            },
+            api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Data(Box::new(
+                    api::PublishBlobData {
+                        offset: 0,
+                        bytes: payload,
+                        ..Default::default()
+                    },
+                ))),
+                ..Default::default()
+            },
+            api::PublishBlobRequest {
+                frame: Some(api::publish_blob_request::Frame::Finish(Box::default())),
+                ..Default::default()
+            },
+        ];
         let inbound: connectrpc::InboundStream<api::PublishBlobRequest> =
-            Box::pin(futures::stream::poll_fn(move |_| {
-                observed.fetch_add(1, Ordering::Relaxed);
-                Poll::<
-                    Option<
-                        Result<connectrpc::StreamMessage<api::PublishBlobRequest>, ConnectError>,
-                    >,
-                >::Pending
-            }));
-        let error = api::AsterApplicationService::publish_blob(
+            Box::pin(futures::stream::iter(frames.into_iter().map(|frame| {
+                Ok(connectrpc::StreamMessage::from_message(&frame))
+            })));
+        let mut responses = api::AsterApplicationService::publish_blob(
             &service,
             RequestContext::default(),
             inbound,
         )
         .await
-        .expect_err("unsupported publish fails at the handler boundary");
-        assert_public_detail(
-            &error,
-            "aster.application.v1alpha1.PublicErrorDetail",
-            ErrorCode::Unimplemented,
-            api::PublicErrorReason::UnsupportedValue,
-            "publish_blob",
-            false,
-        );
-        assert_eq!(polls.load(Ordering::Relaxed), 0);
+        .expect("cross-platform Blob handler")
+        .body;
+        let complete = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(response) = responses.next().await {
+                let response = response.expect("Blob response");
+                if let Some(api::publish_blob_response::Frame::Complete(complete)) = response.frame
+                {
+                    return *complete;
+                }
+            }
+            panic!("Blob response stream ended before completion");
+        })
+        .await
+        .expect("cross-platform Blob publication timeout");
+        assert_eq!(complete.total_len, b"cross-platform Blob".len() as u64);
 
         node.shutdown().await.expect("node shutdown");
     }
@@ -2107,6 +2118,19 @@ mod tests {
                 event_operation_estimated_seconds_to_exhaustion: 0,
                 pending_deliveries: 0,
             },
+            Some(BlobCapacityStatus {
+                reserved_bytes: 11,
+                byte_limit: 100,
+                variants: 2,
+                variant_limit: 10,
+                expected_chunks: 3,
+                chunk_limit: 20,
+                pending_sources: 4,
+                network_staging_bytes: 5,
+                bytes_exhausted: false,
+                variants_exhausted: false,
+                chunks_exhausted: false,
+            }),
         );
 
         assert_eq!(response.configured_emission_mode, api::EmissionMode::Normal);
@@ -2121,6 +2145,20 @@ mod tests {
                 item_limit: 10_000,
                 payload_bytes: 0,
                 payload_byte_limit: 64 * 1024 * 1024,
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            response.blob_capacity.as_option(),
+            Some(&api::BlobCapacityStatus {
+                reserved_bytes: 11,
+                byte_limit: 100,
+                variants: 2,
+                variant_limit: 10,
+                expected_chunks: 3,
+                chunk_limit: 20,
+                pending_sources: 4,
+                network_staging_bytes: 5,
                 ..Default::default()
             })
         );
@@ -2235,6 +2273,7 @@ mod tests {
                     event_operation_estimated_seconds_to_exhaustion: 123,
                     pending_deliveries: 0,
                 },
+                None,
             );
             let operations = response.publish_operation_capacity.as_option().unwrap();
             assert_eq!(

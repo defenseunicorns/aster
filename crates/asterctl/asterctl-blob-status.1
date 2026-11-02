@@ -1,0 +1,115 @@
+." Copyright 2026 Defense Unicorns, Inc.
+." SPDX-License-Identifier: Apache-2.0
+." Clean Room — Privileged
+.TH ASTERCTL-BLOB-STATUS 1 "2026-10-20" "Aster" "User Commands"
+.\" <!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+.\" ```json
+.\" {
+.\"   "schema": 1,
+.\"   "surface": "blob_status_man",
+.\"   "blob_status_scope": "receiver_local_durable_state",
+.\"   "blob_status_reports_remote_delivery_peer_or_convergence": false
+.\" }
+.\" ```
+.\" <!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+.\" blob-status reports receiver-local durable state, not remote delivery, peer status, or convergence.
+.\" <!-- ASTER-BLOB-CAPABILITY:END -->
+.SH NAME
+asterctl-blob-status \- inspect or wait for receiver-local Blob publication state
+.SH SYNOPSIS
+.SY asterctl
+.RI [ GLOBAL-OPTIONS ]
+.B blob-status
+.BI \-\-publication-id " ID"
+.BI \-\-topic " TOPIC"
+.BI \-\-scope " SCOPE"
+.RI [ \-\-wait ]
+.RI [ \-\-poll-ms " N" ]
+.YS
+.SH DESCRIPTION
+.B asterctl blob-status
+reports exact durable state held by the local Aster node for one authenticated
+profile-5 Blob publication identity and exact topic/scope selector.
+.PP
+Local publication is peer-independent. Waiting for
+.B available
+observes one node's canonical publication state; it neither starts contact nor
+confirms that any other node has converged.
+.PP
+Snapshot mode performs one request and exits successfully for every valid
+state, including
+.BR missing .
+The
+.B missing
+state intentionally covers both an absent publication and one the caller is
+not currently authorized to inspect.
+.PP
+With
+.BR \-\-wait ,
+the command keeps at most one request in flight and polls until
+.BR available ,
+.BR expired-or-retired ,
+or the global client deadline. The latter two outcomes exit unsuccessfully and
+print the final complete snapshot. Local publication and durable storage do not
+depend on this polling command or on destination availability.
+.SH OPTIONS
+.TP
+.BI \-\-publication-id " ID"
+Required publication ID from
+.BR asterctl-blob-publish (1),
+as Base64-encoded 32 bytes. This is distinct from the finalized Blob ID.
+.TP
+.BI \-\-topic " TOPIC"
+Required exact Blob topic.
+.TP
+.BI \-\-scope " SCOPE"
+Required exact Blob scope.
+.TP
+.B \-\-wait
+Poll until an available or terminal state, bounded by the global
+.B \-\-timeout
+deadline.
+.TP
+.BI \-\-poll-ms " N"
+Polling interval from 100 through 60000 milliseconds. Default: 1000.
+Requires
+.BR \-\-wait .
+.SH STATES
+.TP
+.B missing
+No currently visible durable evidence. This is not an existence oracle.
+.TP
+.B awaiting-data
+The publication is admitted and awaits its first durable data unit.
+.TP
+.B receiving
+Durable plaintext and authenticated-transfer counters are advancing.
+.TP
+.B ready-to-finalize
+All publication units are durable and finalization remains.
+.TP
+.B available
+Finalization completed; the response includes the content-addressed Blob ID.
+.TP
+.B expired-or-retired
+The publication cannot continue under retained lifecycle evidence.
+.SH OUTPUT
+Text and JSON distinguish plaintext bytes from authenticated transfer bytes.
+The counters and states are receiver-local durable facts and contain no
+inference about a remote node or the IP, non-IP, BLE, or future transport used.
+.SH EXIT STATUS
+.TP
+.B 0
+Snapshot returned a valid state, or wait reached
+.BR available .
+.TP
+.B 1
+RPC or validation failed, the deadline elapsed, or wait reached
+.BR expired-or-retired .
+.TP
+.B 2
+Invalid or missing arguments.
+.SH SEE ALSO
+.BR asterctl (1),
+.BR asterctl-blob-publish (1),
+.BR asterctl-blob-read (1)

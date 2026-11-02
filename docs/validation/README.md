@@ -15,6 +15,8 @@ itself authorize a production release.
   requirements atomization rules and final-stack flags.
 - [Conformance](conformance.md), [security-profile disposition](security-profile-requirements-disposition.md),
   and [CI](ci.md) — verification boundaries and remaining gates.
+- [Blob streaming engineering runbook](blob-streaming-engineering-runbook.md)
+  — large-object application, selected-contact, CM4, and diagnostic examples.
 
 ## Linux Event MVP qualification
 

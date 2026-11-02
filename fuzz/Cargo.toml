@@ -81,6 +81,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "stream_transfer_decode"
+path = "fuzz_targets/stream_transfer_decode.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 
 [patch.crates-io]

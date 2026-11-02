@@ -32,6 +32,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::time::{Duration, Instant};
 
 type SharedContactDriver = RuntimeDriver<ReferenceSemanticRuntimeSession>;
+// This host still transfers Blob content through the semantic-v8/profile-4
+// BlobChunk lane. Advertising v9 would select profile 5 without composing its
+// sender or receiver.
+const SHARED_HOST_SEMANTIC_CEILING: u16 = 8;
 
 /// Fixed aggregate claims charged for each supervisor-owned lifecycle object.
 ///
@@ -1138,22 +1142,26 @@ impl SharedNodeContactSupervisor {
             .map_err(|_| ContactSupervisorError::Credential)?;
         let session = self.authority.session();
         let mut driver = match role {
-            ContactSessionRole::Initiator { peer_hint } => RuntimeDriver::initiator_with_limits(
-                bundle,
-                sync,
-                session,
-                start,
-                peer_hint,
-                self.config.runtime_limits,
-            ),
-            ContactSessionRole::Responder { peer_hint } => {
-                RuntimeDriver::responder_with_start_and_limits(
+            ContactSessionRole::Initiator { peer_hint } => {
+                RuntimeDriver::initiator_with_limits_and_semantic_ceiling(
                     bundle,
                     sync,
                     session,
                     start,
                     peer_hint,
                     self.config.runtime_limits,
+                    SHARED_HOST_SEMANTIC_CEILING,
+                )
+            }
+            ContactSessionRole::Responder { peer_hint } => {
+                RuntimeDriver::responder_with_start_and_limits_and_semantic_ceiling(
+                    bundle,
+                    sync,
+                    session,
+                    start,
+                    peer_hint,
+                    self.config.runtime_limits,
+                    SHARED_HOST_SEMANTIC_CEILING,
                 )
             }
         }
@@ -2141,6 +2149,78 @@ mod tests {
             .unwrap();
         assert!(report.opened);
         assert!(report.actions.is_empty());
+    }
+
+    #[test]
+    fn regression_shared_supervisor_does_not_negotiate_unimplemented_blob_stream_semantics() {
+        let mut initiator = test_node("semantic-ceiling-initiator", 1, 1);
+        let mut responder = test_node("semantic-ceiling-responder", 2, 1);
+        let (initiator_link, responder_link, _, _) =
+            MemoryLink::pair("semantic-ceiling", initiator.identity, responder.identity);
+        open(
+            &mut initiator.supervisor,
+            ContactId(1),
+            1,
+            responder.identity,
+            ContactSessionRole::Initiator {
+                peer_hint: Some(responder.identity),
+            },
+            ContactDirection::Outbound,
+            initiator_link,
+        );
+        open(
+            &mut responder.supervisor,
+            ContactId(1),
+            2,
+            initiator.identity,
+            ContactSessionRole::Responder {
+                peer_hint: Some(initiator.identity),
+            },
+            ContactDirection::Inbound,
+            responder_link,
+        );
+
+        for _ in 0..256 {
+            let now = Instant::now();
+            initiator
+                .supervisor
+                .drive_contact(ContactId(1), now)
+                .expect("drive initiator");
+            responder
+                .supervisor
+                .drive_contact(ContactId(1), now)
+                .expect("drive responder");
+            if initiator.supervisor.contact_status()[0].admitted
+                && responder.supervisor.contact_status()[0].admitted
+            {
+                break;
+            }
+        }
+        assert!(initiator.supervisor.contact_status()[0].admitted);
+        assert!(responder.supervisor.contact_status()[0].admitted);
+
+        // ReferenceSemanticRuntimeBackend still moves Blob content with the
+        // profile-4 BlobChunk lane, which semantic v9 forbids. Until this host
+        // composes profile 5, its authenticated session must stop at v8.
+        for node in [&initiator, &responder] {
+            let version = node
+                .supervisor
+                .contacts
+                .get(&ContactId(1))
+                .expect("managed contact")
+                .driver
+                .authenticated_semantic_version();
+            assert_eq!(
+                version,
+                Some(8),
+                "shared host advertised semantic v9 without a profile-5 Blob implementation"
+            );
+        }
+
+        drop(initiator.supervisor);
+        drop(responder.supervisor);
+        fs::remove_dir_all(initiator.root).unwrap();
+        fs::remove_dir_all(responder.root).unwrap();
     }
 
     fn admitted_three_node_line(

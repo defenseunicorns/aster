@@ -68,6 +68,11 @@ use crate::runtime::{
 use aster_redb_store::EventOperationKey;
 
 mod blob;
+#[cfg(all(test, unix))]
+pub(crate) use blob::{
+    BlobLiveWaitObservation, BlobPublishFinalization, tests::promotion_failure_fixture,
+};
+pub mod blob_stream;
 #[cfg(test)]
 #[path = "application/operation_capacity_test.rs"]
 mod operation_capacity_test;
@@ -75,17 +80,20 @@ mod record;
 mod state;
 pub(crate) use blob::SelectedBlobCommand;
 pub use blob::{
-    BLOB_DELIVERY_TOKEN_BYTES, BlobAcknowledgement, BlobDelivery, BlobDeliveryItem,
-    BlobDeliveryPage, BlobDeliveryStatus, BlobDeliveryToken, BlobDepotLimits,
+    BLOB_DELIVERY_TOKEN_BYTES, BlobAcknowledgement, BlobCapacityStatus, BlobDelivery,
+    BlobDeliveryItem, BlobDeliveryPage, BlobDeliveryStatus, BlobDeliveryToken, BlobDepotLimits,
     BlobGcFailureCategory, BlobGcRetryState, BlobGcStatus, BlobId, BlobPollRequest,
-    BlobPublicationId, BlobPublishOptions, BlobPublishRequest, BlobPublishResult, BlobReadPage,
+    BlobPublicationId, BlobPublicationInspection, BlobPublicationInspectionRequest,
+    BlobPublicationPhase, BlobPublishOptions, BlobPublishRequest, BlobPublishResult, BlobReadPage,
     BlobReadPageRequest, BlobReadRequest, BlobReadResult, BlobRetirementDelivery,
-    BlobRetirementReason, BlobSubscription, BlobSubscriptionId, BlobSubscriptionRequest,
-    BlobTransferPhase, BlobTransferStatus, BlobUnsubscribe, MAX_SELECTED_BLOB_DELIVERIES,
-    MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_BLOB_SUBSCRIPTION_SCAN,
-    MAX_SELECTED_LIVE_BLOB_BYTES, MAX_SELECTED_LIVE_BLOB_CHUNKS, PendingBlobTransferStatus,
-    SelectedBlobHandle, SelectedBlobNode, SelectedBlobOptions,
+    BlobRetirementReason, BlobStreamPublicationId, BlobSubscription, BlobSubscriptionId,
+    BlobSubscriptionRequest, BlobTransferPhase, BlobTransferStatus, BlobUnsubscribe,
+    MAX_SELECTED_BLOB_DELIVERIES, MAX_SELECTED_BLOB_PAGE_BYTES, MAX_SELECTED_BLOB_STREAM_BYTES,
+    MAX_SELECTED_BLOB_SUBSCRIPTION_SCAN, MAX_SELECTED_LIVE_BLOB_BYTES,
+    MAX_SELECTED_LIVE_BLOB_CHUNKS, PendingBlobTransferStatus, SelectedBlobHandle, SelectedBlobNode,
+    SelectedBlobOptions,
 };
+pub use blob_stream::{BlobPublishProgress, BlobPublishStreamRequest, SelectedBlobPublishStream};
 pub(crate) use record::SelectedRecordCommand;
 pub use record::{
     MAX_SELECTED_RECORD_DELIVERIES, MAX_SELECTED_RECORD_SUBSCRIPTION_SCAN,
@@ -3171,7 +3179,10 @@ fn blob_store_error_kind(error: &BlobStoreError) -> ApplicationErrorKind {
         BlobStoreError::PendingSourceMissing
         | BlobStoreError::VariantDeleting
         | BlobStoreError::Io(_) => ApplicationErrorKind::StateUnavailable,
+        BlobStoreError::UnsupportedLegacyProfile5ReceiptSchema
+        | BlobStoreError::UnsupportedProfile5PackSchema => ApplicationErrorKind::LegacyState,
         BlobStoreError::Verification(_)
+        | BlobStoreError::UnsupportedExperimentalBlobStreamSchema
         | BlobStoreError::SchemaInvariant(_)
         | BlobStoreError::DepotIntegrity(_)
         | BlobStoreError::CompletionMismatch

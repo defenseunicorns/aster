@@ -1,9 +1,9 @@
-# Blob range streaming loopback measurement
+# Selected-node Blob streaming measurement
 
-This diagnostic compares upstream main with the optional receipt-free Blob
-range-stream profile on one host. It adds no requirements credit, WAN
-qualification, or production throughput guarantee. The Rust fixture is copied
-unchanged from the prior ACK experiment; no ACK production code is imported.
+This diagnostic measures the selected-node Blob path on one host: independent
+local publication, semantic-v9/profile-5 synchronization, durable receiver
+promotion, restart, and full paged plaintext verification. It adds no
+requirements credit, WAN qualification, or production throughput guarantee.
 
 ## Reproduce
 
@@ -38,11 +38,23 @@ python3 tools/blob_benchmark.py \
   --output /durable/new-scale-results --state /scratch/new-scale-state
 ```
 
-The current production network admission limit is 64 MiB. Therefore, the 100
-MiB campaign currently qualifies the exact resource-limit rejection and its
-retained receipt; it is not evidence of a successful 100 MiB network transfer.
-A successful above-limit network campaign requires a separately reviewed
-production-limit change.
+Semantic v9/profile 5 admits up to 8 GiB. Semantic v7/v8 compatibility profile
+4 remains limited to 64 MiB; profile 5 never downgrades an active attempt into
+profile 4.
+
+Run the explicit 1-GiB profile-5 campaign only on a prepared engineering host:
+
+```sh
+python3 tools/blob_benchmark.py \
+  --campaign profile5-1g \
+  --variant candidate /absolute/repo /absolute/blob_benchmark \
+  --output /durable/new-profile5-1g-results \
+  --state /scratch/new-profile5-1g-state
+```
+
+This campaign has one 1-GiB sample and a 900-second internal reconciliation
+deadline. The runner adds 180 seconds for controlled process teardown. Budget
+at least 4 GiB of disposable state space plus operational reserve.
 
 The core streaming pipeline retains its original generated 101 MiB + 123 byte
 workload as an ignored qualification test. Run only that workload explicitly:
@@ -97,19 +109,27 @@ validation process.
   generation, SHA-256, and fsync precede publication.
 - `publication_ns` brackets awaited peerless local file publication. Successful
   publication means local durable acceptance, not remote delivery.
-- `transfer_until_ready_ns` brackets connected-node startup through first
+- `transfer_until_visible_ns` brackets connected-node startup through the first
   successful receiver read, polled every 20 ms. It excludes publication.
-- `transfer_ns` additionally includes a fixed 600 ms receipt-accounting settle,
-  both node shutdowns, and receiver Store reopen with invariant checks. It is
-  not pure network time.
-- `verification_ns` includes a new peerless receiver actor and full paged
-  plaintext read/SHA-256 verification. Every page's identity, publisher, length,
-  and offset is checked; no network repair is possible after reopen.
+- `transfer_until_ready_ns` extends that interval through terminal authenticated
+  contact accounting. It is the settled-contact boundary, not first visibility.
+- `publish_to_visible_ns` and `publish_to_settled_ns` start before local
+  publication and include the peerless-to-connected node transition.
+- `connected_shutdown_ns` isolates both connected-node shutdowns.
+  `durable_inspection_ns` isolates the following peerless Store reopen and
+  invariant/statistics checks. `transfer_ns` includes startup, synchronization,
+  settlement, both shutdowns, and that inspection; it is not pure network time.
+- `restart_ns` isolates receiver restart. `download_verification_ns` isolates
+  the full paged plaintext read and SHA-256 after that restart.
+  `verification_ns` is their combined interval. Every page's identity,
+  publisher, length, and offset is checked; no network repair is possible.
 - `total_ns` spans publication through full verification, including intermediate
   shutdown, but excludes fixture setup and final verification-node shutdown.
-- Successful runs require only direct contacts, no contact errors, no pending
-  source, no residual carrier prefix or staging bytes, and exact final full
-  plaintext SHA-256. Timeouts remain incomplete observations, never throughput.
+- Successful runs require only direct authenticated terminal contacts, no
+  pending source, no residual carrier prefix or staging bytes, and exact final
+  full plaintext SHA-256. Historical failed attempts remain explicit in
+  receipts; a later authenticated resume may complete the run. Timeouts remain
+  incomplete observations, never throughput.
 
 The runner persists each stdout/stderr and fsynced JSON receipt immediately.
 It records read-only AC/battery/profile/governor snapshots before and after

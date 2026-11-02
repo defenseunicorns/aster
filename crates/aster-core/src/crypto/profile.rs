@@ -65,7 +65,7 @@ impl SecurityProfile {
         suite_id: 0x0001,
         receipt_label: "hybrid-pq-aster-record-v1",
         application_protection: ApplicationProtection::AsterRecordLayer,
-        maximum_semantic_version: 8,
+        maximum_semantic_version: 9,
     };
 
     pub const CLASSICAL_P256_IROH_QUIC_V1: Self = Self {

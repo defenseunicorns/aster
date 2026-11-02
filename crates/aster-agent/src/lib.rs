@@ -49,7 +49,7 @@ pub const MAX_AGENT_ELEMENT_MEMORY_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum encoded protobuf response before protocol-specific framing.
 pub const MAX_AGENT_RESPONSE_PROTO_BYTES: u32 = 2 * 1024 * 1024;
 /// Stable maximum payload carried by one Blob RPC frame or read response.
-pub const BLOB_RPC_FRAME_BYTES: usize = 64 * 1024;
+pub const BLOB_RPC_FRAME_BYTES: usize = 512 * 1024;
 /// Minimum accepted delay following any delivered or caught-up streaming poll.
 pub const MIN_STREAM_BACKOFF_MS: u32 = 100;
 /// Maximum accepted delay following any delivered or caught-up streaming poll.

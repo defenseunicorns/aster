@@ -729,6 +729,19 @@ class ScopeReductionTests(DeliveryTestCase):
 
 
 class RepositoryPolicyTests(unittest.TestCase):
+    def test_asterctl_readme_lists_complete_blob_workflow_and_timeout_defaults(self):
+        readme = (REPOSITORY / "crates/asterctl/README.md").read_text()
+        command_inventory = readme.split("Currently it provides", 1)[1].split(
+            "See man page", 1
+        )[0]
+        for command in ("blob-publish", "blob-status", "blob-read"):
+            with self.subTest(command=command):
+                self.assertIn(command, command_inventory)
+        timeout_row = next(
+            line for line in readme.splitlines() if line.startswith("| `--timeout SECONDS`")
+        )
+        self.assertIn("Blob publish/read default `900`", timeout_row)
+
     def test_blob_read_operator_docs_describe_portable_named_staging(self):
         for path in (
             REPOSITORY / "crates/asterctl/asterctl-blob-read.1",
@@ -753,7 +766,13 @@ class RepositoryPolicyTests(unittest.TestCase):
             cross_device.count('-f "$ASTER_REMOTE_MESH_FILE"'),
             8,
         )
-        for command in (" publish ", " query ", "blob-publish", "blob-read"):
+        for command in (
+            " publish ",
+            " query ",
+            "blob-publish",
+            "blob-status",
+            "blob-read",
+        ):
             with self.subTest(command=command):
                 self.assertIn(command, cross_device)
 
@@ -773,6 +792,38 @@ class RepositoryPolicyTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIn(command, remote_lifecycle)
 
+    def test_cross_device_runbook_activates_reviewed_config_before_transfer(self):
+        runbook = (REPOSITORY / "docs/operator-guide.md").read_text()
+        cross_device = runbook.split(
+            "### Step 7: connect this Docker node to a test device", 1
+        )[1].split("### Compose boundaries", 1)[0]
+
+        docker_edit = cross_device.index("Docker node's `agent.json`:")
+        device_edit = cross_device.index("On the packaged test device:")
+        digest_review = cross_device.index('sha256sum "$ASTER_AGENT_CONFIG_FILE"')
+        preflight = cross_device.index("run --rm preflight")
+        activation = cross_device.index("up -d --force-recreate aster-agent")
+        verification = cross_device.index("run --rm verify")
+        first_transfer = cross_device.index("run --rm asterctl --json publish")
+
+        self.assertLess(docker_edit, digest_review)
+        self.assertLess(device_edit, digest_review)
+        self.assertLess(digest_review, preflight)
+        self.assertLess(preflight, activation)
+        self.assertLess(activation, verification)
+        self.assertLess(verification, first_transfer)
+        activation_block = cross_device[
+            digest_review:cross_device.index("Proceed only after preflight")
+        ]
+        self.assertIn(
+            "export ASTER_AGENT_CONFIG_SHA256='<reviewed-64-lowercase-hex>'",
+            activation_block,
+        )
+        self.assertEqual(
+            activation_block.count('-f "$ASTER_REMOTE_MESH_FILE"'),
+            4,
+        )
+
     def test_operator_runbook_has_artifact_only_compose_cli_examples(self):
         runbook = (REPOSITORY / "docs/operator-guide.md").read_text()
         required = (
@@ -786,6 +837,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             " publish ",
             " query ",
             "blob-publish",
+            "blob-status",
             "blob-read",
             "--ttl-ms",
             "sha256sum",

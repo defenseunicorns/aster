@@ -2,6 +2,18 @@
 ." SPDX-License-Identifier: Apache-2.0
 ." Clean Room — Privileged
 .TH ASTERCTL-BLOB-READ 1 "2026-10-16" "Aster" "User Commands"
+.\" <!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+.\" ```json
+.\" {
+.\"   "schema": 1,
+.\"   "surface": "blob_read_man",
+.\"   "cli_download_resume": "post_merge",
+.\"   "node_to_node_receiver_checkpoint_resume": "implemented"
+.\" }
+.\" ```
+.\" <!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+.\" Interrupted CLI downloads restart at byte zero; node-to-node profile-5 receiver-checkpoint resume is implemented independently.
+.\" <!-- ASTER-BLOB-CAPABILITY:END -->
 .SH NAME
 asterctl-blob-read \- read an authenticated Aster Blob to a new local file
 .SH SYNOPSIS
@@ -46,12 +58,22 @@ Required exact Blob scope.
 .TP
 .BI \-\-output " PATH"
 Required destination path. It must not already exist.
+.TP
+.BI \-\-progress " MODE"
+Progress policy: auto, always, or never. The default auto writes progress only
+when standard error is a terminal. always emits newline-delimited records when
+redirected; never disables progress. Progress never changes standard output.
 .SH OUTPUT
 Blob bytes are written only to
 .BR \-\-output .
 After a complete verified stream, stdout reports Blob ID, publisher, publisher
 counter, topic, scope, priority, total length, optional media type, schema ID,
 acceptance marker, and original TTL. It never prints Blob plaintext.
+.PP
+Progress on standard error reports authenticated bytes written to the hidden
+staging file. Periodic output is limited to four updates per second. On failure,
+the diagnostic reports how many staged bytes were discarded and confirms that
+the requested destination was not published.
 .PP
 Text renders TTL as exactly
 .B TTL: durable

@@ -83,14 +83,42 @@ delivery guides.
 
 ## Stream Blob content safely
 
-The broad bindings use `blob_writer`/`BlobWriter`-style streaming. The selected
-Rust runtime publishes an owned regular file and reads authenticated pages of
-at most 64 KiB. A live publication is nonempty and at most 64 MiB.
+The broad bindings use `blob_writer`/`BlobWriter`-style streaming. The legacy
+selected Rust live-file facade publishes an owned regular file, reads
+authenticated pages of at most 64 KiB, and retains its 64-MiB ceiling. The
+Linux local agent and `asterctl` use resumable 512-KiB application frames over
+the same canonical authority and admit objects through 8 GiB. The selected
+Blob profile and map-unit contract is machine checked:
+
+<!-- ASTER-BLOB-CAPABILITY:BEGIN -->
+```json
+{
+  "schema": 1,
+  "surface": "recipes",
+  "semantic_v7_v8_profile": "4:BlobRangesStreamV1",
+  "semantic_v9_profile": "5:BlobStreamV1",
+  "map_unit": "1048576-byte native plaintext segment",
+  "record": "ASTRBS02, at most 1048706 bytes",
+  "data_body": "4-byte length prefix plus one ASTRBS02 record, at most 1048710 bytes"
+}
+```
+<!-- ASTER-BLOB-CAPABILITY:RENDERED -->
+Semantic v7/v8 selects profile 4 BlobRangesStreamV1; semantic v9 selects profile 5 BlobStreamV1. Profile 5 maps 1,048,576-byte plaintext segments into append-only ASTRBS02 records of at most 1,048,706 bytes and sends one complete length-prefixed record per DATA body, at most 1,048,710 bytes, without repacking or re-encryption.
+<!-- ASTER-BLOB-CAPABILITY:END -->
 
 Each returned chunk or page is authenticated, but whole-content verification
 finishes only at end-of-file. Write to a temporary destination and rename it
 only after the final read succeeds. Caller-owned files and copied plaintext
 remain outside node zeroization.
+
+Local publication is independent of peer availability. The sync scheduler
+opens a bounded profile-5 transfer when an eligible destination becomes
+available, and interruption resumes from lifecycle-owned provisional source
+state plus the native pack checkpoint journal. Atomic promotion precedes
+RESULT; RESULT_ACK or EOF settles only the attempt and owns no durable resume
+state. See the
+[Blob streaming engineering runbook](validation/blob-streaming-engineering-runbook.md)
+for large-object commands, network-path checks, and performance diagnostics.
 
 ## Resolve Record conflicts
 
