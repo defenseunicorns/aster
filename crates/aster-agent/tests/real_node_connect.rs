@@ -985,7 +985,7 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
                             media_type: Some("application/octet-stream".to_owned()),
                             schema_id: b"schema/blob-v1".to_vec(),
                             total_len: finite_payload.len() as u64,
-                            ttl_ms: Some(500),
+                            ttl_ms: Some(1_000),
                             ..Default::default()
                         },
                     ))),
@@ -1004,8 +1004,8 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
             ]
         )
         .expect("publish finite Blob");
-        assert_eq!(finite.ttl_ms, Some(500));
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(finite.ttl_ms, Some(1_000));
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
 
         let retired = client
             .inspect_blob_publication(api::InspectBlobPublicationRequest {
