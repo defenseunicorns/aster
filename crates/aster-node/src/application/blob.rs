@@ -12033,6 +12033,125 @@ pub(crate) mod tests {
         assert_eq!(hidden.phase, BlobPublicationPhase::Missing);
     }
 
+    async fn assert_retired_status_keeps_live_actor_usable(use_transfer_id: bool) {
+        // Break caught: a normal retired lookup must not become actor-fatal,
+        // including after restart, or disclose an ID across granted selectors.
+        let root = TestRoot::new("retired-status-live-actor");
+        let other_topic = Topic::new("ops.other").unwrap();
+        let other_scope = Scope::new("mission/other").unwrap();
+        let access = [
+            ProvisioningAccess::member(
+                blob_scope(),
+                vec![1],
+                vec![blob_topic(), other_topic.clone()],
+            )
+            .unwrap(),
+            ProvisioningAccess::member(other_scope.clone(), vec![1], vec![blob_topic()]).unwrap(),
+        ];
+        let mut provisioner = ReferenceProvisioner::from_seed([0xf2; 32]).unwrap();
+        let mission = provisioner
+            .issue_node(1, &access)
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        drop(UnprotectedReferenceMission::persist(root.mission_path(), mission).unwrap());
+        let mut node = selected_node(&root);
+        node.custody_clock = NodeCustodyClock::injected([0xd7; 16], 1000, 0);
+        let published = node
+            .publish_with_options(
+                request(b"retired-status"),
+                BlobPublishOptions::finite_ttl_ms(50).unwrap(),
+                &mut Cursor::new(payload(53)),
+            )
+            .unwrap();
+        let transfer = node.store.blob_inventory().unwrap()[0];
+        let publication_id = if use_transfer_id {
+            BlobStreamPublicationId::from_bytes(*transfer.as_bytes()).unwrap()
+        } else {
+            published.publication_id.unwrap()
+        };
+        node.custody_clock.set_injected_tick(1050).unwrap();
+        let sample = node.custody_clock.sample().unwrap();
+        let budget = BlobMaintenanceBudget::new(4096, 8, 32 * 1024 * 1024).unwrap();
+        for _ in 0..128 {
+            node.store
+                .run_blob_maintenance_turn_with_sample(budget, Some(sample))
+                .unwrap();
+            node.store.run_blob_capacity_gc(budget, None).unwrap();
+        }
+        assert!(matches!(
+            node.store.get_blob(transfer),
+            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+        ));
+        drop(node);
+        let mut node = selected_node(&root);
+        node.custody_clock = NodeCustodyClock::injected([0xd7; 16], 1050, 0);
+        let (handle, worker) = live_stream_test_actor(node);
+        for (topic, scope, expected) in [
+            (
+                blob_topic(),
+                blob_scope(),
+                BlobPublicationPhase::ExpiredOrRetired,
+            ),
+            (other_topic, blob_scope(), BlobPublicationPhase::Missing),
+            (blob_topic(), other_scope, BlobPublicationPhase::Missing),
+        ] {
+            let status = handle
+                .inspect_publication(BlobPublicationInspectionRequest {
+                    publication_id,
+                    topic,
+                    scope,
+                })
+                .await
+                .expect("normal retirement must not terminate the actor");
+            assert_eq!(status.phase, expected);
+        }
+        handle
+            .capacity_status()
+            .await
+            .expect("next command remains available");
+        let bytes = payload(31);
+        let mut stream = handle
+            .open_publish_stream(BlobPublishStreamRequest {
+                publication: request(b"after-retired-status"),
+                options: BlobPublishOptions::durable(),
+                total_len: 31,
+            })
+            .await
+            .unwrap();
+        stream
+            .write(0, Zeroizing::new(bytes.clone()))
+            .await
+            .unwrap();
+        let replacement = stream.finish().await.unwrap();
+        let page = handle
+            .read_page(BlobReadPageRequest {
+                blob: BlobReadRequest {
+                    id: replacement.id,
+                    topic: blob_topic(),
+                    scope: blob_scope(),
+                },
+                offset: 0,
+                max_bytes: 31,
+            })
+            .await
+            .unwrap();
+        assert!(page.complete);
+        assert_eq!(page.as_bytes(), bytes.as_slice());
+        drop(handle);
+        drop(worker.await.unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retired_local_publication_status_keeps_live_actor_usable() {
+        assert_retired_status_keeps_live_actor_usable(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retired_transfer_publication_status_keeps_live_actor_usable() {
+        assert_retired_status_keeps_live_actor_usable(true).await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn end_to_end_review_abandoned_finite_upload_expires_before_new_admission() {
         let root = TestRoot::new("review-actor-expired-abandoned-capacity");

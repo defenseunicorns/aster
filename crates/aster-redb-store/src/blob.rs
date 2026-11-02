@@ -3990,15 +3990,32 @@ impl Store {
             if matched.is_some() {
                 return Err(blob_error(BlobStoreError::OperationConflict));
             }
-            let operation = decode_blob_operation_record(value.value())?;
-            let publication = publications
-                .get(operation.transfer_id.as_bytes().as_slice())?
-                .ok_or_else(|| {
-                    blob_error(BlobStoreError::SchemaInvariant(
-                        "Blob operation publication is missing",
-                    ))
-                })?;
-            let metadata = decode_blob_metadata(publication.value())?;
+            let retired =
+                lifecycle::operation_record_is_retired(value.value()).map_err(blob_error)?;
+            let metadata = if retired {
+                let Some(metadata) = retired_blob_operation_metadata(
+                    &publications,
+                    lifecycle::publication_encoding_read(&read)?,
+                    &owner,
+                    value.value(),
+                )?
+                else {
+                    // Operation and publication retention expire independently.
+                    // Without publication metadata, no selector can be proven.
+                    return Ok(None);
+                };
+                metadata
+            } else {
+                let operation = decode_blob_operation_record(value.value())?;
+                let publication = publications
+                    .get(operation.transfer_id.as_bytes().as_slice())?
+                    .ok_or_else(|| {
+                        blob_error(BlobStoreError::SchemaInvariant(
+                            "Blob operation publication is missing",
+                        ))
+                    })?;
+                decode_blob_metadata(publication.value())?
+            };
             if &metadata.header.topic != topic || &metadata.header.scope != scope {
                 return Ok(None);
             }
@@ -4007,10 +4024,10 @@ impl Store {
                     owner.publisher,
                 )));
             }
-            if lifecycle::operation_record_is_retired(value.value()).map_err(blob_error)? {
+            if retired {
                 return Err(blob_error(BlobStoreError::ExpiredOrRetired));
             }
-            matched = Some(operation.transfer_id);
+            matched = Some(metadata.transfer_id);
         }
         matched
             .map(|transfer| load_blob_from_read(&read, transfer))
@@ -4141,7 +4158,12 @@ impl Store {
         else {
             return Ok(None);
         };
-        let metadata = decode_blob_metadata(publication.value())?;
+        let metadata =
+            if let Some((metadata, _)) = decode_retired_blob_metadata(publication.value())? {
+                metadata
+            } else {
+                decode_blob_metadata(publication.value())?
+            };
         if &metadata.header.topic != topic || &metadata.header.scope != scope {
             return Ok(None);
         }
@@ -16713,6 +16735,18 @@ fn audit_retired_operation_owner(
     owner: &BlobOperationOwner,
     value: &[u8],
 ) -> Result<(), StoreError> {
+    retired_blob_operation_metadata(publications, publication_encoding, owner, value).map(|_| ())
+}
+
+/// Resolves only the exact retired publication generation. A same-intent live
+/// publication cannot substitute for it, and independently expired evidence
+/// is legitimate absence rather than an ownership contradiction.
+fn retired_blob_operation_metadata(
+    publications: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    publication_encoding: lifecycle::PublicationEncodingGeneration,
+    owner: &BlobOperationOwner,
+    value: &[u8],
+) -> Result<Option<BlobMetadata>, StoreError> {
     let (reason, generation, _, intent_digest, _) = lifecycle::operation_retirement(value)
         .map_err(blob_error)?
         .ok_or_else(|| {
@@ -16750,14 +16784,14 @@ fn audit_retired_operation_owner(
                 "retired Blob operation owner differs from its publication publisher",
             )));
         }
-        if matched.replace(publication_publisher).is_some() {
+        if matched.replace(metadata).is_some() {
             return Err(blob_error(BlobStoreError::SchemaInvariant(
                 "retired Blob operation has ambiguous publication ownership",
             )));
         }
     }
     if matched.is_some() {
-        return Ok(());
+        return Ok(matched);
     }
 
     // A surviving retirement generation is authoritative. Only in its absence
@@ -16791,7 +16825,7 @@ fn audit_retired_operation_owner(
     }
     // Current owner-qualified operation keys remain hash-bound by lifecycle
     // audit after their independently expiring publication evidence is gone.
-    Ok(())
+    Ok(None)
 }
 
 fn migrate_blob_operation_ownership_write(
@@ -29550,6 +29584,96 @@ mod tests {
             operation_deadline,
             replay_key: accepted_dot_key(stored.header.stamp.dot),
         }
+    }
+
+    #[test]
+    fn retired_publication_status_preserves_selector_boundary() {
+        // Break caught: decoding a retired row as active is an integrity error;
+        // returning retirement before matching the selector leaks its existence.
+        let root = BlobTestRoot::new("retired-status-selectors");
+        let mut services = blob_services(0xd1);
+        let fixture = seed_retired_store_fixture(&root, &mut services);
+        let store = Store::open_for_mission(&root.database, services.authority).unwrap();
+        let policy = store.control_policy_snapshot().unwrap();
+        let owner = decode_blob_operation_owner_key(&fixture.operation_storage_key).unwrap();
+        let local_id =
+            local_blob_publication_stream_id(owner.publisher, owner.operation.as_bytes());
+        for (topic, scope, visible) in [
+            (blob_topic(), blob_scope(), true),
+            (Topic::new("other-topic").unwrap(), blob_scope(), false),
+            (blob_topic(), Scope::new("mission/other").unwrap(), false),
+        ] {
+            let local =
+                store.blob_for_local_publication_with_policy(&policy, local_id, &topic, &scope);
+            let received = store.blob_for_transfer_selector(fixture.transfer, &topic, &scope);
+            for status in [local, received] {
+                if visible {
+                    assert!(
+                        matches!(
+                            status,
+                            Err(StoreError::Blob(BlobStoreError::ExpiredOrRetired))
+                        ),
+                        "matching retired selector must remain ordinary: {status:?}"
+                    );
+                } else {
+                    assert!(
+                        status.unwrap().is_none(),
+                        "another selector must see absence"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retired_publication_status_is_missing_after_selector_evidence_expires() {
+        // Break caught: an operation tombstone may outlive its publication's
+        // selector metadata. Absence is legitimate and must survive reopen.
+        let root = BlobTestRoot::new("retired-status-expired-evidence");
+        let mut services = blob_services(0xd2);
+        let fixture = seed_retired_store_fixture(&root, &mut services);
+        let store = Store::open_for_mission(&root.database, services.authority).unwrap();
+        let owner = decode_blob_operation_owner_key(&fixture.operation_storage_key).unwrap();
+        let local_id =
+            local_blob_publication_stream_id(owner.publisher, owner.operation.as_bytes());
+        let write = store.database.begin_write().unwrap();
+        expire_retired_publication_write(
+            &write,
+            fixture.publication_deadline,
+            fixture.transfer,
+            fixture.publication_deadline,
+        )
+        .unwrap();
+        write.commit().unwrap();
+        drop(store);
+        let store = Store::open_for_mission(&root.database, services.authority).unwrap();
+        let policy = store.control_policy_snapshot().unwrap();
+        let read = store.database.begin_read().unwrap();
+        assert!(
+            read.open_table(BLOB_OPERATIONS)
+                .unwrap()
+                .get(fixture.operation_storage_key.as_slice())
+                .unwrap()
+                .is_some()
+        );
+        drop(read);
+        assert!(
+            store
+                .blob_for_local_publication_with_policy(
+                    &policy,
+                    local_id,
+                    &blob_topic(),
+                    &blob_scope(),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .blob_for_transfer_selector(fixture.transfer, &blob_topic(), &blob_scope(),)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
