@@ -183,6 +183,9 @@ pub type ContactFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ContactErr
 pub type ContactRequestHandler<'a> =
     Box<dyn FnOnce(&[u8]) -> Result<(Vec<u8>, bool), ContactError> + Send + 'a>;
 
+/// Synchronous authorization recheck executed adjacent to the first write.
+pub type ContactPreflight<'a> = Box<dyn FnOnce() -> Result<(), ContactError> + Send + 'a>;
+
 /// Adapter-neutral bounded ordered request/response contact.
 ///
 /// A caller must serialize exchange and finish operations for one contact.
@@ -199,6 +202,14 @@ pub trait OrderedContact: Send + Sync {
         &'a self,
         request: &'a [u8],
         total_limit: usize,
+    ) -> ContactFuture<'a, Vec<u8>>;
+
+    /// Sends one bounded exchange after a carrier-adjacent authorization check.
+    fn request_with_total_limit_checked<'a>(
+        &'a self,
+        request: &'a [u8],
+        total_limit: usize,
+        before_write: ContactPreflight<'a>,
     ) -> ContactFuture<'a, Vec<u8>>;
 
     /// Receives one request and sends the synchronous handler's bounded response.

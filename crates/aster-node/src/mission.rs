@@ -3457,6 +3457,18 @@ mod tests {
             })
         }
 
+        fn request_with_total_limit_checked<'a>(
+            &'a self,
+            request: &'a [u8],
+            total_limit: usize,
+            before_write: aster_contact::ContactPreflight<'a>,
+        ) -> ContactFuture<'a, Vec<u8>> {
+            if let Err(error) = before_write() {
+                return Box::pin(async move { Err(error) });
+            }
+            self.request_with_total_limit(request, total_limit)
+        }
+
         fn respond_once_with_total_limit<'a>(
             &'a self,
             _total_limit: usize,

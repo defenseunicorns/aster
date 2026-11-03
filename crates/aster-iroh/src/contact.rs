@@ -1,6 +1,6 @@
 use aster_contact::{
     CarrierPeerEvidence, ChannelBindingCapability, ContactError, ContactErrorKind, ContactFuture,
-    ContactRequestHandler, OrderedContact, StableCarrierId,
+    ContactPreflight, ContactRequestHandler, OrderedContact, StableCarrierId,
 };
 
 use crate::{CarrierError, Connection};
@@ -39,6 +39,31 @@ impl OrderedContact for Connection {
             Connection::request_with_total_limit(self, request, total_limit)
                 .await
                 .map_err(map_carrier_error)
+        })
+    }
+
+    fn request_with_total_limit_checked<'a>(
+        &'a self,
+        request: &'a [u8],
+        total_limit: usize,
+        before_write: ContactPreflight<'a>,
+    ) -> ContactFuture<'a, Vec<u8>> {
+        Box::pin(async move {
+            let mut preflight_error = None;
+            let result =
+                Connection::request_with_total_limit_checked(self, request, total_limit, || {
+                    before_write().map_err(|error| {
+                        preflight_error = Some(error);
+                        CarrierError::Transport("ordered contact preflight rejected write".into())
+                    })
+                })
+                .await;
+            match preflight_error {
+                Some(error) => Err(error),
+                None => result
+                    .map(|(response, ())| response)
+                    .map_err(map_carrier_error),
+            }
         })
     }
 

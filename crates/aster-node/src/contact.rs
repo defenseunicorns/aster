@@ -1,8 +1,8 @@
 //! Owned selected-contact handle with explicit Iroh-only capabilities.
 
 use aster_contact::{
-    CarrierPeerEvidence, ContactError, ContactErrorKind, ContactFuture, ContactRequestHandler,
-    OrderedContact,
+    CarrierPeerEvidence, ContactError, ContactErrorKind, ContactFuture, ContactPreflight,
+    ContactRequestHandler, OrderedContact,
 };
 use std::{fmt, sync::Arc};
 
@@ -20,6 +20,7 @@ impl SelectedContact {
         Self::Iroh(connection)
     }
 
+    #[allow(dead_code)] // The Linux Ring 1 driver consumes this in Task 5.
     pub(crate) fn from_ordered(contact: Arc<dyn OrderedContact>) -> Self {
         Self::Ordered(contact)
     }
@@ -83,6 +84,25 @@ impl OrderedContact for SelectedContact {
                 OrderedContact::request_with_total_limit(connection, request, total_limit)
             }
             Self::Ordered(contact) => contact.request_with_total_limit(request, total_limit),
+        }
+    }
+
+    fn request_with_total_limit_checked<'a>(
+        &'a self,
+        request: &'a [u8],
+        total_limit: usize,
+        before_write: ContactPreflight<'a>,
+    ) -> ContactFuture<'a, Vec<u8>> {
+        match self {
+            Self::Iroh(connection) => OrderedContact::request_with_total_limit_checked(
+                connection,
+                request,
+                total_limit,
+                before_write,
+            ),
+            Self::Ordered(contact) => {
+                contact.request_with_total_limit_checked(request, total_limit, before_write)
+            }
         }
     }
 
