@@ -21436,12 +21436,211 @@ fn account_event_turn_received_frame(
     Ok(())
 }
 
+/// Carrier-private mechanics for one already-protected EventPages turn.
+///
+/// Iroh retains its native unidirectional stream. A plain ordered contact uses
+/// one request with an empty response per protected frame. The terminal Event
+/// frame remains the semantic end marker, so the ordered form needs no extra
+/// protocol byte or capability negotiation.
+enum SelectedEventSendTurn<'a> {
+    Iroh(SendUniTurn),
+    Ordered {
+        contact: &'a SelectedContact,
+        remaining_bytes: usize,
+    },
+}
+
+enum SelectedEventReceiveTurn<'a> {
+    Iroh(ReceiveUniTurn),
+    Ordered {
+        contact: &'a SelectedContact,
+        remaining_bytes: usize,
+    },
+}
+
+async fn open_selected_event_send_turn(
+    contact: &SelectedContact,
+    wire_budget: usize,
+) -> Result<SelectedEventSendTurn<'_>, NodeError> {
+    match contact {
+        SelectedContact::Iroh(connection) => Ok(SelectedEventSendTurn::Iroh(
+            connection
+                .open_send_uni(tokio::time::Instant::now() + CONTACT_DEADLINE, wire_budget)
+                .await?,
+        )),
+        SelectedContact::Ordered(_) => Ok(SelectedEventSendTurn::Ordered {
+            contact,
+            remaining_bytes: wire_budget,
+        }),
+    }
+}
+
+async fn open_selected_event_receive_turn(
+    contact: &SelectedContact,
+    wire_budget: usize,
+) -> Result<SelectedEventReceiveTurn<'_>, NodeError> {
+    match contact {
+        SelectedContact::Iroh(connection) => Ok(SelectedEventReceiveTurn::Iroh(
+            connection
+                .accept_uni(tokio::time::Instant::now() + CONTACT_DEADLINE, wire_budget)
+                .await?,
+        )),
+        SelectedContact::Ordered(_) => Ok(SelectedEventReceiveTurn::Ordered {
+            contact,
+            remaining_bytes: wire_budget,
+        }),
+    }
+}
+
+impl SelectedEventSendTurn<'_> {
+    async fn write_frame_checked<F>(
+        &mut self,
+        frame: &[u8],
+        before_write: F,
+    ) -> Result<(), NodeError>
+    where
+        F: FnOnce() -> Result<(), NodeError> + Send,
+    {
+        match self {
+            Self::Iroh(turn) => turn.write_frame_checked(frame, before_write).await,
+            Self::Ordered {
+                contact,
+                remaining_bytes,
+            } => {
+                if frame.is_empty() {
+                    return Err(NodeError::Protocol(
+                        "ordered Event turn frame must be nonempty".into(),
+                    ));
+                }
+                if frame.len() > *remaining_bytes {
+                    return Err(NodeError::Protocol(
+                        "ordered Event turn exceeds its carrier byte budget".into(),
+                    ));
+                }
+                let callback_error = Arc::new(StdMutex::new(None));
+                let callback_error_for_check = Arc::clone(&callback_error);
+                let exchange = contact
+                    .request_with_total_limit_checked(
+                        frame,
+                        frame.len(),
+                        Box::new(move || match before_write() {
+                            Ok(()) => Ok(()),
+                            Err(error) => {
+                                *callback_error_for_check.lock().map_err(|_| {
+                                    ContactError::new(
+                                        ContactErrorKind::Transport,
+                                        "Event preflight error slot is poisoned",
+                                    )
+                                })? = Some(error);
+                                Err(ContactError::new(
+                                    ContactErrorKind::Protocol,
+                                    "Event frame preflight rejected",
+                                ))
+                            }
+                        }),
+                    )
+                    .await;
+                if let Some(error) = callback_error
+                    .lock()
+                    .map_err(|_| {
+                        NodeError::Protocol("Event preflight error slot is poisoned".into())
+                    })?
+                    .take()
+                {
+                    return Err(error);
+                }
+                let response = exchange?;
+                if !response.is_empty() {
+                    return Err(NodeError::Protocol(
+                        "ordered Event frame acknowledgement must be empty".into(),
+                    ));
+                }
+                *remaining_bytes -= frame.len();
+                Ok(())
+            }
+        }
+    }
+
+    async fn finish(&mut self) -> Result<(), NodeError> {
+        match self {
+            Self::Iroh(turn) => turn.finish().await.map_err(NodeError::from),
+            Self::Ordered { .. } => Ok(()),
+        }
+    }
+}
+
+impl SelectedEventReceiveTurn<'_> {
+    async fn read_frame(&mut self) -> Result<Option<Vec<u8>>, NodeError> {
+        match self {
+            Self::Iroh(turn) => turn.read_frame().await.map_err(NodeError::from),
+            Self::Ordered {
+                contact,
+                remaining_bytes,
+            } => {
+                let received = Arc::new(StdMutex::new(None));
+                let received_for_handler = Arc::clone(&received);
+                let byte_limit = *remaining_bytes;
+                let complete = contact
+                    .respond_once_with_total_limit(
+                        byte_limit,
+                        Box::new(move |request| {
+                            if request.is_empty() {
+                                return Err(ContactError::new(
+                                    ContactErrorKind::Protocol,
+                                    "ordered Event turn frame must be nonempty",
+                                ));
+                            }
+                            *received_for_handler.lock().map_err(|_| {
+                                ContactError::new(
+                                    ContactErrorKind::Transport,
+                                    "Event receive slot is poisoned",
+                                )
+                            })? = Some(request.to_vec());
+                            Ok((Vec::new(), false))
+                        }),
+                    )
+                    .await?;
+                if complete {
+                    return Err(NodeError::Protocol(
+                        "ordered Event frame unexpectedly completed the contact".into(),
+                    ));
+                }
+                let frame = received
+                    .lock()
+                    .map_err(|_| NodeError::Protocol("Event receive slot is poisoned".into()))?
+                    .take()
+                    .ok_or_else(|| {
+                        NodeError::Protocol("ordered Event exchange omitted its request".into())
+                    })?;
+                *remaining_bytes = remaining_bytes.checked_sub(frame.len()).ok_or_else(|| {
+                    NodeError::Protocol("ordered Event turn exceeds its carrier byte budget".into())
+                })?;
+                Ok(Some(frame))
+            }
+        }
+    }
+
+    async fn require_terminal_end(&mut self) -> Result<(), NodeError> {
+        match self {
+            Self::Iroh(turn) => {
+                if turn.read_frame().await?.is_some() {
+                    return Err(NodeError::Protocol(
+                        "Event page turn contains frames after its terminal".into(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::Ordered { .. } => Ok(()),
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "carrier-adjacent authorization, budget, and final-write callback inputs stay explicit"
 )]
 async fn write_v7_event_turn_frame_checked<F>(
-    turn: &mut SendUniTurn,
+    turn: &mut SelectedEventSendTurn<'_>,
     store: &Store,
     mission: &mut MissionSession,
     event_guard: &EventLaneGuard,
@@ -21453,7 +21652,7 @@ async fn write_v7_event_turn_frame_checked<F>(
     before_write: F,
 ) -> Result<(), NodeError>
 where
-    F: FnOnce() -> Result<(), NodeError>,
+    F: FnOnce() -> Result<(), NodeError> + Send,
 {
     event_guard.check(store)?;
     require_contact_frame_initiation()?;
@@ -21496,7 +21695,7 @@ where
     reason = "carrier-adjacent authorization and budget inputs stay explicit"
 )]
 async fn write_v7_event_turn_frame(
-    turn: &mut SendUniTurn,
+    turn: &mut SelectedEventSendTurn<'_>,
     store: &Store,
     mission: &mut MissionSession,
     event_guard: &EventLaneGuard,
@@ -21526,7 +21725,7 @@ async fn write_v7_event_turn_frame(
     reason = "carrier-adjacent authorization and budget inputs stay explicit"
 )]
 async fn read_v7_event_turn_frame(
-    turn: &mut ReceiveUniTurn,
+    turn: &mut SelectedEventReceiveTurn<'_>,
     store: &Store,
     mission: &mut MissionSession,
     event_guard: &EventLaneGuard,
@@ -21570,7 +21769,7 @@ async fn read_v7_event_turn_frame(
     reason = "page progress, authorization, budget, and final-write callback inputs stay explicit"
 )]
 async fn write_change_page<F>(
-    turn: &mut SendUniTurn,
+    turn: &mut SelectedEventSendTurn<'_>,
     store: &Store,
     mission: &mut MissionSession,
     event_guard: &EventLaneGuard,
@@ -21586,7 +21785,7 @@ async fn write_change_page<F>(
     before_write: F,
 ) -> Result<(), NodeError>
 where
-    F: FnOnce() -> Result<(), NodeError>,
+    F: FnOnce() -> Result<(), NodeError> + Send,
 {
     let remaining = scheduled_count
         .checked_sub(consumed)
@@ -21691,7 +21890,7 @@ fn revalidate_event_page_schedule(
 )]
 async fn send_event_page_turn(
     store: &Store,
-    connection: &aster_iroh::Connection,
+    contact: &SelectedContact,
     mission: &mut MissionSession,
     event_verifier: &mut ReferenceEnvelopeSealer,
     lane: DirectedEventLane<'_>,
@@ -21747,10 +21946,8 @@ async fn send_event_page_turn(
         ));
     }
     let reserve = event_turn_reserve();
-    let deadline = tokio::time::Instant::now() + CONTACT_DEADLINE;
-    let mut turn = connection
-        .open_send_uni(deadline, event_turn_wire_budget(receipt, reserve)?)
-        .await?;
+    let mut turn =
+        open_selected_event_send_turn(contact, event_turn_wire_budget(receipt, reserve)?).await?;
     let digest = schedule_digest(&built.scheduled);
     let authenticated_peer = mission.peer().mission_id();
     let peer_route_commitments = mission.peer_route_grant_commitments().to_vec();
@@ -21989,7 +22186,7 @@ async fn send_event_page_turn(
 )]
 async fn receive_event_page_turn(
     store: &Store,
-    connection: &aster_iroh::Connection,
+    contact: &SelectedContact,
     mission: &mut MissionSession,
     event_verifier: &mut ReferenceEnvelopeSealer,
     lane: DirectedEventLane<'_>,
@@ -22041,13 +22238,11 @@ async fn receive_event_page_turn(
     let scheduled_count = usize::try_from(scheduled_count)
         .map_err(|_| NodeError::Protocol("scheduled Event count exceeds usize".into()))?;
     let reserve = event_turn_reserve();
-    let deadline = tokio::time::Instant::now() + CONTACT_DEADLINE;
-    let mut turn = connection
-        .accept_uni(
-            deadline,
-            event_turn_receive_wire_budget(receipt, reserve, limits)?,
-        )
-        .await?;
+    let mut turn = open_selected_event_receive_turn(
+        contact,
+        event_turn_receive_wire_budget(receipt, reserve, limits)?,
+    )
+    .await?;
     let mut frames_read = 0usize;
     let header = read_v7_event_turn_frame(
         &mut turn,
@@ -22269,11 +22464,7 @@ async fn receive_event_page_turn(
             }
         }
     }
-    if turn.read_frame().await?.is_some() {
-        return Err(NodeError::Protocol(
-            "Event page turn contains frames after its terminal".into(),
-        ));
-    }
+    turn.require_terminal_end().await?;
     receipt.event_uni_turns_received = receipt
         .event_uni_turns_received
         .checked_add(1)
@@ -22284,13 +22475,20 @@ async fn receive_event_page_turn(
 struct EventTransferLaneContext<'io, 'lane> {
     store: &'io Store,
     lease_store: Arc<Store>,
-    connection: &'io aster_iroh::Connection,
+    contact: &'io SelectedContact,
     mission: &'io mut MissionSession,
     event_verifier: &'io mut ReferenceEnvelopeSealer,
     lane: DirectedEventLane<'lane>,
     remote_emission: EmissionPolicySnapshot,
     exchanges: &'io mut CustodyExchangeSequence,
     receipt: &'io mut PeerReceipt,
+}
+
+fn skip_selected_event_turn(contact: &SelectedContact) -> Result<(), NodeError> {
+    if let Some(connection) = contact.iroh() {
+        connection.skip_uni_turn()?;
+    }
+    Ok(())
 }
 
 async fn sync_event_transfer_lane_planned(
@@ -22313,13 +22511,13 @@ async fn sync_event_transfer_lane_planned(
                 EventTurnPlanV1::PageActive { .. } | EventTurnPlanV1::PageBlindActive { .. }
                     if !event_page_plan_requires_stream(&local_plan.built.plan) =>
                 {
-                    context.connection.skip_uni_turn()?;
+                    skip_selected_event_turn(context.contact)?;
                     Ok(())
                 }
                 EventTurnPlanV1::PageActive { .. } | EventTurnPlanV1::PageBlindActive { .. } => {
                     send_event_page_turn(
                         context.store,
-                        context.connection,
+                        context.contact,
                         context.mission,
                         context.event_verifier,
                         context.lane,
@@ -22331,7 +22529,7 @@ async fn sync_event_transfer_lane_planned(
                     .await
                 }
                 EventTurnPlanV1::LegacyActive { .. } => {
-                    context.connection.skip_uni_turn()?;
+                    skip_selected_event_turn(context.contact)?;
                     sync_event_transfer_lane_bounded(
                         context,
                         difference,
@@ -22340,7 +22538,7 @@ async fn sync_event_transfer_lane_planned(
                     .await
                 }
                 EventTurnPlanV1::Empty { .. } | EventTurnPlanV1::Suppressed { .. } => {
-                    context.connection.skip_uni_turn()?;
+                    skip_selected_event_turn(context.contact)?;
                     Ok(())
                 }
             }
@@ -22353,7 +22551,7 @@ async fn sync_event_transfer_lane_planned(
                 EventTurnPlanV1::PageActive { .. } | EventTurnPlanV1::PageBlindActive { .. }
                     if !event_page_plan_requires_stream(plan) =>
                 {
-                    context.connection.skip_uni_turn()?;
+                    skip_selected_event_turn(context.contact)?;
                     Ok(())
                 }
                 EventTurnPlanV1::PageActive { .. } | EventTurnPlanV1::PageBlindActive { .. } => {
@@ -22364,7 +22562,7 @@ async fn sync_event_transfer_lane_planned(
                     })?;
                     receive_event_page_turn(
                         context.store,
-                        context.connection,
+                        context.contact,
                         context.mission,
                         context.event_verifier,
                         context.lane,
@@ -22383,11 +22581,11 @@ async fn sync_event_transfer_lane_planned(
                             "legacy Event receiver lacks direction-local limits".into(),
                         )
                     })?;
-                    context.connection.skip_uni_turn()?;
+                    skip_selected_event_turn(context.contact)?;
                     sync_event_transfer_lane_bounded(context, difference, limits).await
                 }
                 EventTurnPlanV1::Empty { .. } | EventTurnPlanV1::Suppressed { .. } => {
-                    context.connection.skip_uni_turn()?;
+                    skip_selected_event_turn(context.contact)?;
                     Ok(())
                 }
             }
@@ -22415,7 +22613,7 @@ async fn serve_event_transfer_lane_planned(
                 EventTurnPlanV1::PageActive { .. } | EventTurnPlanV1::PageBlindActive { .. }
                     if !event_page_plan_requires_stream(plan) =>
                 {
-                    context.connection.skip_uni_turn()?;
+                    skip_selected_event_turn(context.contact)?;
                     Ok(())
                 }
                 EventTurnPlanV1::PageActive { .. } | EventTurnPlanV1::PageBlindActive { .. } => {
@@ -22426,7 +22624,7 @@ async fn serve_event_transfer_lane_planned(
                     })?;
                     receive_event_page_turn(
                         context.store,
-                        context.connection,
+                        context.contact,
                         context.mission,
                         context.event_verifier,
                         context.lane,
@@ -22445,11 +22643,11 @@ async fn serve_event_transfer_lane_planned(
                             "legacy Event receiver lacks direction-local limits".into(),
                         )
                     })?;
-                    context.connection.skip_uni_turn()?;
+                    skip_selected_event_turn(context.contact)?;
                     serve_event_transfer_lane_bounded(context, difference, limits).await
                 }
                 EventTurnPlanV1::Empty { .. } | EventTurnPlanV1::Suppressed { .. } => {
-                    context.connection.skip_uni_turn()?;
+                    skip_selected_event_turn(context.contact)?;
                     Ok(())
                 }
             }
@@ -22462,13 +22660,13 @@ async fn serve_event_transfer_lane_planned(
                 EventTurnPlanV1::PageActive { .. } | EventTurnPlanV1::PageBlindActive { .. }
                     if !event_page_plan_requires_stream(&local_plan.built.plan) =>
                 {
-                    context.connection.skip_uni_turn()?;
+                    skip_selected_event_turn(context.contact)?;
                     Ok(())
                 }
                 EventTurnPlanV1::PageActive { .. } | EventTurnPlanV1::PageBlindActive { .. } => {
                     send_event_page_turn(
                         context.store,
-                        context.connection,
+                        context.contact,
                         context.mission,
                         context.event_verifier,
                         context.lane,
@@ -22480,7 +22678,7 @@ async fn serve_event_transfer_lane_planned(
                     .await
                 }
                 EventTurnPlanV1::LegacyActive { .. } => {
-                    context.connection.skip_uni_turn()?;
+                    skip_selected_event_turn(context.contact)?;
                     serve_event_transfer_lane_bounded(
                         context,
                         difference,
@@ -22489,7 +22687,7 @@ async fn serve_event_transfer_lane_planned(
                     .await
                 }
                 EventTurnPlanV1::Empty { .. } | EventTurnPlanV1::Suppressed { .. } => {
-                    context.connection.skip_uni_turn()?;
+                    skip_selected_event_turn(context.contact)?;
                     Ok(())
                 }
             }
@@ -22573,7 +22771,7 @@ async fn sync_event_transfer_lane_bounded(
     let EventTransferLaneContext {
         store,
         lease_store,
-        connection,
+        contact,
         mission,
         event_verifier,
         lane,
@@ -22587,7 +22785,7 @@ async fn sync_event_transfer_lane_bounded(
         EventTransferLaneContext {
             store,
             lease_store,
-            connection,
+            contact,
             mission,
             event_verifier,
             lane,
@@ -22619,7 +22817,7 @@ async fn sync_event_transfer_lane_inner(
     let EventTransferLaneContext {
         store,
         lease_store,
-        connection,
+        contact,
         mission,
         event_verifier,
         lane,
@@ -22627,6 +22825,7 @@ async fn sync_event_transfer_lane_inner(
         exchanges,
         receipt,
     } = context;
+    let connection = contact.require_iroh()?;
     let DirectedEventLane {
         guard: event_guard,
         receiver_interest,
@@ -28303,7 +28502,7 @@ async fn sync_authenticated_session(
             EventTransferLaneContext {
                 store,
                 lease_store: lease_store.clone(),
-                connection,
+                contact: &contact,
                 mission: &mut mission,
                 event_verifier: &mut event_verifier,
                 lane: to_responder_lane,
@@ -28373,7 +28572,7 @@ async fn sync_authenticated_session(
             EventTransferLaneContext {
                 store,
                 lease_store,
-                connection,
+                contact: &contact,
                 mission: &mut mission,
                 event_verifier: &mut event_verifier,
                 lane: to_initiator_lane,
@@ -28544,7 +28743,7 @@ async fn sync_authenticated_session(
         EventTransferLaneContext {
             store,
             lease_store: lease_store.clone(),
-            connection,
+            contact: &contact,
             mission: &mut mission,
             event_verifier: &mut event_verifier,
             lane: to_responder_lane,
@@ -28573,7 +28772,7 @@ async fn sync_authenticated_session(
         EventTransferLaneContext {
             store,
             lease_store: Arc::clone(&lease_store),
-            connection,
+            contact: &contact,
             mission: &mut mission,
             event_verifier: &mut event_verifier,
             lane: to_initiator_lane,
@@ -29305,7 +29504,7 @@ async fn serve_event_transfer_lane_bounded(
     let EventTransferLaneContext {
         store,
         lease_store,
-        connection,
+        contact,
         mission,
         event_verifier,
         lane,
@@ -29319,7 +29518,7 @@ async fn serve_event_transfer_lane_bounded(
         EventTransferLaneContext {
             store,
             lease_store,
-            connection,
+            contact,
             mission,
             event_verifier,
             lane,
@@ -29351,7 +29550,7 @@ async fn serve_event_transfer_lane_inner(
     let EventTransferLaneContext {
         store,
         lease_store,
-        connection,
+        contact,
         mission,
         event_verifier,
         lane,
@@ -29359,6 +29558,7 @@ async fn serve_event_transfer_lane_inner(
         exchanges,
         receipt,
     } = context;
+    let connection = contact.require_iroh()?;
     let DirectedEventLane {
         guard: event_guard,
         receiver_interest,
@@ -30670,7 +30870,7 @@ async fn serve_session(
             EventTransferLaneContext {
                 store: &store,
                 lease_store: lease_store.clone(),
-                connection: &connection,
+                contact: &selected_contact,
                 mission: &mut mission,
                 event_verifier: &mut event_verifier,
                 lane: to_responder_lane,
@@ -30739,7 +30939,7 @@ async fn serve_session(
             EventTransferLaneContext {
                 store: &store,
                 lease_store,
-                connection: &connection,
+                contact: &selected_contact,
                 mission: &mut mission,
                 event_verifier: &mut event_verifier,
                 lane: to_initiator_lane,
@@ -30908,7 +31108,7 @@ async fn serve_session(
         EventTransferLaneContext {
             store: &store,
             lease_store: lease_store.clone(),
-            connection: &connection,
+            contact: &selected_contact,
             mission: &mut mission,
             event_verifier: &mut event_verifier,
             lane: to_responder_lane,
@@ -30937,7 +31137,7 @@ async fn serve_session(
         EventTransferLaneContext {
             store: &store,
             lease_store,
-            connection: &connection,
+            contact: &selected_contact,
             mission: &mut mission,
             event_verifier: &mut event_verifier,
             lane: to_initiator_lane,
@@ -39260,6 +39460,138 @@ mod tests {
         assert_eq!(receipt.protected_frames, 6);
         assert_eq!(server_receipt.protected_frames, 6);
         assert_eq!(mission.semantic_version(), SEMANTIC_PROTOCOL_V9);
+    }
+
+    #[tokio::test]
+    async fn event_turn_adapter_preserves_frames_over_locator_contact() {
+        // Break caught: EventPages negotiated successfully over an ordered
+        // locator contact but the first page still reached for an Iroh-only
+        // unidirectional stream.
+        let mut issued = issue_missions(2);
+        let initiator = issued.remove(0);
+        let responder = issued.remove(0);
+        let initiator_id = initiator.identity;
+        let responder_id = responder.identity;
+        let initiator_bundle = initiator.credentials.fresh_bundle().unwrap();
+        let responder_bundle = responder.credentials.fresh_bundle().unwrap();
+        let (left_stream, right_stream) = duplex(113);
+        let left = SelectedContact::from_ordered(Arc::new(
+            BleL2capContact::new(
+                left_stream,
+                TransientLocator::new(b"left-event-turn".to_vec()).unwrap(),
+                16 * 1024,
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        ));
+        let right = SelectedContact::from_ordered(Arc::new(
+            BleL2capContact::new(
+                right_stream,
+                TransientLocator::new(b"right-event-turn".to_vec()).unwrap(),
+                16 * 1024,
+                Duration::from_secs(2),
+            )
+            .unwrap(),
+        ));
+        let expected = |label: &[u8], mission_id| {
+            crate::mission::MissionPeerExpectation::new(
+                CarrierPeerEvidence::UnauthenticatedLocator {
+                    transient_locator: TransientLocator::new(label.to_vec()).unwrap(),
+                },
+                mission_id,
+            )
+        };
+        let direction = EventDirection::ToSessionResponder;
+        let profile_digest = [0x44; 32];
+        let scheduled = (0u8..128)
+            .map(|byte| EventTransferId::new([byte; 32]))
+            .collect::<Vec<_>>();
+        let schedule_digest = schedule_digest(&scheduled);
+        let frames = vec![
+            Frame::ChangeTurnHeader(ChangeTurnHeaderV1 {
+                direction,
+                transfer_profile_digest: profile_digest,
+                set_commitment: [0x55; 32],
+                scheduled,
+                schedule_digest,
+            }),
+            Frame::ChangeTurnFinished(ChangeTurnFinishedV1 {
+                direction,
+                transfer_profile_digest: profile_digest,
+                set_commitment: [0x55; 32],
+                schedule_digest,
+                final_page_count: 0,
+            }),
+        ];
+        let expected_plaintext = frames
+            .iter()
+            .map(|frame| {
+                frame
+                    .encode_for_semantic_version(SEMANTIC_PROTOCOL_V9)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let receiver = tokio::spawn(async move {
+            let (mut mission, _) = crate::mission::respond_over_contact_metered(
+                &right,
+                responder_bundle,
+                expected(b"configured-initiator", initiator_id),
+            )
+            .await
+            .unwrap();
+            let mut turn = open_selected_event_receive_turn(&right, 16 * 1024)
+                .await
+                .unwrap();
+            let mut received = Vec::new();
+            for _ in 0..2 {
+                let protected = turn.read_frame().await.unwrap().unwrap();
+                let plaintext = mission
+                    .open_profiled_application_frame(
+                        profile_digest,
+                        LaneId::Event,
+                        TransferProfileId::EventPagesV1,
+                        direction,
+                        &protected,
+                    )
+                    .unwrap();
+                Frame::decode_for_semantic_version(&plaintext, mission.semantic_version()).unwrap();
+                received.push(plaintext);
+            }
+            turn.require_terminal_end().await.unwrap();
+            received
+        });
+
+        let (mut mission, _) = crate::mission::initiate_over_contact_metered(
+            &left,
+            initiator_bundle,
+            expected(b"configured-responder", responder_id),
+        )
+        .await
+        .unwrap();
+        let mut turn = open_selected_event_send_turn(&left, 16 * 1024)
+            .await
+            .unwrap();
+        for frame in &frames {
+            let plaintext = frame
+                .encode_for_semantic_version(mission.semantic_version())
+                .unwrap();
+            let protected = mission
+                .seal_profiled_application_frame(
+                    profile_digest,
+                    LaneId::Event,
+                    TransferProfileId::EventPagesV1,
+                    direction,
+                    &plaintext,
+                )
+                .unwrap();
+            turn.write_frame_checked(&protected, || Ok(()))
+                .await
+                .unwrap();
+        }
+        turn.finish().await.unwrap();
+
+        assert_eq!(receiver.await.unwrap(), expected_plaintext);
     }
 
     #[test]
