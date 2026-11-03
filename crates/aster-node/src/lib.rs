@@ -53,6 +53,7 @@
 
 pub mod application;
 pub mod bridge_runtime;
+mod contact;
 pub mod control_admin;
 mod demo_publication;
 mod event_pages;
