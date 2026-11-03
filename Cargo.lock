@@ -437,6 +437,8 @@ dependencies = [
 name = "aster-node"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "aster-ble-l2cap",
+ "aster-contact",
  "aster-core",
  "aster-iroh",
  "aster-negentropy",
