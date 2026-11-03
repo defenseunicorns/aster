@@ -81,9 +81,10 @@ pub use control_admin::{
 pub use identity::{IdentityError, NodeIdentity};
 pub use mission::{
     CLASSICAL_CHANNEL_BINDING_CONTEXT_BYTES, CarrierBoundClassicalMissionSession,
-    ClassicalChannelBindingContext, MissionPeerBinding, MissionProvisioningOrigin,
-    MissionSessionError, UnprotectedClassicalMission, initiate_classical_over_iroh,
-    respond_classical_over_iroh,
+    ClassicalChannelBindingContext, HybridMissionSession, MissionPeerBinding,
+    MissionPeerExpectation, MissionPeerObservation, MissionProvisioningOrigin, MissionSessionError,
+    UnprotectedClassicalMission, initiate_classical_over_iroh, initiate_over_contact,
+    respond_classical_over_iroh, respond_over_contact,
 };
 pub use runtime::{
     ControlPublicationReceipt, DemoScenario, EventEmissionPolicy,
