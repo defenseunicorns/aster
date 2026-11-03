@@ -3,8 +3,8 @@
 #![forbid(unsafe_code)]
 
 use aster_contact::{
-    CarrierPeerEvidence, ContactError, ContactErrorKind, ContactFuture, ContactRequestHandler,
-    OrderedContact, TransientLocator,
+    CarrierPeerEvidence, ContactError, ContactErrorKind, ContactFuture, ContactPreflight,
+    ContactRequestHandler, OrderedContact, TransientLocator,
 };
 use std::{
     io,
@@ -238,6 +238,15 @@ impl OrderedContact for BleL2capContact {
         request: &'a [u8],
         total_limit: usize,
     ) -> ContactFuture<'a, Vec<u8>> {
+        self.request_with_total_limit_checked(request, total_limit, Box::new(|| Ok(())))
+    }
+
+    fn request_with_total_limit_checked<'a>(
+        &'a self,
+        request: &'a [u8],
+        total_limit: usize,
+        before_write: ContactPreflight<'a>,
+    ) -> ContactFuture<'a, Vec<u8>> {
         Box::pin(async move {
             if request.len() > self.maximum_frame_bytes || request.len() > total_limit {
                 return Err(ContactError::new(
@@ -247,6 +256,7 @@ impl OrderedContact for BleL2capContact {
             }
             self.run_operation(async {
                 let mut io = self.io.lock().await;
+                before_write()?;
                 Self::write_record(&mut **io, TAG_REQUEST, request, self.maximum_frame_bytes)
                     .await?;
                 let response_maximum = self
@@ -479,6 +489,42 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), ContactErrorKind::Bounds);
         assert_eq!(task.await.unwrap().kind(), ContactErrorKind::Bounds);
+    }
+
+    #[tokio::test]
+    async fn rejected_preflight_writes_no_carrier_bytes_and_closes_contact() {
+        let (stream, mut peer) = duplex(32);
+        let contact = contact(stream, 64, Duration::from_secs(1));
+        let error = contact
+            .request_with_total_limit_checked(
+                b"must-not-escape",
+                64,
+                Box::new(|| {
+                    Err(ContactError::new(
+                        ContactErrorKind::Unauthorized,
+                        "policy changed",
+                    ))
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ContactErrorKind::Unauthorized);
+
+        let mut byte = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), peer.read(&mut byte))
+                .await
+                .is_err(),
+            "preflight rejection must happen before the first carrier write"
+        );
+        assert_eq!(
+            contact
+                .request_with_total_limit(b"later", 64)
+                .await
+                .unwrap_err()
+                .kind(),
+            ContactErrorKind::Unavailable
+        );
     }
 
     #[tokio::test]

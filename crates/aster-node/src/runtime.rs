@@ -37,6 +37,7 @@ use std::os::unix::{
 #[cfg(test)]
 use std::sync::LazyLock;
 
+use aster_contact::{ContactError, ContactErrorKind, OrderedContact};
 use aster_iroh::{
     CarrierError, Endpoint, EndpointConfig, EndpointId, ExpectedPeer, PeerRoute, PinnedRelay,
     ReceiveUniTurn, SelectedPath, SendUniTurn,
@@ -139,6 +140,7 @@ use crate::{
         SelectedEventBridgeApplyDisposition, SelectedEventBridgeConfig,
         SelectedEventBridgeDeliveryReceipt, SelectedEventBridgeRuntime,
     },
+    contact::SelectedContact,
     control_admin::{SelectedControlCommand, SelectedControlHandle, admin_error},
     event_pages::{
         AuthenticatedEventMetadata, BuiltLocalEventSendPlan, CHANGE_PAGE_ENTRY_FIXED_BYTES,
@@ -160,11 +162,11 @@ use crate::{
         MAX_OBJECT_BYTES, MutableApplyDisposition, MutableClass, MutableTransferId,
     },
     mission::{
-        MissionHandshakeReceipt, MissionPeerBinding, MissionProvisioningError,
-        MissionProvisioningOrigin, MissionSession, MissionSessionError, PreparedIdentityErasure,
-        PreparedMissionErasure, ResumedSoftwareErasure, SoftwareErasureError,
-        SoftwareErasureTarget, SoftwareSecretArtifact, UnprotectedReferenceMission,
-        initiate_over_iroh_metered, respond_over_iroh_metered,
+        HybridMissionSession, MissionHandshakeReceipt, MissionPeerBinding,
+        MissionProvisioningError, MissionProvisioningOrigin, MissionSession, MissionSessionError,
+        PreparedIdentityErasure, PreparedMissionErasure, ResumedSoftwareErasure,
+        SoftwareErasureError, SoftwareErasureTarget, SoftwareSecretArtifact,
+        UnprotectedReferenceMission, initiate_over_iroh_metered, respond_over_iroh_metered,
     },
     parse_node_id,
 };
@@ -4707,6 +4709,12 @@ impl From<EnvelopeError> for NodeError {
 impl From<MissionSessionError> for NodeError {
     fn from(value: MissionSessionError) -> Self {
         Self::Mission(value)
+    }
+}
+
+impl From<ContactError> for NodeError {
+    fn from(value: ContactError) -> Self {
+        Self::Mission(MissionSessionError::from(value))
     }
 }
 
@@ -19667,7 +19675,7 @@ async fn sync_session(
             CONTACT_EMISSION_GUARD.scope(
                 guard,
                 sync_authenticated_session(
-                    &connection,
+                    SelectedContact::from_iroh(connection.clone()),
                     OutboundAuthenticatedSession {
                         store,
                         credentials,
@@ -19690,13 +19698,13 @@ async fn sync_session(
 
 async fn sync_control_lane(
     store: &Store,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
     receipt: &mut PeerReceipt,
 ) -> Result<EmissionPolicySnapshot, NodeError> {
     let local = verifier.identity();
-    let peer = mission.peer().mission_id();
+    let peer = mission.peer_observation().mission_id();
     let mut verifier_head = store.control_head()?;
     ensure_control_lane_state(store, local, peer, verifier_head)?;
     let inventory = store.control_inventory()?.reconciliation_snapshot();
@@ -19933,8 +19941,8 @@ async fn sync_control_lane(
 
 async fn sync_event_interests(
     store: &Store,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     event_guard: &EventLaneGuard,
     expected_remote_emission: EmissionPolicySnapshot,
     receipt: &mut PeerReceipt,
@@ -20107,8 +20115,8 @@ fn reconciliation_query_plaintext_bytes(query_len: usize) -> Result<usize, NodeE
 }
 
 async fn defer_event_lane(
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     direction: EventDirection,
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
@@ -20138,8 +20146,8 @@ fn record_event_lane_deferred(receipt: &mut PeerReceipt) -> Result<(), NodeError
 
 async fn sync_event_reconciliation_lane(
     store: &Store,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     event_verifier: &mut ReferenceEnvelopeSealer,
     lane: DirectedEventLane<'_>,
     remote_emission: EmissionPolicySnapshot,
@@ -20162,7 +20170,7 @@ async fn sync_event_reconciliation_lane(
             store,
             event_guard.policy(),
             event_verifier,
-            mission.peer().mission_id(),
+            mission.peer_observation().mission_id(),
             mission.peer_route_grant_commitments(),
             receiver_interest,
             allow_finite_ttl,
@@ -27203,8 +27211,8 @@ fn local_transfer_profile_offer(
 }
 
 async fn sync_transfer_profiles(
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    contact: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     receipt: &mut PeerReceipt,
 ) -> Result<Option<V7TransferProfiles>, NodeError> {
     if mission.semantic_version() < SEMANTIC_PROTOCOL_V7 {
@@ -27214,11 +27222,27 @@ async fn sync_transfer_profiles(
     require_contact_frame_initiation()?;
     let wire_budget = exchange_wire_budget(receipt)?;
     let protected_request = mission.seal_transfer_profile_offer(&initiator)?;
-    let (protected_response, _checked) = connection
-        .request_with_total_limit_checked(&protected_request, wire_budget, || {
-            require_contact_frame_initiation()
-        })
-        .await?;
+    let mut preflight_error = None;
+    let protected_response_result = contact
+        .request_with_total_limit_checked(
+            &protected_request,
+            wire_budget,
+            Box::new(|| match require_contact_frame_initiation() {
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    preflight_error = Some(error);
+                    Err(ContactError::new(
+                        ContactErrorKind::Protocol,
+                        "transfer-profile preflight rejected write",
+                    ))
+                }
+            }),
+        )
+        .await;
+    if let Some(error) = preflight_error {
+        return Err(error);
+    }
+    let protected_response = protected_response_result?;
     let responder = mission.open_transfer_profile_offer(&protected_response)?;
     account(receipt, protected_request.len(), protected_response.len())?;
     let negotiated = negotiate_transfer_profiles_for_semantic_version(
@@ -27234,8 +27258,8 @@ async fn sync_transfer_profiles(
 }
 
 async fn serve_transfer_profiles(
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    contact: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     receipt: &mut PeerReceipt,
 ) -> Result<Option<V7TransferProfiles>, NodeError> {
     if mission.semantic_version() < SEMANTIC_PROTOCOL_V7 {
@@ -27248,30 +27272,37 @@ async fn serve_transfer_profiles(
     let mut initiator = None;
     let mut request_bytes = None;
     let mut response_bytes = None;
-    let carrier_result = connection
-        .respond_once_with_total_limit(wire_budget, |protected_request| {
-            require_contact_policy_current()
-                .map_err(|_| CarrierError::Transport("live emission policy changed".into()))?;
-            request_bytes = Some(protected_request.len());
-            let handled = (|| -> Result<Vec<u8>, NodeError> {
-                let offer = mission.open_transfer_profile_offer(protected_request)?;
-                require_contact_frame_response(&Frame::TransferProfileOffer(responder.clone()))?;
-                let protected_response = mission.seal_transfer_profile_offer(&responder)?;
-                require_contact_policy_current()?;
-                response_bytes = Some(protected_response.len());
-                initiator = Some(offer);
-                Ok(protected_response)
-            })();
-            match handled {
-                Ok(response) => Ok((response, true)),
-                Err(error) => {
-                    application_error = Some(error);
-                    Err(CarrierError::Transport(
-                        "mission-protected transfer-profile offer rejected".into(),
-                    ))
+    let carrier_result = contact
+        .respond_once_with_total_limit(
+            wire_budget,
+            Box::new(|protected_request| {
+                require_contact_policy_current().map_err(|_| {
+                    ContactError::new(ContactErrorKind::Protocol, "live emission policy changed")
+                })?;
+                request_bytes = Some(protected_request.len());
+                let handled = (|| -> Result<Vec<u8>, NodeError> {
+                    let offer = mission.open_transfer_profile_offer(protected_request)?;
+                    require_contact_frame_response(&Frame::TransferProfileOffer(
+                        responder.clone(),
+                    ))?;
+                    let protected_response = mission.seal_transfer_profile_offer(&responder)?;
+                    require_contact_policy_current()?;
+                    response_bytes = Some(protected_response.len());
+                    initiator = Some(offer);
+                    Ok(protected_response)
+                })();
+                match handled {
+                    Ok(response) => Ok((response, true)),
+                    Err(error) => {
+                        application_error = Some(error);
+                        Err(ContactError::new(
+                            ContactErrorKind::Protocol,
+                            "mission-protected transfer-profile offer rejected",
+                        ))
+                    }
                 }
-            }
-        })
+            }),
+        )
         .await;
     if let Some(error) = application_error {
         return Err(error);
@@ -27910,8 +27941,8 @@ async fn serve_profile5_blob_lane_if_selected(
 }
 
 async fn sync_event_turn_plans(
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    contact: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     profiles: &V7TransferProfiles,
     local_plan: EventTurnPlanV1,
     receipt: &mut PeerReceipt,
@@ -27931,11 +27962,27 @@ async fn sync_event_turn_plans(
         &plaintext,
     )?;
     let wire_budget = exchange_wire_budget(receipt)?;
-    let (protected_response, _checked) = connection
-        .request_with_total_limit_checked(&protected_request, wire_budget, || {
-            require_contact_frame_initiation()
-        })
-        .await?;
+    let mut preflight_error = None;
+    let protected_response_result = contact
+        .request_with_total_limit_checked(
+            &protected_request,
+            wire_budget,
+            Box::new(|| match require_contact_frame_initiation() {
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    preflight_error = Some(error);
+                    Err(ContactError::new(
+                        ContactErrorKind::Protocol,
+                        "Event-plan preflight rejected write",
+                    ))
+                }
+            }),
+        )
+        .await;
+    if let Some(error) = preflight_error {
+        return Err(error);
+    }
+    let protected_response = protected_response_result?;
     let plaintext = mission.open_profiled_application_frame(
         profiles.digest,
         LaneId::Event,
@@ -27954,8 +28001,8 @@ async fn sync_event_turn_plans(
 }
 
 async fn serve_event_turn_plans(
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    contact: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     profiles: &V7TransferProfiles,
     local_plan: EventTurnPlanV1,
     receipt: &mut PeerReceipt,
@@ -27969,52 +28016,57 @@ async fn serve_event_turn_plans(
     let mut request_len = None;
     let mut response_len = None;
     let mut remote_plan = None;
-    let carrier_result = connection
-        .respond_once_with_total_limit(wire_budget, |protected_request| {
-            require_contact_policy_current()
-                .map_err(|_| CarrierError::Transport("live emission policy changed".into()))?;
-            request_len = Some(protected_request.len());
-            let handled = (|| -> Result<Vec<u8>, NodeError> {
-                let plaintext = mission.open_profiled_application_frame(
-                    profiles.digest,
-                    LaneId::Event,
-                    profile,
-                    EventDirection::ToSessionResponder,
-                    protected_request,
-                )?;
-                let request =
-                    Frame::decode_for_semantic_version(&plaintext, mission.semantic_version())?;
-                let Frame::EventTurnPlan(plan) = request else {
-                    return Err(NodeError::Protocol(
-                        "semantic-v7 Event plan request contained another frame".into(),
-                    ));
-                };
-                remote_plan = Some(plan);
-                let response_frame = Frame::EventTurnPlan(local_plan.clone());
-                require_contact_frame_response(&response_frame)?;
-                let plaintext =
-                    response_frame.encode_for_semantic_version(mission.semantic_version())?;
-                let protected_response = mission.seal_profiled_application_frame(
-                    profiles.digest,
-                    LaneId::Event,
-                    profile,
-                    EventDirection::ToSessionInitiator,
-                    &plaintext,
-                )?;
-                require_contact_policy_current()?;
-                response_len = Some(protected_response.len());
-                Ok(protected_response)
-            })();
-            match handled {
-                Ok(response) => Ok((response, true)),
-                Err(error) => {
-                    application_error = Some(error);
-                    Err(CarrierError::Transport(
-                        "semantic-v7 Event plan exchange rejected".into(),
-                    ))
+    let carrier_result = contact
+        .respond_once_with_total_limit(
+            wire_budget,
+            Box::new(|protected_request| {
+                require_contact_policy_current().map_err(|_| {
+                    ContactError::new(ContactErrorKind::Protocol, "live emission policy changed")
+                })?;
+                request_len = Some(protected_request.len());
+                let handled = (|| -> Result<Vec<u8>, NodeError> {
+                    let plaintext = mission.open_profiled_application_frame(
+                        profiles.digest,
+                        LaneId::Event,
+                        profile,
+                        EventDirection::ToSessionResponder,
+                        protected_request,
+                    )?;
+                    let request =
+                        Frame::decode_for_semantic_version(&plaintext, mission.semantic_version())?;
+                    let Frame::EventTurnPlan(plan) = request else {
+                        return Err(NodeError::Protocol(
+                            "semantic-v7 Event plan request contained another frame".into(),
+                        ));
+                    };
+                    remote_plan = Some(plan);
+                    let response_frame = Frame::EventTurnPlan(local_plan.clone());
+                    require_contact_frame_response(&response_frame)?;
+                    let plaintext =
+                        response_frame.encode_for_semantic_version(mission.semantic_version())?;
+                    let protected_response = mission.seal_profiled_application_frame(
+                        profiles.digest,
+                        LaneId::Event,
+                        profile,
+                        EventDirection::ToSessionInitiator,
+                        &plaintext,
+                    )?;
+                    require_contact_policy_current()?;
+                    response_len = Some(protected_response.len());
+                    Ok(protected_response)
+                })();
+                match handled {
+                    Ok(response) => Ok((response, true)),
+                    Err(error) => {
+                        application_error = Some(error);
+                        Err(ContactError::new(
+                            ContactErrorKind::Protocol,
+                            "semantic-v7 Event plan exchange rejected",
+                        ))
+                    }
                 }
-            }
-        })
+            }),
+        )
         .await;
     if let Some(error) = application_error {
         return Err(error);
@@ -28046,8 +28098,8 @@ struct OutboundAuthenticatedSession {
 }
 
 async fn sync_authenticated_session(
-    connection: &aster_iroh::Connection,
-    contact: OutboundAuthenticatedSession,
+    contact: SelectedContact,
+    session: OutboundAuthenticatedSession,
 ) -> Result<CompletedPeerContact, NodeError> {
     let OutboundAuthenticatedSession {
         store,
@@ -28058,7 +28110,8 @@ async fn sync_authenticated_session(
         policy_lock,
         event_bridge,
         mutable_interests,
-    } = contact;
+    } = session;
+    let connection = contact.require_iroh()?;
     let lease_store = store.clone();
     let store = store.as_ref();
     require_contact_frame_initiation()?;
@@ -28103,7 +28156,7 @@ async fn sync_authenticated_session(
     let mut receipt = authenticated_receipt(connection, &mission, handshake)?;
     #[cfg(test)]
     apply_test_preaccounted_contact_items(&mut receipt)?;
-    let transfer_profiles = sync_transfer_profiles(connection, &mut mission, &mut receipt).await?;
+    let transfer_profiles = sync_transfer_profiles(&contact, &mut mission, &mut receipt).await?;
     let blob_transfer_mode = BlobTransferMode::from_authenticated_profiles(
         mission.semantic_version(),
         transfer_profiles.as_ref(),
@@ -28123,7 +28176,7 @@ async fn sync_authenticated_session(
     )?;
     let remote_emission = sync_control_lane(
         store,
-        connection,
+        &contact,
         &mut mission,
         &mut control_verifier,
         &mut receipt,
@@ -28160,7 +28213,7 @@ async fn sync_authenticated_session(
     }
     let (local_interest, peer_interest, local_emission) = sync_event_interests(
         store,
-        connection,
+        &contact,
         &mut mission,
         &event_guard,
         remote_emission,
@@ -28179,7 +28232,7 @@ async fn sync_authenticated_session(
     };
     let to_responder = match sync_event_reconciliation_lane(
         store,
-        connection,
+        &contact,
         &mut mission,
         &mut event_verifier,
         to_responder_lane,
@@ -28278,7 +28331,7 @@ async fn sync_authenticated_session(
         };
         let to_initiator = match sync_event_reconciliation_lane(
             store,
-            connection,
+            &contact,
             &mut mission,
             &mut event_verifier,
             to_initiator_lane,
@@ -28361,7 +28414,7 @@ async fn sync_authenticated_session(
     } else {
         let reconciliation = match sync_event_reconciliation_lane(
             store,
-            connection,
+            &contact,
             &mut mission,
             &mut event_verifier,
             to_initiator_lane,
@@ -28463,7 +28516,7 @@ async fn sync_authenticated_session(
     )?;
     record_local_event_plan(&mut receipt, &local_plan.built.plan)?;
     let remote_plan = sync_event_turn_plans(
-        connection,
+        &contact,
         &mut mission,
         profiles,
         local_plan.built.plan.clone(),
@@ -28699,13 +28752,13 @@ async fn serve_connection_with_forwarding(
 
 async fn serve_control_lane(
     store: &Store,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
     let local = verifier.identity();
-    let peer = mission.peer().mission_id();
+    let peer = mission.peer_observation().mission_id();
     let emission = contact_policy_or_normal()?;
     let semantic_v3 = mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION;
     if matches!(emission.policy, EventEmissionPolicy::ReceiveOnly) && !semantic_v3 {
@@ -28953,8 +29006,8 @@ async fn serve_control_lane(
 
 async fn serve_event_interests(
     store: &Store,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     event_guard: &EventLaneGuard,
     receipt: &mut PeerReceipt,
 ) -> Result<
@@ -29038,8 +29091,8 @@ async fn serve_event_interests(
 
 async fn serve_event_reconciliation_lane(
     store: &Store,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     event_verifier: &mut ReferenceEnvelopeSealer,
     lane: DirectedEventLane<'_>,
     receipt: &mut PeerReceipt,
@@ -29072,7 +29125,7 @@ async fn serve_event_reconciliation_lane(
                 store,
                 event_guard.policy(),
                 event_verifier,
-                mission.peer().mission_id(),
+                mission.peer_observation().mission_id(),
                 mission.peer_route_grant_commitments(),
                 receiver_interest,
                 allow_finite_ttl,
@@ -30446,6 +30499,7 @@ async fn serve_session(
     mutable_interests: MutableSourceInterests,
 ) -> Result<CompletedPeerContact, NodeError> {
     let lease_store = store.clone();
+    let selected_contact = SelectedContact::from_iroh(connection.clone());
     require_contact_policy_current()?;
     // No inventory is even loaded until the independent mission handshake and
     // either exact configured identity validation or discovered-peer mission admission
@@ -30465,7 +30519,7 @@ async fn serve_session(
     let mut receipt = authenticated_receipt(&connection, &mission, handshake)?;
     #[cfg(test)]
     apply_test_preaccounted_contact_items(&mut receipt)?;
-    let transfer_profiles = serve_transfer_profiles(&connection, &mut mission, &mut receipt)
+    let transfer_profiles = serve_transfer_profiles(&selected_contact, &mut mission, &mut receipt)
         .await
         .map_err(|error| protocol_stage_error("serve transfer profiles", error))?;
     let blob_transfer_mode = BlobTransferMode::from_authenticated_profiles(
@@ -30495,7 +30549,7 @@ async fn serve_session(
     }
     serve_control_lane(
         &store,
-        &connection,
+        &selected_contact,
         &mut mission,
         &mut control_verifier,
         &mut receipt,
@@ -30529,7 +30583,7 @@ async fn serve_session(
     }
     let (local_interest, peer_interest, remote_emission) = serve_event_interests(
         &store,
-        &connection,
+        &selected_contact,
         &mut mission,
         &event_guard,
         &mut receipt,
@@ -30546,7 +30600,7 @@ async fn serve_session(
     };
     let to_responder = match serve_event_reconciliation_lane(
         &store,
-        &connection,
+        &selected_contact,
         &mut mission,
         &mut event_verifier,
         to_responder_lane,
@@ -30644,7 +30698,7 @@ async fn serve_session(
         };
         let to_initiator = match serve_event_reconciliation_lane(
             &store,
-            &connection,
+            &selected_contact,
             &mut mission,
             &mut event_verifier,
             to_initiator_lane,
@@ -30726,7 +30780,7 @@ async fn serve_session(
     } else {
         let reconciliation = match serve_event_reconciliation_lane(
             &store,
-            &connection,
+            &selected_contact,
             &mut mission,
             &mut event_verifier,
             to_initiator_lane,
@@ -30826,7 +30880,7 @@ async fn serve_session(
     )?;
     record_local_event_plan(&mut receipt, &local_plan.built.plan)?;
     let remote_plan = serve_event_turn_plans(
-        &connection,
+        &selected_contact,
         &mut mission,
         profiles,
         local_plan.built.plan.clone(),
@@ -31115,16 +31169,41 @@ fn authorize_event_page_entry(receipt: &PeerReceipt) -> Result<(), NodeError> {
 }
 
 async fn request_mission_frame(
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    contact: &dyn OrderedContact,
+    mission: &mut impl RuntimeMissionSession,
     request: Frame,
     receipt: &mut PeerReceipt,
 ) -> Result<Frame, NodeError> {
     Ok(
-        request_mission_frame_checked(connection, mission, request, receipt, || Ok(()))
+        request_mission_frame_checked(contact, mission, request, receipt, || Ok(()))
             .await?
             .0,
     )
+}
+
+trait RuntimeMissionSession {
+    fn hybrid(&self) -> &HybridMissionSession;
+    fn hybrid_mut(&mut self) -> &mut HybridMissionSession;
+}
+
+impl RuntimeMissionSession for HybridMissionSession {
+    fn hybrid(&self) -> &HybridMissionSession {
+        self
+    }
+
+    fn hybrid_mut(&mut self) -> &mut HybridMissionSession {
+        self
+    }
+}
+
+impl RuntimeMissionSession for MissionSession {
+    fn hybrid(&self) -> &HybridMissionSession {
+        self
+    }
+
+    fn hybrid_mut(&mut self) -> &mut HybridMissionSession {
+        self
+    }
 }
 
 type OpenedBlobCustody = (BlobCustodyClaimV1, AuthenticatedBlobCustodyContactV1);
@@ -31223,18 +31302,20 @@ async fn request_blob_source_fetch_frame(
     Ok((response, authority))
 }
 
-async fn request_mission_frame_checked<F, T>(
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+async fn request_mission_frame_checked<M, F, T>(
+    contact: &dyn OrderedContact,
+    mission: &mut M,
     request: Frame,
     receipt: &mut PeerReceipt,
     before_socket_send: F,
 ) -> Result<(Frame, T), NodeError>
 where
-    F: FnOnce() -> Result<T, NodeError>,
+    M: RuntimeMissionSession,
+    F: FnOnce() -> Result<T, NodeError> + Send,
+    T: Send,
 {
     let (response, (_, checked)) = request_mission_frame_built_checked(
-        connection,
+        contact,
         mission,
         receipt,
         |_mission| Ok((request, ())),
@@ -31244,84 +31325,126 @@ where
     Ok((response, checked))
 }
 
-async fn request_mission_frame_built_checked<F, G, T, U>(
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+async fn request_mission_frame_built_checked<M, F, G, T, U>(
+    contact: &dyn OrderedContact,
+    mission: &mut M,
     receipt: &mut PeerReceipt,
     build_immediately_before_send: F,
     after_outer_seal: G,
 ) -> Result<(Frame, (T, U)), NodeError>
 where
-    F: FnOnce(&mut MissionSession) -> Result<(Frame, T), NodeError>,
-    G: FnOnce(&T) -> Result<U, NodeError>,
+    M: RuntimeMissionSession,
+    F: FnOnce(&mut M) -> Result<(Frame, T), NodeError>,
+    G: FnOnce(&T) -> Result<U, NodeError> + Send,
+    T: Sync,
+    U: Send,
 {
     require_contact_frame_initiation()?;
     let wire_budget = exchange_wire_budget(receipt)?;
     let (request, built) = build_immediately_before_send(mission)?;
-    let plaintext = request.encode_for_semantic_version(mission.semantic_version())?;
+    let plaintext = request.encode_for_semantic_version(mission.hybrid().semantic_version())?;
     #[allow(unused_mut)]
-    let mut protected_request = mission.seal_application_frame(&plaintext)?;
+    let mut protected_request = mission.hybrid_mut().seal_application_frame(&plaintext)?;
     #[cfg(test)]
     corrupt_test_blob_settlement_protection(&request, &mut protected_request);
     // The carrier invokes this check after QUIC stream acquisition and
     // immediately before invoking its first write. No bidirectional-stream
     // acquisition wait separates this custody/policy recheck from that call.
-    let (protected_response, final_checked) = connection
-        .request_with_total_limit_checked(&protected_request, wire_budget, || {
-            require_contact_frame_initiation()?;
-            after_outer_seal(&built)
-        })
-        .await?;
-    let response = mission.open_application_frame(&protected_response)?;
-    let response = Frame::decode_for_semantic_version(&response, mission.semantic_version())?;
+    let mut preflight_error = None;
+    let mut final_checked = None;
+    let protected_response_result = contact
+        .request_with_total_limit_checked(
+            &protected_request,
+            wire_budget,
+            Box::new(|| {
+                match require_contact_frame_initiation().and_then(|_| after_outer_seal(&built)) {
+                    Ok(value) => {
+                        final_checked = Some(value);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        preflight_error = Some(error);
+                        Err(ContactError::new(
+                            ContactErrorKind::Protocol,
+                            "mission-frame preflight rejected write",
+                        ))
+                    }
+                }
+            }),
+        )
+        .await;
+    if let Some(error) = preflight_error {
+        return Err(error);
+    }
+    let protected_response = protected_response_result?;
+    let final_checked = final_checked.ok_or_else(|| {
+        NodeError::Protocol("mission-frame preflight completed without a result".into())
+    })?;
+    let response = mission
+        .hybrid_mut()
+        .open_application_frame(&protected_response)?;
+    let response =
+        Frame::decode_for_semantic_version(&response, mission.hybrid().semantic_version())?;
     account(receipt, protected_request.len(), protected_response.len())?;
     Ok((response, (built, final_checked)))
 }
 
-async fn respond_mission_frame<F>(
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+async fn respond_mission_frame<M, F>(
+    contact: &dyn OrderedContact,
+    mission: &mut M,
     wire_budget: usize,
     handler: F,
 ) -> Result<(bool, usize, usize), NodeError>
 where
-    F: FnOnce(Frame, usize, &mut MissionSession) -> Result<(Frame, bool), NodeError>,
+    M: RuntimeMissionSession + Send,
+    F: FnOnce(Frame, usize, &mut M) -> Result<(Frame, bool), NodeError> + Send,
 {
     let mut application_error = None;
     let mut request_len = None;
     let mut response_len = None;
     let mut complete = None;
-    let carrier_result = connection
-        .respond_once_with_total_limit(wire_budget, |protected_request| {
-            require_contact_policy_current()
-                .map_err(|_| CarrierError::Transport("live emission policy changed".into()))?;
-            request_len = Some(protected_request.len());
-            let handled = (|| -> Result<Vec<u8>, NodeError> {
-                let plaintext = mission.open_application_frame(protected_request)?;
-                let frame =
-                    Frame::decode_for_semantic_version(&plaintext, mission.semantic_version())?;
-                let (response, session_complete) =
-                    handler(frame, protected_request.len(), mission)?;
-                require_contact_frame_response(&response)?;
-                let response = response.encode_for_semantic_version(mission.semantic_version())?;
-                let protected_response = mission.seal_application_frame(&response)?;
-                // Keep the final revision check adjacent to handing bytes back
-                // to the carrier response path.
-                require_contact_policy_current()?;
-                response_len = Some(protected_response.len());
-                complete = Some(session_complete);
-                Ok(protected_response)
-            })();
-            match handled {
-                Ok(response) => Ok((response, complete.unwrap_or(false))),
-                Err(error) => {
-                    application_error = Some(error);
-                    Err(CarrierError::Transport(
-                        "mission-protected application frame rejected".into(),
-                    ))
+    let carrier_result = contact
+        .respond_once_with_total_limit(
+            wire_budget,
+            Box::new(|protected_request| {
+                require_contact_policy_current().map_err(|_| {
+                    ContactError::new(ContactErrorKind::Protocol, "live emission policy changed")
+                })?;
+                request_len = Some(protected_request.len());
+                let handled = (|| -> Result<Vec<u8>, NodeError> {
+                    let plaintext = mission
+                        .hybrid_mut()
+                        .open_application_frame(protected_request)?;
+                    let frame = Frame::decode_for_semantic_version(
+                        &plaintext,
+                        mission.hybrid().semantic_version(),
+                    )?;
+                    let (response, session_complete) =
+                        handler(frame, protected_request.len(), mission)?;
+                    require_contact_frame_response(&response)?;
+                    let response = response
+                        .encode_for_semantic_version(mission.hybrid().semantic_version())?;
+                    let protected_response =
+                        mission.hybrid_mut().seal_application_frame(&response)?;
+                    // Keep the final revision check adjacent to handing bytes back
+                    // to the carrier response path.
+                    require_contact_policy_current()?;
+                    response_len = Some(protected_response.len());
+                    complete = Some(session_complete);
+                    Ok(protected_response)
+                })();
+                match handled {
+                    Ok(response) => Ok((response, complete.unwrap_or(false))),
+                    Err(error) => {
+                        application_error = Some(error);
+                        Err(ContactError::new(
+                            ContactErrorKind::Protocol,
+                            "mission-protected application frame rejected",
+                        ))
+                    }
                 }
-            }
-        })
+            }),
+        )
         .await;
     if let Some(error) = application_error {
         return Err(error);
@@ -33157,6 +33280,9 @@ mod tests {
     use std::sync::{Barrier, mpsc as std_mpsc};
 
     use super::*;
+    use aster_ble_l2cap::BleL2capContact;
+    use aster_contact::{CarrierPeerEvidence, TransientLocator};
+    use tokio::io::duplex;
 
     #[test]
     fn profile5_blob_error_boundary_does_not_expose_internal_detail() {
@@ -38984,6 +39110,156 @@ mod tests {
         assert_eq!(mission.semantic_version(), SEMANTIC_PROTOCOL_V9);
         client.close().await;
         server.close().await;
+    }
+
+    #[tokio::test]
+    async fn v9_profile_and_event_plan_are_identical_over_locator_contact() {
+        // Break caught: the selected profile/Event control path reaches for an
+        // Iroh-only API after the carrier-neutral mission handshake succeeds.
+        let mut issued = issue_missions(2);
+        let initiator = issued.remove(0);
+        let responder = issued.remove(0);
+        let initiator_id = initiator.identity;
+        let responder_id = responder.identity;
+        let initiator_bundle = initiator.credentials.fresh_bundle().unwrap();
+        let responder_bundle = responder.credentials.fresh_bundle().unwrap();
+        let (left_stream, right_stream) = duplex(113);
+        let left = BleL2capContact::new(
+            left_stream,
+            TransientLocator::new(b"left-observed".to_vec()).unwrap(),
+            2 * 1024 * 1024,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let right = BleL2capContact::new(
+            right_stream,
+            TransientLocator::new(b"right-observed".to_vec()).unwrap(),
+            2 * 1024 * 1024,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let expected = |label: &[u8], mission_id| {
+            crate::mission::MissionPeerExpectation::new(
+                CarrierPeerEvidence::UnauthenticatedLocator {
+                    transient_locator: TransientLocator::new(label.to_vec()).unwrap(),
+                },
+                mission_id,
+            )
+        };
+
+        let responder_task =
+            tokio::spawn(async move {
+                let (mut mission, handshake) = crate::mission::respond_over_contact_metered(
+                    &right,
+                    responder_bundle,
+                    expected(b"configured-initiator", initiator_id),
+                )
+                .await
+                .unwrap();
+                let mut receipt = PeerReceipt {
+                    mission_peer: Some(initiator_id),
+                    semantic_version: mission.semantic_version(),
+                    handshake_frames: handshake.frames,
+                    handshake_bytes: handshake.bytes,
+                    ..PeerReceipt::default()
+                };
+                let profiles = serve_transfer_profiles(&right, &mut mission, &mut receipt)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let response_plan = EventTurnPlanV1::Empty {
+                    direction: EventDirection::ToSessionInitiator,
+                    transfer_profile_digest: profiles.digest,
+                    selected_profile: TransferProfileId::EventPagesV1,
+                    set_commitment: empty_set_commitment(),
+                };
+                let request_plan = serve_event_turn_plans(
+                    &right,
+                    &mut mission,
+                    &profiles,
+                    response_plan,
+                    &mut receipt,
+                )
+                .await
+                .unwrap();
+                let wire_budget = exchange_wire_budget(&receipt).unwrap();
+                let (complete, request_bytes, response_bytes) =
+                    respond_mission_frame(&right, &mut mission, wire_budget, |frame, _, _| {
+                        match frame {
+                            Frame::EventInterest(interest) => {
+                                Ok((Frame::EventInterestReply(interest), false))
+                            }
+                            _ => Err(NodeError::Protocol(
+                                "locator Event exchange received another frame".into(),
+                            )),
+                        }
+                    })
+                    .await
+                    .unwrap();
+                assert!(!complete);
+                account(&mut receipt, request_bytes, response_bytes).unwrap();
+                (profiles, request_plan, receipt)
+            });
+
+        let (mut mission, handshake) = crate::mission::initiate_over_contact_metered(
+            &left,
+            initiator_bundle,
+            expected(b"configured-responder", responder_id),
+        )
+        .await
+        .unwrap();
+        let mut receipt = PeerReceipt {
+            mission_peer: Some(responder_id),
+            semantic_version: mission.semantic_version(),
+            handshake_frames: handshake.frames,
+            handshake_bytes: handshake.bytes,
+            ..PeerReceipt::default()
+        };
+        let profiles = sync_transfer_profiles(&left, &mut mission, &mut receipt)
+            .await
+            .unwrap()
+            .unwrap();
+        let request_plan = EventTurnPlanV1::Empty {
+            direction: EventDirection::ToSessionResponder,
+            transfer_profile_digest: profiles.digest,
+            selected_profile: TransferProfileId::EventPagesV1,
+            set_commitment: empty_set_commitment(),
+        };
+        let response_plan = sync_event_turn_plans(
+            &left,
+            &mut mission,
+            &profiles,
+            request_plan.clone(),
+            &mut receipt,
+        )
+        .await
+        .unwrap();
+        let event_interest = EventInterest::empty();
+        let response = request_mission_frame(
+            &left,
+            &mut mission,
+            Frame::EventInterest(event_interest.clone()),
+            &mut receipt,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response, Frame::EventInterestReply(event_interest));
+        let (server_profiles, server_request_plan, server_receipt) = responder_task.await.unwrap();
+
+        assert_eq!(profiles, server_profiles);
+        assert_eq!(server_request_plan, request_plan);
+        assert_eq!(
+            response_plan,
+            EventTurnPlanV1::Empty {
+                direction: EventDirection::ToSessionInitiator,
+                transfer_profile_digest: profiles.digest,
+                selected_profile: TransferProfileId::EventPagesV1,
+                set_commitment: empty_set_commitment(),
+            }
+        );
+        assert_eq!(receipt.protected_frames, 6);
+        assert_eq!(server_receipt.protected_frames, 6);
+        assert_eq!(mission.semantic_version(), SEMANTIC_PROTOCOL_V9);
     }
 
     #[test]
