@@ -136,7 +136,17 @@ pub struct ContactError {
 impl ContactError {
     /// Creates an error while truncating diagnostics at a UTF-8 boundary.
     pub fn new(kind: ContactErrorKind, detail: impl Into<String>) -> Self {
-        let mut detail = detail.into();
+        let mut detail: String = detail
+            .into()
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect();
         if detail.len() > MAX_CONTACT_ERROR_DETAIL_BYTES {
             let mut end = MAX_CONTACT_ERROR_DETAIL_BYTES;
             while !detail.is_char_boundary(end) {
@@ -174,6 +184,9 @@ pub type ContactRequestHandler<'a> =
     Box<dyn FnOnce(&[u8]) -> Result<(Vec<u8>, bool), ContactError> + Send + 'a>;
 
 /// Adapter-neutral bounded ordered request/response contact.
+///
+/// A caller must serialize exchange and finish operations for one contact.
+/// Implementations may reject or close a contact when those operations overlap.
 pub trait OrderedContact: Send + Sync {
     /// Returns typed evidence for the remote carrier peer.
     fn peer_evidence(&self) -> CarrierPeerEvidence;
@@ -258,5 +271,23 @@ mod tests {
 
         assert!(error.detail().len() <= MAX_CONTACT_ERROR_DETAIL_BYTES);
         assert!(error.detail().is_char_boundary(error.detail().len()));
+    }
+
+    #[test]
+    fn contact_error_detail_contains_no_control_characters() {
+        let error = ContactError::new(
+            ContactErrorKind::Transport,
+            "remote\nvalue\twith\u{7f}controls",
+        );
+
+        assert!(!error.detail().chars().any(char::is_control));
+    }
+
+    #[test]
+    fn ordered_contact_remains_object_safe() {
+        fn accepts_trait_object(_contact: &dyn OrderedContact) {}
+
+        let assertion: fn(&dyn OrderedContact) = accepts_trait_object;
+        let _ = assertion;
     }
 }

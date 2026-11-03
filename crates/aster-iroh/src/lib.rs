@@ -2331,6 +2331,11 @@ impl Connection {
         self.max_exchange_bytes.min(DEFAULT_MAX_EXCHANGE_BYTES)
     }
 
+    /// Returns the exact opaque request/response frame ceiling.
+    pub fn max_exchange_bytes(&self) -> usize {
+        self.max_exchange_bytes
+    }
+
     /// Opens a long-lived data stream while concurrently accepting the reverse
     /// control stream. These streams are independent of the legacy ordered-turn
     /// state and remain open for the whole higher-layer attempt.
@@ -2696,6 +2701,10 @@ impl Connection {
     /// Closes this connection.
     pub fn close(&self) {
         self.inner.close(0u8.into(), b"complete");
+    }
+
+    fn abort(&self) {
+        self.inner.close(1u8.into(), b"aborted");
     }
 }
 

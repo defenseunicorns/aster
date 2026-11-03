@@ -27,7 +27,7 @@ impl OrderedContact for Connection {
     }
 
     fn max_frame_bytes(&self) -> usize {
-        self.max_uni_frame_bytes()
+        self.max_exchange_bytes()
     }
 
     fn request_with_total_limit<'a>(
@@ -80,7 +80,7 @@ impl OrderedContact for Connection {
     }
 
     fn close(&self) {
-        Connection::close(self);
+        self.abort();
     }
 }
 
@@ -99,8 +99,11 @@ mod tests {
             .expect("IPv4 loopback binding")
     }
 
-    async fn contact_pair() -> (Endpoint, Endpoint, Connection, Connection) {
-        let config = EndpointConfig::direct("127.0.0.1:0".parse().expect("address"));
+    async fn contact_pair_with_max_exchange(
+        max_exchange_bytes: usize,
+    ) -> (Endpoint, Endpoint, Connection, Connection) {
+        let mut config = EndpointConfig::direct("127.0.0.1:0".parse().expect("address"));
+        config.max_exchange_bytes = max_exchange_bytes;
         let server = Endpoint::bind(SecretKey::generate(), config)
             .await
             .expect("server");
@@ -121,6 +124,10 @@ mod tests {
             .expect("connect");
         let server_contact = accept.await.expect("accept task");
         (server, client, server_contact, client_contact)
+    }
+
+    async fn contact_pair() -> (Endpoint, Endpoint, Connection, Connection) {
+        contact_pair_with_max_exchange(crate::DEFAULT_MAX_EXCHANGE_BYTES).await
     }
 
     #[tokio::test]
@@ -152,35 +159,130 @@ mod tests {
     async fn ordered_contact_preserves_bounded_request_response_and_finish() {
         let (server, client, server_contact, client_contact) = contact_pair().await;
         let responder = tokio::spawn(async move {
-            let handler: ContactRequestHandler<'_> = Box::new(|request| {
-                assert_eq!(request, b"ring-one-request");
-                Ok((b"ring-one-response".to_vec(), false))
+            let first_handler: ContactRequestHandler<'_> = Box::new(|request| {
+                assert_eq!(request, b"non-final-request");
+                Ok((b"non-final-response".to_vec(), false))
             });
             assert!(
                 !<Connection as OrderedContact>::respond_once_with_total_limit(
                     &server_contact,
                     128,
-                    handler,
+                    first_handler,
                 )
                 .await
-                .expect("respond")
+                .expect("respond non-final")
+            );
+            let final_handler: ContactRequestHandler<'_> = Box::new(|request| {
+                assert_eq!(request, b"final-request");
+                Ok((b"ring-one-response".to_vec(), true))
+            });
+            assert!(
+                <Connection as OrderedContact>::respond_once_with_total_limit(
+                    &server_contact,
+                    128,
+                    final_handler,
+                )
+                .await
+                .expect("respond final")
             );
             <Connection as OrderedContact>::finish_as_responder(&server_contact)
                 .await
                 .expect("finish responder");
         });
 
-        let response = <Connection as OrderedContact>::request_with_total_limit(
+        let non_final_response = <Connection as OrderedContact>::request_with_total_limit(
             &client_contact,
-            b"ring-one-request",
+            b"non-final-request",
             128,
         )
         .await
-        .expect("request");
+        .expect("non-final request");
+        assert_eq!(non_final_response, b"non-final-response");
+        let response = <Connection as OrderedContact>::request_with_total_limit(
+            &client_contact,
+            b"final-request",
+            128,
+        )
+        .await
+        .expect("final request");
         assert_eq!(response, b"ring-one-response");
         <Connection as OrderedContact>::finish_as_initiator(&client_contact)
             .await
             .expect("finish initiator");
+        responder.await.expect("responder task");
+
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn ordered_contact_advertises_and_accepts_configured_exchange_ceiling() {
+        let maximum = crate::DEFAULT_MAX_EXCHANGE_BYTES + 1;
+        let (server, client, server_contact, client_contact) =
+            contact_pair_with_max_exchange(maximum).await;
+        assert_eq!(
+            <Connection as OrderedContact>::max_frame_bytes(&client_contact),
+            maximum
+        );
+        let responder = tokio::spawn(async move {
+            let handler: ContactRequestHandler<'_> = Box::new(move |request| {
+                assert_eq!(request.len(), maximum);
+                Ok((Vec::new(), false))
+            });
+            <Connection as OrderedContact>::respond_once_with_total_limit(
+                &server_contact,
+                maximum,
+                handler,
+            )
+            .await
+            .expect("respond at configured ceiling");
+            server_contact.close();
+        });
+
+        let response = <Connection as OrderedContact>::request_with_total_limit(
+            &client_contact,
+            &vec![0x5a; maximum],
+            maximum,
+        )
+        .await
+        .expect("request at configured ceiling");
+        assert!(response.is_empty());
+        responder.await.expect("responder task");
+
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn ordered_contact_abort_cannot_prove_responder_completion() {
+        let (server, client, server_contact, client_contact) = contact_pair().await;
+        let responder = tokio::spawn(async move {
+            let handler: ContactRequestHandler<'_> =
+                Box::new(|_| Ok((b"final-response".to_vec(), true)));
+            assert!(
+                <Connection as OrderedContact>::respond_once_with_total_limit(
+                    &server_contact,
+                    128,
+                    handler,
+                )
+                .await
+                .expect("respond final")
+            );
+            <Connection as OrderedContact>::close(&server_contact);
+        });
+
+        let response = <Connection as OrderedContact>::request_with_total_limit(
+            &client_contact,
+            b"final-request",
+            128,
+        )
+        .await
+        .expect("final request");
+        assert_eq!(response, b"final-response");
+        let error = <Connection as OrderedContact>::finish_as_initiator(&client_contact)
+            .await
+            .expect_err("abort must not prove orderly completion");
+        assert_eq!(error.kind(), ContactErrorKind::Transport);
         responder.await.expect("responder task");
 
         client.close().await;
