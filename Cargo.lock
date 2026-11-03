@@ -301,6 +301,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-ble-l2cap"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "aster-contact",
+ "tokio",
+]
+
+[[package]]
 name = "aster-compose-credentials"
 version = "0.1.0-alpha.1"
 dependencies = [
