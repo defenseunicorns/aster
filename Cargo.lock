@@ -327,6 +327,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-contact"
+version = "0.1.0-alpha.1"
+
+[[package]]
 name = "aster-core"
 version = "0.1.0-alpha.1"
 dependencies = [
