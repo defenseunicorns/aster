@@ -32,6 +32,14 @@ resume is implemented. BLE is not implemented.
 Three-CM4 validation of this candidate has not yet run; historical CM4 receipts
 below retain their original commit and environment boundaries.
 
+The current tree now contains an adapter-neutral bounded ordered-contact
+contract with typed authenticated-carrier versus unauthenticated-locator
+evidence, plus an Iroh parity implementation. This is an implemented-uncredited
+P1-4 foundation only. The selected runtime still uses its existing Iroh entry
+points, and Linux L2CAP CoC, BTLE mission/Event integration, discovery,
+physical evidence, multi-carrier selection, and every BTLE requirement-credit
+change remain open.
+
 ## Purpose
 
 This is the planning and review view of the data-mesh requirements. It groups
