@@ -6,6 +6,8 @@
 
 #![forbid(unsafe_code)]
 
+mod contact;
+
 use std::{
     collections::{BTreeSet, VecDeque},
     error::Error,

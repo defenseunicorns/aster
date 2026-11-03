@@ -379,6 +379,7 @@ dependencies = [
 name = "aster-iroh"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "aster-contact",
  "futures",
  "iroh",
  "iroh-mdns-address-lookup",
