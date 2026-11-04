@@ -1,0 +1,29 @@
+[package]
+name = "aster-ble-linux"
+description = "Evaluation-only Linux BlueZ LE L2CAP driver for Aster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+autobins = false
+
+[[bin]]
+name = "aster-btle-ring1"
+path = "src/bin/aster-btle-ring1.rs"
+
+[dependencies]
+aster-ble-l2cap = { path = "../aster-ble-l2cap" }
+aster-contact = { path = "../aster-contact" }
+aster-mesh = { package = "aster-core", path = "../aster-core", default-features = false, features = ["reference-session"] }
+aster-node = { path = "../aster-node" }
+tokio = { workspace = true, features = ["macros"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros"] }
+
+[lints]
+workspace = true
