@@ -270,13 +270,13 @@ impl RunRegistry {
                     worker_control.clone(),
                     worker_sink.clone(),
                 );
-                worker_control.cancel();
                 if let Ok(mut active) = inner.active.lock()
                     && active.as_ref().is_some_and(|active| active.id == id)
                 {
                     active.take();
                 }
                 worker_sink.emit(SessionEvent::Terminal(outcome));
+                worker_control.cancel();
             });
         if spawn.is_err() {
             control.cancel();
@@ -502,6 +502,50 @@ mod tests {
         }
     }
 
+    struct TerminalOrderingSink {
+        peer: Mutex<UnixStream>,
+        stream_open_at_terminal: Mutex<Option<bool>>,
+        changed: Condvar,
+    }
+
+    impl TerminalOrderingSink {
+        fn new(peer: UnixStream) -> Arc<Self> {
+            peer.set_nonblocking(true).expect("nonblocking peer");
+            Arc::new(Self {
+                peer: Mutex::new(peer),
+                stream_open_at_terminal: Mutex::new(None),
+                changed: Condvar::new(),
+            })
+        }
+
+        fn wait_for_result(&self) -> bool {
+            let result = self.stream_open_at_terminal.lock().expect("result lock");
+            let (result, timeout) = self
+                .changed
+                .wait_timeout_while(result, Duration::from_secs(2), |result| result.is_none())
+                .expect("terminal ordering wait");
+            assert!(!timeout.timed_out(), "terminal ordering timed out");
+            result.expect("terminal ordering result")
+        }
+    }
+
+    impl PhaseSink for TerminalOrderingSink {
+        fn emit(&self, event: SessionEvent) {
+            if !matches!(event, SessionEvent::Terminal(_)) {
+                return;
+            }
+            let mut byte = [0u8; 1];
+            let open = self
+                .peer
+                .lock()
+                .expect("peer lock")
+                .read(&mut byte)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::WouldBlock);
+            *self.stream_open_at_terminal.lock().expect("result lock") = Some(open);
+            self.changed.notify_all();
+        }
+    }
+
     struct ReadUntilEndExecutor;
 
     impl SessionExecutor for ReadUntilEndExecutor {
@@ -706,6 +750,25 @@ mod tests {
         };
         assert_eq!(error.category(), ValidatorErrorCategory::Timeout);
         assert_eq!(sink.terminal_count(), 1);
+    }
+
+    #[test]
+    fn terminal_is_delivered_before_bridge_shutdown() {
+        let test = TestConfig::new();
+        let registry = RunRegistry::new(Arc::new(ImmediateTimeoutExecutor {
+            calls: AtomicUsize::new(0),
+        }));
+        let (fd, peer) = pair();
+        let sink = TerminalOrderingSink::new(peer);
+
+        registry
+            .start(test.config(), fd, sink.clone())
+            .expect("start run");
+
+        assert!(
+            sink.wait_for_result(),
+            "bridge closed before terminal event"
+        );
     }
 
     #[test]
