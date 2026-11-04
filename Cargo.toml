@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+  "crates/aster-ble-android",
   "crates/aster-ble-l2cap",
   "crates/aster-ble-linux",
   "crates/aster-contact",

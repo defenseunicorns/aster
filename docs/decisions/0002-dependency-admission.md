@@ -54,6 +54,15 @@ no component or version beyond the admitted workspace graph.
 
 ## Adopted for a bounded pilot only
 
+- `jni` 0.22.4 is an exact direct dependency only of the isolated Android
+  Ring-1 validator library. The same package and version already exists in the
+  selected locked graph; the direct edge adds no package or transitive code.
+  It is confined to copying bounded configuration into Rust, transferring one
+  process-local descriptor, and delivering sanitized callbacks around the
+  existing transport-neutral node. This grants no production, general binding,
+  background Android, discovery, packaging, or supported-platform claim. The
+  dependency and JNI surface remain removable with the evaluation app.
+
 - `bluer` 0.17.4 is admitted only for the Linux `BleL2capV1` Ring 1
   evaluation driver, exact-pinned with the `l2cap` feature and the minimum
   `bluetoothd` surface needed for a generic connectable advertisement. BlueR is
