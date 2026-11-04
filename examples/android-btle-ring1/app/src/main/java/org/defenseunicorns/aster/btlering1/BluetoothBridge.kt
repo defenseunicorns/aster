@@ -4,6 +4,8 @@ import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothSocket
 import android.os.ParcelFileDescriptor
+import android.system.Os
+import android.system.OsConstants
 import java.io.Closeable
 import java.io.InputStream
 import java.io.OutputStream
@@ -12,6 +14,24 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+
+internal enum class PumpDirection {
+    NATIVE_TO_BLUETOOTH,
+    BLUETOOTH_TO_NATIVE,
+}
+
+internal enum class PumpExitAction {
+    AWAIT_NATIVE_TERMINAL,
+    SIGNAL_NATIVE_EOF,
+    FAIL_BRIDGE,
+}
+
+internal fun pumpExitAction(direction: PumpDirection, failed: Boolean): PumpExitAction =
+    when {
+        failed -> PumpExitAction.FAIL_BRIDGE
+        direction == PumpDirection.BLUETOOTH_TO_NATIVE -> PumpExitAction.SIGNAL_NATIVE_EOF
+        else -> PumpExitAction.AWAIT_NATIVE_TERMINAL
+    }
 
 class BluetoothBridge(private val adapter: BluetoothAdapter) : Closeable {
     private val lock = Any()
@@ -209,6 +229,7 @@ class BluetoothBridge(private val adapter: BluetoothAdapter) : Closeable {
             val bluetoothInput = socket.inputStream
             pumps.execute {
                 pump(
+                    direction = PumpDirection.NATIVE_TO_BLUETOOTH,
                     from = fromNative,
                     to = bluetoothOutput,
                     bufferBytes = sendPacketBytes,
@@ -216,6 +237,7 @@ class BluetoothBridge(private val adapter: BluetoothAdapter) : Closeable {
             }
             pumps.execute {
                 pump(
+                    direction = PumpDirection.BLUETOOTH_TO_NATIVE,
                     from = bluetoothInput,
                     to = toNative,
                     bufferBytes = receivePacketBytes,
@@ -223,7 +245,13 @@ class BluetoothBridge(private val adapter: BluetoothAdapter) : Closeable {
             }
         }
 
-        private fun pump(from: InputStream, to: OutputStream, bufferBytes: Int) {
+        private fun pump(
+            direction: PumpDirection,
+            from: InputStream,
+            to: OutputStream,
+            bufferBytes: Int,
+        ) {
+            var failed = false
             try {
                 val buffer = ByteArray(bufferBytes.coerceIn(1, 0xffff))
                 while (!terminal.get()) {
@@ -234,10 +262,24 @@ class BluetoothBridge(private val adapter: BluetoothAdapter) : Closeable {
                     to.flush()
                 }
             } catch (_: Throwable) {
-                // The common close path below maps all carrier failures to one bounded error.
+                failed = true
             } finally {
-                if (!terminal.get()) {
-                    fail(this, "unavailable", "Bluetooth LE stream ended")
+                // EOF can race a valid native terminal callback. Forward Bluetooth
+                // EOF to Rust and leave validation success/failure to that owner.
+                when (pumpExitAction(direction, failed)) {
+                    PumpExitAction.AWAIT_NATIVE_TERMINAL -> Unit
+                    PumpExitAction.SIGNAL_NATIVE_EOF -> signalNativeEof()
+                    PumpExitAction.FAIL_BRIDGE -> if (!terminal.get()) {
+                        fail(this, "unavailable", "Bluetooth LE stream ended")
+                    }
+                }
+            }
+        }
+
+        private fun signalNativeEof() {
+            synchronized(handoffLock) {
+                localWriteEndpoint?.let { endpoint ->
+                    runCatching { Os.shutdown(endpoint.fileDescriptor, OsConstants.SHUT_WR) }
                 }
             }
         }

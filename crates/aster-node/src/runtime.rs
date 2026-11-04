@@ -14699,12 +14699,12 @@ struct LocalZeroizationRequest;
 impl LocalZeroizationControl {
     #[cfg(test)]
     fn bind(state: &Path, store_path: &Path) -> Result<Self, NodeError> {
-        let control_directory = local_zeroization_control_directory(true)?;
+        let control_directory = local_zeroization_control_directory(state, true)?;
         Self::bind_with_control_directory(state, store_path, control_directory)
     }
 
     fn bind_pinned(state: &Path, store_path: &Path) -> Result<Self, NodeError> {
-        let control_directory = local_zeroization_control_directory(true)?;
+        let control_directory = local_zeroization_control_directory(state, true)?;
         let state_authority = state.to_path_buf();
         let state = local_state_identity_following_pinned_authority(state)?;
         Self::bind_with_identities(state, state_authority, store_path, control_directory)
@@ -14957,13 +14957,14 @@ async fn request_live_zeroization(
         Err(error) => return Err(error.into()),
     }
     let (store_device, store_inode) = local_store_identity(&store_path)?;
-    let tentative_control_directory = local_zeroization_control_directory_path()?;
+    let tentative_control_directory =
+        local_zeroization_control_directory_path(&state.canonical_path)?;
     match fs::symlink_metadata(&tentative_control_directory) {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     }
-    let control_directory = local_zeroization_control_directory(false)?;
+    let control_directory = local_zeroization_control_directory(&state.canonical_path, false)?;
     let socket_path =
         local_zeroization_socket_path(&control_directory.canonical_path, store_device, store_inode);
     let before = match fs::symlink_metadata(&socket_path) {
@@ -15137,8 +15138,11 @@ fn local_mission_request_identity(path: &Path) -> Result<LocalPathIdentity, Node
 }
 
 #[cfg(unix)]
-fn local_zeroization_control_directory(create: bool) -> Result<LocalPathIdentity, NodeError> {
-    let directory = local_zeroization_control_directory_path()?;
+fn local_zeroization_control_directory(
+    state: &Path,
+    create: bool,
+) -> Result<LocalPathIdentity, NodeError> {
+    let directory = local_zeroization_control_directory_path(state)?;
     local_zeroization_control_directory_at(&directory, create)
 }
 
@@ -15186,12 +15190,33 @@ fn local_zeroization_control_directory_at(
 }
 
 #[cfg(unix)]
-fn local_zeroization_control_directory_path() -> Result<PathBuf, NodeError> {
-    let temporary_root = fs::canonicalize("/tmp")?;
-    Ok(temporary_root.join(format!(
-        "aster-zeroize-{}",
-        rustix::process::geteuid().as_raw()
-    )))
+fn local_zeroization_control_directory_path(state: &Path) -> Result<PathBuf, NodeError> {
+    #[cfg(target_os = "android")]
+    {
+        android_local_zeroization_control_directory_path(state)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = state;
+        let temporary_root = fs::canonicalize("/tmp")?;
+        Ok(temporary_root.join(format!(
+            "aster-zeroize-{}",
+            rustix::process::geteuid().as_raw()
+        )))
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_local_zeroization_control_directory_path(state: &Path) -> Result<PathBuf, NodeError> {
+    let parent = state
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            NodeError::Configuration(
+                "Android node state requires an app-owned parent directory".into(),
+            )
+        })?;
+    Ok(parent.join(".az"))
 }
 
 #[cfg(unix)]
@@ -32845,6 +32870,7 @@ fn account(receipt: &mut PeerReceipt, request: usize, response: usize) -> Result
     let (frames, bytes) = check_account(receipt, request, response)?;
     receipt.protected_frames = frames;
     receipt.protected_bytes = bytes;
+    record_authenticated_contact_progress();
     Ok(())
 }
 
@@ -34459,6 +34485,23 @@ mod tests {
         .await;
 
         assert_eq!(result, Ok("complete"));
+        assert!(started.elapsed() > CONTACT_DEADLINE * 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn authenticated_frame_accounting_extends_contact_lifetime() {
+        let started = tokio::time::Instant::now();
+        let result = with_authenticated_contact_progress_deadline(async {
+            let mut receipt = PeerReceipt::default();
+            for _ in 0..4 {
+                sleep(CONTACT_DEADLINE - Duration::from_secs(1)).await;
+                account(&mut receipt, 1, 1).expect("authenticated frame accounting");
+            }
+            receipt.protected_frames
+        })
+        .await;
+
+        assert_eq!(result, Ok(8));
         assert!(started.elapsed() > CONTACT_DEADLINE * 3);
     }
 
@@ -44248,6 +44291,26 @@ mod tests {
             .join(format!("aster-node-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn android_zeroization_control_stays_in_the_app_owned_state_parent() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let state = Path::new("/data/user/0/org.defenseunicorns.aster.btlering1/files/aster-state");
+        let directory = android_local_zeroization_control_directory_path(state)
+            .expect("Android app-owned control directory");
+
+        assert_eq!(
+            directory,
+            PathBuf::from("/data/user/0/org.defenseunicorns.aster.btlering1/files/.az")
+        );
+        let socket = local_zeroization_socket_path(&directory, u64::MAX, u64::MAX);
+        assert!(
+            socket.as_os_str().as_bytes().len() < 108,
+            "Android filesystem Unix socket path exceeds sun_path"
+        );
     }
 
     #[cfg(unix)]

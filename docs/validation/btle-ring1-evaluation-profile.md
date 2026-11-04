@@ -2,7 +2,7 @@
 
 - Status: implementation profile; no requirement credit or production approval
 - Owner: Aster implementation owner
-- Review date: 2026-11-03
+- Review date: 2026-11-04
 - Semantic boundary: exact selected semantic v9 with v1-v8 compatibility bytes
 - Carrier: initial `BleL2capV1` implementation revision; official exit remains
   Linux-only
@@ -41,6 +41,27 @@ These are evaluation ceilings, not production performance claims or a declared
 minimum supported CoC MTU. The physical test records the actual negotiated send
 and receive MTUs and sends an Event larger than the smaller value.
 
+### Linux platform-write adaptation
+
+The Linux adapter does not impose a fixed BTLE payload or SDU ceiling. Linux
+segments one LE CoC SDU into peer-MPS-sized socket buffers and allocates the
+complete SDU before queueing any byte. On the evaluated Pixel contact, a
+65,535-byte negotiated send MTU combined with the Pixel's 247-byte peer MPS
+could not fit one full-MTU SDU within the host's default 212,992-byte socket
+send-memory budget, so the nonblocking platform write returned `EAGAIN` before
+transmitting data.
+
+The initial adapter implementation responds only to an unsuccessful,
+previously unproven platform write by halving that contact's attempted SDU
+size. Halving is binary backoff from the failed negotiated value, not a
+protocol constant or supported-MTU claim: the observed first retry was 32,767
+bytes, which queued successfully, and that proven size was retained through
+ordinary backpressure. A peer that successfully queues the full negotiated
+MTU is never reduced. This is why the evaluated CM4/Linux contacts needed no
+extra bound: their negotiated MTU/MPS/socket-memory combination already queued
+successfully. The behavior is per contact and makes no assumption about Pi,
+PC, phone, or controller model.
+
 ## Optional Android foreground extension
 
 The tree also contains an evaluation-only Android initiator scaffold and a
@@ -55,9 +76,11 @@ uses manual Linux address/PSM input and requests no scan,
 advertise, location, Internet, service, or receiver capability.
 
 This optional path does not widen the fixed Linux-to-Linux Ring-1 exit or move
-requirement credit. Its source and portable Rust tests exist, but Android
-compilation, APK packaging, JNI ABI loading, real-controller connection, and a
-retained Android/Linux terminal receipt remain separate gates. Follow the
+requirement credit. Its source and portable Rust tests exist. Local physical
+validation additionally exercised Android compilation, APK packaging, JNI ABI
+loading, real-controller connection, and matching Android/Linux terminal
+receipts; those observations remain evaluation evidence rather than a support
+claim. Follow the
 [Android BTLE Ring-1 quickstart](../quickstart/btle-android-ring1.md) to produce
 that evidence without changing the protocol.
 
