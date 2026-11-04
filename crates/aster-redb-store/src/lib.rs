@@ -3490,7 +3490,7 @@ pub struct StoreInspection {
     pub zeroization: StoreZeroizationStatus,
 }
 
-/// Startup proof that redb rejected a concurrent writable open for one live store path.
+/// Startup proof that the exact backing lock rejected a concurrent writable open.
 ///
 /// This only proves the filesystem/backend lock behavior observed while the
 /// current [`Store`] handle was live; it is not an async network-send lease.
@@ -3999,7 +3999,7 @@ pub enum StoreError {
     },
     /// One exact digest appears in both Event and control transfer namespaces.
     TransferNamespaceCollision { transfer_id: [u8; 32] },
-    /// redb did not enforce a second-writer exclusion lock for the selected store path.
+    /// The selected store backing did not enforce its second-writer exclusion lock.
     ProcessExclusiveLockUnavailable,
     /// The exact store already has another writable process/handle.
     StoreInUse,
@@ -4686,8 +4686,9 @@ impl fmt::Display for StoreError {
             Self::TransferNamespaceCollision { .. } => formatter.write_str(
                 "one exact digest appears in both Event and mission-control transfer namespaces",
             ),
-            Self::ProcessExclusiveLockUnavailable => formatter
-                .write_str("redb did not enforce exclusive writer ownership for the store path"),
+            Self::ProcessExclusiveLockUnavailable => {
+                formatter.write_str("store backing did not enforce exclusive writer ownership")
+            }
             Self::StoreInUse => formatter.write_str("store already has a writable owner"),
             Self::StoreZeroized(state) => {
                 write!(
@@ -5309,11 +5310,13 @@ struct SecurityProfilePolicyExpectation {
 ///
 /// Writable construction passes a validated file descriptor directly to redb;
 /// [`Store::backing_identity`] reports the immutable handle identity captured at
-/// open. On Unix, every writable open also synchronizes the exact retained parent
-/// directory before returning a usable handle. Other platforms make neither
-/// backing-identity nor parent-directory durability claims.
+/// open. On Unix, it also retains an Aster-owned nonblocking exclusive lock on
+/// that exact open-file description and synchronizes the retained parent directory
+/// before returning a usable handle. Other platforms make neither backing-identity
+/// nor parent-directory durability claims.
 pub struct Store {
     database: Database,
+    _process_writer_lock: ProcessWriterLock,
     path: PathBuf,
     backing_identity: StoreBackingIdentity,
     limits: StoreLimits,
@@ -5345,6 +5348,7 @@ pub struct Store {
 /// one-way crash-resumable cleanup receipts.
 pub struct ZeroizationStore {
     database: Database,
+    _process_writer_lock: ProcessWriterLock,
     path: PathBuf,
     backing_identity: StoreBackingIdentity,
     status: StoreZeroizationStatus,
@@ -5359,6 +5363,32 @@ struct OpenedStoreBacking {
     identity: StoreBackingIdentity,
     length: u64,
     newly_created: bool,
+}
+
+#[cfg(unix)]
+struct ProcessWriterLock {
+    _file: std::fs::File,
+}
+
+#[cfg(not(unix))]
+struct ProcessWriterLock;
+
+#[cfg(unix)]
+fn acquire_process_writer_lock(file: &std::fs::File) -> Result<ProcessWriterLock, StoreError> {
+    let retained = file.try_clone().map_err(StoreError::StorePath)?;
+    match rustix::fs::flock(
+        &retained,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    ) {
+        Ok(()) => Ok(ProcessWriterLock { _file: retained }),
+        Err(error) if error == rustix::io::Errno::WOULDBLOCK => Err(StoreError::StoreInUse),
+        Err(error) => Err(StoreError::StorePath(error.into())),
+    }
+}
+
+#[cfg(not(unix))]
+fn acquire_process_writer_lock(_file: &std::fs::File) -> Result<ProcessWriterLock, StoreError> {
+    Ok(ProcessWriterLock)
 }
 
 #[cfg(unix)]
@@ -5625,12 +5655,13 @@ fn sync_store_parent(parent: &std::fs::File, path: &Path) -> std::io::Result<()>
 
 fn database_from_store_backing(
     backing: OpenedStoreBacking,
-) -> Result<(Database, StoreBackingIdentity), StoreError> {
+) -> Result<(Database, StoreBackingIdentity, ProcessWriterLock), StoreError> {
     let identity = backing.identity;
     #[cfg(unix)]
     let parent_directory = backing.parent_directory;
     #[cfg(unix)]
     let path = backing.path;
+    let process_writer_lock = acquire_process_writer_lock(&backing.file)?;
     let database = match Database::builder().create_file(backing.file) {
         Ok(database) => database,
         Err(redb::DatabaseError::DatabaseAlreadyOpen) => return Err(StoreError::StoreInUse),
@@ -5643,18 +5674,18 @@ fn database_from_store_backing(
             return Err(StoreError::StorePath(error));
         }
     }
-    Ok((database, identity))
+    Ok((database, identity, process_writer_lock))
 }
 
 fn open_existing_store_database(
     path: &Path,
-) -> Result<(Database, StoreBackingIdentity), StoreError> {
+) -> Result<(Database, StoreBackingIdentity, ProcessWriterLock), StoreError> {
     database_from_store_backing(open_existing_store_backing(path)?)
 }
 
 fn open_or_create_store_database(
     path: &Path,
-) -> Result<(Database, StoreBackingIdentity), StoreError> {
+) -> Result<(Database, StoreBackingIdentity, ProcessWriterLock), StoreError> {
     database_from_store_backing(open_or_create_store_backing(path)?)
 }
 
@@ -5666,6 +5697,16 @@ fn require_exact_writer_exclusion(
     if backing.identity != expected {
         return Err(StoreError::ProcessExclusiveLockUnavailable);
     }
+    #[cfg(unix)]
+    match rustix::fs::flock(
+        &backing.file,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    ) {
+        Err(error) if error == rustix::io::Errno::WOULDBLOCK => Ok(ProcessExclusiveLockProof(())),
+        Err(error) => Err(StoreError::StorePath(error.into())),
+        Ok(()) => Err(StoreError::ProcessExclusiveLockUnavailable),
+    }
+    #[cfg(not(unix))]
     match Database::builder().create_file(backing.file) {
         Err(redb::DatabaseError::DatabaseAlreadyOpen) => Ok(ProcessExclusiveLockProof(())),
         Err(error) => Err(error.into()),
@@ -6102,7 +6143,7 @@ impl Store {
         path: impl AsRef<Path>,
     ) -> Result<StoreZeroizationStatus, StoreError> {
         let path = std::path::absolute(path).map_err(StoreError::StorePath)?;
-        let (database, _) = open_existing_store_database(&path)?;
+        let (database, _, _process_writer_lock) = open_existing_store_database(&path)?;
         inspect_zeroization_readable(&database)
     }
 
@@ -6117,13 +6158,15 @@ impl Store {
     /// becomes usable.
     pub fn open_for_zeroization(path: impl AsRef<Path>) -> Result<ZeroizationStore, StoreError> {
         let path = std::path::absolute(path).map_err(StoreError::StorePath)?;
-        let (database, backing_identity) = open_existing_store_database(&path)?;
+        let (database, backing_identity, process_writer_lock) =
+            open_existing_store_database(&path)?;
         let status = inspect_zeroization_readable(&database)?;
         if status.mission_authority.is_none() {
             return Err(StoreError::MissionNotBound);
         }
         Ok(ZeroizationStore {
             database,
+            _process_writer_lock: process_writer_lock,
             path,
             backing_identity,
             status,
@@ -6180,7 +6223,8 @@ impl Store {
                 Err(error) => return Err(error),
             }
         }
-        let (database, backing_identity) = open_or_create_store_database(&path)?;
+        let (database, backing_identity, process_writer_lock) =
+            open_or_create_store_database(&path)?;
 
         let write = database.begin_write()?;
         if numbered_publication_only {
@@ -6452,6 +6496,7 @@ impl Store {
 
         Ok(Self {
             database,
+            _process_writer_lock: process_writer_lock,
             path,
             backing_identity,
             limits,
@@ -6822,6 +6867,7 @@ impl Store {
         }
         let Self {
             database,
+            _process_writer_lock,
             path,
             backing_identity,
             limits: _,
@@ -6846,6 +6892,7 @@ impl Store {
         } = self;
         Ok(ZeroizationStore {
             database,
+            _process_writer_lock,
             path,
             backing_identity,
             status,
@@ -7975,7 +8022,7 @@ impl Store {
         Ok(EventDeliveryAck::Acknowledged)
     }
 
-    /// Proves that a second writable redb open is rejected while this handle is live.
+    /// Proves that a second writable backing open is rejected while this handle is live.
     ///
     /// Selected startup must call this for the exact path used to construct
     /// this handle. Success is an observed backend/filesystem exclusion proof,
@@ -25299,6 +25346,22 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_writer_lock_rejects_second_exact_backing_before_redb_open() {
+        let file = TestFile::new("process-writer-lock");
+        let first = open_or_create_store_backing(&file.0).expect("first exact backing");
+        let _lock = acquire_process_writer_lock(&first.file).expect("first process writer lock");
+        first.file.set_len(1).expect("nonempty exact backing");
+        let second = open_existing_store_backing(&file.0).expect("second exact backing");
+
+        assert_eq!(first.identity, second.identity);
+        assert!(matches!(
+            acquire_process_writer_lock(&second.file),
+            Err(StoreError::StoreInUse)
+        ));
     }
 
     #[test]
