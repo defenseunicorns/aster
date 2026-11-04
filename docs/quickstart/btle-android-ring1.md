@@ -12,6 +12,12 @@ transport-neutral Aster runtime in-process. Pairing and Bluetooth link encryptio
 grant no Aster authority; the mission handshake authenticates the expected
 mission node ID before inventory.
 
+On each attempt, the native validator creates or replays its private durable
+exact `Consume` subscription for `mesh.messages` at `demo/playground` before
+admitting the BTLE contact. A fresh app state therefore needs no separate
+subscription command. This fixed selector is an evaluation implementation
+detail, not a semantic-v9 field or a production subscription UX.
+
 ## Fixed topology and prerequisites
 
 - Android is the initiator; Linux is the listener.
