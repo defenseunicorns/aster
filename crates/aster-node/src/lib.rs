@@ -1,6 +1,6 @@
 //! Selected-stack Aster node composition.
 //!
-//! The selected runtime composes a mission-authenticated Iroh carrier, bounded
+//! The selected runtime composes mission-authenticated ordered carriers, bounded
 //! Negentropy reconciliation, mission-bound redb state, and the existing
 //! `aster-core` source-authenticated Event semantics. Negotiated semantic v3
 //! adds authenticated custody age, finite-TTL forwarding, bounded global and
@@ -89,13 +89,15 @@ pub use runtime::{
     ControlPublicationReceipt, DemoScenario, EventEmissionPolicy,
     MAX_CUSTODY_FINALIZATION_CHARGE_MS, MissionExpectedPeer, MutableSourceInterests,
     NodeApplication, NodeBootstrapError, NodeBootstrapErrorKind, NodeConfig, NodeConfigOptions,
-    NodeError, NodeOperatorOutputPolicy, NodeReceipt, PeerReceipt, RunningNode,
-    SelectedForwardingConfig, SoftwareZeroizationPathState, SoftwareZeroizationReceipt,
-    SoftwareZeroizationState, SourceInterestSelector, StoreReceipt, audit_store_event_operations,
+    NodeError, NodeOperatorOutputPolicy, NodeReceipt, OrderedEventContactHandle,
+    OrderedEventContactRole, PeerReceipt, RunningNode, SelectedForwardingConfig,
+    SoftwareZeroizationPathState, SoftwareZeroizationReceipt, SoftwareZeroizationState,
+    SourceInterestSelector, StoreReceipt, TransportNeutralNodeConfig, audit_store_event_operations,
     ensure_state_accepts_normal_operation, format_control_transfer_id, inspect_store, put_opaque,
     run_demo, run_demo_scenario, run_node, run_node_with_forwarding, start_node,
     start_node_with_forwarding, start_node_with_forwarding_and_output_policy,
-    start_supervised_node_with_forwarding_and_output_policy, zeroize_node,
+    start_supervised_node_with_forwarding_and_output_policy, start_transport_neutral_node,
+    zeroize_node,
 };
 #[cfg(feature = "nearby-discovery")]
 pub use runtime::{
