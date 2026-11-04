@@ -213,20 +213,23 @@ fn native_start(
     transferred_fd: jint,
     callback: &JObject<'_>,
 ) -> jni::errors::Result<jlong> {
+    // SAFETY: Kotlin transfers ownership with ParcelFileDescriptor.detachFd and must not close it.
+    // Adopt before any fallible JNI setup so every return path either moves or drops this OwnedFd.
+    let descriptor = if transferred_fd >= 0 {
+        Some(unsafe { OwnedFd::from_raw_fd(transferred_fd) })
+    } else {
+        None
+    };
     let vm = env.get_java_vm()?;
     let callback = env.new_global_ref(callback)?;
     let callback: Arc<dyn NativeCallback> = Arc::new(JavaCallback { vm, callback });
-    if transferred_fd < 0 {
+    let Some(descriptor) = descriptor else {
         let _ = callback.error(
             ValidatorErrorCategory::Configuration,
             "validator contact descriptor is invalid",
         );
         return Ok(0);
-    }
-
-    // SAFETY: Kotlin transfers ownership with ParcelFileDescriptor.detachFd and must not close it.
-    // This is the sole adoption point; every return path either moves or drops this OwnedFd.
-    let descriptor = unsafe { OwnedFd::from_raw_fd(transferred_fd) };
+    };
     let config_json = match config_json
         .try_to_string(env)
         .map_err(|_| ())
