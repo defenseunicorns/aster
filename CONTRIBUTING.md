@@ -2,8 +2,10 @@
 
 ## Local verification
 
-Install the exact development tools declared in `mise.toml`, then run the
-complete local gate:
+On Linux, install `pkg-config` and the D-Bus development headers used by the
+evaluation-only BlueZ adapter (`libdbus-1-dev` on Ubuntu/Debian). Then install
+the exact development tools declared in `mise.toml` and run the complete local
+gate:
 
 ```sh
 mise install
