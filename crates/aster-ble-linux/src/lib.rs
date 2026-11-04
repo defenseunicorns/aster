@@ -26,7 +26,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::Notify,
-    time::timeout,
+    time::{sleep, timeout},
 };
 
 /// Largest protected carrier frame admitted by the Ring-1 evaluation profile.
@@ -35,6 +35,8 @@ pub const RING1_MAXIMUM_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const RING1_MAXIMUM_EXCHANGE_BYTES: usize = 64 * 1024 * 1024;
 /// Longest platform or authenticated-progress operation in the Ring-1 profile.
 pub const RING1_MAXIMUM_DEADLINE: Duration = Duration::from_secs(30);
+
+const L2CAP_READINESS_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Provisioned direction of one Ring-1 contact.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -558,6 +560,9 @@ async fn open_bluez(request: OpenRequest) -> Result<SocketOpen, DriverError> {
             let socket = Socket::<Stream>::new_stream().map_err(map_io_error)?;
             socket.bind(local).map_err(map_io_error)?;
             let stream = socket.connect(peer).await.map_err(map_io_error)?;
+            // BlueR may complete the async connect before the LE channel is
+            // ready for I/O. The kernel exposes the send MTU once it is ready.
+            wait_for_l2cap_readiness(|| stream.as_ref().send_mtu()).await?;
             Ok(SocketOpen::from_bluez(stream))
         }
         OpenRequest::Listener {
@@ -584,6 +589,20 @@ async fn open_bluez(request: OpenRequest) -> Result<SocketOpen, DriverError> {
                 ));
             }
             Ok(SocketOpen::from_bluez(stream))
+        }
+    }
+}
+
+async fn wait_for_l2cap_readiness(
+    mut probe_send_mtu: impl FnMut() -> io::Result<u16>,
+) -> Result<(), DriverError> {
+    loop {
+        match probe_send_mtu() {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => {
+                sleep(L2CAP_READINESS_POLL_INTERVAL).await;
+            }
+            Err(error) => return Err(map_io_error(error)),
         }
     }
 }
@@ -688,7 +707,7 @@ mod tests {
         str::FromStr,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -858,6 +877,23 @@ mod tests {
             factory.request.lock().unwrap().as_ref(),
             Some(&config.open_request())
         );
+    }
+
+    #[tokio::test]
+    async fn connection_readiness_retries_not_connected_until_send_mtu_exists() {
+        let attempts = AtomicUsize::new(0);
+
+        wait_for_l2cap_readiness(|| {
+            if attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+                Err(io::Error::from(io::ErrorKind::NotConnected))
+            } else {
+                Ok(128)
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
     }
 
     #[test]
