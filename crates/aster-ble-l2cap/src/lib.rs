@@ -8,12 +8,15 @@ use aster_contact::{
 };
 use std::{
     io,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{Mutex, Notify},
+    sync::Notify,
     time::timeout,
 };
 
@@ -32,7 +35,7 @@ impl<T> AsyncContactIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 /// One bounded ordered contact carried by an LE L2CAP byte stream.
 pub struct BleL2capContact {
-    io: Mutex<Box<dyn AsyncContactIo>>,
+    io: Mutex<Option<Box<dyn AsyncContactIo>>>,
     locator: TransientLocator,
     maximum_frame_bytes: usize,
     operation_timeout: Duration,
@@ -76,7 +79,7 @@ impl BleL2capContact {
             ));
         }
         Ok(Self {
-            io: Mutex::new(Box::new(io)),
+            io: Mutex::new(Some(Box::new(io))),
             locator,
             maximum_frame_bytes,
             operation_timeout,
@@ -94,6 +97,35 @@ impl BleL2capContact {
             ))
         } else {
             Ok(())
+        }
+    }
+
+    fn take_io(&self) -> Result<Box<dyn AsyncContactIo>, ContactError> {
+        self.io
+            .lock()
+            .map_err(|_| {
+                ContactError::new(
+                    ContactErrorKind::Transport,
+                    "LE L2CAP contact stream lock is poisoned",
+                )
+            })?
+            .take()
+            .ok_or_else(|| {
+                ContactError::new(
+                    ContactErrorKind::Unavailable,
+                    "LE L2CAP contact stream is unavailable",
+                )
+            })
+    }
+
+    fn restore_io(&self, io: Box<dyn AsyncContactIo>) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        if let Ok(mut slot) = self.io.lock()
+            && !self.closed.load(Ordering::Acquire)
+        {
+            *slot = Some(io);
         }
     }
 
@@ -216,7 +248,10 @@ impl Drop for ActiveOperation<'_> {
 fn io_error(error: io::Error) -> ContactError {
     let kind = match error.kind() {
         io::ErrorKind::TimedOut => ContactErrorKind::Timeout,
-        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound => ContactErrorKind::Unavailable,
+        io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::NotFound
+        | io::ErrorKind::NotConnected
+        | io::ErrorKind::NetworkDown => ContactErrorKind::Unavailable,
         _ => ContactErrorKind::Transport,
     };
     ContactError::new(kind, error.to_string())
@@ -255,16 +290,19 @@ impl OrderedContact for BleL2capContact {
                 ));
             }
             self.run_operation(async {
-                let mut io = self.io.lock().await;
+                let mut io = self.take_io()?;
                 before_write()?;
-                Self::write_record(&mut **io, TAG_REQUEST, request, self.maximum_frame_bytes)
+                Self::write_record(&mut *io, TAG_REQUEST, request, self.maximum_frame_bytes)
                     .await?;
                 let response_maximum = self
                     .maximum_frame_bytes
                     .min(total_limit.saturating_sub(request.len()));
-                let (tag, response) = Self::read_record(&mut **io, response_maximum).await?;
+                let (tag, response) = Self::read_record(&mut *io, response_maximum).await?;
                 match tag {
-                    TAG_RESPONSE_MORE | TAG_RESPONSE_COMPLETE => Ok(response),
+                    TAG_RESPONSE_MORE | TAG_RESPONSE_COMPLETE => {
+                        self.restore_io(io);
+                        Ok(response)
+                    }
                     TAG_REJECT_BOUNDS => Err(ContactError::new(
                         ContactErrorKind::Bounds,
                         "LE L2CAP peer rejected exchange bounds",
@@ -290,9 +328,9 @@ impl OrderedContact for BleL2capContact {
     ) -> ContactFuture<'a, bool> {
         Box::pin(async move {
             self.run_operation(async {
-                let mut io = self.io.lock().await;
+                let mut io = self.take_io()?;
                 let request_maximum = self.maximum_frame_bytes.min(total_limit);
-                let (tag, request) = Self::read_record(&mut **io, request_maximum).await?;
+                let (tag, request) = Self::read_record(&mut *io, request_maximum).await?;
                 if tag != TAG_REQUEST {
                     return Err(ContactError::new(
                         ContactErrorKind::Protocol,
@@ -303,7 +341,7 @@ impl OrderedContact for BleL2capContact {
                     Ok(response) => response,
                     Err(error) => {
                         let _ = Self::write_record(
-                            &mut **io,
+                            &mut *io,
                             TAG_REJECT_PROTOCOL,
                             &[],
                             self.maximum_frame_bytes,
@@ -316,7 +354,7 @@ impl OrderedContact for BleL2capContact {
                     .maximum_frame_bytes
                     .min(total_limit.saturating_sub(request.len()));
                 if response.len() > response_maximum {
-                    Self::write_record(&mut **io, TAG_REJECT_BOUNDS, &[], self.maximum_frame_bytes)
+                    Self::write_record(&mut *io, TAG_REJECT_BOUNDS, &[], self.maximum_frame_bytes)
                         .await?;
                     return Err(ContactError::new(
                         ContactErrorKind::Bounds,
@@ -328,7 +366,8 @@ impl OrderedContact for BleL2capContact {
                 } else {
                     TAG_RESPONSE_MORE
                 };
-                Self::write_record(&mut **io, tag, &response, response_maximum).await?;
+                Self::write_record(&mut *io, tag, &response, response_maximum).await?;
+                self.restore_io(io);
                 Ok(complete)
             })
             .await
@@ -339,10 +378,9 @@ impl OrderedContact for BleL2capContact {
         Box::pin(async move {
             let result = self
                 .run_operation(async {
-                    let mut io = self.io.lock().await;
-                    Self::write_record(&mut **io, TAG_FINISH, &[], self.maximum_frame_bytes)
-                        .await?;
-                    let (tag, payload) = Self::read_record(&mut **io, 0).await?;
+                    let mut io = self.take_io()?;
+                    Self::write_record(&mut *io, TAG_FINISH, &[], self.maximum_frame_bytes).await?;
+                    let (tag, payload) = Self::read_record(&mut *io, 0).await?;
                     if tag != TAG_FINISH_ACK || !payload.is_empty() {
                         return Err(ContactError::new(
                             ContactErrorKind::Protocol,
@@ -363,15 +401,15 @@ impl OrderedContact for BleL2capContact {
         Box::pin(async move {
             let result = self
                 .run_operation(async {
-                    let mut io = self.io.lock().await;
-                    let (tag, payload) = Self::read_record(&mut **io, 0).await?;
+                    let mut io = self.take_io()?;
+                    let (tag, payload) = Self::read_record(&mut *io, 0).await?;
                     if tag != TAG_FINISH || !payload.is_empty() {
                         return Err(ContactError::new(
                             ContactErrorKind::Protocol,
                             "LE L2CAP finish request is invalid",
                         ));
                     }
-                    Self::write_record(&mut **io, TAG_FINISH_ACK, &[], self.maximum_frame_bytes)
+                    Self::write_record(&mut *io, TAG_FINISH_ACK, &[], self.maximum_frame_bytes)
                         .await?;
                     io.shutdown().await.map_err(io_error)
                 })
@@ -385,6 +423,9 @@ impl OrderedContact for BleL2capContact {
 
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
+        if let Ok(mut io) = self.io.lock() {
+            io.take();
+        }
         self.close_notify.notify_waiters();
         // There is at most one active operation. Retaining one permit closes the
         // race where close happens after the open check but before select polls.
@@ -511,11 +552,13 @@ mod tests {
         assert_eq!(error.kind(), ContactErrorKind::Unauthorized);
 
         let mut byte = [0u8; 1];
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), peer.read(&mut byte))
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), peer.read(&mut byte))
                 .await
-                .is_err(),
-            "preflight rejection must happen before the first carrier write"
+                .expect("preflight rejection must close without retaining the stream")
+                .unwrap(),
+            0,
+            "preflight rejection must happen before the first carrier write",
         );
         assert_eq!(
             contact
@@ -607,7 +650,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_close_cancels_the_active_operation_and_rejects_later_work() {
-        let (stream, _peer) = duplex(32);
+        let (stream, mut peer) = duplex(32);
         let contact = contact(stream, 64, Duration::from_secs(10));
         let operation = tokio::spawn({
             let contact = Arc::clone(&contact);
@@ -623,8 +666,42 @@ mod tests {
             operation.await.unwrap().unwrap_err().kind(),
             ContactErrorKind::Unavailable
         );
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), peer.read(&mut byte))
+                .await
+                .expect("active close must release the stream")
+                .unwrap(),
+            0
+        );
         assert_eq!(
             contact
+                .request_with_total_limit(b"later", 64)
+                .await
+                .unwrap_err()
+                .kind(),
+            ContactErrorKind::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn local_close_releases_the_stream_while_an_arc_is_retained() {
+        let (stream, mut peer) = duplex(32);
+        let contact = contact(stream, 64, Duration::from_secs(10));
+        let retained = Arc::clone(&contact);
+
+        contact.close();
+
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), peer.read(&mut byte))
+                .await
+                .expect("close must release the stream before the contact is dropped")
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            retained
                 .request_with_total_limit(b"later", 64)
                 .await
                 .unwrap_err()
@@ -727,5 +804,15 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind(), ContactErrorKind::Configuration);
+    }
+
+    #[test]
+    fn controller_loss_io_kinds_are_unavailable() {
+        for kind in [io::ErrorKind::NotConnected, io::ErrorKind::NetworkDown] {
+            assert_eq!(
+                io_error(io::Error::from(kind)).kind(),
+                ContactErrorKind::Unavailable
+            );
+        }
     }
 }
