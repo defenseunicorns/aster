@@ -4,7 +4,8 @@
 - Owner: Aster implementation owner
 - Review date: 2026-11-03
 - Semantic boundary: exact selected semantic v9 with v1-v8 compatibility bytes
-- Carrier: initial `BleL2capV1` implementation revision, Linux only
+- Carrier: initial `BleL2capV1` implementation revision; official exit remains
+  Linux-only
 
 ## Users and outcome
 
@@ -40,6 +41,23 @@ These are evaluation ceilings, not production performance claims or a declared
 minimum supported CoC MTU. The physical test records the actual negotiated send
 and receive MTUs and sends an Event larger than the smaller value.
 
+## Optional Android foreground extension
+
+The tree also contains an evaluation-only Android initiator scaffold and a
+narrow Rust JNI adapter. It uses Android's public LE L2CAP CoC socket, bridges
+the socket streams through a process-local Unix socket pair, and then runs the
+same transport-neutral mission, v9 profile, Event, and durable-store path. The
+local socket pair is an Android implementation detail, not a carrier or
+fallback. The app uses manual Linux address/PSM input and requests no scan,
+advertise, location, Internet, service, or receiver capability.
+
+This optional path does not widen the fixed Linux-to-Linux Ring-1 exit or move
+requirement credit. Its source and portable Rust tests exist, but Android
+compilation, APK packaging, JNI ABI loading, real-controller connection, and a
+retained Android/Linux terminal receipt remain separate gates. Follow the
+[Android BTLE Ring-1 quickstart](../quickstart/btle-android-ring1.md) to produce
+that evidence without changing the protocol.
+
 ## Required evidence
 
 - Deterministic framing, bounds, timeout, truncation, close, and mission-order
@@ -56,6 +74,6 @@ and receive MTUs and sends an Event larger than the smaller value.
 
 Discovery proof or grammar, dynamic roles, duplicate-contact reduction,
 event-driven hot-plug, production MTU floor, constrained-emission qualification,
-State, Record, Blob execution, GATT, cross-platform interoperability,
+State, Record, Blob execution, GATT, credited cross-platform interoperability,
 multi-controller operation, automatic carrier selection, downgrade resistance,
 packaging, support rows, and production authorization are excluded.

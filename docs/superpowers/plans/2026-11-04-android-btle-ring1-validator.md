@@ -316,7 +316,13 @@
 
 - [ ] **Step 4: Run Android packaging and physical acceptance when equipment is available**
 
-  Build/install the debug APK, start the Linux listener with a pre-published Event larger than the Android receive packet size, connect from Android, and retain both terminal receipts. Confirm expected mission peer, semantic 9, profile IDs/digest, one received/insertion Event, zero Blob attempt, and larger-than-receive-packet. For recovery evidence, deliberately disconnect a separate attempt before completion, reconnect, and confirm the Event is inserted once without semantic duplicate delivery.
+  Build/install the debug APK, start the Linux listener with a pre-published Event larger than the Android receive packet size, connect from Android, and retain both terminal receipts. Confirm expected mission peer, semantic 9, profile IDs/digest, one received/insertion Event, zero Blob attempt, and larger-than-receive-packet. Run any connection-recovery diagnostic as an alternative freshly provisioned setup before its first successful delivery: disconnect its first attempt before `reconciling`, then reconnect so the retry becomes that setup's first successful acceptance.
+
+  The minimal validator cannot distinguish cancellation after a durable insert
+  but before terminal callback. Limit its recovery diagnostic to interruption
+  before `reconciling`; treat it as connection recovery only. Any deduplication
+  acceptance requires separate retained store instrumentation that can observe
+  cumulative insertion state across the ambiguous boundary.
 
 - [ ] **Step 5: Inspect every change and signed commit**
 
