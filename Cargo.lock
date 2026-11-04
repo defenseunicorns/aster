@@ -310,11 +310,14 @@ dependencies = [
 name = "aster-ble-android"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "aster-ble-l2cap",
+ "aster-contact",
  "aster-core",
  "aster-node",
  "jni 0.22.4",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
