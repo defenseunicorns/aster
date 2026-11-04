@@ -162,11 +162,12 @@ use crate::{
         MAX_OBJECT_BYTES, MutableApplyDisposition, MutableClass, MutableTransferId,
     },
     mission::{
-        HybridMissionSession, MissionHandshakeReceipt, MissionPeerBinding,
+        HybridMissionSession, MissionHandshakeReceipt, MissionPeerBinding, MissionPeerExpectation,
         MissionProvisioningError, MissionProvisioningOrigin, MissionSession, MissionSessionError,
         PreparedIdentityErasure, PreparedMissionErasure, ResumedSoftwareErasure,
         SoftwareErasureError, SoftwareErasureTarget, SoftwareSecretArtifact,
-        UnprotectedReferenceMission, initiate_over_iroh_metered, respond_over_iroh_metered,
+        UnprotectedReferenceMission, initiate_over_contact_metered, initiate_over_iroh_metered,
+        respond_over_contact_metered, respond_over_iroh_metered,
     },
     parse_node_id,
 };
@@ -360,6 +361,7 @@ const BLOB_MAINTENANCE_ROWS_PER_TURN: u64 = aster_redb_store::MAX_BLOB_POLICY_RE
 const BLOB_MAINTENANCE_FILES_PER_TURN: u64 = 1;
 const BLOB_MAINTENANCE_BYTES_PER_TURN: u64 = aster_redb_store::MAX_BLOB_POLICY_RETIREMENT_BYTES;
 const CONTROL_COMMAND_CAPACITY: usize = 1;
+const ORDERED_EVENT_CONTACT_CAPACITY: usize = 4;
 const CONTROL_COMMAND_BUDGET: usize = 4;
 const APPLICATION_COMMAND_BUDGET: usize = 8;
 const NETWORK_EVENT_BUDGET: usize = 8;
@@ -782,6 +784,7 @@ const ACTIVE_RECONCILIATION_CLASSES: &str =
     "event,state,record,blob-v9-profile5-v7-v8-profile4-compat";
 const READY_RECONCILIATION_CLASSES: &str =
     "event,state,record,blob-v9-profile5-v7-v8-profile4-compat,event-bridge-v6-opt-in";
+const ORDERED_EVENT_RECONCILIATION_CLASSES: &str = "event";
 
 const fn contact_reconciliation_classes(semantic_version: u16) -> &'static str {
     if semantic_version >= SEMANTIC_PROTOCOL_V7 {
@@ -1283,6 +1286,44 @@ pub struct NodeConfig {
     pub run_for: Option<Duration>,
     /// Explicit sample application hosted by this process.
     pub application: NodeApplication,
+}
+
+/// Selected-node configuration with no required IP transport.
+///
+/// The node opens its durable application actor and waits for contacts admitted
+/// through [`OrderedEventContactHandle`]. It binds no Iroh socket and configures
+/// no implicit carrier fallback.
+#[derive(Clone, Debug)]
+pub struct TransportNeutralNodeConfig {
+    /// Independent durable root for this process.
+    pub state: PathBuf,
+    /// Required mission credentials; no unauthenticated runtime mode exists.
+    pub mission: UnprotectedReferenceMission,
+    /// Explicit class-separated State, Record, and opt-in Blob interests.
+    pub mutable_interests: MutableSourceInterests,
+    /// Delay between bounded maintenance turns.
+    pub sync_interval: Duration,
+    /// Optional process lifetime, primarily for deterministic orchestration.
+    pub run_for: Option<Duration>,
+    /// Explicit sample application hosted by this process.
+    pub application: NodeApplication,
+}
+
+impl TransportNeutralNodeConfig {
+    fn into_node_config(self) -> NodeConfig {
+        NodeConfig {
+            state: self.state,
+            // This value is intentionally unreachable while IP transport is
+            // disabled, but retains one internal actor configuration shape.
+            bind: SocketAddr::from(([0, 0, 0, 0], 0)),
+            mission: self.mission,
+            peers: Vec::new(),
+            mutable_interests: self.mutable_interests,
+            sync_interval: self.sync_interval,
+            run_for: self.run_for,
+            application: self.application,
+        }
+    }
 }
 
 /// Mission-independent options for protected selected-node startup.
@@ -3773,6 +3814,7 @@ pub struct RunningNode {
     selected_records: SelectedRecordHandle,
     selected_blobs: SelectedBlobHandle,
     selected_controls: SelectedControlHandle,
+    ordered_event_contacts: OrderedEventContactHandle,
     state_root: PinnedNodeStateRoot,
     application_admission: Arc<AtomicBool>,
     emission_policy: Arc<LiveEmissionPolicy>,
@@ -3780,6 +3822,99 @@ pub struct RunningNode {
     nearby_discovery_stop: Option<NearbyDiscoveryControl>,
     shutdown: Option<mpsc::Sender<()>>,
     task: Option<JoinHandle<Result<NodeReceipt, NodeError>>>,
+}
+
+/// Fixed role for one externally established adapter-neutral Event contact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrderedEventContactRole {
+    /// This node sends mission handshake flight one.
+    Initiator,
+    /// This node receives mission handshake flight one.
+    Responder,
+}
+
+struct OrderedEventContactCommand {
+    role: OrderedEventContactRole,
+    contact: Arc<dyn OrderedContact>,
+    peer: MissionPeerExpectation,
+    response: oneshot::Sender<Result<PeerReceipt, NodeError>>,
+}
+
+type OrderedEventContactTaskOutput = (
+    OrderedEventContactRole,
+    oneshot::Sender<Result<PeerReceipt, NodeError>>,
+    Result<CompletedPeerContact, NodeError>,
+);
+
+struct OrderedEventContactCloseGuard(Option<Arc<dyn OrderedContact>>);
+
+impl OrderedEventContactCloseGuard {
+    fn disarm(&mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for OrderedEventContactCloseGuard {
+    fn drop(&mut self) {
+        if let Some(contact) = self.0.take() {
+            contact.close();
+        }
+    }
+}
+
+/// Bounded in-process admission handle for Ring-1 ordered Event contacts.
+#[derive(Clone)]
+pub struct OrderedEventContactHandle {
+    sender: mpsc::Sender<OrderedEventContactCommand>,
+    admission: Arc<AtomicBool>,
+}
+
+impl OrderedEventContactHandle {
+    /// Runs one already-connected ordered contact through the live node actor.
+    ///
+    /// Calling this method is privileged in-process roster admission: the caller
+    /// supplies the exact expected mission identity and fixed session role. The
+    /// contact's locator evidence is never promoted to peer identity, and the
+    /// authenticated mission identity must match before profile or inventory work.
+    /// The contact is closed if admission or the caller's response wait is
+    /// cancelled. Once admitted, cancellation is observed by the actor and
+    /// aborts the in-flight session before the handle returns.
+    pub async fn run(
+        &self,
+        role: OrderedEventContactRole,
+        contact: Arc<dyn OrderedContact>,
+        peer: MissionPeerExpectation,
+    ) -> Result<PeerReceipt, NodeError> {
+        if !self.admission.load(Ordering::Acquire) {
+            contact.close();
+            return Err(NodeError::Protocol(
+                "ordered Event contact admission is closed".into(),
+            ));
+        }
+        let (response, completed) = oneshot::channel();
+        let mut pending = OrderedEventContactCloseGuard(Some(contact.clone()));
+        self.sender
+            .send(OrderedEventContactCommand {
+                role,
+                contact,
+                peer,
+                response,
+            })
+            .await
+            .map_err(|error| {
+                error.0.contact.close();
+                NodeError::Protocol("ordered Event contact actor is unavailable".into())
+            })?;
+        match completed.await {
+            Ok(result) => {
+                pending.disarm();
+                result
+            }
+            Err(_) => Err(NodeError::Protocol(
+                "ordered Event contact actor stopped before completion".into(),
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3954,6 +4089,14 @@ impl RunningNode {
     /// Returns the cloneable, one-command live authority-control handle.
     pub fn selected_controls(&self) -> SelectedControlHandle {
         self.selected_controls.clone()
+    }
+
+    /// Returns the bounded adapter-neutral Event-contact admission handle.
+    ///
+    /// Submitting through this handle is privileged in-process roster admission;
+    /// adapter drivers must pass an explicitly configured mission expectation.
+    pub fn ordered_event_contacts(&self) -> OrderedEventContactHandle {
+        self.ordered_event_contacts.clone()
     }
 
     /// Returns the exact directory authority used by this node's durable store.
@@ -6892,12 +7035,18 @@ fn ensure_contact_principals_active(
 fn authorize_contact_before_inventory(
     store: &Store,
     local: NodeId,
-    peer: MissionPeerBinding,
+    peer: NodeId,
+    #[cfg(feature = "nearby-discovery")] iroh_peer: Option<MissionPeerBinding>,
     #[cfg(feature = "nearby-discovery")] automatic_admission: Option<&AutomaticNearbyAdmission>,
 ) -> Result<(), NodeError> {
-    ensure_contact_principals_active(store, local, peer.mission_id())?;
+    ensure_contact_principals_active(store, local, peer)?;
     #[cfg(feature = "nearby-discovery")]
     if let Some(admission) = automatic_admission {
+        let peer = iroh_peer.ok_or_else(|| {
+            NodeError::Protocol(
+                "automatic nearby admission requires an authenticated Iroh carrier binding".into(),
+            )
+        })?;
         admission.admit(peer)?;
     }
     Ok(())
@@ -7015,7 +7164,7 @@ struct EventReceiveAuthority<'a> {
 }
 
 struct ReceivedCustody<'a> {
-    mission: &'a mut MissionSession,
+    mission: &'a mut HybridMissionSession,
     exchange_id: u64,
     expected_policy_revision: u64,
     wrapper: &'a [u8],
@@ -9929,7 +10078,7 @@ fn require_event_page_final_send(
     reason = "authenticated source, page batch authority, and wrapper inputs stay explicit"
 )]
 fn prepare_event_page_custody(
-    mission: &mut MissionSession,
+    mission: &mut HybridMissionSession,
     exchanges: &mut CustodyExchangeSequence,
     transfer_id: EventTransferId,
     state: EventTransferState,
@@ -9984,7 +10133,7 @@ fn prepare_event_page_custody(
 
 fn prepare_loaded_event_page_entries(
     store: &Store,
-    mission: &mut MissionSession,
+    mission: &mut HybridMissionSession,
     exchanges: &mut CustodyExchangeSequence,
     loaded: Vec<LoadedEventPageEntry>,
 ) -> Result<PreparedEventPage, NodeError> {
@@ -10103,7 +10252,7 @@ fn require_event_page_entries_fit(
 impl PreparedOutboundCustody {
     fn build_offer(
         &self,
-        mission: &mut MissionSession,
+        mission: &mut HybridMissionSession,
         direction: EventDirection,
         transfer_id: EventTransferId,
         bytes: Vec<u8>,
@@ -10231,7 +10380,7 @@ struct OutboundCustodySource<'a> {
 
 fn prepare_outbound_custody(
     store: Arc<Store>,
-    mission: &MissionSession,
+    mission: &HybridMissionSession,
     source: OutboundCustodySource<'_>,
 ) -> Result<PreparedOutboundCustody, NodeError> {
     let OutboundCustodySource {
@@ -11952,7 +12101,7 @@ struct PreparedReceivedPageEntry<'a> {
 }
 
 struct ReceivedPageCustody<'a> {
-    mission: &'a mut MissionSession,
+    mission: &'a mut HybridMissionSession,
     expected_sender_policy_revision: u64,
     evidence: Option<&'a ChangePageCustody>,
 }
@@ -13438,7 +13587,7 @@ struct PreparedOutboundBlobClaim {
 fn authorize_outbound_blob_claim(
     store: &Store,
     guard: &EventLaneGuard,
-    mission: &MissionSession,
+    mission: &HybridMissionSession,
     snapshot: &AuthenticatedMutableSenderSnapshot,
     id: MutableTransferId,
     direction: EventDirection,
@@ -16385,6 +16534,23 @@ pub async fn start_node(config: NodeConfig) -> Result<RunningNode, NodeError> {
     start_node_with_forwarding(config, SelectedForwardingConfig::default()).await
 }
 
+/// Starts one durable selected node without binding an IP transport.
+///
+/// Local application operations remain available immediately. Ordered Event
+/// adapters may be attached later through [`RunningNode::ordered_event_contacts`].
+pub async fn start_transport_neutral_node(
+    config: TransportNeutralNodeConfig,
+) -> Result<RunningNode, NodeError> {
+    start_node_with_shutdown_ownership(
+        config.into_node_config(),
+        SelectedForwardingConfig::default(),
+        NodeOperatorOutput::process(NodeOperatorOutputPolicy::default()),
+        false,
+        true,
+    )
+    .await
+}
+
 /// Starts one selected node with explicit carrier, emission, and durable-admission policy.
 pub async fn start_node_with_forwarding(
     config: NodeConfig,
@@ -16417,7 +16583,7 @@ async fn start_node_with_forwarding_output(
     forwarding: SelectedForwardingConfig,
     output: NodeOperatorOutput,
 ) -> Result<RunningNode, NodeError> {
-    start_node_with_shutdown_ownership(config, forwarding, output, true).await
+    start_node_with_shutdown_ownership(config, forwarding, output, true, true).await
 }
 
 /// Starts a node whose shutdown is owned by its embedding supervisor.
@@ -16434,6 +16600,7 @@ pub async fn start_supervised_node_with_forwarding_and_output_policy(
         config,
         forwarding,
         NodeOperatorOutput::process(output_policy),
+        true,
         false,
     )
     .await
@@ -16443,6 +16610,7 @@ async fn start_node_with_shutdown_ownership(
     config: NodeConfig,
     forwarding: SelectedForwardingConfig,
     output: NodeOperatorOutput,
+    iroh_transport_enabled: bool,
     handle_sigint: bool,
 ) -> Result<RunningNode, NodeError> {
     let identity = config.mission.identity();
@@ -16475,6 +16643,12 @@ async fn start_node_with_shutdown_ownership(
     );
     let (control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
     let selected_controls = SelectedControlHandle::new(control_sender, identity, mission_authority);
+    let (ordered_event_contact_sender, ordered_event_contact_receiver) =
+        mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
+    let ordered_event_contacts = OrderedEventContactHandle {
+        sender: ordered_event_contact_sender,
+        admission: application_admission.clone(),
+    };
     let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
     let (ready_sender, ready_receiver) = oneshot::channel();
     let emission_policy = Arc::new(LiveEmissionPolicy::new(forwarding.emission_policy()));
@@ -16482,10 +16656,12 @@ async fn start_node_with_shutdown_ownership(
         application_receiver,
         application_admission.clone(),
         control_receiver,
+        ordered_event_contact_receiver,
         shutdown_receiver,
         ready_sender,
     );
     channels.handle_sigint = handle_sigint;
+    channels.iroh_transport_enabled = iroh_transport_enabled;
     #[cfg(test)]
     let contact_activity = channels.contact_activity.clone();
     let task = tokio::spawn(inherit_node_output(run_node_actor_with_forwarding_output(
@@ -16518,6 +16694,7 @@ async fn start_node_with_shutdown_ownership(
         selected_records,
         selected_blobs,
         selected_controls,
+        ordered_event_contacts,
         state_root: ready.state_root,
         application_admission,
         emission_policy,
@@ -16872,9 +17049,11 @@ struct EventOperationAuditTestControl {
 
 struct NodeActorChannels {
     handle_sigint: bool,
+    iroh_transport_enabled: bool,
     application_receiver: mpsc::Receiver<SelectedApplicationCommand>,
     application_admission: Arc<AtomicBool>,
     control_receiver: mpsc::Receiver<SelectedControlCommand>,
+    ordered_event_contact_receiver: mpsc::Receiver<OrderedEventContactCommand>,
     shutdown_receiver: mpsc::Receiver<()>,
     ready: oneshot::Sender<NodeReady>,
     #[cfg(test)]
@@ -17093,14 +17272,17 @@ impl NodeActorChannels {
         application_receiver: mpsc::Receiver<SelectedApplicationCommand>,
         application_admission: Arc<AtomicBool>,
         control_receiver: mpsc::Receiver<SelectedControlCommand>,
+        ordered_event_contact_receiver: mpsc::Receiver<OrderedEventContactCommand>,
         shutdown_receiver: mpsc::Receiver<()>,
         ready: oneshot::Sender<NodeReady>,
     ) -> Self {
         Self {
             application_receiver,
             handle_sigint: true,
+            iroh_transport_enabled: true,
             application_admission,
             control_receiver,
+            ordered_event_contact_receiver,
             shutdown_receiver,
             ready,
             #[cfg(test)]
@@ -17122,6 +17304,7 @@ async fn run_node_actor(
     let forwarding = SelectedForwardingConfig::default();
     let emission_policy = Arc::new(LiveEmissionPolicy::new(forwarding.emission_policy()));
     let (_control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
+    let (_ordered_sender, ordered_receiver) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
     run_node_actor_with_forwarding(
         config,
         forwarding,
@@ -17130,6 +17313,7 @@ async fn run_node_actor(
             application_receiver,
             application_admission,
             control_receiver,
+            ordered_receiver,
             shutdown_receiver,
             ready,
         ),
@@ -17177,9 +17361,11 @@ async fn run_node_actor_inner(
 ) -> Result<NodeReceipt, NodeError> {
     let NodeActorChannels {
         handle_sigint,
+        iroh_transport_enabled,
         mut application_receiver,
         application_admission,
         mut control_receiver,
+        mut ordered_event_contact_receiver,
         mut shutdown_receiver,
         ready,
         #[cfg(test)]
@@ -17187,6 +17373,16 @@ async fn run_node_actor_inner(
         #[cfg(all(test, unix))]
         mut test_control,
     } = channels;
+    let ready_reconciliation_classes = if iroh_transport_enabled {
+        READY_RECONCILIATION_CLASSES
+    } else {
+        ORDERED_EVENT_RECONCILIATION_CLASSES
+    };
+    let active_reconciliation_classes = if iroh_transport_enabled {
+        ACTIVE_RECONCILIATION_CLASSES
+    } else {
+        ORDERED_EVENT_RECONCILIATION_CLASSES
+    };
     let stop_deadline = config
         .run_for
         .map(|duration| {
@@ -17200,6 +17396,19 @@ async fn run_node_actor_inner(
     #[cfg(test)]
     run_pinned_state_root_test_hook(&config.state, &state_root.path);
     validate_forwarding_config(&forwarding)?;
+    if !iroh_transport_enabled {
+        if !config.peers.is_empty() || forwarding.controlled_relay.is_some() {
+            return Err(NodeError::Configuration(
+                "transport-neutral startup cannot configure Iroh peers or relay routing".into(),
+            ));
+        }
+        #[cfg(feature = "nearby-discovery")]
+        if forwarding.nearby_discovery.is_some() {
+            return Err(NodeError::Configuration(
+                "transport-neutral startup cannot configure Iroh nearby discovery".into(),
+            ));
+        }
+    }
     let (peer_missions, configured_peers) =
         configured_runtime_peers(&config, &forwarding, direct_peer_missions)?;
     let allowed = peer_missions.keys().copied().collect::<BTreeSet<_>>();
@@ -17399,43 +17608,64 @@ async fn run_node_actor_inner(
     }
     #[cfg(unix)]
     let zeroization_control = LocalZeroizationControl::bind_pinned(&state_root.path, &store_path)?;
-    let endpoint_config = EndpointConfig::direct(config.bind);
-    let endpoint = match &forwarding.controlled_relay {
-        Some(routing) if routing.relay_only => {
-            Endpoint::bind_relay_only(identity.secret()?, endpoint_config, routing.relay.clone())
+    let endpoint = if iroh_transport_enabled {
+        let endpoint_config = EndpointConfig::direct(config.bind);
+        Some(match &forwarding.controlled_relay {
+            Some(routing) if routing.relay_only => {
+                Endpoint::bind_relay_only(
+                    identity.secret()?,
+                    endpoint_config,
+                    routing.relay.clone(),
+                )
                 .await?
-        }
-        Some(routing) => {
-            Endpoint::bind_with_relay(identity.secret()?, endpoint_config, routing.relay.clone())
-                .await?
-        }
-        None => Endpoint::bind(identity.secret()?, endpoint_config).await?,
-    };
-    let relay_readiness = match &forwarding.controlled_relay {
-        Some(routing) if routing.relay_only => {
-            if let Err(error) = endpoint.wait_relay_ready().await {
-                endpoint.close().await;
-                return Err(error.into());
             }
-            "required-ready"
+            Some(routing) => {
+                Endpoint::bind_with_relay(
+                    identity.secret()?,
+                    endpoint_config,
+                    routing.relay.clone(),
+                )
+                .await?
+            }
+            None => Endpoint::bind(identity.secret()?, endpoint_config).await?,
+        })
+    } else {
+        None
+    };
+    let relay_readiness = if let Some(endpoint) = endpoint.as_ref() {
+        match &forwarding.controlled_relay {
+            Some(routing) if routing.relay_only => {
+                if let Err(error) = endpoint.wait_relay_ready().await {
+                    endpoint.close().await;
+                    return Err(error.into());
+                }
+                "required-ready"
+            }
+            Some(_) => "deferred",
+            None => "not-applicable",
         }
-        Some(_) => "deferred",
-        None => "not-applicable",
+    } else {
+        "disabled"
     };
     #[cfg(feature = "nearby-discovery")]
     let mut nearby_session = match forwarding.nearby_discovery.as_ref() {
-        Some(routing) if !routing.automatic => {
-            Some(endpoint.start_nearby_discovery_on_ipv4_interfaces(
-                routing.window,
-                routing.ipv4_interfaces.clone(),
-            )?)
-        }
+        Some(routing) if !routing.automatic => Some(
+            endpoint
+                .as_ref()
+                .expect("validated Iroh nearby transport")
+                .start_nearby_discovery_on_ipv4_interfaces(
+                    routing.window,
+                    routing.ipv4_interfaces.clone(),
+                )?,
+        ),
         _ => None,
     };
     #[cfg(feature = "nearby-discovery")]
     let mut automatic_browser = match forwarding.nearby_discovery.as_ref() {
         Some(routing) if routing.automatic => Some(
             endpoint
+                .as_ref()
+                .expect("validated Iroh nearby transport")
                 .start_nearby_browser_on_ipv4_interfaces(
                     routing.window,
                     routing.ipv4_interfaces.clone(),
@@ -17467,7 +17697,9 @@ async fn run_node_actor_inner(
     #[cfg(not(feature = "nearby-discovery"))]
     let _automatic_event_sender_guard = automatic_event_sender;
     let (zeroization_sender, mut zeroization_receiver) = mpsc::channel(1);
-    let bound_sockets = endpoint.bound_sockets();
+    let bound_sockets = endpoint
+        .as_ref()
+        .map_or_else(Vec::new, Endpoint::bound_sockets);
     let sockets = if bound_sockets.is_empty() {
         "none".into()
     } else {
@@ -17477,21 +17709,25 @@ async fn run_node_actor_inner(
             .collect::<Vec<_>>()
             .join(",")
     };
-    let (carrier_route, relay_url, relay_trust) = match &forwarding.controlled_relay {
-        Some(routing) => (
-            if routing.relay_only {
-                "controlled-relay-only"
-            } else {
-                "direct-plus-controlled-relay"
-            },
-            routing.relay.url().to_string(),
-            if routing.relay.ca_roots_der().is_empty() {
-                "embedded-webpki"
-            } else {
-                "explicit-der-roots"
-            },
-        ),
-        None => ("direct", "none".into(), "none"),
+    let (carrier_route, relay_url, relay_trust) = if !iroh_transport_enabled {
+        ("none", "none".into(), "none")
+    } else {
+        match &forwarding.controlled_relay {
+            Some(routing) => (
+                if routing.relay_only {
+                    "controlled-relay-only"
+                } else {
+                    "direct-plus-controlled-relay"
+                },
+                routing.relay.url().to_string(),
+                if routing.relay.ca_roots_der().is_empty() {
+                    "embedded-webpki"
+                } else {
+                    "explicit-der-roots"
+                },
+            ),
+            None => ("direct", "none".into(), "none"),
+        }
     };
     #[cfg(feature = "nearby-discovery")]
     let carrier_route = match forwarding.nearby_discovery.as_ref() {
@@ -17558,7 +17794,7 @@ async fn run_node_actor_inner(
             0
         },
         provisioning_origin,
-        READY_RECONCILIATION_CLASSES,
+        ready_reconciliation_classes,
         if event_bridge.is_some() {
             "enabled-static-v6"
         } else {
@@ -17593,7 +17829,10 @@ async fn run_node_actor_inner(
         let control = nearby_discovery_stop
             .clone()
             .expect("automatic browser has stop control");
-        let endpoint = endpoint.clone();
+        let endpoint = endpoint
+            .as_ref()
+            .expect("validated automatic nearby transport")
+            .clone();
         Some(tokio::spawn(inherit_node_output(
             run_automatic_nearby_discovery(
                 endpoint,
@@ -17811,6 +18050,7 @@ async fn run_node_actor_inner(
     let mut application_commands_since_yield = 0usize;
     let mut event_publication_group_sequence = 0u64;
     let mut network_events_since_application = 0usize;
+    let mut ordered_event_contact_yield_required = false;
     let mut inbound: JoinSet<(EndpointId, Result<CompletedPeerContact, NodeError>)> =
         JoinSet::new();
     let mut inbound_peers = BTreeSet::new();
@@ -17822,6 +18062,8 @@ async fn run_node_actor_inner(
     let mut outbound_tasks = BTreeMap::<TaskId, ContactTaskMetadata>::new();
     let mut outbound_abort_handles = BTreeMap::<EndpointId, (TaskId, AbortHandle)>::new();
     let mut collision_aborted_outbound = BTreeSet::<TaskId>::new();
+    let mut ordered_event_contacts: JoinSet<OrderedEventContactTaskOutput> = JoinSet::new();
+    let mut ordered_event_contacts_open = owner_ready;
     let non_preferred_fallback_delay = non_preferred_contact_fallback_delay(config.sync_interval);
     let contact_election_started = Instant::now();
     let mut peer_contact_activity = configured_peers
@@ -17847,13 +18089,16 @@ async fn run_node_actor_inner(
     // cancellation on accept-only nodes.
     let (accepted_sender, mut accepted_receiver) = mpsc::channel(1);
     #[cfg(feature = "nearby-discovery")]
-    let accept_enabled = !allowed.is_empty() || automatic_nearby;
+    let accept_enabled = endpoint.is_some() && (!allowed.is_empty() || automatic_nearby);
     #[cfg(not(feature = "nearby-discovery"))]
-    let accept_enabled = !allowed.is_empty();
+    let accept_enabled = endpoint.is_some() && !allowed.is_empty();
     let mut accept_task = if !owner_ready || !accept_enabled {
         None
     } else {
-        let endpoint = endpoint.clone();
+        let endpoint = endpoint
+            .as_ref()
+            .expect("enabled Iroh acceptance has an endpoint")
+            .clone();
         let allowed = allowed.clone();
         #[cfg(feature = "nearby-discovery")]
         let automatic = automatic_nearby;
@@ -17967,6 +18212,15 @@ async fn run_node_actor_inner(
             {
                 application_tick_pending = true;
             }
+            let ordered_event_contact_must_yield =
+                std::mem::take(&mut ordered_event_contact_yield_required);
+            let ordered_event_contact_can_progress = audit_can_progress
+                && !ordered_event_contact_must_yield
+                && !control_yield_required
+                && !discovery_yield_required
+                && !emission_policy_yield_required
+                && !(application_tick_pending && application_tick_yield_required)
+                && network_events_since_application < NETWORK_EVENT_BUDGET;
             tokio::select! {
             biased;
             zeroization = zeroization_receiver.recv() => {
@@ -18039,6 +18293,219 @@ async fn run_node_actor_inner(
             }
             _ = shutdown_receiver.recv() => break,
             _ = &mut stop => break,
+            command = ordered_event_contact_receiver.recv(),
+                if ordered_event_contacts_open
+                    && ordered_event_contacts.len() < ORDERED_EVENT_CONTACT_CAPACITY
+                    && ordered_event_contact_can_progress => {
+                let yield_for_network = command.is_some()
+                    && account_network_event(&mut network_events_since_application);
+                match command {
+                    Some(command) => {
+                        ordered_event_contact_yield_required = true;
+                        if command.response.is_closed() {
+                            command.contact.close();
+                            continue;
+                        }
+                        let mission_peer = command.peer.mission_id();
+                        if !selected_event_status.configured_peers.contains(&mission_peer) {
+                            if selected_event_status.configured_peers.len()
+                                >= MAX_CONFIGURED_PEERS
+                            {
+                                receipt.contact_errors = receipt.contact_errors.saturating_add(1);
+                                command.contact.close();
+                                let _ = command.response.send(Err(NodeError::Protocol(
+                                    "ordered Event mission roster capacity exhausted".into(),
+                                )));
+                                continue;
+                            }
+                            // Submission through the bounded handle is the
+                            // explicit in-process roster admission for this
+                            // fixed-role contact.
+                            selected_event_status.configured_peers.insert(mission_peer);
+                        }
+                        let store = store.clone();
+                        let credentials = config.mission.clone();
+                        let policy_lock = policy_lock.clone();
+                        let live_policy = emission_policy.clone();
+                        let custody_clock = custody_clock.clone();
+                        let event_route_cache = event_route_cache.clone();
+                        let event_inserted = Arc::new(AtomicBool::new(false));
+                        ordered_event_contacts.spawn(inherit_node_output(async move {
+                            let OrderedEventContactCommand {
+                                role,
+                                contact,
+                                peer,
+                                mut response,
+                            } = command;
+                            let _close = OrderedEventContactCloseGuard(Some(contact.clone()));
+                            let contact = SelectedContact::from_ordered(contact);
+                            let session = async {
+                                if matches!(role, OrderedEventContactRole::Initiator) {
+                                    drive_custody_maintenance(&store, &custody_clock, &[])?;
+                                }
+                                let captured = live_policy.snapshot()?;
+                                if matches!(role, OrderedEventContactRole::Initiator)
+                                    && !captured.policy.permits_contact_initiation()
+                                {
+                                    return Err(NodeError::Protocol(
+                                        "receive-only policy cannot initiate a carrier contact"
+                                            .into(),
+                                    ));
+                                }
+                                let guard = ContactEmissionGuard {
+                                    live: live_policy,
+                                    captured,
+                                    custody_clock: custody_clock.clone(),
+                                };
+                                let session = async {
+                                    match role {
+                                        OrderedEventContactRole::Initiator => {
+                                            sync_ordered_event_session(
+                                                store,
+                                                contact,
+                                                credentials,
+                                                peer,
+                                                policy_lock,
+                                                MutableSourceInterests::default(),
+                                            )
+                                            .await
+                                        }
+                                        OrderedEventContactRole::Responder => {
+                                            serve_ordered_event_session(
+                                                store,
+                                                contact,
+                                                credentials,
+                                                peer,
+                                                custody_clock,
+                                                policy_lock,
+                                                MutableSourceInterests::default(),
+                                            )
+                                            .await
+                                        }
+                                    }
+                                };
+                                with_authenticated_contact_progress_deadline(
+                                    CONTACT_EVENT_INSERTED.scope(
+                                        event_inserted,
+                                        CONTACT_EVENT_ROUTE_CACHE.scope(
+                                            event_route_cache,
+                                            CONTACT_EMISSION_GUARD.scope(guard, session),
+                                        ),
+                                    ),
+                                )
+                                .await
+                                .map_err(|()| {
+                                    NodeError::Protocol(
+                                        "ordered contact exceeded its authenticated-progress deadline"
+                                            .into(),
+                                    )
+                                })?
+                            };
+                            let result = tokio::select! {
+                                biased;
+                                _ = response.closed() => Err(NodeError::Protocol(
+                                    "ordered Event contact caller cancelled the session".into(),
+                                )),
+                                result = session => result,
+                            };
+                            (role, response, result)
+                        }));
+                    }
+                    None => ordered_event_contacts_open = false,
+                }
+                if yield_for_network {
+                    tokio::task::yield_now().await;
+                }
+            }
+            completed = ordered_event_contacts.join_next(),
+                if !ordered_event_contacts.is_empty()
+                    && ordered_event_contact_can_progress => {
+                let yield_for_network = completed.is_some()
+                    && account_network_event(&mut network_events_since_application);
+                if completed.is_some() {
+                    ordered_event_contact_yield_required = true;
+                }
+                match completed {
+                    Some(Ok((role, response, Ok(completed)))) => {
+                        let accounting = selected_event_status
+                            .record(&completed)
+                            .and_then(|()| {
+                                account_data_receipt(&mut receipt, &completed.receipt)
+                            })
+                            .and_then(|()| {
+                                account_blob_receipt(&mut receipt, &completed.receipt)
+                            })
+                            .and_then(|()| {
+                                account_path_receipt(&mut receipt, &completed.receipt)
+                            });
+                        if let Err(error) = accounting {
+                            let _ = response.send(Err(NodeError::Protocol(
+                                "ordered contact accounting failed".into(),
+                            )));
+                            fatal_error = Some(error);
+                            break;
+                        }
+                        let peer_receipt = completed.receipt;
+                        receipt.contacts = match receipt.contacts.checked_add(1) {
+                            Some(contacts) => contacts,
+                            None => {
+                                let _ = response.send(Err(NodeError::Protocol(
+                                    "aggregate ordered contact count overflow".into(),
+                                )));
+                                fatal_error = Some(NodeError::Protocol(
+                                    "aggregate contact count overflow".into(),
+                                ));
+                                break;
+                            }
+                        };
+                        node_stdout!(
+                            "CONTACT direction={} carrier=ordered mission_peer={} offered={} fetched={} inserted={} duplicates={} transfer_profiles={} transfer_profile_digest={} status={}",
+                            match role {
+                                OrderedEventContactRole::Initiator => "out",
+                                OrderedEventContactRole::Responder => "in",
+                            },
+                            format_node_id(peer_receipt.mission_peer.expect(
+                                "successful ordered mission contact has peer identity"
+                            )),
+                            peer_receipt.offered,
+                            peer_receipt.fetched,
+                            peer_receipt.inserted,
+                            peer_receipt.duplicates,
+                            format_transfer_profiles(peer_receipt.negotiated_transfer_profiles),
+                            format_transfer_profile_digest(peer_receipt.transfer_profile_digest),
+                            contact_status(&peer_receipt),
+                        );
+                        let _ = response.send(Ok(peer_receipt));
+                    }
+                    Some(Ok((_role, response, Err(error)))) => {
+                        receipt.contact_errors = receipt.contact_errors.saturating_add(1);
+                        if actor_fatal_contact_error(&error, config.mission.identity()) {
+                            let _ = response.send(Err(NodeError::Protocol(
+                                "ordered contact encountered a fatal local authorization error"
+                                    .into(),
+                            )));
+                            fatal_error = Some(error);
+                            break;
+                        }
+                        node_stderr!(
+                            "CONTACT carrier=ordered status=error error={}",
+                            format_receipt_field(&error.to_string())
+                        );
+                        let _ = response.send(Err(error));
+                    }
+                    Some(Err(error)) => {
+                        receipt.contact_errors = receipt.contact_errors.saturating_add(1);
+                        node_stderr!(
+                            "CONTACT carrier=ordered status=error error={}",
+                            format_receipt_field(&format!("task failed: {error}"))
+                        );
+                    }
+                    None => {}
+                }
+                if yield_for_network {
+                    tokio::task::yield_now().await;
+                }
+            }
             completed = async {
                 blob_maintenance_task
                     .as_mut()
@@ -18516,7 +18983,10 @@ async fn run_node_actor_inner(
                     let previous_activity = *last_activity;
                     *last_activity = election_now;
                     let store = store.clone();
-                    let endpoint = endpoint.clone();
+                    let endpoint = endpoint
+                        .as_ref()
+                        .expect("configured Iroh peer has an endpoint")
+                        .clone();
                     let policy_lock = policy_lock.clone();
                     let emission_policy = emission_policy.clone();
                     let custody_clock = custody_clock.clone();
@@ -19222,6 +19692,7 @@ async fn run_node_actor_inner(
             }
             _ = tokio::task::yield_now(),
                 if !audit_can_progress
+                    || ordered_event_contact_must_yield
                     || control_yield_required
                     || discovery_yield_required
                     || emission_policy_yield_required
@@ -19241,6 +19712,7 @@ async fn run_node_actor_inner(
     audit_progress_receiver.close();
     application_receiver.close();
     control_receiver.close();
+    ordered_event_contact_receiver.close();
     pending_control_lease.take();
     if let Some(command) = pending_application_command.take() {
         command.reject();
@@ -19253,6 +19725,12 @@ async fn run_node_actor_inner(
     }
     while let Ok(command) = control_receiver.try_recv() {
         command.reject();
+    }
+    while let Ok(command) = ordered_event_contact_receiver.try_recv() {
+        command.contact.close();
+        let _ = command.response.send(Err(NodeError::Protocol(
+            "ordered Event contact admission closed during shutdown".into(),
+        )));
     }
     if let Some(task) = audit_task.take() {
         let _ = task.await;
@@ -19284,8 +19762,10 @@ async fn run_node_actor_inner(
     drop(accepted_receiver);
     inbound.shutdown().await;
     outbound.shutdown().await;
-    endpoint.close().await;
-    drop(endpoint);
+    ordered_event_contacts.shutdown().await;
+    if let Some(endpoint) = endpoint {
+        endpoint.close().await;
+    }
     drop(application);
     drop(state_application);
     drop(record_application);
@@ -19485,7 +19965,7 @@ async fn run_node_actor_inner(
         receipt.blob_remaining,
         receipt.blob_deferred,
         provisioning_origin,
-        ACTIVE_RECONCILIATION_CLASSES,
+        active_reconciliation_classes,
     );
     Ok(receipt)
 }
@@ -19674,19 +20154,19 @@ async fn sync_session(
             event_route_cache,
             CONTACT_EMISSION_GUARD.scope(
                 guard,
-                sync_authenticated_session(
+                Box::pin(sync_authenticated_session(
                     SelectedContact::from_iroh(connection.clone()),
                     OutboundAuthenticatedSession {
                         store,
                         credentials,
-                        peer,
+                        peer: OutboundMissionPeer::Iroh(peer),
                         #[cfg(feature = "nearby-discovery")]
                         automatic_admission,
                         policy_lock,
                         event_bridge,
                         mutable_interests,
                     },
-                ),
+                )),
             ),
         )
         .await;
@@ -20620,7 +21100,7 @@ fn event_lane_remaining_since(
 
 async fn finish_v3_event_lane(
     connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    mission: &mut HybridMissionSession,
     direction: EventDirection,
     remaining: u64,
     receipt: &mut PeerReceipt,
@@ -20651,7 +21131,7 @@ async fn finish_v3_event_lane(
 struct V3OfferIo<'a> {
     store: Arc<Store>,
     connection: &'a aster_iroh::Connection,
-    mission: &'a mut MissionSession,
+    mission: &'a mut HybridMissionSession,
     event_guard: &'a EventLaneGuard,
     exchanges: &'a mut CustodyExchangeSequence,
     receipt: &'a mut PeerReceipt,
@@ -21458,6 +21938,8 @@ enum SelectedEventReceiveTurn<'a> {
     },
 }
 
+const SELECTED_EVENT_FRAME_LENGTH_BYTES: usize = std::mem::size_of::<u32>();
+
 async fn open_selected_event_send_turn(
     contact: &SelectedContact,
     wire_budget: usize,
@@ -21512,7 +21994,12 @@ impl SelectedEventSendTurn<'_> {
                         "ordered Event turn frame must be nonempty".into(),
                     ));
                 }
-                if frame.len() > *remaining_bytes {
+                let encoded_bytes = SELECTED_EVENT_FRAME_LENGTH_BYTES
+                    .checked_add(frame.len())
+                    .ok_or_else(|| {
+                        NodeError::Protocol("ordered Event frame length overflow".into())
+                    })?;
+                if encoded_bytes > *remaining_bytes {
                     return Err(NodeError::Protocol(
                         "ordered Event turn exceeds its carrier byte budget".into(),
                     ));
@@ -21555,7 +22042,7 @@ impl SelectedEventSendTurn<'_> {
                         "ordered Event frame acknowledgement must be empty".into(),
                     ));
                 }
-                *remaining_bytes -= frame.len();
+                *remaining_bytes -= encoded_bytes;
                 Ok(())
             }
         }
@@ -21579,7 +22066,7 @@ impl SelectedEventReceiveTurn<'_> {
             } => {
                 let received = Arc::new(StdMutex::new(None));
                 let received_for_handler = Arc::clone(&received);
-                let byte_limit = *remaining_bytes;
+                let byte_limit = remaining_bytes.saturating_sub(SELECTED_EVENT_FRAME_LENGTH_BYTES);
                 let complete = contact
                     .respond_once_with_total_limit(
                         byte_limit,
@@ -21612,7 +22099,12 @@ impl SelectedEventReceiveTurn<'_> {
                     .ok_or_else(|| {
                         NodeError::Protocol("ordered Event exchange omitted its request".into())
                     })?;
-                *remaining_bytes = remaining_bytes.checked_sub(frame.len()).ok_or_else(|| {
+                let encoded_bytes = SELECTED_EVENT_FRAME_LENGTH_BYTES
+                    .checked_add(frame.len())
+                    .ok_or_else(|| {
+                        NodeError::Protocol("ordered Event frame length overflow".into())
+                    })?;
+                *remaining_bytes = remaining_bytes.checked_sub(encoded_bytes).ok_or_else(|| {
                     NodeError::Protocol("ordered Event turn exceeds its carrier byte budget".into())
                 })?;
                 Ok(Some(frame))
@@ -21642,7 +22134,7 @@ impl SelectedEventReceiveTurn<'_> {
 async fn write_v7_event_turn_frame_checked<F>(
     turn: &mut SelectedEventSendTurn<'_>,
     store: &Store,
-    mission: &mut MissionSession,
+    mission: &mut HybridMissionSession,
     event_guard: &EventLaneGuard,
     profiles: &V7TransferProfiles,
     direction: EventDirection,
@@ -21697,7 +22189,7 @@ where
 async fn write_v7_event_turn_frame(
     turn: &mut SelectedEventSendTurn<'_>,
     store: &Store,
-    mission: &mut MissionSession,
+    mission: &mut HybridMissionSession,
     event_guard: &EventLaneGuard,
     profiles: &V7TransferProfiles,
     direction: EventDirection,
@@ -21727,7 +22219,7 @@ async fn write_v7_event_turn_frame(
 async fn read_v7_event_turn_frame(
     turn: &mut SelectedEventReceiveTurn<'_>,
     store: &Store,
-    mission: &mut MissionSession,
+    mission: &mut HybridMissionSession,
     event_guard: &EventLaneGuard,
     profiles: &V7TransferProfiles,
     direction: EventDirection,
@@ -21771,7 +22263,7 @@ async fn read_v7_event_turn_frame(
 async fn write_change_page<F>(
     turn: &mut SelectedEventSendTurn<'_>,
     store: &Store,
-    mission: &mut MissionSession,
+    mission: &mut HybridMissionSession,
     event_guard: &EventLaneGuard,
     profiles: &V7TransferProfiles,
     direction: EventDirection,
@@ -21891,7 +22383,7 @@ fn revalidate_event_page_schedule(
 async fn send_event_page_turn(
     store: &Store,
     contact: &SelectedContact,
-    mission: &mut MissionSession,
+    mission: &mut HybridMissionSession,
     event_verifier: &mut ReferenceEnvelopeSealer,
     lane: DirectedEventLane<'_>,
     profiles: &V7TransferProfiles,
@@ -21949,7 +22441,7 @@ async fn send_event_page_turn(
     let mut turn =
         open_selected_event_send_turn(contact, event_turn_wire_budget(receipt, reserve)?).await?;
     let digest = schedule_digest(&built.scheduled);
-    let authenticated_peer = mission.peer().mission_id();
+    let authenticated_peer = mission.peer_observation().mission_id();
     let peer_route_commitments = mission.peer_route_grant_commitments().to_vec();
     write_v7_event_turn_frame_checked(
         &mut turn,
@@ -22187,7 +22679,7 @@ async fn send_event_page_turn(
 async fn receive_event_page_turn(
     store: &Store,
     contact: &SelectedContact,
-    mission: &mut MissionSession,
+    mission: &mut HybridMissionSession,
     event_verifier: &mut ReferenceEnvelopeSealer,
     lane: DirectedEventLane<'_>,
     profiles: &V7TransferProfiles,
@@ -22284,7 +22776,7 @@ async fn receive_event_page_turn(
         ));
     }
 
-    let authenticated_peer = mission.peer().mission_id();
+    let authenticated_peer = mission.peer_observation().mission_id();
     let peer_route_commitments = mission.peer_route_grant_commitments().to_vec();
     let mut consumed = 0usize;
     let mut page_count = 0usize;
@@ -22476,7 +22968,7 @@ struct EventTransferLaneContext<'io, 'lane> {
     store: &'io Store,
     lease_store: Arc<Store>,
     contact: &'io SelectedContact,
-    mission: &'io mut MissionSession,
+    mission: &'io mut HybridMissionSession,
     event_verifier: &'io mut ReferenceEnvelopeSealer,
     lane: DirectedEventLane<'lane>,
     remote_emission: EmissionPolicySnapshot,
@@ -22489,6 +22981,13 @@ fn skip_selected_event_turn(contact: &SelectedContact) -> Result<(), NodeError> 
         connection.skip_uni_turn()?;
     }
     Ok(())
+}
+
+fn selected_event_max_frame_bytes(contact: &SelectedContact) -> usize {
+    contact.iroh().map_or_else(
+        || contact.max_frame_bytes(),
+        |iroh| iroh.max_uni_frame_bytes(),
+    )
 }
 
 async fn sync_event_transfer_lane_planned(
@@ -22832,7 +23331,7 @@ async fn sync_event_transfer_lane_inner(
         receiver_selector_revision,
         direction,
     } = lane;
-    let authenticated_peer = mission.peer().mission_id();
+    let authenticated_peer = mission.peer_observation().mission_id();
     let peer_route_commitments = mission.peer_route_grant_commitments().to_vec();
     let semantic_v3 = mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION;
     let post_event_semantic = (supports_mutable_semantic(mission.semantic_version())
@@ -24105,8 +24604,8 @@ impl MutableFetchSettlement {
 }
 
 async fn defer_mutable_lane(
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     class: MutableClass,
     direction: EventDirection,
     receipt: &mut PeerReceipt,
@@ -24151,8 +24650,8 @@ async fn defer_mutable_lane(
 }
 
 async fn defer_mutable_lane_from_reserved_class_skip(
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     class: MutableClass,
     direction: EventDirection,
     receipt: &mut PeerReceipt,
@@ -24179,8 +24678,8 @@ enum MutableReconciliationOutcome {
 }
 
 async fn sync_mutable_interests(
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     class: MutableClass,
     local_interest: &EventInterest,
     full_class: bool,
@@ -24230,8 +24729,8 @@ async fn sync_mutable_interests(
 }
 
 async fn sync_blob_interests(
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     local_interest: &BlobInterest,
     full_class: bool,
     receipt: &mut PeerReceipt,
@@ -24269,8 +24768,8 @@ async fn sync_blob_interests(
 
 async fn sync_mutable_reconciliation_lane(
     store: &Store,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
     lane: DirectedMutableLane<'_>,
     receipt: &mut PeerReceipt,
@@ -24291,7 +24790,7 @@ async fn sync_mutable_reconciliation_lane(
             verifier,
             receiver_interest,
             Some((
-                mission.peer().mission_id(),
+                mission.peer_observation().mission_id(),
                 mission.peer_route_grant_commitments(),
             )),
         )?,
@@ -26492,8 +26991,8 @@ fn serve_verified_blob_range_in_schedule(
 
 async fn sync_mutable_transfer_lane(
     store: &Store,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
     lane: DirectedMutableLane<'_>,
     difference: &MutableDifference,
@@ -26509,7 +27008,7 @@ async fn sync_mutable_transfer_lane(
         blob_contact_mode,
     } = lane;
     difference.validate(class)?;
-    let peer = mission.peer().mission_id();
+    let peer = mission.peer_observation().mission_id();
     let commitments = mission.peer_route_grant_commitments().to_vec();
     let capacity = mutable_transfer_capacity(receipt, semantic_version, class, direction)?;
     let mut cursor = store.mutable_transfer_cursor(
@@ -26787,8 +27286,8 @@ async fn sync_mutable_transfer_lane(
 
 async fn sync_mutable_class(
     store: &Store,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
     contact: MutableClassContact<'_>,
     receipt: &mut PeerReceipt,
@@ -26914,10 +27413,28 @@ async fn sync_mutable_class(
     })
 }
 
-async fn sync_mutable_classes(
+fn sync_mutable_classes<'a>(
+    store: &'a Store,
+    selected_contact: &'a SelectedContact,
+    mission: &'a mut HybridMissionSession,
+    verifier: &'a mut ReferenceEnvelopeSealer,
+    contact: MutableClassesContact<'a>,
+    receipt: &'a mut PeerReceipt,
+) -> Pin<Box<dyn Future<Output = Result<(), NodeError>> + Send + 'a>> {
+    Box::pin(sync_mutable_classes_inner(
+        store,
+        selected_contact,
+        mission,
+        verifier,
+        contact,
+        receipt,
+    ))
+}
+
+async fn sync_mutable_classes_inner(
     store: &Store,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    selected_contact: &SelectedContact,
+    mission: &mut HybridMissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
     contact: MutableClassesContact<'_>,
     receipt: &mut PeerReceipt,
@@ -26939,7 +27456,7 @@ async fn sync_mutable_classes(
         }
         let exchanged = sync_mutable_class(
             store,
-            connection,
+            selected_contact,
             mission,
             verifier,
             MutableClassContact {
@@ -26956,6 +27473,7 @@ async fn sync_mutable_classes(
         }
     }
     if let Some((local, peer)) = blob_interests {
+        let connection = selected_contact.require_iroh()?;
         let blob_contact_mode = blob_contact_mode.ok_or_else(|| {
             NodeError::Protocol("legacy Blob interests entered the profile-5 stream lane".into())
         })?;
@@ -27058,11 +27576,11 @@ fn bridge_runtime_error(operation: &'static str, error: impl fmt::Display) -> No
 
 async fn send_selected_event_bridge_routes(
     connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    mission: &mut HybridMissionSession,
     bridge: &SelectedEventBridgeHandle,
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
-    let authenticated_peer = mission.peer().mission_id();
+    let authenticated_peer = mission.peer_observation().mission_id();
     let route_limit = event_bridge_route_send_limit(mission.semantic_version());
     let batch = {
         let peer_route_grant_commitments = mission.peer_route_grant_commitments();
@@ -27158,7 +27676,7 @@ async fn send_selected_event_bridge_routes(
 
 async fn receive_selected_event_bridge_routes(
     connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    mission: &mut HybridMissionSession,
     bridge: &SelectedEventBridgeHandle,
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
@@ -27257,7 +27775,7 @@ async fn receive_selected_event_bridge_routes(
 
 async fn sync_selected_event_bridge(
     connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    mission: &mut HybridMissionSession,
     bridge: Option<&SelectedEventBridgeHandle>,
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
@@ -27291,7 +27809,7 @@ async fn sync_selected_event_bridge(
 
 async fn serve_selected_event_bridge(
     connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    mission: &mut HybridMissionSession,
     bridge: Option<&SelectedEventBridgeHandle>,
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
@@ -27781,7 +28299,7 @@ struct Profile5BlobSendDirection<'a> {
 
 async fn send_profile5_blob_direction(
     context: Profile5BlobSendDirection<'_>,
-    mission: &mut MissionSession,
+    mission: &mut HybridMissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
     receipt: &mut PeerReceipt,
 ) -> Result<(), NodeError> {
@@ -27794,7 +28312,7 @@ async fn send_profile5_blob_direction(
         direction,
     } = context;
     guard.check(&store)?;
-    let peer = mission.peer().mission_id();
+    let peer = mission.peer_observation().mission_id();
     let selected = next_canonical_blob_publication(
         &store,
         guard.policy(),
@@ -27911,7 +28429,7 @@ async fn send_profile5_blob_direction(
 async fn receive_profile5_blob_direction(
     store: Arc<Store>,
     connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    mission: &mut HybridMissionSession,
     profiles: &V7TransferProfiles,
     guard: &EventLaneGuard,
     verifier: &mut ReferenceEnvelopeSealer,
@@ -27977,7 +28495,7 @@ async fn receive_profile5_blob_direction(
         .selector(&source.topic, &source.scope)
         .filter(|selector| selector.epoch() == source.key_epoch)
         .ok_or_else(|| NodeError::Protocol("accepted Blob offer lost local interest".into()))?;
-    let peer = mission.peer().mission_id();
+    let peer = mission.peer_observation().mission_id();
     if !verifier.peer_can_route(
         peer,
         mission.peer_route_grant_commitments(),
@@ -28029,7 +28547,7 @@ async fn sync_profile5_blob_lane_if_selected(
     store: &Store,
     lease_store: Arc<Store>,
     connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    mission: &mut HybridMissionSession,
     profiles: Option<&V7TransferProfiles>,
     mode: BlobTransferMode,
     guard: &EventLaneGuard,
@@ -28086,7 +28604,7 @@ async fn sync_profile5_blob_lane_if_selected(
 async fn serve_profile5_blob_lane_if_selected(
     store: Arc<Store>,
     connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    mission: &mut HybridMissionSession,
     profiles: Option<&V7TransferProfiles>,
     mode: BlobTransferMode,
     guard: &EventLaneGuard,
@@ -28288,7 +28806,7 @@ async fn serve_event_turn_plans(
 struct OutboundAuthenticatedSession {
     store: Arc<Store>,
     credentials: UnprotectedReferenceMission,
-    peer: ContactPeer,
+    peer: OutboundMissionPeer,
     #[cfg(feature = "nearby-discovery")]
     automatic_admission: Option<AutomaticNearbyAdmission>,
     policy_lock: Arc<RwLock<()>>,
@@ -28296,10 +28814,205 @@ struct OutboundAuthenticatedSession {
     mutable_interests: MutableSourceInterests,
 }
 
+enum OutboundMissionPeer {
+    Iroh(ContactPeer),
+    Ordered(MissionPeerExpectation),
+}
+
+struct IrohPostEventContext {
+    store: Arc<Store>,
+    contact: SelectedContact,
+    mission: HybridMissionSession,
+    profiles: Option<V7TransferProfiles>,
+    blob_transfer_mode: BlobTransferMode,
+    event_guard: EventLaneGuard,
+    event_verifier: ReferenceEnvelopeSealer,
+    mutable_interests: MutableSourceInterests,
+    event_bridge: Option<SelectedEventBridgeHandle>,
+    run_event_bridge: bool,
+    local_emission_enabled: bool,
+    remote_emission_enabled: bool,
+    receipt: PeerReceipt,
+}
+
+enum EventSessionOutcome {
+    Completed(Box<CompletedPeerContact>),
+    IrohPostEvent(Box<IrohPostEventContext>),
+}
+
+fn sync_iroh_post_event(
+    context: Box<IrohPostEventContext>,
+) -> Pin<Box<dyn Future<Output = Result<CompletedPeerContact, NodeError>> + Send>> {
+    Box::pin(async move {
+        let IrohPostEventContext {
+            store,
+            contact,
+            mut mission,
+            profiles,
+            blob_transfer_mode,
+            event_guard,
+            mut event_verifier,
+            mutable_interests,
+            event_bridge,
+            run_event_bridge,
+            local_emission_enabled,
+            remote_emission_enabled,
+            mut receipt,
+        } = *context;
+        let mutable_contact = MutableClassesContact {
+            guard: &event_guard,
+            interests: &mutable_interests,
+            blob_contact_mode: blob_transfer_mode.legacy(),
+        };
+        if remote_emission_enabled {
+            sync_mutable_classes(
+                &store,
+                &contact,
+                &mut mission,
+                &mut event_verifier,
+                mutable_contact,
+                &mut receipt,
+            )
+            .await?;
+        }
+        let connection = contact.require_iroh()?;
+        sync_profile5_blob_lane_if_selected(
+            &store,
+            Arc::clone(&store),
+            connection,
+            &mut mission,
+            profiles.as_ref(),
+            blob_transfer_mode,
+            &event_guard,
+            event_verifier,
+            &mutable_interests,
+            local_emission_enabled,
+            remote_emission_enabled,
+            &mut receipt,
+        )
+        .await?;
+        if run_event_bridge {
+            sync_selected_event_bridge(
+                connection,
+                &mut mission,
+                event_bridge.as_ref(),
+                &mut receipt,
+            )
+            .await?;
+        }
+        event_guard.check(&store)?;
+        let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
+        let completed = complete_peer_contact(&contact, receipt, event_policy);
+        contact.finish_as_initiator().await?;
+        Ok(completed)
+    })
+}
+
+fn serve_iroh_post_event(
+    context: Box<IrohPostEventContext>,
+) -> Pin<Box<dyn Future<Output = Result<CompletedPeerContact, NodeError>> + Send>> {
+    Box::pin(async move {
+        let IrohPostEventContext {
+            store,
+            contact,
+            mut mission,
+            profiles,
+            blob_transfer_mode,
+            event_guard,
+            mut event_verifier,
+            mutable_interests,
+            event_bridge,
+            run_event_bridge,
+            local_emission_enabled,
+            remote_emission_enabled,
+            mut receipt,
+        } = *context;
+        let mutable_contact = MutableClassesContact {
+            guard: &event_guard,
+            interests: &mutable_interests,
+            blob_contact_mode: blob_transfer_mode.legacy(),
+        };
+        if local_emission_enabled {
+            serve_mutable_classes(
+                &store,
+                &contact,
+                &mut mission,
+                &mut event_verifier,
+                mutable_contact,
+                &mut receipt,
+            )
+            .await?;
+        }
+        let connection = contact.require_iroh()?;
+        serve_profile5_blob_lane_if_selected(
+            Arc::clone(&store),
+            connection,
+            &mut mission,
+            profiles.as_ref(),
+            blob_transfer_mode,
+            &event_guard,
+            event_verifier,
+            &mutable_interests,
+            remote_emission_enabled,
+            local_emission_enabled,
+            &mut receipt,
+        )
+        .await?;
+        if run_event_bridge {
+            serve_selected_event_bridge(
+                connection,
+                &mut mission,
+                event_bridge.as_ref(),
+                &mut receipt,
+            )
+            .await?;
+        }
+        event_guard.check(&store)?;
+        let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
+        let completed = complete_peer_contact(&contact, receipt, event_policy);
+        contact.finish_as_responder().await?;
+        Ok(completed)
+    })
+}
+
+async fn sync_ordered_event_session(
+    store: Arc<Store>,
+    contact: SelectedContact,
+    credentials: UnprotectedReferenceMission,
+    peer: MissionPeerExpectation,
+    policy_lock: Arc<RwLock<()>>,
+    mutable_interests: MutableSourceInterests,
+) -> Result<CompletedPeerContact, NodeError> {
+    Box::pin(sync_authenticated_session(
+        contact,
+        OutboundAuthenticatedSession {
+            store,
+            credentials,
+            peer: OutboundMissionPeer::Ordered(peer),
+            #[cfg(feature = "nearby-discovery")]
+            automatic_admission: None,
+            policy_lock,
+            event_bridge: None,
+            mutable_interests,
+        },
+    ))
+    .await
+}
+
 async fn sync_authenticated_session(
     contact: SelectedContact,
     session: OutboundAuthenticatedSession,
 ) -> Result<CompletedPeerContact, NodeError> {
+    match Box::pin(sync_authenticated_event_session(contact, session)).await? {
+        EventSessionOutcome::Completed(completed) => Ok(*completed),
+        EventSessionOutcome::IrohPostEvent(context) => sync_iroh_post_event(context).await,
+    }
+}
+
+async fn sync_authenticated_event_session(
+    contact: SelectedContact,
+    session: OutboundAuthenticatedSession,
+) -> Result<EventSessionOutcome, NodeError> {
     let OutboundAuthenticatedSession {
         store,
         credentials,
@@ -28310,49 +29023,67 @@ async fn sync_authenticated_session(
         event_bridge,
         mutable_interests,
     } = session;
-    let connection = contact.require_iroh()?;
     let lease_store = store.clone();
     let store = store.as_ref();
     require_contact_frame_initiation()?;
     // Mission authentication is deliberately first. No inventory bytes or
     // object operation can reach the carrier before this returns a session.
-    let (mut mission, handshake) = match peer.expected_mission() {
-        Some(expected) => {
-            #[cfg(test)]
-            if let Ok(Some(semantic_version)) = TEST_SEMANTIC_VERSION.try_with(std::cell::Cell::get)
-            {
-                initiate_over_iroh_metered_for_semantic_version(
-                    connection,
-                    credentials.fresh_bundle()?,
-                    MissionPeerBinding::new(peer.carrier(), expected),
-                    semantic_version,
-                )
-                .await?
-            } else {
-                initiate_over_iroh_metered(
-                    connection,
-                    credentials.fresh_bundle()?,
-                    MissionPeerBinding::new(peer.carrier(), expected),
-                )
-                .await?
-            }
-            #[cfg(not(test))]
-            initiate_over_iroh_metered(
-                connection,
-                credentials.fresh_bundle()?,
-                MissionPeerBinding::new(peer.carrier(), expected),
-            )
-            .await?
+    let (mut mission, handshake, _iroh_peer) = match peer {
+        OutboundMissionPeer::Iroh(peer) => {
+            let connection = contact.require_iroh()?;
+            let (mission, handshake) = match peer.expected_mission() {
+                Some(expected) => {
+                    #[cfg(test)]
+                    if let Ok(Some(semantic_version)) =
+                        TEST_SEMANTIC_VERSION.try_with(std::cell::Cell::get)
+                    {
+                        initiate_over_iroh_metered_for_semantic_version(
+                            connection,
+                            credentials.fresh_bundle()?,
+                            MissionPeerBinding::new(peer.carrier(), expected),
+                            semantic_version,
+                        )
+                        .await?
+                    } else {
+                        initiate_over_iroh_metered(
+                            connection,
+                            credentials.fresh_bundle()?,
+                            MissionPeerBinding::new(peer.carrier(), expected),
+                        )
+                        .await?
+                    }
+                    #[cfg(not(test))]
+                    initiate_over_iroh_metered(
+                        connection,
+                        credentials.fresh_bundle()?,
+                        MissionPeerBinding::new(peer.carrier(), expected),
+                    )
+                    .await?
+                }
+                #[cfg(feature = "nearby-discovery")]
+                None => {
+                    initiate_discovered_over_iroh_metered(connection, credentials.fresh_bundle()?)
+                        .await?
+                }
+                #[cfg(not(feature = "nearby-discovery"))]
+                None => unreachable!("discovered peers require the nearby-discovery feature"),
+            };
+            let binding = mission.peer();
+            (mission.into_hybrid(), handshake, Some(binding))
         }
-        #[cfg(feature = "nearby-discovery")]
-        None => {
-            initiate_discovered_over_iroh_metered(connection, credentials.fresh_bundle()?).await?
+        OutboundMissionPeer::Ordered(peer) => {
+            let (mission, handshake) =
+                initiate_over_contact_metered(&contact, credentials.fresh_bundle()?, peer).await?;
+            (mission, handshake, None)
         }
-        #[cfg(not(feature = "nearby-discovery"))]
-        None => unreachable!("discovered peers require the nearby-discovery feature"),
     };
+    if contact.iroh().is_none() && mission.semantic_version() != SEMANTIC_PROTOCOL_V9 {
+        return Err(NodeError::Protocol(
+            "ordered Event contacts require semantic protocol v9".into(),
+        ));
+    }
     reject_unsupported_blob_intent(mission.semantic_version(), &mutable_interests)?;
-    let mut receipt = authenticated_receipt(connection, &mission, handshake)?;
+    let mut receipt = authenticated_receipt(&contact, &mission, handshake)?;
     #[cfg(test)]
     apply_test_preaccounted_contact_items(&mut receipt)?;
     let transfer_profiles = sync_transfer_profiles(&contact, &mut mission, &mut receipt).await?;
@@ -28369,7 +29100,9 @@ async fn sync_authenticated_session(
     authorize_contact_before_inventory(
         store,
         control_verifier.identity(),
-        mission.peer(),
+        mission.peer_observation().mission_id(),
+        #[cfg(feature = "nearby-discovery")]
+        _iroh_peer,
         #[cfg(feature = "nearby-discovery")]
         automatic_admission.as_ref(),
     )?;
@@ -28393,17 +29126,12 @@ async fn sync_authenticated_session(
         event_lease,
         store,
         event_verifier.identity(),
-        mission.peer().mission_id(),
+        mission.peer_observation().mission_id(),
         receipt.controls_remaining,
     )?;
-    let mutable_contact = MutableClassesContact {
-        guard: &event_guard,
-        interests: &mutable_interests,
-        blob_contact_mode: blob_transfer_mode.legacy(),
-    };
     if mission.semantic_version() < SEMANTIC_PROTOCOL_V7 {
         sync_selected_event_bridge(
-            connection,
+            contact.require_iroh()?,
             &mut mission,
             event_bridge.as_ref(),
             &mut receipt,
@@ -28443,55 +29171,44 @@ async fn sync_authenticated_session(
         EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
         EventReconciliationOutcome::Deferred => {
             if transfer_profiles.is_some() {
-                connection.skip_uni_turn()?;
-                connection.skip_uni_turn()?;
+                skip_selected_event_turn(&contact)?;
+                skip_selected_event_turn(&contact)?;
             }
-            if !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
-                sync_mutable_classes(
-                    store,
-                    connection,
-                    &mut mission,
-                    &mut event_verifier,
-                    mutable_contact,
-                    &mut receipt,
-                )
-                .await?;
+            if let Some(completed) =
+                finish_ordered_event_initiator(store, &contact, &event_guard, &receipt).await?
+            {
+                return Ok(EventSessionOutcome::Completed(Box::new(completed)));
             }
-            sync_profile5_blob_lane_if_selected(
-                store,
-                Arc::clone(&lease_store),
-                connection,
-                &mut mission,
-                transfer_profiles.as_ref(),
-                blob_transfer_mode,
-                &event_guard,
-                event_verifier,
-                &mutable_interests,
-                !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly),
-                !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly),
-                &mut receipt,
-            )
-            .await?;
-            if transfer_profiles.is_some() {
-                sync_selected_event_bridge(
-                    connection,
-                    &mut mission,
-                    event_bridge.as_ref(),
-                    &mut receipt,
-                )
-                .await?;
-            }
-            event_guard.check(store)?;
-            let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
-            let completed = complete_peer_contact(connection, receipt, event_policy);
-            connection.finish_as_initiator().await?;
-            return Ok(completed);
+            let run_event_bridge = transfer_profiles.is_some();
+            return Ok(EventSessionOutcome::IrohPostEvent(Box::new(
+                IrohPostEventContext {
+                    store: lease_store,
+                    contact,
+                    mission,
+                    profiles: transfer_profiles,
+                    blob_transfer_mode,
+                    event_guard,
+                    event_verifier,
+                    mutable_interests,
+                    event_bridge,
+                    run_event_bridge,
+                    local_emission_enabled: !matches!(
+                        local_emission.policy,
+                        EventEmissionPolicy::ReceiveOnly
+                    ),
+                    remote_emission_enabled: !matches!(
+                        remote_emission.policy,
+                        EventEmissionPolicy::ReceiveOnly
+                    ),
+                    receipt,
+                },
+            )));
         }
     };
     settle_authenticated_event_common_set(
         store,
         &event_guard,
-        mission.peer().mission_id(),
+        mission.peer_observation().mission_id(),
         mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION,
         remote_emission,
         to_responder_lane.receiver_selector_revision,
@@ -28515,11 +29232,26 @@ async fn sync_authenticated_session(
         .await?;
 
         if matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
-            event_guard.check(store)?;
-            let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
-            let completed = complete_peer_contact(connection, receipt, event_policy);
-            connection.finish_as_initiator().await?;
-            return Ok(completed);
+            return Ok(EventSessionOutcome::IrohPostEvent(Box::new(
+                IrohPostEventContext {
+                    store: lease_store,
+                    contact,
+                    mission,
+                    profiles: transfer_profiles,
+                    blob_transfer_mode,
+                    event_guard,
+                    event_verifier,
+                    mutable_interests,
+                    event_bridge,
+                    run_event_bridge: false,
+                    local_emission_enabled: !matches!(
+                        local_emission.policy,
+                        EventEmissionPolicy::ReceiveOnly
+                    ),
+                    remote_emission_enabled: false,
+                    receipt,
+                },
+            )));
         }
 
         let to_initiator_lane = DirectedEventLane {
@@ -28541,28 +29273,35 @@ async fn sync_authenticated_session(
         {
             EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
             EventReconciliationOutcome::Deferred => {
-                if !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
-                    sync_mutable_classes(
-                        store,
-                        connection,
-                        &mut mission,
-                        &mut event_verifier,
-                        mutable_contact,
-                        &mut receipt,
-                    )
-                    .await?;
-                }
-                event_guard.check(store)?;
-                let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
-                let completed = complete_peer_contact(connection, receipt, event_policy);
-                connection.finish_as_initiator().await?;
-                return Ok(completed);
+                return Ok(EventSessionOutcome::IrohPostEvent(Box::new(
+                    IrohPostEventContext {
+                        store: lease_store,
+                        contact,
+                        mission,
+                        profiles: transfer_profiles,
+                        blob_transfer_mode,
+                        event_guard,
+                        event_verifier,
+                        mutable_interests,
+                        event_bridge,
+                        run_event_bridge: false,
+                        local_emission_enabled: !matches!(
+                            local_emission.policy,
+                            EventEmissionPolicy::ReceiveOnly
+                        ),
+                        remote_emission_enabled: !matches!(
+                            remote_emission.policy,
+                            EventEmissionPolicy::ReceiveOnly
+                        ),
+                        receipt,
+                    },
+                )));
             }
         };
         settle_authenticated_event_common_set(
             store,
             &event_guard,
-            mission.peer().mission_id(),
+            mission.peer_observation().mission_id(),
             mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION,
             remote_emission,
             to_initiator_lane.receiver_selector_revision,
@@ -28571,7 +29310,7 @@ async fn sync_authenticated_session(
         sync_event_transfer_lane(
             EventTransferLaneContext {
                 store,
-                lease_store,
+                lease_store: Arc::clone(&lease_store),
                 contact: &contact,
                 mission: &mut mission,
                 event_verifier: &mut event_verifier,
@@ -28583,20 +29322,29 @@ async fn sync_authenticated_session(
             &to_initiator.difference,
         )
         .await?;
-        sync_mutable_classes(
-            store,
-            connection,
-            &mut mission,
-            &mut event_verifier,
-            mutable_contact,
-            &mut receipt,
-        )
-        .await?;
-        event_guard.check(store)?;
-        let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
-        let completed = complete_peer_contact(connection, receipt, event_policy);
-        connection.finish_as_initiator().await?;
-        return Ok(completed);
+        return Ok(EventSessionOutcome::IrohPostEvent(Box::new(
+            IrohPostEventContext {
+                store: lease_store,
+                contact,
+                mission,
+                profiles: transfer_profiles,
+                blob_transfer_mode,
+                event_guard,
+                event_verifier,
+                mutable_interests,
+                event_bridge,
+                run_event_bridge: false,
+                local_emission_enabled: !matches!(
+                    local_emission.policy,
+                    EventEmissionPolicy::ReceiveOnly
+                ),
+                remote_emission_enabled: !matches!(
+                    remote_emission.policy,
+                    EventEmissionPolicy::ReceiveOnly
+                ),
+                receipt,
+            },
+        )));
     }
 
     let profiles = transfer_profiles
@@ -28624,50 +29372,42 @@ async fn sync_authenticated_session(
         {
             EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
             EventReconciliationOutcome::Deferred => {
-                connection.skip_uni_turn()?;
-                connection.skip_uni_turn()?;
-                sync_mutable_classes(
-                    store,
-                    connection,
-                    &mut mission,
-                    &mut event_verifier,
-                    mutable_contact,
-                    &mut receipt,
-                )
-                .await?;
-                sync_profile5_blob_lane_if_selected(
-                    store,
-                    Arc::clone(&lease_store),
-                    connection,
-                    &mut mission,
-                    transfer_profiles.as_ref(),
-                    blob_transfer_mode,
-                    &event_guard,
-                    event_verifier,
-                    &mutable_interests,
-                    !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly),
-                    !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly),
-                    &mut receipt,
-                )
-                .await?;
-                sync_selected_event_bridge(
-                    connection,
-                    &mut mission,
-                    event_bridge.as_ref(),
-                    &mut receipt,
-                )
-                .await?;
-                event_guard.check(store)?;
-                let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
-                let completed = complete_peer_contact(connection, receipt, event_policy);
-                connection.finish_as_initiator().await?;
-                return Ok(completed);
+                skip_selected_event_turn(&contact)?;
+                skip_selected_event_turn(&contact)?;
+                if let Some(completed) =
+                    finish_ordered_event_initiator(store, &contact, &event_guard, &receipt).await?
+                {
+                    return Ok(EventSessionOutcome::Completed(Box::new(completed)));
+                }
+                return Ok(EventSessionOutcome::IrohPostEvent(Box::new(
+                    IrohPostEventContext {
+                        store: lease_store,
+                        contact,
+                        mission,
+                        profiles: transfer_profiles,
+                        blob_transfer_mode,
+                        event_guard,
+                        event_verifier,
+                        mutable_interests,
+                        event_bridge,
+                        run_event_bridge: true,
+                        local_emission_enabled: !matches!(
+                            local_emission.policy,
+                            EventEmissionPolicy::ReceiveOnly
+                        ),
+                        remote_emission_enabled: !matches!(
+                            remote_emission.policy,
+                            EventEmissionPolicy::ReceiveOnly
+                        ),
+                        receipt,
+                    },
+                )));
             }
         };
         settle_authenticated_event_common_set(
             store,
             &event_guard,
-            mission.peer().mission_id(),
+            mission.peer_observation().mission_id(),
             true,
             remote_emission,
             to_initiator_lane.receiver_selector_revision,
@@ -28691,7 +29431,7 @@ async fn sync_authenticated_session(
         &receipt,
         to_responder_count,
         to_initiator_count,
-        connection.max_uni_frame_bytes(),
+        selected_event_max_frame_bytes(&contact),
     )?;
     let local_difference = if matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
         LocalEventSendDifference::Blind
@@ -28707,7 +29447,7 @@ async fn sync_authenticated_session(
         local_difference,
         false,
         to_responder_limits,
-        mission.peer().mission_id(),
+        mission.peer_observation().mission_id(),
         mission.peer_route_grant_commitments(),
         to_responder_lane.receiver_interest,
         to_responder_lane.receiver_selector_revision.value(),
@@ -28788,44 +29528,34 @@ async fn sync_authenticated_session(
     )
     .await?;
 
-    if !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
-        sync_mutable_classes(
-            store,
-            connection,
-            &mut mission,
-            &mut event_verifier,
-            mutable_contact,
-            &mut receipt,
-        )
-        .await?;
+    if let Some(completed) =
+        finish_ordered_event_initiator(store, &contact, &event_guard, &receipt).await?
+    {
+        return Ok(EventSessionOutcome::Completed(Box::new(completed)));
     }
-    sync_profile5_blob_lane_if_selected(
-        store,
-        lease_store,
-        connection,
-        &mut mission,
-        Some(profiles),
-        blob_transfer_mode,
-        &event_guard,
-        event_verifier,
-        &mutable_interests,
-        !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly),
-        !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly),
-        &mut receipt,
-    )
-    .await?;
-    sync_selected_event_bridge(
-        connection,
-        &mut mission,
-        event_bridge.as_ref(),
-        &mut receipt,
-    )
-    .await?;
-    event_guard.check(store)?;
-    let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
-    let completed = complete_peer_contact(connection, receipt, event_policy);
-    connection.finish_as_initiator().await?;
-    Ok(completed)
+    Ok(EventSessionOutcome::IrohPostEvent(Box::new(
+        IrohPostEventContext {
+            store: lease_store,
+            contact,
+            mission,
+            profiles: transfer_profiles,
+            blob_transfer_mode,
+            event_guard,
+            event_verifier,
+            mutable_interests,
+            event_bridge,
+            run_event_bridge: true,
+            local_emission_enabled: !matches!(
+                local_emission.policy,
+                EventEmissionPolicy::ReceiveOnly
+            ),
+            remote_emission_enabled: !matches!(
+                remote_emission.policy,
+                EventEmissionPolicy::ReceiveOnly
+            ),
+            receipt,
+        },
+    )))
 }
 
 #[cfg(test)]
@@ -29586,7 +30316,7 @@ async fn serve_event_transfer_lane_inner(
         // the protected interest, route grant, custody wrapper, and store
         // policy before admission.
         let mut blind_offers = BTreeSet::new();
-        let authenticated_peer = mission.peer().mission_id();
+        let authenticated_peer = mission.peer_observation().mission_id();
         let peer_route_commitments = mission.peer_route_grant_commitments().to_vec();
         loop {
             event_guard.check(store)?;
@@ -29702,7 +30432,7 @@ async fn serve_event_transfer_lane_inner(
     }
     if semantic_v3 && direction == EventDirection::ToSessionInitiator {
         let lane_remaining_before = receipt.remaining;
-        let authenticated_peer = mission.peer().mission_id();
+        let authenticated_peer = mission.peer_observation().mission_id();
         let peer_route_commitments = mission.peer_route_grant_commitments().to_vec();
         let ordered = ordered_due_custody_transfers(
             store,
@@ -29776,7 +30506,7 @@ async fn serve_event_transfer_lane_inner(
         return Ok(());
     }
     let mut authorization = TransferAuthorization::for_peer(difference, direction, capacity)?;
-    let authenticated_peer = mission.peer().mission_id();
+    let authenticated_peer = mission.peer_observation().mission_id();
     let peer_route_commitments = mission.peer_route_grant_commitments().to_vec();
     loop {
         event_guard.check(store)?;
@@ -30009,8 +30739,8 @@ impl<'a> MutableTransferAuthorization<'a> {
 }
 
 async fn serve_mutable_interests(
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     class: MutableClass,
     local_interest: &EventInterest,
     receipt: &mut PeerReceipt,
@@ -30048,8 +30778,8 @@ async fn serve_mutable_interests(
 }
 
 async fn serve_blob_interests(
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     local_interest: &BlobInterest,
     receipt: &mut PeerReceipt,
 ) -> Result<BlobInterest, NodeError> {
@@ -30076,8 +30806,8 @@ async fn serve_blob_interests(
 
 async fn serve_mutable_reconciliation_lane(
     store: &Store,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
     lane: DirectedMutableLane<'_>,
     receipt: &mut PeerReceipt,
@@ -30101,7 +30831,7 @@ async fn serve_mutable_reconciliation_lane(
             verifier,
             receiver_interest,
             Some((
-                mission.peer().mission_id(),
+                mission.peer_observation().mission_id(),
                 mission.peer_route_grant_commitments(),
             )),
         )?,
@@ -30256,8 +30986,8 @@ async fn serve_mutable_reconciliation_lane(
 
 async fn serve_mutable_transfer_lane(
     store: &Store,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
     lane: DirectedMutableLane<'_>,
     difference: &MutableDifference,
@@ -30278,7 +31008,7 @@ async fn serve_mutable_transfer_lane(
     let base_remaining = authorization.remaining;
     let mut deferred_offers = 0usize;
     let mut fetch_settlement = MutableFetchSettlement::default();
-    let peer = mission.peer().mission_id();
+    let peer = mission.peer_observation().mission_id();
     let commitments = mission.peer_route_grant_commitments().to_vec();
     loop {
         guard.check(store)?;
@@ -30505,8 +31235,8 @@ async fn serve_mutable_transfer_lane(
 
 async fn serve_mutable_class(
     store: &Store,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
     contact: MutableClassContact<'_>,
     receipt: &mut PeerReceipt,
@@ -30613,10 +31343,28 @@ async fn serve_mutable_class(
     })
 }
 
-async fn serve_mutable_classes(
+fn serve_mutable_classes<'a>(
+    store: &'a Store,
+    selected_contact: &'a SelectedContact,
+    mission: &'a mut HybridMissionSession,
+    verifier: &'a mut ReferenceEnvelopeSealer,
+    contact: MutableClassesContact<'a>,
+    receipt: &'a mut PeerReceipt,
+) -> Pin<Box<dyn Future<Output = Result<(), NodeError>> + Send + 'a>> {
+    Box::pin(serve_mutable_classes_inner(
+        store,
+        selected_contact,
+        mission,
+        verifier,
+        contact,
+        receipt,
+    ))
+}
+
+async fn serve_mutable_classes_inner(
     store: &Store,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    selected_contact: &SelectedContact,
+    mission: &mut HybridMissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
     contact: MutableClassesContact<'_>,
     receipt: &mut PeerReceipt,
@@ -30638,7 +31386,7 @@ async fn serve_mutable_classes(
         }
         let exchanged = serve_mutable_class(
             store,
-            connection,
+            selected_contact,
             mission,
             verifier,
             MutableClassContact {
@@ -30655,6 +31403,7 @@ async fn serve_mutable_classes(
         }
     }
     if let Some((local, peer)) = blob_interests {
+        let connection = selected_contact.require_iroh()?;
         let blob_contact_mode = blob_contact_mode.ok_or_else(|| {
             NodeError::Protocol("legacy Blob interests entered the profile-5 stream lane".into())
         })?;
@@ -30698,25 +31447,120 @@ async fn serve_session(
     policy_lock: Arc<RwLock<()>>,
     mutable_interests: MutableSourceInterests,
 ) -> Result<CompletedPeerContact, NodeError> {
+    Box::pin(serve_selected_session(
+        store,
+        SelectedContact::from_iroh(connection),
+        credentials,
+        InboundMissionPeer::Iroh(expected_peer),
+        pre_inventory,
+        policy_lock,
+        mutable_interests,
+    ))
+    .await
+}
+
+enum InboundMissionPeer {
+    Iroh(Option<MissionPeerBinding>),
+    Ordered(MissionPeerExpectation),
+}
+
+async fn serve_ordered_event_session(
+    store: Arc<Store>,
+    contact: SelectedContact,
+    credentials: UnprotectedReferenceMission,
+    peer: MissionPeerExpectation,
+    custody_clock: NodeCustodyClock,
+    policy_lock: Arc<RwLock<()>>,
+    mutable_interests: MutableSourceInterests,
+) -> Result<CompletedPeerContact, NodeError> {
+    Box::pin(serve_selected_session(
+        store,
+        contact,
+        credentials,
+        InboundMissionPeer::Ordered(peer),
+        InboundPreInventoryAuthorization {
+            #[cfg(feature = "nearby-discovery")]
+            automatic_admission: None,
+            deferred_custody_maintenance: Some(custody_clock),
+            event_bridge: None,
+        },
+        policy_lock,
+        mutable_interests,
+    ))
+    .await
+}
+
+async fn serve_selected_session(
+    store: Arc<Store>,
+    selected_contact: SelectedContact,
+    credentials: UnprotectedReferenceMission,
+    expected_peer: InboundMissionPeer,
+    pre_inventory: InboundPreInventoryAuthorization,
+    policy_lock: Arc<RwLock<()>>,
+    mutable_interests: MutableSourceInterests,
+) -> Result<CompletedPeerContact, NodeError> {
+    match Box::pin(serve_selected_event_session(
+        store,
+        selected_contact,
+        credentials,
+        expected_peer,
+        pre_inventory,
+        policy_lock,
+        mutable_interests,
+    ))
+    .await?
+    {
+        EventSessionOutcome::Completed(completed) => Ok(*completed),
+        EventSessionOutcome::IrohPostEvent(context) => serve_iroh_post_event(context).await,
+    }
+}
+
+async fn serve_selected_event_session(
+    store: Arc<Store>,
+    selected_contact: SelectedContact,
+    credentials: UnprotectedReferenceMission,
+    expected_peer: InboundMissionPeer,
+    pre_inventory: InboundPreInventoryAuthorization,
+    policy_lock: Arc<RwLock<()>>,
+    mutable_interests: MutableSourceInterests,
+) -> Result<EventSessionOutcome, NodeError> {
     let lease_store = store.clone();
-    let selected_contact = SelectedContact::from_iroh(connection.clone());
     require_contact_policy_current()?;
     // No inventory is even loaded until the independent mission handshake and
     // either exact configured identity validation or discovered-peer mission admission
     // finishes.
-    let (mut mission, handshake) = match expected_peer {
-        Some(peer) => {
-            respond_over_iroh_metered(&connection, credentials.fresh_bundle()?, peer).await?
+    let (mut mission, handshake, _iroh_peer) = match expected_peer {
+        InboundMissionPeer::Iroh(expected_peer) => {
+            let connection = selected_contact.require_iroh()?;
+            let (mission, handshake) = match expected_peer {
+                Some(peer) => {
+                    respond_over_iroh_metered(connection, credentials.fresh_bundle()?, peer).await?
+                }
+                #[cfg(feature = "nearby-discovery")]
+                None => {
+                    respond_discovered_over_iroh_metered(connection, credentials.fresh_bundle()?)
+                        .await?
+                }
+                #[cfg(not(feature = "nearby-discovery"))]
+                None => unreachable!("discovered peers require the nearby-discovery feature"),
+            };
+            let binding = mission.peer();
+            (mission.into_hybrid(), handshake, Some(binding))
         }
-        #[cfg(feature = "nearby-discovery")]
-        None => {
-            respond_discovered_over_iroh_metered(&connection, credentials.fresh_bundle()?).await?
+        InboundMissionPeer::Ordered(peer) => {
+            let (mission, handshake) =
+                respond_over_contact_metered(&selected_contact, credentials.fresh_bundle()?, peer)
+                    .await?;
+            (mission, handshake, None)
         }
-        #[cfg(not(feature = "nearby-discovery"))]
-        None => unreachable!("discovered peers require the nearby-discovery feature"),
     };
+    if selected_contact.iroh().is_none() && mission.semantic_version() != SEMANTIC_PROTOCOL_V9 {
+        return Err(NodeError::Protocol(
+            "ordered Event contacts require semantic protocol v9".into(),
+        ));
+    }
     reject_unsupported_blob_intent(mission.semantic_version(), &mutable_interests)?;
-    let mut receipt = authenticated_receipt(&connection, &mission, handshake)?;
+    let mut receipt = authenticated_receipt(&selected_contact, &mission, handshake)?;
     #[cfg(test)]
     apply_test_preaccounted_contact_items(&mut receipt)?;
     let transfer_profiles = serve_transfer_profiles(&selected_contact, &mut mission, &mut receipt)
@@ -30740,7 +31584,9 @@ async fn serve_session(
     authorize_contact_before_inventory(
         &store,
         control_verifier.identity(),
-        mission.peer(),
+        mission.peer_observation().mission_id(),
+        #[cfg(feature = "nearby-discovery")]
+        _iroh_peer,
         #[cfg(feature = "nearby-discovery")]
         pre_inventory.automatic_admission.as_ref(),
     )?;
@@ -30764,17 +31610,12 @@ async fn serve_session(
         event_lease,
         &store,
         event_verifier.identity(),
-        mission.peer().mission_id(),
+        mission.peer_observation().mission_id(),
         receipt.controls_remaining,
     )?;
-    let mutable_contact = MutableClassesContact {
-        guard: &event_guard,
-        interests: &mutable_interests,
-        blob_contact_mode: blob_transfer_mode.legacy(),
-    };
     if mission.semantic_version() < SEMANTIC_PROTOCOL_V7 {
         serve_selected_event_bridge(
-            &connection,
+            selected_contact.require_iroh()?,
             &mut mission,
             pre_inventory.event_bridge.as_ref(),
             &mut receipt,
@@ -30811,55 +31652,48 @@ async fn serve_session(
     {
         EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
         EventReconciliationOutcome::Deferred => {
-            if !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly) {
-                if transfer_profiles.is_some() {
-                    connection.skip_uni_turn()?;
-                    connection.skip_uni_turn()?;
-                }
-                serve_mutable_classes(
-                    &store,
-                    &connection,
-                    &mut mission,
-                    &mut event_verifier,
-                    mutable_contact,
-                    &mut receipt,
-                )
-                .await?;
+            if !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly)
+                && transfer_profiles.is_some()
+            {
+                skip_selected_event_turn(&selected_contact)?;
+                skip_selected_event_turn(&selected_contact)?;
             }
-            serve_profile5_blob_lane_if_selected(
-                Arc::clone(&store),
-                &connection,
-                &mut mission,
-                transfer_profiles.as_ref(),
-                blob_transfer_mode,
-                &event_guard,
-                event_verifier,
-                &mutable_interests,
-                !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly),
-                !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly),
-                &mut receipt,
-            )
-            .await?;
-            if transfer_profiles.is_some() {
-                serve_selected_event_bridge(
-                    &connection,
-                    &mut mission,
-                    pre_inventory.event_bridge.as_ref(),
-                    &mut receipt,
-                )
-                .await?;
+            if let Some(completed) =
+                finish_ordered_event_responder(&store, &selected_contact, &event_guard, &receipt)
+                    .await?
+            {
+                return Ok(EventSessionOutcome::Completed(Box::new(completed)));
             }
-            event_guard.check(&store)?;
-            let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
-            let completed = complete_peer_contact(&connection, receipt, event_policy);
-            connection.finish_as_responder().await?;
-            return Ok(completed);
+            let run_event_bridge = transfer_profiles.is_some();
+            return Ok(EventSessionOutcome::IrohPostEvent(Box::new(
+                IrohPostEventContext {
+                    store,
+                    contact: selected_contact,
+                    mission,
+                    profiles: transfer_profiles,
+                    blob_transfer_mode,
+                    event_guard,
+                    event_verifier,
+                    mutable_interests,
+                    event_bridge: pre_inventory.event_bridge,
+                    run_event_bridge,
+                    local_emission_enabled: !matches!(
+                        local_emission.policy,
+                        EventEmissionPolicy::ReceiveOnly
+                    ),
+                    remote_emission_enabled: !matches!(
+                        remote_emission.policy,
+                        EventEmissionPolicy::ReceiveOnly
+                    ),
+                    receipt,
+                },
+            )));
         }
     };
     settle_authenticated_event_common_set(
         &store,
         &event_guard,
-        mission.peer().mission_id(),
+        mission.peer_observation().mission_id(),
         mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION,
         remote_emission,
         to_responder_lane.receiver_selector_revision,
@@ -30883,11 +31717,26 @@ async fn serve_session(
         .await?;
 
         if matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly) {
-            event_guard.check(&store)?;
-            let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
-            let completed = complete_peer_contact(&connection, receipt, event_policy);
-            connection.finish_as_responder().await?;
-            return Ok(completed);
+            return Ok(EventSessionOutcome::IrohPostEvent(Box::new(
+                IrohPostEventContext {
+                    store,
+                    contact: selected_contact,
+                    mission,
+                    profiles: transfer_profiles,
+                    blob_transfer_mode,
+                    event_guard,
+                    event_verifier,
+                    mutable_interests,
+                    event_bridge: pre_inventory.event_bridge,
+                    run_event_bridge: false,
+                    local_emission_enabled: false,
+                    remote_emission_enabled: !matches!(
+                        remote_emission.policy,
+                        EventEmissionPolicy::ReceiveOnly
+                    ),
+                    receipt,
+                },
+            )));
         }
 
         let to_initiator_lane = DirectedEventLane {
@@ -30908,28 +31757,35 @@ async fn serve_session(
         {
             EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
             EventReconciliationOutcome::Deferred => {
-                if !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly) {
-                    serve_mutable_classes(
-                        &store,
-                        &connection,
-                        &mut mission,
-                        &mut event_verifier,
-                        mutable_contact,
-                        &mut receipt,
-                    )
-                    .await?;
-                }
-                event_guard.check(&store)?;
-                let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
-                let completed = complete_peer_contact(&connection, receipt, event_policy);
-                connection.finish_as_responder().await?;
-                return Ok(completed);
+                return Ok(EventSessionOutcome::IrohPostEvent(Box::new(
+                    IrohPostEventContext {
+                        store,
+                        contact: selected_contact,
+                        mission,
+                        profiles: transfer_profiles,
+                        blob_transfer_mode,
+                        event_guard,
+                        event_verifier,
+                        mutable_interests,
+                        event_bridge: pre_inventory.event_bridge,
+                        run_event_bridge: false,
+                        local_emission_enabled: !matches!(
+                            local_emission.policy,
+                            EventEmissionPolicy::ReceiveOnly
+                        ),
+                        remote_emission_enabled: !matches!(
+                            remote_emission.policy,
+                            EventEmissionPolicy::ReceiveOnly
+                        ),
+                        receipt,
+                    },
+                )));
             }
         };
         settle_authenticated_event_common_set(
             &store,
             &event_guard,
-            mission.peer().mission_id(),
+            mission.peer_observation().mission_id(),
             mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION,
             remote_emission,
             to_initiator_lane.receiver_selector_revision,
@@ -30950,20 +31806,29 @@ async fn serve_session(
             &to_initiator.difference,
         )
         .await?;
-        serve_mutable_classes(
-            &store,
-            &connection,
-            &mut mission,
-            &mut event_verifier,
-            mutable_contact,
-            &mut receipt,
-        )
-        .await?;
-        event_guard.check(&store)?;
-        let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
-        let completed = complete_peer_contact(&connection, receipt, event_policy);
-        connection.finish_as_responder().await?;
-        return Ok(completed);
+        return Ok(EventSessionOutcome::IrohPostEvent(Box::new(
+            IrohPostEventContext {
+                store,
+                contact: selected_contact,
+                mission,
+                profiles: transfer_profiles,
+                blob_transfer_mode,
+                event_guard,
+                event_verifier,
+                mutable_interests,
+                event_bridge: pre_inventory.event_bridge,
+                run_event_bridge: false,
+                local_emission_enabled: !matches!(
+                    local_emission.policy,
+                    EventEmissionPolicy::ReceiveOnly
+                ),
+                remote_emission_enabled: !matches!(
+                    remote_emission.policy,
+                    EventEmissionPolicy::ReceiveOnly
+                ),
+                receipt,
+            },
+        )));
     }
 
     let profiles = transfer_profiles
@@ -30990,49 +31855,47 @@ async fn serve_session(
         {
             EventReconciliationOutcome::Complete(reconciliation) => reconciliation,
             EventReconciliationOutcome::Deferred => {
-                connection.skip_uni_turn()?;
-                connection.skip_uni_turn()?;
-                serve_mutable_classes(
+                skip_selected_event_turn(&selected_contact)?;
+                skip_selected_event_turn(&selected_contact)?;
+                if let Some(completed) = finish_ordered_event_responder(
                     &store,
-                    &connection,
-                    &mut mission,
-                    &mut event_verifier,
-                    mutable_contact,
-                    &mut receipt,
-                )
-                .await?;
-                serve_profile5_blob_lane_if_selected(
-                    Arc::clone(&store),
-                    &connection,
-                    &mut mission,
-                    transfer_profiles.as_ref(),
-                    blob_transfer_mode,
+                    &selected_contact,
                     &event_guard,
-                    event_verifier,
-                    &mutable_interests,
-                    !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly),
-                    !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly),
-                    &mut receipt,
+                    &receipt,
                 )
-                .await?;
-                serve_selected_event_bridge(
-                    &connection,
-                    &mut mission,
-                    pre_inventory.event_bridge.as_ref(),
-                    &mut receipt,
-                )
-                .await?;
-                event_guard.check(&store)?;
-                let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
-                let completed = complete_peer_contact(&connection, receipt, event_policy);
-                connection.finish_as_responder().await?;
-                return Ok(completed);
+                .await?
+                {
+                    return Ok(EventSessionOutcome::Completed(Box::new(completed)));
+                }
+                return Ok(EventSessionOutcome::IrohPostEvent(Box::new(
+                    IrohPostEventContext {
+                        store,
+                        contact: selected_contact,
+                        mission,
+                        profiles: transfer_profiles,
+                        blob_transfer_mode,
+                        event_guard,
+                        event_verifier,
+                        mutable_interests,
+                        event_bridge: pre_inventory.event_bridge,
+                        run_event_bridge: true,
+                        local_emission_enabled: !matches!(
+                            local_emission.policy,
+                            EventEmissionPolicy::ReceiveOnly
+                        ),
+                        remote_emission_enabled: !matches!(
+                            remote_emission.policy,
+                            EventEmissionPolicy::ReceiveOnly
+                        ),
+                        receipt,
+                    },
+                )));
             }
         };
         settle_authenticated_event_common_set(
             &store,
             &event_guard,
-            mission.peer().mission_id(),
+            mission.peer_observation().mission_id(),
             true,
             remote_emission,
             to_initiator_lane.receiver_selector_revision,
@@ -31056,7 +31919,7 @@ async fn serve_session(
         &receipt,
         to_responder_count,
         to_initiator_count,
-        connection.max_uni_frame_bytes(),
+        selected_event_max_frame_bytes(&selected_contact),
     )?;
     let local_difference = to_initiator
         .as_ref()
@@ -31072,7 +31935,7 @@ async fn serve_session(
         local_difference,
         matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly),
         to_initiator_limits,
-        mission.peer().mission_id(),
+        mission.peer_observation().mission_id(),
         mission.peer_route_grant_commitments(),
         to_initiator_lane.receiver_interest,
         to_initiator_lane.receiver_selector_revision.value(),
@@ -31153,43 +32016,34 @@ async fn serve_session(
     )
     .await?;
 
-    if !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly) {
-        serve_mutable_classes(
-            &store,
-            &connection,
-            &mut mission,
-            &mut event_verifier,
-            mutable_contact,
-            &mut receipt,
-        )
-        .await?;
+    if let Some(completed) =
+        finish_ordered_event_responder(&store, &selected_contact, &event_guard, &receipt).await?
+    {
+        return Ok(EventSessionOutcome::Completed(Box::new(completed)));
     }
-    serve_profile5_blob_lane_if_selected(
-        Arc::clone(&store),
-        &connection,
-        &mut mission,
-        Some(profiles),
-        blob_transfer_mode,
-        &event_guard,
-        event_verifier,
-        &mutable_interests,
-        !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly),
-        !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly),
-        &mut receipt,
-    )
-    .await?;
-    serve_selected_event_bridge(
-        &connection,
-        &mut mission,
-        pre_inventory.event_bridge.as_ref(),
-        &mut receipt,
-    )
-    .await?;
-    event_guard.check(&store)?;
-    let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
-    let completed = complete_peer_contact(&connection, receipt, event_policy);
-    connection.finish_as_responder().await?;
-    Ok(completed)
+    Ok(EventSessionOutcome::IrohPostEvent(Box::new(
+        IrohPostEventContext {
+            store,
+            contact: selected_contact,
+            mission,
+            profiles: transfer_profiles,
+            blob_transfer_mode,
+            event_guard,
+            event_verifier,
+            mutable_interests,
+            event_bridge: pre_inventory.event_bridge,
+            run_event_bridge: true,
+            local_emission_enabled: !matches!(
+                local_emission.policy,
+                EventEmissionPolicy::ReceiveOnly
+            ),
+            remote_emission_enabled: !matches!(
+                remote_emission.policy,
+                EventEmissionPolicy::ReceiveOnly
+            ),
+            receipt,
+        },
+    )))
 }
 
 #[derive(Debug)]
@@ -31434,14 +32288,16 @@ fn require_opened_blob_custody(
 async fn request_blob_source_offer_frame<F>(
     store: &Store,
     guard: &EventLaneGuard,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     direction: EventDirection,
     receipt: &mut PeerReceipt,
     build_immediately_before_send: F,
 ) -> Result<(Frame, Option<[u8; 32]>), NodeError>
 where
-    F: FnOnce(&mut MissionSession) -> Result<(Frame, Option<PreparedOutboundBlobClaim>), NodeError>,
+    F: FnOnce(
+        &mut HybridMissionSession,
+    ) -> Result<(Frame, Option<PreparedOutboundBlobClaim>), NodeError>,
 {
     require_contact_frame_initiation()?;
     let wire_budget = exchange_wire_budget(receipt)?;
@@ -31458,12 +32314,31 @@ where
     let plaintext = request.encode_for_semantic_version(mission.semantic_version())?;
     let protected_request =
         mission.seal_blob_source_frame(blob_custody_direction(direction), claim, &plaintext)?;
-    let (protected_response, _) = connection
-        .request_with_total_limit_checked(&protected_request, wire_budget, || {
-            require_contact_frame_initiation()
-                .and_then(|_| finalize_outbound_blob_claim(store, guard, &request, prepared))
-        })
-        .await?;
+    let mut preflight_error = None;
+    let protected_response_result = connection
+        .request_with_total_limit_checked(
+            &protected_request,
+            wire_budget,
+            Box::new(|| {
+                match require_contact_frame_initiation()
+                    .and_then(|_| finalize_outbound_blob_claim(store, guard, &request, prepared))
+                {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        preflight_error = Some(error);
+                        Err(ContactError::new(
+                            ContactErrorKind::Protocol,
+                            "Blob source-offer preflight rejected write",
+                        ))
+                    }
+                }
+            }),
+        )
+        .await;
+    if let Some(error) = preflight_error {
+        return Err(error);
+    }
+    let protected_response = protected_response_result?;
     let response = mission.open_application_frame(&protected_response)?;
     let response = Frame::decode_for_semantic_version(&response, mission.semantic_version())?;
     account(receipt, protected_request.len(), protected_response.len())?;
@@ -31471,8 +32346,8 @@ where
 }
 
 async fn request_blob_source_fetch_frame(
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     direction: EventDirection,
     request: Frame,
     receipt: &mut PeerReceipt,
@@ -31481,11 +32356,27 @@ async fn request_blob_source_fetch_frame(
     let wire_budget = exchange_wire_budget(receipt)?;
     let plaintext = request.encode_for_semantic_version(mission.semantic_version())?;
     let protected_request = mission.seal_application_frame(&plaintext)?;
-    let (protected_response, _) = connection
-        .request_with_total_limit_checked(&protected_request, wire_budget, || {
-            require_contact_frame_initiation()
-        })
-        .await?;
+    let mut preflight_error = None;
+    let protected_response_result = connection
+        .request_with_total_limit_checked(
+            &protected_request,
+            wire_budget,
+            Box::new(|| match require_contact_frame_initiation() {
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    preflight_error = Some(error);
+                    Err(ContactError::new(
+                        ContactErrorKind::Protocol,
+                        "Blob source-fetch preflight rejected write",
+                    ))
+                }
+            }),
+        )
+        .await;
+    if let Some(error) = preflight_error {
+        return Err(error);
+    }
+    let protected_response = protected_response_result?;
     let (response, authority) =
         mission.open_blob_source_frame(blob_custody_direction(direction), &protected_response)?;
     #[cfg(test)]
@@ -31671,8 +32562,8 @@ where
 async fn respond_mutable_transfer_frame<F>(
     store: &Store,
     guard: &EventLaneGuard,
-    connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    connection: &dyn OrderedContact,
+    mission: &mut HybridMissionSession,
     wire_budget: usize,
     direction: EventDirection,
     source_request: bool,
@@ -31681,90 +32572,96 @@ async fn respond_mutable_transfer_frame<F>(
 ) -> Result<(bool, usize, usize), NodeError>
 where
     F: FnOnce(
-        Frame,
-        Option<OpenedBlobCustody>,
-        usize,
-        &mut MissionSession,
-    ) -> Result<(Frame, bool, Option<PreparedOutboundBlobClaim>), NodeError>,
+            Frame,
+            Option<OpenedBlobCustody>,
+            usize,
+            &mut HybridMissionSession,
+        ) -> Result<(Frame, bool, Option<PreparedOutboundBlobClaim>), NodeError>
+        + Send,
 {
     let mut application_error = None;
     let mut request_len = None;
     let mut response_len = None;
     let mut complete = None;
     let carrier_result = connection
-        .respond_once_with_total_limit(wire_budget, |protected_request| {
-            require_contact_policy_current()
-                .map_err(|_| CarrierError::Transport("live emission policy changed".into()))?;
-            request_len = Some(protected_request.len());
-            let handled = (|| -> Result<Vec<u8>, NodeError> {
-                let (plaintext, authority) = if source_request {
-                    let opened = mission.open_blob_source_frame(
-                        blob_custody_direction(direction),
-                        protected_request,
-                    )?;
-                    #[cfg(test)]
-                    if take_test_blob_receive_replay() {
-                        let _ = mission.open_blob_source_frame(
+        .respond_once_with_total_limit(
+            wire_budget,
+            Box::new(|protected_request| {
+                require_contact_policy_current().map_err(|_| {
+                    ContactError::new(ContactErrorKind::Protocol, "live emission policy changed")
+                })?;
+                request_len = Some(protected_request.len());
+                let handled = (|| -> Result<Vec<u8>, NodeError> {
+                    let (plaintext, authority) = if source_request {
+                        let opened = mission.open_blob_source_frame(
                             blob_custody_direction(direction),
                             protected_request,
                         )?;
-                        return Err(NodeError::Protocol(
-                            "replayed Blob source frame unexpectedly reopened".into(),
-                        ));
-                    }
-                    opened
-                } else {
-                    (mission.open_application_frame(protected_request)?, None)
-                };
-                let frame =
-                    Frame::decode_for_semantic_version(&plaintext, mission.semantic_version())?;
-                let authority = if source_request {
-                    require_opened_blob_custody(&frame, authority)?
-                } else {
-                    None
-                };
-                let (response, session_complete, prepared) =
-                    handler(frame, authority, protected_request.len(), mission)?;
-                require_contact_frame_response(&response)?;
-                let response_plaintext =
-                    response.encode_for_semantic_version(mission.semantic_version())?;
-                #[allow(unused_mut)]
-                let mut protected_response = if source_response {
-                    let claim = match &response {
-                        Frame::MutableObject { claim, .. } => claim.as_ref(),
-                        _ => {
+                        #[cfg(test)]
+                        if take_test_blob_receive_replay() {
+                            let _ = mission.open_blob_source_frame(
+                                blob_custody_direction(direction),
+                                protected_request,
+                            )?;
                             return Err(NodeError::Protocol(
-                                "Blob source response protection received a non-object frame"
-                                    .into(),
+                                "replayed Blob source frame unexpectedly reopened".into(),
                             ));
                         }
+                        opened
+                    } else {
+                        (mission.open_application_frame(protected_request)?, None)
                     };
-                    mission.seal_blob_source_frame(
-                        blob_custody_direction(direction),
-                        claim,
-                        &response_plaintext,
-                    )?
-                } else {
-                    mission.seal_application_frame(&response_plaintext)?
-                };
-                #[cfg(test)]
-                corrupt_test_blob_settlement_protection(&response, &mut protected_response);
-                finalize_outbound_blob_claim(store, guard, &response, prepared)?;
-                require_contact_policy_current()?;
-                response_len = Some(protected_response.len());
-                complete = Some(session_complete);
-                Ok(protected_response)
-            })();
-            match handled {
-                Ok(response) => Ok((response, complete.unwrap_or(false))),
-                Err(error) => {
-                    application_error = Some(error);
-                    Err(CarrierError::Transport(
-                        "mission-protected mutable transfer frame rejected".into(),
-                    ))
+                    let frame =
+                        Frame::decode_for_semantic_version(&plaintext, mission.semantic_version())?;
+                    let authority = if source_request {
+                        require_opened_blob_custody(&frame, authority)?
+                    } else {
+                        None
+                    };
+                    let (response, session_complete, prepared) =
+                        handler(frame, authority, protected_request.len(), mission)?;
+                    require_contact_frame_response(&response)?;
+                    let response_plaintext =
+                        response.encode_for_semantic_version(mission.semantic_version())?;
+                    #[allow(unused_mut)]
+                    let mut protected_response = if source_response {
+                        let claim = match &response {
+                            Frame::MutableObject { claim, .. } => claim.as_ref(),
+                            _ => {
+                                return Err(NodeError::Protocol(
+                                    "Blob source response protection received a non-object frame"
+                                        .into(),
+                                ));
+                            }
+                        };
+                        mission.seal_blob_source_frame(
+                            blob_custody_direction(direction),
+                            claim,
+                            &response_plaintext,
+                        )?
+                    } else {
+                        mission.seal_application_frame(&response_plaintext)?
+                    };
+                    #[cfg(test)]
+                    corrupt_test_blob_settlement_protection(&response, &mut protected_response);
+                    finalize_outbound_blob_claim(store, guard, &response, prepared)?;
+                    require_contact_policy_current()?;
+                    response_len = Some(protected_response.len());
+                    complete = Some(session_complete);
+                    Ok(protected_response)
+                })();
+                match handled {
+                    Ok(response) => Ok((response, complete.unwrap_or(false))),
+                    Err(error) => {
+                        application_error = Some(error);
+                        Err(ContactError::new(
+                            ContactErrorKind::Protocol,
+                            "mission-protected mutable transfer frame rejected",
+                        ))
+                    }
                 }
-            }
-        })
+            }),
+        )
         .await;
     if let Some(error) = application_error {
         return Err(error);
@@ -31806,8 +32703,8 @@ fn apply_test_preaccounted_contact_items(receipt: &mut PeerReceipt) -> Result<()
 }
 
 fn authenticated_receipt(
-    connection: &aster_iroh::Connection,
-    mission: &MissionSession,
+    contact: &SelectedContact,
+    mission: &HybridMissionSession,
     handshake: MissionHandshakeReceipt,
 ) -> Result<PeerReceipt, NodeError> {
     if handshake.frames > MAX_CONTACT_FRAMES || handshake.bytes > MAX_CONTACT_BYTES {
@@ -31815,36 +32712,73 @@ fn authenticated_receipt(
             "mission handshake exceeded the total contact budget".into(),
         ));
     }
-    let path = connection.path_witness();
-    Ok(PeerReceipt {
-        peer: Some(connection.remote_id()),
-        mission_peer: Some(mission.peer().mission_id()),
-        carrier_path: Some(path.selected),
-        carrier_path_transitions: path.transition_count,
-        carrier_path_transitions_saturated: path.transitions_saturated,
+    let mut receipt = PeerReceipt {
+        mission_peer: Some(mission.peer_observation().mission_id()),
         semantic_version: mission.semantic_version(),
         handshake_frames: handshake.frames,
         handshake_bytes: handshake.bytes,
         ..PeerReceipt::default()
-    })
+    };
+    if let Some(connection) = contact.iroh() {
+        let path = connection.path_witness();
+        receipt.peer = Some(connection.remote_id());
+        receipt.carrier_path = Some(path.selected);
+        receipt.carrier_path_transitions = path.transition_count;
+        receipt.carrier_path_transitions_saturated = path.transitions_saturated;
+    }
+    Ok(receipt)
 }
 
 fn complete_peer_contact(
-    connection: &aster_iroh::Connection,
+    contact: &SelectedContact,
     mut receipt: PeerReceipt,
     event_policy: ContactEventPolicy,
 ) -> CompletedPeerContact {
     // Sample only after the mission-authenticated work has completed. This is
     // bounded carrier telemetry and is deliberately absent from every
     // authorization, inventory, and admission decision above.
-    let path = connection.path_witness();
-    receipt.carrier_path = Some(path.selected);
-    receipt.carrier_path_transitions = path.transition_count;
-    receipt.carrier_path_transitions_saturated = path.transitions_saturated;
+    if let Some(connection) = contact.iroh() {
+        let path = connection.path_witness();
+        receipt.carrier_path = Some(path.selected);
+        receipt.carrier_path_transitions = path.transition_count;
+        receipt.carrier_path_transitions_saturated = path.transitions_saturated;
+    }
     CompletedPeerContact {
         receipt,
         event_policy,
     }
+}
+
+async fn finish_ordered_event_initiator(
+    store: &Store,
+    contact: &SelectedContact,
+    event_guard: &EventLaneGuard,
+    receipt: &PeerReceipt,
+) -> Result<Option<CompletedPeerContact>, NodeError> {
+    if contact.iroh().is_some() {
+        return Ok(None);
+    }
+    event_guard.check(store)?;
+    let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
+    let completed = complete_peer_contact(contact, receipt.clone(), event_policy);
+    contact.finish_as_initiator().await?;
+    Ok(Some(completed))
+}
+
+async fn finish_ordered_event_responder(
+    store: &Store,
+    contact: &SelectedContact,
+    event_guard: &EventLaneGuard,
+    receipt: &PeerReceipt,
+) -> Result<Option<CompletedPeerContact>, NodeError> {
+    if contact.iroh().is_some() {
+        return Ok(None);
+    }
+    event_guard.check(store)?;
+    let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
+    let completed = complete_peer_contact(contact, receipt.clone(), event_policy);
+    contact.finish_as_responder().await?;
+    Ok(Some(completed))
 }
 
 const fn carrier_path_name(path: Option<SelectedPath>) -> &'static str {
@@ -34112,9 +35046,11 @@ mod tests {
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             NodeActorChannels {
                 handle_sigint: false,
+                iroh_transport_enabled: true,
                 application_receiver,
                 application_admission,
                 control_receiver,
+                ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
@@ -34355,9 +35291,11 @@ mod tests {
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             NodeActorChannels {
                 handle_sigint: false,
+                iroh_transport_enabled: true,
                 application_receiver,
                 application_admission,
                 control_receiver,
+                ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
@@ -34448,9 +35386,11 @@ mod tests {
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             NodeActorChannels {
                 handle_sigint: false,
+                iroh_transport_enabled: true,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 control_receiver,
+                ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
@@ -38664,6 +39604,8 @@ mod tests {
         let local_id = NodeIdentity::load_or_create(&state)
             .expect("actor terminal local identity")
             .id();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700))
+            .expect("owner-only actor terminal state");
         let carrying_secret = loop {
             let candidate = aster_iroh::SecretKey::generate();
             if scenario != ActorContactTerminalScenario::CollisionCancellation
@@ -38746,9 +39688,11 @@ mod tests {
             emission_policy,
             NodeActorChannels {
                 handle_sigint: false,
+                iroh_transport_enabled: true,
                 application_receiver,
                 application_admission,
                 control_receiver,
+                ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
                 ready: ready_sender,
                 contact_activity,
@@ -38926,6 +39870,8 @@ mod tests {
         // peer's higher-ID fallback on the next scheduler turn.
         let state = root("higher-id-policy-contact-retry");
         fs::create_dir_all(&state).expect("actor state");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700))
+            .expect("owner-only actor state");
         let local_id = NodeIdentity::load_or_create(&state)
             .expect("local carrier identity")
             .id();
@@ -38985,9 +39931,11 @@ mod tests {
             emission_policy.clone(),
             NodeActorChannels {
                 handle_sigint: false,
+                iroh_transport_enabled: true,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 control_receiver,
+                ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
@@ -39132,8 +40080,12 @@ mod tests {
                 )
                 .await
                 .expect("server handshake");
-                let mut receipt = authenticated_receipt(&connection, &mission, handshake)
-                    .expect("server receipt");
+                let mut receipt = authenticated_receipt(
+                    &SelectedContact::from_iroh(connection.clone()),
+                    &mission,
+                    handshake,
+                )
+                .expect("server receipt");
                 let _error = serve_transfer_profiles(&connection, &mut mission, &mut receipt)
                     .await
                     .expect_err("legacy Blob offer must fail");
@@ -39162,8 +40114,12 @@ mod tests {
         )
         .await
         .expect("client handshake");
-        let mut receipt =
-            authenticated_receipt(&connection, &mission, handshake).expect("client receipt");
+        let mut receipt = authenticated_receipt(
+            &SelectedContact::from_iroh(connection.clone()),
+            &mission,
+            handshake,
+        )
+        .expect("client receipt");
         assert_eq!(receipt.protected_frames, 0);
         // Historical offer is readable, but cannot select a Blob data path.
         let legacy = TransferProfileOfferV1::decode(&[
@@ -39235,8 +40191,12 @@ mod tests {
                 )
                 .await
                 .expect("server handshake");
-                let mut receipt = authenticated_receipt(&connection, &mission, handshake)
-                    .expect("server receipt");
+                let mut receipt = authenticated_receipt(
+                    &SelectedContact::from_iroh(connection.clone()),
+                    &mission,
+                    handshake,
+                )
+                .expect("server receipt");
                 let profiles = serve_transfer_profiles(&connection, &mut mission, &mut receipt)
                     .await
                     .expect("serve profiles")
@@ -39277,8 +40237,12 @@ mod tests {
         )
         .await
         .expect("client handshake");
-        let mut receipt =
-            authenticated_receipt(&connection, &mission, handshake).expect("client receipt");
+        let mut receipt = authenticated_receipt(
+            &SelectedContact::from_iroh(connection.clone()),
+            &mission,
+            handshake,
+        )
+        .expect("client receipt");
         assert_eq!(receipt.protected_frames, 0);
         let client_profiles = sync_transfer_profiles(&connection, &mut mission, &mut receipt)
             .await
@@ -39562,13 +40526,30 @@ mod tests {
             received
         });
 
-        let (mut mission, _) = crate::mission::initiate_over_contact_metered(
+        let (mut mission, handshake) = crate::mission::initiate_over_contact_metered(
             &left,
             initiator_bundle,
             expected(b"configured-responder", responder_id),
         )
         .await
         .unwrap();
+        let receipt = authenticated_receipt(&left, &mission, handshake).unwrap();
+        assert_eq!(receipt.peer, None);
+        assert_eq!(receipt.mission_peer, Some(responder_id));
+        assert_eq!(receipt.carrier_path, None);
+        assert_eq!(receipt.handshake_frames, 4);
+        assert_eq!(receipt.semantic_version, SEMANTIC_PROTOCOL_V9);
+        let completed = complete_peer_contact(
+            &left,
+            receipt.clone(),
+            ContactEventPolicy {
+                control_head: None,
+                selector_generation: 0,
+            },
+        );
+        assert_eq!(completed.carrier_path, None);
+        assert_eq!(completed.carrier_path_transitions, 0);
+        assert_eq!(selected_event_max_frame_bytes(&left), 16 * 1024);
         let mut turn = open_selected_event_send_turn(&left, 16 * 1024)
             .await
             .unwrap();
@@ -39592,6 +40573,1685 @@ mod tests {
         turn.finish().await.unwrap();
 
         assert_eq!(receiver.await.unwrap(), expected_plaintext);
+    }
+
+    async fn ordered_test_event_contact_pair(
+        initiator_store: Arc<Store>,
+        initiator_credentials: UnprotectedReferenceMission,
+        initiator_id: NodeId,
+        responder_store: Arc<Store>,
+        responder_credentials: UnprotectedReferenceMission,
+        responder_id: NodeId,
+        clock_seed: u8,
+    ) -> (CompletedPeerContact, CompletedPeerContact) {
+        ordered_test_event_contact_pair_with_responder_policy(
+            initiator_store,
+            initiator_credentials,
+            initiator_id,
+            responder_store,
+            responder_credentials,
+            responder_id,
+            clock_seed,
+            EventEmissionPolicy::Normal,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn ordered_test_event_contact_pair_with_responder_policy(
+        initiator_store: Arc<Store>,
+        initiator_credentials: UnprotectedReferenceMission,
+        initiator_id: NodeId,
+        responder_store: Arc<Store>,
+        responder_credentials: UnprotectedReferenceMission,
+        responder_id: NodeId,
+        clock_seed: u8,
+        responder_emission_policy: EventEmissionPolicy,
+    ) -> (CompletedPeerContact, CompletedPeerContact) {
+        let (initiator_stream, responder_stream) = duplex(113);
+        let initiator_contact = SelectedContact::from_ordered(Arc::new(
+            BleL2capContact::new(
+                initiator_stream,
+                TransientLocator::new(b"ordered-responder".to_vec()).unwrap(),
+                64 * 1024,
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+        ));
+        let responder_contact = SelectedContact::from_ordered(Arc::new(
+            BleL2capContact::new(
+                responder_stream,
+                TransientLocator::new(b"ordered-initiator".to_vec()).unwrap(),
+                64 * 1024,
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+        ));
+        let expectation = |locator: &[u8], mission_id| {
+            MissionPeerExpectation::new(
+                CarrierPeerEvidence::UnauthenticatedLocator {
+                    transient_locator: TransientLocator::new(locator.to_vec()).unwrap(),
+                },
+                mission_id,
+            )
+        };
+
+        let responder_policy = Arc::new(LiveEmissionPolicy::new(responder_emission_policy));
+        let responder_custody_clock =
+            NodeCustodyClock::injected([clock_seed.wrapping_add(1); 16], 0, 0);
+        let responder_guard = ContactEmissionGuard {
+            live: responder_policy.clone(),
+            captured: responder_policy.snapshot().unwrap(),
+            custody_clock: responder_custody_clock.clone(),
+        };
+        let responder_cache = test_event_route_cache(&responder_store, &responder_credentials);
+        let responder_task = tokio::spawn({
+            let responder_store = responder_store.clone();
+            async move {
+                CONTACT_EVENT_ROUTE_CACHE
+                    .scope(
+                        responder_cache,
+                        CONTACT_EMISSION_GUARD.scope(
+                            responder_guard,
+                            serve_ordered_event_session(
+                                responder_store,
+                                responder_contact,
+                                responder_credentials,
+                                expectation(b"expected-initiator", initiator_id),
+                                responder_custody_clock,
+                                Arc::new(RwLock::new(())),
+                                MutableSourceInterests::default(),
+                            ),
+                        ),
+                    )
+                    .await
+            }
+        });
+
+        let initiator_policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+        let initiator_guard = ContactEmissionGuard {
+            live: initiator_policy.clone(),
+            captured: initiator_policy.snapshot().unwrap(),
+            custody_clock: NodeCustodyClock::injected([clock_seed; 16], 0, 0),
+        };
+        let initiator_cache = test_event_route_cache(&initiator_store, &initiator_credentials);
+        let initiator_receipt = CONTACT_EVENT_ROUTE_CACHE
+            .scope(
+                initiator_cache,
+                CONTACT_EMISSION_GUARD.scope(
+                    initiator_guard,
+                    sync_ordered_event_session(
+                        initiator_store,
+                        initiator_contact,
+                        initiator_credentials,
+                        expectation(b"expected-responder", responder_id),
+                        Arc::new(RwLock::new(())),
+                        MutableSourceInterests::default(),
+                    ),
+                ),
+            )
+            .await
+            .expect("ordered initiator session");
+        let responder_receipt = responder_task
+            .await
+            .expect("ordered responder task")
+            .expect("ordered responder session");
+        (initiator_receipt, responder_receipt)
+    }
+
+    struct CountingOrderedContact {
+        inner: BleL2capContact,
+        operations: Arc<AtomicUsize>,
+    }
+
+    impl CountingOrderedContact {
+        fn new(inner: BleL2capContact, operations: Arc<AtomicUsize>) -> Self {
+            Self { inner, operations }
+        }
+
+        fn count(&self) {
+            self.operations.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl OrderedContact for CountingOrderedContact {
+        fn peer_evidence(&self) -> CarrierPeerEvidence {
+            self.inner.peer_evidence()
+        }
+
+        fn max_frame_bytes(&self) -> usize {
+            self.inner.max_frame_bytes()
+        }
+
+        fn request_with_total_limit<'a>(
+            &'a self,
+            request: &'a [u8],
+            total_limit: usize,
+        ) -> aster_contact::ContactFuture<'a, Vec<u8>> {
+            self.count();
+            self.inner.request_with_total_limit(request, total_limit)
+        }
+
+        fn request_with_total_limit_checked<'a>(
+            &'a self,
+            request: &'a [u8],
+            total_limit: usize,
+            before_write: aster_contact::ContactPreflight<'a>,
+        ) -> aster_contact::ContactFuture<'a, Vec<u8>> {
+            self.count();
+            self.inner
+                .request_with_total_limit_checked(request, total_limit, before_write)
+        }
+
+        fn respond_once_with_total_limit<'a>(
+            &'a self,
+            total_limit: usize,
+            handler: aster_contact::ContactRequestHandler<'a>,
+        ) -> aster_contact::ContactFuture<'a, bool> {
+            self.count();
+            self.inner
+                .respond_once_with_total_limit(total_limit, handler)
+        }
+
+        fn finish_as_initiator(&self) -> aster_contact::ContactFuture<'_, ()> {
+            self.inner.finish_as_initiator()
+        }
+
+        fn finish_as_responder(&self) -> aster_contact::ContactFuture<'_, ()> {
+            self.inner.finish_as_responder()
+        }
+
+        fn close(&self) {
+            self.inner.close();
+        }
+    }
+
+    struct DisconnectAfterDurableEventContact {
+        inner: BleL2capContact,
+        disconnected: Arc<AtomicBool>,
+    }
+
+    impl DisconnectAfterDurableEventContact {
+        fn new(inner: BleL2capContact, disconnected: Arc<AtomicBool>) -> Self {
+            Self {
+                inner,
+                disconnected,
+            }
+        }
+    }
+
+    impl OrderedContact for DisconnectAfterDurableEventContact {
+        fn peer_evidence(&self) -> CarrierPeerEvidence {
+            self.inner.peer_evidence()
+        }
+
+        fn max_frame_bytes(&self) -> usize {
+            self.inner.max_frame_bytes()
+        }
+
+        fn request_with_total_limit<'a>(
+            &'a self,
+            request: &'a [u8],
+            total_limit: usize,
+        ) -> aster_contact::ContactFuture<'a, Vec<u8>> {
+            self.inner.request_with_total_limit(request, total_limit)
+        }
+
+        fn request_with_total_limit_checked<'a>(
+            &'a self,
+            request: &'a [u8],
+            total_limit: usize,
+            before_write: aster_contact::ContactPreflight<'a>,
+        ) -> aster_contact::ContactFuture<'a, Vec<u8>> {
+            self.inner
+                .request_with_total_limit_checked(request, total_limit, before_write)
+        }
+
+        fn respond_once_with_total_limit<'a>(
+            &'a self,
+            total_limit: usize,
+            handler: aster_contact::ContactRequestHandler<'a>,
+        ) -> aster_contact::ContactFuture<'a, bool> {
+            Box::pin(async move {
+                let handled = self
+                    .inner
+                    .respond_once_with_total_limit(total_limit, handler)
+                    .await?;
+                let durable = CONTACT_EVENT_INSERTED
+                    .try_with(|inserted| inserted.load(Ordering::Acquire))
+                    .unwrap_or(false);
+                if durable && !self.disconnected.swap(true, Ordering::SeqCst) {
+                    self.inner.close();
+                    return Err(ContactError::new(
+                        ContactErrorKind::Transport,
+                        "synthetic ordered disconnect after durable Event commit",
+                    ));
+                }
+                Ok(handled)
+            })
+        }
+
+        fn finish_as_initiator(&self) -> aster_contact::ContactFuture<'_, ()> {
+            self.inner.finish_as_initiator()
+        }
+
+        fn finish_as_responder(&self) -> aster_contact::ContactFuture<'_, ()> {
+            self.inner.finish_as_responder()
+        }
+
+        fn close(&self) {
+            self.inner.close();
+        }
+    }
+
+    #[derive(Default)]
+    struct StalledOrderedContact {
+        operations: AtomicUsize,
+        closes: AtomicUsize,
+    }
+
+    impl StalledOrderedContact {
+        fn operations(&self) -> usize {
+            self.operations.load(Ordering::SeqCst)
+        }
+
+        fn closes(&self) -> usize {
+            self.closes.load(Ordering::SeqCst)
+        }
+
+        fn stall<'a, T: 'a>(&'a self) -> aster_contact::ContactFuture<'a, T> {
+            self.operations.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    impl OrderedContact for StalledOrderedContact {
+        fn peer_evidence(&self) -> CarrierPeerEvidence {
+            CarrierPeerEvidence::UnauthenticatedLocator {
+                transient_locator: TransientLocator::new(b"stalled-ordered-contact".to_vec())
+                    .unwrap(),
+            }
+        }
+
+        fn max_frame_bytes(&self) -> usize {
+            64 * 1024
+        }
+
+        fn request_with_total_limit<'a>(
+            &'a self,
+            _request: &'a [u8],
+            _total_limit: usize,
+        ) -> aster_contact::ContactFuture<'a, Vec<u8>> {
+            self.stall()
+        }
+
+        fn request_with_total_limit_checked<'a>(
+            &'a self,
+            _request: &'a [u8],
+            _total_limit: usize,
+            _before_write: aster_contact::ContactPreflight<'a>,
+        ) -> aster_contact::ContactFuture<'a, Vec<u8>> {
+            self.stall()
+        }
+
+        fn respond_once_with_total_limit<'a>(
+            &'a self,
+            _total_limit: usize,
+            _handler: aster_contact::ContactRequestHandler<'a>,
+        ) -> aster_contact::ContactFuture<'a, bool> {
+            self.stall()
+        }
+
+        fn finish_as_initiator(&self) -> aster_contact::ContactFuture<'_, ()> {
+            self.stall()
+        }
+
+        fn finish_as_responder(&self) -> aster_contact::ContactFuture<'_, ()> {
+            self.stall()
+        }
+
+        fn close(&self) {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct FailingOrderedContact {
+        operations: Arc<AtomicUsize>,
+    }
+
+    impl FailingOrderedContact {
+        fn fail<'a, T: 'a>(&'a self) -> aster_contact::ContactFuture<'a, T> {
+            self.operations.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(ContactError::new(
+                    ContactErrorKind::Transport,
+                    "synthetic ordered contact failure",
+                ))
+            })
+        }
+    }
+
+    impl OrderedContact for FailingOrderedContact {
+        fn peer_evidence(&self) -> CarrierPeerEvidence {
+            CarrierPeerEvidence::UnauthenticatedLocator {
+                transient_locator: TransientLocator::new(b"failing-ordered-contact".to_vec())
+                    .unwrap(),
+            }
+        }
+
+        fn max_frame_bytes(&self) -> usize {
+            64 * 1024
+        }
+
+        fn request_with_total_limit<'a>(
+            &'a self,
+            _request: &'a [u8],
+            _total_limit: usize,
+        ) -> aster_contact::ContactFuture<'a, Vec<u8>> {
+            self.fail()
+        }
+
+        fn request_with_total_limit_checked<'a>(
+            &'a self,
+            _request: &'a [u8],
+            _total_limit: usize,
+            _before_write: aster_contact::ContactPreflight<'a>,
+        ) -> aster_contact::ContactFuture<'a, Vec<u8>> {
+            self.fail()
+        }
+
+        fn respond_once_with_total_limit<'a>(
+            &'a self,
+            _total_limit: usize,
+            _handler: aster_contact::ContactRequestHandler<'a>,
+        ) -> aster_contact::ContactFuture<'a, bool> {
+            self.fail()
+        }
+
+        fn finish_as_initiator(&self) -> aster_contact::ContactFuture<'_, ()> {
+            self.fail()
+        }
+
+        fn finish_as_responder(&self) -> aster_contact::ContactFuture<'_, ()> {
+            self.fail()
+        }
+
+        fn close(&self) {}
+    }
+
+    #[tokio::test]
+    async fn ordered_production_session_transfers_one_durable_event() {
+        let test_root = root("ordered-production-event");
+        let initiator_root = test_root.join("initiator");
+        let responder_root = test_root.join("responder");
+        fs::create_dir_all(&initiator_root).expect("initiator state");
+        fs::create_dir_all(&responder_root).expect("responder state");
+        #[cfg(unix)]
+        for state in [&initiator_root, &responder_root] {
+            fs::set_permissions(state, fs::Permissions::from_mode(0o700))
+                .expect("owner-only node state");
+        }
+
+        let mut issued = issue_missions(2);
+        let initiator = issued.remove(0);
+        let responder = issued.remove(0);
+        let authority = initiator.credentials.mission_authority_id();
+        assert_eq!(authority, responder.credentials.mission_authority_id());
+        let initiator_store = Arc::new(
+            Store::open_for_mission(initiator_root.join(STORE_FILE), authority)
+                .expect("initiator store"),
+        );
+        let responder_store = Arc::new(
+            Store::open_for_mission(responder_root.join(STORE_FILE), authority)
+                .expect("responder store"),
+        );
+        let topic = Topic::new("opaque").expect("Event topic");
+        let scope = Scope::new("test/runtime-contact").expect("Event scope");
+        for store in [&initiator_store, &responder_store] {
+            seed_test_event_subscription(
+                store,
+                EventSubscriptionMode::Consume,
+                &topic,
+                &scope,
+                b"ordered-production-event",
+            );
+        }
+        let mut sealer = open_test_sealer(&initiator.credentials);
+        let event = publish_test_epoch_one_event_with_payload(
+            &initiator_store,
+            &mut sealer,
+            &topic,
+            &scope,
+            b"ordered-production-source",
+            &vec![0x5a; 4 * 1024],
+            Priority::Routine,
+        );
+        let mut responder_sealer = open_test_sealer(&responder.credentials);
+        let responder_event = publish_test_epoch_one_event_with_payload(
+            &responder_store,
+            &mut responder_sealer,
+            &topic,
+            &scope,
+            b"ordered-production-responder-source",
+            &vec![0x6b; 3 * 1024],
+            Priority::Routine,
+        );
+
+        let (initiator_receipt, responder_receipt) = ordered_test_event_contact_pair(
+            initiator_store.clone(),
+            initiator.credentials.clone(),
+            initiator.identity,
+            responder_store.clone(),
+            responder.credentials.clone(),
+            responder.identity,
+            0xa1,
+        )
+        .await;
+
+        assert_eq!(
+            initiator_receipt.receipt.semantic_version,
+            SEMANTIC_PROTOCOL_V9
+        );
+        assert_eq!(
+            responder_receipt.receipt.semantic_version,
+            SEMANTIC_PROTOCOL_V9
+        );
+        assert_eq!(
+            initiator_receipt.receipt.transfer_profile_digest,
+            responder_receipt.receipt.transfer_profile_digest
+        );
+        let offer = TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V9)
+            .expect("canonical v9 profile offer");
+        let negotiated =
+            negotiate_transfer_profiles_for_semantic_version(SEMANTIC_PROTOCOL_V9, &offer, &offer)
+                .expect("canonical v9 profile negotiation");
+        assert_eq!(
+            initiator_receipt.receipt.transfer_profile_digest,
+            Some(transfer_profile_digest(&offer, &offer, &negotiated))
+        );
+        assert_eq!(
+            initiator_receipt.receipt.negotiated_transfer_profiles,
+            responder_receipt.receipt.negotiated_transfer_profiles
+        );
+        assert_eq!(
+            initiator_receipt.receipt.negotiated_transfer_profiles,
+            Some([2, 1, 1, 5, 1]),
+            "BTLE keeps the complete v9 profile transcript while non-Event lanes stay dormant"
+        );
+        assert_eq!(
+            initiator_receipt.receipt.blob_stream,
+            BlobStreamContactReceipt::default()
+        );
+        assert_eq!(
+            responder_receipt.receipt.blob_stream,
+            BlobStreamContactReceipt::default()
+        );
+        assert_eq!(initiator_receipt.receipt.offered, 1);
+        assert_eq!(initiator_receipt.receipt.fetched, 1);
+        assert_eq!(responder_receipt.receipt.offered, 1);
+        assert_eq!(responder_receipt.receipt.fetched, 1);
+        assert!(
+            responder_store
+                .get_event(event)
+                .expect("received Event lookup")
+                .is_some()
+        );
+        assert!(
+            initiator_store
+                .get_event(responder_event)
+                .expect("reverse received Event lookup")
+                .is_some()
+        );
+
+        let (converged_initiator, converged_responder) = ordered_test_event_contact_pair(
+            initiator_store.clone(),
+            initiator.credentials.clone(),
+            initiator.identity,
+            responder_store.clone(),
+            responder.credentials.clone(),
+            responder.identity,
+            0xc3,
+        )
+        .await;
+        assert_eq!(converged_initiator.receipt.offered, 0);
+        assert_eq!(converged_initiator.receipt.fetched, 0);
+        assert_eq!(converged_responder.receipt.offered, 0);
+        assert_eq!(converged_responder.receipt.fetched, 0);
+        assert_eq!(
+            initiator_store
+                .event_count()
+                .expect("converged initiator Event count"),
+            2
+        );
+        assert_eq!(
+            responder_store
+                .event_count()
+                .expect("converged responder Event count"),
+            2
+        );
+
+        drop((initiator_store, responder_store));
+        fs::remove_dir_all(test_root).expect("ordered production cleanup");
+    }
+
+    #[tokio::test]
+    async fn ordered_receive_only_responder_fetches_and_terminates() {
+        let test_root = root("ordered-receive-only-responder");
+        let initiator_root = test_root.join("initiator");
+        let responder_root = test_root.join("responder");
+        fs::create_dir_all(&initiator_root).expect("initiator state");
+        fs::create_dir_all(&responder_root).expect("responder state");
+
+        let mut issued = issue_missions(2);
+        let initiator = issued.remove(0);
+        let responder = issued.remove(0);
+        let authority = initiator.credentials.mission_authority_id();
+        let initiator_store = Arc::new(
+            Store::open_for_mission(initiator_root.join(STORE_FILE), authority)
+                .expect("initiator store"),
+        );
+        let responder_store = Arc::new(
+            Store::open_for_mission(responder_root.join(STORE_FILE), authority)
+                .expect("responder store"),
+        );
+        let topic = Topic::new("opaque").expect("Event topic");
+        let scope = Scope::new("test/runtime-contact").expect("Event scope");
+        for store in [&initiator_store, &responder_store] {
+            seed_test_event_subscription(
+                store,
+                EventSubscriptionMode::Consume,
+                &topic,
+                &scope,
+                b"ordered-receive-only",
+            );
+        }
+        let mut sealer = open_test_sealer(&initiator.credentials);
+        let event = publish_test_epoch_one_event_with_payload(
+            &initiator_store,
+            &mut sealer,
+            &topic,
+            &scope,
+            b"ordered-receive-only-source",
+            b"receive-only ordered Event",
+            Priority::Routine,
+        );
+
+        let (initiator_receipt, responder_receipt) = timeout(
+            Duration::from_secs(10),
+            ordered_test_event_contact_pair_with_responder_policy(
+                initiator_store.clone(),
+                initiator.credentials.clone(),
+                initiator.identity,
+                responder_store.clone(),
+                responder.credentials.clone(),
+                responder.identity,
+                0xd4,
+                EventEmissionPolicy::ReceiveOnly,
+            ),
+        )
+        .await
+        .expect("receive-only ordered contact termination");
+
+        assert_eq!(initiator_receipt.receipt.offered, 1);
+        assert_eq!(initiator_receipt.receipt.fetched, 0);
+        assert_eq!(responder_receipt.receipt.offered, 0);
+        assert_eq!(responder_receipt.receipt.fetched, 1);
+        assert!(
+            responder_store
+                .get_event(event)
+                .expect("receive-only Event lookup")
+                .is_some()
+        );
+
+        drop((initiator_store, responder_store));
+        fs::remove_dir_all(test_root).expect("receive-only ordered cleanup");
+    }
+
+    #[tokio::test]
+    async fn ordered_wrong_mission_is_rejected_before_profile_or_inventory() {
+        let test_root = root("ordered-wrong-mission");
+        let initiator_root = test_root.join("initiator");
+        let responder_root = test_root.join("responder");
+        fs::create_dir_all(&initiator_root).expect("initiator state");
+        fs::create_dir_all(&responder_root).expect("responder state");
+
+        let mut issued = issue_missions(3);
+        let initiator = issued.remove(0);
+        let responder = issued.remove(0);
+        let wrong = issued.remove(0);
+        let authority = initiator.credentials.mission_authority_id();
+        let initiator_store = Arc::new(
+            Store::open_for_mission(initiator_root.join(STORE_FILE), authority)
+                .expect("initiator store"),
+        );
+        let responder_store = Arc::new(
+            Store::open_for_mission(responder_root.join(STORE_FILE), authority)
+                .expect("responder store"),
+        );
+        let expectation = |mission_id| {
+            MissionPeerExpectation::new(
+                CarrierPeerEvidence::UnauthenticatedLocator {
+                    transient_locator: TransientLocator::new(b"ordered-peer".to_vec()).unwrap(),
+                },
+                mission_id,
+            )
+        };
+        let (initiator_stream, responder_stream) = duplex(113);
+        let initiator_operations = Arc::new(AtomicUsize::new(0));
+        let responder_operations = Arc::new(AtomicUsize::new(0));
+        let contact = |stream, operations| {
+            SelectedContact::from_ordered(Arc::new(CountingOrderedContact::new(
+                BleL2capContact::new(
+                    stream,
+                    TransientLocator::new(b"ordered-peer".to_vec()).unwrap(),
+                    64 * 1024,
+                    Duration::from_secs(5),
+                )
+                .unwrap(),
+                operations,
+            )))
+        };
+        let initiator_contact = contact(initiator_stream, initiator_operations.clone());
+        let responder_contact = contact(responder_stream, responder_operations.clone());
+
+        let responder_policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+        let responder_custody_clock = NodeCustodyClock::injected([0xe2; 16], 0, 0);
+        let responder_guard = ContactEmissionGuard {
+            live: responder_policy.clone(),
+            captured: responder_policy.snapshot().unwrap(),
+            custody_clock: responder_custody_clock.clone(),
+        };
+        let responder_cache = test_event_route_cache(&responder_store, &responder.credentials);
+        let responder_task = tokio::spawn({
+            let responder_store = responder_store.clone();
+            let responder_credentials = responder.credentials.clone();
+            async move {
+                CONTACT_EVENT_ROUTE_CACHE
+                    .scope(
+                        responder_cache,
+                        CONTACT_EMISSION_GUARD.scope(
+                            responder_guard,
+                            serve_ordered_event_session(
+                                responder_store,
+                                responder_contact,
+                                responder_credentials,
+                                expectation(wrong.identity),
+                                responder_custody_clock,
+                                Arc::new(RwLock::new(())),
+                                MutableSourceInterests::default(),
+                            ),
+                        ),
+                    )
+                    .await
+            }
+        });
+
+        let initiator_policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+        let initiator_guard = ContactEmissionGuard {
+            live: initiator_policy.clone(),
+            captured: initiator_policy.snapshot().unwrap(),
+            custody_clock: NodeCustodyClock::injected([0xe1; 16], 0, 0),
+        };
+        let initiator_cache = test_event_route_cache(&initiator_store, &initiator.credentials);
+        let initiator_result = CONTACT_EVENT_ROUTE_CACHE
+            .scope(
+                initiator_cache,
+                CONTACT_EMISSION_GUARD.scope(
+                    initiator_guard,
+                    sync_ordered_event_session(
+                        initiator_store.clone(),
+                        initiator_contact,
+                        initiator.credentials.clone(),
+                        expectation(responder.identity),
+                        Arc::new(RwLock::new(())),
+                        MutableSourceInterests::default(),
+                    ),
+                ),
+            )
+            .await;
+        let responder_result = responder_task.await.expect("responder task");
+
+        assert!(initiator_result.is_err());
+        assert!(matches!(
+            responder_result,
+            Err(NodeError::Mission(
+                MissionSessionError::MissionIdentityMismatch { .. }
+            ))
+        ));
+        assert_eq!(initiator_operations.load(Ordering::SeqCst), 2);
+        assert_eq!(responder_operations.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            initiator_store
+                .event_count()
+                .expect("initiator Event count"),
+            0
+        );
+        assert_eq!(
+            responder_store
+                .event_count()
+                .expect("responder Event count"),
+            0
+        );
+
+        drop((initiator_store, responder_store));
+        fs::remove_dir_all(test_root).expect("wrong-mission cleanup");
+    }
+
+    #[tokio::test]
+    async fn ordered_wrong_mission_cannot_trigger_custody_maintenance() {
+        let test_root = root("ordered-wrong-mission-custody");
+        let node_root = test_root.join("node");
+        let attacker_root = test_root.join("attacker");
+        fs::create_dir_all(&node_root).expect("node state");
+        fs::create_dir_all(&attacker_root).expect("attacker state");
+        #[cfg(unix)]
+        for state in [&node_root, &attacker_root] {
+            fs::set_permissions(state, fs::Permissions::from_mode(0o700))
+                .expect("owner-only ordered custody state");
+        }
+
+        let mut issued = issue_missions(3);
+        let local = issued.remove(0);
+        let attacker = issued.remove(0);
+        let expected = issued.remove(0);
+        let authority = local.credentials.mission_authority_id();
+        let node = start_node(NodeConfig {
+            state: node_root.clone(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            mission: local.credentials.clone(),
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start ordered custody node");
+        let events = node.selected_events();
+        let client = subscription_fixture_client(&events).await;
+        events
+            .publish_numbered(
+                NumberedEventPublishRequest {
+                    client_id: client.client_id,
+                    session: client.session,
+                    sequence: aster_redb_store::EventOperationSequence::new(1).unwrap(),
+                    predecessor: None,
+                    topic: Topic::new("opaque").unwrap(),
+                    scope: Scope::new("test/runtime-contact").unwrap(),
+                    priority: Priority::Routine,
+                    logical_key: b"pre-auth-custody".to_vec(),
+                    payload: b"must survive rejected locator".to_vec(),
+                    tombstone: false,
+                },
+                EventPublishOptions::finite_ttl_ms(250).unwrap(),
+            )
+            .await
+            .expect("publish finite Event before rejected contact");
+        sleep(Duration::from_millis(300)).await;
+
+        let attacker_store = Arc::new(
+            Store::open_for_mission(attacker_root.join(STORE_FILE), authority)
+                .expect("attacker store"),
+        );
+        let (attacker_stream, node_stream) = duplex(113);
+        let contact = |stream| {
+            Arc::new(
+                BleL2capContact::new(
+                    stream,
+                    TransientLocator::new(b"ordered-custody-peer".to_vec()).unwrap(),
+                    64 * 1024,
+                    Duration::from_secs(5),
+                )
+                .unwrap(),
+            ) as Arc<dyn OrderedContact>
+        };
+        let expectation = |mission_id| {
+            MissionPeerExpectation::new(
+                CarrierPeerEvidence::UnauthenticatedLocator {
+                    transient_locator: TransientLocator::new(b"ordered-custody-peer".to_vec())
+                        .unwrap(),
+                },
+                mission_id,
+            )
+        };
+        let responder = node.ordered_event_contacts();
+        let responder_task = tokio::spawn(async move {
+            responder
+                .run(
+                    OrderedEventContactRole::Responder,
+                    contact(node_stream),
+                    expectation(expected.identity),
+                )
+                .await
+        });
+        let attacker_policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+        let attacker_guard = ContactEmissionGuard {
+            live: attacker_policy.clone(),
+            captured: attacker_policy.snapshot().unwrap(),
+            custody_clock: NodeCustodyClock::injected([0xe3; 16], 0, 0),
+        };
+        let attacker_cache = test_event_route_cache(&attacker_store, &attacker.credentials);
+        let attacker_result = CONTACT_EVENT_ROUTE_CACHE
+            .scope(
+                attacker_cache,
+                CONTACT_EMISSION_GUARD.scope(
+                    attacker_guard,
+                    sync_ordered_event_session(
+                        attacker_store.clone(),
+                        SelectedContact::from_ordered(contact(attacker_stream)),
+                        attacker.credentials,
+                        expectation(local.identity),
+                        Arc::new(RwLock::new(())),
+                        MutableSourceInterests::default(),
+                    ),
+                ),
+            )
+            .await;
+        let responder_result = responder_task.await.expect("responder task");
+        assert!(attacker_result.is_err());
+        assert!(responder_result.is_err());
+
+        let receipt = node
+            .shutdown()
+            .await
+            .expect("shutdown ordered custody node");
+        assert_eq!(receipt.events, 1, "rejected locator mutated custody state");
+        drop(attacker_store);
+        fs::remove_dir_all(test_root).expect("ordered custody cleanup");
+    }
+
+    #[tokio::test]
+    async fn running_node_accepts_and_accounts_ordered_event_contacts() {
+        use crate::application::{EventId, EventPollRequest, EventSubscriptionRequest};
+
+        let test_root = root("running-node-ordered-contact");
+        let initiator_root = test_root.join("initiator");
+        let responder_root = test_root.join("responder");
+        fs::create_dir_all(&initiator_root).expect("initiator state");
+        fs::create_dir_all(&responder_root).expect("responder state");
+        #[cfg(unix)]
+        for state in [&initiator_root, &responder_root] {
+            fs::set_permissions(state, fs::Permissions::from_mode(0o700))
+                .expect("owner-only running-node state");
+        }
+        let mut issued = issue_missions(2);
+        let initiator = issued.remove(0);
+        let responder = issued.remove(0);
+        let authority = initiator.credentials.mission_authority_id();
+        assert_eq!(authority, responder.credentials.mission_authority_id());
+
+        let config =
+            |state: PathBuf, mission: UnprotectedReferenceMission| TransportNeutralNodeConfig {
+                state,
+                mission,
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            };
+        let initiator_node = start_transport_neutral_node(config(
+            initiator_root.clone(),
+            initiator.credentials.clone(),
+        ))
+        .await
+        .expect("initiator node");
+        let responder_node = start_transport_neutral_node(config(
+            responder_root.clone(),
+            responder.credentials.clone(),
+        ))
+        .await
+        .expect("responder node");
+        assert!(initiator_node.bound_sockets.is_empty());
+        assert!(responder_node.bound_sockets.is_empty());
+
+        let topic = Topic::new("opaque").expect("Event topic");
+        let scope = Scope::new("test/runtime-contact").expect("Event scope");
+        let initiator_events = initiator_node.selected_events();
+        let responder_events = responder_node.selected_events();
+        let initiator_subscription = initiator_events
+            .subscribe(EventSubscriptionRequest {
+                client: subscription_fixture_client(&initiator_events).await,
+                operation_key: b"running-node-ordered-initiator-subscription".to_vec(),
+                topic: topic.clone(),
+                scope: scope.clone(),
+                include_descendant_scopes: false,
+            })
+            .await
+            .expect("subscribe initiator before ordered contact");
+        let subscription = responder_events
+            .subscribe(EventSubscriptionRequest {
+                client: subscription_fixture_client(&responder_events).await,
+                operation_key: b"running-node-ordered-contact-subscription".to_vec(),
+                topic: topic.clone(),
+                scope: scope.clone(),
+                include_descendant_scopes: false,
+            })
+            .await
+            .expect("subscribe responder before ordered contact");
+        let initiator_client = subscription_fixture_client(&initiator_events).await;
+        let initiator_published = initiator_events
+            .publish_numbered(
+                NumberedEventPublishRequest {
+                    client_id: initiator_client.client_id,
+                    session: initiator_client.session,
+                    sequence: aster_redb_store::EventOperationSequence::new(1).unwrap(),
+                    predecessor: None,
+                    topic,
+                    scope,
+                    priority: Priority::Priority,
+                    logical_key: b"actor-ordered-event".to_vec(),
+                    payload: vec![0x7c; 4 * 1024],
+                    tombstone: false,
+                },
+                EventPublishOptions::durable(),
+            )
+            .await
+            .expect("publish initiator Event before ordered contact");
+        let initiator_published_id =
+            EventId::from_bytes(*initiator_published.result.receipt.semantic_id.as_bytes());
+        let responder_client = subscription_fixture_client(&responder_events).await;
+        let responder_published = responder_events
+            .publish_numbered(
+                NumberedEventPublishRequest {
+                    client_id: responder_client.client_id,
+                    session: responder_client.session,
+                    sequence: aster_redb_store::EventOperationSequence::new(1).unwrap(),
+                    predecessor: None,
+                    topic: Topic::new("opaque").expect("Event topic"),
+                    scope: Scope::new("test/runtime-contact").expect("Event scope"),
+                    priority: Priority::Priority,
+                    logical_key: b"actor-ordered-reverse-event".to_vec(),
+                    payload: vec![0x4d; 3 * 1024],
+                    tombstone: false,
+                },
+                EventPublishOptions::durable(),
+            )
+            .await
+            .expect("publish responder Event before ordered contact");
+        let responder_published_id =
+            EventId::from_bytes(*responder_published.result.receipt.semantic_id.as_bytes());
+
+        let (initiator_stream, responder_stream) = duplex(113);
+        let ordered = |stream, locator: &[u8]| {
+            Arc::new(
+                BleL2capContact::new(
+                    stream,
+                    TransientLocator::new(locator.to_vec()).unwrap(),
+                    64 * 1024,
+                    Duration::from_secs(5),
+                )
+                .unwrap(),
+            ) as Arc<dyn OrderedContact>
+        };
+        let expectation = |mission_id| {
+            MissionPeerExpectation::new(
+                CarrierPeerEvidence::UnauthenticatedLocator {
+                    transient_locator: TransientLocator::new(b"ring1-peer".to_vec()).unwrap(),
+                },
+                mission_id,
+            )
+        };
+        let (interrupted_initiator_stream, interrupted_responder_stream) = duplex(113);
+        let interrupted_initiator =
+            ordered(interrupted_initiator_stream, b"ring1-interrupted-responder");
+        let disconnected_after_commit = Arc::new(AtomicBool::new(false));
+        let interrupted_responder = Arc::new(DisconnectAfterDurableEventContact::new(
+            BleL2capContact::new(
+                interrupted_responder_stream,
+                TransientLocator::new(b"ring1-interrupted-initiator".to_vec()).unwrap(),
+                64 * 1024,
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            disconnected_after_commit.clone(),
+        ));
+        let interrupted_responder_contacts = responder_node.ordered_event_contacts();
+        let interrupted_responder_task = tokio::spawn(async move {
+            interrupted_responder_contacts
+                .run(
+                    OrderedEventContactRole::Responder,
+                    interrupted_responder,
+                    expectation(initiator.identity),
+                )
+                .await
+        });
+        assert!(
+            initiator_node
+                .ordered_event_contacts()
+                .run(
+                    OrderedEventContactRole::Initiator,
+                    interrupted_initiator,
+                    expectation(responder.identity),
+                )
+                .await
+                .is_err(),
+            "injected disconnect must interrupt the first contact"
+        );
+        assert!(
+            interrupted_responder_task
+                .await
+                .expect("interrupted responder task")
+                .is_err()
+        );
+        assert!(
+            disconnected_after_commit.load(Ordering::SeqCst),
+            "disconnect must be injected only after the target Event is durable"
+        );
+        let before_restart = responder_events
+            .query(crate::application::EventQuery {
+                after_acceptance_marker: 0,
+                limit: 8,
+                ..crate::application::EventQuery::default()
+            })
+            .await
+            .expect("query responder after interrupted durable commit");
+        assert_eq!(
+            before_restart
+                .items
+                .iter()
+                .filter(|item| item.id == initiator_published_id)
+                .count(),
+            1,
+            "target Event must be durably present exactly once before restart"
+        );
+        let interrupted_responder_receipt = responder_node
+            .shutdown()
+            .await
+            .expect("shutdown interrupted responder");
+        assert_eq!(interrupted_responder_receipt.contact_errors, 1);
+
+        let responder_node = start_transport_neutral_node(config(
+            responder_root.clone(),
+            responder.credentials.clone(),
+        ))
+        .await
+        .expect("restart responder after interrupted contact");
+        assert!(responder_node.bound_sockets.is_empty());
+        let responder_events = responder_node.selected_events();
+
+        let responder_contacts = responder_node.ordered_event_contacts();
+        let responder_task = tokio::spawn(async move {
+            responder_contacts
+                .run(
+                    OrderedEventContactRole::Responder,
+                    ordered(responder_stream, b"ring1-initiator"),
+                    expectation(initiator.identity),
+                )
+                .await
+        });
+        let initiator_receipt = initiator_node
+            .ordered_event_contacts()
+            .run(
+                OrderedEventContactRole::Initiator,
+                ordered(initiator_stream, b"ring1-responder"),
+                expectation(responder.identity),
+            )
+            .await
+            .expect("initiator ordered contact");
+        let responder_receipt = responder_task
+            .await
+            .expect("responder task")
+            .expect("responder ordered contact");
+        assert_eq!(initiator_receipt.semantic_version, SEMANTIC_PROTOCOL_V9);
+        assert_eq!(responder_receipt.semantic_version, SEMANTIC_PROTOCOL_V9);
+        assert_eq!(initiator_receipt.offered, 0);
+        assert_eq!(initiator_receipt.fetched, 1);
+        assert_eq!(responder_receipt.offered, 1);
+        assert_eq!(responder_receipt.fetched, 0);
+        let offer = TransferProfileOfferV1::for_semantic_version(SEMANTIC_PROTOCOL_V9)
+            .expect("canonical v9 profile offer");
+        let negotiated =
+            negotiate_transfer_profiles_for_semantic_version(SEMANTIC_PROTOCOL_V9, &offer, &offer)
+                .expect("canonical v9 profile negotiation");
+        let digest = transfer_profile_digest(&offer, &offer, &negotiated);
+        for receipt in [&initiator_receipt, &responder_receipt] {
+            assert_eq!(receipt.negotiated_transfer_profiles, Some([2, 1, 1, 5, 1]));
+            assert_eq!(receipt.transfer_profile_digest, Some(digest));
+            assert_eq!(receipt.blob_stream, BlobStreamContactReceipt::default());
+        }
+        let delivered = responder_events
+            .poll(EventPollRequest {
+                client: subscription_fixture_client(&responder_events).await,
+                subscription: subscription.id,
+                delivery_limit: 8,
+                scan_limit: 8,
+            })
+            .await
+            .expect("poll Event transferred through live ordered handle");
+        assert_eq!(
+            delivered
+                .deliveries
+                .iter()
+                .filter(|delivery| delivery.event.id == initiator_published_id)
+                .count(),
+            1,
+            "restart and reconnect must produce one semantic delivery"
+        );
+        let reverse_delivered = initiator_events
+            .poll(EventPollRequest {
+                client: subscription_fixture_client(&initiator_events).await,
+                subscription: initiator_subscription.id,
+                delivery_limit: 8,
+                scan_limit: 8,
+            })
+            .await
+            .expect("poll reverse Event transferred through live ordered handle");
+        assert_eq!(
+            reverse_delivered
+                .deliveries
+                .iter()
+                .filter(|delivery| delivery.event.id == responder_published_id)
+                .count(),
+            1,
+            "interrupted reconnect must not duplicate reverse delivery"
+        );
+
+        let initiator_node_receipt = initiator_node.shutdown().await.expect("initiator shutdown");
+        let responder_node_receipt = responder_node.shutdown().await.expect("responder shutdown");
+        assert_eq!(initiator_node_receipt.contacts, 1);
+        assert_eq!(responder_node_receipt.contacts, 1);
+        assert_eq!(initiator_node_receipt.contact_errors, 1);
+        assert_eq!(responder_node_receipt.contact_errors, 0);
+        assert_eq!(initiator_node_receipt.events, 2);
+        assert_eq!(responder_node_receipt.events, 2);
+        fs::remove_dir_all(test_root).expect("running-node ordered cleanup");
+    }
+
+    #[tokio::test]
+    async fn ordered_handle_receive_only_rejects_initiation_before_contact_write() {
+        let test_root = root("ordered-handle-receive-only");
+        fs::create_dir_all(&test_root).expect("receive-only state");
+        #[cfg(unix)]
+        fs::set_permissions(&test_root, fs::Permissions::from_mode(0o700))
+            .expect("owner-only receive-only state");
+        let mut issued = issue_missions(2);
+        let local = issued.remove(0);
+        let peer = issued.remove(0);
+        let node = start_node_with_forwarding(
+            NodeConfig {
+                state: test_root.clone(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                mission: local.credentials,
+                peers: Vec::new(),
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            SelectedForwardingConfig::default()
+                .with_emission_policy(EventEmissionPolicy::ReceiveOnly),
+        )
+        .await
+        .expect("start receive-only node");
+        let contact = Arc::new(StalledOrderedContact::default());
+        let result = node
+            .ordered_event_contacts()
+            .run(
+                OrderedEventContactRole::Initiator,
+                contact.clone(),
+                MissionPeerExpectation::new(contact.peer_evidence(), peer.identity),
+            )
+            .await;
+        assert!(matches!(result, Err(NodeError::Protocol(_))));
+        assert_eq!(contact.operations(), 0);
+        assert_eq!(contact.closes(), 1);
+
+        let receipt = node.shutdown().await.expect("shutdown receive-only node");
+        assert_eq!(receipt.contacts, 0);
+        assert_eq!(receipt.contact_errors, 1);
+        fs::remove_dir_all(test_root).expect("receive-only cleanup");
+    }
+
+    #[tokio::test]
+    async fn ordered_handle_caller_cancellation_closes_active_contact() {
+        let test_root = root("ordered-handle-caller-cancellation");
+        fs::create_dir_all(&test_root).expect("caller-cancellation state");
+        #[cfg(unix)]
+        fs::set_permissions(&test_root, fs::Permissions::from_mode(0o700))
+            .expect("owner-only caller-cancellation state");
+        let mut issued = issue_missions(2);
+        let local = issued.remove(0);
+        let peer = issued.remove(0);
+        let node = start_transport_neutral_node(TransportNeutralNodeConfig {
+            state: test_root.clone(),
+            mission: local.credentials,
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start caller-cancellation node");
+        let contact = Arc::new(StalledOrderedContact::default());
+        let task_contact = contact.clone();
+        let handle = node.ordered_event_contacts();
+        let caller = tokio::spawn(async move {
+            handle
+                .run(
+                    OrderedEventContactRole::Initiator,
+                    task_contact.clone(),
+                    MissionPeerExpectation::new(task_contact.peer_evidence(), peer.identity),
+                )
+                .await
+        });
+        timeout(Duration::from_secs(5), async {
+            while contact.operations() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordered contact becomes active");
+
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        timeout(Duration::from_secs(5), async {
+            while contact.closes() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("caller cancellation closes active contact");
+
+        let receipt = node.shutdown().await.expect("caller-cancellation shutdown");
+        assert_eq!(receipt.contacts, 0);
+        assert_eq!(receipt.contact_errors, 1);
+        fs::remove_dir_all(test_root).expect("caller-cancellation cleanup");
+    }
+
+    #[tokio::test]
+    async fn ordered_fast_failures_do_not_starve_application_or_shutdown() {
+        let test_root = root("ordered-fast-failure-fairness");
+        fs::create_dir_all(&test_root).expect("fairness state");
+        #[cfg(unix)]
+        fs::set_permissions(&test_root, fs::Permissions::from_mode(0o700))
+            .expect("owner-only fairness state");
+        let mut issued = issue_missions(2);
+        let local = issued.remove(0);
+        let peer = issued.remove(0);
+        let node = start_node_with_forwarding_and_output_policy(
+            NodeConfig {
+                state: test_root.clone(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                mission: local.credentials,
+                peers: Vec::new(),
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            SelectedForwardingConfig::default(),
+            NodeOperatorOutputPolicy::CustomerSafe,
+        )
+        .await
+        .expect("start fairness node");
+        let events = node.selected_events();
+        let handle = node.ordered_event_contacts();
+        let operations = Arc::new(AtomicUsize::new(0));
+        let keep_running = Arc::new(AtomicBool::new(true));
+        let expectation = MissionPeerExpectation::new(
+            CarrierPeerEvidence::UnauthenticatedLocator {
+                transient_locator: TransientLocator::new(b"failing-ordered-contact".to_vec())
+                    .unwrap(),
+            },
+            peer.identity,
+        );
+        let flood = (0..(ORDERED_EVENT_CONTACT_CAPACITY * 4))
+            .map(|_| {
+                let handle = handle.clone();
+                let operations = operations.clone();
+                let keep_running = keep_running.clone();
+                let expectation = expectation.clone();
+                tokio::spawn(async move {
+                    while keep_running.load(Ordering::Acquire) {
+                        let contact = Arc::new(FailingOrderedContact {
+                            operations: operations.clone(),
+                        });
+                        let _ = handle
+                            .run(
+                                OrderedEventContactRole::Initiator,
+                                contact,
+                                expectation.clone(),
+                            )
+                            .await;
+                        tokio::task::yield_now().await;
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        timeout(Duration::from_secs(5), async {
+            while operations.load(Ordering::Acquire) < NETWORK_EVENT_BUDGET * 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordered failure flood becomes active");
+        timeout(Duration::from_secs(1), events.status())
+            .await
+            .expect("application status must not starve")
+            .expect("application status");
+        let receipt = timeout(Duration::from_secs(5), node.shutdown())
+            .await
+            .expect("shutdown must not starve")
+            .expect("fairness shutdown");
+        keep_running.store(false, Ordering::Release);
+        for task in flood {
+            task.await.expect("ordered failure producer");
+        }
+        assert!(receipt.contact_errors >= NETWORK_EVENT_BUDGET);
+        fs::remove_dir_all(test_root).expect("fairness cleanup");
+    }
+
+    #[tokio::test]
+    async fn ordered_mission_roster_is_bounded_before_contact_operation() {
+        let test_root = root("ordered-roster-capacity");
+        fs::create_dir_all(&test_root).expect("roster state");
+        #[cfg(unix)]
+        fs::set_permissions(&test_root, fs::Permissions::from_mode(0o700))
+            .expect("owner-only roster state");
+        let local = issue_missions(1).remove(0);
+        let node = start_node_with_forwarding_and_output_policy(
+            NodeConfig {
+                state: test_root.clone(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                mission: local.credentials,
+                peers: Vec::new(),
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            SelectedForwardingConfig::default(),
+            NodeOperatorOutputPolicy::CustomerSafe,
+        )
+        .await
+        .expect("start roster node");
+        let handle = node.ordered_event_contacts();
+        let operations = Arc::new(AtomicUsize::new(0));
+        for index in 0..MAX_CONFIGURED_PEERS {
+            let mut mission_peer = [0u8; 32];
+            mission_peer[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
+            let contact = Arc::new(FailingOrderedContact {
+                operations: operations.clone(),
+            });
+            assert!(
+                handle
+                    .run(
+                        OrderedEventContactRole::Responder,
+                        contact.clone(),
+                        MissionPeerExpectation::new(contact.peer_evidence(), mission_peer),
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(operations.load(Ordering::Acquire), MAX_CONFIGURED_PEERS);
+
+        let rejected = Arc::new(StalledOrderedContact::default());
+        let result = timeout(
+            Duration::from_secs(1),
+            handle.run(
+                OrderedEventContactRole::Responder,
+                rejected.clone(),
+                MissionPeerExpectation::new(rejected.peer_evidence(), [0xff; 32]),
+            ),
+        )
+        .await
+        .expect("capacity rejection must not enter the contact");
+        assert!(matches!(
+            result,
+            Err(NodeError::Protocol(detail))
+                if detail == "ordered Event mission roster capacity exhausted"
+        ));
+        assert_eq!(rejected.operations(), 0);
+        assert_eq!(rejected.closes(), 1);
+
+        let receipt = node.shutdown().await.expect("roster shutdown");
+        assert_eq!(receipt.contact_errors, MAX_CONFIGURED_PEERS + 1);
+        fs::remove_dir_all(test_root).expect("roster cleanup");
+    }
+
+    #[tokio::test]
+    async fn queued_shutdown_precedes_ready_ordered_admission() {
+        let test_root = root("ordered-shutdown-priority");
+        fs::create_dir_all(&test_root).expect("shutdown-priority state");
+        #[cfg(unix)]
+        fs::set_permissions(&test_root, fs::Permissions::from_mode(0o700))
+            .expect("owner-only shutdown-priority state");
+        let mut issued = issue_missions(2);
+        let local = issued.remove(0);
+        let peer = issued.remove(0);
+        let node = start_node(NodeConfig {
+            state: test_root.clone(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            mission: local.credentials,
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start shutdown-priority node");
+        let contact = Arc::new(StalledOrderedContact::default());
+        let (response, completed) = oneshot::channel();
+        node.ordered_event_contacts()
+            .sender
+            .try_send(OrderedEventContactCommand {
+                role: OrderedEventContactRole::Initiator,
+                contact: contact.clone(),
+                peer: MissionPeerExpectation::new(contact.peer_evidence(), peer.identity),
+                response,
+            })
+            .expect("queue ordered contact before shutdown");
+        node.shutdown
+            .as_ref()
+            .expect("live shutdown sender")
+            .try_send(())
+            .expect("queue shutdown beside ordered contact");
+        timeout(Duration::from_secs(5), node.wait())
+            .await
+            .expect("priority shutdown deadline")
+            .expect("priority shutdown");
+        let error = completed
+            .await
+            .expect("queued ordered response")
+            .expect_err("queued shutdown must reject ordered admission");
+        assert!(matches!(
+            error,
+            NodeError::Protocol(detail)
+                if detail == "ordered Event contact admission closed during shutdown"
+        ));
+        assert_eq!(contact.operations(), 0);
+        assert_eq!(contact.closes(), 1);
+        fs::remove_dir_all(test_root).expect("shutdown-priority cleanup");
+    }
+
+    #[tokio::test]
+    async fn ordered_handle_shutdown_closes_active_queued_blocked_and_cancelled_contacts() {
+        let test_root = root("ordered-handle-shutdown");
+        fs::create_dir_all(&test_root).expect("shutdown state");
+        #[cfg(unix)]
+        fs::set_permissions(&test_root, fs::Permissions::from_mode(0o700))
+            .expect("owner-only shutdown state");
+        let mut issued = issue_missions(2);
+        let local = issued.remove(0);
+        let peer = issued.remove(0);
+        let node = start_node(NodeConfig {
+            state: test_root.clone(),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            mission: local.credentials,
+            peers: Vec::new(),
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start shutdown node");
+        let handle = node.ordered_event_contacts();
+        let expectation = MissionPeerExpectation::new(
+            CarrierPeerEvidence::UnauthenticatedLocator {
+                transient_locator: TransientLocator::new(b"shutdown-peer".to_vec()).unwrap(),
+            },
+            peer.identity,
+        );
+        let contacts = (0..9)
+            .map(|_| Arc::new(StalledOrderedContact::default()))
+            .collect::<Vec<_>>();
+        let launch = |contact: Arc<StalledOrderedContact>| {
+            let handle = handle.clone();
+            let expectation = expectation.clone();
+            tokio::spawn(async move {
+                handle
+                    .run(OrderedEventContactRole::Initiator, contact, expectation)
+                    .await
+            })
+        };
+
+        let mut active = contacts[..ORDERED_EVENT_CONTACT_CAPACITY]
+            .iter()
+            .cloned()
+            .map(&launch)
+            .collect::<Vec<_>>();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if contacts[..ORDERED_EVENT_CONTACT_CAPACITY]
+                    .iter()
+                    .map(|contact| contact.operations())
+                    .sum::<usize>()
+                    == ORDERED_EVENT_CONTACT_CAPACITY
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("four ordered contacts become active");
+
+        let mut queued = contacts[ORDERED_EVENT_CONTACT_CAPACITY..8]
+            .iter()
+            .cloned()
+            .map(&launch)
+            .collect::<Vec<_>>();
+        sleep(Duration::from_millis(25)).await;
+        let mut blocked = launch(contacts[8].clone());
+        assert!(
+            timeout(Duration::from_millis(25), &mut blocked)
+                .await
+                .is_err(),
+            "ninth contact must remain blocked behind four active and four queued contacts"
+        );
+        let cancelled = queued.remove(0);
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        timeout(Duration::from_secs(5), async {
+            while contacts[ORDERED_EVENT_CONTACT_CAPACITY].closes() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued caller cancellation closes before actor admission or shutdown");
+        assert_eq!(
+            contacts[ORDERED_EVENT_CONTACT_CAPACITY].operations(),
+            0,
+            "cancelled queued contact must not enter an operation"
+        );
+
+        timeout(Duration::from_secs(5), node.shutdown())
+            .await
+            .expect("ordered shutdown deadline")
+            .expect("ordered shutdown");
+        for task in active.drain(..).chain(queued.drain(..)) {
+            assert!(task.await.expect("ordered caller task").is_err());
+        }
+        assert!(blocked.await.expect("blocked ordered caller task").is_err());
+        for contact in &contacts {
+            assert!(contact.closes() >= 1, "every admitted contact must close");
+        }
+        assert_eq!(
+            contacts[..ORDERED_EVENT_CONTACT_CAPACITY]
+                .iter()
+                .map(|contact| contact.operations())
+                .sum::<usize>(),
+            ORDERED_EVENT_CONTACT_CAPACITY
+        );
+        assert!(
+            contacts[ORDERED_EVENT_CONTACT_CAPACITY..]
+                .iter()
+                .all(|contact| contact.operations() == 0)
+        );
+        fs::remove_dir_all(test_root).expect("ordered shutdown cleanup");
+    }
+
+    #[tokio::test]
+    async fn ordered_event_turn_accepts_exact_framed_byte_budget() {
+        let (left_stream, right_stream) = duplex(37);
+        let left = SelectedContact::from_ordered(Arc::new(
+            BleL2capContact::new(
+                left_stream,
+                TransientLocator::new(b"left-exact-budget".to_vec()).unwrap(),
+                64,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        ));
+        let right = SelectedContact::from_ordered(Arc::new(
+            BleL2capContact::new(
+                right_stream,
+                TransientLocator::new(b"right-exact-budget".to_vec()).unwrap(),
+                64,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        ));
+        let receiver = tokio::spawn(async move {
+            let mut turn = open_selected_event_receive_turn(&right, 10).await.unwrap();
+            assert_eq!(turn.read_frame().await.unwrap().unwrap(), vec![0x5a; 6]);
+        });
+
+        let mut turn = open_selected_event_send_turn(&left, 10).await.unwrap();
+        turn.write_frame_checked(&[0x5a; 6], || Ok(()))
+            .await
+            .unwrap();
+        receiver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordered_event_turn_rejects_one_byte_over_framed_budget() {
+        let (left_stream, right_stream) = duplex(37);
+        let left = SelectedContact::from_ordered(Arc::new(
+            BleL2capContact::new(
+                left_stream,
+                TransientLocator::new(b"left-over-budget".to_vec()).unwrap(),
+                64,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        ));
+        let right = SelectedContact::from_ordered(Arc::new(
+            BleL2capContact::new(
+                right_stream,
+                TransientLocator::new(b"right-over-budget".to_vec()).unwrap(),
+                64,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        ));
+        let receiver = tokio::spawn(async move {
+            let mut turn = open_selected_event_receive_turn(&right, 9).await.unwrap();
+            turn.read_frame().await
+        });
+
+        let mut turn = open_selected_event_send_turn(&left, 9).await.unwrap();
+        let error = turn
+            .write_frame_checked(&[0x5a; 6], || Ok(()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, NodeError::Protocol(_)));
+        left.close();
+        assert!(receiver.await.unwrap().is_err());
     }
 
     #[test]
@@ -40989,14 +43649,14 @@ mod tests {
 
     async fn finish_equal_difference(
         connection: &aster_iroh::Connection,
-        mission: &mut MissionSession,
+        mission: &mut HybridMissionSession,
         inventory: aster_profile::InventorySnapshot,
         interest: EventInterest,
     ) -> PeerReceipt {
         let limits = ReconciliationLimits::default();
         let mut receipt = PeerReceipt {
             peer: Some(connection.remote_id()),
-            mission_peer: Some(mission.peer().mission_id()),
+            mission_peer: Some(mission.peer_observation().mission_id()),
             semantic_version: mission.semantic_version(),
             ..PeerReceipt::default()
         };
@@ -41254,7 +43914,7 @@ mod tests {
 
     async fn reconcile_equal_event_lane(
         connection: &aster_iroh::Connection,
-        mission: &mut MissionSession,
+        mission: &mut HybridMissionSession,
         inventory: InventorySnapshot,
         direction: EventDirection,
         receipt: &mut PeerReceipt,
@@ -41344,7 +44004,7 @@ mod tests {
     async fn defer_empty_mutable_classes(
         credentials: &UnprotectedReferenceMission,
         connection: &aster_iroh::Connection,
-        mission: &mut MissionSession,
+        mission: &mut HybridMissionSession,
         receipt: &mut PeerReceipt,
     ) {
         for &class in mutable_classes_for_semantic(mission.semantic_version()) {
@@ -41457,7 +44117,7 @@ mod tests {
                 Arc::new(RwLock::new(())).read_owned().await,
                 &store,
                 verifier.identity(),
-                mission.peer().mission_id(),
+                mission.peer_observation().mission_id(),
                 0,
             )
             .unwrap();
@@ -41615,8 +44275,11 @@ mod tests {
     async fn local_zeroization_socket_is_owner_only_and_exact_state_bound() {
         let state = root("local-zeroization-control");
         fs::create_dir_all(&state).expect("state");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("owner-only state");
         let store_path = state.join(STORE_FILE);
         fs::write(&store_path, b"exact-store-identity").expect("store identity file");
+        fs::set_permissions(&store_path, fs::Permissions::from_mode(0o600))
+            .expect("owner-only store identity file");
         let mission_path = state.join("mission.bundle");
         fs::write(&mission_path, b"bounded-test-secret").expect("mission artifact");
         fs::set_permissions(&mission_path, fs::Permissions::from_mode(0o600))
@@ -41654,8 +44317,11 @@ mod tests {
     async fn local_zeroization_integrity_failure_stops_accept_loop() {
         let state = root("local-zeroization-integrity-failure");
         fs::create_dir_all(&state).expect("state");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("owner-only state");
         let store_path = state.join(STORE_FILE);
         fs::write(&store_path, b"exact-store-identity").expect("store identity file");
+        fs::set_permissions(&store_path, fs::Permissions::from_mode(0o600))
+            .expect("owner-only store identity file");
         let control = LocalZeroizationControl::bind(&state, &store_path).expect("bind control");
         let socket_path = control.socket_path.clone();
         let displaced_socket = socket_path.with_extension("sock.displaced");
@@ -41701,8 +44367,11 @@ mod tests {
         let state = temporary_root.join(format!("aster-zdir-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&state);
         fs::create_dir_all(&state).expect("state");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("owner-only state");
         let store_path = state.join(STORE_FILE);
         fs::write(&store_path, b"exact-store-identity").expect("store identity file");
+        fs::set_permissions(&store_path, fs::Permissions::from_mode(0o600))
+            .expect("owner-only store identity file");
         let control_directory = state.join("control");
         let control = LocalZeroizationControl::bind_in_control_directory(
             &state,
@@ -41750,6 +44419,7 @@ mod tests {
         let state = root.join("state");
         let mission_path = root.join("mission.bundle");
         fs::create_dir_all(&state).expect("state");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("owner-only state");
         persist_zeroization_test_mission(&mission_path, 0xb6);
         let mission = UnprotectedReferenceMission::load(&mission_path).expect("mission");
         let mission_authority = mission.mission_authority_id();
@@ -41802,6 +44472,10 @@ mod tests {
         let aliased_mission_path = root.join("aliased.bundle");
         fs::create_dir_all(&first_state).expect("first state");
         fs::create_dir_all(&aliased_state).expect("aliased state");
+        for state in [&first_state, &aliased_state] {
+            fs::set_permissions(state, fs::Permissions::from_mode(0o700))
+                .expect("owner-only state");
+        }
 
         let access = ProvisioningAccess::member(
             Scope::new("test/zeroization-hardlink").expect("scope"),
@@ -42319,9 +44993,11 @@ mod tests {
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             NodeActorChannels {
                 handle_sigint: true,
+                iroh_transport_enabled: true,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 control_receiver,
+                ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
@@ -42463,9 +45139,11 @@ mod tests {
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             NodeActorChannels {
                 handle_sigint: true,
+                iroh_transport_enabled: true,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 control_receiver,
+                ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
@@ -42616,6 +45294,7 @@ mod tests {
     async fn init_only_state_is_bound_terminally_before_secret_erasure() {
         let state = root("zeroize-init-only");
         fs::create_dir_all(&state).expect("state");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("owner-only state");
         let identity = NodeIdentity::load_or_create(&state).expect("identity");
         let identity_path = identity.path().to_path_buf();
         drop(identity);
@@ -42659,6 +45338,7 @@ mod tests {
     async fn wrong_valid_mission_authority_cannot_mark_or_erase_any_artifact() {
         let state = root("zeroize-wrong-authority");
         fs::create_dir_all(&state).expect("state");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("owner-only state");
         let identity = NodeIdentity::load_or_create(&state).expect("identity");
         let identity_path = identity.path().to_path_buf();
         drop(identity);
@@ -42989,9 +45669,11 @@ mod tests {
             output,
             NodeActorChannels {
                 handle_sigint: false,
+                iroh_transport_enabled: true,
                 application_receiver,
                 application_admission,
                 control_receiver,
+                ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
@@ -43148,9 +45830,11 @@ mod tests {
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             NodeActorChannels {
                 handle_sigint: false,
+                iroh_transport_enabled: true,
                 application_receiver,
                 application_admission,
                 control_receiver,
+                ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
@@ -43280,6 +45964,7 @@ mod tests {
         let state = root.join("state");
         let mission_path = root.join("mission.bundle");
         fs::create_dir_all(&state).expect("state");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("owner-only state");
         persist_zeroization_test_mission(&mission_path, 0xcf);
         let mission = UnprotectedReferenceMission::load(&mission_path).expect("mission");
         let (application_sender, application_receiver) =
@@ -43308,9 +45993,11 @@ mod tests {
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             NodeActorChannels {
                 handle_sigint: false,
+                iroh_transport_enabled: true,
                 application_receiver,
                 application_admission,
                 control_receiver,
+                ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
@@ -44046,6 +46733,11 @@ mod tests {
             drop(identity);
             carrier
         };
+        #[cfg(unix)]
+        for state in [&left_state, &right_state] {
+            fs::set_permissions(state, fs::Permissions::from_mode(0o700))
+                .expect("owner-only saturated contact state");
+        }
         let (left_sender, left_receiver) = mpsc::channel(APPLICATION_COMMAND_CAPACITY);
         let left_admission = Arc::new(AtomicBool::new(true));
         let left_selected = SelectedEventHandle::new(
@@ -44772,9 +47464,11 @@ mod tests {
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             NodeActorChannels {
                 handle_sigint: false,
+                iroh_transport_enabled: true,
                 application_receiver: receiver,
                 application_admission: admission,
                 control_receiver: controls,
+                ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
                 ready,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
@@ -48919,6 +51613,7 @@ mod tests {
                 application_receiver,
                 application_admission.clone(),
                 control_receiver,
+                mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
                 ready_sender,
             ),
@@ -49068,9 +51763,11 @@ mod tests {
             emission_policy,
             NodeActorChannels {
                 handle_sigint: true,
+                iroh_transport_enabled: true,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 control_receiver,
+                ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
@@ -53886,7 +56583,11 @@ mod tests {
             .open_blob_upload_writer(&reservation, &checkpoint)
             .unwrap();
         let durable = writer.checkpoint().unwrap();
-        let sink = Arc::new(std::sync::Mutex::new((writer, checkpoint.clone(), 0)));
+        let sink = Arc::new(std::sync::Mutex::new((
+            writer,
+            Box::new(checkpoint.clone()),
+            0,
+        )));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .max_blocking_threads(1)
@@ -53912,7 +56613,7 @@ mod tests {
                     task_store,
                     policy,
                     task_reservation,
-                    task_checkpoint,
+                    Box::new(task_checkpoint),
                     task_durable,
                 );
                 queued_tx.send(()).unwrap();
@@ -66930,23 +69631,26 @@ mod tests {
 
         let local = services.other.identity();
         let admission = AutomaticNearbyAdmission::new(local);
+        let revoked_binding =
+            MissionPeerBinding::new(aster_iroh::SecretKey::generate().public(), revoked);
         let error = authorize_contact_before_inventory(
             &store,
             local,
-            MissionPeerBinding::new(aster_iroh::SecretKey::generate().public(), revoked),
+            revoked,
+            Some(revoked_binding),
             Some(&admission),
         )
         .expect_err("revoked authenticated identity must fail before slot commitment");
         assert!(matches!(error, NodeError::Revoked(subject) if subject == revoked));
         assert_eq!(admission.authenticated_mission_count(), 0);
-
+        let active = services.authority.identity();
+        let active_binding =
+            MissionPeerBinding::new(aster_iroh::SecretKey::generate().public(), active);
         authorize_contact_before_inventory(
             &store,
             local,
-            MissionPeerBinding::new(
-                aster_iroh::SecretKey::generate().public(),
-                services.authority.identity(),
-            ),
+            active,
+            Some(active_binding),
             Some(&admission),
         )
         .expect("active authenticated identity consumes one slot");

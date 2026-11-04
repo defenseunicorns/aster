@@ -1,9 +1,11 @@
 //! Profile-5 Blob network DAG composition.
 
+#[cfg(test)]
+use crate::mission::MissionSession;
 use crate::{
     event_pages::TransferProfileId,
     frame::{BlobStreamSourceOfferV1, EventDirection},
-    mission::MissionSession,
+    mission::HybridMissionSession,
     stream_pipeline::{
         MappedPartition, PipelineError, PipelineLimits, PipelineReport, StreamJobId,
         StreamPartition, run_ordered_channel_pipeline_from,
@@ -48,21 +50,23 @@ tokio::task_local! {
 }
 
 pub(super) type NativeProfile5Sink =
-    Arc<std::sync::Mutex<(BlobPackWriter, BlobUploadCheckpoint, u64)>>;
+    Arc<std::sync::Mutex<(BlobPackWriter, Box<BlobUploadCheckpoint>, u64)>>;
 
 pub(super) fn spawn_native_profile5_checkpoint(
     sink: NativeProfile5Sink,
     store: Arc<Store>,
     policy: ControlPolicySnapshot,
     reservation: aster_redb_store::BlobUploadReservation,
-    expected: BlobUploadCheckpoint,
+    expected: Box<BlobUploadCheckpoint>,
     durable: BlobPackCheckpoint,
-) -> tokio::task::JoinHandle<Result<BlobUploadCheckpoint, StoreError>> {
+) -> tokio::task::JoinHandle<Result<Box<BlobUploadCheckpoint>, StoreError>> {
     tokio::task::spawn_blocking(move || {
         // A blocking commit survives cancellation of the receive future. Keep
         // the physical writer owned until that commit has published its bytes.
         let _ownership = sink;
-        store.checkpoint_blob_upload(&policy, &reservation, expected, durable)
+        store
+            .checkpoint_blob_upload(&policy, &reservation, *expected, durable)
+            .map(Box::new)
     })
 }
 
@@ -594,7 +598,7 @@ impl BlobRecordCodec for PlainBlobRecordCodec {
 }
 
 struct MissionBlobRecordCodec<'a> {
-    mission: &'a mut MissionSession,
+    mission: &'a mut HybridMissionSession,
     profile_digest: [u8; 32],
     direction: EventDirection,
     attempt_nonce: [u8; 32],
@@ -1174,7 +1178,7 @@ async fn send_native_profile5_pack(
     store: Arc<Store>,
     policy: &ControlPolicySnapshot,
     source: &CanonicalBlobSendSource,
-    session: &mut MissionSession,
+    session: &mut HybridMissionSession,
     profile_digest: [u8; 32],
     direction: EventDirection,
     attempt_nonce: [u8; 32],
@@ -1606,8 +1610,13 @@ impl NativeProfile5RecordParser {
 #[derive(Clone)]
 struct NativeProfile5DurableProgress {
     wire_offset: u64,
-    checkpoint: BlobUploadCheckpoint,
+    checkpoint: Box<BlobUploadCheckpoint>,
 }
+
+type ExistingNativeProfile5PackRead = (
+    Box<StoredBlob>,
+    Box<aster_redb_store::Profile5PackReadSession>,
+);
 
 fn existing_native_profile5_pack(
     store: &Store,
@@ -1615,7 +1624,7 @@ fn existing_native_profile5_pack(
     authority: &VerifiedBlobStreamPublicationSource,
     source: &[u8],
     transfer_open: &StreamOpenV1,
-) -> Result<Option<(StoredBlob, aster_redb_store::Profile5PackReadSession)>, BlobNetworkError> {
+) -> Result<Option<ExistingNativeProfile5PackRead>, BlobNetworkError> {
     let publication = authority.publication();
     let physical_open = authority.physical_open();
     let open = publication.publication().open();
@@ -1628,8 +1637,7 @@ fn existing_native_profile5_pack(
     else {
         return Ok(None);
     };
-    let pack = store
-        .open_profile5_pack_transfer_read(blob.variant_id)
+    let pack = open_profile5_pack_transfer_read_boxed(store, blob.variant_id)
         .map_err(|error| durability_failure("open promoted native Profile-5 retry", error))?;
     let decoded = authority.source();
     let inbound_transfer_id = BlobTransferId::new(Sha256::digest(source).into());
@@ -1679,7 +1687,16 @@ fn existing_native_profile5_pack(
             "existing publication differs from authenticated transport source",
         ));
     }
-    Ok(Some((blob, pack)))
+    Ok(Some((Box::new(blob), pack)))
+}
+
+fn open_profile5_pack_transfer_read_boxed(
+    store: &Store,
+    variant: BlobVariantId,
+) -> Result<Box<aster_redb_store::Profile5PackReadSession>, StoreError> {
+    store
+        .open_profile5_pack_transfer_read(variant)
+        .map(Box::new)
 }
 
 struct ExistingNativeProfile5Settlement<'a> {
@@ -1699,7 +1716,7 @@ enum NativeProfile5Completion {
 
 struct CompletedNativeProfile5Upload {
     reservation: aster_redb_store::BlobUploadReservation,
-    checkpoint: BlobUploadCheckpoint,
+    checkpoint: Box<BlobUploadCheckpoint>,
     _reader: BlobPackReader,
     _retained_lease: Option<aster_redb_store::Profile5PackReadSession>,
 }
@@ -2068,10 +2085,7 @@ async fn receive_native_profile5_pack(
                 policy,
             },
             ExistingNativeProfile5Pack {
-                completion: NativeProfile5Completion::Published {
-                    blob: Box::new(blob),
-                    pack: Box::new(pack),
-                },
+                completion: NativeProfile5Completion::Published { blob, pack },
                 wire_len,
                 pending_custody,
             },
@@ -2088,7 +2102,7 @@ async fn receive_native_profile5_pack(
         .map_err(|error| lifecycle_failure("resolve native Profile-5 pending upload", error))?
         .is_none()
     {
-        match store.open_profile5_pack_transfer_read(variant) {
+        match open_profile5_pack_transfer_read_boxed(&store, variant) {
             Ok(pack) => {
                 if pack.commitment().blob_id() != commitment.blob_id()
                     || pack.open().total_len() != physical_open_value.total_len()
@@ -2113,7 +2127,7 @@ async fn receive_native_profile5_pack(
                         policy,
                     },
                     ExistingNativeProfile5Pack {
-                        completion: NativeProfile5Completion::Retained(Box::new(pack)),
+                        completion: NativeProfile5Completion::Retained(pack),
                         wire_len,
                         pending_custody,
                     },
@@ -2132,6 +2146,7 @@ async fn receive_native_profile5_pack(
     let (reservation, initial_checkpoint, restored_open) = store
         .reserve_received_profile5_upload_with_policy(policy, &publication, &physical_open)
         .map_err(|error| lifecycle_failure("reserve native Profile-5 receiver pack", error))?;
+    let initial_checkpoint = Box::new(initial_checkpoint);
     if restored_open != physical_open {
         return Err(authentication_failure(
             "restore native Profile-5 receiver open",
@@ -2212,14 +2227,13 @@ async fn receive_native_profile5_pack(
         attempt.send_control(&codec.encode(accept)?),
     )
     .await?;
-
     let next_index = durable_pack.map_or(0, BlobPackCheckpoint::next_index);
     let (partition_tx, partition_rx) = mpsc::channel(8);
     let (durable_tx, mut durable_rx) = mpsc::unbounded_channel();
     let sink_store = Arc::clone(&store);
     let sink_policy = *policy;
     let sink_reservation = reservation.clone();
-    let sink_initial = initial_checkpoint.clone();
+    let sink_initial = initial_checkpoint;
     let total_plaintext = open.total_len();
     let mut job = [0_u8; 16];
     job.copy_from_slice(&transfer_open.transfer_id[..16]);
@@ -2327,7 +2341,7 @@ async fn receive_native_profile5_pack(
             .map_err(|_| PipelineError::WorkerPanicked)?
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok::<_, PipelineError>((report, writer, projected))
+        Ok::<_, PipelineError>(Box::new((report, Box::new(writer), projected)))
     });
 
     let mut parser = NativeProfile5RecordParser::new(next_index, resumed_from);
@@ -2428,7 +2442,7 @@ async fn receive_native_profile5_pack(
         }
     };
     let (mut codec, mut state, checkpoints) = receive_result;
-    let (pipeline, writer, projected) = pipeline_result;
+    let (pipeline, writer, projected) = *pipeline_result;
     let encoded_finish =
         await_authenticated_progress("receive native Profile-5 finish", attempt.receive_data())
             .await?
@@ -2458,6 +2472,7 @@ async fn receive_native_profile5_pack(
     let finish_reservation = reservation.clone();
     let projected = tokio::task::spawn_blocking(move || {
         let completion = (|| {
+            let projected = *projected;
             let completion = writer
                 .finish_profile5(&physical_commitment)
                 .map_err(|error| {
@@ -2477,7 +2492,8 @@ async fn receive_native_profile5_pack(
                 &physical_commitment,
                 lineage,
             )
-        })();
+        })()
+        .map(Box::new);
         if let Err(error) = &completion
             && terminal_profile5_promotion_error(error)
         {
@@ -2632,7 +2648,7 @@ pub(crate) async fn send_canonical_blob_profile5(
     store: Arc<Store>,
     policy: &ControlPolicySnapshot,
     source: &CanonicalBlobSendSource,
-    session: &mut MissionSession,
+    session: &mut HybridMissionSession,
     profile_digest: [u8; 32],
     direction: EventDirection,
     attempt_nonce: [u8; 32],
@@ -2658,7 +2674,7 @@ pub(crate) async fn receive_canonical_blob_profile5(
     store: Arc<Store>,
     policy: &ControlPolicySnapshot,
     verifier: &mut ReferenceEnvelopeSealer,
-    mission: &mut MissionSession,
+    mission: &mut HybridMissionSession,
     profile_digest: [u8; 32],
     direction: EventDirection,
     expected_nonce: [u8; 32],

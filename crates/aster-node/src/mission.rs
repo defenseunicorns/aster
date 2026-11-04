@@ -2771,6 +2771,11 @@ impl MissionSession {
     pub const fn peer(&self) -> MissionPeerBinding {
         self.peer
     }
+
+    /// Removes the Iroh compatibility wrapper after carrier admission.
+    pub(crate) fn into_hybrid(self) -> HybridMissionSession {
+        self.inner
+    }
 }
 
 #[cfg(feature = "fuzzing")]

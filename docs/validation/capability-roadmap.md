@@ -16,7 +16,7 @@
 Local Blob publication commits without waiting for a peer. Rust, the native-gRPC agent, and asterctl implement bounded Blob publication and authenticated reads. blob-status reports receiver-local durable state, not remote delivery, peer status, or convergence. CLI download resume is post-merge work; an interrupted download restarts at byte zero.
 <!-- ASTER-BLOB-CAPABILITY:END -->
 
-- Status date: 2026-09-15
+- Status date: 2026-11-04
 - Product-intent authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Security-profile applicability:
   [`security-profile-requirements-disposition.md`](security-profile-requirements-disposition.md)
@@ -28,17 +28,19 @@ Local Blob publication commits without waiting for a peer. Rust, the native-gRPC
 
 The machine-checked capability block above is authoritative for the current
 publication, status, and download boundary. Node-to-node receiver-checkpoint
-resume is implemented. BLE is not implemented.
+resume is implemented. For the retained physical/support boundary, BLE is not implemented.
 Three-CM4 validation of this candidate has not yet run; historical CM4 receipts
 below retain their original commit and environment boundaries.
 
 The current tree now contains an adapter-neutral bounded ordered-contact
 contract with typed authenticated-carrier versus unauthenticated-locator
-evidence, plus an Iroh parity implementation. This is an implemented-uncredited
-P1-4 foundation only. The selected runtime still uses its existing Iroh entry
-points, and Linux L2CAP CoC, BTLE mission/Event integration, discovery,
-physical evidence, multi-carrier selection, and every BTLE requirement-credit
-change remain open.
+evidence, plus Iroh parity and an in-process selected-runtime admission path for
+fixed-role v9 Event contacts. The runtime can start without binding an IP
+transport, publish durably, and wait for a later admitted ordered contact. This
+is an implemented-uncredited Ring-1 software foundation only. Linux BlueZ
+L2CAP CoC/controller integration, discovery, physical evidence, multi-carrier
+selection, production support, and every BTLE requirement-credit change remain
+open.
 
 ## Purpose
 
