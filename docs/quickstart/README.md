@@ -16,6 +16,7 @@ on using the current product surface.
 | Measure the bounded 8/16/32-node LAN diagnostic | `mise run lan-scale-compose -- --nodes N` | [LAN scale](lan-scale.md) |
 | Run a five-node static Event hierarchy | `mise run hierarchy-mvp-compose` | [Hierarchy MVP](../../docker/hierarchy-mvp/README.md) |
 | Measure the 8/32/64-publisher hierarchy diagnostic | `mise run hierarchy-scale-compose -- --publishers-per-leaf N` | [Hierarchy scale](hierarchy-scale.md) |
+| Attempt one foreground Android-to-Linux non-IP Event validation | Android app + `aster-btle-ring1` | [Android BTLE Ring-1](btle-android-ring1.md) |
 | Rehearse a built Debian package with two static peers | `mise run deb-compose -- --deb /path/to/aster.deb` | [Package Compose smoke](../../docker/deb-test/README.md) |
 | Operate the bounded Linux Event evaluation slice | Operator procedures | [Linux Event MVP runbook](../mvp/linux-event-mvp-runbook.md) |
 
