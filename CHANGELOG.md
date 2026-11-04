@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - An adapter-neutral bounded ordered-contact contract with typed
   authenticated-carrier and unauthenticated-locator evidence, plus an Iroh
-  parity implementation. Selected-runtime migration and BTLE transport support
-  remain open.
+  parity implementation, selected-runtime integration, and an implemented-
+  uncredited Linux LE L2CAP Ring-1 Event evaluation adapter. Physical BTLE
+  qualification and production support remain open.
 - Optional `before_acceptance_marker` filter for `QueryEvents` RPC call
 - `asterctl unsubscribe` command to remove an Event subscription by ID.
 - subsriptions option for asterctl to get Event subscriptions list

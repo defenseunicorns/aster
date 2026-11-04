@@ -101,7 +101,10 @@ use tokio::{
     net::{UnixListener, UnixStream},
 };
 use tokio::{
-    sync::{Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, mpsc, oneshot, watch},
+    sync::{
+        Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock,
+        Semaphore, mpsc, oneshot, watch,
+    },
     task::{AbortHandle, Id as TaskId, JoinHandle, JoinSet},
     time::{MissedTickBehavior, Sleep, sleep, timeout},
 };
@@ -361,7 +364,7 @@ const BLOB_MAINTENANCE_ROWS_PER_TURN: u64 = aster_redb_store::MAX_BLOB_POLICY_RE
 const BLOB_MAINTENANCE_FILES_PER_TURN: u64 = 1;
 const BLOB_MAINTENANCE_BYTES_PER_TURN: u64 = aster_redb_store::MAX_BLOB_POLICY_RETIREMENT_BYTES;
 const CONTROL_COMMAND_CAPACITY: usize = 1;
-const ORDERED_EVENT_CONTACT_CAPACITY: usize = 4;
+const ORDERED_EVENT_CONTACT_CAPACITY: usize = 1;
 const CONTROL_COMMAND_BUDGET: usize = 4;
 const APPLICATION_COMMAND_BUDGET: usize = 8;
 const NETWORK_EVENT_BUDGET: usize = 8;
@@ -3838,6 +3841,7 @@ struct OrderedEventContactCommand {
     contact: Arc<dyn OrderedContact>,
     peer: MissionPeerExpectation,
     response: oneshot::Sender<Result<PeerReceipt, NodeError>>,
+    _session_permit: OwnedSemaphorePermit,
 }
 
 type OrderedEventContactTaskOutput = (
@@ -3867,6 +3871,7 @@ impl Drop for OrderedEventContactCloseGuard {
 pub struct OrderedEventContactHandle {
     sender: mpsc::Sender<OrderedEventContactCommand>,
     admission: Arc<AtomicBool>,
+    session_permit: Arc<Semaphore>,
 }
 
 impl OrderedEventContactHandle {
@@ -3891,18 +3896,26 @@ impl OrderedEventContactHandle {
                 "ordered Event contact admission is closed".into(),
             ));
         }
+        let session_permit = self
+            .session_permit
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                contact.close();
+                NodeError::Protocol("ordered Event contact admission is busy".into())
+            })?;
         let (response, completed) = oneshot::channel();
         let mut pending = OrderedEventContactCloseGuard(Some(contact.clone()));
         self.sender
-            .send(OrderedEventContactCommand {
+            .try_send(OrderedEventContactCommand {
                 role,
                 contact,
                 peer,
                 response,
+                _session_permit: session_permit,
             })
-            .await
             .map_err(|error| {
-                error.0.contact.close();
+                error.into_inner().contact.close();
                 NodeError::Protocol("ordered Event contact actor is unavailable".into())
             })?;
         match completed.await {
@@ -16648,6 +16661,7 @@ async fn start_node_with_shutdown_ownership(
     let ordered_event_contacts = OrderedEventContactHandle {
         sender: ordered_event_contact_sender,
         admission: application_admission.clone(),
+        session_permit: Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY)),
     };
     let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
     let (ready_sender, ready_receiver) = oneshot::channel();
@@ -18336,6 +18350,7 @@ async fn run_node_actor_inner(
                                 contact,
                                 peer,
                                 mut response,
+                                _session_permit,
                             } = command;
                             let _close = OrderedEventContactCloseGuard(Some(contact.clone()));
                             let contact = SelectedContact::from_ordered(contact);
@@ -41355,39 +41370,28 @@ mod tests {
         let attacker = issued.remove(0);
         let expected = issued.remove(0);
         let authority = local.credentials.mission_authority_id();
-        let node = start_node(NodeConfig {
-            state: node_root.clone(),
-            bind: "127.0.0.1:0".parse().unwrap(),
-            mission: local.credentials.clone(),
-            peers: Vec::new(),
-            mutable_interests: MutableSourceInterests::default(),
-            sync_interval: Duration::from_secs(60),
-            run_for: None,
-            application: NodeApplication::Relay,
-        })
-        .await
-        .expect("start ordered custody node");
-        let events = node.selected_events();
-        let client = subscription_fixture_client(&events).await;
-        events
-            .publish_numbered(
-                NumberedEventPublishRequest {
-                    client_id: client.client_id,
-                    session: client.session,
-                    sequence: aster_redb_store::EventOperationSequence::new(1).unwrap(),
-                    predecessor: None,
-                    topic: Topic::new("opaque").unwrap(),
-                    scope: Scope::new("test/runtime-contact").unwrap(),
-                    priority: Priority::Routine,
-                    logical_key: b"pre-auth-custody".to_vec(),
-                    payload: b"must survive rejected locator".to_vec(),
-                    tombstone: false,
+        let node_store = Arc::new(
+            Store::open_for_mission(node_root.join(STORE_FILE), authority).expect("node store"),
+        );
+        let clock_id = [0xe4; 16];
+        publish_test_custody_event(
+            &node_store,
+            &mut open_test_sealer(&local.credentials),
+            TestCustodyPublication {
+                operation: b"pre-auth-custody",
+                topic: &Topic::new("opaque").unwrap(),
+                scope: &Scope::new("test/runtime-contact").unwrap(),
+                priority: Priority::Routine,
+                ttl_ms: Some(250),
+                sample: CustodySample {
+                    clock_id,
+                    tick_ms: 0,
                 },
-                EventPublishOptions::finite_ttl_ms(250).unwrap(),
-            )
-            .await
-            .expect("publish finite Event before rejected contact");
-        sleep(Duration::from_millis(300)).await;
+                payload: b"must survive rejected locator",
+                tombstone: false,
+            },
+        );
+        let responder_custody_clock = NodeCustodyClock::injected(clock_id, 300, 0);
 
         let attacker_store = Arc::new(
             Store::open_for_mission(attacker_root.join(STORE_FILE), authority)
@@ -41414,13 +41418,30 @@ mod tests {
                 mission_id,
             )
         };
-        let responder = node.ordered_event_contacts();
+        let responder_policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+        let responder_guard = ContactEmissionGuard {
+            live: responder_policy.clone(),
+            captured: responder_policy.snapshot().unwrap(),
+            custody_clock: responder_custody_clock.clone(),
+        };
+        let responder_cache = test_event_route_cache(&node_store, &local.credentials);
+        let responder_store = node_store.clone();
         let responder_task = tokio::spawn(async move {
-            responder
-                .run(
-                    OrderedEventContactRole::Responder,
-                    contact(node_stream),
-                    expectation(expected.identity),
+            CONTACT_EVENT_ROUTE_CACHE
+                .scope(
+                    responder_cache,
+                    CONTACT_EMISSION_GUARD.scope(
+                        responder_guard,
+                        serve_ordered_event_session(
+                            responder_store,
+                            SelectedContact::from_ordered(contact(node_stream)),
+                            local.credentials,
+                            expectation(expected.identity),
+                            responder_custody_clock,
+                            Arc::new(RwLock::new(())),
+                            MutableSourceInterests::default(),
+                        ),
+                    ),
                 )
                 .await
         });
@@ -41451,12 +41472,12 @@ mod tests {
         assert!(attacker_result.is_err());
         assert!(responder_result.is_err());
 
-        let receipt = node
-            .shutdown()
-            .await
-            .expect("shutdown ordered custody node");
-        assert_eq!(receipt.events, 1, "rejected locator mutated custody state");
-        drop(attacker_store);
+        assert_eq!(
+            node_store.event_count().expect("node Event count"),
+            1,
+            "rejected locator mutated custody state"
+        );
+        drop((node_store, attacker_store));
         fs::remove_dir_all(test_root).expect("ordered custody cleanup");
     }
 
@@ -42042,6 +42063,12 @@ mod tests {
                 contact: contact.clone(),
                 peer: MissionPeerExpectation::new(contact.peer_evidence(), peer.identity),
                 response,
+                _session_permit: node
+                    .ordered_event_contacts()
+                    .session_permit
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("reserve the sole ordered contact session"),
             })
             .expect("queue ordered contact before shutdown");
         node.shutdown
@@ -42068,121 +42095,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordered_handle_shutdown_closes_active_queued_blocked_and_cancelled_contacts() {
-        let test_root = root("ordered-handle-shutdown");
-        fs::create_dir_all(&test_root).expect("shutdown state");
+    async fn ordered_contact_overlap_fails_closed_without_queueing() {
+        let test_root = root("ordered-overlap");
+        fs::create_dir_all(&test_root).expect("overlap state");
         #[cfg(unix)]
         fs::set_permissions(&test_root, fs::Permissions::from_mode(0o700))
-            .expect("owner-only shutdown state");
+            .expect("owner-only overlap state");
         let mut issued = issue_missions(2);
         let local = issued.remove(0);
         let peer = issued.remove(0);
-        let node = start_node(NodeConfig {
+        let node = start_transport_neutral_node(TransportNeutralNodeConfig {
             state: test_root.clone(),
-            bind: "127.0.0.1:0".parse().unwrap(),
             mission: local.credentials,
-            peers: Vec::new(),
             mutable_interests: MutableSourceInterests::default(),
             sync_interval: Duration::from_secs(60),
             run_for: None,
             application: NodeApplication::Relay,
         })
         .await
-        .expect("start shutdown node");
+        .expect("start overlap node");
         let handle = node.ordered_event_contacts();
         let expectation = MissionPeerExpectation::new(
             CarrierPeerEvidence::UnauthenticatedLocator {
-                transient_locator: TransientLocator::new(b"shutdown-peer".to_vec()).unwrap(),
+                transient_locator: TransientLocator::new(b"overlap-peer".to_vec()).unwrap(),
             },
             peer.identity,
         );
-        let contacts = (0..9)
-            .map(|_| Arc::new(StalledOrderedContact::default()))
-            .collect::<Vec<_>>();
-        let launch = |contact: Arc<StalledOrderedContact>| {
+        let active = Arc::new(StalledOrderedContact::default());
+        let active_task = tokio::spawn({
             let handle = handle.clone();
             let expectation = expectation.clone();
-            tokio::spawn(async move {
+            let active = active.clone();
+            async move {
                 handle
-                    .run(OrderedEventContactRole::Initiator, contact, expectation)
+                    .run(OrderedEventContactRole::Initiator, active, expectation)
                     .await
-            })
-        };
-
-        let mut active = contacts[..ORDERED_EVENT_CONTACT_CAPACITY]
-            .iter()
-            .cloned()
-            .map(&launch)
-            .collect::<Vec<_>>();
+            }
+        });
         timeout(Duration::from_secs(5), async {
-            loop {
-                if contacts[..ORDERED_EVENT_CONTACT_CAPACITY]
-                    .iter()
-                    .map(|contact| contact.operations())
-                    .sum::<usize>()
-                    == ORDERED_EVENT_CONTACT_CAPACITY
-                {
-                    break;
-                }
+            while active.operations() == 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("four ordered contacts become active");
+        .expect("first ordered contact becomes active");
 
-        let mut queued = contacts[ORDERED_EVENT_CONTACT_CAPACITY..8]
-            .iter()
-            .cloned()
-            .map(&launch)
-            .collect::<Vec<_>>();
-        sleep(Duration::from_millis(25)).await;
-        let mut blocked = launch(contacts[8].clone());
-        assert!(
-            timeout(Duration::from_millis(25), &mut blocked)
-                .await
-                .is_err(),
-            "ninth contact must remain blocked behind four active and four queued contacts"
-        );
-        let cancelled = queued.remove(0);
-        cancelled.abort();
-        assert!(cancelled.await.unwrap_err().is_cancelled());
-        timeout(Duration::from_secs(5), async {
-            while contacts[ORDERED_EVENT_CONTACT_CAPACITY].closes() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
+        let rejected = Arc::new(StalledOrderedContact::default());
+        let error = timeout(
+            Duration::from_millis(100),
+            handle.run(
+                OrderedEventContactRole::Responder,
+                rejected.clone(),
+                expectation,
+            ),
+        )
         .await
-        .expect("queued caller cancellation closes before actor admission or shutdown");
-        assert_eq!(
-            contacts[ORDERED_EVENT_CONTACT_CAPACITY].operations(),
-            0,
-            "cancelled queued contact must not enter an operation"
-        );
+        .expect("overlap must fail without waiting")
+        .expect_err("overlap must be rejected");
+        assert!(matches!(
+            error,
+            NodeError::Protocol(detail)
+                if detail == "ordered Event contact admission is busy"
+        ));
+        assert_eq!(rejected.operations(), 0);
+        assert_eq!(rejected.closes(), 1);
 
-        timeout(Duration::from_secs(5), node.shutdown())
-            .await
-            .expect("ordered shutdown deadline")
-            .expect("ordered shutdown");
-        for task in active.drain(..).chain(queued.drain(..)) {
-            assert!(task.await.expect("ordered caller task").is_err());
-        }
-        assert!(blocked.await.expect("blocked ordered caller task").is_err());
-        for contact in &contacts {
-            assert!(contact.closes() >= 1, "every admitted contact must close");
-        }
-        assert_eq!(
-            contacts[..ORDERED_EVENT_CONTACT_CAPACITY]
-                .iter()
-                .map(|contact| contact.operations())
-                .sum::<usize>(),
-            ORDERED_EVENT_CONTACT_CAPACITY
-        );
-        assert!(
-            contacts[ORDERED_EVENT_CONTACT_CAPACITY..]
-                .iter()
-                .all(|contact| contact.operations() == 0)
-        );
-        fs::remove_dir_all(test_root).expect("ordered shutdown cleanup");
+        node.shutdown().await.expect("overlap shutdown");
+        assert!(active_task.await.expect("active ordered caller").is_err());
+        fs::remove_dir_all(test_root).expect("overlap cleanup");
     }
 
     #[tokio::test]

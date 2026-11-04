@@ -188,4 +188,3 @@ process restart, no duplicate semantic delivery, complete v9 profile digest,
 and bounded resource observations. Preserve installed services and remove all
 temporary artifacts. Retain a local receipt but move no requirement credit and
 make no production/support-row claim.
-
