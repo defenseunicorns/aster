@@ -1,8 +1,9 @@
 //! Evaluation-only Android LE L2CAP validator adapter.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod config;
+mod jni;
 mod receipt;
 mod session;
 

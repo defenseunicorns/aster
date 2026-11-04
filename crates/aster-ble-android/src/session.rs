@@ -28,6 +28,16 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RunId(u64);
 
+impl RunId {
+    pub(crate) const fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub(crate) const fn into_raw(self) -> u64 {
+        self.0
+    }
+}
+
 /// Sanitized foreground validator progress phase.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +48,16 @@ pub enum ValidatorPhase {
     Authenticating,
     /// Authentication and reconciliation completed; receipt validation is running.
     Reconciling,
+}
+
+impl ValidatorPhase {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CarrierConnected => "carrier_connected",
+            Self::Authenticating => "authenticating",
+            Self::Reconciling => "reconciling",
+        }
+    }
 }
 
 /// Exactly one phase update or terminal outcome.
