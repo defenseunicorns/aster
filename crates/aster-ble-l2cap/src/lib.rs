@@ -248,7 +248,9 @@ impl Drop for ActiveOperation<'_> {
 fn io_error(error: io::Error) -> ContactError {
     let kind = match error.kind() {
         io::ErrorKind::TimedOut => ContactErrorKind::Timeout,
-        io::ErrorKind::ConnectionRefused
+        io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionReset
         | io::ErrorKind::NotFound
         | io::ErrorKind::NotConnected
         | io::ErrorKind::NetworkDown => ContactErrorKind::Unavailable,
@@ -808,7 +810,12 @@ mod tests {
 
     #[test]
     fn controller_loss_io_kinds_are_unavailable() {
-        for kind in [io::ErrorKind::NotConnected, io::ErrorKind::NetworkDown] {
+        for kind in [
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::NotConnected,
+            io::ErrorKind::NetworkDown,
+        ] {
             assert_eq!(
                 io_error(io::Error::from(kind)).kind(),
                 ContactErrorKind::Unavailable
