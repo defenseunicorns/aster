@@ -44,8 +44,9 @@ exact-pinned Linux BlueZ LE L2CAP driver and temporary fixed-role harness now
 attach that contact to the protected Event runtime and retain negotiated-MTU
 observations. This is an implemented-uncredited Ring-1 software foundation
 only. An evaluation-only foreground Android initiator and narrow JNI adapter
-also exist in source, with portable Rust tests, but have not been compiled as an
-APK or exercised over a real Android/Linux radio pair. Real-controller
+also exist in source. The pinned Linux-hosted APK build, six JVM tests, and
+portable Rust tests pass, but the app has not been installed or exercised over
+a real Android/Linux radio pair. Real-controller
 operation, physical evidence, discovery, packaging,
 multi-carrier selection, production support, and every BTLE requirement-credit
 change remain open.

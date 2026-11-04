@@ -41,13 +41,17 @@ case "$(uname -s)" in
 esac
 
 readonly clang="${ndk_root}/toolchains/llvm/prebuilt/${host_tag}/bin/aarch64-linux-android29-clang"
-if [[ ! -x "${clang}" ]]; then
-  echo "NDK API-29 arm64 clang was not found" >&2
+readonly ar="${ndk_root}/toolchains/llvm/prebuilt/${host_tag}/bin/llvm-ar"
+readonly ranlib="${ndk_root}/toolchains/llvm/prebuilt/${host_tag}/bin/llvm-ranlib"
+if [[ ! -x "${clang}" || ! -x "${ar}" || ! -x "${ranlib}" ]]; then
+  echo "NDK API-29 arm64 compiler tools were not found" >&2
   exit 1
 fi
 
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${clang}"
 export CC_aarch64_linux_android="${clang}"
+export AR_aarch64_linux_android="${ar}"
+export RANLIB_aarch64_linux_android="${ranlib}"
 cargo build \
   --manifest-path "${repo_root}/Cargo.toml" \
   --locked \
