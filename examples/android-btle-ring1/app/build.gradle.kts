@@ -31,7 +31,9 @@ android {
     }
 
     sourceSets.named("main") {
-        jniLibs.srcDir(layout.buildDirectory.dir("generated/jniLibs"))
+        jniLibs.directories.add(
+            layout.buildDirectory.asFile.get().resolve("generated/jniLibs").absolutePath,
+        )
     }
 
     testOptions {
@@ -39,7 +41,7 @@ android {
     }
 }
 
-val buildRust by tasks.registering(Exec::class) {
+val buildRust = tasks.register<Exec>("buildRust") {
     val output = layout.buildDirectory.dir("generated/jniLibs")
     inputs.dir(rootProject.file("../../crates"))
     inputs.dir(rootProject.file("../../third-party"))

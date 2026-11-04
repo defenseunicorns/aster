@@ -263,6 +263,6 @@ This run does not establish production readiness, background operation,
 discovery, pairing authority, rotating-address support, reconnection policy,
 controller hot-plug, State/Record/Blob transfer, transport selection or
 fallback, all-class scheduling, packaging/support status, performance, scale,
-or independent interoperability. Until the APK build and physical run succeed
-and both terminal receipts are retained, the Android path remains an unverified
-evaluation scaffold.
+or independent interoperability. Until the physical run succeeds and both
+terminal receipts are retained, the Android path remains an unverified
+radio-interoperability scaffold.

@@ -22,6 +22,7 @@
 /coverage/
 /examples/android-btle-ring1/.gradle/
 /examples/android-btle-ring1/local.properties
+/examples/android-btle-ring1/build/
 /examples/android-btle-ring1/app/build/
 /.worktrees/
 /debian/.debhelper/
