@@ -6,11 +6,17 @@ use aster_ble_l2cap::BleL2capContact;
 use aster_contact::{ContactErrorKind, OrderedContact, TransientLocator};
 use aster_node::{
     MissionPeerExpectation, MutableSourceInterests, NodeApplication, NodeError,
-    OrderedEventContactRole, TransportNeutralNodeConfig, mission::UnprotectedReferenceMission,
+    OrderedEventContactRole, RunningNode, TransportNeutralNodeConfig,
+    application::{
+        ApplicationError, ApplicationErrorKind, EventClientContext, EventClientDisposition,
+        EventClientId, EventSubscriptionRequest, Scope, Topic,
+    },
+    mission::UnprotectedReferenceMission,
     start_transport_neutral_node,
 };
 use serde::Serialize;
 use std::{
+    future::Future,
     os::{fd::OwnedFd, unix::net::UnixStream},
     sync::{
         Arc, Mutex, OnceLock,
@@ -23,6 +29,11 @@ use tokio::sync::Notify;
 
 const MAXIMUM_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const RING1_EVENT_CLIENT_ID: &[u8] = b"aster.android-btle-ring1.subscription.v1";
+const RING1_EVENT_CLAIM_NONCE: &[u8] = b"aster.android-btle-ring1.subscription-claim.v1";
+const RING1_EVENT_SUBSCRIPTION_KEY: &[u8] = b"aster.android-btle-ring1.consume.v1";
+const RING1_EVENT_TOPIC: &str = "mesh.messages";
+const RING1_EVENT_SCOPE: &str = "demo/playground";
 
 /// Opaque identifier for one process-local validator attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -364,6 +375,13 @@ async fn run_session(
     })
     .await
     .map_err(map_node_error)?;
+    if let Err(error) =
+        await_subscription_or_cancellation(ensure_ring1_event_subscription(&node), control.as_ref())
+            .await
+    {
+        let _ = node.shutdown().await;
+        return Err(error);
+    }
     control.install_contact(contact.clone());
     let expectation = MissionPeerExpectation::new(contact.peer_evidence(), config.mission_peer());
     sink.emit(SessionEvent::Phase(ValidatorPhase::Authenticating));
@@ -397,6 +415,114 @@ async fn run_session(
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
     }
+}
+
+async fn await_subscription_or_cancellation<F>(
+    preparation: F,
+    control: &RunControl,
+) -> Result<(), ValidatorError>
+where
+    F: Future<Output = Result<(), ValidatorError>>,
+{
+    tokio::pin!(preparation);
+    tokio::select! {
+        biased;
+        () = control.cancelled() => Err(ValidatorError::new(
+            ValidatorErrorCategory::Unavailable,
+            "validator contact was cancelled",
+        )),
+        result = &mut preparation => result,
+    }
+}
+
+async fn ensure_ring1_event_subscription(node: &RunningNode) -> Result<(), ValidatorError> {
+    let events = node.selected_events();
+    let client_id = EventClientId::new(RING1_EVENT_CLIENT_ID.to_vec())
+        .map_err(|_| internal_subscription_error())?;
+    let observed = events
+        .client_status(client_id.clone(), None)
+        .await
+        .map_err(map_subscription_error)?;
+    let context = match observed.current_session {
+        Some(session) => {
+            let current = events
+                .client_status(client_id.clone(), Some(session))
+                .await
+                .map_err(map_subscription_error)?;
+            if current.disposition == EventClientDisposition::Current {
+                EventClientContext { client_id, session }
+            } else {
+                recover_subscription_client(&events, client_id, session.get()).await?
+            }
+        }
+        None if observed.disposition == EventClientDisposition::Unregistered => {
+            recover_subscription_client(&events, client_id, 0).await?
+        }
+        None => return Err(internal_subscription_error()),
+    };
+    events
+        .subscribe(EventSubscriptionRequest {
+            client: context,
+            operation_key: RING1_EVENT_SUBSCRIPTION_KEY.to_vec(),
+            topic: Topic::new(RING1_EVENT_TOPIC).map_err(|_| internal_subscription_error())?,
+            scope: Scope::new(RING1_EVENT_SCOPE).map_err(|_| internal_subscription_error())?,
+            include_descendant_scopes: false,
+        })
+        .await
+        .map_err(map_subscription_error)?;
+    Ok(())
+}
+
+async fn recover_subscription_client(
+    events: &aster_node::application::SelectedEventHandle,
+    client_id: EventClientId,
+    expected_session: u64,
+) -> Result<EventClientContext, ValidatorError> {
+    let recovery = events
+        .begin_publication_session(
+            client_id.clone(),
+            expected_session,
+            RING1_EVENT_CLAIM_NONCE.to_vec(),
+        )
+        .await
+        .map_err(map_subscription_error)?;
+    events
+        .complete_publication_recovery(
+            client_id.clone(),
+            recovery.session,
+            recovery.snapshot_revision,
+        )
+        .await
+        .map_err(map_subscription_error)?;
+    Ok(EventClientContext {
+        client_id,
+        session: recovery.session,
+    })
+}
+
+fn map_subscription_error(error: ApplicationError) -> ValidatorError {
+    let category = match error.kind() {
+        ApplicationErrorKind::RequestRejected
+        | ApplicationErrorKind::UnauthorizedOrRevoked
+        | ApplicationErrorKind::PolicyUnsettled => ValidatorErrorCategory::Authentication,
+        ApplicationErrorKind::ResourceLimit
+        | ApplicationErrorKind::OperationCapacity
+        | ApplicationErrorKind::StateUnavailable
+        | ApplicationErrorKind::Integrity
+        | ApplicationErrorKind::Provisioning => ValidatorErrorCategory::Storage,
+        _ => ValidatorErrorCategory::Internal,
+    };
+    ValidatorError::new(
+        category,
+        "validator Event subscription could not be prepared",
+    )
+}
+
+fn internal_subscription_error() -> ValidatorError {
+    ValidatorError::new(
+        ValidatorErrorCategory::Internal,
+        "validator Event subscription configuration is invalid",
+    )
 }
 
 fn map_contact_error(error: aster_contact::ContactError) -> ValidatorError {
@@ -440,6 +566,8 @@ fn map_node_error(error: NodeError) -> ValidatorError {
 mod tests {
     use super::*;
     use crate::{ValidatorConfig, ValidatorError, ValidatorErrorCategory};
+    use aster_mesh::{ProvisioningAccess, ReferenceProvisioner, Scope, Topic};
+    use aster_node::mission::UnprotectedReferenceMission;
     use std::{
         io::Read,
         os::fd::OwnedFd,
@@ -658,6 +786,185 @@ mod tests {
     fn pair() -> (OwnedFd, UnixStream) {
         let (native, peer) = UnixStream::pair().expect("socket pair");
         (native.into(), peer)
+    }
+
+    fn validator_mission(seed: u8, topic: &str) -> UnprotectedReferenceMission {
+        let topic = Topic::new(topic).expect("validator mission topic");
+        let scope = Scope::new(RING1_EVENT_SCOPE).expect("validator mission scope");
+        let access = ProvisioningAccess::member(scope, vec![1], vec![topic])
+            .expect("validator mission access");
+        let mut provisioner =
+            ReferenceProvisioner::from_seed([seed; 32]).expect("validator mission provisioner");
+        let bundle = provisioner
+            .issue_node(1, &[access])
+            .expect("validator mission bundle")
+            .to_bytes()
+            .expect("encode validator mission bundle");
+        UnprotectedReferenceMission::from_bytes(bundle).expect("validator mission")
+    }
+
+    async fn start_validator_test_node(
+        state: PathBuf,
+        mission: UnprotectedReferenceMission,
+    ) -> RunningNode {
+        start_transport_neutral_node(TransportNeutralNodeConfig {
+            state,
+            mission,
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start validator node")
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_subscription_preparation() {
+        let (cancellation_stream, peer) = UnixStream::pair().expect("cancellation stream pair");
+        let control = Arc::new(RunControl::new(cancellation_stream));
+        let worker_control = control.clone();
+        let waiting = tokio::spawn(async move {
+            await_subscription_or_cancellation(
+                std::future::pending::<Result<(), ValidatorError>>(),
+                worker_control.as_ref(),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        control.cancel();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("subscription cancellation deadline")
+            .expect("subscription cancellation task")
+            .expect_err("cancelled subscription preparation");
+        assert_eq!(error.category(), ValidatorErrorCategory::Unavailable);
+        drop(peer);
+    }
+
+    #[tokio::test]
+    async fn fresh_validator_state_has_one_durable_event_subscription() {
+        let test = TestConfig::new();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &test.root,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("owner-only validator test root");
+        let topic = Topic::new("mesh.messages").expect("validator topic");
+        let scope = Scope::new("demo/playground").expect("validator scope");
+        let mission = validator_mission(0x7a, RING1_EVENT_TOPIC);
+        let state = test.root.join("live-state");
+        let node = start_validator_test_node(state.clone(), mission.clone()).await;
+
+        ensure_ring1_event_subscription(&node)
+            .await
+            .expect("provision fresh validator subscription");
+        ensure_ring1_event_subscription(&node)
+            .await
+            .expect("replay validator subscription");
+
+        let subscriptions = node
+            .selected_events()
+            .list_subscriptions()
+            .await
+            .expect("list validator subscriptions");
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].topic, topic);
+        assert_eq!(subscriptions[0].scope, scope);
+        assert!(!subscriptions[0].include_descendant_scopes);
+        node.shutdown().await.expect("shutdown validator node");
+
+        let reopened = start_validator_test_node(state, mission).await;
+        let durable = reopened
+            .selected_events()
+            .list_subscriptions()
+            .await
+            .expect("list durable validator subscriptions before replay");
+        assert_eq!(durable.len(), 1);
+        assert_eq!(durable[0].operation_key, RING1_EVENT_SUBSCRIPTION_KEY);
+        assert_eq!(durable[0].topic, topic);
+        assert_eq!(durable[0].scope, scope);
+        ensure_ring1_event_subscription(&reopened)
+            .await
+            .expect("replay durable validator subscription after restart");
+        let subscriptions = reopened
+            .selected_events()
+            .list_subscriptions()
+            .await
+            .expect("list reopened validator subscriptions");
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].topic, topic);
+        assert_eq!(subscriptions[0].scope, scope);
+        reopened
+            .shutdown()
+            .await
+            .expect("shutdown reopened validator node");
+    }
+
+    #[tokio::test]
+    async fn interrupted_subscription_client_claim_recovers_after_restart() {
+        let test = TestConfig::new();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &test.root,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("owner-only recovery test root");
+        let mission = validator_mission(0x7b, RING1_EVENT_TOPIC);
+        let state = test.root.join("recovery-state");
+        let node = start_validator_test_node(state.clone(), mission.clone()).await;
+        let events = node.selected_events();
+        let client_id = EventClientId::new(RING1_EVENT_CLIENT_ID.to_vec())
+            .expect("validator subscription client");
+        events
+            .begin_publication_session(client_id, 0, RING1_EVENT_CLAIM_NONCE.to_vec())
+            .await
+            .expect("begin interrupted validator client claim");
+        node.shutdown()
+            .await
+            .expect("shutdown with incomplete validator client claim");
+
+        let reopened = start_validator_test_node(state, mission).await;
+        ensure_ring1_event_subscription(&reopened)
+            .await
+            .expect("recover interrupted validator client claim");
+        let subscriptions = reopened
+            .selected_events()
+            .list_subscriptions()
+            .await
+            .expect("list recovered validator subscription");
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].operation_key, RING1_EVENT_SUBSCRIPTION_KEY);
+        reopened
+            .shutdown()
+            .await
+            .expect("shutdown recovered validator node");
+    }
+
+    #[tokio::test]
+    async fn unauthorized_validator_selector_is_authentication_failure() {
+        let test = TestConfig::new();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &test.root,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("owner-only authorization test root");
+        let node = start_validator_test_node(
+            test.root.join("unauthorized-state"),
+            validator_mission(0x7c, "other.topic"),
+        )
+        .await;
+
+        let error = ensure_ring1_event_subscription(&node)
+            .await
+            .expect_err("unauthorized validator subscription");
+        assert_eq!(error.category(), ValidatorErrorCategory::Authentication);
+        node.shutdown()
+            .await
+            .expect("shutdown unauthorized validator node");
     }
 
     #[test]

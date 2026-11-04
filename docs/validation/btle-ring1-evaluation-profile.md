@@ -48,7 +48,10 @@ narrow Rust JNI adapter. It uses Android's public LE L2CAP CoC socket, bridges
 the socket streams through a process-local Unix socket pair, and then runs the
 same transport-neutral mission, v9 profile, Event, and durable-store path. The
 local socket pair is an Android implementation detail, not a carrier or
-fallback. The app uses manual Linux address/PSM input and requests no scan,
+fallback. Before contact it idempotently prepares one private exact durable
+`Consume` subscription for the profile's Event selector through the existing
+application API; this adds no protocol or public configuration field. The app
+uses manual Linux address/PSM input and requests no scan,
 advertise, location, Internet, service, or receiver capability.
 
 This optional path does not widen the fixed Linux-to-Linux Ring-1 exit or move

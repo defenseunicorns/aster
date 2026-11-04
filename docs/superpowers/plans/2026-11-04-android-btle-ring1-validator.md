@@ -15,6 +15,12 @@
 - Evaluation-only foreground interoperability; no production or requirement-credit claim.
 - Android is the fixed initiator and the existing Linux Ring-1 process is the fixed listener.
 - Preserve exact semantic v9, mission profile `0x0001`, profile IDs `[2, 1, 1, 5, 1]`, canonical transfer-profile digest, Event bytes, and durable store behavior.
+- Before contact, create or replay the validator's private, versioned exact
+  `Consume` subscription for `mesh.messages` at `demo/playground` through the
+  existing selected-Event application API; do not add a protocol or public
+  configuration field. Any future selector change must remove/migrate the old
+  durable selector or require fresh evaluation state; a second operation key
+  alone is not a migration.
 - Do not add protocol bytes, IP relay, carrier fallback, scan, advertise, listener mode, background service, GATT, pairing authority, or controller management.
 - Minimum Android API is 29; first packaged ABI is `arm64-v8a`; Android 12+ requests only `BLUETOOTH_CONNECT` for the manual-address topology.
 - One active attempt, 2 MiB protected frame ceiling, 64 MiB complete-contact ceiling, and 30-second authenticated-progress/platform-operation deadline remain unchanged.
@@ -147,6 +153,10 @@
 - [ ] **Step 4: Implement the real validator session**
 
   On the dedicated runtime thread, wrap the transferred descriptor as nonblocking `tokio::net::UnixStream`, load `UnprotectedReferenceMission`, start `TransportNeutralNodeConfig` with `NodeApplication::Relay`, create `BleL2capContact` with the fixed Ring-1 bounds, run as `OrderedEventContactRole::Initiator` against the configured `MissionPeerExpectation`, validate the receipt with Task 1, and always shut down the node. Emit only `Connecting`, `CarrierConnected`, `Authenticating`, `Reconciling`, and one terminal outcome.
+
+  Before contact admission, create or replay the private exact durable Event
+  subscription. Cover a fresh state, same-process replay, and restart replay
+  with a focused live-node regression.
 
 - [ ] **Step 5: Run Task 2 checks**
 

@@ -36,6 +36,15 @@ contact. The operator supplies:
 - an Android mission bundle selected with the system document picker; and
 - the exact expected Linux mission node ID.
 
+Before admitting the contact, the native validator creates or replays one
+durable exact `Consume` subscription for `mesh.messages` at `demo/playground`
+through the existing selected-Event application API. The client and operation
+keys are private, versioned validator constants. They are neither protocol
+fields nor Android form inputs. A later evaluation selector must explicitly
+unsubscribe and migrate the old durable selector, or require fresh evaluation
+state; adding a new versioned key alone would incorrectly widen receive
+interest. None of these implementation changes require a semantic-v9 change.
+
 The app copies the selected mission bundle into its private files directory and
 stores all Aster state under a private application directory. It neither scans
 nor advertises. It requests only the Bluetooth connect permission needed by the
@@ -109,7 +118,8 @@ storage, or internal; raw secrets and peer-controlled strings are omitted.
 ## Verification boundary
 
 Host-side tests cover configuration parsing, one-active-run admission, result
-validation, cancellation, and sanitized failure mapping. Existing
+validation, cancellation, sanitized failure mapping, and fresh-state/restart
+idempotence of the exact durable Event subscription. Existing
 `aster-ble-l2cap` tests remain the authority for record framing and hostile
 stream behavior. Android JVM tests cover permission decisions, form validation,
 phase reduction, and receipt rendering without Bluetooth hardware.
