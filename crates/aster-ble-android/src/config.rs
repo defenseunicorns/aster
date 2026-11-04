@@ -36,6 +36,21 @@ pub enum ValidatorErrorCategory {
     Internal,
 }
 
+impl ValidatorErrorCategory {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Configuration => "configuration",
+            Self::Bounds => "bounds",
+            Self::Unavailable => "unavailable",
+            Self::Timeout => "timeout",
+            Self::Authentication => "authentication",
+            Self::Protocol => "protocol",
+            Self::Storage => "storage",
+            Self::Internal => "internal",
+        }
+    }
+}
+
 /// Sanitized validator error that never retains peer-controlled input.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ValidatorError {

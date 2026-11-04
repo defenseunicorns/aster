@@ -20,5 +20,11 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 
-[lints]
-workspace = true
+[lints.rust]
+# Descriptor adoption and exported JNI symbols require narrowly scoped unsafe
+# operations. The transport-neutral node and adapter implementation remain safe.
+unsafe_code = "allow"
+missing_docs = "allow"
+
+[lints.clippy]
+all = "warn"
