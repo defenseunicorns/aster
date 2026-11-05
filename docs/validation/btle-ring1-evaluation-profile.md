@@ -35,7 +35,9 @@ It is engineering evidence for the carrier seam, not a supported deployment.
   cancelled or closed when its enclosing deadline expires.
 - Transient locator: 1-256 bytes under the adapter-neutral contract.
 - Queued session operations: one active operation; overlap fails closed.
-- Controller recovery: process restart or explicit reconfiguration only.
+- Fixed-role Ring-1 controller recovery: process restart or explicit
+  reconfiguration only. The separate unattended Linux/Linux extension below
+  adds event-driven recovery without changing this physical-evidence profile.
 
 These are evaluation ceilings, not production performance claims or a declared
 minimum supported CoC MTU. The physical test records the actual negotiated send
@@ -84,6 +86,35 @@ claim. Follow the
 [Android BTLE Ring-1 quickstart](../quickstart/btle-android-ring1.md) to produce
 that evidence without changing the protocol.
 
+## Unattended Linux/Linux lifecycle extension
+
+The tree also contains a separate `aster-btle-event` evaluation executable.
+It starts a transport-neutral node before a Linux/BlueZ supervisor, tolerates
+BlueZ or configured-controller absence, and observes add, remove, power, and
+identity changes without polling. For exactly one configured controller and
+one provisioned peer per process, complete mission node IDs derive
+complementary Linux roles. One open or active ordered Event contact is owned at
+a time; controller loss and shutdown cancel and drain it before another epoch
+or node shutdown.
+
+This extension reuses the existing semantic-v9 Event contact and the Ring-1
+frame, exchange, and deadline ceilings. Its 250 ms to 30 second peer retry and
+60-second default successful-contact cadence are local implementation policy,
+not protocol constants. Local publication remains durably available with no
+transport, and a later admitted contact reconciles retained Event work. The
+standalone evaluator exposes no application endpoint; publication during
+unavailability is exercised through an in-process node embedding or the
+focused adapter-neutral node integration test.
+
+Deterministic unit and lifecycle tests cover controller absence/recovery,
+single-attempt ownership, capped backoff, admission classification, and drain
+on shutdown. Linux/Linux radio evidence for controller power-cycle recovery is
+still pending per hardware/kernel/BlueZ/controller-driver combination. This
+mechanism does not alter the fixed-role Android/Linux evidence above and gives
+no requirement credit or production approval. The operator procedure and
+retained-evidence boundary are in the
+[unattended Linux BTLE Event quickstart](../quickstart/btle-linux-unattended.md).
+
 ## Required evidence
 
 - Deterministic framing, bounds, timeout, truncation, close, and mission-order
@@ -98,8 +129,11 @@ that evidence without changing the protocol.
 
 ## Explicit exclusions
 
-Discovery proof or grammar, dynamic roles, duplicate-contact reduction,
-event-driven hot-plug, production MTU floor, constrained-emission qualification,
-State, Record, Blob execution, GATT, credited cross-platform interoperability,
-multi-controller operation, automatic carrier selection, downgrade resistance,
-packaging, support rows, and production authorization are excluded.
+Discovery proof or grammar, negotiated/dynamic role selection, production MTU
+floor, constrained-emission qualification, State, Record, Blob execution,
+GATT, credited cross-platform interoperability, multi-controller operation,
+automatic carrier selection or fallback, daemon packaging, support rows, and
+production authorization are excluded. The unattended Linux/Linux extension
+implements deterministic local role derivation, single-contact ownership, and
+event-driven controller recovery in source; those mechanisms are not added to
+the fixed physical Ring-1 claim without retained target evidence.
