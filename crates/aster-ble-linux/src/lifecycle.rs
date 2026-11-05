@@ -97,6 +97,7 @@ impl Error for SupervisorError {}
 /// Owned unattended Linux BTLE Event lifecycle.
 pub struct LinuxBtleEventSupervisor {
     availability: watch::Receiver<BtleAvailability>,
+    completion: watch::Receiver<bool>,
     cancellation: LifecycleCancellation,
     monitor: JoinHandle<Result<(), DriverError>>,
     contacts: JoinHandle<Result<(), SupervisorError>>,
@@ -111,6 +112,16 @@ impl LinuxBtleEventSupervisor {
     /// Requests idempotent cancellation of all owned lifecycle work.
     pub fn cancel(&self) {
         self.cancellation.cancel();
+    }
+
+    /// Waits until either owned lifecycle task reaches a terminal result.
+    pub async fn wait_for_completion(&self) {
+        let mut completion = self.completion.clone();
+        while !*completion.borrow_and_update() {
+            if completion.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     /// Cancels and joins the controller monitor and contact loop.
@@ -147,11 +158,14 @@ fn spawn_linux_btle_event_supervisor_with(
     let cancellation = LifecycleCancellation::new();
     let initial = BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable);
     let (updates, availability) = watch::channel(initial);
+    let (completion_updates, completion) = watch::channel(false);
 
     let monitor_cancellation = cancellation.clone();
     let monitor_exit = cancellation.clone();
     let monitor_link = config.link().clone();
+    let monitor_completion = completion_updates.clone();
     let monitor_task = tokio::spawn(async move {
+        let _completion = CompletionOnDrop(monitor_completion);
         let result = monitor
             .run(&monitor_link, updates, monitor_cancellation)
             .await;
@@ -162,7 +176,9 @@ fn spawn_linux_btle_event_supervisor_with(
     let contact_cancellation = cancellation.clone();
     let contact_exit = cancellation.clone();
     let contact_availability = availability.clone();
+    let contact_completion = completion_updates;
     let contact_task = tokio::spawn(async move {
+        let _completion = CompletionOnDrop(contact_completion);
         let result = run_contact_loop(
             config,
             contact_availability,
@@ -177,9 +193,25 @@ fn spawn_linux_btle_event_supervisor_with(
 
     LinuxBtleEventSupervisor {
         availability,
+        completion,
         cancellation,
         monitor: monitor_task,
         contacts: contact_task,
+    }
+}
+
+struct CompletionOnDrop(watch::Sender<bool>);
+
+impl Drop for CompletionOnDrop {
+    fn drop(&mut self) {
+        self.0.send_if_modified(|completed| {
+            if *completed {
+                false
+            } else {
+                *completed = true;
+                true
+            }
+        });
     }
 }
 
@@ -549,6 +581,19 @@ mod tests {
             }),
             events,
         )
+    }
+
+    struct PanickingMonitor;
+
+    impl AvailabilityMonitor for PanickingMonitor {
+        fn run<'a>(
+            &'a self,
+            _link: &'a ValidatedLinkConfig,
+            _updates: watch::Sender<BtleAvailability>,
+            _cancellation: LifecycleCancellation,
+        ) -> MonitorFuture<'a> {
+            Box::pin(async { panic!("test monitor panic") })
+        }
     }
 
     struct TestContact {
@@ -1191,6 +1236,49 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn terminal_failure_signals_completion_before_shutdown() {
+        let activity = Arc::new(Activity::default());
+        let (monitor, events) = fake_monitor();
+        let opener = FakeOpener::new([OpenAction::Succeed(TestContact::new())], activity.clone());
+        let admission =
+            FakeAdmission::new([AdmissionAction::Fail(AdmissionFailure::Closed)], activity);
+        let supervisor = spawn_test(
+            config(1, 2, Duration::from_secs(10)),
+            monitor,
+            opener,
+            admission,
+        );
+        events.send(BtleAvailability::Available).unwrap();
+
+        supervisor.wait_for_completion().await;
+
+        assert_eq!(
+            supervisor.shutdown().await.unwrap_err(),
+            SupervisorError::AdmissionClosed
+        );
+    }
+
+    #[tokio::test]
+    async fn task_panic_signals_completion_before_shutdown() {
+        let activity = Arc::new(Activity::default());
+        let opener = FakeOpener::new([], activity.clone());
+        let admission = FakeAdmission::new([], activity);
+        let supervisor = spawn_test(
+            config(1, 2, Duration::from_secs(10)),
+            Arc::new(PanickingMonitor),
+            opener,
+            admission,
+        );
+
+        supervisor.wait_for_completion().await;
+
+        assert_eq!(
+            supervisor.shutdown().await.unwrap_err(),
+            SupervisorError::TaskStopped
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn shutdown_drains_every_lifecycle_state() {
         async fn run_case(
             availability: bool,
@@ -1268,8 +1356,10 @@ mod tests {
         });
         contacts.abort();
         let (_updates, availability) = watch::channel(BtleAvailability::Available);
+        let (_completion_updates, completion) = watch::channel(false);
         let supervisor = LinuxBtleEventSupervisor {
             availability,
+            completion,
             cancellation,
             monitor,
             contacts,

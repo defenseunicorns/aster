@@ -3823,6 +3823,8 @@ pub struct RunningNode {
     emission_policy: Arc<LiveEmissionPolicy>,
     #[cfg(feature = "nearby-discovery")]
     nearby_discovery_stop: Option<NearbyDiscoveryControl>,
+    #[cfg(test)]
+    handles_sigint: bool,
     shutdown: Option<mpsc::Sender<()>>,
     task: Option<JoinHandle<Result<NodeReceipt, NodeError>>>,
 }
@@ -16627,6 +16629,36 @@ pub async fn start_transport_neutral_node(
     .await
 }
 
+/// Starts a transport-neutral node whose shutdown is owned by its embedding.
+///
+/// This node binds no IP transport and does not consume process SIGINT. The
+/// embedding must stop its admitted transports before calling
+/// [`RunningNode::shutdown`].
+pub async fn start_externally_supervised_transport_neutral_node(
+    config: TransportNeutralNodeConfig,
+    output_policy: NodeOperatorOutputPolicy,
+) -> Result<RunningNode, NodeError> {
+    start_externally_supervised_transport_neutral_node_with_output(
+        config,
+        NodeOperatorOutput::process(output_policy),
+    )
+    .await
+}
+
+async fn start_externally_supervised_transport_neutral_node_with_output(
+    config: TransportNeutralNodeConfig,
+    output: NodeOperatorOutput,
+) -> Result<RunningNode, NodeError> {
+    start_node_with_shutdown_ownership(
+        config.into_node_config(),
+        SelectedForwardingConfig::default(),
+        output,
+        false,
+        false,
+    )
+    .await
+}
+
 /// Starts one selected node with explicit carrier, emission, and durable-admission policy.
 pub async fn start_node_with_forwarding(
     config: NodeConfig,
@@ -16777,6 +16809,8 @@ async fn start_node_with_shutdown_ownership(
         emission_policy,
         #[cfg(feature = "nearby-discovery")]
         nearby_discovery_stop: ready.nearby_discovery_stop,
+        #[cfg(test)]
+        handles_sigint: handle_sigint,
         shutdown: Some(shutdown_sender),
         task: Some(task),
     })
@@ -41194,16 +41228,22 @@ mod tests {
         let mut issued = issue_missions(2);
         let local = issued.remove(0);
         let peer = issued.remove(0);
-        let node = start_transport_neutral_node(TransportNeutralNodeConfig {
-            state: test_root.clone(),
-            mission: local.credentials,
-            mutable_interests: MutableSourceInterests::default(),
-            sync_interval: Duration::from_secs(60),
-            run_for: None,
-            application: NodeApplication::Relay,
-        })
+        let (output, captured) = captured_node_output(NodeOperatorOutputPolicy::CustomerSafe);
+        let node = start_externally_supervised_transport_neutral_node_with_output(
+            TransportNeutralNodeConfig {
+                state: test_root.clone(),
+                mission: local.credentials,
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            output,
+        )
         .await
         .expect("start typed failure node");
+        assert!(node.bound_sockets.is_empty());
+        assert!(!node.handles_sigint);
         let contact = Arc::new(FailingOrderedContact {
             operations: Arc::new(AtomicUsize::new(0)),
             closes: Arc::new(AtomicUsize::new(0)),
@@ -41225,6 +41265,7 @@ mod tests {
         assert!(contact.closes.load(Ordering::SeqCst) > 0);
         let receipt = node.shutdown().await.expect("typed failure shutdown");
         assert_eq!(receipt.contact_errors, 1);
+        assert!(captured.records().is_empty());
         fs::remove_dir_all(test_root).expect("typed failure cleanup");
     }
 
