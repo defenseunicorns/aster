@@ -1,8 +1,9 @@
 # BTLE Ring 1 evaluation profile
 
-- Status: implementation profile; no requirement credit or production approval
+- Status: bounded Linux evaluation evidence retained; no requirement credit or
+  production approval
 - Owner: Aster implementation owner
-- Review date: 2026-11-04
+- Review date: 2026-11-05
 - Semantic boundary: exact selected semantic v9 with v1-v8 compatibility bytes
 - Carrier: initial `BleL2capV1` implementation revision; official exit remains
   Linux-only
@@ -112,14 +113,25 @@ embedding or the focused adapter-neutral node integration test.
 
 Deterministic unit and lifecycle tests cover controller absence/recovery,
 single-attempt ownership, capped backoff, admission classification, and drain
-on shutdown. Linux/Linux radio evidence for controller power-cycle recovery is
-still pending per hardware/kernel/BlueZ/controller-driver combination. This
+on shutdown. The [bounded two-CM4 observation](evidence/2026-11-05-cm4-btle-ring1-event-validation.md)
+retains one Linux/Linux Event transfer, zero-work deduplication, controller
+power-cycle recovery, process restart, application-level receipt, point
+resource observations, and cleanup. On that exact stack, process restart alone
+left the unpaired ACL connected in BlueZ; a controller power cycle was required
+before the restarted processes completed another zero-work contact. This
 mechanism does not alter the fixed-role Android/Linux evidence above and gives
-no requirement credit or production approval. The operator procedure and
-retained-evidence boundary are in the
+no requirement credit or production approval. The operator procedure is in the
 [unattended Linux BTLE Event quickstart](../quickstart/btle-linux-unattended.md).
 
 ## Required evidence
+
+The retained CM4 record above partially satisfies this section for its exact
+hardware and stated limitations. It covers the functional Event receipt,
+controller lifecycle, application receipt, point resource observations, and
+cleanup. It does not retain independently reproducible source-to-artifact
+provenance, secret-bearing exact configuration, or repository-retained raw or
+machine-readable logs. It is not a reusable hardware support row or release
+qualification.
 
 - Deterministic framing, bounds, timeout, truncation, close, and mission-order
   tests, including no inventory or Event bytes before mission authentication.
