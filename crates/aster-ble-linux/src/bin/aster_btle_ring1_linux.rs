@@ -1,5 +1,5 @@
 use aster_ble_linux::{
-    DriverConfig, FixedRole, OpenCancellation, RING1_MAXIMUM_DEADLINE,
+    DriverConfig, FixedRole, LinkConfig, OpenCancellation, RING1_MAXIMUM_DEADLINE,
     RING1_MAXIMUM_EXCHANGE_BYTES, RING1_MAXIMUM_FRAME_BYTES, ValidatedConfig, open_contact,
 };
 use aster_contact::{
@@ -180,17 +180,19 @@ fn parse_command(arguments: Vec<String>) -> Result<HarnessCommand, String> {
     }
     .map_err(|_| "invalid LE PSM".to_owned())?;
     let driver = DriverConfig {
-        adapter_name: value("--adapter")?,
-        local_address: parse_address("--local-address")?,
-        local_address_type: address_type("--local-address-type")?,
-        peer_address: parse_address("--peer-address")?,
-        peer_address_type: address_type("--peer-address-type")?,
-        psm,
+        link: LinkConfig {
+            adapter_name: value("--adapter")?,
+            local_address: parse_address("--local-address")?,
+            local_address_type: address_type("--local-address-type")?,
+            peer_address: parse_address("--peer-address")?,
+            peer_address_type: address_type("--peer-address-type")?,
+            psm,
+            maximum_frame_bytes: RING1_MAXIMUM_FRAME_BYTES,
+            maximum_exchange_bytes: RING1_MAXIMUM_EXCHANGE_BYTES,
+            open_timeout: RING1_MAXIMUM_DEADLINE,
+            operation_timeout: RING1_MAXIMUM_DEADLINE,
+        },
         role,
-        maximum_frame_bytes: RING1_MAXIMUM_FRAME_BYTES,
-        maximum_exchange_bytes: RING1_MAXIMUM_EXCHANGE_BYTES,
-        open_timeout: RING1_MAXIMUM_DEADLINE,
-        operation_timeout: RING1_MAXIMUM_DEADLINE,
     }
     .validate()
     .map_err(|error| error.to_string())?;
