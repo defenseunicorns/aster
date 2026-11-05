@@ -4,12 +4,19 @@
 #![cfg(target_os = "linux")]
 
 mod config;
+// Task 4 consumes these crate-private lifecycle surfaces. Keep them internal
+// until the public supervisor owns their construction and cancellation.
+#[allow(dead_code)]
+mod controller;
+#[allow(dead_code)]
+mod policy;
 
 pub use config::{
     DriverConfig, FixedRole, LinkConfig, OpenRequest, RING1_MAXIMUM_DEADLINE,
     RING1_MAXIMUM_EXCHANGE_BYTES, RING1_MAXIMUM_FRAME_BYTES, SupervisorConfig, ValidatedConfig,
     ValidatedLinkConfig, ValidatedSupervisorConfig,
 };
+pub use controller::{AvailabilityReason, BtleAvailability};
 
 use aster_ble_l2cap::BleL2capContact;
 use bluer::{

@@ -17,6 +17,7 @@ aster-ble-l2cap = { path = "../aster-ble-l2cap" }
 aster-contact = { path = "../aster-contact" }
 aster-mesh = { package = "aster-core", path = "../aster-core", default-features = false, features = ["reference-session"] }
 aster-node = { path = "../aster-node" }
+futures.workspace = true
 tokio = { workspace = true, features = ["macros"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
