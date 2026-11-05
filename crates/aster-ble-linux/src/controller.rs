@@ -429,7 +429,7 @@ async fn retry_session(
 }
 
 fn publish(updates: &watch::Sender<BtleAvailability>, availability: BtleAvailability) {
-    updates.send_if_modified(|current| {
+    let changed = updates.send_if_modified(|current| {
         if *current == availability {
             false
         } else {
@@ -437,6 +437,14 @@ fn publish(updates: &watch::Sender<BtleAvailability>, availability: BtleAvailabi
             true
         }
     });
+    if changed {
+        match availability {
+            BtleAvailability::Available => eprintln!("BTLE_EVENT status=available"),
+            BtleAvailability::Unavailable(reason) => {
+                eprintln!("BTLE_EVENT status=unavailable reason={reason:?}");
+            }
+        }
+    }
 }
 
 struct ProductionBluez;

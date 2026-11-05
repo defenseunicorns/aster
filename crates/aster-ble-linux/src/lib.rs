@@ -4,11 +4,8 @@
 #![cfg(target_os = "linux")]
 
 mod config;
-// Task 4 consumes these crate-private lifecycle surfaces. Keep them internal
-// until the public supervisor owns their construction and cancellation.
-#[allow(dead_code)]
 mod controller;
-#[allow(dead_code)]
+mod lifecycle;
 mod policy;
 
 pub use config::{
@@ -17,6 +14,7 @@ pub use config::{
     ValidatedLinkConfig, ValidatedSupervisorConfig,
 };
 pub use controller::{AvailabilityReason, BtleAvailability};
+pub use lifecycle::{LinuxBtleEventSupervisor, SupervisorError, spawn_linux_btle_event_supervisor};
 
 use aster_ble_l2cap::BleL2capContact;
 use bluer::{
