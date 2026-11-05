@@ -101,20 +101,61 @@ pub(crate) trait AvailabilityMonitor: Send + Sync {
     ) -> MonitorFuture<'a>;
 }
 
+trait AvailabilityOutput: Send + Sync {
+    fn emit(&self, availability: BtleAvailability);
+}
+
+struct ProcessAvailabilityOutput;
+
+impl AvailabilityOutput for ProcessAvailabilityOutput {
+    fn emit(&self, availability: BtleAvailability) {
+        match availability {
+            BtleAvailability::Available => eprintln!("BTLE_EVENT status=available"),
+            BtleAvailability::Unavailable(reason) => {
+                eprintln!("BTLE_EVENT status=unavailable reason={reason:?}");
+            }
+        }
+    }
+}
+
 pub(crate) struct BluezAvailabilityMonitor {
     backend: Arc<dyn BluezBackend>,
+    output: Arc<dyn AvailabilityOutput>,
 }
 
 impl BluezAvailabilityMonitor {
     pub(crate) fn new() -> Self {
         Self {
             backend: Arc::new(ProductionBluez),
+            output: Arc::new(ProcessAvailabilityOutput),
         }
     }
 
     #[cfg(test)]
     fn with_backend(backend: Arc<dyn BluezBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            output: Arc::new(ProcessAvailabilityOutput),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_backend_and_output(
+        backend: Arc<dyn BluezBackend>,
+        output: Arc<dyn AvailabilityOutput>,
+    ) -> Self {
+        Self { backend, output }
+    }
+
+    async fn retry_session(
+        &self,
+        updates: &watch::Sender<BtleAvailability>,
+        cancellation: &LifecycleCancellation,
+        backoff: &mut CappedBackoff,
+        failure: BluezFailure,
+    ) -> bool {
+        publish(updates, self.output.as_ref(), failure.availability());
+        wait_delay(cancellation, backoff.next_delay()).await
     }
 
     async fn run_monitor(
@@ -125,6 +166,9 @@ impl BluezAvailabilityMonitor {
     ) -> Result<(), DriverError> {
         let configured = ConfiguredController::from_link(link);
         let mut backoff = CappedBackoff::new(INITIAL_SESSION_RETRY, MAXIMUM_SESSION_RETRY);
+        self.output.emit(BtleAvailability::Unavailable(
+            AvailabilityReason::BluezUnavailable,
+        ));
 
         loop {
             if cancellation.is_cancelled() {
@@ -134,7 +178,10 @@ impl BluezAvailabilityMonitor {
             let session = match wait_for(&cancellation, self.backend.open_session()).await {
                 WaitResult::Value(Ok(session)) => session,
                 WaitResult::Value(Err(failure)) => {
-                    if retry_session(&updates, &cancellation, &mut backoff, failure).await {
+                    if self
+                        .retry_session(&updates, &cancellation, &mut backoff, failure)
+                        .await
+                    {
                         return Ok(());
                     }
                     continue;
@@ -144,7 +191,10 @@ impl BluezAvailabilityMonitor {
             let session_events = match wait_for(&cancellation, session.subscribe()).await {
                 WaitResult::Value(Ok(events)) => events,
                 WaitResult::Value(Err(failure)) => {
-                    if retry_session(&updates, &cancellation, &mut backoff, failure).await {
+                    if self
+                        .retry_session(&updates, &cancellation, &mut backoff, failure)
+                        .await
+                    {
                         return Ok(());
                     }
                     continue;
@@ -154,7 +204,10 @@ impl BluezAvailabilityMonitor {
             let adapter_names = match wait_for(&cancellation, session.adapter_names()).await {
                 WaitResult::Value(Ok(names)) => names,
                 WaitResult::Value(Err(failure)) => {
-                    if retry_session(&updates, &cancellation, &mut backoff, failure).await {
+                    if self
+                        .retry_session(&updates, &cancellation, &mut backoff, failure)
+                        .await
+                    {
                         return Ok(());
                     }
                     continue;
@@ -170,13 +223,17 @@ impl BluezAvailabilityMonitor {
                 &configured,
                 present,
                 &updates,
+                self.output.as_ref(),
                 &cancellation,
             )
             .await
             {
                 SessionOutcome::Cancelled => return Ok(()),
                 SessionOutcome::Lost(failure) => {
-                    if retry_session(&updates, &cancellation, &mut backoff, failure).await {
+                    if self
+                        .retry_session(&updates, &cancellation, &mut backoff, failure)
+                        .await
+                    {
                         return Ok(());
                     }
                 }
@@ -247,12 +304,14 @@ async fn monitor_session(
     configured: &ConfiguredController,
     mut present: bool,
     updates: &watch::Sender<BtleAvailability>,
+    output: &dyn AvailabilityOutput,
     cancellation: &LifecycleCancellation,
 ) -> SessionOutcome {
     loop {
         if !present {
             publish(
                 updates,
+                output,
                 BtleAvailability::Unavailable(AvailabilityReason::ControllerAbsent),
             );
             present = match next_configured_session_event(
@@ -301,7 +360,7 @@ async fn monitor_session(
             WaitResult::Value(Err(failure)) => return SessionOutcome::Lost(failure),
             WaitResult::Cancelled => return SessionOutcome::Cancelled,
         };
-        publish(updates, configured.classify(initial));
+        publish(updates, output, configured.classify(initial));
 
         let session_observations = session_events
             .by_ref()
@@ -323,6 +382,7 @@ async fn monitor_session(
                     Some(SessionSignal::AdapterRemoved(name)) if name == configured.name => {
                         publish(
                             updates,
+                            output,
                             BtleAvailability::Unavailable(AvailabilityReason::ControllerAbsent),
                         );
                         present = false;
@@ -335,11 +395,12 @@ async fn monitor_session(
                     Some(AdapterSignal::PropertiesChanged) => {
                         match wait_for(cancellation, adapter.snapshot()).await {
                             WaitResult::Value(Ok(snapshot)) => {
-                                publish(updates, configured.classify(snapshot));
+                                publish(updates, output, configured.classify(snapshot));
                             }
                             WaitResult::Value(Err(BluezFailure::ControllerAbsent)) => {
                                 publish(
                                     updates,
+                                    output,
                                     BtleAvailability::Unavailable(
                                         AvailabilityReason::ControllerAbsent,
                                     ),
@@ -418,17 +479,11 @@ async fn wait_delay(cancellation: &LifecycleCancellation, delay: Duration) -> bo
     }
 }
 
-async fn retry_session(
+fn publish(
     updates: &watch::Sender<BtleAvailability>,
-    cancellation: &LifecycleCancellation,
-    backoff: &mut CappedBackoff,
-    failure: BluezFailure,
-) -> bool {
-    publish(updates, failure.availability());
-    wait_delay(cancellation, backoff.next_delay()).await
-}
-
-fn publish(updates: &watch::Sender<BtleAvailability>, availability: BtleAvailability) {
+    output: &dyn AvailabilityOutput,
+    availability: BtleAvailability,
+) {
     let changed = updates.send_if_modified(|current| {
         if *current == availability {
             false
@@ -438,12 +493,7 @@ fn publish(updates: &watch::Sender<BtleAvailability>, availability: BtleAvailabi
         }
     });
     if changed {
-        match availability {
-            BtleAvailability::Available => eprintln!("BTLE_EVENT status=available"),
-            BtleAvailability::Unavailable(reason) => {
-                eprintln!("BTLE_EVENT status=unavailable reason={reason:?}");
-            }
-        }
+        output.emit(availability);
     }
 }
 
@@ -725,6 +775,31 @@ mod tests {
         })
     }
 
+    #[derive(Default)]
+    struct RecordingAvailabilityOutput {
+        records: Mutex<Vec<BtleAvailability>>,
+        changed: Notify,
+    }
+
+    impl AvailabilityOutput for RecordingAvailabilityOutput {
+        fn emit(&self, availability: BtleAvailability) {
+            self.records.lock().unwrap().push(availability);
+            self.changed.notify_waiters();
+        }
+    }
+
+    impl RecordingAvailabilityOutput {
+        async fn wait_for_records(&self, count: usize) {
+            loop {
+                let changed = self.changed.notified();
+                if self.records.lock().unwrap().len() >= count {
+                    return;
+                }
+                changed.await;
+            }
+        }
+    }
+
     fn address(value: &str) -> Address {
         Address::from_str(value).expect("test Bluetooth address")
     }
@@ -788,6 +863,38 @@ mod tests {
     ) {
         cancellation.cancel();
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn monitor_emits_initial_unavailable_once_while_retries_coalesce() {
+        let bluez = ScriptedBluez::new([Err(BluezFailure::BluezUnavailable)], [], [], [], []);
+        let output = Arc::new(RecordingAvailabilityOutput::default());
+        let monitor =
+            BluezAvailabilityMonitor::with_backend_and_output(Arc::new(bluez), output.clone());
+        let (updates, receiver) = watch::channel(BtleAvailability::Unavailable(
+            AvailabilityReason::BluezUnavailable,
+        ));
+        let cancellation = LifecycleCancellation::new();
+        let worker_cancellation = cancellation.clone();
+        let link = link();
+        let task =
+            tokio::spawn(async move { monitor.run(&link, updates, worker_cancellation).await });
+
+        output.wait_for_records(1).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            *output.records.lock().unwrap(),
+            [BtleAvailability::Unavailable(
+                AvailabilityReason::BluezUnavailable
+            )]
+        );
+        assert_eq!(
+            *receiver.borrow(),
+            BtleAvailability::Unavailable(AvailabilityReason::BluezUnavailable)
+        );
+        assert!(!receiver.has_changed().unwrap());
+        stop(cancellation, task).await;
     }
 
     #[tokio::test(start_paused = true)]

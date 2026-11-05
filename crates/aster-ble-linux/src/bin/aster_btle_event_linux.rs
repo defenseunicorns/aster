@@ -3,8 +3,9 @@ use aster_ble_linux::{
     RING1_MAXIMUM_FRAME_BYTES, SupervisorConfig, spawn_linux_btle_event_supervisor,
 };
 use aster_node::{
-    MutableSourceInterests, NodeApplication, TransportNeutralNodeConfig,
-    mission::UnprotectedReferenceMission, parse_node_id, start_transport_neutral_node,
+    MutableSourceInterests, NodeApplication, NodeOperatorOutputPolicy, TransportNeutralNodeConfig,
+    mission::UnprotectedReferenceMission, parse_node_id,
+    start_externally_supervised_transport_neutral_node,
 };
 use bluer::{Address, AddressType};
 use std::{
@@ -113,16 +114,17 @@ fn parse_command(arguments: Vec<String>) -> Result<EvaluationCommand, String> {
 }
 
 type LifecycleFuture<T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send>>;
+type WaitForStopFuture<S> = Pin<Box<dyn Future<Output = (S, Result<(), String>)> + Send>>;
 type StartNode<N> = Box<dyn FnOnce() -> LifecycleFuture<N> + Send>;
 type StartSupervisor<N, S> = Box<dyn FnOnce(&N) -> S + Send>;
-type WaitForShutdown = Box<dyn FnOnce() -> LifecycleFuture<()> + Send>;
+type WaitForStop<S> = Box<dyn FnOnce(S) -> WaitForStopFuture<S> + Send>;
 type StopSupervisor<S> = Box<dyn FnOnce(S) -> LifecycleFuture<()> + Send>;
 type StopNode<N> = Box<dyn FnOnce(N) -> LifecycleFuture<()> + Send>;
 
 struct Lifecycle<N, S> {
     start_node: StartNode<N>,
     start_supervisor: StartSupervisor<N, S>,
-    wait: WaitForShutdown,
+    wait_for_stop: WaitForStop<S>,
     stop_supervisor: StopSupervisor<S>,
     stop_node: StopNode<N>,
 }
@@ -131,11 +133,11 @@ async fn run_owned<N, S>(lifecycle: Lifecycle<N, S>) -> Result<(), String> {
     let node = (lifecycle.start_node)().await?;
     let supervisor = (lifecycle.start_supervisor)(&node);
 
-    let wait_result = (lifecycle.wait)().await;
+    let (supervisor, wait_result) = (lifecycle.wait_for_stop)(supervisor).await;
     let supervisor_result = (lifecycle.stop_supervisor)(supervisor).await;
     let node_result = (lifecycle.stop_node)(node).await;
-    wait_result?;
     supervisor_result?;
+    wait_result?;
     node_result
 }
 
@@ -174,7 +176,10 @@ async fn run(config: EvaluationConfig) -> Result<(), String> {
     run_owned(Lifecycle {
         start_node: Box::new(|| {
             Box::pin(async move {
-                start_transport_neutral_node(node_config)
+                start_externally_supervised_transport_neutral_node(
+                    node_config,
+                    NodeOperatorOutputPolicy::CustomerSafe,
+                )
                     .await
                     .map_err(|_| "failed to start the transport-neutral node".to_owned())
             })
@@ -185,13 +190,23 @@ async fn run(config: EvaluationConfig) -> Result<(), String> {
                 node.ordered_event_contacts(),
             )
         }),
-        wait: Box::new(|| Box::pin(wait_for_shutdown_signal())),
+        wait_for_stop: Box::new(|supervisor| {
+            Box::pin(async move {
+                let result = tokio::select! {
+                    result = wait_for_shutdown_signal() => result,
+                    () = supervisor.wait_for_completion() => {
+                        Err("Linux BTLE supervisor stopped unexpectedly".to_owned())
+                    }
+                };
+                (supervisor, result)
+            })
+        }),
         stop_supervisor: Box::new(|supervisor| {
             Box::pin(async move {
                 supervisor
                     .shutdown()
                     .await
-                    .map_err(|_| "Linux BTLE supervisor shutdown failed".to_owned())
+                    .map_err(|error| error.to_string())
             })
         }),
         stop_node: Box::new(|node| {
@@ -317,7 +332,9 @@ mod tests {
                     events.lock().unwrap().push("supervisor-start");
                 }
             }),
-            wait: Box::new(|| Box::pin(async { Err("signal failure".to_owned()) })),
+            wait_for_stop: Box::new(|supervisor| {
+                Box::pin(async move { (supervisor, Err("signal failure".to_owned())) })
+            }),
             stop_supervisor: Box::new({
                 let events = events.clone();
                 move |_| {
@@ -340,6 +357,75 @@ mod tests {
         .await
         .unwrap_err();
 
+        assert_eq!(
+            *observed.lock().unwrap(),
+            ["node-start", "supervisor-start", "supervisor-stop", "node-stop"]
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_completion_triggers_prompt_ordered_shutdown() {
+        struct EarlySupervisor {
+            completion: Arc<tokio::sync::Notify>,
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        let completion = Arc::new(tokio::sync::Notify::new());
+        completion.notify_one();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_owned(Lifecycle {
+                start_node: Box::new({
+                    let events = events.clone();
+                    move || {
+                        Box::pin(async move {
+                            events.lock().unwrap().push("node-start");
+                            Ok(())
+                        })
+                    }
+                }),
+                start_supervisor: Box::new({
+                    let events = events.clone();
+                    move |_| {
+                        events.lock().unwrap().push("supervisor-start");
+                        EarlySupervisor { completion }
+                    }
+                }),
+                wait_for_stop: Box::new(|supervisor| {
+                    Box::pin(async move {
+                        supervisor.completion.notified().await;
+                        (
+                            supervisor,
+                            Err("Linux BTLE supervisor stopped unexpectedly".to_owned()),
+                        )
+                    })
+                }),
+                stop_supervisor: Box::new({
+                    let events = events.clone();
+                    move |_| {
+                        Box::pin(async move {
+                            events.lock().unwrap().push("supervisor-stop");
+                            Ok(())
+                        })
+                    }
+                }),
+                stop_node: Box::new({
+                    let events = events.clone();
+                    move |_| {
+                        Box::pin(async move {
+                            events.lock().unwrap().push("node-stop");
+                            Ok(())
+                        })
+                    }
+                }),
+            }),
+        )
+        .await
+        .expect("supervisor completion must not wait for a process signal")
+        .expect_err("unexpected supervisor completion must fail the evaluator");
+
+        assert_eq!(result, "Linux BTLE supervisor stopped unexpectedly");
         assert_eq!(
             *observed.lock().unwrap(),
             ["node-start", "supervisor-start", "supervisor-stop", "node-stop"]

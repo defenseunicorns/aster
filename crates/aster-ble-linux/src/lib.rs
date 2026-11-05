@@ -1,4 +1,4 @@
-//! Fixed-role Linux BlueZ LE L2CAP evaluation driver.
+//! Linux BlueZ LE L2CAP evaluation driver.
 
 #![forbid(unsafe_code)]
 #![cfg(target_os = "linux")]
