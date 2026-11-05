@@ -3,12 +3,19 @@
 #![forbid(unsafe_code)]
 #![cfg(target_os = "linux")]
 
+mod config;
+
+pub use config::{
+    DriverConfig, FixedRole, LinkConfig, OpenRequest, RING1_MAXIMUM_DEADLINE,
+    RING1_MAXIMUM_EXCHANGE_BYTES, RING1_MAXIMUM_FRAME_BYTES, SupervisorConfig, ValidatedConfig,
+    ValidatedLinkConfig, ValidatedSupervisorConfig,
+};
+
 use aster_ble_l2cap::BleL2capContact;
-use aster_contact::TransientLocator;
 use bluer::{
     Address, AddressType, ErrorKind, InternalErrorKind,
     adv::Advertisement,
-    l2cap::{PSM_LE_DYN_START, PSM_LE_MAX, Socket, SocketAddr, Stream},
+    l2cap::{Socket, SocketAddr, Stream},
 };
 use std::{
     error::Error,
@@ -29,178 +36,12 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-/// Largest protected carrier frame admitted by the Ring-1 evaluation profile.
-pub const RING1_MAXIMUM_FRAME_BYTES: usize = 2 * 1024 * 1024;
-/// Largest complete contact exchange admitted by the Ring-1 evaluation profile.
-pub const RING1_MAXIMUM_EXCHANGE_BYTES: usize = 64 * 1024 * 1024;
-/// Longest platform or authenticated-progress operation in the Ring-1 profile.
-pub const RING1_MAXIMUM_DEADLINE: Duration = Duration::from_secs(30);
-
 const L2CAP_READINESS_POLL_INTERVAL: Duration = Duration::from_millis(1);
-
-/// Provisioned direction of one Ring-1 contact.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FixedRole {
-    /// Opens one connection to the provisioned listener.
-    Initiator,
-    /// Advertises, listens, and accepts only the provisioned peer.
-    Listener,
-}
-
-/// Complete fixed-role Linux driver configuration.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DriverConfig {
-    /// Exact BlueZ controller name, such as `hci0`.
-    pub adapter_name: String,
-    /// Exact provisioned local controller address.
-    pub local_address: Address,
-    /// Public or random type of the local address.
-    pub local_address_type: AddressType,
-    /// Exact provisioned peer address.
-    pub peer_address: Address,
-    /// Public or random type of the peer address.
-    pub peer_address_type: AddressType,
-    /// Provisioned unprivileged LE PSM.
-    pub psm: u16,
-    /// Fixed direction for this process.
-    pub role: FixedRole,
-    /// Maximum protected carrier frame.
-    pub maximum_frame_bytes: usize,
-    /// Maximum complete contact accounting.
-    pub maximum_exchange_bytes: usize,
-    /// Deadline for controller verification and socket establishment.
-    pub open_timeout: Duration,
-    /// Deadline for one ordered-contact operation.
-    pub operation_timeout: Duration,
-}
-
-impl DriverConfig {
-    /// Validates the complete local configuration before BlueZ is contacted.
-    pub fn validate(self) -> Result<ValidatedConfig, DriverError> {
-        let adapter_index = self.adapter_name.strip_prefix("hci").unwrap_or_default();
-        if adapter_index.is_empty() || !adapter_index.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(configuration(
-                "Bluetooth adapter name must be hci followed by digits",
-            ));
-        }
-        if self.local_address == Address::any() || self.peer_address == Address::any() {
-            return Err(configuration("Bluetooth addresses must be explicit"));
-        }
-        if self.local_address == self.peer_address {
-            return Err(configuration(
-                "local and peer Bluetooth addresses must differ",
-            ));
-        }
-        if !is_le(self.local_address_type) || !is_le(self.peer_address_type) {
-            return Err(configuration(
-                "Bluetooth address types must be LE public or random",
-            ));
-        }
-        if !(PSM_LE_DYN_START..=PSM_LE_MAX).contains(&self.psm) {
-            return Err(configuration(
-                "LE PSM is outside the unprivileged dynamic range",
-            ));
-        }
-        if self.maximum_frame_bytes == 0
-            || self.maximum_frame_bytes > RING1_MAXIMUM_FRAME_BYTES
-            || self.maximum_frame_bytes > u32::MAX as usize
-        {
-            return Err(configuration(
-                "carrier frame bound is outside the Ring-1 profile",
-            ));
-        }
-        if self.maximum_exchange_bytes != RING1_MAXIMUM_EXCHANGE_BYTES {
-            return Err(configuration(
-                "exchange bound must equal the fixed Ring-1 ceiling",
-            ));
-        }
-        if self.open_timeout.is_zero() || self.open_timeout > RING1_MAXIMUM_DEADLINE {
-            return Err(configuration(
-                "platform open deadline is outside the Ring-1 profile",
-            ));
-        }
-        if self.operation_timeout.is_zero() || self.operation_timeout > RING1_MAXIMUM_DEADLINE {
-            return Err(configuration(
-                "contact deadline is outside the Ring-1 profile",
-            ));
-        }
-        Ok(ValidatedConfig(self))
-    }
-}
-
-fn is_le(address_type: AddressType) -> bool {
-    matches!(address_type, AddressType::LePublic | AddressType::LeRandom)
-}
-
-/// Configuration that passed all local Ring-1 checks.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ValidatedConfig(DriverConfig);
-
-impl ValidatedConfig {
-    /// Constructs the exact operation passed to the platform socket factory.
-    pub fn open_request(&self) -> OpenRequest {
-        let config = &self.0;
-        match config.role {
-            FixedRole::Initiator => OpenRequest::Initiator {
-                adapter_name: config.adapter_name.clone(),
-                local: SocketAddr::new(config.local_address, config.local_address_type, 0),
-                peer: SocketAddr::new(config.peer_address, config.peer_address_type, config.psm),
-            },
-            FixedRole::Listener => OpenRequest::Listener {
-                adapter_name: config.adapter_name.clone(),
-                local: SocketAddr::new(config.local_address, config.local_address_type, config.psm),
-                expected_peer_address: config.peer_address,
-                expected_peer_address_type: config.peer_address_type,
-            },
-        }
-    }
-
-    /// Fixed role of this process.
-    pub const fn role(&self) -> FixedRole {
-        self.0.role
-    }
-
-    /// Maximum complete exchange byte count.
-    pub const fn maximum_exchange_bytes(&self) -> usize {
-        self.0.maximum_exchange_bytes
-    }
-
-    fn peer_locator(&self) -> Result<TransientLocator, DriverError> {
-        let locator = format!("btle:{}:{}", self.0.peer_address, self.0.peer_address_type);
-        TransientLocator::new(locator.into_bytes())
-            .map_err(|_| configuration("peer locator is outside its carrier bound"))
-    }
-}
-
-/// Exact socket operation selected from validated fixed-role configuration.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum OpenRequest {
-    /// Bind the configured local controller address and connect to the peer PSM.
-    Initiator {
-        /// Exact BlueZ adapter name verified before opening the socket.
-        adapter_name: String,
-        /// Exact local address; its PSM is zero for a client-side ephemeral bind.
-        local: SocketAddr,
-        /// Exact provisioned remote address and dynamic PSM.
-        peer: SocketAddr,
-    },
-    /// Bind the configured local controller/PSM and accept the provisioned peer.
-    Listener {
-        /// Exact BlueZ adapter name verified before advertising.
-        adapter_name: String,
-        /// Exact local address and dynamic PSM.
-        local: SocketAddr,
-        /// Only accepted remote Bluetooth address.
-        expected_peer_address: Address,
-        /// Only accepted remote Bluetooth address type.
-        expected_peer_address_type: AddressType,
-    },
-}
 
 /// Closed failure categories surfaced by the Linux platform driver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DriverErrorKind {
-    /// Invalid fixed local configuration.
+    /// Invalid local configuration.
     Configuration,
     /// Configured controller, permission, or peer is currently unavailable.
     Unavailable,
@@ -568,7 +409,7 @@ pub async fn open_contact_with_factory(
                 "platform open was cancelled",
             ));
         }
-        result = timeout(config.0.open_timeout, open) => match result {
+        result = timeout(config.open_timeout(), open) => match result {
             Ok(result) => result?,
             Err(_) => return Err(DriverError::new(
                 DriverErrorKind::Timeout,
@@ -586,13 +427,13 @@ pub async fn open_contact_with_factory(
     let contact = BleL2capContact::new(
         stream,
         config.peer_locator()?,
-        config.0.maximum_frame_bytes,
-        config.0.operation_timeout,
+        config.maximum_frame_bytes(),
+        config.operation_timeout(),
     )
     .map_err(|_| configuration("validated carrier contact bounds were rejected"))?;
     Ok(OpenedContact {
         contact: Arc::new(contact),
-        maximum_exchange_bytes: config.0.maximum_exchange_bytes,
+        maximum_exchange_bytes: config.maximum_exchange_bytes(),
         mtu,
     })
 }
@@ -787,120 +628,20 @@ mod tests {
 
     fn config(role: FixedRole) -> DriverConfig {
         DriverConfig {
-            adapter_name: "hci7".to_owned(),
-            local_address: address("02:00:00:00:00:01"),
-            local_address_type: AddressType::LeRandom,
-            peer_address: address("02:00:00:00:00:02"),
-            peer_address_type: AddressType::LePublic,
-            psm: 0x0081,
+            link: LinkConfig {
+                adapter_name: "hci7".to_owned(),
+                local_address: address("02:00:00:00:00:01"),
+                local_address_type: AddressType::LeRandom,
+                peer_address: address("02:00:00:00:00:02"),
+                peer_address_type: AddressType::LePublic,
+                psm: 0x0081,
+                maximum_frame_bytes: 2 * 1024 * 1024,
+                maximum_exchange_bytes: 64 * 1024 * 1024,
+                open_timeout: Duration::from_secs(5),
+                operation_timeout: Duration::from_secs(30),
+            },
             role,
-            maximum_frame_bytes: 2 * 1024 * 1024,
-            maximum_exchange_bytes: 64 * 1024 * 1024,
-            open_timeout: Duration::from_secs(5),
-            operation_timeout: Duration::from_secs(30),
         }
-    }
-
-    #[test]
-    fn configuration_rejects_invalid_adapter_addresses_psm_bounds_and_deadlines() {
-        let mut candidate = config(FixedRole::Initiator);
-        candidate.adapter_name.clear();
-        assert_eq!(
-            candidate.validate().unwrap_err().kind(),
-            DriverErrorKind::Configuration
-        );
-
-        let mut candidate = config(FixedRole::Initiator);
-        candidate.local_address = Address::any();
-        assert_eq!(
-            candidate.validate().unwrap_err().kind(),
-            DriverErrorKind::Configuration
-        );
-
-        let mut candidate = config(FixedRole::Initiator);
-        candidate.peer_address_type = AddressType::BrEdr;
-        assert_eq!(
-            candidate.validate().unwrap_err().kind(),
-            DriverErrorKind::Configuration
-        );
-
-        let mut candidate = config(FixedRole::Initiator);
-        candidate.psm = bluer::l2cap::PSM_LE_DYN_START - 1;
-        assert_eq!(
-            candidate.validate().unwrap_err().kind(),
-            DriverErrorKind::Configuration
-        );
-
-        let mut candidate = config(FixedRole::Initiator);
-        candidate.maximum_frame_bytes = 0;
-        assert_eq!(
-            candidate.validate().unwrap_err().kind(),
-            DriverErrorKind::Configuration
-        );
-
-        let mut candidate = config(FixedRole::Initiator);
-        candidate.maximum_exchange_bytes = candidate.maximum_frame_bytes - 1;
-        assert_eq!(
-            candidate.validate().unwrap_err().kind(),
-            DriverErrorKind::Configuration
-        );
-
-        let mut candidate = config(FixedRole::Initiator);
-        candidate.maximum_exchange_bytes = RING1_MAXIMUM_EXCHANGE_BYTES - 1;
-        assert_eq!(
-            candidate.validate().unwrap_err().kind(),
-            DriverErrorKind::Configuration
-        );
-
-        let mut candidate = config(FixedRole::Initiator);
-        candidate.open_timeout = Duration::ZERO;
-        assert_eq!(
-            candidate.validate().unwrap_err().kind(),
-            DriverErrorKind::Configuration
-        );
-
-        let mut candidate = config(FixedRole::Initiator);
-        candidate.operation_timeout = Duration::ZERO;
-        assert_eq!(
-            candidate.validate().unwrap_err().kind(),
-            DriverErrorKind::Configuration
-        );
-    }
-
-    #[test]
-    fn fixed_roles_construct_exact_bound_client_and_listener_requests() {
-        let initiator = config(FixedRole::Initiator).validate().unwrap();
-        assert_eq!(
-            initiator.open_request(),
-            OpenRequest::Initiator {
-                adapter_name: "hci7".to_owned(),
-                local: bluer::l2cap::SocketAddr::new(
-                    address("02:00:00:00:00:01"),
-                    AddressType::LeRandom,
-                    0,
-                ),
-                peer: bluer::l2cap::SocketAddr::new(
-                    address("02:00:00:00:00:02"),
-                    AddressType::LePublic,
-                    0x0081,
-                ),
-            }
-        );
-
-        let listener = config(FixedRole::Listener).validate().unwrap();
-        assert_eq!(
-            listener.open_request(),
-            OpenRequest::Listener {
-                adapter_name: "hci7".to_owned(),
-                local: bluer::l2cap::SocketAddr::new(
-                    address("02:00:00:00:00:01"),
-                    AddressType::LeRandom,
-                    0x0081,
-                ),
-                expected_peer_address: address("02:00:00:00:00:02"),
-                expected_peer_address_type: AddressType::LePublic,
-            }
-        );
     }
 
     struct ResultFactory {
@@ -1419,7 +1160,7 @@ mod tests {
             dropped: dropped.clone(),
         };
         let mut config = config(FixedRole::Listener);
-        config.open_timeout = Duration::from_millis(1);
+        config.link.open_timeout = Duration::from_millis(1);
 
         let error = open_contact_with_factory(
             &config.validate().unwrap(),
