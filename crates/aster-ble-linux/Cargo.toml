@@ -12,6 +12,10 @@ autobins = false
 name = "aster-btle-ring1"
 path = "src/bin/aster-btle-ring1.rs"
 
+[[bin]]
+name = "aster-btle-event"
+path = "src/bin/aster-btle-event.rs"
+
 [dependencies]
 aster-ble-l2cap = { path = "../aster-ble-l2cap" }
 aster-contact = { path = "../aster-contact" }
