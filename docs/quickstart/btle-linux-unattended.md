@@ -232,6 +232,15 @@ BTLE_EVENT status=stopped
 Verify with host Bluetooth tooling that the process left no advertisement or
 listener. A forced process kill is not clean-shutdown evidence.
 
+On the bounded CM4/BlueZ 5.82 observation, both evaluators stopped cleanly but
+BlueZ continued to report the unpaired peer ACL as connected. Fresh processes
+reached `Available` but timed out until the receiver controller entered a new
+power epoch. Treat process-only recovery as unverified for a platform until a
+retained run proves otherwise. The evaluator deliberately does not disconnect
+other controller users or change controller power to hide this platform state.
+The exact observation is retained in the
+[CM4 Ring-1 evidence record](../validation/evidence/2026-11-05-cm4-btle-ring1-event-validation.md).
+
 ## Verify the application receipt
 
 After the evaluators stop and release their state, restart the same peerless
