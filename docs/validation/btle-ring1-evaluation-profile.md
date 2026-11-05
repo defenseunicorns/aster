@@ -101,10 +101,14 @@ This extension reuses the existing semantic-v9 Event contact and the Ring-1
 frame, exchange, and deadline ceilings. Its 250 ms to 30 second peer retry and
 60-second default successful-contact cadence are local implementation policy,
 not protocol constants. Local publication remains durably available with no
-transport, and a later admitted contact reconciles retained Event work. The
-standalone evaluator exposes no application endpoint; publication during
-unavailability is exercised through an in-process node embedding or the
-focused adapter-neutral node integration test.
+transport, and a later admitted contact reconciles retained Event work when
+the receiver has matching durable application selection. The standalone
+evaluator exposes no application endpoint. Its physical procedure prepares
+the publisher Event and receiver `Consume` subscription through application
+handles before starting the evaluator; a peerless loopback agent is only an
+evaluation preparation/query tool, not a BTLE dependency or fallback.
+Publication during unavailability is exercised through an in-process node
+embedding or the focused adapter-neutral node integration test.
 
 Deterministic unit and lifecycle tests cover controller absence/recovery,
 single-attempt ownership, capped backoff, admission classification, and drain
