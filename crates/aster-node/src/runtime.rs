@@ -3836,17 +3836,62 @@ pub enum OrderedEventContactRole {
     Responder,
 }
 
+/// Terminal result for one adapter-neutral ordered Event contact admission.
+#[derive(Debug)]
+pub enum OrderedEventContactError {
+    /// The node is no longer admitting ordered Event contacts.
+    AdmissionClosed,
+    /// The bounded ordered Event contact lane is occupied.
+    AdmissionBusy,
+    /// The node actor could not receive the contact command.
+    ActorUnavailable,
+    /// The node actor stopped before completing the contact.
+    ActorStopped,
+    /// An admitted contact failed while running its protected session.
+    Contact(NodeError),
+}
+
+impl fmt::Display for OrderedEventContactError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AdmissionClosed => {
+                formatter.write_str("ordered Event contact admission is closed")
+            }
+            Self::AdmissionBusy => formatter.write_str("ordered Event contact admission is busy"),
+            Self::ActorUnavailable => {
+                formatter.write_str("ordered Event contact actor is unavailable")
+            }
+            Self::ActorStopped => {
+                formatter.write_str("ordered Event contact actor stopped before completion")
+            }
+            Self::Contact(error) => write!(formatter, "ordered Event contact: {error}"),
+        }
+    }
+}
+
+impl Error for OrderedEventContactError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Contact(error) => Some(error),
+            Self::AdmissionClosed
+            | Self::AdmissionBusy
+            | Self::ActorUnavailable
+            | Self::ActorStopped => None,
+        }
+    }
+}
+
 struct OrderedEventContactCommand {
     role: OrderedEventContactRole,
     contact: Arc<dyn OrderedContact>,
     peer: MissionPeerExpectation,
-    response: oneshot::Sender<Result<PeerReceipt, NodeError>>,
+    response: oneshot::Sender<Result<PeerReceipt, OrderedEventContactError>>,
     _session_permit: OwnedSemaphorePermit,
 }
 
 type OrderedEventContactTaskOutput = (
     OrderedEventContactRole,
-    oneshot::Sender<Result<PeerReceipt, NodeError>>,
+    oneshot::Sender<Result<PeerReceipt, OrderedEventContactError>>,
     Result<CompletedPeerContact, NodeError>,
 );
 
@@ -3889,12 +3934,10 @@ impl OrderedEventContactHandle {
         role: OrderedEventContactRole,
         contact: Arc<dyn OrderedContact>,
         peer: MissionPeerExpectation,
-    ) -> Result<PeerReceipt, NodeError> {
+    ) -> Result<PeerReceipt, OrderedEventContactError> {
         if !self.admission.load(Ordering::Acquire) {
             contact.close();
-            return Err(NodeError::Protocol(
-                "ordered Event contact admission is closed".into(),
-            ));
+            return Err(OrderedEventContactError::AdmissionClosed);
         }
         let session_permit = self
             .session_permit
@@ -3902,7 +3945,7 @@ impl OrderedEventContactHandle {
             .try_acquire_owned()
             .map_err(|_| {
                 contact.close();
-                NodeError::Protocol("ordered Event contact admission is busy".into())
+                OrderedEventContactError::AdmissionBusy
             })?;
         let (response, completed) = oneshot::channel();
         let mut pending = OrderedEventContactCloseGuard(Some(contact.clone()));
@@ -3914,18 +3957,13 @@ impl OrderedEventContactHandle {
                 response,
                 _session_permit: session_permit,
             })
-            .map_err(|error| {
-                error.into_inner().contact.close();
-                NodeError::Protocol("ordered Event contact actor is unavailable".into())
-            })?;
+            .map_err(|_| OrderedEventContactError::ActorUnavailable)?;
         match completed.await {
             Ok(result) => {
                 pending.disarm();
                 result
             }
-            Err(_) => Err(NodeError::Protocol(
-                "ordered Event contact actor stopped before completion".into(),
-            )),
+            Err(_) => Err(OrderedEventContactError::ActorStopped),
         }
     }
 }
@@ -18352,9 +18390,11 @@ async fn run_node_actor_inner(
                             {
                                 receipt.contact_errors = receipt.contact_errors.saturating_add(1);
                                 command.contact.close();
-                                let _ = command.response.send(Err(NodeError::Protocol(
-                                    "ordered Event mission roster capacity exhausted".into(),
-                                )));
+                                let _ = command.response.send(Err(
+                                    OrderedEventContactError::Contact(NodeError::Protocol(
+                                        "ordered Event mission roster capacity exhausted".into(),
+                                    )),
+                                ));
                                 continue;
                             }
                             // Submission through the bounded handle is the
@@ -18479,8 +18519,8 @@ async fn run_node_actor_inner(
                                 account_path_receipt(&mut receipt, &completed.receipt)
                             });
                         if let Err(error) = accounting {
-                            let _ = response.send(Err(NodeError::Protocol(
-                                "ordered contact accounting failed".into(),
+                            let _ = response.send(Err(OrderedEventContactError::Contact(
+                                NodeError::Protocol("ordered contact accounting failed".into()),
                             )));
                             fatal_error = Some(error);
                             break;
@@ -18489,8 +18529,10 @@ async fn run_node_actor_inner(
                         receipt.contacts = match receipt.contacts.checked_add(1) {
                             Some(contacts) => contacts,
                             None => {
-                                let _ = response.send(Err(NodeError::Protocol(
-                                    "aggregate ordered contact count overflow".into(),
+                                let _ = response.send(Err(OrderedEventContactError::Contact(
+                                    NodeError::Protocol(
+                                        "aggregate ordered contact count overflow".into(),
+                                    ),
                                 )));
                                 fatal_error = Some(NodeError::Protocol(
                                     "aggregate contact count overflow".into(),
@@ -18520,9 +18562,11 @@ async fn run_node_actor_inner(
                     Some(Ok((_role, response, Err(error)))) => {
                         receipt.contact_errors = receipt.contact_errors.saturating_add(1);
                         if actor_fatal_contact_error(&error, config.mission.identity()) {
-                            let _ = response.send(Err(NodeError::Protocol(
-                                "ordered contact encountered a fatal local authorization error"
-                                    .into(),
+                            let _ = response.send(Err(OrderedEventContactError::Contact(
+                                NodeError::Protocol(
+                                    "ordered contact encountered a fatal local authorization error"
+                                        .into(),
+                                ),
                             )));
                             fatal_error = Some(error);
                             break;
@@ -18531,7 +18575,7 @@ async fn run_node_actor_inner(
                             "CONTACT carrier=ordered status=error error={}",
                             format_receipt_field(&error.to_string())
                         );
-                        let _ = response.send(Err(error));
+                        let _ = response.send(Err(OrderedEventContactError::Contact(error)));
                     }
                     Some(Err(error)) => {
                         receipt.contact_errors = receipt.contact_errors.saturating_add(1);
@@ -19768,9 +19812,9 @@ async fn run_node_actor_inner(
     }
     while let Ok(command) = ordered_event_contact_receiver.try_recv() {
         command.contact.close();
-        let _ = command.response.send(Err(NodeError::Protocol(
-            "ordered Event contact admission closed during shutdown".into(),
-        )));
+        let _ = command
+            .response
+            .send(Err(OrderedEventContactError::AdmissionClosed));
     }
     if let Some(task) = audit_task.take() {
         let _ = task.await;
@@ -40975,6 +41019,7 @@ mod tests {
 
     struct FailingOrderedContact {
         operations: Arc<AtomicUsize>,
+        closes: Arc<AtomicUsize>,
     }
 
     impl FailingOrderedContact {
@@ -41034,7 +41079,153 @@ mod tests {
             self.fail()
         }
 
-        fn close(&self) {}
+        fn close(&self) {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn ordered_contact_closed_is_typed() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let handle = OrderedEventContactHandle {
+            sender,
+            admission: Arc::new(AtomicBool::new(false)),
+            session_permit: Arc::new(Semaphore::new(1)),
+        };
+        let peer = issue_missions(1).remove(0);
+        let contact = Arc::new(StalledOrderedContact::default());
+
+        let error = handle
+            .run(
+                OrderedEventContactRole::Initiator,
+                contact.clone(),
+                MissionPeerExpectation::new(contact.peer_evidence(), peer.identity),
+            )
+            .await
+            .expect_err("closed admission must reject the ordered contact");
+
+        assert!(matches!(error, OrderedEventContactError::AdmissionClosed));
+        assert_eq!(contact.operations(), 0);
+        assert_eq!(contact.closes(), 1);
+    }
+
+    #[tokio::test]
+    async fn ordered_contact_busy_is_typed() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let handle = OrderedEventContactHandle {
+            sender,
+            admission: Arc::new(AtomicBool::new(true)),
+            session_permit: Arc::new(Semaphore::new(0)),
+        };
+        let peer = issue_missions(1).remove(0);
+        let contact = Arc::new(StalledOrderedContact::default());
+
+        let error = handle
+            .run(
+                OrderedEventContactRole::Initiator,
+                contact.clone(),
+                MissionPeerExpectation::new(contact.peer_evidence(), peer.identity),
+            )
+            .await
+            .expect_err("exhausted admission must reject the ordered contact");
+
+        assert!(matches!(error, OrderedEventContactError::AdmissionBusy));
+        assert_eq!(contact.operations(), 0);
+        assert_eq!(contact.closes(), 1);
+    }
+
+    #[tokio::test]
+    async fn ordered_contact_actor_loss_is_typed() {
+        let peer = issue_missions(1).remove(0);
+        let unavailable_contact = Arc::new(StalledOrderedContact::default());
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let unavailable = OrderedEventContactHandle {
+            sender,
+            admission: Arc::new(AtomicBool::new(true)),
+            session_permit: Arc::new(Semaphore::new(1)),
+        };
+        let error = unavailable
+            .run(
+                OrderedEventContactRole::Initiator,
+                unavailable_contact.clone(),
+                MissionPeerExpectation::new(unavailable_contact.peer_evidence(), peer.identity),
+            )
+            .await
+            .expect_err("stopped actor must reject the ordered contact");
+        assert!(matches!(error, OrderedEventContactError::ActorUnavailable));
+        assert_eq!(unavailable_contact.operations(), 0);
+        assert!(unavailable_contact.closes() > 0);
+
+        let stopped_contact = Arc::new(StalledOrderedContact::default());
+        let (sender, mut receiver) = mpsc::channel(1);
+        let stopped = OrderedEventContactHandle {
+            sender,
+            admission: Arc::new(AtomicBool::new(true)),
+            session_permit: Arc::new(Semaphore::new(1)),
+        };
+        let actor = tokio::spawn(async move {
+            let command = receiver.recv().await.expect("ordered contact command");
+            drop(command);
+        });
+        let error = stopped
+            .run(
+                OrderedEventContactRole::Initiator,
+                stopped_contact.clone(),
+                MissionPeerExpectation::new(stopped_contact.peer_evidence(), peer.identity),
+            )
+            .await
+            .expect_err("actor response loss must reject the ordered contact");
+        actor.await.expect("synthetic actor");
+        assert!(matches!(error, OrderedEventContactError::ActorStopped));
+        assert_eq!(stopped_contact.operations(), 0);
+        assert!(stopped_contact.closes() > 0);
+    }
+
+    #[tokio::test]
+    async fn ordered_contact_failure_preserves_node_error() {
+        let test_root = root("ordered-contact-typed-failure");
+        fs::create_dir_all(&test_root).expect("typed failure state");
+        #[cfg(unix)]
+        fs::set_permissions(&test_root, fs::Permissions::from_mode(0o700))
+            .expect("owner-only typed failure state");
+        let mut issued = issue_missions(2);
+        let local = issued.remove(0);
+        let peer = issued.remove(0);
+        let node = start_transport_neutral_node(TransportNeutralNodeConfig {
+            state: test_root.clone(),
+            mission: local.credentials,
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start typed failure node");
+        let contact = Arc::new(FailingOrderedContact {
+            operations: Arc::new(AtomicUsize::new(0)),
+            closes: Arc::new(AtomicUsize::new(0)),
+        });
+
+        let error = node
+            .ordered_event_contacts()
+            .run(
+                OrderedEventContactRole::Initiator,
+                contact.clone(),
+                MissionPeerExpectation::new(contact.peer_evidence(), peer.identity),
+            )
+            .await
+            .expect_err("contact failure must preserve its node error");
+
+        assert!(matches!(error, OrderedEventContactError::Contact(_)));
+        assert!(Error::source(&error).is_some_and(|source| source.is::<NodeError>()));
+        assert_eq!(contact.operations.load(Ordering::SeqCst), 1);
+        assert!(contact.closes.load(Ordering::SeqCst) > 0);
+        let receipt = node.shutdown().await.expect("typed failure shutdown");
+        assert_eq!(receipt.contact_errors, 1);
+        fs::remove_dir_all(test_root).expect("typed failure cleanup");
     }
 
     #[tokio::test]
@@ -41856,7 +42047,10 @@ mod tests {
                 MissionPeerExpectation::new(contact.peer_evidence(), peer.identity),
             )
             .await;
-        assert!(matches!(result, Err(NodeError::Protocol(_))));
+        assert!(matches!(
+            result,
+            Err(OrderedEventContactError::Contact(NodeError::Protocol(_)))
+        ));
         assert_eq!(contact.operations(), 0);
         assert_eq!(contact.closes(), 1);
 
@@ -41969,6 +42163,7 @@ mod tests {
                     while keep_running.load(Ordering::Acquire) {
                         let contact = Arc::new(FailingOrderedContact {
                             operations: operations.clone(),
+                            closes: Arc::new(AtomicUsize::new(0)),
                         });
                         let _ = handle
                             .run(
@@ -42037,6 +42232,7 @@ mod tests {
             mission_peer[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
             let contact = Arc::new(FailingOrderedContact {
                 operations: operations.clone(),
+                closes: Arc::new(AtomicUsize::new(0)),
             });
             assert!(
                 handle
@@ -42064,8 +42260,7 @@ mod tests {
         .expect("capacity rejection must not enter the contact");
         assert!(matches!(
             result,
-            Err(NodeError::Protocol(detail))
-                if detail == "ordered Event mission roster capacity exhausted"
+            Err(OrderedEventContactError::Contact(NodeError::Protocol(_)))
         ));
         assert_eq!(rejected.operations(), 0);
         assert_eq!(rejected.closes(), 1);
@@ -42127,11 +42322,7 @@ mod tests {
             .await
             .expect("queued ordered response")
             .expect_err("queued shutdown must reject ordered admission");
-        assert!(matches!(
-            error,
-            NodeError::Protocol(detail)
-                if detail == "ordered Event contact admission closed during shutdown"
-        ));
+        assert!(matches!(error, OrderedEventContactError::AdmissionClosed));
         assert_eq!(contact.operations(), 0);
         assert_eq!(contact.closes(), 1);
         fs::remove_dir_all(test_root).expect("shutdown-priority cleanup");
@@ -42195,11 +42386,7 @@ mod tests {
         .await
         .expect("overlap must fail without waiting")
         .expect_err("overlap must be rejected");
-        assert!(matches!(
-            error,
-            NodeError::Protocol(detail)
-                if detail == "ordered Event contact admission is busy"
-        ));
+        assert!(matches!(error, OrderedEventContactError::AdmissionBusy));
         assert_eq!(rejected.operations(), 0);
         assert_eq!(rejected.closes(), 1);
 
