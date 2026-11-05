@@ -43,6 +43,77 @@ Build the evaluator:
 cargo build --locked -p aster-ble-linux --bin aster-btle-event
 ```
 
+For the standalone preparation and query procedure below, also build the
+existing loopback application tools:
+
+```console
+cargo build --locked \
+  -p aster-agent -p asterctl \
+  --bin aster-agent --bin asterctl
+```
+
+## Prepare standalone application state on each target
+
+The ordered Event contact honors durable application selection; it does not
+copy every Event merely because a transport became available. Prepare the
+publisher and receiver state through application-owned handles before starting
+the standalone evaluator:
+
+- commit the evaluation Event in the publisher state; and
+- create one exact durable `Consume` subscription in the receiver state for
+  the Event topic and scope.
+
+Create and first open each state directory on the target host. An initialized
+store is deliberately bound to its canonical path and filesystem backing.
+Copying an initialized state directory to another path or host is expected to
+fail integrity validation. Evaluation credentials may be provisioned on the
+target, or copied before that state is first opened, but every node still
+requires its own mission bundle and identity.
+
+An embedding should prepare both sides directly through its retained
+application handles. For a standalone evaluation, a peerless loopback agent
+can prepare the receiver without creating a mesh contact. Replace the paths,
+topic, and scope below with the exact evaluation values:
+
+```console
+umask 077
+openssl rand -hex 32 > /owner-only/receiver/client.token
+
+target/debug/asterctl publication-init \
+  --journal /owner-only/receiver/subscriber.redb \
+  --client-id btle-evaluation-consumer/v1
+
+target/debug/aster-agent \
+  --state /owner-only/receiver/state \
+  --mesh-bind 127.0.0.1:0 \
+  --listen 127.0.0.1:8181 \
+  --mission-bundle-unprotected-reference /owner-only/receiver/mission.bundle \
+  --client-token-file /owner-only/receiver/client.token
+```
+
+After the agent reports `AGENT status=ready`, run in another terminal:
+
+```console
+target/debug/asterctl --token-file /owner-only/receiver/client.token \
+  subscribe \
+  --journal /owner-only/receiver/subscriber.redb \
+  --client-id btle-evaluation-consumer/v1 \
+  --scope EVENT_SCOPE \
+  --operation-key btle-evaluation-consume/v1 \
+  EVENT_TOPIC
+```
+
+Stop the agent cleanly and wait for it to exit before starting
+`aster-btle-event` against the same state. The subscription is durable across
+that restart. Prepare the publisher with its application-owned Event API or
+the peerless publication procedure in the
+[Android/Linux Ring-1 quickstart](btle-android-ring1.md#publish-one-event-while-linux-has-no-peer),
+then stop that application process before starting the evaluator.
+
+The loopback agent is only an evaluation preparation and query tool. It is not
+a BTLE lifecycle dependency, fallback carrier, or daemon recommendation; it
+does not participate in the BTLE contact or add another protocol path.
+
 ## Start with controllers unavailable
 
 Leave both configured controllers detached or powered off. On each host, run
@@ -120,6 +191,11 @@ BTLE_EVENT status=listening role=Listener
 BTLE_EVENT status=contact-complete offered=N fetched=N inserted=N
 ```
 
+If the receiver has no matching durable `Consume` subscription, an
+authenticated contact can correctly complete with `offered=0`, `fetched=0`,
+and `inserted=0`. That result proves the protected contact path only; it is not
+an Event-transfer or convergence result.
+
 A matching Bluetooth address is only locator evidence. The protected session
 must also authenticate the exact provisioned mission peer before profile,
 inventory, or Event work. Confirm the reconciled Event through the embedding's
@@ -133,7 +209,12 @@ controller. The current open/contact is cancelled and drained, availability
 returns to an unavailable category, and no second attempt overlaps it. Restore
 the same provisioned controller. A new availability epoch starts with fresh
 peer backoff and can reconcile retained Event work without restarting either
-node.
+node. After one successful transfer, require a later contact to report zero
+offered, fetched, and inserted Events. That second contact is bounded
+deduplication evidence. Wait for the configured successful-contact cadence, or
+perform a second bounded controller power-cycle after the successful transfer.
+The restoration that produced the transfer is not itself the deduplication
+contact.
 
 This source path and its deterministic tests implement that recovery. Retain a
 bounded physical observation before treating a particular kernel, BlueZ,
@@ -150,6 +231,26 @@ BTLE_EVENT status=stopped
 
 Verify with host Bluetooth tooling that the process left no advertisement or
 listener. A forced process kill is not clean-shutdown evidence.
+
+## Verify the application receipt
+
+After the evaluators stop and release their state, restart the same peerless
+loopback agent against the receiver state. Query the exact selector locally:
+
+```console
+target/debug/asterctl --token-file /owner-only/receiver/client.token \
+  --json query \
+  --topic EVENT_TOPIC \
+  --scope EVENT_SCOPE \
+  --limit 2
+```
+
+Require exactly one Event. Compare its Event ID with the source
+`publication.json`, then decode the query's Base64 payload and compare its
+bytes or SHA-256 digest with the retained source `event.bin`. Stop the agent
+cleanly. The query is local application proof; it opens no BTLE contact. A
+preceding zero-work contact plus exactly one matching application result
+demonstrates durable deduplication for this bounded run.
 
 ## Evidence to retain
 

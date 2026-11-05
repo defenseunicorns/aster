@@ -326,10 +326,11 @@ The tree includes a separate `aster-btle-event` evaluator for two provisioned
 Linux nodes. Each process owns one exact BlueZ controller, one exact peer, and
 one Event contact at a time. The transport-neutral node starts before the
 Linux-specific supervisor, so BlueZ or controller absence does not block local
-durable node operation. Controller availability later starts the existing
-mission-authenticated semantic-v9 ordered Event contact; controller loss
-cancels and drains that attempt, and restoration starts a fresh availability
-epoch.
+durable node operation. With a published Event and matching receiver
+application selection already durable, controller availability later starts
+the existing mission-authenticated semantic-v9 ordered Event contact;
+controller loss cancels and drains that attempt, and restoration starts a
+fresh availability epoch.
 
 This lifecycle belongs to `aster-ble-linux`, not the protocol or generic node
 runtime. Its deterministic role, retry, and 60-second default success cadence
