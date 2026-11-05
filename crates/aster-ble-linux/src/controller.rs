@@ -3,7 +3,7 @@ use crate::{
     policy::{CappedBackoff, LifecycleCancellation},
 };
 use bluer::{AdapterEvent, AdapterProperty, Address, AddressType, SessionEvent};
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, stream};
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use tokio::sync::watch;
 
@@ -283,7 +283,7 @@ async fn monitor_session(
             WaitResult::Value(Err(failure)) => return SessionOutcome::Lost(failure),
             WaitResult::Cancelled => return SessionOutcome::Cancelled,
         };
-        let mut adapter_events = match wait_for(cancellation, adapter.subscribe()).await {
+        let adapter_events = match wait_for(cancellation, adapter.subscribe()).await {
             WaitResult::Value(Ok(events)) => events,
             WaitResult::Value(Err(BluezFailure::ControllerAbsent)) => {
                 present = false;
@@ -303,11 +303,23 @@ async fn monitor_session(
         };
         publish(updates, configured.classify(initial));
 
+        let session_observations = session_events
+            .by_ref()
+            .map(|event| ControllerEvent::Session(Some(event)))
+            .chain(stream::iter([ControllerEvent::Session(None)]));
+        let adapter_observations = adapter_events
+            .map(|event| ControllerEvent::Adapter(Some(event)))
+            .chain(stream::iter([ControllerEvent::Adapter(None)]));
+        // Round-robin source selection prevents starvation; only cancellation is prioritized.
+        let mut events = stream::select(session_observations, adapter_observations);
         loop {
-            tokio::select! {
+            let event = tokio::select! {
                 biased;
                 () = cancellation.cancelled() => return SessionOutcome::Cancelled,
-                session_event = session_events.next() => match session_event {
+                event = events.next() => event,
+            };
+            match event {
+                Some(ControllerEvent::Session(session_event)) => match session_event {
                     Some(SessionSignal::AdapterRemoved(name)) if name == configured.name => {
                         publish(
                             updates,
@@ -319,7 +331,7 @@ async fn monitor_session(
                     Some(_) => {}
                     None => return SessionOutcome::Lost(BluezFailure::BluezUnavailable),
                 },
-                adapter_event = adapter_events.next() => match adapter_event {
+                Some(ControllerEvent::Adapter(adapter_event)) => match adapter_event {
                     Some(AdapterSignal::PropertiesChanged) => {
                         match wait_for(cancellation, adapter.snapshot()).await {
                             WaitResult::Value(Ok(snapshot)) => {
@@ -328,28 +340,31 @@ async fn monitor_session(
                             WaitResult::Value(Err(BluezFailure::ControllerAbsent)) => {
                                 publish(
                                     updates,
-                                    BtleAvailability::Unavailable(AvailabilityReason::ControllerAbsent),
+                                    BtleAvailability::Unavailable(
+                                        AvailabilityReason::ControllerAbsent,
+                                    ),
                                 );
                                 present = false;
                                 break;
                             }
-                            WaitResult::Value(Err(failure)) => return SessionOutcome::Lost(failure),
+                            WaitResult::Value(Err(failure)) => {
+                                return SessionOutcome::Lost(failure);
+                            }
                             WaitResult::Cancelled => return SessionOutcome::Cancelled,
                         }
                     }
                     Some(AdapterSignal::Unrelated) => {}
-                    None => {
-                        publish(
-                            updates,
-                            BtleAvailability::Unavailable(AvailabilityReason::ControllerAbsent),
-                        );
-                        present = false;
-                        break;
-                    }
+                    None => return SessionOutcome::Lost(BluezFailure::BluezUnavailable),
                 },
+                None => return SessionOutcome::Lost(BluezFailure::BluezUnavailable),
             }
         }
     }
+}
+
+enum ControllerEvent {
+    Session(Option<SessionSignal>),
+    Adapter(Option<AdapterSignal>),
 }
 
 enum SessionEventOutcome {
@@ -925,6 +940,79 @@ mod tests {
 
         assert_eq!(bluez.calls().len(), 6);
         assert!(!updates.has_changed().unwrap());
+        stop(cancellation, task).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn monitor_does_not_starve_adapter_events_during_unrelated_session_flood() {
+        let (session_tx, session_rx) = mpsc::unbounded_channel();
+        let (adapter_tx, adapter_rx) = mpsc::unbounded_channel();
+        let bluez = ScriptedBluez::new(
+            [Ok(())],
+            [session_rx],
+            [Ok(vec!["hci7".to_owned()])],
+            [adapter_rx],
+            [Ok(expected_snapshot(false)), Ok(expected_snapshot(true))],
+        );
+        for _ in 0..4096 {
+            session_tx
+                .send(SessionSignal::AdapterAdded("hci0".to_owned()))
+                .unwrap();
+        }
+        adapter_tx.send(AdapterSignal::PropertiesChanged).unwrap();
+        let (mut updates, cancellation, task) = spawn_monitor(bluez.clone());
+        bluez.wait_for_calls(6).await;
+
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            bluez
+                .calls()
+                .iter()
+                .filter(|call| **call == Call::SnapshotAdapter)
+                .count(),
+            2
+        );
+        assert_eq!(*updates.borrow_and_update(), BtleAvailability::Available);
+        stop(cancellation, task).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn monitor_reconnects_when_adapter_stream_ends_while_controller_remains_present() {
+        let (_first_session_tx, first_session_rx) = mpsc::unbounded_channel();
+        let (_second_session_tx, second_session_rx) = mpsc::unbounded_channel();
+        let (first_adapter_tx, first_adapter_rx) = mpsc::unbounded_channel();
+        let (_second_adapter_tx, second_adapter_rx) = mpsc::unbounded_channel();
+        let bluez = ScriptedBluez::new(
+            [Ok(()), Ok(())],
+            [first_session_rx, second_session_rx],
+            [Ok(vec!["hci7".to_owned()]), Ok(vec!["hci7".to_owned()])],
+            [first_adapter_rx, second_adapter_rx],
+            [Ok(expected_snapshot(true)), Ok(expected_snapshot(true))],
+        );
+        let (mut updates, cancellation, task) = spawn_monitor(bluez.clone());
+        bluez.wait_for_calls(6).await;
+        assert_eq!(next_update(&mut updates).await, BtleAvailability::Available);
+
+        drop(first_adapter_tx);
+        assert_eq!(
+            next_update(&mut updates).await,
+            BtleAvailability::Unavailable(AvailabilityReason::BluezUnavailable)
+        );
+        tokio::time::advance(Duration::from_millis(250)).await;
+        bluez.wait_for_calls(12).await;
+
+        assert_eq!(next_update(&mut updates).await, BtleAvailability::Available);
+        assert_eq!(
+            bluez
+                .calls()
+                .iter()
+                .filter(|call| **call == Call::OpenSession)
+                .count(),
+            2
+        );
         stop(cancellation, task).await;
     }
 
