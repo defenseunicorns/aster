@@ -334,10 +334,12 @@ async fn run_attempt(
         biased;
         () = cancellation.cancelled() => {
             contact.close();
+            let _ = (&mut contact_result).await;
             return Ok(AttemptOutcome::Stopped);
         }
         changed = availability.changed() => {
             contact.close();
+            let _ = (&mut contact_result).await;
             return Ok(if changed.is_ok() {
                 AttemptOutcome::Changed
             } else {
@@ -561,6 +563,16 @@ mod tests {
                 close_notify: Notify::new(),
             })
         }
+
+        async fn wait_until_closed(&self) {
+            loop {
+                let closed = self.close_notify.notified();
+                if self.closed.load(Ordering::SeqCst) > 0 {
+                    return;
+                }
+                closed.await;
+            }
+        }
     }
 
     impl OrderedContact for TestContact {
@@ -688,6 +700,29 @@ mod tests {
         Fail(AdmissionFailure),
         Succeed,
         Pending,
+        PendingUntilClosed(Arc<TestContact>),
+        DelayedTeardown(Arc<TeardownControl>),
+    }
+
+    #[derive(Default)]
+    struct TeardownControl {
+        released: AtomicBool,
+        release: Notify,
+        acknowledged: AtomicBool,
+    }
+
+    impl TeardownControl {
+        fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.release.notify_waiters();
+        }
+
+        async fn wait(&self) {
+            while !self.released.load(Ordering::SeqCst) {
+                self.release.notified().await;
+            }
+            self.acknowledged.store(true, Ordering::SeqCst);
+        }
     }
 
     struct FakeAdmission {
@@ -735,6 +770,18 @@ mod tests {
                 match action {
                     AdmissionAction::Succeed => Ok(PeerReceipt::default()),
                     AdmissionAction::Pending => pending().await,
+                    AdmissionAction::PendingUntilClosed(contact) => {
+                        contact.wait_until_closed().await;
+                        Err(OrderedEventContactError::Contact(NodeError::Protocol(
+                            "test contact closed".to_owned(),
+                        )))
+                    }
+                    AdmissionAction::DelayedTeardown(control) => {
+                        control.wait().await;
+                        Err(OrderedEventContactError::Contact(NodeError::Protocol(
+                            "test teardown complete".to_owned(),
+                        )))
+                    }
                     AdmissionAction::Fail(failure) => Err(match failure {
                         AdmissionFailure::Closed => OrderedEventContactError::AdmissionClosed,
                         AdmissionFailure::Busy => OrderedEventContactError::AdmissionBusy,
@@ -816,7 +863,10 @@ mod tests {
             [OpenAction::Pending, OpenAction::Succeed(contact.clone())],
             activity.clone(),
         );
-        let admission = FakeAdmission::new([AdmissionAction::Pending], activity.clone());
+        let admission = FakeAdmission::new(
+            [AdmissionAction::PendingUntilClosed(contact.clone())],
+            activity.clone(),
+        );
         let supervisor = spawn_test(
             config(1, 2, Duration::from_secs(10)),
             monitor,
@@ -849,6 +899,86 @@ mod tests {
         assert_eq!(activity.active.load(Ordering::SeqCst), 0);
         assert_eq!(activity.maximum.load(Ordering::SeqCst), 1);
         supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn new_epoch_waits_for_active_admission_teardown() {
+        let activity = Arc::new(Activity::default());
+        let teardown = Arc::new(TeardownControl::default());
+        let contact = TestContact::new();
+        let (monitor, events) = fake_monitor();
+        let opener = FakeOpener::new(
+            [OpenAction::Succeed(contact.clone()), OpenAction::Pending],
+            activity.clone(),
+        );
+        let admission = FakeAdmission::new(
+            [AdmissionAction::DelayedTeardown(teardown.clone())],
+            activity.clone(),
+        );
+        let supervisor = spawn_test(
+            config(1, 2, Duration::from_secs(10)),
+            monitor,
+            opener.clone(),
+            admission,
+        );
+
+        events.send(BtleAvailability::Available).unwrap();
+        settle().await;
+        events
+            .send(BtleAvailability::Unavailable(
+                AvailabilityReason::ControllerAbsent,
+            ))
+            .unwrap();
+        settle().await;
+        events.send(BtleAvailability::Available).unwrap();
+        settle().await;
+
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(activity.active.load(Ordering::SeqCst), 1);
+        assert_eq!(contact.closed.load(Ordering::SeqCst), 1);
+        assert!(!teardown.acknowledged.load(Ordering::SeqCst));
+
+        teardown.release();
+        settle().await;
+
+        assert!(teardown.acknowledged.load(Ordering::SeqCst));
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(activity.maximum.load(Ordering::SeqCst), 1);
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_waits_for_active_admission_teardown() {
+        let activity = Arc::new(Activity::default());
+        let teardown = Arc::new(TeardownControl::default());
+        let contact = TestContact::new();
+        let (monitor, events) = fake_monitor();
+        let opener = FakeOpener::new([OpenAction::Succeed(contact.clone())], activity.clone());
+        let admission = FakeAdmission::new(
+            [AdmissionAction::DelayedTeardown(teardown.clone())],
+            activity.clone(),
+        );
+        let supervisor = spawn_test(
+            config(1, 2, Duration::from_secs(10)),
+            monitor,
+            opener,
+            admission,
+        );
+        events.send(BtleAvailability::Available).unwrap();
+        settle().await;
+
+        let shutdown = tokio::spawn(supervisor.shutdown());
+        settle().await;
+
+        assert!(!shutdown.is_finished());
+        assert_eq!(activity.active.load(Ordering::SeqCst), 1);
+        assert_eq!(contact.closed.load(Ordering::SeqCst), 1);
+        assert!(!teardown.acknowledged.load(Ordering::SeqCst));
+
+        teardown.release();
+        assert_eq!(shutdown.await.unwrap(), Ok(()));
+        assert!(teardown.acknowledged.load(Ordering::SeqCst));
+        assert_eq!(activity.active.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1092,13 +1222,14 @@ mod tests {
             (activity, contacts)
         }
 
+        let active_contact = TestContact::new();
         let cases = [
             run_case(false, vec![], vec![]).await,
             run_case(true, vec![OpenAction::Pending], vec![]).await,
             run_case(
                 true,
-                vec![OpenAction::Succeed(TestContact::new())],
-                vec![AdmissionAction::Pending],
+                vec![OpenAction::Succeed(active_contact.clone())],
+                vec![AdmissionAction::PendingUntilClosed(active_contact)],
             )
             .await,
             run_case(
