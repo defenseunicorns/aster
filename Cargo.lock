@@ -337,6 +337,7 @@ dependencies = [
  "aster-core",
  "aster-node",
  "bluer",
+ "futures",
  "tokio",
 ]
 
