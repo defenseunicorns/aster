@@ -19,15 +19,18 @@ contacts. This demonstrates the original Ring-1 purpose: one real non-IP
 adapter carrying the existing protected Event protocol through the
 adapter-neutral ordered-contact boundary.
 
-One platform limitation remains explicit. After both evaluators stopped
+One platform limitation remained explicit. After both evaluators stopped
 cleanly, BlueZ 5.82 still reported the unpaired peer ACL as connected. Fresh
 evaluator processes reached `Available` and selected complementary roles, but
 their contacts timed out until the receiver controller entered a new power
 epoch. The next contact then completed with zero Event work, and the application
-still exposed exactly one Event. The observation proves restart durability and
-deduplication, but not seamless process-only radio recovery on this
-kernel/BlueZ/controller combination. The evaluator does not hide that behavior
-by disconnecting peers or mutating controller power.
+still exposed exactly one Event. A later bounded diagnostic bound this behavior
+to the Linux 6.18 L2CAP signaling-identifier leak fixed by CVE-2026-72333, not
+to Aster process state or advertisement restart. See the
+[clean-restart diagnostic](2026-11-06-cm4-btle-clean-restart-diagnostic.md).
+This run proves restart durability and deduplication, but not process-only
+radio recovery on its affected kernel. The evaluator does not hide that
+behavior by disconnecting peers or mutating controller power.
 
 ## Source and artifact binding
 
@@ -109,7 +112,9 @@ restarting either evaluator.
 
 After clean evaluator shutdown and restart, both processes reached `Available`
 but contact attempts timed out while BlueZ still reported the unpaired peer ACL
-as connected. A receiver controller power cycle cleared that platform state;
+as connected. The follow-up diagnostic identified exhausted kernel L2CAP
+signaling identifiers as the cause. A receiver controller power cycle cleared
+that affected kernel state;
 both restarted evaluators then completed a zero-work contact. Their post-restart
 snapshots were 16,808/16,996 KiB RSS, nine threads each, and 19/20 file
 descriptors. These are point observations, not idle, peak, variance, capacity,

@@ -150,29 +150,42 @@ Choose exactly one boundary supported by the trace: incomplete owned channel tea
 
 Document the exact API/operation, ownership, timeout, failure classification, and tests. If no non-destructive adapter-local recovery exists, record the limitation and stop rather than adding a controller or peer-wide reset.
 
-### Task 4: Implement the evidence-supported clean-restart recovery
+### Task 4: Establish the evidence-supported clean-restart boundary
 
 **Files:**
-- Determined by Task 3, limited to `crates/aster-ble-linux/src/{stream,platform,peer,lifecycle}.rs`
+- Modify: `crates/aster-ble-linux/src/lifecycle.rs` tests only
 - Modify: `docs/quickstart/btle-linux-unattended.md`
 - Modify: `docs/validation/btle-ring1-evaluation-profile.md`
-- Test: owning `aster-ble-linux` module from Task 3
+- Test: `crates/aster-ble-linux/src/lifecycle.rs`
 
 **Interfaces:**
-- Consumes: the exact recovery interface added to this plan at Task 3 Step 5.
-- Produces: clean process restart without controller mutation for the bounded Linux profile.
+- Consumes: the Task-3 proof that affected Linux 6.18.39 exhausts the kernel
+  L2CAP signaling-ID allocator (CVE-2026-72333).
+- Produces: no Aster reset path; a fixed-kernel platform prerequisite,
+  deterministic proof that a new supervisor retains no process-local lifecycle
+  state, and a physical fixed-kernel restart candidate.
 
-- [ ] **Step 1: Write the smallest failing regression from the physical trace**
+- [ ] **Step 1: Write the smallest lifecycle restart regression**
 
-The regression must fail on the pre-fix code for the demonstrated boundary and assert call order, bounded cancellation, and no peer/controller-wide mutation.
+Start one injected supervisor, complete and drain a contact, shut it down, then
+start a completely new supervisor with fresh injected dependencies. Assert the
+second instance opens and completes independently, with no overlap or retained
+backoff. This bounds Aster-owned state only; it must not emulate or claim to fix
+the kernel allocator.
 
-- [ ] **Step 2: Run the regression and verify RED**
+- [ ] **Step 2: Run the characterization regression**
 
-Run the exact test and confirm the expected failure is the missing recovery behavior.
+The Task-3 evidence located the defect below Aster, so no production behavior
+is missing at this boundary. Run the exact new test and require GREEN on the
+existing implementation; a contrived production RED would misstate the root
+cause.
 
-- [ ] **Step 3: Implement one minimal recovery change**
+- [ ] **Step 3: Keep production behavior unchanged**
 
-Implement only the proven adapter-local change. Do not combine unrelated cleanup or broaden configuration/protocol surfaces.
+The physical trace proves there is no safe adapter-local production change.
+Do not add `Device1.Disconnect`, controller mutation, raw-HCI teardown, kernel
+version parsing, or protocol/configuration surface. The existing socket drop
+and supervisor drain are the complete Aster-owned cleanup.
 
 - [ ] **Step 4: Verify GREEN and focused regressions**
 
@@ -180,7 +193,11 @@ Run the exact test, complete `aster-ble-linux`, `aster-ble-l2cap`, and changed A
 
 - [ ] **Step 5: Update documentation and review production code**
 
-Document supported clean restart and remaining crash/platform limits. Review the entire production diff for DRY structure, ownership, bounded waits, error closure, cancellation, descriptor/task cleanup, sanitized output, and comments. Create a signed fix commit.
+Document CVE-2026-72333, the fixed-kernel prerequisite, why no runtime version
+heuristic is used, and the prohibition on peer/controller-wide reset. Review
+the entire production diff for DRY structure, ownership, bounded waits, error
+closure, cancellation, descriptor/task cleanup, sanitized output, and
+comments. Create a signed test/documentation commit.
 
 ### Task 5: Physical Linux and Android validation
 
