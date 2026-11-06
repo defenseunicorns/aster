@@ -6,6 +6,7 @@
 mod config;
 mod controller;
 mod lifecycle;
+mod peer;
 mod platform;
 mod policy;
 mod stream;

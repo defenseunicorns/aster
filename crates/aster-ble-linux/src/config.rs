@@ -113,6 +113,14 @@ fn is_le(address_type: AddressType) -> bool {
 pub struct ValidatedLinkConfig(LinkConfig);
 
 impl ValidatedLinkConfig {
+    pub(crate) fn adapter_name(&self) -> &str {
+        &self.0.adapter_name
+    }
+
+    pub(crate) const fn peer_address(&self) -> Address {
+        self.0.peer_address
+    }
+
     /// Applies a fixed role to an already-validated link configuration.
     pub fn for_role(&self, role: FixedRole) -> ValidatedConfig {
         ValidatedConfig {

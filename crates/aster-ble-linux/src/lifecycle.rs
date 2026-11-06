@@ -3,6 +3,7 @@ use crate::{
     OpenCancellation, ValidatedConfig, ValidatedSupervisorConfig,
     controller::{AvailabilityMonitor, BluezAvailabilityMonitor},
     open_contact_with_factory,
+    peer::{BluezPeerAclObserver, PeerAclObserver},
     policy::{CappedBackoff, LifecycleCancellation},
 };
 use aster_contact::OrderedContact;
@@ -146,6 +147,7 @@ pub fn spawn_linux_btle_event_supervisor(
         Arc::new(contacts),
         Arc::new(BluezAvailabilityMonitor::new()),
         Arc::new(ProductionContactOpener),
+        Arc::new(BluezPeerAclObserver::new()),
     )
 }
 
@@ -154,6 +156,7 @@ fn spawn_linux_btle_event_supervisor_with(
     admission: Arc<dyn ContactAdmission>,
     monitor: Arc<dyn AvailabilityMonitor>,
     opener: Arc<dyn ContactOpener>,
+    peer_observer: Arc<dyn PeerAclObserver>,
 ) -> LinuxBtleEventSupervisor {
     let cancellation = LifecycleCancellation::new();
     let initial = BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable);
@@ -185,6 +188,7 @@ fn spawn_linux_btle_event_supervisor_with(
             contact_cancellation,
             opener,
             admission,
+            peer_observer,
         )
         .await;
         contact_exit.cancel();
@@ -221,6 +225,7 @@ async fn run_contact_loop(
     cancellation: LifecycleCancellation,
     opener: Arc<dyn ContactOpener>,
     admission: Arc<dyn ContactAdmission>,
+    peer_observer: Arc<dyn PeerAclObserver>,
 ) -> Result<(), SupervisorError> {
     loop {
         match wait_until_available(&mut availability, &cancellation).await {
@@ -237,6 +242,7 @@ async fn run_contact_loop(
                 &cancellation,
                 opener.as_ref(),
                 admission.as_ref(),
+                peer_observer.as_ref(),
             )
             .await?
             {
@@ -316,6 +322,7 @@ async fn run_attempt(
     cancellation: &LifecycleCancellation,
     opener: &dyn ContactOpener,
     admission: &dyn ContactAdmission,
+    peer_observer: &dyn PeerAclObserver,
 ) -> Result<AttemptOutcome, SupervisorError> {
     let driver_config = config.link().for_role(config.role());
     let open_cancellation = OpenCancellation::new();
@@ -360,27 +367,47 @@ async fn run_attempt(
         FixedRole::Listener => OrderedEventContactRole::Responder,
     };
     let peer = MissionPeerExpectation::new(contact.peer_evidence(), config.peer_mission_id());
-    let contact_result = admission.run(role, contact.clone(), peer);
-    tokio::pin!(contact_result);
-    let result = tokio::select! {
+    let mut contact_result = admission.run(role, contact.clone(), peer);
+    let outcome = tokio::select! {
         biased;
         () = cancellation.cancelled() => {
             contact.close();
             let _ = (&mut contact_result).await;
-            return Ok(AttemptOutcome::Stopped);
+            DrainedAdmissionOutcome::Stopped
         }
         changed = availability.changed() => {
             contact.close();
             let _ = (&mut contact_result).await;
-            return Ok(if changed.is_ok() {
-                AttemptOutcome::Changed
+            if changed.is_ok() {
+                DrainedAdmissionOutcome::Changed
             } else {
-                AttemptOutcome::Stopped
-            });
+                DrainedAdmissionOutcome::Stopped
+            }
         }
-        result = &mut contact_result => result,
+        result = &mut contact_result => {
+            contact.close();
+            DrainedAdmissionOutcome::Completed(classify_admission_result(result))
+        },
     };
-    contact.close();
+    drop(contact_result);
+    drop(contact);
+    let peer_acl = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => crate::peer::PeerAclObservation::Cancelled,
+        observation = peer_observer.observe(config.link(), cancellation) => observation,
+    };
+    eprintln!("BTLE_EVENT peer_acl={peer_acl}");
+
+    match outcome {
+        DrainedAdmissionOutcome::Completed(result) => result,
+        DrainedAdmissionOutcome::Changed => Ok(AttemptOutcome::Changed),
+        DrainedAdmissionOutcome::Stopped => Ok(AttemptOutcome::Stopped),
+    }
+}
+
+fn classify_admission_result(
+    result: Result<PeerReceipt, OrderedEventContactError>,
+) -> Result<AttemptOutcome, SupervisorError> {
     match result {
         Ok(receipt) => Ok(AttemptOutcome::Success(receipt.into())),
         Err(OrderedEventContactError::AdmissionBusy) => {
@@ -393,6 +420,12 @@ async fn run_attempt(
         Err(OrderedEventContactError::ActorUnavailable) => Err(SupervisorError::ActorUnavailable),
         Err(OrderedEventContactError::ActorStopped) => Err(SupervisorError::ActorStopped),
     }
+}
+
+enum DrainedAdmissionOutcome {
+    Completed(Result<AttemptOutcome, SupervisorError>),
+    Changed,
+    Stopped,
 }
 
 const fn driver_retry(kind: DriverErrorKind) -> RetryCategory {
@@ -458,6 +491,7 @@ mod tests {
         OpenCancellation, RING1_MAXIMUM_EXCHANGE_BYTES, RING1_MAXIMUM_FRAME_BYTES, ValidatedConfig,
         ValidatedLinkConfig, ValidatedSupervisorConfig,
         controller::{AvailabilityMonitor, MonitorFuture},
+        peer::{PeerAclFuture, PeerAclObservation, PeerAclObserver, PeerAclState},
         policy::LifecycleCancellation,
     };
     use aster_contact::{
@@ -597,16 +631,27 @@ mod tests {
     }
 
     struct TestContact {
-        closed: AtomicUsize,
+        closed: Arc<AtomicUsize>,
         close_notify: Notify,
+        dropped: Arc<AtomicBool>,
     }
 
     impl TestContact {
         fn new() -> Arc<Self> {
             Arc::new(Self {
-                closed: AtomicUsize::new(0),
+                closed: Arc::new(AtomicUsize::new(0)),
                 close_notify: Notify::new(),
+                dropped: Arc::new(AtomicBool::new(false)),
             })
+        }
+
+        fn with_witness() -> (Arc<Self>, Arc<AtomicUsize>, Arc<AtomicBool>) {
+            let contact = Self::new();
+            (
+                contact.clone(),
+                contact.closed.clone(),
+                contact.dropped.clone(),
+            )
         }
 
         async fn wait_until_closed(&self) {
@@ -617,6 +662,12 @@ mod tests {
                 }
                 closed.await;
             }
+        }
+    }
+
+    impl Drop for TestContact {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
         }
     }
 
@@ -847,7 +898,137 @@ mod tests {
         opener: Arc<dyn ContactOpener>,
         admission: Arc<dyn ContactAdmission>,
     ) -> LinuxBtleEventSupervisor {
-        spawn_linux_btle_event_supervisor_with(config, admission, monitor, opener)
+        spawn_linux_btle_event_supervisor_with(
+            config,
+            admission,
+            monitor,
+            opener,
+            Arc::new(StaticPeerObserver),
+        )
+    }
+
+    struct StaticPeerObserver;
+
+    impl PeerAclObserver for StaticPeerObserver {
+        fn observe<'a>(
+            &'a self,
+            _link: &'a ValidatedLinkConfig,
+            _cancellation: &'a LifecycleCancellation,
+        ) -> PeerAclFuture<'a> {
+            Box::pin(async { PeerAclObservation::State(PeerAclState::Absent) })
+        }
+    }
+
+    struct RecordingPeerObserver {
+        calls: AtomicUsize,
+        valid_order: AtomicBool,
+        closed: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+        activity: Arc<Activity>,
+        observed: Notify,
+    }
+
+    impl PeerAclObserver for RecordingPeerObserver {
+        fn observe<'a>(
+            &'a self,
+            _link: &'a ValidatedLinkConfig,
+            _cancellation: &'a LifecycleCancellation,
+        ) -> PeerAclFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.valid_order.store(
+                self.closed.load(Ordering::SeqCst) == 1
+                    && self.dropped.load(Ordering::SeqCst)
+                    && self.activity.active.load(Ordering::SeqCst) == 0,
+                Ordering::SeqCst,
+            );
+            self.observed.notify_one();
+            Box::pin(async { PeerAclObservation::State(PeerAclState::Disconnected) })
+        }
+    }
+
+    struct StuckPeerObserver {
+        started: Notify,
+        dropped: Arc<AtomicBool>,
+    }
+
+    struct ObservationDropWitness(Arc<AtomicBool>);
+
+    impl Drop for ObservationDropWitness {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl PeerAclObserver for StuckPeerObserver {
+        fn observe<'a>(
+            &'a self,
+            _link: &'a ValidatedLinkConfig,
+            _cancellation: &'a LifecycleCancellation,
+        ) -> PeerAclFuture<'a> {
+            let witness = ObservationDropWitness(self.dropped.clone());
+            Box::pin(async move {
+                let _witness = witness;
+                self.started.notify_one();
+                pending().await
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_acl_observation_starts_after_contact_and_admission_are_drained() {
+        let activity = Arc::new(Activity::default());
+        let (contact, closed, dropped) = TestContact::with_witness();
+        let observer = Arc::new(RecordingPeerObserver {
+            calls: AtomicUsize::new(0),
+            valid_order: AtomicBool::new(false),
+            closed,
+            dropped,
+            activity: activity.clone(),
+            observed: Notify::new(),
+        });
+        let (monitor, events) = fake_monitor();
+        let opener = FakeOpener::new([OpenAction::Succeed(contact)], activity.clone());
+        let admission = FakeAdmission::new([AdmissionAction::Succeed], activity);
+        let supervisor = spawn_linux_btle_event_supervisor_with(
+            config(1, 2, Duration::from_secs(10)),
+            admission,
+            monitor,
+            opener,
+            observer.clone(),
+        );
+
+        events.send(BtleAvailability::Available).unwrap();
+        observer.observed.notified().await;
+
+        assert_eq!(observer.calls.load(Ordering::SeqCst), 1);
+        assert!(observer.valid_order.load(Ordering::SeqCst));
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_and_drops_a_stuck_peer_acl_observation() {
+        let activity = Arc::new(Activity::default());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let observer = Arc::new(StuckPeerObserver {
+            started: Notify::new(),
+            dropped: dropped.clone(),
+        });
+        let (monitor, events) = fake_monitor();
+        let opener = FakeOpener::new([OpenAction::Succeed(TestContact::new())], activity.clone());
+        let admission = FakeAdmission::new([AdmissionAction::Succeed], activity);
+        let supervisor = spawn_linux_btle_event_supervisor_with(
+            config(1, 2, Duration::from_secs(10)),
+            admission,
+            monitor,
+            opener,
+            observer.clone(),
+        );
+        events.send(BtleAvailability::Available).unwrap();
+        observer.started.notified().await;
+
+        supervisor.shutdown().await.unwrap();
+
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[tokio::test(start_paused = true)]
