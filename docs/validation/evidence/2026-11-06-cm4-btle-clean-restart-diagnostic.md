@@ -119,6 +119,8 @@ the installed kernel package or source to the fix and then execute the restart
 procedure.
 
 The temporary traces contain link-layer locators and remain outside the
-repository. They are diagnostic artifacts, not reusable fixtures. This record
-does not claim fixed-kernel validation, Android restart behavior, multi-peer or
-multi-controller safety, crash recovery, or production support.
+repository. They are diagnostic artifacts, not reusable fixtures. The later
+[fixed-kernel validation](2026-11-06-cm4-btle-clean-restart-validation.md)
+completed process-only restart on the same CM4 hardware with Linux 6.18.60.
+This diagnostic record itself does not claim Android restart behavior,
+multi-peer or multi-controller safety, crash recovery, or production support.
