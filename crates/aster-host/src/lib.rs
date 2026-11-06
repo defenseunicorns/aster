@@ -5,11 +5,17 @@
 
 #![forbid(unsafe_code)]
 
+mod discovery_credentials;
 mod mesh_host;
 mod node_admission;
 mod node_budget;
 mod shared_node;
 
+pub use discovery_credentials::{
+    DiscoveryCredentialAuthority, DiscoveryCredentialError, DiscoveryCredentialMaterialParts,
+    LeasedDiscoveryCredentialMaterial, TrustedClock, TrustedClockSample,
+    load_unprotected_reference_discovery_credentials,
+};
 pub use mesh_host::{
     CandidateId, CandidateLocator, CandidateProvenance, CandidateStatus, CarrierIdentity,
     ContactCloseReason, ContactDirection, ContactId, ContactPath, HostAction, HostConfig,

@@ -399,6 +399,11 @@ name = "aster-host"
 version = "0.1.0-alpha.1"
 dependencies = [
  "aster-core",
+ "hmac 0.13.0",
+ "libc",
+ "rustix",
+ "sha2 0.11.1",
+ "zeroize",
 ]
 
 [[package]]
