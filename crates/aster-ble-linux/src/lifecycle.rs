@@ -907,6 +907,27 @@ mod tests {
         )
     }
 
+    async fn complete_fresh_supervisor_once(activity: Arc<Activity>) {
+        let contact = TestContact::new();
+        let (monitor, events) = fake_monitor();
+        let opener = FakeOpener::new([OpenAction::Succeed(contact.clone())], activity.clone());
+        let admission = FakeAdmission::new([AdmissionAction::Succeed], activity.clone());
+        let supervisor = spawn_test(
+            config(1, 2, Duration::from_secs(10)),
+            monitor,
+            opener.clone(),
+            admission.clone(),
+        );
+
+        events.send(BtleAvailability::Available).unwrap();
+        settle().await;
+        assert_eq!(opener.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(admission.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(contact.closed.load(Ordering::SeqCst), 1);
+        supervisor.shutdown().await.unwrap();
+        assert_eq!(activity.active.load(Ordering::SeqCst), 0);
+    }
+
     struct StaticPeerObserver;
 
     impl PeerAclObserver for StaticPeerObserver {
@@ -1078,6 +1099,16 @@ mod tests {
         assert_eq!(*opener.roles.lock().unwrap(), [FixedRole::Initiator]);
         assert_eq!(activity.maximum.load(Ordering::SeqCst), 1);
         supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fresh_supervisor_after_shutdown_has_no_process_local_state() {
+        let activity = Arc::new(Activity::default());
+
+        complete_fresh_supervisor_once(activity.clone()).await;
+        complete_fresh_supervisor_once(activity.clone()).await;
+
+        assert_eq!(activity.maximum.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(start_paused = true)]
