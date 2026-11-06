@@ -10,7 +10,9 @@ cargo-fuzz = true
 
 [dependencies]
 aster-ble-l2cap = { path = "../crates/aster-ble-l2cap", features = ["fuzzing"] }
+aster-ble-linux = { path = "../crates/aster-ble-linux" }
 aster-core = { path = "../crates/aster-core", features = ["adapter-sdk"] }
+aster-host = { path = "../crates/aster-host", features = ["fuzzing"] }
 aster-iroh = { path = "../crates/aster-iroh", features = ["fuzzing"] }
 aster-negentropy = { path = "../crates/aster-negentropy" }
 aster-node = { path = "../crates/aster-node", features = ["fuzzing"] }
@@ -22,6 +24,20 @@ libfuzzer-sys = "=0.4.13"
 [[bin]]
 name = "ble_l2cap_record"
 path = "fuzz_targets/ble_l2cap_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ble_roster_beacon"
+path = "fuzz_targets/ble_roster_beacon.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ble_discovery_credential"
+path = "fuzz_targets/ble_discovery_credential.rs"
 test = false
 doc = false
 bench = false

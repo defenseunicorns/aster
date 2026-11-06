@@ -11,6 +11,9 @@ mod node_admission;
 mod node_budget;
 mod shared_node;
 
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use discovery_credentials::fuzz_parse_discovery_credential_artifact;
 pub use discovery_credentials::{
     DiscoveryCredentialAuthority, DiscoveryCredentialError, DiscoveryCredentialMaterialParts,
     LeasedDiscoveryCredentialMaterial, TrustedClock, TrustedClockSample,

@@ -240,6 +240,10 @@ impl AsterRosterBeaconV1 {
         credentials: &LeasedDiscoveryCredentialSet,
         now: Instant,
     ) -> Result<Self, DiscoveryRecordError> {
+        Self::decode_structure(record)?.verify(record, credentials, now)
+    }
+
+    pub(crate) fn decode_structure(record: &[u8]) -> Result<Self, DiscoveryRecordError> {
         if record.len() != ASTER_ROSTER_BEACON_V1_BYTES {
             return Err(DiscoveryRecordError::WrongLength);
         }
@@ -258,14 +262,6 @@ impl AsterRosterBeaconV1 {
             record[4], record[5], record[6], record[7],
         ]))
         .map_err(|_| DiscoveryRecordError::UnknownGeneration)?;
-        let credential = credentials.credential(generation, now)?;
-        let expected = proof_tag(&credential.secret, &record[..HEADER_BYTES]);
-        let supplied: &[u8; PROOF_BYTES] = record[HEADER_BYTES..]
-            .try_into()
-            .map_err(|_| DiscoveryRecordError::WrongLength)?;
-        if !bool::from(expected.ct_eq(supplied)) {
-            return Err(DiscoveryRecordError::InvalidProof);
-        }
         let mut nonce = [0_u8; 16];
         nonce.copy_from_slice(&record[8..HEADER_BYTES]);
         Ok(Self {
@@ -273,6 +269,23 @@ impl AsterRosterBeaconV1 {
             generation,
             nonce,
         })
+    }
+
+    pub(crate) fn verify(
+        self,
+        record: &[u8],
+        credentials: &LeasedDiscoveryCredentialSet,
+        now: Instant,
+    ) -> Result<Self, DiscoveryRecordError> {
+        let credential = credentials.credential(self.generation, now)?;
+        let expected = proof_tag(&credential.secret, &record[..HEADER_BYTES]);
+        let supplied: &[u8; PROOF_BYTES] = record[HEADER_BYTES..]
+            .try_into()
+            .map_err(|_| DiscoveryRecordError::WrongLength)?;
+        if !bool::from(expected.ct_eq(supplied)) {
+            return Err(DiscoveryRecordError::InvalidProof);
+        }
+        Ok(self)
     }
 
     /// Transient listener PSM authenticated by the proof.

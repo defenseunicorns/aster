@@ -16,6 +16,7 @@ zeroize.workspace = true
 
 [features]
 default = []
+fuzzing = []
 gate-h-formal = []
 
 [lints]

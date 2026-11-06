@@ -5,6 +5,7 @@
 
 mod config;
 mod controller;
+mod discovery;
 mod discovery_record;
 mod lifecycle;
 mod peer;
@@ -18,6 +19,11 @@ pub use config::{
     ValidatedLinkConfig, ValidatedSupervisorConfig,
 };
 pub use controller::{AvailabilityReason, BtleAvailability};
+pub use discovery::{
+    AttemptKind, CanonicalLocator, CanonicalLocatorError, DiscoveryAdmission, DiscoveryCandidate,
+    ObservationOutcome, ObservationRejection, ScanStartOutcome, ScanState, ScanStopReason,
+    ScanWindowCounters,
+};
 pub use discovery_record::{
     ASTER_ROSTER_BEACON_V1_BYTES, ASTER_ROSTER_SERVICE_UUID, AsterRosterBeaconV1,
     DiscoveryCredential, DiscoveryCredentialError, DiscoveryGeneration, DiscoveryRecordError,

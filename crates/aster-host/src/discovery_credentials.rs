@@ -892,6 +892,26 @@ pub fn load_unprotected_reference_discovery_credentials(
         .accept_authenticated(&bytes, sample)
 }
 
+/// Exercises the exact credential artifact parser without exposing it to
+/// production callers.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_parse_discovery_credential_artifact(bytes: &[u8]) {
+    let mut expected_scope = bytes
+        .get(41..73)
+        .and_then(|value| value.try_into().ok())
+        .unwrap_or([1; 32]);
+    if expected_scope == [0; 32] {
+        expected_scope[0] = 1;
+    }
+    let wall_now = bytes
+        .get(17..25)
+        .and_then(|value| value.try_into().ok())
+        .map(u64::from_be_bytes)
+        .unwrap_or(1);
+    let _ = ParsedDiscoveryArtifact::parse(bytes, expected_scope, wall_now);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
