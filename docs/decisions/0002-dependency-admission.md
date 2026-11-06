@@ -52,6 +52,13 @@ The IP adapter directly reuses the already admitted `getrandom`, `hkdf`, and
 adapter and binding code uses the standard library and `aster-core`; this adds
 no component or version beyond the admitted workspace graph.
 
+The BTLE Ring 2 increment path-patches exact `hmac` 0.13.0 to zeroize its
+constructor derived-key temporary. Because Cargo patching is workspace-wide,
+the qualification covers every exact 0.13.0 consumer rather than treating the
+change as discovery-local. [Decision 0046](0046-btle-ring2-vendored-dependency-patches.md)
+records the source pedigree, affected graph, tests, maintenance owner, and
+removal gate. This does not admit a custom MAC or change protocol bytes.
+
 ## Adopted for a bounded pilot only
 
 - `jni` 0.22.4 is an exact direct dependency only of the isolated Android
@@ -74,6 +81,11 @@ no component or version beyond the admitted workspace graph.
   GATT, dynamic-role, or support-row claim. Exact locked graph, license,
   advisory, cross-build, cancellation, resource, and physical CM4 evidence are
   exit gates; failure closes or removes the replaceable Linux driver.
+  Ring 2 retains that claim limit while adding a minimal, exact-source fork for
+  acknowledged advertisement/discovery ownership and bounded D-Bus ingress.
+  [Decision 0046](0046-btle-ring2-vendored-dependency-patches.md) owns the patch
+  pedigree and removal gate; it does not by itself promote BlueR or BTLE to a
+  production-supported transport.
 
 - Proposal 0004 is closed with no provider selected. Its focused
   `aster-libp2p-provider` graph remains only as publish-disabled, opt-in test

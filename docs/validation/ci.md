@@ -58,7 +58,7 @@ mandatory-access-control profile. The manual operator procedure is
 | Check | Runner | Purpose |
 | --- | --- | --- |
 | `Cargo lockfiles` | `ubuntu-24.04` | Checks every committed Cargo graph with `cargo fetch --locked` before Cargo builds start, and tests rejection of stale or missing lockfiles offline. |
-| `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
+| `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink and BTLE dependency source-equivalence/compatibility gates, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
 | `Rust Clippy` | `ubuntu-24.04` | Runs locked Clippy for every workspace target and feature, with warnings denied. |
 | `Rust tests (1/2)` and `Rust tests (2/2)` | `ubuntu-24.04` | Run two disjoint nextest partitions covering the complete locked, all-feature Rust workspace suite. Partition 1 also runs all workspace doctests with Cargo. Both start independently of Clippy and use the existing resource wrapper. |
 | `macOS compatibility` | `macos-15` | Compiles and links every all-feature Rust workspace test target, then runs focused macOS/non-Linux custody-clock, finite-TTL, Blob staging/read, and credential-provider contracts. |
@@ -1762,6 +1762,20 @@ The companion scope gate fails if either ignored package's reverse graph
 drifts, if either appears in the separately excluded fuzz graph, or if any
 `paste` version reappears. Any change to a package chain or advisory
 disposition requires a recorded pilot review.
+
+The BTLE Ring 2 increment path-patches exact `hmac` 0.13.0 and `bluer`
+0.17.4. `tools/check-btle-vendor-patches.py` fails on source/file-set drift,
+noncanonical or undeclared patch bytes, missing root or fuzz path patches,
+registry-provenanced exact lock entries, and feature drift. It reverse-applies
+each checked-in canonical diff and verifies every reconstructed file against
+the crates.io archive receipt. `tools/test-btle-vendor-patches.sh` runs the
+HMAC upstream tests with and without zeroization, the BlueR lifecycle tests,
+and Aster's frozen RFC 4231 vector serially. Every positive and negative lane
+uses a disposable isolated Cargo target; advertisement cleanup, discovery
+cleanup, definite discovery-absence handling, and exact ingress capacity are
+mutated and rejected independently. These gates prove source pedigree and the
+bounded patch contracts; they do not prove radio interoperability,
+physical-device qualification, production admission, or release authorization.
 
 The selected Iroh graph carries five exact-coordinate license exceptions
 recorded by Decision 0028: `webpki-root-certs` and `webpki-roots` 1.0.10 use

@@ -1,0 +1,203 @@
+--- a/src/block_api.rs
++++ b/src/block_api.rs
+@@ -1,5 +1,7 @@
+ use crate::utils::{IPAD, OPAD, get_der_key};
+ use core::{fmt, slice};
++#[cfg(feature = "zeroize")]
++use digest::zeroize::{Zeroize, Zeroizing};
+ use digest::{
+     InvalidLength, KeyInit, MacMarker, Output, Reset,
+     block_api::{
+@@ -10,6 +12,83 @@
+     common::{Key, KeySizeUser},
+ };
+ 
++struct DerivedKeyBlock<D: EagerHash>(Block<D::Core>);
++
++#[cfg(all(test, feature = "zeroize"))]
++mod drop_observer {
++    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++
++    pub(super) static ENABLED: AtomicBool = AtomicBool::new(false);
++    pub(super) static PANIC_AFTER_CONSTRUCTION: AtomicBool = AtomicBool::new(false);
++    pub(super) static ZEROIZED: AtomicUsize = AtomicUsize::new(0);
++    pub(super) static NOT_ZEROIZED: AtomicUsize = AtomicUsize::new(0);
++
++    pub(super) fn reset() {
++        ZEROIZED.store(0, Ordering::Release);
++        NOT_ZEROIZED.store(0, Ordering::Release);
++        PANIC_AFTER_CONSTRUCTION.store(false, Ordering::Release);
++        ENABLED.store(true, Ordering::Release);
++    }
++}
++
++impl<D: EagerHash> DerivedKeyBlock<D> {
++    fn block(&self) -> &Block<D::Core> {
++        &self.0
++    }
++
++    fn bytes_mut(&mut self) -> &mut [u8] {
++        self.0.as_mut_slice()
++    }
++}
++
++#[cfg(feature = "zeroize")]
++impl<D: EagerHash> Zeroize for DerivedKeyBlock<D> {
++    fn zeroize(&mut self) {
++        self.bytes_mut().zeroize();
++    }
++}
++
++#[cfg(all(test, feature = "zeroize"))]
++impl<D: EagerHash> Drop for DerivedKeyBlock<D> {
++    fn drop(&mut self) {
++        use core::sync::atomic::Ordering;
++
++        if drop_observer::ENABLED.load(Ordering::Acquire) {
++            let counter = if self.0.iter().all(|byte| *byte == 0) {
++                &drop_observer::ZEROIZED
++            } else {
++                &drop_observer::NOT_ZEROIZED
++            };
++            counter.fetch_add(1, Ordering::AcqRel);
++        }
++    }
++}
++
++#[cfg(feature = "zeroize")]
++type ProtectedDerivedKey<D> = Zeroizing<DerivedKeyBlock<D>>;
++#[cfg(not(feature = "zeroize"))]
++type ProtectedDerivedKey<D> = DerivedKeyBlock<D>;
++
++#[cfg(feature = "zeroize")]
++fn protected_derived_key<D: EagerHash>(key: &[u8]) -> ProtectedDerivedKey<D> {
++    Zeroizing::new(DerivedKeyBlock(get_der_key::<D>(key)))
++}
++
++#[cfg(not(feature = "zeroize"))]
++fn protected_derived_key<D: EagerHash>(key: &[u8]) -> ProtectedDerivedKey<D> {
++    DerivedKeyBlock(get_der_key::<D>(key))
++}
++
++#[cfg(all(test, feature = "zeroize"))]
++fn inject_constructor_unwind() {
++    use core::sync::atomic::Ordering;
++
++    assert!(
++        !drop_observer::PANIC_AFTER_CONSTRUCTION.swap(false, Ordering::AcqRel),
++        "injected constructor unwind"
++    );
++}
++
+ /// Generic core HMAC instance, which operates over blocks.
+ pub struct HmacCore<D: EagerHash> {
+     digest: D::Core,
+@@ -51,16 +130,18 @@
+ 
+     #[inline(always)]
+     fn new_from_slice(key: &[u8]) -> Result<Self, InvalidLength> {
+-        let mut buf = get_der_key::<D>(key);
+-        buf.iter_mut().for_each(|b: &mut u8| *b ^= IPAD);
++        let mut buf = protected_derived_key::<D>(key);
++        #[cfg(all(test, feature = "zeroize"))]
++        inject_constructor_unwind();
++        buf.bytes_mut().iter_mut().for_each(|b| *b ^= IPAD);
+ 
+         let mut digest = D::Core::default();
+-        digest.update_blocks(slice::from_ref(&buf));
++        digest.update_blocks(slice::from_ref(buf.block()));
+ 
+-        buf.iter_mut().for_each(|b: &mut u8| *b ^= IPAD ^ OPAD);
++        buf.bytes_mut().iter_mut().for_each(|b| *b ^= IPAD ^ OPAD);
+ 
+         let mut opad_digest = D::Core::default();
+-        opad_digest.update_blocks(slice::from_ref(&buf));
++        opad_digest.update_blocks(slice::from_ref(buf.block()));
+ 
+         Ok(Self {
+             opad_digest,
+@@ -150,16 +231,18 @@
+ 
+     #[inline(always)]
+     fn new_from_slice(key: &[u8]) -> Result<Self, InvalidLength> {
+-        let mut buf = get_der_key::<D>(key);
+-        buf.iter_mut().for_each(|b: &mut u8| *b ^= IPAD);
++        let mut buf = protected_derived_key::<D>(key);
++        #[cfg(all(test, feature = "zeroize"))]
++        inject_constructor_unwind();
++        buf.bytes_mut().iter_mut().for_each(|b| *b ^= IPAD);
+ 
+         let mut digest = D::Core::default();
+-        digest.update_blocks(slice::from_ref(&buf));
++        digest.update_blocks(slice::from_ref(buf.block()));
+ 
+-        buf.iter_mut().for_each(|b: &mut u8| *b ^= IPAD ^ OPAD);
++        buf.bytes_mut().iter_mut().for_each(|b| *b ^= IPAD ^ OPAD);
+ 
+         let mut opad_digest = D::Core::default();
+-        opad_digest.update_blocks(slice::from_ref(&buf));
++        opad_digest.update_blocks(slice::from_ref(buf.block()));
+ 
+         Ok(Self {
+             ipad_digest: digest.clone(),
+@@ -213,3 +296,60 @@
+         f.write_str("HmacResetCore { ... }")
+     }
+ }
++
++#[cfg(all(test, feature = "zeroize"))]
++mod aster_tests {
++    extern crate std;
++
++    use super::*;
++    use core::sync::atomic::Ordering;
++    use std::{panic, sync::Mutex};
++
++    static TEST_LOCK: Mutex<()> = Mutex::new(());
++
++    fn assert_one_zeroized_drop() {
++        assert_eq!(drop_observer::ZEROIZED.load(Ordering::Acquire), 1);
++        assert_eq!(drop_observer::NOT_ZEROIZED.load(Ordering::Acquire), 0);
++        drop_observer::ENABLED.store(false, Ordering::Release);
++    }
++
++    #[test]
++    fn derived_key_is_zeroized_after_both_constructors_return() {
++        let _guard = TEST_LOCK
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++
++        drop_observer::reset();
++        HmacCore::<sha2::Sha256>::new_from_slice(b"normal-return")
++            .expect("fixed key length is valid");
++        assert_one_zeroized_drop();
++
++        drop_observer::reset();
++        HmacResetCore::<sha2::Sha256>::new_from_slice(b"normal-return")
++            .expect("fixed key length is valid");
++        assert_one_zeroized_drop();
++    }
++
++    #[test]
++    fn derived_key_is_zeroized_when_both_constructors_unwind() {
++        let _guard = TEST_LOCK
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++
++        drop_observer::reset();
++        drop_observer::PANIC_AFTER_CONSTRUCTION.store(true, Ordering::Release);
++        assert!(panic::catch_unwind(|| {
++            let _ = HmacCore::<sha2::Sha256>::new_from_slice(b"unwind");
++        })
++        .is_err());
++        assert_one_zeroized_drop();
++
++        drop_observer::reset();
++        drop_observer::PANIC_AFTER_CONSTRUCTION.store(true, Ordering::Release);
++        assert!(panic::catch_unwind(|| {
++            let _ = HmacResetCore::<sha2::Sha256>::new_from_slice(b"unwind");
++        })
++        .is_err());
++        assert_one_zeroized_drop();
++    }
++}

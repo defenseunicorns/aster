@@ -1,0 +1,2084 @@
+--- a/src/adapter.rs
++++ b/src/adapter.rs
+@@ -8,15 +8,17 @@
+ use futures::{
+     future,
+     stream::{self, SelectAll},
+-    Stream, StreamExt,
++    FutureExt, Stream, StreamExt,
+ };
+ use std::{
+     collections::{BTreeSet, HashMap, HashSet},
+     fmt::{Debug, Formatter},
++    future::Future,
+     sync::Arc,
++    time::Duration,
+ };
+ use strum::{Display, EnumString};
+-use tokio::sync::mpsc;
++use tokio::sync::{mpsc, oneshot, watch};
+ use tokio_stream::wrappers::ReceiverStream;
+ use uuid::Uuid;
+ 
+@@ -47,6 +49,398 @@
+     name: Arc<String>,
+ }
+ 
++enum DiscoveryCommand {
++    Stop(oneshot::Sender<Result<()>>),
++}
++
++enum DiscoveryOwnerExit {
++    RegistrationFailed(oneshot::Sender<Result<()>>, Error),
++    RegistrationTerminated(oneshot::Sender<Result<()>>, DiscoveryTermination),
++    Stopped(oneshot::Sender<Result<()>>),
++    Terminated(DiscoveryTermination),
++    Released,
++}
++
++enum DiscoveryOperationOutcome<T> {
++    Completed(Result<T>),
++    Terminated(DiscoveryTermination),
++}
++
++struct DiscoveryStartup<Start, PreBaseline, Discovering, PostBaseline> {
++    start: Start,
++    pre_state_baseline: PreBaseline,
++    discovering: Discovering,
++    post_start_baseline: PostBaseline,
++}
++
++impl DiscoveryOwnerExit {
++    fn finish(self, termination: watch::Sender<Option<DiscoveryTermination>>) {
++        match self {
++            Self::RegistrationFailed(reply, error) => {
++                let _ = reply.send(Err(error));
++            }
++            Self::RegistrationTerminated(reply, reason) => {
++                let error = discovery_registration_error(&reason);
++                termination.send_replace(Some(reason));
++                let _ = reply.send(Err(error));
++            }
++            Self::Stopped(reply) => {
++                termination.send_replace(Some(DiscoveryTermination::DiscoveringStopped));
++                let _ = reply.send(Ok(()));
++            }
++            Self::Terminated(reason) => {
++                termination.send_replace(Some(reason));
++            }
++            Self::Released => {}
++        }
++    }
++}
++
++async fn run_discovery_owner<
++    EventsFuture,
++    Events,
++    FilterFuture,
++    StartFuture,
++    PreBaselineFuture,
++    DiscoveringFuture,
++    PostBaselineFuture,
++    Stop,
++    StopFuture,
++>(
++    events: EventsFuture,
++    set_filter: FilterFuture,
++    startup: DiscoveryStartup<
++        StartFuture,
++        PreBaselineFuture,
++        DiscoveringFuture,
++        PostBaselineFuture,
++    >,
++    mut stop: Stop,
++    mut registration_reply: oneshot::Sender<Result<()>>,
++    mut commands: mpsc::Receiver<DiscoveryCommand>,
++    mut session: watch::Receiver<Option<Error>>,
++) -> DiscoveryOwnerExit
++where
++    EventsFuture: Future<Output = Result<Events>>,
++    Events: Stream<Item = AdapterEvent> + Unpin,
++    FilterFuture: Future<Output = Result<()>>,
++    StartFuture: Future<Output = Result<()>>,
++    PreBaselineFuture: Future<Output = Result<()>>,
++    DiscoveringFuture: Future<Output = Result<bool>>,
++    PostBaselineFuture: Future<Output = Result<()>>,
++    Stop: FnMut() -> StopFuture,
++    StopFuture: Future<Output = Result<()>>,
++{
++    let mut events = tokio::select! {
++        result = events => match result {
++            Ok(events) => events,
++            Err(error) => return DiscoveryOwnerExit::RegistrationFailed(registration_reply, error),
++        },
++        () = registration_reply.closed() => return DiscoveryOwnerExit::Released,
++    };
++
++    tokio::select! {
++        result = set_filter => if let Err(error) = result {
++            return DiscoveryOwnerExit::RegistrationFailed(registration_reply, error);
++        },
++        () = registration_reply.closed() => return DiscoveryOwnerExit::Released,
++    }
++
++    match establish_discovery(startup, &mut events, &mut session).await {
++        DiscoveryOperationOutcome::Completed(Ok(())) => {}
++        DiscoveryOperationOutcome::Completed(Err(error)) => {
++            cleanup_unconfirmed_discovery(&mut events, &mut session, &mut stop).await;
++            return DiscoveryOwnerExit::RegistrationFailed(registration_reply, error);
++        }
++        DiscoveryOperationOutcome::Terminated(reason) => {
++            return DiscoveryOwnerExit::RegistrationTerminated(registration_reply, reason);
++        }
++    }
++
++    let commands_open = registration_reply.send(Ok(())).is_ok();
++    if !commands_open {
++        cleanup_unconfirmed_discovery(&mut events, &mut session, &mut stop).await;
++        return DiscoveryOwnerExit::Released;
++    }
++
++    loop {
++        tokio::select! {
++            biased;
++            changed = session.changed() => {
++                return DiscoveryOwnerExit::Terminated(session_ended(changed, &mut session));
++            },
++            command = commands.recv() => match command {
++                Some(DiscoveryCommand::Stop(reply)) => {
++                    match await_discovery_operation(stop(), &mut events, &mut session, true).await {
++                        DiscoveryOperationOutcome::Completed(Ok(())) => {
++                            return DiscoveryOwnerExit::Stopped(reply);
++                        }
++                        DiscoveryOperationOutcome::Completed(Err(error))
++                            if confirms_discovery_absent_error(&error) => {
++                                return DiscoveryOwnerExit::Stopped(reply);
++                            }
++                        DiscoveryOperationOutcome::Completed(Err(error)) => {
++                            let _ = reply.send(Err(error));
++                        }
++                        DiscoveryOperationOutcome::Terminated(
++                            DiscoveryTermination::DiscoveringStopped,
++                        ) => return DiscoveryOwnerExit::Stopped(reply),
++                        DiscoveryOperationOutcome::Terminated(reason) => {
++                            return DiscoveryOwnerExit::Terminated(reason);
++                        }
++                    }
++                }
++                None => {
++                    cleanup_unconfirmed_discovery(&mut events, &mut session, &mut stop).await;
++                    return DiscoveryOwnerExit::Released;
++                }
++            },
++            event = events.next() => match event {
++                Some(AdapterEvent::PropertyChanged(AdapterProperty::Discovering(false))) => {
++                    return DiscoveryOwnerExit::Terminated(DiscoveryTermination::DiscoveringStopped);
++                }
++                Some(_) => {},
++                None => {
++                    return DiscoveryOwnerExit::Terminated(DiscoveryTermination::AdapterRemoved);
++                }
++            },
++        }
++    }
++}
++
++fn discovery_registration_error(reason: &DiscoveryTermination) -> Error {
++    match reason {
++        DiscoveryTermination::DiscoveringStopped => Error::new(ErrorKind::NotReady),
++        DiscoveryTermination::AdapterRemoved => Error::new(ErrorKind::NotFound),
++        DiscoveryTermination::SessionEnded(error) => error.clone(),
++    }
++}
++
++async fn establish_discovery<Start, PreBaseline, Discovering, PostBaseline, Events>(
++    startup: DiscoveryStartup<Start, PreBaseline, Discovering, PostBaseline>,
++    events: &mut Events,
++    session: &mut watch::Receiver<Option<Error>>,
++) -> DiscoveryOperationOutcome<()>
++where
++    Start: Future<Output = Result<()>>,
++    PreBaseline: Future<Output = Result<()>>,
++    Discovering: Future<Output = Result<bool>>,
++    PostBaseline: Future<Output = Result<()>>,
++    Events: Stream<Item = AdapterEvent> + Unpin,
++{
++    let DiscoveryStartup {
++        start,
++        pre_state_baseline,
++        discovering,
++        post_start_baseline,
++    } = startup;
++
++    match await_discovery_operation(start, events, session, false).await {
++        DiscoveryOperationOutcome::Completed(Ok(())) => {
++            if let Some(reason) = drain_discovery_events(events, false) {
++                return DiscoveryOperationOutcome::Terminated(reason);
++            }
++        }
++        outcome => return outcome,
++    }
++
++    match await_discovery_operation(pre_state_baseline, events, session, false).await {
++        DiscoveryOperationOutcome::Completed(Ok(())) => {
++            if let Some(reason) = drain_discovery_events(events, false) {
++                return DiscoveryOperationOutcome::Terminated(reason);
++            }
++        }
++        outcome => return outcome,
++    }
++
++    // Flush callback backlog, reconcile the property, then fence signals that
++    // raced the property response before publishing ownership.
++    match await_discovery_operation(discovering, events, session, true).await {
++        DiscoveryOperationOutcome::Completed(Ok(true)) => {}
++        DiscoveryOperationOutcome::Completed(Ok(false)) => {
++            return DiscoveryOperationOutcome::Terminated(
++                DiscoveryTermination::DiscoveringStopped,
++            );
++        }
++        DiscoveryOperationOutcome::Completed(Err(error)) => {
++            return DiscoveryOperationOutcome::Completed(Err(error));
++        }
++        DiscoveryOperationOutcome::Terminated(reason) => {
++            return DiscoveryOperationOutcome::Terminated(reason);
++        }
++    }
++
++    match await_discovery_operation(post_start_baseline, events, session, true).await {
++        DiscoveryOperationOutcome::Completed(Ok(())) => {
++            match drain_discovery_events(events, true) {
++                Some(reason) => DiscoveryOperationOutcome::Terminated(reason),
++                None => DiscoveryOperationOutcome::Completed(Ok(())),
++            }
++        }
++        outcome => outcome,
++    }
++}
++
++async fn await_discovery_operation<Operation, Events, Output>(
++    operation: Operation,
++    events: &mut Events,
++    session: &mut watch::Receiver<Option<Error>>,
++    stopped_proves_completion: bool,
++) -> DiscoveryOperationOutcome<Output>
++where
++    Operation: Future<Output = Result<Output>>,
++    Events: Stream<Item = AdapterEvent> + Unpin,
++{
++    tokio::pin!(operation);
++    loop {
++        tokio::select! {
++            biased;
++            result = &mut operation => return DiscoveryOperationOutcome::Completed(result),
++            changed = session.changed() => {
++                return DiscoveryOperationOutcome::Terminated(session_ended(changed, session));
++            },
++            event = events.next() => match event {
++                Some(AdapterEvent::PropertyChanged(AdapterProperty::Discovering(false)))
++                    if stopped_proves_completion => {
++                    return DiscoveryOperationOutcome::Terminated(
++                        DiscoveryTermination::DiscoveringStopped,
++                    );
++                }
++                Some(_) => {}
++                None => {
++                    return DiscoveryOperationOutcome::Terminated(
++                        DiscoveryTermination::AdapterRemoved,
++                    );
++                }
++            },
++        }
++    }
++}
++
++fn drain_discovery_events<Events>(
++    events: &mut Events,
++    stopped_proves_completion: bool,
++) -> Option<DiscoveryTermination>
++where
++    Events: Stream<Item = AdapterEvent> + Unpin,
++{
++    while let Some(event) = events.next().now_or_never() {
++        match event {
++            Some(AdapterEvent::PropertyChanged(AdapterProperty::Discovering(false)))
++                if stopped_proves_completion =>
++            {
++                return Some(DiscoveryTermination::DiscoveringStopped);
++            }
++            Some(_) => {}
++            None => return Some(DiscoveryTermination::AdapterRemoved),
++        }
++    }
++    None
++}
++
++async fn cleanup_unconfirmed_discovery<Events, Stop, StopFuture>(
++    events: &mut Events,
++    session: &mut watch::Receiver<Option<Error>>,
++    stop: &mut Stop,
++) where
++    Events: Stream<Item = AdapterEvent> + Unpin,
++    Stop: FnMut() -> StopFuture,
++    StopFuture: Future<Output = Result<()>>,
++{
++    loop {
++        match await_discovery_operation(stop(), events, session, true).await {
++            DiscoveryOperationOutcome::Completed(Ok(())) => return,
++            DiscoveryOperationOutcome::Completed(Err(error))
++                if confirms_discovery_absent_error(&error) => return,
++            DiscoveryOperationOutcome::Completed(_) => {}
++            DiscoveryOperationOutcome::Terminated(_) => return,
++        }
++        tokio::select! {
++            changed = session.changed() => {
++                if changed.is_err() || session.borrow_and_update().is_some() {
++                    return;
++                }
++            },
++            event = events.next() => match event {
++                Some(AdapterEvent::PropertyChanged(AdapterProperty::Discovering(false))) | None => return,
++                Some(_) => {},
++            },
++            () = tokio::time::sleep(Duration::from_secs(1)) => {},
++        }
++    }
++}
++
++fn session_ended(
++    changed: std::result::Result<(), watch::error::RecvError>,
++    session: &mut watch::Receiver<Option<Error>>,
++) -> DiscoveryTermination {
++    let error = if changed.is_err() {
++        Error::new(ErrorKind::Internal(InternalErrorKind::DBusConnectionLost))
++    } else {
++        session.borrow_and_update().clone().unwrap_or_else(|| {
++            Error::new(ErrorKind::Internal(InternalErrorKind::DBusConnectionLost))
++        })
++    };
++    DiscoveryTermination::SessionEnded(error)
++}
++
++fn confirms_discovery_absent_error(error: &Error) -> bool {
++    matches!(
++        error.kind,
++        ErrorKind::DoesNotExist
++            | ErrorKind::NotFound
++            | ErrorKind::NotReady
++            | ErrorKind::NotRegistered
++    )
++}
++
++/// Independently proven owned-discovery termination.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub enum DiscoveryTermination {
++    /// BlueZ acknowledged stop or reported discovery stopped.
++    DiscoveringStopped,
++    /// The adapter event stream ended or the adapter was removed.
++    AdapterRemoved,
++    /// The owning D-Bus session ended.
++    SessionEnded(Error),
++}
++
++/// Exclusive owned discovery session with acknowledged stop.
++#[must_use = "DiscoverySession must be held while discovery is active"]
++pub struct DiscoverySession {
++    commands: mpsc::Sender<DiscoveryCommand>,
++    termination: watch::Receiver<Option<DiscoveryTermination>>,
++}
++
++impl DiscoverySession {
++    /// Requests discovery stop and waits for BlueZ acknowledgement.
++    pub async fn stop(&mut self) -> Result<()> {
++        let (reply, result) = oneshot::channel();
++        self.commands
++            .send(DiscoveryCommand::Stop(reply))
++            .await
++            .map_err(|_| Error::new(ErrorKind::NotRegistered))?;
++        result
++            .await
++            .map_err(|_| Error::new(ErrorKind::NotRegistered))?
++    }
++
++    /// Waits for acknowledged stop, adapter removal, or session loss.
++    pub async fn terminated(&self) -> DiscoveryTermination {
++        let mut termination = self.termination.clone();
++        loop {
++            if let Some(reason) = termination.borrow_and_update().clone() {
++                return reason;
++            }
++            if termination.changed().await.is_err() {
++                return DiscoveryTermination::SessionEnded(Error::new(ErrorKind::Internal(
++                    InternalErrorKind::DBusConnectionLost,
++                )));
++            }
++        }
++    }
++}
++
+ impl Debug for Adapter {
+     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+         f.debug_struct("Adapter").field("name", &self.name()).finish()
+@@ -142,12 +536,13 @@
+     /// The discovery filter can only be changed when no device discovery is currently active.
+     /// Otherwise a [DiscoveryActive error](ErrorKind::DiscoveryActive) will be returned.
+     pub async fn set_discovery_filter(&self, discovery_filter: DiscoveryFilter) -> Result<()> {
+-        if self.inner.is_single_session_active(&self.dbus_path).await {
+-            return Err(Error::new(ErrorKind::DiscoveryActive));
+-        }
+-
+-        self.inner.adapter_discovery_filter.lock().await.insert(self.name().to_string(), discovery_filter);
+-        Ok(())
++        self.inner
++            .set_discovery_filter_if_idle(
++                &self.dbus_path,
++                self.name().to_string(),
++                discovery_filter,
++            )
++            .await
+     }
+ 
+     /// This method starts the device discovery session.
+@@ -265,6 +660,69 @@
+         Ok(token)
+     }
+ 
++    /// Starts one exclusive discovery session with an acknowledged stop handle.
++    pub async fn start_discovery_session(&self) -> Result<DiscoverySession> {
++        self.inner
++            .reserve_exclusive_session(&self.dbus_path)
++            .await?;
++        let (commands, command_rx) = mpsc::channel(1);
++        let (termination, termination_rx) = watch::channel(None);
++        let (registration_tx, registration_rx) = oneshot::channel();
++        let adapter = self.clone();
++        let events_adapter = adapter.clone();
++        let filter_adapter = adapter.clone();
++        let start_adapter = adapter.clone();
++        let state_adapter = adapter.clone();
++        let stop_adapter = adapter.clone();
++        let pre_state_baseline = adapter.inner.event_ingress_barrier();
++        let post_start_baseline = pre_state_baseline.clone();
++        let session = self.inner.terminal.subscribe();
++
++        tokio::spawn(async move {
++            let exit = run_discovery_owner(
++                async move { events_adapter.events().await },
++                async move {
++                    filter_adapter
++                        .call_method(
++                            "SetDiscoveryFilter",
++                            (filter_adapter.discovery_filter().await.into_dict(),),
++                        )
++                        .await
++                },
++                DiscoveryStartup {
++                    start: async move {
++                        start_adapter.call_method("StartDiscovery", ()).await
++                    },
++                    pre_state_baseline: async move { pre_state_baseline.wait().await },
++                    discovering: async move { state_adapter.is_discovering().await },
++                    post_start_baseline: async move { post_start_baseline.wait().await },
++                },
++                move || {
++                    let adapter = stop_adapter.clone();
++                    async move { adapter.call_method("StopDiscovery", ()).await }
++                },
++                registration_tx,
++                command_rx,
++                session,
++            )
++            .await;
++
++            adapter
++                .inner
++                .release_exclusive_session(&adapter.dbus_path)
++                .await;
++            exit.finish(termination);
++        });
++
++        registration_rx.await.map_err(|_| {
++            Error::new(ErrorKind::Internal(InternalErrorKind::DBusConnectionLost))
++        })??;
++        Ok(DiscoverySession {
++            commands,
++            termination: termination_rx,
++        })
++    }
++
+     dbus_interface!();
+     dbus_default_interface!(INTERFACE);
+ 
+@@ -806,3 +1264,434 @@
+         hm
+     }
+ }
++
++#[cfg(test)]
++mod aster_tests {
++    use super::*;
++    use std::{
++        future::Future,
++        sync::{
++            atomic::{AtomicUsize, Ordering},
++            Arc,
++        },
++    };
++
++    fn session() -> (
++        DiscoverySession,
++        mpsc::Receiver<DiscoveryCommand>,
++        watch::Sender<Option<DiscoveryTermination>>,
++    ) {
++        let (commands, command_rx) = mpsc::channel(1);
++        let (termination, termination_rx) = watch::channel(None);
++        (
++            DiscoverySession {
++                commands,
++                termination: termination_rx,
++            },
++            command_rx,
++            termination,
++        )
++    }
++
++    #[tokio::test]
++    async fn owned_discovery_stop_waits_for_ack_after_waiter_cancellation() {
++        let (mut discovery, commands, termination) = session();
++        let stops = Arc::new(AtomicUsize::new(0));
++        let observed = stops.clone();
++        let started = Arc::new(tokio::sync::Notify::new());
++        let owner_started = started.clone();
++        let allow_reply = Arc::new(tokio::sync::Notify::new());
++        let owner_reply = allow_reply.clone();
++        let (registration_reply, registration_result) = oneshot::channel();
++        let (_session_tx, session_rx) = watch::channel(None);
++        let owner = tokio::spawn(async move {
++            let exit = run_discovery_owner(
++                std::future::ready(Ok(stream::pending::<AdapterEvent>())),
++                std::future::ready(Ok(())),
++                DiscoveryStartup {
++                    start: std::future::ready(Ok(())),
++                    pre_state_baseline: std::future::ready(Ok(())),
++                    discovering: std::future::ready(Ok(true)),
++                    post_start_baseline: std::future::ready(Ok(())),
++                },
++                move || {
++                    let observed = observed.clone();
++                    let started = owner_started.clone();
++                    let allow = owner_reply.clone();
++                    async move {
++                        observed.fetch_add(1, Ordering::AcqRel);
++                        started.notify_one();
++                        allow.notified().await;
++                        Ok(())
++                    }
++                },
++                registration_reply,
++                commands,
++                session_rx,
++            )
++            .await;
++            exit.finish(termination);
++        });
++        registration_result.await.unwrap().unwrap();
++
++        let mut stop = Box::pin(discovery.stop());
++        std::future::poll_fn(|context| {
++            assert!(stop.as_mut().poll(context).is_pending());
++            std::task::Poll::Ready(())
++        })
++        .await;
++        started.notified().await;
++        assert_eq!(stops.load(Ordering::Acquire), 1);
++        drop(stop);
++        allow_reply.notify_one();
++        owner.await.unwrap();
++        assert_eq!(stops.load(Ordering::Acquire), 1);
++    }
++
++    #[tokio::test]
++    async fn pending_stop_observes_discovering_stopped() {
++        let (mut discovery, commands, termination) = session();
++        let (event_tx, event_rx) = mpsc::channel(1);
++        let stop_started = Arc::new(tokio::sync::Notify::new());
++        let owner_stop_started = stop_started.clone();
++        let (registration_reply, registration_result) = oneshot::channel();
++        let (_session_tx, session_rx) = watch::channel(None);
++        let owner = tokio::spawn(async move {
++            let exit = run_discovery_owner(
++                std::future::ready(Ok(ReceiverStream::new(event_rx))),
++                std::future::ready(Ok(())),
++                DiscoveryStartup {
++                    start: std::future::ready(Ok(())),
++                    pre_state_baseline: std::future::ready(Ok(())),
++                    discovering: std::future::ready(Ok(true)),
++                    post_start_baseline: std::future::ready(Ok(())),
++                },
++                move || {
++                    let started = owner_stop_started.clone();
++                    async move {
++                        started.notify_one();
++                        std::future::pending::<Result<()>>().await
++                    }
++                },
++                registration_reply,
++                commands,
++                session_rx,
++            )
++            .await;
++            exit.finish(termination);
++        });
++        registration_result.await.unwrap().unwrap();
++
++        let stopped = tokio::spawn(async move { discovery.stop().await });
++        stop_started.notified().await;
++        event_tx
++            .send(AdapterEvent::PropertyChanged(
++                AdapterProperty::Discovering(false),
++            ))
++            .await
++            .unwrap();
++
++        stopped.await.unwrap().unwrap();
++        owner.await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn registration_cancellation_releases_before_event_subscription_finishes() {
++        let (registration_reply, registration_result) = oneshot::channel();
++        drop(registration_result);
++        let (_commands, command_rx) = mpsc::channel(1);
++        let (_session_tx, session_rx) = watch::channel(None);
++        let stops = Arc::new(AtomicUsize::new(0));
++        let observed = stops.clone();
++
++        let exit = run_discovery_owner(
++            std::future::pending::<Result<futures::stream::Pending<AdapterEvent>>>(),
++            std::future::ready(Ok(())),
++            DiscoveryStartup {
++                start: std::future::ready(Ok(())),
++                pre_state_baseline: std::future::ready(Ok(())),
++                discovering: std::future::ready(Ok(true)),
++                post_start_baseline: std::future::ready(Ok(())),
++            },
++            move || {
++                observed.fetch_add(1, Ordering::AcqRel);
++                std::future::ready(Ok(()))
++            },
++            registration_reply,
++            command_rx,
++            session_rx,
++        )
++        .await;
++
++        assert!(matches!(exit, DiscoveryOwnerExit::Released));
++        assert_eq!(stops.load(Ordering::Acquire), 0);
++    }
++
++    #[tokio::test]
++    async fn ambiguous_start_failure_is_stopped_before_error_is_returned() {
++        let (registration_reply, mut registration_result) = oneshot::channel();
++        let (_commands, command_rx) = mpsc::channel(1);
++        let (_session_tx, session_rx) = watch::channel(None);
++        let stops = Arc::new(AtomicUsize::new(0));
++        let observed = stops.clone();
++        let start_error = Error::new(ErrorKind::Failed);
++
++        let exit = run_discovery_owner(
++            std::future::ready(Ok(stream::pending::<AdapterEvent>())),
++            std::future::ready(Ok(())),
++            DiscoveryStartup {
++                start: std::future::ready(Err(start_error.clone())),
++                pre_state_baseline: std::future::ready(Ok(())),
++                discovering: std::future::ready(Ok(true)),
++                post_start_baseline: std::future::ready(Ok(())),
++            },
++            move || {
++                observed.fetch_add(1, Ordering::AcqRel);
++                std::future::ready(Ok(()))
++            },
++            registration_reply,
++            command_rx,
++            session_rx,
++        )
++        .await;
++
++        assert_eq!(stops.load(Ordering::Acquire), 1);
++        assert!(registration_result.try_recv().is_err());
++        let (termination, _termination_rx) = watch::channel(None);
++        exit.finish(termination);
++        assert_eq!(registration_result.await.unwrap(), Err(start_error));
++    }
++
++    #[tokio::test]
++    async fn cleanup_accepts_not_ready_as_proof_discovery_is_absent() {
++        let mut events = stream::pending::<AdapterEvent>();
++        let (_session_tx, mut session_rx) = watch::channel(None);
++        let mut stop = || std::future::ready(Err(Error::new(ErrorKind::NotReady)));
++        let mut cleanup = Box::pin(cleanup_unconfirmed_discovery(
++            &mut events,
++            &mut session_rx,
++            &mut stop,
++        ));
++
++        let first_poll = std::future::poll_fn(|context| {
++            std::task::Poll::Ready(cleanup.as_mut().poll(context))
++        })
++        .await;
++
++        assert!(first_poll.is_ready());
++    }
++
++    #[tokio::test]
++    async fn pending_start_observes_session_termination() {
++        let (registration_reply, registration_result) = oneshot::channel();
++        let (_commands, command_rx) = mpsc::channel(1);
++        let (session_tx, session_rx) = watch::channel(None);
++        let mut owner = Box::pin(run_discovery_owner(
++            std::future::ready(Ok(stream::pending::<AdapterEvent>())),
++            std::future::ready(Ok(())),
++            DiscoveryStartup {
++                start: std::future::pending::<Result<()>>(),
++                pre_state_baseline: std::future::ready(Ok(())),
++                discovering: std::future::ready(Ok(true)),
++                post_start_baseline: std::future::ready(Ok(())),
++            },
++            || std::future::ready(Ok(())),
++            registration_reply,
++            command_rx,
++            session_rx,
++        ));
++
++        let first_poll = std::future::poll_fn(|context| {
++            std::task::Poll::Ready(owner.as_mut().poll(context))
++        })
++        .await;
++        assert!(first_poll.is_pending());
++
++        let session_error = Error::new(ErrorKind::Internal(InternalErrorKind::IngressOverflow));
++        session_tx.send_replace(Some(session_error.clone()));
++        let second_poll = std::future::poll_fn(|context| {
++            std::task::Poll::Ready(owner.as_mut().poll(context))
++        })
++        .await;
++        let std::task::Poll::Ready(exit) = second_poll else {
++            panic!("session termination must stop registration");
++        };
++        assert!(matches!(
++            &exit,
++            DiscoveryOwnerExit::RegistrationTerminated(
++                _,
++                DiscoveryTermination::SessionEnded(error)
++            ) if *error == session_error
++        ));
++        let (termination, _termination_rx) = watch::channel(None);
++        exit.finish(termination);
++        assert_eq!(registration_result.await.unwrap(), Err(session_error));
++    }
++
++    #[tokio::test]
++    async fn queued_pre_start_false_does_not_terminate_started_discovery() {
++        let (registration_reply, mut registration_result) = oneshot::channel();
++        let (_commands, command_rx) = mpsc::channel(1);
++        let (_session_tx, session_rx) = watch::channel(None);
++        let events = stream::iter([AdapterEvent::PropertyChanged(
++            AdapterProperty::Discovering(false),
++        )])
++        .chain(stream::pending());
++        let mut owner = Box::pin(run_discovery_owner(
++            std::future::ready(Ok(events)),
++            std::future::ready(Ok(())),
++            DiscoveryStartup {
++                start: std::future::ready(Ok(())),
++                pre_state_baseline: std::future::ready(Ok(())),
++                discovering: std::future::ready(Ok(true)),
++                post_start_baseline: std::future::ready(Ok(())),
++            },
++            || std::future::ready(Ok(())),
++            registration_reply,
++            command_rx,
++            session_rx,
++        ));
++
++        let first_poll = std::future::poll_fn(|context| {
++            std::task::Poll::Ready(owner.as_mut().poll(context))
++        })
++        .await;
++
++        assert!(first_poll.is_pending());
++        assert_eq!(registration_result.try_recv().unwrap(), Ok(()));
++    }
++
++    #[tokio::test]
++    async fn pre_state_baseline_forwards_stale_false_before_registration() {
++        let (registration_reply, mut registration_result) = oneshot::channel();
++        let (_commands, command_rx) = mpsc::channel(1);
++        let (_session_tx, session_rx) = watch::channel(None);
++        let (event_tx, event_rx) = mpsc::channel(1);
++        let _event_tx = event_tx.clone();
++        let baseline_reached = Arc::new(AtomicUsize::new(0));
++        let observed = baseline_reached.clone();
++        let mut owner = Box::pin(run_discovery_owner(
++            std::future::ready(Ok(ReceiverStream::new(event_rx))),
++            std::future::ready(Ok(())),
++            DiscoveryStartup {
++                start: std::future::ready(Ok(())),
++                pre_state_baseline: async move {
++                    event_tx
++                        .send(AdapterEvent::PropertyChanged(
++                            AdapterProperty::Discovering(false),
++                        ))
++                        .await
++                        .unwrap();
++                    observed.fetch_add(1, Ordering::AcqRel);
++                    Ok(())
++                },
++                discovering: std::future::ready(Ok(true)),
++                post_start_baseline: std::future::ready(Ok(())),
++            },
++            || std::future::ready(Ok(())),
++            registration_reply,
++            command_rx,
++            session_rx,
++        ));
++
++        let first_poll = std::future::poll_fn(|context| {
++            std::task::Poll::Ready(owner.as_mut().poll(context))
++        })
++        .await;
++
++        assert!(first_poll.is_pending());
++        assert_eq!(baseline_reached.load(Ordering::Acquire), 1);
++        assert_eq!(registration_result.try_recv().unwrap(), Ok(()));
++    }
++
++    #[tokio::test]
++    async fn false_after_authoritative_state_prevents_registration() {
++        let (registration_reply, registration_result) = oneshot::channel();
++        let (_commands, command_rx) = mpsc::channel(1);
++        let (_session_tx, session_rx) = watch::channel(None);
++        let (event_tx, event_rx) = mpsc::channel(1);
++        let exit = run_discovery_owner(
++            std::future::ready(Ok(ReceiverStream::new(event_rx))),
++            std::future::ready(Ok(())),
++            DiscoveryStartup {
++                start: std::future::ready(Ok(())),
++                pre_state_baseline: std::future::ready(Ok(())),
++                discovering: std::future::ready(Ok(true)),
++                post_start_baseline: async move {
++                    event_tx
++                        .send(AdapterEvent::PropertyChanged(
++                            AdapterProperty::Discovering(false),
++                        ))
++                        .await
++                        .unwrap();
++                    Ok(())
++                },
++            },
++            || std::future::ready(Ok(())),
++            registration_reply,
++            command_rx,
++            session_rx,
++        )
++        .await;
++
++        assert!(matches!(
++            &exit,
++            DiscoveryOwnerExit::RegistrationTerminated(
++                _,
++                DiscoveryTermination::DiscoveringStopped
++            )
++        ));
++        let (termination, _termination_rx) = watch::channel(None);
++        exit.finish(termination);
++        assert_eq!(
++            registration_result.await.unwrap(),
++            Err(Error::new(ErrorKind::NotReady))
++        );
++    }
++
++    #[tokio::test]
++    async fn adapter_removal_before_registration_returns_not_found() {
++        let (registration_reply, registration_result) = oneshot::channel();
++        let (_commands, command_rx) = mpsc::channel(1);
++        let (_session_tx, session_rx) = watch::channel(None);
++        let exit = run_discovery_owner(
++            std::future::ready(Ok(stream::empty::<AdapterEvent>())),
++            std::future::ready(Ok(())),
++            DiscoveryStartup {
++                start: std::future::pending::<Result<()>>(),
++                pre_state_baseline: std::future::ready(Ok(())),
++                discovering: std::future::ready(Ok(true)),
++                post_start_baseline: std::future::ready(Ok(())),
++            },
++            || std::future::ready(Ok(())),
++            registration_reply,
++            command_rx,
++            session_rx,
++        )
++        .await;
++
++        assert!(matches!(
++            &exit,
++            DiscoveryOwnerExit::RegistrationTerminated(
++                _,
++                DiscoveryTermination::AdapterRemoved
++            )
++        ));
++        let (termination, _termination_rx) = watch::channel(None);
++        exit.finish(termination);
++        assert_eq!(
++            registration_result.await.unwrap(),
++            Err(Error::new(ErrorKind::NotFound))
++        );
++    }
++
++    #[tokio::test]
++    async fn owned_discovery_termination_is_persistent() {
++        let (session, _commands, termination) = session();
++        termination.send_replace(Some(DiscoveryTermination::DiscoveringStopped));
++        assert_eq!(
++            session.terminated().await,
++            DiscoveryTermination::DiscoveringStopped
++        );
++    }
++}
+--- a/src/adv.rs
++++ b/src/adv.rs
+@@ -2,20 +2,24 @@
+ 
+ use dbus::{
+     arg::{PropMap, RefArg, Variant},
+-    nonblock::Proxy,
++    nonblock::{Proxy, SyncConnection},
+ };
+ use dbus_crossroads::{Crossroads, IfaceBuilder, IfaceToken};
+-use futures::channel::oneshot;
+ use std::{
+     collections::{BTreeMap, BTreeSet, HashMap},
+     fmt,
++    future::Future,
+     sync::Arc,
+     time::Duration,
+ };
+ use strum::{Display, EnumString};
++use tokio::sync::{mpsc, oneshot, watch};
+ use uuid::Uuid;
+ 
+-use crate::{read_dict, Adapter, Result, SessionInner, SERVICE_NAME, TIMEOUT};
++use crate::{
++    method_call, read_dict, Adapter, Error, ErrorKind, InternalErrorKind, Result, SessionInner,
++    SERVICE_NAME, TIMEOUT,
++};
+ 
+ pub(crate) const MANAGER_INTERFACE: &str = "org.bluez.LEAdvertisingManager1";
+ pub(crate) const ADVERTISEMENT_INTERFACE: &str = "org.bluez.LEAdvertisement1";
+@@ -236,59 +240,72 @@
+     pub _non_exhaustive: (),
+ }
+ 
++pub(crate) struct RegisteredAdvertisement {
++    advertisement: Advertisement,
++    release: watch::Sender<bool>,
++}
++
+ impl Advertisement {
+-    pub(crate) fn register_interface(cr: &mut Crossroads) -> IfaceToken<Self> {
+-        cr.register(ADVERTISEMENT_INTERFACE, |ib: &mut IfaceBuilder<Self>| {
++    pub(crate) fn register_interface(
++        cr: &mut Crossroads,
++    ) -> IfaceToken<Arc<RegisteredAdvertisement>> {
++        cr.register(ADVERTISEMENT_INTERFACE, |ib: &mut IfaceBuilder<Arc<RegisteredAdvertisement>>| {
+             cr_property!(ib, "Type", la => {
+-                Some(la.advertisement_type.to_string())
++                Some(la.advertisement.advertisement_type.to_string())
+             });
+             cr_property!(ib, "ServiceUUIDs", la => {
+-                Some(la.service_uuids.iter().map(|uuid| uuid.to_string()).collect::<Vec<_>>())
++                Some(la.advertisement.service_uuids.iter().map(|uuid| uuid.to_string()).collect::<Vec<_>>())
+             });
+             cr_property!(ib, "ManufacturerData", la => {
+-                Some(la.manufacturer_data.clone().into_iter().map(|(k, v)| (k, Variant(v))).collect::<HashMap<_, _>>())
++                Some(la.advertisement.manufacturer_data.clone().into_iter().map(|(k, v)| (k, Variant(v))).collect::<HashMap<_, _>>())
+             });
+             cr_property!(ib, "SolicitUUIDs", la => {
+-                Some(la.solicit_uuids.iter().map(|uuid| uuid.to_string()).collect::<Vec<_>>())
++                Some(la.advertisement.solicit_uuids.iter().map(|uuid| uuid.to_string()).collect::<Vec<_>>())
+             });
+             cr_property!(ib, "ServiceData", la => {
+-                Some(la.service_data.iter().map(|(k, v)| (k.to_string(), Variant(v.clone()))).collect::<HashMap<_, _>>())
++                Some(la.advertisement.service_data.iter().map(|(k, v)| (k.to_string(), Variant(v.clone()))).collect::<HashMap<_, _>>())
+             });
+             cr_property!(ib, "Data", la => {
+-                Some(la.advertising_data.iter().map(|(k, v)| (*k, Variant(v.clone()))).collect::<HashMap<_, _>>())
++                Some(la.advertisement.advertising_data.iter().map(|(k, v)| (*k, Variant(v.clone()))).collect::<HashMap<_, _>>())
+             });
+             cr_property!(ib, "Discoverable", la => {
+-                la.discoverable
++                la.advertisement.discoverable
+             });
+             cr_property!(ib, "DiscoverableTimeout", la => {
+-                la.discoverable_timeout.map(|t| t.as_secs().min(u16::MAX as _) as u16)
++                la.advertisement.discoverable_timeout.map(|t| t.as_secs().min(u16::MAX as _) as u16)
+             });
+             cr_property!(ib, "Includes", la => {
+-                Some(la.system_includes.iter().map(|v| v.to_string()).collect::<Vec<_>>())
++                Some(la.advertisement.system_includes.iter().map(|v| v.to_string()).collect::<Vec<_>>())
+             });
+             cr_property!(ib, "LocalName", la => {
+-                la.local_name.clone()
++                la.advertisement.local_name.clone()
+             });
+             cr_property!(ib, "Appearance", la => {
+-                la.appearance
++                la.advertisement.appearance
+             });
+             cr_property!(ib, "Duration", la => {
+-                la.duration.map(|t| t.as_secs().min(u16::MAX as _) as u16)
++                la.advertisement.duration.map(|t| t.as_secs().min(u16::MAX as _) as u16)
+             });
+             cr_property!(ib, "Timeout", la => {
+-                la.timeout.map(|t| t.as_secs().min(u16::MAX as _) as u16)
++                la.advertisement.timeout.map(|t| t.as_secs().min(u16::MAX as _) as u16)
+             });
+             cr_property!(ib, "SecondaryChannel", la => {
+-                la.secondary_channel.map(|v| v.to_string())
++                la.advertisement.secondary_channel.map(|v| v.to_string())
+             });
+             cr_property!(ib, "MinInterval", la => {
+-                la.min_interval.map(|t| t.as_millis().min(u32::MAX as _) as u32)
++                la.advertisement.min_interval.map(|t| t.as_millis().min(u32::MAX as _) as u32)
+             });
+             cr_property!(ib, "MaxInterval", la => {
+-                la.max_interval.map(|t| t.as_millis().min(u32::MAX as _) as u32)
++                la.advertisement.max_interval.map(|t| t.as_millis().min(u32::MAX as _) as u32)
+             });
+             cr_property!(ib, "TxPower", la => {
+-                la.tx_power
++                la.advertisement.tx_power
++            });
++            ib.method_with_cr_async("Release", (), (), |ctx, cr, ()| {
++                method_call(ctx, cr, |registered: Arc<RegisteredAdvertisement>| async move {
++                    registered.release.send_replace(true);
++                    Ok(())
++                })
+             });
+         })
+     }
+@@ -297,44 +314,263 @@
+         self, inner: Arc<SessionInner>, adapter_name: Arc<String>,
+     ) -> Result<AdvertisementHandle> {
+         let name = dbus::Path::new(format!("{}{}", ADVERTISEMENT_PREFIX, Uuid::new_v4().as_simple())).unwrap();
++        let proxy = Proxy::new(
++            SERVICE_NAME,
++            Adapter::dbus_path(&adapter_name)?,
++            TIMEOUT,
++            inner.connection.clone(),
++        );
++        let (release, release_rx) = watch::channel(false);
+         log::trace!("Publishing advertisement at {}", &name);
+ 
+         {
+             let mut cr = inner.crossroads.lock().await;
+-            cr.insert(name.clone(), &[inner.le_advertisment_token], self);
++            cr.insert(
++                name.clone(),
++                &[inner.le_advertisment_token],
++                Arc::new(RegisteredAdvertisement {
++                    advertisement: self,
++                    release,
++                }),
++            );
+         }
+ 
+-        log::trace!("Registering advertisement at {}", &name);
+-        let proxy =
+-            Proxy::new(SERVICE_NAME, Adapter::dbus_path(&adapter_name)?, TIMEOUT, inner.connection.clone());
+-        let () =
+-            proxy.method_call(MANAGER_INTERFACE, "RegisterAdvertisement", (name.clone(), PropMap::new())).await?;
+-
+-        let (drop_tx, drop_rx) = oneshot::channel();
+-        let unreg_name = name.clone();
++        let (commands, command_rx) = mpsc::channel(1);
++        let (registration_tx, registration_rx) = oneshot::channel();
++        let owner_name = name.clone();
++        let mut owner_release = release_rx.clone();
++        let mut owner_session = inner.terminal.subscribe();
++        let handle_session = inner.terminal.subscribe();
+         tokio::spawn(async move {
+-            let _ = drop_rx.await;
+-
+-            log::trace!("Unregistering advertisement at {}", &unreg_name);
+-            let _: std::result::Result<(), dbus::Error> =
+-                proxy.method_call(MANAGER_INTERFACE, "UnregisterAdvertisement", (unreg_name.clone(),)).await;
++            log::trace!("Registering advertisement at {}", &owner_name);
++            let registration = proxy
++                .method_call(
++                    MANAGER_INTERFACE,
++                    "RegisterAdvertisement",
++                    (owner_name.clone(), PropMap::new()),
++                )
++                .await
++                .map_err(Error::from);
++            let exit = run_advertisement_owner(
++                registration,
++                registration_tx,
++                command_rx,
++                &mut owner_release,
++                &mut owner_session,
++                || unregister_advertisement(&proxy, &owner_name),
++            )
++            .await;
+ 
+-            log::trace!("Unpublishing advertisement at {}", &unreg_name);
++            log::trace!("Unpublishing advertisement at {}", &owner_name);
+             let mut cr = inner.crossroads.lock().await;
+-            let _: Option<Self> = cr.remove(&unreg_name);
++            let _: Option<Arc<RegisteredAdvertisement>> = cr.remove(&owner_name);
++            drop(cr);
++            exit.finish();
+         });
+ 
+-        Ok(AdvertisementHandle { name, _drop_tx: drop_tx })
++        registration_rx.await.map_err(|_| {
++            Error::new(ErrorKind::Internal(InternalErrorKind::DBusConnectionLost))
++        })??;
++        Ok(AdvertisementHandle {
++            name,
++            commands,
++            release: release_rx,
++            session: handle_session,
++        })
++    }
++}
++
++enum AdvertisementCommand {
++    Stop(oneshot::Sender<Result<()>>),
++}
++
++enum AdvertisementOwnerExit {
++    RegistrationFailed(oneshot::Sender<Result<()>>, Error),
++    Stopped(oneshot::Sender<Result<()>>),
++    Released,
++}
++
++impl AdvertisementOwnerExit {
++    fn finish(self) {
++        match self {
++            Self::RegistrationFailed(reply, error) => {
++                let _ = reply.send(Err(error));
++            }
++            Self::Stopped(reply) => {
++                let _ = reply.send(Ok(()));
++            }
++            Self::Released => {}
++        }
++    }
++}
++
++async fn unregister_advertisement(
++    proxy: &Proxy<'_, Arc<SyncConnection>>,
++    name: &dbus::Path<'static>,
++) -> Result<()> {
++    log::trace!("Unregistering advertisement at {}", name);
++    proxy
++        .method_call(
++            MANAGER_INTERFACE,
++            "UnregisterAdvertisement",
++            (name.clone(),),
++        )
++        .await
++        .map_err(Error::from)
++}
++
++async fn run_advertisement_owner<U, UFut>(
++    registration: Result<()>,
++    registration_reply: oneshot::Sender<Result<()>>,
++    mut commands: mpsc::Receiver<AdvertisementCommand>,
++    release: &mut watch::Receiver<bool>,
++    session: &mut watch::Receiver<Option<Error>>,
++    mut unregister: U,
++) -> AdvertisementOwnerExit
++where
++    U: FnMut() -> UFut,
++    UFut: Future<Output = Result<()>>,
++{
++    if let Err(error) = registration {
++        cleanup_unconfirmed_advertisement(release, session, &mut unregister).await;
++        return AdvertisementOwnerExit::RegistrationFailed(registration_reply, error);
++    }
++
++    let commands_open = registration_reply.send(Ok(())).is_ok();
++    if !commands_open {
++        cleanup_unconfirmed_advertisement(release, session, &mut unregister).await;
++        return AdvertisementOwnerExit::Released;
++    }
++
++    loop {
++        tokio::select! {
++            command = commands.recv(), if commands_open => match command {
++                Some(AdvertisementCommand::Stop(reply)) => {
++                    let result = unregister().await;
++                    if confirms_advertisement_absent(&result) {
++                        return AdvertisementOwnerExit::Stopped(reply);
++                    }
++                    if let Err(error) = result {
++                        let _ = reply.send(Err(error));
++                    }
++                },
++                None => {
++                    cleanup_unconfirmed_advertisement(release, session, &mut unregister).await;
++                    return AdvertisementOwnerExit::Released;
++                },
++            },
++            changed = release.changed() => {
++                if changed.is_err() || *release.borrow_and_update() {
++                    return AdvertisementOwnerExit::Released;
++                }
++            },
++            changed = session.changed() => {
++                if changed.is_err() || session.borrow_and_update().is_some() {
++                    return AdvertisementOwnerExit::Released;
++                }
++            },
++        }
++    }
++}
++
++async fn cleanup_unconfirmed_advertisement<U, UFut>(
++    release: &mut watch::Receiver<bool>,
++    session: &mut watch::Receiver<Option<Error>>,
++    unregister: &mut U,
++) where
++    U: FnMut() -> UFut,
++    UFut: Future<Output = Result<()>>,
++{
++    loop {
++        if confirms_advertisement_absent(&unregister().await) {
++            return;
++        }
++        tokio::select! {
++            changed = release.changed() => {
++                if changed.is_err() || *release.borrow_and_update() {
++                    return;
++                }
++            },
++            changed = session.changed() => {
++                if changed.is_err() || session.borrow_and_update().is_some() {
++                    return;
++                }
++            },
++            () = tokio::time::sleep(Duration::from_secs(1)) => {},
++        }
+     }
+ }
+ 
++fn confirms_advertisement_absent(result: &Result<()>) -> bool {
++    matches!(
++        result,
++        Ok(())
++            | Err(Error {
++                kind: ErrorKind::DoesNotExist | ErrorKind::NotFound | ErrorKind::NotRegistered,
++                ..
++            })
++    )
++}
++
++/// Independently proven advertisement termination.
++#[derive(Clone, Debug, Eq, PartialEq)]
++pub enum AdvertisementTermination {
++    /// BlueZ invoked `LEAdvertisement1.Release`.
++    Released,
++    /// The owning D-Bus session ended.
++    SessionEnded(Error),
++}
++
+ /// Handle to active Bluetooth LE advertisement.
+ ///
+ /// Drop to unregister advertisement.
+ #[must_use = "AdvertisementHandle must be held for advertisement to be broadcasted"]
+ pub struct AdvertisementHandle {
+     name: dbus::Path<'static>,
+-    _drop_tx: oneshot::Sender<()>,
++    commands: mpsc::Sender<AdvertisementCommand>,
++    release: watch::Receiver<bool>,
++    session: watch::Receiver<Option<Error>>,
++}
++
++impl AdvertisementHandle {
++    /// Requests unregister and waits for BlueZ to acknowledge it.
++    pub async fn stop(&mut self) -> Result<()> {
++        let (reply, result) = oneshot::channel();
++        self.commands
++            .send(AdvertisementCommand::Stop(reply))
++            .await
++            .map_err(|_| Error::new(ErrorKind::NotRegistered))?;
++        result
++            .await
++            .map_err(|_| Error::new(ErrorKind::NotRegistered))?
++    }
++
++    /// Waits for BlueZ release or terminal session loss.
++    pub async fn terminated(&self) -> AdvertisementTermination {
++        let mut release = self.release.clone();
++        let mut session = self.session.clone();
++        let mut release_open = true;
++        let mut session_open = true;
++        loop {
++            if *release.borrow_and_update() {
++                return AdvertisementTermination::Released;
++            }
++            if let Some(error) = session.borrow_and_update().clone() {
++                return AdvertisementTermination::SessionEnded(error);
++            }
++            tokio::select! {
++                changed = release.changed(), if release_open => {
++                    release_open = changed.is_ok();
++                },
++                changed = session.changed(), if session_open => {
++                    session_open = changed.is_ok();
++                },
++                else => return AdvertisementTermination::SessionEnded(
++                    Error::new(ErrorKind::Internal(InternalErrorKind::DBusConnectionLost))
++                ),
++            }
++        }
++    }
+ }
+ 
+ impl Drop for AdvertisementHandle {
+@@ -348,3 +584,154 @@
+         write!(f, "AdvertisementHandle {{ {} }}", &self.name)
+     }
+ }
++
++#[cfg(test)]
++mod aster_tests {
++    use super::*;
++    use std::{
++        future::Future,
++        sync::{
++            atomic::{AtomicUsize, Ordering},
++            Arc,
++        },
++    };
++
++    fn test_handle() -> (
++        AdvertisementHandle,
++        mpsc::Receiver<AdvertisementCommand>,
++        watch::Sender<bool>,
++        watch::Sender<Option<Error>>,
++    ) {
++        let (commands, command_rx) = mpsc::channel(1);
++        let (release, release_rx) = watch::channel(false);
++        let (session, session_rx) = watch::channel(None);
++        (
++            AdvertisementHandle {
++                name: "/org/bluez/aster_test".into(),
++                commands,
++                release: release_rx,
++                session: session_rx,
++            },
++            command_rx,
++            release,
++            session,
++        )
++    }
++
++    #[tokio::test]
++    async fn stop_waits_for_owner_ack_and_survives_waiter_cancellation() {
++        let (mut handle, commands, release, session) = test_handle();
++        let unregisters = Arc::new(AtomicUsize::new(0));
++        let observed = unregisters.clone();
++        let started = Arc::new(tokio::sync::Notify::new());
++        let owner_started = started.clone();
++        let allow_reply = Arc::new(tokio::sync::Notify::new());
++        let owner_reply = allow_reply.clone();
++        let (registration_reply, registration_result) = oneshot::channel();
++        let mut owner_release = release.subscribe();
++        let mut owner_session = session.subscribe();
++        let owner = tokio::spawn(async move {
++            let exit = run_advertisement_owner(
++                Ok(()),
++                registration_reply,
++                commands,
++                &mut owner_release,
++                &mut owner_session,
++                move || {
++                    let observed = observed.clone();
++                    let started = owner_started.clone();
++                    let allow = owner_reply.clone();
++                    async move {
++                        observed.fetch_add(1, Ordering::AcqRel);
++                        started.notify_one();
++                        allow.notified().await;
++                        Ok(())
++                    }
++                },
++            )
++            .await;
++            exit.finish();
++        });
++        registration_result.await.unwrap().unwrap();
++
++        let mut stop = Box::pin(handle.stop());
++        std::future::poll_fn(|context| {
++            assert!(stop.as_mut().poll(context).is_pending());
++            std::task::Poll::Ready(())
++        })
++        .await;
++        started.notified().await;
++        assert_eq!(unregisters.load(Ordering::Acquire), 1);
++        drop(stop);
++        allow_reply.notify_one();
++        owner.await.unwrap();
++        assert_eq!(unregisters.load(Ordering::Acquire), 1);
++    }
++
++    #[tokio::test]
++    async fn failed_registration_attempts_cleanup_before_returning_error() {
++        let (_handle, commands, release, session) = test_handle();
++        let calls = Arc::new(AtomicUsize::new(0));
++        let observed = calls.clone();
++        let signal_release = release.clone();
++        let mut owner_release = release.subscribe();
++        let mut owner_session = session.subscribe();
++        let (registration_reply, mut registration_result) = oneshot::channel();
++        let registration_error = Error::new(ErrorKind::Failed);
++
++        let exit = run_advertisement_owner(
++            Err(registration_error.clone()),
++            registration_reply,
++            commands,
++            &mut owner_release,
++            &mut owner_session,
++            move || {
++                observed.fetch_add(1, Ordering::AcqRel);
++                signal_release.send_replace(true);
++                std::future::ready(Err(Error::new(ErrorKind::Failed)))
++            },
++        )
++        .await;
++
++        assert_eq!(calls.load(Ordering::Acquire), 1);
++        assert!(registration_result.try_recv().is_err());
++        exit.finish();
++        assert_eq!(registration_result.await.unwrap(), Err(registration_error));
++    }
++
++    #[tokio::test]
++    async fn release_and_session_termination_are_persistent() {
++        let (handle, _commands, release, _session) = test_handle();
++        release.send_replace(true);
++        assert_eq!(
++            handle.terminated().await,
++            AdvertisementTermination::Released
++        );
++
++        let (handle, _commands, _release, session) = test_handle();
++        let error = Error::new(ErrorKind::Internal(InternalErrorKind::IngressOverflow));
++        session.send_replace(Some(error.clone()));
++        assert_eq!(
++            handle.terminated().await,
++            AdvertisementTermination::SessionEnded(error)
++        );
++    }
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn closed_release_watch_does_not_starve_session_termination() {
++        let (handle, _commands, release, session) = test_handle();
++        drop(release);
++        let waiter = tokio::spawn(async move { handle.terminated().await });
++        tokio::task::yield_now().await;
++        let error = Error::new(ErrorKind::Internal(InternalErrorKind::IngressOverflow));
++        session.send_replace(Some(error.clone()));
++
++        assert_eq!(
++            tokio::time::timeout(Duration::from_millis(100), waiter)
++                .await
++                .unwrap()
++                .unwrap(),
++            AdvertisementTermination::SessionEnded(error)
++        );
++    }
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -690,6 +690,8 @@
+     DBus(String),
+     /// lost connection to D-Bus
+     DBusConnectionLost,
++    /// bounded D-Bus ingress queue overflowed
++    IngressOverflow,
+ }
+ 
+ #[cfg(feature = "bluetoothd")]
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -23,16 +23,18 @@
+ use std::{
+     collections::{HashMap, HashSet},
+     fmt::{Debug, Formatter},
+-    sync::{Arc, Weak},
++    sync::{Arc, Mutex as StdMutex, Weak},
+ };
+ use tokio::{
+     select,
+-    task::{spawn_blocking, JoinHandle},
++    sync::{mpsc as tokio_mpsc, watch},
++    task::{spawn_blocking, AbortHandle, JoinHandle},
+ };
++use tokio_stream::wrappers::ReceiverStream;
+ 
+ use crate::{
+     adapter,
+-    adv::Advertisement,
++    adv::{Advertisement, RegisteredAdvertisement},
+     agent::{Agent, AgentHandle, RegisteredAgent},
+     all_dbus_objects, gatt,
+     monitor::RegisteredMonitor,
+@@ -51,11 +53,87 @@
+ /// Terminate TX and terminated RX for single session.
+ type SingleSessionTerm = (Weak<oneshot::Sender<()>>, oneshot::Receiver<()>);
+ 
++const DBUS_INGRESS_CAPACITY: usize = 256;
++
++fn try_bounded_send<T>(
++    sender: &tokio_mpsc::Sender<T>,
++    value: T,
++    terminal: &SessionTerminal,
++) -> bool {
++    let _gate = terminal
++        .gate
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner);
++    if terminal.has_failed() {
++        return false;
++    }
++    match sender.try_send(value) {
++        Ok(()) => true,
++        Err(tokio_mpsc::error::TrySendError::Full(_)) => {
++            terminal.fail_locked(Error::new(ErrorKind::Internal(
++                InternalErrorKind::IngressOverflow,
++            )));
++            false
++        }
++        Err(tokio_mpsc::error::TrySendError::Closed(_)) => false,
++    }
++}
++
++pub(crate) struct SessionTerminal {
++    state: watch::Sender<Option<Error>>,
++    gate: StdMutex<()>,
++    dbus_abort: AbortHandle,
++}
++
++impl SessionTerminal {
++    fn new(dbus_abort: AbortHandle) -> Arc<Self> {
++        let (state, _) = watch::channel(None);
++        Arc::new(Self {
++            state,
++            gate: StdMutex::new(()),
++            dbus_abort,
++        })
++    }
++
++    fn fail(&self, error: Error) {
++        let _gate = self
++            .gate
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        self.fail_locked(error);
++    }
++
++    fn fail_locked(&self, error: Error) {
++        if self.state.send_if_modified(|state| {
++            if state.is_some() {
++                false
++            } else {
++                *state = Some(error);
++                true
++            }
++        }) {
++            self.dbus_abort.abort();
++        }
++    }
++
++    fn has_failed(&self) -> bool {
++        self.state.borrow().is_some()
++    }
++
++    pub(crate) fn error(&self) -> Option<Error> {
++        self.state.borrow().clone()
++    }
++
++    pub(crate) fn subscribe(&self) -> watch::Receiver<Option<Error>> {
++        self.state.subscribe()
++    }
++}
++
+ /// Shared state of all objects in a Bluetooth session.
+ pub(crate) struct SessionInner {
+     pub connection: Arc<SyncConnection>,
+     pub crossroads: Mutex<Crossroads>,
+-    pub le_advertisment_token: IfaceToken<Advertisement>,
++    pub le_advertisment_token: IfaceToken<Arc<RegisteredAdvertisement>>,
+     pub gatt_reg_service_token: IfaceToken<Arc<gatt::local::RegisteredService>>,
+     pub gatt_reg_characteristic_token: IfaceToken<Arc<gatt::local::RegisteredCharacteristic>>,
+     pub gatt_reg_characteristic_descriptor_token: IfaceToken<Arc<gatt::local::RegisteredDescriptor>>,
+@@ -73,16 +151,45 @@
+     #[cfg(feature = "rfcomm")]
+     pub profile_token: IfaceToken<Arc<RegisteredProfile>>,
+     pub single_sessions: Mutex<HashMap<dbus::Path<'static>, SingleSessionTerm>>,
++    pub exclusive_sessions: Mutex<HashSet<dbus::Path<'static>>>,
+     pub event_sub_tx: mpsc::Sender<SubscriptionReq>,
+-    dbus_task: JoinHandle<connection::IOResourceError>,
++    event_ingress_tx: tokio_mpsc::Sender<RawIngress>,
++    dbus_task: JoinHandle<()>,
++    event_task: JoinHandle<()>,
++    pub(crate) terminal: Arc<SessionTerminal>,
+     pub adapter_discovery_filter: Mutex<HashMap<String, DiscoveryFilter>>,
+ }
+ 
+ impl SessionInner {
++    pub async fn reserve_exclusive_session(&self, path: &dbus::Path<'static>) -> Result<()> {
++        let mut exclusive_sessions = self.exclusive_sessions.lock().await;
++        if exclusive_sessions.contains(path) {
++            return Err(Error::new(ErrorKind::DiscoveryActive));
++        }
++        let mut single_sessions = self.single_sessions.lock().await;
++        if let Some((term_tx_weak, termed_rx)) = single_sessions.get_mut(path) {
++            if term_tx_weak.upgrade().is_some() {
++                return Err(Error::new(ErrorKind::DiscoveryActive));
++            }
++            let _ = termed_rx.await;
++            single_sessions.remove(path);
++        }
++        exclusive_sessions.insert(path.clone());
++        Ok(())
++    }
++
++    pub async fn release_exclusive_session(&self, path: &dbus::Path<'static>) {
++        self.exclusive_sessions.lock().await.remove(path);
++    }
++
+     pub async fn single_session(
+         &self, path: &dbus::Path<'static>, start_fn: impl Future<Output = Result<()>>,
+         stop_fn: impl Future<Output = ()> + Send + 'static,
+     ) -> Result<SingleSessionToken> {
++        let exclusive_sessions = self.exclusive_sessions.lock().await;
++        if exclusive_sessions.contains(path) {
++            return Err(Error::new(ErrorKind::DiscoveryActive));
++        }
+         let mut single_sessions = self.single_sessions.lock().await;
+ 
+         if let Some((term_tx_weak, termed_rx)) = single_sessions.get_mut(path) {
+@@ -116,38 +223,73 @@
+             log::trace!("Terminated single session for {}", &path);
+         });
+ 
++        drop(exclusive_sessions);
+         Ok(SingleSessionToken(term_tx))
+     }
+ 
+-    pub async fn is_single_session_active(&self, path: &dbus::Path<'static>) -> bool {
++    pub async fn set_discovery_filter_if_idle(
++        &self,
++        path: &dbus::Path<'static>,
++        adapter: String,
++        filter: DiscoveryFilter,
++    ) -> Result<()> {
++        let exclusive_sessions = self.exclusive_sessions.lock().await;
++        if exclusive_sessions.contains(path) {
++            return Err(Error::new(ErrorKind::DiscoveryActive));
++        }
+         let mut single_sessions = self.single_sessions.lock().await;
+ 
+         if let Some((term_tx_weak, termed_rx)) = single_sessions.get_mut(path) {
+             match term_tx_weak.upgrade() {
+-                Some(_) => true,
++                Some(_) => return Err(Error::new(ErrorKind::DiscoveryActive)),
+                 None => {
+                     log::trace!("Waiting for termination of previous single session for {}", &path);
+                     let _ = termed_rx.await;
+                     single_sessions.remove(path);
+-                    false
+                 }
+             }
+-        } else {
+-            false
+         }
++
++        self.adapter_discovery_filter
++            .lock()
++            .await
++            .insert(adapter, filter);
++        drop(single_sessions);
++        drop(exclusive_sessions);
++        Ok(())
+     }
+ 
+     pub async fn events(
+-        &self, path: dbus::Path<'static>, child_objects: bool,
+-    ) -> Result<mpsc::UnboundedReceiver<Event>> {
+-        Event::subscribe(&mut self.event_sub_tx.clone(), path, child_objects).await
++        &self,
++        path: dbus::Path<'static>,
++        child_objects: bool,
++    ) -> Result<ReceiverStream<Event>> {
++        if let Some(error) = self.terminal.error() {
++            return Err(error);
++        }
++        Event::subscribe(
++            &mut self.event_sub_tx.clone(),
++            path,
++            child_objects,
++            self.terminal.clone(),
++        )
++        .await
++    }
++
++    pub(crate) fn event_ingress_barrier(&self) -> EventIngressBarrier {
++        EventIngressBarrier {
++            tx: self.event_ingress_tx.clone(),
++            terminal: self.terminal.clone(),
++        }
+     }
+ }
+ 
+ impl Drop for SessionInner {
+     fn drop(&mut self) {
+         // documentation for dbus_tokio::connection::IOResource indicates it is abortable
++        self.terminal.dbus_abort.abort();
+         self.dbus_task.abort();
++        self.event_task.abort();
+     }
+ }
+ 
+@@ -193,7 +335,15 @@
+     /// This establishes a connection to the system Bluetooth daemon over D-Bus.
+     pub async fn new() -> Result<Self> {
+         let (resource, connection) = spawn_blocking(connection::new_system_sync).await??;
+-        let dbus_task = tokio::spawn(resource);
++        let resource_task = tokio::spawn(resource);
++        let terminal = SessionTerminal::new(resource_task.abort_handle());
++        let dbus_terminal = terminal.clone();
++        let dbus_task = tokio::spawn(async move {
++            let _ = resource_task.await;
++            dbus_terminal.fail(Error::new(ErrorKind::Internal(
++                InternalErrorKind::DBusConnectionLost,
++            )));
++        });
+         log::trace!("Connected to D-Bus with unique name {}", &connection.unique_name());
+ 
+         let mut crossroads = Crossroads::new();
+@@ -227,7 +377,20 @@
+         let provision_agent_token = RegisteredProvisionAgent::register_interface(&mut crossroads);
+ 
+         let (event_sub_tx, event_sub_rx) = mpsc::channel(1);
+-        Event::handle_connection(connection.clone(), event_sub_rx).await?;
++        let (event_task, event_ingress_tx) = match Event::handle_connection(
++            connection.clone(),
++            event_sub_rx,
++            terminal.clone(),
++        )
++        .await
++        {
++            Ok(task) => task,
++            Err(error) => {
++                terminal.dbus_abort.abort();
++                dbus_task.abort();
++                return Err(error);
++            }
++        };
+ 
+         let inner = Arc::new(SessionInner {
+             connection: connection.clone(),
+@@ -250,8 +413,12 @@
+             #[cfg(feature = "rfcomm")]
+             profile_token,
+             single_sessions: Mutex::new(HashMap::new()),
++            exclusive_sessions: Mutex::new(HashSet::new()),
+             event_sub_tx,
++            event_ingress_tx,
+             dbus_task,
++            event_task,
++            terminal,
+             adapter_discovery_filter: Mutex::new(HashMap::new()),
+         });
+ 
+@@ -272,6 +439,19 @@
+         Ok(Self { inner })
+     }
+ 
++    /// Waits until the D-Bus session becomes unusable and returns the terminal error.
++    pub async fn terminated(&self) -> Error {
++        let mut terminal = self.inner.terminal.subscribe();
++        loop {
++            if let Some(error) = terminal.borrow_and_update().clone() {
++                return error;
++            }
++            if terminal.changed().await.is_err() {
++                return Error::new(ErrorKind::Internal(InternalErrorKind::DBusConnectionLost));
++            }
++        }
++    }
++
+     /// Create an interface to the default Bluetooth adapter.
+     ///
+     /// If `hci0` is present it is used as the default adapter.
+@@ -408,25 +588,62 @@
+ pub(crate) struct SubscriptionReq {
+     path: dbus::Path<'static>,
+     child_objects: bool,
+-    tx: mpsc::UnboundedSender<Event>,
++    tx: tokio_mpsc::Sender<Event>,
+     ready_tx: oneshot::Sender<()>,
+ }
+ 
++enum RawIngress {
++    Message(Message),
++    // Sharing the signal FIFO makes the acknowledgement an ingress watermark.
++    Barrier(oneshot::Sender<()>),
++}
++
++#[derive(Clone)]
++pub(crate) struct EventIngressBarrier {
++    tx: tokio_mpsc::Sender<RawIngress>,
++    terminal: Arc<SessionTerminal>,
++}
++
++impl EventIngressBarrier {
++    pub(crate) async fn wait(&self) -> Result<()> {
++        if let Some(error) = self.terminal.error() {
++            return Err(error);
++        }
++        let (ready_tx, ready_rx) = oneshot::channel();
++        self.tx
++            .send(RawIngress::Barrier(ready_tx))
++            .await
++            .map_err(|_| self.terminal.error().unwrap_or_else(connection_lost))?;
++        ready_rx
++            .await
++            .map_err(|_| self.terminal.error().unwrap_or_else(connection_lost))?;
++        self.terminal.error().map_or(Ok(()), Err)
++    }
++}
++
+ impl Event {
+     /// Spawns a task that handles events for the specified connection.
+-    pub(crate) async fn handle_connection(
+-        connection: Arc<SyncConnection>, mut sub_rx: mpsc::Receiver<SubscriptionReq>,
+-    ) -> Result<()> {
++    async fn handle_connection(
++        connection: Arc<SyncConnection>,
++        mut sub_rx: mpsc::Receiver<SubscriptionReq>,
++        terminal: Arc<SessionTerminal>,
++    ) -> Result<(JoinHandle<()>, tokio_mpsc::Sender<RawIngress>)> {
+         use dbus::message::SignalArgs;
+         lazy_static! {
+             static ref SERVICE_NAME_BUS: BusName<'static> = BusName::new(SERVICE_NAME).unwrap();
+             static ref SERVICE_NAME_REF: Option<&'static BusName<'static>> = Some(&SERVICE_NAME_BUS);
+         }
+ 
+-        let (msg_tx, mut msg_rx) = mpsc::unbounded();
++        let (event_ingress_tx, mut event_ingress_rx) =
++            tokio_mpsc::channel(DBUS_INGRESS_CAPACITY);
++        let callback_ingress_tx = event_ingress_tx.clone();
++        let callback_terminal = terminal.clone();
+         let handle_msg = move |msg: Message| {
+-            let _ = msg_tx.unbounded_send(msg);
+-            true
++            try_bounded_send(
++                &callback_ingress_tx,
++                RawIngress::Message(msg),
++                &callback_terminal,
++            )
+         };
+ 
+         let rule_add = ObjectManagerInterfacesAdded::match_rule(*SERVICE_NAME_REF, None);
+@@ -438,20 +655,24 @@
+         let rule_prop = PropertiesPropertiesChanged::match_rule(*SERVICE_NAME_REF, None);
+         let msg_match_prop = connection.add_match(rule_prop).await?.msg_cb(handle_msg.clone());
+ 
+-        tokio::spawn(async move {
++        let event_task = tokio::spawn(async move {
+             log::trace!("Starting event loop for {}", &connection.unique_name());
++            let mut terminal_rx = terminal.subscribe();
+ 
+             struct Subscription {
+                 child_objects: bool,
+-                tx: mpsc::UnboundedSender<Event>,
++                tx: tokio_mpsc::Sender<Event>,
+             }
+             let mut subs: HashMap<String, Vec<Subscription>> = HashMap::new();
+ 
+             loop {
++                if terminal.error().is_some() {
++                    break;
++                }
+                 select! {
+-                    msg_opt = msg_rx.next() => {
++                    msg_opt = event_ingress_rx.recv() => {
+                         match msg_opt {
+-                            Some(msg) => {
++                            Some(RawIngress::Message(msg)) => {
+                                 // Properties changed.
+                                 if let (Some(object), Some(PropertiesPropertiesChanged { interface_name, changed_properties, .. })) =
+                                     (msg.path(), PropertiesPropertiesChanged::from_message(&msg))
+@@ -464,7 +685,7 @@
+                                             changed: changed_properties,
+                                         };
+                                         log::trace!("Event: {:?}", &evt);
+-                                        path_subs.retain(|sub| sub.tx.unbounded_send(evt.clone()).is_ok());
++                                        path_subs.retain(|sub| try_bounded_send(&sub.tx, evt.clone(), &terminal));
+                                         if path_subs.is_empty() {
+                                             subs.remove(&*object);
+                                         }
+@@ -485,7 +706,7 @@
+                                         log::trace!("Event: {:?}", &evt);
+                                         parent_subs.retain(|sub| {
+                                             if sub.child_objects {
+-                                                sub.tx.unbounded_send(evt.clone()).is_ok()
++                                                try_bounded_send(&sub.tx, evt.clone(), &terminal)
+                                             } else {
+                                                 true
+                                             }
+@@ -513,7 +734,7 @@
+                                         log::trace!("Event: {:?}", &evt);
+                                         parent_subs.retain(|sub| {
+                                             if sub.child_objects {
+-                                                sub.tx.unbounded_send(evt.clone()).is_ok()
++                                                try_bounded_send(&sub.tx, evt.clone(), &terminal)
+                                             } else {
+                                                 true
+                                             }
+@@ -524,6 +745,9 @@
+                                     }
+                                 }
+                             },
++                            Some(RawIngress::Barrier(ready_tx)) => {
++                                let _ = ready_tx.send(());
++                            }
+                             None => break,
+                         }
+                     },
+@@ -539,33 +763,107 @@
+                             }
+                             None => break,
+                         }
++                    },
++                    changed = terminal_rx.changed() => {
++                        if changed.is_err() || terminal_rx.borrow_and_update().is_some() {
++                            break;
++                        }
+                     }
+                 }
+             }
+ 
++            drop(subs);
+             let _ = connection.remove_match(msg_match_add.token()).await;
+             let _ = connection.remove_match(msg_match_removed.token()).await;
+             let _ = connection.remove_match(msg_match_prop.token()).await;
+             log::trace!("Terminated event loop for {}", &connection.unique_name());
+         });
+-
+-        Ok(())
++        Ok((event_task, event_ingress_tx))
+     }
+ 
+     /// Subscribe to D-Bus events for specified path.
+     ///
+     /// If `child_objects` is [true] events about *direct* child objects being added and removed
+     /// will also be delivered.
+-    pub(crate) async fn subscribe(
+-        sub_tx: &mut mpsc::Sender<SubscriptionReq>, path: dbus::Path<'static>, child_objects: bool,
+-    ) -> Result<mpsc::UnboundedReceiver<Event>> {
+-        let (tx, rx) = mpsc::unbounded();
++    async fn subscribe(
++        sub_tx: &mut mpsc::Sender<SubscriptionReq>,
++        path: dbus::Path<'static>,
++        child_objects: bool,
++        terminal: Arc<SessionTerminal>,
++    ) -> Result<ReceiverStream<Event>> {
++        if let Some(error) = terminal.error() {
++            return Err(error);
++        }
++        let (tx, rx) = tokio_mpsc::channel(DBUS_INGRESS_CAPACITY);
+         let (ready_tx, ready_rx) = oneshot::channel();
+         sub_tx
+-            .send(SubscriptionReq { path, child_objects, tx, ready_tx })
++            .send(SubscriptionReq {
++                path,
++                child_objects,
++                tx,
++                ready_tx,
++            })
++            .await
++            .map_err(|_| terminal.error().unwrap_or_else(connection_lost))?;
++        ready_rx
+             .await
+-            .map_err(|_| Error::new(ErrorKind::Internal(InternalErrorKind::DBusConnectionLost)))?;
+-        ready_rx.await.map_err(|_| Error::new(ErrorKind::Internal(InternalErrorKind::DBusConnectionLost)))?;
+-        Ok(rx)
++            .map_err(|_| terminal.error().unwrap_or_else(connection_lost))?;
++        if let Some(error) = terminal.error() {
++            return Err(error);
++        }
++        Ok(ReceiverStream::new(rx))
++    }
++}
++
++fn connection_lost() -> Error {
++    Error::new(ErrorKind::Internal(InternalErrorKind::DBusConnectionLost))
++}
++
++#[cfg(test)]
++mod aster_tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn event_barrier_follows_already_queued_raw_ingress() {
++        let dbus_task = tokio::spawn(std::future::pending::<()>());
++        let terminal = SessionTerminal::new(dbus_task.abort_handle());
++        let (tx, mut rx) = tokio_mpsc::channel(DBUS_INGRESS_CAPACITY);
++        let message = Message::new_signal("/", "org.bluez.Adapter1", "Changed").unwrap();
++        assert!(try_bounded_send(
++            &tx,
++            RawIngress::Message(message),
++            &terminal
++        ));
++        let barrier = EventIngressBarrier {
++            tx: tx.clone(),
++            terminal,
++        };
++        let waiter = tokio::spawn(async move { barrier.wait().await });
++
++        assert!(matches!(rx.recv().await, Some(RawIngress::Message(_))));
++        let Some(RawIngress::Barrier(ready_tx)) = rx.recv().await else {
++            panic!("barrier must follow the queued D-Bus message");
++        };
++        ready_tx.send(()).unwrap();
++        waiter.await.unwrap().unwrap();
++    }
++
++    #[tokio::test]
++    async fn bounded_ingress_fails_the_session_on_item_257() {
++        assert_eq!(DBUS_INGRESS_CAPACITY, 256);
++        let dbus_task = tokio::spawn(std::future::pending::<()>());
++        let terminal = SessionTerminal::new(dbus_task.abort_handle());
++        let (sender, _receiver) = tokio_mpsc::channel(DBUS_INGRESS_CAPACITY);
++
++        for value in 0..DBUS_INGRESS_CAPACITY {
++            assert!(try_bounded_send(&sender, value, &terminal));
++        }
++        assert!(!try_bounded_send(&sender, DBUS_INGRESS_CAPACITY, &terminal));
++        assert_eq!(
++            terminal.error().unwrap().kind,
++            ErrorKind::Internal(InternalErrorKind::IngressOverflow)
++        );
++        assert!(!try_bounded_send(&sender, usize::MAX, &terminal));
++        assert!(dbus_task.await.unwrap_err().is_cancelled());
+     }
+ }

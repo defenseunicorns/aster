@@ -21,5 +21,8 @@ fuzz/corpus/** -text
 # Preserve this hash-frozen comparison receipt byte-for-byte (registered CRLF).
 docs/evaluations/0005/results/stack-comparison.csv -text
 
+# Preserve BlueR's hash-frozen assigned-number database byte-for-byte (CRLF).
+third-party/bluer-0.17.4-aster/bluetooth-numbers-database/v1/company_ids.json -text
+
 # Preserve the byte-exact historical v0-r1 CDDL, including its registered final blank line.
 conformance/evaluation-v0/history/v0-r1/profile-v0.cddl -whitespace

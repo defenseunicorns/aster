@@ -115,4 +115,6 @@ bench = false
 [workspace]
 
 [patch.crates-io]
+bluer = { path = "../third-party/bluer-0.17.4-aster" }
+hmac = { path = "../third-party/hmac-0.13.0-aster" }
 netlink-packet-core = { path = "../third-party/netlink-packet-core-0.8.2-aster" }
