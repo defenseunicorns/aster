@@ -95,7 +95,7 @@ impl<'a> Context<'a> {
     async fn write(
         &self,
         turn: &mut SendUniTurn,
-        mission: &mut MissionSession,
+        mission: &mut HybridMissionSession,
         plaintext: &[u8],
         receipt: &mut PeerReceipt,
     ) -> Result<(), NodeError> {
@@ -126,7 +126,7 @@ impl<'a> Context<'a> {
     async fn read(
         &self,
         turn: &mut ReceiveUniTurn,
-        mission: &mut MissionSession,
+        mission: &mut HybridMissionSession,
         limit: usize,
         receipt: &mut PeerReceipt,
     ) -> Result<Vec<u8>, NodeError> {
@@ -311,7 +311,7 @@ fn capacity(receipt: &PeerReceipt, reserve: ContactReserve) -> Result<usize, Nod
 pub(super) async fn receive(
     store: &Store,
     connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    mission: &mut HybridMissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
     guard: &EventLaneGuard,
     blob_contact_mode: BlobContactMode,
@@ -325,7 +325,7 @@ pub(super) async fn receive(
         connection.begin_additional_uni_pair()?;
     }
     let limit = capacity(receipt, context.reserve)?;
-    let peer = mission.peer().mission_id();
+    let peer = mission.peer_observation().mission_id();
     let cursor = store.blob_carrier_fetch_cursor(peer)?;
     let mut work = selected_pending_blob_contact_work(
         store,
@@ -639,7 +639,7 @@ pub(super) async fn receive(
 pub(super) async fn send(
     store: &Store,
     connection: &aster_iroh::Connection,
-    mission: &mut MissionSession,
+    mission: &mut HybridMissionSession,
     verifier: &mut ReferenceEnvelopeSealer,
     guard: &EventLaneGuard,
     blob_contact_mode: BlobContactMode,
@@ -706,7 +706,7 @@ pub(super) async fn send(
     #[cfg(test)]
     blob_ranges_stream_test::record_sender_schedule(store, ranges.len());
     let digest = schedule_hash(&schedule);
-    let peer = mission.peer().mission_id();
+    let peer = mission.peer_observation().mission_id();
     let commitments = mission.peer_route_grant_commitments().to_vec();
     let mut turn = connection
         .open_send_uni(deadline, event_turn_wire_budget(receipt, context.reserve)?)

@@ -54,6 +54,27 @@ no component or version beyond the admitted workspace graph.
 
 ## Adopted for a bounded pilot only
 
+- `jni` 0.22.4 is an exact direct dependency only of the isolated Android
+  Ring-1 validator library. The same package and version already exists in the
+  selected locked graph; the direct edge adds no package or transitive code.
+  It is confined to copying bounded configuration into Rust, transferring one
+  process-local descriptor, and delivering sanitized callbacks around the
+  existing transport-neutral node. This grants no production, general binding,
+  background Android, discovery, packaging, or supported-platform claim. The
+  dependency and JNI surface remain removable with the evaluation app.
+
+- `bluer` 0.17.4 is admitted only for the Linux `BleL2capV1` Ring 1
+  evaluation driver, exact-pinned with the `l2cap` feature and the minimum
+  `bluetoothd` surface needed for a generic connectable advertisement. BlueR is
+  the official BlueZ Rust binding, declares BSD-2-Clause, publishes an upstream
+  security policy, and exposes Tokio-style LE L2CAP client/listener streams.
+  The common carrier remains in a dependency-light platform-neutral crate, so
+  this Linux binding owns no mission, protocol, store, or durable-progress
+  authority. This admission grants no production, cross-platform, discovery,
+  GATT, dynamic-role, or support-row claim. Exact locked graph, license,
+  advisory, cross-build, cancellation, resource, and physical CM4 evidence are
+  exit gates; failure closes or removes the replaceable Linux driver.
+
 - Proposal 0004 is closed with no provider selected. Its focused
   `aster-libp2p-provider` graph remains only as publish-disabled, opt-in test
   evidence, not a selected carrier or continuing experiment.
@@ -108,9 +129,6 @@ no component or version beyond the admitted workspace graph.
   directly to SQLite; replacing SQLite remains possible behind `RecordStore`.
 - Tokio 1.51.4 LTS was considered for adapter scheduling. The MVP adapters use
   nonblocking standard-library I/O and require no runtime dependency.
-- `bluer` 0.17.4 was considered for a Linux-specific BTLE implementation. The
-  shipped adapter is platform-neutral; a concrete driver remains a hardware
-  integration gate and `bluer` is not in the lockfile.
 - `minicbor` 2.3.0 was considered. BlueOak-1.0.0 is OSI-approved, but the narrow
   deterministic decoder needed strict non-minimal, ordering, duplicate, depth,
   and critical-extension behavior. The protocol-owned bounded subset is used

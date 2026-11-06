@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
 members = [
+  "crates/aster-ble-android",
+  "crates/aster-ble-l2cap",
+  "crates/aster-ble-linux",
+  "crates/aster-contact",
   "crates/aster-compose-credentials",
   "crates/aster-profile",
   "crates/aster-redb-store",
@@ -37,6 +41,7 @@ age-core = { version = "=0.11.0", default-features = false }
 aes-gcm = { version = "=0.11.1", default-features = false, features = ["aes", "alloc", "zeroize"] }
 buffa = { version = "=0.9.2", default-features = false, features = ["fast-utf8", "json", "std"] }
 bytes = "=1.12.1"
+bluer = { version = "=0.17.4", default-features = false, features = ["bluetoothd", "l2cap"] }
 connectrpc = { version = "=0.9.1", default-features = false }
 connectrpc-build = "=0.9.0"
 futures = "=0.3.34"

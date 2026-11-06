@@ -104,6 +104,7 @@ shared-host ceiling does not reduce that selected capability.
 | Current semantic in-memory link | High-level host contact, authentication, reconciliation, resume, and failure behavior | Reference carrier; not wired to the selected composition |
 | Current semantic UDP/IP | Nonblocking link, manual endpoint mapping, protected local discovery, rendezvous helpers, opaque relay components | Migration onto the selected node; full host acceptance on physical or operational networks |
 | Current semantic NAT/rendezvous and relay | Bounded rendezvous, endpoint-punching, and opaque-relay helpers | Not integrated into the selected node |
+| Linux BlueZ Event evaluation | One exact controller and provisioned peer per process; event-driven availability, deterministic Linux role, bounded retry, and one semantic-v9 ordered Event contact | [Bounded CM4 evidence](validation/evidence/2026-11-05-cm4-btle-ring1-event-validation.md); evaluation only; observed process restart required a controller epoch reset before contact resumed; no discovery, selection/fallback, daemon, other data class, requirement credit, or production authorization |
 | Current semantic BTLE | MTU-aware link, unicast plus an advertisement primitive, disconnect handling, platform `BleRadio` seam | Selected-node integration; a shipped Android, iOS, Linux, or controller-specific radio driver; complete one-to-many profile |
 | LoRa, serial, file | The requirements and semantic design do not preclude them | No selected adapters ship |
 
@@ -318,6 +319,31 @@ controlled-Iroh relay path above.
 
 Start with manually known addresses. Add discovery or rendezvous only after the
 authenticated two-node path is understood and measured in the target network.
+
+## Linux unattended BTLE Event evaluation
+
+The tree includes a separate `aster-btle-event` evaluator for two provisioned
+Linux nodes. Each process owns one exact BlueZ controller, one exact peer, and
+one Event contact at a time. The transport-neutral node starts before the
+Linux-specific supervisor, so BlueZ or controller absence does not block local
+durable node operation. With a published Event and matching receiver
+application selection already durable, controller availability later starts
+the existing mission-authenticated semantic-v9 ordered Event contact;
+controller loss cancels and drains that attempt, and restoration starts a
+fresh availability epoch.
+
+This lifecycle belongs to `aster-ble-linux`, not the protocol or generic node
+runtime. Its deterministic role, retry, and 60-second default success cadence
+are implementation policy. The node sees only an adapter-neutral admitted
+contact and remains valid when no transport is available.
+
+The claim is evaluation-stage Linux/Linux, one controller, one provisioned
+peer, and Event-only. It adds no discovery, transport selection or fallback,
+daemon/service boundary, State/Record/Blob execution, requirement credit,
+supported-hardware row, or production authorization. See the
+[unattended Linux BTLE Event quickstart](quickstart/btle-linux-unattended.md)
+for the exact CLI, controller power-cycle procedure, shutdown order, and
+evidence boundary.
 
 ## Current semantic BTLE integration seam
 

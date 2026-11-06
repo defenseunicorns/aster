@@ -14,6 +14,7 @@ nearby-discovery = ["dep:iroh-mdns-address-lookup", "dep:swarm-discovery"]
 test-utils = ["dep:iroh-relay"]
 
 [dependencies]
+aster-contact = { path = "../aster-contact" }
 futures.workspace = true
 iroh.workspace = true
 iroh-mdns-address-lookup = { workspace = true, optional = true }

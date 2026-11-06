@@ -1,0 +1,30 @@
+[package]
+name = "aster-ble-android"
+description = "Evaluation-only Android LE L2CAP validator adapter for Aster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+aster-ble-l2cap = { path = "../aster-ble-l2cap" }
+aster-contact = { path = "../aster-contact" }
+aster-mesh = { package = "aster-core", path = "../aster-core", default-features = false, features = ["reference-session"] }
+aster-node = { path = "../aster-node" }
+jni = "=0.22.4"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[lints.rust]
+# Descriptor adoption and exported JNI symbols require narrowly scoped unsafe
+# operations. The transport-neutral node and adapter implementation remain safe.
+unsafe_code = "allow"
+missing_docs = "allow"
+
+[lints.clippy]
+all = "warn"
