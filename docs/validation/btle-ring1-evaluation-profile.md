@@ -79,11 +79,12 @@ uses manual Linux address/PSM input and requests no scan,
 advertise, location, Internet, service, or receiver capability.
 
 This optional path does not widen the fixed Linux-to-Linux Ring-1 exit or move
-requirement credit. Its source and portable Rust tests exist. Local physical
-validation additionally exercised Android compilation, APK packaging, JNI ABI
-loading, real-controller connection, and matching Android/Linux terminal
-receipts; those observations remain evaluation evidence rather than a support
-claim. Follow the
+requirement credit. Its source and portable Rust tests exist. The
+[bounded Pixel/Linux record](evidence/2026-11-06-android-linux-btle-ring1-validation.md)
+additionally exercises Android compilation, APK packaging, JNI ABI loading,
+real-controller connection, and matching Android/Linux terminal receipts;
+those observations remain evaluation evidence rather than a support claim.
+Follow the
 [Android BTLE Ring-1 quickstart](../quickstart/btle-android-ring1.md) to produce
 that evidence without changing the protocol.
 
