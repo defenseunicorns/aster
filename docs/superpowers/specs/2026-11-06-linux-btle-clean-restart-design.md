@@ -28,7 +28,8 @@ is therefore evidence-preserving diagnosis, not an assumed BlueZ disconnect.
   peer ACL that remains connected after the owned channel is drained.
 - Reproduce the clean-restart failure on the exact available CM4 stack and bind
   the failure to one component boundary before implementing recovery.
-- Implement the narrowest adapter-local recovery supported by that evidence.
+- Implement the narrowest safe recovery supported by that evidence, including
+  a platform prerequisite when the failing state is below adapter ownership.
 - Prove clean stop, immediate process restart, zero-work authenticated contact,
   durable deduplication, and application receipt without controller power
   mutation.
@@ -64,12 +65,18 @@ is therefore evidence-preserving diagnosis, not an assumed BlueZ disconnect.
    have drained. On restart failure, retain the transition sequence and exact
    closed error category.
 4. Use a pre-fix physical reproduction to select one minimal recovery change.
-   Prefer correct socket/channel teardown or reuse of the existing ACL. If the
-   platform exposes only peer-wide destructive control, keep the limitation
-   explicit rather than hiding it behind an unsafe reset.
-5. Add the recovery regression first, implement the proven change, then run
-   the focused portable suite and physical Linux/Linux and Android/Linux
-   validation.
+   The reproduction bound the failure to CVE-2026-72333 on Linux 6.18.39: LE
+   credit commands exhausted the kernel signaling-ID allocator and later CoC
+   requests used invalid identifier zero. Re-advertisement succeeded and a
+   second PSM failed identically. Aster owns neither allocator nor ACL-wide
+   recovery authority.
+5. Require a distribution kernel containing upstream fix
+   `6e1930ece855a4c256f1c7e6632d634cfb9888b5` or its stable backport for clean
+   restart qualification. Do not add a kernel-version heuristic or an Aster
+   peer/controller reset: vendors may backport the fix, and either reset would
+   exceed adapter ownership. Add deterministic coverage that a completely new
+   supervisor instance retains no process-local lifecycle state, then validate
+   the exact fixed-kernel platform physically.
 
 ## Non-goals
 
@@ -86,8 +93,9 @@ is therefore evidence-preserving diagnosis, not an assumed BlueZ disconnect.
   Android tests remain green.
 - Deterministic tests prove observation does not overlap contact ownership,
   leaks no locator, and cannot mutate controller or peer state.
-- Two cleanly stopped CM4 evaluators restart immediately and complete a
-  zero-work authenticated contact without a controller power epoch change.
+- On a CM4 kernel bound to the upstream fix, two cleanly stopped evaluators
+  restart immediately and complete a zero-work authenticated contact without a
+  controller power epoch change.
 - The receiver still exposes exactly the original Event after restart.
 - Pixel 9 Pro XL and the Linux reference complete the existing foreground
   semantic-v9 Event validation, or the exact platform blocker is retained
