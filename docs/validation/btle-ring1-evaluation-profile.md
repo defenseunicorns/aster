@@ -128,6 +128,10 @@ Clean-restart qualification therefore requires a distribution kernel containing
 the upstream fix (6.18.40 is the first fixed 6.18 release), plus a physical
 post-stop contact without a controller epoch change. Aster deliberately adds
 no peer-wide disconnect, controller reset, or runtime kernel-version heuristic.
+The [fixed-kernel CM4 record](evidence/2026-11-06-cm4-btle-clean-restart-validation.md)
+observes that exact zero-work process restart on Raspberry Pi Linux 6.18.60,
+including nonzero signaling identifiers and no kernel allocation errors. It
+does not repeat Event payload or application-receipt validation.
 This mechanism does not alter the fixed-role Android/Linux evidence above and
 gives no requirement credit or production approval. The operator procedure is
 in the [unattended Linux BTLE Event quickstart](../quickstart/btle-linux-unattended.md).
