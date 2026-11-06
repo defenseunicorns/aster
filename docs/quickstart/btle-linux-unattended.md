@@ -229,6 +229,28 @@ monitor and contact loop before shutting down the node. Expect:
 BTLE_EVENT status=stopped
 ```
 
+After an owned contact has closed, its admission future has drained, and the
+last supervisor-held contact reference has been dropped, the evaluator emits
+one read-only peer-link diagnostic:
+
+```text
+BTLE_EVENT peer_acl=absent
+BTLE_EVENT peer_acl=disconnected
+BTLE_EVENT peer_acl=connected
+```
+
+Only one line is emitted after an opened-contact attempt drains. `unavailable`,
+`timeout`, or `cancelled` can appear when the bounded BlueZ query cannot
+complete. These are closed, sanitized categories: no adapter name, Bluetooth
+address, or BlueZ error text is retained. The query never connects,
+disconnects, removes, pairs, trusts, advertises, or changes controller state.
+
+This diagnostic describes only BlueZ's view of the provisioned peer ACL at
+that instant. `connected` does not mean an L2CAP channel exists, does not
+authenticate the mission peer, and does not prove that an Aster contact can be
+opened or reused. It grants no authority and cannot change node readiness or
+retry behavior.
+
 Verify with host Bluetooth tooling that the process left no advertisement or
 listener. A forced process kill is not clean-shutdown evidence.
 
