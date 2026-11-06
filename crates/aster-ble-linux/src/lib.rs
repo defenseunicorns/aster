@@ -5,6 +5,7 @@
 
 mod config;
 mod controller;
+mod discovery_record;
 mod lifecycle;
 mod peer;
 mod platform;
@@ -17,6 +18,11 @@ pub use config::{
     ValidatedLinkConfig, ValidatedSupervisorConfig,
 };
 pub use controller::{AvailabilityReason, BtleAvailability};
+pub use discovery_record::{
+    ASTER_ROSTER_BEACON_V1_BYTES, ASTER_ROSTER_SERVICE_UUID, AsterRosterBeaconV1,
+    DiscoveryCredential, DiscoveryCredentialError, DiscoveryGeneration, DiscoveryRecordError,
+    DiscoverySecret, LeasedDiscoveryCredentialSet,
+};
 pub use lifecycle::{LinuxBtleEventSupervisor, SupervisorError, spawn_linux_btle_event_supervisor};
 pub use platform::{
     BluezSocketFactory, OpenFuture, OpenedContact, SocketFactory, open_contact,

@@ -332,7 +332,11 @@ dependencies = [
  "aster-node",
  "bluer",
  "futures",
+ "hmac 0.13.0",
+ "sha2 0.11.1",
+ "subtle",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

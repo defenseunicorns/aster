@@ -22,7 +22,11 @@ aster-contact = { path = "../aster-contact" }
 aster-mesh = { package = "aster-core", path = "../aster-core", default-features = false, features = ["reference-session"] }
 aster-node = { path = "../aster-node" }
 futures.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+subtle.workspace = true
 tokio = { workspace = true, features = ["macros"] }
+zeroize.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 bluer.workspace = true
