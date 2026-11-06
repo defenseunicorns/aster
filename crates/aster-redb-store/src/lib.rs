@@ -5310,10 +5310,11 @@ struct SecurityProfilePolicyExpectation {
 ///
 /// Writable construction passes a validated file descriptor directly to redb;
 /// [`Store::backing_identity`] reports the immutable handle identity captured at
-/// open. On Linux, it also retains an Aster-owned nonblocking exclusive lock on
-/// that exact open-file description. Unix platforms synchronize the retained
-/// parent directory before returning a usable handle. Other platforms make
-/// neither backing-identity nor parent-directory durability claims.
+/// open. On Linux and Android, it also retains an Aster-owned nonblocking
+/// exclusive lock on that exact open-file description. Unix platforms
+/// synchronize the retained parent directory before returning a usable handle.
+/// Other platforms make neither backing-identity nor parent-directory durability
+/// claims.
 pub struct Store {
     database: Database,
     _process_writer_lock: ProcessWriterLock,
@@ -5365,15 +5366,15 @@ struct OpenedStoreBacking {
     newly_created: bool,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 struct ProcessWriterLock {
     _file: std::fs::File,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 struct ProcessWriterLock;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn acquire_process_writer_lock(file: &std::fs::File) -> Result<ProcessWriterLock, StoreError> {
     let retained = file.try_clone().map_err(StoreError::StorePath)?;
     match rustix::fs::flock(
@@ -5386,7 +5387,7 @@ fn acquire_process_writer_lock(file: &std::fs::File) -> Result<ProcessWriterLock
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn acquire_process_writer_lock(_file: &std::fs::File) -> Result<ProcessWriterLock, StoreError> {
     Ok(ProcessWriterLock)
 }
@@ -5697,7 +5698,7 @@ fn require_exact_writer_exclusion(
     if backing.identity != expected {
         return Err(StoreError::ProcessExclusiveLockUnavailable);
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     match rustix::fs::flock(
         &backing.file,
         rustix::fs::FlockOperation::NonBlockingLockExclusive,
@@ -5706,7 +5707,7 @@ fn require_exact_writer_exclusion(
         Err(error) => Err(StoreError::StorePath(error.into())),
         Ok(()) => Err(StoreError::ProcessExclusiveLockUnavailable),
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     match Database::builder().create_file(backing.file) {
         Err(redb::DatabaseError::DatabaseAlreadyOpen) => Ok(ProcessExclusiveLockProof(())),
         Err(error) => Err(error.into()),
@@ -25348,7 +25349,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn process_writer_lock_rejects_second_exact_backing_before_redb_open() {
         let file = TestFile::new("process-writer-lock");
