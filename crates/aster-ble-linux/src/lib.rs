@@ -14,9 +14,11 @@ mod policy;
 mod stream;
 
 pub use config::{
-    DriverConfig, FixedRole, LinkConfig, OpenRequest, RING1_MAXIMUM_DEADLINE,
-    RING1_MAXIMUM_EXCHANGE_BYTES, RING1_MAXIMUM_FRAME_BYTES, SupervisorConfig, ValidatedConfig,
-    ValidatedLinkConfig, ValidatedSupervisorConfig,
+    ContactLimits, ControllerConfig, DriverConfig, FixedRole, LinkConfig, OpenRequest,
+    RING1_MAXIMUM_DEADLINE, RING1_MAXIMUM_EXCHANGE_BYTES, RING1_MAXIMUM_FRAME_BYTES,
+    RosteredAdapterConfig, RosteredDiscoveryConfig, RosteredSupervisorConfig, SupervisorConfig,
+    ValidatedConfig, ValidatedContactLimits, ValidatedControllerConfig, ValidatedLinkConfig,
+    ValidatedRosteredDiscoveryConfig, ValidatedRosteredSupervisorConfig, ValidatedSupervisorConfig,
 };
 pub use controller::{AvailabilityReason, BtleAvailability};
 pub use discovery::{
