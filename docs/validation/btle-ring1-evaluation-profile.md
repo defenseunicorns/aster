@@ -112,16 +112,25 @@ Publication during unavailability is exercised through an in-process node
 embedding or the focused adapter-neutral node integration test.
 
 Deterministic unit and lifecycle tests cover controller absence/recovery,
-single-attempt ownership, capped backoff, admission classification, and drain
-on shutdown. The [bounded two-CM4 observation](evidence/2026-11-05-cm4-btle-ring1-event-validation.md)
+single-attempt ownership, capped backoff, admission classification, drain on
+shutdown, and independent fresh supervisor instances. The
+[bounded two-CM4 observation](evidence/2026-11-05-cm4-btle-ring1-event-validation.md)
 retains one Linux/Linux Event transfer, zero-work deduplication, controller
 power-cycle recovery, process restart, application-level receipt, point
-resource observations, and cleanup. On that exact stack, process restart alone
-left the unpaired ACL connected in BlueZ; a controller power cycle was required
-before the restarted processes completed another zero-work contact. This
-mechanism does not alter the fixed-role Android/Linux evidence above and gives
-no requirement credit or production approval. The operator procedure is in the
-[unattended Linux BTLE Event quickstart](../quickstart/btle-linux-unattended.md).
+resource observations, and cleanup. The later
+[clean-restart diagnostic](evidence/2026-11-06-cm4-btle-clean-restart-diagnostic.md)
+bound the process-only failure on that exact stack to CVE-2026-72333 in Linux
+6.18.39: the kernel exhausted L2CAP signaling identifiers and emitted invalid
+identifier-zero CoC requests. It was not an Aster lifecycle or advertisement
+restart defect.
+
+Clean-restart qualification therefore requires a distribution kernel containing
+the upstream fix (6.18.40 is the first fixed 6.18 release), plus a physical
+post-stop contact without a controller epoch change. Aster deliberately adds
+no peer-wide disconnect, controller reset, or runtime kernel-version heuristic.
+This mechanism does not alter the fixed-role Android/Linux evidence above and
+gives no requirement credit or production approval. The operator procedure is
+in the [unattended Linux BTLE Event quickstart](../quickstart/btle-linux-unattended.md).
 
 ## Required evidence
 

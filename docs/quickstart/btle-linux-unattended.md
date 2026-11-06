@@ -32,6 +32,15 @@ Prepare two Linux hosts with:
 - compatible Linux kernel, BlueZ, controller, and driver support for LE L2CAP
   connection-oriented channels.
 
+Clean process restart additionally requires a kernel containing the fix for
+[CVE-2026-72333](https://kernel.googlesource.com/pub/scm/linux/security/vulns/+/ffaa1b4ec1ea8813a90a5a6f9f577958c848a33c/cve/published/2026/CVE-2026-72333.mbox).
+Affected kernels leak L2CAP signaling identifiers on LE flow-credit commands;
+after exhaustion, a fresh CoC request uses invalid identifier zero and stalls.
+Upstream records Linux 6.18.21 through 6.18.39 as affected and 6.18.40 as the
+first fixed 6.18 release. Other stable series have different affected and fixed
+versions. Bind qualification to the distribution's fix or source, not only its
+version string, because vendors may backport the change.
+
 The two mission node IDs must differ. The lower complete 32-byte mission node
 ID initiates and the higher ID listens. This deterministic role choice is a
 Linux implementation detail; it is not a protocol rule. There is no `--role`
@@ -256,12 +265,36 @@ listener. A forced process kill is not clean-shutdown evidence.
 
 On the bounded CM4/BlueZ 5.82 observation, both evaluators stopped cleanly but
 BlueZ continued to report the unpaired peer ACL as connected. Fresh processes
-reached `Available` but timed out until the receiver controller entered a new
-power epoch. Treat process-only recovery as unverified for a platform until a
-retained run proves otherwise. The evaluator deliberately does not disconnect
-other controller users or change controller power to hide this platform state.
-The exact observation is retained in the
-[CM4 Ring-1 evidence record](../validation/evidence/2026-11-05-cm4-btle-ring1-event-validation.md).
+reached `Available` but timed out because affected Linux 6.18.39 had exhausted
+its L2CAP signaling identifiers. The
+[clean-restart diagnostic](../validation/evidence/2026-11-06-cm4-btle-clean-restart-diagnostic.md)
+binds the invalid identifier-zero requests and kernel allocation errors to
+CVE-2026-72333. Treat process-only recovery as unverified for a platform until
+a retained run on a fixed kernel proves otherwise.
+
+The evaluator deliberately does not disconnect the peer, reset the adapter, or
+change controller power to hide this kernel state. Those actions can disrupt
+other controller users, and `Device1.Disconnect` can disable future inbound LE
+connections for an untrusted peer. The adapter also does not reject kernels by
+parsing `uname`: a vendor backport can fix an older version string, while a
+newer vendor build is not evidence without its package/source relationship.
+
+## Clean process restart
+
+After a successful or zero-work contact, stop both evaluators cleanly and
+require `BTLE_EVENT status=stopped` plus process exit. Leave both controllers
+powered and make no peer, trust, pairing, advertisement, or controller change.
+Start the listener and then the initiator with the same provisioned values and
+require another authenticated zero-work contact. A listener advertisement or
+BlueZ `Connected` ACL alone is not success; both sides must report
+`status=contact-complete`.
+
+Retain the installed kernel package/source relationship to the CVE fix, the
+exact evaluator digest, controller/driver/BlueZ versions, first post-restart
+contact results, and cleanup. If the restarted open times out and the kernel
+reports `Bluetooth: Unable to allocate ident: -28`, the platform is not a
+clean-restart candidate until its kernel is fixed. Do not convert that failure
+into an Aster peer-wide or controller-wide reset.
 
 ## Verify the application receipt
 
