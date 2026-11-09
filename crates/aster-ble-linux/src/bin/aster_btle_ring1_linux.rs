@@ -241,6 +241,14 @@ async fn run(config: HarnessConfig) -> Result<(), String> {
         let _ = node.shutdown().await;
         return Err(error);
     }
+    let events = node.selected_events();
+    let text_event_before_contact = match query_text_event(&events, config.mission_peer).await {
+        Ok(event) => event,
+        Err(error) => {
+            let _ = node.shutdown().await;
+            return Err(error);
+        }
+    };
     let role = config.driver.role();
     let cancellation = OpenCancellation::new();
     let open = open_contact(&config.driver, &cancellation);
@@ -310,7 +318,11 @@ async fn run(config: HarnessConfig) -> Result<(), String> {
             mtu.receive_bytes(),
             config.require_event_larger_than_mtu,
         )?;
-        let text_event = query_text_event(&node.selected_events(), config.mission_peer).await?;
+        validate_received_text_receipt(&receipt)?;
+        let text_event = validate_new_text_event(
+            query_text_event(&events, config.mission_peer).await?,
+            text_event_before_contact.as_ref(),
+        )?;
         eprintln!("{}", render_text_event(&text_event)?);
         let digest = receipt
             .transfer_profile_digest
@@ -417,7 +429,7 @@ async fn recover_text_event_client(
 async fn query_text_event(
     events: &SelectedEventHandle,
     publisher: [u8; 32],
-) -> Result<EventItem, String> {
+) -> Result<Option<EventItem>, String> {
     let mut query = EventQuery {
         publisher: Some(publisher),
         topic: Some(Topic::new(TEXT_EVENT_TOPIC).map_err(|_| "text Event selector is invalid")?),
@@ -426,33 +438,63 @@ async fn query_text_event(
         limit: 128,
         ..EventQuery::default()
     };
-    let mut items = Vec::new();
+    let mut latest = None;
+    let mut previous_marker = query.after_acceptance_marker;
     loop {
         let page = events
             .query(query.clone())
             .await
             .map_err(|_| "received text Event query failed".to_owned())?;
-        items.extend(page.items);
-        if !page.has_more {
-            return select_text_event(items, publisher);
+        if let Some(candidate) = select_text_event(page.items, publisher)
+            && latest
+                .as_ref()
+                .is_none_or(|current: &EventItem| {
+                    candidate.event_sequence > current.event_sequence
+                })
+        {
+            latest = Some(candidate);
         }
+        if !page.has_more {
+            return Ok(latest);
+        }
+        if page.scanned_through <= previous_marker {
+            return Err("received text Event query did not advance".to_owned());
+        }
+        previous_marker = page.scanned_through;
         query.after_acceptance_marker = page.scanned_through;
     }
 }
 
-fn select_text_event(items: Vec<EventItem>, publisher: [u8; 32]) -> Result<EventItem, String> {
-    let event = items
+fn select_text_event(
+    items: Vec<EventItem>,
+    publisher: [u8; 32],
+) -> Option<EventItem> {
+    items
         .into_iter()
         .filter(|event| {
             event.publisher == publisher
                 && event.topic.as_str() == TEXT_EVENT_TOPIC
                 && event.scope.as_str() == TEXT_EVENT_SCOPE
                 && event.logical_key == TEXT_EVENT_LOGICAL_KEY
-                && !event.tombstone
-                && event.ttl_ms.is_none()
         })
         .max_by_key(|event| event.event_sequence)
-        .ok_or_else(|| "authenticated Android text Event was not received".to_owned())?;
+}
+
+fn validate_new_text_event(
+    event: Option<EventItem>,
+    before_contact: Option<&EventItem>,
+) -> Result<EventItem, String> {
+    let event = event.ok_or_else(|| "authenticated Android text Event was not received".to_owned())?;
+    if before_contact.is_some_and(|previous| {
+        event.event_sequence <= previous.event_sequence
+            || event.acceptance_marker <= previous.acceptance_marker
+            || event.id == previous.id
+    }) {
+        return Err("authenticated Android text Event was not received in this contact".to_owned());
+    }
+    if event.tombstone || event.ttl_ms.is_some() {
+        return Err("received text Event is not a durable value".to_owned());
+    }
     if event.payload.is_empty() || event.payload.len() > MAX_TEXT_EVENT_BYTES {
         return Err("received text Event payload is outside its bound".to_owned());
     }
@@ -464,8 +506,7 @@ fn select_text_event(items: Vec<EventItem>, publisher: [u8; 32]) -> Result<Event
 fn render_text_event(event: &EventItem) -> Result<String, String> {
     let text = std::str::from_utf8(&event.payload)
         .map_err(|_| "received text Event payload is not UTF-8".to_owned())?;
-    let escaped = serde_json::to_string(text)
-        .map_err(|_| "received text Event could not be rendered".to_owned())?;
+    let escaped = terminal_safe_json_string(text);
     Ok(format!(
         "BTLE_RING1_EVENT status=received publisher={} sequence={} id={} payload_sha256={} text={escaped}",
         format_digest(event.publisher),
@@ -473,6 +514,60 @@ fn render_text_event(event: &EventItem) -> Result<String, String> {
         event.id,
         format_digest(Sha256::digest(&event.payload).into()),
     ))
+}
+
+fn terminal_safe_json_string(text: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut escaped = String::with_capacity(text.len().saturating_add(2));
+    escaped.push('"');
+    for character in text.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\u{0008}' => escaped.push_str("\\b"),
+            '\u{000c}' => escaped.push_str("\\f"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() || is_terminal_format_control(character) => {
+                let _ = write!(&mut escaped, "\\u{:04x}", u32::from(character));
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped.push('"');
+    escaped
+}
+
+const fn is_terminal_format_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+    )
+}
+
+fn validate_received_text_receipt(receipt: &PeerReceipt) -> Result<(), String> {
+    if receipt.fetched == 0
+        || receipt.inserted == 0
+        || receipt.event_page_entries_received == 0
+        || receipt.event_page_inserts == 0
+        || receipt.event_page_inserts != receipt.event_page_entries_received
+        || receipt.event_page_duplicates != 0
+        || receipt.remaining != 0
+        || receipt.deferred_event_lanes != 0
+        || receipt.event_page_unscheduled != 0
+    {
+        return Err(
+            "contact did not completely reconcile the current Android text Event".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn canonical_v9_profile_digest() -> Result<[u8; 32], String> {
@@ -673,6 +768,39 @@ mod tests {
         assert!(validate_ring1_receipt(&receipt, 128, 96, true).is_err());
     }
 
+    #[test]
+    fn text_receipt_requires_a_new_durable_inbound_insert() {
+        let mut receipt = PeerReceipt::default();
+        assert!(validate_received_text_receipt(&receipt).is_err());
+
+        receipt.fetched = 1;
+        receipt.inserted = 1;
+        receipt.event_page_entries_received = 1;
+        receipt.event_page_inserts = 1;
+        validate_received_text_receipt(&receipt).expect("one new durable text Event");
+
+        receipt.event_page_duplicates = 1;
+        assert!(validate_received_text_receipt(&receipt).is_err());
+
+        receipt.event_page_duplicates = 0;
+        for deferred in [
+            PeerReceipt {
+                remaining: 1,
+                ..receipt.clone()
+            },
+            PeerReceipt {
+                deferred_event_lanes: 1,
+                ..receipt.clone()
+            },
+            PeerReceipt {
+                event_page_unscheduled: 1,
+                ..receipt.clone()
+            },
+        ] {
+            assert!(validate_received_text_receipt(&deferred).is_err());
+        }
+    }
+
     fn text_event(publisher: [u8; 32], sequence: u64, payload: &[u8]) -> EventItem {
         EventItem {
             id: EventId::from_bytes([u8::try_from(sequence).unwrap(); 32]),
@@ -702,27 +830,55 @@ mod tests {
             text_event(publisher, 2, b"second"),
         ];
 
-        let selected = select_text_event(events, publisher).expect("select exact text Event");
+        let selected = select_text_event(events, publisher).expect("matching text Event");
 
         assert_eq!(selected.event_sequence, 2);
         assert_eq!(selected.payload, b"second");
     }
 
     #[test]
+    fn requires_text_event_newer_than_the_pre_contact_snapshot() {
+        let publisher = [0x11; 32];
+        let retained = text_event(publisher, 2, b"retained");
+
+        assert!(validate_new_text_event(Some(retained.clone()), Some(&retained)).is_err());
+        assert!(
+            validate_new_text_event(Some(text_event(publisher, 1, b"older")), Some(&retained))
+                .is_err()
+        );
+        let current = validate_new_text_event(
+            Some(text_event(publisher, 3, b"current")),
+            Some(&retained),
+        )
+        .expect("new Event from current contact");
+        assert_eq!(current.payload, b"current");
+    }
+
+    #[test]
     fn rejects_invalid_text_payload_and_renders_controls_on_one_line() {
         let publisher = [0x11; 32];
         for payload in [Vec::new(), vec![0xff], vec![b'x'; 1_025]] {
-            assert!(select_text_event(vec![text_event(publisher, 1, &payload)], publisher).is_err());
+            let selected = select_text_event(vec![text_event(publisher, 1, &payload)], publisher);
+            assert!(validate_new_text_event(selected, None).is_err());
         }
 
-        let event = select_text_event(
-            vec![text_event(publisher, 7, b"Snowman \xe2\x98\x83\n\"quoted\"\0")],
-            publisher,
+        let event = validate_new_text_event(
+            select_text_event(
+                vec![text_event(
+                    publisher,
+                    7,
+                    "Snowman ☃\n\"quoted\"\0\u{0085}\u{202e}".as_bytes(),
+                )],
+                publisher,
+            ),
+            None,
         )
         .expect("valid control text Event");
         let rendered = render_text_event(&event).expect("render text Event");
         assert!(!rendered.contains('\n'));
-        assert!(rendered.contains("text=\"Snowman ☃\\n\\\"quoted\\\"\\u0000\""));
+        assert!(rendered.contains(
+            "text=\"Snowman ☃\\n\\\"quoted\\\"\\u0000\\u0085\\u202e\""
+        ));
         assert!(rendered.contains("sequence=7"));
     }
 }

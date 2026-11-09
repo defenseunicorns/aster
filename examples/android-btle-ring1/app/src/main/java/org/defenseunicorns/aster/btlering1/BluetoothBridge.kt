@@ -53,7 +53,6 @@ class BluetoothBridge(private val adapter: BluetoothAdapter) : Closeable {
         connector.execute {
             var attempt: Active? = null
             try {
-                if (!NativeValidator.nativePrepare(config.toJson(), callback)) return@execute
                 check(!pendingCancellation.isRequested()) { "validator was cancelled" }
                 check(adapter.isEnabled) { "Bluetooth is disabled" }
                 val device = adapter.getRemoteDevice(config.bluetoothAddress)

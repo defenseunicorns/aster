@@ -94,13 +94,22 @@ pub fn validate_ring1_receipt(
             "validator contact did not durably insert exactly one Event",
         ));
     }
-    if receipt.event_pages_sent != 1
-        || receipt.event_page_entries_sent != 1
+    if receipt.event_pages_sent == 0
+        || receipt.event_page_entries_sent == 0
         || receipt.event_page_bytes_sent == 0
     {
         return Err(ValidatorError::new(
             ValidatorErrorCategory::Protocol,
-            "validator contact did not send exactly one text Event",
+            "validator contact did not send a text Event",
+        ));
+    }
+    if receipt.remaining != 0
+        || receipt.deferred_event_lanes != 0
+        || receipt.event_page_unscheduled != 0
+    {
+        return Err(ValidatorError::new(
+            ValidatorErrorCategory::Protocol,
+            "validator contact deferred text Event work",
         ));
     }
     let event_larger_than_receive_packet =
@@ -325,13 +334,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_or_multiple_sent_text_events() {
+    fn rejects_missing_or_deferred_text_event_work() {
         let test = TestConfig::new();
-        for entries in [0, 2] {
-            let mut receipt = valid_receipt();
-            receipt.event_page_entries_sent = entries;
-            let error = validate_ring1_receipt(&test.config, &receipt, &published_event())
-                .expect_err("wrong sent Event count");
+        let mut missing = valid_receipt();
+        missing.event_page_entries_sent = 0;
+        let error = validate_ring1_receipt(&test.config, &missing, &published_event())
+            .expect_err("missing sent Event");
+        assert_eq!(error.category(), ValidatorErrorCategory::Protocol);
+
+        for deferred in [
+            PeerReceipt {
+                remaining: 1,
+                ..valid_receipt()
+            },
+            PeerReceipt {
+                deferred_event_lanes: 1,
+                ..valid_receipt()
+            },
+            PeerReceipt {
+                event_page_unscheduled: 1,
+                ..valid_receipt()
+            },
+        ] {
+            let error = validate_ring1_receipt(&test.config, &deferred, &published_event())
+                .expect_err("deferred Event work");
             assert_eq!(error.category(), ValidatorErrorCategory::Protocol);
         }
     }

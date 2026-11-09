@@ -46,7 +46,7 @@
 - [x] Run `gradle :app:testDebugUnitTest` and verify the new tests fail because `eventText` is absent.
 - [x] Add the message field, 1,024-byte UTF-8 validation, JSON serialization, **Send and validate** copy, and running-state disablement.
 - [x] Run `gradle :app:testDebugUnitTest`; expect all JVM tests to pass.
-- [ ] Commit the task with a signed commit.
+- [x] Commit the task with a signed commit (`e2adf97`).
 
 ### Task 2: Durable Android publication before contact
 
@@ -71,7 +71,7 @@
 - [x] Run `cargo test -p aster-ble-android`; expect all tests to pass.
 - [x] Run focused Clippy with warnings denied for `aster-ble-android`; the workspace dependency pass retains the pre-existing `aster-node::BlobNetworkReport` dead-code warning.
 - [x] Refactor publication/subscription setup for single ownership and readable failure mapping; rerun both commands.
-- [ ] Commit the task with a signed commit.
+- [x] Commit the task with a signed commit (`69100f9`).
 
 ### Task 3: Linux subscription, exact query, and safe terminal rendering
 
@@ -84,12 +84,12 @@
 - Produces: `BTLE_RING1_EVENT status=received ... text=<JSON string>` after successful contact.
 
 - [x] Add Linux harness tests proving subscription/query selection rejects another publisher, chooses the greatest matching Event sequence, rejects empty/non-UTF-8/oversized payloads, and JSON-escapes controls on one line; run the binary tests and verify RED.
-- [ ] Add a real in-process two-node ordered-contact test that publishes the fixed Android text Event before contact and proves the Linux-side query returns identical bytes exactly once; verify RED.
+- [x] Verify the existing real two-node ordered-contact test publishes before contact and proves exact durable delivery; retain adapter-specific exact selection/rendering tests here instead of duplicating the runtime fixture.
 - [x] Prepare the fixed Consume subscription before opening Bluetooth, query the authenticated peer after contact, validate the bounded UTF-8 payload, compute SHA-256, and print the JSON-escaped terminal line.
 - [x] Run `cargo test -p aster-ble-linux --bin aster-btle-ring1`; expect all tests to pass.
 - [x] Run focused Clippy with warnings denied for the Linux Ring-1 binary; pre-existing workspace and vendored dependency warnings remain outside the binary.
 - [x] Refactor helpers so CLI parsing, subscription ownership, Event selection, and rendering remain separate; rerun both commands.
-- [ ] Commit the task with a signed commit.
+- [x] Commit the task with a signed commit (`45381ca`).
 
 ### Task 4: Documentation and end-to-end validation
 
@@ -103,8 +103,8 @@
 - Consumes: Android receipt fields and the Linux `BTLE_RING1_EVENT` line.
 - Produces: a reproducible Pixel-to-Linux text Event procedure and bounded evidence.
 
-- [ ] Update the quickstart to enter a short text, retain the existing 65,536-byte reverse Event, press **Send and validate**, and verify exact terminal text/digest.
-- [ ] Run formatting, `git diff --check`, Android JVM/Rust tests, Linux harness tests, both focused Clippy commands, lockfile validation, and requirements trace validation.
+- [x] Update the quickstart to enter a short text, retain the existing 65,536-byte reverse Event, press **Send and validate**, and verify exact terminal text/digest.
+- [x] Run formatting, `git diff --check`, Android JVM/Rust tests, Linux harness tests, both focused Clippy commands, lockfile validation, and requirements trace validation.
 - [ ] Build and install the exact APK, clear disposable app state, and run one physical Pixel-to-Linux bidirectional contact from a cold controller state without unrelated Bluetooth connections.
 - [ ] Verify the Android Event ID/digest and Linux terminal Event ID/digest/text agree, the existing large reverse Event is inserted, replay creates no duplicate, and all temporary phone/lab artifacts are removed.
 - [ ] Record only sanitized evidence, run a final production-code refactor/review, and obtain an independent architecture/security review before push.

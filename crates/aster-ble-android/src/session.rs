@@ -410,14 +410,85 @@ async fn run_session(
     }
 }
 
-pub(crate) async fn prepare_local_event(
+pub(crate) struct PreparationControl {
+    cancelled: AtomicBool,
+    cancellation: Notify,
+}
+
+impl PreparationControl {
+    pub(crate) fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            cancellation: Notify::new(),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.cancellation.notify_waiters();
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let notified = self.cancellation.notified();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+pub(crate) async fn prepare_local_event_cancellable(
     config: &ValidatorConfig,
+    control: Option<&PreparationControl>,
+) -> Result<EventPublishResult, ValidatorError> {
+    tokio::time::timeout(
+        OPERATION_TIMEOUT,
+        prepare_local_event_inner(config, control),
+    )
+    .await
+    .map_err(|_| {
+        ValidatorError::new(
+            ValidatorErrorCategory::Timeout,
+            "validator local Event preparation timed out",
+        )
+    })?
+}
+
+async fn prepare_local_event_inner(
+    config: &ValidatorConfig,
+    control: Option<&PreparationControl>,
 ) -> Result<EventPublishResult, ValidatorError> {
     let mission = load_mission(config)?;
-    let node = start_transport_neutral_node(node_config(config, mission))
-        .await
-        .map_err(|error| local_node_error(error, "validator local Event node could not start"))?;
-    let prepared = prepare_text_event(&node, config).await;
+    let start = start_transport_neutral_node(node_config(config, mission));
+    tokio::pin!(start);
+    let node = match control {
+        Some(control) => tokio::select! {
+            biased;
+            () = control.cancelled() => return Err(preparation_cancelled()),
+            result = &mut start => result,
+        },
+        None => start.await,
+    }
+    .map_err(|error| local_node_error(error, "validator local Event node could not start"))?;
+    let prepared = {
+        let preparation = prepare_text_event(&node, config);
+        tokio::pin!(preparation);
+        match control {
+            Some(control) => tokio::select! {
+                biased;
+                () = control.cancelled() => Err(preparation_cancelled()),
+                result = &mut preparation => result,
+            },
+            None => preparation.await,
+        }
+    };
     let shutdown = node
         .shutdown()
         .await
@@ -426,6 +497,13 @@ pub(crate) async fn prepare_local_event(
         (Ok(publication), Ok(_)) => Ok(publication),
         (Err(error), _) | (Ok(_), Err(error)) => Err(error),
     }
+}
+
+fn preparation_cancelled() -> ValidatorError {
+    ValidatorError::new(
+        ValidatorErrorCategory::Unavailable,
+        "validator local Event preparation was cancelled",
+    )
 }
 
 async fn prepare_text_event(
@@ -571,6 +649,7 @@ async fn latest_text_event(
         ..EventQuery::default()
     };
     let mut latest: Option<EventItem> = None;
+    let mut previous_marker = query.after_acceptance_marker;
     loop {
         let page = events
             .query(query.clone())
@@ -587,6 +666,13 @@ async fn latest_text_event(
         if !page.has_more {
             return Ok(latest);
         }
+        if page.scanned_through <= previous_marker {
+            return Err(ValidatorError::new(
+                ValidatorErrorCategory::Storage,
+                "validator Event query did not advance",
+            ));
+        }
+        previous_marker = page.scanned_through;
         query.after_acceptance_marker = page.scanned_through;
     }
 }
@@ -1018,10 +1104,10 @@ mod tests {
         .expect("persist validator mission");
         let config = test.config();
 
-        let first = prepare_local_event(&config)
+        let first = prepare_local_event_cancellable(&config, None)
             .await
             .expect("publish without a carrier");
-        let retry = prepare_local_event(&config)
+        let retry = prepare_local_event_cancellable(&config, None)
             .await
             .expect("retry local publication");
 
@@ -1061,6 +1147,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_local_preparation_starts_no_transport_or_node_state() {
+        let test = TestConfig::new();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &test.root,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("owner-only cancellation test root");
+        std::fs::remove_file(&test.mission).expect("replace mission fixture");
+        UnprotectedReferenceMission::persist(
+            &test.mission,
+            validator_mission_bundle(0x77, RING1_EVENT_TOPIC),
+        )
+        .expect("persist validator mission");
+        let control = PreparationControl::new();
+        control.cancel();
+
+        let error = prepare_local_event_cancellable(&test.config(), Some(&control))
+            .await
+            .expect_err("cancelled preparation");
+
+        assert_eq!(error.category(), ValidatorErrorCategory::Unavailable);
+        assert!(!test.state.exists());
+    }
+
+    #[tokio::test]
     async fn changed_text_advances_the_durable_event_sequence() {
         let test = TestConfig::new();
         #[cfg(unix)]
@@ -1076,10 +1188,10 @@ mod tests {
         )
         .expect("persist validator mission");
 
-        let first = prepare_local_event(&test.config_with_text("first"))
+        let first = prepare_local_event_cancellable(&test.config_with_text("first"), None)
             .await
             .expect("publish first text");
-        let second = prepare_local_event(&test.config_with_text("second"))
+        let second = prepare_local_event_cancellable(&test.config_with_text("second"), None)
             .await
             .expect("publish changed text");
 
@@ -1127,7 +1239,7 @@ mod tests {
         )
         .expect("persist unauthorized validator mission");
 
-        let error = prepare_local_event(&test.config())
+        let error = prepare_local_event_cancellable(&test.config(), None)
             .await
             .expect_err("unauthorized validator subscription");
         assert_eq!(error.category(), ValidatorErrorCategory::Authentication);

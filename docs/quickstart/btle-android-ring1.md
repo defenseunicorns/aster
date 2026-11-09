@@ -2,7 +2,9 @@
 
 This evaluation path runs one foreground Android initiator against the fixed-role
 Linux Ring-1 listener over an LE L2CAP credit-based channel. It is intended to
-produce cross-platform engineering evidence for one protected semantic-v9 Event.
+produce cross-platform engineering evidence for protected semantic-v9 Events in
+both directions, including a short text Event entered on Android and printed by
+the Linux terminal.
 It is not a production app, daemon, supported transport, or requirement-credit
 path.
 
@@ -12,11 +14,16 @@ transport-neutral Aster runtime in-process. Pairing and Bluetooth link encryptio
 grant no Aster authority; the mission handshake authenticates the expected
 mission node ID before inventory.
 
-On each attempt, the native validator creates or replays its private durable
-exact `Consume` subscription for `mesh.messages` at `demo/playground` before
-admitting the BTLE contact. A fresh app state therefore needs no separate
-subscription command. This fixed selector is an evaluation implementation
-detail, not a semantic-v9 field or a production subscription UX.
+Before requesting Bluetooth permission, inspecting adapter availability, or
+opening a socket, the native
+validator durably commits or reuses the bounded text Event and creates or
+replays its private durable exact `Consume` subscription for `mesh.messages` at
+`demo/playground`. A fresh app state therefore needs no separate publication or
+subscription command, and a missing carrier leaves the publication waiting
+durably for a later contact. The Linux harness prepares the complementary exact
+durable subscription before admitting the BTLE contact. These fixed selectors
+and journals are evaluation implementation details, not semantic-v9 fields or a
+production publication/subscription UX.
 
 ## Fixed topology and prerequisites
 
@@ -169,13 +176,14 @@ PSM=128
 
 Open **Aster BTLE Ring-1** before starting the listener and enter:
 
+- Message: a non-empty text value whose UTF-8 encoding is at most 1,024 bytes;
 - Linux Bluetooth address: `LINUX_BT_ADDRESS`;
 - LE PSM: decimal `128`;
 - expected Linux mission node ID: `LINUX_MISSION_ID`; and
 - mission bundle: select `aster-android-ring1.bundle` through the picker and
   wait for the copy to complete.
 
-Do not press **Connect and validate** yet.
+Do not press **Send and validate** yet.
 
 ## Start the listener and connect within 30 seconds
 
@@ -199,7 +207,7 @@ terminal only after the Android form is ready:
   2>&1 | tee "$ASTER_BTLE_LAB/linux-ring1.log"
 ```
 
-Promptly press **Connect and validate** and keep the Activity in the foreground.
+Promptly press **Send and validate** and keep the Activity in the foreground.
 If the listener reaches its deadline first, restart it and make a fresh app
 attempt; a timed-out stream is never reused. The expected progression is:
 
@@ -207,12 +215,34 @@ attempt; a timed-out stream is never reused. The expected progression is:
 ready -> connecting -> carrier connected -> authenticating -> reconciling -> complete
 ```
 
-A valid Android completion must report semantic 9, profiles `2,1,1,5,1`, a
+A valid Android completion must report a non-empty `published_event_id`, a
+64-hex-character `published_payload_sha256`, a positive outbound Event page
+entry and byte count, semantic 9, profiles `2,1,1,5,1`, a
 64-hex-character canonical profile digest, `peer_match=true`,
 `digest_match=true`, one received Event entry, one durable insert,
 `larger_than_rx=true`, and `no_blob=true`. The Linux terminal must independently
 print `BTLE_RING1 status=complete`, the same semantic/profile result, one Event
-sent, no profile drift, and `event_validation=true`.
+sent, no profile drift, and `event_validation=true`. It snapshots retained
+matching Events before contact and must also print exactly one safe, single-line
+receipt for a newer Event durably inserted by this contact:
+
+```text
+BTLE_RING1_EVENT status=received publisher=<ANDROID_MISSION_ID> sequence=<n> id=<event-id> payload_sha256=<sha256> text="<entered text>"
+```
+
+The terminal Event ID and payload digest must equal the Android publication
+receipt. The rendered text must preserve the entered UTF-8 bytes; quotes,
+backslashes, newlines, C0/C1 controls, Unicode line separators, and bidi/format
+controls are JSON-escaped so the receipt cannot inject or visually reorder
+terminal fields.
+
+If more than one message was durably retained across earlier unavailable
+carrier attempts, the contact may reconcile that bounded backlog. Validation
+succeeds only when the receipt reports no remaining, deferred-lane, or
+unscheduled Event work. Linux then prints the greatest sequence newly inserted
+by this contact; compare that Event ID and digest with the current Android
+publication receipt. If the contact reaches its work bound first, it fails
+closed while retaining durable progress; repeat the contact to continue.
 
 Retain the Linux log and an Android screenshot or UI hierarchy showing the
 bounded terminal summary. Also retain `git rev-parse HEAD` and

@@ -72,10 +72,24 @@ narrow Rust JNI adapter. It uses Android's public LE L2CAP CoC socket, bridges
 the socket streams through a process-local Unix socket pair, and then runs the
 same transport-neutral mission, v9 profile, Event, and durable-store path. The
 local socket pair is an Android implementation detail, not a carrier or
-fallback. Before contact it idempotently prepares one private exact durable
-`Consume` subscription for the profile's Event selector through the existing
-application API; this adds no protocol or public configuration field. The app
-uses manual Linux address/PSM input and requests no scan,
+fallback. Before requesting Bluetooth permission, inspecting adapter
+availability, or opening a socket, the
+native adapter idempotently commits or reuses a non-empty text Event of at most
+1,024 UTF-8 bytes and prepares one private exact durable `Consume` subscription
+through existing application APIs. The Linux harness prepares the complementary
+exact subscription, snapshots the retained selector before contact, and prints
+only a newer matching Android Event durably inserted by that authenticated
+contact as one terminal-safe JSON string. This adds no
+protocol or public configuration field: selectors, journal locations, and the
+text bound are evaluation implementation policy. Local preparation is
+cancellable and uses the existing 30-second foreground operation deadline for
+the complete native lifecycle, including graceful node shutdown, so a blocked
+local node/store operation cannot retain the Activity indefinitely. The value
+matches the existing maximum foreground adapter operation and remains
+implementation policy. A successful text receipt has zero remaining,
+deferred-lane, and unscheduled Event work; a bounded partial contact retains
+progress but must be retried. The app uses manual Linux
+address/PSM input and requests no scan,
 advertise, location, Internet, service, or receiver capability.
 
 This optional path does not widen the fixed Linux-to-Linux Ring-1 exit or move

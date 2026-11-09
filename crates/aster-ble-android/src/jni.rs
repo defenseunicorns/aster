@@ -2,11 +2,12 @@
 
 use crate::{
     PhaseSink, RunId, RunOutcome, RunRegistry, SessionEvent, ValidationReceipt, ValidatorConfig,
-    ValidatorError, ValidatorErrorCategory, ValidatorPhase, session::prepare_local_event,
+    ValidatorError, ValidatorErrorCategory, ValidatorPhase,
+    session::{PreparationControl, prepare_local_event_cancellable},
 };
 use jni::{
     Env, EnvUnowned, JValue, JavaVM, jni_sig, jni_str,
-    objects::{JClass, JObject, JString},
+    objects::{JCharArray, JClass, JObject, JString},
     refs::Global,
     sys::{jboolean, jint, jlong},
 };
@@ -14,7 +15,7 @@ use std::{
     os::fd::{FromRawFd, OwnedFd},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -135,15 +136,20 @@ fn decode_utf16(units: &[u16]) -> Result<String, ValidatorError> {
     })
 }
 
-fn validate_java_string(value: String) -> Result<String, ValidatorError> {
-    if value.contains('\u{fffd}') {
-        return Err(ValidatorError::new(
-            ValidatorErrorCategory::Configuration,
-            "validator configuration string is invalid",
-        ));
-    }
-    let units: Vec<u16> = value.encode_utf16().collect();
-    decode_utf16(&units)
+fn decode_java_string(env: &mut Env<'_>, value: &JString<'_>) -> Result<String, ()> {
+    let array = env
+        .call_method(
+            <JString<'_> as AsRef<JObject<'_>>>::as_ref(value),
+            jni_str!("toCharArray"),
+            jni_sig!("()[C"),
+            &[],
+        )
+        .and_then(|value| value.l())
+        .and_then(|value| JCharArray::cast_local(env, value))
+        .map_err(|_| ())?;
+    let mut units = vec![0; array.len(env).map_err(|_| ())?];
+    array.get_region(env, 0, &mut units).map_err(|_| ())?;
+    decode_utf16(&units).map_err(|_| ())
 }
 
 struct JavaCallback {
@@ -230,11 +236,7 @@ fn native_start(
         );
         return Ok(0);
     };
-    let config_json = match config_json
-        .try_to_string(env)
-        .map_err(|_| ())
-        .and_then(|value| validate_java_string(value).map_err(|_| ()))
-    {
+    let config_json = match decode_java_string(env, config_json) {
         Ok(value) => value,
         _ => {
             let _ = callback.error(
@@ -266,7 +268,93 @@ fn native_start(
     }
 }
 
-fn prepare_config(config: &ValidatorConfig) -> Result<(), ValidatorError> {
+struct ActivePreparation {
+    id: u64,
+    control: Arc<PreparationControl>,
+}
+
+#[derive(Default)]
+struct PreparationRegistryState {
+    active: Option<ActivePreparation>,
+    cancelled_through: u64,
+}
+
+struct PreparationRegistry {
+    state: Mutex<PreparationRegistryState>,
+}
+
+impl PreparationRegistry {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(PreparationRegistryState::default()),
+        }
+    }
+
+    fn global() -> &'static Self {
+        static REGISTRY: OnceLock<PreparationRegistry> = OnceLock::new();
+        REGISTRY.get_or_init(Self::new)
+    }
+
+    fn begin(&self, id: u64) -> Result<Arc<PreparationControl>, ValidatorError> {
+        if id == 0 {
+            return Err(ValidatorError::new(
+                ValidatorErrorCategory::Configuration,
+                "validator preparation identifier is invalid",
+            ));
+        }
+        let mut state = self.state.lock().map_err(|_| {
+            ValidatorError::new(
+                ValidatorErrorCategory::Internal,
+                "validator preparation registry is unavailable",
+            )
+        })?;
+        if id <= state.cancelled_through {
+            return Err(ValidatorError::new(
+                ValidatorErrorCategory::Unavailable,
+                "validator local Event preparation was cancelled",
+            ));
+        }
+        if state.active.is_some() {
+            return Err(ValidatorError::new(
+                ValidatorErrorCategory::Unavailable,
+                "validator preparation is already active",
+            ));
+        }
+        let control = Arc::new(PreparationControl::new());
+        state.active = Some(ActivePreparation {
+            id,
+            control: control.clone(),
+        });
+        Ok(control)
+    }
+
+    fn finish(&self, id: u64) {
+        if let Ok(mut state) = self.state.lock()
+            && state.active.as_ref().is_some_and(|active| active.id == id)
+        {
+            state.active.take();
+        }
+    }
+
+    fn cancel(&self, id: u64) {
+        let control = self.state.lock().ok().and_then(|mut state| {
+            state.cancelled_through = state.cancelled_through.max(id);
+            state
+                .active
+                .as_ref()
+                .filter(|active| active.id == id)
+                .map(|active| active.control.clone())
+        });
+        if let Some(control) = control {
+            control.cancel();
+        }
+    }
+}
+
+fn prepare_config(
+    config: &ValidatorConfig,
+    control: &PreparationControl,
+) -> Result<(), ValidatorError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -276,22 +364,21 @@ fn prepare_config(config: &ValidatorConfig) -> Result<(), ValidatorError> {
                 "validator runtime failed to start",
             )
         })?;
-    runtime.block_on(prepare_local_event(config)).map(|_| ())
+    runtime
+        .block_on(prepare_local_event_cancellable(config, Some(control)))
+        .map(|_| ())
 }
 
 fn native_prepare(
     env: &mut Env<'_>,
     config_json: &JString<'_>,
+    preparation_id: jlong,
     callback: &JObject<'_>,
 ) -> jni::errors::Result<jboolean> {
     let vm = env.get_java_vm()?;
     let callback = env.new_global_ref(callback)?;
     let callback: Arc<dyn NativeCallback> = Arc::new(JavaCallback { vm, callback });
-    let config_json = match config_json
-        .try_to_string(env)
-        .map_err(|_| ())
-        .and_then(|value| validate_java_string(value).map_err(|_| ()))
-    {
+    let config_json = match decode_java_string(env, config_json) {
         Ok(value) => value,
         Err(()) => {
             let _ = callback.error(
@@ -308,7 +395,27 @@ fn native_prepare(
             return Ok(false);
         }
     };
-    match contain(|| prepare_config(&config)) {
+    let preparation_id = match u64::try_from(preparation_id) {
+        Ok(id) if id != 0 => id,
+        _ => {
+            let _ = callback.error(
+                ValidatorErrorCategory::Configuration,
+                "validator preparation identifier is invalid",
+            );
+            return Ok(false);
+        }
+    };
+    let registry = PreparationRegistry::global();
+    let control = match contain(|| registry.begin(preparation_id)) {
+        Ok(control) => control,
+        Err(error) => {
+            let _ = callback.error(error.category(), &error.to_string());
+            return Ok(false);
+        }
+    };
+    let result = contain(|| prepare_config(&config, &control));
+    registry.finish(preparation_id);
+    match result {
         Ok(()) => Ok(true),
         Err(error) => {
             let _ = callback.error(error.category(), &error.to_string());
@@ -324,10 +431,30 @@ pub extern "system" fn Java_org_defenseunicorns_aster_btlering1_NativeValidator_
     mut env: EnvUnowned<'caller>,
     _class: JClass<'caller>,
     config_json: JString<'caller>,
+    preparation_id: jlong,
     callback: JObject<'caller>,
 ) -> jboolean {
-    env.with_env(|env| native_prepare(env, &config_json, &callback))
+    env.with_env(|env| native_prepare(env, &config_json, preparation_id, &callback))
         .resolve::<jni::errors::LogErrorAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_defenseunicorns_aster_btlering1_NativeValidator_nativeCancelPrepare<
+    'caller,
+>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    preparation_id: jlong,
+) {
+    env.with_env(|_| {
+        if let Ok(preparation_id) = u64::try_from(preparation_id)
+            && preparation_id != 0
+        {
+            PreparationRegistry::global().cancel(preparation_id);
+        }
+        Ok::<_, jni::errors::Error>(())
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
 #[unsafe(no_mangle)]
@@ -435,6 +562,10 @@ mod tests {
     fn invalid_utf16_and_json_do_not_start() {
         let utf16 = decode_utf16(&[0xd800]).expect_err("unpaired surrogate rejected");
         assert_eq!(utf16.category(), ValidatorErrorCategory::Configuration);
+        assert_eq!(
+            decode_utf16(&[0xfffd]).expect("valid replacement char"),
+            "\u{fffd}"
+        );
 
         let json = decode_utf16(&[u16::from(b'{')]).expect("valid UTF-16");
         let error = crate::ValidatorConfig::from_json(&json).expect_err("invalid JSON rejected");
@@ -474,5 +605,27 @@ mod tests {
             callback.calls.lock().expect("callback calls").as_slice(),
             ["error:Timeout"]
         );
+    }
+
+    #[test]
+    fn preparation_registry_carries_cancellation_across_registration() {
+        let registry = PreparationRegistry::new();
+        let control = registry.begin(41).expect("start preparation");
+        assert!(registry.begin(42).is_err());
+
+        registry.cancel(42);
+        assert!(!control.is_cancelled());
+        registry.cancel(41);
+        assert!(control.is_cancelled());
+
+        registry.finish(41);
+        let Err(error) = registry.begin(42) else {
+            panic!("queued preparation was cancelled");
+        };
+        assert_eq!(error.category(), ValidatorErrorCategory::Unavailable);
+
+        let next = registry.begin(43).expect("newer preparation may start");
+        assert!(!next.is_cancelled());
+        registry.finish(43);
     }
 }

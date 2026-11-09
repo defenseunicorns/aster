@@ -30,6 +30,7 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
 
     private val fileExecutor = Executors.newSingleThreadExecutor()
+    private val eventPreparer = EventPreparer()
     private var missionBundle: File? = null
     private var missionCopying = false
     private var bridge: BluetoothBridge? = null
@@ -52,7 +53,7 @@ class MainActivity : Activity() {
         psm.setText("128")
         selectMission.setOnClickListener { selectMissionBundle() }
         connect.setOnClickListener { validateAndConnect() }
-        cancel.setOnClickListener { bridge?.cancel() }
+        cancel.setOnClickListener { cancelValidation() }
         render()
     }
 
@@ -134,14 +135,27 @@ class MainActivity : Activity() {
             return
         }
 
+        state = reduce(ValidationState.Ready, ValidationEvent.ConnectRequested)
+        render()
+        eventPreparer.prepare(
+            config,
+            validationCallback(),
+        ) {
+            runOnUiThread { continueWithTransport(config) }
+        }
+    }
+
+    private fun continueWithTransport(config: ValidatorConfig) {
+        if (state != ValidationState.Connecting) return
         val permissionGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
-            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) ==
+            PackageManager.PERMISSION_GRANTED
         if (needsBluetoothConnectPermission(Build.VERSION.SDK_INT, permissionGranted)) {
             pendingPermissionConfig = config
             requestPermissions(arrayOf(Manifest.permission.BLUETOOTH_CONNECT), REQUEST_CONNECT)
             return
         }
-        begin(config)
+        beginTransport(config)
     }
 
     override fun onRequestPermissionsResult(
@@ -152,32 +166,45 @@ class MainActivity : Activity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode != REQUEST_CONNECT) return
         val config = pendingPermissionConfig.also { pendingPermissionConfig = null }
-        if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED && config != null) {
-            begin(config)
+        if (state != ValidationState.Connecting || config == null) return
+        if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+            beginTransport(config)
         } else {
             state = ValidationState.Failed("permission", "Bluetooth connect permission was denied")
             render()
         }
     }
 
-    private fun begin(config: ValidatorConfig) {
+    private fun beginTransport(config: ValidatorConfig) {
         val adapter = getSystemService(BluetoothManager::class.java)?.adapter
         if (adapter == null) {
             state = ValidationState.Failed("unavailable", "Bluetooth LE is unavailable")
             render()
             return
         }
-        state = reduce(ValidationState.Ready, ValidationEvent.ConnectRequested)
-        render()
         val currentBridge = BluetoothBridge(adapter)
         bridge = currentBridge
-        currentBridge.connect(config, object : NativeValidator.Callback {
+        currentBridge.connect(config, validationCallback())
+    }
+
+    private fun validationCallback(): NativeValidator.Callback =
+        object : NativeValidator.Callback {
             override fun onPhase(phase: String) = dispatch(ValidationEvent.Phase(phase))
             override fun onComplete(receiptJson: String) =
                 dispatch(ValidationEvent.Complete(receiptJson))
             override fun onError(category: String, message: String) =
                 dispatch(ValidationEvent.Error(category, message))
-        })
+        }
+
+    private fun cancelValidation() {
+        pendingPermissionConfig = null
+        val currentBridge = bridge
+        eventPreparer.cancel()
+        currentBridge?.cancel()
+        if (currentBridge == null && state == ValidationState.Connecting) {
+            state = ValidationState.Failed("unavailable", "validator was cancelled")
+            render()
+        }
     }
 
     private fun dispatch(event: ValidationEvent) {
@@ -211,6 +238,7 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         bridge?.close()
         bridge = null
+        eventPreparer.close()
         fileExecutor.shutdownNow()
         super.onDestroy()
     }

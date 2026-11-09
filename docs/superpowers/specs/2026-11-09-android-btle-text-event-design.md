@@ -36,12 +36,28 @@ Ring-1 terminal after transfer over BTLE.
 - Topic remains `mesh.messages`; scope remains `demo/playground`; the logical
   key is the fixed evaluation value `android-btle-ring1/text/v1`.
 - Android uses a private numbered-publication journal under its existing state
-  directory. The bridge invokes a synchronous native local-preparation step on
-  its worker before checking adapter availability or creating a Bluetooth
-  socket. Publication and journal acknowledgement therefore complete before
-  any carrier attempt, so a missing carrier never undoes local publication.
+  directory. A dedicated foreground-operation worker invokes a synchronous,
+  natively cancellable local-preparation step before requesting Bluetooth
+  permission, checking adapter availability, or creating a socket. Publication
+  and journal acknowledgement therefore complete before any carrier attempt,
+  so a missing carrier never undoes local publication.
+- Local preparation has a 30-second foreground deadline covering native node
+  startup, journal/store work, publication, subscription, and shutdown. The
+  value matches the existing maximum foreground adapter operation, giving the
+  operator one consistent retry interval without adding another lifecycle
+  class. Java and native code enforce the same bound, and cancellation is
+  retained across queued-worker/native-registration races. This is Android
+  implementation policy, not a protocol timeout.
 - The existing 65,536-byte Linux Event remains part of the validation contact,
   preserving the negotiated-MTU observation and prior Linux-to-Android path.
+- If the operator changes the message after an unavailable carrier, the next
+  contact may reconcile a bounded backlog of retained Android Events. Android
+  therefore requires positive outbound Event evidence rather than an exact
+  count of one. Success additionally requires zero remaining, deferred-lane,
+  and unscheduled Event work. Linux snapshots the selector before contact and
+  prints the greatest newly inserted sequence only after those zero-work
+  checks, so the printed Event corresponds to the latest retained message. An
+  incomplete bounded contact retains progress but reports failure for retry.
 - Linux creates an exact durable Consume subscription before opening the
   contact, queries only Events from the configured Android mission identity,
   and selects the greatest Event sequence for the fixed selector.
@@ -65,7 +81,9 @@ Ring-1 terminal after transfer over BTLE.
 
 The form adds one `Message` input. The existing button becomes **Send and
 validate**. On press, the app validates the form, durably publishes the text
-through the in-process native preparation boundary, then opens the LE CoC and
+through the in-process native preparation boundary, then requests any required
+Bluetooth permission and opens the LE CoC. Cancellation is routed to the exact
+active local preparation or contact operation. The contact then
 runs the bidirectional v9 Event contact. Android reports
 the locally committed Event ID/digest and contact counters. Linux prints one
 line shaped as:
