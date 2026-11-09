@@ -17,6 +17,7 @@ import (
 
 	"connectrpc.com/connect"
 	api "github.com/defenseunicorns/aster/conformance/agent-go/gen/aster/application/v1alpha1"
+	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -77,7 +78,7 @@ func regularOwned(file *os.File) bool {
 	return ok && stat.Uid == uint32(os.Geteuid())
 }
 func openFileAt(dir *os.File, name string, flags int) (*os.File, error) {
-	fd, err := syscall.Openat(int(dir.Fd()), name, flags|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0600)
+	fd, err := unix.Openat(int(dir.Fd()), name, flags|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0600)
 	if err != nil {
 		return nil, ErrJournal
 	}
@@ -100,7 +101,7 @@ func openParent(path string) (*os.File, error) {
 		if part == "" {
 			continue
 		}
-		fd, err := syscall.Openat(int(dir.Fd()), part, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+		fd, err := unix.Openat(int(dir.Fd()), part, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 		dir.Close()
 		if err != nil {
 			return nil, ErrJournal
@@ -239,7 +240,7 @@ func (j *Journal) save() (saveError error) {
 	if err != nil {
 		return ErrJournal
 	}
-	defer syscall.Unlinkat(int(j.dir.Fd()), name)
+	defer unix.Unlinkat(int(j.dir.Fd()), name, 0)
 	if file.Chmod(0600) != nil {
 		file.Close()
 		return ErrJournal
@@ -251,7 +252,7 @@ func (j *Journal) save() (saveError error) {
 	if file.Close() != nil {
 		return ErrJournal
 	}
-	if syscall.Renameat(int(j.dir.Fd()), name, int(j.dir.Fd()), filepath.Base(j.path)) != nil {
+	if unix.Renameat(int(j.dir.Fd()), name, int(j.dir.Fd()), filepath.Base(j.path)) != nil {
 		return ErrJournal
 	}
 	if j.syncDir() != nil {

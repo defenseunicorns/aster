@@ -260,7 +260,8 @@ and parent before proceeding. The SDK requires existing parents. Rust journal
 filesystem operations fail as unsupported on non-Unix platforms; directory
 synchronization must also be supported by the filesystem.
 
-The Go acceptance journal is Linux-only and uses descriptor-relative operations:
+The Go acceptance journal uses descriptor-relative Unix operations through
+`golang.org/x/sys/unix` (pinned in its module):
 its lock, read, exclusive temporary creation, replacement, cleanup, and parent
 synchronization all use the same retained directory. Renaming or replacing an
 ancestor pathname does not redirect an already-open journal's writes. Rust
@@ -273,9 +274,8 @@ A failed directory synchronization returns an error without deleting or
 reinitializing the valid written state. Preserve that file and its client ID;
 close and reopen it for recovery, rather than starting a new identity. A Go
 save failure disables further RPCs on that owner until close/reopen. Tests use
-deterministic directory replacement and injected synchronization failures on
-one Linux host; they do not qualify filesystem, device, or physical power-loss
-recovery and do not advance retained requirements evidence.
+deterministic directory replacement and injected synchronization failures; they
+do not qualify filesystem, device, or physical power-loss recovery and do not advance retained requirements evidence.
 
 Initialization is a separate one-time operation:
 

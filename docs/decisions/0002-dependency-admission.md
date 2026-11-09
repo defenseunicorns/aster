@@ -172,3 +172,14 @@ graph, and associated server/ACME packages. The new direct `rustls` 0.23.43
 edge reuses an already locked package/version. Those distinctions keep server
 code out of the normal node graph; they do not waive review of the expanded
 test/lock graph or admit any dependency for a shipped relay server.
+
+### Go acceptance journal filesystem wrappers
+
+The test-only `conformance/agent-go` module exact-pins
+[`golang.org/x/sys` v0.46.0](https://cs.opensource.google/go/x/sys/+/refs/tags/v0.46.0:).
+Its BSD-3-Clause-licensed `unix` package supplies descriptor-relative
+`Openat`, `Renameat`, and `Unlinkat` wrappers on Linux and macOS, where Go's
+frozen `syscall` package does not expose the same API set. The journal retains
+no-follow traversal, exclusive creation, descriptor-bound replacement, and
+parent synchronization. This dependency is outside the Rust product graph;
+platform/filesystem qualification and requirements evidence remain unchanged.
