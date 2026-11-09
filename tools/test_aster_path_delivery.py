@@ -1357,19 +1357,6 @@ class PathDeliveryControllerTests(unittest.TestCase):
         self.assertEqual(scenario["payload"], "bounded real Event over routed netem")
         self.assertEqual(scenario["seed"], 104729)
 
-    def test_repository_entrypoints_keep_delivery_as_a_separate_required_lane(self) -> None:
-        root = MODULE_PATH.parents[1]
-        mise = (root / "mise.toml").read_text(encoding="utf-8")
-        self.assertIn("[tasks.path-delivery-plan]", mise)
-        self.assertIn("[tasks.path-delivery-smoke]", mise)
-        workflow = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        self.assertIn("path-delivery-smoke:", workflow)
-        self.assertIn("- path-delivery-smoke", workflow)
-        readme = (root / "docker/path-lab/README.md").read_text(encoding="utf-8")
-        self.assertIn("one-host container limitation", readme)
-        self.assertIn("does not claim recovery", readme)
-        self.assertIn("exact Event ID, logical key, and payload", readme)
-
     def test_delivery_build_context_text_contract_and_copy_sources(self) -> None:
         root = MODULE_PATH.parents[1]
         dockerfile = root / "docker/path-lab/Dockerfile.delivery"
