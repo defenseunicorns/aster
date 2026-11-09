@@ -12,3 +12,5 @@
 !lab/Dockerfile.selected-nat
 !lab/Dockerfile.dockerignore
 !lab/debian.sources
+third-party/bluer-0.17.4-aster/bluetooth-numbers-database/.github/
+third-party/bluer-0.17.4-aster/bluetooth-numbers-database/.github/**

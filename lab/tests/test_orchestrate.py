@@ -606,6 +606,53 @@ curl\t8.0
         self.assertIn("lab/Dockerfile", paths)
         self.assertRegex(orchestrate.build_input_digest(inputs), r"^[0-9a-f]{64}$")
 
+    def test_build_inputs_retain_but_do_not_seal_reviewed_vendor_automation(self):
+        automation = (
+            "third-party/bluer-0.17.4-aster/"
+            "bluetooth-numbers-database/.github/workflows/verify_ids.yml"
+        )
+        self.assertTrue((orchestrate.WORKSPACE / automation).is_file())
+        paths = {item.relative_path for item in orchestrate.collect_build_inputs()}
+        self.assertNotIn(automation, paths)
+        self.assertIn(
+            "third-party/bluer-0.17.4-aster/"
+            "bluetooth-numbers-database/.gitignore",
+            paths,
+        )
+
+    def test_build_inputs_reject_unreviewed_hidden_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            (workspace / "crates").mkdir()
+            hidden = workspace / "third-party/example/.github/workflows"
+            hidden.mkdir(parents=True)
+            (hidden / "unreviewed.yml").write_text("unreviewed\n", encoding="utf-8")
+            (workspace / "lab").mkdir()
+            for relative in (
+                "Cargo.toml",
+                "Cargo.lock",
+                "LICENSE",
+                "THIRD_PARTY_NOTICES.md",
+                "lab/debian.sources",
+            ):
+                (workspace / relative).write_text("fixture\n", encoding="utf-8")
+            (workspace / ".dockerignore").write_text(
+                orchestrate.EXPECTED_DOCKERIGNORE, encoding="utf-8"
+            )
+            (workspace / "lab/Dockerfile.dockerignore").write_text(
+                orchestrate.EXPECTED_DOCKERIGNORE, encoding="utf-8"
+            )
+            (workspace / "lab/Dockerfile").write_text(
+                f"ARG LAB_BASE_IMAGE={orchestrate.LAB_BASE_IMAGE}\n"
+                "FROM ${LAB_BASE_IMAGE}\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(orchestrate, "WORKSPACE", workspace):
+                with self.assertRaisesRegex(
+                    orchestrate.LabError, "prohibited or symbolic build input"
+                ):
+                    orchestrate.collect_build_inputs()
+
     def test_build_boundary_seals_only_hashed_bytes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1063,6 +1110,68 @@ curl\t8.0
             orchestrate.validate_selected_nat_tracked_inputs(
                 context, "/usr/bin/git", inputs
             )
+
+    def test_selected_nat_source_gates_exclude_only_reviewed_vendor_automation(self):
+        automation = (
+            "third-party/bluer-0.17.4-aster/"
+            "bluetooth-numbers-database/.github/workflows/verify_ids.yml"
+        )
+        cargo = b"cargo"
+        automation_bytes = b"upstream automation"
+        inputs = [
+            orchestrate.BuildInput(
+                "Cargo.toml", cargo, hashlib.sha256(cargo).hexdigest()
+            )
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            context = self.context(Path(temporary))
+            context.runner = mock.Mock()
+            context.runner.run.return_value = subprocess.CompletedProcess(
+                [], 0, f"Cargo.toml\0{automation}\0", ""
+            )
+            orchestrate.validate_selected_nat_tracked_inputs(
+                context, "/usr/bin/git", inputs
+            )
+
+            context.runner.run.return_value = subprocess.CompletedProcess(
+                [],
+                0,
+                (
+                    "100644 blob "
+                    f"{orchestrate.git_sha1_blob(cargo)}\tCargo.toml\0"
+                    "100644 blob "
+                    f"{orchestrate.git_sha1_blob(automation_bytes)}\t{automation}\0"
+                ),
+                "",
+            )
+            orchestrate.validate_selected_nat_commit_inputs(
+                context, "/usr/bin/git", "a" * 40, inputs
+            )
+
+            unknown = "third-party/example/.github/workflows/unreviewed.yml"
+            context.runner.run.return_value = subprocess.CompletedProcess(
+                [], 0, f"Cargo.toml\0{unknown}\0", ""
+            )
+            with self.assertRaisesRegex(orchestrate.LabError, "tracked omitted"):
+                orchestrate.validate_selected_nat_tracked_inputs(
+                    context, "/usr/bin/git", inputs
+                )
+
+            context.runner.run.return_value = subprocess.CompletedProcess(
+                [],
+                0,
+                (
+                    "100644 blob "
+                    f"{orchestrate.git_sha1_blob(cargo)}\tCargo.toml\0"
+                    "100644 blob "
+                    f"{orchestrate.git_sha1_blob(automation_bytes)}\t{unknown}\0"
+                ),
+                "",
+            )
+            with self.assertRaisesRegex(orchestrate.LabError, "commit tree"):
+                orchestrate.validate_selected_nat_commit_inputs(
+                    context, "/usr/bin/git", "a" * 40, inputs
+                )
 
     def test_selected_nat_commit_input_gate_rejects_post_status_byte_mutation(self):
         with tempfile.TemporaryDirectory() as temporary:
