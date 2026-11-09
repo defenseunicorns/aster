@@ -451,6 +451,15 @@ impl PublicationJournal {
         client_id: &[u8],
         sync_parent: impl FnOnce(&aster_node::journal_directory::JournalDirectory) -> Result<()>,
     ) -> Result<()> {
+        Self::initialize_state_with_parent_sync(path, client_id, None, sync_parent)
+    }
+
+    fn initialize_state_with_parent_sync(
+        path: &Path,
+        client_id: &[u8],
+        reconstruction_session: Option<u64>,
+        sync_parent: impl FnOnce(&aster_node::journal_directory::JournalDirectory) -> Result<()>,
+    ) -> Result<()> {
         validate_client_id(client_id)?;
         let directory = aster_node::journal_directory::JournalDirectory::open(path, false)
             .map_err(|error| journal_error(path, "open parent directory", error))?;
@@ -461,10 +470,14 @@ impl PublicationJournal {
             .create_file(file)
             .map_err(|error| journal_error(path, "initialize", error))?;
         let state = JournalState {
-            reconstructing: false,
-            version: JOURNAL_VERSION,
+            reconstructing: reconstruction_session.is_some(),
+            version: if reconstruction_session.is_some() {
+                RECONSTRUCTED_JOURNAL_VERSION
+            } else {
+                JOURNAL_VERSION
+            },
             client_id: client_id.to_vec(),
-            session: 0,
+            session: reconstruction_session.unwrap_or(0),
             allocated_through: 0,
             snapshot_revision: 0,
             recovery_complete: false,
@@ -808,16 +821,13 @@ where
                 "client cannot be reconstructed".to_owned(),
             ));
         }
-        PublicationJournal::initialize(path.as_ref(), client_id)?;
+        PublicationJournal::initialize_state_with_parent_sync(
+            path.as_ref(),
+            client_id,
+            status.current_session,
+            sync_journal_parent,
+        )?;
         let sdk = Self::open(client, path, client_id)?;
-        sdk.journal.update_state(|state| {
-            state.version = RECONSTRUCTED_JOURNAL_VERSION;
-            state.session = status
-                .current_session
-                .expect("validated registered session");
-            state.reconstructing = true;
-            Ok(())
-        })?;
         let report = sdk.recover().await?;
         Ok((sdk, report))
     }
@@ -3718,6 +3728,42 @@ mod tests {
         let journal = PublicationJournal::open(&path, b"client").unwrap();
         assert_eq!(journal.read_state().unwrap().next_sequence, Some(1));
         drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconstruction_initialization_failure_before_first_claim_is_recoverable() {
+        let path = journal_path("reconstruction-before-claim");
+        // Fail after the initial durable commit, before any claim or reopen.
+        let error = PublicationJournal::initialize_state_with_parent_sync(
+            &path,
+            b"client",
+            Some(4),
+            |directory| {
+                sync_journal_parent(directory)?;
+                Err(NumberedEventSdkError::Journal(
+                    "injected interruption".into(),
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected interruption"));
+        assert!(PublicationJournal::initialize(&path, b"client").is_err());
+        let journal = PublicationJournal::open(&path, b"client").unwrap();
+        let state = journal.read_state().unwrap();
+        assert_eq!(state.version, RECONSTRUCTED_JOURNAL_VERSION);
+        assert_eq!(state.session, 4);
+        assert!(state.reconstructing);
+        assert!(state.pending_claim.is_none());
+        drop(journal);
+        let (_, client) = scripted(vec![begin(5, 100, vec![result(3)]), complete()]);
+        let sdk = NumberedEventSdk::open(client, &path, b"client").unwrap();
+        let report = sdk.recover().await.unwrap();
+        assert_eq!(report.allocated_through, 100);
+        assert_eq!(report.operations.len(), 1);
+        assert!(sdk.journal.entry(3).unwrap().unwrap().result_only);
+        assert!(!sdk.journal.read_state().unwrap().reconstructing);
+        drop(sdk);
         std::fs::remove_file(path).unwrap();
     }
 
