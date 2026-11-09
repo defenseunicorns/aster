@@ -101,6 +101,7 @@ pub enum EventClientDisposition {
     Current,
     Fenced,
     RecoveryRequired,
+    Retired,
 }
 
 /// Bounded, local application ownership observation, not an operating-system process identity.
@@ -198,6 +199,7 @@ pub enum NumberedEventOperationError {
     LegacyStoreRequiresFreshState,
     LegacyOperationDisabled,
     ClientNotFound,
+    ClientRetired,
     SubscriptionOwnerMismatch,
     SessionFenced,
     RecoveryRequired,
@@ -233,6 +235,7 @@ impl fmt::Display for NumberedEventOperationError {
                 "legacy Event operation publication is disabled for this store"
             }
             Self::SubscriptionOwnerMismatch => "Event subscription belongs to another client",
+            Self::ClientRetired => "Event client identity is permanently retired",
             Self::ClientNotFound => "publication client was not found",
             Self::SessionFenced => "publication session was fenced by another claimant",
             Self::RecoveryRequired => "publication recovery must complete before mutation",
@@ -258,6 +261,7 @@ pub struct NumberedEventOperationStats {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ClientRecord {
+    retired: bool,
     session: u64,
     allocated_through: u64,
     snapshot_revision: u64,
@@ -332,6 +336,17 @@ impl Store {
         }
         let write = self.database.begin_write()?;
         crate::enforce_live_write(&write)?;
+        if write.list_tables()?.any(|t| t.name() == CLIENTS.name())
+            && write
+                .open_table(CLIENTS)?
+                .get(client.as_bytes())?
+                .map(|v| decode_client(v.value()))
+                .transpose()?
+                .is_some_and(|r| r.retired)
+        {
+            return Err(NumberedEventOperationError::ClientRetired.into());
+        }
+
         {
             let mut table = write.open_table(APPLICATION_CHECKPOINTS)?;
             if table.get(client.as_bytes())?.is_none() && table.len()? >= MAX_NUMBERED_EVENT_CLIENTS
@@ -390,6 +405,9 @@ impl Store {
             None
         };
         let record = match existing {
+            Some(record) if record.retired => {
+                return Err(NumberedEventOperationError::ClientRetired.into());
+            }
             Some(record)
                 if record.last_claim_expected == expected_session
                     && record.last_claim_digest == claim_digest =>
@@ -415,10 +433,11 @@ impl Store {
                     return Err(NumberedEventOperationError::SessionFenced.into());
                 }
                 let stats = read_stats_write(&write)?;
-                if stats.clients >= MAX_NUMBERED_EVENT_CLIENTS {
+                if stats.clients >= client_limits_write(&write)?.max_clients {
                     return Err(NumberedEventOperationError::ClientLimitExceeded.into());
                 }
                 ClientRecord {
+                    retired: false,
                     session: 1,
                     allocated_through: 0,
                     snapshot_revision: 1,
@@ -438,6 +457,7 @@ impl Store {
             let mut stats = read_stats_write(&write)?;
             let encoded = encode_client(record);
             charge_new_record(
+                &write,
                 &mut stats,
                 self.operation_limits,
                 client.as_bytes().len() + encoded.len(),
@@ -809,7 +829,7 @@ pub(crate) fn admit_numbered_result_write(
     if operation.sequence.get() != expected {
         return Err(NumberedEventOperationError::SequenceGap.into());
     }
-    if outstanding.len() as u64 >= MAX_OUTSTANDING_EVENT_RESULTS_PER_CLIENT {
+    if outstanding.len() as u64 >= client_limits_write(write)?.max_outstanding_results {
         return Err(NumberedEventOperationError::OutstandingLimitExceeded.into());
     }
     let result = NumberedEventResult {
@@ -822,6 +842,7 @@ pub(crate) fn admit_numbered_result_write(
     let reverse = reverse_key(receipt.transfer_id, operation.client, operation.sequence);
     let mut stats = read_stats_write(write)?;
     charge_new_record(
+        write,
         &mut stats,
         limits,
         key.len() + encoded.len() + reverse.len(),
@@ -1029,6 +1050,7 @@ pub(crate) fn legacy_operation_allowed_write(
 pub(crate) fn audit_numbered_tables_write(
     write: &redb::WriteTransaction,
 ) -> Result<NumberedEventOperationStats, StoreError> {
+    let _ = client_limits_write(write)?;
     let table_names = [
         "aster.numbered-event-clients.v1",
         "aster.numbered-event-results.v1",
@@ -1110,7 +1132,17 @@ pub(crate) fn audit_numbered_tables_write(
         let (key, value) = row?;
         let client = EventClientId::new(key.value().to_vec())?;
         let record = decode_client(value.value())?;
-        client_frontiers.insert(client, (record.allocated_through, 0));
+        client_frontiers.insert(
+            client,
+            (
+                if record.retired {
+                    0
+                } else {
+                    record.allocated_through
+                },
+                0,
+            ),
+        );
         checked_accounting_add(&mut stats.clients, 1)?;
         checked_accounting_add_lengths(
             &mut stats.logical_bytes,
@@ -1228,6 +1260,7 @@ pub(crate) fn audit_numbered_result_authority_write(
 pub(crate) fn audit_numbered_tables_read(
     read: &redb::ReadTransaction,
 ) -> Result<NumberedEventOperationStats, StoreError> {
+    let _ = client_limits_read(read)?;
     let table_names = [
         "aster.numbered-event-clients.v1",
         "aster.numbered-event-results.v1",
@@ -1354,7 +1387,17 @@ pub(crate) fn audit_numbered_tables_read(
         let (key, value) = row?;
         let client = EventClientId::new(key.value().to_vec())?;
         let record = decode_client(value.value())?;
-        client_frontiers.insert(client, (record.allocated_through, 0));
+        client_frontiers.insert(
+            client,
+            (
+                if record.retired {
+                    0
+                } else {
+                    record.allocated_through
+                },
+                0,
+            ),
+        );
         checked_accounting_add(&mut stats.clients, 1)?;
         checked_accounting_add_lengths(
             &mut stats.logical_bytes,
@@ -1551,6 +1594,9 @@ fn require_session(
     record: ClientRecord,
     session: EventPublicationSession,
 ) -> Result<(), StoreError> {
+    if record.retired {
+        return Err(NumberedEventOperationError::ClientRetired.into());
+    }
     if record.session != session.get() {
         return Err(NumberedEventOperationError::SessionFenced.into());
     }
@@ -1807,8 +1853,14 @@ fn decode_reverse_key(bytes: &[u8]) -> Result<(EventClientId, EventOperationSequ
     decode_result_key(&bytes[32..])
 }
 
-fn encode_client(record: ClientRecord) -> [u8; 81] {
-    let mut encoded = [0u8; 81];
+fn encode_client(record: ClientRecord) -> Vec<u8> {
+    if record.retired {
+        let mut encoded = vec![2];
+        encoded.extend_from_slice(&record.session.to_be_bytes());
+        encoded.extend_from_slice(&record.allocated_through.to_be_bytes());
+        return encoded;
+    }
+    let mut encoded = vec![0u8; 81];
     encoded[0] = CLIENT_VERSION;
     for (index, value) in [
         record.session,
@@ -1829,6 +1881,22 @@ fn encode_client(record: ClientRecord) -> [u8; 81] {
 }
 
 fn decode_client(bytes: &[u8]) -> Result<ClientRecord, StoreError> {
+    if bytes.len() == 17 && bytes[0] == 2 {
+        let session = u64::from_be_bytes(bytes[1..9].try_into().expect("fixed session"));
+        if session == 0 {
+            return Err(NumberedEventOperationError::InvalidSession.into());
+        }
+        return Ok(ClientRecord {
+            retired: true,
+            session,
+            allocated_through: u64::from_be_bytes(bytes[9..17].try_into().expect("fixed frontier")),
+            snapshot_revision: 1,
+            completed_session: 0,
+            completed_revision: 0,
+            last_claim_expected: 0,
+            last_claim_digest: [0; 32],
+        });
+    }
     let encoded: &[u8; 81] = bytes.try_into().map_err(|_| {
         NumberedEventOperationError::Invariant("numbered Event client record length is invalid")
     })?;
@@ -1843,6 +1911,7 @@ fn decode_client(bytes: &[u8]) -> Result<ClientRecord, StoreError> {
         u64::from_be_bytes(encoded[offset..offset + 8].try_into().expect("fixed field"))
     };
     let record = ClientRecord {
+        retired: false,
         session: read(0),
         allocated_through: read(1),
         snapshot_revision: read(2),
@@ -1927,6 +1996,7 @@ fn decode_result_with_digest(
 }
 
 fn charge_new_record(
+    write: &redb::WriteTransaction,
     stats: &mut NumberedEventOperationStats,
     limits: EventOperationLimits,
     incoming_bytes: usize,
@@ -1937,12 +2007,13 @@ fn charge_new_record(
         .checked_add(stats.outstanding_results)
         .and_then(|records| records.checked_add(1))
         .ok_or(NumberedEventOperationError::GlobalRecordLimitExceeded)?;
+    let configured = client_limits_write(write)?;
     let record_limit = if emergency {
         limits.max_records()
     } else {
         limits.ordinary_record_limit()
     };
-    if next_records > record_limit {
+    if next_records > record_limit.min(configured.max_records) {
         return Err(NumberedEventOperationError::GlobalRecordLimitExceeded.into());
     }
     let incoming = u64::try_from(incoming_bytes)
@@ -1956,7 +2027,7 @@ fn charge_new_record(
         .logical_bytes
         .checked_add(incoming)
         .ok_or(NumberedEventOperationError::GlobalByteLimitExceeded)?;
-    if next_bytes > byte_limit {
+    if next_bytes > byte_limit.min(configured.max_logical_bytes) {
         return Err(NumberedEventOperationError::GlobalByteLimitExceeded.into());
     }
     stats.logical_bytes = next_bytes;
@@ -2067,14 +2138,26 @@ pub(crate) fn require_owner_registered_write(
     write: &redb::WriteTransaction,
     owner: &EventClientId,
 ) -> Result<(), StoreError> {
-    load_client_write(write, owner).map(|_| ())
+    load_client_write(write, owner).and_then(|r| {
+        if r.retired {
+            Err(NumberedEventOperationError::ClientRetired.into())
+        } else {
+            Ok(())
+        }
+    })
 }
 
 pub(crate) fn require_owner_registered_read(
     read: &redb::ReadTransaction,
     owner: &EventClientId,
 ) -> Result<(), StoreError> {
-    load_client_read(read, owner).map(|_| ())
+    load_client_read(read, owner).and_then(|r| {
+        if r.retired {
+            Err(NumberedEventOperationError::ClientRetired.into())
+        } else {
+            Ok(())
+        }
+    })
 }
 
 fn load_client_read(
@@ -2107,7 +2190,9 @@ pub(crate) fn client_disposition_read(
     let Some(record) = record else {
         return Ok((None, EventClientDisposition::Unregistered));
     };
-    let disposition = if observed_session.is_some_and(|session| record.session != session.get()) {
+    let disposition = if record.retired {
+        EventClientDisposition::Retired
+    } else if observed_session.is_some_and(|session| record.session != session.get()) {
         EventClientDisposition::Fenced
     } else if observed_session.is_none()
         || record.completed_session != record.session
@@ -2192,6 +2277,220 @@ impl Store {
     }
 }
 
+/// Admission-only tuning. Hard safety ceilings and recovery response limits never change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventClientLimits {
+    pub max_clients: u64,
+    pub max_outstanding_results: u64,
+    pub max_records: u64,
+    pub max_logical_bytes: u64,
+}
+impl EventClientLimits {
+    pub const DEFAULT: Self = Self {
+        max_clients: MAX_NUMBERED_EVENT_CLIENTS,
+        max_outstanding_results: MAX_OUTSTANDING_EVENT_RESULTS_PER_CLIENT,
+        max_records: u64::MAX,
+        max_logical_bytes: u64::MAX,
+    };
+    pub fn new(max_clients: u64, max_outstanding_results: u64) -> Result<Self, StoreError> {
+        if max_clients == 0
+            || max_clients > MAX_NUMBERED_EVENT_CLIENTS
+            || max_outstanding_results == 0
+            || max_outstanding_results > MAX_OUTSTANDING_EVENT_RESULTS_PER_CLIENT
+        {
+            return Err(StoreError::SemanticInvariant(
+                "Event client admission limits exceed safety bounds",
+            ));
+        }
+        Ok(Self {
+            max_clients,
+            max_outstanding_results,
+            ..Self::DEFAULT
+        })
+    }
+    pub fn with_global_limits(mut self, records: u64, bytes: u64) -> Result<Self, StoreError> {
+        if records == 0 || bytes == 0 {
+            return Err(StoreError::SemanticInvariant(
+                "numbered Event global admission limits must be nonzero",
+            ));
+        }
+        self.max_records = records;
+        self.max_logical_bytes = bytes;
+        Ok(self)
+    }
+}
+const CLIENT_LIMIT: &str = "numbered_event_client_admission_limit_v1";
+const GLOBAL_RECORD_LIMIT: &str = "numbered_event_global_admission_records_v1";
+const GLOBAL_BYTE_LIMIT: &str = "numbered_event_global_admission_bytes_v1";
+const OUTSTANDING_LIMIT: &str = "numbered_event_outstanding_admission_limit_v1";
+fn decode_client_limits(fields: [Option<u64>; 4]) -> Result<EventClientLimits, StoreError> {
+    if fields.iter().all(Option::is_none) {
+        return Ok(EventClientLimits::DEFAULT);
+    }
+    let [Some(clients), Some(outstanding), Some(records), Some(bytes)] = fields else {
+        return Err(StoreError::SemanticInvariant(
+            "Event client admission configuration is incomplete",
+        ));
+    };
+    EventClientLimits::new(clients, outstanding)?.with_global_limits(records, bytes)
+}
+fn client_limits_write(write: &redb::WriteTransaction) -> Result<EventClientLimits, StoreError> {
+    let table = write.open_table(METADATA)?;
+    decode_client_limits([
+        table.get(CLIENT_LIMIT)?.map(|v| v.value()),
+        table.get(OUTSTANDING_LIMIT)?.map(|v| v.value()),
+        table.get(GLOBAL_RECORD_LIMIT)?.map(|v| v.value()),
+        table.get(GLOBAL_BYTE_LIMIT)?.map(|v| v.value()),
+    ])
+}
+fn client_limits_read(read: &redb::ReadTransaction) -> Result<EventClientLimits, StoreError> {
+    let table = read.open_table(METADATA)?;
+    decode_client_limits([
+        table.get(CLIENT_LIMIT)?.map(|v| v.value()),
+        table.get(OUTSTANDING_LIMIT)?.map(|v| v.value()),
+        table.get(GLOBAL_RECORD_LIMIT)?.map(|v| v.value()),
+        table.get(GLOBAL_BYTE_LIMIT)?.map(|v| v.value()),
+    ])
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventClientCapacity {
+    pub limits: EventClientLimits,
+    pub stats: NumberedEventOperationStats,
+    pub retired_clients: u64,
+    pub global_record_limit: u64,
+    pub global_byte_limit: u64,
+}
+impl Store {
+    /// Offline/operator administration, never an SDK session mutation. Lower quotas
+    /// affect new admission only, not retained rows or state-reducing operations.
+    pub fn configure_event_client_limits(
+        &self,
+        limits: EventClientLimits,
+    ) -> Result<(), StoreError> {
+        self.require_live()?;
+        let limits = EventClientLimits::new(limits.max_clients, limits.max_outstanding_results)?
+            .with_global_limits(limits.max_records, limits.max_logical_bytes)?;
+        let write = self.database.begin_write()?;
+        crate::enforce_live_write(&write)?;
+        require_numbered_mode_write(&write, true)?;
+        let mut table = write.open_table(METADATA)?;
+        table.insert(CLIENT_LIMIT, limits.max_clients)?;
+        table.insert(OUTSTANDING_LIMIT, limits.max_outstanding_results)?;
+        table.insert(GLOBAL_RECORD_LIMIT, limits.max_records)?;
+        table.insert(GLOBAL_BYTE_LIMIT, limits.max_logical_bytes)?;
+        drop(table);
+        write.commit()?;
+        Ok(())
+    }
+    pub fn event_client_capacity(&self) -> Result<EventClientCapacity, StoreError> {
+        self.require_live()?;
+        let read = self.database.begin_read()?;
+        client_capacity_read(&read, self.operation_limits)
+    }
+    pub fn inspect_event_client_capacity(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<EventClientCapacity, StoreError> {
+        let database = redb::Builder::new().open_read_only(path)?;
+        client_capacity_read(&database.begin_read()?, EventOperationLimits::DEFAULT)
+    }
+
+    /// Irreversible administrative retirement with a reviewed-session CAS.
+    /// Atomically drops ownership/results but keeps a permanent, charged client fence.
+    pub fn retire_event_client(
+        &self,
+        client: &EventClientId,
+        expected_session: EventPublicationSession,
+    ) -> Result<bool, StoreError> {
+        self.require_live()?;
+        let write = self.database.begin_write()?;
+        crate::enforce_live_write(&write)?;
+        require_numbered_mode_write(&write, false)?;
+        let mut record = load_client_write(&write, client)?;
+        if record.session != expected_session.get() {
+            return Err(NumberedEventOperationError::SessionFenced.into());
+        }
+        if record.retired {
+            return Ok(false);
+        }
+        crate::remove_event_client_subscriptions_write(&write, client)?;
+        let outstanding = stored_results_for_client_write(&write, client)?;
+        let mut stats = read_stats_write(&write)?;
+        for (key, result, _) in outstanding {
+            let reverse = reverse_key(result.receipt.transfer_id, client, result.sequence);
+            let length = write
+                .open_table(RESULTS)?
+                .remove(key.as_slice())?
+                .ok_or(NumberedEventOperationError::ResultNotFound)?
+                .value()
+                .len();
+            if write
+                .open_table(RESULT_BY_EVENT)?
+                .remove(reverse.as_slice())?
+                .is_none()
+            {
+                return Err(NumberedEventOperationError::Invariant(
+                    "retired result has no reverse edge",
+                )
+                .into());
+            }
+            stats.outstanding_results -= 1;
+            stats.reverse_edges -= 1;
+            stats.logical_bytes = stats
+                .logical_bytes
+                .checked_sub((key.len() + length + reverse.len()) as u64)
+                .ok_or(NumberedEventOperationError::Invariant(
+                    "retirement accounting underflow",
+                ))?;
+        }
+        stats.logical_bytes =
+            stats
+                .logical_bytes
+                .checked_sub(64)
+                .ok_or(NumberedEventOperationError::Invariant(
+                    "client fence accounting underflow",
+                ))?;
+        record.retired = true;
+        write
+            .open_table(CLIENTS)?
+            .insert(client.as_bytes(), encode_client(record).as_slice())?;
+        write
+            .open_table(APPLICATION_CHECKPOINTS)?
+            .remove(client.as_bytes())?;
+        write_stats(&write, stats)?;
+        write.commit()?;
+        Ok(true)
+    }
+}
+
+fn client_capacity_read(
+    read: &redb::ReadTransaction,
+    operation_limits: EventOperationLimits,
+) -> Result<EventClientCapacity, StoreError> {
+    let stats = read_stats_read(read)?;
+    let mut retired_clients = 0;
+    if read.list_tables()?.any(|t| t.name() == CLIENTS.name()) {
+        let table = read.open_table(CLIENTS)?;
+        if table.len()? > MAX_NUMBERED_EVENT_CLIENTS {
+            return Err(NumberedEventOperationError::ClientLimitExceeded.into());
+        }
+        for row in table.iter()? {
+            let (_, value) = row?;
+            retired_clients += u64::from(decode_client(value.value())?.retired);
+        }
+    }
+    Ok(EventClientCapacity {
+        limits: client_limits_read(read)?,
+        stats,
+        retired_clients,
+        global_record_limit: operation_limits
+            .ordinary_record_limit()
+            .min(client_limits_read(read)?.max_records),
+        global_byte_limit: (operation_limits.max_logical_bytes()
+            - operation_limits.emergency_byte_reserve())
+        .min(client_limits_read(read)?.max_logical_bytes),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2251,6 +2550,130 @@ mod tests {
         client
     }
 
+    fn random_claim_nonce() -> [u8; 32] {
+        let mut nonce = [0; 32];
+        getrandom::fill(&mut nonce).expect("test claim randomness");
+        nonce
+    }
+
+    #[test]
+    fn lifecycle_limits_reject_only_growth_and_retirement_releases_sparse_results() {
+        let file = CorruptionFile::new("lifecycle-capacity");
+        let store = file.open();
+        let client = capacity_client(&store);
+        store
+            .configure_event_client_limits(EventClientLimits::new(1, 1).unwrap())
+            .unwrap();
+        capacity_admit(&store, &client, 1, false, EventOperationLimits::DEFAULT).unwrap();
+        assert!(capacity_admit(&store, &client, 2, false, EventOperationLimits::DEFAULT).is_err());
+        let before = store.numbered_event_operation_stats().unwrap();
+        assert_eq!(before.outstanding_results, 1);
+        // Saturation still permits takeover/recovery and individual acknowledgement.
+        let claim = store
+            .begin_event_publication_session(&client, 1, &random_claim_nonce())
+            .unwrap();
+        store
+            .complete_event_publication_recovery(&client, claim.session, claim.snapshot_revision)
+            .unwrap();
+        store
+            .acknowledge_event_publication_result(
+                &client,
+                claim.session,
+                EventOperationSequence::new(1).unwrap(),
+            )
+            .unwrap();
+        capacity_admit(&store, &client, 2, false, EventOperationLimits::DEFAULT).unwrap();
+        store
+            .configure_event_client_limits(
+                EventClientLimits::new(1, 1)
+                    .unwrap()
+                    .with_global_limits(1, 1)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(store.retire_event_client(&client, claim.session).unwrap());
+        let capacity = store.event_client_capacity().unwrap();
+        assert_eq!(capacity.stats.outstanding_results, 0);
+        assert_eq!(capacity.stats.reverse_edges, 0);
+        assert_eq!(
+            capacity.stats.logical_bytes,
+            client.as_bytes().len() as u64 + 17
+        );
+        assert_eq!(capacity.retired_clients, 1);
+    }
+
+    #[test]
+    fn incomplete_or_out_of_bounds_lifecycle_limits_are_never_defaulted() {
+        assert!(EventClientLimits::new(0, 1).is_err());
+        assert!(EventClientLimits::new(MAX_NUMBERED_EVENT_CLIENTS + 1, 1).is_err());
+        assert!(EventClientLimits::new(1, MAX_OUTSTANDING_EVENT_RESULTS_PER_CLIENT + 1).is_err());
+        let file = CorruptionFile::new("partial-lifecycle-limits");
+        let store = file.open();
+        store
+            .configure_event_client_limits(EventClientLimits::new(1, 1).unwrap())
+            .unwrap();
+        let write = store.database.begin_write().unwrap();
+        write
+            .open_table(METADATA)
+            .unwrap()
+            .remove(OUTSTANDING_LIMIT)
+            .unwrap();
+        write.commit().unwrap();
+        assert!(store.event_client_capacity().is_err());
+        assert!(
+            store
+                .begin_event_publication_session(
+                    &EventClientId::new(b"new".to_vec()).unwrap(),
+                    0,
+                    &random_claim_nonce()
+                )
+                .is_err()
+        );
+        drop(store);
+        assert!(Store::open_for_mission(&file.0, CORRUPTION_MISSION).is_err());
+    }
+
+    #[test]
+    fn configured_global_lifecycle_limits_reject_admission_without_advancing_frontier() {
+        let file = CorruptionFile::new("configured-global-limits");
+        let store = file.open();
+        let client = capacity_client(&store);
+        let before = store.numbered_event_operation_stats().unwrap();
+        for (records, bytes, expected) in [
+            (
+                1,
+                100_000,
+                NumberedEventOperationError::GlobalRecordLimitExceeded,
+            ),
+            (10, 1, NumberedEventOperationError::GlobalByteLimitExceeded),
+        ] {
+            store
+                .configure_event_client_limits(
+                    EventClientLimits::new(2, 2)
+                        .unwrap()
+                        .with_global_limits(records, bytes)
+                        .unwrap(),
+                )
+                .unwrap();
+            assert!(
+                matches!(capacity_admit(&store, &client, 1, false, EventOperationLimits::DEFAULT),
+                Err(StoreError::NumberedEventOperation(error)) if error == expected)
+            );
+            assert_eq!(store.numbered_event_operation_stats().unwrap(), before);
+        }
+        let snapshot = store
+            .begin_event_publication_session(&client, 1, &random_claim_nonce())
+            .unwrap();
+        assert_eq!(snapshot.allocated_through, 0);
+        store
+            .complete_event_publication_recovery(
+                &client,
+                snapshot.session,
+                snapshot.snapshot_revision,
+            )
+            .unwrap();
+    }
+
     fn capacity_operation(
         client: &EventClientId,
         sequence: u64,
@@ -2281,7 +2704,10 @@ mod tests {
         let result = crate::admit_pending_event_operation_write(
             &write,
             &[0x71; 32],
-            crate::PendingEventOperation::Numbered(capacity_operation(client, sequence)),
+            crate::PendingEventOperation::Numbered(PendingNumberedEventOperation {
+                session: EventPublicationSession::new(load_client_write(&write, client)?.session)?,
+                ..capacity_operation(client, sequence)
+            }),
             receipt,
             CommittedEventContent::Available,
             limits,
@@ -2756,6 +3182,7 @@ mod tests {
         let write = store.database.begin_write().expect("write");
         let mut stats = read_stats_write(&write).expect("stats");
         let record = ClientRecord {
+            retired: false,
             session: 1,
             allocated_through: 0,
             snapshot_revision: 1,

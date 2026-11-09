@@ -36,6 +36,33 @@ const PLAYGROUND_TOPIC: &str = "mesh.messages";
 const PLAYGROUND_EPOCH: u64 = 1;
 const PLAYGROUND_MISSION_BUNDLE_FILE: &str = "mission.unprotected-reference.bundle";
 
+fn admin_event_client_id(
+    text: Option<String>,
+    hex: Option<String>,
+) -> Result<aster_redb_store::EventClientId, Box<dyn std::error::Error>> {
+    let bytes = match (text, hex) {
+        (Some(text), None) => text.into_bytes(),
+        (None, Some(hex)) => {
+            if hex.is_empty()
+                || hex.len() > 128
+                || hex.len() % 2 != 0
+                || !hex.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err("--client-id-hex requires 1–64 hex-encoded bytes".into());
+            }
+            hex.as_bytes()
+                .chunks_exact(2)
+                .map(|part| {
+                    u8::from_str_radix(std::str::from_utf8(part).expect("validated ASCII"), 16)
+                        .expect("validated hex")
+                })
+                .collect()
+        }
+        _ => return Err("exactly one of --client-id or --client-id-hex is required".into()),
+    };
+    Ok(aster_redb_store::EventClientId::new(bytes)?)
+}
+
 fn main() -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -58,7 +85,8 @@ fn main() -> ExitCode {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = Arguments::new(env::args().skip(1));
-    match arguments.command()?.as_str() {
+    let command = arguments.command()?;
+    match command.as_str() {
         "init" => {
             let state = arguments.required_path("--state")?;
             arguments.finish()?;
@@ -118,6 +146,59 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
             for id in receipt.ids {
                 println!("ITEM id={}", aster_node::format_item_id(id));
+            }
+        }
+        "event-client-capacity" | "event-client-limits" | "event-client-retire" => {
+            let state = arguments.required_path("--state")?;
+            let action = &command;
+            let path = state.join("mesh.redb");
+            let inspection = aster_redb_store::Store::inspect_existing(&path)?;
+            let authority = inspection
+                .mission_authority
+                .ok_or("mission-bound state is required")?;
+            if action == "event-client-capacity" {
+                arguments.finish()?;
+                let capacity = aster_redb_store::Store::inspect_event_client_capacity(&path)?;
+                println!(
+                    "EVENT_CLIENT_CAPACITY clients={} retired={} outstanding={} reverse_edges={} logical_bytes={} max_clients={} max_outstanding={} max_records={} max_bytes={} reusable_slots=false",
+                    capacity.stats.clients,
+                    capacity.retired_clients,
+                    capacity.stats.outstanding_results,
+                    capacity.stats.reverse_edges,
+                    capacity.stats.logical_bytes,
+                    capacity.limits.max_clients,
+                    capacity.limits.max_outstanding_results,
+                    capacity.global_record_limit,
+                    capacity.global_byte_limit
+                );
+            } else if action == "event-client-limits" {
+                let clients = arguments.required("--max-clients")?.parse()?;
+                let outstanding = arguments.required("--max-outstanding")?.parse()?;
+                let records = arguments.required("--max-records")?.parse()?;
+                let bytes = arguments.required("--max-bytes")?.parse()?;
+                arguments.finish()?;
+                let limits = aster_redb_store::EventClientLimits::new(clients, outstanding)?
+                    .with_global_limits(records, bytes)?;
+                let store = aster_redb_store::Store::open_for_mission(&path, authority)?;
+                store.configure_event_client_limits(limits)?;
+                println!("EVENT_CLIENT_LIMITS status=pass admission_only=true");
+            } else {
+                let client = admin_event_client_id(
+                    arguments.optional_once("--client-id")?,
+                    arguments.optional_once("--client-id-hex")?,
+                )?;
+                let expected = aster_redb_store::EventPublicationSession::new(
+                    arguments.required("--expected-session")?.parse()?,
+                )?;
+                if !arguments.switch("--irreversible")? {
+                    return Err("--irreversible is required for permanent client retirement".into());
+                }
+                arguments.finish()?;
+                let store = aster_redb_store::Store::open_for_mission(&path, authority)?;
+                let retired = store.retire_event_client(&client, expected)?;
+                println!(
+                    "EVENT_CLIENT_RETIRE status=pass changed={retired} permanent=true reusable_slot=false"
+                );
             }
         }
         "control-revoke" => {
@@ -707,6 +788,9 @@ const HELP: &str = "Aster selected-stack mesh CLI\n\n\
          Commands:\n\
            aster init --state DIR\n\
            aster put --state DIR --id HEX64 --file PATH  # maximum 1,048,576 bytes\n\
+           aster event-client-capacity --state DIR\n\
+           aster event-client-limits --state DIR --max-clients N --max-outstanding N --max-records N --max-bytes N\n\
+           aster event-client-retire --state DIR (--client-id ID | --client-id-hex HEX) --expected-session N --irreversible\n\
            aster inspect --state DIR [--audit-event-operations]\n\
            aster playground-init --nodes N --root DIR\n\
            aster zeroize --state DIR \\
@@ -1286,5 +1370,23 @@ mod tests {
         symlink(target.path(), source.path()).expect("create source symlink");
         let error = read_put_source(source.path()).expect_err("reject symlink source");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+}
+
+#[cfg(test)]
+mod event_client_admin_tests {
+    #[test]
+    fn admin_identity_covers_binary_clients_and_rejects_ambiguous_or_malformed_input() {
+        assert_eq!(
+            super::admin_event_client_id(None, Some("00ff7F".into()))
+                .unwrap()
+                .as_bytes(),
+            &[0, 255, 127]
+        );
+        for value in ["", "a", "gg", "é", &"ab".repeat(65)] {
+            assert!(super::admin_event_client_id(None, Some(value.into())).is_err());
+        }
+        assert!(super::admin_event_client_id(None, None).is_err());
+        assert!(super::admin_event_client_id(Some("a".into()), Some("61".into())).is_err());
     }
 }
