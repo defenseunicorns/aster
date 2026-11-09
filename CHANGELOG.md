@@ -72,6 +72,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   either content metadata or a retirement notice. This is a Rust source
   compatibility break; callers must match the tagged delivery item.
 
+### Fixed
+
+- Fixed unused-field warnings in `aster-node` builds.
+
 ### Security
 - Fixed RUSTSEC-2026-0459 by updating rusqlite to 0.41.1 and libsqlite3-sys to 0.39.1.
 - Bounded abandoned received Profile-5 uploads with a receiver-local 30-day
