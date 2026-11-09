@@ -12,13 +12,10 @@ use crate::application::{
     EventPublishResult, EventQuery, EventRecoverySnapshot, NumberedEventPublishOutcome,
     NumberedEventPublishRequest, Priority, Scope, SelectedEventHandle, SelectedEventNode, Topic,
 };
+use crate::journal_directory::JournalDirectory;
 use redb::{Database, Durability, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
-use std::{
-    error::Error,
-    fs::{File, OpenOptions},
-    path::Path,
-};
+use std::{error::Error, path::Path};
 
 type Failure = Box<dyn Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Failure>;
@@ -223,63 +220,37 @@ fn ready_stopped<T>(future: impl std::future::Future<Output = Result<T>>) -> Res
     }
 }
 
-fn file(path: &Path, create: bool) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create_new(create);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = options.open(path)?;
-    #[cfg(unix)]
-    if create {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || (!create && metadata.len() == 0) {
-        return Err("journal must be an existing nonempty regular file".into());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
-            return Err("journal must be owned and private".into());
-        }
-    }
-    Ok(file)
-}
 impl Journal {
     pub fn initialize(path: &Path, client: &[u8]) -> Result<()> {
+        Self::initialize_with_parent_sync(path, client, |directory| Ok(directory.sync()?))
+    }
+    fn initialize_with_parent_sync(
+        path: &Path,
+        client: &[u8],
+        sync_parent: impl FnOnce(&JournalDirectory) -> Result<()>,
+    ) -> Result<()> {
         EventClientId::new(client.to_vec())?;
-        let parent = path.parent().ok_or("journal parent missing")?;
-        if !parent.exists() {
-            let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt as _;
-                builder.mode(0o700);
-            }
-            let created: Vec<_> = parent
-                .ancestors()
-                .take_while(|directory| !directory.exists())
-                .collect();
-            builder.create(parent)?;
-            for directory in created.into_iter().rev() {
-                File::open(directory)?.sync_all()?;
-                File::open(
-                    directory
-                        .parent()
-                        .ok_or("new journal directory has no parent")?,
-                )?
-                .sync_all()?;
-            }
-        }
-        let database = redb::Builder::new().create_file(file(path, true)?)?;
+        let directory = JournalDirectory::open(path, true)?;
+        Self::initialize_in(directory, path, client, sync_parent)
+    }
+    /// Internal fixture entry point for an already-retained parent directory.
+    #[doc(hidden)]
+    pub fn initialize_at(directory: &std::fs::File, name: &Path, client: &[u8]) -> Result<()> {
+        EventClientId::new(client.to_vec())?;
+        Self::initialize_in(
+            JournalDirectory::from_file(directory, name)?,
+            name,
+            client,
+            |directory| Ok(directory.sync()?),
+        )
+    }
+    fn initialize_in(
+        directory: JournalDirectory,
+        path: &Path,
+        client: &[u8],
+        sync_parent: impl FnOnce(&JournalDirectory) -> Result<()>,
+    ) -> Result<()> {
+        let database = redb::Builder::new().create_file(directory.file(path, true)?)?;
         let journal = Self {
             poisoned: std::cell::Cell::new(false),
             database,
@@ -295,11 +266,20 @@ impl Journal {
             },
         };
         journal.save()?;
-        File::open(path.parent().ok_or("journal parent missing")?)?.sync_all()?;
+        sync_parent(&directory)?;
         Ok(())
     }
     pub fn open(path: &Path, client: &[u8]) -> Result<Self> {
-        let database = redb::Builder::new().create_file(file(path, false)?)?;
+        let directory = JournalDirectory::open(path, false)?;
+        Self::open_in(directory, path, client)
+    }
+    /// Internal fixture entry point preserving a caller's directory binding.
+    #[doc(hidden)]
+    pub fn open_at(directory: &std::fs::File, name: &Path, client: &[u8]) -> Result<Self> {
+        Self::open_in(JournalDirectory::from_file(directory, name)?, name, client)
+    }
+    fn open_in(directory: JournalDirectory, path: &Path, client: &[u8]) -> Result<Self> {
+        let database = redb::Builder::new().create_file(directory.file(path, false)?)?;
         let read = database.begin_read()?;
         let table = read.open_table(CHECKPOINT)?;
         let raw = table.get("state")?.ok_or("journal metadata missing")?;
@@ -574,7 +554,11 @@ mod tests {
             let mut nonce = [0; 16];
             getrandom::fill(&mut nonce).unwrap();
             let name: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
-            let path = std::env::temp_dir().join(format!("aster-native-publication-{name}"));
+            // Resolve the test environment only; keep journal symlink checks intact.
+            let path = std::env::temp_dir()
+                .canonicalize()
+                .expect("canonical temporary directory")
+                .join(format!("aster-native-publication-{name}"));
             std::fs::create_dir(&path).unwrap();
             #[cfg(unix)]
             {
@@ -622,6 +606,79 @@ mod tests {
             },
         )
     }
+    #[test]
+    fn preopened_directory_initialization_survives_rename() {
+        let root = Root::new();
+        let parent = root.0.join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let directory = std::fs::File::open(&parent).unwrap();
+        let moved = root.0.join("moved");
+        std::fs::rename(&parent, &moved).unwrap();
+        Journal::initialize_at(&directory, Path::new("journal.redb"), b"client").unwrap();
+        let journal = Journal::open_at(&directory, Path::new("journal.redb"), b"client").unwrap();
+        assert_eq!(journal.state.next, 1);
+        assert!(Journal::open(&moved.join("journal.redb"), b"client").is_err());
+    }
+
+    #[test]
+    fn journal_parent_sync_succeeds_after_rename() {
+        let root = Root::new();
+        let parent = root.0.join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let moved = root.0.join("moved");
+        Journal::initialize_with_parent_sync(
+            &parent.join("journal.redb"),
+            b"client",
+            |directory| {
+                std::fs::rename(&parent, &moved)?;
+                Ok(directory.sync()?)
+            },
+        )
+        .unwrap();
+        let journal = Journal::open(&moved.join("journal.redb"), b"client").unwrap();
+        assert_eq!(journal.state.next, 1);
+    }
+
+    #[test]
+    fn journal_parent_rename_and_sync_failure_retain_identity() {
+        let root = Root::new();
+        let parent = root.0.join("new/nested");
+        let path = parent.join("journal.redb");
+        let moved = root.0.join("moved");
+        let error = Journal::initialize_with_parent_sync(&path, b"client", |directory| {
+            std::fs::rename(&parent, &moved)?;
+            std::fs::create_dir(&parent)?;
+            std::fs::write(parent.join("sentinel"), b"unchanged")?;
+            directory.sync()?;
+            Err("injected directory sync failure".into())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected"));
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read(parent.join("sentinel")).unwrap(),
+            b"unchanged"
+        );
+        let retained = moved.join("journal.redb");
+        assert!(Journal::initialize(&retained, b"different").is_err());
+        assert!(Journal::open(&retained, b"different").is_err());
+        let journal = Journal::open(&retained, b"client").unwrap();
+        assert_eq!(journal.state.next, 1);
+        assert!(Journal::open(&retained, b"client").is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn journal_rejects_symlink_parent_without_creating_state() {
+        let root = Root::new();
+        let target = root.0.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let alias = root.0.join("alias");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        assert!(Journal::initialize(&alias.join("journal.redb"), b"client").is_err());
+        assert!(!target.join("journal.redb").exists());
+    }
+
     #[test]
     fn stopped_journal_roundtrip_needs_no_async_runtime() {
         let root = Root::new();

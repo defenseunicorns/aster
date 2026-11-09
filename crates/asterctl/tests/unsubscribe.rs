@@ -49,11 +49,14 @@ fn run(port: u16, args: &[&str]) -> Output {
 
 fn run_with_stdout(port: u16, args: &[&str], stdout: Stdio) -> Output {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!(
-        "asterctl-owned-fixture-{}-{}-unsubscribe.redb",
-        std::process::id(),
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
+    let path = std::env::temp_dir()
+        .canonicalize()
+        .expect("canonical temporary directory")
+        .join(format!(
+            "asterctl-owned-fixture-{}-{}-unsubscribe.redb",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
     let journal = path.to_str().unwrap();
     assert!(
         cli(&[

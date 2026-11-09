@@ -381,8 +381,9 @@ fn prepare(options: &Options) -> Result<()> {
         drop(identity);
         state_directory.sync_all()?;
 
-        numbered::Journal::initialize(
-            &descriptor_child_path(&state_directory, "publication.redb")?,
+        numbered::Journal::initialize_at(
+            &state_directory,
+            Path::new("publication.redb"),
             publication_client(name).as_bytes(),
         )?;
         let mut selected = SelectedEventNode::open_unprotected_reference(&state, &mission_path)?;
@@ -402,8 +403,9 @@ fn prepare(options: &Options) -> Result<()> {
             Some(_) => {}
             None => mission_authority = Some(selected.mission_authority()),
         }
-        let mut journal = numbered::Journal::open(
-            &descriptor_child_path(&state_directory, "publication.redb")?,
+        let mut journal = numbered::Journal::open_at(
+            &state_directory,
+            Path::new("publication.redb"),
             publication_client(name).as_bytes(),
         )?;
         journal.recover_stopped(&mut selected)?;
@@ -499,8 +501,11 @@ fn publish(options: &Options) -> Result<()> {
         0o600,
     )?;
     let mission = descriptor_child_path(&tree.private, &mission_name)?;
-    let journal_path = descriptor_child_path(&state_directory, "publication.redb")?;
-    let mut journal = numbered::Journal::open(&journal_path, publication_client(name).as_bytes())?;
+    let mut journal = numbered::Journal::open_at(
+        &state_directory,
+        Path::new("publication.redb"),
+        publication_client(name).as_bytes(),
+    )?;
     let mut selected = SelectedEventNode::open_unprotected_reference(&state, &mission)?;
     retained_bundle.require_unchanged()?;
     retained_bundle.require_pathname(&tree.private, &mission_name)?;
@@ -613,8 +618,9 @@ fn verify(options: &Options) -> Result<()> {
             "receiver mission authority does not match manifest",
         ));
     }
-    let mut journal = numbered::Journal::open(
-        &descriptor_child_path(&state_directory, "publication.redb")?,
+    let mut journal = numbered::Journal::open_at(
+        &state_directory,
+        Path::new("publication.redb"),
         publication_client(name).as_bytes(),
     )?;
     journal.recover_stopped(&mut selected)?;
