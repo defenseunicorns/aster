@@ -25,11 +25,14 @@ fn command_with_timeout(
     key: Option<&str>,
     timeout_seconds: Option<&str>,
 ) -> Command {
-    let directory = std::env::temp_dir().join(format!(
-        "asterctl-key-owner-{}-{}",
-        std::process::id(),
-        port
-    ));
+    let directory = std::env::temp_dir()
+        .canonicalize()
+        .expect("canonical temporary directory")
+        .join(format!(
+            "asterctl-key-owner-{}-{}",
+            std::process::id(),
+            port
+        ));
     std::fs::create_dir_all(&directory).unwrap();
     #[cfg(unix)]
     {
@@ -386,10 +389,13 @@ fn timeouts_preserve_the_generated_key_without_retrying() {
 fn client_status_after_publication_init_omits_unissued_session() {
     let listener = listener();
     let port = listener.local_addr().unwrap().port();
-    let root = std::env::temp_dir().join(format!(
-        "asterctl-fresh-status-{}-{port}",
-        std::process::id()
-    ));
+    let root = std::env::temp_dir()
+        .canonicalize()
+        .expect("canonical temporary directory")
+        .join(format!(
+            "asterctl-fresh-status-{}-{port}",
+            std::process::id()
+        ));
     std::fs::create_dir(&root).unwrap();
     #[cfg(unix)]
     {
