@@ -5694,15 +5694,25 @@ fn remove_event_client_subscriptions_write(
         }
     }
     drop(table);
-    for id in ids {
-        remove_event_subscription_write(write, id)?;
-    }
-    Ok(())
+    remove_event_subscriptions_write(write, &ids)
 }
 fn remove_event_subscription_write(
     write: &redb::WriteTransaction,
     id: EventSubscriptionId,
 ) -> Result<(), StoreError> {
+    remove_event_subscriptions_write(write, &[id])
+}
+
+// Retirement gathers ownership once, then visits each delivery table once.
+// Keep the per-selector generation meaning while writing accounting only once.
+fn remove_event_subscriptions_write(
+    write: &redb::WriteTransaction,
+    ids: &[EventSubscriptionId],
+) -> Result<(), StoreError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let owned: std::collections::BTreeSet<_> = ids.iter().map(|id| *id.as_bytes()).collect();
     let subscription_count = write.open_table(EVENT_SUBSCRIPTIONS)?.len()?;
     let pending_count = write.open_table(EVENT_SUBSCRIPTION_PENDING)?.len()?;
     let acknowledgement_count = write.open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)?.len()?;
@@ -5732,11 +5742,9 @@ fn remove_event_subscription_write(
             })?
             .value();
         validate_event_selector_generation(generation, subscription_count)?;
-        let next_count = subscription_count
-            .checked_sub(1)
-            .ok_or(StoreError::SemanticInvariant(
-                "Event subscription counter underflow",
-            ))?;
+        let next_count = subscription_count.checked_sub(ids.len() as u64).ok_or(
+            StoreError::SemanticInvariant("Event subscription counter underflow"),
+        )?;
         (generation, next_count)
     };
 
@@ -5749,7 +5757,7 @@ fn remove_event_subscription_write(
                 StoreError::SemanticInvariant("Event pending-delivery key has invalid length")
             })?;
             let (row_subscription, _) = parse_event_pending_delivery_key(&key_bytes)?;
-            if row_subscription == id {
+            if owned.contains(row_subscription.as_bytes()) {
                 let pending = decode_event_pending_delivery_record(value.value())?;
                 pending_removals.push((key_bytes, pending.semantic_id));
             }
@@ -5764,7 +5772,7 @@ fn remove_event_subscription_write(
                 StoreError::SemanticInvariant("Event acknowledgement key has invalid length")
             })?;
             let (row_subscription, semantic_id) = parse_event_acknowledgement_key(&key_bytes)?;
-            if row_subscription == id {
+            if owned.contains(row_subscription.as_bytes()) {
                 decode_event_acknowledgement_record(value.value())?;
                 acknowledgement_removals.push((key_bytes, semantic_id));
             }
@@ -5786,7 +5794,7 @@ fn remove_event_subscription_write(
             "Event acknowledgement counter underflow",
         ))?;
     let next_generation = selector_generation
-        .checked_add(1)
+        .checked_add(ids.len() as u64)
         .ok_or(StoreError::ItemCountAccountingOverflow)?;
 
     {
@@ -5811,14 +5819,15 @@ fn remove_event_subscription_write(
             )?;
         }
     }
-    if write
-        .open_table(EVENT_SUBSCRIPTIONS)?
-        .remove(id.as_bytes().as_slice())?
-        .is_none()
     {
-        return Err(StoreError::SemanticInvariant(
-            "Event subscription disappeared during its write transaction",
-        ));
+        let mut subscriptions = write.open_table(EVENT_SUBSCRIPTIONS)?;
+        for id in ids {
+            if subscriptions.remove(id.as_bytes().as_slice())?.is_none() {
+                return Err(StoreError::SemanticInvariant(
+                    "Event subscription disappeared during its write transaction",
+                ));
+            }
+        }
     }
     {
         let mut metadata = write.open_table(METADATA)?;

@@ -649,3 +649,157 @@ fn retirement_failure_rolls_back_every_owned_selector() {
         EventClientDisposition::Current
     );
 }
+
+/// Bounded host diagnostic, not Tier-2 qualification. Uses the subscription cap
+/// and 4,096 rows in each delivery table, with another client's rows interleaved.
+#[test]
+fn retirement_scale_preserves_other_owner_and_generation_accounting() {
+    let file = TestFile::new("client-retirement-scale");
+    let mut services = event_services(0xb8);
+    let store = Store::open_for_mission(&file.0, services.authority).unwrap();
+    let (owner, _) = claim(&store, b"scale-owner", 0, true);
+    let (other, _) = claim(&store, b"scale-other", 0, true);
+    let policy = store.control_policy_snapshot().unwrap();
+    let mut subscriptions = Vec::new();
+    for index in 0..MAX_EVENT_SUBSCRIPTIONS {
+        let context = if index % 2 == 0 { &owner } else { &other };
+        subscriptions.push(
+            store
+                .create_event_subscription_with_policy(
+                    context,
+                    &policy,
+                    &EventSubscriptionKey::new(index.to_be_bytes().to_vec()).unwrap(),
+                    subscription_spec(EventSubscriptionMode::Consume),
+                )
+                .unwrap()
+                .id,
+        );
+    }
+    let publisher = services.publisher.identity();
+    let mut events = Vec::new();
+    for sequence in 1..=32 {
+        events.push(accept_event(
+            &store,
+            &mut services,
+            event_header(
+                publisher,
+                sequence,
+                sequence,
+                VersionVector::default(),
+                b"scale",
+                b"retained",
+                None,
+            ),
+            b"retained",
+        ));
+    }
+    // Bulk-load a valid delivered/acknowledged image so setup does not require
+    // thousands of durable transactions. Reopen below audits all surviving rows.
+    let write = store.database.begin_write().unwrap();
+    for id in &subscriptions {
+        let mut table = write.open_table(EVENT_SUBSCRIPTIONS).unwrap();
+        let mut record = decode_event_subscription_record(
+            table
+                .get(id.as_bytes().as_slice())
+                .unwrap()
+                .unwrap()
+                .value(),
+        )
+        .unwrap();
+        record.discovered_through = events.last().unwrap().acceptance_marker;
+        let encoded = encode_event_subscription_record(&record).unwrap();
+        table
+            .insert(id.as_bytes().as_slice(), encoded.as_slice())
+            .unwrap();
+        drop(table);
+        for (index, event) in events.iter().enumerate() {
+            if index % 2 == 0 {
+                let key = event_pending_delivery_key(*id, event.acceptance_marker);
+                let value = encode_event_pending_delivery_record(EventPendingDeliveryRecord {
+                    semantic_id: event.semantic_id,
+                    attempts: 1,
+                });
+                write
+                    .open_table(EVENT_SUBSCRIPTION_PENDING)
+                    .unwrap()
+                    .insert(key.as_slice(), value.as_slice())
+                    .unwrap();
+                custody::insert_event_pending_retirement_reference_write(
+                    &write,
+                    event.semantic_id,
+                    key.as_slice(),
+                )
+                .unwrap();
+            } else {
+                let key = event_acknowledgement_key(*id, event.semantic_id);
+                let value = encode_event_acknowledgement_record(EventAcknowledgementRecord {
+                    acceptance_marker: event.acceptance_marker,
+                    attempts: 1,
+                });
+                write
+                    .open_table(EVENT_DELIVERY_ACKNOWLEDGEMENTS)
+                    .unwrap()
+                    .insert(key.as_slice(), value.as_slice())
+                    .unwrap();
+                custody::insert_event_acknowledgement_retirement_reference_write(
+                    &write,
+                    event.semantic_id,
+                    key.as_slice(),
+                )
+                .unwrap();
+            }
+        }
+    }
+    let rows_per_table = MAX_EVENT_SUBSCRIPTIONS * 16;
+    write
+        .open_table(METADATA)
+        .unwrap()
+        .insert(EVENT_PENDING_DELIVERY_COUNT, rows_per_table)
+        .unwrap();
+    write
+        .open_table(METADATA)
+        .unwrap()
+        .insert(EVENT_ACKNOWLEDGEMENT_COUNT, rows_per_table)
+        .unwrap();
+    write.commit().unwrap();
+    let before = store.event_subscription_stats().unwrap();
+    let other_before = store
+        .event_client_status(&other.client_id, Some(other.session))
+        .unwrap();
+    let started = std::time::Instant::now();
+    assert!(
+        store
+            .retire_event_client(&owner.client_id, owner.session)
+            .unwrap()
+    );
+    eprintln!(
+        "RETIREMENT_SCALE subscriptions={} pending={} acknowledgements={} elapsed_us={}",
+        before.subscriptions,
+        before.pending_deliveries,
+        before.acknowledged_deliveries,
+        started.elapsed().as_micros()
+    );
+    let after = store.event_subscription_stats().unwrap();
+    assert_eq!(after.subscriptions, MAX_EVENT_SUBSCRIPTIONS / 2);
+    assert_eq!(after.pending_deliveries, rows_per_table / 2);
+    assert_eq!(after.acknowledged_deliveries, rows_per_table / 2);
+    assert_eq!(
+        after.selector_revision,
+        before.selector_revision + MAX_EVENT_SUBSCRIPTIONS / 2
+    );
+    assert_eq!(
+        store
+            .event_client_status(&other.client_id, Some(other.session))
+            .unwrap(),
+        other_before
+    );
+    drop(store);
+    let reopened = Store::open_for_mission(&file.0, services.authority).unwrap();
+    assert_eq!(reopened.event_subscription_stats().unwrap(), after);
+    assert_eq!(
+        reopened
+            .event_client_status(&other.client_id, Some(other.session))
+            .unwrap(),
+        other_before
+    );
+}
