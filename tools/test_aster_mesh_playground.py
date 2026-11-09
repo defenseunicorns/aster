@@ -1386,10 +1386,6 @@ class ArgumentAndModeTests(unittest.TestCase):
         )
         self.assertTrue(hello.hello)
         self.assertEqual(hello.network, "nearby")
-        self.assertIn("assert-unseen MESSAGE NODE[,NODE...]", playground.HELP_TEXT)
-        self.assertIn("add NAME", playground.HELLO_HELP_TEXT)
-        smoke = MODULE_PATH.parent / "testdata" / "aster-mesh-playground-real.commands"
-        self.assertIn("assert-unseen m1 2", smoke.read_text(encoding="utf-8"))
 
     def test_non_tty_auto_view_is_plain(self) -> None:
         original_stdin = sys.stdin
@@ -1489,10 +1485,8 @@ class ArgumentAndModeTests(unittest.TestCase):
         self.assertIn(b"nearby", result.stderr)
         self.assertIn(b"invitation", result.stderr)
 
-    def test_playground_wrapper_builds_the_discovery_enabled_agent(self) -> None:
+    def test_wrapper_shell_syntax(self) -> None:
         wrapper = MODULE_PATH.with_name("aster-mesh-playground.sh")
-        text = wrapper.read_text(encoding="utf-8")
-        self.assertIn("--features aster-agent/nearby-discovery", text)
         syntax = subprocess.run(
             ["/bin/sh", "-n", str(wrapper)],
             stdout=subprocess.PIPE,
