@@ -19,6 +19,7 @@ class ValidatorConfigTest {
             missionPeer = "AB".repeat(32),
             missionBundle = mission,
             statePath = File(root, "state"),
+            eventText = "hello from Android",
             sendPacketBytes = 512,
             receivePacketBytes = 256,
         )
@@ -58,18 +59,74 @@ class ValidatorConfigTest {
         assertEquals(false, needsBluetoothConnectPermission(31, true))
     }
 
+    @Test
+    fun preservesBoundedUnicodeAndControlTextInJson() {
+        val root = Files.createTempDirectory("aster-android-text").toFile()
+        val mission = File(root, "mission.bundle").apply { writeText("mission") }
+        val text = "Snowman ☃\n\"quoted\"\u0000"
+
+        val config = ValidatorConfig.parse(
+            address = "7C:FA:80:72:3B:7A",
+            psm = "128",
+            missionPeer = "11".repeat(32),
+            missionBundle = mission,
+            statePath = File(root, "state"),
+            eventText = text,
+            sendPacketBytes = 512,
+            receivePacketBytes = 256,
+        )
+
+        assertEquals(text, config.eventText)
+        assertTrue(config.toJson().contains("\"event_text\":\"Snowman ☃\\n\\\"quoted\\\"\\u0000\""))
+        root.deleteRecursively()
+    }
+
+    @Test
+    fun rejectsEmptyOrOversizedUtf8Text() {
+        val root = Files.createTempDirectory("aster-android-text-bound").toFile()
+        val mission = File(root, "mission.bundle").apply { writeText("mission") }
+
+        assertThrows(IllegalArgumentException::class.java) {
+            valid("7C:FA:80:72:3B:7A", "128", "11".repeat(32), mission, root, "")
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            valid(
+                "7C:FA:80:72:3B:7A",
+                "128",
+                "11".repeat(32),
+                mission,
+                root,
+                "x".repeat(1_025),
+            )
+        }
+        assertEquals(
+            1_024,
+            valid(
+                "7C:FA:80:72:3B:7A",
+                "128",
+                "11".repeat(32),
+                mission,
+                root,
+                "é".repeat(512),
+            ).eventText.toByteArray(Charsets.UTF_8).size,
+        )
+        root.deleteRecursively()
+    }
+
     private fun valid(
         address: String,
         psm: String,
         peer: String,
         mission: File,
         root: File,
+        eventText: String = "hello from Android",
     ) = ValidatorConfig.parse(
         address,
         psm,
         peer,
         mission,
         File(root, "state"),
+        eventText,
         512,
         256,
     )

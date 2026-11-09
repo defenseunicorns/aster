@@ -22,6 +22,7 @@ class MainActivity : Activity() {
     private lateinit var address: EditText
     private lateinit var psm: EditText
     private lateinit var missionPeer: EditText
+    private lateinit var eventText: EditText
     private lateinit var selectMission: Button
     private lateinit var connect: Button
     private lateinit var cancel: Button
@@ -41,6 +42,7 @@ class MainActivity : Activity() {
         address = findViewById(R.id.address)
         psm = findViewById(R.id.psm)
         missionPeer = findViewById(R.id.missionPeer)
+        eventText = findViewById(R.id.eventText)
         selectMission = findViewById(R.id.selectMission)
         connect = findViewById(R.id.connect)
         cancel = findViewById(R.id.cancel)
@@ -122,6 +124,7 @@ class MainActivity : Activity() {
                 missionPeer = missionPeer.text.toString(),
                 missionBundle = missionBundle,
                 statePath = File(filesDir, "aster-state"),
+                eventText = eventText.text.toString(),
                 sendPacketBytes = 1,
                 receivePacketBytes = 1,
             )
@@ -199,6 +202,7 @@ class MainActivity : Activity() {
         address.isEnabled = !running
         psm.isEnabled = !running
         missionPeer.isEnabled = !running
+        eventText.isEnabled = !running
         selectMission.isEnabled = !running && !missionCopying
         connect.isEnabled = !running && !missionCopying
         cancel.isEnabled = running

@@ -51,11 +51,20 @@
             android:layout_height="wrap_content"
             android:text="@string/mission_missing" />
 
+        <EditText
+            android:id="@+id/eventText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="@string/message"
+            android:inputType="textCapSentences|textMultiLine"
+            android:maxLength="1024"
+            android:maxLines="4" />
+
         <Button
             android:id="@+id/connect"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="@string/connect_validate" />
+            android:text="@string/send_validate" />
 
         <Button
             android:id="@+id/cancel"

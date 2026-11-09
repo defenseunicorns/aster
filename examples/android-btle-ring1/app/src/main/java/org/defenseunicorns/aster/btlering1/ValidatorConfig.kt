@@ -9,6 +9,7 @@ data class ValidatorConfig(
     val missionPeer: String,
     val bluetoothAddress: String,
     val psm: Int,
+    val eventText: String,
     val sendPacketBytes: Int,
     val receivePacketBytes: Int,
 ) {
@@ -20,6 +21,7 @@ data class ValidatorConfig(
         append("\"mission_peer\":\"").append(missionPeer).append("\",")
         append("\"bluetooth_address\":\"").append(bluetoothAddress).append("\",")
         append("\"psm\":").append(psm).append(',')
+        append("\"event_text\":\"").append(jsonEscape(eventText)).append("\",")
         append("\"send_packet_bytes\":").append(sendPacketBytes).append(',')
         append("\"receive_packet_bytes\":").append(receivePacketBytes).append(',')
         append("\"require_event_larger_than_mtu\":true")
@@ -28,6 +30,7 @@ data class ValidatorConfig(
 
     companion object {
         const val MAX_MISSION_BUNDLE_BYTES = 125_877L
+        const val MAX_EVENT_TEXT_BYTES = 1_024
         private val ADDRESS = Regex("^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
         private val NODE_ID = Regex("^[0-9A-Fa-f]{64}$")
 
@@ -37,6 +40,7 @@ data class ValidatorConfig(
             missionPeer: String,
             missionBundle: File?,
             statePath: File,
+            eventText: String,
             sendPacketBytes: Int,
             receivePacketBytes: Int,
         ): ValidatorConfig {
@@ -55,6 +59,10 @@ data class ValidatorConfig(
             require(statePath.absolutePath != missionBundle.absolutePath) {
                 "state and mission paths must be distinct"
             }
+            require(eventText.isNotEmpty()) { "message must not be empty" }
+            require(eventText.toByteArray(Charsets.UTF_8).size <= MAX_EVENT_TEXT_BYTES) {
+                "message must not exceed $MAX_EVENT_TEXT_BYTES UTF-8 bytes"
+            }
             require(sendPacketBytes in 1..0xffff && receivePacketBytes in 1..0xffff) {
                 "Bluetooth packet size is invalid"
             }
@@ -64,6 +72,7 @@ data class ValidatorConfig(
                 missionPeer = normalizedPeer,
                 bluetoothAddress = normalizedAddress,
                 psm = parsedPsm,
+                eventText = eventText,
                 sendPacketBytes = sendPacketBytes,
                 receivePacketBytes = receivePacketBytes,
             )
