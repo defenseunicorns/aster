@@ -237,6 +237,12 @@ class RustTimingLaneTests(unittest.TestCase):
 
 
 class QualityLaneTests(unittest.TestCase):
+    def test_fuzz_lane_installs_the_linux_bluez_build_prerequisite(self):
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        fuzz = workflow_job(workflow, "fuzz-smoke", "required")
+
+        self.assertIn("- *install-linux-bluez-build-prerequisite", fuzz)
+
     def test_quality_reuses_foundation_core_without_repeating_gated_checks(self):
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
         quality = workflow_job(workflow, "quality", "cargo-lockfiles")

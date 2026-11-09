@@ -515,6 +515,8 @@ jobs:
     steps:
       - *checkout-source
 
+      - *install-linux-bluez-build-prerequisite
+
       - *setup-sccache
 
       - name: Install pinned fuzz toolchain

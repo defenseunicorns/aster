@@ -14,6 +14,7 @@ PORTABLE = [
     "wire_decode", "fragment_decode", "envelope_inspect",
     "selected_frame_decode", "selected_negentropy", "classical_profile_decode",
     "systemd_credential_decode", "stream_transfer_decode", "ble_l2cap_record",
+    "ble_roster_beacon", "ble_discovery_credential",
 ]
 LINUX_ONLY = ["systemd_admin_record_decode", "systemd_backup_decode"]
 
@@ -45,7 +46,7 @@ class FuzzSmokeTests(unittest.TestCase):
             self.assertFalse(list(root.glob("aster-fuzz-smoke.*")))
             return result, log.read_text().splitlines()
 
-    def test_linux_runs_all_eleven_targets(self):
+    def test_linux_runs_all_thirteen_targets(self):
         result, calls = self.run_smoke("Linux")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, PORTABLE + LINUX_ONLY)
