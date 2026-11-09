@@ -275,11 +275,11 @@ records the exact HMAC/BlueR source snapshot. Check and archive it with:
 python3 tools/check-btle-vendor-patches.py
 
 tar --sort=name --format=ustar --mtime=@0 \
-    --owner=0 --group=0 --numeric-owner \
+    --owner=0 --group=0 --numeric-owner --mode=u+rw,go+r-w,a+X \
     -cf /build/sbom/cyclonedx/hmac-0.13.0-aster.tar \
     -C third-party hmac-0.13.0-aster
 tar --sort=name --format=ustar --mtime=@0 \
-    --owner=0 --group=0 --numeric-owner \
+    --owner=0 --group=0 --numeric-owner --mode=u+rw,go+r-w,a+X \
     -cf /build/sbom/cyclonedx/bluer-0.17.4-aster.tar \
     -C third-party bluer-0.17.4-aster
 sha256sum /build/sbom/cyclonedx/hmac-0.13.0-aster.tar \
@@ -287,9 +287,9 @@ sha256sum /build/sbom/cyclonedx/hmac-0.13.0-aster.tar \
 ```
 
 The recorded deterministic hashes are
-`a8c69874ba79751497be40c9dccf63b2a10b891441ba1a880bcbaa627cda61d6`
+`b58cc1f47d33459f5a5a728d476515362f0de7a0d3706cbdb0d24831084760a1`
 and
-`0d58bacf77348f871068fe9fe2f859cb5ec2ccb4ff81d7f6fa05f40477c6bb01`.
+`739106c3be8a2541016e4f20e7af25812f2cec30c50069a2b1df09da7c6d814c`.
 Any source, provenance-note, patch, or mode change requires fresh archives and
 a reviewed replacement set-list.
 

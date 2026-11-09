@@ -47,7 +47,7 @@ VENDORS = (
             ("LICENSE-MIT", "9e0dfd2dd4173a530e238cb6adb37aa78c34c6bc7444e0e10c1ab5d8881f63ba"),
         ),
         patch_sha256="c9962ca0b2c271f1bd3876567ab99571252e9bff4500fcdf7d09cee135c6e4c7",
-        source_archive_sha256="a8c69874ba79751497be40c9dccf63b2a10b891441ba1a880bcbaa627cda61d6",
+        source_archive_sha256="b58cc1f47d33459f5a5a728d476515362f0de7a0d3706cbdb0d24831084760a1",
         patched=("src/block_api.rs",),
     ),
     Vendor(
@@ -60,7 +60,7 @@ VENDORS = (
         license_bindings=("BSD-2-Clause", "BSD-3-Clause", "GPL-2.0-only"),
         notice_files=(("LICENSE", "da053620434ccd59747d44b04e87e06464763f22db320bc71dc9b00b1e4db460"),),
         patch_sha256="ce4de362bf30ccc318c741694adfce8678c53202b44a5b4827a509ea681044af",
-        source_archive_sha256="0d58bacf77348f871068fe9fe2f859cb5ec2ccb4ff81d7f6fa05f40477c6bb01",
+        source_archive_sha256="739106c3be8a2541016e4f20e7af25812f2cec30c50069a2b1df09da7c6d814c",
         patched=("src/adapter.rs", "src/adv.rs", "src/lib.rs", "src/session.rs"),
     ),
 )
@@ -131,6 +131,7 @@ def deterministic_archive_digest(vendor: Vendor) -> str:
             "--owner=0",
             "--group=0",
             "--numeric-owner",
+            "--mode=u+rw,go+r-w,a+X",
             "-cf",
             "-",
             "-C",

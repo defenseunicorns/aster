@@ -42,11 +42,11 @@
         {
           "type": "distribution",
           "url": "hmac-0.13.0-aster.tar",
-          "comment": "Deterministic patched-source archive distributed beside this SBOM; GNU tar --sort=name --format=ustar --mtime=@0 --owner=0 --group=0 --numeric-owner.",
+          "comment": "Deterministic patched-source archive distributed beside this SBOM; GNU tar --sort=name --format=ustar --mtime=@0 --owner=0 --group=0 --numeric-owner --mode=u+rw,go+r-w,a+X.",
           "hashes": [
             {
               "alg": "SHA-256",
-              "content": "a8c69874ba79751497be40c9dccf63b2a10b891441ba1a880bcbaa627cda61d6"
+              "content": "b58cc1f47d33459f5a5a728d476515362f0de7a0d3706cbdb0d24831084760a1"
             }
           ]
         },
@@ -116,11 +116,11 @@
         {
           "type": "distribution",
           "url": "bluer-0.17.4-aster.tar",
-          "comment": "Deterministic patched-source archive distributed beside this SBOM; GNU tar --sort=name --format=ustar --mtime=@0 --owner=0 --group=0 --numeric-owner.",
+          "comment": "Deterministic patched-source archive distributed beside this SBOM; GNU tar --sort=name --format=ustar --mtime=@0 --owner=0 --group=0 --numeric-owner --mode=u+rw,go+r-w,a+X.",
           "hashes": [
             {
               "alg": "SHA-256",
-              "content": "0d58bacf77348f871068fe9fe2f859cb5ec2ccb4ff81d7f6fa05f40477c6bb01"
+              "content": "739106c3be8a2541016e4f20e7af25812f2cec30c50069a2b1df09da7c6d814c"
             }
           ]
         },
