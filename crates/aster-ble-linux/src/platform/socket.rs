@@ -1,13 +1,15 @@
+use super::{map_bluer_error, map_io_error};
 use crate::{
     CanonicalLocator, DriverError, DriverErrorKind, OpenCancellation, OpenRequest, ValidatedConfig,
-    ValidatedControllerConfig, configuration,
+    ValidatedControllerConfig, ValidatedRosteredSupervisorConfig, configuration,
     stream::{MtuBoundedStream, MtuProbe, NegotiatedMtu, SocketOpen},
 };
 use aster_ble_l2cap::BleL2capContact;
+use aster_contact::TransientLocator;
 use bluer::{
-    Address, AddressType, ErrorKind, InternalErrorKind,
+    Address, AddressType,
     adv::Advertisement,
-    l2cap::{PSM_LE_DYN_START, PSM_LE_MAX, Socket, SocketAddr, Stream},
+    l2cap::{PSM_LE_DYN_START, PSM_LE_MAX, Socket, SocketAddr, Stream, StreamListener},
 };
 use std::{fmt, future::Future, io, pin::Pin, sync::Arc, time::Duration};
 use tokio::time::{sleep, timeout};
@@ -26,9 +28,11 @@ pub trait SocketFactory: Send + Sync {
 
 pub(crate) type RosteredBindFuture<'a, L> =
     Pin<Box<dyn Future<Output = Result<BoundRosteredListener<L>, DriverError>> + Send + 'a>>;
+pub(crate) type RosteredAcceptFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(SocketOpen, CanonicalLocator), DriverError>> + Send + 'a>>;
 
 pub(crate) trait RosteredSocketFactory: Send + Sync {
-    type Listener: Send + 'static;
+    type Listener: Send + Sync + 'static;
 
     fn bind_dynamic_listener<'a>(
         &'a self,
@@ -41,6 +45,86 @@ pub(crate) trait RosteredSocketFactory: Send + Sync {
         locator: CanonicalLocator,
         advertised_psm: u16,
     ) -> OpenFuture<'a>;
+
+    fn accept<'a>(&'a self, listener: &'a Self::Listener) -> RosteredAcceptFuture<'a>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BluezRosteredSocketFactory;
+
+impl RosteredSocketFactory for BluezRosteredSocketFactory {
+    type Listener = StreamListener;
+
+    fn bind_dynamic_listener<'a>(
+        &'a self,
+        controller: &'a ValidatedControllerConfig,
+    ) -> RosteredBindFuture<'a, Self::Listener> {
+        Box::pin(async move {
+            let session = bluer::Session::new().await.map_err(map_bluer_error)?;
+            let local = rostered_local_address(controller);
+            verify_adapter(&session, controller.adapter_name(), local).await?;
+            let socket = Socket::<Stream>::new_stream().map_err(map_io_error)?;
+            socket.bind(local).map_err(map_io_error)?;
+            let allocated_psm = socket.local_addr().map_err(map_io_error)?.psm;
+            let listener = socket.listen(1).map_err(map_io_error)?;
+            BoundRosteredListener::new(listener, allocated_psm)
+        })
+    }
+
+    fn connect<'a>(
+        &'a self,
+        controller: &'a ValidatedControllerConfig,
+        locator: CanonicalLocator,
+        advertised_psm: u16,
+    ) -> OpenFuture<'a> {
+        Box::pin(async move {
+            if !(PSM_LE_DYN_START..=PSM_LE_MAX).contains(&advertised_psm) {
+                return Err(configuration(
+                    "advertised LE PSM is outside the dynamic range",
+                ));
+            }
+            let session = bluer::Session::new().await.map_err(map_bluer_error)?;
+            let (local, peer) = rostered_socket_addresses(controller, locator, advertised_psm);
+            verify_adapter(&session, controller.adapter_name(), local).await?;
+            let socket = Socket::<Stream>::new_stream().map_err(map_io_error)?;
+            socket.bind(local).map_err(map_io_error)?;
+            let stream = socket.connect(peer).await.map_err(map_io_error)?;
+            wait_for_l2cap_readiness(|| stream.as_ref().send_mtu()).await?;
+            Ok(SocketOpen::from_bluez(stream))
+        })
+    }
+
+    fn accept<'a>(&'a self, listener: &'a Self::Listener) -> RosteredAcceptFuture<'a> {
+        Box::pin(async move {
+            let (stream, peer) = listener.accept().await.map_err(map_io_error)?;
+            let locator = CanonicalLocator::new(peer.addr, peer.addr_type).map_err(|_| {
+                DriverError::new(
+                    DriverErrorKind::Transport,
+                    "accepted rostered peer locator is invalid",
+                )
+            })?;
+            Ok((SocketOpen::from_bluez(stream), locator))
+        })
+    }
+}
+
+fn rostered_socket_addresses(
+    controller: &ValidatedControllerConfig,
+    locator: CanonicalLocator,
+    advertised_psm: u16,
+) -> (SocketAddr, SocketAddr) {
+    (
+        rostered_local_address(controller),
+        SocketAddr::new(locator.address(), locator.address_type(), advertised_psm),
+    )
+}
+
+fn rostered_local_address(controller: &ValidatedControllerConfig) -> SocketAddr {
+    SocketAddr::new(
+        controller.local_address(),
+        controller.local_address_type(),
+        0,
+    )
 }
 
 pub(crate) struct BoundRosteredListener<L> {
@@ -136,6 +220,40 @@ pub async fn open_contact_with_factory(
             )),
         }
     };
+    opened_contact(
+        opened_socket,
+        config.peer_locator()?,
+        config.maximum_frame_bytes(),
+        config.maximum_exchange_bytes(),
+        config.operation_timeout(),
+    )
+}
+
+pub(crate) fn opened_rostered_contact(
+    config: &ValidatedRosteredSupervisorConfig,
+    locator: CanonicalLocator,
+    opened_socket: SocketOpen,
+) -> Result<OpenedContact, DriverError> {
+    let peer_locator = TransientLocator::new(
+        format!("btle:{}:{}", locator.address(), locator.address_type()).into_bytes(),
+    )
+    .map_err(|_| configuration("peer locator is outside its carrier bound"))?;
+    opened_contact(
+        opened_socket,
+        peer_locator,
+        config.maximum_frame_bytes(),
+        config.maximum_exchange_bytes(),
+        config.operation_timeout(),
+    )
+}
+
+fn opened_contact(
+    opened_socket: SocketOpen,
+    peer_locator: TransientLocator,
+    maximum_frame_bytes: usize,
+    maximum_exchange_bytes: usize,
+    operation_timeout: Duration,
+) -> Result<OpenedContact, DriverError> {
     let SocketOpen { stream, mtu } = opened_socket;
     let stream = Box::new(MtuBoundedStream {
         stream,
@@ -143,16 +261,12 @@ pub async fn open_contact_with_factory(
         maximum_write_bytes: usize::MAX,
         largest_successful_write_bytes: 0,
     });
-    let contact = BleL2capContact::new(
-        stream,
-        config.peer_locator()?,
-        config.maximum_frame_bytes(),
-        config.operation_timeout(),
-    )
-    .map_err(|_| configuration("validated carrier contact bounds were rejected"))?;
+    let contact =
+        BleL2capContact::new(stream, peer_locator, maximum_frame_bytes, operation_timeout)
+            .map_err(|_| configuration("validated carrier contact bounds were rejected"))?;
     Ok(OpenedContact {
         contact: Arc::new(contact),
-        maximum_exchange_bytes: config.maximum_exchange_bytes(),
+        maximum_exchange_bytes,
         mtu,
     })
 }
@@ -285,48 +399,6 @@ fn classify_adapter_identity(
     Ok(())
 }
 
-fn map_bluer_error(error: bluer::Error) -> DriverError {
-    let kind = match error.kind {
-        ErrorKind::DoesNotExist
-        | ErrorKind::NotAvailable
-        | ErrorKind::NotAuthorized
-        | ErrorKind::NotFound
-        | ErrorKind::NotPermitted
-        | ErrorKind::NotReady => DriverErrorKind::Unavailable,
-        ErrorKind::AuthenticationTimeout => DriverErrorKind::Timeout,
-        ErrorKind::InvalidArguments
-        | ErrorKind::InvalidLength
-        | ErrorKind::InvalidAddress(_)
-        | ErrorKind::InvalidName(_) => DriverErrorKind::Configuration,
-        ErrorKind::Internal(InternalErrorKind::DBusConnectionLost) => DriverErrorKind::Unavailable,
-        ErrorKind::Internal(InternalErrorKind::Io(kind)) => classify_io_error(kind),
-        _ => DriverErrorKind::Transport,
-    };
-    DriverError::new(kind, "BlueZ operation failed")
-}
-
-fn map_io_error(error: io::Error) -> DriverError {
-    let kind = classify_io_error(error.kind());
-    DriverError::new(kind, "kernel L2CAP operation failed")
-}
-
-fn classify_io_error(kind: io::ErrorKind) -> DriverErrorKind {
-    match kind {
-        io::ErrorKind::AddrNotAvailable
-        | io::ErrorKind::ConnectionAborted
-        | io::ErrorKind::ConnectionRefused
-        | io::ErrorKind::ConnectionReset
-        | io::ErrorKind::HostUnreachable
-        | io::ErrorKind::NetworkUnreachable
-        | io::ErrorKind::NotConnected
-        | io::ErrorKind::NotFound
-        | io::ErrorKind::PermissionDenied => DriverErrorKind::Unavailable,
-        io::ErrorKind::TimedOut => DriverErrorKind::Timeout,
-        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => DriverErrorKind::Configuration,
-        _ => DriverErrorKind::Transport,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,7 +451,7 @@ mod tests {
             Instant::now() + Duration::from_secs(60),
         )
         .unwrap();
-        RosteredAdapterConfig::Enabled(RosteredSupervisorConfig {
+        RosteredAdapterConfig::Enabled(Box::new(RosteredSupervisorConfig {
             controller: ControllerConfig {
                 adapter_name: "hci7".to_owned(),
                 local_address: address("02:00:00:00:00:01"),
@@ -395,7 +467,7 @@ mod tests {
                 open_timeout: Duration::from_secs(5),
                 operation_timeout: Duration::from_secs(30),
             },
-        })
+        }))
         .validate()
         .unwrap()
         .unwrap()
@@ -429,6 +501,10 @@ mod tests {
                 SocketOpen::with_observed_mtu(Box::new(stream), 128, 96)
             })
         }
+
+        fn accept<'a>(&'a self, _listener: &'a Self::Listener) -> RosteredAcceptFuture<'a> {
+            Box::pin(std::future::pending())
+        }
     }
 
     #[tokio::test]
@@ -455,6 +531,53 @@ mod tests {
             .unwrap();
 
         assert_eq!(*factory.connected.lock().unwrap(), Some((locator, 0x0083)));
+    }
+
+    #[test]
+    fn rostered_socket_addresses_preserve_exact_controller_and_candidate() {
+        let config = rostered_config();
+        let locator =
+            CanonicalLocator::new(address("02:00:00:00:00:09"), AddressType::LeRandom).unwrap();
+
+        let (local, peer) = rostered_socket_addresses(config.controller(), locator, 0x0081);
+
+        assert_eq!(local.addr, config.controller().local_address());
+        assert_eq!(local.addr_type, config.controller().local_address_type());
+        assert_eq!(local.psm, 0);
+        assert_eq!(peer.addr, locator.address());
+        assert_eq!(peer.addr_type, locator.address_type());
+        assert_eq!(peer.psm, 0x0081);
+    }
+
+    #[test]
+    fn rostered_socket_builds_a_bounded_contact_with_transient_locator_evidence() {
+        use aster_contact::{CarrierPeerEvidence, OrderedContact};
+
+        let config = rostered_config();
+        let locator =
+            CanonicalLocator::new(address("02:00:00:00:00:09"), AddressType::LeRandom).unwrap();
+        let (stream, _peer) = tokio::io::duplex(4096);
+        let socket = SocketOpen::with_observed_mtu(Box::new(stream), 128, 96).unwrap();
+
+        let opened = opened_rostered_contact(&config, locator, socket).unwrap();
+
+        assert_eq!(
+            opened.maximum_exchange_bytes(),
+            RING1_MAXIMUM_EXCHANGE_BYTES
+        );
+        assert_eq!(
+            opened.contact().max_frame_bytes(),
+            RING1_MAXIMUM_FRAME_BYTES
+        );
+        assert_eq!(
+            opened.contact().peer_evidence(),
+            CarrierPeerEvidence::UnauthenticatedLocator {
+                transient_locator: aster_contact::TransientLocator::new(
+                    b"btle:02:00:00:00:00:09:random".to_vec()
+                )
+                .unwrap(),
+            }
+        );
     }
 
     struct ResultFactory {

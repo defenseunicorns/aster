@@ -17,8 +17,8 @@ const MAX_NEGATIVE_ENTRIES: usize = 32;
 const CANDIDATE_FRESHNESS: Duration = Duration::from_secs(90);
 const REPLAY_TTL: Duration = Duration::from_secs(10 * 60);
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
-const SCAN_ACTIVE_INTERVAL: Duration = Duration::from_secs(10);
-const SCAN_IDLE_INTERVAL: Duration = Duration::from_secs(20);
+pub(crate) const SCAN_ACTIVE_INTERVAL: Duration = Duration::from_secs(10);
+pub(crate) const SCAN_IDLE_INTERVAL: Duration = Duration::from_secs(20);
 const ATTEMPT_BUCKET_CAPACITY: u8 = 4;
 const ATTEMPT_TOKEN_REFILL: Duration = Duration::from_secs(30);
 const AUTHENTICATED_HEADER_BYTES: usize = 24;
@@ -593,6 +593,16 @@ impl TokenBucket {
             ATTEMPT_TOKEN_REFILL.saturating_mul(u32::try_from(intervals).unwrap_or(u32::MAX)),
         );
     }
+
+    fn retry_at(&mut self, now: Instant) -> Instant {
+        self.refill(now);
+        if self.available > 0 {
+            return now;
+        }
+        self.last_refill
+            .and_then(|last| last.checked_add(ATTEMPT_TOKEN_REFILL))
+            .unwrap_or(now)
+    }
 }
 
 /// Fixed-capacity roster observation, replay, retry, and scan policy state.
@@ -779,6 +789,11 @@ impl DiscoveryAdmission {
     /// Consumes one token from an independent fixed-capacity attempt bucket.
     pub fn try_consume_attempt(&mut self, kind: AttemptKind, now: Instant) -> bool {
         self.attempts[kind.index()].consume(now)
+    }
+
+    /// Earliest time at which the attempt bucket can provide a token.
+    pub fn attempt_retry_at(&mut self, kind: AttemptKind, now: Instant) -> Instant {
+        self.attempts[kind.index()].retry_at(now)
     }
 
     /// Admits an inbound pre-authentication contact only for a recent locator.
@@ -1125,6 +1140,10 @@ mod tests {
                 assert!(admission.try_consume_attempt(kind, now));
             }
             assert!(!admission.try_consume_attempt(kind, now));
+            assert_eq!(
+                admission.attempt_retry_at(kind, now),
+                now + ATTEMPT_TOKEN_REFILL
+            );
             assert!(
                 !admission.try_consume_attempt(
                     kind,

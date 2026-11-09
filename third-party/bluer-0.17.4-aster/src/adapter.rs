@@ -427,15 +427,22 @@ impl DiscoverySession {
 
     /// Waits for acknowledged stop, adapter removal, or session loss.
     pub async fn terminated(&self) -> DiscoveryTermination {
+        self.termination().await
+    }
+
+    /// Returns an owned waiter for acknowledged stop, adapter removal, or session loss.
+    pub fn termination(&self) -> impl Future<Output = DiscoveryTermination> + Send + 'static {
         let mut termination = self.termination.clone();
-        loop {
-            if let Some(reason) = termination.borrow_and_update().clone() {
-                return reason;
-            }
-            if termination.changed().await.is_err() {
-                return DiscoveryTermination::SessionEnded(Error::new(ErrorKind::Internal(
-                    InternalErrorKind::DBusConnectionLost,
-                )));
+        async move {
+            loop {
+                if let Some(reason) = termination.borrow_and_update().clone() {
+                    return reason;
+                }
+                if termination.changed().await.is_err() {
+                    return DiscoveryTermination::SessionEnded(Error::new(ErrorKind::Internal(
+                        InternalErrorKind::DBusConnectionLost,
+                    )));
+                }
             }
         }
     }
@@ -1693,5 +1700,15 @@ mod aster_tests {
             session.terminated().await,
             DiscoveryTermination::DiscoveringStopped
         );
+    }
+
+    #[tokio::test]
+    async fn owned_discovery_termination_waiter_outlives_the_handle() {
+        let (session, _commands, termination) = session();
+        let waiter = session.termination();
+        drop(session);
+        termination.send_replace(Some(DiscoveryTermination::DiscoveringStopped));
+
+        assert_eq!(waiter.await, DiscoveryTermination::DiscoveringStopped);
     }
 }

@@ -16,7 +16,7 @@ mod shared_node;
 pub use discovery_credentials::fuzz_parse_discovery_credential_artifact;
 pub use discovery_credentials::{
     DiscoveryCredentialAuthority, DiscoveryCredentialError, DiscoveryCredentialMaterialParts,
-    LeasedDiscoveryCredentialMaterial, TrustedClock, TrustedClockSample,
+    LeasedDiscoveryCredentialMaterial, TrustedClock, TrustedClockLeaseGuard, TrustedClockSample,
     load_unprotected_reference_discovery_credentials,
 };
 pub use mesh_host::{

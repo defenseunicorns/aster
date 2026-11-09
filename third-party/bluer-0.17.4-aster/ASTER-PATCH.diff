@@ -20,7 +20,7 @@
  use tokio_stream::wrappers::ReceiverStream;
  use uuid::Uuid;
  
-@@ -47,6 +49,398 @@
+@@ -47,6 +49,405 @@
      name: Arc<String>,
  }
  
@@ -402,15 +402,22 @@
 +
 +    /// Waits for acknowledged stop, adapter removal, or session loss.
 +    pub async fn terminated(&self) -> DiscoveryTermination {
++        self.termination().await
++    }
++
++    /// Returns an owned waiter for acknowledged stop, adapter removal, or session loss.
++    pub fn termination(&self) -> impl Future<Output = DiscoveryTermination> + Send + 'static {
 +        let mut termination = self.termination.clone();
-+        loop {
-+            if let Some(reason) = termination.borrow_and_update().clone() {
-+                return reason;
-+            }
-+            if termination.changed().await.is_err() {
-+                return DiscoveryTermination::SessionEnded(Error::new(ErrorKind::Internal(
-+                    InternalErrorKind::DBusConnectionLost,
-+                )));
++        async move {
++            loop {
++                if let Some(reason) = termination.borrow_and_update().clone() {
++                    return reason;
++                }
++                if termination.changed().await.is_err() {
++                    return DiscoveryTermination::SessionEnded(Error::new(ErrorKind::Internal(
++                        InternalErrorKind::DBusConnectionLost,
++                    )));
++                }
 +            }
 +        }
 +    }
@@ -419,7 +426,7 @@
  impl Debug for Adapter {
      fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
          f.debug_struct("Adapter").field("name", &self.name()).finish()
-@@ -142,12 +536,13 @@
+@@ -142,12 +543,13 @@
      /// The discovery filter can only be changed when no device discovery is currently active.
      /// Otherwise a [DiscoveryActive error](ErrorKind::DiscoveryActive) will be returned.
      pub async fn set_discovery_filter(&self, discovery_filter: DiscoveryFilter) -> Result<()> {
@@ -439,7 +446,7 @@
      }
  
      /// This method starts the device discovery session.
-@@ -265,6 +660,69 @@
+@@ -265,6 +667,69 @@
          Ok(token)
      }
  
@@ -509,7 +516,7 @@
      dbus_interface!();
      dbus_default_interface!(INTERFACE);
  
-@@ -806,3 +1264,434 @@
+@@ -806,3 +1271,444 @@
          hm
      }
  }
@@ -943,6 +950,16 @@
 +            DiscoveryTermination::DiscoveringStopped
 +        );
 +    }
++
++    #[tokio::test]
++    async fn owned_discovery_termination_waiter_outlives_the_handle() {
++        let (session, _commands, termination) = session();
++        let waiter = session.termination();
++        drop(session);
++        termination.send_replace(Some(DiscoveryTermination::DiscoveringStopped));
++
++        assert_eq!(waiter.await, DiscoveryTermination::DiscoveringStopped);
++    }
 +}
 --- a/src/adv.rs
 +++ b/src/adv.rs
@@ -1066,7 +1083,7 @@
              });
          })
      }
-@@ -297,44 +314,263 @@
+@@ -297,44 +314,272 @@
          self, inner: Arc<SessionInner>, adapter_name: Arc<String>,
      ) -> Result<AdvertisementHandle> {
          let name = dbus::Path::new(format!("{}{}", ADVERTISEMENT_PREFIX, Uuid::new_v4().as_simple())).unwrap();
@@ -1321,34 +1338,43 @@
 +
 +    /// Waits for BlueZ release or terminal session loss.
 +    pub async fn terminated(&self) -> AdvertisementTermination {
++        self.termination().await
++    }
++
++    /// Returns an owned waiter for BlueZ release or terminal session loss.
++    pub fn termination(
++        &self,
++    ) -> impl Future<Output = AdvertisementTermination> + Send + 'static {
 +        let mut release = self.release.clone();
 +        let mut session = self.session.clone();
-+        let mut release_open = true;
-+        let mut session_open = true;
-+        loop {
-+            if *release.borrow_and_update() {
-+                return AdvertisementTermination::Released;
-+            }
-+            if let Some(error) = session.borrow_and_update().clone() {
-+                return AdvertisementTermination::SessionEnded(error);
-+            }
-+            tokio::select! {
-+                changed = release.changed(), if release_open => {
-+                    release_open = changed.is_ok();
-+                },
-+                changed = session.changed(), if session_open => {
-+                    session_open = changed.is_ok();
-+                },
-+                else => return AdvertisementTermination::SessionEnded(
-+                    Error::new(ErrorKind::Internal(InternalErrorKind::DBusConnectionLost))
-+                ),
++        async move {
++            let mut release_open = true;
++            let mut session_open = true;
++            loop {
++                if *release.borrow_and_update() {
++                    return AdvertisementTermination::Released;
++                }
++                if let Some(error) = session.borrow_and_update().clone() {
++                    return AdvertisementTermination::SessionEnded(error);
++                }
++                tokio::select! {
++                    changed = release.changed(), if release_open => {
++                        release_open = changed.is_ok();
++                    },
++                    changed = session.changed(), if session_open => {
++                        session_open = changed.is_ok();
++                    },
++                    else => return AdvertisementTermination::SessionEnded(
++                        Error::new(ErrorKind::Internal(InternalErrorKind::DBusConnectionLost))
++                    ),
++                }
 +            }
 +        }
 +    }
  }
  
  impl Drop for AdvertisementHandle {
-@@ -348,3 +584,154 @@
+@@ -348,3 +593,164 @@
          write!(f, "AdvertisementHandle {{ {} }}", &self.name)
      }
  }
@@ -1483,6 +1509,16 @@
 +            handle.terminated().await,
 +            AdvertisementTermination::SessionEnded(error)
 +        );
++    }
++
++    #[tokio::test]
++    async fn owned_termination_waiter_outlives_the_handle() {
++        let (handle, _commands, release, _session) = test_handle();
++        let termination = handle.termination();
++        drop(handle);
++        release.send_replace(true);
++
++        assert_eq!(termination.await, AdvertisementTermination::Released);
 +    }
 +
 +    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1808,7 +1844,7 @@
              adapter_discovery_filter: Mutex::new(HashMap::new()),
          });
  
-@@ -272,6 +439,19 @@
+@@ -272,6 +439,29 @@
          Ok(Self { inner })
      }
  
@@ -1825,10 +1861,20 @@
 +        }
 +    }
 +
++    /// Forces terminal owner loss for this session and every derived handle.
++    ///
++    /// This is idempotent and aborts the underlying D-Bus resource task so
++    /// owned advertisement and discovery waiters can prove termination.
++    pub fn close(&self) {
++        self.inner.terminal.fail(Error::new(ErrorKind::Internal(
++            InternalErrorKind::DBusConnectionLost,
++        )));
++    }
++
      /// Create an interface to the default Bluetooth adapter.
      ///
      /// If `hci0` is present it is used as the default adapter.
-@@ -408,25 +588,62 @@
+@@ -408,25 +598,62 @@
  pub(crate) struct SubscriptionReq {
      path: dbus::Path<'static>,
      child_objects: bool,
@@ -1898,7 +1944,7 @@
          };
  
          let rule_add = ObjectManagerInterfacesAdded::match_rule(*SERVICE_NAME_REF, None);
-@@ -438,20 +655,24 @@
+@@ -438,20 +665,24 @@
          let rule_prop = PropertiesPropertiesChanged::match_rule(*SERVICE_NAME_REF, None);
          let msg_match_prop = connection.add_match(rule_prop).await?.msg_cb(handle_msg.clone());
  
@@ -1927,7 +1973,7 @@
                                  // Properties changed.
                                  if let (Some(object), Some(PropertiesPropertiesChanged { interface_name, changed_properties, .. })) =
                                      (msg.path(), PropertiesPropertiesChanged::from_message(&msg))
-@@ -464,7 +685,7 @@
+@@ -464,7 +695,7 @@
                                              changed: changed_properties,
                                          };
                                          log::trace!("Event: {:?}", &evt);
@@ -1936,7 +1982,7 @@
                                          if path_subs.is_empty() {
                                              subs.remove(&*object);
                                          }
-@@ -485,7 +706,7 @@
+@@ -485,7 +716,7 @@
                                          log::trace!("Event: {:?}", &evt);
                                          parent_subs.retain(|sub| {
                                              if sub.child_objects {
@@ -1945,7 +1991,7 @@
                                              } else {
                                                  true
                                              }
-@@ -513,7 +734,7 @@
+@@ -513,7 +744,7 @@
                                          log::trace!("Event: {:?}", &evt);
                                          parent_subs.retain(|sub| {
                                              if sub.child_objects {
@@ -1954,7 +2000,7 @@
                                              } else {
                                                  true
                                              }
-@@ -524,6 +745,9 @@
+@@ -524,6 +755,9 @@
                                      }
                                  }
                              },
@@ -1964,7 +2010,7 @@
                              None => break,
                          }
                      },
-@@ -539,33 +763,107 @@
+@@ -539,33 +773,125 @@
                              }
                              None => break,
                          }
@@ -2079,6 +2125,24 @@
 +            ErrorKind::Internal(InternalErrorKind::IngressOverflow)
 +        );
 +        assert!(!try_bounded_send(&sender, usize::MAX, &terminal));
++        assert!(dbus_task.await.unwrap_err().is_cancelled());
++    }
++
++    #[tokio::test]
++    async fn forced_owner_loss_notifies_waiters_and_aborts_dbus() {
++        let dbus_task = tokio::spawn(std::future::pending::<()>());
++        let terminal = SessionTerminal::new(dbus_task.abort_handle());
++        let mut waiter = terminal.subscribe();
++
++        terminal.fail(Error::new(ErrorKind::Internal(
++            InternalErrorKind::DBusConnectionLost,
++        )));
++
++        waiter.changed().await.unwrap();
++        assert_eq!(
++            waiter.borrow_and_update().as_ref().unwrap().kind,
++            ErrorKind::Internal(InternalErrorKind::DBusConnectionLost)
++        );
 +        assert!(dbus_task.await.unwrap_err().is_cancelled());
      }
  }

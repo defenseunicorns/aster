@@ -366,6 +366,46 @@ impl TrustedClockSample {
     }
 }
 
+/// Continuity guard for a lease derived from paired wall and monotonic time.
+pub struct TrustedClockLeaseGuard {
+    last_sample: TrustedClockSample,
+}
+
+impl TrustedClockLeaseGuard {
+    /// Starts continuity tracking from the sample used to derive the lease.
+    pub const fn new(initial_sample: TrustedClockSample) -> Self {
+        Self {
+            last_sample: initial_sample,
+        }
+    }
+
+    /// Accepts the next sample or invalidates continuity on clock divergence.
+    pub fn resample(&mut self, sample: TrustedClockSample) -> Result<(), DiscoveryCredentialError> {
+        validate_clock_continuity(self.last_sample, sample)?;
+        self.last_sample = sample;
+        Ok(())
+    }
+}
+
+fn validate_clock_continuity(
+    previous: TrustedClockSample,
+    sample: TrustedClockSample,
+) -> Result<(), DiscoveryCredentialError> {
+    let monotonic_elapsed = sample
+        .monotonic
+        .checked_duration_since(previous.monotonic)
+        .ok_or(DiscoveryCredentialError::ClockDiscontinuity)?
+        .as_secs();
+    let wall_elapsed = sample
+        .wall_unix_seconds
+        .checked_sub(previous.wall_unix_seconds)
+        .ok_or(DiscoveryCredentialError::ClockDiscontinuity)?;
+    if wall_elapsed.abs_diff(monotonic_elapsed) > 5 * 60 {
+        return Err(DiscoveryCredentialError::ClockDiscontinuity);
+    }
+    Ok(())
+}
+
 trait DiscoveryCheckpointStore {
     fn load(&mut self) -> Result<Option<DiscoveryCheckpoint>, DiscoveryCredentialError>;
 
@@ -789,19 +829,7 @@ where
         let Some(previous) = self.last_clock_sample else {
             return Ok(());
         };
-        let monotonic_elapsed = sample
-            .monotonic
-            .checked_duration_since(previous.monotonic)
-            .ok_or(DiscoveryCredentialError::ClockDiscontinuity)?
-            .as_secs();
-        let wall_elapsed = sample
-            .wall_unix_seconds
-            .checked_sub(previous.wall_unix_seconds)
-            .ok_or(DiscoveryCredentialError::ClockDiscontinuity)?;
-        if wall_elapsed.abs_diff(monotonic_elapsed) > 5 * 60 {
-            return Err(DiscoveryCredentialError::ClockDiscontinuity);
-        }
-        Ok(())
+        validate_clock_continuity(previous, sample)
     }
 
     fn observe_clock(
@@ -1241,6 +1269,28 @@ mod tests {
                         monotonic + Duration::from_secs(11),
                     ),
                 )
+                .unwrap_err(),
+            DiscoveryCredentialError::ClockDiscontinuity
+        );
+    }
+
+    #[test]
+    fn trusted_clock_lease_guard_reuses_authority_continuity_rules() {
+        let monotonic = Instant::now();
+        let mut guard = TrustedClockLeaseGuard::new(TrustedClockSample::new(ISSUED, monotonic));
+
+        guard
+            .resample(TrustedClockSample::new(
+                ISSUED + 60,
+                monotonic + Duration::from_secs(60),
+            ))
+            .unwrap();
+        assert_eq!(
+            guard
+                .resample(TrustedClockSample::new(
+                    ISSUED + 60 + 302,
+                    monotonic + Duration::from_secs(61),
+                ))
                 .unwrap_err(),
             DiscoveryCredentialError::ClockDiscontinuity
         );

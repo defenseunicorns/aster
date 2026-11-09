@@ -289,7 +289,7 @@ sha256sum /build/sbom/cyclonedx/hmac-0.13.0-aster.tar \
 The recorded deterministic hashes are
 `a8c69874ba79751497be40c9dccf63b2a10b891441ba1a880bcbaa627cda61d6`
 and
-`59c5fc53018e32ce3b234dfc48041c9afe4728cb1b7af991c09f5406b39aa05f`.
+`0d58bacf77348f871068fe9fe2f859cb5ec2ccb4ff81d7f6fa05f40477c6bb01`.
 Any source, provenance-note, patch, or mode change requires fresh archives and
 a reviewed replacement set-list.
 

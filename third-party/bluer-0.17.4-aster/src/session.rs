@@ -452,6 +452,16 @@ impl Session {
         }
     }
 
+    /// Forces terminal owner loss for this session and every derived handle.
+    ///
+    /// This is idempotent and aborts the underlying D-Bus resource task so
+    /// owned advertisement and discovery waiters can prove termination.
+    pub fn close(&self) {
+        self.inner.terminal.fail(Error::new(ErrorKind::Internal(
+            InternalErrorKind::DBusConnectionLost,
+        )));
+    }
+
     /// Create an interface to the default Bluetooth adapter.
     ///
     /// If `hci0` is present it is used as the default adapter.
@@ -864,6 +874,24 @@ mod aster_tests {
             ErrorKind::Internal(InternalErrorKind::IngressOverflow)
         );
         assert!(!try_bounded_send(&sender, usize::MAX, &terminal));
+        assert!(dbus_task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn forced_owner_loss_notifies_waiters_and_aborts_dbus() {
+        let dbus_task = tokio::spawn(std::future::pending::<()>());
+        let terminal = SessionTerminal::new(dbus_task.abort_handle());
+        let mut waiter = terminal.subscribe();
+
+        terminal.fail(Error::new(ErrorKind::Internal(
+            InternalErrorKind::DBusConnectionLost,
+        )));
+
+        waiter.changed().await.unwrap();
+        assert_eq!(
+            waiter.borrow_and_update().as_ref().unwrap().kind,
+            ErrorKind::Internal(InternalErrorKind::DBusConnectionLost)
+        );
         assert!(dbus_task.await.unwrap_err().is_cancelled());
     }
 }

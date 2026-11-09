@@ -19,14 +19,14 @@ const MAXIMUM_PEER_RETRY: Duration = Duration::from_secs(30);
 
 type ContactOpenFuture =
     Pin<Box<dyn Future<Output = Result<Arc<dyn OrderedContact>, DriverError>> + Send>>;
-type ContactAdmissionFuture =
+pub(crate) type ContactAdmissionFuture =
     Pin<Box<dyn Future<Output = Result<PeerReceipt, OrderedEventContactError>> + Send>>;
 
 trait ContactOpener: Send + Sync {
     fn open(&self, config: ValidatedConfig, cancellation: OpenCancellation) -> ContactOpenFuture;
 }
 
-trait ContactAdmission: Send + Sync {
+pub(crate) trait ContactAdmission: Send + Sync {
     fn run(
         &self,
         role: OrderedEventContactRole,
@@ -74,6 +74,8 @@ pub enum SupervisorError {
     Controller(DriverErrorKind),
     /// An owned supervisor child task stopped unexpectedly.
     TaskStopped,
+    /// Consuming shutdown forced owner loss without confirming platform cleanup.
+    PlatformCleanupUnconfirmed,
 }
 
 impl fmt::Display for SupervisorError {
@@ -89,6 +91,9 @@ impl fmt::Display for SupervisorError {
             Self::ActorStopped => formatter.write_str("Linux BTLE ordered Event actor stopped"),
             Self::Controller(kind) => write!(formatter, "Linux BTLE controller failed: {kind:?}"),
             Self::TaskStopped => formatter.write_str("Linux BTLE supervisor task stopped"),
+            Self::PlatformCleanupUnconfirmed => {
+                formatter.write_str("Linux BTLE platform cleanup could not be confirmed")
+            }
         }
     }
 }

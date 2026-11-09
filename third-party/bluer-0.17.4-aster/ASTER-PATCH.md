@@ -11,12 +11,14 @@
   `da053620434ccd59747d44b04e87e06464763f22db320bc71dc9b00b1e4db460`.
 - Per-file upstream receipt: `ASTER-UPSTREAM.sha256`.
 - Canonical patch: `ASTER-PATCH.diff`, SHA-256
-  `9ba08f50d70a34276b8e2daa4879da92cf3b2c7e935b4c4bd59e8f76d42bcb38`.
+  `ce4de362bf30ccc318c741694adfce8678c53202b44a5b4827a509ea681044af`.
 
 The upstream-code delta is limited to `src/adapter.rs`, `src/adv.rs`,
 `src/lib.rs`, and `src/session.rs`. It adds cancellation-independent owners for
 advertisement registration/unregistration and exclusive discovery start/stop,
-persistent termination notification, and a first-wins terminal session latch.
+persistent owned termination waiters, a first-wins terminal session latch, and
+an idempotent explicit session close used to force owner loss during bounded
+shutdown.
 Discovery ownership is published only after FIFO ingress barriers surround an
 authoritative `Discovering` property read.
 The D-Bus ingress and subscriber queues are bounded to 256 items; overflow

@@ -547,27 +547,36 @@ impl AdvertisementHandle {
 
     /// Waits for BlueZ release or terminal session loss.
     pub async fn terminated(&self) -> AdvertisementTermination {
+        self.termination().await
+    }
+
+    /// Returns an owned waiter for BlueZ release or terminal session loss.
+    pub fn termination(
+        &self,
+    ) -> impl Future<Output = AdvertisementTermination> + Send + 'static {
         let mut release = self.release.clone();
         let mut session = self.session.clone();
-        let mut release_open = true;
-        let mut session_open = true;
-        loop {
-            if *release.borrow_and_update() {
-                return AdvertisementTermination::Released;
-            }
-            if let Some(error) = session.borrow_and_update().clone() {
-                return AdvertisementTermination::SessionEnded(error);
-            }
-            tokio::select! {
-                changed = release.changed(), if release_open => {
-                    release_open = changed.is_ok();
-                },
-                changed = session.changed(), if session_open => {
-                    session_open = changed.is_ok();
-                },
-                else => return AdvertisementTermination::SessionEnded(
-                    Error::new(ErrorKind::Internal(InternalErrorKind::DBusConnectionLost))
-                ),
+        async move {
+            let mut release_open = true;
+            let mut session_open = true;
+            loop {
+                if *release.borrow_and_update() {
+                    return AdvertisementTermination::Released;
+                }
+                if let Some(error) = session.borrow_and_update().clone() {
+                    return AdvertisementTermination::SessionEnded(error);
+                }
+                tokio::select! {
+                    changed = release.changed(), if release_open => {
+                        release_open = changed.is_ok();
+                    },
+                    changed = session.changed(), if session_open => {
+                        session_open = changed.is_ok();
+                    },
+                    else => return AdvertisementTermination::SessionEnded(
+                        Error::new(ErrorKind::Internal(InternalErrorKind::DBusConnectionLost))
+                    ),
+                }
             }
         }
     }
@@ -715,6 +724,16 @@ mod aster_tests {
             handle.terminated().await,
             AdvertisementTermination::SessionEnded(error)
         );
+    }
+
+    #[tokio::test]
+    async fn owned_termination_waiter_outlives_the_handle() {
+        let (handle, _commands, release, _session) = test_handle();
+        let termination = handle.termination();
+        drop(handle);
+        release.send_replace(true);
+
+        assert_eq!(termination.await, AdvertisementTermination::Released);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -342,7 +342,7 @@ pub enum RosteredAdapterConfig {
     /// No BTLE rostered listener, advertisement, scan, or supervisor exists.
     Off,
     /// Validate and own one rostered Linux supervisor configuration.
-    Enabled(RosteredSupervisorConfig),
+    Enabled(Box<RosteredSupervisorConfig>),
 }
 
 impl RosteredAdapterConfig {
@@ -350,7 +350,7 @@ impl RosteredAdapterConfig {
     pub fn validate(self) -> Result<Option<ValidatedRosteredSupervisorConfig>, DriverError> {
         match self {
             Self::Off => Ok(None),
-            Self::Enabled(config) => config.validate().map(Some),
+            Self::Enabled(config) => (*config).validate().map(Some),
         }
     }
 }
@@ -741,7 +741,7 @@ mod tests {
             Instant::now() + Duration::from_secs(60),
         )
         .unwrap();
-        RosteredAdapterConfig::Enabled(RosteredSupervisorConfig {
+        RosteredAdapterConfig::Enabled(Box::new(RosteredSupervisorConfig {
             controller: ControllerConfig {
                 adapter_name: "hci7".to_owned(),
                 local_address: address("02:00:00:00:00:01"),
@@ -757,7 +757,7 @@ mod tests {
                 open_timeout: Duration::from_secs(5),
                 operation_timeout: Duration::from_secs(30),
             },
-        })
+        }))
     }
 
     #[test]

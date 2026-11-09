@@ -2,22 +2,29 @@
 
 This guide exercises the evaluation-stage Linux/BlueZ lifecycle around the
 existing semantic-v9 ordered Event contact. It covers exactly two Linux
-processes, one configured controller per process, one provisioned peer per
-process, and Event data. It is not a production deployment guide.
+processes, one configured controller per process, one provisioned mission peer
+per process, and Event data. It is not a production deployment guide.
 
 The lifecycle runs in the same process as the transport-neutral node. The node
 starts first and remains usable when BlueZ or the configured controller is
-absent. The BTLE supervisor observes controller availability, opens one contact
+absent. The selected BTLE supervisor owns only its adapter, opens one contact
 when possible, and drains before node shutdown.
 
 ## Boundary
 
-This path has no discovery, pairing workflow, controller selection, transport
-selection or fallback, multi-peer operation, daemon mode, or State, Record, or
-Blob transfer. It does not change the Aster protocol and grants no requirement
-credit, production authorization, platform-support promise, or performance
-claim. The fixed-role Android/Linux and Linux/Linux Ring-1 procedures remain
-separate evidence paths.
+The evaluator has two explicit, mutually exclusive adapters:
+
+- `--transport fixed` retains the provisioned peer locator and PSM path; and
+- `--transport rostered` uses a dynamic listener PSM plus authenticated,
+  transient discovery records.
+
+Neither adapter is fallback for the other. A rostered failure leaves that
+adapter unavailable; it never starts the fixed adapter or any IP carrier.
+There is no pairing workflow, automatic controller selection, multi-peer
+operation, daemon mode, or State, Record, or Blob transfer. This does not
+change the Aster protocol and grants no requirement credit, production
+authorization, platform-support promise, or performance claim. The
+Android/Linux Ring-1 procedure remains a separate fixed-locator evidence path.
 
 ## Prerequisites
 
@@ -26,11 +33,15 @@ Prepare two Linux hosts with:
 - a separately provisioned reference mission bundle and owner-only state
   directory for each node;
 - the other node's exact mission `NodeId`;
-- one BlueZ controller name, exact local and peer Bluetooth addresses and LE
-  address types, and one unprivileged dynamic LE PSM (`0x80` through `0xff`)
-  per process; and
+- one BlueZ controller name plus its exact local Bluetooth address and LE
+  address type; and
 - compatible Linux kernel, BlueZ, controller, and driver support for LE L2CAP
   connection-oriented channels.
+
+Fixed mode also requires the exact peer address and address type plus one
+unprivileged dynamic LE PSM (`0x80` through `0xff`) per process. Rostered mode
+instead requires the shared discovery artifact and deployment-scope ID
+described below; the kernel allocates its listener PSM.
 
 Clean process restart additionally requires a kernel containing the fix for
 [CVE-2026-72333](https://kernel.googlesource.com/pub/scm/linux/security/vulns/+/ffaa1b4ec1ea8813a90a5a6f9f577958c848a33c/cve/published/2026/CVE-2026-72333.mbox).
@@ -130,6 +141,7 @@ the evaluator with that host's values:
 
 ```console
 target/debug/aster-btle-event \
+  --transport fixed \
   --adapter hciN \
   --local-address AA:BB:CC:DD:EE:FF \
   --local-address-type public \
@@ -147,18 +159,67 @@ Use `random` instead of `public` where provisioned. The cadence option accepts
 contact after a successful contact; it is not retry policy or a wire or
 compatibility value.
 
+## Start the rostered discovery evaluator
+
+Rostered mode removes the peer Bluetooth address, peer address type, and PSM
+from configuration. Both nodes bind a backlog-one dynamic LE CoC listener,
+advertise its authenticated PSM, and scan for the other node. The lower mission
+NodeId opens the newest recent proof-valid candidate; the higher mission NodeId
+admits only an inbound locator that it observed recently. The existing mission
+handshake still authenticates the exact configured mission peer before Event
+reconciliation.
+
+Provision the same owner-protected discovery-group artifact and independent
+nonzero 32-byte deployment-scope ID on both evaluation hosts. The artifact is
+separate from mission identity and contains no command-line secret. This
+unprotected-reference option is evaluation-only: the file must be an
+effective-UID-owned, mode-`0600`, one-link regular file in the canonical
+`ASTRBD02` artifact format. The evaluator reads it once through the host
+credential authority and a private temporary checkpoint. It does not accept a
+raw discovery secret through arguments or the environment.
+The evaluator resamples paired wall and monotonic time every 60 seconds using
+the same continuity rule as the production credential authority. A backward
+step or divergence greater than five minutes cancels the adapter and requires
+a fresh authenticated load; it never extends the loaded lease.
+
+Run on each host with its local controller and the other node's mission ID:
+
+```console
+target/debug/aster-btle-event \
+  --transport rostered \
+  --adapter hciN \
+  --local-address AA:BB:CC:DD:EE:FF \
+  --local-address-type public \
+  --state /owner-only/path/to/state \
+  --mission-bundle /owner-only/path/to/mission.bundle \
+  --mission-peer PEER_MISSION_NODE_ID_HEX64 \
+  --discovery-scope-id DEPLOYMENT_SCOPE_ID_HEX64 \
+  --discovery-credential-unprotected-reference /owner-only/path/to/discovery.credential \
+  --contact-cadence-seconds 60
+```
+
+Do not provide `--peer-address`, `--peer-address-type`, or `--psm` in rostered
+mode. Conversely, fixed mode rejects rostered credential options. Credential
+lease expiry stops and drains the current rostered epoch; it is an unavailable
+adapter condition, not invalid protocol data and not a fallback trigger. The
+rostered supervisor then remains parked until shutdown or a future embedding
+replaces it with freshly authenticated credentials. The transport-neutral node
+continues serving local durable publication while the adapter is parked.
+
 Configuration and mission provisioning are validated before node startup. A
 valid process then starts its transport-neutral node before the BTLE
-supervisor. While the controller is absent or powered off, expect a sanitized
-line such as:
+supervisor. While the controller is absent or powered off, fixed mode reports a
+sanitized line such as:
 
 ```text
 BTLE_EVENT status=unavailable reason=ControllerAbsent
 ```
 
-The category may instead report BlueZ unavailable, unpowered, unauthorized, or
-an identity mismatch. Output does not include configured Bluetooth addresses
-or mission identities.
+The fixed category may instead report BlueZ unavailable, unpowered,
+unauthorized, or an identity mismatch. Rostered mode currently exposes only
+the coarse `BluezUnavailable` category for its complete private platform
+epoch. Output does not include configured Bluetooth addresses, discovery
+material, or mission identities.
 
 ## Durable publication while BTLE is unavailable
 
@@ -195,10 +256,12 @@ Expected sanitized transitions include:
 
 ```text
 BTLE_EVENT status=available
-BTLE_EVENT status=opening role=Initiator
-BTLE_EVENT status=listening role=Listener
 BTLE_EVENT status=contact-complete offered=N fetched=N inserted=N
 ```
+
+Fixed mode additionally reports `status=opening role=Initiator` or
+`status=listening role=Listener`. Rostered mode does not expose transient peer
+locators or dynamic PSMs in lifecycle output.
 
 If the receiver has no matching durable `Consume` subscription, an
 authenticated contact can correctly complete with `offered=0`, `fetched=0`,
@@ -214,16 +277,17 @@ counters alone are not a global convergence claim.
 ## Power-cycle recovery
 
 During an open or active contact, power off or detach one configured
-controller. The current open/contact is cancelled and drained, availability
-returns to an unavailable category, and no second attempt overlaps it. Restore
-the same provisioned controller. A new availability epoch starts with fresh
-peer backoff and can reconcile retained Event work without restarting either
-node. After one successful transfer, require a later contact to report zero
-offered, fetched, and inserted Events. That second contact is bounded
-deduplication evidence. Wait for the configured successful-contact cadence, or
-perform a second bounded controller power-cycle after the successful transfer.
-The restoration that produced the transfer is not itself the deduplication
-contact.
+controller. The selected adapter drains the current owned work and reports an
+unavailable category; no second attempt overlaps it. Fixed mode observes the
+controller epoch directly. Rostered mode reconstructs its private BlueZ
+advertisement, scan, listener, and candidate state after owned-platform loss.
+Restore the same provisioned controller. A new adapter epoch can reconcile
+retained Event work without restarting either node. After one successful
+transfer, require a later contact to report zero offered, fetched, and inserted
+Events. That second contact is bounded deduplication evidence. Wait for the
+configured successful-contact cadence, or perform a second bounded controller
+power-cycle after the successful transfer. The restoration that produced the
+transfer is not itself the deduplication contact.
 
 This source path and its deterministic tests implement that recovery. Retain a
 bounded physical observation before treating a particular kernel, BlueZ,
@@ -238,9 +302,29 @@ monitor and contact loop before shutting down the node. Expect:
 BTLE_EVENT status=stopped
 ```
 
-After an owned contact has closed, its admission future has drained, and the
-last supervisor-held contact reference has been dropped, the evaluator emits
-one read-only peer-link diagnostic:
+Rostered shutdown allows owned platform cleanup 35 seconds. If it has not
+completed, the supervisor explicitly closes its BlueZ D-Bus session to force
+advertisement and discovery owner loss, then allows five more seconds for the
+owned cleanup tasks to join. A successful forced path reports
+`status=stopped owner_loss=forced`. If cleanup still cannot be proven within
+the total 40-second bound, shutdown returns an error and reports:
+
+```text
+BTLE_EVENT status=cleanup-unconfirmed
+```
+
+Treat `cleanup-unconfirmed` as failed shutdown evidence; inspect BlueZ state
+before restarting the adapter process.
+
+The current Linux adapter also gives an admitted Event contact up to five
+seconds to observe cancellation after the contact is closed. This matches the
+owned BlueZ stop allowance and prevents a stuck admission task from retaining
+expired discovery credentials indefinitely. It is an implementation safety
+bound, not a wire-protocol deadline or a requirement on other transports.
+
+In fixed mode only, after an owned contact has closed, its admission future has
+drained, and the last supervisor-held contact reference has been dropped, the
+evaluator emits one read-only peer-link diagnostic:
 
 ```text
 BTLE_EVENT peer_acl=absent
@@ -284,10 +368,11 @@ newer vendor build is not evidence without its package/source relationship.
 After a successful or zero-work contact, stop both evaluators cleanly and
 require `BTLE_EVENT status=stopped` plus process exit. Leave both controllers
 powered and make no peer, trust, pairing, advertisement, or controller change.
-Start the listener and then the initiator with the same provisioned values and
-require another authenticated zero-work contact. A listener advertisement or
-BlueZ `Connected` ACL alone is not success; both sides must report
-`status=contact-complete`.
+For fixed mode, start the listener and then the initiator with the same
+provisioned values. For rostered mode, start both explicit rostered adapters
+with the same discovery inputs. Require another authenticated zero-work
+contact. A listener advertisement or BlueZ `Connected` ACL alone is not
+success; both sides must report `status=contact-complete`.
 
 Retain the installed kernel package/source relationship to the CVE fix, the
 exact evaluator digest, controller/driver/BlueZ versions, first post-restart
@@ -323,8 +408,9 @@ For each bounded run, retain:
 - source commit and build/toolchain identity;
 - Linux distribution and kernel, BlueZ version, controller chipset/firmware,
   and kernel driver;
-- configured address types, PSM, derived role, negotiated send/receive MTUs,
-  Event size, and cadence;
+- selected adapter mode, configured address types, fixed or kernel-allocated
+  PSM as applicable, derived role, negotiated send/receive MTUs, Event size,
+  and cadence;
 - timestamps for unavailable, available, contact start/completion, controller
   loss/restoration, and clean shutdown;
 - proof that local publication committed before contact, plus application-level

@@ -3,7 +3,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::{fmt, num::NonZeroU32, time::Instant};
 use subtle::ConstantTimeEq;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroizing;
 
 /// Canonical private UUID bytes for the rostered LE L2CAP carrier.
 pub const ASTER_ROSTER_SERVICE_UUID: [u8; 16] = [
@@ -48,13 +48,17 @@ impl DiscoveryGeneration {
 }
 
 /// Zeroize-on-drop 32-byte discovery proof secret.
-#[derive(Zeroize, ZeroizeOnDrop)]
-pub struct DiscoverySecret([u8; 32]);
+pub struct DiscoverySecret(Zeroizing<[u8; 32]>);
 
 impl DiscoverySecret {
     /// Adopts a provisioned random secret, rejecting the reserved zero value.
     pub fn new(bytes: [u8; 32]) -> Result<Self, DiscoveryCredentialError> {
-        if bytes == [0; 32] {
+        Self::from_zeroizing(Zeroizing::new(bytes))
+    }
+
+    /// Adopts an already-zeroizing provisioned secret without copying it out.
+    pub fn from_zeroizing(bytes: Zeroizing<[u8; 32]>) -> Result<Self, DiscoveryCredentialError> {
+        if bytes.as_ref() == [0; 32] {
             return Err(DiscoveryCredentialError::ZeroSecret);
         }
         Ok(Self(bytes))
@@ -531,6 +535,7 @@ mod tests {
     fn discovery_credentials_reject_invalid_values_and_redact_debug() {
         assert!(DiscoveryGeneration::new(0).is_err());
         assert!(DiscoverySecret::new([0; 32]).is_err());
+        assert!(DiscoverySecret::from_zeroizing(Zeroizing::new([7; 32])).is_ok());
 
         let (credentials, _) = credentials(None);
         let debug = format!("{credentials:?}");

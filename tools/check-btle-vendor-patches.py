@@ -59,8 +59,8 @@ VENDORS = (
         license_expression="BSD-2-Clause",
         license_bindings=("BSD-2-Clause", "BSD-3-Clause", "GPL-2.0-only"),
         notice_files=(("LICENSE", "da053620434ccd59747d44b04e87e06464763f22db320bc71dc9b00b1e4db460"),),
-        patch_sha256="9ba08f50d70a34276b8e2daa4879da92cf3b2c7e935b4c4bd59e8f76d42bcb38",
-        source_archive_sha256="59c5fc53018e32ce3b234dfc48041c9afe4728cb1b7af991c09f5406b39aa05f",
+        patch_sha256="ce4de362bf30ccc318c741694adfce8678c53202b44a5b4827a509ea681044af",
+        source_archive_sha256="0d58bacf77348f871068fe9fe2f859cb5ec2ccb4ff81d7f6fa05f40477c6bb01",
         patched=("src/adapter.rs", "src/adv.rs", "src/lib.rs", "src/session.rs"),
     ),
 )

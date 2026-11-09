@@ -1,6 +1,13 @@
 use aster_ble_linux::{
-    LinkConfig, RING1_MAXIMUM_DEADLINE, RING1_MAXIMUM_EXCHANGE_BYTES,
-    RING1_MAXIMUM_FRAME_BYTES, SupervisorConfig, spawn_linux_btle_event_supervisor,
+    ContactLimits, ControllerConfig, DiscoveryCredential, DiscoveryGeneration, DiscoverySecret,
+    LeasedDiscoveryCredentialSet, LinkConfig, RING1_MAXIMUM_DEADLINE,
+    RING1_MAXIMUM_EXCHANGE_BYTES, RING1_MAXIMUM_FRAME_BYTES, RosteredDiscoveryConfig,
+    RosteredSupervisorConfig, SupervisorConfig, LinuxRosteredBtleEventSupervisor,
+    spawn_linux_btle_event_supervisor, spawn_linux_rostered_btle_event_supervisor,
+};
+use aster_host::{
+    TrustedClockLeaseGuard, TrustedClockSample,
+    load_unprotected_reference_discovery_credentials,
 };
 use aster_node::{
     MutableSourceInterests, NodeApplication, NodeOperatorOutputPolicy, TransportNeutralNodeConfig,
@@ -10,24 +17,37 @@ use aster_node::{
 use bluer::{Address, AddressType};
 use std::{
     collections::BTreeMap,
+    fs,
     future::Future,
+    os::unix::fs::DirBuilderExt,
     path::PathBuf,
     pin::Pin,
     process::ExitCode,
     str::FromStr,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const DEFAULT_CONTACT_CADENCE_SECONDS: u64 = 60;
 const MAXIMUM_CONTACT_CADENCE_SECONDS: u64 = 24 * 60 * 60;
-const USAGE: &str = "usage: aster-btle-event --adapter hciN \
+const TRUSTED_CLOCK_RESAMPLE_INTERVAL: Duration = Duration::from_secs(60);
+const USAGE: &str = "usage: aster-btle-event --transport fixed|rostered --adapter hciN \
     --local-address AA:BB:CC:DD:EE:FF --local-address-type public|random \
-    --peer-address AA:BB:CC:DD:EE:FF --peer-address-type public|random \
-    --psm 0x80..0xff --state PATH --mission-bundle PATH --mission-peer NODE_ID_HEX \
+    --state PATH --mission-bundle PATH --mission-peer NODE_ID_HEX \
+    [fixed: --peer-address AA:BB:CC:DD:EE:FF --peer-address-type public|random --psm 0x80..0xff] \
+    [rostered: --discovery-scope-id HEX --discovery-credential-unprotected-reference FILE] \
     [--contact-cadence-seconds 1..86400]";
 
+enum EvaluationTransport {
+    Fixed(LinkConfig),
+    Rostered {
+        controller: ControllerConfig,
+        discovery_scope_id: [u8; 32],
+        credential_reference: PathBuf,
+    },
+}
+
 struct EvaluationConfig {
-    link: LinkConfig,
+    transport: EvaluationTransport,
     state: PathBuf,
     mission_bundle: PathBuf,
     mission_peer: [u8; 32],
@@ -51,7 +71,8 @@ fn parse_command(arguments: Vec<String>) -> Result<EvaluationCommand, String> {
     for pair in arguments.chunks_exact(2) {
         if !matches!(
             pair[0].as_str(),
-            "--adapter"
+            "--transport"
+                | "--adapter"
                 | "--local-address"
                 | "--local-address-type"
                 | "--peer-address"
@@ -61,6 +82,8 @@ fn parse_command(arguments: Vec<String>) -> Result<EvaluationCommand, String> {
                 | "--mission-bundle"
                 | "--mission-peer"
                 | "--contact-cadence-seconds"
+                | "--discovery-scope-id"
+                | "--discovery-credential-unprotected-reference"
         ) || options.insert(pair[0].clone(), pair[1].clone()).is_some()
         {
             return Err(USAGE.to_owned());
@@ -76,13 +99,6 @@ fn parse_command(arguments: Vec<String>) -> Result<EvaluationCommand, String> {
         "random" => Ok(AddressType::LeRandom),
         _ => Err(USAGE.to_owned()),
     };
-    let psm_text = value("--psm")?;
-    let psm = if let Some(hex) = psm_text.strip_prefix("0x") {
-        u16::from_str_radix(hex, 16)
-    } else {
-        psm_text.parse()
-    }
-    .map_err(|_| "invalid LE PSM".to_owned())?;
     let cadence_seconds = match options.get("--contact-cadence-seconds") {
         Some(value) => value
             .parse::<u64>()
@@ -93,19 +109,61 @@ fn parse_command(arguments: Vec<String>) -> Result<EvaluationCommand, String> {
         return Err("invalid contact cadence".to_owned());
     }
 
+    let adapter_name = value("--adapter")?;
+    let local_address = parse_address("--local-address")?;
+    let local_address_type = address_type("--local-address-type")?;
+    let transport = match value("--transport")?.as_str() {
+        "fixed" => {
+            if options.contains_key("--discovery-scope-id")
+                || options.contains_key("--discovery-credential-unprotected-reference")
+            {
+                return Err(USAGE.to_owned());
+            }
+            let psm_text = value("--psm")?;
+            let psm = if let Some(hex) = psm_text.strip_prefix("0x") {
+                u16::from_str_radix(hex, 16)
+            } else {
+                psm_text.parse()
+            }
+            .map_err(|_| "invalid LE PSM".to_owned())?;
+            EvaluationTransport::Fixed(LinkConfig {
+                adapter_name,
+                local_address,
+                local_address_type,
+                peer_address: parse_address("--peer-address")?,
+                peer_address_type: address_type("--peer-address-type")?,
+                psm,
+                maximum_frame_bytes: RING1_MAXIMUM_FRAME_BYTES,
+                maximum_exchange_bytes: RING1_MAXIMUM_EXCHANGE_BYTES,
+                open_timeout: RING1_MAXIMUM_DEADLINE,
+                operation_timeout: RING1_MAXIMUM_DEADLINE,
+            })
+        }
+        "rostered" => {
+            if options.contains_key("--peer-address")
+                || options.contains_key("--peer-address-type")
+                || options.contains_key("--psm")
+            {
+                return Err(USAGE.to_owned());
+            }
+            EvaluationTransport::Rostered {
+                controller: ControllerConfig {
+                    adapter_name,
+                    local_address,
+                    local_address_type,
+                },
+                discovery_scope_id: parse_node_id(&value("--discovery-scope-id")?)
+                    .map_err(|_| USAGE.to_owned())?,
+                credential_reference: PathBuf::from(value(
+                    "--discovery-credential-unprotected-reference",
+                )?),
+            }
+        }
+        _ => return Err(USAGE.to_owned()),
+    };
+
     Ok(EvaluationCommand::Run(EvaluationConfig {
-        link: LinkConfig {
-            adapter_name: value("--adapter")?,
-            local_address: parse_address("--local-address")?,
-            local_address_type: address_type("--local-address-type")?,
-            peer_address: parse_address("--peer-address")?,
-            peer_address_type: address_type("--peer-address-type")?,
-            psm,
-            maximum_frame_bytes: RING1_MAXIMUM_FRAME_BYTES,
-            maximum_exchange_bytes: RING1_MAXIMUM_EXCHANGE_BYTES,
-            open_timeout: RING1_MAXIMUM_DEADLINE,
-            operation_timeout: RING1_MAXIMUM_DEADLINE,
-        },
+        transport,
         state: PathBuf::from(value("--state")?),
         mission_bundle: PathBuf::from(value("--mission-bundle")?),
         mission_peer: parse_node_id(&value("--mission-peer")?).map_err(|_| USAGE.to_owned())?,
@@ -127,6 +185,11 @@ struct Lifecycle<N, S> {
     wait_for_stop: WaitForStop<S>,
     stop_supervisor: StopSupervisor<S>,
     stop_node: StopNode<N>,
+}
+
+struct RosteredEvaluationSupervisor {
+    transport: LinuxRosteredBtleEventSupervisor,
+    clock: TrustedClockLeaseGuard,
 }
 
 async fn run_owned<N, S>(lifecycle: Lifecycle<N, S>) -> Result<(), String> {
@@ -156,14 +219,6 @@ async fn run(config: EvaluationConfig) -> Result<(), String> {
     let mission = UnprotectedReferenceMission::load(&config.mission_bundle)
         .map_err(|_| "failed to load the evaluation mission bundle".to_owned())?;
     let local_mission_id = mission.identity();
-    let supervisor_config = SupervisorConfig {
-        link: config.link,
-        local_mission_id,
-        peer_mission_id: config.mission_peer,
-        contact_cadence: config.contact_cadence,
-    }
-    .validate()
-    .map_err(|_| "invalid Linux BTLE supervisor configuration".to_owned())?;
     let node_config = TransportNeutralNodeConfig {
         state: config.state,
         mission,
@@ -173,52 +228,239 @@ async fn run(config: EvaluationConfig) -> Result<(), String> {
         application: NodeApplication::Relay,
     };
 
-    run_owned(Lifecycle {
-        start_node: Box::new(|| {
-            Box::pin(async move {
-                start_externally_supervised_transport_neutral_node(
-                    node_config,
-                    NodeOperatorOutputPolicy::CustomerSafe,
-                )
-                    .await
-                    .map_err(|_| "failed to start the transport-neutral node".to_owned())
+    match config.transport {
+        EvaluationTransport::Fixed(link) => {
+            let supervisor_config = SupervisorConfig {
+                link,
+                local_mission_id,
+                peer_mission_id: config.mission_peer,
+                contact_cadence: config.contact_cadence,
+            }
+            .validate()
+            .map_err(|_| "invalid fixed Linux BTLE supervisor configuration".to_owned())?;
+            run_owned(Lifecycle {
+                start_node: Box::new(|| {
+                    Box::pin(async move {
+                        start_externally_supervised_transport_neutral_node(
+                            node_config,
+                            NodeOperatorOutputPolicy::CustomerSafe,
+                        )
+                        .await
+                        .map_err(|_| "failed to start the transport-neutral node".to_owned())
+                    })
+                }),
+                start_supervisor: Box::new(|node| {
+                    spawn_linux_btle_event_supervisor(
+                        supervisor_config,
+                        node.ordered_event_contacts(),
+                    )
+                }),
+                wait_for_stop: Box::new(|supervisor| {
+                    Box::pin(async move {
+                        let result = tokio::select! {
+                            result = wait_for_shutdown_signal() => result,
+                            () = supervisor.wait_for_completion() => {
+                                Err("Linux BTLE supervisor stopped unexpectedly".to_owned())
+                            }
+                        };
+                        (supervisor, result)
+                    })
+                }),
+                stop_supervisor: Box::new(|supervisor| {
+                    Box::pin(async move {
+                        supervisor
+                            .shutdown()
+                            .await
+                            .map_err(|error| error.to_string())
+                    })
+                }),
+                stop_node: Box::new(|node| {
+                    Box::pin(async move {
+                        node.shutdown()
+                            .await
+                            .map(|_| ())
+                            .map_err(|_| "node shutdown failed".to_owned())
+                    })
+                }),
             })
-        }),
-        start_supervisor: Box::new(|node| {
-            spawn_linux_btle_event_supervisor(
-                supervisor_config,
-                node.ordered_event_contacts(),
-            )
-        }),
-        wait_for_stop: Box::new(|supervisor| {
-            Box::pin(async move {
-                let result = tokio::select! {
-                    result = wait_for_shutdown_signal() => result,
-                    () = supervisor.wait_for_completion() => {
-                        Err("Linux BTLE supervisor stopped unexpectedly".to_owned())
+            .await
+        }
+        EvaluationTransport::Rostered {
+            controller,
+            discovery_scope_id,
+            credential_reference,
+        } => {
+            let (credentials, clock) = load_reference_credentials(
+                discovery_scope_id,
+                &credential_reference,
+            )?;
+            let supervisor_config = RosteredSupervisorConfig {
+                controller,
+                discovery: RosteredDiscoveryConfig { credentials },
+                local_mission_id,
+                peer_mission_id: config.mission_peer,
+                contact_cadence: config.contact_cadence,
+                contact_limits: ContactLimits {
+                    maximum_frame_bytes: RING1_MAXIMUM_FRAME_BYTES,
+                    maximum_exchange_bytes: RING1_MAXIMUM_EXCHANGE_BYTES,
+                    open_timeout: RING1_MAXIMUM_DEADLINE,
+                    operation_timeout: RING1_MAXIMUM_DEADLINE,
+                },
+            }
+            .validate()
+            .map_err(|_| "invalid rostered Linux BTLE supervisor configuration".to_owned())?;
+            run_owned(Lifecycle {
+                start_node: Box::new(|| {
+                    Box::pin(async move {
+                        start_externally_supervised_transport_neutral_node(
+                            node_config,
+                            NodeOperatorOutputPolicy::CustomerSafe,
+                        )
+                        .await
+                        .map_err(|_| "failed to start the transport-neutral node".to_owned())
+                    })
+                }),
+                start_supervisor: Box::new(|node| {
+                    RosteredEvaluationSupervisor {
+                        transport: spawn_linux_rostered_btle_event_supervisor(
+                            supervisor_config,
+                            node.ordered_event_contacts(),
+                        ),
+                        clock,
                     }
-                };
-                (supervisor, result)
+                }),
+                wait_for_stop: Box::new(|mut supervisor| {
+                    Box::pin(async move {
+                        let mut shutdown_signal = Box::pin(wait_for_shutdown_signal());
+                        let result = loop {
+                            tokio::select! {
+                                result = &mut shutdown_signal => break result,
+                                () = supervisor.transport.wait_for_completion() => {
+                                    break Err("Linux BTLE supervisor stopped unexpectedly".to_owned());
+                                }
+                                () = tokio::time::sleep(TRUSTED_CLOCK_RESAMPLE_INTERVAL) => {
+                                    let sample = match trusted_clock_sample() {
+                                        Ok(sample) => sample,
+                                        Err(error) => break Err(error),
+                                    };
+                                    if supervisor.clock.resample(sample).is_err() {
+                                        break Err("trusted clock continuity was lost".to_owned());
+                                    }
+                                }
+                            }
+                        };
+                        if result.is_err() {
+                            supervisor.transport.cancel();
+                        }
+                        (supervisor, result)
+                    })
+                }),
+                stop_supervisor: Box::new(|supervisor| {
+                    Box::pin(async move {
+                        supervisor
+                            .transport
+                            .shutdown()
+                            .await
+                            .map_err(|error| error.to_string())
+                    })
+                }),
+                stop_node: Box::new(|node| {
+                    Box::pin(async move {
+                        node.shutdown()
+                            .await
+                            .map(|_| ())
+                            .map_err(|_| "node shutdown failed".to_owned())
+                    })
+                }),
             })
-        }),
-        stop_supervisor: Box::new(|supervisor| {
-            Box::pin(async move {
-                supervisor
-                    .shutdown()
-                    .await
-                    .map_err(|error| error.to_string())
-            })
-        }),
-        stop_node: Box::new(|node| {
-            Box::pin(async move {
-                node.shutdown()
-                    .await
-                    .map(|_| ())
-                    .map_err(|_| "node shutdown failed".to_owned())
-            })
-        }),
-    })
-    .await
+            .await
+        }
+    }
+}
+
+fn load_reference_credentials(
+    discovery_scope_id: [u8; 32],
+    reference: &std::path::Path,
+) -> Result<(LeasedDiscoveryCredentialSet, TrustedClockLeaseGuard), String> {
+    let checkpoint = TemporaryCheckpoint::create()?;
+    let parent = reference
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let basename = reference
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "invalid discovery credential reference".to_owned())?;
+    let sample = trusted_clock_sample()?;
+    let material = load_unprotected_reference_discovery_credentials(
+        discovery_scope_id,
+        &checkpoint.0,
+        parent,
+        basename,
+        sample,
+    )
+    .map_err(|_| "discovery credential reference was rejected".to_owned())?;
+    let (emitting, overlap, expires_at) = material.into_parts();
+    let emitting = adopt_credential(emitting)?;
+    let overlap = overlap.map(adopt_credential).transpose()?;
+    let credentials = LeasedDiscoveryCredentialSet::new(emitting, overlap, expires_at)
+        .map_err(|_| "discovery credential lease was rejected".to_owned())?;
+    Ok((credentials, TrustedClockLeaseGuard::new(sample)))
+}
+
+fn trusted_clock_sample() -> Result<TrustedClockSample, String> {
+    let wall_unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "trusted clock is unavailable".to_owned())?
+        .as_secs();
+    Ok(TrustedClockSample::new(wall_unix_seconds, Instant::now()))
+}
+
+fn adopt_credential(
+    (generation, secret): (u32, zeroize::Zeroizing<[u8; 32]>),
+) -> Result<DiscoveryCredential, String> {
+    let generation = DiscoveryGeneration::new(generation)
+        .map_err(|_| "discovery credential generation was rejected".to_owned())?;
+    let secret = DiscoverySecret::from_zeroizing(secret)
+        .map_err(|_| "discovery credential secret was rejected".to_owned())?;
+    Ok(DiscoveryCredential::new(generation, secret))
+}
+
+struct TemporaryCheckpoint(PathBuf);
+
+impl TemporaryCheckpoint {
+    fn create() -> Result<Self, String> {
+        for _ in 0..4 {
+            let mut suffix = [0_u8; 16];
+            getrandom::fill(&mut suffix)
+                .map_err(|_| "temporary checkpoint entropy is unavailable".to_owned())?;
+            let name = format!(
+                "aster-btle-discovery-{}-{}",
+                std::process::id(),
+                suffix
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            );
+            let path = std::env::temp_dir().join(name);
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return Err("temporary checkpoint could not be created".to_owned()),
+            }
+        }
+        Err("temporary checkpoint name could not be allocated".to_owned())
+    }
+}
+
+impl Drop for TemporaryCheckpoint {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.0.join("discovery-checkpoint.next"));
+        let _ = fs::remove_file(self.0.join("discovery-checkpoint"));
+        let _ = fs::remove_dir(&self.0);
+    }
 }
 
 #[tokio::main]
@@ -245,10 +487,12 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::{os::unix::fs::PermissionsExt, sync::{Arc, Mutex}};
 
     fn arguments() -> Vec<String> {
         [
+            "--transport",
+            "fixed",
             "--adapter",
             "hci2",
             "--local-address",
@@ -273,11 +517,38 @@ mod tests {
         .collect()
     }
 
+    fn rostered_arguments() -> Vec<String> {
+        [
+            "--transport",
+            "rostered",
+            "--adapter",
+            "hci2",
+            "--local-address",
+            "02:00:00:00:00:01",
+            "--local-address-type",
+            "random",
+            "--state",
+            "/tmp/aster-btle-event-state",
+            "--mission-bundle",
+            "/tmp/aster-btle-event-mission.bundle",
+            "--mission-peer",
+            "0101010101010101010101010101010101010101010101010101010101010101",
+            "--discovery-scope-id",
+            "0202020202020202020202020202020202020202020202020202020202020202",
+            "--discovery-credential-unprotected-reference",
+            "/tmp/aster-btle-discovery.credential",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
     #[test]
     fn parses_unattended_configuration_without_role() {
         let EvaluationCommand::Run(config) = parse_command(arguments()).unwrap() else {
             panic!("run command");
         };
+        assert!(matches!(config.transport, EvaluationTransport::Fixed(_)));
         assert_eq!(
             config.contact_cadence,
             Duration::from_secs(DEFAULT_CONTACT_CADENCE_SECONDS)
@@ -286,6 +557,35 @@ mod tests {
             parse_command(vec!["--help".to_owned()]).unwrap(),
             EvaluationCommand::Help
         ));
+    }
+
+    #[test]
+    fn parses_explicit_rostered_configuration_without_fixed_locator_or_psm() {
+        let EvaluationCommand::Run(config) = parse_command(rostered_arguments()).unwrap() else {
+            panic!("run command");
+        };
+        assert!(matches!(
+            config.transport,
+            EvaluationTransport::Rostered { .. }
+        ));
+
+        let mut mixed = rostered_arguments();
+        mixed.extend(["--psm".to_owned(), "0x81".to_owned()]);
+        assert!(parse_command(mixed).is_err());
+
+        let mut missing_mode = arguments();
+        missing_mode.drain(0..2);
+        assert!(parse_command(missing_mode).is_err());
+    }
+
+    #[test]
+    fn temporary_discovery_checkpoint_is_private_and_removed_on_drop() {
+        let checkpoint = TemporaryCheckpoint::create().unwrap();
+        let path = checkpoint.0.clone();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o700);
+
+        drop(checkpoint);
+        assert!(!path.exists());
     }
 
     #[test]

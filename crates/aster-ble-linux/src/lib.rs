@@ -11,6 +11,7 @@ mod lifecycle;
 mod peer;
 mod platform;
 mod policy;
+mod rostered_lifecycle;
 mod stream;
 
 pub use config::{
@@ -35,6 +36,9 @@ pub use lifecycle::{LinuxBtleEventSupervisor, SupervisorError, spawn_linux_btle_
 pub use platform::{
     BluezSocketFactory, OpenFuture, OpenedContact, SocketFactory, open_contact,
     open_contact_with_factory,
+};
+pub use rostered_lifecycle::{
+    LinuxRosteredBtleEventSupervisor, spawn_linux_rostered_btle_event_supervisor,
 };
 pub use stream::{NegotiatedMtu, SocketOpen};
 

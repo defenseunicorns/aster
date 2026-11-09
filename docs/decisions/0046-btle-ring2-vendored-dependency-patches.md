@@ -33,7 +33,7 @@ feature is enabled. It changes no result bytes or public API.
 
 The BlueR delta changes only `src/adapter.rs`, `src/adv.rs`, `src/lib.rs`, and
 `src/session.rs`: it adds cancellation-independent advertisement/discovery
-owners with acknowledged stop, persistent termination notification, and a
+owners with acknowledged stop, persistent owned termination waiters, and a
 256-item first ingress bound whose overflow terminates the session. Existing
 shared discovery/drop APIs remain compatible. No mission, roster, durable
 store, transport-selection, or Aster protocol policy enters the fork.
