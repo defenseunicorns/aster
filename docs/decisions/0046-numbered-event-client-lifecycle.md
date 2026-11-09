@@ -12,8 +12,11 @@ bounded data lifecycle. Retained physical acceptance remains a separate gate.
 `asterctl publication-reconstruct --journal NEW_PATH --client-id ID` are explicit
 loss-recovery operations. They observe the registered client's current session,
 create an exclusively opened new journal, durably record the reconstruction
-state and claim nonce, and use the existing compare-and-swap takeover and
-recovery-completion protocol. A concurrent claimant causes rejection; the SDK
+state and then the claim nonce, and use the existing compare-and-swap takeover
+and recovery-completion protocol. The initial durable transaction writes version
+2, the observed nonzero session, and the reconstruction flag together through
+the retained parent-directory handle. An interruption after this commit but
+before the first claim leaves an ordinarily recoverable reconstruction journal. A concurrent claimant causes rejection; the SDK
 never silently retakes ownership. Failed RPCs leave the new journal available
 for ordinary `open`/`recover`, including a lost claim or completion response.
 Reconstructed journals use version 2 so older SDKs refuse result-only entries
@@ -58,7 +61,11 @@ acknowledged deliveries and custody dependency edges, sparse publication
 results and reverse edges, and the internal application checkpoint. It retains
 an immutable 17-byte fence (tag, last session, allocation frontier), charged
 alongside the client ID. It preserves committed Events and their ordinary
-transport/TTL/custody lifecycle. A failure rolls back the whole transaction;
+transport/TTL/custody lifecycle. Cleanup gathers the owned subscription IDs and
+scans each delivery table once, removing matching rows and custody edges. It
+writes accounting and selector generation once; generation advances by the
+number of removed selectors, preserving its existing durable invariant.
+A failure rolls back the whole transaction;
 repeating the same retirement is an idempotent no-op. The fence permanently
 rejects session claims, recovery completion, publications, abandonment, result
 acknowledgement, subscription mutations and checkpoint writes. Read-only status

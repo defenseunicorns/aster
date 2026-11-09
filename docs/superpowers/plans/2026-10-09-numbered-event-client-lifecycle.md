@@ -83,3 +83,42 @@ Rebase validation (macOS, 2026-10-22, after PR #118):
   348 baseline IDs and 140 exact mappings, with no evidence-boundary changes.
 - Formatting and whitespace checks passed. No new physical, Linux qualification
   or production authorization is claimed; earlier results remain historical.
+
+
+Review repair and rebase (macOS, 2026-11-09):
+
+- Replayed only Increment 3 and its nonce-fixture follow-up onto main
+  `48c2b520`, including merged PR #126's retained directory handles and the
+  already merged semantic-v9 Blob pipeline. Preserved the Blob status manual
+  entry and regenerated the combined application descriptor from the merged
+  schema. PR #128 is closed/superseded and adds no sequencing dependency.
+- Reconstruction now commits version 2, the observed nonzero session, and its
+  reconstruction flag in the initial durable transaction through the hardened
+  directory handle. Failure injection after that commit and before the first
+  claim verifies ordinary reopen/recovery, receipt retention, and refusal to
+  overwrite the journal.
+- Retirement gathers owned subscription IDs, scans each delivery table once,
+  removes matching rows and custody references, and writes accounting and
+  generation once. The generation increment preserves the existing per-selector
+  count and parity invariant. Existing overflow rollback remains covered.
+- The bounded mixed-owner diagnostic uses all 256 subscription slots and 4,096
+  pending plus 4,096 acknowledged deliveries. Retiring 128 owned subscriptions
+  took 116,408 microseconds in one local run; the other owner's exact status,
+  remaining counts, and reopened-store audit passed. This is host diagnostic
+  evidence, not maximum-table-capacity or Tier-2 resource qualification.
+- All 43 SDK tests and eight ownership/retirement tests passed. Requirements
+  validation retains all 348 baseline IDs and 140 exact mappings; no requirement
+  evidence boundary or retained physical receipt changes.
+- Broader final validation passed: all 716 store tests, all 164 `asterctl`
+  unit/integration tests, real-agent journal-loss reconstruction, offline
+  lifecycle CLI administration/writer exclusion, strict all-target/all-feature
+  workspace Clippy, and generated Go client reproducibility. Protocol descriptor,
+  formatting and whitespace checks passed.
+- `mise run check` was attempted and stopped at the same 16 macOS failures in
+  `tools/test_aster_path_diagnostic.py` caused by absent `/proc/self/ns/net`.
+  Both diagnostic files are unchanged from main. A full gate pass is not claimed.
+  The full workspace and remaining aggregate integration gates were not rerun;
+  the focused suites above were run separately after the aggregate stopped.
+- Fuzz smoke was not repeated for these initialization/transaction-scanning
+  repairs: no parser, framing, envelope, fragmentation or wire-format validation
+  changed. Earlier fuzz runs above remain historical.

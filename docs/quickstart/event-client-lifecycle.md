@@ -19,8 +19,10 @@ retained committed receipts. There are no original intents for these receipts;
 `publication-show` refuses them. Unsent intents, compacted receipts and business
 effects are unrecoverable. Apply retained receipts idempotently using application
 records, then use `publication-ack`. Subsequent commands use the new journal.
-If an RPC fails after creation, use `publication-recover` on that path. The
-current Rust journal retains at most eight entries within its 1 MiB logical
+If initialization reports an error after its first durable commit, or an RPC
+fails after creation, use `publication-recover` on that path. The initial commit
+already contains the reconstruction session and format; preserve the journal
+rather than deleting or replacing it. The current Rust journal retains at most eight entries within its 1 MiB logical
 budget. An oversized reconstruction snapshot is refused without dropping
 receipts or completing recovery; retrying requires a snapshot within those
 limits.
