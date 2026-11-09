@@ -18121,7 +18121,7 @@ mod sqlite_integration_tests {
     #[test]
     fn bundled_sqlite_runtime_is_pinned() {
         let store = SqliteStore::open_in_memory(StoreConfig::default()).unwrap();
-        assert_eq!(store.sqlite_version().unwrap(), "3.53.2");
+        assert_eq!(store.sqlite_version().unwrap(), "3.54.1");
     }
 
     #[test]
