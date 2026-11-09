@@ -106,6 +106,8 @@
 - [x] Update the quickstart to enter a short text, retain the existing 65,536-byte reverse Event, press **Send and validate**, and verify exact terminal text/digest.
 - [x] Run formatting, `git diff --check`, Android JVM/Rust tests, Linux harness tests, both focused Clippy commands, lockfile validation, and requirements trace validation.
 - [ ] Build and install the exact APK, clear disposable app state, and run one physical Pixel-to-Linux bidirectional contact from a cold controller state without unrelated Bluetooth connections.
-- [ ] Verify the Android Event ID/digest and Linux terminal Event ID/digest/text agree, the existing large reverse Event is inserted, replay creates no duplicate, and all temporary phone/lab artifacts are removed.
-- [ ] Record only sanitized evidence, run a final production-code refactor/review, and obtain an independent architecture/security review before push.
+- [x] Retain a separate warm-state Pixel-to-Linux run of the exact final APK with matching Android/Linux text Event ID, payload digest, terminal text, and reciprocal 65,536-byte Event; keep cold qualification explicitly open.
+- [x] Verify the Android Event ID/digest and Linux terminal Event ID/digest/text agree, the existing large reverse Event is inserted, and all temporary phone/lab artifacts are removed.
+- [ ] Verify replay creates no duplicate semantic Event.
+- [x] Record only sanitized evidence, run a final production-code refactor/review, and obtain an independent architecture/security review before push.
 - [ ] Commit all final changes with a signed commit, push PR 146, let CI pass, update the PR claim, and mark it ready again.

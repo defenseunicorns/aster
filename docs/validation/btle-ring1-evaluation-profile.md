@@ -107,6 +107,12 @@ additionally exercises Android compilation, APK packaging, JNI ABI loading,
 real-controller connection, and matching Android/Linux terminal receipts;
 those observations remain evaluation evidence rather than a support claim.
 The later
+[text Event record](evidence/2026-11-09-android-linux-btle-text-event-validation.md)
+adds a clean-install Android publication, matching Linux terminal text and
+digest, the reciprocal retained large Event, and the bounded native preparation
+stack correction. It is warm-state evidence and does not qualify this host's
+cold-controller path.
+The separate
 [early-ACL diagnostic](evidence/2026-11-09-android-linux-btle-early-acl-diagnostic.md)
 shows that the evaluated Realtek USB controller on Linux 7.0.0-42 can deliver
 inbound ACL data before its HCI Connection Complete event after a cold
