@@ -1,5 +1,9 @@
 # Decision 0022: Do not select an IP mesh substrate from Proposal 0001
 
+> Historical scope: the subsequent retirement of `aster-lab`, `aster-host`,
+> and the native/Gate H controllers supersedes their retention and execution
+> instructions below. Recorded results remain bound to their original revisions.
+
 > ****
 
 - Status: accepted — no production profile selected

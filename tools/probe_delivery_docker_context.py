@@ -13,7 +13,7 @@ import tempfile
 # Independent fixture inventory, not derived by interpreting ignore patterns.
 REQUIRED = {
     "Cargo.toml", "Cargo.lock", "LICENSE", "THIRD_PARTY_NOTICES.md",
-    "lab/debian.sources", "tools/aster_path_delivery.py", "tools/aster_lan_mvp.py",
+    "docker/debian.sources", "tools/aster_path_delivery.py", "tools/aster_lan_mvp.py",
     "docker/path-lab/delivery-provision.py",
     "docker/path-lab/delivery-network-init.py",
     "docker/path-lab/delivery-agent.py", "docker/path-lab/delivery-wan.py",

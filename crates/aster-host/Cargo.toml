@@ -1,6 +1,6 @@
 [package]
 name = "aster-host"
-description = "Shared-node contact and mesh hosts for Aster Mesh"
+description = "Process-owned discovery credential authority for Aster Mesh"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,7 +17,6 @@ zeroize.workspace = true
 [features]
 default = []
 fuzzing = []
-gate-h-formal = []
 # Explicitly non-production constructor support for cross-crate authority tests.
 test-support = []
 

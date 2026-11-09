@@ -1581,7 +1581,7 @@ host sanitization, or sanitization of retained encrypted state and credentials.
 The image/config ID is a local identity only, not a registry image digest.
 
 The canonical projection was reproduced byte-for-byte from the raw root at the
-same 48,302-byte size and SHA-256. The current receipt checker has SHA-256
+same 48,302-byte size and SHA-256. The receipt checker used for that run had SHA-256
 `357b2ac98300dfb88e8ce2dc97672f4c685d401de82c80756db51b0dacb73823`;
 it passed against the immutable signed source, and its synthetic fail-closed
 suite passed 38/38.
@@ -1591,15 +1591,16 @@ bindings. Validate the retained receipt with a source repository containing the
 signed commit object and the reviewer's configured trusted signer:
 
 ```sh
-python3 tools/check-selected-iroh-nat-receipt.py --historical-v1 \
+python3 tools/historical/check-selected-iroh-nat-receipt.py \
   --raw-root /private/tmp/aster-selected-iroh-nat.zFpaqB/20260826T143559Z-selected-iroh-nat-50726015670670e9 \
   --source . \
   docs/validation/evidence/selected-iroh-nat-15f4e0b.json
 ```
 
-To independently reproject the sanitized JSON, choose a fresh nonexistent
-owner-controlled output path; the projector refuses to overwrite an existing
-path. The result must compare byte-for-byte with the checked-in receipt:
+The namespace-NAT controller and projector have been retired. The following
+historical reprojection commands require the original source checkout and a
+fresh owner-controlled output path. The recorded result compared byte-for-byte
+with the checked-in receipt:
 
 ```sh
 nat_review_dir="$(mktemp -d /private/tmp/aster-selected-nat-review.XXXXXX)"
