@@ -995,11 +995,14 @@ mod tests {
 
     impl TestConfig {
         fn new() -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "aster-ble-android-session-{}-{}",
-                std::process::id(),
-                NEXT_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .expect("canonical temporary directory")
+                .join(format!(
+                    "aster-ble-android-session-{}-{}",
+                    std::process::id(),
+                    NEXT_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ));
             std::fs::create_dir(&root).expect("create root");
             let mission = root.join("mission.bundle");
             let state = root.join("state");
