@@ -12,6 +12,9 @@ object NativeValidator {
     }
 
     @JvmStatic
+    external fun nativePrepare(configJson: String, callback: Callback): Boolean
+
+    @JvmStatic
     external fun nativeStart(configJson: String, transferredFd: Int, callback: Callback): Long
 
     @JvmStatic

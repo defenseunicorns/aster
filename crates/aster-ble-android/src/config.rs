@@ -8,6 +8,7 @@ use std::{
 
 const MAX_CONFIG_JSON_BYTES: usize = 16 * 1024;
 const MAX_CONFIG_STRING_BYTES: usize = 4 * 1024;
+const MAX_EVENT_TEXT_BYTES: usize = 1_024;
 const MIN_LE_DYNAMIC_PSM: u16 = 0x0080;
 const MAX_LE_DYNAMIC_PSM: u16 = 0x00ff;
 
@@ -97,6 +98,7 @@ struct RawValidatorConfig {
     mission_peer: String,
     bluetooth_address: String,
     psm: u16,
+    event_text: String,
     send_packet_bytes: usize,
     receive_packet_bytes: usize,
     require_event_larger_than_mtu: bool,
@@ -110,6 +112,7 @@ pub struct ValidatorConfig {
     mission_peer: [u8; 32],
     bluetooth_address: String,
     psm: u16,
+    event_text: String,
     send_packet_bytes: usize,
     receive_packet_bytes: usize,
     require_event_larger_than_mtu: bool,
@@ -158,6 +161,11 @@ impl ValidatorConfig {
                 "validator LE PSM is outside the Ring-1 range",
             ));
         }
+        if raw.event_text.is_empty() || raw.event_text.len() > MAX_EVENT_TEXT_BYTES {
+            return Err(ValidatorError::configuration(
+                "validator Event text is outside its bound",
+            ));
+        }
         if raw.send_packet_bytes == 0
             || raw.send_packet_bytes > usize::from(u16::MAX)
             || raw.receive_packet_bytes == 0
@@ -178,6 +186,7 @@ impl ValidatorConfig {
             mission_peer,
             bluetooth_address: raw.bluetooth_address,
             psm: raw.psm,
+            event_text: raw.event_text,
             send_packet_bytes: raw.send_packet_bytes,
             receive_packet_bytes: raw.receive_packet_bytes,
             require_event_larger_than_mtu: raw.require_event_larger_than_mtu,
@@ -212,6 +221,12 @@ impl ValidatorConfig {
     #[must_use]
     pub const fn psm(&self) -> u16 {
         self.psm
+    }
+
+    /// Returns the exact bounded UTF-8 Event payload entered by the operator.
+    #[must_use]
+    pub fn event_text(&self) -> &str {
+        &self.event_text
     }
 
     /// Returns Android's connected-socket maximum transmit packet size.
@@ -307,6 +322,7 @@ mod tests {
                     "\"mission_peer\":\"{}\",",
                     "\"bluetooth_address\":\"7C:FA:80:72:3B:7A\",",
                     "\"psm\":128,",
+                    "\"event_text\":\"hello from Android\",",
                     "\"send_packet_bytes\":512,",
                     "\"receive_packet_bytes\":256,",
                     "\"require_event_larger_than_mtu\":true",
@@ -335,9 +351,57 @@ mod tests {
         assert_eq!(config.send_packet_bytes(), 512);
         assert_eq!(config.receive_packet_bytes(), 256);
         assert_eq!(config.mission_peer(), [0x11; 32]);
+        assert_eq!(config.event_text(), "hello from Android");
         assert_eq!(config.state_path(), paths.state);
         assert_eq!(config.mission_bundle_path(), paths.mission);
         assert!(config.require_event_larger_than_mtu());
+    }
+
+    #[test]
+    fn preserves_exact_bounded_utf8_event_text() {
+        let paths = TestPaths::new();
+        let text = "Snowman ☃\n\"quoted\"\0";
+        let input = paths.json().replace(
+            "\"event_text\":\"hello from Android\"",
+            &format!(
+                "\"event_text\":{}",
+                serde_json::to_string(text).expect("encode event text")
+            ),
+        );
+
+        let config = ValidatorConfig::from_json(&input).expect("bounded event text");
+
+        assert_eq!(config.event_text().as_bytes(), text.as_bytes());
+    }
+
+    #[test]
+    fn rejects_empty_or_oversized_utf8_event_text() {
+        let paths = TestPaths::new();
+        for text in [String::new(), "é".repeat(513)] {
+            let input = paths.json().replace(
+                "\"event_text\":\"hello from Android\"",
+                &format!(
+                    "\"event_text\":{}",
+                    serde_json::to_string(&text).expect("encode event text")
+                ),
+            );
+            let error = ValidatorConfig::from_json(&input).expect_err("invalid event text");
+            assert_eq!(error.category(), ValidatorErrorCategory::Configuration);
+            if !text.is_empty() {
+                assert!(!error.to_string().contains(&text));
+            }
+        }
+
+        let boundary = "é".repeat(512);
+        let input = paths.json().replace(
+            "\"event_text\":\"hello from Android\"",
+            &format!(
+                "\"event_text\":{}",
+                serde_json::to_string(&boundary).expect("encode boundary event text")
+            ),
+        );
+        let config = ValidatorConfig::from_json(&input).expect("1,024-byte event text");
+        assert_eq!(config.event_text().len(), 1_024);
     }
 
     #[test]

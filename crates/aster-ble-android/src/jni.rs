@@ -2,13 +2,13 @@
 
 use crate::{
     PhaseSink, RunId, RunOutcome, RunRegistry, SessionEvent, ValidationReceipt, ValidatorConfig,
-    ValidatorError, ValidatorErrorCategory, ValidatorPhase,
+    ValidatorError, ValidatorErrorCategory, ValidatorPhase, session::prepare_local_event,
 };
 use jni::{
     Env, EnvUnowned, JValue, JavaVM, jni_sig, jni_str,
     objects::{JClass, JObject, JString},
     refs::Global,
-    sys::{jint, jlong},
+    sys::{jboolean, jint, jlong},
 };
 use std::{
     os::fd::{FromRawFd, OwnedFd},
@@ -264,6 +264,70 @@ fn native_start(
             Ok(0)
         }
     }
+}
+
+fn prepare_config(config: &ValidatorConfig) -> Result<(), ValidatorError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| {
+            ValidatorError::new(
+                ValidatorErrorCategory::Internal,
+                "validator runtime failed to start",
+            )
+        })?;
+    runtime.block_on(prepare_local_event(config)).map(|_| ())
+}
+
+fn native_prepare(
+    env: &mut Env<'_>,
+    config_json: &JString<'_>,
+    callback: &JObject<'_>,
+) -> jni::errors::Result<jboolean> {
+    let vm = env.get_java_vm()?;
+    let callback = env.new_global_ref(callback)?;
+    let callback: Arc<dyn NativeCallback> = Arc::new(JavaCallback { vm, callback });
+    let config_json = match config_json
+        .try_to_string(env)
+        .map_err(|_| ())
+        .and_then(|value| validate_java_string(value).map_err(|_| ()))
+    {
+        Ok(value) => value,
+        Err(()) => {
+            let _ = callback.error(
+                ValidatorErrorCategory::Configuration,
+                "validator configuration string is invalid",
+            );
+            return Ok(false);
+        }
+    };
+    let config = match ValidatorConfig::from_json(&config_json) {
+        Ok(config) => config,
+        Err(error) => {
+            let _ = callback.error(error.category(), &error.to_string());
+            return Ok(false);
+        }
+    };
+    match contain(|| prepare_config(&config)) {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            let _ = callback.error(error.category(), &error.to_string());
+            Ok(false)
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_defenseunicorns_aster_btlering1_NativeValidator_nativePrepare<
+    'caller,
+>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    config_json: JString<'caller>,
+    callback: JObject<'caller>,
+) -> jboolean {
+    env.with_env(|env| native_prepare(env, &config_json, &callback))
+        .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
 #[unsafe(no_mangle)]

@@ -3,8 +3,9 @@ use aster_mesh::{
     TransferProfileOfferV1, negotiate_transfer_profiles_for_semantic_version,
     transfer_profile_digest,
 };
-use aster_node::PeerReceipt;
+use aster_node::{PeerReceipt, application::EventPublishResult};
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
 
 const SEMANTIC_V9: u16 = 9;
@@ -27,6 +28,14 @@ pub struct ValidationReceipt {
     pub send_packet_bytes: usize,
     /// Android's maximum receive packet size for this socket.
     pub receive_packet_bytes: usize,
+    /// Semantic identity of the locally committed text Event.
+    pub published_event_id: String,
+    /// SHA-256 of the exact locally committed text payload.
+    pub published_payload_sha256: String,
+    /// Source Event entries sent to the authenticated peer.
+    pub event_page_entries_sent: usize,
+    /// Protected source Event bytes sent to the authenticated peer.
+    pub event_page_bytes_sent: usize,
     /// Event page entries consumed from the peer.
     pub event_page_entries_received: usize,
     /// Protected source Event bytes consumed from the peer.
@@ -43,6 +52,7 @@ pub struct ValidationReceipt {
 pub fn validate_ring1_receipt(
     config: &ValidatorConfig,
     receipt: &PeerReceipt,
+    publication: &EventPublishResult,
 ) -> Result<ValidationReceipt, ValidatorError> {
     let expected_digest = canonical_v9_profile_digest()?;
     if receipt.mission_peer != Some(config.mission_peer()) {
@@ -84,6 +94,15 @@ pub fn validate_ring1_receipt(
             "validator contact did not durably insert exactly one Event",
         ));
     }
+    if receipt.event_pages_sent != 1
+        || receipt.event_page_entries_sent != 1
+        || receipt.event_page_bytes_sent == 0
+    {
+        return Err(ValidatorError::new(
+            ValidatorErrorCategory::Protocol,
+            "validator contact did not send exactly one text Event",
+        ));
+    }
     let event_larger_than_receive_packet =
         receipt.event_page_bytes_received > config.receive_packet_bytes();
     if config.require_event_larger_than_mtu() && !event_larger_than_receive_packet {
@@ -100,6 +119,10 @@ pub fn validate_ring1_receipt(
         profile_digest_match: true,
         send_packet_bytes: config.send_packet_bytes(),
         receive_packet_bytes: config.receive_packet_bytes(),
+        published_event_id: publication.id.to_string(),
+        published_payload_sha256: format_digest(Sha256::digest(config.event_text()).into()),
+        event_page_entries_sent: receipt.event_page_entries_sent,
+        event_page_bytes_sent: receipt.event_page_bytes_sent,
         event_page_entries_received: receipt.event_page_entries_received,
         event_page_bytes_received: receipt.event_page_bytes_received,
         event_page_inserts: receipt.event_page_inserts,
@@ -137,7 +160,10 @@ fn format_digest(digest: [u8; 32]) -> String {
 mod tests {
     use super::*;
     use crate::{ValidatorConfig, ValidatorErrorCategory};
-    use aster_node::PeerReceipt;
+    use aster_node::{
+        PeerReceipt,
+        application::{EventId, EventPublishResult, Priority},
+    };
     use std::{
         fs,
         path::PathBuf,
@@ -174,6 +200,7 @@ mod tests {
                     "\"mission_peer\":\"{}\",",
                     "\"bluetooth_address\":\"7C:FA:80:72:3B:7A\",",
                     "\"psm\":128,",
+                    "\"event_text\":\"hello from Android\",",
                     "\"send_packet_bytes\":512,",
                     "\"receive_packet_bytes\":256,",
                     "\"require_event_larger_than_mtu\":true",
@@ -206,7 +233,23 @@ mod tests {
             event_page_entries_received: 1,
             event_page_bytes_received: 513,
             event_page_inserts: 1,
+            event_pages_sent: 1,
+            event_page_entries_sent: 1,
+            event_page_bytes_sent: 128,
             ..PeerReceipt::default()
+        }
+    }
+
+    fn published_event() -> EventPublishResult {
+        EventPublishResult {
+            id: EventId::from_bytes([0x42; 32]),
+            publisher: [0x22; 32],
+            publisher_counter: 1,
+            event_sequence: 1,
+            priority: Priority::Priority,
+            ttl_ms: None,
+            acceptance_marker: 1,
+            inserted: true,
         }
     }
 
@@ -214,8 +257,8 @@ mod tests {
     fn accepts_one_inserted_v9_event_larger_than_receive_packet() {
         let test = TestConfig::new();
 
-        let validated =
-            validate_ring1_receipt(&test.config, &valid_receipt()).expect("valid receipt");
+        let validated = validate_ring1_receipt(&test.config, &valid_receipt(), &published_event())
+            .expect("valid receipt");
 
         assert_eq!(validated.semantic_version, 9);
         assert_eq!(validated.negotiated_transfer_profiles, [2, 1, 1, 5, 1]);
@@ -223,6 +266,13 @@ mod tests {
         assert_eq!(validated.event_page_entries_received, 1);
         assert_eq!(validated.event_page_bytes_received, 513);
         assert_eq!(validated.event_page_inserts, 1);
+        assert_eq!(validated.event_page_entries_sent, 1);
+        assert_eq!(validated.event_page_bytes_sent, 128);
+        assert_eq!(validated.published_event_id, "42".repeat(32));
+        assert_eq!(
+            validated.published_payload_sha256,
+            "3b838cbcf12437635ba73915a6a883da20b42b93ea3119f1e7b1c69bb3304817"
+        );
         assert!(validated.mission_peer_match);
         assert!(validated.profile_digest_match);
         assert!(validated.event_larger_than_receive_packet);
@@ -234,12 +284,14 @@ mod tests {
         let test = TestConfig::new();
         let mut wrong_peer = valid_receipt();
         wrong_peer.mission_peer = Some([0x22; 32]);
-        let error = validate_ring1_receipt(&test.config, &wrong_peer).expect_err("wrong peer");
+        let error = validate_ring1_receipt(&test.config, &wrong_peer, &published_event())
+            .expect_err("wrong peer");
         assert_eq!(error.category(), ValidatorErrorCategory::Authentication);
 
         let mut wrong_digest = valid_receipt();
         wrong_digest.transfer_profile_digest = Some([0x33; 32]);
-        let error = validate_ring1_receipt(&test.config, &wrong_digest).expect_err("wrong digest");
+        let error = validate_ring1_receipt(&test.config, &wrong_digest, &published_event())
+            .expect_err("wrong digest");
         assert_eq!(error.category(), ValidatorErrorCategory::Protocol);
     }
 
@@ -248,14 +300,15 @@ mod tests {
         let test = TestConfig::new();
         let mut blob = valid_receipt();
         blob.blob_stream.received_bytes = 1;
-        let error = validate_ring1_receipt(&test.config, &blob).expect_err("Blob attempt");
+        let error = validate_ring1_receipt(&test.config, &blob, &published_event())
+            .expect_err("Blob attempt");
         assert_eq!(error.category(), ValidatorErrorCategory::Protocol);
 
         let mut missing_insert = valid_receipt();
         missing_insert.inserted = 0;
         missing_insert.event_page_inserts = 0;
-        let error =
-            validate_ring1_receipt(&test.config, &missing_insert).expect_err("missing insert");
+        let error = validate_ring1_receipt(&test.config, &missing_insert, &published_event())
+            .expect_err("missing insert");
         assert_eq!(error.category(), ValidatorErrorCategory::Protocol);
     }
 
@@ -265,8 +318,21 @@ mod tests {
         let mut receipt = valid_receipt();
         receipt.event_page_bytes_received = 256;
 
-        let error = validate_ring1_receipt(&test.config, &receipt).expect_err("small Event");
+        let error = validate_ring1_receipt(&test.config, &receipt, &published_event())
+            .expect_err("small Event");
 
         assert_eq!(error.category(), ValidatorErrorCategory::Protocol);
+    }
+
+    #[test]
+    fn rejects_missing_or_multiple_sent_text_events() {
+        let test = TestConfig::new();
+        for entries in [0, 2] {
+            let mut receipt = valid_receipt();
+            receipt.event_page_entries_sent = entries;
+            let error = validate_ring1_receipt(&test.config, &receipt, &published_event())
+                .expect_err("wrong sent Event count");
+            assert_eq!(error.category(), ValidatorErrorCategory::Protocol);
+        }
     }
 }

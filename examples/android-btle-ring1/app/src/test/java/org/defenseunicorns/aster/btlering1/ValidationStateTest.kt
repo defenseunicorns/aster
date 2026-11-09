@@ -19,6 +19,9 @@ class ValidationStateTest {
         assertEquals(complete, state)
         assertTrue(state is ValidationState.Complete)
         assertTrue(state.render().contains("Event entries=1 bytes=513 inserts=1"))
+        assertTrue(state.render().contains("published=${"42".repeat(32)}"))
+        assertTrue(state.render().contains("payload_sha256=${"43".repeat(32)}"))
+        assertTrue(state.render().contains("sent entries=1 bytes=128"))
     }
 
     @Test
@@ -49,5 +52,5 @@ class ValidationStateTest {
         assertEquals(false, cancellation.isRequested())
     }
 
-    private fun receipt(): String = """{"semantic_version":9,"negotiated_transfer_profiles":[2,1,1,5,1],"transfer_profile_digest":"${"ac".repeat(32)}","mission_peer_match":true,"profile_digest_match":true,"send_packet_bytes":512,"receive_packet_bytes":256,"event_page_entries_received":1,"event_page_bytes_received":513,"event_page_inserts":1,"event_larger_than_receive_packet":true,"no_blob_attempt":true}"""
+    private fun receipt(): String = """{"semantic_version":9,"negotiated_transfer_profiles":[2,1,1,5,1],"transfer_profile_digest":"${"ac".repeat(32)}","mission_peer_match":true,"profile_digest_match":true,"send_packet_bytes":512,"receive_packet_bytes":256,"published_event_id":"${"42".repeat(32)}","published_payload_sha256":"${"43".repeat(32)}","event_page_entries_sent":1,"event_page_bytes_sent":128,"event_page_entries_received":1,"event_page_bytes_received":513,"event_page_inserts":1,"event_larger_than_receive_packet":true,"no_blob_attempt":true}"""
 }

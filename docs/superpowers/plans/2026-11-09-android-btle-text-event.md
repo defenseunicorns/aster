@@ -54,19 +54,23 @@
 - Modify: `crates/aster-ble-android/src/config.rs`
 - Modify: `crates/aster-ble-android/src/session.rs`
 - Modify: `crates/aster-ble-android/src/receipt.rs`
+- Modify: `crates/aster-ble-android/src/jni.rs`
 - Modify: `crates/aster-ble-android/Cargo.toml`
+- Modify: `examples/android-btle-ring1/app/src/main/java/org/defenseunicorns/aster/btlering1/NativeValidator.kt`
+- Modify: `examples/android-btle-ring1/app/src/main/java/org/defenseunicorns/aster/btlering1/BluetoothBridge.kt`
+- Modify: `examples/android-btle-ring1/app/src/main/java/org/defenseunicorns/aster/btlering1/ValidationState.kt`
 
 **Interfaces:**
 - Consumes: `ValidatorConfig::event_text() -> &str`.
 - Produces: private journal client `android-btle-ring1-text/v1`, durable `publication_journal::Intent`, and receipt fields `published_event_id`, `published_payload_sha256`, `event_page_entries_sent`, and `event_page_bytes_sent`.
 
-- [ ] Add Rust config tests for exact Unicode/control bytes, empty input, and the 1,024/1,025 UTF-8-byte boundary; run the focused config tests and verify RED.
-- [ ] Add receipt tests requiring one sent text Event while preserving the existing one inserted large Event; run and verify RED.
-- [ ] Add a session test that starts with no carrier, publishes through the real journal/backend, reopens state, and proves one exact payload and monotonically numbered retry-safe publication; run and verify RED.
-- [ ] Implement validated config access, initialize/open/recover the private journal, publish and acknowledge before contact, reuse its client context for the fixed Consume subscription, and extend sanitized receipt output.
-- [ ] Run `cargo test -p aster-ble-android`; expect all tests to pass.
-- [ ] Run `cargo clippy -p aster-ble-android --all-targets -- -D warnings`; expect no warnings.
-- [ ] Refactor publication/subscription setup for single ownership and readable failure mapping; rerun both commands.
+- [x] Add Rust config tests for exact Unicode/control bytes, empty input, and the 1,024/1,025 UTF-8-byte boundary; run the focused config tests and verify RED.
+- [x] Add receipt tests requiring one sent text Event while preserving the existing one inserted large Event; run and verify RED.
+- [x] Add a session test that starts with no carrier, publishes through the real journal/backend, reopens state, and proves one exact payload and monotonically numbered retry-safe publication; run and verify RED.
+- [x] Implement validated config access, initialize/open/recover the private journal, publish and acknowledge before contact, reuse its client context for the fixed Consume subscription, and extend sanitized receipt output.
+- [x] Run `cargo test -p aster-ble-android`; expect all tests to pass.
+- [x] Run focused Clippy with warnings denied for `aster-ble-android`; the workspace dependency pass retains the pre-existing `aster-node::BlobNetworkReport` dead-code warning.
+- [x] Refactor publication/subscription setup for single ownership and readable failure mapping; rerun both commands.
 - [ ] Commit the task with a signed commit.
 
 ### Task 3: Linux subscription, exact query, and safe terminal rendering

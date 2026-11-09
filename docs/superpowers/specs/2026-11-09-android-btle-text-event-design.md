@@ -36,8 +36,10 @@ Ring-1 terminal after transfer over BTLE.
 - Topic remains `mesh.messages`; scope remains `demo/playground`; the logical
   key is the fixed evaluation value `android-btle-ring1/text/v1`.
 - Android uses a private numbered-publication journal under its existing state
-  directory. Publication and journal acknowledgement complete before contact
-  admission, so a missing carrier never undoes local publication.
+  directory. The bridge invokes a synchronous native local-preparation step on
+  its worker before checking adapter availability or creating a Bluetooth
+  socket. Publication and journal acknowledgement therefore complete before
+  any carrier attempt, so a missing carrier never undoes local publication.
 - The existing 65,536-byte Linux Event remains part of the validation contact,
   preserving the negotiated-MTU observation and prior Linux-to-Android path.
 - Linux creates an exact durable Consume subscription before opening the
@@ -62,8 +64,9 @@ Ring-1 terminal after transfer over BTLE.
 ## User flow
 
 The form adds one `Message` input. The existing button becomes **Send and
-validate**. On press, the app validates the form, durably publishes the text,
-opens the LE CoC, and runs the bidirectional v9 Event contact. Android reports
+validate**. On press, the app validates the form, durably publishes the text
+through the in-process native preparation boundary, then opens the LE CoC and
+runs the bidirectional v9 Event contact. Android reports
 the locally committed Event ID/digest and contact counters. Linux prints one
 line shaped as:
 

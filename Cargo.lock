@@ -311,6 +311,7 @@ dependencies = [
  "jni 0.22.4",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tokio",
 ]
 

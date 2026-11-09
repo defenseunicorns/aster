@@ -77,6 +77,10 @@ private data class ReceiptSummary(
     val digest: String,
     val sendPacketBytes: Long,
     val receivePacketBytes: Long,
+    val publishedEventId: String,
+    val publishedPayloadSha256: String,
+    val sentEventEntries: Long,
+    val sentEventBytes: Long,
     val eventEntries: Long,
     val eventBytes: Long,
     val eventInserts: Long,
@@ -94,6 +98,10 @@ private data class ReceiptSummary(
         append(" no_blob=").append(noBlob)
         append("\npackets tx=").append(sendPacketBytes)
         append(" rx=").append(receivePacketBytes)
+        append("\npublished=").append(publishedEventId)
+        append(" payload_sha256=").append(publishedPayloadSha256)
+        append("\nsent entries=").append(sentEventEntries)
+        append(" bytes=").append(sentEventBytes)
         append("\nEvent entries=").append(eventEntries)
         append(" bytes=").append(eventBytes)
         append(" inserts=").append(eventInserts)
@@ -110,19 +118,25 @@ private data class ReceiptSummary(
         private fun string(json: String, name: String): String? =
             Regex("\\\"$name\\\":\\\"([^\\\"]*)\\\"").find(json)?.groupValues?.get(1)
 
+        private fun hex64(json: String, name: String): String? =
+            string(json, name)?.takeIf { Regex("^[0-9a-f]{64}$").matches(it) }
+
         fun parse(json: String): ReceiptSummary? {
             if (json.length !in 2..4096) return null
             val profiles = Regex(
                 "\\\"negotiated_transfer_profiles\\\":\\[([0-9]+(?:,[0-9]+){4})]",
             ).find(json)?.groupValues?.get(1) ?: return null
-            val digest = string(json, "transfer_profile_digest") ?: return null
-            if (!Regex("^[0-9a-f]{64}$").matches(digest)) return null
+            val digest = hex64(json, "transfer_profile_digest") ?: return null
             return ReceiptSummary(
                 semantic = number(json, "semantic_version") ?: return null,
                 profiles = profiles,
                 digest = digest,
                 sendPacketBytes = number(json, "send_packet_bytes") ?: return null,
                 receivePacketBytes = number(json, "receive_packet_bytes") ?: return null,
+                publishedEventId = hex64(json, "published_event_id") ?: return null,
+                publishedPayloadSha256 = hex64(json, "published_payload_sha256") ?: return null,
+                sentEventEntries = number(json, "event_page_entries_sent") ?: return null,
+                sentEventBytes = number(json, "event_page_bytes_sent") ?: return null,
                 eventEntries = number(json, "event_page_entries_received") ?: return null,
                 eventBytes = number(json, "event_page_bytes_received") ?: return null,
                 eventInserts = number(json, "event_page_inserts") ?: return null,

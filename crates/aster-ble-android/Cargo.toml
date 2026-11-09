@@ -18,6 +18,7 @@ aster-node = { path = "../aster-node" }
 jni = "=0.22.4"
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 
 [lints.rust]
