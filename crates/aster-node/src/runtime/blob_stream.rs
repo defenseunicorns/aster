@@ -423,9 +423,11 @@ async fn await_authenticated_progress<T>(
 
 #[derive(Debug)]
 pub struct BlobNetworkReport {
+    #[cfg(any(test, feature = "device-validation"))]
     pub wire_bytes: u64,
     pub resumed_from: u64,
     pub attempt_bytes: u64,
+    #[cfg(any(test, feature = "device-validation"))]
     pub roots: ([u8; 32], [u8; 32]),
     pub checkpoints: u64,
     pub pipeline: Option<PipelineReport>,
@@ -1509,9 +1511,11 @@ async fn send_native_profile5_pack(
         return Err("native Profile-5 control stream contained trailing data".into());
     }
     Ok(BlobNetworkReport {
+        #[cfg(any(test, feature = "device-validation"))]
         wire_bytes: source.wire_len,
         resumed_from,
         attempt_bytes: source.wire_len.saturating_sub(resumed_from),
+        #[cfg(any(test, feature = "device-validation"))]
         roots,
         checkpoints,
         pipeline: None,
@@ -1930,9 +1934,11 @@ async fn settle_existing_native_profile5_pack(
     )
     .await?;
     Ok(BlobNetworkReport {
+        #[cfg(any(test, feature = "device-validation"))]
         wire_bytes: wire_len,
         resumed_from: wire_len,
         attempt_bytes: 0,
+        #[cfg(any(test, feature = "device-validation"))]
         roots,
         checkpoints: 0,
         pipeline: None,
@@ -2604,9 +2610,11 @@ async fn receive_native_profile5_pack(
     )
     .await?;
     Ok(BlobNetworkReport {
+        #[cfg(any(test, feature = "device-validation"))]
         wire_bytes: wire_len,
         resumed_from,
         attempt_bytes: wire_len.saturating_sub(resumed_from),
+        #[cfg(any(test, feature = "device-validation"))]
         roots,
         checkpoints,
         pipeline: Some(pipeline),
@@ -2952,9 +2960,11 @@ async fn send_completed_pack_inner(
         return Err("control stream contained data after terminal result".into());
     }
     Ok(BlobNetworkReport {
+        #[cfg(any(test, feature = "device-validation"))]
         wire_bytes: wire_len,
         resumed_from: resume_offset,
         attempt_bytes: wire_len - resume_offset,
+        #[cfg(any(test, feature = "device-validation"))]
         roots,
         checkpoints,
         pipeline: None,
@@ -3361,9 +3371,11 @@ async fn receive_completed_pack_inner(
     }
     finish_receiver_attempt(attempt).await?;
     Ok(BlobNetworkReport {
+        #[cfg(any(test, feature = "device-validation"))]
         wire_bytes: wire_len,
         resumed_from,
         attempt_bytes: wire_len - resumed_from,
+        #[cfg(any(test, feature = "device-validation"))]
         roots,
         checkpoints,
         pipeline: Some(pipeline),
