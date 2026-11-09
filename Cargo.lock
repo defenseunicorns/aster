@@ -336,6 +336,7 @@ dependencies = [
  "futures",
  "getrandom 0.4.3",
  "hmac 0.13.0",
+ "serde_json",
  "sha2 0.11.1",
  "subtle",
  "tokio",

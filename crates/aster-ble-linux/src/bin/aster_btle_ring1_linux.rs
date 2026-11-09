@@ -11,10 +11,16 @@ use aster_mesh::{
 };
 use aster_node::{
     MissionPeerExpectation, MutableSourceInterests, NodeApplication, OrderedEventContactRole,
-    PeerReceipt, TransportNeutralNodeConfig, mission::UnprotectedReferenceMission, parse_node_id,
-    start_transport_neutral_node,
+    PeerReceipt, RunningNode, TransportNeutralNodeConfig,
+    application::{
+        EventClientContext, EventClientDisposition, EventClientId, EventItem, EventQuery,
+        EventSubscriptionRequest, Scope, SelectedEventHandle, Topic,
+    },
+    mission::UnprotectedReferenceMission,
+    parse_node_id, start_transport_neutral_node,
 };
 use bluer::{Address, AddressType};
+use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -32,6 +38,13 @@ const USAGE: &str = "usage: aster-btle-ring1 --role initiator|listener --adapter
     --peer-address AA:BB:CC:DD:EE:FF --peer-address-type public|random \
     --psm 0x80..0xff --state PATH --mission-bundle PATH --mission-peer NODE_ID_HEX \
     --require-event-larger-than-mtu yes|no";
+const TEXT_EVENT_CLIENT_ID: &[u8] = b"aster.linux-btle-ring1.text-consumer.v1";
+const TEXT_EVENT_CLAIM_NONCE: &[u8] = b"aster.linux-btle-ring1.text-consumer-claim.v1";
+const TEXT_EVENT_SUBSCRIPTION_KEY: &[u8] = b"aster.linux-btle-ring1.text-consume.v1";
+const TEXT_EVENT_TOPIC: &str = "mesh.messages";
+const TEXT_EVENT_SCOPE: &str = "demo/playground";
+const TEXT_EVENT_LOGICAL_KEY: &[u8] = b"android-btle-ring1/text/v1";
+const MAX_TEXT_EVENT_BYTES: usize = 1_024;
 
 struct HarnessConfig {
     driver: ValidatedConfig,
@@ -224,6 +237,10 @@ async fn run(config: HarnessConfig) -> Result<(), String> {
     })
     .await
     .map_err(|_| "failed to start the transport-neutral node".to_owned())?;
+    if let Err(error) = ensure_text_event_subscription(&node).await {
+        let _ = node.shutdown().await;
+        return Err(error);
+    }
     let role = config.driver.role();
     let cancellation = OpenCancellation::new();
     let open = open_contact(&config.driver, &cancellation);
@@ -273,53 +290,189 @@ async fn run(config: HarnessConfig) -> Result<(), String> {
     };
     let exchanges_started = evidence.exchanges_started.load(Ordering::Acquire);
     let mtu = opened.negotiated_mtu();
-    let shutdown_result = node
+    let completed = async {
+        let receipt = match session_result {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let failure_evidence = failed_contact_evidence(exchanges_started);
+                eprintln!(
+                    "BTLE_RING1 status=contact-failed role={role:?} ordered_exchanges_started={exchanges_started} post_handshake_exchanges_started={} no_post_handshake_exchange_observed={} receipt_available=false event_validation=false daemon=false",
+                    failure_evidence.post_handshake_exchanges_started,
+                    failure_evidence.no_post_handshake_exchange_observed,
+                );
+                return Err(error);
+            }
+        };
+        let mtu = mtu.ok_or_else(|| "kernel did not report both negotiated L2CAP MTUs".to_owned())?;
+        let event_larger_than_mtu = validate_ring1_receipt(
+            &receipt,
+            mtu.send_bytes(),
+            mtu.receive_bytes(),
+            config.require_event_larger_than_mtu,
+        )?;
+        let text_event = query_text_event(&node.selected_events(), config.mission_peer).await?;
+        eprintln!("{}", render_text_event(&text_event)?);
+        let digest = receipt
+            .transfer_profile_digest
+            .map(format_digest)
+            .unwrap_or_else(|| "none".to_owned());
+        eprintln!(
+            "BTLE_RING1 status=complete role={role:?} send_mtu={} receive_mtu={} semantic_version={} offered={} fetched={} inserted={} duplicates={} event_page_entries_sent={} event_page_entries_received={} event_page_bytes_sent={} event_page_bytes_received={} event_larger_than_directional_mtu={} transfer_profiles={:?} transfer_profile_digest={} profile_validation=true event_validation={} daemon=false",
+            mtu.send_bytes(),
+            mtu.receive_bytes(),
+            receipt.semantic_version,
+            receipt.offered,
+            receipt.fetched,
+            receipt.inserted,
+            receipt.duplicates,
+            receipt.event_page_entries_sent,
+            receipt.event_page_entries_received,
+            receipt.event_page_bytes_sent,
+            receipt.event_page_bytes_received,
+            event_larger_than_mtu,
+            receipt.negotiated_transfer_profiles,
+            digest,
+            event_larger_than_mtu,
+        );
+        Ok(())
+    }
+    .await;
+    let shutdown = node
         .shutdown()
         .await
         .map_err(|_| "node shutdown failed".to_owned());
-    let receipt = match session_result {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            let failure_evidence = failed_contact_evidence(exchanges_started);
-            eprintln!(
-                "BTLE_RING1 status=contact-failed role={role:?} ordered_exchanges_started={exchanges_started} post_handshake_exchanges_started={} no_post_handshake_exchange_observed={} receipt_available=false event_validation=false daemon=false",
-                failure_evidence.post_handshake_exchanges_started,
-                failure_evidence.no_post_handshake_exchange_observed,
-            );
-            shutdown_result?;
-            return Err(error);
+    match (completed, shutdown) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+    }
+}
+
+async fn ensure_text_event_subscription(node: &RunningNode) -> Result<(), String> {
+    let events = node.selected_events();
+    let client_id = EventClientId::new(TEXT_EVENT_CLIENT_ID.to_vec())
+        .map_err(|_| "text Event client configuration is invalid".to_owned())?;
+    let observed = events
+        .client_status(client_id.clone(), None)
+        .await
+        .map_err(|_| "text Event subscription state is unavailable".to_owned())?;
+    let context = match observed.current_session {
+        Some(session) => {
+            let current = events
+                .client_status(client_id.clone(), Some(session))
+                .await
+                .map_err(|_| "text Event subscription state is unavailable".to_owned())?;
+            if current.disposition == EventClientDisposition::Current {
+                EventClientContext { client_id, session }
+            } else {
+                recover_text_event_client(&events, client_id, session.get()).await?
+            }
         }
+        None if observed.disposition == EventClientDisposition::Unregistered => {
+            recover_text_event_client(&events, client_id, 0).await?
+        }
+        None => return Err("text Event subscription state is invalid".to_owned()),
     };
-    let mtu = mtu.ok_or_else(|| "kernel did not report both negotiated L2CAP MTUs".to_owned())?;
-    let event_larger_than_mtu = validate_ring1_receipt(
-        &receipt,
-        mtu.send_bytes(),
-        mtu.receive_bytes(),
-        config.require_event_larger_than_mtu,
-    )?;
-    let digest = receipt
-        .transfer_profile_digest
-        .map(format_digest)
-        .unwrap_or_else(|| "none".to_owned());
-    eprintln!(
-        "BTLE_RING1 status=complete role={role:?} send_mtu={} receive_mtu={} semantic_version={} offered={} fetched={} inserted={} duplicates={} event_page_entries_sent={} event_page_entries_received={} event_page_bytes_sent={} event_page_bytes_received={} event_larger_than_directional_mtu={} transfer_profiles={:?} transfer_profile_digest={} profile_validation=true event_validation={} daemon=false",
-        mtu.send_bytes(),
-        mtu.receive_bytes(),
-        receipt.semantic_version,
-        receipt.offered,
-        receipt.fetched,
-        receipt.inserted,
-        receipt.duplicates,
-        receipt.event_page_entries_sent,
-        receipt.event_page_entries_received,
-        receipt.event_page_bytes_sent,
-        receipt.event_page_bytes_received,
-        event_larger_than_mtu,
-        receipt.negotiated_transfer_profiles,
-        digest,
-        event_larger_than_mtu,
-    );
-    shutdown_result.map(|_| ())
+    events
+        .subscribe(EventSubscriptionRequest {
+            client: context,
+            operation_key: TEXT_EVENT_SUBSCRIPTION_KEY.to_vec(),
+            topic: Topic::new(TEXT_EVENT_TOPIC)
+                .map_err(|_| "text Event selector is invalid".to_owned())?,
+            scope: Scope::new(TEXT_EVENT_SCOPE)
+                .map_err(|_| "text Event selector is invalid".to_owned())?,
+            include_descendant_scopes: false,
+        })
+        .await
+        .map_err(|_| "text Event subscription could not be prepared".to_owned())?;
+    Ok(())
+}
+
+async fn recover_text_event_client(
+    events: &SelectedEventHandle,
+    client_id: EventClientId,
+    expected_session: u64,
+) -> Result<EventClientContext, String> {
+    let recovery = events
+        .begin_publication_session(
+            client_id.clone(),
+            expected_session,
+            TEXT_EVENT_CLAIM_NONCE.to_vec(),
+        )
+        .await
+        .map_err(|_| "text Event subscription recovery failed".to_owned())?;
+    events
+        .complete_publication_recovery(
+            client_id.clone(),
+            recovery.session,
+            recovery.snapshot_revision,
+        )
+        .await
+        .map_err(|_| "text Event subscription recovery failed".to_owned())?;
+    Ok(EventClientContext {
+        client_id,
+        session: recovery.session,
+    })
+}
+
+async fn query_text_event(
+    events: &SelectedEventHandle,
+    publisher: [u8; 32],
+) -> Result<EventItem, String> {
+    let mut query = EventQuery {
+        publisher: Some(publisher),
+        topic: Some(Topic::new(TEXT_EVENT_TOPIC).map_err(|_| "text Event selector is invalid")?),
+        scope: Some(Scope::new(TEXT_EVENT_SCOPE).map_err(|_| "text Event selector is invalid")?),
+        logical_key: Some(TEXT_EVENT_LOGICAL_KEY.to_vec()),
+        limit: 128,
+        ..EventQuery::default()
+    };
+    let mut items = Vec::new();
+    loop {
+        let page = events
+            .query(query.clone())
+            .await
+            .map_err(|_| "received text Event query failed".to_owned())?;
+        items.extend(page.items);
+        if !page.has_more {
+            return select_text_event(items, publisher);
+        }
+        query.after_acceptance_marker = page.scanned_through;
+    }
+}
+
+fn select_text_event(items: Vec<EventItem>, publisher: [u8; 32]) -> Result<EventItem, String> {
+    let event = items
+        .into_iter()
+        .filter(|event| {
+            event.publisher == publisher
+                && event.topic.as_str() == TEXT_EVENT_TOPIC
+                && event.scope.as_str() == TEXT_EVENT_SCOPE
+                && event.logical_key == TEXT_EVENT_LOGICAL_KEY
+                && !event.tombstone
+                && event.ttl_ms.is_none()
+        })
+        .max_by_key(|event| event.event_sequence)
+        .ok_or_else(|| "authenticated Android text Event was not received".to_owned())?;
+    if event.payload.is_empty() || event.payload.len() > MAX_TEXT_EVENT_BYTES {
+        return Err("received text Event payload is outside its bound".to_owned());
+    }
+    std::str::from_utf8(&event.payload)
+        .map_err(|_| "received text Event payload is not UTF-8".to_owned())?;
+    Ok(event)
+}
+
+fn render_text_event(event: &EventItem) -> Result<String, String> {
+    let text = std::str::from_utf8(&event.payload)
+        .map_err(|_| "received text Event payload is not UTF-8".to_owned())?;
+    let escaped = serde_json::to_string(text)
+        .map_err(|_| "received text Event could not be rendered".to_owned())?;
+    Ok(format!(
+        "BTLE_RING1_EVENT status=received publisher={} sequence={} id={} payload_sha256={} text={escaped}",
+        format_digest(event.publisher),
+        event.event_sequence,
+        event.id,
+        format_digest(Sha256::digest(&event.payload).into()),
+    ))
 }
 
 fn canonical_v9_profile_digest() -> Result<[u8; 32], String> {
@@ -392,7 +545,10 @@ async fn main() -> ExitCode {
 mod tests {
     use super::*;
     use aster_ble_linux::{FixedRole, RING1_MAXIMUM_EXCHANGE_BYTES};
-    use aster_node::PeerReceipt;
+    use aster_node::{
+        PeerReceipt,
+        application::{EventId, EventItem, Priority, Scope, Topic},
+    };
 
     fn arguments(role: &str) -> Vec<String> {
         [
@@ -515,5 +671,58 @@ mod tests {
         receipt.semantic_version = 9;
         receipt.blob_stream.sent_bytes = 1;
         assert!(validate_ring1_receipt(&receipt, 128, 96, true).is_err());
+    }
+
+    fn text_event(publisher: [u8; 32], sequence: u64, payload: &[u8]) -> EventItem {
+        EventItem {
+            id: EventId::from_bytes([u8::try_from(sequence).unwrap(); 32]),
+            publisher,
+            publisher_counter: sequence,
+            event_sequence: sequence,
+            topic: Topic::new("mesh.messages").unwrap(),
+            scope: Scope::new("demo/playground").unwrap(),
+            priority: Priority::Priority,
+            ttl_ms: None,
+            logical_key: b"android-btle-ring1/text/v1".to_vec(),
+            payload: payload.to_vec(),
+            tombstone: false,
+            acceptance_marker: sequence,
+        }
+    }
+
+    #[test]
+    fn selects_greatest_exact_authenticated_android_text_event() {
+        let publisher = [0x11; 32];
+        let mut wrong_selector = text_event(publisher, 10, b"wrong selector");
+        wrong_selector.logical_key = b"other".to_vec();
+        let events = vec![
+            text_event([0x22; 32], 9, b"untrusted"),
+            wrong_selector,
+            text_event(publisher, 1, b"first"),
+            text_event(publisher, 2, b"second"),
+        ];
+
+        let selected = select_text_event(events, publisher).expect("select exact text Event");
+
+        assert_eq!(selected.event_sequence, 2);
+        assert_eq!(selected.payload, b"second");
+    }
+
+    #[test]
+    fn rejects_invalid_text_payload_and_renders_controls_on_one_line() {
+        let publisher = [0x11; 32];
+        for payload in [Vec::new(), vec![0xff], vec![b'x'; 1_025]] {
+            assert!(select_text_event(vec![text_event(publisher, 1, &payload)], publisher).is_err());
+        }
+
+        let event = select_text_event(
+            vec![text_event(publisher, 7, b"Snowman \xe2\x98\x83\n\"quoted\"\0")],
+            publisher,
+        )
+        .expect("valid control text Event");
+        let rendered = render_text_event(&event).expect("render text Event");
+        assert!(!rendered.contains('\n'));
+        assert!(rendered.contains("text=\"Snowman ☃\\n\\\"quoted\\\"\\u0000\""));
+        assert!(rendered.contains("sequence=7"));
     }
 }

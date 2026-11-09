@@ -83,12 +83,12 @@
 - Consumes: fixed selector and authenticated `HarnessConfig.mission_peer`.
 - Produces: `BTLE_RING1_EVENT status=received ... text=<JSON string>` after successful contact.
 
-- [ ] Add Linux harness tests proving subscription/query selection rejects another publisher, chooses the greatest matching Event sequence, rejects empty/non-UTF-8/oversized payloads, and JSON-escapes controls on one line; run the binary tests and verify RED.
+- [x] Add Linux harness tests proving subscription/query selection rejects another publisher, chooses the greatest matching Event sequence, rejects empty/non-UTF-8/oversized payloads, and JSON-escapes controls on one line; run the binary tests and verify RED.
 - [ ] Add a real in-process two-node ordered-contact test that publishes the fixed Android text Event before contact and proves the Linux-side query returns identical bytes exactly once; verify RED.
-- [ ] Prepare the fixed Consume subscription before opening Bluetooth, query the authenticated peer after contact, validate the bounded UTF-8 payload, compute SHA-256, and print the JSON-escaped terminal line.
-- [ ] Run `cargo test -p aster-ble-linux --bin aster-btle-ring1`; expect all tests to pass.
-- [ ] Run `cargo clippy -p aster-ble-linux --all-targets -- -D warnings`; expect no warnings.
-- [ ] Refactor helpers so CLI parsing, subscription ownership, Event selection, and rendering remain separate; rerun both commands.
+- [x] Prepare the fixed Consume subscription before opening Bluetooth, query the authenticated peer after contact, validate the bounded UTF-8 payload, compute SHA-256, and print the JSON-escaped terminal line.
+- [x] Run `cargo test -p aster-ble-linux --bin aster-btle-ring1`; expect all tests to pass.
+- [x] Run focused Clippy with warnings denied for the Linux Ring-1 binary; pre-existing workspace and vendored dependency warnings remain outside the binary.
+- [x] Refactor helpers so CLI parsing, subscription ownership, Event selection, and rendering remain separate; rerun both commands.
 - [ ] Commit the task with a signed commit.
 
 ### Task 4: Documentation and end-to-end validation
