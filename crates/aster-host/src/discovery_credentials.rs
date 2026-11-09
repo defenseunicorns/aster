@@ -601,6 +601,7 @@ fn decode_checkpoint(
     })
 }
 
+#[cfg(target_os = "linux")]
 fn read_unprotected_reference_artifact(
     parent: &Path,
     basename: &str,
@@ -608,6 +609,7 @@ fn read_unprotected_reference_artifact(
     read_unprotected_reference_artifact_after_stat(parent, basename, || {})
 }
 
+#[cfg(target_os = "linux")]
 fn read_unprotected_reference_artifact_after_stat<F>(
     parent: &Path,
     basename: &str,
@@ -700,12 +702,14 @@ where
     Ok(bytes)
 }
 
+#[cfg(target_os = "linux")]
 fn validate_unprotected_reference_stat(
     stat: &rustix::fs::Stat,
 ) -> Result<(), DiscoveryCredentialError> {
     validate_unprotected_reference_stat_for_owner(stat, rustix::process::geteuid().as_raw())
 }
 
+#[cfg(target_os = "linux")]
 fn validate_unprotected_reference_stat_for_owner(
     stat: &rustix::fs::Stat,
     expected_uid: libc::uid_t,
@@ -907,6 +911,7 @@ where
 
 /// Loads the explicitly non-production evaluator artifact through the same
 /// parser, transition machine, and durable checkpoint authority.
+#[cfg(target_os = "linux")]
 pub fn load_unprotected_reference_discovery_credentials(
     expected_scope: [u8; 32],
     checkpoint_root: &Path,
@@ -1347,6 +1352,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn discovery_unprotected_reference_loader_validates_open_descriptor() {
         let root = std::env::temp_dir().join(format!(

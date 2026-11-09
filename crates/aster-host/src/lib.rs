@@ -14,10 +14,11 @@ mod shared_node;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub use discovery_credentials::fuzz_parse_discovery_credential_artifact;
+#[cfg(target_os = "linux")]
+pub use discovery_credentials::load_unprotected_reference_discovery_credentials;
 pub use discovery_credentials::{
     DiscoveryCredentialAuthority, DiscoveryCredentialError, DiscoveryCredentialMaterialParts,
     LeasedDiscoveryCredentialMaterial, TrustedClock, TrustedClockLeaseGuard, TrustedClockSample,
-    load_unprotected_reference_discovery_credentials,
 };
 pub use mesh_host::{
     CandidateId, CandidateLocator, CandidateProvenance, CandidateStatus, CarrierIdentity,
