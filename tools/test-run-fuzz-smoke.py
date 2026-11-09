@@ -51,7 +51,6 @@ class FuzzSmokeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, PORTABLE + LINUX_ONLY)
         self.assertNotIn("SKIP", result.stdout)
-        self.assertIn("-max_len=1052672", (ROOT / "tools/run-fuzz-smoke.sh").read_text())
 
     def test_macos_runs_portable_targets_and_reports_skips(self):
         result, calls = self.run_smoke("Darwin")

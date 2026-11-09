@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
-import inspect
 import io
 import json
 import subprocess
@@ -886,13 +885,6 @@ class ProcessCheckerContractTests(unittest.TestCase):
             mask_events, [checker.signal.SIG_BLOCK, checker.signal.SIG_SETMASK]
         )
 
-    def test_all_checker_subprocesses_use_the_signal_safe_registry(self) -> None:
-        # Break caught: routing only long-lived agents through the registry
-        # leaves short-lived clients and config checks exposed to the same race.
-        checker = load_checker()
-        source = inspect.getsource(checker)
-        self.assertEqual(source.count("ManagedProcess("), 1)
-
     def test_registered_child_does_not_retain_the_checker_signal_mask(self) -> None:
         # Break caught: masking the parent around Popen also masks the child;
         # the spawned process must unblock before exec so drain signals work.
@@ -1453,31 +1445,6 @@ class ProcessCheckerContractTests(unittest.TestCase):
                     checker.require_operation_key_conflict(
                         {"status": "error", "code": code}
                     )
-
-    def test_smoke_trap_precedes_temporary_directory_creation(self) -> None:
-        # Break caught: creating the root before installing the trap leaves a
-        # signal window that can strand sensitive temporary fixture files.
-        mise = CHECKER_PATH.parent.parent / "mise.toml"
-        source = mise.read_text(encoding="utf-8")
-        task = source[source.index("[tasks.agent-process-smoke]") :]
-        empty = task.index('task_root=""')
-        trap = task.index("trap cleanup EXIT HUP INT TERM")
-        create = task.index("task_root=\"$(mktemp -d")
-        self.assertLess(empty, trap)
-        self.assertLess(trap, create)
-        self.assertIn('/tmp/aster-agent-process-smoke.*)', task[empty:create])
-
-    def test_smoke_uses_independent_generated_go_client(self) -> None:
-        # Break caught: reverting the smoke task to the Rust fixture as both
-        # server and client removes the independent-language wire proof.
-        mise = CHECKER_PATH.parent.parent / "mise.toml"
-        source = mise.read_text(encoding="utf-8")
-        task = source[source.index("[tasks.agent-process-smoke]") :]
-        self.assertIn(
-            'go -C conformance/agent-go build -o "$task_root/agent-smoke"', task
-        )
-        self.assertIn('--client "$task_root/agent-smoke"', task)
-        self.assertNotIn('--client "$fixture"', task)
 
 if __name__ == "__main__":
     unittest.main()

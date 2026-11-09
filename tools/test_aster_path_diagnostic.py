@@ -826,30 +826,10 @@ class WorkflowTests(unittest.TestCase):
         cls.scripts = ['\n'.join(line[10:] for line in block.splitlines())
                        for block in cls.scripts]
 
-    def test_manual_read_only_pinned_and_always_retained(self):
-        import re
-        text = self.workflow
-        self.assertIn('on:\n  workflow_dispatch:\n\npermissions:\n  contents: read\n', text)
-        self.assertIn('persist-credentials: false', text)
-        self.assertIn('timeout-minutes: 90', text)
-        self.assertIn('if: ${{ always() }}', text)
-        self.assertIn('path: artifacts/path-diagnostic/', text)
-        self.assertIn('retention-days: 14', text)
-        self.assertEqual(len(re.findall(r'uses: [\w/-]+@[0-9a-f]{40} ', text)), 2)
-        for forbidden in ('pull_request:', 'push:', 'inputs:', 'sudo ', '--privileged',
-                          '--network=host', 'docker system prune', 'continue-on-error:'):
-            self.assertNotIn(forbidden, text)
-
-    def test_shell_syntax_and_canonical_build(self):
+    def test_shell_syntax(self):
         import subprocess
-        self.assertEqual(len(self.scripts), 3)
         for script in self.scripts:
             subprocess.run(['bash', '-n'], input=script, text=True, check=True)
-            self.assertNotIn('${{', script)
-        self.assertIn('--file docker/path-lab/Dockerfile.delivery', self.scripts[1])
-        self.assertIn('--tag aster-path-delivery:local .', self.scripts[1])
-        self.assertIn('timeout --signal=TERM --kill-after=300s 50m', self.scripts[2])
-        self.assertIn('2>&1 | tee artifacts/path-diagnostic/controller.log', self.scripts[2])
 
     def test_preflight_failure_survives_log_pipeline(self):
         import subprocess

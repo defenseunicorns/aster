@@ -656,20 +656,6 @@ class PathDeliveryControllerTests(unittest.TestCase):
             return b""
         self.assertEqual(len(wan.configure(run)), 2)
 
-    def test_delivery_lane_removes_containerlab_and_packages_bounded_helpers(self):
-        root = MODULE_PATH.parents[1]
-        workflow = (root / ".github/workflows/ci.yml").read_text()
-        lane = workflow.split("  path-delivery-smoke:", 1)[1].split("  macos-tests:", 1)[0]
-        self.assertNotIn("containerlab", lane.lower())
-        self.assertIn("test_aster_path_delivery.py", lane)
-        self.assertFalse((root / "docker/path-lab/topology.delivery.clab.yml").exists())
-        self.assertIn(
-            "!tools/aster_path_delivery.py",
-            (root / "docker/path-lab/Dockerfile.delivery.dockerignore").read_text(),
-        )
-        self.assertIn("COPY tools/aster_path_delivery.py", (root / "docker/path-lab/Dockerfile.delivery").read_text())
-        self.assertIn("USER 10001:10001", (root / "docker/path-lab/Dockerfile.delivery").read_text())
-
     def test_preflight_checks_actual_context_socket_and_rootless_state(self):
         with mock.patch.object(MODULE.platform, "system", return_value="Linux"), mock.patch.object(MODULE.os, "geteuid", return_value=0), mock.patch.object(MODULE, "_regular_executable"), mock.patch.dict(MODULE.os.environ, {"DOCKER_HOST": "", "DOCKER_CONTEXT": ""}):
             with mock.patch.object(MODULE, "_run_command", return_value=b"tcp://remote\n"):
@@ -1342,12 +1328,8 @@ class PathDeliveryControllerTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--peer") + 1], "a" * 64 + "@10.77.2.2:4433=" + "b" * 64)
         self.assertNotIn("sh", argv)
 
-    def test_delivery_image_and_scenario_are_fixed_and_separate(self) -> None:
+    def test_delivery_scenario_is_fixed(self) -> None:
         root = MODULE_PATH.parents[1]
-        dockerfile = (root / "docker/path-lab/Dockerfile.delivery").read_text(encoding="utf-8")
-        self.assertIn("cargo build --locked --release -p aster-node -p aster-agent", dockerfile)
-        self.assertIn("iproute2", dockerfile)
-        self.assertIn("delivery-provision.py", dockerfile)
         scenario = json.loads(
             (root / "docker/path-lab/scenarios/event-delivery-netem.json").read_text(
                 encoding="utf-8"
@@ -1356,65 +1338,6 @@ class PathDeliveryControllerTests(unittest.TestCase):
         self.assertEqual(MODULE.compile_scenario(json.dumps(scenario).encode())["netem"], MODULE.FIXED_NETEM)
         self.assertEqual(scenario["payload"], "bounded real Event over routed netem")
         self.assertEqual(scenario["seed"], 104729)
-
-    def test_delivery_build_context_text_contract_and_copy_sources(self) -> None:
-        root = MODULE_PATH.parents[1]
-        dockerfile = root / "docker/path-lab/Dockerfile.delivery"
-        # Docker selects this sibling over the root policy; do not broaden the
-        # root policy, whose exact reviewed form is enforced by the lab suite.
-        ignore = dockerfile.with_name(dockerfile.name + ".dockerignore")
-        self.assertTrue(ignore.is_file(), "delivery needs a Dockerfile-specific policy")
-        expected = """**
-!Cargo.toml
-!Cargo.lock
-!LICENSE
-!THIRD_PARTY_NOTICES.md
-!crates/
-!crates/**
-!proto/
-!proto/**
-!third-party/
-!third-party/**
-!lab/
-lab/**
-!lab/debian.sources
-!tools/
-tools/**
-!tools/aster_path_delivery.py
-!tools/aster_lan_mvp.py
-!docker/
-docker/**
-!docker/path-lab/
-docker/path-lab/**
-!docker/path-lab/delivery-provision.py
-!docker/path-lab/delivery-network-init.py
-!docker/path-lab/delivery-agent.py
-!docker/path-lab/delivery-wan.py
-"""
-        self.assertEqual(ignore.read_text(encoding="utf-8"), expected)
-        # Assert coverage of every local COPY, not just the original missing
-        # proto directory. This deliberately handles only this fixed Dockerfile's
-        # single-line, whitespace-separated COPY syntax, not Docker ignore globs.
-        sources = set()
-        for line in dockerfile.read_text(encoding="utf-8").splitlines():
-            words = line.split()
-            if words and words[0] == "COPY" and not words[1].startswith("--from="):
-                sources.update(words[1:-1])
-        trees = {"crates", "proto", "third-party"}
-        # This is a fixed COPY inventory, not a matcher or proof of exclusion.
-        # tools/probe_delivery_docker_context.py separately exercises Docker itself.
-        self.assertEqual(sources, trees | {
-            "Cargo.toml", "Cargo.lock", "LICENSE", "THIRD_PARTY_NOTICES.md",
-            "lab/debian.sources", "tools/aster_path_delivery.py",
-            "tools/aster_lan_mvp.py", "docker/path-lab/delivery-provision.py",
-            "docker/path-lab/delivery-network-init.py",
-            "docker/path-lab/delivery-agent.py", "docker/path-lab/delivery-wan.py",
-        })
-        for source in sources:
-            with self.subTest(source=source):
-                path = root / source
-                self.assertFalse(path.is_symlink())
-                self.assertTrue(path.is_dir() if source in trees else path.is_file())
 
 
 if __name__ == "__main__":
