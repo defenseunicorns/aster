@@ -248,7 +248,7 @@ jobs:
   macos-tests:
     needs: cargo-lockfiles
     name: macOS compatibility
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
