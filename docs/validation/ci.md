@@ -2,8 +2,7 @@
 
 The `CI` GitHub Actions workflow runs the repository's established validation
 commands on pushes to `main`, pull requests targeting `main`, merge queues, and
-manual dispatches. Configure branch protection or a ruleset to require the
-single stable check name **`CI / required`**.
+manual dispatches. Each validation job reports its own status.
 
 ## Compose-provider checks
 
@@ -66,13 +65,11 @@ mandatory-access-control profile. The manual operator procedure is
 | `dependency policy` | `ubuntu-24.04` | Applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
 | `age reference interoperability` | `ubuntu-24.04` | Installs exact `govulncheck` v1.6.0, runs `mise run age-reference-audit`, then runs `mise run age-reference-interop`: the Go oracle's reachable vulnerability and compiled-module license gates must pass before exact reference Go `filippo.io/age` v1.3.1 and the Rust provider exchange classic-X25519 artifacts in both directions, compare recovered plaintext, and agree on the recipient. |
 | `bounded fuzz smoke` | `ubuntu-24.04` | Runs all nine fixed 10,000-case hostile-input campaigns with the pinned nightly toolchain and `cargo-fuzz`: semantic wire decode, fragment decode, reference-envelope inspection, selected mechanics-frame decode, selected Negentropy, classical-profile decode, systemd credential decode, systemd admin-record decode, and systemd backup decode. |
-| `required` | `ubuntu-24.04` | Fails unless every validation lane completed successfully; this is the branch-protection check. |
 
 The `Cargo lockfiles` lane runs `sh tools/check-cargo-lockfiles.sh` against the
 root, fuzz, and standalone conformance-runner manifests with Rust 1.97.1. It
 reports each failing graph without regenerating lockfiles. Cargo build lanes
-wait for it; the `required` aggregation explicitly requires its success, so a
-failed gate and skipped dependent jobs cannot produce a successful aggregate.
+wait for it and are skipped if it fails.
 Each build runner still acquires its own dependencies before offline checks.
 
 Dependabot uses one Cargo configuration covering `/` and `/fuzz`, grouped by
@@ -113,7 +110,7 @@ feature selection, so the focused contracts execute the already-linked test
 binaries instead of compiling the dependency graph again. The complete macOS
 workspace suite remains available in the separate `macOS full suite` workflow,
 which runs weekly and on manual dispatch. That workflow is diagnostic and is
-not part of `CI / required`.
+not part of the `CI` workflow.
 
 ### Test classes and timing evidence
 
@@ -207,8 +204,7 @@ explicit fail-closed Compose policy step required by its release validator;
 those suites are excluded from the foundation core and execute once. Locally,
 `mise run check-workspace-tests` executes the complete suite without
 partitioning and then all doctests.
-The stable `required` job fails unless Clippy, both test partitions, and every
-other validation lane succeed. No test, feature set, receipt assertion, binding check,
+No test, feature set, receipt assertion, binding check,
 conformance check, or process smoke is omitted. This removes the Clippy wait
 before workspace tests and distributes test execution at the cost of extra
 runner setup and potentially duplicated cold-cache compilation; compare cold
@@ -275,7 +271,7 @@ Caches are optional acceleration: an absent entry rebuilds the tools. Measure
 a cold and warm hosted run before claiming a speedup. These setup changes
 reduce repeated work in the affected lanes; separating Clippy and partitioning
 the tests targets the previous longest lane. Shared checkout, mise, and sccache steps use YAML
-anchors. The validation commands and stable `CI / required` check are retained.
+anchors. The validation commands are retained.
 
 ### Deferred options
 
@@ -297,7 +293,7 @@ This independent workflow runs `mise run build` on Ubuntu 24.04 to build `aster`
 (package `aster-node`) and `aster-agent` (package `aster-agent`) for
 `x86_64-unknown-linux-gnu` in release mode. Download `aster-linux-x86_64-<commit SHA>`
 from the run's **Artifacts** section; it contains `aster-linux-x86_64.tar` and
-is retained for 14 days. The build is manual and is not part of `CI / required`.
+is retained for 14 days. The build is manual and is not part of the `CI` workflow.
 
 ## Manual Ubuntu Debian packages
 
@@ -311,7 +307,7 @@ select the source branch:
 
 These are independent `workflow_dispatch` workflows. Starting one does not
 start or cancel the other. Their files must be present on the default branch
-for their manual launch buttons to appear. They are not part of `CI / required`.
+for their manual launch buttons to appear. They are not part of the `CI` workflow.
 The runner labels follow the [GitHub-hosted runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 
 Both use the same `debian/build.sh` and Debian rules: acquire locked Cargo
