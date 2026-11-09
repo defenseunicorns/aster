@@ -83,10 +83,18 @@ contact as one terminal-safe JSON string. This adds no
 protocol or public configuration field: selectors, journal locations, and the
 text bound are evaluation implementation policy. Local preparation is
 cancellable and uses the existing 30-second foreground operation deadline for
-the complete native lifecycle, including graceful node shutdown, so a blocked
-local node/store operation cannot retain the Activity indefinitely. The value
-matches the existing maximum foreground adapter operation and remains
-implementation policy. A successful text receipt has zero remaining,
+the cooperatively asynchronous native lifecycle, including graceful node
+shutdown. This is not hard preemption for a kernel-blocked syscall while JNI
+joins the worker. The value matches the existing maximum foreground adapter
+operation and remains
+implementation policy. Full node/store preparation runs on one dedicated native
+worker with an 8 MiB stack. The bound matches the conventional Linux and
+existing native full-node test stack after a smaller Android JVM executor stack
+overflowed on a Pixel during this path. It is a conservative implementation
+bound, not a measured minimum or protocol field. Only one preparation can be
+active, so one fixed virtual-memory reservation exists only for that operation;
+the allocation does not scale with Event input. A successful text receipt has
+zero remaining,
 deferred-lane, and unscheduled Event work; a bounded partial contact retains
 progress but must be retried. The app uses manual Linux
 address/PSM input and requests no scan,

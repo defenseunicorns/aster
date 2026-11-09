@@ -25,6 +25,43 @@ durable subscription before admitting the BTLE contact. These fixed selectors
 and journals are evaluation implementation details, not semantic-v9 fields or a
 production publication/subscription UX.
 
+## Minimal end-to-end runbook
+
+Use the detailed sections below for prerequisites and commands. The short
+acceptance sequence is:
+
+1. Rebuild both endpoints from the exact source tree under test. Run
+   `cargo test -p aster-ble-linux --bin aster-btle-ring1 --no-fail-fast`, then
+   `cargo build -p aster-ble-linux --bin aster-btle-ring1 --locked`; run
+   `gradle :app:testDebugUnitTest :app:assembleDebug` under
+   `examples/android-btle-ring1`. Record `git rev-parse HEAD` and SHA-256 hashes
+   for both the Linux binary and APK. Never reuse an older harness binary.
+2. Create a fresh disposable two-node lab, pre-publish the 65,536-byte Linux
+   Event while no peer is configured, and stop the local agent cleanly.
+3. Clear or clean-install the Android app, copy only the node-1 bundle through
+   the document picker, enter a short unique message, and leave **Send and
+   validate** unpressed.
+4. Resolve the Pixel's current LE address and address type on Linux. Configure
+   that exact address, the selected controller, PSM, and expected mission IDs;
+   never use wildcard peer admission or substitute a public/classic identity
+   for an observed random LE address.
+5. Start the current Linux listener command below, immediately press **Send and
+   validate**, and keep the app in the foreground until both sides terminate.
+6. Accept the run only when Android reports `complete` with a publication ID and
+   payload digest, and Linux prints all three of: `CONTACT` with one fetched and
+   inserted Event and zero duplicates; `BTLE_RING1_EVENT` with the exact entered
+   text and matching ID/digest; and `BTLE_RING1 status=complete` with semantic 9,
+   profiles `2,1,1,5,1`, and both profile and Event validation true. Retain a
+   sanitized Linux log and Android screenshot or UI hierarchy.
+7. Remove the copied bundle and UI capture, uninstall or clear the app, and
+   delete the disposable lab after recording only sanitized evidence.
+
+On the evaluated Realtek/Linux stack, a cold controller can hit the documented
+early-ACL kernel race. A connection from an unrelated mouse changed that race
+in diagnosis, but it is not an operational workaround and does not qualify the
+stack. Record such a run as warm evidence and repeat cold qualification on a
+corrected kernel or unaffected controller.
+
 ## Fixed topology and prerequisites
 
 - Android is the initiator; Linux is the listener.

@@ -18,7 +18,16 @@ use std::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
+    thread,
 };
+
+const PREPARATION_THREAD_NAME: &str = "aster-event-prepare";
+// Full node/store preparation normally runs on Linux's conventional 8 MiB
+// stack, also used by the repository's full-node native tests. Android's
+// JVM-created executor threads are smaller. Only one preparation can be active,
+// so this is a fixed per-active-operation virtual-memory bound rather than an
+// input-scaled allocation.
+const PREPARATION_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 trait NativeCallback: Send + Sync + 'static {
     fn phase(&self, phase: ValidatorPhase) -> Result<(), ()>;
@@ -369,6 +378,27 @@ fn prepare_config(
         .map(|_| ())
 }
 
+fn run_preparation_worker<T>(
+    operation: impl FnOnce() -> Result<T, ValidatorError> + Send + 'static,
+) -> Result<T, ValidatorError>
+where
+    T: Send + 'static,
+{
+    fn worker_error() -> ValidatorError {
+        ValidatorError::new(
+            ValidatorErrorCategory::Internal,
+            "validator local Event preparation worker failed",
+        )
+    }
+
+    let worker = thread::Builder::new()
+        .name(PREPARATION_THREAD_NAME.to_owned())
+        .stack_size(PREPARATION_STACK_BYTES)
+        .spawn(move || contain(operation))
+        .map_err(|_| worker_error())?;
+    worker.join().unwrap_or_else(|_| Err(worker_error()))
+}
+
 fn native_prepare(
     env: &mut Env<'_>,
     config_json: &JString<'_>,
@@ -413,7 +443,7 @@ fn native_prepare(
             return Ok(false);
         }
     };
-    let result = contain(|| prepare_config(&config, &control));
+    let result = run_preparation_worker(move || prepare_config(&config, &control));
     registry.finish(preparation_id);
     match result {
         Ok(()) => Ok(true),
@@ -505,6 +535,22 @@ mod tests {
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn preparation_worker_has_bounded_node_stack() {
+        let observed = run_preparation_worker(|| {
+            assert_eq!(std::thread::current().name(), Some(PREPARATION_THREAD_NAME));
+            let mut stack_demand = [0_u8; 2 * 1024 * 1024];
+            for page in stack_demand.chunks_mut(4096) {
+                page[0] = 0x5a;
+            }
+            Ok(stack_demand[0])
+        })
+        .expect("preparation worker");
+
+        assert_eq!(observed, 0x5a);
+        assert_eq!(PREPARATION_STACK_BYTES, 8 * 1024 * 1024);
+    }
 
     #[derive(Default)]
     struct RecordingCallback {

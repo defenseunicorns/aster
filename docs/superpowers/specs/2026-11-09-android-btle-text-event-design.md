@@ -48,6 +48,13 @@ Ring-1 terminal after transfer over BTLE.
   class. Java and native code enforce the same bound, and cancellation is
   retained across queued-worker/native-registration races. This is Android
   implementation policy, not a protocol timeout.
+- Full node/store preparation runs on a dedicated native worker with an 8 MiB
+  stack. The bound matches the conventional Linux and existing native full-node
+  test stack after the smaller Android JVM executor stack overflowed on the
+  Pixel. It is a conservative implementation bound, not a measured minimum or
+  protocol field. The single active preparation permits only one fixed
+  per-operation virtual-memory reservation; it does not scale with message
+  input.
 - The existing 65,536-byte Linux Event remains part of the validation contact,
   preserving the negotiated-MTU observation and prior Linux-to-Android path.
 - If the operator changes the message after an unavailable carrier, the next
