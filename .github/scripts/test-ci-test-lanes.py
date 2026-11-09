@@ -30,7 +30,7 @@ class RequiredMacosLaneTests(unittest.TestCase):
         lane = workflow_job(workflow, "macos-tests", "rust-clippy")
 
         self.assertIn("name: macOS compatibility", lane)
-        self.assertIn("runs-on: macos-14", lane)
+        self.assertIn("runs-on: macos-15", lane)
         self.assertIn("timeout-minutes: 15", lane)
         self.assertIn("run: sh tools/test-macos-compatibility.sh", lane)
         self.assertNotIn(
@@ -128,7 +128,7 @@ class FullMacosLaneTests(unittest.TestCase):
         self.assertIn("schedule:", workflow)
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("permissions:\n  contents: read", workflow)
-        self.assertIn("runs-on: macos-14", workflow)
+        self.assertIn("runs-on: macos-15", workflow)
         self.assertIn("timeout-minutes: 30", workflow)
         self.assertIn(
             "cargo +1.97.1 test --locked --workspace --all-features",
