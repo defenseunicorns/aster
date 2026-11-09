@@ -133,6 +133,10 @@ jobs:
           cargo fetch --locked
           cargo fetch --locked --manifest-path fuzz/Cargo.toml
           cargo fetch --locked --manifest-path conformance/evaluation-v0/runner/Cargo.toml
+          # The offline vendor mutation suite builds these standalone graphs,
+          # including their dev dependencies, outside the root workspace.
+          cargo fetch --locked --manifest-path third-party/hmac-0.13.0-aster/Cargo.toml
+          cargo fetch --locked --manifest-path third-party/bluer-0.17.4-aster/Cargo.toml
 
       # Keep process acceptance on Linux with the pinned Python 3.13 toolchain;
       # the signal-safe subprocess path requires POSIX_SPAWN_CLOSEFROM.
