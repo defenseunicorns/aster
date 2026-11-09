@@ -84,6 +84,14 @@ requirement credit. Its source and portable Rust tests exist. The
 additionally exercises Android compilation, APK packaging, JNI ABI loading,
 real-controller connection, and matching Android/Linux terminal receipts;
 those observations remain evaluation evidence rather than a support claim.
+The later
+[early-ACL diagnostic](evidence/2026-11-09-android-linux-btle-early-acl-diagnostic.md)
+shows that the evaluated Realtek USB controller on Linux 7.0.0-42 can deliver
+inbound ACL data before its HCI Connection Complete event after a cold
+controller epoch. Linux then discards the Pixel's already-sent CoC request.
+That exact host stack is therefore not qualified for unattended cold Android
+initiation; no mouse warm-up, shared-controller reset, protocol fallback, or
+kernel-version heuristic is part of the adapter design.
 Follow the
 [Android BTLE Ring-1 quickstart](../quickstart/btle-android-ring1.md) to produce
 that evidence without changing the protocol.

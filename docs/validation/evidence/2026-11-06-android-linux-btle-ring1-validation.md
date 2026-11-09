@@ -16,6 +16,12 @@ This validates the existing non-IP ordered-contact seam with one Android/Linux
 device pair. It does not change the Aster protocol, transport selection, or the
 Linux-only supported-product boundary.
 
+A later cold-start investigation on this same Linux controller/kernel found an
+intermittent USB HCI packet-order race below Aster. The
+[early-ACL diagnostic](2026-11-09-android-linux-btle-early-acl-diagnostic.md)
+preserves this successful run but prevents treating the exact host stack as
+qualified for unattended cold Android initiation.
+
 ## Source, APK, and platform observation
 
 | Field | Observation |
