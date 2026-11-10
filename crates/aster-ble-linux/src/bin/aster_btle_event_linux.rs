@@ -601,14 +601,32 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_failure_wins_over_wait_and_node_failures() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
         let result = finish_shutdown(
-            async { Err("supervisor failure".to_owned()) },
+            {
+                let events = events.clone();
+                async move {
+                    events.lock().unwrap().push("supervisor-stop");
+                    Err("supervisor failure".to_owned())
+                }
+            },
             Err("wait failure".to_owned()),
-            async { Err("node failure".to_owned()) },
+            {
+                let events = events.clone();
+                async move {
+                    events.lock().unwrap().push("node-stop");
+                    Err("node failure".to_owned())
+                }
+            },
         )
         .await;
 
         assert_eq!(result.unwrap_err(), "supervisor failure");
+        assert_eq!(
+            *observed.lock().unwrap(),
+            ["supervisor-stop", "node-stop"]
+        );
     }
 
     #[tokio::test]
