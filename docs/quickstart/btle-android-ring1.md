@@ -330,6 +330,18 @@ This run does not establish production readiness, background operation,
 discovery, pairing authority, rotating-address support, reconnection policy,
 controller hot-plug, State/Record/Blob transfer, transport selection or
 fallback, all-class scheduling, packaging/support status, performance, scale,
-or independent interoperability. Until the physical run succeeds and both
-terminal receipts are retained, the Android path remains an unverified
-radio-interoperability scaffold.
+or independent interoperability. The retained
+[Pixel/Linux Ring-1 record](../validation/evidence/2026-11-06-android-linux-btle-ring1-validation.md)
+and later
+[text Event record](../validation/evidence/2026-11-09-android-linux-btle-text-event-validation.md)
+establish only bounded foreground warm-state interoperability for their exact
+builds, phone, Linux host, controller, and procedures. They cover the public
+Android CoC connection, APK/JNI path, matching terminal receipts, clean-install
+Android text publication, the reciprocal retained large Event, and the bounded
+native preparation-stack correction. They do not qualify unattended initiation
+from a cold Linux controller epoch: the retained
+[early-ACL diagnostic](../validation/evidence/2026-11-09-android-linux-btle-early-acl-diagnostic.md)
+shows the evaluated Linux host discarding the Pixel's already-sent CoC request
+when inbound ACL data precedes HCI Connection Complete. No warm-up, shared
+controller reset, protocol fallback, or kernel-version heuristic is part of
+this path.

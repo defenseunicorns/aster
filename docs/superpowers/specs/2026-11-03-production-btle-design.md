@@ -404,6 +404,59 @@ and covered by cross-platform conformance vectors. A later carrier revision may
 replace them without changing stored objects, application APIs, or semantic
 version. OS advertisement representation remains platform-local.
 
+The current Linux rostered-discovery slice freezes that carrier-local choice as
+`AsterRosterBeaconV1`. It uses private 128-bit service UUID
+`6aa1cfed-2ce3-46d4-9c69-a33d1dd54ee5` and a 40-byte Service Data value:
+
+```text
+offset  size  field
+0       1     revision = 0x01
+1       1     flags (bit 0 SESSION_COC_AVAILABLE; all others zero)
+2       2     listener_psm, unsigned big-endian
+4       4     credential_generation, unsigned big-endian and nonzero
+8       16    OS-random nonce
+24      16    proof_tag
+```
+
+The UUID also appears in the complete 128-bit Service UUID list. This revision
+requires the resulting 79-byte extended advertisement on the 1M secondary
+channel; it has no legacy-advertisement fallback. With `header = record[0..24]`,
+the tag is:
+
+```text
+first_16_bytes(HMAC-SHA-256(
+    generation_secret,
+    "aster/ble-l2cap/rostered-discovery/v1\0" ||
+    uuid_network_bytes ||
+    header))
+```
+
+Verification uses a constant-time comparison. Unknown revisions or generations,
+reserved flags, invalid dynamic LE PSMs, and non-exact lengths fail before
+candidate allocation. The nonce changes whenever an advertisement generation is
+replaced; it is not a counter, time, identity, or durable resume value.
+
+Discovery credentials use the canonical `ASTRBD02` carrier artifact and contain
+one emitting generation plus at most one adjacent overlap generation, an opaque
+nonzero deployment-scope ID, an increasing manifest sequence, and bounded issue,
+lease, and overlap times. Rotation is the fixed stage `(emit g, accept g+1)`,
+activate `(emit g+1, accept g)`, then retire `(emit g+1 only)` sequence. The host
+credential authority authenticates the artifact source, checks wall/monotonic
+continuity, and durably prevents manifest, generation, secret-binding, and
+overlap-deadline rollback before exposing a non-cloneable leased credential set
+to the adapter. A lease is at most seven days; missing trustworthy time or a
+wall/monotonic discontinuity greater than five minutes cancels it rather than
+extending it. The unprotected owner-only file loader remains evaluation-only.
+
+This implemented slice remains limited to one configured Linux controller, one
+exact mission peer, one dynamic listener PSM, and one active Event contact. The
+lower complete mission `NodeId` initiates and the higher listens. Rostered
+failure never starts the fixed-locator adapter, GATT, or IP. Multiple peers,
+authenticated duplicate-contact arbitration, controller selection, broader
+data classes, packaging, support rows, and production authorization remain
+future Ring-2 exits. Source and deterministic tests do not create a physical
+qualification claim.
+
 Regardless of carrier revision, production discovery discloses no `NodeId`,
 mission identifier, topic, scope, priority, inventory, data class, or
 application payload; it grants no authority and never transports replication
