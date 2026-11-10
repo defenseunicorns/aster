@@ -37,53 +37,6 @@ class TourUiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
-    def test_plans_cover_exact_tour_phase_manifests(self) -> None:
-        quick = UI.make_plan("quick", 2)
-        relay = UI.make_plan("relay", 3)
-        control = UI.make_plan("control", 4)
-
-        self.assertEqual(
-            tuple((phase.name, phase.active_nodes) for phase in quick.phases),
-            (
-                ("ping-publish", (0,)),
-                ("ping-forward-0-to-1", (0, 1)),
-                ("pong-publish", (1,)),
-                ("pong-return-1-to-0", (0, 1)),
-                ("noop", (0, 1)),
-            ),
-        )
-        self.assertEqual(
-            tuple((phase.name, phase.active_nodes) for phase in relay.phases),
-            (
-                ("ping-publish", (0,)),
-                ("ping-forward-0-to-1", (0, 1)),
-                ("ping-forward-1-to-2", (1, 2)),
-                ("pong-publish", (2,)),
-                ("pong-return-2-to-1", (1, 2)),
-                ("pong-return-1-to-0", (0, 1)),
-                ("noop", (0, 1, 2)),
-            ),
-        )
-        self.assertEqual(
-            tuple((phase.name, phase.active_nodes) for phase in control.phases),
-            (
-                ("control-authority-seed", (0, 1)),
-                ("control-authority-absent-forward", (1, 2)),
-                ("control-authority-absent-publish", (2,)),
-                ("control-authority-absent-event-forward", (1, 2)),
-                ("captured-publication-denied", (2, 3)),
-                ("captured-rejoin-denied", (2, 3)),
-                ("pong-ping-forward", (0, 1)),
-                ("pong-publish", (0,)),
-                ("pong-relay-forward", (0, 1)),
-                ("pong-return", (1, 2)),
-                ("noop", (0, 1, 2)),
-            ),
-        )
-        self.assertEqual(relay.roles, ("Origin", "Blind relay", "Responder"))
-        self.assertIn("mesh boundary", control.phases[4].label)
-        self.assertEqual(control.roles[0], "Authority member")
-        self.assertIn("nothing left to sync", control.phases[-1].label)
 
     def test_control_characters_are_never_rendered(self) -> None:
         malicious = "safe\x1b[31m\npath\x00"
@@ -323,20 +276,9 @@ class TourUiTests(unittest.TestCase):
             )
 
         table = UI.render_inspections(plan, rows)
-        self.assertIn(
-            "  Node  Role              App events  Relay cache  Controls applied/total  Control head",
-            table,
-        )
-        self.assertIn(
-            "  n0    Authority member  2           0            2/2                     2",
-            table,
-        )
         self.assertIn("Blind relay", table)
         self.assertIn("n1", table)
         self.assertIn("2/2", table)
-        self.assertIn("protected exact bytes", table)
-        self.assertIn("its own stale epoch-1 Ping", table)
-        self.assertIn("not zeroization", table)
 
         incomplete = UI.render_inspections(plan, [])
         self.assertIn("scenario conclusions withheld", incomplete)

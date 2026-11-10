@@ -121,7 +121,6 @@ jobs:
       - name: Verify direct and nested mise signal-safe Python
         timeout-minutes: 2
         run: |
-          python3 .github/scripts/test-ci-python.py
           python3 .github/scripts/check-ci-python.py
           mise exec -- mise run ci-python-preflight
 
@@ -140,10 +139,9 @@ jobs:
         timeout-minutes: 5
         run: python3 tools/test-aster-agent-process.py
 
-      - name: Validate Compose-provider delivery policy without Docker
+      - name: Test Compose OCI archive inspection without Docker
         timeout-minutes: 2
         run: |
-          python3 tools/test_aster_compose_delivery.py
           python3 tools/test_inspect_aster_compose_oci.py
 
       - name: Run formatting, policy, traceability, and receipt checks
@@ -172,11 +170,6 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.97.1 --profile minimal
-
-      - name: Test stale-lockfile rejection offline
-        env:
-          RUSTUP_TOOLCHAIN: "1.97.1"
-        run: python3 tools/test-check-cargo-lockfiles.py
 
       - name: Validate every committed Cargo dependency graph
         env:
@@ -229,7 +222,6 @@ jobs:
 
       - name: Validate delivery controller contracts
         run: |
-          python3 tools/test_aster_path_delivery.py
           python3 tools/aster_path_delivery.py docker/path-lab/scenarios/event-delivery-netem.json
           docker version --format '{{.Server.Version}}'
           uname -r

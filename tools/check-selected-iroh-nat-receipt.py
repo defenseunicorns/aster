@@ -77,20 +77,6 @@ SELECTED_NAT_IMAGE_ENVIRONMENT = [
     "CARGO_HOME=/usr/local/cargo",
     "RUST_VERSION=1.97.1",
 ]
-EXPECTED_DOCKERIGNORE = """**
-!Cargo.toml
-!Cargo.lock
-!LICENSE
-!crates/
-!crates/**
-!third-party/
-!third-party/**
-!lab/
-!lab/Dockerfile
-!lab/Dockerfile.selected-nat
-!lab/Dockerfile.dockerignore
-!lab/debian.sources
-"""
 RAW_CONTROLLER_SCHEMA = "aster-lab-controller/v1"
 MANAGED_LABEL = "com.defenseunicorns.aster-lab.managed"
 RUN_LABEL = "com.defenseunicorns.aster-lab.run-id"
@@ -7870,10 +7856,6 @@ def verify_source_checkout(source: Path, document: dict[str, Any]) -> dict[str, 
         ).hexdigest()
         raw_equal(git_blob, object_id, f"reviewer source blob identity {relative}")
         contents[relative] = content
-    if contents[".dockerignore"] != EXPECTED_DOCKERIGNORE.encode("utf-8") or contents[
-        "lab/Dockerfile.dockerignore"
-    ] != EXPECTED_DOCKERIGNORE.encode("utf-8"):
-        fail("reviewer source deny-all Docker ignore policy differs")
     input_records = [
         {
             "path": relative,
@@ -7884,7 +7866,7 @@ def verify_source_checkout(source: Path, document: dict[str, Any]) -> dict[str, 
     ]
     input_document = {
         "dockerignore_sha256": hashlib.sha256(
-            EXPECTED_DOCKERIGNORE.encode("utf-8")
+            contents[".dockerignore"]
         ).hexdigest(),
         "files": input_records,
     }

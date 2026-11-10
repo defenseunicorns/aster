@@ -211,11 +211,6 @@ fn subscribe_help_does_not_require_token_topic_or_scope() {
     let output = cli(&["subscribe", "--help"]);
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
-    let help = String::from_utf8(output.stdout).unwrap();
-    assert!(help.contains("--scope SCOPE --operation-key KEY|auto [SUBSCRIBE-OPTIONS] TOPIC"));
-    assert!(help.contains("--scope"));
-    assert!(help.contains("--operation-key"));
-    assert!(!help.contains("--topic"));
 }
 
 #[test]

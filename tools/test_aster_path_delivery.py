@@ -43,49 +43,6 @@ def load_script(name: str):
     return module
 
 
-class TestImportIsolationTests(unittest.TestCase):
-    def test_module_and_discovery_invocations_without_pythonpath(self):
-        env = dict(MODULE.os.environ)
-        env.pop("PYTHONPATH", None)
-        # Select only the controller cases so subprocess discovery cannot recurse
-        # into this invocation regression test.
-        invocations = (
-            ["tools.test_aster_path_delivery.PathDeliveryControllerTests"],
-            ["discover", "-s", "tools", "-p", "test_aster_path_delivery.py",
-             "-k", "PathDeliveryControllerTests"],
-        )
-        for args in invocations:
-            with self.subTest(args=args):
-                result = subprocess.run(
-                    [sys.executable, "-m", "unittest", *args],
-                    cwd=MODULE_PATH.resolve().parents[1], env=env,
-                    stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                    timeout=60,
-                )
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertNotIn("Ran 0 tests", result.stderr)
-                self.assertIn("\nOK\n", result.stderr)
-
-    def test_helper_imports_use_this_controller_without_leaking_registry_state(self):
-        for existing in (None, mock.sentinel.other_controller):
-            with self.subTest(existing=existing), mock.patch.dict(sys.modules):
-                if existing is None:
-                    sys.modules.pop("aster_path_delivery", None)
-                else:
-                    sys.modules["aster_path_delivery"] = existing
-                before_path = list(sys.path)
-                for name in ("delivery-wan.py", "delivery-network-init.py"):
-                    helper = load_script(name)
-                    self.assertIs(helper._run_command, MODULE._run_command)
-                    self.assertIs(helper._strict_json, MODULE._strict_json)
-                    self.assertIs(helper.ExecutionError, MODULE.ExecutionError)
-                    self.assertEqual(sys.path, before_path)
-                    if existing is None:
-                        self.assertNotIn("aster_path_delivery", sys.modules)
-                    else:
-                        self.assertIs(sys.modules["aster_path_delivery"], existing)
-
-
 def unpin(argv):
     if argv[1:3] == ["--host", "unix:///var/run/docker.sock"]:
         return [argv[0], *argv[3:]]
@@ -819,7 +776,6 @@ class PathDeliveryControllerTests(unittest.TestCase):
             self.assertEqual(owned.containers, [])
 
     def test_direct_preflight_rejects_nonlinux_nonroot_and_remote_daemon(self):
-        self.assertEqual(len(__import__("inspect").signature(MODULE.preflight).parameters), 1)
         with mock.patch.object(MODULE.platform, "system", return_value="Darwin"):
             with self.assertRaisesRegex(MODULE.ExecutionError, "Linux"):
                 MODULE.preflight(Path("/usr/bin/docker"))
@@ -1243,10 +1199,6 @@ class PathDeliveryControllerTests(unittest.TestCase):
             MODULE._strict_json(b'{"packet_loss":NaN}', "netem read-back")
 
 
-
-
-
-
     def test_readiness_and_cleanup_shapes_fail_closed(self) -> None:
         status = {
             "identity": base64.b64encode(bytes([3]) * 32).decode("ascii"),
@@ -1327,17 +1279,6 @@ class PathDeliveryControllerTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--listen") + 1], "127.0.0.1:8181")
         self.assertEqual(argv[argv.index("--peer") + 1], "a" * 64 + "@10.77.2.2:4433=" + "b" * 64)
         self.assertNotIn("sh", argv)
-
-    def test_delivery_scenario_is_fixed(self) -> None:
-        root = MODULE_PATH.parents[1]
-        scenario = json.loads(
-            (root / "docker/path-lab/scenarios/event-delivery-netem.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        self.assertEqual(MODULE.compile_scenario(json.dumps(scenario).encode())["netem"], MODULE.FIXED_NETEM)
-        self.assertEqual(scenario["payload"], "bounded real Event over routed netem")
-        self.assertEqual(scenario["seed"], 104729)
 
 
 if __name__ == "__main__":

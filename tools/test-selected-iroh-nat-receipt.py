@@ -2311,6 +2311,21 @@ def canonical(document: dict[str, object]) -> bytes:
     ).encode("ascii")
 
 
+EXPECTED_DOCKERIGNORE = """**
+!Cargo.toml
+!Cargo.lock
+!LICENSE
+!crates/
+!crates/**
+!third-party/
+!third-party/**
+!lab/
+!lab/Dockerfile
+!lab/Dockerfile.selected-nat
+!lab/Dockerfile.dockerignore
+!lab/debian.sources
+"""
+
 class SelectedIrohNatReceiptTests(unittest.TestCase):
     def test_minimum_canonical_receipt_passes(self) -> None:
         document = baseline()
@@ -3557,13 +3572,13 @@ class SelectedIrohNatReceiptTests(unittest.TestCase):
     def test_independent_source_reconstruction_binds_immutable_objects(self) -> None:
         document = baseline()
         contents = {
-            ".dockerignore": CHECKER.EXPECTED_DOCKERIGNORE.encode("utf-8"),
+            ".dockerignore": EXPECTED_DOCKERIGNORE.encode("utf-8"),
             "Cargo.toml": b"[workspace]\nmembers=[]\n",
             "Cargo.lock": b"version = 4\n",
             "LICENSE": b"test license\n",
             "lab/Dockerfile": b"FROM scratch\n",
             "lab/Dockerfile.selected-nat": b"FROM scratch\n",
-            "lab/Dockerfile.dockerignore": CHECKER.EXPECTED_DOCKERIGNORE.encode(
+            "lab/Dockerfile.dockerignore": EXPECTED_DOCKERIGNORE.encode(
                 "utf-8"
             ),
             "lab/debian.sources": b"Types: deb\n",
@@ -3588,7 +3603,7 @@ class SelectedIrohNatReceiptTests(unittest.TestCase):
         build_paths = sorted(set(contents) - {"data-mesh-requirements.md"})
         input_document = {
             "dockerignore_sha256": hashlib.sha256(
-                CHECKER.EXPECTED_DOCKERIGNORE.encode("utf-8")
+                EXPECTED_DOCKERIGNORE.encode("utf-8")
             ).hexdigest(),
             "files": [
                 {

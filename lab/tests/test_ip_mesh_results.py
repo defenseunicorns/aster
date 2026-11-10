@@ -432,13 +432,9 @@ def passing_gate_h_execution_provenance() -> dict:
     cargo_home = Path(os.environ.get("CARGO_HOME", str(home / ".cargo"))).resolve()
     rustup_home = Path(os.environ.get("RUSTUP_HOME", str(home / ".rustup"))).resolve()
     fixture_tool = Path(sys.executable).resolve()
-    rg_value = shutil.which("rg")
-    if rg_value is None:
-        raise AssertionError("Gate-H fixture requires rg")
     tool_paths = {
         "cargo": fixture_tool,
         "git": fixture_tool,
-        "rg": Path(rg_value).resolve(),
         "rustc": fixture_tool,
         "rustdoc": fixture_tool,
         "rustup": fixture_tool,

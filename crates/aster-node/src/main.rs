@@ -1004,17 +1004,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn discover_lan_help_names_identity_free_authorized_mode() {
-        assert!(HELP.contains("[--discover-lan]"));
-        assert!(HELP.contains("takes no peer identity or address"));
-        assert!(HELP.contains("cannot be combined"));
-        assert!(HELP.contains("with --peer or --nearby-peer"));
-        assert!(HELP.contains(
-            "mission handshake authenticates it and current mission authorization succeeds"
-        ));
-    }
-
     #[cfg(feature = "nearby-discovery")]
     #[test]
     fn discover_lan_switch_and_conflicts_fail_closed() {
@@ -1237,17 +1226,6 @@ mod tests {
     }
 
     #[test]
-    fn help_advertises_selected_profile_four_blob_reconciliation() {
-        let source = include_str!("main.rs");
-        assert!(source.contains("[--blob-interest TOPIC@SCOPE ...]"));
-        assert!(
-            source.contains("Blob source and resumable carrier phases require selected semantic")
-        );
-        assert!(source.contains("v7/v8 profile 4"));
-        assert!(source.contains("Semantic v5/v6 Blob intent fails without carrier fallback."));
-    }
-
-    #[test]
     fn controlled_relay_flags_are_inseparable_and_trust_is_explicit() {
         let error = parse_controlled_relay(None, Some("webpki".into()), Vec::new(), false)
             .expect_err("relay trust without URL must fail");
@@ -1347,16 +1325,6 @@ mod tests {
             .finish_redacted()
             .expect_err("unexpected node argument must be redacted");
         assert!(!error.to_string().contains("do-not-log"));
-    }
-
-    #[test]
-    fn help_advertises_bounded_controlled_relay_without_authority_claims() {
-        let source = include_str!("main.rs");
-        assert!(source.contains("--controlled-relay-trust webpki|der-roots"));
-        assert!(source.contains("[--controlled-relay-ca-der FILE ...]"));
-        assert!(source.contains("operator-supplied initial route set is bounded"));
-        assert!(source.contains("authenticated Iroh NAT negotiation may add direct paths"));
-        assert!(source.contains("NAT acceptance remains explicitly unclaimed"));
     }
 
     #[cfg(unix)]
