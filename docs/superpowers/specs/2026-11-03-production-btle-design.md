@@ -436,17 +436,38 @@ reserved flags, invalid dynamic LE PSMs, and non-exact lengths fail before
 candidate allocation. The nonce changes whenever an advertisement generation is
 replaced; it is not a counter, time, identity, or durable resume value.
 
-Discovery credentials use the canonical `ASTRBD02` carrier artifact and contain
-one emitting generation plus at most one adjacent overlap generation, an opaque
-nonzero deployment-scope ID, an increasing manifest sequence, and bounded issue,
-lease, and overlap times. Rotation is the fixed stage `(emit g, accept g+1)`,
-activate `(emit g+1, accept g)`, then retire `(emit g+1 only)` sequence. The host
-credential authority authenticates the artifact source, checks wall/monotonic
-continuity, and durably prevents manifest, generation, secret-binding, and
-overlap-deadline rollback before exposing a non-cloneable leased credential set
-to the adapter. A lease is at most seven days; missing trustworthy time or a
-wall/monotonic discontinuity greater than five minutes cancels it rather than
-extending it. The unprotected owner-only file loader remains evaluation-only.
+Discovery credentials use this canonical `ASTRBD02` carrier artifact layout:
+
+```text
+magic "ASTRBD02" (8 bytes)
+manifest_sequence (8 bytes, unsigned big-endian, nonzero)
+entry_count (1 byte, 1 or 2)
+issued_at_unix_seconds (8 bytes, unsigned big-endian, nonzero)
+lease_not_after_unix_seconds (8 bytes, unsigned big-endian, nonzero)
+overlap_not_after_unix_seconds (8 bytes; zero with one entry)
+deployment_scope_id (32 bytes, not all zero)
+emitting_generation (4 bytes, unsigned big-endian, nonzero)
+emitting_secret (32 bytes, not all zero)
+[overlap_generation (4 bytes, unsigned big-endian, nonzero)
+ overlap_secret (32 bytes, not all zero)]
+```
+
+The artifact is exactly 109 bytes with one entry or 145 bytes with two; trailing
+bytes are rejected. `lease_not_after` is later than `issued_at`, no more than
+seven days later, and not expired. With one entry, `overlap_not_after` is zero.
+With two, the secrets differ, the generations form the adjacent set `{g, g+1}`,
+and `overlap_not_after` is later than `issued_at`, no later than
+`lease_not_after`, and no later than seven days after the original stage.
+Renewal may shorten but never extend that stored overlap deadline.
+
+Rotation is the fixed stage `(emit g, accept g+1)`, activate `(emit g+1, accept
+g)`, then retire `(emit g+1 only)` sequence. The host credential authority
+authenticates the artifact source, checks wall/monotonic continuity, and durably
+prevents manifest, generation, secret-binding, and overlap-deadline rollback
+before exposing a non-cloneable leased credential set to the adapter. Missing
+trustworthy time or a wall/monotonic discontinuity greater than five minutes
+cancels the lease rather than extending it. The unprotected owner-only file
+loader remains evaluation-only.
 
 This implemented slice remains limited to one configured Linux controller, one
 exact mission peer, one dynamic listener PSM, and one active Event contact. The
