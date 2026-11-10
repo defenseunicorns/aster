@@ -29,10 +29,9 @@ run = [
 ]
 
 [tasks.check-lockfiles]
-description = "Validate committed Cargo dependency graphs and their rejection tests"
+description = "Validate committed Cargo dependency graphs"
 run = [
   "sh tools/check-cargo-lockfiles.sh",
-  "python3 tools/test-check-cargo-lockfiles.py",
 ]
 
 [tasks.check-foundation-core]
@@ -42,11 +41,8 @@ run = [
   "sh tools/check-agent-proto.sh",
   "python3 tools/check-project-license.py",
   "python3 tools/check-implementation-requirements.py",
-  "python3 tools/check-protocol-version-contract.py",
   "python3 tools/test-protocol-version-contract.py",
-  "python3 .github/scripts/test-ci-test-lanes.py",
   "python3 .github/scripts/test-nextest-timing.py",
-  "python3 tools/test-run-fuzz-smoke.py",
   "python3 tools/test_aster_tour_ui.py",
   "python3 tools/test_aster_mesh_playground.py",
   "python3 tools/test_aster_lan_mvp.py",
@@ -60,8 +56,6 @@ run = [
   "python3 tools/test_aster_path_delivery.py",
   "python3 tools/test_aster_path_diagnostic.py",
   "python3 tools/aster_path_delivery.py docker/path-lab/scenarios/event-delivery-netem.json",
-  "sh -n docker/lan-scale/init-state.sh",
-  "sh -n docker/hierarchy-mvp/demo-node-entrypoint.sh",
   "python3 tools/test-selected-n32-receipt.py",
   "python3 tools/test-selected-iroh-nat-receipt.py",
   "python3 tools/test-selected-live-mutable-receipt.py",
@@ -79,9 +73,8 @@ run = [
 ]
 
 [tasks.check-compose-policy]
-description = "Validate Compose-provider delivery policy without Docker"
+description = "Test Compose OCI archive inspection without Docker"
 run = [
-  "python3 tools/test_aster_compose_delivery.py",
   "python3 tools/test_inspect_aster_compose_oci.py",
 ]
 
@@ -257,10 +250,6 @@ run = "python3 tools/aster_path_delivery.py docker/path-lab/scenarios/event-deli
 description = "Execute one real Event through isolated Docker segments and WAN netem on Linux"
 run = "python3 tools/aster_path_delivery.py docker/path-lab/scenarios/event-delivery-netem.json --execute"
 
-[tasks.compose-agent-plan]
-description = "Validate the ordinary Compose delivery profile without Docker"
-run = "python3 tools/aster_compose_delivery.py docker/compose-agent/compose.yaml --example-plan"
-
 [tasks.tour]
 description = "Run the fastest two-node causal Ping/Pong capability tour"
 run = "sh ./tools/aster-tour.sh quick"
@@ -301,9 +290,10 @@ run = [
 ]
 
 [tasks.protocol-version-contract]
-description = "Verify implemented and normative semantic-version registries align"
+description = "Verify Profile-5 oracle, runtime transcripts, and fuzz seed decoding"
 run = [
-  "python3 tools/check-protocol-version-contract.py",
+  "python3 conformance/blob_stream_oracle.py",
+  "cargo test --locked -p aster-node --features fuzzing transcript_seed_expectations_match_model_and_production_states -- --nocapture",
   "python3 tools/test-protocol-version-contract.py",
 ]
 

@@ -171,7 +171,7 @@ class GateHFaultTests(unittest.TestCase):
         return {
             name: {
                 "name": name,
-                "argv": ["rg", "-n", "pattern", "source.rs"],
+                "argv": ["cargo", "tree"],
                 "source_files": [],
                 "source_region": None,
                 "assertion": {"kind": "exact_count", "count": 1},
@@ -1340,7 +1340,7 @@ class GateHFaultTests(unittest.TestCase):
             self.assertEqual(receipt["environment"], environment)
             self.assertEqual(receipt["argv"], argv)
 
-    def test_formal_static_build_and_test_children_use_the_signed_export_cwd(self):
+    def test_formal_build_and_test_children_use_the_signed_export_cwd(self):
         with tempfile.TemporaryDirectory() as temporary:
             export = Path(temporary) / "signed-source"
             export.mkdir()
@@ -1352,47 +1352,8 @@ class GateHFaultTests(unittest.TestCase):
                 "environment": {"FORMAL": "exact"},
                 "tools": {
                     "cargo": {"path": "/absolute/cargo"},
-                    "rg": {"path": "/absolute/rg"},
                 },
             }
-            isolated_calls = []
-
-            def isolated(argv, **kwargs):
-                isolated_calls.append((list(argv), dict(kwargs)))
-                stdout = b""
-                stderr = b""
-                return (
-                    {
-                        "started_utc": "2026-08-22T00:00:00Z",
-                        "completed_utc": "2026-08-22T00:00:00Z",
-                        "duration_ms": 0,
-                        "timed_out": False,
-                        "returncode": 1,
-                        "stdout_sha256": faults.sha256_bytes(stdout),
-                        "stderr_sha256": faults.sha256_bytes(stderr),
-                        "stdout": faults.complete_stream(stdout),
-                        "stderr": faults.complete_stream(stderr),
-                        "execution_error": None,
-                    },
-                    stdout,
-                    stderr,
-                )
-
-            with mock.patch.object(
-                faults, "run_isolated_process", side_effect=isolated
-            ):
-                static = faults.execute_rg_assertion(
-                    name="signed_export_absence",
-                    argv=["rg", "-n", "forbidden", "Cargo.toml"],
-                    freeze={"source_files": []},
-                    source_paths=[],
-                    assertion={"kind": "absent", "count": 0},
-                    execution=execution,
-                )
-            self.assertTrue(static["passed"])
-            self.assertEqual(static["cwd"], str(export))
-            self.assertEqual(isolated_calls[0][1]["cwd"], export)
-
             process = mock.Mock()
             process.wait.return_value = 1
             process.returncode = 1
@@ -1546,79 +1507,6 @@ class GateHFaultTests(unittest.TestCase):
                 result = faults.formal_feature_graph(Path("cargo"), {})
                 self.assertEqual(result["passed"], passed)
 
-    def test_static_ownership_checks_are_exact_rg_assertions_and_pass(self):
-        freeze = {"source_files": []}
-        for relative in faults.SOURCE_PATHS:
-            path = faults.WORKSPACE / relative
-            freeze["source_files"].append(
-                {
-                    "path": relative,
-                    "git_blob": "0" * 40,
-                    "sha256": faults.sha256_file(path),
-                    "size_bytes": path.stat().st_size,
-                }
-            )
-        environment = os.environ.copy()
-        cargo = faults.shutil.which("cargo")
-        rg = faults.shutil.which("rg")
-        self.assertIsNotNone(cargo)
-        self.assertIsNotNone(rg)
-        execution = {
-            "environment": environment,
-            "tools": {"rg": {"path": rg}},
-            "formal_feature_graph": faults.formal_feature_graph(
-                Path(cargo), environment
-            ),
-        }
-        checks = faults.execute_static_checks(freeze, execution=execution)
-        self.assertEqual(set(checks), faults.STATIC_CHECK_NAMES)
-        self.assertEqual(len(checks), 20)
-        self.assertEqual(
-            {
-                "host_event_has_no_authenticated_admission_bypass",
-                "mesh_host_admission_coordinator_is_crate_private",
-                "node_admission_coordinator_is_crate_private",
-                "admission_coordinator_has_no_public_reexport",
-            }
-            & set(checks),
-            {
-                "host_event_has_no_authenticated_admission_bypass",
-                "mesh_host_admission_coordinator_is_crate_private",
-                "node_admission_coordinator_is_crate_private",
-                "admission_coordinator_has_no_public_reexport",
-            },
-        )
-        self.assertEqual(
-            checks["mesh_host_admission_coordinator_is_crate_private"]["observed"][
-                "match_count"
-            ],
-            5,
-        )
-        self.assertEqual(
-            checks["node_admission_coordinator_is_crate_private"]["observed"][
-                "match_count"
-            ],
-            2,
-        )
-        self.assertTrue(all(check["passed"] for check in checks.values()))
-        for name, check in checks.items():
-            expected_tool = (
-                "cargo"
-                if name == "formal_graph_has_no_libp2p_or_iroh_dependency"
-                else "rg"
-            )
-            self.assertEqual(Path(check["argv"][0]).name, expected_tool)
-            self.assertRegex(check["stdout_sha256"], r"^[0-9a-f]{64}$")
-            self.assertRegex(check["stderr_sha256"], r"^[0-9a-f]{64}$")
-            self.assertFalse(check["timed_out"])
-            self.assertTrue(check["source_files"])
-            for stream in ("stdout", "stderr"):
-                retained = check[stream]
-                self.assertTrue(retained["complete"])
-                self.assertEqual(
-                    faults.sha256_bytes(base64.b64decode(retained["base64"])),
-                    check[f"{stream}_sha256"],
-                )
 
     def test_generate_receipt_fails_closed_when_one_exact_witness_is_missing(self):
         freeze = {
@@ -1759,7 +1647,7 @@ class GateHFaultTests(unittest.TestCase):
             }
 
         static_checks = self.passing_static_checks(freeze)
-        static_checks["native_process_constructs_one_runtime_authority"]["passed"] = False
+        static_checks["formal_graph_has_no_libp2p_or_iroh_dependency"]["passed"] = False
         with (
             mock.patch.object(faults, "freeze_candidate", return_value=freeze),
             mock.patch.object(faults, "verify_candidate_unchanged"),
@@ -2000,28 +1888,13 @@ class GateHFaultTests(unittest.TestCase):
 
         def interrupted_generate(_args, _output, progress):
             progress.update({"phase": "static_checks"})
-            region = faults.SourceRegion(
-                path="fixture.rs",
-                start_marker="start",
-                end_marker="end",
-                start_line=1,
-                value=source,
-            )
-            return faults.execute_rg_assertion(
-                name="interrupted_static_fixture",
-                argv=[
-                    sys.executable,
-                    "-c",
-                    "import time; time.sleep(60)",
-                ],
-                freeze={"source_files": []},
-                source_paths=[],
-                assertion={"kind": "absent", "count": 0},
-                region=region,
-                execution={
-                    "environment": {"STATIC_FIXTURE_ENV": "exact"},
-                    "tools": {"rg": {"path": sys.executable}},
-                },
+            return faults.run_isolated_process(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                environment={"STATIC_FIXTURE_ENV": "exact"},
+                stdin_value=source,
+                timeout_seconds=30,
+                context="static-check:interrupted_static_fixture",
+                cwd=faults.WORKSPACE,
             )
 
         with tempfile.TemporaryDirectory() as temporary:

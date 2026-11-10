@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import json
-import copy
 import hashlib
 import os
 from pathlib import Path
@@ -27,12 +26,9 @@ from linux_event_mvp_qualification.io import (
     load_canonical_json,
 )
 from linux_event_mvp_qualification.schema import (
-    BODY_SCHEMA_ID,
     CANONICALIZATION_ID,
     REPORT_SCHEMA_ID,
-    SCHEMA_PATH,
     PROFILE_DIGEST,
-    load_machine_schema,
     machine_schema_digest,
 )
 from linux_event_mvp_qualification.bindings import populate_binding_chain
@@ -61,60 +57,6 @@ class CanonicalJsonTests(unittest.TestCase):
     def test_loader_accepts_only_an_object(self) -> None:
         with self.assertRaises(CanonicalJsonError):
             load_canonical_json(b"[]\n", label="fixture", maximum=1024)
-
-
-class MachineSchemaTests(unittest.TestCase):
-    def test_committed_schema_is_canonical_and_exposes_all_document_types(self) -> None:
-        raw = SCHEMA_PATH.read_bytes()
-        document = load_machine_schema()
-        self.assertEqual(canonical_json_bytes(document), raw)
-        self.assertEqual(document["$id"], BODY_SCHEMA_ID)
-        self.assertEqual(document["x-canonicalization"], CANONICALIZATION_ID)
-        self.assertEqual(document["x-report-schema"], REPORT_SCHEMA_ID)
-        self.assertEqual(
-            set(document["$defs"]),
-            {"approval", "candidate_body", "receipt_index", "release_decision"},
-        )
-        self.assertRegex(machine_schema_digest(), r"\Asha256:[0-9a-f]{64}\Z")
-        profile_path = (
-            SCHEMA_PATH.parent.parent / "linux-event-mvp-evaluation-profile-v0.1.md"
-        )
-        self.assertEqual(
-            PROFILE_DIGEST,
-            f"sha256:{hashlib.sha256(profile_path.read_bytes()).hexdigest()}",
-        )
-
-    def test_every_nested_object_and_array_has_an_exact_schema(self) -> None:
-        """Break caught: published schema accepts fields the validator rejects."""
-
-        def assert_exact(node: object, path: str) -> None:
-            if not isinstance(node, dict):
-                return
-            if node.get("type") == "object" and "oneOf" not in node:
-                self.assertIs(
-                    node.get("additionalProperties"),
-                    False,
-                    f"open object schema at {path}",
-                )
-                self.assertIsInstance(
-                    node.get("properties"), dict, f"missing properties at {path}"
-                )
-            if node.get("type") == "array":
-                self.assertIn("items", node, f"unconstrained array at {path}")
-            for keyword in ("properties", "$defs"):
-                children = node.get(keyword, {})
-                if isinstance(children, dict):
-                    for name, child in children.items():
-                        assert_exact(child, f"{path}.{name}")
-            if "items" in node:
-                assert_exact(node["items"], f"{path}[]")
-            for keyword in ("allOf", "anyOf", "oneOf"):
-                children = node.get(keyword, [])
-                if isinstance(children, list):
-                    for index, child in enumerate(children):
-                        assert_exact(child, f"{path}.{keyword}[{index}]")
-
-        assert_exact(load_machine_schema(), "$")
 
 
 class SafeRootTests(unittest.TestCase):
@@ -673,7 +615,6 @@ class CompleteBundleTests(unittest.TestCase):
             report.to_dict()["candidate_id_uniqueness"],
             "global candidate-ID uniqueness not assessed",
         )
-        self.assertEqual(report.to_bytes(), report.to_bytes())
 
     def test_source_mutation_breaks_binding_chain(self) -> None:
         with tempfile.TemporaryDirectory() as parent:

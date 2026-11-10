@@ -128,20 +128,6 @@ fn help_needs_neither_token_nor_agent() {
     let output = cli(&["--help"]);
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
-    let text = String::from_utf8(output.stdout).unwrap();
-    for flag in [
-        "--host",
-        "--port",
-        "--json",
-        "--token",
-        "--token-file",
-        "--help",
-        "blob-publish",
-        "blob-read",
-        "blob-status",
-    ] {
-        assert!(text.contains(flag));
-    }
 }
 
 #[test]

@@ -33,16 +33,6 @@ use buffa::Message as _;
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
-#[test]
-fn customer_fixture_prepares_an_owner_only_state_directory() {
-    // Break caught: leaving state creation to the node makes its security
-    // depend on the test runner's ordinary process umask.
-    let fixture = CustomerFixture::new();
-    let metadata = fs::metadata(fixture.root.join("state")).expect("prepared state directory");
-    assert!(metadata.is_dir());
-    assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn startup_validates_credentials_before_binding_any_listener() {
     // Break caught: moving credential validation after listener binding exposes

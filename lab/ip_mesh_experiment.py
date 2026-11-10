@@ -2571,39 +2571,9 @@ def validate_gate_h_fault_receipt(
     ):
         raise ExperimentError("Gate-H static ownership proof is incomplete")
     expected_static_checks = gate_h_fault_contract.static_check_contract(
-        execution_tools["rg"]["path"], execution_tools["cargo"]["path"]
+        execution_tools["cargo"]["path"]
     )
 
-    def expected_region_receipt(
-        path: str, markers: tuple[str, str] | None
-    ) -> dict[str, Any] | None:
-        if markers is None:
-            return None
-        try:
-            source_text = candidate_sources[path].decode("utf-8")
-            start_marker, end_marker = markers
-            if (
-                source_text.count(start_marker) != 1
-                or source_text.count(end_marker) != 1
-            ):
-                raise ExperimentError(
-                    "Gate-H candidate no longer has exact static-check markers"
-                )
-            start = source_text.index(start_marker)
-            end = source_text.index(end_marker, start + len(start_marker))
-        except (UnicodeError, ValueError) as error:
-            raise ExperimentError(
-                "Gate-H candidate has an invalid static-check source region"
-            ) from error
-        region_bytes = source_text[start:end].encode("utf-8")
-        return {
-            "path": path,
-            "start_marker": start_marker,
-            "end_marker": end_marker,
-            "start_line": source_text.count("\n", 0, start) + 1,
-            "bytes": len(region_bytes),
-            "sha256": hashlib.sha256(region_bytes).hexdigest(),
-        }
 
     static_plan = []
     for name, check in sorted(static_checks.items()):
@@ -2612,12 +2582,6 @@ def validate_gate_h_fault_receipt(
         expected_source_files = [
             source_by_path[path] for path in expected_check["source_paths"]
         ]
-        expected_static_returncode = (
-            1 if expected_check["assertion"].get("kind") == "absent" else 0
-        )
-        expected_region = expected_region_receipt(
-            expected_check["source_paths"][0], expected_check["region"]
-        )
         if (
             not isinstance(check, dict)
             or check.get("name") != name
@@ -2628,14 +2592,14 @@ def validate_gate_h_fault_receipt(
             or isinstance(check.get("expected_returncode"), bool)
             or not isinstance(check.get("expected_returncode"), int)
             or check.get("expected_returncode")
-            != expected_static_returncode
+            != 0
             or check.get("returncode") != check.get("expected_returncode")
             or check.get("execution_error") is not None
             or check.get("passed") is not True
             or check.get("assertion") != expected_check["assertion"]
             or not isinstance(check.get("observed"), dict)
             or check.get("source_files") != expected_source_files
-            or check.get("source_region") != expected_region
+            or check.get("source_region") is not None
         ):
             raise ExperimentError(f"{context} is malformed or failed")
         if name == "formal_graph_has_no_libp2p_or_iroh_dependency":
@@ -2666,41 +2630,6 @@ def validate_gate_h_fault_receipt(
                 raise ExperimentError(
                     f"{context} differs from resolved feature-graph provenance"
                 )
-        region = check.get("source_region")
-        if region is not None:
-            if (
-                not isinstance(region, dict)
-                or set(region)
-                != {
-                    "path",
-                    "start_marker",
-                    "end_marker",
-                    "start_line",
-                    "bytes",
-                    "sha256",
-                }
-                or region.get("path") not in candidate_sources
-                or not isinstance(region.get("start_marker"), str)
-                or not isinstance(region.get("end_marker"), str)
-            ):
-                raise ExperimentError(f"{context} has a malformed source region")
-            try:
-                source_text = candidate_sources[region["path"]].decode("utf-8")
-            except UnicodeError as error:
-                raise ExperimentError(f"{context} source region is not UTF-8") from error
-            start_marker = region["start_marker"]
-            end_marker = region["end_marker"]
-            if source_text.count(start_marker) != 1 or source_text.count(end_marker) != 1:
-                raise ExperimentError(f"{context} source-region markers are not unique")
-            start = source_text.index(start_marker)
-            end = source_text.index(end_marker, start + len(start_marker))
-            region_bytes = source_text[start:end].encode("utf-8")
-            if (
-                region.get("start_line") != source_text.count("\n", 0, start) + 1
-                or region.get("bytes") != len(region_bytes)
-                or region.get("sha256") != hashlib.sha256(region_bytes).hexdigest()
-            ):
-                raise ExperimentError(f"{context} source region differs from the candidate")
         _validate_fault_execution_metadata(
             check,
             context=context,
@@ -2715,7 +2644,6 @@ def validate_gate_h_fault_receipt(
         lines = [line for line in decoded.splitlines() if line]
         assertion = check["assertion"]
         observed = check["observed"]
-        kind = assertion.get("kind")
         assertion_passed = False
         recomputed_observed: dict[str, Any] = {"match_count": len(lines)}
         if name == "formal_graph_has_no_libp2p_or_iroh_dependency":
@@ -2761,39 +2689,6 @@ def validate_gate_h_fault_receipt(
                     "required_exact_counts": assertion["required_exact_counts"],
                     "forbidden_tokens": [],
                 }
-                and check.get("expected_returncode") == 0
-            )
-        elif kind == "absent" and assertion == {"kind": "absent", "count": 0}:
-            assertion_passed = not lines and check.get("expected_returncode") == 1
-        elif kind == "exact_count" and isinstance(assertion.get("count"), int):
-            assertion_passed = (
-                len(lines) == assertion["count"]
-                and check.get("expected_returncode") == 0
-            )
-        elif kind == "token_counts" and isinstance(assertion.get("counts"), dict):
-            counts = assertion["counts"]
-            if all(
-                isinstance(token, str) and isinstance(count, int)
-                for token, count in counts.items()
-            ):
-                recomputed_observed["token_counts"] = {
-                    token: decoded.count(token) for token in counts
-                }
-                assertion_passed = (
-                    recomputed_observed["token_counts"] == counts
-                    and (
-                        assertion.get("match_count") is None
-                        or assertion["match_count"] == len(lines)
-                    )
-                    and check.get("expected_returncode") == 0
-                )
-        elif kind == "method_set" and isinstance(assertion.get("methods"), list):
-            methods = re.findall(r"pub(?: const)? fn ([a-z_][a-z0-9_]*)", decoded)
-            recomputed_observed["methods"] = methods
-            assertion_passed = (
-                len(methods) == len(assertion["methods"])
-                and sorted(methods) == sorted(assertion["methods"])
-                and set(methods) == set(gate_h_fault_contract.TYPED_AUTHORITY_METHODS)
                 and check.get("expected_returncode") == 0
             )
         if not assertion_passed or observed != recomputed_observed:

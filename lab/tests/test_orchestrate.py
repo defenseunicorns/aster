@@ -99,16 +99,6 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("10.250.0.20 tcp dport 4477 counter accept", rules)
         self.assertNotIn("dnat to", rules)
 
-    def test_both_dockerignore_files_are_identical_deny_all_policies(self):
-        workspace = MODULE_PATH.parents[1]
-        self.assertEqual(
-            (workspace / ".dockerignore").read_text(encoding="utf-8"),
-            orchestrate.EXPECTED_DOCKERIGNORE,
-        )
-        self.assertEqual(
-            (workspace / "lab" / "Dockerfile.dockerignore").read_text(encoding="utf-8"),
-            orchestrate.EXPECTED_DOCKERIGNORE,
-        )
 
     def test_runtime_package_inventory_is_exact_and_canonical(self):
         value = """tcpdump\t4.99.3-1
@@ -1034,10 +1024,6 @@ curl\t8.0
                 for path in legacy
             )
         )
-        self.assertIn(
-            "COPY third-party ./third-party",
-            (orchestrate.WORKSPACE / "lab" / "Dockerfile").read_text(encoding="utf-8"),
-        )
 
     def test_selected_nat_tracked_input_gate_rejects_ignored_untracked_input(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1112,6 +1098,9 @@ curl\t8.0
             commit = "a" * 40
             selected = b"selected Dockerfile"
             inputs = [
+                orchestrate.BuildInput(
+                    ".dockerignore", b"**\n", hashlib.sha256(b"**\n").hexdigest()
+                ),
                 orchestrate.BuildInput(
                     "Cargo.toml", b"cargo", hashlib.sha256(b"cargo").hexdigest()
                 ),

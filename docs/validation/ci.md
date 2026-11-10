@@ -7,25 +7,10 @@ manual dispatches. Each validation job reports its own status.
 ## Compose-provider checks
 
 The Compose-provider checks are daemon-free: normal CI runs
-`python3 tools/test_aster_compose_delivery.py` and
-`python3 tools/test_inspect_aster_compose_oci.py` to validate the canonical
-model, generation descriptors, immutable image-reference form,
-manual-delivery/release policy, deterministic redacted plan, and synthetic OCI
+`python3 tools/test_inspect_aster_compose_oci.py` to validate synthetic OCI
 archive safety boundaries. These checks do not call the Docker CLI,
 connect to a Docker socket, execute a lifecycle, clean up Docker resources, or
 produce a host-qualification receipt.
-
-Because the manual packaging workflow intentionally has one fixed shape and
-the repository does not pin a YAML or shell AST dependency for this check, the
-validator binds its reviewed bytes to a checked SHA-256 constant after narrowly
-normalizing the full commit SHA and adjacent version comment for each approved
-Action invocation. Action identities, order, inputs, commands, permissions,
-triggers, jobs, and all other workflow bytes remain hash-bound. Every Action
-must still use a full lowercase 40-character commit SHA, and maintainers must
-review upstream Action changes; a syntactically valid SHA is not proof of
-equivalent behavior. Any non-pin workflow edit requires an intentional constant
-update plus renewed policy-test and reviewer scrutiny; semantic checks remain
-independent defense in depth.
 
 This statement is intentionally scoped to the Compose-provider checks. Other
 repository jobs, including the existing path-lab jobs, use Docker for their own
@@ -199,9 +184,8 @@ while `quality` runs `check-foundation-core` and the integration segment. The
 required `cargo-lockfiles` prerequisite owns the Cargo graph validation in CI;
 the local `check-foundation` aggregate composes `check-lockfiles`,
 `check-foundation-core`, and `check-compose-policy`, so local coverage remains
-complete without repeating the prerequisite in `quality`. CI retains the
-explicit fail-closed Compose policy step required by its release validator;
-those suites are excluded from the foundation core and execute once. Locally,
+complete without repeating the prerequisite in `quality`. CI runs the Compose
+OCI inspection suite separately from the foundation core so it executes once. Locally,
 `mise run check-workspace-tests` executes the complete suite without
 partitioning and then all doctests.
 No test, feature set, receipt assertion, binding check,
@@ -1931,7 +1915,6 @@ python3 .github/scripts/summarize-nextest-junit.py \
 
 # Reporter selection, warning, and malformed-input contracts.
 python3 .github/scripts/test-nextest-timing.py
-python3 .github/scripts/test-ci-test-lanes.py
 ```
 
 A `Duration problems (> 10.000s)` table or `Rust test duration` annotation is

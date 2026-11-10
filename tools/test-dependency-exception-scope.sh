@@ -7,11 +7,7 @@ set -eu
 repository_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 checker="$repository_root/tools/check-dependency-exception-scope.sh"
 failing_cargo="$repository_root/tools/testdata/fail-fuzz-cargo.sh"
-active_hickory_cargo="$repository_root/tools/testdata/inject-active-hickory-cargo.sh"
-expanded_paste_cargo="$repository_root/tools/testdata/inject-expanded-paste-cargo.sh"
-second_paste_version_cargo="$repository_root/tools/testdata/inject-second-paste-version-cargo.sh"
-expanded_basic_toml_cargo="$repository_root/tools/testdata/inject-expanded-basic-toml-cargo.sh"
-fuzz_basic_toml_cargo="$repository_root/tools/testdata/inject-fuzz-basic-toml-cargo.sh"
+scope_cargo="$repository_root/tools/testdata/dependency-scope-cargo.sh"
 real_cargo=$(command -v "${CARGO:-cargo}")
 temporary_directory=$(mktemp -d)
 trap 'rm -rf "$temporary_directory"' EXIT HUP INT TERM
@@ -63,70 +59,28 @@ if [ "$status" -ne 97 ]; then
   exit 1
 fi
 
-if ASTER_TEST_REAL_CARGO="$real_cargo" CARGO="$active_hickory_cargo" \
-  sh "$checker" >/dev/null 2>&1; then
-  printf '%s\n' 'dependency-exception regression failed: active Hickory graph passed' >&2
-  exit 1
-else
-  status=$?
-fi
+# Accept equivalent reverse graphs without freezing Cargo's rendering or versions.
+ASTER_TEST_REAL_CARGO="$real_cargo" ASTER_TEST_SCOPE_MODE=reorder \
+  ASTER_TEST_SCOPE_PACKAGE=basic-toml CARGO="$scope_cargo" sh "$checker"
 
-if [ "$status" -ne 1 ]; then
-  printf 'dependency-exception regression failed: expected active-Hickory status 1, got %s\n' "$status" >&2
-  exit 1
-fi
-
-if ASTER_TEST_REAL_CARGO="$real_cargo" CARGO="$expanded_paste_cargo" \
-  sh "$checker" >/dev/null 2>&1; then
-  printf '%s\n' 'dependency-exception regression failed: reintroduced paste graph passed' >&2
-  exit 1
-else
-  status=$?
-fi
-
-if [ "$status" -ne 1 ]; then
-  printf 'dependency-exception regression failed: expected reintroduced-paste status 1, got %s\n' "$status" >&2
-  exit 1
-fi
-
-if ASTER_TEST_REAL_CARGO="$real_cargo" CARGO="$second_paste_version_cargo" \
-  sh "$checker" >/dev/null 2>&1; then
-  printf '%s\n' 'dependency-exception regression failed: second active paste version passed' >&2
-  exit 1
-else
-  status=$?
-fi
-
-if [ "$status" -ne 1 ]; then
-  printf 'dependency-exception regression failed: expected second-paste-version status 1, got %s\n' "$status" >&2
-  exit 1
-fi
-
-if ASTER_TEST_REAL_CARGO="$real_cargo" CARGO="$expanded_basic_toml_cargo" \
-  sh "$checker" >/dev/null 2>&1; then
-  printf '%s\n' 'dependency-exception regression failed: expanded basic-toml graph passed' >&2
-  exit 1
-else
-  status=$?
-fi
-
-if [ "$status" -ne 1 ]; then
-  printf 'dependency-exception regression failed: expected expanded-basic-toml status 1, got %s\n' "$status" >&2
-  exit 1
-fi
-
-if ASTER_TEST_REAL_CARGO="$real_cargo" CARGO="$fuzz_basic_toml_cargo" \
-  sh "$checker" >/dev/null 2>&1; then
-  printf '%s\n' 'dependency-exception regression failed: fuzz basic-toml graph passed' >&2
-  exit 1
-else
-  status=$?
-fi
-
-if [ "$status" -ne 1 ]; then
-  printf 'dependency-exception regression failed: expected fuzz-basic-toml status 1, got %s\n' "$status" >&2
-  exit 1
-fi
+for package in basic-toml proc-macro-error2; do
+  for mode in escape fuzz empty reverse-failure; do
+    expected_status=1
+    if [ "$mode" = reverse-failure ]; then expected_status=97; fi
+    if ASTER_TEST_REAL_CARGO="$real_cargo" ASTER_TEST_SCOPE_MODE="$mode" \
+      ASTER_TEST_SCOPE_PACKAGE="$package" CARGO="$scope_cargo" \
+      sh "$checker" >"$temporary_directory/output" 2>&1; then
+      status=0
+    else
+      status=$?
+    fi
+    if [ "$status" -ne "$expected_status" ]; then
+      printf 'dependency-exception regression failed: %s %s returned %s, expected %s\n' \
+        "$package" "$mode" "$status" "$expected_status" >&2
+      exit 1
+    fi
+  done
+done
 
 second_basic_toml_lock="$temporary_directory/second-basic-toml.lock"
 cp "$repository_root/Cargo.lock" "$second_basic_toml_lock"
@@ -162,4 +116,4 @@ check_rejected_root_lock \
   'same-version basic-toml with a changed checksum' \
   "$changed_basic_toml_checksum_lock"
 
-printf '%s\n' 'dependency-exception regression passed: cargo-tree failures propagate; active vulnerable Hickory, reintroduced paste, escaped basic-toml, and unreviewed lockfile provenance fail closed'
+printf '%s\n' 'dependency-exception regression passed: equivalent reverse graphs pass; both advisory boundaries, graph failures, and unreviewed lockfile provenance fail closed'

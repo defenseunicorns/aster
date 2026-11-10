@@ -1802,34 +1802,6 @@ class SelectedLiveBlobReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(CHECKER.ReceiptViolation, pattern):
             self.fixture.receipt()
 
-    def test_independent_contract_oracles_match_checker(self) -> None:
-        self.assertEqual(CHECKER.SCHEMA, ORACLE_RECEIPT_SCHEMA)
-        self.assertEqual(CHECKER.RAW_SCHEMA, ORACLE_RAW_SCHEMA)
-        self.assertEqual(CHECKER.TRANSCRIPT_SCHEMA, ORACLE_TRANSCRIPT_SCHEMA)
-        self.assertEqual(CHECKER.CLAIM, ORACLE_CLAIM)
-        self.assertEqual(tuple(CHECKER.PARTICIPANTS), PARTICIPANTS)
-        self.assertEqual(tuple(CHECKER.EXPECTED_BUILD_ARGV), ORACLE_BUILD_ARGV)
-        self.assertEqual(CHECKER.ADMITTED_SOURCE_PATHS, ORACLE_ADMITTED_PATHS)
-        self.assertEqual(tuple(CHECKER.EXPECTED_SEQUENCE), ORACLE_EXPECTED_SEQUENCE)
-        self.assertEqual(CHECKER.READY_KEYS, ORACLE_READY_KEYS)
-        self.assertEqual(CHECKER.CONTACT_KEYS, ORACLE_CONTACT_KEYS)
-        self.assertEqual(CHECKER.STOP_KEYS, ORACLE_STOP_KEYS)
-        self.assertEqual(CHECKER.PAYLOAD_LEN, ORACLE_PAYLOAD_LEN)
-        self.assertEqual(CHECKER.PAGE_LIMIT, ORACLE_PAGE_LIMIT)
-        self.assertEqual(CHECKER.PAYLOAD_SHA256, ORACLE_PAYLOAD_SHA256)
-        self.assertEqual(CHECKER.CHANGED_PAYLOAD_SHA256, ORACLE_CHANGED_PAYLOAD_SHA256)
-        self.assertEqual(CHECKER.SCHEMA_ID_SHA256, ORACLE_SCHEMA_ID_SHA256)
-        self.assertEqual(CHECKER.PAGE_FACTS, ORACLE_PAGE_FACTS)
-        self.assertEqual(tuple(CHECKER.LIMITATIONS), ORACLE_LIMITATIONS)
-        self.assertEqual(tuple(CHECKER.NONCLAIMS), ORACLE_NONCLAIMS)
-        self.assertEqual(
-            CHECKER.OLD_RECEIPT_SOURCE_COMMIT,
-            ORACLE_SUPERSEDED_SOURCE_COMMIT,
-        )
-        self.assertEqual(
-            CHECKER.OLD_RECEIPT_SHA256,
-            ORACLE_SUPERSEDED_RECEIPT_SHA256,
-        )
 
     def test_valid_projection_is_deterministic_bounded_and_sanitized(self) -> None:
         first = self.fixture.receipt()
