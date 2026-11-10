@@ -2419,7 +2419,6 @@ impl EventContactWakeState {
         }
     }
 
-    #[allow(dead_code)] // Reserved for the contact-insertion transition.
     fn arm_event_except(
         &mut self,
         peers: impl IntoIterator<Item = EndpointId>,
@@ -28179,7 +28178,6 @@ fn profile5_blob_network_error(error: blob_stream::BlobNetworkError) -> NodeErro
 }
 
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // Task 5 reconnects the authenticated profile-5 receive path.
 enum BlobStreamReportDirection {
     Sent,
     Received,

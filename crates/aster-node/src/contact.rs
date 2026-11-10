@@ -8,19 +8,16 @@ use std::{fmt, sync::Arc};
 
 /// One owned adapter-neutral contact selected for a runtime session.
 #[derive(Clone)]
-#[allow(dead_code)] // Variants are consumed incrementally by the Task 4 runtime migration.
 pub(crate) enum SelectedContact {
     Iroh(aster_iroh::Connection),
     Ordered(Arc<dyn OrderedContact>),
 }
 
 impl SelectedContact {
-    #[allow(dead_code)] // Consumed by the Iroh compatibility entrypoint migration.
     pub(crate) const fn from_iroh(connection: aster_iroh::Connection) -> Self {
         Self::Iroh(connection)
     }
 
-    #[allow(dead_code)] // The Linux Ring 1 driver consumes this in Task 5.
     pub(crate) fn from_ordered(contact: Arc<dyn OrderedContact>) -> Self {
         Self::Ordered(contact)
     }

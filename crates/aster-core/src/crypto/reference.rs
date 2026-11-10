@@ -12,8 +12,10 @@ use super::{
     MlKemDecapsulationKey, MlKemEncapsulationKey, MlKemKey, MlKemKeyExport, P256SecretKey,
     P256SigningKey, ResponderHandshake, ResponderHandshakePrepared, RustCryptoProvider,
     RustCryptoSigningKey, SealedBatchItem, SealedSourceBatch, Secret32, SecureChannel,
-    SequencedCiphertext, ServerFinished, ServerHello, SessionKeys, ZeroizeKey, client_hello_hash,
+    SequencedCiphertext, ServerFinished, ServerHello, ZeroizeKey, client_hello_hash,
 };
+#[cfg(feature = "fuzzing")]
+use super::SessionKeys;
 use crate::batch;
 use crate::blob::{
     BlobId, BlobPhysicalLineage, BlobRouteCommitment, BlobStore, BlobStoreConfig,

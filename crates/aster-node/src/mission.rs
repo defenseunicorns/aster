@@ -2853,7 +2853,6 @@ impl HybridMissionSession {
             .map_err(Into::into)
     }
 
-    #[allow(dead_code)] // Consumed by the profile-5 runtime driver in Task 7.
     pub(crate) fn mint_blob_custody_send_context_v2(
         &self,
         direction: crate::frame::EventDirection,
@@ -3125,7 +3124,6 @@ impl HybridMissionSession {
         Ok(plaintext)
     }
 
-    #[allow(dead_code)] // Consumed by the profile-5 runtime driver in Task 7.
     pub(crate) fn seal_blob_custody_frame_v2(
         &mut self,
         transfer_profile_digest: [u8; 32],
@@ -3143,7 +3141,6 @@ impl HybridMissionSession {
             .map_err(Into::into)
     }
 
-    #[allow(dead_code)] // Consumed by the profile-5 runtime driver in Task 7.
     pub(crate) fn open_blob_custody_frame_v2(
         &mut self,
         transfer_profile_digest: [u8; 32],
