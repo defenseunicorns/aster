@@ -103,12 +103,6 @@ RESOURCE_NAME = re.compile(r"^aster-lab-[a-z0-9][a-z0-9-]{0,62}$")
 RUN_ID = re.compile(r"^[0-9a-f]{16}$")
 MEMORY_VALUE = re.compile(r"^[1-9][0-9]*(?:[kmgt]b?|b)?$", re.IGNORECASE)
 CPU_VALUE = re.compile(r"^(?:[1-9][0-9]*|0\.[0-9]+|[1-9][0-9]*\.[0-9]+)$")
-BLUER_UPSTREAM_AUTOMATION_DIRECTORY = (
-    "third-party/bluer-0.17.4-aster/bluetooth-numbers-database/.github"
-)
-PROVENANCE_ONLY_BUILD_DIRECTORIES = frozenset(
-    {BLUER_UPSTREAM_AUTOMATION_DIRECTORY}
-)
 EXPECTED_DOCKERIGNORE = f"""**
 !Cargo.toml
 !Cargo.lock
@@ -123,8 +117,6 @@ EXPECTED_DOCKERIGNORE = f"""**
 !lab/Dockerfile.selected-nat
 !lab/Dockerfile.dockerignore
 !lab/debian.sources
-{BLUER_UPSTREAM_AUTOMATION_DIRECTORY}/
-{BLUER_UPSTREAM_AUTOMATION_DIRECTORY}/**
 """
 TIMEOUT_CAPTURE_LIMIT = 4 * 1024 * 1024
 
@@ -1284,13 +1276,6 @@ def exact_resources(label: str, names: Iterable[tuple[str, str]]) -> list[Planne
     return result
 
 
-def provenance_only_build_path(relative: str) -> bool:
-    return any(
-        relative == directory or relative.startswith(f"{directory}/")
-        for directory in PROVENANCE_ONLY_BUILD_DIRECTORIES
-    )
-
-
 def collect_build_inputs() -> list[BuildInput]:
     """Read the complete, deny-all build context into an immutable in-memory set."""
     root_ignore = WORKSPACE / ".dockerignore"
@@ -1313,8 +1298,7 @@ def collect_build_inputs() -> list[BuildInput]:
     ]
     if not from_sources or any(source != "${LAB_BASE_IMAGE}" for source in from_sources):
         raise LabError("Dockerfile contains a base outside the single pinned build argument")
-    # Exact provenance-only directories are pruned during traversal. Every
-    # other hidden directory is rejected; these are the only hidden regular
+    # Hidden directories are rejected; these are the only hidden regular
     # files admitted.
     allowed_hidden_files = {
         ".cargo_vcs_info.json",
@@ -1341,13 +1325,6 @@ def collect_build_inputs() -> list[BuildInput]:
             files.sort()
             directory_path = Path(directory)
             relative_directory = directory_path.relative_to(tree)
-            names[:] = [
-                name
-                for name in names
-                if not provenance_only_build_path(
-                    (directory_path / name).relative_to(WORKSPACE).as_posix()
-                )
-            ]
             if directory_path.is_symlink() or any(
                 part.startswith(".") for part in relative_directory.parts
             ):
@@ -3135,11 +3112,7 @@ def validate_selected_nat_tracked_inputs(
         raise LabError("git returned a noncanonical selected NAT tracked path")
     if len(set(tracked_list)) != len(tracked_list):
         raise LabError("git returned a duplicate selected NAT tracked path")
-    tracked = {
-        relative
-        for relative in tracked_list
-        if not provenance_only_build_path(relative)
-    }
+    tracked = set(tracked_list)
     admitted = {item.relative_path for item in inputs}
     if len(admitted) != len(inputs) or tracked != admitted:
         untracked = sorted(admitted - tracked)
@@ -3216,11 +3189,6 @@ def validate_selected_nat_commit_inputs(
         ):
             raise LabError("selected NAT commit input path is noncanonical or duplicated")
         committed[relative] = (mode, object_id)
-    committed = {
-        relative: value
-        for relative, value in committed.items()
-        if not provenance_only_build_path(relative)
-    }
     captured = {item.relative_path: item for item in inputs}
     if len(captured) != len(inputs) or set(captured) != set(committed):
         raise LabError("selected NAT captured inputs differ from the immutable commit tree")

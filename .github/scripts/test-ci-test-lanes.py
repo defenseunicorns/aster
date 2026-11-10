@@ -263,19 +263,6 @@ class QualityLaneTests(unittest.TestCase):
         self.assertNotIn("test_aster_compose_delivery.py", core)
         self.assertNotIn("test_inspect_aster_compose_oci.py", core)
 
-    def test_quality_prefetches_standalone_vendor_test_graphs(self):
-        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
-        quality = workflow_job(workflow, "quality", "cargo-lockfiles")
-
-        for manifest in (
-            "third-party/hmac-0.13.0-aster/Cargo.toml",
-            "third-party/bluer-0.17.4-aster/Cargo.toml",
-        ):
-            self.assertIn(
-                f"cargo fetch --locked --manifest-path {manifest}",
-                quality,
-            )
-
     def test_local_foundation_aggregate_keeps_lockfile_and_core_coverage(self):
         mise = MISE_CONFIG.read_text(encoding="utf-8")
         foundation = mise.split("[tasks.check-foundation]\n", 1)[1].split(

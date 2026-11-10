@@ -1,97 +1,52 @@
-# Android-to-Linux BTLE Ring-1 Event validation
+# Android-to-Linux BTLE text Event validation
 
-This evaluation path runs one foreground Android initiator against the fixed-role
-Linux Ring-1 listener over an LE L2CAP credit-based channel. It is intended to
-produce cross-platform engineering evidence for protected semantic-v9 Events in
-both directions, including a short text Event entered on Android and printed by
-the Linux terminal.
-It is not a production app, daemon, supported transport, or requirement-credit
-path.
+This runbook sends a short text Event from a foreground Android evaluator to a
+fixed Linux listener over LE L2CAP CoC. Linux prints the authenticated text,
+Event ID, and digest; Android also receives Linux's retained 65,536-byte Event.
+It is evaluation-only: no discovery, background service, IP fallback, pairing
+authority, support row, requirement credit, or production claim.
 
-The Android app does not scan, advertise, use GATT, request Internet access, or
-select a fallback carrier. The Linux harness and Android native library start the
-transport-neutral Aster runtime in-process. Pairing and Bluetooth link encryption
-grant no Aster authority; the mission handshake authenticates the expected
-mission node ID before inventory.
+## Acceptance sequence
 
-Before requesting Bluetooth permission, inspecting adapter availability, or
-opening a socket, the native
-validator durably commits or reuses the bounded text Event and creates or
-replays its private durable exact `Consume` subscription for `mesh.messages` at
-`demo/playground`. A fresh app state therefore needs no separate publication or
-subscription command, and a missing carrier leaves the publication waiting
-durably for a later contact. The Linux harness prepares the complementary exact
-durable subscription before admitting the BTLE contact. These fixed selectors
-and journals are evaluation implementation details, not semantic-v9 fields or a
-production publication/subscription UX.
+1. Build the Linux harness and Android APK from the same source tree; record the
+   source commit and SHA-256 of both artifacts.
+2. Create a fresh two-node lab. Publish the Linux 65,536-byte Event while no
+   peer is configured, then stop the local agent.
+3. Clean-install or clear the Android app, import only the Android mission
+   bundle, and enter a unique text message of at most 1,024 UTF-8 bytes.
+4. Resolve the phone's current LE address/type on Linux. Start the exact-address
+   Linux listener, press **Send and validate**, and keep the app foregrounded.
+5. Accept only matching Android/Linux receipts and the exact terminal-safe text
+   line described below.
+6. Retain sanitized evidence, then remove the bundle, app data, and lab.
 
-## Minimal end-to-end runbook
+## Prerequisites
 
-Use the detailed sections below for prerequisites and commands. The short
-acceptance sequence is:
+- Linux with a BlueZ-visible LE controller and an Android API 29+ arm64 device.
+- JDK 17, Gradle 9.6.0, Android SDK 37, NDK 28.2.13676358, Platform Tools, and
+  Rust target `aarch64-linux-android`.
+- One Linux and one Android mission bundle from the same evaluation authority,
+  authorized for `mesh.messages` in `demo/playground`.
+- One LE PSM from 128 through 255; examples use 128.
+- No Aster IP contact between these peers.
 
-1. Rebuild both endpoints from the exact source tree under test. Run
-   `cargo test -p aster-ble-linux --bin aster-btle-ring1 --no-fail-fast`, then
-   `cargo build -p aster-ble-linux --bin aster-btle-ring1 --locked`; run
-   `gradle :app:testDebugUnitTest :app:assembleDebug` under
-   `examples/android-btle-ring1`. Record `git rev-parse HEAD` and SHA-256 hashes
-   for both the Linux binary and APK. Never reuse an older harness binary.
-2. Create a fresh disposable two-node lab, pre-publish the 65,536-byte Linux
-   Event while no peer is configured, and stop the local agent cleanly.
-3. Clear or clean-install the Android app, copy only the node-1 bundle through
-   the document picker, enter a short unique message, and leave **Send and
-   validate** unpressed.
-4. Resolve the Pixel's current LE address and address type on Linux. Configure
-   that exact address, the selected controller, PSM, and expected mission IDs;
-   never use wildcard peer admission or substitute a public/classic identity
-   for an observed random LE address.
-5. Start the current Linux listener command below, immediately press **Send and
-   validate**, and keep the app in the foreground until both sides terminate.
-6. Accept the run only when Android reports `complete` with a publication ID and
-   payload digest, and Linux prints all three of: `CONTACT` with one fetched and
-   inserted Event and zero duplicates; `BTLE_RING1_EVENT` with the exact entered
-   text and matching ID/digest; and `BTLE_RING1 status=complete` with semantic 9,
-   profiles `2,1,1,5,1`, and both profile and Event validation true. Retain a
-   sanitized Linux log and Android screenshot or UI hierarchy.
-7. Remove the copied bundle and UI capture, uninstall or clear the app, and
-   delete the disposable lab after recording only sanitized evidence.
+The listener requires the exact current phone address and address type. If a
+rotating address cannot be observed and held for the attempt, this fixed-locator
+profile is blocked; do not weaken it to wildcard admission.
 
-On the evaluated Realtek/Linux stack, a cold controller can hit the documented
-early-ACL kernel race. A connection from an unrelated mouse changed that race
-in diagnosis, but it is not an operational workaround and does not qualify the
-stack. Record such a run as warm evidence and repeat cold qualification on a
-corrected kernel or unaffected controller.
+The evaluated Realtek/Linux stack has a cold-controller race in which ACL data
+can arrive before HCI Connection Complete and be discarded. An unrelated mouse
+made the path warm during diagnosis, but that is not an operational workaround.
+Treat success on that stack as warm-state evidence and repeat cold qualification
+on a corrected kernel or unaffected controller.
 
-## Fixed topology and prerequisites
+## Build and create a disposable lab
 
-- Android is the initiator; Linux is the listener.
-- Use one Linux host with a BlueZ-visible LE controller and one Android API 29+
-  arm64 device whose current Bluetooth address and address type can be supplied
-  to the fixed Linux harness.
-- The Android build is pinned to JDK 17, Gradle 9.6.0, Android SDK 37, Android
-  NDK 28.2.13676358, and the Rust `aarch64-linux-android` target.
-- The current native build script supports the NDK `linux-x86_64` or
-  `darwin-x86_64` prebuilt layout. SDK Build Tools and Platform Tools (`adb`)
-  are also required.
-- The Linux and Android nodes need separate unprotected-reference mission bundles
-  issued by the same evaluation authority and authorized for one common Event
-  topic and scope.
-- Choose one LE PSM from 128 through 255. The examples below use 128 (`0x80`).
-- No Aster IP contact may be configured between these two mission peers. The
-  commands below publish through a peerless, loopback-bound Linux agent, stop it,
-  and then start the BTLE-only harness.
-
-The initial Linux driver validates an exact peer Bluetooth address. If the phone
-exposes only a rotating address that the operator cannot resolve and hold for the
-attempt, this profile is blocked on that device. Do not weaken the listener to a
-wildcard peer. Record the observed address and whether it is public or random.
-
-## Build the Linux tools and create disposable identities
-
-Run from the repository root on Linux:
+From the repository root:
 
 ```sh
 mise install
+cargo test -p aster-ble-linux --bin aster-btle-ring1 --no-fail-fast
 cargo build --locked \
   -p aster-node -p aster-agent -p asterctl -p aster-ble-linux \
   --bin aster --bin aster-agent --bin asterctl --bin aster-btle-ring1
@@ -102,29 +57,24 @@ chmod 700 "$ASTER_BTLE_LAB"
   | tee "$ASTER_BTLE_LAB/provisioning.log"
 ```
 
-Retain the two `PLAYGROUND_NODE` lines. In this guide, node 0 is Linux and node
-1 is Android:
+Node 0 is Linux and node 1 is Android. Record their `mission_id` values:
 
 ```text
 LINUX_MISSION_ID=<node-0 mission_id>
 ANDROID_MISSION_ID=<node-1 mission_id>
 ```
 
-The relevant bundle paths are:
+The bundles are:
 
 ```text
 <lab>/mesh/node-0/mission.unprotected-reference.bundle
 <lab>/mesh/node-1/mission.unprotected-reference.bundle
 ```
 
-These are disposable plaintext test credentials. Keep the lab directory
-owner-only, do not commit it, and remove every copied bundle after the run.
+They are disposable plaintext credentials. Keep the lab owner-only and never
+commit or retain the bundles.
 
-## Publish one Event while Linux has no peer
-
-Create a 65,536-byte payload. This is larger than the app's accepted maximum LE
-packet size, so the protected Event page must span the Android receive packet
-size rather than relying on a typical controller MTU.
+## Publish the Linux Event before contact
 
 ```sh
 dd if=/dev/zero of="$ASTER_BTLE_LAB/event.bin" bs=65536 count=1
@@ -146,7 +96,7 @@ chmod 600 "$ASTER_BTLE_LAB/client.token"
 ASTER_AGENT_PID=$!
 ```
 
-After `agent.log` contains `AGENT status=ready`, publish exactly once:
+After `AGENT status=ready` appears:
 
 ```sh
 ./target/debug/asterctl --token-file "$ASTER_BTLE_LAB/client.token" --json publish \
@@ -160,15 +110,10 @@ kill -INT "$ASTER_AGENT_PID"
 wait "$ASTER_AGENT_PID"
 ```
 
-Do not start the listener until the agent has stopped cleanly and released the
-state. The successful publication is a durable local commit; it does not claim
-delivery.
+Do not start the BTLE listener until the agent has released the state. This
+receipt proves local durability, not peer delivery.
 
-## Build and install the Android validator
-
-Install the pinned tools explicitly; this repository does not download them or
-include a Gradle wrapper. Set `ANDROID_HOME` (or `ANDROID_SDK_ROOT`) to the SDK
-containing platform 37 and NDK 28.2.13676358, then run:
+## Build and install Android
 
 ```sh
 rustup target add aarch64-linux-android
@@ -177,30 +122,21 @@ gradle --version
 gradle :app:testDebugUnitTest :app:assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 cd ../..
-```
 
-`gradle --version` must report exactly Gradle 9.6.0 and a JDK 17 runtime. The
-build fails closed for another Gradle or NDK version. The generated native
-library and APK stay under `app/build/` and must not be committed.
-
-Copy the node-1 evaluation bundle to a location available to Android's system
-document picker, for example:
-
-```sh
 adb push \
   "$ASTER_BTLE_LAB/mesh/node-1/mission.unprotected-reference.bundle" \
   /sdcard/Download/aster-android-ring1.bundle
 ```
 
-## Prepare the radio and Android form
+`gradle --version` must report Gradle 9.6.0 on JDK 17. Set `ANDROID_HOME` or
+`ANDROID_SDK_ROOT` to SDK 37 with NDK 28.2.13676358. Build output stays under
+`app/build/` and must not be committed.
 
-Record the exact source commit, APK digest, Android build/device, Linux kernel,
-BlueZ, controller, addresses, address types, and PSM. Useful read-only Linux
-observations include `bluetoothctl show`, `btmgmt -i hci0 info`, and `uname -a`.
-Power and configure the controller before starting Aster; the harness never
-powers a controller implicitly.
+## Configure the radio and form
 
-Set the values observed for the selected devices:
+Record source commit, artifact hashes, Android build/device, Linux kernel,
+BlueZ, controller, addresses/types, and PSM. Power/configure the controller
+using the host procedure; Aster does not power it.
 
 ```text
 LINUX_ADAPTER=hci0
@@ -211,21 +147,18 @@ ANDROID_BT_ADDRESS_TYPE=public|random
 PSM=128
 ```
 
-Open **Aster BTLE Ring-1** before starting the listener and enter:
+Open **Aster BTLE Ring-1** and enter:
 
-- Message: a non-empty text value whose UTF-8 encoding is at most 1,024 bytes;
-- Linux Bluetooth address: `LINUX_BT_ADDRESS`;
-- LE PSM: decimal `128`;
-- expected Linux mission node ID: `LINUX_MISSION_ID`; and
-- mission bundle: select `aster-android-ring1.bundle` through the picker and
-  wait for the copy to complete.
+- a non-empty message of at most 1,024 UTF-8 bytes;
+- Linux Bluetooth address and decimal PSM 128;
+- `LINUX_MISSION_ID`; and
+- `aster-android-ring1.bundle` through the document picker.
 
-Do not press **Send and validate** yet.
+Wait for the bundle copy and do not press **Send and validate** yet.
 
-## Start the listener and connect within 30 seconds
+## Run the contact
 
-The fixed listener's platform-open deadline is 30 seconds. Start it in a second
-terminal only after the Android form is ready:
+The listener has a 30-second open deadline:
 
 ```sh
 ./target/debug/aster-btle-ring1 \
@@ -244,104 +177,50 @@ terminal only after the Android form is ready:
   2>&1 | tee "$ASTER_BTLE_LAB/linux-ring1.log"
 ```
 
-Promptly press **Send and validate** and keep the Activity in the foreground.
-If the listener reaches its deadline first, restart it and make a fresh app
-attempt; a timed-out stream is never reused. The expected progression is:
+Immediately press **Send and validate**. If the deadline expires, start a fresh
+listener and app attempt; never reuse the timed-out stream.
 
-```text
-ready -> connecting -> carrier connected -> authenticating -> reconciling -> complete
-```
+## Verify
 
-A valid Android completion must report a non-empty `published_event_id`, a
-64-hex-character `published_payload_sha256`, a positive outbound Event page
-entry and byte count, semantic 9, profiles `2,1,1,5,1`, a
-64-hex-character canonical profile digest, `peer_match=true`,
-`digest_match=true`, one received Event entry, one durable insert,
-`larger_than_rx=true`, and `no_blob=true`. The Linux terminal must independently
-print `BTLE_RING1 status=complete`, the same semantic/profile result, one Event
-sent, no profile drift, and `event_validation=true`. It snapshots retained
-matching Events before contact and must also print exactly one safe, single-line
-receipt for a newer Event durably inserted by this contact:
+Android must report `complete`, a non-empty publication ID, a 64-hex payload
+digest, positive outbound Event count, semantic 9, profiles `2,1,1,5,1`, profile
+digest and peer matches, one received/durably inserted Event,
+`larger_than_rx=true`, and `no_blob=true`.
+
+Linux must report:
+
+- one fetched and inserted Android Event with zero duplicates;
+- `BTLE_RING1 status=complete` with semantic/profile and Event validation true;
+- one large Event sent; and
+- exactly one line matching:
 
 ```text
 BTLE_RING1_EVENT status=received publisher=<ANDROID_MISSION_ID> sequence=<n> id=<event-id> payload_sha256=<sha256> text="<entered text>"
 ```
 
-The terminal Event ID and payload digest must equal the Android publication
-receipt. The rendered text must preserve the entered UTF-8 bytes; quotes,
-backslashes, newlines, C0/C1 controls, Unicode line separators, and bidi/format
-controls are JSON-escaped so the receipt cannot inject or visually reorder
-terminal fields.
+The Linux Event ID and digest must equal Android's publication receipt, and the
+rendered text must preserve the entered UTF-8 bytes under terminal-safe JSON
+escaping. If prior unavailable attempts left a bounded backlog, require zero
+remaining, deferred-lane, and unscheduled work and compare the greatest newly
+inserted sequence with the current Android receipt.
 
-If more than one message was durably retained across earlier unavailable
-carrier attempts, the contact may reconcile that bounded backlog. Validation
-succeeds only when the receipt reports no remaining, deferred-lane, or
-unscheduled Event work. Linux then prints the greatest sequence newly inserted
-by this contact; compare that Event ID and digest with the current Android
-publication receipt. If the contact reaches its work bound first, it fails
-closed while retaining durable progress; repeat the contact to continue.
+Retain only the source commit, artifact hashes, platform/controller versions,
+address types/PSM, sanitized Linux log, and Android screenshot or UI hierarchy.
+Do not retain credentials, state, payloads, APKs, raw device logs, addresses,
+mission IDs, or device serials in the repository.
 
-Retain the Linux log and an Android screenshot or UI hierarchy showing the
-bounded terminal summary. Also retain `git rev-parse HEAD` and
-`sha256sum examples/android-btle-ring1/app/build/outputs/apk/debug/app-debug.apk`
-with the environment observations. These artifacts are evaluation evidence
-only; do not add credentials, state, payloads, APKs, or raw device logs to the
-repository.
-
-## Connection-recovery diagnostic
-
-Run this as an alternative fresh setup, not after the successful acceptance run
-above. Create a new disposable two-node lab and pre-published Event, clear the
-app's evaluation data with
-`adb shell pm clear org.defenseunicorns.aster.btlering1`, reopen it, and select
-the new node-1 bundle. On that setup's first contact, interrupt only while the
-app is still `connecting` or `authenticating`, before it enters `reconciling`.
-Restart the Linux listener and make a fresh app attempt. That retry becomes the
-setup's first successful delivery and must produce the normal one-insert
-acceptance fields.
-
-This UI is not sufficient to prove deduplication across an arbitrary
-interruption. Cancellation can race a durable insertion before the terminal
-callback; a later contact can then correctly insert zero rows, while this
-validator intentionally requires one new insert and reports failure. If the
-interruption boundary is unknown, discard the evaluation state and reprovision
-before repeating the one-Event acceptance run. A deduplication claim requires
-separate retained store instrumentation and is outside this quickstart.
-
-## Cancel and clean up
-
-The **Cancel** button, Activity destruction, a carrier failure, or the bounded
-deadline closes the Bluetooth socket and native session. The failed stream is
-never reused; start a fresh listener and a fresh app attempt.
-
-After retaining only sanitized evidence, uninstall the app, remove the shared
-bundle copy, and delete the exact disposable lab directory:
+## Clean up and claim boundary
 
 ```sh
 adb uninstall org.defenseunicorns.aster.btlering1
 adb shell rm /sdcard/Download/aster-android-ring1.bundle
-printf 'remove disposable lab: %s\n' "$ASTER_BTLE_LAB"
 rm -r -- "$ASTER_BTLE_LAB"
 ```
 
-## What this does not establish
-
-This run does not establish production readiness, background operation,
-discovery, pairing authority, rotating-address support, reconnection policy,
-controller hot-plug, State/Record/Blob transfer, transport selection or
-fallback, all-class scheduling, packaging/support status, performance, scale,
-or independent interoperability. The retained
-[Pixel/Linux Ring-1 record](../validation/evidence/2026-11-06-android-linux-btle-ring1-validation.md)
-and later
-[text Event record](../validation/evidence/2026-11-09-android-linux-btle-text-event-validation.md)
-establish only bounded foreground warm-state interoperability for their exact
-builds, phone, Linux host, controller, and procedures. They cover the public
-Android CoC connection, APK/JNI path, matching terminal receipts, clean-install
-Android text publication, the reciprocal retained large Event, and the bounded
-native preparation-stack correction. They do not qualify unattended initiation
-from a cold Linux controller epoch: the retained
-[early-ACL diagnostic](../validation/evidence/2026-11-09-android-linux-btle-early-acl-diagnostic.md)
-shows the evaluated Linux host discarding the Pixel's already-sent CoC request
-when inbound ACL data precedes HCI Connection Complete. No warm-up, shared
-controller reset, protocol fallback, or kernel-version heuristic is part of
-this path.
+The retained
+[Android/Linux physical summary](../validation/evidence/2026-11-09-android-linux-btle-text-event-validation.md)
+records the exact warm-state Pixel/Linux result and cold-controller limitation.
+This run does not establish background operation, discovery, pairing authority,
+reconnection policy, controller hot-plug, State/Record/Blob transfer, automatic
+selection/fallback, packaging, performance, scale, broad interoperability, or
+production readiness.

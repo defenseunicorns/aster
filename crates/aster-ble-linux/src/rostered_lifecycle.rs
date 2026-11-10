@@ -668,7 +668,7 @@ where
     );
     if lifecycle_now() >= expires_at {
         discovery.force_owner_loss();
-        let cleanup = stop_advertisement(
+        let cleanup = release_advertisement(
             advertisement
                 .as_mut()
                 .expect("advertisement was just registered")
@@ -689,7 +689,7 @@ where
         Ok(started) => started,
         Err(error) => {
             discovery.force_owner_loss();
-            let cleanup = stop_advertisement(
+            let cleanup = release_advertisement(
                 advertisement
                     .as_mut()
                     .expect("advertisement was just registered")
@@ -705,7 +705,7 @@ where
         discovery.force_owner_loss();
         let (mut scan, _) = started_scan.into_parts();
         let scan_cleanup = stop_scan(scan.as_mut());
-        let advertisement_cleanup = stop_advertisement(
+        let advertisement_cleanup = release_advertisement(
             advertisement
                 .as_mut()
                 .expect("advertisement was just registered")
@@ -731,12 +731,13 @@ where
         },
         deadline: tokio::time::Instant::now() + SCAN_ACTIVE_INTERVAL,
     };
-    let mut advertisement_deadline = tokio::time::Instant::now() + ADVERTISEMENT_ROTATION_INTERVAL;
+    let advertisement_deadline = tokio::time::Instant::now() + ADVERTISEMENT_ROTATION_INTERVAL;
     let credential_deadline = tokio::time::Instant::from_std(expires_at);
     let mut contact_phase = ContactPhase::accepting(sockets.clone(), listener.clone());
     let mut outbound_delay = OutboundDelay::Ready;
     let mut outbound_candidate_pending = false;
     let mut contact_backoff = CappedBackoff::new(INITIAL_EPOCH_RETRY, MAXIMUM_EPOCH_RETRY);
+    let mut owner_loss_required = true;
     if let Some(ref availability) = signals.availability {
         publish_availability(availability, crate::BtleAvailability::Available);
     }
@@ -815,38 +816,12 @@ where
                 break Err(SupervisorError::Controller(DriverErrorKind::Transport));
             }
             EpochEvent::AdvertisementRotation => {
-                let record = match encode_advertisement(&config, listener_psm, nonces.as_ref()) {
-                    Ok(record) => record,
-                    Err(error) => break Err(supervisor_error(error)),
-                };
                 let mut previous = advertisement.take().expect("advertisement is live");
-                if let Err(error) = stop_advertisement(previous.as_mut()).await {
+                if let Err(error) = release_advertisement(previous.as_mut()).await {
                     break Err(supervisor_error(error));
                 }
-                if lifecycle_now() >= config.discovery_credentials().expires_at() {
-                    break Err(SupervisorError::Controller(DriverErrorKind::Unavailable));
-                }
-                advertisement = match await_epoch_platform(
-                    expires_at,
-                    &cancellation,
-                    discovery.start_advertisement(config.controller(), record),
-                )
-                .await
-                {
-                    Ok(owner) => Some(owner),
-                    Err(error) => break Err(error),
-                };
-                if lifecycle_now() >= expires_at {
-                    let mut owner = advertisement
-                        .take()
-                        .expect("advertisement was just registered");
-                    if let Err(error) = stop_advertisement(owner.as_mut()).await {
-                        break Err(supervisor_error(error));
-                    }
-                    break Err(SupervisorError::Controller(DriverErrorKind::Unavailable));
-                }
-                advertisement_deadline =
-                    tokio::time::Instant::now() + ADVERTISEMENT_ROTATION_INTERVAL;
+                owner_loss_required = false;
+                break Err(SupervisorError::Controller(DriverErrorKind::Transport));
             }
             EpochEvent::Observation(Some(observation)) => {
                 let now = lifecycle_now();
@@ -1023,7 +998,7 @@ where
             crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable),
         );
     }
-    if result.is_err() {
+    if result.is_err() && owner_loss_required {
         discovery.force_owner_loss();
     }
     contact_phase.cancel();
@@ -1036,19 +1011,19 @@ where
     };
     let advertisement_cleanup = async move {
         match advertisement {
-            Some(mut advertisement) => stop_advertisement(advertisement.as_mut()).await,
+            Some(mut advertisement) => release_advertisement(advertisement.as_mut()).await,
             None => Ok(()),
         }
     };
-    let (_, scan_stop, advertisement_stop) =
+    let (_, scan_stop, advertisement_release) =
         tokio::join!(contact_join, scan_cleanup, advertisement_cleanup);
     drop(listener);
-    if result.is_ok() && (scan_stop.is_err() || advertisement_stop.is_err()) {
+    if result.is_ok() && (scan_stop.is_err() || advertisement_release.is_err()) {
         discovery.force_owner_loss();
     }
     result?;
     scan_stop.map_err(supervisor_error)?;
-    advertisement_stop.map_err(supervisor_error)
+    advertisement_release.map_err(supervisor_error)
 }
 
 fn finish_contact_attempt(
@@ -1277,15 +1252,15 @@ async fn run_opened_contact(
     completion
 }
 
-async fn stop_advertisement(
+async fn release_advertisement(
     owner: &mut dyn crate::platform::discovery::OwnedAdvertisement,
 ) -> Result<(), DriverError> {
     let terminated = owner.terminated();
-    let stop = owner.stop();
+    let release = owner.release();
     stop_with_barrier(
-        stop,
+        release,
         terminated,
-        "owned roster advertisement stop timed out",
+        "owned roster advertisement release timed out",
     )
     .await
 }
@@ -1462,7 +1437,7 @@ mod tests {
     }
 
     impl OwnedAdvertisement for FakeOwner {
-        fn stop(&mut self) -> PlatformFuture<'_, ()> {
+        fn release(&mut self) -> PlatformFuture<'_, ()> {
             FakeOwner::stop(self)
         }
 
@@ -1498,7 +1473,7 @@ mod tests {
             self.events.lock().unwrap().push("advertise");
             self.advertisements.lock().unwrap().push(_advertisement);
             let owner = FakeOwner {
-                stop_event: "advertisement-stop",
+                stop_event: "advertisement-release",
                 events: self.events.clone(),
             };
             Box::pin(async move { Ok(Box::new(owner) as Box<dyn OwnedAdvertisement>) })
@@ -1734,7 +1709,7 @@ mod tests {
         ) -> PlatformFuture<'a, Box<dyn OwnedAdvertisement>> {
             self.events.lock().unwrap().push("advertise");
             let owner = FakeOwner {
-                stop_event: "advertisement-stop",
+                stop_event: "advertisement-release",
                 events: self.events.clone(),
             };
             Box::pin(async move { Ok(Box::new(owner) as Box<dyn OwnedAdvertisement>) })
@@ -1756,18 +1731,18 @@ mod tests {
 
     struct BlockingAdvertisementOwner {
         events: Arc<Mutex<Vec<&'static str>>>,
-        stop_released: Option<Arc<Notify>>,
+        release_completed: Option<Arc<Notify>>,
         terminated: Arc<Notify>,
     }
 
     impl OwnedAdvertisement for BlockingAdvertisementOwner {
-        fn stop(&mut self) -> PlatformFuture<'_, ()> {
+        fn release(&mut self) -> PlatformFuture<'_, ()> {
             Box::pin(async {
                 self.events
                     .lock()
                     .unwrap()
-                    .push("advertisement-stop-started");
-                match &self.stop_released {
+                    .push("advertisement-release-started");
+                match &self.release_completed {
                     Some(released) => {
                         released.notified().await;
                         Ok(())
@@ -1785,7 +1760,7 @@ mod tests {
 
     struct BarrierDiscovery {
         events: Arc<Mutex<Vec<&'static str>>>,
-        advertisement_stop_released: Option<Arc<Notify>>,
+        advertisement_release_completed: Option<Arc<Notify>>,
         advertisement_terminated: Arc<Notify>,
         scan_started: Arc<Notify>,
         owner_loss_forced: Arc<AtomicU8>,
@@ -1801,7 +1776,7 @@ mod tests {
             self.events.lock().unwrap().push("advertise");
             let owner = BlockingAdvertisementOwner {
                 events: self.events.clone(),
-                stop_released: self.advertisement_stop_released.clone(),
+                release_completed: self.advertisement_release_completed.clone(),
                 terminated: self.advertisement_terminated.clone(),
             };
             Box::pin(async move { Ok(Box::new(owner) as Box<dyn OwnedAdvertisement>) })
@@ -2183,13 +2158,13 @@ mod tests {
                 "advertise",
                 "scan",
                 "scan-stop",
-                "advertisement-stop"
+                "advertisement-release"
             ]
         );
     }
 
     #[tokio::test]
-    async fn scan_start_failure_awaits_advertisement_cessation() {
+    async fn scan_start_failure_releases_the_local_advertisement_owner() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let result = run_available_epoch(
             Arc::new(config()),
@@ -2212,7 +2187,7 @@ mod tests {
         );
         assert_eq!(
             *events.lock().unwrap(),
-            ["bind", "advertise", "scan-failed", "advertisement-stop"]
+            ["bind", "advertise", "scan-failed", "advertisement-release"]
         );
     }
 
@@ -2591,7 +2566,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn scan_owner_runs_ten_seconds_then_waits_twenty_before_restarting() {
+    async fn scan_owner_runs_ten_seconds_then_remains_idle_until_epoch_rotation() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let scan_started = Arc::new(Notify::new());
         let discovery = Arc::new(FakeDiscovery {
@@ -2600,8 +2575,6 @@ mod tests {
             scan_started: scan_started.clone(),
             observation_sender: Mutex::new(None),
         });
-        let cancellation = LifecycleCancellation::new();
-        let task_cancellation = cancellation.clone();
         let socket_events = events.clone();
         let task = tokio::spawn(async move {
             run_available_epoch(
@@ -2613,7 +2586,7 @@ mod tests {
                 Arc::new(SequenceNonce(AtomicU8::new(0x33))),
                 recording_admission(),
                 EpochSignals::default(),
-                task_cancellation,
+                LifecycleCancellation::new(),
             )
             .await
         });
@@ -2631,7 +2604,7 @@ mod tests {
             1
         );
 
-        tokio::time::advance(Duration::from_secs(19)).await;
+        tokio::time::advance(Duration::from_secs(14)).await;
         tokio::task::yield_now().await;
         assert_eq!(
             events
@@ -2642,6 +2615,7 @@ mod tests {
                 .count(),
             1
         );
+        assert!(!task.is_finished());
 
         tokio::time::advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
@@ -2652,11 +2626,14 @@ mod tests {
                 .iter()
                 .filter(|event| **event == "scan")
                 .count(),
-            2
+            1
         );
+        assert!(task.is_finished(), "rotation must end the current epoch");
 
-        cancellation.cancel();
-        task.await.unwrap().unwrap();
+        assert_eq!(
+            task.await.unwrap().unwrap_err(),
+            SupervisorError::Controller(DriverErrorKind::Transport)
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2705,7 +2682,7 @@ mod tests {
                 "advertise",
                 "scan",
                 "scan-stop",
-                "advertisement-stop"
+                "advertisement-release"
             ]
         );
     }
@@ -2717,7 +2694,7 @@ mod tests {
         let scan_started = Arc::new(Notify::new());
         let discovery = Arc::new(BarrierDiscovery {
             events: events.clone(),
-            advertisement_stop_released: None,
+            advertisement_release_completed: None,
             advertisement_terminated: Arc::new(Notify::new()),
             scan_started: scan_started.clone(),
             owner_loss_forced: owner_loss_forced.clone(),
@@ -2765,7 +2742,7 @@ mod tests {
         let scan_started = Arc::new(Notify::new());
         let discovery = Arc::new(BarrierDiscovery {
             events: events.clone(),
-            advertisement_stop_released: None,
+            advertisement_release_completed: None,
             advertisement_terminated: Arc::new(Notify::new()),
             scan_started: scan_started.clone(),
             owner_loss_forced: owner_loss_forced.clone(),
@@ -2802,7 +2779,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn rotation_stops_the_old_advertisement_before_registering_a_fresh_nonce() {
+    async fn rotation_releases_the_local_advertisement_and_ends_the_epoch() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let advertisements = Arc::new(Mutex::new(Vec::new()));
         let scan_started = Arc::new(Notify::new());
@@ -2834,6 +2811,10 @@ mod tests {
         tokio::time::advance(Duration::from_secs(25)).await;
         tokio::task::yield_now().await;
 
+        assert!(
+            task.is_finished(),
+            "rotation must leave replacement registration to a fresh epoch"
+        );
         assert_eq!(
             *events.lock().unwrap(),
             [
@@ -2841,28 +2822,29 @@ mod tests {
                 "advertise",
                 "scan",
                 "scan-stop",
-                "advertisement-stop",
-                "advertise"
+                "advertisement-release"
             ]
         );
         {
             let records = advertisements.lock().unwrap();
-            assert_eq!(records.len(), 2);
-            assert_ne!(records[0].record(), records[1].record());
+            assert_eq!(records.len(), 1);
         }
 
+        assert_eq!(
+            task.await.unwrap().unwrap_err(),
+            SupervisorError::Controller(DriverErrorKind::Transport)
+        );
         cancellation.cancel();
-        task.await.unwrap().unwrap();
     }
 
     #[tokio::test(start_paused = true)]
-    async fn timed_out_rotation_forces_owner_loss_and_never_registers_a_replacement() {
+    async fn timed_out_rotation_release_forces_owner_loss_without_replacement() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let owner_loss_forced = Arc::new(AtomicU8::new(0));
         let scan_started = Arc::new(Notify::new());
         let discovery = Arc::new(BarrierDiscovery {
             events: events.clone(),
-            advertisement_stop_released: None,
+            advertisement_release_completed: None,
             advertisement_terminated: Arc::new(Notify::new()),
             scan_started: scan_started.clone(),
             owner_loss_forced: owner_loss_forced.clone(),
@@ -2897,7 +2879,7 @@ mod tests {
                 "advertise",
                 "scan",
                 "scan-stop",
-                "advertisement-stop-started"
+                "advertisement-release-started"
             ]
         );
 
@@ -2916,14 +2898,14 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn stop_completion_before_deadline_rotates_without_forced_owner_loss() {
+    async fn local_release_before_deadline_ends_epoch_without_forced_owner_loss() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let stop_released = Arc::new(Notify::new());
+        let release_completed = Arc::new(Notify::new());
         let owner_loss_forced = Arc::new(AtomicU8::new(0));
         let scan_started = Arc::new(Notify::new());
         let discovery = Arc::new(BarrierDiscovery {
             events: events.clone(),
-            advertisement_stop_released: Some(stop_released.clone()),
+            advertisement_release_completed: Some(release_completed.clone()),
             advertisement_terminated: Arc::new(Notify::new()),
             scan_started: scan_started.clone(),
             owner_loss_forced: owner_loss_forced.clone(),
@@ -2932,8 +2914,6 @@ mod tests {
         let sockets = Arc::new(FakeSockets {
             events: events.clone(),
         });
-        let cancellation = LifecycleCancellation::new();
-        let task_cancellation = cancellation.clone();
         let task = tokio::spawn(async move {
             run_available_epoch(
                 Arc::new(config()),
@@ -2942,7 +2922,7 @@ mod tests {
                 Arc::new(SequenceNonce(AtomicU8::new(0x33))),
                 recording_admission(),
                 EpochSignals::default(),
-                task_cancellation,
+                LifecycleCancellation::new(),
             )
             .await
         });
@@ -2951,7 +2931,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(25)).await;
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(4)).await;
-        stop_released.notify_one();
+        release_completed.notify_one();
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
 
@@ -2962,12 +2942,14 @@ mod tests {
                 .iter()
                 .filter(|event| **event == "advertise")
                 .count(),
-            2
+            1
         );
         assert_eq!(owner_loss_forced.load(Ordering::Acquire), 0);
+        assert!(task.is_finished(), "local release must end the epoch");
 
-        stop_released.notify_one();
-        cancellation.cancel();
-        task.await.unwrap().unwrap();
+        assert_eq!(
+            task.await.unwrap().unwrap_err(),
+            SupervisorError::Controller(DriverErrorKind::Transport)
+        );
     }
 }

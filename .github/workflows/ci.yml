@@ -133,10 +133,6 @@ jobs:
           cargo fetch --locked
           cargo fetch --locked --manifest-path fuzz/Cargo.toml
           cargo fetch --locked --manifest-path conformance/evaluation-v0/runner/Cargo.toml
-          # The offline vendor mutation suite builds these standalone graphs,
-          # including their dev dependencies, outside the root workspace.
-          cargo fetch --locked --manifest-path third-party/hmac-0.13.0-aster/Cargo.toml
-          cargo fetch --locked --manifest-path third-party/bluer-0.17.4-aster/Cargo.toml
 
       # Keep process acceptance on Linux with the pinned Python 3.13 toolchain;
       # the signal-safe subprocess path requires POSIX_SPAWN_CLOSEFROM.
@@ -494,7 +490,6 @@ jobs:
       - name: Enforce dependency policy offline
         run: |
           python3 tools/check-netlink-packet-core-patch.py
-          python3 tools/check-btle-vendor-patches.py
           CARGO_NET_OFFLINE=true sh ./tools/check-dependency-exception-scope.sh
           CARGO_NET_OFFLINE=true sh ./tools/test-dependency-exception-scope.sh
           cargo +1.97.1 deny --locked --offline check

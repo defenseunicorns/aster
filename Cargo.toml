@@ -24,8 +24,6 @@ members = [
   "crates/aster-systemd-credentials",
 ]
 exclude = [
-  "third-party/bluer-0.17.4-aster",
-  "third-party/hmac-0.13.0-aster",
   "fuzz",
   "third-party/netlink-packet-core-0.8.2-aster",
 ]
@@ -82,8 +80,6 @@ tower-service = "=0.3.3"
 zeroize = { version = "=1.9.1", features = ["derive", "std"] }
 
 [patch.crates-io]
-bluer = { path = "third-party/bluer-0.17.4-aster" }
-hmac = { path = "third-party/hmac-0.13.0-aster" }
 netlink-packet-core = { path = "third-party/netlink-packet-core-0.8.2-aster" }
 
 [workspace.lints.rust]

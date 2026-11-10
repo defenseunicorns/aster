@@ -193,15 +193,15 @@ Registry checksums identify crate archives, not compiled library bytes.
 `metadata.component.version` is the application's Cargo version; the document's
 top-level `version` is the SBOM revision and `specVersion` is the format version.
 
-## Record local dependency patches
+## Record the local dependency patch
 
-The workspace currently carries exact-source local patches for
-`netlink-packet-core` 0.8.2, `hmac` 0.13.0, and `bluer` 0.17.4.
-Cargo-cyclonedx identifies each local copy with a file-qualified purl. Preserve
-that generated `bom-ref` and express origin with CycloneDX `pedigree`; do not
-invent an `-aster` component version. Each pedigree must retain the upstream
-archive checksum/revision/license, canonical diff and digest, and a
-deterministic patched-source archive distributed beside the edited SBOM.
+The workspace currently carries an exact-source local patch for
+`netlink-packet-core` 0.8.2. Cargo-cyclonedx identifies the local copy with a
+file-qualified purl. Preserve that generated `bom-ref` and express origin with
+CycloneDX `pedigree`; do not invent an `-aster` component version. The pedigree
+must retain the upstream archive checksum/revision/license, canonical diff and
+digest, and a deterministic patched-source archive distributed beside the
+edited SBOM.
 
 ### Netlink patch
 
@@ -265,51 +265,6 @@ archive beside the edited SBOMs. In the evaluated editor invocation,
 This limitation is retained in the observation. For future set-lists include
 all references that must survive; do not assume array append behavior.
 
-### BTLE HMAC and BlueR patches
-
-The dated
-[`2026-11-06-btle-vendor-pedigree.set.json`](2026-11-06-btle-vendor-pedigree.set.json)
-records the exact HMAC/BlueR source snapshot. Check and archive it with:
-
-```bash
-python3 tools/check-btle-vendor-patches.py
-
-tar --sort=name --format=ustar --mtime=@0 \
-    --owner=0 --group=0 --numeric-owner --mode=u+rw,go+r-w,a+X \
-    -cf /build/sbom/cyclonedx/hmac-0.13.0-aster.tar \
-    -C third-party hmac-0.13.0-aster
-tar --sort=name --format=ustar --mtime=@0 \
-    --owner=0 --group=0 --numeric-owner --mode=u+rw,go+r-w,a+X \
-    -cf /build/sbom/cyclonedx/bluer-0.17.4-aster.tar \
-    -C third-party bluer-0.17.4-aster
-sha256sum /build/sbom/cyclonedx/hmac-0.13.0-aster.tar \
-    /build/sbom/cyclonedx/bluer-0.17.4-aster.tar
-```
-
-The recorded deterministic hashes are
-`b58cc1f47d33459f5a5a728d476515362f0de7a0d3706cbdb0d24831084760a1`
-and
-`739106c3be8a2541016e4f20e7af25812f2cec30c50069a2b1df09da7c6d814c`.
-Any source, provenance-note, patch, or mode change requires fresh archives and
-a reviewed replacement set-list.
-
-Apply the set-list separately from the historical netlink set-list to each
-generated executable SBOM, then validate the result:
-
-```bash
-cdx-ev set aster.cdx.json \
-    --from-file /build/aster/docs/release/sbom/2026-11-06-btle-vendor-pedigree.set.json \
-    --output aster.btle-pedigree.cdx.json
-cdx-ev set aster-agent.cdx.json \
-    --from-file /build/aster/docs/release/sbom/2026-11-06-btle-vendor-pedigree.set.json \
-    --output aster-agent.btle-pedigree.cdx.json
-cdx-ev validate aster.btle-pedigree.cdx.json --schema-type default
-cdx-ev validate aster-agent.btle-pedigree.cdx.json --schema-type default
-```
-
-This set-list is also snapshot-specific. It is release input, not evidence that
-the generated executable SBOMs were enriched or that a release was admitted.
-
 ## Deliver and interpret the SBOMs
 
 Retain each executable, its corresponding CycloneDX document, checksums,
@@ -318,13 +273,9 @@ and generation logs together. Include the inventory qualification above and
 any source archive referenced by patch pedigree. Do not relabel a previous
 build's checksums or SBOM as belonging to a fresh build.
 
-License fields normally contain package-manifest declarations. The dated BTLE
-set-list additionally records BlueR's complete vendored payload inventory:
-`BSD-2-Clause` primary source, a `BSD-3-Clause` assigned-number database, and
-`GPL-2.0-only` copied/adapted BlueZ API documentation, plus the retained notice
-digest and production-review gate. A full release notice bundle and review of
-native/toolchain licenses remain separate release work. Use the
-[historical observation](2026-09-08-observation.md) only
+License fields normally contain package-manifest declarations. A full release
+notice bundle and review of native/toolchain licenses remain separate release
+work. Use the [historical observation](2026-09-08-observation.md) only
 for its dated results, including its optional binary-audit experiment; it is
 not a current vulnerability scan.
 

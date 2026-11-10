@@ -164,7 +164,7 @@ fn observation_from_service_data(
 }
 
 pub(crate) trait OwnedAdvertisement: Send {
-    fn stop(&mut self) -> PlatformFuture<'_, ()>;
+    fn release(&mut self) -> PlatformFuture<'_, ()>;
     fn terminated(&self) -> TerminationFuture<'static>;
 }
 
@@ -174,29 +174,37 @@ pub(crate) trait OwnedScan: Send {
 }
 
 trait AdvertisementBackend: Send + 'static {
-    fn stop(&mut self) -> PlatformFuture<'_, ()>;
+    fn release(&mut self) -> PlatformFuture<'_, ()>;
     fn terminated(&self) -> TerminationFuture<'static>;
 }
 
-impl AdvertisementBackend for adv::AdvertisementHandle {
-    fn stop(&mut self) -> PlatformFuture<'_, ()> {
-        Box::pin(async {
-            adv::AdvertisementHandle::stop(self)
-                .await
-                .map_err(map_bluer_error)
-        })
+struct BluezAdvertisementBackend {
+    handle: Option<adv::AdvertisementHandle>,
+    owner_loss: watch::Receiver<bool>,
+}
+
+impl BluezAdvertisementBackend {
+    const fn new(handle: adv::AdvertisementHandle, owner_loss: watch::Receiver<bool>) -> Self {
+        Self {
+            handle: Some(handle),
+            owner_loss,
+        }
+    }
+}
+
+impl AdvertisementBackend for BluezAdvertisementBackend {
+    fn release(&mut self) -> PlatformFuture<'_, ()> {
+        self.handle.take();
+        Box::pin(async { Ok(()) })
     }
 
     fn terminated(&self) -> TerminationFuture<'static> {
-        let terminated = self.termination();
-        Box::pin(async move {
-            let _ = terminated.await;
-        })
+        wait_for_owner_loss(self.owner_loss.clone())
     }
 }
 
 enum AdvertisementCommand {
-    Stop(oneshot::Sender<Result<(), DriverError>>),
+    Release(oneshot::Sender<Result<(), DriverError>>),
 }
 
 struct AdvertisementOwner {
@@ -212,7 +220,7 @@ impl Drop for AdvertisementOwner {
 }
 
 impl OwnedAdvertisement for AdvertisementOwner {
-    fn stop(&mut self) -> PlatformFuture<'_, ()> {
+    fn release(&mut self) -> PlatformFuture<'_, ()> {
         let commands = self.commands.clone();
         let ceased = self.ceased.clone();
         Box::pin(async move {
@@ -221,7 +229,7 @@ impl OwnedAdvertisement for AdvertisementOwner {
             }
             let (reply, result) = oneshot::channel();
             if commands
-                .send(AdvertisementCommand::Stop(reply))
+                .send(AdvertisementCommand::Release(reply))
                 .await
                 .is_err()
             {
@@ -283,10 +291,10 @@ async fn run_advertisement_owner<B>(
             () = terminated.as_mut() => OwnerEvent::Terminated,
         };
         match event {
-            OwnerEvent::Command(Some(AdvertisementCommand::Stop(reply))) => {
-                let mut stop = backend.stop();
+            OwnerEvent::Command(Some(AdvertisementCommand::Release(reply))) => {
+                let mut release = backend.release();
                 tokio::select! {
-                    result = stop.as_mut() => match result {
+                    result = release.as_mut() => match result {
                         Ok(()) => {
                             let _ = reply.send(Ok(()));
                             break;
@@ -302,9 +310,9 @@ async fn run_advertisement_owner<B>(
                 }
             }
             OwnerEvent::Command(None) => {
-                let mut stop = backend.stop();
+                let mut release = backend.release();
                 tokio::select! {
-                    _ = stop.as_mut() => {},
+                    _ = release.as_mut() => {},
                     () = terminated.as_mut() => {},
                 }
                 break;
@@ -524,24 +532,22 @@ enum AddDeviceError {
 
 struct BluezScanBackend {
     adapter: bluer::Adapter,
-    session: bluer::DiscoverySession,
-    adapter_events: AdapterEventStream,
+    adapter_events: Option<AdapterEventStream>,
     device_events: SelectAll<DeviceEventStream>,
     watched: BTreeSet<Address>,
     initial_capacity_exceeded: bool,
-    owner_loss: BluezOwnerLoss,
+    owner_loss: watch::Receiver<bool>,
 }
 
 impl BluezScanBackend {
     async fn start(
         adapter: bluer::Adapter,
-        owner_loss: BluezOwnerLoss,
+        owner_loss: watch::Receiver<bool>,
     ) -> Result<Self, DriverError> {
         adapter
             .set_discovery_filter(bluez_discovery_filter())
             .await
             .map_err(map_bluer_error)?;
-        let adapter_events = Box::pin(adapter.events().await.map_err(map_bluer_error)?);
         let mut addresses = adapter.device_addresses().await.map_err(map_bluer_error)?;
         addresses.sort_unstable();
         let mut initial_capacity_exceeded =
@@ -566,14 +572,10 @@ impl BluezScanBackend {
                 device_events.push(events);
             }
         }
-        let session = adapter
-            .start_discovery_session()
-            .await
-            .map_err(map_bluer_error)?;
+        let adapter_events = Box::pin(adapter.discover_devices().await.map_err(map_bluer_error)?);
         Ok(Self {
             adapter,
-            session,
-            adapter_events,
+            adapter_events: Some(adapter_events),
             device_events,
             watched,
             initial_capacity_exceeded,
@@ -604,23 +606,22 @@ impl BluezScanBackend {
         }
         loop {
             enum SourceEvent {
-                SessionEnded,
                 Adapter(Option<bluer::AdapterEvent>),
                 Device(Option<WatchedDeviceEvent>),
             }
+            let Some(adapter_events) = self.adapter_events.as_mut() else {
+                return ScanBackendEvent::Terminated;
+            };
             let event = {
-                let terminated = self.session.terminated();
-                tokio::pin!(terminated);
                 tokio::select! {
-                    _ = terminated.as_mut() => SourceEvent::SessionEnded,
-                    event = self.adapter_events.next() => SourceEvent::Adapter(event),
+                    event = adapter_events.next() => SourceEvent::Adapter(event),
                     event = self.device_events.next(), if !self.device_events.is_empty() => {
                         SourceEvent::Device(event)
                     }
                 }
             };
             match event {
-                SourceEvent::SessionEnded | SourceEvent::Adapter(None) => {
+                SourceEvent::Adapter(None) => {
                     return ScanBackendEvent::Terminated;
                 }
                 SourceEvent::Adapter(Some(bluer::AdapterEvent::DeviceAdded(address))) => {
@@ -658,22 +659,16 @@ impl BluezScanBackend {
 
 impl ScanBackend for BluezScanBackend {
     fn stop(&mut self) -> PlatformFuture<'_, ()> {
-        Box::pin(async { self.session.stop().await.map_err(map_bluer_error) })
+        self.adapter_events.take();
+        Box::pin(async { Ok(()) })
     }
 
     fn terminated(&self) -> TerminationFuture<'static> {
-        let terminated = self.session.termination();
-        Box::pin(async move {
-            let _ = terminated.await;
-        })
+        wait_for_owner_loss(self.owner_loss.clone())
     }
 
     fn next_event(&mut self) -> ScanEventFuture<'_> {
         Box::pin(self.next_bluez_event())
-    }
-
-    fn force_owner_loss(&self) {
-        self.owner_loss.force();
     }
 }
 
@@ -697,29 +692,49 @@ async fn subscribe_device(
 
 pub(crate) struct BluezDiscoveryPlatform {
     session: bluer::Session,
+    owner_loss: BluezOwnerLoss,
 }
 
 #[derive(Clone)]
-pub(crate) struct BluezOwnerLoss {
-    session: bluer::Session,
-}
+pub(crate) struct BluezOwnerLoss(watch::Sender<bool>);
 
 impl BluezOwnerLoss {
-    pub(crate) fn force(&self) {
-        self.session.close();
+    fn channel() -> (Self, watch::Receiver<bool>) {
+        let (sender, receiver) = watch::channel(false);
+        (Self(sender), receiver)
     }
+
+    fn subscribe(&self) -> watch::Receiver<bool> {
+        self.0.subscribe()
+    }
+
+    pub(crate) fn force(&self) {
+        self.0.send_replace(true);
+    }
+}
+
+fn wait_for_owner_loss(mut owner_loss: watch::Receiver<bool>) -> TerminationFuture<'static> {
+    Box::pin(async move {
+        loop {
+            if *owner_loss.borrow_and_update() || owner_loss.changed().await.is_err() {
+                return;
+            }
+        }
+    })
 }
 
 impl BluezDiscoveryPlatform {
     pub(crate) async fn open() -> Result<Self, DriverError> {
         let session = bluer::Session::new().await.map_err(map_bluer_error)?;
-        Ok(Self { session })
+        let (owner_loss, _) = BluezOwnerLoss::channel();
+        Ok(Self {
+            session,
+            owner_loss,
+        })
     }
 
     pub(crate) fn owner_loss(&self) -> BluezOwnerLoss {
-        BluezOwnerLoss {
-            session: self.session.clone(),
-        }
+        self.owner_loss.clone()
     }
 
     async fn adapter(
@@ -782,7 +797,12 @@ impl DiscoveryPlatform for BluezDiscoveryPlatform {
                 .advertise(bluez_advertisement(advertisement))
                 .await
                 .map_err(map_bluer_error)?;
-            Ok(Box::new(spawn_advertisement_owner(handle)) as Box<dyn OwnedAdvertisement>)
+            Ok(
+                Box::new(spawn_advertisement_owner(BluezAdvertisementBackend::new(
+                    handle,
+                    self.owner_loss.subscribe(),
+                ))) as Box<dyn OwnedAdvertisement>,
+            )
         })
     }
 
@@ -792,14 +812,14 @@ impl DiscoveryPlatform for BluezDiscoveryPlatform {
     ) -> PlatformFuture<'a, StartedScan> {
         Box::pin(async move {
             let adapter = self.adapter(controller).await?;
-            BluezScanBackend::start(adapter, self.owner_loss())
+            BluezScanBackend::start(adapter, self.owner_loss.subscribe())
                 .await
                 .map(spawn_scan_owner)
         })
     }
 
     fn force_owner_loss(&self) {
-        self.session.close();
+        self.owner_loss.force();
     }
 }
 
@@ -912,7 +932,7 @@ mod tests {
     }
 
     impl OwnedAdvertisement for FakeOwner {
-        fn stop(&mut self) -> PlatformFuture<'_, ()> {
+        fn release(&mut self) -> PlatformFuture<'_, ()> {
             Box::pin(async {
                 self.stopped.store(true, Ordering::Release);
                 Ok(())
@@ -945,7 +965,7 @@ mod tests {
     struct FakePlatform {
         advertisement: Mutex<Option<RosterAdvertisement>>,
         sender: Mutex<Option<mpsc::Sender<DiscoveryObservation>>>,
-        advertisement_stopped: Arc<AtomicBool>,
+        advertisement_released: Arc<AtomicBool>,
         advertisement_terminated: Arc<Notify>,
         scan_stopped: Arc<AtomicBool>,
         scan_terminated: Arc<Notify>,
@@ -959,7 +979,7 @@ mod tests {
         ) -> PlatformFuture<'a, Box<dyn OwnedAdvertisement>> {
             *self.advertisement.lock().unwrap() = Some(advertisement);
             let owner = FakeOwner {
-                stopped: self.advertisement_stopped.clone(),
+                stopped: self.advertisement_released.clone(),
                 terminated: self.advertisement_terminated.clone(),
             };
             Box::pin(async move { Ok(Box::new(owner) as Box<dyn OwnedAdvertisement>) })
@@ -1102,19 +1122,19 @@ mod tests {
     }
 
     struct BlockingAdvertisementBackend {
-        stop_calls: Arc<AtomicUsize>,
-        stop_released: Arc<Notify>,
+        release_calls: Arc<AtomicUsize>,
+        release_completed: Arc<Notify>,
     }
 
     struct TerminatingAdvertisementBackend {
-        stop_started: Arc<Notify>,
+        release_started: Arc<Notify>,
         terminated: Arc<Notify>,
     }
 
     impl AdvertisementBackend for TerminatingAdvertisementBackend {
-        fn stop(&mut self) -> PlatformFuture<'_, ()> {
+        fn release(&mut self) -> PlatformFuture<'_, ()> {
             Box::pin(async {
-                self.stop_started.notify_one();
+                self.release_started.notify_one();
                 pending().await
             })
         }
@@ -1126,10 +1146,10 @@ mod tests {
     }
 
     impl AdvertisementBackend for BlockingAdvertisementBackend {
-        fn stop(&mut self) -> PlatformFuture<'_, ()> {
+        fn release(&mut self) -> PlatformFuture<'_, ()> {
             Box::pin(async {
-                self.stop_calls.fetch_add(1, Ordering::AcqRel);
-                self.stop_released.notified().await;
+                self.release_calls.fetch_add(1, Ordering::AcqRel);
+                self.release_completed.notified().await;
                 Ok(())
             })
         }
@@ -1140,39 +1160,49 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn advertisement_owner_completes_unregister_after_waiter_deadline() {
-        let stop_calls = Arc::new(AtomicUsize::new(0));
-        let stop_released = Arc::new(Notify::new());
+    async fn advertisement_owner_completes_local_release_after_waiter_deadline() {
+        let release_calls = Arc::new(AtomicUsize::new(0));
+        let release_completed = Arc::new(Notify::new());
         let mut owner = spawn_advertisement_owner(BlockingAdvertisementBackend {
-            stop_calls: stop_calls.clone(),
-            stop_released: stop_released.clone(),
+            release_calls: release_calls.clone(),
+            release_completed: release_completed.clone(),
         });
 
-        let result = tokio::time::timeout(Duration::from_secs(5), owner.stop()).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), owner.release()).await;
         assert!(result.is_err());
-        assert_eq!(stop_calls.load(Ordering::Acquire), 1);
+        assert_eq!(release_calls.load(Ordering::Acquire), 1);
 
-        stop_released.notify_one();
+        release_completed.notify_one();
         owner.terminated().await;
-        assert_eq!(stop_calls.load(Ordering::Acquire), 1);
+        assert_eq!(release_calls.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]
-    async fn advertisement_owner_observes_termination_while_stop_is_blocked() {
-        let stop_started = Arc::new(Notify::new());
+    async fn advertisement_owner_observes_termination_while_release_is_blocked() {
+        let release_started = Arc::new(Notify::new());
         let terminated = Arc::new(Notify::new());
         let mut owner = spawn_advertisement_owner(TerminatingAdvertisementBackend {
-            stop_started: stop_started.clone(),
+            release_started: release_started.clone(),
             terminated: terminated.clone(),
         });
         let release = tokio::spawn(async move {
-            stop_started.notified().await;
+            release_started.notified().await;
             terminated.notify_one();
         });
 
-        owner.stop().await.unwrap();
+        owner.release().await.unwrap();
         release.await.unwrap();
         owner.terminated().await;
+    }
+
+    #[tokio::test]
+    async fn bluez_owner_loss_ends_local_waiters() {
+        let (owner_loss, receiver) = BluezOwnerLoss::channel();
+        let waiter = tokio::spawn(wait_for_owner_loss(receiver));
+
+        owner_loss.force();
+
+        waiter.await.unwrap();
     }
 
     struct QueuedScanBackend {
@@ -1331,11 +1361,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fake_platform_preserves_exact_advertisement_queue_and_owned_stop() {
+    async fn fake_platform_preserves_exact_advertisement_queue_and_owned_release() {
         let platform = FakePlatform {
             advertisement: Mutex::new(None),
             sender: Mutex::new(None),
-            advertisement_stopped: Arc::new(AtomicBool::new(false)),
+            advertisement_released: Arc::new(AtomicBool::new(false)),
             advertisement_terminated: Arc::new(Notify::new()),
             scan_stopped: Arc::new(AtomicBool::new(false)),
             scan_terminated: Arc::new(Notify::new()),
@@ -1371,8 +1401,8 @@ mod tests {
         assert!(!debug.contains("55"));
         platform.advertisement_terminated.notify_one();
         owned_advertisement.terminated().await;
-        owned_advertisement.stop().await.unwrap();
-        assert!(platform.advertisement_stopped.load(Ordering::Acquire));
+        owned_advertisement.release().await.unwrap();
+        assert!(platform.advertisement_released.load(Ordering::Acquire));
 
         let started_scan = platform.start_scan(config().controller()).await.unwrap();
         let (mut owned_scan, _receiver) = started_scan.into_parts();
