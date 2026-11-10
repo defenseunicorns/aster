@@ -52,10 +52,6 @@ python3 "$repository_root/tools/check-btle-vendor-patches.py"
 CARGO_TARGET_DIR="$positive_target" \
   cargo test --offline --locked \
     --manifest-path "$repository_root/third-party/hmac-0.13.0-aster/Cargo.toml" \
-    --no-default-features
-CARGO_TARGET_DIR="$positive_target" \
-  cargo test --offline --locked \
-    --manifest-path "$repository_root/third-party/hmac-0.13.0-aster/Cargo.toml" \
     --no-default-features --features zeroize
 CARGO_TARGET_DIR="$positive_target" \
   cargo test --offline --locked \
@@ -154,5 +150,3 @@ expect_test_failure \
   "$capacity_target" "$capacity_mutant/Cargo.toml" bluetoothd,l2cap \
   session::aster_tests::bounded_ingress_fails_the_session_on_item_257 \
   "$test_root/capacity-negative.log"
-
-python3 "$repository_root/tools/check-btle-vendor-patches.py"

@@ -36,9 +36,6 @@ android {
         )
     }
 
-    testOptions {
-        unitTests.isReturnDefaultValues = false
-    }
 }
 
 val buildRust = tasks.register<Exec>("buildRust") {
