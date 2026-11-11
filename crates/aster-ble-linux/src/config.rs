@@ -13,6 +13,8 @@ pub const RING1_MAXIMUM_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const RING1_MAXIMUM_EXCHANGE_BYTES: usize = 64 * 1024 * 1024;
 /// Longest platform or authenticated-progress operation in the Ring-1 profile.
 pub const RING1_MAXIMUM_DEADLINE: Duration = Duration::from_secs(30);
+/// Initial unavailable epoch used when registering the automatic BTLE adapter.
+pub const AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH: u64 = 0;
 
 const SUPERVISOR_MAXIMUM_CONTACT_CADENCE: Duration = Duration::from_secs(24 * 60 * 60);
 

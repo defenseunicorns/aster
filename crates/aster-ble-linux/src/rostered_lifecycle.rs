@@ -17,14 +17,21 @@ use crate::{
     policy::{CappedBackoff, LifecycleCancellation},
 };
 use aster_contact::OrderedContact;
+use aster_mesh::NodeId;
 use aster_node::{
-    ContactDisposition, ContactOutcome, ContactReason, MissionPeerExpectation,
-    OrderedEventContactHandle, OrderedEventContactRole, PeerReceipt,
+    ContactDisposition, ContactOutcome, ContactReason, EventAdapterControl,
+    EventAdapterRegistration, EventAdapterSnapshot, EventAdapterState, EventAttemptReceiver,
+    EventOutboundAttempt, EventTransportKind, MissionPeerExpectation, OrderedEventContactHandle,
+    OrderedEventContactRole, PeerReceipt,
 };
 use std::{
+    fmt,
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
 use tokio::{
@@ -68,6 +75,7 @@ enum EpochEvent {
     InboundAccepted(Result<(crate::SocketOpen, crate::CanonicalLocator), DriverError>),
     InboundAcceptReady,
     OutboundRetry,
+    CoordinatorAttempt(Option<Box<dyn CoordinatorAttempt>>),
     ContactFinished(ContactAttemptOutcome),
     CredentialExpired,
 }
@@ -80,28 +88,358 @@ type InboundAcceptFuture = Pin<
             + Send,
     >,
 >;
+type CoordinatorAttemptFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+type CoordinatorAttemptReceiveFuture<'a> =
+    Pin<Box<dyn Future<Output = Option<Box<dyn CoordinatorAttempt>>> + Send + 'a>>;
 
-#[derive(Default)]
-struct EpochSignals {
-    availability: Option<watch::Sender<crate::BtleAvailability>>,
-    available_started: Option<oneshot::Sender<Instant>>,
+trait CoordinatorAttempt: Send {
+    fn transport_kind(&self) -> EventTransportKind;
+    fn mission(&self) -> NodeId;
+    fn peer(&self) -> NodeId;
+    fn run(self: Box<Self>, contact: Arc<dyn OrderedContact>) -> CoordinatorAttemptFuture;
+    fn fail_carrier_open(self: Box<Self>);
+    fn fail_unauthenticated_carrier_open(
+        self: Box<Self>,
+        failure: aster_node::UnauthenticatedCarrierOpenFailure,
+    );
+    fn cancel_carrier_open(self: Box<Self>);
 }
 
-impl EpochSignals {
-    const fn monitored(
-        availability: watch::Sender<crate::BtleAvailability>,
-        available_started: oneshot::Sender<Instant>,
-    ) -> Self {
-        Self {
-            availability: Some(availability),
-            available_started: Some(available_started),
+impl CoordinatorAttempt for EventOutboundAttempt {
+    fn transport_kind(&self) -> EventTransportKind {
+        self.transport_kind()
+    }
+
+    fn mission(&self) -> NodeId {
+        self.mission()
+    }
+
+    fn peer(&self) -> NodeId {
+        self.peer()
+    }
+
+    fn run(self: Box<Self>, contact: Arc<dyn OrderedContact>) -> CoordinatorAttemptFuture {
+        Box::pin(async move {
+            let _ = EventOutboundAttempt::run(*self, contact).await;
+        })
+    }
+
+    fn fail_carrier_open(self: Box<Self>) {
+        let _ = EventOutboundAttempt::fail_carrier_open(*self);
+    }
+
+    fn fail_unauthenticated_carrier_open(
+        self: Box<Self>,
+        failure: aster_node::UnauthenticatedCarrierOpenFailure,
+    ) {
+        let _ = EventOutboundAttempt::fail_unauthenticated_carrier_open(*self, failure);
+    }
+
+    fn cancel_carrier_open(self: Box<Self>) {
+        let _ = EventOutboundAttempt::cancel_carrier_open(*self);
+    }
+}
+
+trait CoordinatorAttemptSource: Send {
+    fn recv(&mut self) -> CoordinatorAttemptReceiveFuture<'_>;
+}
+
+impl CoordinatorAttemptSource for EventAttemptReceiver {
+    fn recv(&mut self) -> CoordinatorAttemptReceiveFuture<'_> {
+        Box::pin(async move {
+            EventAttemptReceiver::recv(self)
+                .await
+                .map(|attempt| Box::new(attempt) as Box<dyn CoordinatorAttempt>)
+        })
+    }
+}
+
+enum EpochContactMode {
+    FixedEvaluation,
+    Automatic {
+        attempts: Box<dyn CoordinatorAttemptSource>,
+        pending: Option<Box<dyn CoordinatorAttempt>>,
+    },
+}
+
+impl EpochContactMode {
+    fn automatic(attempts: Box<dyn CoordinatorAttemptSource>) -> Self {
+        Self::Automatic {
+            attempts,
+            pending: None,
+        }
+    }
+
+    const fn is_automatic(&self) -> bool {
+        matches!(self, Self::Automatic { .. })
+    }
+
+    fn accepts_inbound(&self, config: &ValidatedRosteredSupervisorConfig) -> bool {
+        self.is_automatic() || config.role() == FixedRole::Listener
+    }
+
+    fn can_open_outbound(&self, config: &ValidatedRosteredSupervisorConfig) -> bool {
+        match self {
+            Self::FixedEvaluation => config.role() == FixedRole::Initiator,
+            Self::Automatic { pending, .. } => {
+                config.role() == FixedRole::Initiator && pending.is_some()
+            }
+        }
+    }
+
+    fn receive_enabled(&self) -> bool {
+        matches!(self, Self::Automatic { pending: None, .. })
+    }
+
+    async fn recv(&mut self) -> Option<Box<dyn CoordinatorAttempt>> {
+        match self {
+            Self::FixedEvaluation => std::future::pending().await,
+            Self::Automatic { attempts, .. } => attempts.recv().await,
+        }
+    }
+
+    fn accept_attempt(
+        &mut self,
+        config: &ValidatedRosteredSupervisorConfig,
+        attempt: Box<dyn CoordinatorAttempt>,
+    ) -> bool {
+        let matches = attempt.transport_kind() == EventTransportKind::BLE_L2CAP_V1
+            && attempt.mission() == config.local_mission_id()
+            && attempt.peer() == config.peer_mission_id();
+        let Self::Automatic { pending, .. } = self else {
+            attempt.cancel_carrier_open();
+            return false;
+        };
+        if !matches || pending.is_some() {
+            attempt.cancel_carrier_open();
+            false
+        } else if config.role() != FixedRole::Initiator {
+            attempt.fail_carrier_open();
+            false
+        } else {
+            *pending = Some(attempt);
+            true
+        }
+    }
+
+    fn take_outbound(&mut self) -> OutboundAttemptOwner {
+        match self {
+            Self::FixedEvaluation => OutboundAttemptOwner::FixedEvaluation,
+            Self::Automatic { pending, .. } => OutboundAttemptOwner::Coordinator(
+                pending
+                    .take()
+                    .expect("automatic outbound requires a ticket"),
+            ),
+        }
+    }
+
+    fn restore_outbound(&mut self, owner: OutboundAttemptOwner) {
+        if let (Self::Automatic { pending, .. }, OutboundAttemptOwner::Coordinator(attempt)) =
+            (self, owner)
+        {
+            debug_assert!(pending.is_none());
+            *pending = Some(attempt);
+        }
+    }
+
+    fn fail_pending_carrier_open(&mut self) {
+        if let Self::Automatic { pending, .. } = self
+            && let Some(attempt) = pending.take()
+        {
+            attempt.fail_carrier_open();
+        }
+    }
+
+    fn cancel_pending_carrier_open(&mut self) {
+        if let Self::Automatic { pending, .. } = self
+            && let Some(attempt) = pending.take()
+        {
+            attempt.cancel_carrier_open();
         }
     }
 }
 
+enum OutboundAttemptOwner {
+    FixedEvaluation,
+    Coordinator(Box<dyn CoordinatorAttempt>),
+}
+
+trait EventAvailabilityControl: Send + Sync {
+    fn publish_availability(&self, snapshot: EventAdapterSnapshot) -> bool;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AvailabilityPublishError {
+    RegistrationRejected,
+    EpochExhausted,
+}
+
+impl EventAvailabilityControl for EventAdapterControl {
+    fn publish_availability(&self, snapshot: EventAdapterSnapshot) -> bool {
+        EventAdapterControl::publish_availability(self, snapshot)
+    }
+}
+
+struct AdapterAvailabilityPublisher {
+    control: Option<Arc<dyn EventAvailabilityControl>>,
+    selector_can_originate: bool,
+    updates: watch::Sender<crate::BtleAvailability>,
+    output: crate::BtleOperatorOutput,
+    epoch: AtomicU64,
+}
+
+impl AdapterAvailabilityPublisher {
+    fn fixed(
+        updates: watch::Sender<crate::BtleAvailability>,
+        output: crate::BtleOperatorOutput,
+    ) -> Self {
+        Self {
+            control: None,
+            selector_can_originate: false,
+            updates,
+            output,
+            epoch: AtomicU64::new(crate::AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH),
+        }
+    }
+
+    fn automatic(
+        control: Arc<dyn EventAvailabilityControl>,
+        updates: watch::Sender<crate::BtleAvailability>,
+        output: crate::BtleOperatorOutput,
+        role: FixedRole,
+    ) -> Self {
+        Self {
+            control: Some(control),
+            selector_can_originate: role == FixedRole::Initiator,
+            updates,
+            output,
+            epoch: AtomicU64::new(crate::AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH),
+        }
+    }
+
+    fn publish(
+        &self,
+        availability: crate::BtleAvailability,
+    ) -> Result<(), AvailabilityPublishError> {
+        if *self.updates.borrow() == availability {
+            return Ok(());
+        }
+        if let Some(control) = &self.control {
+            let current = self.epoch.load(Ordering::Acquire);
+            let epoch = current
+                .checked_add(1)
+                .ok_or(AvailabilityPublishError::EpochExhausted)?;
+            let state = if self.selector_can_originate
+                && availability == crate::BtleAvailability::Available
+            {
+                EventAdapterState::Available
+            } else {
+                EventAdapterState::Unavailable
+            };
+            if !control.publish_availability(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                epoch,
+                state,
+                true,
+                0,
+            )) {
+                return Err(AvailabilityPublishError::RegistrationRejected);
+            }
+            self.epoch.store(epoch, Ordering::Release);
+        }
+        self.updates.send_replace(availability);
+        self.output
+            .emit(crate::controller::availability_event(availability));
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct EpochSignals {
+    availability: Option<watch::Sender<crate::BtleAvailability>>,
+    publisher: Option<Arc<AdapterAvailabilityPublisher>>,
+    available_started: Option<oneshot::Sender<Instant>>,
+}
+
+impl EpochSignals {
+    fn with_publisher(
+        publisher: Arc<AdapterAvailabilityPublisher>,
+        available_started: oneshot::Sender<Instant>,
+    ) -> Self {
+        Self {
+            availability: None,
+            publisher: Some(publisher),
+            available_started: Some(available_started),
+        }
+    }
+
+    fn publish(&self, availability: crate::BtleAvailability) -> Result<(), SupervisorError> {
+        if let Some(publisher) = &self.publisher {
+            publisher
+                .publish(availability)
+                .map_err(|_| SupervisorError::TaskStopped)
+        } else if let Some(updates) = &self.availability {
+            publish_availability(updates, availability);
+            Ok(())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Closed reason an automatic BTLE registration was rejected before startup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutomaticBtleRegistrationError {
+    /// The paired registration belongs to another transport kind.
+    WrongTransport,
+    /// Automatic BTLE registration must begin at the fixed initial epoch.
+    InitialEpoch,
+    /// Automatic BTLE registration must begin unavailable.
+    InitialState,
+    /// The registration does not permit Event contacts.
+    NotEventCapable,
+}
+
+impl fmt::Display for AutomaticBtleRegistrationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::WrongTransport => "automatic BTLE registration has the wrong transport kind",
+            Self::InitialEpoch => "automatic BTLE registration has the wrong initial epoch",
+            Self::InitialState => "automatic BTLE registration must begin unavailable",
+            Self::NotEventCapable => "automatic BTLE registration is not Event-capable",
+        })
+    }
+}
+
+impl std::error::Error for AutomaticBtleRegistrationError {}
+
+fn validate_automatic_registration(
+    registration: EventAdapterRegistration,
+) -> Result<(EventAdapterControl, EventAttemptReceiver), AutomaticBtleRegistrationError> {
+    let snapshot = registration.initial_snapshot();
+    if snapshot.kind() != EventTransportKind::BLE_L2CAP_V1 {
+        return Err(AutomaticBtleRegistrationError::WrongTransport);
+    }
+    if snapshot.availability_epoch() != crate::AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH {
+        return Err(AutomaticBtleRegistrationError::InitialEpoch);
+    }
+    if snapshot.state() != EventAdapterState::Unavailable {
+        return Err(AutomaticBtleRegistrationError::InitialState);
+    }
+    if !snapshot.event_capable() {
+        return Err(AutomaticBtleRegistrationError::NotEventCapable);
+    }
+    let (_, control, attempts) = registration.into_parts();
+    Ok((control, attempts))
+}
+
 enum ContactAttemptOutcome {
-    Opened(Box<OpenedContact>),
+    Opened {
+        opened: Box<OpenedContact>,
+        owner: OutboundAttemptOwner,
+    },
     Completed(Box<Result<PeerReceipt, ContactOutcome>>),
+    CoordinatorCompleted,
     OpenFailed(Box<ContactOpenFailure>),
     Cancelled,
 }
@@ -109,6 +447,7 @@ enum ContactAttemptOutcome {
 struct ContactOpenFailure {
     candidate: DiscoveryCandidate,
     error: DriverError,
+    owner: OutboundAttemptOwner,
 }
 
 enum ContactPhase {
@@ -159,6 +498,7 @@ impl ContactPhase {
         config: Arc<ValidatedRosteredSupervisorConfig>,
         sockets: Arc<S>,
         candidate: DiscoveryCandidate,
+        owner: OutboundAttemptOwner,
     ) -> Self
     where
         S: RosteredSocketFactory + 'static,
@@ -176,10 +516,14 @@ impl ContactPhase {
                 )
                 .await
                 {
-                    Ok(opened) => ContactAttemptOutcome::Opened(Box::new(opened)),
+                    Ok(opened) => ContactAttemptOutcome::Opened {
+                        opened: Box::new(opened),
+                        owner,
+                    },
                     Err(error) => ContactAttemptOutcome::OpenFailed(Box::new(ContactOpenFailure {
                         candidate,
                         error,
+                        owner,
                     })),
                 }
             }),
@@ -213,6 +557,17 @@ impl ContactPhase {
         }
     }
 
+    fn admitted_coordinator(attempt: Box<dyn CoordinatorAttempt>, opened: OpenedContact) -> Self {
+        let cancellation = LifecycleCancellation::new();
+        let work_cancellation = cancellation.clone();
+        Self::Active {
+            cancellation,
+            work: Box::pin(async move {
+                run_coordinator_contact(attempt, opened, &work_cancellation).await
+            }),
+        }
+    }
+
     async fn next(&mut self) -> EpochEvent {
         match self {
             Self::Accepting(accept) => EpochEvent::InboundAccepted(accept.await),
@@ -234,10 +589,44 @@ impl ContactPhase {
         }
     }
 
-    async fn join(self) {
+    async fn join(self) -> Option<ContactAttemptOutcome> {
         if let Self::Active { mut work, .. } = self {
-            let _ = (&mut work).await;
+            Some((&mut work).await)
+        } else {
+            None
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EpochContactTermination {
+    Cancelled,
+    LocalEpochLoss,
+}
+
+fn complete_interrupted_contact(
+    outcome: Option<ContactAttemptOutcome>,
+    termination: EpochContactTermination,
+) {
+    let owner = match outcome {
+        Some(ContactAttemptOutcome::Opened { opened, owner }) => {
+            drop(opened);
+            Some(owner)
+        }
+        Some(ContactAttemptOutcome::OpenFailed(failure)) => Some(failure.owner),
+        Some(
+            ContactAttemptOutcome::Completed(_)
+            | ContactAttemptOutcome::CoordinatorCompleted
+            | ContactAttemptOutcome::Cancelled,
+        )
+        | None => None,
+    };
+    let Some(OutboundAttemptOwner::Coordinator(attempt)) = owner else {
+        return;
+    };
+    match termination {
+        EpochContactTermination::Cancelled => attempt.cancel_carrier_open(),
+        EpochContactTermination::LocalEpochLoss => attempt.fail_carrier_open(),
     }
 }
 
@@ -308,6 +697,7 @@ pub struct LinuxRosteredBtleEventSupervisor {
     completion: watch::Receiver<bool>,
     cancellation: LifecycleCancellation,
     platform_owner: Arc<PlatformOwner>,
+    output: crate::BtleOperatorOutput,
     task: JoinHandle<Result<(), SupervisorError>>,
 }
 
@@ -382,21 +772,23 @@ impl LinuxRosteredBtleEventSupervisor {
         match timeout(OWNER_LOSS_AFTER, &mut task).await {
             Ok(result) => {
                 let result = result.map_err(|_| SupervisorError::TaskStopped)?;
-                eprintln!("BTLE_EVENT status=stopped");
+                self.output.emit(crate::BtleOperatorEvent::Stopped);
                 result
             }
             Err(_) => {
                 self.platform_owner.force_loss();
+                self.output.emit(crate::BtleOperatorEvent::CleanupForced);
                 match timeout(OWNER_LOSS_JOIN_DEADLINE, &mut task).await {
                     Ok(result) => {
                         let result = result.map_err(|_| SupervisorError::TaskStopped)?;
-                        eprintln!("BTLE_EVENT status=stopped owner_loss=forced");
+                        self.output.emit(crate::BtleOperatorEvent::Stopped);
                         result
                     }
                     Err(_) => {
                         task.abort();
                         let _ = task.await;
-                        eprintln!("BTLE_EVENT status=cleanup-unconfirmed");
+                        self.output
+                            .emit(crate::BtleOperatorEvent::CleanupUnconfirmed);
                         Err(SupervisorError::PlatformCleanupUnconfirmed)
                     }
                 }
@@ -425,10 +817,60 @@ pub fn spawn_linux_rostered_btle_event_supervisor(
     config: ValidatedRosteredSupervisorConfig,
     contacts: OrderedEventContactHandle,
 ) -> LinuxRosteredBtleEventSupervisor {
+    spawn_rostered_btle_event_supervisor(
+        config,
+        contacts,
+        EpochContactMode::FixedEvaluation,
+        None,
+        crate::BtleOperatorOutput::discard(),
+    )
+}
+
+/// Starts one automatic rostered Linux BTLE Event adapter.
+///
+/// The caller owns host policy and must first register an unavailable
+/// `BLE_L2CAP_V1` adapter snapshot at epoch zero. This owner retains the
+/// registration control and consumes the corresponding single-owner attempt
+/// receiver until shutdown.
+pub fn spawn_automatic_linux_rostered_btle_event_supervisor(
+    config: ValidatedRosteredSupervisorConfig,
+    contacts: OrderedEventContactHandle,
+    registration: EventAdapterRegistration,
+    output: crate::BtleOperatorOutput,
+) -> Result<LinuxRosteredBtleEventSupervisor, AutomaticBtleRegistrationError> {
+    let (adapter_control, attempts) = validate_automatic_registration(registration)?;
+    Ok(spawn_rostered_btle_event_supervisor(
+        config,
+        contacts,
+        EpochContactMode::automatic(Box::new(attempts)),
+        Some(Arc::new(adapter_control)),
+        output,
+    ))
+}
+
+fn spawn_rostered_btle_event_supervisor(
+    config: ValidatedRosteredSupervisorConfig,
+    contacts: OrderedEventContactHandle,
+    mode: EpochContactMode,
+    adapter_control: Option<Arc<dyn EventAvailabilityControl>>,
+    output: crate::BtleOperatorOutput,
+) -> LinuxRosteredBtleEventSupervisor {
+    let role = config.role();
     let cancellation = LifecycleCancellation::new();
     let initial = crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable);
-    eprintln!("BTLE_EVENT status=unavailable reason=BluezUnavailable");
     let (availability_updates, availability) = watch::channel(initial);
+    output.emit(crate::BtleOperatorEvent::AdapterUnavailable(
+        crate::AvailabilityReason::BluezUnavailable,
+    ));
+    let publisher = Arc::new(match adapter_control {
+        Some(control) => AdapterAvailabilityPublisher::automatic(
+            control,
+            availability_updates,
+            output.clone(),
+            role,
+        ),
+        None => AdapterAvailabilityPublisher::fixed(availability_updates, output.clone()),
+    });
     let (completion_updates, completion) = watch::channel(false);
     let platform_owner = Arc::new(PlatformOwner::default());
     let task_cancellation = cancellation.clone();
@@ -438,9 +880,10 @@ pub fn spawn_linux_rostered_btle_event_supervisor(
         run_rostered_supervisor(
             Arc::new(config),
             Arc::new(contacts),
-            availability_updates,
+            publisher,
             task_cancellation,
             task_platform_owner,
+            mode,
         )
         .await
     });
@@ -449,6 +892,7 @@ pub fn spawn_linux_rostered_btle_event_supervisor(
         completion,
         cancellation,
         platform_owner,
+        output,
         task,
     }
 }
@@ -456,9 +900,10 @@ pub fn spawn_linux_rostered_btle_event_supervisor(
 async fn run_rostered_supervisor(
     config: Arc<ValidatedRosteredSupervisorConfig>,
     contacts: Arc<OrderedEventContactHandle>,
-    availability: watch::Sender<crate::BtleAvailability>,
+    publisher: Arc<AdapterAvailabilityPublisher>,
     cancellation: LifecycleCancellation,
     platform_owner: Arc<PlatformOwner>,
+    mut mode: EpochContactMode,
 ) -> Result<(), SupervisorError> {
     let sockets = Arc::new(BluezRosteredSocketFactory);
     let nonces = Arc::new(production_nonce_source());
@@ -468,7 +913,7 @@ async fn run_rostered_supervisor(
             return Ok(());
         }
         if lifecycle_now() >= config.discovery_credentials().expires_at() {
-            return park_expired_adapter(config, &availability, &cancellation).await;
+            return park_expired_adapter(config, &publisher, &cancellation).await;
         }
         let credential_deadline =
             tokio::time::Instant::from_std(config.discovery_credentials().expires_at());
@@ -476,7 +921,7 @@ async fn run_rostered_supervisor(
             biased;
             () = cancellation.cancelled() => return Ok(()),
             () = tokio::time::sleep_until(credential_deadline) => {
-                return park_expired_adapter(config, &availability, &cancellation).await;
+                return park_expired_adapter(config, &publisher, &cancellation).await;
             }
             result = BluezDiscoveryPlatform::open() => match result {
                 Ok(discovery) => discovery,
@@ -484,9 +929,11 @@ async fn run_rostered_supervisor(
                     if error.kind() == DriverErrorKind::Configuration {
                         return Err(SupervisorError::Configuration);
                     }
-                    publish_availability(&availability, crate::BtleAvailability::Unavailable(
-                        crate::AvailabilityReason::BluezUnavailable,
-                    ));
+                    publisher
+                        .publish(crate::BtleAvailability::Unavailable(
+                            crate::AvailabilityReason::BluezUnavailable,
+                        ))
+                        .map_err(|_| SupervisorError::TaskStopped)?;
                     if wait_epoch_retry(backoff.next_delay(), &cancellation).await {
                         return Ok(());
                     }
@@ -496,16 +943,18 @@ async fn run_rostered_supervisor(
         };
         platform_owner.replace(discovery.owner_loss());
         let (available_started, available_started_at) = oneshot::channel();
-        let result = run_available_epoch(
+        let result = run_available_epoch_with_mode(
             config.clone(),
             sockets.clone(),
             Arc::new(discovery),
             nonces.clone(),
             contacts.clone(),
-            EpochSignals::monitored(availability.clone(), available_started),
+            &mut mode,
+            EpochSignals::with_publisher(publisher.clone(), available_started),
             cancellation.clone(),
         )
         .await;
+        complete_pending_after_epoch(&mut mode, &cancellation, &result);
         platform_owner.clear();
         if available_started_at
             .await
@@ -526,14 +975,13 @@ async fn run_rostered_supervisor(
                 | SupervisorError::PlatformCleanupUnconfirmed),
             ) => return Err(error),
             Err(SupervisorError::Controller(_)) => {
-                publish_availability(
-                    &availability,
-                    crate::BtleAvailability::Unavailable(
+                publisher
+                    .publish(crate::BtleAvailability::Unavailable(
                         crate::AvailabilityReason::BluezUnavailable,
-                    ),
-                );
+                    ))
+                    .map_err(|_| SupervisorError::TaskStopped)?;
                 if lifecycle_now() >= config.discovery_credentials().expires_at() {
-                    return park_expired_adapter(config, &availability, &cancellation).await;
+                    return park_expired_adapter(config, &publisher, &cancellation).await;
                 }
                 if wait_epoch_retry(backoff.next_delay(), &cancellation).await {
                     return Ok(());
@@ -543,16 +991,29 @@ async fn run_rostered_supervisor(
     }
 }
 
+fn complete_pending_after_epoch(
+    mode: &mut EpochContactMode,
+    cancellation: &LifecycleCancellation,
+    result: &Result<(), SupervisorError>,
+) {
+    if matches!(result, Err(SupervisorError::Controller(_))) && !cancellation.is_cancelled() {
+        mode.fail_pending_carrier_open();
+    } else {
+        mode.cancel_pending_carrier_open();
+    }
+}
+
 async fn park_expired_adapter(
     config: Arc<ValidatedRosteredSupervisorConfig>,
-    availability: &watch::Sender<crate::BtleAvailability>,
+    publisher: &AdapterAvailabilityPublisher,
     cancellation: &LifecycleCancellation,
 ) -> Result<(), SupervisorError> {
     drop(config);
-    publish_availability(
-        availability,
-        crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable),
-    );
+    publisher
+        .publish(crate::BtleAvailability::Unavailable(
+            crate::AvailabilityReason::BluezUnavailable,
+        ))
+        .map_err(|_| SupervisorError::TaskStopped)?;
     cancellation.cancelled().await;
     Ok(())
 }
@@ -609,29 +1070,84 @@ fn publish_availability(
     updates: &watch::Sender<crate::BtleAvailability>,
     availability: crate::BtleAvailability,
 ) {
-    if updates.send_if_modified(|current| {
+    let _ = updates.send_if_modified(|current| {
         if *current == availability {
             false
         } else {
             *current = availability;
             true
         }
-    }) {
-        match availability {
-            crate::BtleAvailability::Available => eprintln!("BTLE_EVENT status=available"),
-            crate::BtleAvailability::Unavailable(reason) => {
-                eprintln!("BTLE_EVENT status=unavailable reason={reason:?}");
-            }
-        }
-    }
+    });
 }
 
+#[cfg(test)]
 async fn run_available_epoch<S, D, N>(
     config: Arc<ValidatedRosteredSupervisorConfig>,
     sockets: Arc<S>,
     discovery: Arc<D>,
     nonces: Arc<N>,
     contacts: SharedContactAdmission,
+    signals: EpochSignals,
+    cancellation: LifecycleCancellation,
+) -> Result<(), SupervisorError>
+where
+    S: RosteredSocketFactory + 'static,
+    D: DiscoveryPlatform,
+    N: DiscoveryNonceSource,
+{
+    let mut mode = EpochContactMode::FixedEvaluation;
+    run_available_epoch_with_mode(
+        config,
+        sockets,
+        discovery,
+        nonces,
+        contacts,
+        &mut mode,
+        signals,
+        cancellation,
+    )
+    .await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn run_automatic_available_epoch<S, D, N>(
+    config: Arc<ValidatedRosteredSupervisorConfig>,
+    sockets: Arc<S>,
+    discovery: Arc<D>,
+    nonces: Arc<N>,
+    contacts: SharedContactAdmission,
+    attempts: Box<dyn CoordinatorAttemptSource>,
+    signals: EpochSignals,
+    cancellation: LifecycleCancellation,
+) -> Result<(), SupervisorError>
+where
+    S: RosteredSocketFactory + 'static,
+    D: DiscoveryPlatform,
+    N: DiscoveryNonceSource,
+{
+    let mut mode = EpochContactMode::automatic(attempts);
+    run_available_epoch_with_mode(
+        config,
+        sockets,
+        discovery,
+        nonces,
+        contacts,
+        &mut mode,
+        signals,
+        cancellation,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_available_epoch_with_mode<S, D, N>(
+    config: Arc<ValidatedRosteredSupervisorConfig>,
+    sockets: Arc<S>,
+    discovery: Arc<D>,
+    nonces: Arc<N>,
+    contacts: SharedContactAdmission,
+    mode: &mut EpochContactMode,
     mut signals: EpochSignals,
     cancellation: LifecycleCancellation,
 ) -> Result<(), SupervisorError>
@@ -740,103 +1256,174 @@ where
     let mut outbound_candidate_pending = false;
     let mut contact_backoff = CappedBackoff::new(INITIAL_EPOCH_RETRY, MAXIMUM_EPOCH_RETRY);
     let mut owner_loss_required = true;
-    if let Some(ref availability) = signals.availability {
-        publish_availability(availability, crate::BtleAvailability::Available);
-    }
-    if let Some(available_started) = signals.available_started.take() {
+    let mut result = signals.publish(crate::BtleAvailability::Available);
+    if result.is_ok()
+        && let Some(available_started) = signals.available_started.take()
+    {
         let _ = available_started.send(lifecycle_now());
     }
 
-    let result = loop {
-        let contact_is_free = contact_phase.is_free();
-        let outbound_retry_enabled =
-            contact_is_free && outbound_candidate_pending && config.role() == FixedRole::Initiator;
-        let outbound_retry_deadline =
-            tokio::time::Instant::from_std(outbound_delay.deadline(lifecycle_now()));
-        let event = match &mut scan_phase {
-            ScanPhase::Active { scan, deadline } => {
-                let advertisement_terminated = advertisement
-                    .as_ref()
-                    .expect("advertisement is live")
-                    .terminated();
-                let scan_terminated = scan.owner.termination();
-                tokio::select! {
-                    biased;
-                    () = cancellation.cancelled() => EpochEvent::Cancelled,
-                    () = tokio::time::sleep_until(credential_deadline) => EpochEvent::CredentialExpired,
-                    () = tokio::time::sleep_until(*deadline) => EpochEvent::ScanDeadline,
-                    () = tokio::time::sleep_until(advertisement_deadline) => {
-                        EpochEvent::AdvertisementRotation
-                    },
-                    () = advertisement_terminated => EpochEvent::AdvertisementTerminated,
-                    reason = scan_terminated => EpochEvent::ScanTerminated(reason),
-                    () = tokio::time::sleep_until(outbound_retry_deadline), if outbound_retry_enabled => {
-                        EpochEvent::OutboundRetry
-                    },
-                    observation = scan.observations.recv() => EpochEvent::Observation(observation),
-                    event = contact_phase.next() => event,
+    if result.is_ok() {
+        result = loop {
+            let contact_is_free = contact_phase.is_free();
+            let outbound_retry_enabled =
+                contact_is_free && outbound_candidate_pending && mode.can_open_outbound(&config);
+            let coordinator_receive_enabled = mode.receive_enabled();
+            let outbound_retry_deadline =
+                tokio::time::Instant::from_std(outbound_delay.deadline(lifecycle_now()));
+            let event = match &mut scan_phase {
+                ScanPhase::Active { scan, deadline } => {
+                    let advertisement_terminated = advertisement
+                        .as_ref()
+                        .expect("advertisement is live")
+                        .terminated();
+                    let scan_terminated = scan.owner.termination();
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => EpochEvent::Cancelled,
+                        () = tokio::time::sleep_until(credential_deadline) => EpochEvent::CredentialExpired,
+                        () = tokio::time::sleep_until(*deadline) => EpochEvent::ScanDeadline,
+                        () = tokio::time::sleep_until(advertisement_deadline) => {
+                            EpochEvent::AdvertisementRotation
+                        },
+                        () = advertisement_terminated => EpochEvent::AdvertisementTerminated,
+                        reason = scan_terminated => EpochEvent::ScanTerminated(reason),
+                        attempt = mode.recv(), if coordinator_receive_enabled => {
+                            EpochEvent::CoordinatorAttempt(attempt)
+                        },
+                        () = tokio::time::sleep_until(outbound_retry_deadline), if outbound_retry_enabled => {
+                            EpochEvent::OutboundRetry
+                        },
+                        observation = scan.observations.recv() => EpochEvent::Observation(observation),
+                        event = contact_phase.next() => event,
+                    }
                 }
-            }
-            ScanPhase::Idle { deadline } => {
-                let advertisement_terminated = advertisement
-                    .as_ref()
-                    .expect("advertisement is live")
-                    .terminated();
-                tokio::select! {
-                    biased;
-                    () = cancellation.cancelled() => EpochEvent::Cancelled,
-                    () = tokio::time::sleep_until(credential_deadline) => EpochEvent::CredentialExpired,
-                    () = tokio::time::sleep_until(*deadline), if contact_is_free => {
-                        EpochEvent::ScanIdleDeadline
-                    },
-                    () = tokio::time::sleep_until(advertisement_deadline) => {
-                        EpochEvent::AdvertisementRotation
-                    },
-                    () = advertisement_terminated => EpochEvent::AdvertisementTerminated,
-                    () = tokio::time::sleep_until(outbound_retry_deadline), if outbound_retry_enabled => {
-                        EpochEvent::OutboundRetry
-                    },
-                    event = contact_phase.next() => event,
+                ScanPhase::Idle { deadline } => {
+                    let advertisement_terminated = advertisement
+                        .as_ref()
+                        .expect("advertisement is live")
+                        .terminated();
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => EpochEvent::Cancelled,
+                        () = tokio::time::sleep_until(credential_deadline) => EpochEvent::CredentialExpired,
+                        () = tokio::time::sleep_until(*deadline), if contact_is_free => {
+                            EpochEvent::ScanIdleDeadline
+                        },
+                        () = tokio::time::sleep_until(advertisement_deadline) => {
+                            EpochEvent::AdvertisementRotation
+                        },
+                        () = advertisement_terminated => EpochEvent::AdvertisementTerminated,
+                        attempt = mode.recv(), if coordinator_receive_enabled => {
+                            EpochEvent::CoordinatorAttempt(attempt)
+                        },
+                        () = tokio::time::sleep_until(outbound_retry_deadline), if outbound_retry_enabled => {
+                            EpochEvent::OutboundRetry
+                        },
+                        event = contact_phase.next() => event,
+                    }
                 }
-            }
-        };
-        match event {
-            EpochEvent::Cancelled => break Ok(()),
-            EpochEvent::AdvertisementTerminated => {
-                break Err(SupervisorError::Controller(DriverErrorKind::Transport));
-            }
-            EpochEvent::CredentialExpired => {
-                break Err(SupervisorError::Controller(DriverErrorKind::Unavailable));
-            }
-            EpochEvent::ScanTerminated(ScanTermination::CapacityExceeded) => {
-                finish_ended_scan(&mut scan_phase, &mut admission);
-            }
-            EpochEvent::ScanTerminated(
-                ScanTermination::Requested | ScanTermination::Unexpected,
-            )
-            | EpochEvent::Observation(None) => {
-                break Err(SupervisorError::Controller(DriverErrorKind::Transport));
-            }
-            EpochEvent::AdvertisementRotation => {
-                let mut previous = advertisement.take().expect("advertisement is live");
-                if let Err(error) = release_advertisement(previous.as_mut()).await {
-                    break Err(supervisor_error(error));
+            };
+            match event {
+                EpochEvent::Cancelled => break Ok(()),
+                EpochEvent::AdvertisementTerminated => {
+                    break Err(SupervisorError::Controller(DriverErrorKind::Transport));
                 }
-                owner_loss_required = false;
-                break Err(SupervisorError::Controller(DriverErrorKind::Transport));
-            }
-            EpochEvent::Observation(Some(observation)) => {
-                let now = lifecycle_now();
-                let outcome = admit_platform_observation(&mut admission, &config, observation, now);
-                if matches!(outcome, ObservationOutcome::StopWindow(_)) {
+                EpochEvent::CredentialExpired => {
+                    break Err(SupervisorError::Controller(DriverErrorKind::Unavailable));
+                }
+                EpochEvent::ScanTerminated(ScanTermination::CapacityExceeded) => {
+                    finish_ended_scan(&mut scan_phase, &mut admission);
+                }
+                EpochEvent::ScanTerminated(
+                    ScanTermination::Requested | ScanTermination::Unexpected,
+                )
+                | EpochEvent::Observation(None) => {
+                    break Err(SupervisorError::Controller(DriverErrorKind::Transport));
+                }
+                EpochEvent::AdvertisementRotation => {
+                    let mut previous = advertisement.take().expect("advertisement is live");
+                    if let Err(error) = release_advertisement(previous.as_mut()).await {
+                        break Err(supervisor_error(error));
+                    }
+                    owner_loss_required = false;
+                    break Err(SupervisorError::Controller(DriverErrorKind::Transport));
+                }
+                EpochEvent::Observation(Some(observation)) => {
+                    let now = lifecycle_now();
+                    let outcome =
+                        admit_platform_observation(&mut admission, &config, observation, now);
+                    if matches!(outcome, ObservationOutcome::StopWindow(_)) {
+                        if let Err(error) = stop_active_scan(&mut scan_phase, &mut admission).await
+                        {
+                            break Err(supervisor_error(error));
+                        }
+                    } else if outcome == ObservationOutcome::Accepted
+                        && (mode.is_automatic() || config.role() == FixedRole::Initiator)
+                    {
+                        outbound_candidate_pending = true;
+                        outbound_delay.wake_for_new_candidate();
+                        match begin_outbound_contact(
+                            &config,
+                            &sockets,
+                            &mut admission,
+                            &mut scan_phase,
+                            &mut outbound_candidate_pending,
+                            &mut outbound_delay,
+                            mode,
+                        )
+                        .await
+                        {
+                            Ok(Some(phase)) => contact_phase = phase,
+                            Ok(None) => {}
+                            Err(error) => break Err(supervisor_error(error)),
+                        }
+                    }
+                }
+                EpochEvent::InboundAccepted(accepted) => {
+                    let (opened_socket, locator) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) if error.kind() == DriverErrorKind::PeerRejected => {
+                            contact_phase =
+                                ContactPhase::accepting(sockets.clone(), listener.clone());
+                            continue;
+                        }
+                        Err(error) => break Err(supervisor_error(error)),
+                    };
+                    let now = lifecycle_now();
+                    match admit_inbound_contact(&config, &mut admission, locator, now, mode) {
+                        InboundContactAdmission::Admitted => {}
+                        InboundContactAdmission::Rejected => {
+                            drop(opened_socket);
+                            contact_phase =
+                                ContactPhase::accepting(sockets.clone(), listener.clone());
+                            continue;
+                        }
+                        InboundContactAdmission::BackoffUntil(deadline) => {
+                            drop(opened_socket);
+                            contact_phase = ContactPhase::paused_until(deadline);
+                            continue;
+                        }
+                    }
+                    let opened = match opened_rostered_contact(&config, locator, opened_socket) {
+                        Ok(opened) => opened,
+                        Err(error) => break Err(supervisor_error(error)),
+                    };
                     if let Err(error) = stop_active_scan(&mut scan_phase, &mut admission).await {
                         break Err(supervisor_error(error));
                     }
-                } else if outcome == ObservationOutcome::Accepted
-                    && config.role() == FixedRole::Initiator
-                {
-                    outbound_candidate_pending = true;
-                    outbound_delay.wake_for_new_candidate();
+                    admission.enter_authenticated_contact(now);
+                    contact_phase = ContactPhase::admitted(
+                        config.clone(),
+                        contacts.clone(),
+                        OrderedEventContactRole::Responder,
+                        opened,
+                    );
+                }
+                EpochEvent::InboundAcceptReady => {
+                    contact_phase = ContactPhase::accepting(sockets.clone(), listener.clone());
+                }
+                EpochEvent::OutboundRetry => {
                     match begin_outbound_contact(
                         &config,
                         &sockets,
@@ -844,6 +1431,7 @@ where
                         &mut scan_phase,
                         &mut outbound_candidate_pending,
                         &mut outbound_delay,
+                        mode,
                     )
                     .await
                     {
@@ -852,153 +1440,139 @@ where
                         Err(error) => break Err(supervisor_error(error)),
                     }
                 }
-            }
-            EpochEvent::InboundAccepted(accepted) => {
-                let (opened_socket, locator) = match accepted {
-                    Ok(accepted) => accepted,
-                    Err(error) if error.kind() == DriverErrorKind::PeerRejected => {
-                        contact_phase = ContactPhase::accepting(sockets.clone(), listener.clone());
-                        continue;
-                    }
-                    Err(error) => break Err(supervisor_error(error)),
-                };
-                let now = lifecycle_now();
-                match admit_inbound_contact(&config, &mut admission, locator, now) {
-                    InboundContactAdmission::Admitted => {}
-                    InboundContactAdmission::Rejected => {
-                        drop(opened_socket);
-                        contact_phase = ContactPhase::accepting(sockets.clone(), listener.clone());
-                        continue;
-                    }
-                    InboundContactAdmission::BackoffUntil(deadline) => {
-                        drop(opened_socket);
-                        contact_phase = ContactPhase::paused_until(deadline);
-                        continue;
-                    }
-                }
-                let opened = match opened_rostered_contact(&config, locator, opened_socket) {
-                    Ok(opened) => opened,
-                    Err(error) => break Err(supervisor_error(error)),
-                };
-                if let Err(error) = stop_active_scan(&mut scan_phase, &mut admission).await {
-                    break Err(supervisor_error(error));
-                }
-                admission.enter_authenticated_contact(now);
-                contact_phase = ContactPhase::admitted(
-                    config.clone(),
-                    contacts.clone(),
-                    OrderedEventContactRole::Responder,
-                    opened,
-                );
-            }
-            EpochEvent::InboundAcceptReady => {
-                contact_phase = ContactPhase::accepting(sockets.clone(), listener.clone());
-            }
-            EpochEvent::OutboundRetry => {
-                match begin_outbound_contact(
-                    &config,
-                    &sockets,
-                    &mut admission,
-                    &mut scan_phase,
-                    &mut outbound_candidate_pending,
-                    &mut outbound_delay,
-                )
-                .await
-                {
-                    Ok(Some(phase)) => contact_phase = phase,
-                    Ok(None) => {}
-                    Err(error) => break Err(supervisor_error(error)),
-                }
-            }
-            EpochEvent::ContactFinished(outcome) => {
-                let now = lifecycle_now();
-                let outcome = match outcome {
-                    ContactAttemptOutcome::Opened(opened) => {
-                        if now >= config.discovery_credentials().expires_at() {
-                            drop(opened);
-                            break Err(SupervisorError::Controller(DriverErrorKind::Unavailable));
+                EpochEvent::CoordinatorAttempt(Some(attempt)) => {
+                    if mode.accept_attempt(&config, attempt) {
+                        outbound_candidate_pending =
+                            admission.selected_candidate(lifecycle_now()).is_some();
+                        if outbound_candidate_pending && contact_phase.is_free() {
+                            match begin_outbound_contact(
+                                &config,
+                                &sockets,
+                                &mut admission,
+                                &mut scan_phase,
+                                &mut outbound_candidate_pending,
+                                &mut outbound_delay,
+                                mode,
+                            )
+                            .await
+                            {
+                                Ok(Some(phase)) => contact_phase = phase,
+                                Ok(None) => {}
+                                Err(error) => break Err(supervisor_error(error)),
+                            }
                         }
-                        if !admission.try_consume_attempt(AttemptKind::MissionHandshake, now) {
-                            drop(opened);
-                            admission.contact_closed(now);
-                            scan_phase = idle_scan_phase();
-                            outbound_candidate_pending = true;
-                            outbound_delay = OutboundDelay::TokenRefillUntil(
-                                admission.attempt_retry_at(AttemptKind::MissionHandshake, now),
-                            );
-                            contact_phase =
-                                ContactPhase::accepting(sockets.clone(), listener.clone());
+                    }
+                }
+                EpochEvent::CoordinatorAttempt(None) => break Ok(()),
+                EpochEvent::ContactFinished(outcome) => {
+                    let now = lifecycle_now();
+                    let outcome = match outcome {
+                        ContactAttemptOutcome::Opened { opened, owner } => {
+                            if now >= config.discovery_credentials().expires_at() {
+                                drop(opened);
+                                if let OutboundAttemptOwner::Coordinator(attempt) = owner {
+                                    attempt.fail_carrier_open();
+                                }
+                                break Err(SupervisorError::Controller(
+                                    DriverErrorKind::Unavailable,
+                                ));
+                            }
+                            if !admission.try_consume_attempt(AttemptKind::MissionHandshake, now) {
+                                drop(opened);
+                                admission.contact_closed(now);
+                                scan_phase = idle_scan_phase();
+                                outbound_candidate_pending = true;
+                                mode.restore_outbound(owner);
+                                outbound_delay = OutboundDelay::TokenRefillUntil(
+                                    admission.attempt_retry_at(AttemptKind::MissionHandshake, now),
+                                );
+                                contact_phase =
+                                    ContactPhase::accepting(sockets.clone(), listener.clone());
+                                continue;
+                            }
+                            contact_phase = match owner {
+                                OutboundAttemptOwner::FixedEvaluation => ContactPhase::admitted(
+                                    config.clone(),
+                                    contacts.clone(),
+                                    OrderedEventContactRole::Initiator,
+                                    *opened,
+                                ),
+                                OutboundAttemptOwner::Coordinator(attempt) => {
+                                    ContactPhase::admitted_coordinator(attempt, *opened)
+                                }
+                            };
                             continue;
                         }
-                        contact_phase = ContactPhase::admitted(
-                            config.clone(),
-                            contacts.clone(),
-                            OrderedEventContactRole::Initiator,
-                            *opened,
-                        );
-                        continue;
+                        ContactAttemptOutcome::CoordinatorCompleted => {
+                            outbound_candidate_pending = false;
+                            ContactAttemptOutcome::Cancelled
+                        }
+                        outcome => outcome,
+                    };
+                    admission.contact_closed(now);
+                    scan_phase = idle_scan_phase();
+                    let mut schedule = OutboundSchedule {
+                        delay: &mut outbound_delay,
+                        candidate_pending: &mut outbound_candidate_pending,
+                        backoff: &mut contact_backoff,
+                        self_schedule: !mode.is_automatic(),
+                    };
+                    if let Err(error) =
+                        finish_contact_attempt(&config, &mut admission, outcome, now, &mut schedule)
+                    {
+                        break Err(error);
                     }
-                    outcome => outcome,
-                };
-                admission.contact_closed(now);
-                scan_phase = idle_scan_phase();
-                if let Err(error) = finish_contact_attempt(
-                    &config,
-                    &mut admission,
-                    outcome,
-                    now,
-                    &mut outbound_delay,
-                    &mut outbound_candidate_pending,
-                    &mut contact_backoff,
-                ) {
-                    break Err(error);
+                    contact_phase = ContactPhase::accepting(sockets.clone(), listener.clone());
                 }
-                contact_phase = ContactPhase::accepting(sockets.clone(), listener.clone());
-            }
-            EpochEvent::ScanDeadline => {
-                if let Err(error) = stop_active_scan(&mut scan_phase, &mut admission).await {
-                    break Err(supervisor_error(error));
-                }
-            }
-            EpochEvent::ScanIdleDeadline => {
-                let started_scan = match await_epoch_platform(
-                    expires_at,
-                    &cancellation,
-                    discovery.start_scan(config.controller()),
-                )
-                .await
-                {
-                    Ok(started) => started,
-                    Err(error) => break Err(error),
-                };
-                if lifecycle_now() >= expires_at {
-                    let (mut owner, _) = started_scan.into_parts();
-                    if let Err(error) = stop_scan(owner.as_mut()).await {
+                EpochEvent::ScanDeadline => {
+                    if let Err(error) = stop_active_scan(&mut scan_phase, &mut admission).await {
                         break Err(supervisor_error(error));
                     }
-                    break Err(SupervisorError::Controller(DriverErrorKind::Unavailable));
                 }
-                let (owner, observations) = started_scan.into_parts();
-                let now = lifecycle_now();
-                debug_assert_eq!(admission.start_scan(now), crate::ScanStartOutcome::Started);
-                scan_phase = ScanPhase::Active {
-                    scan: ActiveScan {
-                        owner,
-                        observations,
-                    },
-                    deadline: tokio::time::Instant::now() + SCAN_ACTIVE_INTERVAL,
-                };
+                EpochEvent::ScanIdleDeadline => {
+                    let started_scan = match await_epoch_platform(
+                        expires_at,
+                        &cancellation,
+                        discovery.start_scan(config.controller()),
+                    )
+                    .await
+                    {
+                        Ok(started) => started,
+                        Err(error) => break Err(error),
+                    };
+                    if lifecycle_now() >= expires_at {
+                        let (mut owner, _) = started_scan.into_parts();
+                        if let Err(error) = stop_scan(owner.as_mut()).await {
+                            break Err(supervisor_error(error));
+                        }
+                        break Err(SupervisorError::Controller(DriverErrorKind::Unavailable));
+                    }
+                    let (owner, observations) = started_scan.into_parts();
+                    let now = lifecycle_now();
+                    debug_assert_eq!(admission.start_scan(now), crate::ScanStartOutcome::Started);
+                    scan_phase = ScanPhase::Active {
+                        scan: ActiveScan {
+                            owner,
+                            observations,
+                        },
+                        deadline: tokio::time::Instant::now() + SCAN_ACTIVE_INTERVAL,
+                    };
+                }
             }
-        }
-    };
+        };
+    }
 
+    let contact_termination = if matches!(result, Err(SupervisorError::Controller(_))) {
+        EpochContactTermination::LocalEpochLoss
+    } else {
+        EpochContactTermination::Cancelled
+    };
     if result.is_err()
-        && let Some(ref availability) = signals.availability
+        && let Err(error) = signals.publish(crate::BtleAvailability::Unavailable(
+            crate::AvailabilityReason::BluezUnavailable,
+        ))
     {
-        publish_availability(
-            availability,
-            crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable),
-        );
+        result = Err(error);
     }
     if result.is_err() && owner_loss_required {
         discovery.force_owner_loss();
@@ -1017,8 +1591,9 @@ where
             None => Ok(()),
         }
     };
-    let (_, scan_stop, advertisement_release) =
+    let (contact_outcome, scan_stop, advertisement_release) =
         tokio::join!(contact_join, scan_cleanup, advertisement_cleanup);
+    complete_interrupted_contact(contact_outcome, contact_termination);
     drop(listener);
     if result.is_ok() && (scan_stop.is_err() || advertisement_release.is_err()) {
         discovery.force_owner_loss();
@@ -1028,44 +1603,74 @@ where
     advertisement_release.map_err(supervisor_error)
 }
 
+struct OutboundSchedule<'a> {
+    delay: &'a mut OutboundDelay,
+    candidate_pending: &'a mut bool,
+    backoff: &'a mut CappedBackoff,
+    self_schedule: bool,
+}
+
 fn finish_contact_attempt(
     config: &ValidatedRosteredSupervisorConfig,
     admission: &mut DiscoveryAdmission,
     outcome: ContactAttemptOutcome,
     now: Instant,
-    outbound_delay: &mut OutboundDelay,
-    outbound_candidate_pending: &mut bool,
-    contact_backoff: &mut CappedBackoff,
+    schedule: &mut OutboundSchedule<'_>,
 ) -> Result<(), SupervisorError> {
     match outcome {
-        ContactAttemptOutcome::Opened(_) => unreachable!("opened contact is handled in the epoch"),
+        ContactAttemptOutcome::Opened { .. } => {
+            unreachable!("opened contact is handled in the epoch")
+        }
+        ContactAttemptOutcome::CoordinatorCompleted => {
+            unreachable!("coordinator completion is handled in the epoch")
+        }
         ContactAttemptOutcome::OpenFailed(failure) => {
-            let ContactOpenFailure { candidate, error } = *failure;
+            let ContactOpenFailure {
+                candidate,
+                error,
+                owner,
+            } = *failure;
             if error.kind() == DriverErrorKind::Configuration {
+                if let OutboundAttemptOwner::Coordinator(attempt) = owner {
+                    attempt.cancel_carrier_open();
+                }
                 return Err(SupervisorError::Configuration);
             }
-            if error.kind() != DriverErrorKind::Cancelled {
-                admission.invalidate_after_open_failure(candidate, now);
-                if config.role() == FixedRole::Initiator {
-                    *outbound_candidate_pending = admission.selected_candidate(now).is_some();
-                    if *outbound_candidate_pending {
-                        *outbound_delay =
-                            OutboundDelay::PeerRetryUntil(now + contact_backoff.next_delay());
+            if error.kind() == DriverErrorKind::Cancelled {
+                if let OutboundAttemptOwner::Coordinator(attempt) = owner {
+                    attempt.cancel_carrier_open();
+                }
+                return Ok(());
+            }
+            admission.invalidate_after_open_failure(candidate, now);
+            match owner {
+                OutboundAttemptOwner::FixedEvaluation => {
+                    if schedule.self_schedule && config.role() == FixedRole::Initiator {
+                        *schedule.candidate_pending = admission.selected_candidate(now).is_some();
+                        if *schedule.candidate_pending {
+                            *schedule.delay =
+                                OutboundDelay::PeerRetryUntil(now + schedule.backoff.next_delay());
+                        }
                     }
+                }
+                OutboundAttemptOwner::Coordinator(attempt) => {
+                    *schedule.candidate_pending = false;
+                    let failure = if error.kind() == DriverErrorKind::Timeout {
+                        aster_node::UnauthenticatedCarrierOpenFailure::TimedOut
+                    } else {
+                        aster_node::UnauthenticatedCarrierOpenFailure::Interrupted
+                    };
+                    attempt.fail_unauthenticated_carrier_open(failure);
                 }
             }
         }
         ContactAttemptOutcome::Cancelled => {}
         ContactAttemptOutcome::Completed(result) => match *result {
-            Ok(receipt) => {
-                eprintln!(
-                    "BTLE_EVENT status=contact-complete offered={} fetched={} inserted={}",
-                    receipt.offered, receipt.fetched, receipt.inserted
-                );
-                if config.role() == FixedRole::Initiator {
-                    contact_backoff.reset();
-                    *outbound_candidate_pending = admission.selected_candidate(now).is_some();
-                    *outbound_delay = OutboundDelay::CadenceUntil(now + config.contact_cadence());
+            Ok(_receipt) => {
+                if schedule.self_schedule && config.role() == FixedRole::Initiator {
+                    schedule.backoff.reset();
+                    *schedule.candidate_pending = admission.selected_candidate(now).is_some();
+                    *schedule.delay = OutboundDelay::CadenceUntil(now + config.contact_cadence());
                 }
             }
             Err(outcome) if outcome.reason() == ContactReason::AdmissionClosed => {
@@ -1083,41 +1688,36 @@ fn finish_contact_attempt(
                 outcome.disposition(),
                 outcome.reason(),
                 now,
-                outbound_delay,
-                outbound_candidate_pending,
-                contact_backoff,
+                schedule,
             )?,
         },
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn finish_contact_disposition(
     config: &ValidatedRosteredSupervisorConfig,
     admission: &mut DiscoveryAdmission,
     disposition: ContactDisposition,
     reason: ContactReason,
     now: Instant,
-    outbound_delay: &mut OutboundDelay,
-    outbound_candidate_pending: &mut bool,
-    contact_backoff: &mut CappedBackoff,
+    schedule: &mut OutboundSchedule<'_>,
 ) -> Result<(), SupervisorError> {
     match contact_schedule_effect(disposition) {
         ContactScheduleEffect::RetryLater => {
-            if config.role() == FixedRole::Initiator {
-                *outbound_candidate_pending = admission.selected_candidate(now).is_some();
-                if *outbound_candidate_pending {
-                    *outbound_delay =
-                        OutboundDelay::PeerRetryUntil(now + contact_backoff.next_delay());
+            if schedule.self_schedule && config.role() == FixedRole::Initiator {
+                *schedule.candidate_pending = admission.selected_candidate(now).is_some();
+                if *schedule.candidate_pending {
+                    *schedule.delay =
+                        OutboundDelay::PeerRetryUntil(now + schedule.backoff.next_delay());
                 }
             }
             Ok(())
         }
         ContactScheduleEffect::Reselect => {
-            if config.role() == FixedRole::Initiator {
-                *outbound_candidate_pending = admission.selected_candidate(now).is_some();
-                *outbound_delay = OutboundDelay::Ready;
+            if schedule.self_schedule && config.role() == FixedRole::Initiator {
+                *schedule.candidate_pending = admission.selected_candidate(now).is_some();
+                *schedule.delay = OutboundDelay::Ready;
             }
             Ok(())
         }
@@ -1134,12 +1734,13 @@ async fn begin_outbound_contact<S>(
     scan_phase: &mut ScanPhase,
     candidate_pending: &mut bool,
     outbound_delay: &mut OutboundDelay,
+    mode: &mut EpochContactMode,
 ) -> Result<Option<ContactPhase>, DriverError>
 where
     S: RosteredSocketFactory + 'static,
 {
     let now = lifecycle_now();
-    if config.role() != FixedRole::Initiator
+    if !mode.can_open_outbound(config)
         || now >= config.discovery_credentials().expires_at()
         || now < outbound_delay.deadline(now)
     {
@@ -1159,10 +1760,12 @@ where
     admission.enter_authenticated_contact(now);
     *candidate_pending = false;
     *outbound_delay = OutboundDelay::Ready;
+    let owner = mode.take_outbound();
     Ok(Some(ContactPhase::opening(
         config.clone(),
         sockets.clone(),
         candidate,
+        owner,
     )))
 }
 
@@ -1212,9 +1815,10 @@ fn admit_inbound_contact(
     admission: &mut DiscoveryAdmission,
     locator: crate::CanonicalLocator,
     now: Instant,
+    mode: &EpochContactMode,
 ) -> InboundContactAdmission {
     if admission.candidate(locator, now).is_none()
-        || config.role() != FixedRole::Listener
+        || !mode.accepts_inbound(config)
         || now >= config.discovery_credentials().expires_at()
     {
         return InboundContactAdmission::Rejected;
@@ -1288,6 +1892,30 @@ async fn run_opened_contact(
     drop(admission);
     drop(contact);
     completion
+}
+
+async fn run_coordinator_contact(
+    attempt: Box<dyn CoordinatorAttempt>,
+    opened: OpenedContact,
+    cancellation: &LifecycleCancellation,
+) -> ContactAttemptOutcome {
+    let contact: Arc<dyn OrderedContact> = opened.into_contact();
+    let mut completion = attempt.run(contact.clone());
+    let outcome = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {
+            contact.close();
+            let _ = timeout(CONTACT_DRAIN_DEADLINE, &mut completion).await;
+            ContactAttemptOutcome::Cancelled
+        }
+        () = &mut completion => {
+            contact.close();
+            ContactAttemptOutcome::CoordinatorCompleted
+        }
+    };
+    drop(completion);
+    drop(contact);
+    outcome
 }
 
 async fn release_advertisement(
@@ -1395,7 +2023,8 @@ mod tests {
     };
     use aster_contact::OrderedContact;
     use aster_node::{
-        ContactOutcome, MissionPeerExpectation, OrderedEventContactRole, PeerReceipt,
+        AutomaticEventTransportHandle, ContactOutcome, MissionPeerExpectation,
+        OrderedEventContactRole, PeerReceipt,
     };
     use bluer::{Address, AddressType};
     use std::{
@@ -1546,6 +2175,16 @@ mod tests {
         connected: Mutex<Vec<(crate::CanonicalLocator, u16)>>,
     }
 
+    struct FailingConnectSockets {
+        connected: Mutex<Vec<(crate::CanonicalLocator, u16)>>,
+        kind: DriverErrorKind,
+    }
+
+    struct PendingConnectSockets {
+        connected: Mutex<Vec<(crate::CanonicalLocator, u16)>>,
+        started: Arc<Notify>,
+    }
+
     struct RecordingAdmission {
         roles: Mutex<Vec<OrderedEventContactRole>>,
         peers: Mutex<Vec<[u8; 32]>>,
@@ -1577,6 +2216,7 @@ mod tests {
 
     struct InboundSockets {
         accepted: tokio::sync::Mutex<Option<oneshot::Receiver<AcceptedContact>>>,
+        connected: AtomicU8,
     }
 
     impl crate::lifecycle::ContactAdmission for RecordingAdmission {
@@ -1657,6 +2297,7 @@ mod tests {
             _locator: crate::CanonicalLocator,
             _advertised_psm: u16,
         ) -> crate::OpenFuture<'a> {
+            self.connected.fetch_add(1, Ordering::AcqRel);
             Box::pin(pending())
         }
 
@@ -1698,6 +2339,70 @@ mod tests {
                 let (stream, _peer) = tokio::io::duplex(4096);
                 SocketOpen::with_observed_mtu(Box::new(stream), 128, 96)
             })
+        }
+
+        fn accept<'a>(
+            &'a self,
+            _listener: &'a Self::Listener,
+        ) -> crate::platform::socket::RosteredAcceptFuture<'a> {
+            Box::pin(pending())
+        }
+    }
+
+    impl RosteredSocketFactory for FailingConnectSockets {
+        type Listener = ();
+
+        fn bind_dynamic_listener<'a>(
+            &'a self,
+            _controller: &'a ValidatedControllerConfig,
+        ) -> RosteredBindFuture<'a, Self::Listener> {
+            Box::pin(async { BoundRosteredListener::new((), 0x0081) })
+        }
+
+        fn connect<'a>(
+            &'a self,
+            _controller: &'a ValidatedControllerConfig,
+            locator: crate::CanonicalLocator,
+            advertised_psm: u16,
+        ) -> crate::OpenFuture<'a> {
+            self.connected
+                .lock()
+                .unwrap()
+                .push((locator, advertised_psm));
+            let kind = self.kind;
+            Box::pin(async move { Err(DriverError::new(kind, "test connect failure")) })
+        }
+
+        fn accept<'a>(
+            &'a self,
+            _listener: &'a Self::Listener,
+        ) -> crate::platform::socket::RosteredAcceptFuture<'a> {
+            Box::pin(pending())
+        }
+    }
+
+    impl RosteredSocketFactory for PendingConnectSockets {
+        type Listener = ();
+
+        fn bind_dynamic_listener<'a>(
+            &'a self,
+            _controller: &'a ValidatedControllerConfig,
+        ) -> RosteredBindFuture<'a, Self::Listener> {
+            Box::pin(async { BoundRosteredListener::new((), 0x0081) })
+        }
+
+        fn connect<'a>(
+            &'a self,
+            _controller: &'a ValidatedControllerConfig,
+            locator: crate::CanonicalLocator,
+            advertised_psm: u16,
+        ) -> crate::OpenFuture<'a> {
+            self.connected
+                .lock()
+                .unwrap()
+                .push((locator, advertised_psm));
+            self.started.notify_one();
+            Box::pin(pending())
         }
 
         fn accept<'a>(
@@ -1896,6 +2601,7 @@ mod tests {
             completion,
             cancellation: LifecycleCancellation::new(),
             platform_owner,
+            output: crate::BtleOperatorOutput::discard(),
             task,
         }
     }
@@ -2036,8 +2742,10 @@ mod tests {
         let config = Arc::new(config());
         let config_weak = Arc::downgrade(&config);
         let (updates, availability) = watch::channel(crate::BtleAvailability::Available);
+        let publisher =
+            AdapterAvailabilityPublisher::fixed(updates, crate::BtleOperatorOutput::discard());
         let task = tokio::spawn(async move {
-            park_expired_adapter(config, &updates, &task_cancellation).await
+            park_expired_adapter(config, &publisher, &task_cancellation).await
         });
 
         tokio::task::yield_now().await;
@@ -2078,14 +2786,18 @@ mod tests {
             let mut outbound_delay = OutboundDelay::Ready;
             let mut outbound_candidate_pending = false;
             let mut backoff = CappedBackoff::new(INITIAL_EPOCH_RETRY, MAXIMUM_EPOCH_RETRY);
+            let mut schedule = OutboundSchedule {
+                delay: &mut outbound_delay,
+                candidate_pending: &mut outbound_candidate_pending,
+                backoff: &mut backoff,
+                self_schedule: true,
+            };
             let error = finish_contact_attempt(
                 &config(),
                 &mut admission,
                 ContactAttemptOutcome::Completed(Box::new(Err(contact_error))),
                 now,
-                &mut outbound_delay,
-                &mut outbound_candidate_pending,
-                &mut backoff,
+                &mut schedule,
             )
             .unwrap_err();
 
@@ -2127,15 +2839,19 @@ mod tests {
             let mut delay = OutboundDelay::Ready;
             let mut pending = false;
             let mut backoff = CappedBackoff::new(INITIAL_EPOCH_RETRY, MAXIMUM_EPOCH_RETRY);
+            let mut schedule = OutboundSchedule {
+                delay: &mut delay,
+                candidate_pending: &mut pending,
+                backoff: &mut backoff,
+                self_schedule: true,
+            };
             let result = finish_contact_disposition(
                 &config,
                 &mut admission,
                 disposition,
                 ContactReason::ProtocolViolation,
                 now,
-                &mut delay,
-                &mut pending,
-                &mut backoff,
+                &mut schedule,
             );
             (result, pending, delay.deadline(now))
         };
@@ -2611,6 +3327,7 @@ mod tests {
         let (accept_sender, accept_receiver) = oneshot::channel();
         let sockets = Arc::new(InboundSockets {
             accepted: tokio::sync::Mutex::new(Some(accept_receiver)),
+            connected: AtomicU8::new(0),
         });
         let scan_started = Arc::new(Notify::new());
         let discovery = Arc::new(FakeDiscovery {
@@ -3063,5 +3780,1080 @@ mod tests {
             task.await.unwrap().unwrap_err(),
             SupervisorError::Controller(DriverErrorKind::Transport)
         );
+    }
+
+    struct TestCoordinatorAttempt {
+        mission: [u8; 32],
+        peer: [u8; 32],
+        kind: aster_node::EventTransportKind,
+        runs: Arc<AtomicU8>,
+        carrier_failures: Arc<AtomicU8>,
+        ambiguous_failures: Arc<AtomicU8>,
+        cancellations: Arc<AtomicU8>,
+        started: Option<Arc<Notify>>,
+        release: Option<Arc<Notify>>,
+        completed: Arc<AtomicU8>,
+    }
+
+    impl CoordinatorAttempt for TestCoordinatorAttempt {
+        fn transport_kind(&self) -> aster_node::EventTransportKind {
+            self.kind
+        }
+
+        fn mission(&self) -> [u8; 32] {
+            self.mission
+        }
+
+        fn peer(&self) -> [u8; 32] {
+            self.peer
+        }
+
+        fn run(self: Box<Self>, _contact: Arc<dyn OrderedContact>) -> CoordinatorAttemptFuture {
+            Box::pin(async move {
+                self.runs.fetch_add(1, Ordering::AcqRel);
+                if let Some(started) = &self.started {
+                    started.notify_one();
+                }
+                if let Some(release) = &self.release {
+                    release.notified().await;
+                }
+                self.completed.store(1, Ordering::Release);
+            })
+        }
+
+        fn fail_carrier_open(self: Box<Self>) {
+            self.carrier_failures.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn fail_unauthenticated_carrier_open(
+            self: Box<Self>,
+            _failure: aster_node::UnauthenticatedCarrierOpenFailure,
+        ) {
+            self.ambiguous_failures.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn cancel_carrier_open(self: Box<Self>) {
+            self.cancellations.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    struct TestCoordinatorAttemptSource {
+        attempts: mpsc::Receiver<Box<dyn CoordinatorAttempt>>,
+        received: Option<Arc<Notify>>,
+    }
+
+    impl CoordinatorAttemptSource for TestCoordinatorAttemptSource {
+        fn recv(&mut self) -> CoordinatorAttemptReceiveFuture<'_> {
+            Box::pin(async move {
+                let attempt = self.attempts.recv().await;
+                if attempt.is_some()
+                    && let Some(received) = &self.received
+                {
+                    received.notify_one();
+                }
+                attempt
+            })
+        }
+    }
+
+    fn test_attempt(
+        mission: [u8; 32],
+        peer: [u8; 32],
+        runs: Arc<AtomicU8>,
+        carrier_failures: Arc<AtomicU8>,
+        completed: Arc<AtomicU8>,
+    ) -> Box<dyn CoordinatorAttempt> {
+        Box::new(TestCoordinatorAttempt {
+            mission,
+            peer,
+            kind: aster_node::EventTransportKind::BLE_L2CAP_V1,
+            runs,
+            carrier_failures,
+            ambiguous_failures: Arc::new(AtomicU8::new(0)),
+            cancellations: Arc::new(AtomicU8::new(0)),
+            started: None,
+            release: None,
+            completed,
+        })
+    }
+
+    #[derive(Default)]
+    struct TestAttemptCounters {
+        runs: Arc<AtomicU8>,
+        carrier_failures: Arc<AtomicU8>,
+        ambiguous_failures: Arc<AtomicU8>,
+        cancellations: Arc<AtomicU8>,
+        completed: Arc<AtomicU8>,
+    }
+
+    fn instrumented_attempt(
+        mission: [u8; 32],
+        peer: [u8; 32],
+        counters: &TestAttemptCounters,
+    ) -> Box<dyn CoordinatorAttempt> {
+        Box::new(TestCoordinatorAttempt {
+            mission,
+            peer,
+            kind: aster_node::EventTransportKind::BLE_L2CAP_V1,
+            runs: counters.runs.clone(),
+            carrier_failures: counters.carrier_failures.clone(),
+            ambiguous_failures: counters.ambiguous_failures.clone(),
+            cancellations: counters.cancellations.clone(),
+            started: None,
+            release: None,
+            completed: counters.completed.clone(),
+        })
+    }
+
+    fn coordinator_attempt_channel() -> (
+        mpsc::Sender<Box<dyn CoordinatorAttempt>>,
+        Box<dyn CoordinatorAttemptSource>,
+    ) {
+        let (sender, attempts) = mpsc::channel(1);
+        (
+            sender,
+            Box::new(TestCoordinatorAttemptSource {
+                attempts,
+                received: None,
+            }),
+        )
+    }
+
+    async fn send_observation(
+        discovery: &FakeDiscovery,
+        config: &ValidatedRosteredSupervisorConfig,
+        locator: crate::CanonicalLocator,
+    ) {
+        let record = AsterRosterBeaconV1::encode(
+            0x0083,
+            [0x73; 16],
+            config.discovery_credentials(),
+            Instant::now(),
+        )
+        .unwrap();
+        let sender = discovery
+            .observation_sender
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone();
+        sender
+            .send(
+                DiscoveryObservation::new(locator.address(), locator.address_type(), &record)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn send_observation_to_barrier(
+        discovery: &BarrierDiscovery,
+        config: &ValidatedRosteredSupervisorConfig,
+        locator: crate::CanonicalLocator,
+    ) {
+        let record = AsterRosterBeaconV1::encode(
+            0x0083,
+            [0x74; 16],
+            config.discovery_credentials(),
+            Instant::now(),
+        )
+        .unwrap();
+        let sender = discovery
+            .observation_sender
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone();
+        sender
+            .send(
+                DiscoveryObservation::new(locator.address(), locator.address_type(), &record)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_inbound_listening_is_independently_bounded_without_a_ticket() {
+        let config = config_with_ids([0x11; 32], [0x22; 32]);
+        assert_eq!(config.role(), FixedRole::Initiator);
+        let locator = crate::CanonicalLocator::new(
+            Address::new([2, 0, 0, 0, 0, 0x71]),
+            AddressType::LeRandom,
+        )
+        .unwrap();
+        let (accept_sender, accept_receiver) = oneshot::channel();
+        let sockets = Arc::new(InboundSockets {
+            accepted: tokio::sync::Mutex::new(Some(accept_receiver)),
+            connected: AtomicU8::new(0),
+        });
+        let discovery = Arc::new(FakeDiscovery {
+            events: Arc::new(Mutex::new(Vec::new())),
+            advertisements: Arc::new(Mutex::new(Vec::new())),
+            scan_started: Arc::new(Notify::new()),
+            observation_sender: Mutex::new(None),
+        });
+        let contacts = Arc::new(NotifyingAdmission {
+            roles: Mutex::new(Vec::new()),
+            peers: Mutex::new(Vec::new()),
+            admitted: Notify::new(),
+        });
+        let (_attempt_sender, attempts) = coordinator_attempt_channel();
+        let cancellation = LifecycleCancellation::new();
+        let task = tokio::spawn(run_automatic_available_epoch(
+            Arc::new(config),
+            sockets,
+            discovery.clone(),
+            Arc::new(FixedNonce([0x31; 16])),
+            contacts.clone(),
+            attempts,
+            EpochSignals::default(),
+            cancellation.clone(),
+        ));
+
+        discovery.scan_started.notified().await;
+        let config = config_with_ids([0x11; 32], [0x22; 32]);
+        send_observation(&discovery, &config, locator).await;
+        let (stream, _peer) = tokio::io::duplex(4096);
+        assert!(
+            accept_sender
+                .send(
+                    SocketOpen::with_observed_mtu(Box::new(stream), 128, 96)
+                        .map(|opened| (opened, locator)),
+                )
+                .is_ok()
+        );
+
+        contacts.admitted.notified().await;
+        assert_eq!(
+            *contacts.roles.lock().unwrap(),
+            [OrderedEventContactRole::Responder]
+        );
+        assert_eq!(*contacts.peers.lock().unwrap(), [[0x22; 32]]);
+        cancellation.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn automatic_inbound_admission_exhausts_its_bound_without_a_ticket() {
+        let config = config();
+        let locator = crate::CanonicalLocator::new(
+            Address::new([2, 0, 0, 0, 0, 0x76]),
+            AddressType::LeRandom,
+        )
+        .unwrap();
+        let now = Instant::now();
+        let mut admission = DiscoveryAdmission::new();
+        assert_eq!(admission.start_scan(now), crate::ScanStartOutcome::Started);
+        let record =
+            AsterRosterBeaconV1::encode(0x0083, [0x76; 16], config.discovery_credentials(), now)
+                .unwrap();
+        assert_eq!(
+            admit_platform_observation(
+                &mut admission,
+                &config,
+                DiscoveryObservation::new(locator.address(), locator.address_type(), &record)
+                    .unwrap(),
+                now,
+            ),
+            ObservationOutcome::Accepted
+        );
+        let (_attempt_sender, attempts) = coordinator_attempt_channel();
+        let mode = EpochContactMode::automatic(attempts);
+
+        for _ in 0..4 {
+            assert!(matches!(
+                admit_inbound_contact(&config, &mut admission, locator, now, &mode),
+                InboundContactAdmission::Admitted
+            ));
+        }
+        assert!(matches!(
+            admit_inbound_contact(&config, &mut admission, locator, now, &mode),
+            InboundContactAdmission::BackoffUntil(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn automatic_outbound_open_requires_a_matching_coordinator_ticket() {
+        let locator = crate::CanonicalLocator::new(
+            Address::new([2, 0, 0, 0, 0, 0x72]),
+            AddressType::LeRandom,
+        )
+        .unwrap();
+        let sockets = Arc::new(ConnectingSockets {
+            connected: Mutex::new(Vec::new()),
+        });
+        let discovery = Arc::new(FakeDiscovery {
+            events: Arc::new(Mutex::new(Vec::new())),
+            advertisements: Arc::new(Mutex::new(Vec::new())),
+            scan_started: Arc::new(Notify::new()),
+            observation_sender: Mutex::new(None),
+        });
+        let (attempt_sender, attempts) = coordinator_attempt_channel();
+        let cancellation = LifecycleCancellation::new();
+        let task = tokio::spawn(run_automatic_available_epoch(
+            Arc::new(config()),
+            sockets.clone(),
+            discovery.clone(),
+            Arc::new(FixedNonce([0x32; 16])),
+            recording_admission(),
+            attempts,
+            EpochSignals::default(),
+            cancellation.clone(),
+        ));
+
+        discovery.scan_started.notified().await;
+        send_observation(&discovery, &config(), locator).await;
+        tokio::task::yield_now().await;
+        assert!(sockets.connected.lock().unwrap().is_empty());
+
+        let mismatched_runs = Arc::new(AtomicU8::new(0));
+        attempt_sender
+            .send(test_attempt(
+                [0x11; 32],
+                [0x44; 32],
+                mismatched_runs.clone(),
+                Arc::new(AtomicU8::new(0)),
+                Arc::new(AtomicU8::new(0)),
+            ))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(sockets.connected.lock().unwrap().is_empty());
+        assert_eq!(mismatched_runs.load(Ordering::Acquire), 0);
+
+        let matching_runs = Arc::new(AtomicU8::new(0));
+        let completed = Arc::new(AtomicU8::new(0));
+        attempt_sender
+            .send(test_attempt(
+                [0x11; 32],
+                [0x22; 32],
+                matching_runs.clone(),
+                Arc::new(AtomicU8::new(0)),
+                completed.clone(),
+            ))
+            .await
+            .unwrap();
+        for _ in 0..8 {
+            if completed.load(Ordering::Acquire) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(*sockets.connected.lock().unwrap(), [(locator, 0x0083)]);
+        assert_eq!(matching_runs.load(Ordering::Acquire), 1);
+        assert_eq!(completed.load(Ordering::Acquire), 1);
+        cancellation.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn roster_discovery_never_creates_outbound_peer_eligibility() {
+        let locator = crate::CanonicalLocator::new(
+            Address::new([2, 0, 0, 0, 0, 0x73]),
+            AddressType::LeRandom,
+        )
+        .unwrap();
+        let sockets = Arc::new(ConnectingSockets {
+            connected: Mutex::new(Vec::new()),
+        });
+        let discovery = Arc::new(FakeDiscovery {
+            events: Arc::new(Mutex::new(Vec::new())),
+            advertisements: Arc::new(Mutex::new(Vec::new())),
+            scan_started: Arc::new(Notify::new()),
+            observation_sender: Mutex::new(None),
+        });
+        let (_attempt_sender, attempts) = coordinator_attempt_channel();
+        let cancellation = LifecycleCancellation::new();
+        let task = tokio::spawn(run_automatic_available_epoch(
+            Arc::new(config()),
+            sockets.clone(),
+            discovery.clone(),
+            Arc::new(FixedNonce([0x33; 16])),
+            recording_admission(),
+            attempts,
+            EpochSignals::default(),
+            cancellation.clone(),
+        ));
+
+        discovery.scan_started.notified().await;
+        send_observation(&discovery, &config(), locator).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(sockets.connected.lock().unwrap().is_empty());
+        cancellation.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    struct RecordingEventAdapterControl {
+        snapshots: Mutex<Vec<aster_node::EventAdapterSnapshot>>,
+        accepts: bool,
+    }
+
+    impl EventAvailabilityControl for RecordingEventAdapterControl {
+        fn publish_availability(&self, snapshot: aster_node::EventAdapterSnapshot) -> bool {
+            self.snapshots.lock().unwrap().push(snapshot);
+            self.accepts
+        }
+    }
+
+    #[test]
+    fn automatic_registration_validation_rejects_unpaired_initial_state_and_unregisters() {
+        let cases = [
+            (
+                EventAdapterSnapshot::new(
+                    EventTransportKind::IROH_QUIC_V1,
+                    0,
+                    EventAdapterState::Unavailable,
+                    true,
+                    7,
+                ),
+                AutomaticBtleRegistrationError::WrongTransport,
+            ),
+            (
+                EventAdapterSnapshot::new(
+                    EventTransportKind::BLE_L2CAP_V1,
+                    1,
+                    EventAdapterState::Unavailable,
+                    true,
+                    7,
+                ),
+                AutomaticBtleRegistrationError::InitialEpoch,
+            ),
+            (
+                EventAdapterSnapshot::new(
+                    EventTransportKind::BLE_L2CAP_V1,
+                    0,
+                    EventAdapterState::Available,
+                    true,
+                    7,
+                ),
+                AutomaticBtleRegistrationError::InitialState,
+            ),
+            (
+                EventAdapterSnapshot::new(
+                    EventTransportKind::BLE_L2CAP_V1,
+                    0,
+                    EventAdapterState::Unavailable,
+                    false,
+                    7,
+                ),
+                AutomaticBtleRegistrationError::NotEventCapable,
+            ),
+        ];
+
+        for (snapshot, expected) in cases {
+            let handle = AutomaticEventTransportHandle::new();
+            let registration = handle.register_paired(snapshot).unwrap();
+
+            assert_eq!(
+                validate_automatic_registration(registration).err(),
+                Some(expected)
+            );
+            assert!(
+                handle.register_paired(snapshot).is_some(),
+                "rejected registration must release its lease"
+            );
+        }
+    }
+
+    #[test]
+    fn controller_loss_publishes_a_new_unavailable_adapter_epoch() {
+        let control = Arc::new(RecordingEventAdapterControl {
+            snapshots: Mutex::new(Vec::new()),
+            accepts: true,
+        });
+        let output = crate::BtleOperatorOutput::discard();
+        let (updates, _availability) = watch::channel(crate::BtleAvailability::Unavailable(
+            crate::AvailabilityReason::BluezUnavailable,
+        ));
+        let publisher = AdapterAvailabilityPublisher::automatic(
+            control.clone(),
+            updates,
+            output,
+            FixedRole::Initiator,
+        );
+
+        publisher
+            .publish(crate::BtleAvailability::Available)
+            .unwrap();
+        publisher
+            .publish(crate::BtleAvailability::Unavailable(
+                crate::AvailabilityReason::ControllerAbsent,
+            ))
+            .unwrap();
+
+        let snapshots = control.snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].availability_epoch(), 1);
+        assert_eq!(
+            snapshots[0].state(),
+            aster_node::EventAdapterState::Available
+        );
+        assert_eq!(snapshots[1].availability_epoch(), 2);
+        assert_eq!(
+            snapshots[1].state(),
+            aster_node::EventAdapterState::Unavailable
+        );
+    }
+
+    #[test]
+    fn rejected_or_exhausted_availability_epoch_fails_closed_without_divergence() {
+        let control = Arc::new(RecordingEventAdapterControl {
+            snapshots: Mutex::new(Vec::new()),
+            accepts: false,
+        });
+        let output = crate::BtleOperatorOutput::discard();
+        let (updates, availability) = watch::channel(crate::BtleAvailability::Unavailable(
+            crate::AvailabilityReason::BluezUnavailable,
+        ));
+        let publisher =
+            AdapterAvailabilityPublisher::automatic(control, updates, output, FixedRole::Initiator);
+
+        assert_eq!(
+            publisher.publish(crate::BtleAvailability::Available),
+            Err(AvailabilityPublishError::RegistrationRejected)
+        );
+        assert_eq!(
+            *availability.borrow(),
+            crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable)
+        );
+
+        let control = Arc::new(RecordingEventAdapterControl {
+            snapshots: Mutex::new(Vec::new()),
+            accepts: true,
+        });
+        let (updates, availability) = watch::channel(crate::BtleAvailability::Unavailable(
+            crate::AvailabilityReason::BluezUnavailable,
+        ));
+        let publisher = AdapterAvailabilityPublisher {
+            control: Some(control.clone()),
+            selector_can_originate: true,
+            updates,
+            output: crate::BtleOperatorOutput::discard(),
+            epoch: AtomicU64::new(u64::MAX),
+        };
+
+        assert_eq!(
+            publisher.publish(crate::BtleAvailability::Available),
+            Err(AvailabilityPublishError::EpochExhausted)
+        );
+        assert!(control.snapshots.lock().unwrap().is_empty());
+        assert_eq!(
+            *availability.borrow(),
+            crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_pre_auth_ticket_completion_never_self_selects_an_alternate() {
+        let locator = crate::CanonicalLocator::new(
+            Address::new([2, 0, 0, 0, 0, 0x74]),
+            AddressType::LeRandom,
+        )
+        .unwrap();
+        let sockets = Arc::new(ConnectingSockets {
+            connected: Mutex::new(Vec::new()),
+        });
+        let discovery = Arc::new(FakeDiscovery {
+            events: Arc::new(Mutex::new(Vec::new())),
+            advertisements: Arc::new(Mutex::new(Vec::new())),
+            scan_started: Arc::new(Notify::new()),
+            observation_sender: Mutex::new(None),
+        });
+        let (attempt_sender, attempts) = coordinator_attempt_channel();
+        let runs = Arc::new(AtomicU8::new(0));
+        let completed = Arc::new(AtomicU8::new(0));
+        attempt_sender
+            .send(test_attempt(
+                [0x11; 32],
+                [0x22; 32],
+                runs.clone(),
+                Arc::new(AtomicU8::new(0)),
+                completed.clone(),
+            ))
+            .await
+            .unwrap();
+        let cancellation = LifecycleCancellation::new();
+        let task = tokio::spawn(run_automatic_available_epoch(
+            Arc::new(config()),
+            sockets.clone(),
+            discovery.clone(),
+            Arc::new(FixedNonce([0x34; 16])),
+            recording_admission(),
+            attempts,
+            EpochSignals::default(),
+            cancellation.clone(),
+        ));
+
+        discovery.scan_started.notified().await;
+        send_observation(&discovery, &config(), locator).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        // Remote pre-auth classification belongs to the coordinator-owned
+        // runner. The adapter observes only terminal ticket completion and
+        // must not turn that completion into another carrier open.
+        assert_eq!(runs.load(Ordering::Acquire), 1);
+        assert_eq!(completed.load(Ordering::Acquire), 1);
+        assert_eq!(sockets.connected.lock().unwrap().len(), 1);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(sockets.connected.lock().unwrap().len(), 1);
+        cancellation.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_socket_open_error_completes_ticket_without_alternate_selection() {
+        let locator = crate::CanonicalLocator::new(
+            Address::new([2, 0, 0, 0, 0, 0x77]),
+            AddressType::LeRandom,
+        )
+        .unwrap();
+        let sockets = Arc::new(FailingConnectSockets {
+            connected: Mutex::new(Vec::new()),
+            kind: DriverErrorKind::Transport,
+        });
+        let discovery = Arc::new(FakeDiscovery {
+            events: Arc::new(Mutex::new(Vec::new())),
+            advertisements: Arc::new(Mutex::new(Vec::new())),
+            scan_started: Arc::new(Notify::new()),
+            observation_sender: Mutex::new(None),
+        });
+        let (attempt_sender, attempts) = coordinator_attempt_channel();
+        let counters = TestAttemptCounters::default();
+        attempt_sender
+            .send(instrumented_attempt([0x11; 32], [0x22; 32], &counters))
+            .await
+            .unwrap();
+        let cancellation = LifecycleCancellation::new();
+        let task = tokio::spawn(run_automatic_available_epoch(
+            Arc::new(config()),
+            sockets.clone(),
+            discovery.clone(),
+            Arc::new(FixedNonce([0x37; 16])),
+            recording_admission(),
+            attempts,
+            EpochSignals::default(),
+            cancellation.clone(),
+        ));
+
+        discovery.scan_started.notified().await;
+        send_observation(&discovery, &config(), locator).await;
+        for _ in 0..8 {
+            if counters.ambiguous_failures.load(Ordering::Acquire) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(*sockets.connected.lock().unwrap(), [(locator, 0x0083)]);
+        assert_eq!(counters.ambiguous_failures.load(Ordering::Acquire), 1);
+        assert_eq!(counters.carrier_failures.load(Ordering::Acquire), 0);
+        assert_eq!(counters.cancellations.load(Ordering::Acquire), 0);
+        assert_eq!(counters.runs.load(Ordering::Acquire), 0);
+        cancellation.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_listener_is_locally_available_but_selector_stays_unavailable() {
+        let listener_config = Arc::new(config_with_ids([0x22; 32], [0x11; 32]));
+        assert_eq!(listener_config.role(), FixedRole::Listener);
+        let locator = crate::CanonicalLocator::new(
+            Address::new([2, 0, 0, 0, 0, 0x7a]),
+            AddressType::LeRandom,
+        )
+        .unwrap();
+        let (accept_sender, accept_receiver) = oneshot::channel();
+        let sockets = Arc::new(InboundSockets {
+            accepted: tokio::sync::Mutex::new(Some(accept_receiver)),
+            connected: AtomicU8::new(0),
+        });
+        let discovery = Arc::new(FakeDiscovery {
+            events: Arc::new(Mutex::new(Vec::new())),
+            advertisements: Arc::new(Mutex::new(Vec::new())),
+            scan_started: Arc::new(Notify::new()),
+            observation_sender: Mutex::new(None),
+        });
+        let contacts = Arc::new(NotifyingAdmission {
+            roles: Mutex::new(Vec::new()),
+            peers: Mutex::new(Vec::new()),
+            admitted: Notify::new(),
+        });
+        let control = Arc::new(RecordingEventAdapterControl {
+            snapshots: Mutex::new(Vec::new()),
+            accepts: true,
+        });
+        let (updates, mut local_availability) = watch::channel(
+            crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable),
+        );
+        let publisher = Arc::new(AdapterAvailabilityPublisher::automatic(
+            control.clone(),
+            updates,
+            crate::BtleOperatorOutput::discard(),
+            listener_config.role(),
+        ));
+        let (_attempt_sender, attempts) = coordinator_attempt_channel();
+        let cancellation = LifecycleCancellation::new();
+        let (available_started, _available_started_at) = oneshot::channel();
+        let task = tokio::spawn(run_automatic_available_epoch(
+            listener_config.clone(),
+            sockets.clone(),
+            discovery.clone(),
+            Arc::new(FixedNonce([0x3a; 16])),
+            contacts.clone(),
+            attempts,
+            EpochSignals::with_publisher(publisher, available_started),
+            cancellation.clone(),
+        ));
+
+        discovery.scan_started.notified().await;
+        local_availability.changed().await.unwrap();
+        assert_eq!(
+            *local_availability.borrow_and_update(),
+            crate::BtleAvailability::Available
+        );
+        send_observation(&discovery, &listener_config, locator).await;
+        let (stream, _peer) = tokio::io::duplex(4096);
+        assert!(
+            accept_sender
+                .send(
+                    SocketOpen::with_observed_mtu(Box::new(stream), 128, 96)
+                        .map(|opened| (opened, locator)),
+                )
+                .is_ok()
+        );
+        contacts.admitted.notified().await;
+
+        assert_eq!(sockets.connected.load(Ordering::Acquire), 0);
+        assert_eq!(
+            *contacts.roles.lock().unwrap(),
+            [OrderedEventContactRole::Responder]
+        );
+        assert!(
+            control
+                .snapshots
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|snapshot| snapshot.state() == EventAdapterState::Unavailable)
+        );
+
+        cancellation.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn listener_rejects_matching_outbound_ticket_without_opening_or_spinning() {
+        let listener_config = Arc::new(config_with_ids([0x22; 32], [0x11; 32]));
+        assert_eq!(listener_config.role(), FixedRole::Listener);
+        let locator = crate::CanonicalLocator::new(
+            Address::new([2, 0, 0, 0, 0, 0x78]),
+            AddressType::LeRandom,
+        )
+        .unwrap();
+        let sockets = Arc::new(ConnectingSockets {
+            connected: Mutex::new(Vec::new()),
+        });
+        let discovery = Arc::new(FakeDiscovery {
+            events: Arc::new(Mutex::new(Vec::new())),
+            advertisements: Arc::new(Mutex::new(Vec::new())),
+            scan_started: Arc::new(Notify::new()),
+            observation_sender: Mutex::new(None),
+        });
+        let (attempt_sender, attempts) = coordinator_attempt_channel();
+        let counters = TestAttemptCounters::default();
+        attempt_sender
+            .send(instrumented_attempt([0x22; 32], [0x11; 32], &counters))
+            .await
+            .unwrap();
+        let cancellation = LifecycleCancellation::new();
+        let task = tokio::spawn(run_automatic_available_epoch(
+            listener_config.clone(),
+            sockets.clone(),
+            discovery.clone(),
+            Arc::new(FixedNonce([0x38; 16])),
+            recording_admission(),
+            attempts,
+            EpochSignals::default(),
+            cancellation.clone(),
+        ));
+
+        discovery.scan_started.notified().await;
+        send_observation(&discovery, &listener_config, locator).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(sockets.connected.lock().unwrap().is_empty());
+        assert_eq!(counters.carrier_failures.load(Ordering::Acquire), 1);
+        assert_eq!(counters.ambiguous_failures.load(Ordering::Acquire), 0);
+        assert_eq!(counters.runs.load(Ordering::Acquire), 0);
+        cancellation.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn controller_loss_mid_open_completes_ticket_as_local_carrier_loss() {
+        let locator = crate::CanonicalLocator::new(
+            Address::new([2, 0, 0, 0, 0, 0x79]),
+            AddressType::LeRandom,
+        )
+        .unwrap();
+        let connect_started = Arc::new(Notify::new());
+        let sockets = Arc::new(PendingConnectSockets {
+            connected: Mutex::new(Vec::new()),
+            started: connect_started.clone(),
+        });
+        let advertisement_release_completed = Arc::new(Notify::new());
+        let advertisement_terminated = Arc::new(Notify::new());
+        let discovery = Arc::new(BarrierDiscovery {
+            events: Arc::new(Mutex::new(Vec::new())),
+            advertisement_release_completed: Some(advertisement_release_completed.clone()),
+            advertisement_terminated: advertisement_terminated.clone(),
+            scan_started: Arc::new(Notify::new()),
+            owner_loss_forced: Arc::new(AtomicU8::new(0)),
+            observation_sender: Mutex::new(None),
+        });
+        let (attempt_sender, attempts) = coordinator_attempt_channel();
+        let counters = TestAttemptCounters::default();
+        attempt_sender
+            .send(instrumented_attempt([0x11; 32], [0x22; 32], &counters))
+            .await
+            .unwrap();
+        let control = Arc::new(RecordingEventAdapterControl {
+            snapshots: Mutex::new(Vec::new()),
+            accepts: true,
+        });
+        let (updates, _availability) = watch::channel(crate::BtleAvailability::Unavailable(
+            crate::AvailabilityReason::BluezUnavailable,
+        ));
+        let publisher = Arc::new(AdapterAvailabilityPublisher::automatic(
+            control.clone(),
+            updates,
+            crate::BtleOperatorOutput::discard(),
+            FixedRole::Initiator,
+        ));
+        let (available_started, _available) = oneshot::channel();
+        let task = tokio::spawn(run_automatic_available_epoch(
+            Arc::new(config()),
+            sockets,
+            discovery.clone(),
+            Arc::new(FixedNonce([0x39; 16])),
+            recording_admission(),
+            attempts,
+            EpochSignals::with_publisher(publisher, available_started),
+            LifecycleCancellation::new(),
+        ));
+
+        discovery.scan_started.notified().await;
+        send_observation_to_barrier(&discovery, &config(), locator).await;
+        connect_started.notified().await;
+        advertisement_terminated.notify_one();
+        advertisement_release_completed.notify_one();
+
+        assert_eq!(
+            task.await.unwrap().unwrap_err(),
+            SupervisorError::Controller(DriverErrorKind::Transport)
+        );
+        assert_eq!(counters.carrier_failures.load(Ordering::Acquire), 1);
+        assert_eq!(counters.ambiguous_failures.load(Ordering::Acquire), 0);
+        assert_eq!(counters.cancellations.load(Ordering::Acquire), 0);
+        let snapshots = control.snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].availability_epoch(), 1);
+        assert_eq!(snapshots[0].state(), EventAdapterState::Available);
+        assert_eq!(snapshots[1].availability_epoch(), 2);
+        assert_eq!(snapshots[1].state(), EventAdapterState::Unavailable);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_remains_cancellation_when_owned_cleanup_fails() {
+        let locator = crate::CanonicalLocator::new(
+            Address::new([2, 0, 0, 0, 0, 0x7a]),
+            AddressType::LeRandom,
+        )
+        .unwrap();
+        let connect_started = Arc::new(Notify::new());
+        let sockets = Arc::new(PendingConnectSockets {
+            connected: Mutex::new(Vec::new()),
+            started: connect_started.clone(),
+        });
+        let discovery = Arc::new(BarrierDiscovery {
+            events: Arc::new(Mutex::new(Vec::new())),
+            advertisement_release_completed: None,
+            advertisement_terminated: Arc::new(Notify::new()),
+            scan_started: Arc::new(Notify::new()),
+            owner_loss_forced: Arc::new(AtomicU8::new(0)),
+            observation_sender: Mutex::new(None),
+        });
+        let (attempt_sender, attempts) = coordinator_attempt_channel();
+        let counters = TestAttemptCounters::default();
+        attempt_sender
+            .send(instrumented_attempt([0x11; 32], [0x22; 32], &counters))
+            .await
+            .unwrap();
+        let cancellation = LifecycleCancellation::new();
+        let task = tokio::spawn(run_automatic_available_epoch(
+            Arc::new(config()),
+            sockets,
+            discovery.clone(),
+            Arc::new(FixedNonce([0x3a; 16])),
+            recording_admission(),
+            attempts,
+            EpochSignals::default(),
+            cancellation.clone(),
+        ));
+
+        discovery.scan_started.notified().await;
+        send_observation_to_barrier(&discovery, &config(), locator).await;
+        connect_started.notified().await;
+        cancellation.cancel();
+        tokio::task::yield_now().await;
+        tokio::time::advance(OWNED_STOP_DEADLINE + Duration::from_millis(1)).await;
+
+        assert_eq!(
+            task.await.unwrap().unwrap_err(),
+            SupervisorError::Controller(DriverErrorKind::Transport)
+        );
+        assert_eq!(counters.cancellations.load(Ordering::Acquire), 1);
+        assert_eq!(counters.carrier_failures.load(Ordering::Acquire), 0);
+        assert_eq!(counters.ambiguous_failures.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_ticket_cancellation_survives_cleanup_failure() {
+        let sockets = Arc::new(ConnectingSockets {
+            connected: Mutex::new(Vec::new()),
+        });
+        let discovery = Arc::new(BarrierDiscovery {
+            events: Arc::new(Mutex::new(Vec::new())),
+            advertisement_release_completed: None,
+            advertisement_terminated: Arc::new(Notify::new()),
+            scan_started: Arc::new(Notify::new()),
+            owner_loss_forced: Arc::new(AtomicU8::new(0)),
+            observation_sender: Mutex::new(None),
+        });
+        let (attempt_sender, attempts) = mpsc::channel(1);
+        let received = Arc::new(Notify::new());
+        let counters = TestAttemptCounters::default();
+        attempt_sender
+            .send(instrumented_attempt([0x11; 32], [0x22; 32], &counters))
+            .await
+            .unwrap();
+        let cancellation = LifecycleCancellation::new();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn({
+            let sockets = sockets.clone();
+            let discovery = discovery.clone();
+            let received = received.clone();
+            async move {
+                let mut mode =
+                    EpochContactMode::automatic(Box::new(TestCoordinatorAttemptSource {
+                        attempts,
+                        received: Some(received),
+                    }));
+                let result = run_available_epoch_with_mode(
+                    Arc::new(config()),
+                    sockets,
+                    discovery,
+                    Arc::new(FixedNonce([0x3b; 16])),
+                    recording_admission(),
+                    &mut mode,
+                    EpochSignals::default(),
+                    task_cancellation.clone(),
+                )
+                .await;
+                complete_pending_after_epoch(&mut mode, &task_cancellation, &result);
+                result
+            }
+        });
+
+        discovery.scan_started.notified().await;
+        received.notified().await;
+        cancellation.cancel();
+        tokio::task::yield_now().await;
+        tokio::time::advance(OWNED_STOP_DEADLINE + Duration::from_millis(1)).await;
+
+        assert_eq!(
+            task.await.unwrap().unwrap_err(),
+            SupervisorError::Controller(DriverErrorKind::Transport)
+        );
+        assert_eq!(counters.cancellations.load(Ordering::Acquire), 1);
+        assert_eq!(counters.carrier_failures.load(Ordering::Acquire), 0);
+        assert_eq!(counters.ambiguous_failures.load(Ordering::Acquire), 0);
+        assert_eq!(counters.runs.load(Ordering::Acquire), 0);
+        assert!(sockets.connected.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn automatic_cancellation_joins_ticket_scan_and_advertisement_work() {
+        let locator = crate::CanonicalLocator::new(
+            Address::new([2, 0, 0, 0, 0, 0x75]),
+            AddressType::LeRandom,
+        )
+        .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sockets = Arc::new(ConnectingSockets {
+            connected: Mutex::new(Vec::new()),
+        });
+        let discovery = Arc::new(FakeDiscovery {
+            events: events.clone(),
+            advertisements: Arc::new(Mutex::new(Vec::new())),
+            scan_started: Arc::new(Notify::new()),
+            observation_sender: Mutex::new(None),
+        });
+        let (attempt_sender, attempts) = coordinator_attempt_channel();
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let completed = Arc::new(AtomicU8::new(0));
+        attempt_sender
+            .send(Box::new(TestCoordinatorAttempt {
+                mission: [0x11; 32],
+                peer: [0x22; 32],
+                kind: aster_node::EventTransportKind::BLE_L2CAP_V1,
+                runs: Arc::new(AtomicU8::new(0)),
+                carrier_failures: Arc::new(AtomicU8::new(0)),
+                ambiguous_failures: Arc::new(AtomicU8::new(0)),
+                cancellations: Arc::new(AtomicU8::new(0)),
+                started: Some(started.clone()),
+                release: Some(release.clone()),
+                completed: completed.clone(),
+            }))
+            .await
+            .unwrap();
+        let cancellation = LifecycleCancellation::new();
+        let task = tokio::spawn(run_automatic_available_epoch(
+            Arc::new(config()),
+            sockets,
+            discovery.clone(),
+            Arc::new(FixedNonce([0x35; 16])),
+            recording_admission(),
+            attempts,
+            EpochSignals::default(),
+            cancellation.clone(),
+        ));
+
+        discovery.scan_started.notified().await;
+        send_observation(&discovery, &config(), locator).await;
+        started.notified().await;
+        cancellation.cancel();
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "shutdown must join the owned ticket");
+        release.notify_one();
+        task.await.unwrap().unwrap();
+
+        assert_eq!(completed.load(Ordering::Acquire), 1);
+        assert!(events.lock().unwrap().contains(&"scan-stop"));
+        assert!(events.lock().unwrap().contains(&"advertisement-release"));
     }
 }

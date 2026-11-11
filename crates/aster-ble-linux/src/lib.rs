@@ -15,13 +15,17 @@ mod rostered_lifecycle;
 mod stream;
 
 pub use config::{
-    ContactLimits, ControllerConfig, DriverConfig, FixedRole, LinkConfig, OpenRequest,
-    RING1_MAXIMUM_DEADLINE, RING1_MAXIMUM_EXCHANGE_BYTES, RING1_MAXIMUM_FRAME_BYTES,
-    RosteredAdapterConfig, RosteredDiscoveryConfig, RosteredSupervisorConfig, SupervisorConfig,
-    ValidatedConfig, ValidatedContactLimits, ValidatedControllerConfig, ValidatedLinkConfig,
-    ValidatedRosteredDiscoveryConfig, ValidatedRosteredSupervisorConfig, ValidatedSupervisorConfig,
+    AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH, ContactLimits, ControllerConfig, DriverConfig,
+    FixedRole, LinkConfig, OpenRequest, RING1_MAXIMUM_DEADLINE, RING1_MAXIMUM_EXCHANGE_BYTES,
+    RING1_MAXIMUM_FRAME_BYTES, RosteredAdapterConfig, RosteredDiscoveryConfig,
+    RosteredSupervisorConfig, SupervisorConfig, ValidatedConfig, ValidatedContactLimits,
+    ValidatedControllerConfig, ValidatedLinkConfig, ValidatedRosteredDiscoveryConfig,
+    ValidatedRosteredSupervisorConfig, ValidatedSupervisorConfig,
 };
-pub use controller::{AvailabilityReason, BtleAvailability};
+pub use controller::{
+    AvailabilityReason, BTLE_OPERATOR_OUTPUT_CAPACITY, BtleAvailability, BtleOperatorEvent,
+    BtleOperatorOutput,
+};
 pub use discovery::{
     AttemptKind, CanonicalLocator, CanonicalLocatorError, DiscoveryAdmission, DiscoveryCandidate,
     ObservationOutcome, ObservationRejection, ScanStartOutcome, ScanState, ScanStopReason,
@@ -38,7 +42,9 @@ pub use platform::{
     open_contact_with_factory,
 };
 pub use rostered_lifecycle::{
-    LinuxRosteredBtleEventSupervisor, spawn_linux_rostered_btle_event_supervisor,
+    AutomaticBtleRegistrationError, LinuxRosteredBtleEventSupervisor,
+    spawn_automatic_linux_rostered_btle_event_supervisor,
+    spawn_linux_rostered_btle_event_supervisor,
 };
 pub use stream::{NegotiatedMtu, SocketOpen};
 

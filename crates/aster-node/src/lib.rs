@@ -82,10 +82,10 @@ pub use control_admin::{
 };
 pub use event_transport::{
     AutomaticEventTransportHandle, ContactDisposition, ContactOutcome, ContactProvenance,
-    ContactReason, ContactScope, ContactStage, EventAdapterControl, EventAdapterSnapshot,
-    EventAdapterState, EventAttemptReceiver, EventOutboundAttempt, EventPeerEligibility,
-    EventPeerEligibilitySource, EventTransportKind, MAX_EVENT_PEER_ELIGIBILITY,
-    MAX_PENDING_EVENT_COHORTS,
+    ContactReason, ContactScope, ContactStage, EventAdapterControl, EventAdapterRegistration,
+    EventAdapterSnapshot, EventAdapterState, EventAttemptReceiver, EventOutboundAttempt,
+    EventPeerEligibility, EventPeerEligibilitySource, EventTransportKind,
+    MAX_EVENT_PEER_ELIGIBILITY, MAX_PENDING_EVENT_COHORTS, UnauthenticatedCarrierOpenFailure,
 };
 pub use identity::{IdentityError, NodeIdentity};
 pub use mission::{

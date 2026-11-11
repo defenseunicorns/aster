@@ -3901,6 +3901,17 @@ impl RunningAutomaticEventTransportHandle {
             .flatten()
     }
 
+    /// Registers one opaque paired adapter lease and bounded attempt lane.
+    pub fn register_paired(
+        &self,
+        snapshot: EventAdapterSnapshot,
+    ) -> Option<crate::EventAdapterRegistration> {
+        self.admission
+            .load(Ordering::Acquire)
+            .then(|| self.coordinator.register_paired(snapshot))
+            .flatten()
+    }
+
     /// Replaces the complete exact-peer eligibility roster and wakes every
     /// unique current peer for this node's mission.
     ///

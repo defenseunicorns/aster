@@ -8,7 +8,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex, Weak},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use aster_contact::OrderedContact;
@@ -19,6 +19,11 @@ use tokio::sync::{mpsc, watch};
 pub const MAX_PENDING_EVENT_COHORTS: usize = 64;
 /// Maximum exact-peer eligibility entries retained by the selector.
 pub const MAX_EVENT_PEER_ELIGIBILITY: usize = 256;
+
+// Match the node's smallest automatic-contact reopen backoff. One retained
+// cohort can therefore wake at most four times per second, and the private
+// policy remains a single easy-to-change constant.
+const RETRY_LATER_READINESS_DELAY: Duration = Duration::from_millis(250);
 
 /// Stable in-process identity for an admitted Event transport adapter.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -224,6 +229,7 @@ struct PendingEventCohort {
     runner: EventAttemptRunner,
     failed_instances: BTreeMap<EventTransportKind, EventAdapterInstance>,
     mailbox_full_instances: BTreeMap<EventTransportKind, EventAdapterInstance>,
+    ready_at: Option<tokio::time::Instant>,
 }
 
 impl PendingEventCohort {
@@ -361,6 +367,20 @@ impl AutomaticEventTransportHandle {
         &self,
         snapshot: EventAdapterSnapshot,
     ) -> Option<(EventAdapterControl, EventAttemptReceiver)> {
+        self.register_paired(snapshot).map(|registration| {
+            let (_, control, attempts) = registration.into_parts();
+            (control, attempts)
+        })
+    }
+
+    /// Registers one paired adapter lease, attempt lane, and initial snapshot.
+    ///
+    /// The opaque registration has no public constructor. Adapter owners that
+    /// validate a transport-specific initial state consume it exactly once.
+    pub fn register_paired(
+        &self,
+        snapshot: EventAdapterSnapshot,
+    ) -> Option<EventAdapterRegistration> {
         let (sender, receiver) = mpsc::channel(1);
         let mut state = self
             .shared
@@ -380,19 +400,20 @@ impl AutomaticEventTransportHandle {
             },
         );
         transition(&self.shared, &mut state);
-        Some((
-            EventAdapterControl {
+        Some(EventAdapterRegistration {
+            initial_snapshot: snapshot,
+            control: EventAdapterControl {
                 shared: Arc::downgrade(&self.shared),
                 kind: snapshot.kind,
                 registration_identity: Arc::clone(&registration_identity),
             },
-            EventAttemptReceiver {
+            attempts: EventAttemptReceiver {
                 receiver,
                 shared: Arc::downgrade(&self.shared),
                 kind: snapshot.kind,
                 registration_identity,
             },
-        ))
+        })
     }
 
     /// Atomically replaces host-owned exact-peer eligibility.
@@ -474,6 +495,7 @@ impl AutomaticEventTransportHandle {
             runner,
             failed_instances: BTreeMap::new(),
             mailbox_full_instances: BTreeMap::new(),
+            ready_at: None,
         });
         transition(&self.shared, &mut state);
         EventAttemptAdmission::Accepted
@@ -490,6 +512,31 @@ impl AutomaticEventTransportHandle {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .transition_count
+    }
+}
+
+/// Opaque paired ownership returned by one adapter registration.
+pub struct EventAdapterRegistration {
+    initial_snapshot: EventAdapterSnapshot,
+    control: EventAdapterControl,
+    attempts: EventAttemptReceiver,
+}
+
+impl EventAdapterRegistration {
+    /// Returns the exact snapshot atomically installed with this registration.
+    pub const fn initial_snapshot(&self) -> EventAdapterSnapshot {
+        self.initial_snapshot
+    }
+
+    /// Consumes the opaque pairing for one transport adapter owner.
+    pub fn into_parts(
+        self,
+    ) -> (
+        EventAdapterSnapshot,
+        EventAdapterControl,
+        EventAttemptReceiver,
+    ) {
+        (self.initial_snapshot, self.control, self.attempts)
     }
 }
 
@@ -601,6 +648,15 @@ pub struct EventOutboundAttempt {
     completed: bool,
 }
 
+/// Closed ambiguous evidence available before a carrier contact opens.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnauthenticatedCarrierOpenFailure {
+    /// The carrier open was interrupted without proving adapter loss.
+    Interrupted,
+    /// The carrier open exceeded its bounded deadline without proving adapter loss.
+    TimedOut,
+}
+
 impl EventOutboundAttempt {
     /// Returns the selected stable transport kind.
     pub const fn transport_kind(&self) -> EventTransportKind {
@@ -631,6 +687,26 @@ impl EventOutboundAttempt {
         outcome
     }
 
+    /// Completes an ambiguous or unauthenticated carrier-open failure.
+    ///
+    /// This retains durable work for a later operation but never authorizes an
+    /// immediate alternate-carrier selection.
+    pub fn fail_unauthenticated_carrier_open(
+        mut self,
+        failure: UnauthenticatedCarrierOpenFailure,
+    ) -> ContactOutcome {
+        let outcome = ContactOutcome::unauthenticated_carrier_open(failure);
+        self.complete(&Err(outcome));
+        outcome
+    }
+
+    /// Completes caller cancellation while the carrier is still opening.
+    pub fn cancel_carrier_open(mut self) -> ContactOutcome {
+        let outcome = ContactOutcome::caller_cancelled(ContactStage::CarrierOpen);
+        self.complete(&Err(outcome));
+        outcome
+    }
+
     fn owns_in_flight_slot(&self, state: &AutomaticEventTransportState) -> bool {
         state.attempt_in_flight.as_ref().is_some_and(|attempt| {
             Arc::ptr_eq(&attempt.identity, &self.identity) && attempt.key == self.key
@@ -648,41 +724,63 @@ impl EventOutboundAttempt {
             return;
         }
         state.attempt_in_flight = None;
-        let released_capacity = match result {
-            Ok(()) => {
-                transition(&self.shared, &mut state);
-                true
-            }
-            Err(outcome) if outcome.permits_reselection() => {
-                let still_current = state
-                    .eligibility
-                    .iter()
-                    .any(|entry| entry.mission == self.key.mission && entry.peer == self.key.peer);
-                if still_current {
-                    self.failed_instances.insert(
-                        self.kind,
-                        EventAdapterInstance::new(
-                            &self.registration_identity,
-                            self.availability_epoch,
-                        ),
-                    );
-                    state.pending.push_front(PendingEventCohort {
-                        key: self.key,
-                        runner: Arc::clone(&self.runner),
-                        failed_instances: std::mem::take(&mut self.failed_instances),
-                        mailbox_full_instances: BTreeMap::new(),
-                    });
+        let mut retry_deadline = None;
+        let released_capacity =
+            match result {
+                Ok(()) => {
+                    transition(&self.shared, &mut state);
+                    true
                 }
-                transition(&self.shared, &mut state);
-                !still_current
-            }
-            Err(_) => {
-                transition(&self.shared, &mut state);
-                true
-            }
-        };
+                Err(outcome) if outcome.permits_reselection() => {
+                    let still_current = state.eligibility.iter().any(|entry| {
+                        entry.mission == self.key.mission && entry.peer == self.key.peer
+                    });
+                    if still_current {
+                        self.failed_instances.insert(
+                            self.kind,
+                            EventAdapterInstance::new(
+                                &self.registration_identity,
+                                self.availability_epoch,
+                            ),
+                        );
+                        state.pending.push_front(PendingEventCohort {
+                            key: self.key,
+                            runner: Arc::clone(&self.runner),
+                            failed_instances: std::mem::take(&mut self.failed_instances),
+                            mailbox_full_instances: BTreeMap::new(),
+                            ready_at: None,
+                        });
+                    }
+                    transition(&self.shared, &mut state);
+                    !still_current
+                }
+                Err(outcome) if outcome.disposition() == ContactDisposition::RetryLater => {
+                    let still_current = state.eligibility.iter().any(|entry| {
+                        entry.mission == self.key.mission && entry.peer == self.key.peer
+                    });
+                    if still_current {
+                        let ready_at = tokio::time::Instant::now() + RETRY_LATER_READINESS_DELAY;
+                        state.pending.push_back(PendingEventCohort {
+                            key: self.key,
+                            runner: Arc::clone(&self.runner),
+                            failed_instances: std::mem::take(&mut self.failed_instances),
+                            mailbox_full_instances: BTreeMap::new(),
+                            ready_at: Some(ready_at),
+                        });
+                        retry_deadline = Some(ready_at);
+                    }
+                    transition(&self.shared, &mut state);
+                    !still_current
+                }
+                Err(_) => {
+                    transition(&self.shared, &mut state);
+                    true
+                }
+            };
         drop(state);
-        if released_capacity {
+        if let Some(deadline) = retry_deadline {
+            schedule_retry_later_readiness(&self.shared, deadline);
+        } else if released_capacity {
             notify_capacity_progress(&self.shared);
         }
     }
@@ -715,6 +813,31 @@ fn notify_capacity_progress(shared: &AutomaticEventTransportShared) {
         .send_modify(|generation| *generation = generation.saturating_add(1));
 }
 
+fn schedule_retry_later_readiness(
+    shared: &Arc<AutomaticEventTransportShared>,
+    deadline: tokio::time::Instant,
+) {
+    let shared = Arc::downgrade(shared);
+    tokio::spawn(async move {
+        tokio::time::sleep_until(deadline).await;
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        let mut state = shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let now = tokio::time::Instant::now();
+        if state
+            .pending
+            .iter()
+            .any(|cohort| cohort.ready_at.is_some_and(|ready_at| ready_at <= now))
+        {
+            transition(&shared, &mut state);
+        }
+    });
+}
+
 fn transition(
     shared: &Arc<AutomaticEventTransportShared>,
     state: &mut AutomaticEventTransportState,
@@ -724,11 +847,20 @@ fn transition(
         return;
     }
     let now = (shared.clock)();
+    let readiness_now = tokio::time::Instant::now();
     let pending_count = state.pending.len();
     for _ in 0..pending_count {
         let Some(mut pending) = state.pending.pop_front() else {
             break;
         };
+        if pending
+            .ready_at
+            .is_some_and(|ready_at| ready_at > readiness_now)
+        {
+            state.pending.push_back(pending);
+            continue;
+        }
+        pending.ready_at = None;
         loop {
             let snapshots: Vec<_> = state
                 .adapters
@@ -935,6 +1067,20 @@ impl ContactOutcome {
             provenance: ContactProvenance::Adapter,
             disposition: ContactDisposition::Reselect,
             reason: ContactReason::CarrierUnavailable,
+        }
+    }
+
+    const fn unauthenticated_carrier_open(failure: UnauthenticatedCarrierOpenFailure) -> Self {
+        let reason = match failure {
+            UnauthenticatedCarrierOpenFailure::Interrupted => ContactReason::TransportInterrupted,
+            UnauthenticatedCarrierOpenFailure::TimedOut => ContactReason::TransportTimeout,
+        };
+        Self {
+            stage: ContactStage::CarrierOpen,
+            scope: ContactScope::Locator,
+            provenance: ContactProvenance::UnauthenticatedRemote,
+            disposition: ContactDisposition::RetryLater,
+            reason,
         }
     }
 
@@ -1869,6 +2015,220 @@ mod tests {
             ble_attempts.recv().await.unwrap().transport_kind(),
             EventTransportKind::BLE_L2CAP_V1
         );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_carrier_open_completion_retries_later_without_alternate_selection() {
+        let handle = AutomaticEventTransportHandle::new();
+        handle.replace_eligibility(vec![
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+        ]);
+        let (_iroh_control, mut iroh_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .unwrap();
+        let (_ble_control, mut ble_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .unwrap();
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
+
+        let selected = iroh_attempts.recv().await.unwrap();
+        let outcome = selected
+            .fail_unauthenticated_carrier_open(UnauthenticatedCarrierOpenFailure::Interrupted);
+
+        assert_eq!(outcome.stage(), ContactStage::CarrierOpen);
+        assert_eq!(outcome.scope(), ContactScope::Locator);
+        assert_eq!(
+            outcome.provenance(),
+            ContactProvenance::UnauthenticatedRemote
+        );
+        assert_eq!(outcome.disposition(), ContactDisposition::RetryLater);
+        assert_eq!(outcome.reason(), ContactReason::TransportInterrupted);
+        assert!(ble_attempts.receiver.try_recv().is_err());
+        assert!(iroh_attempts.receiver.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ambiguous_carrier_open_retries_once_after_private_readiness_deadline() {
+        let handle = AutomaticEventTransportHandle::new();
+        handle.replace_eligibility(vec![
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+        ]);
+        let (_iroh_control, mut iroh_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .unwrap();
+        let (_ble_control, mut ble_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .unwrap();
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
+
+        iroh_attempts
+            .recv()
+            .await
+            .unwrap()
+            .fail_unauthenticated_carrier_open(UnauthenticatedCarrierOpenFailure::Interrupted);
+
+        assert!(iroh_attempts.receiver.try_recv().is_err());
+        assert!(ble_attempts.receiver.try_recv().is_err());
+        {
+            let state = handle.shared.state.lock().unwrap();
+            assert_eq!(
+                state.pending.len() + usize::from(state.attempt_in_flight.is_some()),
+                1,
+                "RetryLater retains exactly the already-admitted cohort"
+            );
+        }
+
+        tokio::time::advance(Duration::from_millis(249)).await;
+        tokio::task::yield_now().await;
+        assert!(iroh_attempts.receiver.try_recv().is_err());
+        assert!(ble_attempts.receiver.try_recv().is_err());
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        let fresh = iroh_attempts
+            .receiver
+            .try_recv()
+            .expect("one normal selection runs when readiness matures");
+        assert_eq!(fresh.transport_kind(), EventTransportKind::IROH_QUIC_V1);
+        assert!(ble_attempts.receiver.try_recv().is_err());
+        {
+            let state = handle.shared.state.lock().unwrap();
+            assert_eq!(
+                state.pending.len() + usize::from(state.attempt_in_flight.is_some()),
+                1,
+                "the deferred retry consumes no additional cohort capacity"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_carrier_open_completion_never_selects_an_alternate() {
+        let handle = AutomaticEventTransportHandle::new();
+        handle.replace_eligibility(vec![
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+        ]);
+        let (_iroh_control, mut iroh_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .unwrap();
+        let (_ble_control, mut ble_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .unwrap();
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
+
+        let selected = iroh_attempts.recv().await.unwrap();
+        let outcome = selected.cancel_carrier_open();
+
+        assert_eq!(outcome.disposition(), ContactDisposition::Cancelled);
+        assert_eq!(outcome.reason(), ContactReason::CallerCancelled);
+        assert!(ble_attempts.receiver.try_recv().is_err());
+        assert!(iroh_attempts.receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn paired_registration_retains_the_exact_initial_snapshot() {
+        let handle = AutomaticEventTransportHandle::new();
+        let initial = EventAdapterSnapshot::new(
+            EventTransportKind::BLE_L2CAP_V1,
+            0,
+            EventAdapterState::Unavailable,
+            true,
+            7,
+        );
+
+        let registration = handle
+            .register_paired(initial)
+            .expect("first paired registration is admitted");
+
+        assert_eq!(registration.initial_snapshot(), initial);
+        let (snapshot, _control, _attempts) = registration.into_parts();
+        assert_eq!(snapshot, initial);
     }
 
     #[tokio::test(start_paused = true)]

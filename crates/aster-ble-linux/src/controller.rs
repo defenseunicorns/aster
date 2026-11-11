@@ -5,7 +5,7 @@ use crate::{
 use bluer::{AdapterEvent, AdapterProperty, Address, AddressType, SessionEvent};
 use futures::{Stream, StreamExt, stream};
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 const INITIAL_SESSION_RETRY: Duration = Duration::from_millis(250);
 const MAXIMUM_SESSION_RETRY: Duration = Duration::from_secs(30);
@@ -32,6 +32,61 @@ pub enum AvailabilityReason {
     ControllerUnauthorized,
     /// The named controller does not have the provisioned address and address type.
     ControllerIdentityMismatch,
+}
+
+/// Closed, sanitized events emitted by Linux BTLE lifecycle owners.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BtleOperatorEvent {
+    /// The BTLE adapter can accept selected Event work.
+    AdapterAvailable,
+    /// The BTLE adapter is unavailable for one coarse reason.
+    AdapterUnavailable(AvailabilityReason),
+    /// The lifecycle owner stopped after joining its work.
+    Stopped,
+    /// Platform owner loss was required to unblock cleanup.
+    CleanupForced,
+    /// Cleanup could not be confirmed within its hard bound.
+    CleanupUnconfirmed,
+}
+
+/// Fixed number of sanitized operator events retained without blocking owners.
+pub const BTLE_OPERATOR_OUTPUT_CAPACITY: usize = 32;
+
+/// Nonblocking, bounded redaction boundary for Linux BTLE operator output.
+#[derive(Clone, Debug, Default)]
+pub struct BtleOperatorOutput {
+    events: Option<mpsc::Sender<BtleOperatorEvent>>,
+}
+
+impl BtleOperatorOutput {
+    /// Creates a bounded output and its single consumer.
+    pub fn bounded() -> (Self, mpsc::Receiver<BtleOperatorEvent>) {
+        let (events, receiver) = mpsc::channel(BTLE_OPERATOR_OUTPUT_CAPACITY);
+        (
+            Self {
+                events: Some(events),
+            },
+            receiver,
+        )
+    }
+
+    /// Creates an output that intentionally discards every event.
+    pub const fn discard() -> Self {
+        Self { events: None }
+    }
+
+    pub(crate) fn emit(&self, event: BtleOperatorEvent) {
+        if let Some(events) = &self.events {
+            let _ = events.try_send(event);
+        }
+    }
+}
+
+pub(crate) const fn availability_event(availability: BtleAvailability) -> BtleOperatorEvent {
+    match availability {
+        BtleAvailability::Available => BtleOperatorEvent::AdapterAvailable,
+        BtleAvailability::Unavailable(reason) => BtleOperatorEvent::AdapterUnavailable(reason),
+    }
 }
 
 pub(crate) type MonitorFuture<'a> =
@@ -101,33 +156,16 @@ pub(crate) trait AvailabilityMonitor: Send + Sync {
     ) -> MonitorFuture<'a>;
 }
 
-trait AvailabilityOutput: Send + Sync {
-    fn emit(&self, availability: BtleAvailability);
-}
-
-struct ProcessAvailabilityOutput;
-
-impl AvailabilityOutput for ProcessAvailabilityOutput {
-    fn emit(&self, availability: BtleAvailability) {
-        match availability {
-            BtleAvailability::Available => eprintln!("BTLE_EVENT status=available"),
-            BtleAvailability::Unavailable(reason) => {
-                eprintln!("BTLE_EVENT status=unavailable reason={reason:?}");
-            }
-        }
-    }
-}
-
 pub(crate) struct BluezAvailabilityMonitor {
     backend: Arc<dyn BluezBackend>,
-    output: Arc<dyn AvailabilityOutput>,
+    output: BtleOperatorOutput,
 }
 
 impl BluezAvailabilityMonitor {
     pub(crate) fn new() -> Self {
         Self {
             backend: Arc::new(ProductionBluez),
-            output: Arc::new(ProcessAvailabilityOutput),
+            output: BtleOperatorOutput::discard(),
         }
     }
 
@@ -135,15 +173,12 @@ impl BluezAvailabilityMonitor {
     fn with_backend(backend: Arc<dyn BluezBackend>) -> Self {
         Self {
             backend,
-            output: Arc::new(ProcessAvailabilityOutput),
+            output: BtleOperatorOutput::discard(),
         }
     }
 
     #[cfg(test)]
-    fn with_backend_and_output(
-        backend: Arc<dyn BluezBackend>,
-        output: Arc<dyn AvailabilityOutput>,
-    ) -> Self {
+    fn with_backend_and_output(backend: Arc<dyn BluezBackend>, output: BtleOperatorOutput) -> Self {
         Self { backend, output }
     }
 
@@ -154,7 +189,7 @@ impl BluezAvailabilityMonitor {
         backoff: &mut CappedBackoff,
         failure: BluezFailure,
     ) -> bool {
-        publish(updates, self.output.as_ref(), failure.availability());
+        publish(updates, &self.output, failure.availability());
         wait_delay(cancellation, backoff.next_delay()).await
     }
 
@@ -166,7 +201,7 @@ impl BluezAvailabilityMonitor {
     ) -> Result<(), DriverError> {
         let configured = ConfiguredController::from_link(link);
         let mut backoff = CappedBackoff::new(INITIAL_SESSION_RETRY, MAXIMUM_SESSION_RETRY);
-        self.output.emit(BtleAvailability::Unavailable(
+        self.output.emit(BtleOperatorEvent::AdapterUnavailable(
             AvailabilityReason::BluezUnavailable,
         ));
 
@@ -223,7 +258,7 @@ impl BluezAvailabilityMonitor {
                 &configured,
                 present,
                 &updates,
-                self.output.as_ref(),
+                &self.output,
                 &cancellation,
             )
             .await
@@ -304,7 +339,7 @@ async fn monitor_session(
     configured: &ConfiguredController,
     mut present: bool,
     updates: &watch::Sender<BtleAvailability>,
-    output: &dyn AvailabilityOutput,
+    output: &BtleOperatorOutput,
     cancellation: &LifecycleCancellation,
 ) -> SessionOutcome {
     loop {
@@ -481,7 +516,7 @@ async fn wait_delay(cancellation: &LifecycleCancellation, delay: Duration) -> bo
 
 fn publish(
     updates: &watch::Sender<BtleAvailability>,
-    output: &dyn AvailabilityOutput,
+    output: &BtleOperatorOutput,
     availability: BtleAvailability,
 ) {
     let changed = updates.send_if_modified(|current| {
@@ -493,7 +528,7 @@ fn publish(
         }
     });
     if changed {
-        output.emit(availability);
+        output.emit(availability_event(availability));
     }
 }
 
@@ -775,29 +810,23 @@ mod tests {
         })
     }
 
-    #[derive(Default)]
-    struct RecordingAvailabilityOutput {
-        records: Mutex<Vec<BtleAvailability>>,
-        changed: Notify,
-    }
+    #[test]
+    fn operator_output_is_nonblocking_and_fixed_capacity() {
+        let (output, mut events) = BtleOperatorOutput::bounded();
 
-    impl AvailabilityOutput for RecordingAvailabilityOutput {
-        fn emit(&self, availability: BtleAvailability) {
-            self.records.lock().unwrap().push(availability);
-            self.changed.notify_waiters();
+        for _ in 0..=BTLE_OPERATOR_OUTPUT_CAPACITY {
+            output.emit(BtleOperatorEvent::AdapterAvailable);
         }
-    }
 
-    impl RecordingAvailabilityOutput {
-        async fn wait_for_records(&self, count: usize) {
-            loop {
-                let changed = self.changed.notified();
-                if self.records.lock().unwrap().len() >= count {
-                    return;
-                }
-                changed.await;
-            }
+        for _ in 0..BTLE_OPERATOR_OUTPUT_CAPACITY {
+            assert_eq!(
+                events.try_recv().unwrap(),
+                BtleOperatorEvent::AdapterAvailable
+            );
         }
+        assert!(events.try_recv().is_err(), "overflow must be dropped");
+
+        BtleOperatorOutput::discard().emit(BtleOperatorEvent::Stopped);
     }
 
     fn address(value: &str) -> Address {
@@ -868,9 +897,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn monitor_emits_initial_unavailable_once_while_retries_coalesce() {
         let bluez = ScriptedBluez::new([Err(BluezFailure::BluezUnavailable)], [], [], [], []);
-        let output = Arc::new(RecordingAvailabilityOutput::default());
-        let monitor =
-            BluezAvailabilityMonitor::with_backend_and_output(Arc::new(bluez), output.clone());
+        let (output, mut output_events) = BtleOperatorOutput::bounded();
+        let monitor = BluezAvailabilityMonitor::with_backend_and_output(Arc::new(bluez), output);
         let (updates, receiver) = watch::channel(BtleAvailability::Unavailable(
             AvailabilityReason::BluezUnavailable,
         ));
@@ -880,15 +908,15 @@ mod tests {
         let task =
             tokio::spawn(async move { monitor.run(&link, updates, worker_cancellation).await });
 
-        output.wait_for_records(1).await;
+        assert_eq!(
+            output_events.recv().await,
+            Some(BtleOperatorEvent::AdapterUnavailable(
+                AvailabilityReason::BluezUnavailable
+            ))
+        );
         tokio::task::yield_now().await;
 
-        assert_eq!(
-            *output.records.lock().unwrap(),
-            [BtleAvailability::Unavailable(
-                AvailabilityReason::BluezUnavailable
-            )]
-        );
+        assert!(output_events.try_recv().is_err());
         assert_eq!(
             *receiver.borrow(),
             BtleAvailability::Unavailable(AvailabilityReason::BluezUnavailable)
