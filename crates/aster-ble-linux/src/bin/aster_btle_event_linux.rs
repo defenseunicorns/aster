@@ -6,7 +6,7 @@ use aster_ble_linux::{
     spawn_linux_rostered_btle_event_supervisor,
 };
 use aster_host::{
-    TrustedClockLeaseGuard, TrustedClockSample,
+    TrustedClockLeaseGuard, TrustedClockSample, UnprotectedReferenceAuthorityGuard,
     load_unprotected_reference_discovery_credentials,
 };
 use aster_node::{
@@ -17,9 +17,7 @@ use aster_node::{
 use bluer::{Address, AddressType};
 use std::{
     collections::BTreeMap,
-    fs,
     future::Future,
-    os::unix::fs::DirBuilderExt,
     path::PathBuf,
     process::ExitCode,
     str::FromStr,
@@ -265,7 +263,7 @@ async fn run(config: EvaluationConfig) -> Result<(), String> {
             discovery_scope_id,
             credential_reference,
         } => {
-            let (credentials, mut clock) = load_reference_credentials(
+            let (credentials, mut clock, _credential_authority) = load_reference_credentials(
                 discovery_scope_id,
                 &credential_reference,
             )?;
@@ -338,8 +336,14 @@ async fn run(config: EvaluationConfig) -> Result<(), String> {
 fn load_reference_credentials(
     discovery_scope_id: [u8; 32],
     reference: &std::path::Path,
-) -> Result<(LeasedDiscoveryCredentialSet, TrustedClockLeaseGuard), String> {
-    let checkpoint = TemporaryCheckpoint::create()?;
+) -> Result<
+    (
+        LeasedDiscoveryCredentialSet,
+        TrustedClockLeaseGuard,
+        UnprotectedReferenceAuthorityGuard,
+    ),
+    String,
+> {
     let parent = reference
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -351,18 +355,22 @@ fn load_reference_credentials(
     let sample = trusted_clock_sample()?;
     let material = load_unprotected_reference_discovery_credentials(
         discovery_scope_id,
-        &checkpoint.0,
         parent,
         basename,
         sample,
     )
     .map_err(|_| "discovery credential reference was rejected".to_owned())?;
-    let (emitting, overlap, expires_at) = material.into_parts();
+    let (parts, authority) = material.into_parts();
+    let (emitting, overlap, expires_at) = parts.into_adapter_parts();
     let emitting = adopt_credential(emitting)?;
     let overlap = overlap.map(adopt_credential).transpose()?;
     let credentials = LeasedDiscoveryCredentialSet::new(emitting, overlap, expires_at)
         .map_err(|_| "discovery credential lease was rejected".to_owned())?;
-    Ok((credentials, TrustedClockLeaseGuard::new(sample)))
+    Ok((
+        credentials,
+        TrustedClockLeaseGuard::new(sample),
+        authority,
+    ))
 }
 
 fn trusted_clock_sample() -> Result<TrustedClockSample, String> {
@@ -381,43 +389,6 @@ fn adopt_credential(
     let secret = DiscoverySecret::from_zeroizing(secret)
         .map_err(|_| "discovery credential secret was rejected".to_owned())?;
     Ok(DiscoveryCredential::new(generation, secret))
-}
-
-struct TemporaryCheckpoint(PathBuf);
-
-impl TemporaryCheckpoint {
-    fn create() -> Result<Self, String> {
-        for _ in 0..4 {
-            let mut suffix = [0_u8; 16];
-            getrandom::fill(&mut suffix)
-                .map_err(|_| "temporary checkpoint entropy is unavailable".to_owned())?;
-            let name = format!(
-                "aster-btle-discovery-{}-{}",
-                std::process::id(),
-                suffix
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            );
-            let path = std::env::temp_dir().join(name);
-            let mut builder = fs::DirBuilder::new();
-            builder.mode(0o700);
-            match builder.create(&path) {
-                Ok(()) => return Ok(Self(path)),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(_) => return Err("temporary checkpoint could not be created".to_owned()),
-            }
-        }
-        Err("temporary checkpoint name could not be allocated".to_owned())
-    }
-}
-
-impl Drop for TemporaryCheckpoint {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(self.0.join("discovery-checkpoint.next"));
-        let _ = fs::remove_file(self.0.join("discovery-checkpoint"));
-        let _ = fs::remove_dir(&self.0);
-    }
 }
 
 #[tokio::main]
@@ -444,7 +415,7 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{os::unix::fs::PermissionsExt, sync::{Arc, Mutex}};
+    use std::sync::{Arc, Mutex};
 
     fn arguments() -> Vec<String> {
         [
@@ -533,16 +504,6 @@ mod tests {
         let mut missing_mode = arguments();
         missing_mode.drain(0..2);
         assert!(parse_command(missing_mode).is_err());
-    }
-
-    #[test]
-    fn temporary_discovery_checkpoint_is_private_and_removed_on_drop() {
-        let checkpoint = TemporaryCheckpoint::create().unwrap();
-        let path = checkpoint.0.clone();
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o700);
-
-        drop(checkpoint);
-        assert!(!path.exists());
     }
 
     #[test]

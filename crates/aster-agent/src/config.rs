@@ -10,7 +10,7 @@ use std::{
 };
 
 use aster_iroh::{PinnedRelay, RelayUrl};
-use aster_mesh::ProvisioningLoadId;
+use aster_mesh::{NodeId, ProvisioningLoadId};
 use aster_node::application::{Scope, Topic};
 use aster_node::{
     BlobDepotLimits, EventEmissionPolicy, MissionExpectedPeer, MutableSourceInterests,
@@ -22,7 +22,7 @@ use aster_redb_store::{
 };
 use serde::Deserialize;
 
-use crate::{MAX_AGENT_MESSAGE_BYTES, credentials::load_startup_credentials};
+use crate::MAX_AGENT_MESSAGE_BYTES;
 
 const SYSTEMD_SCHEMA_VERSION: u32 = 1;
 const COMPOSE_SCHEMA_VERSION: u32 = 2;
@@ -38,11 +38,44 @@ const MAX_APPLICATION_HEADER_BYTES: usize = 16 * 1024;
 const MAX_FIRST_AUTHENTICATION_TIMEOUT_MS: u64 = 5_000;
 const MAX_IN_FLIGHT_APPLICATION_REQUESTS: usize = 64;
 const MAX_SHUTDOWN_GRACE_MS: u64 = 30_000;
+// The config-only feature matrix cannot depend unconditionally on the
+// Linux-specific provider crate. The packaged build uses the provider constant
+// directly and compile-time checks its schema spelling against the portable
+// config literal, so drift cannot reach a customer binary.
+const BTLE_ROSTER_CREDENTIAL_SCHEMA_NAME: &str = "aster-btle-roster";
+#[cfg(feature = "systemd-provider")]
+pub use aster_systemd_credentials::BTLE_ROSTER_CREDENTIAL_NAME;
+#[cfg(not(feature = "systemd-provider"))]
+pub const BTLE_ROSTER_CREDENTIAL_NAME: &str = BTLE_ROSTER_CREDENTIAL_SCHEMA_NAME;
+
+#[cfg(feature = "systemd-provider")]
+const _: () = assert!(const_str_equal(
+    BTLE_ROSTER_CREDENTIAL_SCHEMA_NAME,
+    BTLE_ROSTER_CREDENTIAL_NAME,
+));
+
+#[cfg(feature = "systemd-provider")]
+const fn const_str_equal(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < left.len() {
+        if left[index] != right[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigReason {
     AbsolutePathRequired,
     BlobDepotRequired,
+    BtleEmissionPolicyConflict,
     DuplicateField,
     DuplicateBlobInterest,
     DistinctListenersRequired,
@@ -54,6 +87,7 @@ pub enum ConfigReason {
     InvalidEmissionPolicy,
     InvalidBlobDepot,
     InvalidBlobInterest,
+    InvalidBtlePolicy,
     InvalidPeer,
     InvalidRelay,
     InvalidStorage,
@@ -76,6 +110,9 @@ impl ConfigReason {
         match self {
             Self::AbsolutePathRequired => "configuration path must be absolute",
             Self::BlobDepotRequired => "configuration Blob interests require explicit depot limits",
+            Self::BtleEmissionPolicyConflict => {
+                "configuration BTLE emission policy conflicts with node policy"
+            }
             Self::DuplicateBlobInterest => "configuration contains a duplicate Blob interest",
             Self::DuplicateField => "configuration contains a duplicate field",
             Self::DistinctListenersRequired => "configuration listeners must be distinct",
@@ -87,6 +124,7 @@ impl ConfigReason {
             Self::InvalidEmissionPolicy => "configuration emission policy is invalid",
             Self::InvalidBlobDepot => "configuration Blob depot limits are invalid",
             Self::InvalidBlobInterest => "configuration Blob interest is invalid",
+            Self::InvalidBtlePolicy => "configuration BTLE policy is invalid",
             Self::InvalidPeer => "configuration peer is invalid",
             Self::InvalidRelay => "configuration relay is invalid",
             Self::InvalidStorage => "configuration storage limits are invalid",
@@ -221,6 +259,7 @@ pub struct ValidatedRuntimeConfig {
     forwarding: SelectedForwardingConfig,
     limits: AgentLimits,
     sync_interval: Duration,
+    btle: Option<ValidatedBtlePolicy>,
 }
 
 impl ValidatedRuntimeConfig {
@@ -252,6 +291,52 @@ impl ValidatedRuntimeConfig {
 
     pub const fn health(&self) -> SocketAddr {
         self.health
+    }
+
+    pub const fn btle_policy(&self) -> Option<&ValidatedBtlePolicy> {
+        self.btle.as_ref()
+    }
+}
+
+/// Exact restart-only Linux rostered-BTLE startup policy.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ValidatedBtlePolicy {
+    peer: NodeId,
+    deployment_scope_id: [u8; 32],
+    emission_policy: EventEmissionPolicy,
+    configured_priority: u16,
+}
+
+impl fmt::Debug for ValidatedBtlePolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ValidatedBtlePolicy([REDACTED])")
+    }
+}
+
+impl ValidatedBtlePolicy {
+    pub const fn peer(&self) -> NodeId {
+        self.peer
+    }
+
+    pub const fn deployment_scope_id(&self) -> &[u8; 32] {
+        &self.deployment_scope_id
+    }
+
+    pub const fn emission_policy(&self) -> EventEmissionPolicy {
+        self.emission_policy
+    }
+
+    pub const fn configured_priority(&self) -> u16 {
+        self.configured_priority
+    }
+
+    pub const fn credential_name(&self) -> &'static str {
+        BTLE_ROSTER_CREDENTIAL_NAME
+    }
+
+    /// Discovery credential renewal is applied only by controlled restart.
+    pub const fn renewal_requires_restart(&self) -> bool {
+        true
     }
 }
 
@@ -308,6 +393,26 @@ struct RawAgentConfig<C> {
     storage: RawStorage,
     #[serde(default)]
     limits: RawLimits,
+    #[serde(default)]
+    btle: Option<RawBtlePolicy>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBtlePolicy {
+    enabled: bool,
+    #[serde(default)]
+    peer: Option<String>,
+    #[serde(default)]
+    deployment_scope_id: Option<String>,
+    #[serde(default)]
+    policy: Option<String>,
+    #[serde(default)]
+    emission_policy: Option<String>,
+    #[serde(default)]
+    priority: Option<u16>,
+    #[serde(default)]
+    credential: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -468,10 +573,7 @@ pub fn validate_compose_config_bytes(
 }
 
 pub fn check_config(path: &Path) -> Result<(), ConfigError> {
-    let config = load_and_validate_config(path)?;
-    load_startup_credentials(config.credential_paths())
-        .map_err(|_| ConfigError::new(ConfigReason::CredentialBoundary))?;
-    Ok(())
+    load_and_validate_config(path).map(|_| ())
 }
 
 fn classify_json_error(error: serde_json::Error) -> ConfigError {
@@ -523,6 +625,9 @@ fn validate_compose(
     if raw.state.directory != Path::new(COMPOSE_STATE_PATH) {
         return Err(ConfigError::new(ConfigReason::StateBoundary));
     }
+    if raw.btle.is_some() {
+        return Err(ConfigError::new(ConfigReason::InvalidBtlePolicy));
+    }
     Ok(ValidatedComposeAgentConfig {
         runtime: validate_runtime(raw)?,
     })
@@ -538,8 +643,9 @@ fn validate_runtime<C>(raw: RawAgentConfig<C>) -> Result<ValidatedRuntimeConfig,
         return Err(ConfigError::new(ConfigReason::BlobDepotRequired));
     }
     let mutable_interests = MutableSourceInterests::default().with_blob(blob_interests);
-    let forwarding =
-        validate_forwarding(raw.storage, raw.mesh.emission_policy.into(), raw.mesh.relay)?;
+    let emission_policy = raw.mesh.emission_policy.into();
+    let btle = validate_btle_policy(raw.btle, emission_policy)?;
+    let forwarding = validate_forwarding(raw.storage, emission_policy, raw.mesh.relay)?;
     let limits = validate_limits(raw.limits)?;
 
     Ok(ValidatedRuntimeConfig {
@@ -552,7 +658,80 @@ fn validate_runtime<C>(raw: RawAgentConfig<C>) -> Result<ValidatedRuntimeConfig,
         forwarding,
         limits,
         sync_interval,
+        btle,
     })
+}
+
+fn validate_btle_policy(
+    raw: Option<RawBtlePolicy>,
+    node_emission: EventEmissionPolicy,
+) -> Result<Option<ValidatedBtlePolicy>, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if !raw.enabled {
+        if raw.peer.is_some()
+            || raw.deployment_scope_id.is_some()
+            || raw.policy.is_some()
+            || raw.emission_policy.is_some()
+            || raw.priority.is_some()
+            || raw.credential.is_some()
+        {
+            return Err(ConfigError::new(ConfigReason::InvalidBtlePolicy));
+        }
+        return Ok(None);
+    }
+
+    let peer = raw
+        .peer
+        .as_deref()
+        .ok_or_else(|| ConfigError::new(ConfigReason::InvalidBtlePolicy))
+        .and_then(|value| {
+            aster_node::parse_node_id(value)
+                .map_err(|_| ConfigError::new(ConfigReason::InvalidBtlePolicy))
+        })?;
+    let deployment_scope_id = raw
+        .deployment_scope_id
+        .as_deref()
+        .and_then(parse_hex_32)
+        .filter(|scope| *scope != [0; 32])
+        .ok_or_else(|| ConfigError::new(ConfigReason::InvalidBtlePolicy))?;
+    if raw.policy.as_deref() != Some("rostered")
+        || raw.credential.as_deref() != Some(BTLE_ROSTER_CREDENTIAL_NAME)
+    {
+        return Err(ConfigError::new(ConfigReason::InvalidBtlePolicy));
+    }
+    let emission_policy = match raw.emission_policy.as_deref() {
+        Some("normal") => EventEmissionPolicy::Normal,
+        Some("receive_only") => EventEmissionPolicy::ReceiveOnly,
+        _ => return Err(ConfigError::new(ConfigReason::InvalidBtlePolicy)),
+    };
+    if node_emission == EventEmissionPolicy::ReceiveOnly
+        && emission_policy != EventEmissionPolicy::ReceiveOnly
+    {
+        return Err(ConfigError::new(ConfigReason::BtleEmissionPolicyConflict));
+    }
+    let configured_priority = raw
+        .priority
+        .filter(|priority| *priority != 0)
+        .ok_or_else(|| ConfigError::new(ConfigReason::InvalidBtlePolicy))?;
+    Ok(Some(ValidatedBtlePolicy {
+        peer,
+        deployment_scope_id,
+        emission_policy,
+        configured_priority,
+    }))
+}
+
+fn parse_hex_32(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        bytes[index] = (hex_digit(pair[0])? << 4) | hex_digit(pair[1])?;
+    }
+    Some(bytes)
 }
 
 fn validate_limits(raw: RawLimits) -> Result<AgentLimits, ConfigError> {
@@ -595,11 +774,32 @@ fn tighten_u64(value: Option<u64>, ceiling: u64) -> Result<u64, ConfigError> {
 }
 
 fn require_absolute(path: &Path) -> Result<(), ConfigError> {
-    if path.is_absolute() {
-        Ok(())
-    } else {
+    if !path.is_absolute() || has_lexical_non_normal_component(path) {
         Err(ConfigError::new(ConfigReason::AbsolutePathRequired))
+    } else {
+        Ok(())
     }
+}
+
+#[cfg(unix)]
+fn has_lexical_non_normal_component(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let bytes = path.as_os_str().as_bytes();
+    bytes != b"/"
+        && bytes.strip_prefix(b"/").is_none_or(|relative| {
+            relative
+                .split(|byte| *byte == b'/')
+                .any(|component| matches!(component, b"." | b".."))
+        })
+}
+
+#[cfg(not(unix))]
+fn has_lexical_non_normal_component(path: &Path) -> bool {
+    use std::path::Component;
+
+    path.components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
 }
 
 fn validate_listeners(application: SocketAddr, health: SocketAddr) -> Result<(), ConfigError> {
@@ -861,6 +1061,134 @@ mod tests {
     }
 
     #[test]
+    fn btle_policy_absence_and_explicit_off_preserve_default_off_compatibility() {
+        // Break caught: adding BTLE configuration must not activate or require
+        // credentials for an existing systemd-v1 deployment.
+        let absent = validate_json(config_with_storage(4_161, 17_891_328))
+            .expect("legacy configuration without BTLE policy");
+        assert!(absent.btle_policy().is_none());
+
+        let off = validate_json(config_with_btle(serde_json::json!({"enabled": false})))
+            .expect("explicitly disabled BTLE policy");
+        assert!(off.btle_policy().is_none());
+    }
+
+    #[test]
+    fn systemd_state_directory_rejects_dot_and_parent_components() {
+        // Break caught: an absolute state path containing lexical traversal
+        // must not reach the descriptor-pinned checkpoint authority.
+        for state in [
+            "/var/lib/./aster-agent",
+            "/var/lib/aster-agent/../aster-agent",
+        ] {
+            let mut config: serde_json::Value =
+                serde_json::from_str(&config_with_storage(4_161, 17_891_328)).unwrap();
+            config["state"]["directory"] = serde_json::json!(state);
+            assert_reason(config.to_string(), ConfigReason::AbsolutePathRequired);
+        }
+    }
+
+    #[test]
+    fn systemd_state_directory_accepts_repeated_and_trailing_separators() {
+        // Break caught: empty path segments are harmless separators, not
+        // traversal components, and legacy default-off configurations may
+        // already contain them.
+        for state in ["/var//lib/aster-agent", "/var/lib/aster-agent/"] {
+            let mut config: serde_json::Value =
+                serde_json::from_str(&config_with_storage(4_161, 17_891_328)).unwrap();
+            config["state"]["directory"] = serde_json::json!(state);
+            let validated =
+                validate_json(config.to_string()).expect("harmless repeated or trailing separator");
+            assert!(validated.btle_policy().is_none());
+        }
+    }
+
+    #[test]
+    fn btle_policy_names_exact_peer_scope_rostered_emission_priority_and_credential() {
+        // Break caught: accepting a controller locator or dropping an exact
+        // authority/policy field would let hardware discovery alter mission
+        // authorization or local selection policy.
+        let config = validate_json(config_with_btle(valid_btle_policy()))
+            .expect("complete rostered BTLE policy");
+        let policy = config.btle_policy().expect("enabled BTLE policy");
+        assert_eq!(policy.peer(), [0xaa; 32]);
+        assert_eq!(policy.deployment_scope_id(), &[0x42; 32]);
+        assert_eq!(policy.emission_policy(), EventEmissionPolicy::Normal);
+        assert_eq!(policy.configured_priority(), 100);
+        assert_eq!(policy.credential_name(), "aster-btle-roster");
+        assert!(policy.renewal_requires_restart());
+        assert_eq!(format!("{policy:?}"), "ValidatedBtlePolicy([REDACTED])");
+
+        let mut with_controller = valid_btle_policy();
+        with_controller["controller"] = serde_json::json!("hci0");
+        assert_reason(
+            config_with_btle(with_controller),
+            ConfigReason::UnknownField,
+        );
+    }
+
+    #[test]
+    fn btle_policy_rejects_unknown_duplicate_inexact_authority_and_credential_aliases() {
+        // Break caught: permissive decoding could ignore an operator typo,
+        // truncate authority, or reuse the mission credential as BTLE proof.
+        let mut unknown = valid_btle_policy();
+        unknown["unknown"] = serde_json::json!(true);
+        assert_reason(config_with_btle(unknown), ConfigReason::UnknownField);
+
+        let duplicate = config_with_btle(valid_btle_policy()).replacen(
+            "\"priority\":100",
+            "\"priority\":100,\"priority\":101",
+            1,
+        );
+        assert_reason(duplicate, ConfigReason::DuplicateField);
+
+        for (field, value) in [
+            ("peer", serde_json::json!("aa")),
+            ("deployment_scope_id", serde_json::json!("42")),
+            ("deployment_scope_id", serde_json::json!("00".repeat(32))),
+            ("policy", serde_json::json!("mission")),
+            ("credential", serde_json::json!("aster-provisioning.bundle")),
+            ("priority", serde_json::json!(0)),
+        ] {
+            let mut policy = valid_btle_policy();
+            policy[field] = value;
+            assert_reason(config_with_btle(policy), ConfigReason::InvalidBtlePolicy);
+        }
+    }
+
+    #[test]
+    fn btle_emission_policy_cannot_weaken_node_receive_only_policy() {
+        // Break caught: a transport-local normal policy must not originate
+        // traffic after the node-wide configuration selected receive-only.
+        let mut receive_only_node: serde_json::Value =
+            serde_json::from_str(&config_with_btle(valid_btle_policy())).unwrap();
+        receive_only_node["mesh"]["emission_policy"] = serde_json::json!("receive_only");
+        assert_reason(
+            receive_only_node.to_string(),
+            ConfigReason::BtleEmissionPolicyConflict,
+        );
+
+        let mut local_receive_only = valid_btle_policy();
+        local_receive_only["emission_policy"] = serde_json::json!("receive_only");
+        validate_json(config_with_btle(local_receive_only))
+            .expect("node normal with stricter BTLE receive-only policy");
+    }
+
+    #[test]
+    fn check_config_is_pure_and_does_not_open_credentials_or_platform_services() {
+        // Break caught: --check-config must remain usable in packaging and CI
+        // without a systemd credential mount, BlueZ, D-Bus, or a controller.
+        let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "aster-agent-pure-check-config-{}-{sequence}.json",
+            std::process::id()
+        ));
+        fs::write(&path, config_with_btle(valid_btle_policy())).expect("write config fixture");
+        super::check_config(&path).expect("pure structural validation");
+        fs::remove_file(path).expect("remove config fixture");
+    }
+
+    #[test]
     fn legacy_v1_and_v2_configs_preserve_default_blob_depot_limits() {
         // Break caught: making the new optional Blob configuration replace the
         // established depot limits for existing systemd-v1 or Compose-v2 files.
@@ -1038,6 +1366,22 @@ mod tests {
                 "alternate Compose state path must be rejected",
             );
             assert_eq!(error.reason(), ConfigReason::StateBoundary, "state {state}");
+        }
+    }
+
+    #[test]
+    fn compose_rejects_enabled_and_explicitly_disabled_btle_blocks() {
+        // Break caught: adding even an off BTLE block to the Compose schema
+        // must not create a second deployment or credential boundary.
+        for btle in [serde_json::json!({"enabled": false}), valid_btle_policy()] {
+            let mut config: serde_json::Value =
+                serde_json::from_str(&compose_config_with_state("/var/lib/aster")).unwrap();
+            config["btle"] = btle;
+            let error = rejected(
+                validate_compose_json(config.to_string()),
+                "Compose BTLE policy must be rejected",
+            );
+            assert_eq!(error.reason(), ConfigReason::InvalidBtlePolicy);
         }
     }
 
@@ -1403,6 +1747,25 @@ mod tests {
         format!(
             r#"{{"schema_version":1,"state":{{"directory":"/var/lib/aster-agent"}},"application":{{"listen":"127.0.0.1:8181"}},"health":{{"listen":"127.0.0.1:8182"}},"mesh":{{"bind":"127.0.0.1:8183","sync_interval_ms":500,"emission_policy":"normal","peers":[]}},"credentials":{{"client_token_file":"/run/aster-agent/client-token","mission_secret_ref_file":"/run/aster-agent/mission-ref","mission_load_id":"1111111111111111111111111111111111111111111111111111111111111111"}},"storage":{{"max_items":{max_items},"max_payload_bytes":{max_payload_bytes},"operations":{{"max_records":1000000,"max_logical_bytes":201326592,"emergency_reserve":10000}}}}}}"#
         )
+    }
+
+    fn config_with_btle(policy: serde_json::Value) -> String {
+        let mut config: serde_json::Value =
+            serde_json::from_str(&config_with_storage(4_161, 17_891_328)).unwrap();
+        config["btle"] = policy;
+        config.to_string()
+    }
+
+    fn valid_btle_policy() -> serde_json::Value {
+        serde_json::json!({
+            "enabled": true,
+            "peer": "aa".repeat(32),
+            "deployment_scope_id": "42".repeat(32),
+            "policy": "rostered",
+            "emission_policy": "normal",
+            "priority": 100,
+            "credential": "aster-btle-roster"
+        })
     }
 
     fn config_with_blob(interests: Vec<&str>, depot: Option<serde_json::Value>) -> String {

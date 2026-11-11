@@ -265,6 +265,7 @@ name = "aster-agent"
 version = "0.1.0-alpha.1"
 dependencies = [
  "aster-core",
+ "aster-host",
  "aster-iroh",
  "aster-node",
  "aster-profile",

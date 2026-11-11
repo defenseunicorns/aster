@@ -1,14 +1,12 @@
-use aster_mesh::{
-    ProvisioningLoadId, ProvisioningSecretLoader, ProvisioningSecretRef, load_provisioning_secret,
-};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use std::{
+    ffi::{OsStr, OsString},
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::File,
     io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-    path::{Path, PathBuf},
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    path::Path,
     time::Instant,
 };
 use zeroize::Zeroizing;
@@ -22,13 +20,43 @@ const CHECKPOINT_MAGIC: &[u8; 8] = b"ASTRDC01";
 const CHECKPOINT_BYTES: usize = 165;
 const CHECKPOINT_FILE: &str = "discovery-checkpoint";
 const CHECKPOINT_NEXT_FILE: &str = "discovery-checkpoint.next";
+/// Fixed root-controlled process-wide namespace anchor for the BTLE authority.
+///
+/// Task 6 provisions this file and its exact custody profile. It is
+/// intentionally not configurable and is outside the service-writable state
+/// tree so replacing that tree cannot fork credential history.
+pub const BTLE_AUTHORITY_LOCK_PATH: &str = "/run/aster-agent/btle-authority.lock";
+const POSIX_ACL_ACCESS: &str = "system.posix_acl_access";
 type ActiveCredentialState = (u32, [u8; 32], Option<(u32, [u8; 32])>);
-/// Move-only parts passed once from the authority into the Linux adapter.
-pub type DiscoveryCredentialMaterialParts = (
+/// Final move-only tuple accepted by the Linux adapter composition boundary.
+pub type DiscoveryCredentialAdapterParts = (
     (u32, Zeroizing<[u8; 32]>),
     Option<(u32, Zeroizing<[u8; 32]>)>,
     Instant,
 );
+
+/// Move-only credential parts passed once into the Linux adapter.
+///
+/// Callers can only obtain this value together with an active authority guard;
+/// its fields are private so it cannot be constructed independently.
+pub struct DiscoveryCredentialMaterialParts {
+    emitting: (u32, Zeroizing<[u8; 32]>),
+    overlap: Option<(u32, Zeroizing<[u8; 32]>)>,
+    expires_at: Instant,
+}
+
+impl DiscoveryCredentialMaterialParts {
+    /// Moves the credential values into the adapter composition boundary.
+    pub fn into_adapter_parts(self) -> DiscoveryCredentialAdapterParts {
+        (self.emitting, self.overlap, self.expires_at)
+    }
+}
+
+impl fmt::Debug for DiscoveryCredentialMaterialParts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DiscoveryCredentialMaterialParts([REDACTED])")
+    }
+}
 
 /// Closed authenticated discovery-credential authority failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,8 +77,58 @@ pub enum DiscoveryCredentialError {
     TimeOverflow,
     /// Explicit evaluator-only file failed descriptor custody validation.
     UnprotectedReferenceRejected,
-    /// Authenticated provisioning source could not produce the exact artifact.
-    ProvisioningUnavailable,
+    /// Authenticated artifact source could not produce the exact credential.
+    ArtifactUnavailable,
+}
+
+/// Fixed-capacity, move-only ownership of one candidate ASTRBD02 artifact.
+///
+/// This value enforces only the host allocation boundary. Authenticating the
+/// source is a provider precondition and is not claimed or repeated here.
+pub struct BoundedDiscoveryCredentialArtifact {
+    bytes: Zeroizing<[u8; TWO_ENTRY_BYTES]>,
+    len: usize,
+}
+
+impl BoundedDiscoveryCredentialArtifact {
+    /// Copies a provider-authenticated, zeroizing allocation into fixed host
+    /// storage and rejects any value beyond the canonical artifact maximum.
+    pub fn from_zeroizing(bytes: Zeroizing<Vec<u8>>) -> Result<Self, DiscoveryCredentialError> {
+        if bytes.len() > TWO_ENTRY_BYTES {
+            return Err(DiscoveryCredentialError::InvalidArtifact);
+        }
+        let len = bytes.len();
+        let mut bounded = Zeroizing::new([0_u8; TWO_ENTRY_BYTES]);
+        bounded[..len].copy_from_slice(&bytes);
+        Ok(Self {
+            bytes: bounded,
+            len,
+        })
+    }
+
+    /// Borrows only the initialized candidate artifact bytes.
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl fmt::Debug for BoundedDiscoveryCredentialArtifact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BoundedDiscoveryCredentialArtifact([REDACTED])")
+    }
+}
+
+/// Move-only provider of one bounded ASTRBD02 artifact candidate.
+///
+/// Implementations must authenticate the source before constructing the
+/// bounded value and must not parse, clone, cache, or expose discovery secrets.
+/// Parsing and durable replacement remain solely owned by
+/// [`PreparedDiscoveryCredential`].
+pub trait DiscoveryCredentialArtifactProvider {
+    /// Moves one source-authenticated candidate into the host authority.
+    fn load_bounded_artifact(
+        &mut self,
+    ) -> Result<BoundedDiscoveryCredentialArtifact, DiscoveryCredentialError>;
 }
 
 struct CredentialEntry {
@@ -411,44 +489,46 @@ trait DiscoveryCheckpointStore {
 
     fn replace(&mut self, checkpoint: &DiscoveryCheckpoint)
     -> Result<(), DiscoveryCredentialError>;
+
+    fn revalidate_namespace(&self) -> Result<(), DiscoveryCredentialError>;
 }
 
 struct FileDiscoveryCheckpointStore {
-    root: PathBuf,
+    state: PinnedStateRoot,
 }
 
 impl FileDiscoveryCheckpointStore {
-    fn new(root: &Path) -> Result<Self, DiscoveryCredentialError> {
-        let metadata = fs::symlink_metadata(root)
-            .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?;
-        if !metadata.file_type().is_dir()
-            || metadata.uid() != rustix::process::geteuid().as_raw()
-            || metadata.permissions().mode() & 0o077 != 0
-        {
-            return Err(DiscoveryCredentialError::CheckpointCorrupt);
-        }
-        let store = Self {
-            root: root.to_path_buf(),
-        };
+    fn new(state: PinnedStateRoot) -> Result<Self, DiscoveryCredentialError> {
+        state.revalidate()?;
+        let store = Self { state };
         store.cleanup_next()?;
         Ok(store)
     }
 
-    fn checkpoint_path(&self) -> PathBuf {
-        self.root.join(CHECKPOINT_FILE)
-    }
-
-    fn next_path(&self) -> PathBuf {
-        self.root.join(CHECKPOINT_NEXT_FILE)
+    #[cfg(test)]
+    fn new_for_test(root: &Path) -> Result<Self, DiscoveryCredentialError> {
+        Self::new(PinnedStateRoot::open_for_test(root)?)
     }
 
     fn cleanup_next(&self) -> Result<(), DiscoveryCredentialError> {
-        let next = self.next_path();
-        let metadata = match fs::symlink_metadata(&next) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(_) => return Err(DiscoveryCredentialError::CheckpointUnavailable),
+        self.state.revalidate()?;
+        let descriptor = match rustix::fs::openat(
+            self.state.root(),
+            CHECKPOINT_NEXT_FILE,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(rustix::io::Errno::NOENT) => return Ok(()),
+            Err(_) => return Err(DiscoveryCredentialError::CheckpointCorrupt),
         };
+        let file = File::from(descriptor);
+        let metadata = file
+            .metadata()
+            .map_err(|_| DiscoveryCredentialError::CheckpointCorrupt)?;
         if !metadata.file_type().is_file()
             || metadata.uid() != rustix::process::geteuid().as_raw()
             || metadata.permissions().mode() & 0o077 != 0
@@ -457,25 +537,460 @@ impl FileDiscoveryCheckpointStore {
         {
             return Err(DiscoveryCredentialError::CheckpointCorrupt);
         }
-        fs::remove_file(next).map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?;
-        File::open(&self.root)
-            .and_then(|directory| directory.sync_all())
+        rustix::fs::unlinkat(
+            self.state.root(),
+            CHECKPOINT_NEXT_FILE,
+            rustix::fs::AtFlags::empty(),
+        )
+        .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?;
+        self.state
+            .root()
+            .sync_all()
             .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)
     }
+
+    fn replace_with_before_rename<F>(
+        &mut self,
+        checkpoint: &DiscoveryCheckpoint,
+        before_rename: F,
+    ) -> Result<(), DiscoveryCredentialError>
+    where
+        F: FnOnce(),
+    {
+        self.cleanup_next()?;
+        self.state.revalidate()?;
+        let mut file = File::from(
+            rustix::fs::openat(
+                self.state.root(),
+                CHECKPOINT_NEXT_FILE,
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::CREATE
+                    | rustix::fs::OFlags::EXCL
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )
+            .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?,
+        );
+        let bytes = encode_checkpoint(checkpoint);
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?;
+        validate_checkpoint_metadata(&file)?;
+        before_rename();
+        self.state.revalidate()?;
+        rustix::fs::renameat(
+            self.state.root(),
+            CHECKPOINT_NEXT_FILE,
+            self.state.root(),
+            CHECKPOINT_FILE,
+        )
+        .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?;
+        self.state
+            .root()
+            .sync_all()
+            .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)
+    }
+
+    #[cfg(test)]
+    fn replace_after_write_for_test<F>(
+        &mut self,
+        checkpoint: &DiscoveryCheckpoint,
+        before_rename: F,
+    ) -> Result<(), DiscoveryCredentialError>
+    where
+        F: FnOnce(),
+    {
+        self.replace_with_before_rename(checkpoint, before_rename)
+    }
+}
+
+struct PinnedStateRoot {
+    ancestors: Vec<File>,
+    parent: File,
+    basename: OsString,
+    root: File,
+    device: u64,
+    inode: u64,
+    service_uid: libc::uid_t,
+    enforce_production_custody: bool,
+}
+
+impl PinnedStateRoot {
+    fn open_production(path: &Path) -> Result<Self, DiscoveryCredentialError> {
+        Self::open(path, true)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn open_for_test(path: &Path) -> Result<Self, DiscoveryCredentialError> {
+        Self::open(path, false)
+    }
+
+    fn open(
+        path: &Path,
+        enforce_production_custody: bool,
+    ) -> Result<Self, DiscoveryCredentialError> {
+        let components = absolute_normal_components(path)?;
+        let (basename, parent_components) = components
+            .split_last()
+            .ok_or(DiscoveryCredentialError::CheckpointUnavailable)?;
+        let flags = directory_open_flags();
+        let mut directory = open_root_directory()?;
+        let mut ancestors = Vec::with_capacity(parent_components.len() + 1);
+        if enforce_production_custody {
+            validate_root_owned_ancestor(&directory)?;
+        }
+        ancestors.push(
+            directory
+                .try_clone()
+                .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?,
+        );
+        for component in parent_components {
+            directory = open_child_directory(&directory, component)?;
+            if enforce_production_custody {
+                validate_root_owned_ancestor(&directory)?;
+            }
+            ancestors.push(
+                directory
+                    .try_clone()
+                    .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?,
+            );
+        }
+        let parent = directory;
+        let root = File::from(
+            rustix::fs::openat(&parent, basename, flags, rustix::fs::Mode::empty())
+                .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?,
+        );
+        let service_uid = rustix::process::geteuid().as_raw();
+        if enforce_production_custody {
+            validate_service_state_root(&root, service_uid)?;
+        } else {
+            validate_test_state_root(&root)?;
+        }
+        let metadata = root
+            .metadata()
+            .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?;
+        let pinned = Self {
+            ancestors,
+            parent,
+            basename: basename.clone(),
+            root,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            service_uid,
+            enforce_production_custody,
+        };
+        pinned.revalidate()?;
+        Ok(pinned)
+    }
+
+    fn root(&self) -> &File {
+        &self.root
+    }
+
+    fn revalidate(&self) -> Result<(), DiscoveryCredentialError> {
+        if self.enforce_production_custody {
+            for ancestor in &self.ancestors {
+                validate_root_owned_ancestor(ancestor)?;
+            }
+            validate_service_state_root(&self.root, self.service_uid)?;
+        } else {
+            validate_test_state_root(&self.root)?;
+        }
+        let current = File::from(
+            rustix::fs::openat(
+                &self.parent,
+                &self.basename,
+                directory_open_flags(),
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?,
+        );
+        if self.enforce_production_custody {
+            validate_service_state_root(&current, self.service_uid)?;
+        } else {
+            validate_test_state_root(&current)?;
+        }
+        let metadata = current
+            .metadata()
+            .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?;
+        if metadata.dev() != self.device || metadata.ino() != self.inode {
+            return Err(DiscoveryCredentialError::CheckpointUnavailable);
+        }
+        Ok(())
+    }
+}
+
+fn directory_open_flags() -> rustix::fs::OFlags {
+    rustix::fs::OFlags::RDONLY
+        | rustix::fs::OFlags::DIRECTORY
+        | rustix::fs::OFlags::CLOEXEC
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::NONBLOCK
+}
+
+fn absolute_normal_components(path: &Path) -> Result<Vec<OsString>, DiscoveryCredentialError> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return Err(DiscoveryCredentialError::CheckpointUnavailable);
+    }
+    path.components()
+        .filter_map(|component| match component {
+            Component::RootDir => None,
+            Component::Normal(name) => Some(Ok(name.to_owned())),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                Some(Err(DiscoveryCredentialError::CheckpointUnavailable))
+            }
+        })
+        .collect()
+}
+
+fn open_root_directory() -> Result<File, DiscoveryCredentialError> {
+    rustix::fs::open("/", directory_open_flags(), rustix::fs::Mode::empty())
+        .map(File::from)
+        .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)
+}
+
+fn open_child_directory(parent: &File, name: &OsStr) -> Result<File, DiscoveryCredentialError> {
+    rustix::fs::openat(
+        parent,
+        name,
+        directory_open_flags(),
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)
+}
+
+fn open_absolute_nofollow(path: &Path) -> Result<(File, Vec<File>), DiscoveryCredentialError> {
+    let components = absolute_normal_components(path)?;
+    let (final_component, parent_components) = components
+        .split_last()
+        .ok_or(DiscoveryCredentialError::CheckpointUnavailable)?;
+    let mut directory = open_root_directory()?;
+    let mut ancestors = Vec::new();
+    validate_root_owned_ancestor(&directory)?;
+    ancestors.push(
+        directory
+            .try_clone()
+            .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?,
+    );
+    for component in parent_components {
+        directory = open_child_directory(&directory, component)?;
+        validate_root_owned_ancestor(&directory)?;
+        ancestors.push(
+            directory
+                .try_clone()
+                .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?,
+        );
+    }
+    let file = File::from(
+        rustix::fs::openat(
+            &directory,
+            final_component,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?,
+    );
+    Ok((file, ancestors))
+}
+
+fn validate_root_owned_ancestor(directory: &File) -> Result<(), DiscoveryCredentialError> {
+    validate_root_owned_ancestor_metadata(&custody_metadata(directory)?)
+}
+
+fn validate_service_state_root(
+    root: &File,
+    expected_uid: libc::uid_t,
+) -> Result<(), DiscoveryCredentialError> {
+    validate_service_state_root_metadata(&custody_metadata(root)?, expected_uid)
+}
+
+fn validate_test_state_root(root: &File) -> Result<(), DiscoveryCredentialError> {
+    let metadata = root
+        .metadata()
+        .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(DiscoveryCredentialError::CheckpointCorrupt);
+    }
+    Ok(())
+}
+
+struct AuthorityLock {
+    _file: File,
+}
+
+impl AuthorityLock {
+    fn acquire_production() -> Result<Self, DiscoveryCredentialError> {
+        let service_uid = rustix::process::geteuid().as_raw();
+        let (lock, ancestors) = open_absolute_nofollow(Path::new(BTLE_AUTHORITY_LOCK_PATH))?;
+        for ancestor in &ancestors {
+            validate_root_owned_ancestor(ancestor)?;
+        }
+        validate_authority_lock(&lock, service_uid)?;
+        Self::acquire(lock, Some(service_uid))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn acquire_for_test(lock: File) -> Result<Self, DiscoveryCredentialError> {
+        Self::acquire(lock, None)
+    }
+
+    fn acquire(
+        lock: File,
+        production_service_uid: Option<libc::uid_t>,
+    ) -> Result<Self, DiscoveryCredentialError> {
+        if let Some(service_uid) = production_service_uid {
+            validate_authority_lock(&lock, service_uid)?;
+        }
+        match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::WOULDBLOCK) => {
+                return Err(DiscoveryCredentialError::CheckpointUnavailable);
+            }
+            Err(_) => return Err(DiscoveryCredentialError::CheckpointUnavailable),
+        }
+        if let Some(service_uid) = production_service_uid {
+            validate_authority_lock(&lock, service_uid)?;
+        }
+        Ok(Self { _file: lock })
+    }
+}
+
+fn validate_authority_lock(
+    lock: &File,
+    service_uid: libc::uid_t,
+) -> Result<(), DiscoveryCredentialError> {
+    validate_authority_lock_metadata(&custody_metadata(lock)?, service_uid)
+}
+
+#[derive(Clone)]
+struct CustodyMetadata {
+    is_file: bool,
+    is_directory: bool,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    mode: u32,
+    links: u64,
+    length: u64,
+    access_acl: Option<Vec<u8>>,
+}
+
+fn custody_metadata(file: &File) -> Result<CustodyMetadata, DiscoveryCredentialError> {
+    let metadata = file
+        .metadata()
+        .map_err(|_| DiscoveryCredentialError::CheckpointCorrupt)?;
+    Ok(CustodyMetadata {
+        is_file: metadata.file_type().is_file(),
+        is_directory: metadata.file_type().is_dir(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode: metadata.permissions().mode() & 0o777,
+        links: metadata.nlink(),
+        length: metadata.len(),
+        access_acl: read_access_acl(file)?,
+    })
+}
+
+fn validate_root_owned_ancestor_metadata(
+    metadata: &CustodyMetadata,
+) -> Result<(), DiscoveryCredentialError> {
+    if !metadata.is_directory
+        || metadata.uid != 0
+        || metadata.mode & 0o022 != 0
+        || metadata.access_acl.is_some()
+    {
+        return Err(DiscoveryCredentialError::CheckpointCorrupt);
+    }
+    Ok(())
+}
+
+fn validate_service_state_root_metadata(
+    metadata: &CustodyMetadata,
+    service_uid: libc::uid_t,
+) -> Result<(), DiscoveryCredentialError> {
+    if !metadata.is_directory
+        || metadata.uid != service_uid
+        || metadata.mode & 0o077 != 0
+        || metadata.access_acl.is_some()
+    {
+        return Err(DiscoveryCredentialError::CheckpointCorrupt);
+    }
+    Ok(())
+}
+
+fn validate_authority_lock_metadata(
+    metadata: &CustodyMetadata,
+    service_uid: libc::uid_t,
+) -> Result<(), DiscoveryCredentialError> {
+    if !metadata.is_file
+        || metadata.uid != 0
+        || metadata.gid != 0
+        || metadata.mode != 0o440
+        || metadata.links != 1
+        || metadata.length != 0
+        || metadata.access_acl.as_deref()
+            != Some(expected_authority_lock_acl(service_uid).as_slice())
+    {
+        return Err(DiscoveryCredentialError::CheckpointCorrupt);
+    }
+    Ok(())
+}
+
+fn read_access_acl(file: &File) -> Result<Option<Vec<u8>>, DiscoveryCredentialError> {
+    let mut bytes = [0_u8; 128];
+    match rustix::fs::fgetxattr(file, POSIX_ACL_ACCESS, &mut bytes) {
+        Ok(length) => Ok(Some(bytes[..length].to_vec())),
+        Err(rustix::io::Errno::NODATA) => Ok(None),
+        Err(_) => Err(DiscoveryCredentialError::CheckpointCorrupt),
+    }
+}
+
+fn expected_authority_lock_acl(service_uid: libc::uid_t) -> [u8; 44] {
+    const ACL_UNDEFINED_ID: u32 = u32::MAX;
+    let entries = [
+        (0x01_u16, 0o4_u16, ACL_UNDEFINED_ID),
+        (0x02_u16, 0o4_u16, service_uid),
+        (0x04_u16, 0_u16, ACL_UNDEFINED_ID),
+        (0x10_u16, 0o4_u16, ACL_UNDEFINED_ID),
+        (0x20_u16, 0_u16, ACL_UNDEFINED_ID),
+    ];
+    let mut acl = [0_u8; 44];
+    acl[..4].copy_from_slice(&2_u32.to_le_bytes());
+    for (index, (tag, permissions, id)) in entries.into_iter().enumerate() {
+        let offset = 4 + index * 8;
+        acl[offset..offset + 2].copy_from_slice(&tag.to_le_bytes());
+        acl[offset + 2..offset + 4].copy_from_slice(&permissions.to_le_bytes());
+        acl[offset + 4..offset + 8].copy_from_slice(&id.to_le_bytes());
+    }
+    acl
 }
 
 impl DiscoveryCheckpointStore for FileDiscoveryCheckpointStore {
     fn load(&mut self) -> Result<Option<DiscoveryCheckpoint>, DiscoveryCredentialError> {
-        let path = self.checkpoint_path();
-        let mut file = match OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        self.state.revalidate()?;
+        let descriptor = match rustix::fs::openat(
+            self.state.root(),
+            CHECKPOINT_FILE,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
             Err(_) => return Err(DiscoveryCredentialError::CheckpointCorrupt),
         };
+        let mut file = File::from(descriptor);
         validate_checkpoint_metadata(&file)?;
         let mut bytes = [0_u8; CHECKPOINT_BYTES];
         file.read_exact(&mut bytes)
@@ -496,24 +1011,11 @@ impl DiscoveryCheckpointStore for FileDiscoveryCheckpointStore {
         &mut self,
         checkpoint: &DiscoveryCheckpoint,
     ) -> Result<(), DiscoveryCredentialError> {
-        self.cleanup_next()?;
-        let next = self.next_path();
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(&next)
-            .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?;
-        let bytes = encode_checkpoint(checkpoint);
-        file.write_all(&bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?;
-        fs::rename(&next, self.checkpoint_path())
-            .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?;
-        File::open(&self.root)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)
+        self.replace_with_before_rename(checkpoint, || {})
+    }
+
+    fn revalidate_namespace(&self) -> Result<(), DiscoveryCredentialError> {
+        self.state.revalidate()
     }
 }
 
@@ -727,37 +1229,34 @@ fn validate_unprotected_reference_stat_for_owner(
     Ok(())
 }
 
-/// Zeroizing host-owned lease ready for one explicit adapter composition step.
-pub struct LeasedDiscoveryCredentialMaterial {
+/// Zeroizing host-owned lease retained inside a prepared authority value.
+struct LeasedDiscoveryCredentialMaterial {
     emitting: CredentialEntry,
     overlap: Option<CredentialEntry>,
     expires_at: Instant,
 }
 
 impl LeasedDiscoveryCredentialMaterial {
-    /// Emitting credential generation.
-    pub const fn emitting_generation(&self) -> u32 {
+    #[cfg(test)]
+    const fn emitting_generation(&self) -> u32 {
         self.emitting.generation
     }
 
-    /// Optional accepted overlap generation.
-    pub fn overlap_generation(&self) -> Option<u32> {
+    fn overlap_generation(&self) -> Option<u32> {
         self.overlap.as_ref().map(|entry| entry.generation)
     }
 
-    /// Monotonic instant at which the adapter must tear down discovery.
-    pub const fn expires_at(&self) -> Instant {
+    #[cfg(test)]
+    const fn expires_at(&self) -> Instant {
         self.expires_at
     }
 
-    /// Moves zeroizing material into the Linux adapter composition boundary
-    /// without cloning it.
-    pub fn into_parts(self) -> DiscoveryCredentialMaterialParts {
-        (
-            (self.emitting.generation, self.emitting.secret),
-            self.overlap.map(|entry| (entry.generation, entry.secret)),
-            self.expires_at,
-        )
+    fn into_parts(self) -> DiscoveryCredentialMaterialParts {
+        DiscoveryCredentialMaterialParts {
+            emitting: (self.emitting.generation, self.emitting.secret),
+            overlap: self.overlap.map(|entry| (entry.generation, entry.secret)),
+            expires_at: self.expires_at,
+        }
     }
 }
 
@@ -797,18 +1296,44 @@ where
         })
     }
 
-    fn accept_authenticated(
+    fn accept_provider_artifact(
         &mut self,
         bytes: &[u8],
         sample: TrustedClockSample,
     ) -> Result<LeasedDiscoveryCredentialMaterial, DiscoveryCredentialError> {
+        self.accept_provider_artifact_with_expiry(bytes, sample, |instant, duration| {
+            instant.checked_add(duration)
+        })
+    }
+
+    fn accept_provider_artifact_with_expiry<F>(
+        &mut self,
+        bytes: &[u8],
+        sample: TrustedClockSample,
+        derive_expiry: F,
+    ) -> Result<LeasedDiscoveryCredentialMaterial, DiscoveryCredentialError>
+    where
+        F: FnOnce(Instant, std::time::Duration) -> Option<Instant>,
+    {
+        self.accept_provider_artifact_with_hooks(bytes, sample, derive_expiry, || {})
+    }
+
+    fn accept_provider_artifact_with_hooks<F, H>(
+        &mut self,
+        bytes: &[u8],
+        sample: TrustedClockSample,
+        derive_expiry: F,
+        after_checkpoint: H,
+    ) -> Result<LeasedDiscoveryCredentialMaterial, DiscoveryCredentialError>
+    where
+        F: FnOnce(Instant, std::time::Duration) -> Option<Instant>,
+        H: FnOnce(),
+    {
         self.validate_clock(sample)?;
         let artifact =
             ParsedDiscoveryArtifact::parse(bytes, self.expected_scope, sample.wall_unix_seconds)?;
         let previous = self.checkpoint_store.load()?;
         let next = DiscoveryCheckpoint::transition(previous.as_ref(), &artifact)?;
-        self.checkpoint_store.replace(&next)?;
-
         let effective_not_after = if artifact.overlap.is_some() {
             artifact.lease_not_after.min(artifact.overlap_not_after)
         } else {
@@ -817,16 +1342,18 @@ where
         let remaining = effective_not_after
             .checked_sub(sample.wall_unix_seconds)
             .ok_or(DiscoveryCredentialError::InvalidArtifact)?;
-        let expires_at = sample
-            .monotonic
-            .checked_add(std::time::Duration::from_secs(remaining))
+        let expires_at = derive_expiry(sample.monotonic, std::time::Duration::from_secs(remaining))
             .ok_or(DiscoveryCredentialError::TimeOverflow)?;
-        self.last_clock_sample = Some(sample);
-        Ok(LeasedDiscoveryCredentialMaterial {
+        let prepared = LeasedDiscoveryCredentialMaterial {
             emitting: artifact.emitting,
             overlap: artifact.overlap,
             expires_at,
-        })
+        };
+        self.checkpoint_store.replace(&next)?;
+        after_checkpoint();
+        self.checkpoint_store.revalidate_namespace()?;
+        self.last_clock_sample = Some(sample);
+        Ok(prepared)
     }
 
     fn validate_clock(&self, sample: TrustedClockSample) -> Result<(), DiscoveryCredentialError> {
@@ -857,72 +1384,247 @@ pub trait TrustedClock {
     fn sample(&mut self) -> Result<TrustedClockSample, DiscoveryCredentialError>;
 }
 
-/// Authenticated provisioning-backed discovery credential authority.
-pub struct DiscoveryCredentialAuthority<L, C> {
+struct DiscoveryCredentialAuthority<L, C> {
     loader: L,
-    load_operation: ProvisioningLoadId,
-    secret_ref: ProvisioningSecretRef,
     clock: C,
     core: DiscoveryCredentialAuthorityCore<FileDiscoveryCheckpointStore>,
+    _authority_lock: AuthorityLock,
 }
 
 impl<L, C> DiscoveryCredentialAuthority<L, C>
 where
-    L: ProvisioningSecretLoader,
+    L: DiscoveryCredentialArtifactProvider,
     C: TrustedClock,
 {
-    /// Binds the authenticated source, trusted clock, deployment scope, and
-    /// owner-protected durable checkpoint directory.
-    pub fn new(
+    fn new(
         loader: L,
-        load_operation: ProvisioningLoadId,
-        secret_ref: ProvisioningSecretRef,
         clock: C,
         expected_scope: [u8; 32],
         checkpoint_root: &Path,
     ) -> Result<Self, DiscoveryCredentialError> {
-        let checkpoint_store = FileDiscoveryCheckpointStore::new(checkpoint_root)?;
+        let state = PinnedStateRoot::open_production(checkpoint_root)?;
+        let authority_lock = AuthorityLock::acquire_production()?;
+        state.revalidate()?;
+        let checkpoint_store = FileDiscoveryCheckpointStore::new(state)?;
         Ok(Self {
             loader,
-            load_operation,
-            secret_ref,
             clock,
             core: DiscoveryCredentialAuthorityCore::new(expected_scope, checkpoint_store)?,
+            _authority_lock: authority_lock,
         })
     }
 
-    /// Commits the next authority checkpoint before exposing leased material.
-    pub fn load(&mut self) -> Result<LeasedDiscoveryCredentialMaterial, DiscoveryCredentialError> {
-        let sample = self.clock.sample()?;
-        let receipt =
-            load_provisioning_secret(self.load_operation, &self.secret_ref, &mut self.loader)
-                .map_err(|_| DiscoveryCredentialError::ProvisioningUnavailable)?;
-        self.core
-            .accept_authenticated(receipt.plaintext().expose(), sample)
+    #[cfg(any(test, feature = "test-support"))]
+    fn new_for_test(
+        loader: L,
+        clock: C,
+        expected_scope: [u8; 32],
+        checkpoint_root: &Path,
+        authority_lock: File,
+    ) -> Result<Self, DiscoveryCredentialError> {
+        let state = PinnedStateRoot::open_for_test(checkpoint_root)?;
+        let authority_lock = AuthorityLock::acquire_for_test(authority_lock)?;
+        state.revalidate()?;
+        let checkpoint_store = FileDiscoveryCheckpointStore::new(state)?;
+        Ok(Self {
+            loader,
+            clock,
+            core: DiscoveryCredentialAuthorityCore::new(expected_scope, checkpoint_store)?,
+            _authority_lock: authority_lock,
+        })
     }
 
-    /// Resamples the trusted clock at the fixed authority cadence. Failure
-    /// invalidates the active lease and requires a fresh authenticated load.
-    pub fn resample_clock(&mut self) -> Result<(), DiscoveryCredentialError> {
+    fn prepare_once(
+        mut self,
+    ) -> Result<PreparedDiscoveryCredential<L, C>, DiscoveryCredentialError> {
+        let sample = self.clock.sample()?;
+        let artifact = self.loader.load_bounded_artifact()?;
+        let material = self
+            .core
+            .accept_provider_artifact(artifact.as_bytes(), sample)?;
+        Ok(PreparedDiscoveryCredential {
+            material,
+            authority: self,
+        })
+    }
+
+    fn resample_clock(&mut self) -> Result<(), DiscoveryCredentialError> {
         let sample = self.clock.sample()?;
         self.core.observe_clock(sample)
     }
 }
 
-/// Loads the explicitly non-production evaluator artifact through the same
-/// parser, transition machine, and durable checkpoint authority.
+/// One prepared production discovery credential and its exclusive authority.
+///
+/// Construction performs exactly one provider load and commits the authority
+/// checkpoint before returning. The material cannot be separated from the
+/// authority without also receiving an active must-use guard that retains the
+/// fixed external lock.
+pub struct PreparedDiscoveryCredential<L, C> {
+    material: LeasedDiscoveryCredentialMaterial,
+    authority: DiscoveryCredentialAuthority<L, C>,
+}
+
+impl<L, C> PreparedDiscoveryCredential<L, C>
+where
+    L: DiscoveryCredentialArtifactProvider,
+    C: TrustedClock,
+{
+    /// Moves the adapter credential parts together with the authority guard
+    /// that must remain alive for their full active lifetime.
+    pub fn into_parts(
+        self,
+    ) -> (
+        DiscoveryCredentialMaterialParts,
+        ActiveDiscoveryCredentialAuthority<L, C>,
+    ) {
+        (
+            self.material.into_parts(),
+            ActiveDiscoveryCredentialAuthority {
+                authority: self.authority,
+            },
+        )
+    }
+}
+
+/// Active production discovery authority retained after adapter provisioning.
+#[must_use = "the active authority must live as long as its discovery credentials"]
+pub struct ActiveDiscoveryCredentialAuthority<L, C> {
+    authority: DiscoveryCredentialAuthority<L, C>,
+}
+
+impl<L, C> ActiveDiscoveryCredentialAuthority<L, C>
+where
+    L: DiscoveryCredentialArtifactProvider,
+    C: TrustedClock,
+{
+    /// Resamples the trusted clock without loading another credential artifact.
+    pub fn resample_clock(&mut self) -> Result<(), DiscoveryCredentialError> {
+        self.authority.resample_clock()
+    }
+}
+
+/// Authenticates and prepares exactly one production discovery credential.
+pub fn prepare_discovery_credential<L, C>(
+    loader: L,
+    clock: C,
+    expected_scope: [u8; 32],
+    checkpoint_root: &Path,
+) -> Result<PreparedDiscoveryCredential<L, C>, DiscoveryCredentialError>
+where
+    L: DiscoveryCredentialArtifactProvider,
+    C: TrustedClock,
+{
+    DiscoveryCredentialAuthority::new(loader, clock, expected_scope, checkpoint_root)?
+        .prepare_once()
+}
+
+/// Test-only preparation seam using an explicit already-open authority anchor.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn prepare_discovery_credential_for_test<L, C>(
+    loader: L,
+    clock: C,
+    expected_scope: [u8; 32],
+    checkpoint_root: &Path,
+    authority_lock: File,
+) -> Result<PreparedDiscoveryCredential<L, C>, DiscoveryCredentialError>
+where
+    L: DiscoveryCredentialArtifactProvider,
+    C: TrustedClock,
+{
+    DiscoveryCredentialAuthority::new_for_test(
+        loader,
+        clock,
+        expected_scope,
+        checkpoint_root,
+        authority_lock,
+    )?
+    .prepare_once()
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct UnprotectedReferenceCheckpointStore {
+    checkpoint: Option<DiscoveryCheckpoint>,
+}
+
+#[cfg(target_os = "linux")]
+impl DiscoveryCheckpointStore for UnprotectedReferenceCheckpointStore {
+    fn load(&mut self) -> Result<Option<DiscoveryCheckpoint>, DiscoveryCredentialError> {
+        Ok(self.checkpoint.clone())
+    }
+
+    fn replace(
+        &mut self,
+        checkpoint: &DiscoveryCheckpoint,
+    ) -> Result<(), DiscoveryCredentialError> {
+        self.checkpoint = Some(checkpoint.clone());
+        Ok(())
+    }
+
+    fn revalidate_namespace(&self) -> Result<(), DiscoveryCredentialError> {
+        Ok(())
+    }
+}
+
+/// Evaluator-only material owner retaining its explicitly non-production
+/// in-memory authority until the caller moves out the lease and guard.
+#[cfg(target_os = "linux")]
+pub struct UnprotectedReferenceDiscoveryCredentials {
+    material: LeasedDiscoveryCredentialMaterial,
+    authority: DiscoveryCredentialAuthorityCore<UnprotectedReferenceCheckpointStore>,
+}
+
+/// Lifetime guard for evaluator-only leased discovery credentials.
+///
+/// This guard intentionally does not claim production exclusivity or durable
+/// rollback protection; the evaluator authority is process-local and
+/// in-memory. Production callers use [`prepare_discovery_credential`].
+#[cfg(target_os = "linux")]
+#[must_use = "the evaluator authority guard must live as long as its leased credentials"]
+pub struct UnprotectedReferenceAuthorityGuard {
+    _authority: DiscoveryCredentialAuthorityCore<UnprotectedReferenceCheckpointStore>,
+}
+
+#[cfg(target_os = "linux")]
+impl UnprotectedReferenceDiscoveryCredentials {
+    /// Moves the lease parts out while returning the authority guard that must
+    /// remain alive for the evaluator credential lifetime.
+    pub fn into_parts(
+        self,
+    ) -> (
+        DiscoveryCredentialMaterialParts,
+        UnprotectedReferenceAuthorityGuard,
+    ) {
+        (
+            self.material.into_parts(),
+            UnprotectedReferenceAuthorityGuard {
+                _authority: self.authority,
+            },
+        )
+    }
+}
+
+/// Loads the explicitly non-production evaluator artifact through the shared
+/// parser and transition machine with a process-local in-memory authority.
 #[cfg(target_os = "linux")]
 pub fn load_unprotected_reference_discovery_credentials(
     expected_scope: [u8; 32],
-    checkpoint_root: &Path,
     artifact_parent: &Path,
     artifact_basename: &str,
     sample: TrustedClockSample,
-) -> Result<LeasedDiscoveryCredentialMaterial, DiscoveryCredentialError> {
+) -> Result<UnprotectedReferenceDiscoveryCredentials, DiscoveryCredentialError> {
     let bytes = read_unprotected_reference_artifact(artifact_parent, artifact_basename)?;
-    let store = FileDiscoveryCheckpointStore::new(checkpoint_root)?;
-    DiscoveryCredentialAuthorityCore::new(expected_scope, store)?
-        .accept_authenticated(&bytes, sample)
+    let mut authority = DiscoveryCredentialAuthorityCore::new(
+        expected_scope,
+        UnprotectedReferenceCheckpointStore::default(),
+    )?;
+    let material = authority.accept_provider_artifact(&bytes, sample)?;
+    Ok(UnprotectedReferenceDiscoveryCredentials {
+        material,
+        authority,
+    })
 }
 
 /// Exercises the exact credential artifact parser without exposing it to
@@ -948,13 +1650,11 @@ pub fn fuzz_parse_discovery_credential_artifact(bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aster_mesh::{
-        ProvisioningLoadId, ProvisioningLoadReceipt, ProvisioningSecretLoader,
-        ProvisioningSecretRef, ProvisioningSecretStoreError, UnprotectedProvisioning,
-    };
     use std::{
-        fs,
+        cell::Cell,
+        fs::{self, OpenOptions},
         os::unix::fs::PermissionsExt,
+        rc::Rc,
         time::{Duration, Instant},
     };
 
@@ -963,11 +1663,20 @@ mod tests {
     const NEW_SECRET: [u8; 32] = [0x22; 32];
     const ISSUED: u64 = 1_800_000_000;
 
+    fn open_test_anchor(path: &Path) -> File {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap()
+    }
+
     #[derive(Default)]
     struct MemoryCheckpointStore {
         checkpoint: Option<DiscoveryCheckpoint>,
         replacements: usize,
         fail_replace: bool,
+        fail_revalidate: bool,
     }
 
     struct StaticClock(TrustedClockSample);
@@ -982,17 +1691,29 @@ mod tests {
         bytes: Vec<u8>,
     }
 
-    impl ProvisioningSecretLoader for StaticLoader {
-        fn load(
+    struct CountingLoader {
+        bytes: Vec<u8>,
+        loads: Rc<Cell<usize>>,
+    }
+
+    impl DiscoveryCredentialArtifactProvider for StaticLoader {
+        fn load_bounded_artifact(
             &mut self,
-            operation: ProvisioningLoadId,
-            secret_ref: &ProvisioningSecretRef,
-        ) -> Result<ProvisioningLoadReceipt, ProvisioningSecretStoreError> {
-            Ok(ProvisioningLoadReceipt::new(
-                operation,
-                secret_ref.clone(),
-                UnprotectedProvisioning::new(self.bytes.clone()).unwrap(),
-            ))
+        ) -> Result<BoundedDiscoveryCredentialArtifact, DiscoveryCredentialError> {
+            BoundedDiscoveryCredentialArtifact::from_zeroizing(Zeroizing::new(std::mem::take(
+                &mut self.bytes,
+            )))
+        }
+    }
+
+    impl DiscoveryCredentialArtifactProvider for CountingLoader {
+        fn load_bounded_artifact(
+            &mut self,
+        ) -> Result<BoundedDiscoveryCredentialArtifact, DiscoveryCredentialError> {
+            self.loads.set(self.loads.get() + 1);
+            BoundedDiscoveryCredentialArtifact::from_zeroizing(Zeroizing::new(std::mem::take(
+                &mut self.bytes,
+            )))
         }
     }
 
@@ -1011,6 +1732,14 @@ mod tests {
             self.checkpoint = Some(checkpoint.clone());
             self.replacements += 1;
             Ok(())
+        }
+
+        fn revalidate_namespace(&self) -> Result<(), DiscoveryCredentialError> {
+            if self.fail_revalidate {
+                Err(DiscoveryCredentialError::CheckpointUnavailable)
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1064,6 +1793,30 @@ mod tests {
 
     fn parse(bytes: &[u8]) -> ParsedDiscoveryArtifact {
         ParsedDiscoveryArtifact::parse(bytes, SCOPE, ISSUED + 1).unwrap()
+    }
+
+    #[test]
+    fn bounded_discovery_artifact_owns_only_canonical_maximum_capacity() {
+        // Break caught: a provider implementation must not transfer an
+        // attacker-sized allocation across the host authority boundary.
+        let one = artifact(1, ISSUED + 60, 0, (7, OLD_SECRET), None);
+        let bounded =
+            BoundedDiscoveryCredentialArtifact::from_zeroizing(Zeroizing::new(one.clone()))
+                .unwrap();
+        assert_eq!(bounded.as_bytes(), one);
+        assert_eq!(
+            format!("{bounded:?}"),
+            "BoundedDiscoveryCredentialArtifact([REDACTED])"
+        );
+        assert_eq!(
+            BoundedDiscoveryCredentialArtifact::from_zeroizing(Zeroizing::new(vec![
+                0x42;
+                TWO_ENTRY_BYTES
+                    + 1
+            ]))
+            .unwrap_err(),
+            DiscoveryCredentialError::InvalidArtifact
+        );
     }
 
     #[test]
@@ -1205,7 +1958,7 @@ mod tests {
         let mut authority =
             DiscoveryCredentialAuthorityCore::new(SCOPE, MemoryCheckpointStore::default()).unwrap();
         let lease = authority
-            .accept_authenticated(
+            .accept_provider_artifact(
                 &artifact(1, ISSUED + 60, 0, (7, OLD_SECRET), None),
                 TrustedClockSample::new(ISSUED + 10, monotonic),
             )
@@ -1225,13 +1978,60 @@ mod tests {
         .unwrap();
         assert_eq!(
             unavailable
-                .accept_authenticated(
+                .accept_provider_artifact(
                     &artifact(1, ISSUED + 60, 0, (7, OLD_SECRET), None),
                     TrustedClockSample::new(ISSUED + 10, monotonic),
                 )
                 .unwrap_err(),
             DiscoveryCredentialError::CheckpointUnavailable
         );
+
+        let mut namespace_swapped = DiscoveryCredentialAuthorityCore::new(
+            SCOPE,
+            MemoryCheckpointStore {
+                fail_revalidate: true,
+                ..MemoryCheckpointStore::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            namespace_swapped
+                .accept_provider_artifact(
+                    &artifact(1, ISSUED + 60, 0, (7, OLD_SECRET), None),
+                    TrustedClockSample::new(ISSUED + 10, monotonic),
+                )
+                .unwrap_err(),
+            DiscoveryCredentialError::CheckpointUnavailable
+        );
+        assert_eq!(namespace_swapped.checkpoint_store().replacements, 1);
+    }
+
+    #[test]
+    fn discovery_authority_derivation_failure_leaves_checkpoint_unchanged() {
+        // Break caught: publishing the next checkpoint before fallible lease
+        // derivation can consume a rotation sequence without issuing a lease.
+        let monotonic = Instant::now();
+        let mut authority =
+            DiscoveryCredentialAuthorityCore::new(SCOPE, MemoryCheckpointStore::default()).unwrap();
+        authority
+            .accept_provider_artifact(
+                &artifact(1, ISSUED + 60, 0, (7, OLD_SECRET), None),
+                TrustedClockSample::new(ISSUED + 10, monotonic),
+            )
+            .unwrap();
+        let before = authority.checkpoint_store().checkpoint.clone();
+        let replacements = authority.checkpoint_store().replacements;
+
+        let error = authority
+            .accept_provider_artifact_with_expiry(
+                &artifact(2, ISSUED + 120, 0, (7, OLD_SECRET), None),
+                TrustedClockSample::new(ISSUED + 20, monotonic + Duration::from_secs(10)),
+                |_, _| None,
+            )
+            .unwrap_err();
+        assert_eq!(error, DiscoveryCredentialError::TimeOverflow);
+        assert_eq!(authority.checkpoint_store().checkpoint, before);
+        assert_eq!(authority.checkpoint_store().replacements, replacements);
     }
 
     #[test]
@@ -1240,13 +2040,13 @@ mod tests {
         let mut authority =
             DiscoveryCredentialAuthorityCore::new(SCOPE, MemoryCheckpointStore::default()).unwrap();
         authority
-            .accept_authenticated(
+            .accept_provider_artifact(
                 &artifact(1, ISSUED + 120, 0, (7, OLD_SECRET), None),
                 TrustedClockSample::new(ISSUED + 10, monotonic),
             )
             .unwrap();
         let staged = authority
-            .accept_authenticated(
+            .accept_provider_artifact(
                 &artifact(
                     2,
                     ISSUED + 120,
@@ -1261,7 +2061,7 @@ mod tests {
 
         assert_eq!(
             authority
-                .accept_authenticated(
+                .accept_provider_artifact(
                     &artifact(
                         3,
                         ISSUED + 120,
@@ -1314,7 +2114,7 @@ mod tests {
 
         let initial = parse(&artifact(1, ISSUED + 60, 0, (7, OLD_SECRET), None));
         let checkpoint = DiscoveryCheckpoint::transition(None, &initial).unwrap();
-        let mut store = FileDiscoveryCheckpointStore::new(&root).unwrap();
+        let mut store = FileDiscoveryCheckpointStore::new_for_test(&root).unwrap();
         assert_eq!(store.load().unwrap(), None);
         store.replace(&checkpoint).unwrap();
         assert_eq!(store.load().unwrap(), Some(checkpoint));
@@ -1341,15 +2141,334 @@ mod tests {
         let next = root.join("discovery-checkpoint.next");
         fs::write(&next, [0x55; 32]).unwrap();
         fs::set_permissions(&next, fs::Permissions::from_mode(0o600)).unwrap();
-        FileDiscoveryCheckpointStore::new(&root).unwrap();
+        FileDiscoveryCheckpointStore::new_for_test(&root).unwrap();
         assert!(!next.exists());
 
         std::os::unix::fs::symlink(root.join("missing"), &next).unwrap();
         assert!(matches!(
-            FileDiscoveryCheckpointStore::new(&root),
+            FileDiscoveryCheckpointStore::new_for_test(&root),
             Err(DiscoveryCredentialError::CheckpointCorrupt)
         ));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovery_checkpoint_store_rejects_ancestor_and_final_symlinks() {
+        // Break caught: validating only the final pathname lets an ancestor
+        // symlink redirect the durable rollback authority.
+        let parent = std::env::temp_dir().join(format!(
+            "aster-discovery-checkpoint-links-{}-{}",
+            std::process::id(),
+            ISSUED
+        ));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let real = parent.join("real");
+        fs::create_dir(&real).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+        let nested = real.join("checkpoint-root");
+        fs::create_dir(&nested).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&real, parent.join("ancestor-link")).unwrap();
+        assert!(matches!(
+            FileDiscoveryCheckpointStore::new_for_test(
+                &parent.join("ancestor-link/checkpoint-root")
+            ),
+            Err(DiscoveryCredentialError::CheckpointUnavailable)
+                | Err(DiscoveryCredentialError::CheckpointCorrupt)
+        ));
+        std::os::unix::fs::symlink(&real, parent.join("final-link")).unwrap();
+        assert!(matches!(
+            FileDiscoveryCheckpointStore::new_for_test(&parent.join("final-link")),
+            Err(DiscoveryCredentialError::CheckpointUnavailable)
+                | Err(DiscoveryCredentialError::CheckpointCorrupt)
+        ));
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn discovery_checkpoint_store_fails_closed_after_root_rename_and_replacement() {
+        // Break caught: descriptor-relative writes alone are insufficient;
+        // the configured namespace must still resolve to the pinned inode.
+        let parent = std::env::temp_dir().join(format!(
+            "aster-discovery-checkpoint-swap-{}-{}",
+            std::process::id(),
+            ISSUED
+        ));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = parent.join("state");
+        let moved = parent.join("original-state");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut store = FileDiscoveryCheckpointStore::new_for_test(&root).unwrap();
+        fs::rename(&root, &moved).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let initial = parse(&artifact(1, ISSUED + 60, 0, (7, OLD_SECRET), None));
+        let checkpoint = DiscoveryCheckpoint::transition(None, &initial).unwrap();
+        assert_eq!(
+            store.replace(&checkpoint).unwrap_err(),
+            DiscoveryCredentialError::CheckpointUnavailable
+        );
+        assert!(!moved.join(CHECKPOINT_FILE).exists());
+        assert!(!root.join(CHECKPOINT_FILE).exists());
+
+        drop(store);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn discovery_checkpoint_store_revalidates_namespace_immediately_before_rename() {
+        let parent = std::env::temp_dir().join(format!(
+            "aster-discovery-checkpoint-pre-rename-swap-{}-{}",
+            std::process::id(),
+            ISSUED
+        ));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = parent.join("state");
+        let moved = parent.join("original-state");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut store = FileDiscoveryCheckpointStore::new_for_test(&root).unwrap();
+        let initial = parse(&artifact(1, ISSUED + 60, 0, (7, OLD_SECRET), None));
+        let checkpoint = DiscoveryCheckpoint::transition(None, &initial).unwrap();
+
+        assert_eq!(
+            store
+                .replace_after_write_for_test(&checkpoint, || {
+                    fs::rename(&root, &moved).unwrap();
+                    fs::create_dir(&root).unwrap();
+                    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+                })
+                .unwrap_err(),
+            DiscoveryCredentialError::CheckpointUnavailable
+        );
+        assert!(!moved.join(CHECKPOINT_FILE).exists());
+        assert!(!root.join(CHECKPOINT_FILE).exists());
+        assert!(fs::read_dir(&root).unwrap().next().is_none());
+
+        drop(store);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn discovery_authority_revalidates_namespace_after_commit_before_lease() {
+        // A checkpoint may already be durable at this crash boundary, but a
+        // renamed authority namespace must never receive active material.
+        let parent = std::env::temp_dir().join(format!(
+            "aster-discovery-pre-lease-swap-{}-{}",
+            std::process::id(),
+            ISSUED
+        ));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = parent.join("state");
+        let moved = parent.join("original-state");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let store = FileDiscoveryCheckpointStore::new_for_test(&root).unwrap();
+        let mut authority = DiscoveryCredentialAuthorityCore::new(SCOPE, store).unwrap();
+
+        assert_eq!(
+            authority
+                .accept_provider_artifact_with_hooks(
+                    &artifact(1, ISSUED + 60, 0, (7, OLD_SECRET), None),
+                    TrustedClockSample::new(ISSUED + 10, Instant::now()),
+                    |instant, duration| instant.checked_add(duration),
+                    || {
+                        fs::rename(&root, &moved).unwrap();
+                        fs::create_dir(&root).unwrap();
+                        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+                    },
+                )
+                .unwrap_err(),
+            DiscoveryCredentialError::CheckpointUnavailable
+        );
+        assert!(moved.join(CHECKPOINT_FILE).is_file());
+        assert!(fs::read_dir(&root).unwrap().next().is_none());
+
+        drop(authority);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn discovery_authority_exclusively_owns_checkpoint_until_drop() {
+        // Break caught: two authorities sharing an unlocked checkpoint can
+        // validate from the same old state and both expose successor leases.
+        let parent = std::env::temp_dir().join(format!(
+            "aster-discovery-checkpoint-lock-{}-{}",
+            std::process::id(),
+            ISSUED
+        ));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = parent.join("state");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let anchor = parent.join("authority.lock");
+        fs::write(&anchor, []).unwrap();
+        fs::set_permissions(&anchor, fs::Permissions::from_mode(0o600)).unwrap();
+        let sample = TrustedClockSample::new(ISSUED + 10, Instant::now());
+        let first = prepare_discovery_credential_for_test(
+            StaticLoader {
+                bytes: artifact(1, ISSUED + 60, 0, (7, OLD_SECRET), None),
+            },
+            StaticClock(sample),
+            SCOPE,
+            &root,
+            open_test_anchor(&anchor),
+        )
+        .unwrap();
+        let (parts, first_guard) = first.into_parts();
+        let (emitting, overlap, _expires_at) = parts.into_adapter_parts();
+        assert_eq!(emitting.0, 7);
+        assert!(overlap.is_none());
+
+        let moved = parent.join("original-state");
+        fs::rename(&root, &moved).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let locked = prepare_discovery_credential_for_test(
+            StaticLoader {
+                bytes: artifact(2, ISSUED + 60, 0, (7, OLD_SECRET), None),
+            },
+            StaticClock(sample),
+            SCOPE,
+            &root,
+            open_test_anchor(&anchor),
+        )
+        .err()
+        .expect("second live authority must fail closed");
+        assert_eq!(locked, DiscoveryCredentialError::CheckpointUnavailable);
+        assert_eq!(format!("{locked:?}"), "CheckpointUnavailable");
+        assert!(!format!("{locked:?}").contains(root.to_str().unwrap()));
+        assert!(!root.join(CHECKPOINT_FILE).exists());
+        drop(emitting);
+        drop(overlap);
+        drop(first_guard);
+
+        fs::remove_dir(&root).unwrap();
+        fs::rename(&moved, &root).unwrap();
+        let restarted = prepare_discovery_credential_for_test(
+            StaticLoader {
+                bytes: artifact(2, ISSUED + 60, 0, (7, OLD_SECRET), None),
+            },
+            StaticClock(sample),
+            SCOPE,
+            &root,
+            open_test_anchor(&anchor),
+        )
+        .unwrap();
+        let (parts, restarted_guard) = restarted.into_parts();
+        let (restarted_emitting, _, _) = parts.into_adapter_parts();
+        assert_eq!(restarted_emitting.0, 7);
+        drop(restarted_guard);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn authority_lock_and_state_custody_reject_unsafe_profiles() {
+        // Break caught: the fixed external anchor and trusted ancestry must
+        // reject type, ownership, mode, link, length, and ACL weakening.
+        let service_uid = 12_345;
+        let valid_acl = expected_authority_lock_acl(service_uid).to_vec();
+        let valid_lock = CustodyMetadata {
+            is_file: true,
+            is_directory: false,
+            uid: 0,
+            gid: 0,
+            mode: 0o440,
+            links: 1,
+            length: 0,
+            access_acl: Some(valid_acl.clone()),
+        };
+        assert!(validate_authority_lock_metadata(&valid_lock, service_uid).is_ok());
+        let invalid = vec![
+            CustodyMetadata {
+                is_file: false,
+                ..valid_lock.clone()
+            },
+            CustodyMetadata {
+                uid: service_uid,
+                ..valid_lock.clone()
+            },
+            CustodyMetadata {
+                mode: 0o660,
+                ..valid_lock.clone()
+            },
+            CustodyMetadata {
+                links: 2,
+                ..valid_lock.clone()
+            },
+            CustodyMetadata {
+                length: 1,
+                ..valid_lock.clone()
+            },
+            CustodyMetadata {
+                access_acl: None,
+                ..valid_lock.clone()
+            },
+            CustodyMetadata {
+                access_acl: Some(vec![0x42]),
+                ..valid_lock
+            },
+        ];
+        for metadata in invalid {
+            assert_eq!(
+                validate_authority_lock_metadata(&metadata, service_uid).unwrap_err(),
+                DiscoveryCredentialError::CheckpointCorrupt
+            );
+        }
+
+        let valid_ancestor = CustodyMetadata {
+            is_file: false,
+            is_directory: true,
+            uid: 0,
+            gid: 0,
+            mode: 0o755,
+            links: 2,
+            length: 0,
+            access_acl: None,
+        };
+        assert!(validate_root_owned_ancestor_metadata(&valid_ancestor).is_ok());
+        for metadata in [
+            CustodyMetadata {
+                uid: service_uid,
+                ..valid_ancestor.clone()
+            },
+            CustodyMetadata {
+                mode: 0o775,
+                ..valid_ancestor.clone()
+            },
+            CustodyMetadata {
+                access_acl: Some(vec![0x42]),
+                ..valid_ancestor.clone()
+            },
+        ] {
+            assert_eq!(
+                validate_root_owned_ancestor_metadata(&metadata).unwrap_err(),
+                DiscoveryCredentialError::CheckpointCorrupt
+            );
+        }
+
+        let service_root = CustodyMetadata {
+            uid: service_uid,
+            mode: 0o700,
+            ..valid_ancestor
+        };
+        assert!(validate_service_state_root_metadata(&service_root, service_uid).is_ok());
+        assert_eq!(
+            validate_service_state_root_metadata(&service_root, service_uid + 1).unwrap_err(),
+            DiscoveryCredentialError::CheckpointCorrupt
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1437,30 +2556,126 @@ mod tests {
     }
 
     #[test]
-    fn discovery_authority_loads_authenticated_provisioning_source() {
-        let root = std::env::temp_dir().join(format!(
+    fn discovery_preparation_loads_provider_exactly_once_and_guard_only_resamples_clock() {
+        let parent = std::env::temp_dir().join(format!(
             "aster-discovery-authority-{}-{}",
             std::process::id(),
             ISSUED
         ));
-        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = parent.join("state");
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let anchor = parent.join("authority.lock");
+        fs::write(&anchor, []).unwrap();
         let monotonic = Instant::now();
-        let mut authority = DiscoveryCredentialAuthority::new(
-            StaticLoader {
+        let loads = Rc::new(Cell::new(0));
+        let prepared = prepare_discovery_credential_for_test(
+            CountingLoader {
                 bytes: artifact(1, ISSUED + 60, 0, (7, OLD_SECRET), None),
+                loads: Rc::clone(&loads),
             },
-            ProvisioningLoadId::new([0x33; 32]),
-            ProvisioningSecretRef::from_opaque(vec![0x44]).unwrap(),
             StaticClock(TrustedClockSample::new(ISSUED + 10, monotonic)),
             SCOPE,
             &root,
+            open_test_anchor(&anchor),
         )
         .unwrap();
-        let lease = authority.load().unwrap();
-        assert_eq!(lease.emitting_generation(), 7);
-        assert_eq!(lease.expires_at(), monotonic + Duration::from_secs(50));
-        fs::remove_dir_all(root).unwrap();
+        assert_eq!(loads.get(), 1);
+        let (parts, mut guard) = prepared.into_parts();
+        let (emitting, overlap, expires_at) = parts.into_adapter_parts();
+        assert_eq!(emitting.0, 7);
+        assert!(overlap.is_none());
+        assert_eq!(expires_at, monotonic + Duration::from_secs(50));
+        guard.resample_clock().unwrap();
+        assert_eq!(loads.get(), 1);
+        drop(guard);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn discovery_authority_restart_reuses_checkpoint_and_rejects_rollback_without_replacement() {
+        // Break caught: a process restart must retain manifest/generation/
+        // secret binding, and a rejected older replacement must not rewrite
+        // the current durable authority.
+        let parent = std::env::temp_dir().join(format!(
+            "aster-discovery-restart-{}-{}",
+            std::process::id(),
+            ISSUED
+        ));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = parent.join("state");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let anchor = parent.join("authority.lock");
+        fs::write(&anchor, []).unwrap();
+        let monotonic = Instant::now();
+
+        let current_artifact = artifact(2, ISSUED + 90, 0, (7, OLD_SECRET), None);
+        let initial = prepare_discovery_credential_for_test(
+            StaticLoader {
+                bytes: current_artifact.clone(),
+            },
+            StaticClock(TrustedClockSample::new(ISSUED + 10, monotonic)),
+            SCOPE,
+            &root,
+            open_test_anchor(&anchor),
+        )
+        .unwrap();
+        let (parts, initial_guard) = initial.into_parts();
+        let (initial_emitting, _, _) = parts.into_adapter_parts();
+        assert_eq!(initial_emitting.0, 7);
+        let checkpoint_before = fs::read(root.join(CHECKPOINT_FILE)).unwrap();
+        drop(initial_guard);
+
+        // A later mission/runtime startup failure occurs after the credential
+        // checkpoint. A controlled restart must accept the identical artifact
+        // rather than requiring a new generation.
+        let exact_restart = prepare_discovery_credential_for_test(
+            StaticLoader {
+                bytes: current_artifact,
+            },
+            StaticClock(TrustedClockSample::new(
+                ISSUED + 20,
+                monotonic + Duration::from_secs(10),
+            )),
+            SCOPE,
+            &root,
+            open_test_anchor(&anchor),
+        )
+        .unwrap();
+        let (parts, restart_guard) = exact_restart.into_parts();
+        let (restart_emitting, _, _) = parts.into_adapter_parts();
+        assert_eq!(restart_emitting.0, 7);
+        assert_eq!(
+            fs::read(root.join(CHECKPOINT_FILE)).unwrap(),
+            checkpoint_before
+        );
+        drop(restart_guard);
+
+        let rollback = prepare_discovery_credential_for_test(
+            StaticLoader {
+                bytes: artifact(1, ISSUED + 80, 0, (6, [0x33; 32]), None),
+            },
+            StaticClock(TrustedClockSample::new(
+                ISSUED + 30,
+                monotonic + Duration::from_secs(20),
+            )),
+            SCOPE,
+            &root,
+            open_test_anchor(&anchor),
+        )
+        .err()
+        .expect("rollback must fail before a prepared credential returns");
+        assert_eq!(rollback, DiscoveryCredentialError::InvalidTransition);
+        assert_eq!(
+            fs::read(root.join(CHECKPOINT_FILE)).unwrap(),
+            checkpoint_before
+        );
+        fs::remove_dir_all(parent).unwrap();
     }
 }

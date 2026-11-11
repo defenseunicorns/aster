@@ -753,10 +753,10 @@ async fn closed_signal_task_propagates_only_a_bounded_failure_reason() {
 }
 
 #[test]
-fn config_check_validates_files_without_a_provider_and_bootstrap_uses_exact_reference() {
-    // Break caught: configuration checking that skips credential-file safety
-    // accepts an unsafe provider capability; bootstrap that substitutes a
-    // reference or operation directs the provider to the wrong secret.
+fn config_check_is_pure_and_bootstrap_uses_exact_reference() {
+    // Break caught: configuration checking must not read credentials or touch
+    // platform services; bootstrap must still enforce file custody and use the
+    // exact mission reference and operation.
     let fixture = CustomerFixture::new();
     let expected_reference = fixture.reference();
     let expected_operation = ProvisioningLoadId::new([0x11; 32]);
@@ -766,8 +766,10 @@ fn config_check_validates_files_without_a_provider_and_bootstrap_uses_exact_refe
     assert_eq!(loader.calls(), 0);
 
     fixture.chmod_reference(0o640);
-    assert!(check_config(fixture.config_path()).is_err());
+    check_config(fixture.config_path()).expect("pure configuration check");
     assert_eq!(loader.calls(), 0);
+    let config = load_and_validate_config(fixture.config_path()).expect("validated config");
+    assert!(load_startup_credentials(config.credential_paths()).is_err());
     fixture.chmod_reference(0o600);
 
     let config = load_and_validate_config(fixture.config_path()).expect("validated config");

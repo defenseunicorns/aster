@@ -18,6 +18,8 @@ zeroize.workspace = true
 default = []
 fuzzing = []
 gate-h-formal = []
+# Explicitly non-production constructor support for cross-crate authority tests.
+test-support = []
 
 [lints]
 workspace = true
