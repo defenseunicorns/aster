@@ -213,9 +213,8 @@ struct EventCohortKey {
 
 struct PendingEventCohort {
     key: EventCohortKey,
-    now: SystemTime,
     runner: EventAttemptRunner,
-    failed_epochs: BTreeMap<EventTransportKind, u64>,
+    failed_instances: BTreeMap<EventTransportKind, (u64, u64)>,
 }
 
 struct RegisteredEventAdapter {
@@ -246,21 +245,45 @@ impl Default for AutomaticEventTransportState {
     }
 }
 
-#[derive(Default)]
 struct AutomaticEventTransportShared {
     state: Mutex<AutomaticEventTransportState>,
+    clock: Arc<dyn Fn() -> SystemTime + Send + Sync + 'static>,
 }
 
 /// Cloneable host handle for exact-peer Event adapter selection.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AutomaticEventTransportHandle {
     shared: Arc<AutomaticEventTransportShared>,
+}
+
+impl Default for AutomaticEventTransportHandle {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AutomaticEventTransportHandle {
     /// Creates an empty application-ready registry.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            shared: Arc::new(AutomaticEventTransportShared {
+                state: Mutex::new(AutomaticEventTransportState::default()),
+                clock: Arc::new(SystemTime::now),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_clock<F>(clock: F) -> Self
+    where
+        F: Fn() -> SystemTime + Send + Sync + 'static,
+    {
+        Self {
+            shared: Arc::new(AutomaticEventTransportShared {
+                state: Mutex::new(AutomaticEventTransportState::default()),
+                clock: Arc::new(clock),
+            }),
+        }
     }
 
     /// Registers one adapter-owned attempt mailbox.
@@ -320,13 +343,7 @@ impl AutomaticEventTransportHandle {
     }
 
     #[allow(dead_code)] // Wired to durable publication by Task 3 of this stacked increment.
-    pub(crate) fn request_attempt<F, Fut>(
-        &self,
-        mission: NodeId,
-        peer: NodeId,
-        now: SystemTime,
-        runner: F,
-    ) -> bool
+    pub(crate) fn request_attempt<F, Fut>(&self, mission: NodeId, peer: NodeId, runner: F) -> bool
     where
         F: Fn(Arc<dyn OrderedContact>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), ContactOutcome>> + Send + 'static,
@@ -336,15 +353,14 @@ impl AutomaticEventTransportHandle {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if state.pending.len() >= MAX_PENDING_EVENT_COHORTS {
+        if state.pending.len() + usize::from(state.attempt_in_flight) >= MAX_PENDING_EVENT_COHORTS {
             return false;
         }
         let runner: EventAttemptRunner = Arc::new(move |contact| Box::pin(runner(contact)));
         state.pending.push_back(PendingEventCohort {
             key: EventCohortKey { mission, peer },
-            now,
             runner,
-            failed_epochs: BTreeMap::new(),
+            failed_instances: BTreeMap::new(),
         });
         transition(&self.shared, &mut state);
         true
@@ -371,6 +387,7 @@ impl EventAdapterControl {
     /// Publishes a strictly newer sanitized lifecycle snapshot.
     ///
     /// A different kind, stale epoch, or replaced registration is rejected.
+    /// The registration's core-owned configured priority remains immutable.
     pub fn publish_availability(&self, snapshot: EventAdapterSnapshot) -> bool {
         if snapshot.kind != self.kind {
             return false;
@@ -390,7 +407,13 @@ impl EventAdapterControl {
         {
             return false;
         }
-        adapter.snapshot = snapshot;
+        adapter.snapshot = EventAdapterSnapshot::new(
+            snapshot.kind,
+            snapshot.availability_epoch,
+            snapshot.state,
+            snapshot.event_capable,
+            adapter.snapshot.configured_priority,
+        );
         transition(&shared, &mut state);
         true
     }
@@ -433,10 +456,10 @@ pub struct EventOutboundAttempt {
     shared: Arc<AutomaticEventTransportShared>,
     key: EventCohortKey,
     kind: EventTransportKind,
+    registration_id: u64,
     availability_epoch: u64,
-    now: SystemTime,
     runner: EventAttemptRunner,
-    failed_epochs: BTreeMap<EventTransportKind, u64>,
+    failed_instances: BTreeMap<EventTransportKind, (u64, u64)>,
     completed: bool,
 }
 
@@ -481,17 +504,16 @@ impl EventOutboundAttempt {
         match result {
             Ok(()) => transition(&self.shared, &mut state),
             Err(outcome) if outcome.permits_reselection() => {
-                self.failed_epochs
-                    .insert(self.kind, self.availability_epoch);
+                self.failed_instances
+                    .insert(self.kind, (self.registration_id, self.availability_epoch));
                 state.pending.push_front(PendingEventCohort {
                     key: self.key,
-                    now: self.now,
                     runner: Arc::clone(&self.runner),
-                    failed_epochs: std::mem::take(&mut self.failed_epochs),
+                    failed_instances: std::mem::take(&mut self.failed_instances),
                 });
                 transition(&self.shared, &mut state);
             }
-            Err(_) => {}
+            Err(_) => transition(&self.shared, &mut state),
         }
     }
 }
@@ -520,6 +542,7 @@ fn transition(
     if state.attempt_in_flight {
         return;
     }
+    let now = (shared.clock)();
     let mut selected = None;
     let pending_count = state.pending.len();
     for _ in 0..pending_count {
@@ -530,8 +553,8 @@ fn transition(
             .adapters
             .values()
             .filter(|adapter| {
-                pending.failed_epochs.get(&adapter.snapshot.kind)
-                    != Some(&adapter.snapshot.availability_epoch)
+                pending.failed_instances.get(&adapter.snapshot.kind)
+                    != Some(&(adapter.registration_id, adapter.snapshot.availability_epoch))
             })
             .map(|adapter| adapter.snapshot)
             .collect();
@@ -540,7 +563,7 @@ fn transition(
             &state.eligibility,
             pending.key.mission,
             pending.key.peer,
-            pending.now,
+            now,
         ) {
             selected = Some((pending, kind));
             break;
@@ -550,12 +573,15 @@ fn transition(
     let Some((pending, kind)) = selected else {
         return;
     };
-    let Some((availability_epoch, attempts)) = state.adapters.get(&kind).map(|adapter| {
-        (
-            adapter.snapshot.availability_epoch,
-            adapter.attempts.clone(),
-        )
-    }) else {
+    let Some((registration_id, availability_epoch, attempts)) =
+        state.adapters.get(&kind).map(|adapter| {
+            (
+                adapter.registration_id,
+                adapter.snapshot.availability_epoch,
+                adapter.attempts.clone(),
+            )
+        })
+    else {
         state.pending.push_front(pending);
         return;
     };
@@ -563,10 +589,10 @@ fn transition(
         shared: Arc::clone(shared),
         key: pending.key,
         kind,
+        registration_id,
         availability_epoch,
-        now: pending.now,
         runner: pending.runner,
-        failed_epochs: pending.failed_epochs,
+        failed_instances: pending.failed_instances,
         completed: false,
     };
     match attempts.try_send(attempt) {
@@ -575,18 +601,16 @@ fn transition(
             attempt.completed = true;
             state.pending.push_front(PendingEventCohort {
                 key: attempt.key,
-                now: attempt.now,
                 runner: Arc::clone(&attempt.runner),
-                failed_epochs: std::mem::take(&mut attempt.failed_epochs),
+                failed_instances: std::mem::take(&mut attempt.failed_instances),
             });
         }
         Err(mpsc::error::TrySendError::Closed(mut attempt)) => {
             attempt.completed = true;
             state.pending.push_front(PendingEventCohort {
                 key: attempt.key,
-                now: attempt.now,
                 runner: Arc::clone(&attempt.runner),
-                failed_epochs: std::mem::take(&mut attempt.failed_epochs),
+                failed_instances: std::mem::take(&mut attempt.failed_instances),
             });
             state.adapters.remove(&kind);
             transition(shared, state);
@@ -896,6 +920,7 @@ mod tests {
         CarrierPeerEvidence, ContactFuture, ContactPreflight, ContactRequestHandler,
         TransientLocator,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, UNIX_EPOCH};
 
     const MISSION: [u8; 32] = [0x11; 32];
@@ -1200,7 +1225,6 @@ mod tests {
 
     #[tokio::test]
     async fn pending_work_is_retained_until_an_eligible_adapter_registers() {
-        let now = UNIX_EPOCH + Duration::from_secs(100);
         let handle = AutomaticEventTransportHandle::new();
         handle.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
             MISSION,
@@ -1211,7 +1235,7 @@ mod tests {
             0,
             None,
         )]);
-        assert!(handle.request_attempt(MISSION, PEER, now, |_contact| async { Ok(()) }));
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
 
         let (_control, mut attempts) = handle
             .register(EventAdapterSnapshot::new(
@@ -1230,7 +1254,6 @@ mod tests {
 
     #[tokio::test]
     async fn newer_availability_epoch_wakes_selection_and_stale_epoch_is_ignored() {
-        let now = UNIX_EPOCH + Duration::from_secs(100);
         let handle = AutomaticEventTransportHandle::new();
         handle.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
             MISSION,
@@ -1250,7 +1273,7 @@ mod tests {
                 10,
             ))
             .unwrap();
-        assert!(handle.request_attempt(MISSION, PEER, now, |_contact| async { Ok(()) }));
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
         assert!(attempts.receiver.try_recv().is_err());
 
         assert!(!control.publish_availability(EventAdapterSnapshot::new(
@@ -1275,9 +1298,71 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn availability_publication_cannot_rewrite_configured_priority() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let handle = AutomaticEventTransportHandle::with_clock(move || now);
+        assert!(handle.replace_eligibility(vec![
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+        ]));
+        let (_iroh_control, mut iroh_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .unwrap();
+        let (ble_control, mut ble_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                9,
+            ))
+            .unwrap();
+
+        assert!(ble_control.publish_availability(EventAdapterSnapshot::new(
+            EventTransportKind::BLE_L2CAP_V1,
+            2,
+            EventAdapterState::Available,
+            true,
+            100,
+        )));
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), iroh_attempts.recv())
+                .await
+                .expect("configured priority remains core-owned")
+                .unwrap()
+                .transport_kind(),
+            EventTransportKind::IROH_QUIC_V1
+        );
+        assert!(ble_attempts.receiver.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn one_global_attempt_rotates_fairly_to_the_next_peer_after_completion() {
-        let now = UNIX_EPOCH + Duration::from_secs(100);
         let second_peer = [0x33; 32];
         let handle = AutomaticEventTransportHandle::new();
         handle.replace_eligibility(vec![
@@ -1309,8 +1394,8 @@ mod tests {
                 10,
             ))
             .unwrap();
-        assert!(handle.request_attempt(MISSION, PEER, now, |_contact| async { Ok(()) }));
-        assert!(handle.request_attempt(MISSION, second_peer, now, |_contact| async { Ok(()) }));
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
+        assert!(handle.request_attempt(MISSION, second_peer, |_contact| async { Ok(()) }));
 
         let first = attempts.recv().await.unwrap();
         assert_eq!(first.peer(), PEER);
@@ -1323,7 +1408,6 @@ mod tests {
 
     #[tokio::test]
     async fn locally_proven_carrier_open_failure_reselects_an_alternate_kind() {
-        let now = UNIX_EPOCH + Duration::from_secs(100);
         let handle = AutomaticEventTransportHandle::new();
         handle.replace_eligibility(vec![
             EventPeerEligibility::provisioned_exact_peer(
@@ -1363,7 +1447,7 @@ mod tests {
                 10,
             ))
             .unwrap();
-        assert!(handle.request_attempt(MISSION, PEER, now, |_contact| async { Ok(()) }));
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
 
         let selected = iroh_attempts.recv().await.unwrap();
         let outcome = selected.fail_carrier_open();
@@ -1375,9 +1459,57 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn failed_old_registration_does_not_exclude_replacement_at_same_epoch() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let handle = AutomaticEventTransportHandle::with_clock(move || now);
+        assert!(
+            handle.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),])
+        );
+        let (old_control, mut old_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .unwrap();
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
+        let old_attempt = old_attempts.recv().await.unwrap();
+
+        drop(old_control);
+        assert!(old_attempt.fail_carrier_open().permits_reselection());
+
+        let (_new_control, mut new_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("replacement registration is admitted");
+        let replacement_attempt = tokio::time::timeout(Duration::from_secs(1), new_attempts.recv())
+            .await
+            .expect("old registration evidence does not suppress its replacement")
+            .unwrap();
+        assert_eq!(
+            replacement_attempt.transport_kind(),
+            EventTransportKind::IROH_QUIC_V1
+        );
+    }
+
     #[tokio::test]
     async fn remote_pre_auth_outcome_does_not_immediately_try_an_alternate_carrier() {
-        let now = UNIX_EPOCH + Duration::from_secs(100);
         let handle = AutomaticEventTransportHandle::new();
         handle.replace_eligibility(vec![
             EventPeerEligibility::provisioned_exact_peer(
@@ -1417,13 +1549,11 @@ mod tests {
                 10,
             ))
             .unwrap();
-        assert!(
-            handle.request_attempt(MISSION, PEER, now, |_contact| async {
-                Err(ContactOutcome::pre_auth_remote(
-                    ContactReason::AuthenticationFailed,
-                ))
-            })
-        );
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async {
+            Err(ContactOutcome::pre_auth_remote(
+                ContactReason::AuthenticationFailed,
+            ))
+        }));
 
         let outcome = iroh_attempts
             .recv()
@@ -1441,9 +1571,61 @@ mod tests {
         assert!(iroh_attempts.receiver.try_recv().is_err());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn terminal_remote_outcome_immediately_admits_the_next_peer() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let next_peer = [0x33; 32];
+        let handle = AutomaticEventTransportHandle::with_clock(move || now);
+        assert!(handle.replace_eligibility(vec![
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                next_peer,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+        ]));
+        let (_control, mut attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .unwrap();
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async {
+            Err(ContactOutcome::pre_auth_remote(
+                ContactReason::AuthenticationFailed,
+            ))
+        }));
+        assert!(handle.request_attempt(MISSION, next_peer, |_contact| async { Ok(()) }));
+
+        let failed = attempts.recv().await.unwrap();
+        assert_eq!(failed.peer(), PEER);
+        assert!(failed.run(Arc::new(TestOrderedContact)).await.is_err());
+
+        let next = tokio::time::timeout(Duration::from_secs(1), attempts.recv())
+            .await
+            .expect("terminal completion wakes the next unrelated cohort")
+            .unwrap();
+        assert_eq!(next.peer(), next_peer);
+        assert!(attempts.receiver.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn empty_registry_retains_work_without_spinning() {
-        let now = UNIX_EPOCH + Duration::from_secs(100);
         let handle = AutomaticEventTransportHandle::new();
         handle.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
             MISSION,
@@ -1454,7 +1636,7 @@ mod tests {
             0,
             None,
         )]);
-        assert!(handle.request_attempt(MISSION, PEER, now, |_contact| async { Ok(()) }));
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
         let transitions_after_enqueue = handle.transition_count();
 
         for _ in 0..8 {
@@ -1476,7 +1658,6 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_registration_makes_that_kind_unavailable() {
-        let now = UNIX_EPOCH + Duration::from_secs(100);
         let handle = AutomaticEventTransportHandle::new();
         handle.replace_eligibility(vec![
             EventPeerEligibility::provisioned_exact_peer(
@@ -1508,7 +1689,7 @@ mod tests {
             ))
             .unwrap();
         drop(iroh_control);
-        assert!(handle.request_attempt(MISSION, PEER, now, |_contact| async { Ok(()) }));
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
         assert!(iroh_attempts.receiver.try_recv().is_err());
 
         let (_ble_control, mut ble_attempts) = handle
@@ -1528,7 +1709,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn dropping_an_attempt_releases_the_single_global_lane() {
-        let now = UNIX_EPOCH + Duration::from_secs(100);
         let second_peer = [0x33; 32];
         let handle = AutomaticEventTransportHandle::new();
         handle.replace_eligibility(vec![
@@ -1560,8 +1740,8 @@ mod tests {
                 10,
             ))
             .unwrap();
-        assert!(handle.request_attempt(MISSION, PEER, now, |_contact| async { Ok(()) }));
-        assert!(handle.request_attempt(MISSION, second_peer, now, |_contact| async { Ok(()) }));
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
+        assert!(handle.request_attempt(MISSION, second_peer, |_contact| async { Ok(()) }));
 
         drop(attempts.recv().await.unwrap());
 
@@ -1577,7 +1757,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn ineligible_front_cohort_does_not_strand_a_later_eligible_peer() {
-        let now = UNIX_EPOCH + Duration::from_secs(100);
         let eligible_peer = [0x33; 32];
         let handle = AutomaticEventTransportHandle::new();
         handle.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
@@ -1598,8 +1777,8 @@ mod tests {
                 10,
             ))
             .unwrap();
-        assert!(handle.request_attempt(MISSION, PEER, now, |_contact| async { Ok(()) }));
-        assert!(handle.request_attempt(MISSION, eligible_peer, now, |_contact| async { Ok(()) }));
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
+        assert!(handle.request_attempt(MISSION, eligible_peer, |_contact| async { Ok(()) }));
 
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), attempts.recv())
@@ -1609,6 +1788,52 @@ mod tests {
                 .peer(),
             eligible_peer
         );
+    }
+
+    #[tokio::test]
+    async fn mailbox_bound_counts_in_flight_and_survives_reselection() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let handle = AutomaticEventTransportHandle::with_clock(move || now);
+        assert!(
+            handle.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),])
+        );
+        let (_control, mut attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .unwrap();
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
+        let admitted = attempts.recv().await.unwrap();
+
+        for _ in 1..MAX_PENDING_EVENT_COHORTS {
+            assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
+        }
+        let overflow_was_accepted =
+            handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) });
+        assert!(admitted.fail_carrier_open().permits_reselection());
+
+        let state = handle
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(
+            state.pending.len() + usize::from(state.attempt_in_flight) <= MAX_PENDING_EVENT_COHORTS,
+            "reselection must not grow the admitted cohort population"
+        );
+        assert!(!overflow_was_accepted);
     }
 
     #[test]
@@ -1633,6 +1858,57 @@ mod tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .eligibility,
             vec![eligible]
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_work_rechecks_expiry_at_availability_wake() {
+        let seconds = Arc::new(AtomicU64::new(100));
+        let clock_seconds = Arc::clone(&seconds);
+        let handle = AutomaticEventTransportHandle::with_clock(move || {
+            UNIX_EPOCH + Duration::from_secs(clock_seconds.load(Ordering::SeqCst))
+        });
+        assert!(
+            handle.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                Some(UNIX_EPOCH + Duration::from_secs(150)),
+            ),])
+        );
+        let (control, mut attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Unavailable,
+                true,
+                10,
+            ))
+            .unwrap();
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) },));
+
+        seconds.store(200, Ordering::SeqCst);
+        assert!(control.publish_availability(EventAdapterSnapshot::new(
+            EventTransportKind::IROH_QUIC_V1,
+            2,
+            EventAdapterState::Available,
+            true,
+            10,
+        )));
+
+        assert!(attempts.receiver.try_recv().is_err());
+        assert_eq!(
+            handle
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pending
+                .len(),
+            1
         );
     }
 }
