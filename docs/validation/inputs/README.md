@@ -11,6 +11,9 @@ archived destinations are the
 and the
 [Ubuntu v1 provider design](../../../archive/design-history/specs/2026-09-07-systemd-credential-provider-design.md).
 
-Hash-identical copies of the two active inputs remain at the original
-`docs/superpowers/specs` paths so the immutable profile's literal path-and-digest
-bindings continue to verify.
+The profile links to the canonical inputs in this directory:
+[provider design](raspberry-pi-systemd-credential-provider-v2-design.md) and
+[credential-presentation amendment](systemd-257-credential-presentation-amendment.md).
+Their current bytes do not match the approval digests recorded in the profile.
+Preserve both the files and the recorded digests; qualification requires a
+separate review of that mismatch.
