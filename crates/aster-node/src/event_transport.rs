@@ -231,11 +231,18 @@ struct RegisteredEventAdapter {
     attempts: mpsc::Sender<EventOutboundAttempt>,
 }
 
+#[derive(Clone, Copy)]
+struct InFlightEventAttempt {
+    id: u64,
+    key: EventCohortKey,
+}
+
 struct AutomaticEventTransportState {
     adapters: BTreeMap<EventTransportKind, RegisteredEventAdapter>,
     eligibility: Vec<EventPeerEligibility>,
     pending: VecDeque<PendingEventCohort>,
-    attempt_in_flight: bool,
+    attempt_in_flight: Option<InFlightEventAttempt>,
+    next_attempt_id: u64,
     next_registration_id: u64,
     transition_count: u64,
 }
@@ -246,7 +253,8 @@ impl Default for AutomaticEventTransportState {
             adapters: BTreeMap::new(),
             eligibility: Vec::new(),
             pending: VecDeque::new(),
-            attempt_in_flight: false,
+            attempt_in_flight: None,
+            next_attempt_id: 1,
             next_registration_id: 1,
             transition_count: 0,
         }
@@ -368,7 +376,13 @@ impl AutomaticEventTransportHandle {
         state
             .pending
             .retain(|cohort| current_cohorts.contains(&cohort.key));
-        let released_capacity = state.pending.len() < pending_before;
+        let revoked_in_flight = state
+            .attempt_in_flight
+            .is_some_and(|attempt| !current_cohorts.contains(&attempt.key));
+        if revoked_in_flight {
+            state.attempt_in_flight = None;
+        }
+        let released_capacity = state.pending.len() < pending_before || revoked_in_flight;
         transition(&self.shared, &mut state);
         drop(state);
         if released_capacity {
@@ -404,7 +418,9 @@ impl AutomaticEventTransportHandle {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if state.pending.len() + usize::from(state.attempt_in_flight) >= MAX_PENDING_EVENT_COHORTS {
+        if state.pending.len() + usize::from(state.attempt_in_flight.is_some())
+            >= MAX_PENDING_EVENT_COHORTS
+        {
             return EventAttemptAdmission::CapacityFull;
         }
         let runner: EventAttemptRunner = Arc::new(move |contact| Box::pin(runner(contact)));
@@ -509,6 +525,7 @@ impl EventAttemptReceiver {
 /// One globally admitted fresh Event contact attempt.
 pub struct EventOutboundAttempt {
     shared: Arc<AutomaticEventTransportShared>,
+    attempt_id: u64,
     key: EventCohortKey,
     kind: EventTransportKind,
     registration_id: u64,
@@ -548,14 +565,23 @@ impl EventOutboundAttempt {
         outcome
     }
 
+    fn owns_in_flight_slot(&self, state: &AutomaticEventTransportState) -> bool {
+        state
+            .attempt_in_flight
+            .is_some_and(|attempt| attempt.id == self.attempt_id && attempt.key == self.key)
+    }
+
     fn complete(&mut self, result: &Result<(), ContactOutcome>) {
         let mut state = self
             .shared
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        state.attempt_in_flight = false;
         self.completed = true;
+        if !self.owns_in_flight_slot(&state) {
+            return;
+        }
+        state.attempt_in_flight = None;
         let released_capacity = match result {
             Ok(()) => {
                 transition(&self.shared, &mut state);
@@ -601,7 +627,10 @@ impl Drop for EventOutboundAttempt {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         self.completed = true;
-        state.attempt_in_flight = false;
+        if !self.owns_in_flight_slot(&state) {
+            return;
+        }
+        state.attempt_in_flight = None;
         transition(&self.shared, &mut state);
         drop(state);
         notify_capacity_progress(&self.shared);
@@ -619,7 +648,7 @@ fn transition(
     state: &mut AutomaticEventTransportState,
 ) {
     state.transition_count = state.transition_count.saturating_add(1);
-    if state.attempt_in_flight {
+    if state.attempt_in_flight.is_some() {
         return;
     }
     let now = (shared.clock)();
@@ -665,8 +694,11 @@ fn transition(
         state.pending.push_front(pending);
         return;
     };
+    let attempt_id = state.next_attempt_id;
+    state.next_attempt_id = state.next_attempt_id.saturating_add(1);
     let attempt = EventOutboundAttempt {
         shared: Arc::clone(shared),
+        attempt_id,
         key: pending.key,
         kind,
         registration_id,
@@ -676,7 +708,12 @@ fn transition(
         completed: false,
     };
     match attempts.try_send(attempt) {
-        Ok(()) => state.attempt_in_flight = true,
+        Ok(()) => {
+            state.attempt_in_flight = Some(InFlightEventAttempt {
+                id: attempt_id,
+                key: pending.key,
+            });
+        }
         Err(mpsc::error::TrySendError::Full(mut attempt)) => {
             attempt.completed = true;
             state.pending.push_front(PendingEventCohort {
@@ -1961,7 +1998,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         assert!(
-            state.pending.len() + usize::from(state.attempt_in_flight) <= MAX_PENDING_EVENT_COHORTS,
+            state.pending.len() + usize::from(state.attempt_in_flight.is_some())
+                <= MAX_PENDING_EVENT_COHORTS,
             "reselection must not grow the admitted cohort population"
         );
         assert!(!overflow_was_accepted);
@@ -2074,7 +2112,115 @@ mod tests {
             state.pending.is_empty(),
             "a peer removed while in flight must not return as an obsolete pending cohort"
         );
-        assert!(!state.attempt_in_flight);
+        assert!(state.attempt_in_flight.is_none());
+    }
+
+    #[tokio::test]
+    async fn removed_in_flight_attempt_releases_slot_before_obsolete_ticket_drop() {
+        let replacement_peer = [0x33; 32];
+        let eligibility = |peer| {
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                peer,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            )
+        };
+        let handle = AutomaticEventTransportHandle::new();
+        assert!(handle.replace_eligibility(vec![eligibility(PEER), eligibility(replacement_peer)]));
+        let (_control, mut attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("adapter registration");
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
+        assert!(handle.request_attempt(MISSION, replacement_peer, |_contact| async { Ok(()) }));
+        assert!(handle.request_attempt(MISSION, replacement_peer, |_contact| async { Ok(()) }));
+        let obsolete = attempts.recv().await.expect("obsolete peer ticket");
+        assert_eq!(obsolete.peer(), PEER);
+
+        assert!(handle.replace_eligibility(vec![eligibility(replacement_peer)]));
+        let current = attempts
+            .receiver
+            .try_recv()
+            .expect("removal releases the sole slot before the obsolete ticket resolves");
+        assert_eq!(current.peer(), replacement_peer);
+
+        drop(obsolete);
+        assert!(
+            attempts.receiver.try_recv().is_err(),
+            "late obsolete drop must not release the newer in-flight owner"
+        );
+        drop(current);
+        assert_eq!(
+            attempts
+                .receiver
+                .try_recv()
+                .expect("current owner drop releases the next cohort")
+                .peer(),
+            replacement_peer
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_and_readd_does_not_resurrect_obsolete_in_flight_cohort() {
+        let eligibility = |kind| {
+            EventPeerEligibility::provisioned_exact_peer(MISSION, PEER, kind, true, 1, 0, None)
+        };
+        let handle = AutomaticEventTransportHandle::new();
+        assert!(handle.replace_eligibility(vec![eligibility(EventTransportKind::IROH_QUIC_V1)]));
+        let (_iroh_control, mut iroh_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("Iroh registration");
+        let (_ble_control, mut ble_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("BLE registration");
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
+        let obsolete = iroh_attempts.recv().await.expect("obsolete Iroh ticket");
+
+        assert!(handle.replace_eligibility(Vec::new()));
+        assert!(handle.replace_eligibility(vec![
+            eligibility(EventTransportKind::IROH_QUIC_V1),
+            eligibility(EventTransportKind::BLE_L2CAP_V1),
+        ]));
+        assert!(obsolete.fail_carrier_open().permits_reselection());
+
+        assert!(
+            iroh_attempts.receiver.try_recv().is_err(),
+            "re-added peer needs new work rather than the obsolete cohort"
+        );
+        assert!(
+            ble_attempts.receiver.try_recv().is_err(),
+            "old adapter failure must not resurrect work under the re-added roster"
+        );
+        assert!(
+            handle
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pending
+                .is_empty()
+        );
     }
 
     #[tokio::test]
