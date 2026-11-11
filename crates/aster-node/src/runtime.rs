@@ -158,8 +158,9 @@ use crate::{
         validate_remote_event_send_plan,
     },
     event_transport::{
-        ContactDisposition, ContactOutcome, ContactProvenance, ContactReason, ContactScope,
-        ContactStage,
+        AutomaticEventTransportHandle, ContactDisposition, ContactOutcome, ContactProvenance,
+        ContactReason, ContactScope, ContactStage, EventAdapterControl, EventAdapterSnapshot,
+        EventAttemptReceiver, EventPeerEligibility,
     },
     format_node_id, format_path_field, format_receipt_field,
     frame::{
@@ -3821,6 +3822,7 @@ pub struct RunningNode {
     selected_blobs: SelectedBlobHandle,
     selected_controls: SelectedControlHandle,
     ordered_event_contacts: OrderedEventContactHandle,
+    automatic_event_transports: RunningAutomaticEventTransportHandle,
     state_root: PinnedNodeStateRoot,
     application_admission: Arc<AtomicBool>,
     emission_policy: Arc<LiveEmissionPolicy>,
@@ -3839,6 +3841,132 @@ pub enum OrderedEventContactRole {
     Initiator,
     /// This node receives mission handshake flight one.
     Responder,
+}
+
+#[derive(Default)]
+struct AutomaticEventRuntimeState {
+    durable_generation: u64,
+    requested_generation: BTreeMap<NodeId, u64>,
+}
+
+/// Runtime-owned automatic Event transport registration and eligibility facade.
+///
+/// Durable work is coalesced by exact peer and local publication generation.
+/// The delegated coordinator remains the sole owner of adapter selection and
+/// aggregate attempt admission.
+#[derive(Clone)]
+pub struct RunningAutomaticEventTransportHandle {
+    coordinator: AutomaticEventTransportHandle,
+    admission: Arc<AtomicBool>,
+    state: Arc<StdMutex<AutomaticEventRuntimeState>>,
+    mission: NodeId,
+    ordered_contacts: OrderedEventContactHandle,
+}
+
+impl RunningAutomaticEventTransportHandle {
+    fn new(
+        admission: Arc<AtomicBool>,
+        mission: NodeId,
+        ordered_contacts: OrderedEventContactHandle,
+    ) -> Self {
+        Self {
+            coordinator: AutomaticEventTransportHandle::new(),
+            admission,
+            state: Arc::new(StdMutex::new(AutomaticEventRuntimeState::default())),
+            mission,
+            ordered_contacts,
+        }
+    }
+
+    /// Registers one adapter-owned bounded attempt mailbox.
+    ///
+    /// The returned control remains adapter-owned. An embedding shuts down and
+    /// joins that owner before invoking [`RunningNode::shutdown`].
+    pub fn register(
+        &self,
+        snapshot: EventAdapterSnapshot,
+    ) -> Option<(EventAdapterControl, EventAttemptReceiver)> {
+        self.admission
+            .load(Ordering::Acquire)
+            .then(|| self.coordinator.register(snapshot))
+            .flatten()
+    }
+
+    /// Replaces exact-peer eligibility and wakes this peer's durable generation.
+    ///
+    /// `peer` is the same authority-rostered identity represented by the
+    /// replacement entries. Mismatched entries remain ineligible in the closed
+    /// selector; the runtime does not reinterpret them.
+    pub fn replace_eligibility(
+        &self,
+        peer: NodeId,
+        eligibility: Vec<EventPeerEligibility>,
+    ) -> bool {
+        if !self.admission.load(Ordering::Acquire)
+            || !self.coordinator.replace_eligibility(eligibility)
+        {
+            return false;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.requested_generation.entry(peer).or_default();
+        self.request_peer_generation(&mut state, peer);
+        true
+    }
+
+    fn note_durable_work(&self) {
+        if !self.admission.load(Ordering::Acquire) {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.durable_generation = state.durable_generation.saturating_add(1);
+        let peers = state
+            .requested_generation
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for peer in peers {
+            self.request_peer_generation(&mut state, peer);
+        }
+    }
+
+    fn request_peer_generation(&self, state: &mut AutomaticEventRuntimeState, peer: NodeId) {
+        let generation = state.durable_generation;
+        if generation == 0
+            || state
+                .requested_generation
+                .get(&peer)
+                .is_some_and(|requested| *requested >= generation)
+        {
+            return;
+        }
+        let ordered_contacts = self.ordered_contacts.clone();
+        let accepted = self
+            .coordinator
+            .request_attempt(self.mission, peer, move |contact| {
+                let ordered_contacts = ordered_contacts.clone();
+                async move {
+                    let expectation = MissionPeerExpectation::new(contact.peer_evidence(), peer);
+                    ordered_contacts
+                        .run(OrderedEventContactRole::Initiator, contact, expectation)
+                        .await
+                        .map(|_| ())
+                }
+            });
+        if accepted {
+            state.requested_generation.insert(peer, generation);
+        }
+    }
+
+    #[cfg(test)]
+    fn transition_count(&self) -> u64 {
+        self.coordinator.transition_count()
+    }
 }
 
 struct OrderedEventContactCommand {
@@ -4338,6 +4466,15 @@ impl RunningNode {
     /// adapter drivers must pass an explicitly configured mission expectation.
     pub fn ordered_event_contacts(&self) -> OrderedEventContactHandle {
         self.ordered_event_contacts.clone()
+    }
+
+    /// Returns the runtime-owned automatic Event transport facade.
+    ///
+    /// Adapters register bounded attempt mailboxes here. Eligibility replacement
+    /// also wakes durable work for its exact mission peer; applications never
+    /// choose the selected transport.
+    pub fn automatic_event_transports(&self) -> RunningAutomaticEventTransportHandle {
+        self.automatic_event_transports.clone()
     }
 
     /// Returns the exact directory authority used by this node's durable store.
@@ -16946,6 +17083,11 @@ async fn start_node_with_shutdown_ownership(
         admission: application_admission.clone(),
         session_permit: Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY)),
     };
+    let automatic_event_transports = RunningAutomaticEventTransportHandle::new(
+        application_admission.clone(),
+        mission_authority,
+        ordered_event_contacts.clone(),
+    );
     let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
     let (ready_sender, ready_receiver) = oneshot::channel();
     let emission_policy = Arc::new(LiveEmissionPolicy::new(forwarding.emission_policy()));
@@ -16959,6 +17101,7 @@ async fn start_node_with_shutdown_ownership(
     );
     channels.handle_sigint = handle_sigint;
     channels.iroh_transport_enabled = iroh_transport_enabled;
+    channels.automatic_event_transports = Some(automatic_event_transports.clone());
     #[cfg(test)]
     let contact_activity = channels.contact_activity.clone();
     let task = tokio::spawn(inherit_node_output(run_node_actor_with_forwarding_output(
@@ -16992,6 +17135,7 @@ async fn start_node_with_shutdown_ownership(
         selected_blobs,
         selected_controls,
         ordered_event_contacts,
+        automatic_event_transports,
         state_root: ready.state_root,
         application_admission,
         emission_policy,
@@ -17349,6 +17493,7 @@ struct EventOperationAuditTestControl {
 struct NodeActorChannels {
     handle_sigint: bool,
     iroh_transport_enabled: bool,
+    automatic_event_transports: Option<RunningAutomaticEventTransportHandle>,
     application_receiver: mpsc::Receiver<SelectedApplicationCommand>,
     application_admission: Arc<AtomicBool>,
     control_receiver: mpsc::Receiver<SelectedControlCommand>,
@@ -17579,6 +17724,7 @@ impl NodeActorChannels {
             application_receiver,
             handle_sigint: true,
             iroh_transport_enabled: true,
+            automatic_event_transports: None,
             application_admission,
             control_receiver,
             ordered_event_contact_receiver,
@@ -17661,6 +17807,7 @@ async fn run_node_actor_inner(
     let NodeActorChannels {
         handle_sigint,
         iroh_transport_enabled,
+        automatic_event_transports,
         mut application_receiver,
         application_admission,
         mut control_receiver,
@@ -18056,6 +18203,11 @@ async fn run_node_actor_inner(
     } else {
         false
     };
+    if store.event_count()? != 0
+        && let Some(automatic) = &automatic_event_transports
+    {
+        automatic.note_durable_work();
+    }
     let provisioning_origin = config.provisioning_origin().receipt_label();
     node_stdout!(
         "READY selected=true pid={} carrier_id={} mission_id={} mission_authority={} sockets={} state={} peers={} application={} carrier_route={} controlled_relay_url={} controlled_relay_trust={} controlled_relay_readiness={} public_relay_fallback=false hosted_discovery=false nearby_discovery={} nearby_window_seconds={} discovery_metadata={} discovery_authority={} discovery_candidate_limit={} nat_traversal=not-claimed path_observation=not-authorization mission_auth=hybrid-pq provisioning={} semantics=source-authenticated-event reconciliation_classes={} controls=source-authenticated-flash commit_before_activate=true content_admission=capability-gated event_bridge={}",
@@ -19404,6 +19556,9 @@ async fn run_node_actor_inner(
                 );
                 application_tick_yield_required = false;
                 if new_event_inserted {
+                    if let Some(automatic) = &automatic_event_transports {
+                        automatic.note_durable_work();
+                    }
                     if automatic_nearby {
                         event_contact_wake.arm_event(automatic_candidates.iter().copied());
                     } else {
@@ -19975,6 +20130,9 @@ async fn run_node_actor_inner(
                 );
                 application_tick_yield_required = false;
                 if new_event_inserted {
+                    if let Some(automatic) = &automatic_event_transports {
+                        automatic.note_durable_work();
+                    }
                     if automatic_nearby {
                         event_contact_wake.arm_event(automatic_candidates.iter().copied());
                     } else {
@@ -35371,6 +35529,7 @@ mod tests {
             NodeActorChannels {
                 handle_sigint: false,
                 iroh_transport_enabled: true,
+                automatic_event_transports: None,
                 application_receiver,
                 application_admission,
                 control_receiver,
@@ -35616,6 +35775,7 @@ mod tests {
             NodeActorChannels {
                 handle_sigint: false,
                 iroh_transport_enabled: true,
+                automatic_event_transports: None,
                 application_receiver,
                 application_admission,
                 control_receiver,
@@ -35711,6 +35871,7 @@ mod tests {
             NodeActorChannels {
                 handle_sigint: false,
                 iroh_transport_enabled: true,
+                automatic_event_transports: None,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 control_receiver,
@@ -40013,6 +40174,7 @@ mod tests {
             NodeActorChannels {
                 handle_sigint: false,
                 iroh_transport_enabled: true,
+                automatic_event_transports: None,
                 application_receiver,
                 application_admission,
                 control_receiver,
@@ -40256,6 +40418,7 @@ mod tests {
             NodeActorChannels {
                 handle_sigint: false,
                 iroh_transport_enabled: true,
+                automatic_event_transports: None,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 control_receiver,
@@ -41073,6 +41236,81 @@ mod tests {
             handler: aster_contact::ContactRequestHandler<'a>,
         ) -> aster_contact::ContactFuture<'a, bool> {
             self.count();
+            self.inner
+                .respond_once_with_total_limit(total_limit, handler)
+        }
+
+        fn finish_as_initiator(&self) -> aster_contact::ContactFuture<'_, ()> {
+            self.inner.finish_as_initiator()
+        }
+
+        fn finish_as_responder(&self) -> aster_contact::ContactFuture<'_, ()> {
+            self.inner.finish_as_responder()
+        }
+
+        fn close(&self) {
+            self.inner.close();
+        }
+    }
+
+    struct FreshHandshakeOrderedContact {
+        inner: BleL2capContact,
+        first_request: Arc<StdMutex<Option<Vec<u8>>>>,
+    }
+
+    impl FreshHandshakeOrderedContact {
+        fn new(inner: BleL2capContact, first_request: Arc<StdMutex<Option<Vec<u8>>>>) -> Self {
+            Self {
+                inner,
+                first_request,
+            }
+        }
+
+        fn capture_first_request(&self, request: &[u8]) {
+            let mut first = self
+                .first_request
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if first.is_none() {
+                *first = Some(request.to_vec());
+            }
+        }
+    }
+
+    impl OrderedContact for FreshHandshakeOrderedContact {
+        fn peer_evidence(&self) -> CarrierPeerEvidence {
+            self.inner.peer_evidence()
+        }
+
+        fn max_frame_bytes(&self) -> usize {
+            self.inner.max_frame_bytes()
+        }
+
+        fn request_with_total_limit<'a>(
+            &'a self,
+            request: &'a [u8],
+            total_limit: usize,
+        ) -> aster_contact::ContactFuture<'a, Vec<u8>> {
+            self.capture_first_request(request);
+            self.inner.request_with_total_limit(request, total_limit)
+        }
+
+        fn request_with_total_limit_checked<'a>(
+            &'a self,
+            request: &'a [u8],
+            total_limit: usize,
+            before_write: aster_contact::ContactPreflight<'a>,
+        ) -> aster_contact::ContactFuture<'a, Vec<u8>> {
+            self.capture_first_request(request);
+            self.inner
+                .request_with_total_limit_checked(request, total_limit, before_write)
+        }
+
+        fn respond_once_with_total_limit<'a>(
+            &'a self,
+            total_limit: usize,
+            handler: aster_contact::ContactRequestHandler<'a>,
+        ) -> aster_contact::ContactFuture<'a, bool> {
             self.inner
                 .respond_once_with_total_limit(total_limit, handler)
         }
@@ -42604,6 +42842,353 @@ mod tests {
         assert_eq!(initiator_node_receipt.events, 2);
         assert_eq!(responder_node_receipt.events, 2);
         fs::remove_dir_all(test_root).expect("running-node ordered cleanup");
+    }
+
+    #[tokio::test]
+    async fn automatic_event_transport_waits_durably_and_starts_each_ticket_fresh() {
+        use crate::{
+            EventAdapterSnapshot, EventAdapterState, EventPeerEligibility, EventTransportKind,
+            application::{EventId, EventQuery, NumberedEventPublishRequest},
+        };
+
+        let test_root = root("running-node-automatic-event-transport");
+        let initiator_root = test_root.join("initiator");
+        let responder_root = test_root.join("responder");
+        fs::create_dir_all(&initiator_root).expect("automatic initiator state");
+        fs::create_dir_all(&responder_root).expect("automatic responder state");
+        #[cfg(unix)]
+        for state in [&initiator_root, &responder_root] {
+            fs::set_permissions(state, fs::Permissions::from_mode(0o700))
+                .expect("owner-only automatic transport state");
+        }
+        let mut issued = issue_missions(2);
+        let initiator = issued.remove(0);
+        let responder = issued.remove(0);
+        let mission = initiator.credentials.mission_authority_id();
+        assert_eq!(mission, responder.credentials.mission_authority_id());
+        let config =
+            |state: PathBuf, mission: UnprotectedReferenceMission| TransportNeutralNodeConfig {
+                state,
+                mission,
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            };
+
+        let initiator_node = start_transport_neutral_node(config(
+            initiator_root.clone(),
+            initiator.credentials.clone(),
+        ))
+        .await
+        .expect("start automatic initiator without adapters");
+        assert!(initiator_node.bound_sockets.is_empty());
+        let events = initiator_node.selected_events();
+        let client = subscription_fixture_client(&events).await;
+        let topic = Topic::new("opaque").expect("automatic Event topic");
+        let scope = Scope::new("test/runtime-contact").expect("automatic Event scope");
+        let first = events
+            .publish_numbered(
+                NumberedEventPublishRequest {
+                    client_id: client.client_id.clone(),
+                    session: client.session,
+                    sequence: aster_redb_store::EventOperationSequence::new(1).unwrap(),
+                    predecessor: None,
+                    topic: topic.clone(),
+                    scope: scope.clone(),
+                    priority: Priority::Priority,
+                    logical_key: b"automatic-1".to_vec(),
+                    payload: b"durable before any adapter".to_vec(),
+                    tombstone: false,
+                },
+                EventPublishOptions::durable(),
+            )
+            .await
+            .expect("zero-adapter publication commits");
+        let first_id = EventId::from_bytes(*first.result.receipt.semantic_id.as_bytes());
+        let automatic = initiator_node.automatic_event_transports();
+        let transitions_after_publish = automatic.transition_count();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(automatic.transition_count(), transitions_after_publish);
+        events
+            .status()
+            .await
+            .expect("zero-adapter node remains usable");
+        initiator_node
+            .shutdown()
+            .await
+            .expect("shutdown zero-adapter initiator");
+
+        let initiator_node = start_transport_neutral_node(config(
+            initiator_root.clone(),
+            initiator.credentials.clone(),
+        ))
+        .await
+        .expect("restart automatic initiator without adapters");
+        assert!(initiator_node.bound_sockets.is_empty());
+        let events = initiator_node.selected_events();
+        let reopened = events
+            .query(EventQuery {
+                after_acceptance_marker: 0,
+                limit: 8,
+                ..EventQuery::default()
+            })
+            .await
+            .expect("query restarted durable Event");
+        assert!(reopened.items.iter().any(|item| item.id == first_id));
+
+        let responder_node = start_transport_neutral_node(config(
+            responder_root.clone(),
+            responder.credentials.clone(),
+        ))
+        .await
+        .expect("start automatic responder");
+        let automatic = initiator_node.automatic_event_transports();
+        let (first_control, mut first_attempts) = automatic
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("register first fake adapter");
+        tokio::select! {
+            biased;
+            _attempt = first_attempts.recv() => panic!("adapter without eligibility received a ticket"),
+            () = tokio::task::yield_now() => {}
+        }
+        assert!(automatic.replace_eligibility(
+            responder.identity,
+            vec![EventPeerEligibility::provisioned_exact_peer(
+                mission,
+                responder.identity,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            )],
+        ));
+        let first_attempt = first_attempts
+            .recv()
+            .await
+            .expect("eligibility wakes the durable startup ticket");
+        assert_eq!(
+            first_attempt.transport_kind(),
+            EventTransportKind::BLE_L2CAP_V1
+        );
+        assert_eq!(first_attempt.mission(), mission);
+        assert_eq!(first_attempt.peer(), responder.identity);
+
+        let first_flight = Arc::new(StdMutex::new(None));
+        let (first_initiator_stream, first_responder_stream) = duplex(113);
+        let first_initiator_contact = Arc::new(FreshHandshakeOrderedContact::new(
+            BleL2capContact::new(
+                first_initiator_stream,
+                TransientLocator::new(b"automatic-first-responder".to_vec()).unwrap(),
+                64 * 1024,
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            first_flight.clone(),
+        ));
+        let first_responder_contact = Arc::new(
+            BleL2capContact::new(
+                first_responder_stream,
+                TransientLocator::new(b"automatic-first-initiator".to_vec()).unwrap(),
+                64 * 1024,
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+        );
+        let first_responder = responder_node.ordered_event_contacts();
+        let first_responder_task = tokio::spawn(async move {
+            first_responder
+                .run(
+                    OrderedEventContactRole::Responder,
+                    first_responder_contact,
+                    MissionPeerExpectation::new(
+                        CarrierPeerEvidence::UnauthenticatedLocator {
+                            transient_locator: TransientLocator::new(
+                                b"automatic-first-initiator".to_vec(),
+                            )
+                            .unwrap(),
+                        },
+                        initiator.identity,
+                    ),
+                )
+                .await
+        });
+        first_attempt
+            .run(first_initiator_contact)
+            .await
+            .expect("first automatic contact");
+        first_responder_task
+            .await
+            .expect("first responder task")
+            .expect("first responder contact");
+        tokio::select! {
+            biased;
+            _attempt = first_attempts.recv() => panic!("one durable generation emitted an extra ticket"),
+            () = tokio::task::yield_now() => {}
+        }
+
+        drop(first_control);
+        let second = events
+            .publish_numbered(
+                NumberedEventPublishRequest {
+                    client_id: client.client_id.clone(),
+                    session: client.session,
+                    sequence: aster_redb_store::EventOperationSequence::new(2).unwrap(),
+                    predecessor: Some(first_id),
+                    topic: topic.clone(),
+                    scope: scope.clone(),
+                    priority: Priority::Priority,
+                    logical_key: b"automatic-2".to_vec(),
+                    payload: b"wait after adapter removal".to_vec(),
+                    tombstone: false,
+                },
+                EventPublishOptions::durable(),
+            )
+            .await
+            .expect("publication after adapter removal commits");
+        let second_id = EventId::from_bytes(*second.result.receipt.semantic_id.as_bytes());
+        let transitions_while_waiting = automatic.transition_count();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(automatic.transition_count(), transitions_while_waiting);
+
+        let (second_control, mut second_attempts) = automatic
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                2,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("register replacement fake adapter");
+        let second_attempt = second_attempts
+            .recv()
+            .await
+            .expect("adapter registration wakes the next durable generation");
+        assert_eq!(
+            second_attempt.transport_kind(),
+            EventTransportKind::BLE_L2CAP_V1
+        );
+        assert_eq!(second_attempt.mission(), mission);
+        assert_eq!(second_attempt.peer(), responder.identity);
+        let second_flight = Arc::new(StdMutex::new(None));
+        let (second_initiator_stream, second_responder_stream) = duplex(113);
+        let second_initiator_contact = Arc::new(FreshHandshakeOrderedContact::new(
+            BleL2capContact::new(
+                second_initiator_stream,
+                TransientLocator::new(b"automatic-second-responder".to_vec()).unwrap(),
+                64 * 1024,
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            second_flight.clone(),
+        ));
+        let second_responder_contact = Arc::new(
+            BleL2capContact::new(
+                second_responder_stream,
+                TransientLocator::new(b"automatic-second-initiator".to_vec()).unwrap(),
+                64 * 1024,
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+        );
+        let second_responder = responder_node.ordered_event_contacts();
+        let second_responder_task = tokio::spawn(async move {
+            second_responder
+                .run(
+                    OrderedEventContactRole::Responder,
+                    second_responder_contact,
+                    MissionPeerExpectation::new(
+                        CarrierPeerEvidence::UnauthenticatedLocator {
+                            transient_locator: TransientLocator::new(
+                                b"automatic-second-initiator".to_vec(),
+                            )
+                            .unwrap(),
+                        },
+                        initiator.identity,
+                    ),
+                )
+                .await
+        });
+        second_attempt
+            .run(second_initiator_contact)
+            .await
+            .expect("second automatic contact");
+        second_responder_task
+            .await
+            .expect("second responder task")
+            .expect("second responder contact");
+        let first_flight = first_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("first ticket starts mission flight one");
+        let second_flight = second_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("second ticket starts mission flight one");
+        assert_ne!(
+            first_flight, second_flight,
+            "a later ticket must start a fresh mission handshake nonce"
+        );
+        tokio::select! {
+            biased;
+            _attempt = second_attempts.recv() => panic!("second durable generation emitted an extra ticket"),
+            () = tokio::task::yield_now() => {}
+        }
+
+        events
+            .publish_numbered(
+                NumberedEventPublishRequest {
+                    client_id: client.client_id,
+                    session: client.session,
+                    sequence: aster_redb_store::EventOperationSequence::new(3).unwrap(),
+                    predecessor: Some(second_id),
+                    topic,
+                    scope,
+                    priority: Priority::Priority,
+                    logical_key: b"automatic-3".to_vec(),
+                    payload: b"ticket closed by shutdown".to_vec(),
+                    tombstone: false,
+                },
+                EventPublishOptions::durable(),
+            )
+            .await
+            .expect("final automatic publication commits");
+        let pending_shutdown = second_attempts
+            .recv()
+            .await
+            .expect("final generation produces one pending ticket");
+        drop(second_control);
+        initiator_node
+            .shutdown()
+            .await
+            .expect("automatic initiator shutdown");
+        let closed_contact = Arc::new(StalledOrderedContact::default());
+        let closed = pending_shutdown
+            .run(closed_contact.clone())
+            .await
+            .expect_err("shutdown closes automatic contact admission");
+        assert_eq!(closed.reason(), ContactReason::AdmissionClosed);
+        assert_eq!(closed_contact.operations(), 0);
+        assert_eq!(closed_contact.closes(), 1);
+
+        responder_node
+            .shutdown()
+            .await
+            .expect("automatic responder shutdown");
+        fs::remove_dir_all(test_root).expect("automatic transport cleanup");
     }
 
     #[tokio::test]
@@ -45819,6 +46404,7 @@ mod tests {
             NodeActorChannels {
                 handle_sigint: true,
                 iroh_transport_enabled: true,
+                automatic_event_transports: None,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 control_receiver,
@@ -45965,6 +46551,7 @@ mod tests {
             NodeActorChannels {
                 handle_sigint: true,
                 iroh_transport_enabled: true,
+                automatic_event_transports: None,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 control_receiver,
@@ -46495,6 +47082,7 @@ mod tests {
             NodeActorChannels {
                 handle_sigint: false,
                 iroh_transport_enabled: true,
+                automatic_event_transports: None,
                 application_receiver,
                 application_admission,
                 control_receiver,
@@ -46656,6 +47244,7 @@ mod tests {
             NodeActorChannels {
                 handle_sigint: false,
                 iroh_transport_enabled: true,
+                automatic_event_transports: None,
                 application_receiver,
                 application_admission,
                 control_receiver,
@@ -46819,6 +47408,7 @@ mod tests {
             NodeActorChannels {
                 handle_sigint: false,
                 iroh_transport_enabled: true,
+                automatic_event_transports: None,
                 application_receiver,
                 application_admission,
                 control_receiver,
@@ -48290,6 +48880,7 @@ mod tests {
             NodeActorChannels {
                 handle_sigint: false,
                 iroh_transport_enabled: true,
+                automatic_event_transports: None,
                 application_receiver: receiver,
                 application_admission: admission,
                 control_receiver: controls,
@@ -52589,6 +53180,7 @@ mod tests {
             NodeActorChannels {
                 handle_sigint: true,
                 iroh_transport_enabled: true,
+                automatic_event_transports: None,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 control_receiver,
