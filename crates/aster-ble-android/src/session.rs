@@ -5,8 +5,8 @@ use crate::{
 use aster_ble_l2cap::BleL2capContact;
 use aster_contact::{ContactErrorKind, OrderedContact, TransientLocator};
 use aster_node::{
-    MissionPeerExpectation, MutableSourceInterests, NodeApplication, NodeError,
-    OrderedEventContactError, OrderedEventContactRole, RunningNode, TransportNeutralNodeConfig,
+    ContactOutcome, ContactReason, MissionPeerExpectation, MutableSourceInterests, NodeApplication,
+    NodeError, OrderedEventContactRole, RunningNode, TransportNeutralNodeConfig,
     application::{
         ApplicationError, ApplicationErrorKind, EventClientContext, EventItem, EventPublishResult,
         EventQuery, EventSubscriptionRequest, Priority, Scope, SelectedEventHandle, Topic,
@@ -798,17 +798,25 @@ fn map_node_error(error: NodeError) -> ValidatorError {
     ValidatorError::new(category, "validator protected Event session failed")
 }
 
-fn map_ordered_contact_error(error: OrderedEventContactError) -> ValidatorError {
-    match error {
-        OrderedEventContactError::Contact(error) => map_node_error(error),
-        OrderedEventContactError::AdmissionClosed
-        | OrderedEventContactError::AdmissionBusy
-        | OrderedEventContactError::ActorUnavailable
-        | OrderedEventContactError::ActorStopped => ValidatorError::new(
-            ValidatorErrorCategory::Unavailable,
-            "validator ordered Event contact is unavailable",
-        ),
-    }
+fn map_ordered_contact_error(outcome: ContactOutcome) -> ValidatorError {
+    let category = match outcome.reason() {
+        ContactReason::AdmissionClosed
+        | ContactReason::AdmissionBusy
+        | ContactReason::ActorUnavailable
+        | ContactReason::ActorStopped
+        | ContactReason::CallerCancelled
+        | ContactReason::CarrierUnavailable
+        | ContactReason::TransportInterrupted
+        | ContactReason::TransportTimeout => ValidatorErrorCategory::Unavailable,
+        ContactReason::IdentityMismatch | ContactReason::AuthenticationFailed => {
+            ValidatorErrorCategory::Authentication
+        }
+        ContactReason::PolicyRejected | ContactReason::ProtocolViolation => {
+            ValidatorErrorCategory::Protocol
+        }
+        ContactReason::LocalInvariant => ValidatorErrorCategory::Internal,
+    };
+    ValidatorError::new(category, "validator ordered Event contact failed")
 }
 
 #[cfg(test)]
@@ -1251,23 +1259,16 @@ mod tests {
     #[test]
     fn ordered_contact_error_maps_to_validator_categories() {
         for error in [
-            aster_node::OrderedEventContactError::AdmissionClosed,
-            aster_node::OrderedEventContactError::AdmissionBusy,
-            aster_node::OrderedEventContactError::ActorUnavailable,
-            aster_node::OrderedEventContactError::ActorStopped,
+            ContactOutcome::admission_closed(),
+            ContactOutcome::admission_busy(),
+            ContactOutcome::actor_unavailable(),
+            ContactOutcome::actor_stopped(),
         ] {
             assert_eq!(
                 map_ordered_contact_error(error).category(),
                 ValidatorErrorCategory::Unavailable
             );
         }
-
-        assert_eq!(
-            map_ordered_contact_error(aster_node::OrderedEventContactError::Contact(
-                NodeError::Configuration("test contact failure".into()),
-            )),
-            map_node_error(NodeError::Configuration("test contact failure".into()))
-        );
     }
 
     #[test]

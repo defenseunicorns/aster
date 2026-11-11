@@ -157,6 +157,10 @@ use crate::{
         transfer_profile_digest, validate_remote_event_page_budget,
         validate_remote_event_send_plan,
     },
+    event_transport::{
+        ContactDisposition, ContactOutcome, ContactProvenance, ContactReason, ContactScope,
+        ContactStage,
+    },
     format_node_id, format_path_field, format_receipt_field,
     frame::{
         BlobInterest, BlobInterestSelector, BlobObjectId, BlobRangeDisposition,
@@ -3837,64 +3841,193 @@ pub enum OrderedEventContactRole {
     Responder,
 }
 
-/// Terminal result for one adapter-neutral ordered Event contact admission.
-#[derive(Debug)]
-pub enum OrderedEventContactError {
-    /// The node is no longer admitting ordered Event contacts.
-    AdmissionClosed,
-    /// The bounded ordered Event contact lane is occupied.
-    AdmissionBusy,
-    /// The node actor could not receive the contact command.
-    ActorUnavailable,
-    /// The node actor stopped before completing the contact.
-    ActorStopped,
-    /// An admitted contact failed while running its protected session.
-    Contact(NodeError),
-}
-
-impl fmt::Display for OrderedEventContactError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::AdmissionClosed => {
-                formatter.write_str("ordered Event contact admission is closed")
-            }
-            Self::AdmissionBusy => formatter.write_str("ordered Event contact admission is busy"),
-            Self::ActorUnavailable => {
-                formatter.write_str("ordered Event contact actor is unavailable")
-            }
-            Self::ActorStopped => {
-                formatter.write_str("ordered Event contact actor stopped before completion")
-            }
-            Self::Contact(error) => write!(formatter, "ordered Event contact: {error}"),
-        }
-    }
-}
-
-impl Error for OrderedEventContactError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Contact(error) => Some(error),
-            Self::AdmissionClosed
-            | Self::AdmissionBusy
-            | Self::ActorUnavailable
-            | Self::ActorStopped => None,
-        }
-    }
-}
-
 struct OrderedEventContactCommand {
     role: OrderedEventContactRole,
     contact: Arc<dyn OrderedContact>,
     peer: MissionPeerExpectation,
-    response: oneshot::Sender<Result<PeerReceipt, OrderedEventContactError>>,
+    response: oneshot::Sender<Result<PeerReceipt, ContactOutcome>>,
     _session_permit: OwnedSemaphorePermit,
 }
 
 type OrderedEventContactTaskOutput = (
     OrderedEventContactRole,
-    oneshot::Sender<Result<PeerReceipt, OrderedEventContactError>>,
-    Result<CompletedPeerContact, NodeError>,
+    oneshot::Sender<Result<PeerReceipt, ContactOutcome>>,
+    Result<CompletedPeerContact, OrderedEventContactTaskFailure>,
 );
+
+tokio::task_local! {
+    static ORDERED_CONTACT_EXACT_AUTHENTICATED: Arc<AtomicBool>;
+}
+
+struct OrderedEventContactTaskFailure {
+    outcome: ContactOutcome,
+    error: Option<NodeError>,
+}
+
+fn mark_ordered_contact_authenticated() {
+    let _ = ORDERED_CONTACT_EXACT_AUTHENTICATED
+        .try_with(|authenticated| authenticated.store(true, Ordering::Release));
+}
+
+fn ordered_contact_transport_outcome(
+    kind: ContactErrorKind,
+    authenticated: bool,
+) -> ContactOutcome {
+    if authenticated {
+        match kind {
+            ContactErrorKind::Unavailable => ContactOutcome::authenticated_transport(
+                ContactScope::AdapterEpoch,
+                ContactProvenance::Adapter,
+                ContactDisposition::Reselect,
+                ContactReason::CarrierUnavailable,
+            ),
+            ContactErrorKind::Timeout => ContactOutcome::authenticated_transport(
+                ContactScope::Attempt,
+                ContactProvenance::Adapter,
+                ContactDisposition::Reselect,
+                ContactReason::TransportTimeout,
+            ),
+            ContactErrorKind::Transport => ContactOutcome::authenticated_transport(
+                ContactScope::Attempt,
+                ContactProvenance::AuthenticatedMission,
+                ContactDisposition::Reselect,
+                ContactReason::TransportInterrupted,
+            ),
+            ContactErrorKind::Configuration
+            | ContactErrorKind::Bounds
+            | ContactErrorKind::Unauthorized
+            | ContactErrorKind::Protocol
+            | ContactErrorKind::Unsupported => ContactOutcome::authenticated_session(
+                ContactScope::Mission,
+                ContactDisposition::Suppress,
+                ContactReason::ProtocolViolation,
+            ),
+        }
+    } else {
+        match kind {
+            ContactErrorKind::Unavailable => ContactOutcome::pre_auth_transport(
+                ContactScope::AdapterEpoch,
+                ContactProvenance::Adapter,
+                ContactDisposition::Reselect,
+                ContactReason::CarrierUnavailable,
+            ),
+            ContactErrorKind::Timeout => ContactOutcome::pre_auth_transport(
+                ContactScope::Attempt,
+                ContactProvenance::Adapter,
+                ContactDisposition::Reselect,
+                ContactReason::TransportTimeout,
+            ),
+            ContactErrorKind::Transport => ContactOutcome::pre_auth_transport(
+                ContactScope::Attempt,
+                ContactProvenance::UnauthenticatedRemote,
+                ContactDisposition::RetryLater,
+                ContactReason::TransportInterrupted,
+            ),
+            ContactErrorKind::Unauthorized => {
+                ContactOutcome::pre_auth_remote(ContactReason::AuthenticationFailed)
+            }
+            ContactErrorKind::Configuration
+            | ContactErrorKind::Bounds
+            | ContactErrorKind::Protocol
+            | ContactErrorKind::Unsupported => {
+                ContactOutcome::pre_auth_remote(ContactReason::ProtocolViolation)
+            }
+        }
+    }
+}
+
+fn ordered_contact_failure(
+    error: NodeError,
+    authenticated: bool,
+) -> OrderedEventContactTaskFailure {
+    let outcome = if authenticated {
+        match &error {
+            NodeError::Mission(MissionSessionError::Contact(error)) => {
+                ordered_contact_transport_outcome(error.kind(), true)
+            }
+            NodeError::Carrier(_) => ContactOutcome::authenticated_transport(
+                ContactScope::Attempt,
+                ContactProvenance::Adapter,
+                ContactDisposition::Reselect,
+                ContactReason::TransportInterrupted,
+            ),
+            NodeError::EmissionPolicyChanged | NodeError::CustodySendSkipped => {
+                ContactOutcome::authenticated_session(
+                    ContactScope::Policy,
+                    ContactDisposition::RetryLater,
+                    ContactReason::PolicyRejected,
+                )
+            }
+            NodeError::Revoked(_) => ContactOutcome::authenticated_session(
+                ContactScope::ExpectedPeer,
+                ContactDisposition::Suppress,
+                ContactReason::PolicyRejected,
+            ),
+            NodeError::SourceEnvelope(_)
+            | NodeError::Mission(_)
+            | NodeError::Reconciliation(_)
+            | NodeError::Protocol(_) => ContactOutcome::authenticated_session(
+                ContactScope::Mission,
+                ContactDisposition::Suppress,
+                ContactReason::ProtocolViolation,
+            ),
+            NodeError::Configuration(_)
+            | NodeError::Identity(_)
+            | NodeError::MissionProvisioning(_)
+            | NodeError::SoftwareErasure(_)
+            | NodeError::Store(_)
+            | NodeError::FatalBlobCoherence(_)
+            | NodeError::Io(_)
+            | NodeError::Demo(_) => {
+                ContactOutcome::local_invariant(ContactStage::AuthenticatedSession)
+            }
+        }
+    } else {
+        match &error {
+            NodeError::Mission(MissionSessionError::MissionIdentityMismatch { .. })
+            | NodeError::Mission(MissionSessionError::ContactPeerEvidenceMismatch)
+            | NodeError::Mission(MissionSessionError::CarrierIdentityMismatch { .. }) => {
+                ContactOutcome::pre_auth_remote(ContactReason::IdentityMismatch)
+            }
+            NodeError::Mission(MissionSessionError::Authentication(_)) => {
+                ContactOutcome::pre_auth_remote(ContactReason::AuthenticationFailed)
+            }
+            NodeError::Mission(MissionSessionError::Contact(error)) => {
+                ordered_contact_transport_outcome(error.kind(), false)
+            }
+            NodeError::Mission(MissionSessionError::Carrier(_)) | NodeError::Carrier(_) => {
+                ContactOutcome::pre_auth_transport(
+                    ContactScope::Attempt,
+                    ContactProvenance::UnauthenticatedRemote,
+                    ContactDisposition::RetryLater,
+                    ContactReason::TransportInterrupted,
+                )
+            }
+            NodeError::Mission(MissionSessionError::CarrierSecurityProfileMismatch { .. })
+            | NodeError::SourceEnvelope(_)
+            | NodeError::Reconciliation(_)
+            | NodeError::Protocol(_) => {
+                ContactOutcome::pre_auth_remote(ContactReason::ProtocolViolation)
+            }
+            NodeError::EmissionPolicyChanged | NodeError::CustodySendSkipped => {
+                ContactOutcome::local_policy(ContactStage::MissionHandshake)
+            }
+            NodeError::Configuration(_)
+            | NodeError::Identity(_)
+            | NodeError::MissionProvisioning(_)
+            | NodeError::SoftwareErasure(_)
+            | NodeError::Revoked(_)
+            | NodeError::Store(_)
+            | NodeError::FatalBlobCoherence(_)
+            | NodeError::Io(_)
+            | NodeError::Demo(_) => ContactOutcome::local_invariant(ContactStage::MissionHandshake),
+        }
+    };
+    OrderedEventContactTaskFailure {
+        outcome,
+        error: Some(error),
+    }
+}
 
 struct OrderedEventContactCloseGuard(Option<Arc<dyn OrderedContact>>);
 
@@ -3935,10 +4068,10 @@ impl OrderedEventContactHandle {
         role: OrderedEventContactRole,
         contact: Arc<dyn OrderedContact>,
         peer: MissionPeerExpectation,
-    ) -> Result<PeerReceipt, OrderedEventContactError> {
+    ) -> Result<PeerReceipt, ContactOutcome> {
         if !self.admission.load(Ordering::Acquire) {
             contact.close();
-            return Err(OrderedEventContactError::AdmissionClosed);
+            return Err(ContactOutcome::admission_closed());
         }
         let session_permit = self
             .session_permit
@@ -3946,7 +4079,7 @@ impl OrderedEventContactHandle {
             .try_acquire_owned()
             .map_err(|_| {
                 contact.close();
-                OrderedEventContactError::AdmissionBusy
+                ContactOutcome::admission_busy()
             })?;
         let (response, completed) = oneshot::channel();
         let mut pending = OrderedEventContactCloseGuard(Some(contact.clone()));
@@ -3958,13 +4091,13 @@ impl OrderedEventContactHandle {
                 response,
                 _session_permit: session_permit,
             })
-            .map_err(|_| OrderedEventContactError::ActorUnavailable)?;
+            .map_err(|_| ContactOutcome::actor_unavailable())?;
         match completed.await {
             Ok(result) => {
                 pending.disarm();
                 result
             }
-            Err(_) => Err(OrderedEventContactError::ActorStopped),
+            Err(_) => Err(ContactOutcome::actor_stopped()),
         }
     }
 }
@@ -18423,11 +18556,7 @@ async fn run_node_actor_inner(
                             {
                                 receipt.contact_errors = receipt.contact_errors.saturating_add(1);
                                 command.contact.close();
-                                let _ = command.response.send(Err(
-                                    OrderedEventContactError::Contact(NodeError::Protocol(
-                                        "ordered Event mission roster capacity exhausted".into(),
-                                    )),
-                                ));
+                                let _ = command.response.send(Err(ContactOutcome::admission_busy()));
                                 continue;
                             }
                             // Submission through the bounded handle is the
@@ -18452,6 +18581,7 @@ async fn run_node_actor_inner(
                             } = command;
                             let _close = OrderedEventContactCloseGuard(Some(contact.clone()));
                             let contact = SelectedContact::from_ordered(contact);
+                            let authenticated = Arc::new(AtomicBool::new(false));
                             let session = async {
                                 if matches!(role, OrderedEventContactRole::Initiator) {
                                     drive_custody_maintenance(&store, &custody_clock, &[])?;
@@ -18514,12 +18644,26 @@ async fn run_node_actor_inner(
                                     )
                                 })?
                             };
+                            let session = ORDERED_CONTACT_EXACT_AUTHENTICATED
+                                .scope(authenticated.clone(), session);
                             let result = tokio::select! {
                                 biased;
-                                _ = response.closed() => Err(NodeError::Protocol(
-                                    "ordered Event contact caller cancelled the session".into(),
-                                )),
-                                result = session => result,
+                                _ = response.closed() => Err(OrderedEventContactTaskFailure {
+                                    outcome: ContactOutcome::caller_cancelled(
+                                        if authenticated.load(Ordering::Acquire) {
+                                            ContactStage::AuthenticatedSession
+                                        } else {
+                                            ContactStage::MissionHandshake
+                                        },
+                                    ),
+                                    error: None,
+                                }),
+                                result = session => result.map_err(|error| {
+                                    ordered_contact_failure(
+                                        error,
+                                        authenticated.load(Ordering::Acquire),
+                                    )
+                                }),
                             };
                             (role, response, result)
                         }));
@@ -18552,8 +18696,8 @@ async fn run_node_actor_inner(
                                 account_path_receipt(&mut receipt, &completed.receipt)
                             });
                         if let Err(error) = accounting {
-                            let _ = response.send(Err(OrderedEventContactError::Contact(
-                                NodeError::Protocol("ordered contact accounting failed".into()),
+                            let _ = response.send(Err(ContactOutcome::local_invariant(
+                                ContactStage::AuthenticatedSession,
                             )));
                             fatal_error = Some(error);
                             break;
@@ -18562,10 +18706,8 @@ async fn run_node_actor_inner(
                         receipt.contacts = match receipt.contacts.checked_add(1) {
                             Some(contacts) => contacts,
                             None => {
-                                let _ = response.send(Err(OrderedEventContactError::Contact(
-                                    NodeError::Protocol(
-                                        "aggregate ordered contact count overflow".into(),
-                                    ),
+                                let _ = response.send(Err(ContactOutcome::local_invariant(
+                                    ContactStage::AuthenticatedSession,
                                 )));
                                 fatal_error = Some(NodeError::Protocol(
                                     "aggregate contact count overflow".into(),
@@ -18592,23 +18734,22 @@ async fn run_node_actor_inner(
                         );
                         let _ = response.send(Ok(peer_receipt));
                     }
-                    Some(Ok((_role, response, Err(error)))) => {
+                    Some(Ok((_role, response, Err(mut failure)))) => {
                         receipt.contact_errors = receipt.contact_errors.saturating_add(1);
-                        if actor_fatal_contact_error(&error, config.mission.identity()) {
-                            let _ = response.send(Err(OrderedEventContactError::Contact(
-                                NodeError::Protocol(
-                                    "ordered contact encountered a fatal local authorization error"
-                                        .into(),
-                                ),
+                        if failure.error.as_ref().is_some_and(|error| {
+                            actor_fatal_contact_error(error, config.mission.identity())
+                        }) {
+                            let _ = response.send(Err(ContactOutcome::local_invariant(
+                                failure.outcome.stage(),
                             )));
-                            fatal_error = Some(error);
+                            fatal_error = failure.error.take();
                             break;
                         }
                         node_stderr!(
-                            "CONTACT carrier=ordered status=error error={}",
-                            format_receipt_field(&error.to_string())
+                            "CONTACT carrier=ordered status=error outcome={}",
+                            format_receipt_field(&failure.outcome.to_string())
                         );
-                        let _ = response.send(Err(OrderedEventContactError::Contact(error)));
+                        let _ = response.send(Err(failure.outcome));
                     }
                     Some(Err(error)) => {
                         receipt.contact_errors = receipt.contact_errors.saturating_add(1);
@@ -19847,7 +19988,7 @@ async fn run_node_actor_inner(
         command.contact.close();
         let _ = command
             .response
-            .send(Err(OrderedEventContactError::AdmissionClosed));
+            .send(Err(ContactOutcome::admission_closed()));
     }
     if let Some(task) = audit_task.take() {
         let _ = task.await;
@@ -29193,6 +29334,9 @@ async fn sync_authenticated_event_session(
             (mission, handshake, None)
         }
     };
+    if contact.iroh().is_none() {
+        mark_ordered_contact_authenticated();
+    }
     if contact.iroh().is_none() && mission.semantic_version() != SEMANTIC_PROTOCOL_V9 {
         return Err(NodeError::Protocol(
             "ordered Event contacts require semantic protocol v9".into(),
@@ -31670,6 +31814,9 @@ async fn serve_selected_event_session(
             (mission, handshake, None)
         }
     };
+    if selected_contact.iroh().is_none() {
+        mark_ordered_contact_authenticated();
+    }
     if selected_contact.iroh().is_none() && mission.semantic_version() != SEMANTIC_PROTOCOL_V9 {
         return Err(NodeError::Protocol(
             "ordered Event contacts require semantic protocol v9".into(),
@@ -41137,7 +41284,12 @@ mod tests {
             .await
             .expect_err("closed admission must reject the ordered contact");
 
-        assert!(matches!(error, OrderedEventContactError::AdmissionClosed));
+        assert_eq!(error.stage(), ContactStage::Candidate);
+        assert_eq!(error.scope(), ContactScope::Attempt);
+        assert_eq!(error.provenance(), ContactProvenance::Local);
+        assert_eq!(error.disposition(), ContactDisposition::Terminal);
+        assert_eq!(error.reason(), ContactReason::AdmissionClosed);
+        assert!(!error.permits_reselection());
         assert_eq!(contact.operations(), 0);
         assert_eq!(contact.closes(), 1);
     }
@@ -41163,7 +41315,12 @@ mod tests {
             .await
             .expect_err("exhausted admission must reject the ordered contact");
 
-        assert!(matches!(error, OrderedEventContactError::AdmissionBusy));
+        assert_eq!(error.stage(), ContactStage::Candidate);
+        assert_eq!(error.scope(), ContactScope::Attempt);
+        assert_eq!(error.provenance(), ContactProvenance::Local);
+        assert_eq!(error.disposition(), ContactDisposition::RetryLater);
+        assert_eq!(error.reason(), ContactReason::AdmissionBusy);
+        assert!(!error.permits_reselection());
         assert_eq!(contact.operations(), 0);
         assert_eq!(contact.closes(), 1);
     }
@@ -41187,7 +41344,12 @@ mod tests {
             )
             .await
             .expect_err("stopped actor must reject the ordered contact");
-        assert!(matches!(error, OrderedEventContactError::ActorUnavailable));
+        assert_eq!(error.stage(), ContactStage::Candidate);
+        assert_eq!(error.scope(), ContactScope::Attempt);
+        assert_eq!(error.provenance(), ContactProvenance::Local);
+        assert_eq!(error.disposition(), ContactDisposition::RetryLater);
+        assert_eq!(error.reason(), ContactReason::ActorUnavailable);
+        assert!(!error.permits_reselection());
         assert_eq!(unavailable_contact.operations(), 0);
         assert!(unavailable_contact.closes() > 0);
 
@@ -41211,13 +41373,129 @@ mod tests {
             .await
             .expect_err("actor response loss must reject the ordered contact");
         actor.await.expect("synthetic actor");
-        assert!(matches!(error, OrderedEventContactError::ActorStopped));
+        assert_eq!(error.stage(), ContactStage::Candidate);
+        assert_eq!(error.scope(), ContactScope::Attempt);
+        assert_eq!(error.provenance(), ContactProvenance::Local);
+        assert_eq!(error.disposition(), ContactDisposition::Terminal);
+        assert_eq!(error.reason(), ContactReason::ActorStopped);
+        assert!(!error.permits_reselection());
         assert_eq!(stopped_contact.operations(), 0);
         assert!(stopped_contact.closes() > 0);
     }
 
+    #[test]
+    fn ordered_contact_caller_cancellation_stays_cancelled() {
+        let outcome = ContactOutcome::caller_cancelled(ContactStage::MissionHandshake);
+
+        assert_eq!(outcome.stage(), ContactStage::MissionHandshake);
+        assert_eq!(outcome.scope(), ContactScope::Attempt);
+        assert_eq!(outcome.provenance(), ContactProvenance::Local);
+        assert_eq!(outcome.disposition(), ContactDisposition::Cancelled);
+        assert_eq!(outcome.reason(), ContactReason::CallerCancelled);
+        assert!(!outcome.permits_reselection());
+    }
+
+    #[test]
+    fn ordered_contact_carrier_open_unavailability_permits_reselection() {
+        let outcome = ContactOutcome::carrier_open_unavailable();
+
+        assert_eq!(outcome.stage(), ContactStage::CarrierOpen);
+        assert_eq!(outcome.scope(), ContactScope::AdapterEpoch);
+        assert_eq!(outcome.provenance(), ContactProvenance::Adapter);
+        assert_eq!(outcome.disposition(), ContactDisposition::Reselect);
+        assert_eq!(outcome.reason(), ContactReason::CarrierUnavailable);
+        assert!(outcome.permits_reselection());
+    }
+
+    #[test]
+    fn ordered_contact_mission_identity_mismatch_is_pre_auth_and_not_reselectable() {
+        let failure = ordered_contact_failure(
+            NodeError::Mission(MissionSessionError::MissionIdentityMismatch {
+                expected: [0x11; 32],
+                authenticated: [0x22; 32],
+            }),
+            false,
+        );
+
+        assert_eq!(failure.outcome.stage(), ContactStage::MissionHandshake);
+        assert_eq!(failure.outcome.scope(), ContactScope::Locator);
+        assert_eq!(
+            failure.outcome.provenance(),
+            ContactProvenance::UnauthenticatedRemote
+        );
+        assert_eq!(
+            failure.outcome.disposition(),
+            ContactDisposition::RetryLater
+        );
+        assert_eq!(failure.outcome.reason(), ContactReason::IdentityMismatch);
+        assert!(!failure.outcome.permits_reselection());
+    }
+
+    #[test]
+    fn ordered_contact_handshake_authentication_failure_is_not_peer_scoped() {
+        let failure = ordered_contact_failure(
+            NodeError::Mission(MissionSessionError::Contact(ContactError::new(
+                ContactErrorKind::Unauthorized,
+                "synthetic authentication rejection",
+            ))),
+            false,
+        );
+
+        assert_eq!(failure.outcome.stage(), ContactStage::MissionHandshake);
+        assert_eq!(failure.outcome.scope(), ContactScope::Locator);
+        assert_eq!(
+            failure.outcome.provenance(),
+            ContactProvenance::UnauthenticatedRemote
+        );
+        assert_eq!(
+            failure.outcome.disposition(),
+            ContactDisposition::RetryLater
+        );
+        assert_eq!(
+            failure.outcome.reason(),
+            ContactReason::AuthenticationFailed
+        );
+        assert!(!failure.outcome.permits_reselection());
+    }
+
+    #[test]
+    fn ordered_contact_post_auth_protocol_failure_is_mission_scoped() {
+        let failure = ordered_contact_failure(
+            NodeError::Protocol("synthetic authenticated protocol rejection".into()),
+            true,
+        );
+
+        assert_eq!(failure.outcome.stage(), ContactStage::AuthenticatedSession);
+        assert_eq!(failure.outcome.scope(), ContactScope::Mission);
+        assert_eq!(
+            failure.outcome.provenance(),
+            ContactProvenance::AuthenticatedMission
+        );
+        assert_eq!(failure.outcome.disposition(), ContactDisposition::Suppress);
+        assert_eq!(failure.outcome.reason(), ContactReason::ProtocolViolation);
+        assert!(!failure.outcome.permits_reselection());
+    }
+
+    #[test]
+    fn ordered_contact_post_auth_policy_failure_is_policy_scoped() {
+        let failure = ordered_contact_failure(NodeError::EmissionPolicyChanged, true);
+
+        assert_eq!(failure.outcome.stage(), ContactStage::AuthenticatedSession);
+        assert_eq!(failure.outcome.scope(), ContactScope::Policy);
+        assert_eq!(
+            failure.outcome.provenance(),
+            ContactProvenance::AuthenticatedMission
+        );
+        assert_eq!(
+            failure.outcome.disposition(),
+            ContactDisposition::RetryLater
+        );
+        assert_eq!(failure.outcome.reason(), ContactReason::PolicyRejected);
+        assert!(!failure.outcome.permits_reselection());
+    }
+
     #[tokio::test]
-    async fn ordered_contact_failure_preserves_node_error() {
+    async fn ordered_contact_remote_pre_auth_failure_is_not_reselectable() {
         let test_root = root("ordered-contact-typed-failure");
         fs::create_dir_all(&test_root).expect("typed failure state");
         #[cfg(unix)]
@@ -41255,10 +41533,14 @@ mod tests {
                 MissionPeerExpectation::new(contact.peer_evidence(), peer.identity),
             )
             .await
-            .expect_err("contact failure must preserve its node error");
+            .expect_err("contact failure must return a closed outcome");
 
-        assert!(matches!(error, OrderedEventContactError::Contact(_)));
-        assert!(Error::source(&error).is_some_and(|source| source.is::<NodeError>()));
+        assert_eq!(error.stage(), ContactStage::MissionHandshake);
+        assert_eq!(error.scope(), ContactScope::Attempt);
+        assert_eq!(error.provenance(), ContactProvenance::UnauthenticatedRemote);
+        assert_eq!(error.disposition(), ContactDisposition::RetryLater);
+        assert_eq!(error.reason(), ContactReason::TransportInterrupted);
+        assert!(!error.permits_reselection());
         assert_eq!(contact.operations.load(Ordering::SeqCst), 1);
         assert!(contact.closes.load(Ordering::SeqCst) > 0);
         let receipt = node.shutdown().await.expect("typed failure shutdown");
@@ -42086,10 +42368,10 @@ mod tests {
                 MissionPeerExpectation::new(contact.peer_evidence(), peer.identity),
             )
             .await;
-        assert!(matches!(
-            result,
-            Err(OrderedEventContactError::Contact(NodeError::Protocol(_)))
-        ));
+        let error = result.expect_err("receive-only initiation must fail");
+        assert_eq!(error.stage(), ContactStage::MissionHandshake);
+        assert_eq!(error.disposition(), ContactDisposition::RetryLater);
+        assert!(!error.permits_reselection());
         assert_eq!(contact.operations(), 0);
         assert_eq!(contact.closes(), 1);
 
@@ -42297,10 +42579,9 @@ mod tests {
         )
         .await
         .expect("capacity rejection must not enter the contact");
-        assert!(matches!(
-            result,
-            Err(OrderedEventContactError::Contact(NodeError::Protocol(_)))
-        ));
+        let error = result.expect_err("roster capacity must fail");
+        assert_eq!(error.reason(), ContactReason::AdmissionBusy);
+        assert!(!error.permits_reselection());
         assert_eq!(rejected.operations(), 0);
         assert_eq!(rejected.closes(), 1);
 
@@ -42361,7 +42642,8 @@ mod tests {
             .await
             .expect("queued ordered response")
             .expect_err("queued shutdown must reject ordered admission");
-        assert!(matches!(error, OrderedEventContactError::AdmissionClosed));
+        assert_eq!(error.reason(), ContactReason::AdmissionClosed);
+        assert!(!error.permits_reselection());
         assert_eq!(contact.operations(), 0);
         assert_eq!(contact.closes(), 1);
         fs::remove_dir_all(test_root).expect("shutdown-priority cleanup");
@@ -42425,7 +42707,8 @@ mod tests {
         .await
         .expect("overlap must fail without waiting")
         .expect_err("overlap must be rejected");
-        assert!(matches!(error, OrderedEventContactError::AdmissionBusy));
+        assert_eq!(error.reason(), ContactReason::AdmissionBusy);
+        assert!(!error.permits_reselection());
         assert_eq!(rejected.operations(), 0);
         assert_eq!(rejected.closes(), 1);
 

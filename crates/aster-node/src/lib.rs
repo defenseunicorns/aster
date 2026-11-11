@@ -57,6 +57,7 @@ mod contact;
 pub mod control_admin;
 mod demo_publication;
 mod event_pages;
+mod event_transport;
 mod frame;
 mod identity;
 #[doc(hidden)]
@@ -79,6 +80,10 @@ pub use control_admin::{
     MAX_SELECTED_REKEY_REGISTRY_BYTES, MAX_SELECTED_REKEY_TOPIC_GRANTS, RegistryGenerationWitness,
     RevocationRequest, ScopeRekeyRequest, SelectedControlAdmin, SelectedControlHandle,
 };
+pub use event_transport::{
+    ContactDisposition, ContactOutcome, ContactProvenance, ContactReason, ContactScope,
+    ContactStage,
+};
 pub use identity::{IdentityError, NodeIdentity};
 pub use mission::{
     CLASSICAL_CHANNEL_BINDING_CONTEXT_BYTES, CarrierBoundClassicalMissionSession,
@@ -91,14 +96,14 @@ pub use runtime::{
     ControlPublicationReceipt, DemoScenario, EventEmissionPolicy,
     MAX_CUSTODY_FINALIZATION_CHARGE_MS, MissionExpectedPeer, MutableSourceInterests,
     NodeApplication, NodeBootstrapError, NodeBootstrapErrorKind, NodeConfig, NodeConfigOptions,
-    NodeError, NodeOperatorOutputPolicy, NodeReceipt, OrderedEventContactError,
-    OrderedEventContactHandle, OrderedEventContactRole, PeerReceipt, RunningNode,
-    SelectedForwardingConfig, SoftwareZeroizationPathState, SoftwareZeroizationReceipt,
-    SoftwareZeroizationState, SourceInterestSelector, StoreReceipt, TransportNeutralNodeConfig,
-    audit_store_event_operations, ensure_state_accepts_normal_operation,
-    format_control_transfer_id, inspect_store, put_opaque, run_demo, run_demo_scenario, run_node,
-    run_node_with_forwarding, start_externally_supervised_transport_neutral_node, start_node,
-    start_node_with_forwarding, start_node_with_forwarding_and_output_policy,
+    NodeError, NodeOperatorOutputPolicy, NodeReceipt, OrderedEventContactHandle,
+    OrderedEventContactRole, PeerReceipt, RunningNode, SelectedForwardingConfig,
+    SoftwareZeroizationPathState, SoftwareZeroizationReceipt, SoftwareZeroizationState,
+    SourceInterestSelector, StoreReceipt, TransportNeutralNodeConfig, audit_store_event_operations,
+    ensure_state_accepts_normal_operation, format_control_transfer_id, inspect_store, put_opaque,
+    run_demo, run_demo_scenario, run_node, run_node_with_forwarding,
+    start_externally_supervised_transport_neutral_node, start_node, start_node_with_forwarding,
+    start_node_with_forwarding_and_output_policy,
     start_supervised_node_with_forwarding_and_output_policy, start_transport_neutral_node,
     zeroize_node,
 };

@@ -8,8 +8,8 @@ use crate::{
 };
 use aster_contact::OrderedContact;
 use aster_node::{
-    MissionPeerExpectation, OrderedEventContactError, OrderedEventContactHandle,
-    OrderedEventContactRole, PeerReceipt,
+    ContactDisposition, ContactOutcome, ContactReason, MissionPeerExpectation,
+    OrderedEventContactHandle, OrderedEventContactRole, PeerReceipt,
 };
 use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc, time::Duration};
 use tokio::{sync::watch, task::JoinHandle, time::sleep};
@@ -20,7 +20,7 @@ const MAXIMUM_PEER_RETRY: Duration = Duration::from_secs(30);
 type ContactOpenFuture =
     Pin<Box<dyn Future<Output = Result<Arc<dyn OrderedContact>, DriverError>> + Send>>;
 pub(crate) type ContactAdmissionFuture =
-    Pin<Box<dyn Future<Output = Result<PeerReceipt, OrderedEventContactError>> + Send>>;
+    Pin<Box<dyn Future<Output = Result<PeerReceipt, ContactOutcome>> + Send>>;
 
 trait ContactOpener: Send + Sync {
     fn open(&self, config: ValidatedConfig, cancellation: OpenCancellation) -> ContactOpenFuture;
@@ -411,19 +411,29 @@ async fn run_attempt(
 }
 
 fn classify_admission_result(
-    result: Result<PeerReceipt, OrderedEventContactError>,
+    result: Result<PeerReceipt, ContactOutcome>,
 ) -> Result<AttemptOutcome, SupervisorError> {
     match result {
         Ok(receipt) => Ok(AttemptOutcome::Success(receipt.into())),
-        Err(OrderedEventContactError::AdmissionBusy) => {
+        Err(outcome) if outcome.reason() == ContactReason::AdmissionBusy => {
             Ok(AttemptOutcome::Retry(RetryCategory::AdmissionBusy))
         }
-        Err(OrderedEventContactError::Contact(_)) => {
-            Ok(AttemptOutcome::Retry(RetryCategory::Contact))
+        Err(outcome) if outcome.reason() == ContactReason::AdmissionClosed => {
+            Err(SupervisorError::AdmissionClosed)
         }
-        Err(OrderedEventContactError::AdmissionClosed) => Err(SupervisorError::AdmissionClosed),
-        Err(OrderedEventContactError::ActorUnavailable) => Err(SupervisorError::ActorUnavailable),
-        Err(OrderedEventContactError::ActorStopped) => Err(SupervisorError::ActorStopped),
+        Err(outcome) if outcome.reason() == ContactReason::ActorUnavailable => {
+            Err(SupervisorError::ActorUnavailable)
+        }
+        Err(outcome) if outcome.reason() == ContactReason::ActorStopped => {
+            Err(SupervisorError::ActorStopped)
+        }
+        Err(outcome) => match outcome.disposition() {
+            ContactDisposition::RetryLater
+            | ContactDisposition::Reselect
+            | ContactDisposition::Suppress
+            | ContactDisposition::Cancelled
+            | ContactDisposition::Terminal => Ok(AttemptOutcome::Retry(RetryCategory::Contact)),
+        },
     }
 }
 
@@ -504,8 +514,7 @@ mod tests {
         OrderedContact, TransientLocator,
     };
     use aster_node::{
-        MissionPeerExpectation, NodeError, OrderedEventContactError, OrderedEventContactRole,
-        PeerReceipt,
+        ContactOutcome, MissionPeerExpectation, OrderedEventContactRole, PeerReceipt,
     };
     use bluer::{Address, AddressType};
     use std::{
@@ -873,24 +882,19 @@ mod tests {
                     AdmissionAction::Pending => pending().await,
                     AdmissionAction::PendingUntilClosed(contact) => {
                         contact.wait_until_closed().await;
-                        Err(OrderedEventContactError::Contact(NodeError::Protocol(
-                            "test contact closed".to_owned(),
-                        )))
+                        Err(ContactOutcome::admission_busy())
                     }
                     AdmissionAction::DelayedTeardown(control) => {
                         control.wait().await;
-                        Err(OrderedEventContactError::Contact(NodeError::Protocol(
-                            "test teardown complete".to_owned(),
-                        )))
+                        Err(ContactOutcome::admission_busy())
                     }
                     AdmissionAction::Fail(failure) => Err(match failure {
-                        AdmissionFailure::Closed => OrderedEventContactError::AdmissionClosed,
-                        AdmissionFailure::Busy => OrderedEventContactError::AdmissionBusy,
-                        AdmissionFailure::Unavailable => OrderedEventContactError::ActorUnavailable,
-                        AdmissionFailure::Stopped => OrderedEventContactError::ActorStopped,
-                        AdmissionFailure::Contact => OrderedEventContactError::Contact(
-                            NodeError::Protocol("test contact failure".to_owned()),
-                        ),
+                        AdmissionFailure::Closed => ContactOutcome::admission_closed(),
+                        AdmissionFailure::Busy | AdmissionFailure::Contact => {
+                            ContactOutcome::admission_busy()
+                        }
+                        AdmissionFailure::Unavailable => ContactOutcome::actor_unavailable(),
+                        AdmissionFailure::Stopped => ContactOutcome::actor_stopped(),
                     }),
                 }
             })

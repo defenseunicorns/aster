@@ -18,8 +18,8 @@ use crate::{
 };
 use aster_contact::OrderedContact;
 use aster_node::{
-    MissionPeerExpectation, OrderedEventContactError, OrderedEventContactHandle,
-    OrderedEventContactRole, PeerReceipt,
+    ContactDisposition, ContactOutcome, ContactReason, MissionPeerExpectation,
+    OrderedEventContactHandle, OrderedEventContactRole, PeerReceipt,
 };
 use std::{
     future::Future,
@@ -101,7 +101,7 @@ impl EpochSignals {
 
 enum ContactAttemptOutcome {
     Opened(Box<OpenedContact>),
-    Completed(Box<Result<PeerReceipt, OrderedEventContactError>>),
+    Completed(Box<Result<PeerReceipt, ContactOutcome>>),
     OpenFailed(Box<ContactOpenFailure>),
     Cancelled,
 }
@@ -1066,7 +1066,25 @@ fn finish_contact_attempt(
                     *outbound_delay = OutboundDelay::CadenceUntil(now + config.contact_cadence());
                 }
             }
-            Err(OrderedEventContactError::AdmissionBusy | OrderedEventContactError::Contact(_)) => {
+            Err(outcome) if outcome.reason() == ContactReason::AdmissionClosed => {
+                return Err(SupervisorError::AdmissionClosed);
+            }
+            Err(outcome) if outcome.reason() == ContactReason::ActorUnavailable => {
+                return Err(SupervisorError::ActorUnavailable);
+            }
+            Err(outcome) if outcome.reason() == ContactReason::ActorStopped => {
+                return Err(SupervisorError::ActorStopped);
+            }
+            Err(outcome)
+                if outcome.reason() == ContactReason::AdmissionBusy
+                    || matches!(
+                        outcome.disposition(),
+                        ContactDisposition::RetryLater
+                            | ContactDisposition::Reselect
+                            | ContactDisposition::Suppress
+                            | ContactDisposition::Cancelled
+                    ) =>
+            {
                 if config.role() == FixedRole::Initiator {
                     *outbound_candidate_pending = admission.selected_candidate(now).is_some();
                     if *outbound_candidate_pending {
@@ -1075,15 +1093,7 @@ fn finish_contact_attempt(
                     }
                 }
             }
-            Err(OrderedEventContactError::AdmissionClosed) => {
-                return Err(SupervisorError::AdmissionClosed);
-            }
-            Err(OrderedEventContactError::ActorUnavailable) => {
-                return Err(SupervisorError::ActorUnavailable);
-            }
-            Err(OrderedEventContactError::ActorStopped) => {
-                return Err(SupervisorError::ActorStopped);
-            }
+            Err(_) => return Err(SupervisorError::ActorStopped),
         },
     }
     Ok(())
@@ -1357,7 +1367,7 @@ mod tests {
     };
     use aster_contact::OrderedContact;
     use aster_node::{
-        MissionPeerExpectation, OrderedEventContactError, OrderedEventContactRole, PeerReceipt,
+        ContactOutcome, MissionPeerExpectation, OrderedEventContactRole, PeerReceipt,
     };
     use bluer::{Address, AddressType};
     use std::{
@@ -1567,11 +1577,9 @@ mod tests {
                 started.notify_one();
                 let result = contact.finish_as_initiator().await;
                 drained.store(1, Ordering::SeqCst);
-                result.map(|()| PeerReceipt::default()).map_err(|_| {
-                    OrderedEventContactError::Contact(aster_node::NodeError::Protocol(
-                        "test contact closed".to_owned(),
-                    ))
-                })
+                result
+                    .map(|()| PeerReceipt::default())
+                    .map_err(|_| ContactOutcome::admission_busy())
             })
         }
     }
@@ -2023,15 +2031,15 @@ mod tests {
     fn terminal_contact_admission_errors_remain_terminal_supervisor_errors() {
         let cases = [
             (
-                OrderedEventContactError::AdmissionClosed,
+                ContactOutcome::admission_closed(),
                 SupervisorError::AdmissionClosed,
             ),
             (
-                OrderedEventContactError::ActorUnavailable,
+                ContactOutcome::actor_unavailable(),
                 SupervisorError::ActorUnavailable,
             ),
             (
-                OrderedEventContactError::ActorStopped,
+                ContactOutcome::actor_stopped(),
                 SupervisorError::ActorStopped,
             ),
         ];
