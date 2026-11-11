@@ -3,7 +3,7 @@ use crate::{
     DriverError, DriverErrorKind, FixedRole, ObservationOutcome, SupervisorError,
     ValidatedRosteredSupervisorConfig,
     discovery::{SCAN_ACTIVE_INTERVAL, SCAN_IDLE_INTERVAL},
-    lifecycle::ContactAdmission,
+    lifecycle::{ContactAdmission, ContactScheduleEffect, contact_schedule_effect},
     platform::{
         discovery::{
             BluezDiscoveryPlatform, BluezOwnerLoss, DiscoveryObservation, DiscoveryPlatform,
@@ -520,6 +520,8 @@ async fn run_rostered_supervisor(
                 error @ (SupervisorError::AdmissionClosed
                 | SupervisorError::ActorUnavailable
                 | SupervisorError::ActorStopped
+                | SupervisorError::ContactSuppressed(_)
+                | SupervisorError::ContactTerminal(_)
                 | SupervisorError::TaskStopped
                 | SupervisorError::PlatformCleanupUnconfirmed),
             ) => return Err(error),
@@ -1075,28 +1077,54 @@ fn finish_contact_attempt(
             Err(outcome) if outcome.reason() == ContactReason::ActorStopped => {
                 return Err(SupervisorError::ActorStopped);
             }
-            Err(outcome)
-                if outcome.reason() == ContactReason::AdmissionBusy
-                    || matches!(
-                        outcome.disposition(),
-                        ContactDisposition::RetryLater
-                            | ContactDisposition::Reselect
-                            | ContactDisposition::Suppress
-                            | ContactDisposition::Cancelled
-                    ) =>
-            {
-                if config.role() == FixedRole::Initiator {
-                    *outbound_candidate_pending = admission.selected_candidate(now).is_some();
-                    if *outbound_candidate_pending {
-                        *outbound_delay =
-                            OutboundDelay::PeerRetryUntil(now + contact_backoff.next_delay());
-                    }
-                }
-            }
-            Err(_) => return Err(SupervisorError::ActorStopped),
+            Err(outcome) => finish_contact_disposition(
+                config,
+                admission,
+                outcome.disposition(),
+                outcome.reason(),
+                now,
+                outbound_delay,
+                outbound_candidate_pending,
+                contact_backoff,
+            )?,
         },
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_contact_disposition(
+    config: &ValidatedRosteredSupervisorConfig,
+    admission: &mut DiscoveryAdmission,
+    disposition: ContactDisposition,
+    reason: ContactReason,
+    now: Instant,
+    outbound_delay: &mut OutboundDelay,
+    outbound_candidate_pending: &mut bool,
+    contact_backoff: &mut CappedBackoff,
+) -> Result<(), SupervisorError> {
+    match contact_schedule_effect(disposition) {
+        ContactScheduleEffect::RetryLater => {
+            if config.role() == FixedRole::Initiator {
+                *outbound_candidate_pending = admission.selected_candidate(now).is_some();
+                if *outbound_candidate_pending {
+                    *outbound_delay =
+                        OutboundDelay::PeerRetryUntil(now + contact_backoff.next_delay());
+                }
+            }
+            Ok(())
+        }
+        ContactScheduleEffect::Reselect => {
+            if config.role() == FixedRole::Initiator {
+                *outbound_candidate_pending = admission.selected_candidate(now).is_some();
+                *outbound_delay = OutboundDelay::Ready;
+            }
+            Ok(())
+        }
+        ContactScheduleEffect::Suppress => Err(SupervisorError::ContactSuppressed(reason)),
+        ContactScheduleEffect::Cancelled => Ok(()),
+        ContactScheduleEffect::Terminal => Err(SupervisorError::ContactTerminal(reason)),
+    }
 }
 
 async fn begin_outbound_contact<S>(
@@ -2063,6 +2091,82 @@ mod tests {
 
             assert_eq!(error, expected);
         }
+    }
+
+    #[test]
+    fn rostered_contact_dispositions_drive_distinct_scheduler_effects() {
+        let config = config();
+        let now = Instant::now();
+        let admission_with_candidate = || {
+            let record = AsterRosterBeaconV1::encode(
+                0x0081,
+                [0x6d; 16],
+                config.discovery_credentials(),
+                now,
+            )
+            .unwrap();
+            let locator = crate::CanonicalLocator::new(
+                Address::new([2, 0, 0, 0, 0, 0x6d]),
+                AddressType::LeRandom,
+            )
+            .unwrap();
+            let observation =
+                DiscoveryObservation::new(locator.address(), locator.address_type(), &record)
+                    .unwrap();
+            let mut admission = DiscoveryAdmission::new();
+            assert_eq!(admission.start_scan(now), crate::ScanStartOutcome::Started);
+            assert_eq!(
+                admit_platform_observation(&mut admission, &config, observation, now),
+                ObservationOutcome::Accepted
+            );
+            admission
+        };
+
+        let run = |disposition| {
+            let mut admission = admission_with_candidate();
+            let mut delay = OutboundDelay::Ready;
+            let mut pending = false;
+            let mut backoff = CappedBackoff::new(INITIAL_EPOCH_RETRY, MAXIMUM_EPOCH_RETRY);
+            let result = finish_contact_disposition(
+                &config,
+                &mut admission,
+                disposition,
+                ContactReason::ProtocolViolation,
+                now,
+                &mut delay,
+                &mut pending,
+                &mut backoff,
+            );
+            (result, pending, delay.deadline(now))
+        };
+
+        let (retry, retry_pending, retry_deadline) = run(ContactDisposition::RetryLater);
+        assert_eq!(retry, Ok(()));
+        assert!(retry_pending);
+        assert!(retry_deadline > now);
+
+        let (reselect, reselect_pending, reselect_deadline) = run(ContactDisposition::Reselect);
+        assert_eq!(reselect, Ok(()));
+        assert!(reselect_pending);
+        assert_eq!(reselect_deadline, now);
+
+        let (cancelled, cancelled_pending, cancelled_deadline) = run(ContactDisposition::Cancelled);
+        assert_eq!(cancelled, Ok(()));
+        assert!(!cancelled_pending);
+        assert_eq!(cancelled_deadline, now);
+
+        assert!(matches!(
+            run(ContactDisposition::Suppress).0,
+            Err(SupervisorError::ContactSuppressed(
+                ContactReason::ProtocolViolation
+            ))
+        ));
+        assert!(matches!(
+            run(ContactDisposition::Terminal).0,
+            Err(SupervisorError::ContactTerminal(
+                ContactReason::ProtocolViolation
+            ))
+        ));
     }
 
     #[test]

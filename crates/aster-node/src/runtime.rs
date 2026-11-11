@@ -3869,6 +3869,55 @@ fn mark_ordered_contact_authenticated() {
         .try_with(|authenticated| authenticated.store(true, Ordering::Release));
 }
 
+#[allow(dead_code)] // The automatic attempt ticket calls this boundary in Task 2.
+fn classify_ordered_contact_carrier_open<T>(
+    opened: Result<T, ContactError>,
+) -> Result<T, ContactOutcome> {
+    opened.map_err(|error| match error.kind() {
+        ContactErrorKind::Unavailable => ContactOutcome::carrier_open_unavailable(),
+        ContactErrorKind::Configuration
+        | ContactErrorKind::Bounds
+        | ContactErrorKind::Timeout
+        | ContactErrorKind::Transport
+        | ContactErrorKind::Unauthorized
+        | ContactErrorKind::Protocol
+        | ContactErrorKind::Unsupported => {
+            ContactOutcome::local_invariant(ContactStage::CarrierOpen)
+        }
+    })
+}
+
+async fn await_ordered_contact_response<F>(
+    mut response: oneshot::Sender<Result<PeerReceipt, ContactOutcome>>,
+    session: F,
+    authenticated: Arc<AtomicBool>,
+) -> (
+    oneshot::Sender<Result<PeerReceipt, ContactOutcome>>,
+    Result<CompletedPeerContact, OrderedEventContactTaskFailure>,
+)
+where
+    F: Future<Output = Result<CompletedPeerContact, NodeError>>,
+{
+    tokio::pin!(session);
+    let result = tokio::select! {
+        biased;
+        _ = response.closed() => Err(OrderedEventContactTaskFailure {
+            outcome: ContactOutcome::caller_cancelled(
+                if authenticated.load(Ordering::Acquire) {
+                    ContactStage::AuthenticatedSession
+                } else {
+                    ContactStage::MissionHandshake
+                },
+            ),
+            error: None,
+        }),
+        result = &mut session => result.map_err(|error| {
+            ordered_contact_failure_after_transition(error, &authenticated)
+        }),
+    };
+    (response, result)
+}
+
 fn ordered_contact_transport_outcome(
     kind: ContactErrorKind,
     authenticated: bool,
@@ -3906,15 +3955,15 @@ fn ordered_contact_transport_outcome(
     } else {
         match kind {
             ContactErrorKind::Unavailable => ContactOutcome::pre_auth_transport(
-                ContactScope::AdapterEpoch,
-                ContactProvenance::Adapter,
-                ContactDisposition::Reselect,
+                ContactScope::Attempt,
+                ContactProvenance::UnauthenticatedRemote,
+                ContactDisposition::RetryLater,
                 ContactReason::CarrierUnavailable,
             ),
             ContactErrorKind::Timeout => ContactOutcome::pre_auth_transport(
                 ContactScope::Attempt,
-                ContactProvenance::Adapter,
-                ContactDisposition::Reselect,
+                ContactProvenance::UnauthenticatedRemote,
+                ContactDisposition::RetryLater,
                 ContactReason::TransportTimeout,
             ),
             ContactErrorKind::Transport => ContactOutcome::pre_auth_transport(
@@ -4027,6 +4076,13 @@ fn ordered_contact_failure(
         outcome,
         error: Some(error),
     }
+}
+
+fn ordered_contact_failure_after_transition(
+    error: NodeError,
+    authenticated: &AtomicBool,
+) -> OrderedEventContactTaskFailure {
+    ordered_contact_failure(error, authenticated.load(Ordering::Acquire))
 }
 
 struct OrderedEventContactCloseGuard(Option<Arc<dyn OrderedContact>>);
@@ -18576,7 +18632,7 @@ async fn run_node_actor_inner(
                                 role,
                                 contact,
                                 peer,
-                                mut response,
+                                response,
                                 _session_permit,
                             } = command;
                             let _close = OrderedEventContactCloseGuard(Some(contact.clone()));
@@ -18646,25 +18702,12 @@ async fn run_node_actor_inner(
                             };
                             let session = ORDERED_CONTACT_EXACT_AUTHENTICATED
                                 .scope(authenticated.clone(), session);
-                            let result = tokio::select! {
-                                biased;
-                                _ = response.closed() => Err(OrderedEventContactTaskFailure {
-                                    outcome: ContactOutcome::caller_cancelled(
-                                        if authenticated.load(Ordering::Acquire) {
-                                            ContactStage::AuthenticatedSession
-                                        } else {
-                                            ContactStage::MissionHandshake
-                                        },
-                                    ),
-                                    error: None,
-                                }),
-                                result = session => result.map_err(|error| {
-                                    ordered_contact_failure(
-                                        error,
-                                        authenticated.load(Ordering::Acquire),
-                                    )
-                                }),
-                            };
+                            let (response, result) = await_ordered_contact_response(
+                                response,
+                                session,
+                                authenticated,
+                            )
+                            .await;
                             (role, response, result)
                         }));
                     }
@@ -41213,6 +41256,82 @@ mod tests {
         }
     }
 
+    struct TypedFailingOrderedContact {
+        kind: ContactErrorKind,
+        operations: AtomicUsize,
+        closes: AtomicUsize,
+    }
+
+    impl TypedFailingOrderedContact {
+        const fn new(kind: ContactErrorKind) -> Self {
+            Self {
+                kind,
+                operations: AtomicUsize::new(0),
+                closes: AtomicUsize::new(0),
+            }
+        }
+
+        fn fail<'a, T: 'a>(&'a self) -> aster_contact::ContactFuture<'a, T> {
+            self.operations.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Err(ContactError::new(
+                    self.kind,
+                    "synthetic typed ordered contact failure",
+                ))
+            })
+        }
+    }
+
+    impl OrderedContact for TypedFailingOrderedContact {
+        fn peer_evidence(&self) -> CarrierPeerEvidence {
+            CarrierPeerEvidence::UnauthenticatedLocator {
+                transient_locator: TransientLocator::new(b"typed-failing-contact".to_vec())
+                    .unwrap(),
+            }
+        }
+
+        fn max_frame_bytes(&self) -> usize {
+            64 * 1024
+        }
+
+        fn request_with_total_limit<'a>(
+            &'a self,
+            _request: &'a [u8],
+            _total_limit: usize,
+        ) -> aster_contact::ContactFuture<'a, Vec<u8>> {
+            self.fail()
+        }
+
+        fn request_with_total_limit_checked<'a>(
+            &'a self,
+            _request: &'a [u8],
+            _total_limit: usize,
+            _before_write: aster_contact::ContactPreflight<'a>,
+        ) -> aster_contact::ContactFuture<'a, Vec<u8>> {
+            self.fail()
+        }
+
+        fn respond_once_with_total_limit<'a>(
+            &'a self,
+            _total_limit: usize,
+            _handler: aster_contact::ContactRequestHandler<'a>,
+        ) -> aster_contact::ContactFuture<'a, bool> {
+            self.fail()
+        }
+
+        fn finish_as_initiator(&self) -> aster_contact::ContactFuture<'_, ()> {
+            self.fail()
+        }
+
+        fn finish_as_responder(&self) -> aster_contact::ContactFuture<'_, ()> {
+            self.fail()
+        }
+
+        fn close(&self) {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     impl OrderedContact for FailingOrderedContact {
         fn peer_evidence(&self) -> CarrierPeerEvidence {
             CarrierPeerEvidence::UnauthenticatedLocator {
@@ -41383,9 +41502,38 @@ mod tests {
         assert!(stopped_contact.closes() > 0);
     }
 
-    #[test]
-    fn ordered_contact_caller_cancellation_stays_cancelled() {
-        let outcome = ContactOutcome::caller_cancelled(ContactStage::MissionHandshake);
+    #[tokio::test]
+    async fn ordered_contact_caller_cancellation_stays_cancelled() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let handle = OrderedEventContactHandle {
+            sender,
+            admission: Arc::new(AtomicBool::new(true)),
+            session_permit: Arc::new(Semaphore::new(1)),
+        };
+        let peer = issue_missions(1).remove(0);
+        let contact = Arc::new(StalledOrderedContact::default());
+        let run_contact = contact.clone();
+        let caller = tokio::spawn(async move {
+            handle
+                .run(
+                    OrderedEventContactRole::Initiator,
+                    run_contact.clone(),
+                    MissionPeerExpectation::new(run_contact.peer_evidence(), peer.identity),
+                )
+                .await
+        });
+        let command = receiver.recv().await.expect("real ordered contact command");
+        let authenticated = Arc::new(AtomicBool::new(false));
+        let actor = tokio::spawn(await_ordered_contact_response(
+            command.response,
+            std::future::pending(),
+            authenticated,
+        ));
+
+        caller.abort();
+        let (_response, result) = actor.await.expect("synthetic ordered actor");
+        let failure = result.expect_err("dropping run must close the actor response");
+        let outcome = failure.outcome;
 
         assert_eq!(outcome.stage(), ContactStage::MissionHandshake);
         assert_eq!(outcome.scope(), ContactScope::Attempt);
@@ -41395,9 +41543,16 @@ mod tests {
         assert!(!outcome.permits_reselection());
     }
 
-    #[test]
-    fn ordered_contact_carrier_open_unavailability_permits_reselection() {
-        let outcome = ContactOutcome::carrier_open_unavailable();
+    #[tokio::test]
+    async fn ordered_contact_carrier_open_unavailability_permits_reselection() {
+        let open = async {
+            Err::<(), _>(ContactError::new(
+                ContactErrorKind::Unavailable,
+                "synthetic locally observed adapter-open failure",
+            ))
+        };
+        let outcome = classify_ordered_contact_carrier_open(open.await)
+            .expect_err("adapter-open failure must be classified at carrier-open");
 
         assert_eq!(outcome.stage(), ContactStage::CarrierOpen);
         assert_eq!(outcome.scope(), ContactScope::AdapterEpoch);
@@ -41458,40 +41613,78 @@ mod tests {
         assert!(!failure.outcome.permits_reselection());
     }
 
-    #[test]
-    fn ordered_contact_post_auth_protocol_failure_is_mission_scoped() {
-        let failure = ordered_contact_failure(
+    #[tokio::test]
+    async fn ordered_contact_post_auth_scope_requires_completed_exact_transcript() {
+        let test_root = root("ordered-contact-authenticated-outcomes");
+        let initiator_root = test_root.join("initiator");
+        let responder_root = test_root.join("responder");
+        fs::create_dir_all(&initiator_root).expect("initiator state");
+        fs::create_dir_all(&responder_root).expect("responder state");
+        #[cfg(unix)]
+        for state in [&initiator_root, &responder_root] {
+            fs::set_permissions(state, fs::Permissions::from_mode(0o700))
+                .expect("owner-only node state");
+        }
+        let mut issued = issue_missions(2);
+        let initiator = issued.remove(0);
+        let responder = issued.remove(0);
+        let authority = initiator.credentials.mission_authority_id();
+        let initiator_store = Arc::new(
+            Store::open_for_mission(initiator_root.join(STORE_FILE), authority)
+                .expect("initiator store"),
+        );
+        let responder_store = Arc::new(
+            Store::open_for_mission(responder_root.join(STORE_FILE), authority)
+                .expect("responder store"),
+        );
+        let authenticated = Arc::new(AtomicBool::new(false));
+
+        ORDERED_CONTACT_EXACT_AUTHENTICATED
+            .scope(
+                authenticated.clone(),
+                ordered_test_event_contact_pair(
+                    initiator_store.clone(),
+                    initiator.credentials.clone(),
+                    initiator.identity,
+                    responder_store.clone(),
+                    responder.credentials.clone(),
+                    responder.identity,
+                    0xc7,
+                ),
+            )
+            .await;
+        assert!(authenticated.load(Ordering::Acquire));
+
+        let protocol = ordered_contact_failure_after_transition(
             NodeError::Protocol("synthetic authenticated protocol rejection".into()),
-            true,
+            &authenticated,
         );
-
-        assert_eq!(failure.outcome.stage(), ContactStage::AuthenticatedSession);
-        assert_eq!(failure.outcome.scope(), ContactScope::Mission);
+        assert_eq!(protocol.outcome.stage(), ContactStage::AuthenticatedSession);
+        assert_eq!(protocol.outcome.scope(), ContactScope::Mission);
         assert_eq!(
-            failure.outcome.provenance(),
+            protocol.outcome.provenance(),
             ContactProvenance::AuthenticatedMission
         );
-        assert_eq!(failure.outcome.disposition(), ContactDisposition::Suppress);
-        assert_eq!(failure.outcome.reason(), ContactReason::ProtocolViolation);
-        assert!(!failure.outcome.permits_reselection());
-    }
+        assert_eq!(protocol.outcome.disposition(), ContactDisposition::Suppress);
+        assert_eq!(protocol.outcome.reason(), ContactReason::ProtocolViolation);
+        assert!(!protocol.outcome.permits_reselection());
 
-    #[test]
-    fn ordered_contact_post_auth_policy_failure_is_policy_scoped() {
-        let failure = ordered_contact_failure(NodeError::EmissionPolicyChanged, true);
-
-        assert_eq!(failure.outcome.stage(), ContactStage::AuthenticatedSession);
-        assert_eq!(failure.outcome.scope(), ContactScope::Policy);
+        let policy = ordered_contact_failure_after_transition(
+            NodeError::EmissionPolicyChanged,
+            &authenticated,
+        );
+        assert_eq!(policy.outcome.stage(), ContactStage::AuthenticatedSession);
+        assert_eq!(policy.outcome.scope(), ContactScope::Policy);
         assert_eq!(
-            failure.outcome.provenance(),
+            policy.outcome.provenance(),
             ContactProvenance::AuthenticatedMission
         );
-        assert_eq!(
-            failure.outcome.disposition(),
-            ContactDisposition::RetryLater
-        );
-        assert_eq!(failure.outcome.reason(), ContactReason::PolicyRejected);
-        assert!(!failure.outcome.permits_reselection());
+        assert_eq!(policy.outcome.disposition(), ContactDisposition::RetryLater);
+        assert_eq!(policy.outcome.reason(), ContactReason::PolicyRejected);
+        assert!(!policy.outcome.permits_reselection());
+
+        drop((initiator_store, responder_store));
+        fs::remove_dir_all(test_root).expect("authenticated outcome cleanup");
     }
 
     #[tokio::test]
@@ -41547,6 +41740,67 @@ mod tests {
         assert_eq!(receipt.contact_errors, 1);
         assert!(captured.records().is_empty());
         fs::remove_dir_all(test_root).expect("typed failure cleanup");
+    }
+
+    #[tokio::test]
+    async fn ordered_contact_post_open_pre_auth_deadlines_are_not_reselectable() {
+        for (kind, reason) in [
+            (
+                ContactErrorKind::Unavailable,
+                ContactReason::CarrierUnavailable,
+            ),
+            (ContactErrorKind::Timeout, ContactReason::TransportTimeout),
+        ] {
+            let test_root = root(match kind {
+                ContactErrorKind::Unavailable => "ordered-contact-pre-auth-unavailable",
+                ContactErrorKind::Timeout => "ordered-contact-pre-auth-timeout",
+                _ => unreachable!(),
+            });
+            fs::create_dir_all(&test_root).expect("typed failure state");
+            #[cfg(unix)]
+            fs::set_permissions(&test_root, fs::Permissions::from_mode(0o700))
+                .expect("owner-only typed failure state");
+            let mut issued = issue_missions(2);
+            let local = issued.remove(0);
+            let peer = issued.remove(0);
+            let (output, _captured) = captured_node_output(NodeOperatorOutputPolicy::CustomerSafe);
+            let node = start_externally_supervised_transport_neutral_node_with_output(
+                TransportNeutralNodeConfig {
+                    state: test_root.clone(),
+                    mission: local.credentials,
+                    mutable_interests: MutableSourceInterests::default(),
+                    sync_interval: Duration::from_secs(60),
+                    run_for: None,
+                    application: NodeApplication::Relay,
+                },
+                output,
+            )
+            .await
+            .expect("start typed failure node");
+            let contact = Arc::new(TypedFailingOrderedContact::new(kind));
+
+            let error = node
+                .ordered_event_contacts()
+                .run(
+                    OrderedEventContactRole::Initiator,
+                    contact.clone(),
+                    MissionPeerExpectation::new(contact.peer_evidence(), peer.identity),
+                )
+                .await
+                .expect_err("pre-authentication transport failure must be closed");
+
+            assert_eq!(error.stage(), ContactStage::MissionHandshake);
+            assert_eq!(error.scope(), ContactScope::Attempt);
+            assert_eq!(error.provenance(), ContactProvenance::UnauthenticatedRemote);
+            assert_eq!(error.disposition(), ContactDisposition::RetryLater);
+            assert_eq!(error.reason(), reason);
+            assert!(!error.permits_reselection());
+            assert_eq!(contact.operations.load(Ordering::SeqCst), 1);
+            assert!(contact.closes.load(Ordering::SeqCst) > 0);
+
+            node.shutdown().await.expect("typed failure shutdown");
+            fs::remove_dir_all(test_root).expect("typed failure cleanup");
+        }
     }
 
     #[tokio::test]
@@ -41832,23 +42086,28 @@ mod tests {
             custody_clock: responder_custody_clock.clone(),
         };
         let responder_cache = test_event_route_cache(&responder_store, &responder.credentials);
+        let responder_authenticated = Arc::new(AtomicBool::new(false));
         let responder_task = tokio::spawn({
             let responder_store = responder_store.clone();
             let responder_credentials = responder.credentials.clone();
+            let responder_authenticated = responder_authenticated.clone();
             async move {
-                CONTACT_EVENT_ROUTE_CACHE
+                ORDERED_CONTACT_EXACT_AUTHENTICATED
                     .scope(
-                        responder_cache,
-                        CONTACT_EMISSION_GUARD.scope(
-                            responder_guard,
-                            serve_ordered_event_session(
-                                responder_store,
-                                responder_contact,
-                                responder_credentials,
-                                expectation(wrong.identity),
-                                responder_custody_clock,
-                                Arc::new(RwLock::new(())),
-                                MutableSourceInterests::default(),
+                        responder_authenticated,
+                        CONTACT_EVENT_ROUTE_CACHE.scope(
+                            responder_cache,
+                            CONTACT_EMISSION_GUARD.scope(
+                                responder_guard,
+                                serve_ordered_event_session(
+                                    responder_store,
+                                    responder_contact,
+                                    responder_credentials,
+                                    expectation(wrong.identity),
+                                    responder_custody_clock,
+                                    Arc::new(RwLock::new(())),
+                                    MutableSourceInterests::default(),
+                                ),
                             ),
                         ),
                     )
@@ -41882,12 +42141,26 @@ mod tests {
         let responder_result = responder_task.await.expect("responder task");
 
         assert!(initiator_result.is_err());
+        let responder_error = responder_result.expect_err("wrong exact mission must fail");
         assert!(matches!(
-            responder_result,
-            Err(NodeError::Mission(
-                MissionSessionError::MissionIdentityMismatch { .. }
-            ))
+            &responder_error,
+            NodeError::Mission(MissionSessionError::MissionIdentityMismatch { .. })
         ));
+        assert!(!responder_authenticated.load(Ordering::Acquire));
+        let failure =
+            ordered_contact_failure_after_transition(responder_error, &responder_authenticated);
+        assert_eq!(failure.outcome.stage(), ContactStage::MissionHandshake);
+        assert_eq!(failure.outcome.scope(), ContactScope::Locator);
+        assert_eq!(
+            failure.outcome.provenance(),
+            ContactProvenance::UnauthenticatedRemote
+        );
+        assert_eq!(
+            failure.outcome.disposition(),
+            ContactDisposition::RetryLater
+        );
+        assert_eq!(failure.outcome.reason(), ContactReason::IdentityMismatch);
+        assert!(!failure.outcome.permits_reselection());
         assert_eq!(initiator_operations.load(Ordering::SeqCst), 2);
         assert_eq!(responder_operations.load(Ordering::SeqCst), 2);
         assert_eq!(

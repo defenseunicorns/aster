@@ -70,6 +70,10 @@ pub enum SupervisorError {
     ActorUnavailable,
     /// The node actor stopped before completing the contact.
     ActorStopped,
+    /// Authenticated work is suppressed until a new authority lifecycle recreates the supervisor.
+    ContactSuppressed(ContactReason),
+    /// A closed contact outcome forbids automatic retry.
+    ContactTerminal(ContactReason),
     /// The controller monitor stopped with a closed driver category.
     Controller(DriverErrorKind),
     /// An owned supervisor child task stopped unexpectedly.
@@ -89,6 +93,14 @@ impl fmt::Display for SupervisorError {
                 formatter.write_str("Linux BTLE ordered Event actor is unavailable")
             }
             Self::ActorStopped => formatter.write_str("Linux BTLE ordered Event actor stopped"),
+            Self::ContactSuppressed(reason) => write!(
+                formatter,
+                "Linux BTLE ordered Event contact suppressed: {reason:?}"
+            ),
+            Self::ContactTerminal(reason) => write!(
+                formatter,
+                "Linux BTLE ordered Event contact terminated: {reason:?}"
+            ),
             Self::Controller(kind) => write!(formatter, "Linux BTLE controller failed: {kind:?}"),
             Self::TaskStopped => formatter.write_str("Linux BTLE supervisor task stopped"),
             Self::PlatformCleanupUnconfirmed => {
@@ -280,6 +292,10 @@ async fn run_contact_loop(
                         WaitOutcome::Stopped => return Ok(()),
                     }
                 }
+                AttemptOutcome::Reselect => {
+                    backoff.reset();
+                    continue;
+                }
                 AttemptOutcome::Changed => break,
                 AttemptOutcome::Stopped => return Ok(()),
             }
@@ -317,8 +333,30 @@ impl From<PeerReceipt> for ContactCompletion {
 enum AttemptOutcome {
     Success(ContactCompletion),
     Retry(RetryCategory),
+    Reselect,
     Changed,
     Stopped,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ContactScheduleEffect {
+    RetryLater,
+    Reselect,
+    Suppress,
+    Cancelled,
+    Terminal,
+}
+
+pub(super) const fn contact_schedule_effect(
+    disposition: ContactDisposition,
+) -> ContactScheduleEffect {
+    match disposition {
+        ContactDisposition::RetryLater => ContactScheduleEffect::RetryLater,
+        ContactDisposition::Reselect => ContactScheduleEffect::Reselect,
+        ContactDisposition::Suppress => ContactScheduleEffect::Suppress,
+        ContactDisposition::Cancelled => ContactScheduleEffect::Cancelled,
+        ContactDisposition::Terminal => ContactScheduleEffect::Terminal,
+    }
 }
 
 async fn run_attempt(
@@ -427,13 +465,20 @@ fn classify_admission_result(
         Err(outcome) if outcome.reason() == ContactReason::ActorStopped => {
             Err(SupervisorError::ActorStopped)
         }
-        Err(outcome) => match outcome.disposition() {
-            ContactDisposition::RetryLater
-            | ContactDisposition::Reselect
-            | ContactDisposition::Suppress
-            | ContactDisposition::Cancelled
-            | ContactDisposition::Terminal => Ok(AttemptOutcome::Retry(RetryCategory::Contact)),
-        },
+        Err(outcome) => classify_contact_disposition(outcome.disposition(), outcome.reason()),
+    }
+}
+
+fn classify_contact_disposition(
+    disposition: ContactDisposition,
+    reason: ContactReason,
+) -> Result<AttemptOutcome, SupervisorError> {
+    match contact_schedule_effect(disposition) {
+        ContactScheduleEffect::RetryLater => Ok(AttemptOutcome::Retry(RetryCategory::Contact)),
+        ContactScheduleEffect::Reselect => Ok(AttemptOutcome::Reselect),
+        ContactScheduleEffect::Suppress => Err(SupervisorError::ContactSuppressed(reason)),
+        ContactScheduleEffect::Cancelled => Ok(AttemptOutcome::Stopped),
+        ContactScheduleEffect::Terminal => Err(SupervisorError::ContactTerminal(reason)),
     }
 }
 
@@ -1454,6 +1499,49 @@ mod tests {
             supervisor.shutdown().await.unwrap_err(),
             SupervisorError::Configuration
         );
+    }
+
+    #[test]
+    fn contact_dispositions_have_distinct_scheduler_effects() {
+        assert!(matches!(
+            classify_contact_disposition(
+                ContactDisposition::RetryLater,
+                ContactReason::TransportInterrupted,
+            ),
+            Ok(AttemptOutcome::Retry(RetryCategory::Contact))
+        ));
+        assert!(matches!(
+            classify_contact_disposition(
+                ContactDisposition::Reselect,
+                ContactReason::CarrierUnavailable,
+            ),
+            Ok(AttemptOutcome::Reselect)
+        ));
+        assert!(matches!(
+            classify_contact_disposition(
+                ContactDisposition::Suppress,
+                ContactReason::ProtocolViolation,
+            ),
+            Err(SupervisorError::ContactSuppressed(
+                ContactReason::ProtocolViolation
+            ))
+        ));
+        assert!(matches!(
+            classify_contact_disposition(
+                ContactDisposition::Cancelled,
+                ContactReason::CallerCancelled,
+            ),
+            Ok(AttemptOutcome::Stopped)
+        ));
+        assert!(matches!(
+            classify_contact_disposition(
+                ContactDisposition::Terminal,
+                ContactReason::LocalInvariant,
+            ),
+            Err(SupervisorError::ContactTerminal(
+                ContactReason::LocalInvariant
+            ))
+        ));
     }
 
     #[tokio::test(start_paused = true)]
