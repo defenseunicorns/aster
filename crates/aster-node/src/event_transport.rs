@@ -222,12 +222,65 @@ struct EventCohortKey {
 struct PendingEventCohort {
     key: EventCohortKey,
     runner: EventAttemptRunner,
-    failed_instances: BTreeMap<EventTransportKind, (u64, u64)>,
-    mailbox_full_instances: BTreeMap<EventTransportKind, (u64, u64)>,
+    failed_instances: BTreeMap<EventTransportKind, EventAdapterInstance>,
+    mailbox_full_instances: BTreeMap<EventTransportKind, EventAdapterInstance>,
+}
+
+impl PendingEventCohort {
+    fn excludes(
+        &self,
+        kind: EventTransportKind,
+        registration_identity: &Arc<EventAdapterRegistrationIdentity>,
+        availability_epoch: u64,
+    ) -> bool {
+        self.failed_instances
+            .get(&kind)
+            .is_some_and(|instance| instance.matches(registration_identity, availability_epoch))
+            || self
+                .mailbox_full_instances
+                .get(&kind)
+                .is_some_and(|instance| instance.matches(registration_identity, availability_epoch))
+    }
+}
+
+struct EventAdapterRegistrationIdentity;
+
+#[derive(Clone)]
+struct EventAdapterInstance {
+    registration_identity: Arc<EventAdapterRegistrationIdentity>,
+    availability_epoch: u64,
+}
+
+impl EventAdapterInstance {
+    fn new(
+        registration_identity: &Arc<EventAdapterRegistrationIdentity>,
+        availability_epoch: u64,
+    ) -> Self {
+        Self {
+            registration_identity: Arc::clone(registration_identity),
+            availability_epoch,
+        }
+    }
+
+    fn has_registration(
+        &self,
+        registration_identity: &Arc<EventAdapterRegistrationIdentity>,
+    ) -> bool {
+        Arc::ptr_eq(&self.registration_identity, registration_identity)
+    }
+
+    fn matches(
+        &self,
+        registration_identity: &Arc<EventAdapterRegistrationIdentity>,
+        availability_epoch: u64,
+    ) -> bool {
+        self.has_registration(registration_identity)
+            && self.availability_epoch == availability_epoch
+    }
 }
 
 struct RegisteredEventAdapter {
-    registration_id: u64,
+    registration_identity: Arc<EventAdapterRegistrationIdentity>,
     snapshot: EventAdapterSnapshot,
     attempts: mpsc::Sender<EventOutboundAttempt>,
 }
@@ -239,26 +292,13 @@ struct InFlightEventAttempt {
     key: EventCohortKey,
 }
 
+#[derive(Default)]
 struct AutomaticEventTransportState {
     adapters: BTreeMap<EventTransportKind, RegisteredEventAdapter>,
     eligibility: Vec<EventPeerEligibility>,
     pending: VecDeque<PendingEventCohort>,
     attempt_in_flight: Option<InFlightEventAttempt>,
-    next_registration_id: u64,
     transition_count: u64,
-}
-
-impl Default for AutomaticEventTransportState {
-    fn default() -> Self {
-        Self {
-            adapters: BTreeMap::new(),
-            eligibility: Vec::new(),
-            pending: VecDeque::new(),
-            attempt_in_flight: None,
-            next_registration_id: 1,
-            transition_count: 0,
-        }
-    }
 }
 
 struct AutomaticEventTransportShared {
@@ -330,12 +370,11 @@ impl AutomaticEventTransportHandle {
         if state.adapters.contains_key(&snapshot.kind) {
             return None;
         }
-        let registration_id = state.next_registration_id;
-        state.next_registration_id = state.next_registration_id.saturating_add(1);
+        let registration_identity = Arc::new(EventAdapterRegistrationIdentity);
         state.adapters.insert(
             snapshot.kind,
             RegisteredEventAdapter {
-                registration_id,
+                registration_identity: Arc::clone(&registration_identity),
                 snapshot,
                 attempts: sender,
             },
@@ -345,13 +384,13 @@ impl AutomaticEventTransportHandle {
             EventAdapterControl {
                 shared: Arc::downgrade(&self.shared),
                 kind: snapshot.kind,
-                registration_id,
+                registration_identity: Arc::clone(&registration_identity),
             },
             EventAttemptReceiver {
                 receiver,
                 shared: Arc::downgrade(&self.shared),
                 kind: snapshot.kind,
-                registration_id,
+                registration_identity,
             },
         ))
     }
@@ -458,7 +497,7 @@ impl AutomaticEventTransportHandle {
 pub struct EventAdapterControl {
     shared: Weak<AutomaticEventTransportShared>,
     kind: EventTransportKind,
-    registration_id: u64,
+    registration_identity: Arc<EventAdapterRegistrationIdentity>,
 }
 
 impl EventAdapterControl {
@@ -480,7 +519,7 @@ impl EventAdapterControl {
         let Some(adapter) = state.adapters.get_mut(&self.kind) else {
             return false;
         };
-        if adapter.registration_id != self.registration_id
+        if !Arc::ptr_eq(&adapter.registration_identity, &self.registration_identity)
             || snapshot.availability_epoch <= adapter.snapshot.availability_epoch
         {
             return false;
@@ -506,11 +545,9 @@ impl Drop for EventAdapterControl {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if state
-            .adapters
-            .get(&self.kind)
-            .is_some_and(|adapter| adapter.registration_id == self.registration_id)
-        {
+        if state.adapters.get(&self.kind).is_some_and(|adapter| {
+            Arc::ptr_eq(&adapter.registration_identity, &self.registration_identity)
+        }) {
             state.adapters.remove(&self.kind);
             transition(&shared, &mut state);
         }
@@ -522,7 +559,7 @@ pub struct EventAttemptReceiver {
     receiver: mpsc::Receiver<EventOutboundAttempt>,
     shared: Weak<AutomaticEventTransportShared>,
     kind: EventTransportKind,
-    registration_id: u64,
+    registration_identity: Arc<EventAdapterRegistrationIdentity>,
 }
 
 impl EventAttemptReceiver {
@@ -540,7 +577,7 @@ impl EventAttemptReceiver {
                 if pending
                     .mailbox_full_instances
                     .get(&self.kind)
-                    .is_some_and(|(registration_id, _)| *registration_id == self.registration_id)
+                    .is_some_and(|instance| instance.has_registration(&self.registration_identity))
                 {
                     pending.mailbox_full_instances.remove(&self.kind);
                 }
@@ -557,10 +594,10 @@ pub struct EventOutboundAttempt {
     identity: Arc<EventAttemptIdentity>,
     key: EventCohortKey,
     kind: EventTransportKind,
-    registration_id: u64,
+    registration_identity: Arc<EventAdapterRegistrationIdentity>,
     availability_epoch: u64,
     runner: EventAttemptRunner,
-    failed_instances: BTreeMap<EventTransportKind, (u64, u64)>,
+    failed_instances: BTreeMap<EventTransportKind, EventAdapterInstance>,
     completed: bool,
 }
 
@@ -622,8 +659,13 @@ impl EventOutboundAttempt {
                     .iter()
                     .any(|entry| entry.mission == self.key.mission && entry.peer == self.key.peer);
                 if still_current {
-                    self.failed_instances
-                        .insert(self.kind, (self.registration_id, self.availability_epoch));
+                    self.failed_instances.insert(
+                        self.kind,
+                        EventAdapterInstance::new(
+                            &self.registration_identity,
+                            self.availability_epoch,
+                        ),
+                    );
                     state.pending.push_front(PendingEventCohort {
                         key: self.key,
                         runner: Arc::clone(&self.runner),
@@ -692,10 +734,11 @@ fn transition(
                 .adapters
                 .values()
                 .filter(|adapter| {
-                    let instance = (adapter.registration_id, adapter.snapshot.availability_epoch);
-                    pending.failed_instances.get(&adapter.snapshot.kind) != Some(&instance)
-                        && pending.mailbox_full_instances.get(&adapter.snapshot.kind)
-                            != Some(&instance)
+                    !pending.excludes(
+                        adapter.snapshot.kind,
+                        &adapter.registration_identity,
+                        adapter.snapshot.availability_epoch,
+                    )
                 })
                 .map(|adapter| adapter.snapshot)
                 .collect();
@@ -708,10 +751,10 @@ fn transition(
             ) else {
                 break;
             };
-            let Some((registration_id, availability_epoch, attempts)) =
+            let Some((registration_identity, availability_epoch, attempts)) =
                 state.adapters.get(&kind).map(|adapter| {
                     (
-                        adapter.registration_id,
+                        Arc::clone(&adapter.registration_identity),
                         adapter.snapshot.availability_epoch,
                         adapter.attempts.clone(),
                     )
@@ -725,7 +768,7 @@ fn transition(
                 identity: Arc::clone(&identity),
                 key: pending.key,
                 kind,
-                registration_id,
+                registration_identity: Arc::clone(&registration_identity),
                 availability_epoch,
                 runner: Arc::clone(&pending.runner),
                 failed_instances: pending.failed_instances.clone(),
@@ -741,17 +784,16 @@ fn transition(
                 }
                 Err(mpsc::error::TrySendError::Full(mut attempt)) => {
                     attempt.completed = true;
-                    pending
-                        .mailbox_full_instances
-                        .insert(kind, (registration_id, availability_epoch));
+                    pending.mailbox_full_instances.insert(
+                        kind,
+                        EventAdapterInstance::new(&registration_identity, availability_epoch),
+                    );
                 }
                 Err(mpsc::error::TrySendError::Closed(mut attempt)) => {
                     attempt.completed = true;
-                    if state
-                        .adapters
-                        .get(&kind)
-                        .is_some_and(|adapter| adapter.registration_id == registration_id)
-                    {
+                    if state.adapters.get(&kind).is_some_and(|adapter| {
+                        Arc::ptr_eq(&adapter.registration_identity, &registration_identity)
+                    }) {
                         state.adapters.remove(&kind);
                     }
                 }
@@ -1489,6 +1531,182 @@ mod tests {
         assert_eq!(
             attempts.recv().await.unwrap().transport_kind(),
             EventTransportKind::IROH_QUIC_V1
+        );
+    }
+
+    fn stale_control_and_fresh_registration() -> (
+        AutomaticEventTransportHandle,
+        EventAdapterControl,
+        EventAdapterControl,
+        EventAttemptReceiver,
+    ) {
+        let handle = AutomaticEventTransportHandle::new();
+        assert!(
+            handle.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),])
+        );
+        let (stale_control, stale_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("stale registration");
+        drop(stale_attempts);
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
+
+        let (fresh_control, fresh_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("fresh registration");
+        assert!(!Arc::ptr_eq(
+            &stale_control.registration_identity,
+            &fresh_control.registration_identity,
+        ));
+        (handle, stale_control, fresh_control, fresh_attempts)
+    }
+
+    #[test]
+    fn stale_control_cannot_publish_to_fresh_same_kind_registration() {
+        let (_handle, stale_control, fresh_control, _fresh_attempts) =
+            stale_control_and_fresh_registration();
+
+        assert!(
+            !stale_control.publish_availability(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                2,
+                EventAdapterState::Unavailable,
+                true,
+                10,
+            ))
+        );
+        assert!(
+            fresh_control.publish_availability(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                2,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+        );
+    }
+
+    #[test]
+    fn stale_control_drop_cannot_remove_fresh_same_kind_registration() {
+        let (_handle, stale_control, fresh_control, _fresh_attempts) =
+            stale_control_and_fresh_registration();
+
+        drop(stale_control);
+        assert!(
+            fresh_control.publish_availability(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                2,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_receiver_dequeue_cannot_clear_fresh_registration_marker() {
+        let fresh_ticket_peer = [0x33; 32];
+        let pending_peer = [0x44; 32];
+        let ble_ticket_peer = [0x55; 32];
+        let eligibility = |peer, kind| {
+            EventPeerEligibility::provisioned_exact_peer(MISSION, peer, kind, true, 1, 0, None)
+        };
+        let handle = AutomaticEventTransportHandle::new();
+        assert!(
+            handle.replace_eligibility(vec![eligibility(PEER, EventTransportKind::IROH_QUIC_V1,)])
+        );
+        let (stale_control, mut stale_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("stale Iroh registration");
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
+        assert!(handle.replace_eligibility(vec![
+            eligibility(fresh_ticket_peer, EventTransportKind::IROH_QUIC_V1),
+            eligibility(pending_peer, EventTransportKind::IROH_QUIC_V1),
+            eligibility(ble_ticket_peer, EventTransportKind::BLE_L2CAP_V1),
+        ]));
+        drop(stale_control);
+
+        let (fresh_control, _fresh_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("fresh Iroh registration");
+        let (_ble_control, _ble_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("BLE registration");
+        assert!(handle.request_attempt(MISSION, fresh_ticket_peer, |_contact| async { Ok(()) }));
+        assert!(handle.request_attempt(MISSION, pending_peer, |_contact| async { Ok(()) }));
+        assert!(handle.request_attempt(MISSION, ble_ticket_peer, |_contact| async { Ok(()) }));
+        assert!(handle.replace_eligibility(vec![
+            eligibility(pending_peer, EventTransportKind::IROH_QUIC_V1),
+            eligibility(ble_ticket_peer, EventTransportKind::BLE_L2CAP_V1),
+        ]));
+
+        let marker_matches_fresh = || {
+            let state = handle
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            state
+                .pending
+                .iter()
+                .find(|cohort| cohort.key.peer == pending_peer)
+                .and_then(|cohort| {
+                    cohort
+                        .mailbox_full_instances
+                        .get(&EventTransportKind::IROH_QUIC_V1)
+                })
+                .is_some_and(|instance| instance.matches(&fresh_control.registration_identity, 1))
+        };
+        assert!(marker_matches_fresh(), "fresh Iroh full marker is present");
+
+        assert_eq!(
+            stale_attempts
+                .recv()
+                .await
+                .expect("stale buffered attempt")
+                .peer(),
+            PEER
+        );
+        assert!(
+            marker_matches_fresh(),
+            "stale receiver dequeue must not clear the fresh Iroh marker"
         );
     }
 
