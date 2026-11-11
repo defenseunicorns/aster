@@ -1,6 +1,598 @@
 //! Closed outcomes shared by Event transport admission and selection.
 
-use std::{error::Error, fmt};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, VecDeque},
+    error::Error,
+    fmt,
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex, Weak},
+    time::SystemTime,
+};
+
+use aster_contact::OrderedContact;
+use aster_mesh::NodeId;
+use tokio::sync::mpsc;
+
+/// Maximum distinct peer cohorts retained by the in-memory wake mailbox.
+pub const MAX_PENDING_EVENT_COHORTS: usize = 64;
+/// Maximum exact-peer eligibility entries retained by the selector.
+pub const MAX_EVENT_PEER_ELIGIBILITY: usize = 256;
+
+/// Stable in-process identity for an admitted Event transport adapter.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct EventTransportKind(u16);
+
+impl EventTransportKind {
+    /// Iroh QUIC adapter using the existing ordered-contact contract.
+    pub const IROH_QUIC_V1: Self = Self(1);
+    /// Bluetooth LE L2CAP CoC adapter using the existing ordered-contact contract.
+    pub const BLE_L2CAP_V1: Self = Self(2);
+
+    /// Returns the stable local kind identifier.
+    pub const fn as_u16(self) -> u16 {
+        self.0
+    }
+}
+
+/// Sanitized availability reported by one adapter-owned lifecycle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventAdapterState {
+    /// The adapter cannot originate a contact in this epoch.
+    Unavailable,
+    /// The adapter can originate an Event contact in this epoch.
+    Available,
+}
+
+/// Bounded adapter-owned input to local Event selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventAdapterSnapshot {
+    kind: EventTransportKind,
+    availability_epoch: u64,
+    state: EventAdapterState,
+    event_capable: bool,
+    configured_priority: u16,
+}
+
+impl EventAdapterSnapshot {
+    /// Creates one sanitized snapshot without locator or mission authority.
+    pub const fn new(
+        kind: EventTransportKind,
+        availability_epoch: u64,
+        state: EventAdapterState,
+        event_capable: bool,
+        configured_priority: u16,
+    ) -> Self {
+        Self {
+            kind,
+            availability_epoch,
+            state,
+            event_capable,
+            configured_priority,
+        }
+    }
+
+    /// Returns the stable adapter kind.
+    pub const fn kind(&self) -> EventTransportKind {
+        self.kind
+    }
+
+    /// Returns the adapter-owned lifecycle epoch.
+    pub const fn availability_epoch(&self) -> u64 {
+        self.availability_epoch
+    }
+
+    /// Returns the sanitized availability state.
+    pub const fn state(&self) -> EventAdapterState {
+        self.state
+    }
+
+    /// Returns whether this adapter is qualified for Event contacts.
+    pub const fn event_capable(&self) -> bool {
+        self.event_capable
+    }
+
+    /// Returns the local configured ranking priority; larger values rank first.
+    pub const fn configured_priority(&self) -> u16 {
+        self.configured_priority
+    }
+}
+
+/// Exact authority that established one peer-indexed eligibility entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventPeerEligibilitySource {
+    /// Local provisioning named the exact mission peer.
+    ProvisionedExactPeer,
+    /// A prior complete mission transcript authenticated the exact peer.
+    MissionAuthenticated,
+}
+
+/// Host-owned authority permitting one adapter kind for one exact mission peer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventPeerEligibility {
+    mission: NodeId,
+    peer: NodeId,
+    kind: EventTransportKind,
+    event_capable: bool,
+    source: EventPeerEligibilitySource,
+    authority_generation: u64,
+    revocation_generation: u64,
+    expires_at: Option<SystemTime>,
+}
+
+impl EventPeerEligibility {
+    /// Creates locally provisioned exact-peer authority.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn provisioned_exact_peer(
+        mission: NodeId,
+        peer: NodeId,
+        kind: EventTransportKind,
+        event_capable: bool,
+        authority_generation: u64,
+        revocation_generation: u64,
+        expires_at: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            mission,
+            peer,
+            kind,
+            event_capable,
+            source: EventPeerEligibilitySource::ProvisionedExactPeer,
+            authority_generation,
+            revocation_generation,
+            expires_at,
+        }
+    }
+
+    /// Creates authority learned from a prior exact-peer mission transcript.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // Runtime mission-authenticated binding is wired in Task 3.
+    pub(crate) const fn mission_authenticated(
+        mission: NodeId,
+        peer: NodeId,
+        kind: EventTransportKind,
+        event_capable: bool,
+        authority_generation: u64,
+        revocation_generation: u64,
+        expires_at: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            mission,
+            peer,
+            kind,
+            event_capable,
+            source: EventPeerEligibilitySource::MissionAuthenticated,
+            authority_generation,
+            revocation_generation,
+            expires_at,
+        }
+    }
+
+    /// Returns the authority source; there is deliberately no locator source.
+    pub const fn source(&self) -> EventPeerEligibilitySource {
+        self.source
+    }
+}
+
+fn select_event_adapter(
+    adapters: &[EventAdapterSnapshot],
+    eligibility: &[EventPeerEligibility],
+    mission: NodeId,
+    peer: NodeId,
+    now: SystemTime,
+) -> Option<EventTransportKind> {
+    adapters
+        .iter()
+        .filter(|adapter| {
+            adapter.state == EventAdapterState::Available
+                && adapter.event_capable
+                && eligibility.iter().any(|entry| {
+                    entry.mission == mission
+                        && entry.peer == peer
+                        && entry.kind == adapter.kind
+                        && entry.event_capable
+                        && entry.authority_generation > entry.revocation_generation
+                        && entry.expires_at.is_none_or(|expiry| now < expiry)
+                })
+        })
+        .min_by_key(|adapter| (Reverse(adapter.configured_priority), adapter.kind))
+        .map(|adapter| adapter.kind)
+}
+
+type EventAttemptFuture =
+    Pin<Box<dyn Future<Output = Result<(), ContactOutcome>> + Send + 'static>>;
+type EventAttemptRunner =
+    Arc<dyn Fn(Arc<dyn OrderedContact>) -> EventAttemptFuture + Send + Sync + 'static>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EventCohortKey {
+    mission: NodeId,
+    peer: NodeId,
+}
+
+struct PendingEventCohort {
+    key: EventCohortKey,
+    now: SystemTime,
+    runner: EventAttemptRunner,
+    failed_epochs: BTreeMap<EventTransportKind, u64>,
+}
+
+struct RegisteredEventAdapter {
+    registration_id: u64,
+    snapshot: EventAdapterSnapshot,
+    attempts: mpsc::Sender<EventOutboundAttempt>,
+}
+
+struct AutomaticEventTransportState {
+    adapters: BTreeMap<EventTransportKind, RegisteredEventAdapter>,
+    eligibility: Vec<EventPeerEligibility>,
+    pending: VecDeque<PendingEventCohort>,
+    attempt_in_flight: bool,
+    next_registration_id: u64,
+    transition_count: u64,
+}
+
+impl Default for AutomaticEventTransportState {
+    fn default() -> Self {
+        Self {
+            adapters: BTreeMap::new(),
+            eligibility: Vec::new(),
+            pending: VecDeque::new(),
+            attempt_in_flight: false,
+            next_registration_id: 1,
+            transition_count: 0,
+        }
+    }
+}
+
+#[derive(Default)]
+struct AutomaticEventTransportShared {
+    state: Mutex<AutomaticEventTransportState>,
+}
+
+/// Cloneable host handle for exact-peer Event adapter selection.
+#[derive(Clone, Default)]
+pub struct AutomaticEventTransportHandle {
+    shared: Arc<AutomaticEventTransportShared>,
+}
+
+impl AutomaticEventTransportHandle {
+    /// Creates an empty application-ready registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers one adapter-owned attempt mailbox.
+    ///
+    /// A duplicate live kind is rejected. Dropping the returned control removes
+    /// the registration; the receiver remains single-owner and bounded to one.
+    pub fn register(
+        &self,
+        snapshot: EventAdapterSnapshot,
+    ) -> Option<(EventAdapterControl, EventAttemptReceiver)> {
+        let (sender, receiver) = mpsc::channel(1);
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.adapters.contains_key(&snapshot.kind) {
+            return None;
+        }
+        let registration_id = state.next_registration_id;
+        state.next_registration_id = state.next_registration_id.saturating_add(1);
+        state.adapters.insert(
+            snapshot.kind,
+            RegisteredEventAdapter {
+                registration_id,
+                snapshot,
+                attempts: sender,
+            },
+        );
+        transition(&self.shared, &mut state);
+        Some((
+            EventAdapterControl {
+                shared: Arc::downgrade(&self.shared),
+                kind: snapshot.kind,
+                registration_id,
+            },
+            EventAttemptReceiver { receiver },
+        ))
+    }
+
+    /// Atomically replaces host-owned exact-peer eligibility.
+    ///
+    /// Returns `false` and preserves the prior authority when the replacement
+    /// exceeds [`MAX_EVENT_PEER_ELIGIBILITY`].
+    pub fn replace_eligibility(&self, eligibility: Vec<EventPeerEligibility>) -> bool {
+        if eligibility.len() > MAX_EVENT_PEER_ELIGIBILITY {
+            return false;
+        }
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.eligibility = eligibility;
+        transition(&self.shared, &mut state);
+        true
+    }
+
+    #[allow(dead_code)] // Wired to durable publication by Task 3 of this stacked increment.
+    pub(crate) fn request_attempt<F, Fut>(
+        &self,
+        mission: NodeId,
+        peer: NodeId,
+        now: SystemTime,
+        runner: F,
+    ) -> bool
+    where
+        F: Fn(Arc<dyn OrderedContact>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), ContactOutcome>> + Send + 'static,
+    {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.pending.len() >= MAX_PENDING_EVENT_COHORTS {
+            return false;
+        }
+        let runner: EventAttemptRunner = Arc::new(move |contact| Box::pin(runner(contact)));
+        state.pending.push_back(PendingEventCohort {
+            key: EventCohortKey { mission, peer },
+            now,
+            runner,
+            failed_epochs: BTreeMap::new(),
+        });
+        transition(&self.shared, &mut state);
+        true
+    }
+
+    #[allow(dead_code)] // Task 3 uses this deterministic no-spin observation in runtime tests.
+    pub(crate) fn transition_count(&self) -> u64 {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .transition_count
+    }
+}
+
+/// Adapter-owned availability publisher and registration lease.
+pub struct EventAdapterControl {
+    shared: Weak<AutomaticEventTransportShared>,
+    kind: EventTransportKind,
+    registration_id: u64,
+}
+
+impl EventAdapterControl {
+    /// Publishes a strictly newer sanitized lifecycle snapshot.
+    ///
+    /// A different kind, stale epoch, or replaced registration is rejected.
+    pub fn publish_availability(&self, snapshot: EventAdapterSnapshot) -> bool {
+        if snapshot.kind != self.kind {
+            return false;
+        }
+        let Some(shared) = self.shared.upgrade() else {
+            return false;
+        };
+        let mut state = shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(adapter) = state.adapters.get_mut(&self.kind) else {
+            return false;
+        };
+        if adapter.registration_id != self.registration_id
+            || snapshot.availability_epoch <= adapter.snapshot.availability_epoch
+        {
+            return false;
+        }
+        adapter.snapshot = snapshot;
+        transition(&shared, &mut state);
+        true
+    }
+}
+
+impl Drop for EventAdapterControl {
+    fn drop(&mut self) {
+        let Some(shared) = self.shared.upgrade() else {
+            return;
+        };
+        let mut state = shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state
+            .adapters
+            .get(&self.kind)
+            .is_some_and(|adapter| adapter.registration_id == self.registration_id)
+        {
+            state.adapters.remove(&self.kind);
+            transition(&shared, &mut state);
+        }
+    }
+}
+
+/// Single-owner receiver for one adapter's bounded outbound attempt lane.
+pub struct EventAttemptReceiver {
+    receiver: mpsc::Receiver<EventOutboundAttempt>,
+}
+
+impl EventAttemptReceiver {
+    /// Waits without polling for the next selected outbound attempt.
+    pub async fn recv(&mut self) -> Option<EventOutboundAttempt> {
+        self.receiver.recv().await
+    }
+}
+
+/// One globally admitted fresh Event contact attempt.
+pub struct EventOutboundAttempt {
+    shared: Arc<AutomaticEventTransportShared>,
+    key: EventCohortKey,
+    kind: EventTransportKind,
+    availability_epoch: u64,
+    now: SystemTime,
+    runner: EventAttemptRunner,
+    failed_epochs: BTreeMap<EventTransportKind, u64>,
+    completed: bool,
+}
+
+impl EventOutboundAttempt {
+    /// Returns the selected stable transport kind.
+    pub const fn transport_kind(&self) -> EventTransportKind {
+        self.kind
+    }
+
+    /// Returns the mission authority bound to the pending cohort.
+    pub const fn mission(&self) -> NodeId {
+        self.key.mission
+    }
+
+    /// Returns the exact expected mission peer.
+    pub const fn peer(&self) -> NodeId {
+        self.key.peer
+    }
+
+    /// Runs this fresh contact through the node-owned ordered Event admission.
+    pub async fn run(mut self, contact: Arc<dyn OrderedContact>) -> Result<(), ContactOutcome> {
+        let result = (Arc::clone(&self.runner))(contact).await;
+        self.complete(&result);
+        result
+    }
+
+    /// Completes carrier opening with locally proven adapter unavailability.
+    pub fn fail_carrier_open(mut self) -> ContactOutcome {
+        let outcome = ContactOutcome::carrier_open_unavailable();
+        self.complete(&Err(outcome));
+        outcome
+    }
+
+    fn complete(&mut self, result: &Result<(), ContactOutcome>) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.attempt_in_flight = false;
+        self.completed = true;
+        match result {
+            Ok(()) => transition(&self.shared, &mut state),
+            Err(outcome) if outcome.permits_reselection() => {
+                self.failed_epochs
+                    .insert(self.kind, self.availability_epoch);
+                state.pending.push_front(PendingEventCohort {
+                    key: self.key,
+                    now: self.now,
+                    runner: Arc::clone(&self.runner),
+                    failed_epochs: std::mem::take(&mut self.failed_epochs),
+                });
+                transition(&self.shared, &mut state);
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+impl Drop for EventOutboundAttempt {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.completed = true;
+        state.attempt_in_flight = false;
+        transition(&self.shared, &mut state);
+    }
+}
+
+fn transition(
+    shared: &Arc<AutomaticEventTransportShared>,
+    state: &mut AutomaticEventTransportState,
+) {
+    state.transition_count = state.transition_count.saturating_add(1);
+    if state.attempt_in_flight {
+        return;
+    }
+    let mut selected = None;
+    let pending_count = state.pending.len();
+    for _ in 0..pending_count {
+        let Some(pending) = state.pending.pop_front() else {
+            break;
+        };
+        let snapshots: Vec<_> = state
+            .adapters
+            .values()
+            .filter(|adapter| {
+                pending.failed_epochs.get(&adapter.snapshot.kind)
+                    != Some(&adapter.snapshot.availability_epoch)
+            })
+            .map(|adapter| adapter.snapshot)
+            .collect();
+        if let Some(kind) = select_event_adapter(
+            &snapshots,
+            &state.eligibility,
+            pending.key.mission,
+            pending.key.peer,
+            pending.now,
+        ) {
+            selected = Some((pending, kind));
+            break;
+        }
+        state.pending.push_back(pending);
+    }
+    let Some((pending, kind)) = selected else {
+        return;
+    };
+    let Some((availability_epoch, attempts)) = state.adapters.get(&kind).map(|adapter| {
+        (
+            adapter.snapshot.availability_epoch,
+            adapter.attempts.clone(),
+        )
+    }) else {
+        state.pending.push_front(pending);
+        return;
+    };
+    let attempt = EventOutboundAttempt {
+        shared: Arc::clone(shared),
+        key: pending.key,
+        kind,
+        availability_epoch,
+        now: pending.now,
+        runner: pending.runner,
+        failed_epochs: pending.failed_epochs,
+        completed: false,
+    };
+    match attempts.try_send(attempt) {
+        Ok(()) => state.attempt_in_flight = true,
+        Err(mpsc::error::TrySendError::Full(mut attempt)) => {
+            attempt.completed = true;
+            state.pending.push_front(PendingEventCohort {
+                key: attempt.key,
+                now: attempt.now,
+                runner: Arc::clone(&attempt.runner),
+                failed_epochs: std::mem::take(&mut attempt.failed_epochs),
+            });
+        }
+        Err(mpsc::error::TrySendError::Closed(mut attempt)) => {
+            attempt.completed = true;
+            state.pending.push_front(PendingEventCohort {
+                key: attempt.key,
+                now: attempt.now,
+                runner: Arc::clone(&attempt.runner),
+                failed_epochs: std::mem::take(&mut attempt.failed_epochs),
+            });
+            state.adapters.remove(&kind);
+            transition(shared, state);
+        }
+    }
+}
 
 /// Last trusted transition reached by one Event contact attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -296,3 +888,751 @@ impl fmt::Display for ContactOutcome {
 }
 
 impl Error for ContactOutcome {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aster_contact::{
+        CarrierPeerEvidence, ContactFuture, ContactPreflight, ContactRequestHandler,
+        TransientLocator,
+    };
+    use std::time::{Duration, UNIX_EPOCH};
+
+    const MISSION: [u8; 32] = [0x11; 32];
+    const PEER: [u8; 32] = [0x22; 32];
+
+    struct TestOrderedContact;
+
+    impl OrderedContact for TestOrderedContact {
+        fn peer_evidence(&self) -> CarrierPeerEvidence {
+            CarrierPeerEvidence::UnauthenticatedLocator {
+                transient_locator: TransientLocator::new(vec![1]).unwrap(),
+            }
+        }
+
+        fn max_frame_bytes(&self) -> usize {
+            1024
+        }
+
+        fn request_with_total_limit<'a>(
+            &'a self,
+            _request: &'a [u8],
+            _total_limit: usize,
+        ) -> ContactFuture<'a, Vec<u8>> {
+            Box::pin(async { unreachable!("test runner does not use the contact") })
+        }
+
+        fn request_with_total_limit_checked<'a>(
+            &'a self,
+            _request: &'a [u8],
+            _total_limit: usize,
+            _before_write: ContactPreflight<'a>,
+        ) -> ContactFuture<'a, Vec<u8>> {
+            Box::pin(async { unreachable!("test runner does not use the contact") })
+        }
+
+        fn respond_once_with_total_limit<'a>(
+            &'a self,
+            _total_limit: usize,
+            _handler: ContactRequestHandler<'a>,
+        ) -> ContactFuture<'a, bool> {
+            Box::pin(async { unreachable!("test runner does not use the contact") })
+        }
+
+        fn finish_as_initiator(&self) -> ContactFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn finish_as_responder(&self) -> ContactFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn close(&self) {}
+    }
+
+    #[test]
+    fn selector_returns_none_for_empty_or_unavailable_registry() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        assert_eq!(select_event_adapter(&[], &[], MISSION, PEER, now), None);
+
+        let unavailable = EventAdapterSnapshot::new(
+            EventTransportKind::IROH_QUIC_V1,
+            1,
+            EventAdapterState::Unavailable,
+            true,
+            10,
+        );
+        let eligible = EventPeerEligibility::provisioned_exact_peer(
+            MISSION,
+            PEER,
+            EventTransportKind::IROH_QUIC_V1,
+            true,
+            1,
+            0,
+            None,
+        );
+        assert_eq!(
+            select_event_adapter(&[unavailable], &[eligible], MISSION, PEER, now),
+            None
+        );
+    }
+
+    #[test]
+    fn selector_requires_local_eligibility_for_the_exact_mission_peer() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let available = EventAdapterSnapshot::new(
+            EventTransportKind::IROH_QUIC_V1,
+            1,
+            EventAdapterState::Available,
+            true,
+            10,
+        );
+        let eligible = EventPeerEligibility::provisioned_exact_peer(
+            MISSION,
+            PEER,
+            EventTransportKind::IROH_QUIC_V1,
+            true,
+            1,
+            0,
+            None,
+        );
+
+        assert_eq!(
+            select_event_adapter(&[available], &[eligible], MISSION, PEER, now),
+            Some(EventTransportKind::IROH_QUIC_V1)
+        );
+        assert_eq!(
+            select_event_adapter(&[available], &[eligible], MISSION, [0x23; 32], now),
+            None
+        );
+        assert_eq!(
+            select_event_adapter(&[available], &[], MISSION, PEER, now),
+            None
+        );
+    }
+
+    #[test]
+    fn selector_rejects_expired_or_revoked_peer_authority() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let available = EventAdapterSnapshot::new(
+            EventTransportKind::IROH_QUIC_V1,
+            1,
+            EventAdapterState::Available,
+            true,
+            10,
+        );
+        let expired = EventPeerEligibility::provisioned_exact_peer(
+            MISSION,
+            PEER,
+            EventTransportKind::IROH_QUIC_V1,
+            true,
+            2,
+            0,
+            Some(now),
+        );
+        let revoked = EventPeerEligibility::provisioned_exact_peer(
+            MISSION,
+            PEER,
+            EventTransportKind::IROH_QUIC_V1,
+            true,
+            2,
+            2,
+            None,
+        );
+
+        assert_eq!(
+            select_event_adapter(&[available], &[expired], MISSION, PEER, now),
+            None
+        );
+        assert_eq!(
+            select_event_adapter(&[available], &[revoked], MISSION, PEER, now),
+            None
+        );
+    }
+
+    #[test]
+    fn selector_requires_event_capability_from_adapter_and_peer_authority() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let unavailable_for_event = EventAdapterSnapshot::new(
+            EventTransportKind::IROH_QUIC_V1,
+            1,
+            EventAdapterState::Available,
+            false,
+            10,
+        );
+        let adapter_capable = EventAdapterSnapshot::new(
+            EventTransportKind::IROH_QUIC_V1,
+            1,
+            EventAdapterState::Available,
+            true,
+            10,
+        );
+        let event_eligible = EventPeerEligibility::provisioned_exact_peer(
+            MISSION,
+            PEER,
+            EventTransportKind::IROH_QUIC_V1,
+            true,
+            1,
+            0,
+            None,
+        );
+        let not_event_eligible = EventPeerEligibility::provisioned_exact_peer(
+            MISSION,
+            PEER,
+            EventTransportKind::IROH_QUIC_V1,
+            false,
+            1,
+            0,
+            None,
+        );
+
+        assert_eq!(
+            select_event_adapter(
+                &[unavailable_for_event],
+                &[event_eligible],
+                MISSION,
+                PEER,
+                now,
+            ),
+            None
+        );
+        assert_eq!(
+            select_event_adapter(
+                &[adapter_capable],
+                &[not_event_eligible],
+                MISSION,
+                PEER,
+                now,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn selector_ranks_configured_priority_then_stable_kind() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let eligibility = [
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+        ];
+        let tied = [
+            EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ),
+            EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ),
+        ];
+        let ble_preferred = [
+            tied[1],
+            EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                11,
+            ),
+        ];
+
+        assert_eq!(
+            select_event_adapter(&tied, &eligibility, MISSION, PEER, now),
+            Some(EventTransportKind::IROH_QUIC_V1)
+        );
+        assert_eq!(
+            select_event_adapter(&ble_preferred, &eligibility, MISSION, PEER, now),
+            Some(EventTransportKind::BLE_L2CAP_V1)
+        );
+    }
+
+    #[test]
+    fn selector_accepts_authenticated_exact_peer_without_locator_input() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let available = EventAdapterSnapshot::new(
+            EventTransportKind::BLE_L2CAP_V1,
+            7,
+            EventAdapterState::Available,
+            true,
+            10,
+        );
+        let eligible = EventPeerEligibility::mission_authenticated(
+            MISSION,
+            PEER,
+            EventTransportKind::BLE_L2CAP_V1,
+            true,
+            9,
+            2,
+            None,
+        );
+
+        assert_eq!(
+            eligible.source(),
+            EventPeerEligibilitySource::MissionAuthenticated
+        );
+        assert_eq!(
+            select_event_adapter(&[available], &[eligible], MISSION, PEER, now),
+            Some(EventTransportKind::BLE_L2CAP_V1)
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_work_is_retained_until_an_eligible_adapter_registers() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let handle = AutomaticEventTransportHandle::new();
+        handle.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+            MISSION,
+            PEER,
+            EventTransportKind::IROH_QUIC_V1,
+            true,
+            1,
+            0,
+            None,
+        )]);
+        assert!(handle.request_attempt(MISSION, PEER, now, |_contact| async { Ok(()) }));
+
+        let (_control, mut attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("first registration is admitted");
+        let attempt = attempts.recv().await.expect("retained work wakes");
+        assert_eq!(attempt.transport_kind(), EventTransportKind::IROH_QUIC_V1);
+        assert_eq!(attempt.mission(), MISSION);
+        assert_eq!(attempt.peer(), PEER);
+    }
+
+    #[tokio::test]
+    async fn newer_availability_epoch_wakes_selection_and_stale_epoch_is_ignored() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let handle = AutomaticEventTransportHandle::new();
+        handle.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+            MISSION,
+            PEER,
+            EventTransportKind::IROH_QUIC_V1,
+            true,
+            1,
+            0,
+            None,
+        )]);
+        let (control, mut attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Unavailable,
+                true,
+                10,
+            ))
+            .unwrap();
+        assert!(handle.request_attempt(MISSION, PEER, now, |_contact| async { Ok(()) }));
+        assert!(attempts.receiver.try_recv().is_err());
+
+        assert!(!control.publish_availability(EventAdapterSnapshot::new(
+            EventTransportKind::IROH_QUIC_V1,
+            1,
+            EventAdapterState::Available,
+            true,
+            10,
+        )));
+        assert!(attempts.receiver.try_recv().is_err());
+
+        assert!(control.publish_availability(EventAdapterSnapshot::new(
+            EventTransportKind::IROH_QUIC_V1,
+            2,
+            EventAdapterState::Available,
+            true,
+            10,
+        )));
+        assert_eq!(
+            attempts.recv().await.unwrap().transport_kind(),
+            EventTransportKind::IROH_QUIC_V1
+        );
+    }
+
+    #[tokio::test]
+    async fn one_global_attempt_rotates_fairly_to_the_next_peer_after_completion() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let second_peer = [0x33; 32];
+        let handle = AutomaticEventTransportHandle::new();
+        handle.replace_eligibility(vec![
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                second_peer,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+        ]);
+        let (_control, mut attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .unwrap();
+        assert!(handle.request_attempt(MISSION, PEER, now, |_contact| async { Ok(()) }));
+        assert!(handle.request_attempt(MISSION, second_peer, now, |_contact| async { Ok(()) }));
+
+        let first = attempts.recv().await.unwrap();
+        assert_eq!(first.peer(), PEER);
+        assert!(attempts.receiver.try_recv().is_err());
+        assert_eq!(first.run(Arc::new(TestOrderedContact)).await, Ok(()));
+
+        let second = attempts.recv().await.unwrap();
+        assert_eq!(second.peer(), second_peer);
+    }
+
+    #[tokio::test]
+    async fn locally_proven_carrier_open_failure_reselects_an_alternate_kind() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let handle = AutomaticEventTransportHandle::new();
+        handle.replace_eligibility(vec![
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+        ]);
+        let (_iroh_control, mut iroh_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .unwrap();
+        let (_ble_control, mut ble_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .unwrap();
+        assert!(handle.request_attempt(MISSION, PEER, now, |_contact| async { Ok(()) }));
+
+        let selected = iroh_attempts.recv().await.unwrap();
+        let outcome = selected.fail_carrier_open();
+        assert_eq!(outcome, ContactOutcome::carrier_open_unavailable());
+        assert!(outcome.permits_reselection());
+        assert_eq!(
+            ble_attempts.recv().await.unwrap().transport_kind(),
+            EventTransportKind::BLE_L2CAP_V1
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_pre_auth_outcome_does_not_immediately_try_an_alternate_carrier() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let handle = AutomaticEventTransportHandle::new();
+        handle.replace_eligibility(vec![
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+        ]);
+        let (_iroh_control, mut iroh_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .unwrap();
+        let (_ble_control, mut ble_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .unwrap();
+        assert!(
+            handle.request_attempt(MISSION, PEER, now, |_contact| async {
+                Err(ContactOutcome::pre_auth_remote(
+                    ContactReason::AuthenticationFailed,
+                ))
+            })
+        );
+
+        let outcome = iroh_attempts
+            .recv()
+            .await
+            .unwrap()
+            .run(Arc::new(TestOrderedContact))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            outcome.provenance(),
+            ContactProvenance::UnauthenticatedRemote
+        );
+        assert!(!outcome.permits_reselection());
+        assert!(ble_attempts.receiver.try_recv().is_err());
+        assert!(iroh_attempts.receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn empty_registry_retains_work_without_spinning() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let handle = AutomaticEventTransportHandle::new();
+        handle.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+            MISSION,
+            PEER,
+            EventTransportKind::IROH_QUIC_V1,
+            true,
+            1,
+            0,
+            None,
+        )]);
+        assert!(handle.request_attempt(MISSION, PEER, now, |_contact| async { Ok(()) }));
+        let transitions_after_enqueue = handle.transition_count();
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(handle.transition_count(), transitions_after_enqueue);
+        assert_eq!(
+            handle
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pending
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_registration_makes_that_kind_unavailable() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let handle = AutomaticEventTransportHandle::new();
+        handle.replace_eligibility(vec![
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+        ]);
+        let (iroh_control, mut iroh_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .unwrap();
+        drop(iroh_control);
+        assert!(handle.request_attempt(MISSION, PEER, now, |_contact| async { Ok(()) }));
+        assert!(iroh_attempts.receiver.try_recv().is_err());
+
+        let (_ble_control, mut ble_attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .unwrap();
+        assert_eq!(
+            ble_attempts.recv().await.unwrap().transport_kind(),
+            EventTransportKind::BLE_L2CAP_V1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_an_attempt_releases_the_single_global_lane() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let second_peer = [0x33; 32];
+        let handle = AutomaticEventTransportHandle::new();
+        handle.replace_eligibility(vec![
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                second_peer,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+        ]);
+        let (_control, mut attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .unwrap();
+        assert!(handle.request_attempt(MISSION, PEER, now, |_contact| async { Ok(()) }));
+        assert!(handle.request_attempt(MISSION, second_peer, now, |_contact| async { Ok(()) }));
+
+        drop(attempts.recv().await.unwrap());
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), attempts.recv())
+                .await
+                .expect("dropping a ticket releases admission")
+                .unwrap()
+                .peer(),
+            second_peer
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ineligible_front_cohort_does_not_strand_a_later_eligible_peer() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let eligible_peer = [0x33; 32];
+        let handle = AutomaticEventTransportHandle::new();
+        handle.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+            MISSION,
+            eligible_peer,
+            EventTransportKind::IROH_QUIC_V1,
+            true,
+            1,
+            0,
+            None,
+        )]);
+        let (_control, mut attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .unwrap();
+        assert!(handle.request_attempt(MISSION, PEER, now, |_contact| async { Ok(()) }));
+        assert!(handle.request_attempt(MISSION, eligible_peer, now, |_contact| async { Ok(()) }));
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), attempts.recv())
+                .await
+                .expect("fair rotation reaches an eligible cohort")
+                .unwrap()
+                .peer(),
+            eligible_peer
+        );
+    }
+
+    #[test]
+    fn eligibility_replacement_is_bounded_and_preserves_last_valid_authority() {
+        let handle = AutomaticEventTransportHandle::new();
+        let eligible = EventPeerEligibility::provisioned_exact_peer(
+            MISSION,
+            PEER,
+            EventTransportKind::IROH_QUIC_V1,
+            true,
+            1,
+            0,
+            None,
+        );
+        assert!(handle.replace_eligibility(vec![eligible]));
+        assert!(!handle.replace_eligibility(vec![eligible; MAX_EVENT_PEER_ELIGIBILITY + 1]));
+        assert_eq!(
+            handle
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .eligibility,
+            vec![eligible]
+        );
+    }
+}
