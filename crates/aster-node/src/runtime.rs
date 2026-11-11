@@ -160,7 +160,7 @@ use crate::{
     event_transport::{
         AutomaticEventTransportHandle, ContactDisposition, ContactOutcome, ContactProvenance,
         ContactReason, ContactScope, ContactStage, EventAdapterControl, EventAdapterSnapshot,
-        EventAttemptReceiver, EventPeerEligibility,
+        EventAttemptAdmission, EventAttemptReceiver, EventPeerEligibility,
     },
     format_node_id, format_path_field, format_receipt_field,
     frame::{
@@ -3863,6 +3863,15 @@ pub struct RunningAutomaticEventTransportHandle {
     ordered_contacts: OrderedEventContactHandle,
 }
 
+/// Result of applying one complete automatic Event peer-eligibility roster.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutomaticEventRosterStatus {
+    /// Every current peer's durable generation is admitted or already scheduled.
+    Scheduled,
+    /// The roster is installed and at least one current peer awaits bounded capacity.
+    PendingCapacity,
+}
+
 impl RunningAutomaticEventTransportHandle {
     fn new(
         admission: Arc<AtomicBool>,
@@ -3892,28 +3901,43 @@ impl RunningAutomaticEventTransportHandle {
             .flatten()
     }
 
-    /// Replaces exact-peer eligibility and wakes this peer's durable generation.
+    /// Replaces the complete exact-peer eligibility roster and wakes every
+    /// unique current peer for this node's mission.
     ///
-    /// `peer` is the same authority-rostered identity represented by the
-    /// replacement entries. Mismatched entries remain ineligible in the closed
-    /// selector; the runtime does not reinterpret them.
+    /// Returns `None` when node admission is closed or the bounded coordinator
+    /// rejects the replacement. A pending-capacity result keeps the accepted
+    /// roster and durable scheduling obligations for an event-driven retry.
     pub fn replace_eligibility(
         &self,
-        peer: NodeId,
         eligibility: Vec<EventPeerEligibility>,
-    ) -> bool {
-        if !self.admission.load(Ordering::Acquire)
-            || !self.coordinator.replace_eligibility(eligibility)
-        {
-            return false;
+    ) -> Option<AutomaticEventRosterStatus> {
+        if !self.admission.load(Ordering::Acquire) {
+            return None;
         }
+        let current_peers = eligibility
+            .iter()
+            .filter(|entry| entry.mission() == self.mission)
+            .map(EventPeerEligibility::peer)
+            .collect::<BTreeSet<_>>();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.requested_generation.entry(peer).or_default();
-        self.request_peer_generation(&mut state, peer);
-        true
+        if !self.coordinator.replace_eligibility(eligibility) {
+            return None;
+        }
+        state
+            .requested_generation
+            .retain(|peer, _| current_peers.contains(peer));
+        for peer in &current_peers {
+            state.requested_generation.entry(*peer).or_default();
+        }
+        let pending_capacity = self.schedule_current_generation(&mut state);
+        Some(if pending_capacity {
+            AutomaticEventRosterStatus::PendingCapacity
+        } else {
+            AutomaticEventRosterStatus::Scheduled
+        })
     }
 
     fn note_durable_work(&self) {
@@ -3925,17 +3949,38 @@ impl RunningAutomaticEventTransportHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.durable_generation = state.durable_generation.saturating_add(1);
+        self.schedule_current_generation(&mut state);
+    }
+
+    fn retry_pending_capacity(&self) {
+        if !self.admission.load(Ordering::Acquire) {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.schedule_current_generation(&mut state);
+    }
+
+    fn schedule_current_generation(&self, state: &mut AutomaticEventRuntimeState) -> bool {
         let peers = state
             .requested_generation
             .keys()
             .copied()
             .collect::<Vec<_>>();
+        let mut pending_capacity = false;
         for peer in peers {
-            self.request_peer_generation(&mut state, peer);
+            pending_capacity |= !self.request_peer_generation(state, peer);
         }
+        pending_capacity
     }
 
-    fn request_peer_generation(&self, state: &mut AutomaticEventRuntimeState, peer: NodeId) {
+    fn request_peer_generation(
+        &self,
+        state: &mut AutomaticEventRuntimeState,
+        peer: NodeId,
+    ) -> bool {
         let generation = state.durable_generation;
         if generation == 0
             || state
@@ -3943,23 +3988,28 @@ impl RunningAutomaticEventTransportHandle {
                 .get(&peer)
                 .is_some_and(|requested| *requested >= generation)
         {
-            return;
+            return true;
         }
         let ordered_contacts = self.ordered_contacts.clone();
-        let accepted = self
-            .coordinator
-            .request_attempt(self.mission, peer, move |contact| {
-                let ordered_contacts = ordered_contacts.clone();
-                async move {
-                    let expectation = MissionPeerExpectation::new(contact.peer_evidence(), peer);
-                    ordered_contacts
-                        .run(OrderedEventContactRole::Initiator, contact, expectation)
-                        .await
-                        .map(|_| ())
-                }
-            });
-        if accepted {
-            state.requested_generation.insert(peer, generation);
+        let accepted =
+            self.coordinator
+                .request_attempt_admission(self.mission, peer, move |contact| {
+                    let ordered_contacts = ordered_contacts.clone();
+                    async move {
+                        let expectation =
+                            MissionPeerExpectation::new(contact.peer_evidence(), peer);
+                        ordered_contacts
+                            .run(OrderedEventContactRole::Initiator, contact, expectation)
+                            .await
+                            .map(|_| ())
+                    }
+                });
+        match accepted {
+            EventAttemptAdmission::Accepted => {
+                state.requested_generation.insert(peer, generation);
+                true
+            }
+            EventAttemptAdmission::CapacityFull => false,
         }
     }
 
@@ -18203,6 +18253,9 @@ async fn run_node_actor_inner(
     } else {
         false
     };
+    let mut automatic_event_capacity_progress = automatic_event_transports
+        .as_ref()
+        .map(|automatic| automatic.coordinator.subscribe_capacity_progress());
     if store.event_count()? != 0
         && let Some(automatic) = &automatic_event_transports
     {
@@ -18744,6 +18797,21 @@ async fn run_node_actor_inner(
             }
             _ = shutdown_receiver.recv() => break,
             _ = &mut stop => break,
+            capacity_progress = async {
+                match automatic_event_capacity_progress.as_mut() {
+                    Some(progress) => progress.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match capacity_progress {
+                    Ok(()) => {
+                        if let Some(automatic) = &automatic_event_transports {
+                            automatic.retry_pending_capacity();
+                        }
+                    }
+                    Err(_) => automatic_event_capacity_progress = None,
+                }
+            }
             command = ordered_event_contact_receiver.recv(),
                 if ordered_event_contacts_open
                     && ordered_event_contacts.len() < ORDERED_EVENT_CONTACT_CAPACITY
@@ -42960,9 +43028,8 @@ mod tests {
             _attempt = first_attempts.recv() => panic!("adapter without eligibility received a ticket"),
             () = tokio::task::yield_now() => {}
         }
-        assert!(automatic.replace_eligibility(
-            responder.identity,
-            vec![EventPeerEligibility::provisioned_exact_peer(
+        assert_eq!(
+            automatic.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
                 mission,
                 responder.identity,
                 EventTransportKind::BLE_L2CAP_V1,
@@ -42970,8 +43037,9 @@ mod tests {
                 1,
                 0,
                 None,
-            )],
-        ));
+            )]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
         let first_attempt = first_attempts
             .recv()
             .await
@@ -43189,6 +43257,248 @@ mod tests {
             .await
             .expect("automatic responder shutdown");
         fs::remove_dir_all(test_root).expect("automatic transport cleanup");
+    }
+
+    #[tokio::test]
+    async fn automatic_event_transport_full_roster_schedules_each_current_peer_once() {
+        use crate::{
+            EventAdapterSnapshot, EventAdapterState, EventPeerEligibility, EventTransportKind,
+        };
+
+        let mission = [0x81; 32];
+        let first_peer = [0x82; 32];
+        let second_peer = [0x83; 32];
+        let foreign_peer = [0x84; 32];
+        let admission = Arc::new(AtomicBool::new(true));
+        let (ordered_sender, _ordered_receiver) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
+        let automatic = RunningAutomaticEventTransportHandle::new(
+            admission.clone(),
+            mission,
+            OrderedEventContactHandle {
+                sender: ordered_sender,
+                admission,
+                session_permit: Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY)),
+            },
+        );
+        automatic.note_durable_work();
+        let (_control, mut attempts) = automatic
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("fake adapter registration");
+        let first = EventPeerEligibility::provisioned_exact_peer(
+            mission,
+            first_peer,
+            EventTransportKind::BLE_L2CAP_V1,
+            true,
+            1,
+            0,
+            None,
+        );
+        assert_eq!(
+            automatic.replace_eligibility(vec![
+                first,
+                first,
+                EventPeerEligibility::provisioned_exact_peer(
+                    mission,
+                    second_peer,
+                    EventTransportKind::BLE_L2CAP_V1,
+                    true,
+                    1,
+                    0,
+                    None,
+                ),
+                EventPeerEligibility::provisioned_exact_peer(
+                    [0x91; 32],
+                    foreign_peer,
+                    EventTransportKind::BLE_L2CAP_V1,
+                    true,
+                    1,
+                    0,
+                    None,
+                ),
+            ]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+
+        let first_attempt = attempts.recv().await.expect("first unique peer ticket");
+        let mut scheduled = BTreeSet::from([first_attempt.peer()]);
+        drop(first_attempt);
+        let second_attempt = attempts.recv().await.expect("second unique peer ticket");
+        assert!(scheduled.insert(second_attempt.peer()));
+        drop(second_attempt);
+        assert_eq!(scheduled, BTreeSet::from([first_peer, second_peer]));
+        tokio::select! {
+            biased;
+            _attempt = attempts.recv() => panic!("duplicate or foreign-mission peer was scheduled"),
+            () = tokio::task::yield_now() => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_event_transport_roster_replacement_removes_old_peer_obligations() {
+        use crate::{EventPeerEligibility, EventTransportKind};
+
+        let mission = [0x85; 32];
+        let removed_peer = [0x86; 32];
+        let current_peer = [0x87; 32];
+        let admission = Arc::new(AtomicBool::new(true));
+        let (ordered_sender, _ordered_receiver) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
+        let automatic = RunningAutomaticEventTransportHandle::new(
+            admission.clone(),
+            mission,
+            OrderedEventContactHandle {
+                sender: ordered_sender,
+                admission,
+                session_permit: Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY)),
+            },
+        );
+        automatic.note_durable_work();
+        let eligibility = |peer| {
+            EventPeerEligibility::provisioned_exact_peer(
+                mission,
+                peer,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            )
+        };
+        assert_eq!(
+            automatic
+                .replace_eligibility(vec![eligibility(removed_peer), eligibility(current_peer),]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+        assert_eq!(
+            automatic.replace_eligibility(vec![eligibility(current_peer)]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+
+        let state = automatic
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            state
+                .requested_generation
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![current_peer],
+            "full-roster replacement must remove old retry obligations without erasing a current peer"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automatic_event_transport_capacity_progress_retries_pending_generation() {
+        use crate::{
+            EventAdapterSnapshot, EventAdapterState, EventPeerEligibility, EventTransportKind,
+            event_transport::MAX_PENDING_EVENT_COHORTS,
+        };
+
+        let test_root = root("running-node-automatic-capacity-progress");
+        fs::create_dir_all(&test_root).expect("automatic capacity state");
+        #[cfg(unix)]
+        fs::set_permissions(&test_root, fs::Permissions::from_mode(0o700))
+            .expect("owner-only automatic capacity state");
+        let local = issue_missions(1).remove(0);
+        let mission = local.credentials.mission_authority_id();
+        let target_peer = [0x10; 32];
+        let filler_peer = [0x20; 32];
+        let node = start_transport_neutral_node(TransportNeutralNodeConfig {
+            state: test_root.clone(),
+            mission: local.credentials,
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start automatic capacity node");
+        let automatic = node.automatic_event_transports();
+        automatic.note_durable_work();
+        for _ in 0..MAX_PENDING_EVENT_COHORTS {
+            assert_eq!(
+                automatic.coordinator.request_attempt_admission(
+                    mission,
+                    filler_peer,
+                    |_contact| async { Ok(()) },
+                ),
+                EventAttemptAdmission::Accepted
+            );
+        }
+        let (control, mut attempts) = automatic
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("fake capacity adapter");
+        let eligibility = |peer| {
+            EventPeerEligibility::provisioned_exact_peer(
+                mission,
+                peer,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            )
+        };
+        assert_eq!(
+            automatic.replace_eligibility(vec![eligibility(filler_peer), eligibility(target_peer)]),
+            Some(AutomaticEventRosterStatus::PendingCapacity),
+            "accepted roster must report its retained capacity obligation"
+        );
+
+        let first_filler = attempts.recv().await.expect("first filler attempt");
+        assert_eq!(first_filler.peer(), filler_peer);
+        drop(first_filler);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let state = automatic
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            state.requested_generation.get(&target_peer),
+            Some(&state.durable_generation),
+            "capacity progress never admitted the retained target generation"
+        );
+        drop(state);
+
+        let mut target_delivered = false;
+        for _ in 0..MAX_PENDING_EVENT_COHORTS {
+            let attempt = attempts
+                .recv()
+                .await
+                .expect("capacity progress attempt delivery");
+            if attempt.peer() == target_peer {
+                target_delivered = true;
+                drop(attempt);
+                break;
+            }
+            assert_eq!(attempt.peer(), filler_peer);
+            drop(attempt);
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            target_delivered,
+            "retained target never reached the adapter after bounded prior work"
+        );
+
+        drop(control);
+        drop(attempts);
+        node.shutdown().await.expect("automatic capacity shutdown");
+        fs::remove_dir_all(test_root).expect("automatic capacity cleanup");
     }
 
     #[tokio::test]

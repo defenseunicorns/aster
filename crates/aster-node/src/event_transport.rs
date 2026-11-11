@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     error::Error,
     fmt,
     future::Future,
@@ -13,7 +13,7 @@ use std::{
 
 use aster_contact::OrderedContact;
 use aster_mesh::NodeId;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 /// Maximum distinct peer cohorts retained by the in-memory wake mailbox.
 pub const MAX_PENDING_EVENT_COHORTS: usize = 64;
@@ -173,6 +173,14 @@ impl EventPeerEligibility {
     pub const fn source(&self) -> EventPeerEligibilitySource {
         self.source
     }
+
+    pub(crate) const fn mission(&self) -> NodeId {
+        self.mission
+    }
+
+    pub(crate) const fn peer(&self) -> NodeId {
+        self.peer
+    }
 }
 
 fn select_event_adapter(
@@ -205,7 +213,7 @@ type EventAttemptFuture =
 type EventAttemptRunner =
     Arc<dyn Fn(Arc<dyn OrderedContact>) -> EventAttemptFuture + Send + Sync + 'static>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct EventCohortKey {
     mission: NodeId,
     peer: NodeId,
@@ -248,6 +256,13 @@ impl Default for AutomaticEventTransportState {
 struct AutomaticEventTransportShared {
     state: Mutex<AutomaticEventTransportState>,
     clock: Arc<dyn Fn() -> SystemTime + Send + Sync + 'static>,
+    capacity_progress: watch::Sender<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EventAttemptAdmission {
+    Accepted,
+    CapacityFull,
 }
 
 /// Cloneable host handle for exact-peer Event adapter selection.
@@ -265,10 +280,12 @@ impl Default for AutomaticEventTransportHandle {
 impl AutomaticEventTransportHandle {
     /// Creates an empty application-ready registry.
     pub fn new() -> Self {
+        let (capacity_progress, _) = watch::channel(0);
         Self {
             shared: Arc::new(AutomaticEventTransportShared {
                 state: Mutex::new(AutomaticEventTransportState::default()),
                 clock: Arc::new(SystemTime::now),
+                capacity_progress,
             }),
         }
     }
@@ -278,10 +295,12 @@ impl AutomaticEventTransportHandle {
     where
         F: Fn() -> SystemTime + Send + Sync + 'static,
     {
+        let (capacity_progress, _) = watch::channel(0);
         Self {
             shared: Arc::new(AutomaticEventTransportShared {
                 state: Mutex::new(AutomaticEventTransportState::default()),
                 clock: Arc::new(clock),
+                capacity_progress,
             }),
         }
     }
@@ -332,18 +351,50 @@ impl AutomaticEventTransportHandle {
         if eligibility.len() > MAX_EVENT_PEER_ELIGIBILITY {
             return false;
         }
+        let current_cohorts = eligibility
+            .iter()
+            .map(|entry| EventCohortKey {
+                mission: entry.mission,
+                peer: entry.peer,
+            })
+            .collect::<BTreeSet<_>>();
         let mut state = self
             .shared
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         state.eligibility = eligibility;
+        let pending_before = state.pending.len();
+        state
+            .pending
+            .retain(|cohort| current_cohorts.contains(&cohort.key));
+        let released_capacity = state.pending.len() < pending_before;
         transition(&self.shared, &mut state);
+        drop(state);
+        if released_capacity {
+            notify_capacity_progress(&self.shared);
+        }
         true
     }
 
-    #[allow(dead_code)] // Wired to durable publication by Task 3 of this stacked increment.
-    pub(crate) fn request_attempt<F, Fut>(&self, mission: NodeId, peer: NodeId, runner: F) -> bool
+    #[cfg(test)]
+    fn request_attempt<F, Fut>(&self, mission: NodeId, peer: NodeId, runner: F) -> bool
+    where
+        F: Fn(Arc<dyn OrderedContact>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), ContactOutcome>> + Send + 'static,
+    {
+        matches!(
+            self.request_attempt_admission(mission, peer, runner),
+            EventAttemptAdmission::Accepted
+        )
+    }
+
+    pub(crate) fn request_attempt_admission<F, Fut>(
+        &self,
+        mission: NodeId,
+        peer: NodeId,
+        runner: F,
+    ) -> EventAttemptAdmission
     where
         F: Fn(Arc<dyn OrderedContact>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), ContactOutcome>> + Send + 'static,
@@ -354,7 +405,7 @@ impl AutomaticEventTransportHandle {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if state.pending.len() + usize::from(state.attempt_in_flight) >= MAX_PENDING_EVENT_COHORTS {
-            return false;
+            return EventAttemptAdmission::CapacityFull;
         }
         let runner: EventAttemptRunner = Arc::new(move |contact| Box::pin(runner(contact)));
         state.pending.push_back(PendingEventCohort {
@@ -363,7 +414,11 @@ impl AutomaticEventTransportHandle {
             failed_instances: BTreeMap::new(),
         });
         transition(&self.shared, &mut state);
-        true
+        EventAttemptAdmission::Accepted
+    }
+
+    pub(crate) fn subscribe_capacity_progress(&self) -> watch::Receiver<u64> {
+        self.shared.capacity_progress.subscribe()
     }
 
     #[allow(dead_code)] // Task 3 uses this deterministic no-spin observation in runtime tests.
@@ -501,19 +556,36 @@ impl EventOutboundAttempt {
             .unwrap_or_else(|error| error.into_inner());
         state.attempt_in_flight = false;
         self.completed = true;
-        match result {
-            Ok(()) => transition(&self.shared, &mut state),
-            Err(outcome) if outcome.permits_reselection() => {
-                self.failed_instances
-                    .insert(self.kind, (self.registration_id, self.availability_epoch));
-                state.pending.push_front(PendingEventCohort {
-                    key: self.key,
-                    runner: Arc::clone(&self.runner),
-                    failed_instances: std::mem::take(&mut self.failed_instances),
-                });
+        let released_capacity = match result {
+            Ok(()) => {
                 transition(&self.shared, &mut state);
+                true
             }
-            Err(_) => transition(&self.shared, &mut state),
+            Err(outcome) if outcome.permits_reselection() => {
+                let still_current = state
+                    .eligibility
+                    .iter()
+                    .any(|entry| entry.mission == self.key.mission && entry.peer == self.key.peer);
+                if still_current {
+                    self.failed_instances
+                        .insert(self.kind, (self.registration_id, self.availability_epoch));
+                    state.pending.push_front(PendingEventCohort {
+                        key: self.key,
+                        runner: Arc::clone(&self.runner),
+                        failed_instances: std::mem::take(&mut self.failed_instances),
+                    });
+                }
+                transition(&self.shared, &mut state);
+                !still_current
+            }
+            Err(_) => {
+                transition(&self.shared, &mut state);
+                true
+            }
+        };
+        drop(state);
+        if released_capacity {
+            notify_capacity_progress(&self.shared);
         }
     }
 }
@@ -531,7 +603,15 @@ impl Drop for EventOutboundAttempt {
         self.completed = true;
         state.attempt_in_flight = false;
         transition(&self.shared, &mut state);
+        drop(state);
+        notify_capacity_progress(&self.shared);
     }
+}
+
+fn notify_capacity_progress(shared: &AutomaticEventTransportShared) {
+    shared
+        .capacity_progress
+        .send_modify(|generation| *generation = generation.saturating_add(1));
 }
 
 fn transition(
@@ -1253,6 +1333,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capacity_release_emits_progress_after_explicit_full_admission() {
+        let handle = AutomaticEventTransportHandle::new();
+        assert!(
+            handle.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),])
+        );
+        let (_control, mut attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("adapter registration");
+        assert_eq!(
+            handle.request_attempt_admission(MISSION, PEER, |_contact| async { Ok(()) }),
+            EventAttemptAdmission::Accepted
+        );
+        let in_flight = attempts.recv().await.expect("one in-flight attempt");
+        for _ in 1..MAX_PENDING_EVENT_COHORTS {
+            assert_eq!(
+                handle.request_attempt_admission(MISSION, PEER, |_contact| async { Ok(()) }),
+                EventAttemptAdmission::Accepted
+            );
+        }
+        assert_eq!(
+            handle.request_attempt_admission(MISSION, PEER, |_contact| async { Ok(()) }),
+            EventAttemptAdmission::CapacityFull
+        );
+        let mut progress = handle.subscribe_capacity_progress();
+
+        drop(in_flight);
+        progress
+            .changed()
+            .await
+            .expect("capacity release is an event-driven progress wake");
+        assert_eq!(
+            handle.request_attempt_admission(MISSION, PEER, |_contact| async { Ok(()) }),
+            EventAttemptAdmission::Accepted
+        );
+    }
+
+    #[tokio::test]
     async fn newer_availability_epoch_wakes_selection_and_stale_epoch_is_ignored() {
         let handle = AutomaticEventTransportHandle::new();
         handle.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
@@ -1859,6 +1990,91 @@ mod tests {
                 .eligibility,
             vec![eligible]
         );
+    }
+
+    #[test]
+    fn eligibility_replacement_purges_removed_cohorts_and_keeps_current_peers() {
+        let removed_peer = [0x33; 32];
+        let current = EventPeerEligibility::provisioned_exact_peer(
+            MISSION,
+            PEER,
+            EventTransportKind::IROH_QUIC_V1,
+            true,
+            1,
+            0,
+            None,
+        );
+        let removed = EventPeerEligibility::provisioned_exact_peer(
+            MISSION,
+            removed_peer,
+            EventTransportKind::IROH_QUIC_V1,
+            true,
+            1,
+            0,
+            None,
+        );
+        let handle = AutomaticEventTransportHandle::new();
+        assert!(handle.replace_eligibility(vec![current, removed]));
+        for index in 0..MAX_PENDING_EVENT_COHORTS {
+            let peer = if index % 2 == 0 { removed_peer } else { PEER };
+            assert!(handle.request_attempt(MISSION, peer, |_contact| async { Ok(()) }));
+        }
+        assert!(!handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
+
+        assert!(handle.replace_eligibility(vec![current]));
+        assert!(
+            handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }),
+            "purging the removed peer must release bounded admission for a current peer"
+        );
+
+        let state = handle
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(state.pending.len(), MAX_PENDING_EVENT_COHORTS / 2 + 1);
+        assert!(state.pending.iter().all(|cohort| cohort.key.peer == PEER));
+    }
+
+    #[tokio::test]
+    async fn removed_in_flight_peer_is_not_requeued_after_reselection_failure() {
+        let handle = AutomaticEventTransportHandle::new();
+        assert!(
+            handle.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                PEER,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),])
+        );
+        let (_control, mut attempts) = handle
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("adapter registration");
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
+        let in_flight = attempts.recv().await.expect("one in-flight attempt");
+
+        assert!(handle.replace_eligibility(Vec::new()));
+        in_flight.fail_carrier_open();
+
+        let state = handle
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(
+            state.pending.is_empty(),
+            "a peer removed while in flight must not return as an obsolete pending cohort"
+        );
+        assert!(!state.attempt_in_flight);
     }
 
     #[tokio::test]
