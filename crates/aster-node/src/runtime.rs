@@ -2036,7 +2036,9 @@ impl NodeCustodyClock {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let mut domain = Vec::new();
+            let domain = Vec::new();
+            #[cfg(target_os = "macos")]
+            let mut domain = domain;
             #[cfg(target_os = "macos")]
             {
                 if let Ok(output) = Command::new("/usr/sbin/sysctl")
@@ -3825,6 +3827,7 @@ pub struct RunningNode {
     automatic_event_transports: RunningAutomaticEventTransportHandle,
     state_root: PinnedNodeStateRoot,
     application_admission: Arc<AtomicBool>,
+    transport_admission: Arc<TransportAdmission>,
     emission_policy: Arc<LiveEmissionPolicy>,
     #[cfg(feature = "nearby-discovery")]
     nearby_discovery_stop: Option<NearbyDiscoveryControl>,
@@ -3832,6 +3835,76 @@ pub struct RunningNode {
     handles_sigint: bool,
     shutdown: Option<mpsc::Sender<()>>,
     task: Option<JoinHandle<Result<NodeReceipt, NodeError>>>,
+}
+
+const TRANSPORT_ADMISSION_STARTUP_CLOSED: u8 = 0;
+const TRANSPORT_ADMISSION_OPEN: u8 = 1;
+const TRANSPORT_ADMISSION_TERMINAL_CLOSED: u8 = 2;
+
+/// Shared one-way admission state for built-in and in-process transports.
+///
+/// Supervised startup may begin closed while the embedding composes every
+/// authorized adapter. Once terminally closed, admission cannot be reopened.
+struct TransportAdmission {
+    state: AtomicU8,
+    changes: watch::Sender<()>,
+}
+
+impl TransportAdmission {
+    fn open() -> Self {
+        Self::new(TRANSPORT_ADMISSION_OPEN)
+    }
+
+    fn startup_closed() -> Self {
+        Self::new(TRANSPORT_ADMISSION_STARTUP_CLOSED)
+    }
+
+    fn new(state: u8) -> Self {
+        let (changes, _) = watch::channel(());
+        Self {
+            state: AtomicU8::new(state),
+            changes,
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.state.load(Ordering::Acquire) == TRANSPORT_ADMISSION_OPEN
+    }
+
+    fn allows_composition(&self) -> bool {
+        self.state.load(Ordering::Acquire) != TRANSPORT_ADMISSION_TERMINAL_CLOSED
+    }
+
+    fn open_initial(&self) -> bool {
+        if self
+            .state
+            .compare_exchange(
+                TRANSPORT_ADMISSION_STARTUP_CLOSED,
+                TRANSPORT_ADMISSION_OPEN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.changes.send_replace(());
+        true
+    }
+
+    fn close(&self) {
+        if self
+            .state
+            .swap(TRANSPORT_ADMISSION_TERMINAL_CLOSED, Ordering::AcqRel)
+            != TRANSPORT_ADMISSION_TERMINAL_CLOSED
+        {
+            self.changes.send_replace(());
+        }
+    }
+
+    fn subscribe(&self) -> watch::Receiver<()> {
+        self.changes.subscribe()
+    }
 }
 
 /// Fixed role for one externally established adapter-neutral Event contact.
@@ -3857,7 +3930,7 @@ struct AutomaticEventRuntimeState {
 #[derive(Clone)]
 pub struct RunningAutomaticEventTransportHandle {
     coordinator: AutomaticEventTransportHandle,
-    admission: Arc<AtomicBool>,
+    admission: Arc<TransportAdmission>,
     state: Arc<StdMutex<AutomaticEventRuntimeState>>,
     mission: NodeId,
     ordered_contacts: OrderedEventContactHandle,
@@ -3874,7 +3947,7 @@ pub enum AutomaticEventRosterStatus {
 
 impl RunningAutomaticEventTransportHandle {
     fn new(
-        admission: Arc<AtomicBool>,
+        admission: Arc<TransportAdmission>,
         mission: NodeId,
         ordered_contacts: OrderedEventContactHandle,
     ) -> Self {
@@ -3889,6 +3962,9 @@ impl RunningAutomaticEventTransportHandle {
 
     /// Registers one adapter-owned bounded attempt mailbox.
     ///
+    /// Registration remains available during supervised startup composition;
+    /// contact selection stays closed until the supervisor opens admission.
+    ///
     /// The returned control remains adapter-owned. An embedding shuts down and
     /// joins that owner before invoking [`RunningNode::shutdown`].
     pub fn register(
@@ -3896,18 +3972,21 @@ impl RunningAutomaticEventTransportHandle {
         snapshot: EventAdapterSnapshot,
     ) -> Option<(EventAdapterControl, EventAttemptReceiver)> {
         self.admission
-            .load(Ordering::Acquire)
+            .allows_composition()
             .then(|| self.coordinator.register(snapshot))
             .flatten()
     }
 
     /// Registers one opaque paired adapter lease and bounded attempt lane.
+    ///
+    /// Registration remains available during supervised startup composition;
+    /// contact selection stays closed until the supervisor opens admission.
     pub fn register_paired(
         &self,
         snapshot: EventAdapterSnapshot,
     ) -> Option<crate::EventAdapterRegistration> {
         self.admission
-            .load(Ordering::Acquire)
+            .allows_composition()
             .then(|| self.coordinator.register_paired(snapshot))
             .flatten()
     }
@@ -3922,7 +4001,7 @@ impl RunningAutomaticEventTransportHandle {
         &self,
         eligibility: Vec<EventPeerEligibility>,
     ) -> Option<AutomaticEventRosterStatus> {
-        if !self.admission.load(Ordering::Acquire) {
+        if !self.admission.is_open() {
             return None;
         }
         let current_peers = eligibility
@@ -3952,7 +4031,7 @@ impl RunningAutomaticEventTransportHandle {
     }
 
     fn note_durable_work(&self) {
-        if !self.admission.load(Ordering::Acquire) {
+        if !self.admission.allows_composition() {
             return;
         }
         let mut state = self
@@ -3960,11 +4039,13 @@ impl RunningAutomaticEventTransportHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.durable_generation = state.durable_generation.saturating_add(1);
-        self.schedule_current_generation(&mut state);
+        if self.admission.is_open() {
+            self.schedule_current_generation(&mut state);
+        }
     }
 
     fn retry_pending_capacity(&self) {
-        if !self.admission.load(Ordering::Acquire) {
+        if !self.admission.is_open() {
             return;
         }
         let mut state = self
@@ -4294,7 +4375,7 @@ impl Drop for OrderedEventContactCloseGuard {
 #[derive(Clone)]
 pub struct OrderedEventContactHandle {
     sender: mpsc::Sender<OrderedEventContactCommand>,
-    admission: Arc<AtomicBool>,
+    admission: Arc<TransportAdmission>,
     session_permit: Arc<Semaphore>,
 }
 
@@ -4314,7 +4395,7 @@ impl OrderedEventContactHandle {
         contact: Arc<dyn OrderedContact>,
         peer: MissionPeerExpectation,
     ) -> Result<PeerReceipt, ContactOutcome> {
-        if !self.admission.load(Ordering::Acquire) {
+        if !self.admission.is_open() {
             contact.close();
             return Err(ContactOutcome::admission_closed());
         }
@@ -4354,6 +4435,7 @@ struct ContactActivitySnapshot {
     active: u64,
     completed: u64,
     failed: u64,
+    transport_blocked: u64,
 }
 
 #[cfg(test)]
@@ -4363,6 +4445,7 @@ struct ContactActivityProbe {
     active: AtomicU64,
     completed: AtomicU64,
     failed: AtomicU64,
+    transport_blocked: AtomicU64,
 }
 
 #[cfg(test)]
@@ -4380,6 +4463,10 @@ impl ContactActivityProbe {
         self.active.fetch_sub(1, Ordering::Release);
     }
 
+    fn transport_blocked(&self) {
+        self.transport_blocked.fetch_add(1, Ordering::Release);
+    }
+
     fn snapshot(&self) -> ContactActivitySnapshot {
         let active = self.active.load(Ordering::Acquire);
         ContactActivitySnapshot {
@@ -4387,6 +4474,7 @@ impl ContactActivityProbe {
             active,
             completed: self.completed.load(Ordering::Acquire),
             failed: self.failed.load(Ordering::Acquire),
+            transport_blocked: self.transport_blocked.load(Ordering::Acquire),
         }
     }
 }
@@ -4547,6 +4635,17 @@ impl RunningNode {
         &self.state_root.path
     }
 
+    /// Opens or initializes one application publication journal in this node's
+    /// pinned state root without rewalking the configured pathname.
+    pub fn open_or_initialize_publication_journal(
+        &self,
+        name: &Path,
+        client: &[u8],
+    ) -> crate::publication_journal::Result<crate::publication_journal::Journal> {
+        self.state_root
+            .open_or_initialize_publication_journal(name, client)
+    }
+
     /// Returns the stable current emission policy and its monotonic revision.
     pub fn event_emission_policy(&self) -> Result<(EventEmissionPolicy, u64), NodeError> {
         let snapshot = self.emission_policy.snapshot()?;
@@ -4572,9 +4671,38 @@ impl RunningNode {
         Ok(update.snapshot.revision)
     }
 
+    /// Idempotently closes contact and automatic-adapter admission without
+    /// consuming the running node or rejecting already-admitted application
+    /// work.
+    ///
+    /// Embeddings use this before cancelling and joining in-process transport
+    /// owners while their application server finishes draining.
+    pub fn close_transport_admission(&self) {
+        self.transport_admission.close();
+    }
+
+    /// Opens transport admission after supervised startup has composed every
+    /// authorized adapter and published its initial availability.
+    ///
+    /// This succeeds exactly once for a node started by the supervised API.
+    /// Ordinary nodes are already open, and terminal closure cannot be undone.
+    #[must_use]
+    pub fn open_transport_admission(&self) -> bool {
+        self.transport_admission.open_initial()
+    }
+
+    /// Idempotently closes application, contact, and automatic-adapter admission
+    /// without consuming the running node.
+    ///
+    /// Embeddings use this before cancelling and joining in-process transport
+    /// owners, then consume the node through [`Self::shutdown`].
+    pub fn close_admission(&self) {
+        close_node_admission(&self.application_admission, &self.transport_admission);
+    }
+
     /// Requests graceful shutdown, closes command admission, and waits for cleanup.
     pub async fn shutdown(mut self) -> Result<NodeReceipt, NodeError> {
-        self.application_admission.store(false, Ordering::Release);
+        self.close_admission();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(()).await;
         }
@@ -4595,9 +4723,14 @@ impl RunningNode {
     }
 }
 
+fn close_node_admission(application: &AtomicBool, transport: &TransportAdmission) {
+    transport.close();
+    application.store(false, Ordering::Release);
+}
+
 impl Drop for RunningNode {
     fn drop(&mut self) {
-        self.application_admission.store(false, Ordering::Release);
+        self.close_admission();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.try_send(());
         }
@@ -17011,6 +17144,7 @@ pub async fn start_transport_neutral_node(
         NodeOperatorOutput::process(NodeOperatorOutputPolicy::default()),
         false,
         true,
+        InitialTransportAdmission::Open,
     )
     .await
 }
@@ -17041,6 +17175,7 @@ async fn start_externally_supervised_transport_neutral_node_with_output(
         output,
         false,
         false,
+        InitialTransportAdmission::Open,
     )
     .await
 }
@@ -17077,13 +17212,23 @@ async fn start_node_with_forwarding_output(
     forwarding: SelectedForwardingConfig,
     output: NodeOperatorOutput,
 ) -> Result<RunningNode, NodeError> {
-    start_node_with_shutdown_ownership(config, forwarding, output, true, true).await
+    start_node_with_shutdown_ownership(
+        config,
+        forwarding,
+        output,
+        true,
+        true,
+        InitialTransportAdmission::Open,
+    )
+    .await
 }
 
 /// Starts a node whose shutdown is owned by its embedding supervisor.
 ///
 /// Unlike standalone startup, this node does not consume process SIGINT.
-/// The supervisor drains its admitted work before calling `RunningNode::shutdown`.
+/// The supervisor composes every authorized transport and publishes its initial
+/// availability before calling [`RunningNode::open_transport_admission`]. It
+/// later drains admitted work before calling [`RunningNode::shutdown`].
 /// An explicitly configured `run_for` deadline still applies.
 pub async fn start_supervised_node_with_forwarding_and_output_policy(
     config: NodeConfig,
@@ -17096,8 +17241,15 @@ pub async fn start_supervised_node_with_forwarding_and_output_policy(
         NodeOperatorOutput::process(output_policy),
         true,
         false,
+        InitialTransportAdmission::SupervisedClosed,
     )
     .await
+}
+
+#[derive(Clone, Copy)]
+enum InitialTransportAdmission {
+    Open,
+    SupervisedClosed,
 }
 
 async fn start_node_with_shutdown_ownership(
@@ -17106,11 +17258,16 @@ async fn start_node_with_shutdown_ownership(
     output: NodeOperatorOutput,
     iroh_transport_enabled: bool,
     handle_sigint: bool,
+    initial_transport_admission: InitialTransportAdmission,
 ) -> Result<RunningNode, NodeError> {
     let identity = config.mission.identity();
     let mission_authority = config.mission.mission_authority_id();
     let (application_sender, application_receiver) = mpsc::channel(APPLICATION_COMMAND_CAPACITY);
     let application_admission = Arc::new(AtomicBool::new(true));
+    let transport_admission = Arc::new(match initial_transport_admission {
+        InitialTransportAdmission::Open => TransportAdmission::open(),
+        InitialTransportAdmission::SupervisedClosed => TransportAdmission::startup_closed(),
+    });
     let selected_events = SelectedEventHandle::new(
         application_sender.clone(),
         application_admission.clone(),
@@ -17141,11 +17298,11 @@ async fn start_node_with_shutdown_ownership(
         mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
     let ordered_event_contacts = OrderedEventContactHandle {
         sender: ordered_event_contact_sender,
-        admission: application_admission.clone(),
+        admission: transport_admission.clone(),
         session_permit: Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY)),
     };
     let automatic_event_transports = RunningAutomaticEventTransportHandle::new(
-        application_admission.clone(),
+        transport_admission.clone(),
         mission_authority,
         ordered_event_contacts.clone(),
     );
@@ -17155,6 +17312,7 @@ async fn start_node_with_shutdown_ownership(
     let mut channels = NodeActorChannels::new(
         application_receiver,
         application_admission.clone(),
+        transport_admission.clone(),
         control_receiver,
         ordered_event_contact_receiver,
         shutdown_receiver,
@@ -17199,6 +17357,7 @@ async fn start_node_with_shutdown_ownership(
         automatic_event_transports,
         state_root: ready.state_root,
         application_admission,
+        transport_admission,
         emission_policy,
         #[cfg(feature = "nearby-discovery")]
         nearby_discovery_stop: ready.nearby_discovery_stop,
@@ -17557,6 +17716,7 @@ struct NodeActorChannels {
     automatic_event_transports: Option<RunningAutomaticEventTransportHandle>,
     application_receiver: mpsc::Receiver<SelectedApplicationCommand>,
     application_admission: Arc<AtomicBool>,
+    transport_admission: Arc<TransportAdmission>,
     control_receiver: mpsc::Receiver<SelectedControlCommand>,
     ordered_event_contact_receiver: mpsc::Receiver<OrderedEventContactCommand>,
     shutdown_receiver: mpsc::Receiver<()>,
@@ -17577,8 +17737,47 @@ struct NodeReady {
 #[derive(Clone)]
 struct PinnedNodeStateRoot {
     path: PathBuf,
-    #[cfg(target_os = "linux")]
-    _directory: Arc<File>,
+    #[cfg(unix)]
+    directory: Arc<File>,
+}
+
+impl PinnedNodeStateRoot {
+    fn open_directory(&self) -> io::Result<File> {
+        #[cfg(unix)]
+        {
+            Ok(File::from(rustix::fs::openat(
+                self.directory.as_ref(),
+                ".",
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )?))
+        }
+        #[cfg(not(unix))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "state-directory capabilities require Unix",
+            ))
+        }
+    }
+
+    fn open_or_initialize_publication_journal(
+        &self,
+        name: &Path,
+        client: &[u8],
+    ) -> crate::publication_journal::Result<crate::publication_journal::Journal> {
+        let directory = self.open_directory()?;
+        match crate::publication_journal::Journal::open_at(&directory, name, client) {
+            Ok(journal) => Ok(journal),
+            Err(_) => {
+                crate::publication_journal::Journal::initialize_at(&directory, name, client)?;
+                crate::publication_journal::Journal::open_at(&directory, name, client)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -17661,12 +17860,56 @@ fn pin_node_state_root(configured: &Path) -> Result<PinnedNodeStateRoot, NodeErr
             ));
         }
         let path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        Ok(PinnedNodeStateRoot { path, directory })
+    }
+    #[cfg(target_os = "android")]
+    {
+        let directory = Arc::new(File::from(
+            rustix::fs::openat(
+                rustix::fs::CWD,
+                configured,
+                rustix::fs::OFlags::PATH
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(io::Error::from)?,
+        ));
+        if !directory.metadata()?.is_dir() {
+            return Err(NodeError::Configuration(
+                "node state root is not a directory".into(),
+            ));
+        }
         Ok(PinnedNodeStateRoot {
-            path,
-            _directory: directory,
+            path: configured.to_path_buf(),
+            directory,
         })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(any(target_os = "android", target_os = "linux"))))]
+    {
+        let directory = Arc::new(File::from(
+            rustix::fs::openat(
+                rustix::fs::CWD,
+                configured,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(io::Error::from)?,
+        ));
+        if !directory.metadata()?.is_dir() {
+            return Err(NodeError::Configuration(
+                "node state root is not a directory".into(),
+            ));
+        }
+        Ok(PinnedNodeStateRoot {
+            path: configured.to_path_buf(),
+            directory,
+        })
+    }
+    #[cfg(not(unix))]
     {
         Ok(PinnedNodeStateRoot {
             path: configured.to_path_buf(),
@@ -17776,6 +18019,7 @@ impl NodeActorChannels {
     fn new(
         application_receiver: mpsc::Receiver<SelectedApplicationCommand>,
         application_admission: Arc<AtomicBool>,
+        transport_admission: Arc<TransportAdmission>,
         control_receiver: mpsc::Receiver<SelectedControlCommand>,
         ordered_event_contact_receiver: mpsc::Receiver<OrderedEventContactCommand>,
         shutdown_receiver: mpsc::Receiver<()>,
@@ -17787,6 +18031,7 @@ impl NodeActorChannels {
             iroh_transport_enabled: true,
             automatic_event_transports: None,
             application_admission,
+            transport_admission,
             control_receiver,
             ordered_event_contact_receiver,
             shutdown_receiver,
@@ -17811,6 +18056,7 @@ async fn run_node_actor(
     let emission_policy = Arc::new(LiveEmissionPolicy::new(forwarding.emission_policy()));
     let (_control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
     let (_ordered_sender, ordered_receiver) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
+    let transport_admission = Arc::new(TransportAdmission::open());
     run_node_actor_with_forwarding(
         config,
         forwarding,
@@ -17818,6 +18064,7 @@ async fn run_node_actor(
         NodeActorChannels::new(
             application_receiver,
             application_admission,
+            transport_admission,
             control_receiver,
             ordered_receiver,
             shutdown_receiver,
@@ -17871,6 +18118,7 @@ async fn run_node_actor_inner(
         automatic_event_transports,
         mut application_receiver,
         application_admission,
+        transport_admission,
         mut control_receiver,
         mut ordered_event_contact_receiver,
         mut shutdown_receiver,
@@ -17880,6 +18128,7 @@ async fn run_node_actor_inner(
         #[cfg(all(test, unix))]
         mut test_control,
     } = channels;
+    let mut transport_admission_changes = transport_admission.subscribe();
     let ready_reconciliation_classes = if iroh_transport_enabled {
         READY_RECONCILIATION_CLASSES
     } else {
@@ -18607,9 +18856,8 @@ async fn run_node_actor_inner(
     let accept_enabled = endpoint.is_some() && (!allowed.is_empty() || automatic_nearby);
     #[cfg(not(feature = "nearby-discovery"))]
     let accept_enabled = endpoint.is_some() && !allowed.is_empty();
-    let mut accept_task = if !owner_ready || !accept_enabled {
-        None
-    } else {
+    let start_accept_task = || {
+        let accepted_sender = accepted_sender.clone();
         let endpoint = endpoint
             .as_ref()
             .expect("enabled Iroh acceptance has an endpoint")
@@ -18617,7 +18865,7 @@ async fn run_node_actor_inner(
         let allowed = allowed.clone();
         #[cfg(feature = "nearby-discovery")]
         let automatic = automatic_nearby;
-        Some(tokio::spawn(inherit_node_output(async move {
+        tokio::spawn(inherit_node_output(async move {
             #[cfg(feature = "nearby-discovery")]
             let mut acceptor = if automatic {
                 endpoint.inbound_candidate_acceptor()
@@ -18642,7 +18890,12 @@ async fn run_node_actor_inner(
                     }
                 }
             }
-        })))
+        }))
+    };
+    let mut accept_task = if !owner_ready || !accept_enabled || !transport_admission.is_open() {
+        None
+    } else {
+        Some(start_accept_task())
     };
 
     #[cfg(all(test, unix))]
@@ -18746,7 +18999,7 @@ async fn run_node_actor_inner(
                         &request,
                     ) {
                         Ok(plan) => {
-                            application_admission.store(false, Ordering::Release);
+                            close_node_admission(&application_admission, &transport_admission);
                             live_zeroization = Some((request, plan));
                             break;
                         }
@@ -18794,7 +19047,7 @@ async fn run_node_actor_inner(
             completion = &mut blob_worker_completion_receiver,
                 if blob_worker_completion_open => {
                 blob_worker_completion_open = false;
-                application_admission.store(false, Ordering::Release);
+                close_node_admission(&application_admission, &transport_admission);
                 fatal_error = Some(match completion {
                     Ok(Err(error)) => error,
                     Ok(Ok(())) => NodeError::Protocol(
@@ -18808,6 +19061,33 @@ async fn run_node_actor_inner(
             }
             _ = shutdown_receiver.recv() => break,
             _ = &mut stop => break,
+            _ = transport_admission_changes.changed() => {
+                // The actor retains `transport_admission`, which owns the sole
+                // sender, so this notification channel cannot close while the
+                // actor is live. The atomic remains the admission authority.
+                if transport_admission.is_open() {
+                    if accept_enabled && accept_task.is_none() {
+                        accept_task = Some(start_accept_task());
+                    }
+                    if let Some(automatic) = &automatic_event_transports {
+                        automatic.retry_pending_capacity();
+                    }
+                    // Preserve durable work armed while startup admission was
+                    // closed and reconsider it immediately after composition.
+                    event_contact_wake.arm_normal_contact();
+                    application_tick_pending = true;
+                } else {
+                    if let Some(task) = accept_task.take() {
+                        task.abort();
+                        let _ = task.await;
+                    }
+                    while let Ok(accepted) = accepted_receiver.try_recv() {
+                        if let Ok(connection) = accepted {
+                            connection.close();
+                        }
+                    }
+                }
+            }
             capacity_progress = async {
                 match automatic_event_capacity_progress.as_mut() {
                     Some(progress) => progress.changed().await,
@@ -19440,6 +19720,11 @@ async fn run_node_actor_inner(
                         break;
                     }
                 };
+                if !transport_admission.is_open() {
+                    #[cfg(test)]
+                    contact_activity.transport_blocked();
+                    continue;
+                }
                 let Some(contact_cause) = event_contact_wake
                     .contact_cause_for(emission_snapshot.policy)
                 else {
@@ -19654,7 +19939,9 @@ async fn run_node_actor_inner(
                     tokio::task::yield_now().await;
                 }
             }
-            accepted = accepted_receiver.recv(), if accept_task.is_some() && inbound.len() < MAX_INBOUND_CONTACTS => {
+            accepted = accepted_receiver.recv(), if transport_admission.is_open()
+                && accept_task.is_some()
+                && inbound.len() < MAX_INBOUND_CONTACTS => {
                 control_yield_required = false;
                 discovery_yield_required = false;
                 application_tick_yield_required = false;
@@ -20244,7 +20531,7 @@ async fn run_node_actor_inner(
         }
     }
 
-    application_admission.store(false, Ordering::Release);
+    close_node_admission(&application_admission, &transport_admission);
     // Closing progress unblocks blocking_send and cancels at the next bounded
     // page checkpoint. Join before zeroization or releasing the store owner.
     audit_progress_receiver.close();
@@ -35611,6 +35898,7 @@ mod tests {
                 automatic_event_transports: None,
                 application_receiver,
                 application_admission,
+                transport_admission: Arc::new(TransportAdmission::open()),
                 control_receiver,
                 ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
@@ -35857,6 +36145,7 @@ mod tests {
                 automatic_event_transports: None,
                 application_receiver,
                 application_admission,
+                transport_admission: Arc::new(TransportAdmission::open()),
                 control_receiver,
                 ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
@@ -35953,6 +36242,7 @@ mod tests {
                 automatic_event_transports: None,
                 application_receiver,
                 application_admission: application_admission.clone(),
+                transport_admission: Arc::new(TransportAdmission::open()),
                 control_receiver,
                 ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
@@ -40256,6 +40546,7 @@ mod tests {
                 automatic_event_transports: None,
                 application_receiver,
                 application_admission,
+                transport_admission: Arc::new(TransportAdmission::open()),
                 control_receiver,
                 ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
@@ -40500,6 +40791,7 @@ mod tests {
                 automatic_event_transports: None,
                 application_receiver,
                 application_admission: application_admission.clone(),
+                transport_admission: Arc::new(TransportAdmission::open()),
                 control_receiver,
                 ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
@@ -41705,7 +41997,7 @@ mod tests {
         drop(receiver);
         let handle = OrderedEventContactHandle {
             sender,
-            admission: Arc::new(AtomicBool::new(false)),
+            admission: Arc::new(TransportAdmission::startup_closed()),
             session_permit: Arc::new(Semaphore::new(1)),
         };
         let peer = issue_missions(1).remove(0);
@@ -41736,7 +42028,7 @@ mod tests {
         drop(receiver);
         let handle = OrderedEventContactHandle {
             sender,
-            admission: Arc::new(AtomicBool::new(true)),
+            admission: Arc::new(TransportAdmission::open()),
             session_permit: Arc::new(Semaphore::new(0)),
         };
         let peer = issue_missions(1).remove(0);
@@ -41769,7 +42061,7 @@ mod tests {
         drop(receiver);
         let unavailable = OrderedEventContactHandle {
             sender,
-            admission: Arc::new(AtomicBool::new(true)),
+            admission: Arc::new(TransportAdmission::open()),
             session_permit: Arc::new(Semaphore::new(1)),
         };
         let error = unavailable
@@ -41793,7 +42085,7 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(1);
         let stopped = OrderedEventContactHandle {
             sender,
-            admission: Arc::new(AtomicBool::new(true)),
+            admission: Arc::new(TransportAdmission::open()),
             session_permit: Arc::new(Semaphore::new(1)),
         };
         let actor = tokio::spawn(async move {
@@ -41824,7 +42116,7 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(1);
         let handle = OrderedEventContactHandle {
             sender,
-            admission: Arc::new(AtomicBool::new(true)),
+            admission: Arc::new(TransportAdmission::open()),
             session_permit: Arc::new(Semaphore::new(1)),
         };
         let peer = issue_missions(1).remove(0);
@@ -43280,7 +43572,7 @@ mod tests {
         let first_peer = [0x82; 32];
         let second_peer = [0x83; 32];
         let foreign_peer = [0x84; 32];
-        let admission = Arc::new(AtomicBool::new(true));
+        let admission = Arc::new(TransportAdmission::open());
         let (ordered_sender, _ordered_receiver) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
         let automatic = RunningAutomaticEventTransportHandle::new(
             admission.clone(),
@@ -43357,7 +43649,7 @@ mod tests {
         let mission = [0x85; 32];
         let removed_peer = [0x86; 32];
         let current_peer = [0x87; 32];
-        let admission = Arc::new(AtomicBool::new(true));
+        let admission = Arc::new(TransportAdmission::open());
         let (ordered_sender, _ordered_receiver) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
         let automatic = RunningAutomaticEventTransportHandle::new(
             admission.clone(),
@@ -43475,16 +43767,17 @@ mod tests {
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
-        let state = automatic
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(
-            state.requested_generation.get(&target_peer),
-            Some(&state.durable_generation),
-            "capacity progress never admitted the retained target generation"
-        );
-        drop(state);
+        {
+            let state = automatic
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                state.requested_generation.get(&target_peer),
+                Some(&state.durable_generation),
+                "capacity progress never admitted the retained target generation"
+            );
+        }
 
         let mut target_delivered = false;
         for _ in 0..MAX_PENDING_EVENT_COHORTS {
@@ -43558,6 +43851,238 @@ mod tests {
         assert_eq!(receipt.contacts, 0);
         assert_eq!(receipt.contact_errors, 1);
         fs::remove_dir_all(test_root).expect("receive-only cleanup");
+    }
+
+    #[tokio::test]
+    async fn running_node_close_admission_precedes_shutdown_and_is_idempotent() {
+        use crate::application::{ApplicationErrorKind, EventQuery};
+
+        // Break caught: an embedding must stop transport owners before node
+        // shutdown without rejecting application work already admitted by its
+        // draining server. Full admission closure remains idempotent.
+        let test_root = root("close-admission-before-shutdown");
+        fs::create_dir_all(&test_root).expect("close-admission state");
+        #[cfg(unix)]
+        fs::set_permissions(&test_root, fs::Permissions::from_mode(0o700))
+            .expect("owner-only close-admission state");
+        let mut issued = issue_missions(2);
+        let local = issued.remove(0);
+        let peer = issued.remove(0);
+        let node = start_transport_neutral_node(TransportNeutralNodeConfig {
+            state: test_root.clone(),
+            mission: local.credentials,
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start close-admission node");
+        let automatic = node.automatic_event_transports();
+        let ordered = node.ordered_event_contacts();
+        let selected = node.selected_events();
+
+        node.close_transport_admission();
+        node.close_transport_admission();
+
+        assert!(
+            automatic
+                .register_paired(EventAdapterSnapshot::new(
+                    crate::EventTransportKind::BLE_L2CAP_V1,
+                    0,
+                    crate::EventAdapterState::Unavailable,
+                    true,
+                    1,
+                ))
+                .is_none(),
+            "automatic admission is closed before adapter join"
+        );
+        let contact = Arc::new(StalledOrderedContact::default());
+        let error = ordered
+            .run(
+                OrderedEventContactRole::Initiator,
+                contact.clone(),
+                MissionPeerExpectation::new(contact.peer_evidence(), peer.identity),
+            )
+            .await
+            .expect_err("ordered contact admission is closed");
+        assert_eq!(error.reason(), ContactReason::AdmissionClosed);
+        assert_eq!(contact.operations(), 0);
+        selected
+            .status()
+            .await
+            .expect("transport-only closure preserves application admission");
+
+        node.close_admission();
+        node.close_admission();
+        let error = selected
+            .query(EventQuery::default())
+            .await
+            .expect_err("selected application admission is closed");
+        assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
+
+        node.shutdown().await.expect("close-admission shutdown");
+        fs::remove_dir_all(test_root).expect("close-admission cleanup");
+    }
+
+    #[tokio::test]
+    async fn supervised_node_opens_initial_transport_admission_once() {
+        // Break caught: supervised startup must not let Iroh or an in-process
+        // adapter become selectable before the embedding has composed every
+        // authorized transport and published its initial availability. A
+        // terminal close must never be reversible by a late startup action.
+        let test_root = root("supervised-initial-transport-admission");
+        fs::create_dir_all(&test_root).expect("supervised admission state");
+        #[cfg(unix)]
+        fs::set_permissions(&test_root, fs::Permissions::from_mode(0o700))
+            .expect("owner-only supervised admission state");
+        let local = issue_missions(1).remove(0);
+        let mission = local.credentials.mission_authority_id();
+        let node = start_supervised_node_with_forwarding_and_output_policy(
+            TransportNeutralNodeConfig {
+                state: test_root.clone(),
+                mission: local.credentials,
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            }
+            .into_node_config(),
+            SelectedForwardingConfig::default(),
+            NodeOperatorOutputPolicy::default(),
+        )
+        .await
+        .expect("start supervised node");
+        let automatic = node.automatic_event_transports();
+        let available = || {
+            EventAdapterSnapshot::new(
+                crate::EventTransportKind::BLE_L2CAP_V1,
+                1,
+                crate::EventAdapterState::Available,
+                true,
+                1,
+            )
+        };
+        let peer = [0x72; 32];
+        let eligibility = || {
+            EventPeerEligibility::provisioned_exact_peer(
+                mission,
+                peer,
+                crate::EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            )
+        };
+
+        let registration = automatic
+            .register_paired(available())
+            .expect("startup admission permits authorized adapter composition");
+        automatic.note_durable_work();
+        assert!(automatic.replace_eligibility(vec![eligibility()]).is_none());
+        node.selected_events()
+            .status()
+            .await
+            .expect("startup transport gate preserves application admission");
+
+        assert!(node.open_transport_admission());
+        assert_eq!(
+            automatic.replace_eligibility(vec![eligibility()]),
+            Some(AutomaticEventRosterStatus::Scheduled),
+            "transport selection begins only after the supervisor opens admission"
+        );
+        let (_, _adapter, mut attempts) = registration.into_parts();
+        assert_eq!(
+            timeout(Duration::from_secs(1), attempts.recv())
+                .await
+                .expect("startup durable attempt deadline")
+                .expect("opened transport attempt")
+                .peer(),
+            peer
+        );
+
+        node.close_transport_admission();
+        assert!(
+            !node.open_transport_admission(),
+            "terminal transport closure cannot be reopened"
+        );
+        assert!(automatic.register_paired(available()).is_none());
+
+        node.shutdown()
+            .await
+            .expect("supervised admission shutdown");
+        fs::remove_dir_all(test_root).expect("supervised admission cleanup");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervised_transport_admission_gates_built_in_iroh_contacts() {
+        // Break caught: gating only the adapter facade still lets the built-in
+        // Iroh actor initiate contact before transport composition completes.
+        let test_root = root("supervised-iroh-transport-admission");
+        fs::create_dir_all(&test_root).expect("supervised Iroh state");
+        #[cfg(unix)]
+        fs::set_permissions(&test_root, fs::Permissions::from_mode(0o700))
+            .expect("owner-only supervised Iroh state");
+        let local_carrier = NodeIdentity::load_or_create(&test_root)
+            .expect("local carrier identity")
+            .id();
+        let peer_carrier = (0..1_024)
+            .find_map(|_| {
+                let candidate = aster_iroh::SecretKey::generate().public();
+                (candidate > local_carrier).then_some(candidate)
+            })
+            .expect("generate higher peer carrier identity");
+        let mut issued = issue_missions(2);
+        let local = issued.remove(0);
+        let peer = issued.remove(0);
+        let node = start_supervised_node_with_forwarding_and_output_policy(
+            NodeConfig {
+                state: test_root.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: local.credentials,
+                peers: vec![MissionExpectedPeer {
+                    carrier: ExpectedPeer {
+                        id: peer_carrier,
+                        address: SocketAddr::from(([127, 0, 0, 1], 9)),
+                    },
+                    mission: peer.identity,
+                }],
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_millis(20),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            SelectedForwardingConfig::default(),
+            NodeOperatorOutputPolicy::default(),
+        )
+        .await
+        .expect("start supervised Iroh node");
+
+        timeout(Duration::from_secs(2), async {
+            while node.contact_activity_snapshot().transport_blocked == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed startup gate observes an Iroh contact opportunity");
+        assert_eq!(
+            node.contact_activity_snapshot().launched,
+            0,
+            "Iroh remains quiescent while startup transport admission is closed"
+        );
+
+        assert!(node.open_transport_admission());
+        timeout(Duration::from_secs(2), async {
+            while node.contact_activity_snapshot().launched == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Iroh contact begins when transport admission opens");
+
+        node.shutdown().await.expect("supervised Iroh shutdown");
+        fs::remove_dir_all(test_root).expect("supervised Iroh cleanup");
     }
 
     #[tokio::test]
@@ -46504,6 +47029,7 @@ mod tests {
         })
         .await
         .expect("start live node");
+        let automatic = running.automatic_event_transports();
         let selected = running.selected_events();
         let selected_state = running.selected_state();
         let selected_records = running.selected_records();
@@ -46540,6 +47066,22 @@ mod tests {
             .await
             .expect("live zeroization");
         assert_eq!(zeroized.state, SoftwareZeroizationState::Complete);
+        assert!(
+            automatic
+                .register_paired(EventAdapterSnapshot::new(
+                    crate::EventTransportKind::BLE_L2CAP_V1,
+                    0,
+                    crate::EventAdapterState::Unavailable,
+                    true,
+                    1,
+                ))
+                .is_none(),
+            "terminal actor closes retained automatic adapter admission"
+        );
+        assert!(
+            automatic.replace_eligibility(Vec::new()).is_none(),
+            "terminal actor closes retained automatic roster admission"
+        );
         let receipt = running.wait().await.expect("zeroized actor completion");
         assert_eq!(receipt.events, 1);
         assert_eq!(receipt.blobs, 1);
@@ -46728,6 +47270,7 @@ mod tests {
                 automatic_event_transports: None,
                 application_receiver,
                 application_admission: application_admission.clone(),
+                transport_admission: Arc::new(TransportAdmission::open()),
                 control_receiver,
                 ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
@@ -46875,6 +47418,7 @@ mod tests {
                 automatic_event_transports: None,
                 application_receiver,
                 application_admission: application_admission.clone(),
+                transport_admission: Arc::new(TransportAdmission::open()),
                 control_receiver,
                 ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
@@ -47368,6 +47912,41 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn pinned_state_root_opens_publication_journal_without_ancestor_access() {
+        struct RestoreOwnerOnlyMode(PathBuf);
+
+        impl Drop for RestoreOwnerOnlyMode {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+            }
+        }
+
+        let fixture = root("pinned-state-root-publication-journal");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&fixture)
+            .expect("publication journal fixture");
+        let state = fixture.join("state");
+        let pinned = pin_node_state_root(&state).expect("pin publication journal state root");
+        let restore_mode = RestoreOwnerOnlyMode(fixture.clone());
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o000))
+            .expect("make state ancestor unavailable");
+
+        let journal = pinned
+            .open_or_initialize_publication_journal(
+                Path::new("publication-journal.redb"),
+                b"pinned-state-root-test",
+            )
+            .expect("open publication journal through pinned state directory");
+
+        drop(journal);
+        drop(restore_mode);
+        assert!(state.join("publication-journal.redb").is_file());
+        fs::remove_dir_all(fixture).expect("cleanup publication journal fixture");
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn live_event_group_coalesces_adjacent_ordinary_publications() {
         let state = root("live-event-group");
@@ -47406,6 +47985,7 @@ mod tests {
                 automatic_event_transports: None,
                 application_receiver,
                 application_admission,
+                transport_admission: Arc::new(TransportAdmission::open()),
                 control_receiver,
                 ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
@@ -47568,6 +48148,7 @@ mod tests {
                 automatic_event_transports: None,
                 application_receiver,
                 application_admission,
+                transport_admission: Arc::new(TransportAdmission::open()),
                 control_receiver,
                 ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
@@ -47732,6 +48313,7 @@ mod tests {
                 automatic_event_transports: None,
                 application_receiver,
                 application_admission,
+                transport_admission: Arc::new(TransportAdmission::open()),
                 control_receiver,
                 ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
@@ -49204,6 +49786,7 @@ mod tests {
                 automatic_event_transports: None,
                 application_receiver: receiver,
                 application_admission: admission,
+                transport_admission: Arc::new(TransportAdmission::open()),
                 control_receiver: controls,
                 ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
@@ -53349,6 +53932,7 @@ mod tests {
             NodeActorChannels::new(
                 application_receiver,
                 application_admission.clone(),
+                Arc::new(TransportAdmission::open()),
                 control_receiver,
                 mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,
@@ -53504,6 +54088,7 @@ mod tests {
                 automatic_event_transports: None,
                 application_receiver,
                 application_admission: application_admission.clone(),
+                transport_admission: Arc::new(TransportAdmission::open()),
                 control_receiver,
                 ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
                 shutdown_receiver,

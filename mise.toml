@@ -52,6 +52,7 @@ run = [
   "python3 tools/test_aster_lan_mvp.py",
   "python3 tools/test_aster_lan_mvp_compose.py",
   "python3 tools/test_aster_deb_compose.py",
+  "python3 tools/test_deb_btle_authority_package.py",
   "python3 tools/test_aster_lan_scale_compose.py",
   "python3 tools/test_aster_hierarchy_mvp_compose.py",
   "python3 tools/test_aster_hierarchy_scale_compose.py",

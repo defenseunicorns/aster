@@ -433,10 +433,17 @@ source verification, and reducers.
 
 Use the `Link` trait and existing IP/BTLE adapters as semantic and test migration
 sources. The selected node now has an adapter-neutral stream registry and
-deterministic selector, while `IrohQuicV1` remains the only adapter registered
-by the shipped production composition. Each adapter owns its connection state
-and attempt creation. Implementing another adapter, or using it as the single
-contact-agreed adapter, does not require changing the Blob stream codec,
+deterministic selector. `IrohQuicV1` remains the only selectable adapter in the
+shipped production composition. In the current local composition, an optional
+BTLE policy whose credential preparation succeeds may also register a
+`BLE_L2CAP_V1` lane, but that lane is fixed `Unavailable` and radio-inert: it
+cannot be selected and performs no BlueZ, Bluetooth, or controller work. A
+complete BTLE policy block is active by default; `"enabled": false` is the
+explicit opt-out, while an absent block grants no BTLE authority. Controller
+presence never supplies missing policy or credential authority. Each adapter
+owns its connection state and attempt creation. Implementing another adapter,
+or using it as the sole contact-agreed adapter, does not require changing the
+Blob stream codec,
 pipeline, persistence, or selector. Candidate support
 and locators must come from local configuration, provisioned peer data, or
 authenticated discovery before `StreamOpen`; peer-supplied ranking is never
@@ -446,6 +453,11 @@ the stream contract, then orders adapter-reported health, configured priority,
 and stable adapter ID. Exactly one adapter carries a logical attempt. Iroh
 direct versus relay remains an Iroh-local path observation, not two selectable
 Aster transports.
+
+The supervised agent keeps both built-in Iroh contact and adapter selection
+closed while authorized transports publish their initial availability, then
+opens contact admission once before reporting Ready. Terminal drain closes the
+same gate permanently. This ordering is a local runtime detail, not protocol.
 
 Fake adapters validate multi-registration ranking, requirement and policy
 filtering, adapter-owned attempt creation, retry, cancellation, terminal
@@ -476,8 +488,9 @@ descending order:
   `0xd6..0xdc` records, v9 custody/record protection, concurrent Iroh
   data/control pair, adapter-neutral registry and selector, bounded parallel
   segment verification, durable pack checkpoints, resume, and lifecycle
-  promotion are implemented. The shipped production registry currently
-  contains only `IrohQuicV1`; automatic selection therefore does not yet mean
+  promotion are implemented. The optional local `BLE_L2CAP_V1` registration is
+  always unavailable and cannot carry an attempt; `IrohQuicV1` remains the only
+  selectable shipped adapter. Automatic selection therefore does not yet mean
   cross-transport failover.
 - **Semantic version 8** inherits semantic-v7 profile
   negotiation and receipt-free Event pages, while profile 4 adds authenticated

@@ -7,7 +7,7 @@ use aster_agent::{
     config::{
         ValidatedBtlePolicy, ValidatedSystemdAgentConfig, check_config, load_and_validate_config,
     },
-    runtime::{AgentExit, AgentSignal, run_customer_agent},
+    runtime::{AgentExit, AgentSignal, BtleRuntimeStartup, run_customer_agent_with_btle},
 };
 use aster_host::{
     BoundedDiscoveryCredentialArtifact, DiscoveryCredentialArtifactProvider,
@@ -205,13 +205,20 @@ async fn run() -> Result<Option<AgentExit>, BoxError> {
         Invocation::CustomerConfig(path) => {
             let config = load_and_validate_config(&path)?;
             // Roster credential renewal is restart-based. The move-only lease
-            // is validated and durably checkpointed before Task 6 hands it to
+            // is validated and durably checkpointed before ownership reaches
             // the adapter; there is deliberately no live replacement here.
-            let _btle_credential = load_btle_startup_credential(&config)?;
+            let btle_runtime = match config.btle_policy() {
+                Some(policy) => {
+                    let prepared = load_btle_startup_credential(&config)?
+                        .ok_or(BtleStartupError::Credential)?;
+                    BtleRuntimeStartup::radio_inert(prepared, *policy, config.state())?
+                }
+                None => BtleRuntimeStartup::disabled(),
+            };
             let mut loader = SystemdCredentialLoader::from_environment()?;
             let signals = translated_signals()?;
             Ok(Some(
-                run_customer_agent(config, &mut loader, signals).await?,
+                run_customer_agent_with_btle(config, &mut loader, signals, btle_runtime).await?,
             ))
         }
         Invocation::LegacyDevelopment(mut arguments) => {
@@ -807,8 +814,8 @@ mod tests {
 
     #[test]
     fn optional_btle_startup_skips_credentials_when_policy_is_absent() {
-        // Break caught: a legacy/default-off deployment must start without a
-        // roster credential or any platform credential access.
+        // Break caught: a deployment without BTLE authority must start without
+        // a roster credential or any platform credential access.
         let config = validated_customer_config(None);
         let called = AtomicBool::new(false);
         let result: Result<Option<()>, BtleStartupError> =

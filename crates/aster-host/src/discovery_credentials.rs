@@ -719,6 +719,20 @@ impl PinnedStateRoot {
         }
         Ok(())
     }
+
+    fn matches_path(&self, path: &Path) -> Result<bool, DiscoveryCredentialError> {
+        self.revalidate()?;
+        let candidate = Self::open(path, self.enforce_production_custody)?;
+        Ok(candidate.device == self.device && candidate.inode == self.inode)
+    }
+
+    fn matches_pinned_path(&self, path: &Path) -> Result<bool, DiscoveryCredentialError> {
+        self.revalidate()?;
+        let metadata = path
+            .metadata()
+            .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?;
+        Ok(metadata.is_dir() && metadata.dev() == self.device && metadata.ino() == self.inode)
+    }
 }
 
 fn directory_open_flags() -> rustix::fs::OFlags {
@@ -1452,6 +1466,20 @@ where
         let sample = self.clock.sample()?;
         self.core.observe_clock(sample)
     }
+
+    fn matches_binding(
+        &self,
+        expected_scope: [u8; 32],
+        checkpoint_root: &Path,
+    ) -> Result<bool, DiscoveryCredentialError> {
+        if self.core.expected_scope != expected_scope {
+            return Ok(false);
+        }
+        self.core
+            .checkpoint_store
+            .state
+            .matches_path(checkpoint_root)
+    }
 }
 
 /// One prepared production discovery credential and its exclusive authority.
@@ -1470,6 +1498,28 @@ where
     L: DiscoveryCredentialArtifactProvider,
     C: TrustedClock,
 {
+    /// Checks the non-secret deployment scope and pinned state-root identity
+    /// that were used to prepare this authority.
+    pub fn matches_binding(
+        &self,
+        expected_scope: [u8; 32],
+        checkpoint_root: &Path,
+    ) -> Result<bool, DiscoveryCredentialError> {
+        self.authority
+            .matches_binding(expected_scope, checkpoint_root)
+    }
+
+    /// Zeroizes credential material that will not be provisioned into an
+    /// adapter while retaining the exclusive authority and rollback custody.
+    pub fn retire_material(self) -> ActiveDiscoveryCredentialAuthority<L, C> {
+        let Self {
+            material,
+            authority,
+        } = self;
+        drop(material);
+        ActiveDiscoveryCredentialAuthority { authority }
+    }
+
     /// Moves the adapter credential parts together with the authority guard
     /// that must remain alive for their full active lifetime.
     pub fn into_parts(
@@ -1488,7 +1538,7 @@ where
 }
 
 /// Active production discovery authority retained after adapter provisioning.
-#[must_use = "the active authority must live as long as its discovery credentials"]
+#[must_use = "retain active authority for credential lifetime or exclusive custody"]
 pub struct ActiveDiscoveryCredentialAuthority<L, C> {
     authority: DiscoveryCredentialAuthority<L, C>,
 }
@@ -1498,6 +1548,36 @@ where
     L: DiscoveryCredentialArtifactProvider,
     C: TrustedClock,
 {
+    /// Checks that the retained authority still names the expected scope and
+    /// the state root pinned by the running node.
+    pub fn matches_binding(
+        &self,
+        expected_scope: [u8; 32],
+        checkpoint_root: &Path,
+    ) -> Result<bool, DiscoveryCredentialError> {
+        self.authority
+            .matches_binding(expected_scope, checkpoint_root)
+    }
+
+    /// Checks the retained scope and state-root identity against a directory
+    /// path already pinned by the running node. Unlike [`Self::matches_binding`],
+    /// this accepts a descriptor-backed path while preserving the original
+    /// configured-path custody revalidation.
+    pub fn matches_pinned_binding(
+        &self,
+        expected_scope: [u8; 32],
+        pinned_checkpoint_root: &Path,
+    ) -> Result<bool, DiscoveryCredentialError> {
+        if self.authority.core.expected_scope != expected_scope {
+            return Ok(false);
+        }
+        self.authority
+            .core
+            .checkpoint_store
+            .state
+            .matches_pinned_path(pinned_checkpoint_root)
+    }
+
     /// Resamples the trusted clock without loading another credential artifact.
     pub fn resample_clock(&mut self) -> Result<(), DiscoveryCredentialError> {
         self.authority.resample_clock()
@@ -2592,6 +2672,69 @@ mod tests {
         guard.resample_clock().unwrap();
         assert_eq!(loads.get(), 1);
         drop(guard);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn prepared_discovery_credential_rejects_cross_scope_and_state_bindings() {
+        let parent = std::env::temp_dir().join(format!(
+            "aster-discovery-binding-{}-{}",
+            std::process::id(),
+            ISSUED
+        ));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = parent.join("state");
+        let foreign_root = parent.join("foreign-state");
+        for path in [&root, &foreign_root] {
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let anchor = parent.join("authority.lock");
+        fs::write(&anchor, []).unwrap();
+        let prepared = prepare_discovery_credential_for_test(
+            StaticLoader {
+                bytes: artifact(1, ISSUED + 60, 0, (7, OLD_SECRET), None),
+            },
+            StaticClock(TrustedClockSample::new(ISSUED + 10, Instant::now())),
+            SCOPE,
+            &root,
+            open_test_anchor(&anchor),
+        )
+        .unwrap();
+
+        assert!(prepared.matches_binding(SCOPE, &root).unwrap());
+        assert!(!prepared.matches_binding([0x7f; 32], &root).unwrap());
+        assert!(!prepared.matches_binding(SCOPE, &foreign_root).unwrap());
+
+        let authority = prepared.retire_material();
+        let pinned_root = File::open(&root).unwrap();
+        #[cfg(target_os = "linux")]
+        let pinned_path = {
+            use std::os::fd::AsRawFd as _;
+            let pinned_path =
+                std::path::PathBuf::from(format!("/proc/self/fd/{}", pinned_root.as_raw_fd()));
+            assert!(
+                authority
+                    .matches_pinned_binding(SCOPE, &pinned_path)
+                    .unwrap()
+            );
+            pinned_path
+        };
+        let retired_root = parent.join("retired-state");
+        fs::rename(&root, &retired_root).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(authority.matches_binding(SCOPE, &root).is_err());
+        #[cfg(target_os = "linux")]
+        assert!(
+            authority
+                .matches_pinned_binding(SCOPE, &pinned_path)
+                .is_err()
+        );
+
+        drop(authority);
         fs::remove_dir_all(parent).unwrap();
     }
 

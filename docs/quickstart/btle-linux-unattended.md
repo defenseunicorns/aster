@@ -5,6 +5,17 @@ mission peer per process, and semantic-v9 Event data. The transport-neutral
 node starts before its Linux/BlueZ supervisor and remains usable while BTLE is
 absent. This is evaluation, not a production deployment.
 
+This explicit-controller evaluator remains separate from the packaged agent.
+The current local agent may retain prepared optional BTLE custody and register
+a `BLE_L2CAP_V1` lane, but that lane is fixed `Unavailable`, never selected,
+and performs no BlueZ, Bluetooth, or controller work. Package sources specify
+a custody-only tmpfiles anchor; the base service does not bind the BTLE roster
+or gain `AF_BLUETOOTH` or Linux capabilities, and the package adds no BlueZ,
+D-Bus, or Polkit policy. This does not prove that the service identity cannot
+reach the system bus. The disposable-VM package assertions have not been
+executed, and this runbook does not close the automatic-controller,
+support-matrix, exact-confinement, or physical production gates.
+
 ## Modes and limits
 
 - `--transport fixed`: exact provisioned peer address/type and PSM.

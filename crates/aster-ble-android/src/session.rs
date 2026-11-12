@@ -18,6 +18,7 @@ use serde::Serialize;
 use std::{
     future::Future,
     os::{fd::OwnedFd, unix::net::UnixStream},
+    path::Path,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -510,12 +511,11 @@ async fn prepare_text_event(
     node: &RunningNode,
     config: &ValidatorConfig,
 ) -> Result<EventPublishResult, ValidatorError> {
-    let journal_path = config.state_path().join(RING1_EVENT_JOURNAL_FILE);
-    if !journal_path.try_exists().map_err(|_| journal_error())? {
-        numbered::Journal::initialize(&journal_path, RING1_EVENT_JOURNAL_CLIENT_ID)
-            .map_err(|_| journal_error())?;
-    }
-    let mut journal = numbered::Journal::open(&journal_path, RING1_EVENT_JOURNAL_CLIENT_ID)
+    let mut journal = node
+        .open_or_initialize_publication_journal(
+            Path::new(RING1_EVENT_JOURNAL_FILE),
+            RING1_EVENT_JOURNAL_CLIENT_ID,
+        )
         .map_err(|_| journal_error())?;
     let events = node.selected_events();
     journal

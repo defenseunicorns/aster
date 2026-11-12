@@ -16,7 +16,7 @@
 Local Blob publication commits without waiting for a peer. Rust, the native-gRPC agent, and asterctl implement bounded Blob publication and authenticated reads. blob-status reports receiver-local durable state, not remote delivery, peer status, or convergence. CLI download resume is post-merge work; an interrupted download restarts at byte zero.
 <!-- ASTER-BLOB-CAPABILITY:END -->
 
-- Status date: 2026-11-06
+- Status date: 2026-11-12
 - Product-intent authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Security-profile applicability:
   [`security-profile-requirements-disposition.md`](security-profile-requirements-disposition.md)
@@ -60,6 +60,19 @@ radio observations do not create a retained Android support claim. Discovery,
 packaging, broader hardware qualification outside the exact fixed stack,
 multi-carrier selection, production support, and every BTLE requirement-credit
 change remain open.
+
+The current local agent may register a `BLE_L2CAP_V1` lane only after optional
+BTLE policy and credential preparation succeed. That lane remains fixed
+`Unavailable`, cannot be selected, and performs no BlueZ, Bluetooth, or
+controller work. Node readiness and local durable publication require no
+transport. Package sources specify a custody-only tmpfiles anchor; the base
+service binds no BTLE roster or `AF_BLUETOOTH` socket and gains no Linux
+capabilities; the package adds no BlueZ, D-Bus, or Polkit policy. This does not
+establish system-bus denial for the service identity. The disposable-VM package
+behavior has not been executed. Production activation remains blocked on a
+qualified automatic controller resolver, support matrix, exact confinement,
+and later physical evidence; none of this advances cross-transport, support,
+or requirement credit.
 
 ## Purpose
 

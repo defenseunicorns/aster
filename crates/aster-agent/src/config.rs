@@ -400,6 +400,7 @@ struct RawAgentConfig<C> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawBtlePolicy {
+    #[serde(default = "default_btle_policy_enabled")]
     enabled: bool,
     #[serde(default)]
     peer: Option<String>,
@@ -413,6 +414,10 @@ struct RawBtlePolicy {
     priority: Option<u16>,
     #[serde(default)]
     credential: Option<String>,
+}
+
+const fn default_btle_policy_enabled() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -1061,9 +1066,9 @@ mod tests {
     }
 
     #[test]
-    fn btle_policy_absence_and_explicit_off_preserve_default_off_compatibility() {
-        // Break caught: adding BTLE configuration must not activate or require
-        // credentials for an existing systemd-v1 deployment.
+    fn btle_policy_absence_and_explicit_off_require_no_btle_authority() {
+        // Break caught: adding BTLE support must not require credentials for
+        // an existing systemd-v1 deployment or an explicit opt-out.
         let absent = validate_json(config_with_storage(4_161, 17_891_328))
             .expect("legacy configuration without BTLE policy");
         assert!(absent.btle_policy().is_none());
@@ -1091,7 +1096,7 @@ mod tests {
     #[test]
     fn systemd_state_directory_accepts_repeated_and_trailing_separators() {
         // Break caught: empty path segments are harmless separators, not
-        // traversal components, and legacy default-off configurations may
+        // traversal components, and legacy configurations may
         // already contain them.
         for state in ["/var//lib/aster-agent", "/var/lib/aster-agent/"] {
             let mut config: serde_json::Value =
@@ -1125,6 +1130,21 @@ mod tests {
             config_with_btle(with_controller),
             ConfigReason::UnknownField,
         );
+    }
+
+    #[test]
+    fn btle_complete_policy_defaults_to_enabled_composition_without_enable_flag() {
+        // Break caught: requiring a redundant positive switch silently omits a
+        // configured adapter from composition before availability is assessed.
+        let mut policy = valid_btle_policy();
+        policy
+            .as_object_mut()
+            .expect("BTLE policy object")
+            .remove("enabled");
+
+        let config = validate_json(config_with_btle(policy))
+            .expect("complete BTLE authority defaults to enabled composition");
+        assert!(config.btle_policy().is_some());
     }
 
     #[test]

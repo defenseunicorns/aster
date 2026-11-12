@@ -533,6 +533,12 @@ A-12 remains failed: the adapter/BTLE simulation exposes a broadcast primitive,
 but there is no protected broadcast replication capsule or implemented
 suppression, repair aggregation, and loop-bounding protocol. The Rust host can
 pump a configured link, but no concrete physical BTLE controller is shipped.
+The current local agent can retain prepared BTLE custody and register a
+`BLE_L2CAP_V1` lane, but the lane is fixed `Unavailable`, cannot be selected,
+and performs no BlueZ, Bluetooth, or controller work. Iroh remains the only
+selectable shipped adapter, so this adds no A-01/A-12, cross-transport,
+failover, support, or requirement credit. Package-VM assertions for the
+custody-only anchor are specified but have not been executed.
 
 The current security construction using suite `0x0001` passes A-09's handshake
 subgate: a runtime capture test reassembles all four tiny-MTU flights and finds
@@ -626,3 +632,6 @@ Simulation is not hardware acceptance. BTLE release evidence requires two
 physical controllers/devices, negotiated small MTU, disconnect/reconnect, GATT
 fallback, and L2CAP where supported. NAT evidence requires controlled cone and
 restrictive NAT/firewall topologies. RF emission claims require platform capture.
+Production BTLE activation additionally requires a qualified automatic
+controller resolver, a support matrix, exact package confinement, and retained
+physical evidence.

@@ -14,7 +14,196 @@ done
 root=$(cd "$(dirname "$0")/.." && pwd)
 package=$(realpath "$1")
 dpkg -i "$package"
-trap 'systemctl stop aster-agent.service || true' EXIT
+lock_holder_pid=
+cleanup() {
+    if [[ -n $lock_holder_pid ]]; then
+        kill "$lock_holder_pid" 2>/dev/null || true
+        wait "$lock_holder_pid" 2>/dev/null || true
+        lock_holder_pid=
+    fi
+    systemctl stop aster-agent.service || true
+}
+trap cleanup EXIT
+
+btle_authority_directory=/run/aster-agent
+btle_authority_lock=$btle_authority_directory/btle-authority.lock
+btle_tmpfiles_policy=/usr/lib/tmpfiles.d/aster.conf
+btle_postinst=/var/lib/dpkg/info/aster.postinst
+
+btle_access_acl() {
+    LC_ALL=C getfacl --access --absolute-names --omit-header -- "$1"
+}
+
+btle_default_acl() {
+    LC_ALL=C getfacl --default --absolute-names --omit-header -- "$1"
+}
+
+assert_btle_authority_ancestor() {
+    [[ ! -L /run && -d /run ]]
+    [[ $(stat -c '%u:%g:%a' -- /run) == 0:0:755 ]]
+    [[ $(btle_access_acl /run) == $'user::rwx\ngroup::r-x\nother::r-x' ]]
+    [[ -z $(btle_default_acl /run) ]]
+}
+
+assert_btle_authority_lock() {
+    assert_btle_authority_ancestor
+    [[ ! -L $btle_authority_directory && -d $btle_authority_directory ]]
+    [[ $(stat -c '%u:%g:%a' -- "$btle_authority_directory") == 0:0:755 ]]
+    [[ $(btle_access_acl "$btle_authority_directory") == \
+        $'user::rwx\ngroup::r-x\nother::r-x' ]]
+    [[ -z $(btle_default_acl "$btle_authority_directory") ]]
+    [[ ! -L $btle_authority_lock && -f $btle_authority_lock ]]
+    [[ $(stat -c '%u:%g:%a:%s:%h' -- "$btle_authority_lock") == 0:0:440:0:1 ]]
+    [[ $(btle_access_acl "$btle_authority_lock") == \
+        $'user::r--\nuser:aster:r--\ngroup::---\nmask::r--\nother::---' ]]
+    [[ -z $(btle_default_acl "$btle_authority_lock") ]]
+}
+
+recreate_btle_authority_lock() {
+    rm -f -- "$btle_authority_lock"
+    systemd-tmpfiles --create "$btle_tmpfiles_policy"
+    assert_btle_authority_lock
+}
+
+recreate_btle_authority_hierarchy() {
+    rm -f -- "$btle_authority_lock"
+    if [[ -L $btle_authority_directory ]]; then
+        rm -f -- "$btle_authority_directory"
+    elif [[ -d $btle_authority_directory ]]; then
+        rmdir -- "$btle_authority_directory"
+    fi
+    [[ ! -e $btle_authority_directory && ! -L $btle_authority_directory ]]
+    systemd-tmpfiles --create "$btle_tmpfiles_policy"
+    assert_btle_authority_lock
+}
+
+assert_unsafe_anchor_rejected() {
+    if "$btle_postinst" configure; then
+        echo "Unsafe BTLE authority fixture was accepted: $1" >&2
+        exit 1
+    fi
+}
+
+assert_unsafe_directory_rejected() {
+    if "$btle_postinst" configure; then
+        echo "Unsafe BTLE authority directory fixture was accepted: $1" >&2
+        exit 1
+    fi
+}
+
+assert_btle_authority_lock
+# The service account can open and exclusively lock the root-owned anchor, but
+# a second process cannot share authority while that lock remains held. The
+# coprocess pipe gives a bounded readiness/release handshake without polling.
+coproc BTLE_LOCK_HOLDER {
+    exec timeout --kill-after=1s 5s runuser -u aster -- sh -c \
+        'exec 9<"$1"; flock -n 9; printf "ready\n"; IFS= read -r release' \
+        sh "$btle_authority_lock"
+}
+lock_holder_pid=$BTLE_LOCK_HOLDER_PID
+IFS= read -r -t 3 lock_status <&"${BTLE_LOCK_HOLDER[0]}"
+[[ $lock_status == ready ]]
+! runuser -u aster -- sh -c 'exec 9<"$1"; flock -n 9' sh "$btle_authority_lock"
+printf 'release\n' >&"${BTLE_LOCK_HOLDER[1]}"
+wait "$lock_holder_pid"
+lock_holder_pid=
+
+# The named ACL grants only read/lock access; the trusted parent prevents path
+# replacement by the service identity.
+! runuser -u aster -- sh -c ': >"$1"' sh "$btle_authority_lock"
+! runuser -u aster -- truncate -s 1 "$btle_authority_lock"
+! runuser -u aster -- chmod 0600 "$btle_authority_lock"
+! runuser -u aster -- mv "$btle_authority_lock" "$btle_authority_lock.moved"
+! runuser -u aster -- rm "$btle_authority_lock"
+assert_btle_authority_lock
+
+# A boot-style tmpfiles invocation recreates the safely deleted volatile
+# hierarchy, not only the lock file.
+recreate_btle_authority_hierarchy
+
+# A valid upgrade is accepted without changing custody.
+"$btle_postinst" configure
+assert_btle_authority_lock
+
+# The fixed /run ancestor is never mutated. Exercise unsafe replaceable child
+# directory profiles and prove pre-helper rejection leaves each unchanged.
+rm -f -- "$btle_authority_lock"
+rmdir -- "$btle_authority_directory"
+symlink_directory_target=$(mktemp -d)
+ln -s -- "$symlink_directory_target" "$btle_authority_directory"
+assert_unsafe_directory_rejected symlink
+[[ -L $btle_authority_directory && \
+    $(readlink -- "$btle_authority_directory") == "$symlink_directory_target" ]]
+rm -f -- "$btle_authority_directory"
+rmdir -- "$symlink_directory_target"
+recreate_btle_authority_hierarchy
+
+rm -f -- "$btle_authority_lock"
+chown aster:aster "$btle_authority_directory"
+assert_unsafe_directory_rejected wrong-owner
+[[ $(stat -c '%u:%g' -- "$btle_authority_directory") == \
+    "$(id -u aster):$(id -g aster)" ]]
+recreate_btle_authority_hierarchy
+
+rm -f -- "$btle_authority_lock"
+chmod 0775 "$btle_authority_directory"
+assert_unsafe_directory_rejected wrong-mode
+[[ $(stat -c '%a' -- "$btle_authority_directory") == 775 ]]
+recreate_btle_authority_hierarchy
+
+rm -f -- "$btle_authority_lock"
+setfacl -m u:aster:r-x,m::r-x "$btle_authority_directory"
+[[ $(stat -c '%a' -- "$btle_authority_directory") == 755 ]]
+unsafe_access_acl=$(btle_access_acl "$btle_authority_directory")
+assert_unsafe_directory_rejected access-acl
+[[ $(btle_access_acl "$btle_authority_directory") == "$unsafe_access_acl" ]]
+recreate_btle_authority_hierarchy
+
+rm -f -- "$btle_authority_lock"
+setfacl -d -m u::rwx,u:aster:rwx,g::r-x,m::rwx,o::r-x "$btle_authority_directory"
+unsafe_default_acl=$(btle_default_acl "$btle_authority_directory")
+assert_unsafe_directory_rejected default-acl
+[[ -n $unsafe_default_acl ]]
+[[ $(btle_default_acl "$btle_authority_directory") == "$unsafe_default_acl" ]]
+recreate_btle_authority_hierarchy
+
+# Pre-helper validation must reject unsafe existing objects before debhelper's
+# tmpfiles snippet can normalize them.
+rm -f -- "$btle_authority_lock"
+symlink_target=$(mktemp)
+printf 'unchanged\n' >"$symlink_target"
+ln -s -- "$symlink_target" "$btle_authority_lock"
+assert_unsafe_anchor_rejected symlink
+[[ -L $btle_authority_lock && $(readlink -- "$btle_authority_lock") == "$symlink_target" ]]
+[[ $(cat "$symlink_target") == unchanged ]]
+rm -f -- "$btle_authority_lock" "$symlink_target"
+recreate_btle_authority_lock
+
+rm -f -- "$btle_authority_lock"
+hardlink_fixture=$btle_authority_directory/hardlink-fixture
+install -o root -g root -m 0440 /dev/null "$hardlink_fixture"
+setfacl -m u::r--,u:aster:r--,g::---,m::r--,o::--- "$hardlink_fixture"
+ln -- "$hardlink_fixture" "$btle_authority_lock"
+assert_unsafe_anchor_rejected hardlink
+[[ $(stat -c '%h' -- "$hardlink_fixture") == 2 ]]
+rm -f -- "$btle_authority_lock" "$hardlink_fixture"
+recreate_btle_authority_lock
+
+printf 'not-empty' >"$btle_authority_lock"
+chown root:root "$btle_authority_lock"
+chmod 0440 "$btle_authority_lock"
+setfacl -m u::r--,u:aster:r--,g::---,m::r--,o::--- "$btle_authority_lock"
+assert_unsafe_anchor_rejected non-empty
+[[ $(cat "$btle_authority_lock") == not-empty ]]
+recreate_btle_authority_lock
+
+rm -f -- "$btle_authority_lock"
+install -o root -g root -m 0440 /dev/null "$btle_authority_lock"
+wrong_acl=$(btle_access_acl "$btle_authority_lock")
+assert_unsafe_anchor_rejected wrong-acl
+[[ $(btle_access_acl "$btle_authority_lock") == "$wrong_acl" ]]
+recreate_btle_authority_lock
+
 ! systemctl is-active --quiet aster-agent.service
 ! systemctl is-enabled --quiet aster-agent.service
 # Missing configuration/provisioning must never produce a running service.
