@@ -38,38 +38,11 @@ const MAX_APPLICATION_HEADER_BYTES: usize = 16 * 1024;
 const MAX_FIRST_AUTHENTICATION_TIMEOUT_MS: u64 = 5_000;
 const MAX_IN_FLIGHT_APPLICATION_REQUESTS: usize = 64;
 const MAX_SHUTDOWN_GRACE_MS: u64 = 30_000;
-// The config-only feature matrix cannot depend unconditionally on the
-// Linux-specific provider crate. The packaged build uses the provider constant
-// directly and compile-time checks its schema spelling against the portable
-// config literal, so drift cannot reach a customer binary.
-const BTLE_ROSTER_CREDENTIAL_SCHEMA_NAME: &str = "aster-btle-roster";
-#[cfg(feature = "systemd-provider")]
-pub use aster_systemd_credentials::BTLE_ROSTER_CREDENTIAL_NAME;
-#[cfg(not(feature = "systemd-provider"))]
-pub const BTLE_ROSTER_CREDENTIAL_NAME: &str = BTLE_ROSTER_CREDENTIAL_SCHEMA_NAME;
-
-#[cfg(feature = "systemd-provider")]
-const _: () = assert!(const_str_equal(
-    BTLE_ROSTER_CREDENTIAL_SCHEMA_NAME,
-    BTLE_ROSTER_CREDENTIAL_NAME,
-));
-
-#[cfg(feature = "systemd-provider")]
-const fn const_str_equal(left: &str, right: &str) -> bool {
-    let left = left.as_bytes();
-    let right = right.as_bytes();
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut index = 0;
-    while index < left.len() {
-        if left[index] != right[index] {
-            return false;
-        }
-        index += 1;
-    }
-    true
-}
+// Keep portable configuration independent of the Linux credential provider.
+// The packaged systemd entrypoint compile-time checks this schema name against
+// its provider constant without contaminating other binaries when Cargo
+// unifies package features across a workspace build.
+pub const BTLE_ROSTER_CREDENTIAL_NAME: &str = "aster-btle-roster";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigReason {

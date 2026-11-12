@@ -28,6 +28,27 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 const MAX_BLOB_INTERESTS: usize = 256;
 
+const _: () = assert!(const_str_equal(
+    aster_agent::config::BTLE_ROSTER_CREDENTIAL_NAME,
+    aster_systemd_credentials::BTLE_ROSTER_CREDENTIAL_NAME,
+));
+
+const fn const_str_equal(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < left.len() {
+        if left[index] != right[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BtleStartupError {
     Credential,
