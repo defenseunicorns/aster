@@ -1781,8 +1781,8 @@ integration are removed; the rest of `aster-lab` remains.
 
 The provider removal also removes the optional Hickory 0.25.2 lock entries.
 The root audit no longer ignores `RUSTSEC-2026-0118` or `RUSTSEC-2026-0119`.
-The dependency-exception scope gate now requires only the retained safe
-`hickory-proto` 0.26.1 lock entry and still rejects vulnerable active Hickory.
+The dependency-exception scope gate now requires only the retained fixed
+`hickory-proto` 0.26.2 lock entry and still rejects vulnerable active Hickory.
 The unrelated age advisory disposition, exact license exceptions, and netlink
 patch remain unchanged.
 
@@ -1843,7 +1843,7 @@ exactly once in the root lock with its reviewed version, crates.io registry
 source, and archive checksum; both must be absent from fuzz. `paste` must remain
 absent from the root lock and resolved workspace/fuzz graphs. The same gate
 proves the vulnerable raw-lock Hickory pair remains inactive while allowing
-Iroh's fixed 0.26.1 packages. Adversarial checks force a fuzz graph command
+Iroh's fixed 0.26.2 package. Adversarial checks force a fuzz graph command
 failure, an active vulnerable Hickory package, reintroduced `paste` versions,
 an expanded `basic-toml` reverse graph, `basic-toml` in fuzz, a second ignored
 package version, an alternate package source, and a changed archive checksum;
