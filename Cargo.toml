@@ -19,7 +19,6 @@ members = [
   "crates/aster-ble",
   "crates/aster-ffi",
   "crates/aster-conformance",
-  "crates/aster-lab",
   "crates/aster-provisioning-age",
   "crates/aster-systemd-credentials",
 ]

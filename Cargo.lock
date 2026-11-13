@@ -439,27 +439,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aster-lab"
-version = "0.1.0-alpha.1"
-dependencies = [
- "aster-core",
- "aster-host",
- "aster-ip",
- "aster-node",
- "getrandom 0.4.3",
- "iroh",
- "iroh-relay",
- "libc",
- "negentropy",
- "rcgen",
- "rustix",
- "rustls",
- "sha2 0.11.1",
- "tokio",
- "zeroize",
-]
-
-[[package]]
 name = "aster-negentropy"
 version = "0.1.0-alpha.1"
 dependencies = [

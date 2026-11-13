@@ -88,10 +88,8 @@ internally. The broader
 semantic implementation remains the migration source for behavior that has not
 yet moved into this composition.
 
-The generic `aster-host` shared-runtime composition remains capped at semantic
-v8 because its Blob lane still uses profile 4 `BlobChunk` objects. The selected
-`aster-node` composition separately owns semantic-v9/profile-5 streaming; the
-shared-host ceiling does not reduce that selected capability.
+The retired `aster-host` shared-runtime composition used semantic v8/profile 4.
+The selected `aster-node` composition owns semantic-v9/profile-5 streaming.
 
 ## Capability boundary
 
@@ -243,9 +241,8 @@ or non-Unix platforms. Exact usage and the crash-resumption boundary are in the
 The repository also retains the current semantic application and host surfaces:
 
 - `ApplicationNode` is the offline application surface.
-- `SharedNodeContactSupervisor` and `MeshHost` remain the native laboratory
-  composition used by Gate H. The retired `MeshService` wrapper is removed;
-  shared core and binding batch, bridge, and merge APIs remain available.
+- Shared core and binding batch, bridge, and merge APIs remain available.
+  The native laboratory host composition and Gate H have been retired.
 - `IpLink` and `BleLink` implement the same opaque-fragment contract.
 - The maintained [implementation-boundary table](../README.md#current-implementation-boundary)
   records which operations each Rust and language-binding surface exposes.
@@ -294,9 +291,8 @@ derived proofs. `IpLink::bind` rejects the all-zero token, including when manual
 peering uses `discovery_target = None`.
 
 These are carrier primitives, not a complete application host. The native
-laboratory composes them through `SharedNodeContactSupervisor` and `MeshHost`;
-see the [native LAN experiment](../lab/README.md#automatic-three-process-lan-mesh-demo).
-A local publish result does not promise remote delivery.
+laboratory and its `SharedNodeContactSupervisor`/`MeshHost` composition have
+been retired. A local publish result does not promise remote delivery.
 
 ### Current semantic discovery, rendezvous, and relay
 

@@ -1529,7 +1529,8 @@ raw root or host. Runtime cleanup removed the cell containers, networks, and
 namespaces; it does not claim deletion of the selected local image, global or
 physical sanitization, or sanitization of retained encrypted state.
 
-A future fresh run requires explicit mutation and build-network authorization:
+The namespace-NAT controller has been retired. The following command records
+the historical workflow and requires its original source checkout:
 
 ```sh
 python3 lab/orchestrate.py selected-iroh-nat-run \
@@ -1541,11 +1542,10 @@ The validator binds the public receipt to the immutable signed Git objects and
 all curated raw artifacts:
 
 ```sh
-python3 tools/check-selected-iroh-nat-receipt.py --historical-v1 \
+python3 tools/historical/check-selected-iroh-nat-receipt.py \
   --raw-root /private/tmp/aster-selected-iroh-nat.zFpaqB/20260826T143559Z-selected-iroh-nat-50726015670670e9 \
   --source . \
   docs/validation/evidence/selected-iroh-nat-15f4e0b.json
-python3 tools/test-selected-iroh-nat-receipt.py
 ```
 
 The raw-root projector independently reproduced the public receipt
