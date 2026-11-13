@@ -606,6 +606,39 @@ curl\t8.0
         self.assertIn("lab/Dockerfile", paths)
         self.assertRegex(orchestrate.build_input_digest(inputs), r"^[0-9a-f]{64}$")
 
+    def test_build_inputs_reject_unreviewed_hidden_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            (workspace / "crates").mkdir()
+            hidden = workspace / "third-party/example/.github/workflows"
+            hidden.mkdir(parents=True)
+            (hidden / "unreviewed.yml").write_text("unreviewed\n", encoding="utf-8")
+            (workspace / "lab").mkdir()
+            for relative in (
+                "Cargo.toml",
+                "Cargo.lock",
+                "LICENSE",
+                "THIRD_PARTY_NOTICES.md",
+                "lab/debian.sources",
+            ):
+                (workspace / relative).write_text("fixture\n", encoding="utf-8")
+            (workspace / ".dockerignore").write_text(
+                orchestrate.EXPECTED_DOCKERIGNORE, encoding="utf-8"
+            )
+            (workspace / "lab/Dockerfile.dockerignore").write_text(
+                orchestrate.EXPECTED_DOCKERIGNORE, encoding="utf-8"
+            )
+            (workspace / "lab/Dockerfile").write_text(
+                f"ARG LAB_BASE_IMAGE={orchestrate.LAB_BASE_IMAGE}\n"
+                "FROM ${LAB_BASE_IMAGE}\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(orchestrate, "WORKSPACE", workspace):
+                with self.assertRaisesRegex(
+                    orchestrate.LabError, "prohibited or symbolic build input"
+                ):
+                    orchestrate.collect_build_inputs()
+
     def test_build_boundary_seals_only_hashed_bytes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

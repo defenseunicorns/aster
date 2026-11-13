@@ -8,10 +8,18 @@ license.workspace = true
 
 [dependencies]
 aster-core = { version = "=0.1.0-alpha.1", path = "../aster-core", features = ["adapter-sdk"] }
+hmac.workspace = true
+libc.workspace = true
+rustix.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
 
 [features]
 default = []
+fuzzing = []
 gate-h-formal = []
+# Explicitly non-production constructor support for cross-crate authority tests.
+test-support = []
 
 [lints]
 workspace = true

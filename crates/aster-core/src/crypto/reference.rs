@@ -5,6 +5,8 @@
 //! algorithm selection, or primitive operations. The RustCrypto implementation remains a
 //! portable conformance aid and is not a FIPS 140-3 validated module.
 
+#[cfg(feature = "fuzzing")]
+use super::SessionKeys;
 use super::{
     AeadCiphertext, BatchCryptoProvider, BridgeCryptoProvider, BridgeEdgeEnrollment,
     BridgeEdgeEnrollmentClaims, ClientFinish, ClientHello, CryptoError, CryptoProvider,
@@ -12,7 +14,7 @@ use super::{
     MlKemDecapsulationKey, MlKemEncapsulationKey, MlKemKey, MlKemKeyExport, P256SecretKey,
     P256SigningKey, ResponderHandshake, ResponderHandshakePrepared, RustCryptoProvider,
     RustCryptoSigningKey, SealedBatchItem, SealedSourceBatch, Secret32, SecureChannel,
-    SequencedCiphertext, ServerFinished, ServerHello, SessionKeys, ZeroizeKey, client_hello_hash,
+    SequencedCiphertext, ServerFinished, ServerHello, ZeroizeKey, client_hello_hash,
 };
 use crate::batch;
 use crate::blob::{

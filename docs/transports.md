@@ -104,6 +104,7 @@ shared-host ceiling does not reduce that selected capability.
 | Current semantic in-memory link | High-level host contact, authentication, reconciliation, resume, and failure behavior | Reference carrier; not wired to the selected composition |
 | Current semantic UDP/IP | Nonblocking link, manual endpoint mapping, protected local discovery, rendezvous helpers, opaque relay components | Migration onto the selected node; full host acceptance on physical or operational networks |
 | Current semantic NAT/rendezvous and relay | Bounded rendezvous, endpoint-punching, and opaque-relay helpers | Not integrated into the selected node |
+| Linux BlueZ Event evaluation | Fixed-locator Ring 1 uses one exact controller and provisioned peer per process, event-driven availability, deterministic Linux role, bounded retry, and one semantic-v9 ordered Event contact. A separate source-present rostered evaluator adds authenticated transient discovery, a dynamic listener PSM, bounded credential/candidate state, and the same one-peer Event boundary. | [Bounded Ring-1 CM4 evidence](validation/evidence/2026-11-05-cm4-btle-ring1-event-validation.md) is evaluation-only. The process-restart failure was bound to CVE-2026-72333 on Linux 6.18.39 by the [clean-restart diagnostic](validation/evidence/2026-11-06-cm4-btle-clean-restart-diagnostic.md); the [fixed-kernel record](validation/evidence/2026-11-06-cm4-btle-clean-restart-validation.md) then observed zero-work restart on Linux 6.18.60 without a controller epoch change. Rostered discovery remains source-and-test evidence: stock `bluer` does not establish acknowledged cancellation-safe advertisement/discovery teardown or a bounded first D-Bus ingress queue, and stock `hmac` does not establish erasure of constructor-derived key/IPAD/OPAD temporaries. No selection/fallback, daemon, other data class, requirement credit, or production authorization is claimed. |
 | Current semantic BTLE | MTU-aware link, unicast plus an advertisement primitive, disconnect handling, platform `BleRadio` seam | Selected-node integration; a shipped Android, iOS, Linux, or controller-specific radio driver; complete one-to-many profile |
 | LoRa, serial, file | The requirements and semantic design do not preclude them | No selected adapters ship |
 
@@ -319,6 +320,31 @@ controlled-Iroh relay path above.
 Start with manually known addresses. Add discovery or rendezvous only after the
 authenticated two-node path is understood and measured in the target network.
 
+## Linux unattended BTLE Event evaluation
+
+The tree includes a separate `aster-btle-event` evaluator for two provisioned
+Linux nodes. Each process owns one exact BlueZ controller, one exact peer, and
+one Event contact at a time. The transport-neutral node starts before the
+Linux-specific supervisor, so BlueZ or controller absence does not block local
+durable node operation. With a published Event and matching receiver
+application selection already durable, controller availability later starts
+the existing mission-authenticated semantic-v9 ordered Event contact;
+controller loss cancels and drains that attempt, and restoration starts a
+fresh availability epoch.
+
+This lifecycle belongs to `aster-ble-linux`, not the protocol or generic node
+runtime. Its deterministic role, retry, and 60-second default success cadence
+are implementation policy. The node sees only an adapter-neutral admitted
+contact and remains valid when no transport is available.
+
+The claim is evaluation-stage Linux/Linux, one controller, one provisioned
+peer, and Event-only. It adds no discovery, transport selection or fallback,
+daemon/service boundary, State/Record/Blob execution, requirement credit,
+supported-hardware row, or production authorization. See the
+[unattended Linux BTLE Event quickstart](quickstart/btle-linux-unattended.md)
+for the exact CLI, controller power-cycle procedure, shutdown order, and
+evidence boundary.
+
 ## Current semantic BTLE integration seam
 
 The BTLE crate deliberately does not choose an operating-system Bluetooth API.
@@ -407,10 +433,17 @@ source verification, and reducers.
 
 Use the `Link` trait and existing IP/BTLE adapters as semantic and test migration
 sources. The selected node now has an adapter-neutral stream registry and
-deterministic selector, while `IrohQuicV1` remains the only adapter registered
-by the shipped production composition. Each adapter owns its connection state
-and attempt creation. Implementing another adapter, or using it as the single
-contact-agreed adapter, does not require changing the Blob stream codec,
+deterministic selector. `IrohQuicV1` remains the only selectable adapter in the
+shipped production composition. In the current local composition, an optional
+BTLE policy whose credential preparation succeeds may also register a
+`BLE_L2CAP_V1` lane, but that lane is fixed `Unavailable` and radio-inert: it
+cannot be selected and performs no BlueZ, Bluetooth, or controller work. A
+complete BTLE policy block is active by default; `"enabled": false` is the
+explicit opt-out, while an absent block grants no BTLE authority. Controller
+presence never supplies missing policy or credential authority. Each adapter
+owns its connection state and attempt creation. Implementing another adapter,
+or using it as the sole contact-agreed adapter, does not require changing the
+Blob stream codec,
 pipeline, persistence, or selector. Candidate support
 and locators must come from local configuration, provisioned peer data, or
 authenticated discovery before `StreamOpen`; peer-supplied ranking is never
@@ -420,6 +453,11 @@ the stream contract, then orders adapter-reported health, configured priority,
 and stable adapter ID. Exactly one adapter carries a logical attempt. Iroh
 direct versus relay remains an Iroh-local path observation, not two selectable
 Aster transports.
+
+The supervised agent keeps both built-in Iroh contact and adapter selection
+closed while authorized transports publish their initial availability, then
+opens contact admission once before reporting Ready. Terminal drain closes the
+same gate permanently. This ordering is a local runtime detail, not protocol.
 
 Fake adapters validate multi-registration ranking, requirement and policy
 filtering, adapter-owned attempt creation, retry, cancellation, terminal
@@ -450,8 +488,9 @@ descending order:
   `0xd6..0xdc` records, v9 custody/record protection, concurrent Iroh
   data/control pair, adapter-neutral registry and selector, bounded parallel
   segment verification, durable pack checkpoints, resume, and lifecycle
-  promotion are implemented. The shipped production registry currently
-  contains only `IrohQuicV1`; automatic selection therefore does not yet mean
+  promotion are implemented. The optional local `BLE_L2CAP_V1` registration is
+  always unavailable and cannot carry an attempt; `IrohQuicV1` remains the only
+  selectable shipped adapter. Automatic selection therefore does not yet mean
   cross-transport failover.
 - **Semantic version 8** inherits semantic-v7 profile
   negotiation and receipt-free Event pages, while profile 4 adds authenticated

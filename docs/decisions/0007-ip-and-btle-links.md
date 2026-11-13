@@ -26,3 +26,30 @@ emission policy behind a narrow `BleRadio` platform contract. It prefers L2CAP
 credit channels and permits GATT fallback. Simulation verifies protocol
 behavior; physical BlueZ/platform evidence remains a release gate and is not
 replaced by a fake hardware claim.
+
+## Selected-node ordered BTLE amendment
+
+The accepted semantic/reference `BleRadio` and `BleLink` path above remains
+unchanged. For the selected semantic-v9 node, this decision additionally
+authorizes an in-process asynchronous, connection-oriented contact seam and a
+bounded Linux LE L2CAP credit-based-channel evaluation adapter.
+
+This selected-node path uses the adapter-neutral ordered-contact framing owned
+by `BleL2capV1`; one protected frame may span multiple platform writes and
+L2CAP SDUs. That path-specific framing supersedes core datagram fragmentation
+ownership only for this ordered contact. It is a carrier implementation detail,
+not a new replication record, semantic version, storage format, or public API.
+
+The initial evaluation fixes one provisioned initiator, one provisioned
+listener, one controller per process, and one session channel. It supports only
+the record-protected hybrid security profile. Bluetooth addresses, PSMs,
+pairing, bonds, controller handles, and link encryption grant no Aster identity
+or authorization. The complete mission handshake precedes inventory or Event
+data. GATT is not an implicit fallback: a future `BleGattV1` is a separately
+registered adapter and requires its own review and evidence.
+
+Discovery encoding, dynamic roles, duplicate-contact reduction, live hot-plug
+recovery, a production MTU floor, Profile-5 attempt channels, automatic
+multi-carrier selection, and production authorization remain outside this
+amendment. Physical evidence is required before even the bounded Ring 1
+evaluation claim moves; it cannot establish a general hardware support row.

@@ -58,7 +58,7 @@ mandatory-access-control profile. The manual operator procedure is
 | Check | Runner | Purpose |
 | --- | --- | --- |
 | `Cargo lockfiles` | `ubuntu-24.04` | Checks every committed Cargo graph with `cargo fetch --locked` before Cargo builds start, and tests rejection of stale or missing lockfiles offline. |
-| `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, vendored netlink source-equivalence and 13-test compatibility gates, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
+| `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, the vendored netlink dependency source-equivalence/compatibility gate, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
 | `Rust Clippy` | `ubuntu-24.04` | Runs locked Clippy for every workspace target and feature, with warnings denied. |
 | `Rust tests (1/2)` and `Rust tests (2/2)` | `ubuntu-24.04` | Run two disjoint nextest partitions covering the complete locked, all-feature Rust workspace suite. Partition 1 also runs all workspace doctests with Cargo. Both start independently of Clippy and use the existing resource wrapper. |
 | `macOS compatibility` | `macos-15` | Compiles and links every all-feature Rust workspace test target, then runs focused macOS/non-Linux custody-clock, finite-TTL, Blob staging/read, and credential-provider contracts. |
@@ -1781,8 +1781,8 @@ integration are removed; the rest of `aster-lab` remains.
 
 The provider removal also removes the optional Hickory 0.25.2 lock entries.
 The root audit no longer ignores `RUSTSEC-2026-0118` or `RUSTSEC-2026-0119`.
-The dependency-exception scope gate now requires only the retained safe
-`hickory-proto` 0.26.1 lock entry and still rejects vulnerable active Hickory.
+The dependency-exception scope gate now requires only the retained fixed
+`hickory-proto` 0.26.2 lock entry and still rejects vulnerable active Hickory.
 The unrelated age advisory disposition, exact license exceptions, and netlink
 patch remain unchanged.
 
@@ -1843,7 +1843,7 @@ exactly once in the root lock with its reviewed version, crates.io registry
 source, and archive checksum; both must be absent from fuzz. `paste` must remain
 absent from the root lock and resolved workspace/fuzz graphs. The same gate
 proves the vulnerable raw-lock Hickory pair remains inactive while allowing
-Iroh's fixed 0.26.1 packages. Adversarial checks force a fuzz graph command
+Iroh's fixed 0.26.2 package. Adversarial checks force a fuzz graph command
 failure, an active vulnerable Hickory package, reintroduced `paste` versions,
 an expanded `basic-toml` reverse graph, `basic-toml` in fuzz, a second ignored
 package version, an alternate package source, and a changed archive checksum;

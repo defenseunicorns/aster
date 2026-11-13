@@ -10,9 +10,13 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "sdk-test-support")]
+use aster_agent::runtime::{
+    BtleRuntimeOwner, BtleRuntimeOwnerError, BtleRuntimeStartup, run_customer_agent_with_btle,
+};
 use aster_agent::{
     ClientToken,
-    config::{check_config, load_and_validate_config},
+    config::{ValidatedBtlePolicy, check_config, load_and_validate_config},
     credentials::{
         CredentialGeneration, StartupCredentials, load_startup_credentials, open_node_config,
     },
@@ -28,8 +32,17 @@ use aster_mesh::{
     ProvisioningSecretStoreError, UnprotectedProvisioning,
 };
 use aster_node::application::{Scope, Topic};
+#[cfg(feature = "sdk-test-support")]
+use aster_node::{
+    EventAdapterControl, EventAdapterSnapshot, EventAdapterState, EventAttemptReceiver,
+    EventPeerEligibility, EventTransportKind, RunningAutomaticEventTransportHandle,
+};
 use aster_node::{MutableSourceInterests, SourceInterestSelector};
 use buffa::Message as _;
+#[cfg(feature = "sdk-test-support")]
+use futures::future::BoxFuture;
+#[cfg(feature = "sdk-test-support")]
+use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -65,6 +78,156 @@ async fn startup_validates_credentials_before_binding_any_listener() {
         std::net::TcpListener::bind(fixture.application()).expect("application was never bound");
         std::net::TcpListener::bind(fixture.health()).expect("health was never bound");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_runtime_rejects_configured_btle_instead_of_silently_disabling_it() {
+    // Break caught: accepting BTLE policy through the legacy composition root
+    // would silently start an IP-only process while the operator expects the
+    // configured adapter authority to be active.
+    let fixture = CustomerFixture::new();
+    fixture.enable_btle_policy();
+    let config = load_and_validate_config(fixture.config_path()).expect("validated BTLE config");
+    let (_signals, receiver) = tokio::sync::mpsc::channel(4);
+    let mut loader = RecordingLoader::new();
+
+    assert_eq!(
+        run_customer_agent(config, &mut loader, receiver).await,
+        Err(AgentRuntimeError::Lifecycle(FailureReason::Startup))
+    );
+    assert_eq!(loader.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn credential_runtime_rejects_configured_btle_without_a_composed_owner() {
+    // Break caught: the lower-level credential entry point must not bypass the
+    // same composition check and silently discard validated BTLE authority.
+    let fixture = CustomerFixture::new();
+    fixture.enable_btle_policy();
+    let config = load_and_validate_config(fixture.config_path()).expect("validated BTLE config");
+    let credentials =
+        load_startup_credentials(config.credential_paths()).expect("startup credentials");
+    let (runtime, _) = config.into_parts();
+    let (_signals, receiver) = tokio::sync::mpsc::channel(4);
+    let mut loader = RecordingLoader::new();
+
+    assert_eq!(
+        run_customer_agent_with_credentials(
+            runtime,
+            credentials,
+            &mut loader,
+            receiver,
+            TokenReloadPolicy::Disabled,
+        )
+        .await,
+        Err(AgentRuntimeError::Lifecycle(FailureReason::Startup))
+    );
+    assert_eq!(loader.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sdk-test-support")]
+async fn btle_runtime_rejects_disabled_startup_for_configured_policy_before_credentials() {
+    let fixture = CustomerFixture::new();
+    fixture.enable_btle_policy();
+    let config = load_and_validate_config(fixture.config_path()).expect("validated BTLE config");
+    let (signals, receiver) = tokio::sync::mpsc::channel(4);
+    signals
+        .send(AgentSignal::Terminate)
+        .await
+        .expect("queue termination");
+    let mut loader = RecordingLoader::new();
+
+    assert_eq!(
+        run_customer_agent_with_btle(
+            config,
+            &mut loader,
+            receiver,
+            BtleRuntimeStartup::disabled(),
+        )
+        .await,
+        Err(AgentRuntimeError::Lifecycle(FailureReason::Startup))
+    );
+    assert_eq!(loader.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sdk-test-support")]
+async fn btle_runtime_rejects_owner_without_configured_policy_before_credentials() {
+    let fixture = CustomerFixture::new();
+    let foreign = CustomerFixture::new();
+    let foreign_policy = foreign.enable_btle_policy();
+    let config = load_and_validate_config(fixture.config_path()).expect("validated config");
+    let (signals, receiver) = tokio::sync::mpsc::channel(4);
+    signals
+        .send(AgentSignal::Terminate)
+        .await
+        .expect("queue termination");
+    let mut loader = RecordingLoader::new();
+
+    assert_eq!(
+        run_customer_agent_with_btle(
+            config,
+            &mut loader,
+            receiver,
+            BtleRuntimeStartup::radio_inert_with_test_observer((), foreign_policy).0,
+        )
+        .await,
+        Err(AgentRuntimeError::Lifecycle(FailureReason::Startup))
+    );
+    assert_eq!(loader.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sdk-test-support")]
+async fn btle_runtime_rejects_owner_bound_to_a_different_policy_before_credentials() {
+    let fixture = CustomerFixture::new();
+    fixture.enable_btle_policy();
+    let foreign = CustomerFixture::new();
+    let foreign_policy = foreign.enable_btle_policy_with_priority(200);
+    let config = load_and_validate_config(fixture.config_path()).expect("validated BTLE config");
+    let (signals, receiver) = tokio::sync::mpsc::channel(4);
+    signals
+        .send(AgentSignal::Terminate)
+        .await
+        .expect("queue termination");
+    let mut loader = RecordingLoader::new();
+
+    assert_eq!(
+        run_customer_agent_with_btle(
+            config,
+            &mut loader,
+            receiver,
+            BtleRuntimeStartup::radio_inert_with_test_observer((), foreign_policy).0,
+        )
+        .await,
+        Err(AgentRuntimeError::Lifecycle(FailureReason::Startup))
+    );
+    assert_eq!(loader.calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sdk-test-support")]
+async fn btle_runtime_rejects_owner_bound_to_a_different_state_before_credentials() {
+    let fixture = CustomerFixture::new();
+    let policy = fixture.enable_btle_policy();
+    let config = load_and_validate_config(fixture.config_path()).expect("validated BTLE config");
+    let foreign = CustomerFixture::new();
+    let (signals, receiver) = tokio::sync::mpsc::channel(4);
+    signals
+        .send(AgentSignal::Terminate)
+        .await
+        .expect("queue termination");
+    let mut loader = RecordingLoader::new();
+    let btle = BtleRuntimeStartup::radio_inert_with_test_observer((), policy)
+        .0
+        .with_authority_state_root_for_test(&foreign.root.join("state"));
+
+    assert_eq!(
+        run_customer_agent_with_btle(config, &mut loader, receiver, btle).await,
+        Err(AgentRuntimeError::Lifecycle(FailureReason::Startup))
+    );
+    assert_eq!(loader.calls(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -752,11 +915,392 @@ async fn closed_signal_task_propagates_only_a_bounded_failure_reason() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sdk-test-support")]
+async fn radio_inert_btle_lane_stays_unselected_for_real_durable_work() {
+    // Break caught: retaining an Unavailable BLE lane must never consume or
+    // dispatch a real eligible durable attempt while the service remains ready.
+    if !socket_access_available() {
+        return;
+    }
+    let fixture = CustomerFixture::new();
+    let prepared_dropped = Arc::new(AtomicBool::new(false));
+    let policy = fixture.enable_btle_policy();
+    let (btle, automatic) = BtleRuntimeStartup::radio_inert_with_test_observer(
+        PreparedBtleProbe(Arc::clone(&prepared_dropped)),
+        policy,
+    );
+    let running = start_with_optional_btle(&fixture, btle).await;
+    let automatic = automatic.await.expect("radio-inert registration observed");
+    let mission = aster_node::mission::UnprotectedReferenceMission::from_bytes(
+        include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle").to_vec(),
+    )
+    .expect("public test mission");
+    let peer = [0x5a; 32];
+
+    assert_eq!(
+        automatic.replace_eligibility(vec![
+            EventPeerEligibility::provisioned_exact_peer(
+                mission.mission_authority_id(),
+                peer,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+            EventPeerEligibility::provisioned_exact_peer(
+                mission.mission_authority_id(),
+                peer,
+                EventTransportKind::IROH_QUIC_V1,
+                true,
+                1,
+                0,
+                None,
+            ),
+        ]),
+        Some(aster_node::AutomaticEventRosterStatus::Scheduled)
+    );
+    assert_eq!(
+        publish_event_status(fixture.application(), fixture.token_bytes()).await,
+        200
+    );
+    let (_iroh_control, mut iroh_attempts) = automatic
+        .register(EventAdapterSnapshot::new(
+            EventTransportKind::IROH_QUIC_V1,
+            0,
+            EventAdapterState::Available,
+            true,
+            1,
+        ))
+        .expect("register available comparison lane");
+    let selected = tokio::time::timeout(Duration::from_secs(2), iroh_attempts.recv())
+        .await
+        .expect("pending work selects the available lane")
+        .expect("available lane remains registered");
+    assert_eq!(selected.transport_kind(), EventTransportKind::IROH_QUIC_V1);
+    assert_eq!(selected.peer(), peer);
+    assert_eq!(health_status(fixture.health(), "/readyz").await, 200);
+    assert!(!prepared_dropped.load(Ordering::Acquire));
+
+    running.stop_clean().await;
+    assert!(prepared_dropped.load(Ordering::Acquire));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sdk-test-support")]
+async fn unavailable_btle_and_availability_changes_do_not_gate_readyz() {
+    // Break caught: coupling adapter availability to service readiness makes a
+    // missing controller or later hotplug take the durable application down.
+    if !socket_access_available() {
+        return;
+    }
+    let fixture = CustomerFixture::new();
+    let (btle, control, prepared_dropped) = injected_btle_runtime(&fixture, JoinBehavior::Complete);
+    let running = start_with_optional_btle(&fixture, btle).await;
+
+    assert_eq!(health_status(fixture.health(), "/readyz").await, 200);
+    control.publish(1, EventAdapterState::Available);
+    tokio::task::yield_now().await;
+    assert_eq!(health_status(fixture.health(), "/readyz").await, 200);
+    control.publish(2, EventAdapterState::Unavailable);
+    tokio::task::yield_now().await;
+    assert_eq!(health_status(fixture.health(), "/readyz").await, 200);
+
+    control
+        .completion
+        .send(true)
+        .expect("announce unexpected completion");
+    assert_eq!(
+        running.finish().await,
+        AgentExit::Failed(FailureReason::Runtime)
+    );
+    assert!(control.state.cancelled.load(Ordering::Acquire));
+    assert!(control.state.joined.load(Ordering::Acquire));
+    assert!(prepared_dropped.load(Ordering::Acquire));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sdk-test-support")]
+async fn btle_cleanup_starts_after_node_attempt_admission_is_closed() {
+    // Break caught: leaving automatic/contact admission open while cancelling
+    // the adapter can delegate fresh work into an owner that is already draining.
+    if !socket_access_available() {
+        return;
+    }
+    let fixture = CustomerFixture::new();
+    let (btle, control, _) = injected_btle_runtime(&fixture, JoinBehavior::Complete);
+    let running = start_with_optional_btle(&fixture, btle).await;
+
+    running
+        .signals
+        .send(AgentSignal::Terminate)
+        .await
+        .expect("begin drain");
+    assert_eq!(running.finish().await, AgentExit::Clean);
+    assert!(control.state.cancelled.load(Ordering::Acquire));
+    assert!(control.state.joined.load(Ordering::Acquire));
+    assert_eq!(
+        *control
+            .state
+            .trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        [
+            "admission_closed",
+            "cancel",
+            "join_started",
+            "join_completed",
+            "node_shutdown_started",
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sdk-test-support")]
+async fn completed_btle_owner_prevents_ready_startup() {
+    // Break caught: an owner already reporting terminal completion must fail
+    // startup rather than briefly publishing Ready and then failing at runtime.
+    assert_pre_ready_btle_terminal(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sdk-test-support")]
+async fn dropped_btle_completion_sender_prevents_ready_startup() {
+    // Break caught: losing the owner's completion sender before Ready is a
+    // terminal startup failure even when it never publishes `true`.
+    assert_pre_ready_btle_terminal(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sdk-test-support")]
+async fn startup_deadline_aborts_blocked_btle_cleanup() {
+    // Break caught: timing out an awaited JoinHandle detaches the task unless
+    // the supervisor explicitly aborts and retires it.
+    if !socket_access_available() {
+        return;
+    }
+    let fixture = CustomerFixture::with_shutdown_grace(100);
+    let (btle, control, prepared_dropped) = injected_btle_runtime(&fixture, JoinBehavior::Block);
+    control
+        .completion
+        .send(true)
+        .expect("complete owner before startup");
+
+    assert_eq!(
+        run_with_optional_btle(&fixture, btle).await,
+        Err(AgentRuntimeError::Lifecycle(FailureReason::Startup))
+    );
+    assert!(prepared_dropped.load(Ordering::Acquire));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sdk-test-support")]
+async fn btle_owner_construction_failure_closes_and_releases_node() {
+    // Break caught: returning directly from failed owner construction could
+    // leak startup-closed admission, listeners, or state custody.
+    if !socket_access_available() {
+        return;
+    }
+    let fixture = CustomerFixture::new();
+    let policy = fixture.enable_btle_policy();
+    let prepared_dropped = Arc::new(AtomicBool::new(false));
+    let prepared = PreparedBtleProbe(Arc::clone(&prepared_dropped));
+    let (entered_send, entered_receive) = tokio::sync::oneshot::channel();
+    let (release_send, release_receive) = std_mpsc::channel();
+    let btle = BtleRuntimeStartup::prepared(policy, prepared, move |_prepared, automatic| {
+        let _ = entered_send.send(automatic);
+        release_receive.recv().expect("release owner construction");
+        Err(BtleRuntimeOwnerError::Startup)
+    });
+    let (_signals, task) = spawn_with_optional_btle(&fixture, btle);
+    let automatic = tokio::time::timeout(Duration::from_secs(2), entered_receive)
+        .await
+        .expect("owner construction entry deadline")
+        .expect("owner construction entered");
+
+    assert_eq!(health_status(fixture.health(), "/readyz").await, 503);
+    let application_probe =
+        std::net::TcpListener::bind(fixture.application()).expect("application remains unbound");
+    drop(application_probe);
+    release_send.send(()).expect("release owner construction");
+
+    assert_eq!(
+        task.await.expect("customer task"),
+        Err(AgentRuntimeError::Lifecycle(FailureReason::Startup))
+    );
+    assert!(prepared_dropped.load(Ordering::Acquire));
+    assert!(
+        automatic
+            .register_paired(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                0,
+                EventAdapterState::Unavailable,
+                true,
+                1,
+            ))
+            .is_none(),
+        "failed startup must terminally close transport admission"
+    );
+    std::net::TcpListener::bind(fixture.application()).expect("application listener released");
+    std::net::TcpListener::bind(fixture.health()).expect("health listener released");
+
+    let (btle, control, _) = injected_btle_runtime(&fixture, JoinBehavior::Complete);
+    let (signals, mut restarted) = spawn_with_optional_btle(&fixture, btle);
+    tokio::select! {
+        result = &mut restarted => panic!("restart failed before Ready: {result:?}"),
+        () = wait_until_ready(&fixture) => {}
+    }
+    signals
+        .send(AgentSignal::Terminate)
+        .await
+        .expect("stop restarted node");
+    assert_eq!(
+        restarted
+            .await
+            .expect("restarted customer task")
+            .expect("restarted customer result"),
+        AgentExit::Clean
+    );
+    assert!(control.state.joined.load(Ordering::Acquire));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sdk-test-support")]
+async fn btle_cleanup_failure_returns_only_the_fixed_shutdown_category() {
+    // Break caught: forwarding owner cleanup detail could disclose controller,
+    // credential, or path data through the process result.
+    if !socket_access_available() {
+        return;
+    }
+    let fixture = CustomerFixture::new();
+    let (btle, control, _) = injected_btle_runtime(&fixture, JoinBehavior::Fail);
+    let running = start_with_optional_btle(&fixture, btle).await;
+
+    running
+        .signals
+        .send(AgentSignal::Terminate)
+        .await
+        .expect("begin drain");
+    assert_eq!(
+        running.finish().await,
+        AgentExit::Failed(FailureReason::Shutdown)
+    );
+    assert!(control.state.joined.load(Ordering::Acquire));
+}
+
+#[cfg(feature = "sdk-test-support")]
+async fn assert_pre_ready_btle_terminal(drop_sender: bool) {
+    if !socket_access_available() {
+        return;
+    }
+    let fixture = CustomerFixture::new();
+    let (btle, control, _) = injected_btle_runtime(&fixture, JoinBehavior::Complete);
+    if drop_sender {
+        drop(control);
+    } else {
+        control
+            .completion
+            .send(true)
+            .expect("complete owner before startup");
+    }
+
+    assert_eq!(
+        run_with_optional_btle(&fixture, btle).await,
+        Err(AgentRuntimeError::Lifecycle(FailureReason::Startup))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sdk-test-support")]
+async fn second_terminate_forces_blocked_btle_cleanup() {
+    // Break caught: a stuck adapter join must not make the existing second-
+    // signal forcing contract wait for the entire grace period.
+    assert_forced_btle_cleanup(true, DrainForce::SecondSignal).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sdk-test-support")]
+async fn grace_expiry_forces_blocked_btle_cleanup() {
+    // Break caught: adapter cleanup must share the process shutdown deadline
+    // instead of adding an unbounded or sequential platform grace period.
+    assert_forced_btle_cleanup(true, DrainForce::GraceExpiry).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sdk-test-support")]
+async fn second_terminate_does_not_repoll_completed_btle_cleanup() {
+    // Break caught: forcing a still-draining application after BTLE cleanup
+    // completed must not poll the completed JoinHandle a second time and panic.
+    assert_forced_btle_cleanup(false, DrainForce::SecondSignal).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sdk-test-support")]
+async fn grace_expiry_does_not_repoll_completed_btle_cleanup() {
+    // Break caught: grace expiry while only the application remains draining
+    // must not await the already-completed BTLE JoinHandle again.
+    assert_forced_btle_cleanup(false, DrainForce::GraceExpiry).await;
+}
+
+#[cfg(feature = "sdk-test-support")]
+#[derive(Clone, Copy)]
+enum DrainForce {
+    SecondSignal,
+    GraceExpiry,
+}
+
+#[cfg(feature = "sdk-test-support")]
+async fn assert_forced_btle_cleanup(block_join: bool, force: DrainForce) {
+    if !socket_access_available() {
+        return;
+    }
+    let grace = match force {
+        DrainForce::SecondSignal => 5_000,
+        DrainForce::GraceExpiry => 100,
+    };
+    let fixture = CustomerFixture::with_shutdown_grace(grace);
+    let join_behavior = if block_join {
+        JoinBehavior::Block
+    } else {
+        JoinBehavior::Complete
+    };
+    let (btle, control, prepared_dropped) = injected_btle_runtime(&fixture, join_behavior);
+    let running = start_with_optional_btle(&fixture, btle).await;
+    let stalled = if block_join {
+        None
+    } else {
+        Some(fill_unauthenticated_admission(fixture.application()).await)
+    };
+
+    running
+        .signals
+        .send(AgentSignal::Terminate)
+        .await
+        .expect("begin drain");
+    wait_for_atomic(if block_join {
+        &control.state.cancelled
+    } else {
+        &control.state.cleanup_retired
+    })
+    .await;
+    if matches!(force, DrainForce::SecondSignal) {
+        running
+            .signals
+            .send(AgentSignal::Terminate)
+            .await
+            .expect("force drain");
+    }
+    assert_eq!(running.finish().await, AgentExit::Forced);
+    assert!(prepared_dropped.load(Ordering::Acquire));
+    drop(stalled);
+}
+
 #[test]
-fn config_check_validates_files_without_a_provider_and_bootstrap_uses_exact_reference() {
-    // Break caught: configuration checking that skips credential-file safety
-    // accepts an unsafe provider capability; bootstrap that substitutes a
-    // reference or operation directs the provider to the wrong secret.
+fn config_check_is_pure_and_bootstrap_uses_exact_reference() {
+    // Break caught: configuration checking must not read credentials or touch
+    // platform services; bootstrap must still enforce file custody and use the
+    // exact mission reference and operation.
     let fixture = CustomerFixture::new();
     let expected_reference = fixture.reference();
     let expected_operation = ProvisioningLoadId::new([0x11; 32]);
@@ -766,8 +1310,10 @@ fn config_check_validates_files_without_a_provider_and_bootstrap_uses_exact_refe
     assert_eq!(loader.calls(), 0);
 
     fixture.chmod_reference(0o640);
-    assert!(check_config(fixture.config_path()).is_err());
+    check_config(fixture.config_path()).expect("pure configuration check");
     assert_eq!(loader.calls(), 0);
+    let config = load_and_validate_config(fixture.config_path()).expect("validated config");
+    assert!(load_startup_credentials(config.credential_paths()).is_err());
     fixture.chmod_reference(0o600);
 
     let config = load_and_validate_config(fixture.config_path()).expect("validated config");
@@ -839,6 +1385,237 @@ fn bootstrap_failure_redacts_the_provider_reference() {
     assert_eq!(error.kind(), aster_node::NodeBootstrapErrorKind::Rejected);
     assert!(!rendered.contains("customer-provider-capability"));
     assert!(!rendered.contains(&fixture.mission_reference.display().to_string()));
+}
+
+#[cfg(feature = "sdk-test-support")]
+struct PreparedBtleProbe(Arc<AtomicBool>);
+
+#[cfg(feature = "sdk-test-support")]
+impl Drop for PreparedBtleProbe {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "sdk-test-support")]
+struct InjectedBtleState {
+    adapter: Mutex<Option<EventAdapterControl>>,
+    cancelled: AtomicBool,
+    joined: AtomicBool,
+    cleanup_retired: AtomicBool,
+    trace: Mutex<Vec<&'static str>>,
+}
+
+#[cfg(feature = "sdk-test-support")]
+impl InjectedBtleState {
+    fn trace(&self, event: &'static str) {
+        self.trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+    }
+}
+
+#[cfg(feature = "sdk-test-support")]
+struct InjectedBtleControl {
+    completion: tokio::sync::watch::Sender<bool>,
+    state: Arc<InjectedBtleState>,
+    _blocked_join: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[cfg(feature = "sdk-test-support")]
+impl InjectedBtleControl {
+    fn publish(&self, epoch: u64, state: EventAdapterState) {
+        let guard = self
+            .state
+            .adapter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            guard
+                .as_ref()
+                .expect("active adapter control")
+                .publish_availability(EventAdapterSnapshot::new(
+                    EventTransportKind::BLE_L2CAP_V1,
+                    epoch,
+                    state,
+                    true,
+                    1,
+                ))
+        );
+    }
+}
+
+#[cfg(feature = "sdk-test-support")]
+struct InjectedBtleOwner {
+    completion: tokio::sync::watch::Receiver<bool>,
+    state: Arc<InjectedBtleState>,
+    _attempts: EventAttemptReceiver,
+    automatic: RunningAutomaticEventTransportHandle,
+    blocked_join: Option<tokio::sync::oneshot::Receiver<()>>,
+    fail_join: bool,
+    _prepared: PreparedBtleProbe,
+}
+
+#[cfg(feature = "sdk-test-support")]
+impl BtleRuntimeOwner for InjectedBtleOwner {
+    fn completion(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.completion.clone()
+    }
+
+    fn cancel(&self) {
+        let registration = self.automatic.register_paired(EventAdapterSnapshot::new(
+            EventTransportKind::IROH_QUIC_V1,
+            0,
+            EventAdapterState::Unavailable,
+            true,
+            1,
+        ));
+        if registration.is_none() {
+            self.state.trace("admission_closed");
+        }
+        drop(registration);
+        self.state.trace("cancel");
+        self.state.cancelled.store(true, Ordering::Release);
+    }
+
+    fn join(self: Box<Self>) -> BoxFuture<'static, Result<(), BtleRuntimeOwnerError>> {
+        Box::pin(async move {
+            self.state.trace("join_started");
+            if let Some(blocked_join) = self.blocked_join {
+                let _ = blocked_join.await;
+            }
+            self.state
+                .adapter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            self.state.trace("join_completed");
+            self.state.joined.store(true, Ordering::Release);
+            if self.fail_join {
+                Err(BtleRuntimeOwnerError::Cleanup)
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+#[cfg(feature = "sdk-test-support")]
+#[derive(Clone, Copy)]
+enum JoinBehavior {
+    Complete,
+    Block,
+    Fail,
+}
+
+#[cfg(feature = "sdk-test-support")]
+fn injected_btle_runtime(
+    fixture: &CustomerFixture,
+    join_behavior: JoinBehavior,
+) -> (BtleRuntimeStartup, InjectedBtleControl, Arc<AtomicBool>) {
+    let policy = fixture.enable_btle_policy();
+    let prepared_dropped = Arc::new(AtomicBool::new(false));
+    let prepared = PreparedBtleProbe(Arc::clone(&prepared_dropped));
+    let (completion_send, completion_receive) = tokio::sync::watch::channel(false);
+    let state = Arc::new(InjectedBtleState {
+        adapter: Mutex::new(None),
+        cancelled: AtomicBool::new(false),
+        joined: AtomicBool::new(false),
+        cleanup_retired: AtomicBool::new(false),
+        trace: Mutex::new(Vec::new()),
+    });
+    let (blocked_join_send, blocked_join_receive) = tokio::sync::oneshot::channel();
+    let block_join = matches!(join_behavior, JoinBehavior::Block);
+    let blocked_join = block_join.then_some(blocked_join_receive);
+    let blocked_join_hold = block_join.then_some(blocked_join_send);
+
+    let control = InjectedBtleControl {
+        completion: completion_send,
+        state: Arc::clone(&state),
+        _blocked_join: blocked_join_hold,
+    };
+    let node_shutdown_state = Arc::clone(&state);
+    let cleanup_retired_state = Arc::clone(&state);
+    let btle = BtleRuntimeStartup::prepared(policy, prepared, move |prepared, automatic| {
+        let registration = automatic
+            .register_paired(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                0,
+                EventAdapterState::Unavailable,
+                true,
+                1,
+            ))
+            .ok_or(BtleRuntimeOwnerError::Startup)?;
+        let (_, adapter_control, attempts) = registration.into_parts();
+        *state
+            .adapter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(adapter_control);
+        Ok(Box::new(InjectedBtleOwner {
+            completion: completion_receive,
+            state,
+            _attempts: attempts,
+            automatic,
+            blocked_join,
+            fail_join: matches!(join_behavior, JoinBehavior::Fail),
+            _prepared: prepared,
+        }))
+    })
+    .with_cleanup_retired_observer(move || {
+        cleanup_retired_state
+            .cleanup_retired
+            .store(true, Ordering::Release);
+    })
+    .with_node_shutdown_observer(move || node_shutdown_state.trace("node_shutdown_started"));
+    (btle, control, prepared_dropped)
+}
+
+#[cfg(feature = "sdk-test-support")]
+async fn start_with_optional_btle(
+    fixture: &CustomerFixture,
+    btle: BtleRuntimeStartup,
+) -> RunningFixture {
+    let (signals, task) = spawn_with_optional_btle(fixture, btle);
+    wait_until_ready(fixture).await;
+    RunningFixture { signals, task }
+}
+
+#[cfg(feature = "sdk-test-support")]
+async fn run_with_optional_btle(
+    fixture: &CustomerFixture,
+    btle: BtleRuntimeStartup,
+) -> Result<AgentExit, AgentRuntimeError> {
+    let (_signals, task) = spawn_with_optional_btle(fixture, btle);
+    task.await.expect("customer task")
+}
+
+#[cfg(feature = "sdk-test-support")]
+fn spawn_with_optional_btle(
+    fixture: &CustomerFixture,
+    btle: BtleRuntimeStartup,
+) -> (
+    tokio::sync::mpsc::Sender<AgentSignal>,
+    tokio::task::JoinHandle<Result<AgentExit, AgentRuntimeError>>,
+) {
+    let config = load_and_validate_config(fixture.config_path()).expect("validated config");
+    let (signals, receiver) = tokio::sync::mpsc::channel(4);
+    let task = tokio::spawn(async move {
+        let mut loader = RecordingLoader::new();
+        run_customer_agent_with_btle(config, &mut loader, receiver, btle).await
+    });
+    (signals, task)
+}
+
+#[cfg(feature = "sdk-test-support")]
+async fn wait_for_atomic(value: &AtomicBool) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !value.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("atomic observation deadline");
 }
 
 struct CustomerFixture {
@@ -955,6 +1732,34 @@ impl CustomerFixture {
             serde_json::to_vec(&config).expect("encode customer config"),
         )
         .expect("write customer config");
+    }
+
+    fn enable_btle_policy(&self) -> ValidatedBtlePolicy {
+        self.enable_btle_policy_with_priority(100)
+    }
+
+    fn enable_btle_policy_with_priority(&self, priority: u16) -> ValidatedBtlePolicy {
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&self.config).expect("read customer config"))
+                .expect("parse customer config");
+        config["btle"] = serde_json::json!({
+            "peer": "aa".repeat(32),
+            "deployment_scope_id": "42".repeat(32),
+            "policy": "rostered",
+            "emission_policy": "normal",
+            "priority": priority,
+            "credential": "aster-btle-roster"
+        });
+        fs::write(
+            &self.config,
+            serde_json::to_vec(&config).expect("encode customer config"),
+        )
+        .expect("write customer config");
+        *load_and_validate_config(&self.config)
+            .expect("validated BTLE config")
+            .runtime()
+            .btle_policy()
+            .expect("configured BTLE policy")
     }
 
     fn chmod_reference(&self, mode: u32) {

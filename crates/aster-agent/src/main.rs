@@ -4,8 +4,15 @@ use std::{
 
 use aster_agent::{
     BoundAgent, ClientToken,
-    config::{check_config, load_and_validate_config},
-    runtime::{AgentExit, AgentSignal, run_customer_agent},
+    config::{
+        ValidatedBtlePolicy, ValidatedSystemdAgentConfig, check_config, load_and_validate_config,
+    },
+    runtime::{AgentExit, AgentSignal, BtleRuntimeStartup, run_customer_agent_with_btle},
+};
+use aster_host::{
+    BoundedDiscoveryCredentialArtifact, DiscoveryCredentialArtifactProvider,
+    DiscoveryCredentialError, PreparedDiscoveryCredential, TrustedClock, TrustedClockSample,
+    prepare_discovery_credential,
 };
 use aster_node::application::{Scope, Topic};
 use aster_node::mission::UnprotectedReferenceMission;
@@ -15,11 +22,150 @@ use aster_node::{
 };
 #[cfg(feature = "nearby-discovery")]
 use aster_node::{MissionNearbyPeer, SelectedForwardingConfig, start_node_with_forwarding};
-use aster_systemd_credentials::SystemdCredentialLoader;
+use aster_systemd_credentials::{SystemdBtleRosterCredentialLoader, SystemdCredentialLoader};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 const MAX_BLOB_INTERESTS: usize = 256;
+
+const _: () = assert!(const_str_equal(
+    aster_agent::config::BTLE_ROSTER_CREDENTIAL_NAME,
+    aster_systemd_credentials::BTLE_ROSTER_CREDENTIAL_NAME,
+));
+
+const fn const_str_equal(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < left.len() {
+        if left[index] != right[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BtleStartupError {
+    Credential,
+}
+
+impl std::fmt::Display for BtleStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BTLE startup credential validation failed")
+    }
+}
+
+impl std::error::Error for BtleStartupError {}
+
+struct SystemdBtleArtifactLoader(SystemdBtleRosterCredentialLoader);
+
+impl DiscoveryCredentialArtifactProvider for SystemdBtleArtifactLoader {
+    fn load_bounded_artifact(
+        &mut self,
+    ) -> Result<BoundedDiscoveryCredentialArtifact, DiscoveryCredentialError> {
+        let bytes = self
+            .0
+            .load_artifact()
+            .map_err(|_| DiscoveryCredentialError::ArtifactUnavailable)?;
+        BoundedDiscoveryCredentialArtifact::from_zeroizing(bytes)
+            .map_err(|_| DiscoveryCredentialError::ArtifactUnavailable)
+    }
+}
+
+struct SystemTrustedClock;
+
+impl TrustedClock for SystemTrustedClock {
+    fn sample(&mut self) -> Result<TrustedClockSample, DiscoveryCredentialError> {
+        let wall_unix_seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| DiscoveryCredentialError::ClockDiscontinuity)?
+            .as_secs();
+        Ok(TrustedClockSample::new(
+            wall_unix_seconds,
+            std::time::Instant::now(),
+        ))
+    }
+}
+
+fn load_optional_btle_credential<T, F>(
+    config: &ValidatedSystemdAgentConfig,
+    load: F,
+) -> Result<Option<T>, BtleStartupError>
+where
+    F: FnOnce(&ValidatedBtlePolicy, &std::path::Path) -> Result<T, BtleStartupError>,
+{
+    let Some(policy) = config.btle_policy() else {
+        return Ok(None);
+    };
+    load(policy, config.state()).map(Some)
+}
+
+fn load_btle_startup_credential(
+    config: &ValidatedSystemdAgentConfig,
+) -> Result<
+    Option<PreparedDiscoveryCredential<SystemdBtleArtifactLoader, SystemTrustedClock>>,
+    BtleStartupError,
+> {
+    load_btle_startup_credential_with(
+        config,
+        || {
+            SystemdBtleRosterCredentialLoader::from_environment()
+                .map(SystemdBtleArtifactLoader)
+                .map_err(|_| BtleStartupError::Credential)
+        },
+        SystemTrustedClock,
+    )
+}
+
+fn load_btle_startup_credential_with<L, C, F>(
+    config: &ValidatedSystemdAgentConfig,
+    open_provider: F,
+    clock: C,
+) -> Result<Option<PreparedDiscoveryCredential<L, C>>, BtleStartupError>
+where
+    L: DiscoveryCredentialArtifactProvider,
+    C: TrustedClock,
+    F: FnOnce() -> Result<L, BtleStartupError>,
+{
+    load_btle_startup_credential_with_preparer(
+        config,
+        open_provider,
+        clock,
+        prepare_discovery_credential,
+    )
+}
+
+fn load_btle_startup_credential_with_preparer<L, C, F, A>(
+    config: &ValidatedSystemdAgentConfig,
+    open_provider: F,
+    clock: C,
+    prepare: A,
+) -> Result<Option<PreparedDiscoveryCredential<L, C>>, BtleStartupError>
+where
+    L: DiscoveryCredentialArtifactProvider,
+    C: TrustedClock,
+    F: FnOnce() -> Result<L, BtleStartupError>,
+    A: FnOnce(
+        L,
+        C,
+        [u8; 32],
+        &std::path::Path,
+    ) -> Result<PreparedDiscoveryCredential<L, C>, DiscoveryCredentialError>,
+{
+    load_optional_btle_credential(config, |policy, state_root| {
+        if policy.credential_name() != aster_systemd_credentials::BTLE_ROSTER_CREDENTIAL_NAME {
+            return Err(BtleStartupError::Credential);
+        }
+        let provider = open_provider()?;
+        prepare(provider, clock, *policy.deployment_scope_id(), state_root)
+            .map_err(|_| BtleStartupError::Credential)
+    })
+}
 
 enum Invocation {
     CheckConfig(PathBuf),
@@ -79,10 +225,21 @@ async fn run() -> Result<Option<AgentExit>, BoxError> {
         }
         Invocation::CustomerConfig(path) => {
             let config = load_and_validate_config(&path)?;
+            // Roster credential renewal is restart-based. The move-only lease
+            // is validated and durably checkpointed before ownership reaches
+            // the adapter; there is deliberately no live replacement here.
+            let btle_runtime = match config.btle_policy() {
+                Some(policy) => {
+                    let prepared = load_btle_startup_credential(&config)?
+                        .ok_or(BtleStartupError::Credential)?;
+                    BtleRuntimeStartup::radio_inert(prepared, *policy, config.state())?
+                }
+                None => BtleRuntimeStartup::disabled(),
+            };
             let mut loader = SystemdCredentialLoader::from_environment()?;
             let signals = translated_signals()?;
             Ok(Some(
-                run_customer_agent(config, &mut loader, signals).await?,
+                run_customer_agent_with_btle(config, &mut loader, signals, btle_runtime).await?,
             ))
         }
         Invocation::LegacyDevelopment(mut arguments) => {
@@ -432,6 +589,13 @@ impl Arguments {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs::OpenOptions,
+        os::unix::fs::PermissionsExt as _,
+        sync::atomic::{AtomicBool, Ordering},
+        time::Instant,
+    };
+
     use super::*;
 
     fn blob_interest_arguments(interests: impl IntoIterator<Item = String>) -> Arguments {
@@ -667,6 +831,315 @@ mod tests {
             error.to_string(),
             "--config cannot be combined with legacy flags"
         );
+    }
+
+    #[test]
+    fn optional_btle_startup_skips_credentials_when_policy_is_absent() {
+        // Break caught: a deployment without BTLE authority must start without
+        // a roster credential or any platform credential access.
+        let config = validated_customer_config(None);
+        let called = AtomicBool::new(false);
+        let result: Result<Option<()>, BtleStartupError> =
+            load_optional_btle_credential(&config, |_, _| {
+                called.store(true, Ordering::SeqCst);
+                Err(BtleStartupError::Credential)
+            });
+        assert_eq!(result.unwrap(), None);
+        assert!(!called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn enabled_btle_startup_fails_closed_and_passes_exact_state_authority() {
+        // Break caught: an enabled policy must not silently become unavailable
+        // when its credential is missing/invalid, and the checkpoint authority
+        // must receive the exact scope below the configured state root.
+        let config = validated_customer_config(Some(serde_json::json!({
+            "enabled": true,
+            "peer": "aa".repeat(32),
+            "deployment_scope_id": "42".repeat(32),
+            "policy": "rostered",
+            "emission_policy": "normal",
+            "priority": 100,
+            "credential": "aster-btle-roster"
+        })));
+        assert_eq!(
+            config.btle_policy().unwrap().credential_name(),
+            aster_systemd_credentials::BTLE_ROSTER_CREDENTIAL_NAME
+        );
+        let called = AtomicBool::new(false);
+        let error = load_optional_btle_credential(&config, |policy, state| {
+            called.store(true, Ordering::SeqCst);
+            assert_eq!(policy.deployment_scope_id(), &[0x42; 32]);
+            assert_eq!(state, std::path::Path::new("/var/lib/aster-agent"));
+            Err::<(), _>(BtleStartupError::Credential)
+        })
+        .unwrap_err();
+        assert_eq!(error, BtleStartupError::Credential);
+        assert!(called.load(Ordering::SeqCst));
+        assert_eq!(
+            error.to_string(),
+            "BTLE startup credential validation failed"
+        );
+    }
+
+    struct TestArtifactProvider(Option<Vec<u8>>);
+
+    impl DiscoveryCredentialArtifactProvider for TestArtifactProvider {
+        fn load_bounded_artifact(
+            &mut self,
+        ) -> Result<BoundedDiscoveryCredentialArtifact, DiscoveryCredentialError> {
+            BoundedDiscoveryCredentialArtifact::from_zeroizing(zeroize::Zeroizing::new(
+                self.0
+                    .take()
+                    .ok_or(DiscoveryCredentialError::ArtifactUnavailable)?,
+            ))
+        }
+    }
+
+    struct TestClock(TrustedClockSample);
+
+    impl TrustedClock for TestClock {
+        fn sample(&mut self) -> Result<TrustedClockSample, DiscoveryCredentialError> {
+            Ok(self.0)
+        }
+    }
+
+    fn prepare_test_btle_credential<L, C>(
+        loader: L,
+        clock: C,
+        scope: [u8; 32],
+        state: &std::path::Path,
+    ) -> Result<PreparedDiscoveryCredential<L, C>, DiscoveryCredentialError>
+    where
+        L: DiscoveryCredentialArtifactProvider,
+        C: TrustedClock,
+    {
+        let anchor = state.join("test-btle-authority.lock");
+        if !anchor.exists() {
+            std::fs::write(&anchor, [])
+                .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?;
+            std::fs::set_permissions(&anchor, std::fs::Permissions::from_mode(0o600))
+                .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?;
+        }
+        let anchor = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(anchor)
+            .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?;
+        aster_host::prepare_discovery_credential_for_test(loader, clock, scope, state, anchor)
+    }
+
+    #[test]
+    fn enabled_btle_startup_inner_commits_and_returns_real_authority_lease() {
+        // Break caught: testing only the optional gate can miss production
+        // policy-to-provider-to-checkpoint wiring entirely.
+        let root = btle_state_fixture("success", 0o700);
+        let config = validated_customer_config_at(Some(valid_btle_json()), &root);
+        let sample = TrustedClockSample::new(1_800_000_010, Instant::now());
+        let prepared = load_btle_startup_credential_with_preparer(
+            &config,
+            || Ok(TestArtifactProvider(Some(valid_btle_artifact()))),
+            TestClock(sample),
+            prepare_test_btle_credential,
+        )
+        .unwrap()
+        .expect("enabled policy lease");
+        let (parts, authority) = prepared.into_parts();
+        let (emitting, overlap, _expires_at) = parts.into_adapter_parts();
+        assert_eq!(emitting.0, 7);
+        assert!(overlap.is_none());
+        assert!(root.join("discovery-checkpoint").is_file());
+        let locked = prepare_test_btle_credential(
+            TestArtifactProvider(Some(valid_btle_artifact())),
+            TestClock(sample),
+            [0x42; 32],
+            &root,
+        )
+        .err()
+        .expect("prepared startup value must retain checkpoint ownership");
+        assert_eq!(locked, DiscoveryCredentialError::CheckpointUnavailable);
+        drop(emitting);
+        drop(overlap);
+        drop(authority);
+        let restarted = prepare_test_btle_credential(
+            TestArtifactProvider(Some(valid_btle_artifact())),
+            TestClock(sample),
+            [0x42; 32],
+            &root,
+        )
+        .expect("dropping prepared startup value releases checkpoint ownership");
+        drop(restarted);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn enabled_btle_startup_inner_collapses_invalid_artifact_failure() {
+        // Break caught: the production inner path must fail closed and expose
+        // no parser or credential value when provider bytes are invalid.
+        let root = btle_state_fixture("invalid", 0o700);
+        let config = validated_customer_config_at(Some(valid_btle_json()), &root);
+        let error = match load_btle_startup_credential_with_preparer(
+            &config,
+            || Ok(TestArtifactProvider(Some(vec![0x42; 109]))),
+            TestClock(TrustedClockSample::new(1_800_000_010, Instant::now())),
+            prepare_test_btle_credential,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid artifact must fail closed"),
+        };
+        assert_eq!(error, BtleStartupError::Credential);
+        assert_eq!(
+            error.to_string(),
+            "BTLE startup credential validation failed"
+        );
+        assert!(!root.join("discovery-checkpoint").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn enabled_btle_startup_inner_collapses_checkpoint_custody_failure() {
+        // Break caught: an enabled policy must not continue when its durable
+        // checkpoint root is not owner-only.
+        let root = btle_state_fixture("checkpoint", 0o755);
+        let config = validated_customer_config_at(Some(valid_btle_json()), &root);
+        let error = match load_btle_startup_credential_with_preparer(
+            &config,
+            || Ok(TestArtifactProvider(Some(valid_btle_artifact()))),
+            TestClock(TrustedClockSample::new(1_800_000_010, Instant::now())),
+            prepare_test_btle_credential,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("unsafe checkpoint root must fail closed"),
+        };
+        assert_eq!(error, BtleStartupError::Credential);
+        assert_eq!(
+            error.to_string(),
+            "BTLE startup credential validation failed"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn production_authority_custody_failure_is_fixed_and_redacted() {
+        // The unprivileged test environment cannot create the root-owned
+        // production ancestry or fixed external anchor. The real constructor
+        // must fail closed without disclosing either configured or fixed paths.
+        let root = btle_state_fixture("production-custody", 0o700);
+        let config = validated_customer_config_at(Some(valid_btle_json()), &root);
+        let error = match load_btle_startup_credential_with(
+            &config,
+            || Ok(TestArtifactProvider(Some(valid_btle_artifact()))),
+            TestClock(TrustedClockSample::new(1_800_000_010, Instant::now())),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("unprivileged production authority profile must fail closed"),
+        };
+        assert_eq!(error, BtleStartupError::Credential);
+        assert_eq!(
+            error.to_string(),
+            "BTLE startup credential validation failed"
+        );
+        assert!(!error.to_string().contains(root.to_str().unwrap()));
+        assert!(
+            !error
+                .to_string()
+                .contains(aster_host::BTLE_AUTHORITY_LOCK_PATH)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn valid_btle_json() -> serde_json::Value {
+        serde_json::json!({
+            "enabled": true,
+            "peer": "aa".repeat(32),
+            "deployment_scope_id": "42".repeat(32),
+            "policy": "rostered",
+            "emission_policy": "normal",
+            "priority": 100,
+            "credential": "aster-btle-roster"
+        })
+    }
+
+    fn valid_btle_artifact() -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(109);
+        bytes.extend_from_slice(b"ASTRBD02");
+        bytes.extend_from_slice(&1_u64.to_be_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&1_800_000_000_u64.to_be_bytes());
+        bytes.extend_from_slice(&1_800_000_060_u64.to_be_bytes());
+        bytes.extend_from_slice(&0_u64.to_be_bytes());
+        bytes.extend_from_slice(&[0x42; 32]);
+        bytes.extend_from_slice(&7_u32.to_be_bytes());
+        bytes.extend_from_slice(&[0x11; 32]);
+        bytes
+    }
+
+    fn btle_state_fixture(label: &str, mode: u32) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "aster-agent-main-btle-{label}-{}-{}",
+            std::process::id(),
+            called_fixture_id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).unwrap();
+        root
+    }
+
+    fn validated_customer_config(
+        btle: Option<serde_json::Value>,
+    ) -> aster_agent::config::ValidatedSystemdAgentConfig {
+        validated_customer_config_at(btle, std::path::Path::new("/var/lib/aster-agent"))
+    }
+
+    fn validated_customer_config_at(
+        btle: Option<serde_json::Value>,
+        state: &std::path::Path,
+    ) -> aster_agent::config::ValidatedSystemdAgentConfig {
+        let mut config = serde_json::json!({
+            "schema_version": 1,
+            "state": {"directory": state},
+            "application": {"listen": "127.0.0.1:8181"},
+            "health": {"listen": "127.0.0.1:8182"},
+            "mesh": {
+                "bind": "127.0.0.1:8183",
+                "sync_interval_ms": 500,
+                "emission_policy": "normal",
+                "peers": []
+            },
+            "credentials": {
+                "client_token_file": "/run/aster-agent/client-token",
+                "mission_secret_ref_file": "/run/aster-agent/mission-ref",
+                "mission_load_id": "11".repeat(32)
+            },
+            "storage": {
+                "max_items": 4161,
+                "max_payload_bytes": 17891328,
+                "operations": {
+                    "max_records": 1000000,
+                    "max_logical_bytes": 201326592,
+                    "emergency_reserve": 10000
+                }
+            }
+        });
+        if let Some(btle) = btle {
+            config["btle"] = btle;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "aster-agent-main-btle-config-{}-{}.json",
+            std::process::id(),
+            called_fixture_id()
+        ));
+        std::fs::write(&path, config.to_string()).unwrap();
+        let validated = load_and_validate_config(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        validated
+    }
+
+    fn called_fixture_id() -> u64 {
+        use std::sync::atomic::AtomicU64;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        NEXT.fetch_add(1, Ordering::Relaxed)
     }
 
     #[test]

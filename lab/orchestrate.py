@@ -103,7 +103,7 @@ RESOURCE_NAME = re.compile(r"^aster-lab-[a-z0-9][a-z0-9-]{0,62}$")
 RUN_ID = re.compile(r"^[0-9a-f]{16}$")
 MEMORY_VALUE = re.compile(r"^[1-9][0-9]*(?:[kmgt]b?|b)?$", re.IGNORECASE)
 CPU_VALUE = re.compile(r"^(?:[1-9][0-9]*|0\.[0-9]+|[1-9][0-9]*\.[0-9]+)$")
-EXPECTED_DOCKERIGNORE = """**
+EXPECTED_DOCKERIGNORE = f"""**
 !Cargo.toml
 !Cargo.lock
 !LICENSE
@@ -1298,9 +1298,8 @@ def collect_build_inputs() -> list[BuildInput]:
     ]
     if not from_sources or any(source != "${LAB_BASE_IMAGE}" for source in from_sources):
         raise LabError("Dockerfile contains a base outside the single pinned build argument")
-    # Hidden directories are always rejected below. These reviewed vendored
-    # metadata files are the only hidden regular files admitted from source
-    # trees.
+    # Hidden directories are rejected; these are the only hidden regular
+    # files admitted.
     allowed_hidden_files = {
         ".cargo_vcs_info.json",
         ".gitignore",
@@ -3111,9 +3110,9 @@ def validate_selected_nat_tracked_inputs(
     tracked_list = result.stdout[:-1].split("\0")
     if any(not value or value.startswith("/") for value in tracked_list):
         raise LabError("git returned a noncanonical selected NAT tracked path")
-    tracked = set(tracked_list)
-    if len(tracked) != len(tracked_list):
+    if len(set(tracked_list)) != len(tracked_list):
         raise LabError("git returned a duplicate selected NAT tracked path")
+    tracked = set(tracked_list)
     admitted = {item.relative_path for item in inputs}
     if len(admitted) != len(inputs) or tracked != admitted:
         untracked = sorted(admitted - tracked)

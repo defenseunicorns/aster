@@ -195,6 +195,16 @@ top-level `version` is the SBOM revision and `specVersion` is the format version
 
 ## Record the local dependency patch
 
+The workspace currently carries an exact-source local patch for
+`netlink-packet-core` 0.8.2. Cargo-cyclonedx identifies the local copy with a
+file-qualified purl. Preserve that generated `bom-ref` and express origin with
+CycloneDX `pedigree`; do not invent an `-aster` component version. The pedigree
+must retain the upstream archive checksum/revision/license, canonical diff and
+digest, and a deterministic patched-source archive distributed beside the
+edited SBOM.
+
+### Netlink patch
+
 `netlink-packet-core` is reached through
 `aster-node -> aster-iroh -> iroh -> netwatch`, including from `aster-agent`.
 The generator identifies the local copy with a file-qualified purl. To express
@@ -263,9 +273,9 @@ and generation logs together. Include the inventory qualification above and
 any source archive referenced by patch pedigree. Do not relabel a previous
 build's checksums or SBOM as belonging to a fresh build.
 
-License fields contain the declarations from each package's manifest. A full
-license-notice bundle and review of native/toolchain licenses remain separate
-release work. Use the [historical observation](2026-09-08-observation.md) only
+License fields normally contain package-manifest declarations. A full release
+notice bundle and review of native/toolchain licenses remain separate release
+work. Use the [historical observation](2026-09-08-observation.md) only
 for its dated results, including its optional binary-audit experiment; it is
 not a current vulnerability scan.
 

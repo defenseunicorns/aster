@@ -76,6 +76,14 @@ jobs:
             build-essential pkg-config libbz2-dev libffi-dev liblzma-dev \
             libsqlite3-dev libssl-dev zlib1g-dev
 
+      - &install-linux-bluez-build-prerequisite
+        name: Install Linux BlueZ build prerequisite
+        timeout-minutes: 2
+        run: |
+          sudo apt-get -o APT::Update::Error-Mode=any update
+          sudo apt-get install --yes --no-install-recommends libdbus-1-dev
+          dpkg-query --show --showformat='${Package}\t${Version}\n' libdbus-1-dev
+
       - name: Cache exact-source CI Python
         id: ci-python-cache
         uses: &cache-artifacts actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -284,6 +292,8 @@ jobs:
     steps:
       - *checkout-source
 
+      - *install-linux-bluez-build-prerequisite
+
       - *setup-toolchain
 
       - *setup-sccache
@@ -311,6 +321,8 @@ jobs:
     env: *rust-build-profiles
     steps:
       - *checkout-source
+
+      - *install-linux-bluez-build-prerequisite
 
       - *setup-toolchain
 
@@ -379,6 +391,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - *checkout-source
+
+      - *install-linux-bluez-build-prerequisite
 
       - name: Install Rust 1.91.0
         run: rustup toolchain install 1.91.0 --profile minimal
@@ -499,6 +513,8 @@ jobs:
       SCCACHE_IDLE_TIMEOUT: "0"
     steps:
       - *checkout-source
+
+      - *install-linux-bluez-build-prerequisite
 
       - *setup-sccache
 

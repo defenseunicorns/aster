@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Aster BTLE Ring-1</string>
+    <string name="linux_address">Linux Bluetooth address</string>
+    <string name="psm">LE PSM (128–255)</string>
+    <string name="mission_peer">Expected Linux mission node ID</string>
+    <string name="select_mission">Select mission bundle</string>
+    <string name="message">Message (1–1024 UTF-8 bytes)</string>
+    <string name="send_validate">Send and validate</string>
+    <string name="cancel">Cancel</string>
+    <string name="mission_missing">No mission bundle selected</string>
+</resources>

@@ -31,6 +31,7 @@ class RequiredMacosLaneTests(unittest.TestCase):
 
         self.assertIn("name: macOS compatibility", lane)
         self.assertIn("runs-on: macos-15", lane)
+        self.assertNotIn("runs-on: macos-14", lane)
         self.assertIn("timeout-minutes: 15", lane)
         self.assertIn("run: sh tools/test-macos-compatibility.sh", lane)
         self.assertNotIn(
@@ -129,6 +130,7 @@ class FullMacosLaneTests(unittest.TestCase):
         self.assertIn("workflow_dispatch:", workflow)
         self.assertIn("permissions:\n  contents: read", workflow)
         self.assertIn("runs-on: macos-15", workflow)
+        self.assertNotIn("runs-on: macos-14", workflow)
         self.assertIn("timeout-minutes: 30", workflow)
         self.assertIn(
             "cargo +1.97.1 test --locked --workspace --all-features",
@@ -237,6 +239,12 @@ class RustTimingLaneTests(unittest.TestCase):
 
 
 class QualityLaneTests(unittest.TestCase):
+    def test_fuzz_lane_installs_the_linux_bluez_build_prerequisite(self):
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        fuzz = workflow_job(workflow, "fuzz-smoke", "required")
+
+        self.assertIn("- *install-linux-bluez-build-prerequisite", fuzz)
+
     def test_quality_reuses_foundation_core_without_repeating_gated_checks(self):
         workflow = CI_WORKFLOW.read_text(encoding="utf-8")
         quality = workflow_job(workflow, "quality", "cargo-lockfiles")

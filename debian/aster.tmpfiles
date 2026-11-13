@@ -1,0 +1,4 @@
+# The BTLE authority remains radio-inert; this anchor only serializes credential custody.
+d /run/aster-agent 0755 root root -
+f /run/aster-agent/btle-authority.lock 0440 root root -
+a /run/aster-agent/btle-authority.lock - - - - u::r--,u:aster:r--,g::---,m::r--,o::---

@@ -13,6 +13,10 @@
 //! after the fourth flight and the selected peer-admission check, can expose
 //! their profile's protected application path.
 
+use aster_contact::{
+    CarrierPeerEvidence, ChannelBindingCapability, ContactError, ContactErrorKind, OrderedContact,
+    StableCarrierId,
+};
 use aster_iroh::{
     CarrierError, CarrierSecurityProfile, ChannelBindingContext as IrohChannelBindingContext,
     Connection, EndpointId, SecretKey,
@@ -36,6 +40,7 @@ use std::{
     fmt,
     fs::File,
     io::{self, Read},
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -60,6 +65,7 @@ const CLASSICAL_CHANNEL_BINDING_CONTEXT_MAGIC: &[u8; 8] = b"ASTRCB01";
 // v7/v8 BlobRangesStreamV1 lane. The separate profile-5 Blob DAG must not be
 // advertised here until it is dispatched by this contact owner.
 const SELECTED_CONTACT_SEMANTIC_CEILING: u16 = 9;
+const MISSION_HANDSHAKE_EXCHANGE_LIMIT: usize = 2 * 1024 * 1024;
 /// Exact bytes in a canonical carrier-bound classical mission context.
 pub const CLASSICAL_CHANNEL_BINDING_CONTEXT_BYTES: usize = 8 + 2 + 8 + 32 * 6;
 
@@ -1407,6 +1413,118 @@ impl MissionPeerBinding {
     }
 }
 
+/// Carrier-neutral exact mission peer expectation for one hybrid contact.
+///
+/// An unauthenticated locator is routing evidence only: its bytes are never
+/// compared as identity. A stable carrier identity, when supplied, must match
+/// the contact's independently authenticated stable identity before flight one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionPeerExpectation {
+    carrier_evidence: CarrierPeerEvidence,
+    mission_id: NodeId,
+}
+
+impl MissionPeerExpectation {
+    /// Creates one typed carrier expectation and authority-rostered mission ID.
+    pub const fn new(carrier_evidence: CarrierPeerEvidence, mission_id: NodeId) -> Self {
+        Self {
+            carrier_evidence,
+            mission_id,
+        }
+    }
+
+    /// Returns the typed evidence expected from this contact.
+    pub const fn carrier_evidence(&self) -> &CarrierPeerEvidence {
+        &self.carrier_evidence
+    }
+
+    /// Returns the authority-rostered mission identity.
+    pub const fn mission_id(&self) -> NodeId {
+        self.mission_id
+    }
+
+    fn admit(
+        &self,
+        observed: CarrierPeerEvidence,
+    ) -> Result<ContactHybridAdmission, MissionSessionError> {
+        match (&self.carrier_evidence, &observed) {
+            (
+                CarrierPeerEvidence::AuthenticatedCarrier {
+                    stable_carrier_id: expected,
+                    ..
+                },
+                CarrierPeerEvidence::AuthenticatedCarrier {
+                    stable_carrier_id: actual,
+                    ..
+                },
+            ) if expected == actual => {}
+            (
+                CarrierPeerEvidence::UnauthenticatedLocator { .. },
+                CarrierPeerEvidence::UnauthenticatedLocator { .. },
+            ) => {}
+            _ => return Err(MissionSessionError::ContactPeerEvidenceMismatch),
+        }
+        Ok(ContactHybridAdmission {
+            observed,
+            expected_mission_id: self.mission_id,
+        })
+    }
+}
+
+/// Carrier and mission observations authenticated at their respective layers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionPeerObservation {
+    carrier_evidence: CarrierPeerEvidence,
+    mission_id: NodeId,
+}
+
+impl MissionPeerObservation {
+    /// Returns the typed evidence supplied by the exact contact.
+    pub const fn carrier_evidence(&self) -> &CarrierPeerEvidence {
+        &self.carrier_evidence
+    }
+
+    /// Returns the authority-authenticated mission identity.
+    pub const fn mission_id(&self) -> NodeId {
+        self.mission_id
+    }
+}
+
+struct ContactHybridAdmission {
+    observed: CarrierPeerEvidence,
+    expected_mission_id: NodeId,
+}
+
+impl ContactHybridAdmission {
+    fn bind(
+        self,
+        mut inner: ReferenceAuthenticatedSession,
+    ) -> Result<HybridMissionSession, MissionSessionError> {
+        let authenticated = inner.peer_identity();
+        if authenticated != self.expected_mission_id {
+            inner.zeroize();
+            return Err(MissionSessionError::MissionIdentityMismatch {
+                expected: self.expected_mission_id,
+                authenticated,
+            });
+        }
+        Ok(HybridMissionSession {
+            inner,
+            peer: MissionPeerObservation {
+                carrier_evidence: self.observed,
+                mission_id: authenticated,
+            },
+        })
+    }
+}
+
+fn iroh_peer_evidence(carrier_id: EndpointId) -> CarrierPeerEvidence {
+    CarrierPeerEvidence::AuthenticatedCarrier {
+        stable_carrier_id: StableCarrierId::new(*carrier_id.as_bytes()),
+        channel_binding: ChannelBindingCapability::Derivable,
+    }
+}
+
 /// Peer-admission decision retained across the hybrid handshake typestate.
 ///
 /// A discovered carrier is not mission authorization. Its mission identity is
@@ -1450,7 +1568,16 @@ impl HybridPeerAdmission {
                 MissionPeerBinding::new(carrier_id, authenticated)
             }
         };
-        Ok(MissionSession { inner, peer })
+        Ok(MissionSession {
+            inner: HybridMissionSession {
+                inner,
+                peer: MissionPeerObservation {
+                    carrier_evidence: iroh_peer_evidence(peer.carrier_id()),
+                    mission_id: peer.mission_id(),
+                },
+            },
+            peer,
+        })
     }
 }
 
@@ -1518,6 +1645,10 @@ impl fmt::Debug for ClassicalChannelBindingContext {
 pub enum MissionSessionError {
     /// The bounded Iroh carrier failed while exchanging an opaque flight.
     Carrier(CarrierError),
+    /// An adapter-neutral ordered contact failed while exchanging a flight.
+    Contact(ContactError),
+    /// Stable-vs-locator evidence or an authenticated stable identity differed.
+    ContactPeerEvidenceMismatch,
     /// The connection's authenticated Iroh identity did not match configuration.
     CarrierIdentityMismatch {
         expected: EndpointId,
@@ -1541,6 +1672,10 @@ impl fmt::Display for MissionSessionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Carrier(error) => write!(formatter, "mission carrier: {error}"),
+            Self::Contact(error) => write!(formatter, "mission contact: {error}"),
+            Self::ContactPeerEvidenceMismatch => {
+                formatter.write_str("mission contact peer evidence mismatch")
+            }
             Self::CarrierIdentityMismatch { expected, observed } => write!(
                 formatter,
                 "carrier identity mismatch: expected {expected}, observed {observed}"
@@ -1567,8 +1702,10 @@ impl Error for MissionSessionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Carrier(error) => Some(error),
+            Self::Contact(error) => Some(error),
             Self::Authentication(error) => Some(error),
-            Self::CarrierIdentityMismatch { .. }
+            Self::ContactPeerEvidenceMismatch
+            | Self::CarrierIdentityMismatch { .. }
             | Self::CarrierSecurityProfileMismatch { .. }
             | Self::MissionIdentityMismatch { .. } => None,
         }
@@ -1584,6 +1721,12 @@ impl From<EnvelopeError> for MissionSessionError {
 impl From<CarrierError> for MissionSessionError {
     fn from(error: CarrierError) -> Self {
         Self::Carrier(error)
+    }
+}
+
+impl From<ContactError> for MissionSessionError {
+    fn from(error: ContactError) -> Self {
+        Self::Contact(error)
     }
 }
 
@@ -1829,6 +1972,53 @@ async fn initiate_over_iroh_metered_with_admission(
     result
 }
 
+/// Runs the hybrid initiator handshake over an adapter-neutral ordered contact.
+///
+/// Locator bytes are never accepted as identity. The expected mission node is
+/// authenticated only by the four-flight authority-provisioned handshake.
+pub async fn initiate_over_contact(
+    contact: &dyn OrderedContact,
+    bundle: ProvisioningBundle,
+    peer: MissionPeerExpectation,
+) -> Result<HybridMissionSession, MissionSessionError> {
+    initiate_over_contact_metered(contact, bundle, peer)
+        .await
+        .map(|(session, _receipt)| session)
+}
+
+pub(crate) async fn initiate_over_contact_metered(
+    contact: &dyn OrderedContact,
+    bundle: ProvisioningBundle,
+    peer: MissionPeerExpectation,
+) -> Result<(HybridMissionSession, MissionHandshakeReceipt), MissionSessionError> {
+    let result = async {
+        let admission = peer.admit(contact.peer_evidence())?;
+        let (initiator, first) = ReferenceSessionInitiator::start_with_semantic_ceiling(
+            bundle,
+            SELECTED_CONTACT_SEMANTIC_CEILING,
+        )?;
+        let second = contact
+            .request_with_total_limit(&first, MISSION_HANDSHAKE_EXCHANGE_LIMIT)
+            .await?;
+        let (pending, third) = initiator.receive_server(&second)?;
+        let fourth = contact
+            .request_with_total_limit(&third, MISSION_HANDSHAKE_EXCHANGE_LIMIT)
+            .await?;
+        let receipt = MissionHandshakeReceipt::from_flights([
+            first.len(),
+            second.len(),
+            third.len(),
+            fourth.len(),
+        ]);
+        Ok((admission.bind(pending.receive_finished(&fourth)?)?, receipt))
+    }
+    .await;
+    if result.is_err() {
+        contact.close();
+    }
+    result
+}
+
 /// Initiator waiting for fourth-flight key confirmation.
 ///
 /// This type has no application-frame methods. It becomes usable only after
@@ -2069,6 +2259,150 @@ async fn respond_over_iroh_inner(
         .into()),
         (Ok(_), None) => Err(CarrierError::Transport(
             "mission carrier skipped the second handshake transition".into(),
+        )
+        .into()),
+    }
+}
+
+/// Runs the hybrid responder handshake over an adapter-neutral ordered contact.
+pub async fn respond_over_contact(
+    contact: &dyn OrderedContact,
+    bundle: ProvisioningBundle,
+    peer: MissionPeerExpectation,
+) -> Result<HybridMissionSession, MissionSessionError> {
+    respond_over_contact_metered(contact, bundle, peer)
+        .await
+        .map(|(session, _receipt)| session)
+}
+
+pub(crate) async fn respond_over_contact_metered(
+    contact: &dyn OrderedContact,
+    bundle: ProvisioningBundle,
+    peer: MissionPeerExpectation,
+) -> Result<(HybridMissionSession, MissionHandshakeReceipt), MissionSessionError> {
+    let result = respond_over_contact_inner(contact, bundle, peer).await;
+    if result.is_err() {
+        contact.close();
+    }
+    result
+}
+
+async fn respond_over_contact_inner(
+    contact: &dyn OrderedContact,
+    bundle: ProvisioningBundle,
+    peer: MissionPeerExpectation,
+) -> Result<(HybridMissionSession, MissionHandshakeReceipt), MissionSessionError> {
+    let admission = peer.admit(contact.peer_evidence())?;
+    let responder = ReferenceSessionResponder::open_with_semantic_ceiling(
+        bundle,
+        SELECTED_CONTACT_SEMANTIC_CEILING,
+    )?;
+    let mut first_transition = None;
+    let mut first_lengths = None;
+    let first_exchange = contact
+        .respond_once_with_total_limit(
+            MISSION_HANDSHAKE_EXCHANGE_LIMIT,
+            Box::new(|first| match responder.receive_client(first) {
+                Ok((pending, second)) => {
+                    first_lengths = Some((first.len(), second.len()));
+                    first_transition = Some(Ok(pending));
+                    Ok((second, false))
+                }
+                Err(error) => {
+                    first_transition = Some(Err(error));
+                    Err(ContactError::new(
+                        ContactErrorKind::Protocol,
+                        "mission handshake rejected before flight two",
+                    ))
+                }
+            }),
+        )
+        .await;
+    let pending = match (first_exchange, first_transition) {
+        (_, Some(Err(error))) => return Err(error.into()),
+        (Err(error), _) => return Err(error.into()),
+        (Ok(false), Some(Ok(pending))) => pending,
+        (Ok(true), Some(Ok(_))) => {
+            return Err(ContactError::new(
+                ContactErrorKind::Protocol,
+                "mission contact reported early handshake completion",
+            )
+            .into());
+        }
+        (Ok(_), None) => {
+            return Err(ContactError::new(
+                ContactErrorKind::Protocol,
+                "mission contact skipped the first handshake transition",
+            )
+            .into());
+        }
+    };
+
+    let mut second_transition = None;
+    let mut second_lengths = None;
+    let mut admission = Some(admission);
+    let second_exchange = contact
+        .respond_once_with_total_limit(
+            MISSION_HANDSHAKE_EXCHANGE_LIMIT,
+            Box::new(|third| match pending.receive_client_auth(third) {
+                Ok((inner, fourth)) => {
+                    let admission = admission
+                        .take()
+                        .expect("contact admission is consumed by exactly one handler call");
+                    match admission.bind(inner) {
+                        Ok(session) => {
+                            second_lengths = Some((third.len(), fourth.len()));
+                            second_transition = Some(Ok(session));
+                            Ok((fourth, true))
+                        }
+                        Err(error) => {
+                            second_transition = Some(Err(error));
+                            Err(ContactError::new(
+                                ContactErrorKind::Protocol,
+                                "mission authorization rejected before flight four",
+                            ))
+                        }
+                    }
+                }
+                Err(error) => {
+                    second_transition = Some(Err(error.into()));
+                    Err(ContactError::new(
+                        ContactErrorKind::Protocol,
+                        "mission handshake rejected before flight four",
+                    ))
+                }
+            }),
+        )
+        .await;
+    match (second_exchange, second_transition) {
+        (_, Some(Err(error))) => Err(error),
+        (Err(error), _) => Err(error.into()),
+        (Ok(true), Some(Ok(session))) => {
+            let (first, second) = first_lengths.ok_or_else(|| {
+                ContactError::new(
+                    ContactErrorKind::Protocol,
+                    "mission contact omitted first-flight accounting",
+                )
+            })?;
+            let (third, fourth) = second_lengths.ok_or_else(|| {
+                ContactError::new(
+                    ContactErrorKind::Protocol,
+                    "mission contact omitted second-flight accounting",
+                )
+            })?;
+            Ok((
+                session,
+                MissionHandshakeReceipt::from_flights([first, second, third, fourth]),
+            ))
+        }
+        (Ok(false), Some(Ok(_))) => Err(ContactError::new(
+            ContactErrorKind::Protocol,
+            "mission contact did not report completed handshake",
+        )
+        .into()),
+        (Ok(_), None) => Err(ContactError::new(
+            ContactErrorKind::Protocol,
+            "mission contact skipped the second handshake transition",
         )
         .into()),
     }
@@ -2406,10 +2740,42 @@ impl Drop for CarrierBoundClassicalMissionSession {
     }
 }
 
-/// Hybrid-authenticated mission session associated with one carrier peer.
-pub struct MissionSession {
+/// Hybrid-authenticated mission session associated with typed carrier evidence.
+pub struct HybridMissionSession {
     inner: ReferenceAuthenticatedSession,
+    peer: MissionPeerObservation,
+}
+
+/// Iroh compatibility wrapper preserving the original carrier-binding API.
+pub struct MissionSession {
+    inner: HybridMissionSession,
     peer: MissionPeerBinding,
+}
+
+impl Deref for MissionSession {
+    type Target = HybridMissionSession;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for MissionSession {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl MissionSession {
+    /// Original Iroh carrier and mission binding for this compatibility session.
+    pub const fn peer(&self) -> MissionPeerBinding {
+        self.peer
+    }
+
+    /// Removes the Iroh compatibility wrapper after carrier admission.
+    pub(crate) fn into_hybrid(self) -> HybridMissionSession {
+        self.inner
+    }
 }
 
 #[cfg(feature = "fuzzing")]
@@ -2425,18 +2791,30 @@ pub(crate) fn fuzz_mission_pair() -> (MissionSession, MissionSession, [u8; 32]) 
     );
     (
         MissionSession {
-            inner: initiator,
+            inner: HybridMissionSession {
+                inner: initiator,
+                peer: MissionPeerObservation {
+                    carrier_evidence: iroh_peer_evidence(initiator_peer.carrier_id()),
+                    mission_id: initiator_peer.mission_id(),
+                },
+            },
             peer: initiator_peer,
         },
         MissionSession {
-            inner: responder,
+            inner: HybridMissionSession {
+                inner: responder,
+                peer: MissionPeerObservation {
+                    carrier_evidence: iroh_peer_evidence(responder_peer.carrier_id()),
+                    mission_id: responder_peer.mission_id(),
+                },
+            },
             peer: responder_peer,
         },
         digest,
     )
 }
 
-impl MissionSession {
+impl HybridMissionSession {
     fn blob_direction(direction: crate::frame::EventDirection) -> BlobCustodyDirectionV1 {
         match direction {
             crate::frame::EventDirection::ToSessionInitiator => {
@@ -2448,13 +2826,9 @@ impl MissionSession {
         }
     }
 
-    /// Carrier and mission identities authenticated independently for this session.
-    ///
-    /// Exact-roster sessions additionally checked the pair against
-    /// configuration. Discovered hybrid sessions make no common-key-ownership
-    /// claim about the two identities.
-    pub const fn peer(&self) -> MissionPeerBinding {
-        self.peer
+    /// Typed carrier evidence and authority-authenticated mission identity.
+    pub const fn peer_observation(&self) -> &MissionPeerObservation {
+        &self.peer
     }
 
     /// Authenticated semantic protocol version selected by `aster-core`.
@@ -2479,7 +2853,6 @@ impl MissionSession {
             .map_err(Into::into)
     }
 
-    #[allow(dead_code)] // Consumed by the profile-5 runtime driver in Task 7.
     pub(crate) fn mint_blob_custody_send_context_v2(
         &self,
         direction: crate::frame::EventDirection,
@@ -2751,7 +3124,6 @@ impl MissionSession {
         Ok(plaintext)
     }
 
-    #[allow(dead_code)] // Consumed by the profile-5 runtime driver in Task 7.
     pub(crate) fn seal_blob_custody_frame_v2(
         &mut self,
         transfer_profile_digest: [u8; 32],
@@ -2769,7 +3141,6 @@ impl MissionSession {
             .map_err(Into::into)
     }
 
-    #[allow(dead_code)] // Consumed by the profile-5 runtime driver in Task 7.
     pub(crate) fn open_blob_custody_frame_v2(
         &mut self,
         transfer_profile_digest: [u8; 32],
@@ -2884,13 +3255,23 @@ impl MissionSession {
     }
 }
 
+impl fmt::Debug for HybridMissionSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HybridMissionSession")
+            .field("peer", &self.peer)
+            .field("semantic_version", &self.inner.semantic_version())
+            .field("key_material", &"[REDACTED]")
+            .finish()
+    }
+}
+
 impl fmt::Debug for MissionSession {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("MissionSession")
             .field("peer", &self.peer)
-            .field("semantic_version", &self.inner.semantic_version())
-            .field("key_material", &"[REDACTED]")
+            .field("session", &self.inner)
             .finish()
     }
 }
@@ -2903,6 +3284,8 @@ mod tests {
         schedule_digest, transfer_profile_digest,
     };
     use crate::frame::{EventDirection, Frame};
+    use aster_ble_l2cap::BleL2capContact;
+    use aster_contact::{ContactFuture, ContactRequestHandler, TransientLocator};
     use aster_iroh::{CarrierSecurityProfile, Endpoint, EndpointConfig, ExpectedPeer, SecretKey};
     use aster_mesh::{
         ClassicalProvisioner, ClassicalProvisioningAccess, CustodyHop, CustodySample,
@@ -2910,7 +3293,9 @@ mod tests {
         ProvisioningLoadReceipt, ReferenceEnvelopeSealer, ReferenceProvisioner, Scope, Topic,
     };
     use aster_redb_store::EventTransferId;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::{collections::BTreeSet, net::SocketAddr, time::Duration};
+    use tokio::io::duplex;
 
     struct IssuedNode {
         bundle: Vec<u8>,
@@ -3016,6 +3401,228 @@ mod tests {
 
     fn binding(peer: &IssuedNode) -> MissionPeerBinding {
         MissionPeerBinding::new(peer.carrier, peer.identity)
+    }
+
+    fn locator_expectation(label: &[u8], mission_id: NodeId) -> MissionPeerExpectation {
+        MissionPeerExpectation::new(
+            CarrierPeerEvidence::UnauthenticatedLocator {
+                transient_locator: TransientLocator::new(label.to_vec()).unwrap(),
+            },
+            mission_id,
+        )
+    }
+
+    fn locator_contact_pair() -> (Arc<BleL2capContact>, Arc<BleL2capContact>) {
+        let (left, right) = duplex(97);
+        let left = BleL2capContact::new(
+            left,
+            TransientLocator::new(b"observed-left".to_vec()).unwrap(),
+            2 * 1024 * 1024,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let right = BleL2capContact::new(
+            right,
+            TransientLocator::new(b"observed-right".to_vec()).unwrap(),
+            2 * 1024 * 1024,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        (Arc::new(left), Arc::new(right))
+    }
+
+    struct EvidenceOnlyContact {
+        evidence: CarrierPeerEvidence,
+        requests: AtomicUsize,
+    }
+
+    impl OrderedContact for EvidenceOnlyContact {
+        fn peer_evidence(&self) -> CarrierPeerEvidence {
+            self.evidence.clone()
+        }
+
+        fn max_frame_bytes(&self) -> usize {
+            2 * 1024 * 1024
+        }
+
+        fn request_with_total_limit<'a>(
+            &'a self,
+            _request: &'a [u8],
+            _total_limit: usize,
+        ) -> ContactFuture<'a, Vec<u8>> {
+            self.requests.fetch_add(1, AtomicOrdering::Relaxed);
+            Box::pin(async {
+                Err(ContactError::new(
+                    ContactErrorKind::Transport,
+                    "unexpected request",
+                ))
+            })
+        }
+
+        fn request_with_total_limit_checked<'a>(
+            &'a self,
+            request: &'a [u8],
+            total_limit: usize,
+            before_write: aster_contact::ContactPreflight<'a>,
+        ) -> ContactFuture<'a, Vec<u8>> {
+            if let Err(error) = before_write() {
+                return Box::pin(async move { Err(error) });
+            }
+            self.request_with_total_limit(request, total_limit)
+        }
+
+        fn respond_once_with_total_limit<'a>(
+            &'a self,
+            _total_limit: usize,
+            _handler: ContactRequestHandler<'a>,
+        ) -> ContactFuture<'a, bool> {
+            self.requests.fetch_add(1, AtomicOrdering::Relaxed);
+            Box::pin(async {
+                Err(ContactError::new(
+                    ContactErrorKind::Transport,
+                    "unexpected response",
+                ))
+            })
+        }
+
+        fn finish_as_initiator(&self) -> ContactFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn finish_as_responder(&self) -> ContactFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn close(&self) {}
+    }
+
+    #[tokio::test]
+    async fn locator_contact_authenticates_only_mission_identity_with_four_flights() {
+        let mut provisioner = ReferenceProvisioner::from_seed([0xa1; 32]).unwrap();
+        let initiator = issue(&mut provisioner, 1);
+        let responder = issue(&mut provisioner, 2);
+        let (left, right) = locator_contact_pair();
+        let responder_task = tokio::spawn({
+            let right = Arc::clone(&right);
+            let bundle = responder.bundle();
+            let expected = locator_expectation(b"configured-initiator", initiator.identity);
+            async move { respond_over_contact_metered(&*right, bundle, expected).await }
+        });
+        let (mut initiator_session, initiator_receipt) = initiate_over_contact_metered(
+            &*left,
+            initiator.bundle(),
+            locator_expectation(b"configured-responder", responder.identity),
+        )
+        .await
+        .unwrap();
+        let (mut responder_session, responder_receipt) = responder_task.await.unwrap().unwrap();
+
+        assert_eq!(initiator_receipt.frames, 4);
+        assert_eq!(responder_receipt.frames, 4);
+        assert_eq!(
+            initiator_session.peer_observation().mission_id(),
+            responder.identity
+        );
+        assert_eq!(
+            responder_session.peer_observation().mission_id(),
+            initiator.identity
+        );
+        assert!(matches!(
+            initiator_session.peer_observation().carrier_evidence(),
+            CarrierPeerEvidence::UnauthenticatedLocator { .. }
+        ));
+        assert_eq!(
+            initiator_session
+                .peer_observation()
+                .carrier_evidence()
+                .stable_carrier_id(),
+            None
+        );
+        let protected = initiator_session
+            .seal_application_frame(b"neutral-contact-event")
+            .unwrap();
+        assert_eq!(
+            responder_session
+                .open_application_frame(&protected)
+                .unwrap(),
+            b"neutral-contact-event"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_rostered_mission_identity_is_rejected_by_responder() {
+        let mut provisioner = ReferenceProvisioner::from_seed([0xa2; 32]).unwrap();
+        let initiator = issue(&mut provisioner, 1);
+        let responder = issue(&mut provisioner, 2);
+        let other = issue(&mut provisioner, 3);
+        let (left, right) = locator_contact_pair();
+        let responder_task = tokio::spawn({
+            let right = Arc::clone(&right);
+            let bundle = responder.bundle();
+            let expected = locator_expectation(b"configured-initiator", other.identity);
+            async move { respond_over_contact_metered(&*right, bundle, expected).await }
+        });
+        let initiator_result = initiate_over_contact_metered(
+            &*left,
+            initiator.bundle(),
+            locator_expectation(b"configured-responder", responder.identity),
+        )
+        .await;
+        let responder_error = responder_task.await.unwrap().unwrap_err();
+        assert!(matches!(
+            responder_error,
+            MissionSessionError::MissionIdentityMismatch {
+                expected,
+                authenticated,
+            } if expected == other.identity && authenticated == initiator.identity
+        ));
+        assert!(matches!(
+            initiator_result,
+            Err(MissionSessionError::Contact(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stable_carrier_mismatch_fails_before_flight_one() {
+        let mut provisioner = ReferenceProvisioner::from_seed([0xa3; 32]).unwrap();
+        let initiator = issue(&mut provisioner, 1);
+        let responder = issue(&mut provisioner, 2);
+        let contact = EvidenceOnlyContact {
+            evidence: CarrierPeerEvidence::AuthenticatedCarrier {
+                stable_carrier_id: StableCarrierId::new([1; 32]),
+                channel_binding: ChannelBindingCapability::Derivable,
+            },
+            requests: AtomicUsize::new(0),
+        };
+        let expectation = MissionPeerExpectation::new(
+            CarrierPeerEvidence::AuthenticatedCarrier {
+                stable_carrier_id: StableCarrierId::new([2; 32]),
+                channel_binding: ChannelBindingCapability::Derivable,
+            },
+            responder.identity,
+        );
+        let error = initiate_over_contact(&contact, initiator.bundle(), expectation)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            MissionSessionError::ContactPeerEvidenceMismatch
+        ));
+        assert_eq!(contact.requests.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[test]
+    fn locator_evidence_cannot_select_the_classical_carrier_profile() {
+        let expectation = locator_expectation(b"routing-only", [0x44; 32]);
+        assert_eq!(
+            expectation.carrier_evidence().channel_binding_capability(),
+            ChannelBindingCapability::Unavailable
+        );
+        assert_eq!(
+            expectation.carrier_evidence().stable_carrier_id(),
+            None,
+            "classical APIs require MissionPeerBinding and never accept a locator expectation"
+        );
     }
 
     #[test]
@@ -3915,6 +4522,7 @@ mod tests {
         v7_context.push(2);
         let substituted = sender
             .inner
+            .inner
             .seal_frame_with_context(b"v7-substitution", &v7_context)
             .expect("seal substituted v7-domain record");
         assert!(
@@ -4108,7 +4716,7 @@ mod tests {
     #[test]
     fn semantic_v7_lane_record_context_stays_byte_identical() {
         let digest = [0x51; 32];
-        let context = MissionSession::lane_record_context(
+        let context = HybridMissionSession::lane_record_context(
             crate::event_pages::SEMANTIC_PROTOCOL_V7,
             digest,
             crate::event_pages::LaneId::Event,

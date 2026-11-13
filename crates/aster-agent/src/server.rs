@@ -48,8 +48,8 @@ const APPLICATION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const APPLICATION_MAX_CONNECTION_AGE: Duration = Duration::from_secs(30 * 60);
 const APPLICATION_CONNECTION_AGE_GRACE: Duration = Duration::from_secs(30);
 
-/// One application-listener control state. Task 6 owns signal translation and
-/// bounded supervisor ordering around these states.
+/// One application-listener control state. The process runtime owns signal
+/// translation and bounded supervisor ordering around these states.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServerStop {
     /// Continue accepting application connections.
