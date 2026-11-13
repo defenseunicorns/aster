@@ -4,7 +4,7 @@
 
 - Status: Accepted for a default-off demo/evaluation profile
 - Date: 2026-08-28
-- Authority: [DESIGN.md](../../DESIGN.md)
+- Authority: [data-mesh-requirements.md](../../data-mesh-requirements.md)
 - Related: [Decision 0028](0028-selected-stack-implementation-boundary.md) and
   [nearby discovery selection](../../archive/research/evaluations/0005/nearby-discovery-selection.md)
 

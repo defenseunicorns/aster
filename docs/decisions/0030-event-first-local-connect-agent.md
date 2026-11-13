@@ -4,7 +4,7 @@
 - Status: accepted for an alpha implementation slice; production and release
   gates remain open
 - Date: 2026-08-25
-- Authority: [`DESIGN.md`](../../DESIGN.md)
+- Authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Related: [Decision 0002](0002-dependency-admission.md),
   [Decision 0008](0008-local-agent-phasing.md),
   [Decision 0009](0009-public-api-boundary.md), and

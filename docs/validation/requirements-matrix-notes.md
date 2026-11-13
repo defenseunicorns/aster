@@ -5,7 +5,7 @@
 ## Authority and provenance
 
 The sole semantic authority for the matrix is
-[`DESIGN.md`](../../DESIGN.md), version 0.1,
+[`data-mesh-requirements.md`](../../data-mesh-requirements.md), version 0.1,
 dated 2026-08-17, with SHA-256
 `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`.
 That exact input is registered as `SRC-001` in the project source ledger.

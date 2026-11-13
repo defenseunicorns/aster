@@ -5,7 +5,7 @@
 - Status: accepted; initial classical evaluation implementation present; release gates open
 - Date: 2026-08-28
 - Authority: stakeholder-approved applicability revision dated 2026-08-28 to
-  the preserved [`DESIGN.md`](../../DESIGN.md)
+  the preserved [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Derived row mapping:
   [security-profile requirements disposition](../validation/security-profile-requirements-disposition.md)
 - Related: [Decision 0001](0001-standards-and-provider-boundaries.md),

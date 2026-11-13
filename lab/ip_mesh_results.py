@@ -1343,7 +1343,6 @@ def _validate_retained_source_freeze_git_commands(
     *,
     commit: str,
     tree: str,
-    requirements_path: str,
     requirements_blob: str,
     requirements_size: int,
     trust: dict[str, Any],
@@ -1365,13 +1364,13 @@ def _validate_retained_source_freeze_git_commands(
             b"",
         ),
         (
-            f"candidate-blob-id:{requirements_path}",
-            ["rev-parse", f"{commit}:{requirements_path}"],
+            "candidate-blob-id:data-mesh-requirements.md",
+            ["rev-parse", f"{commit}:data-mesh-requirements.md"],
             requirements_blob.encode("utf-8"),
         ),
         (
-            f"candidate-blob:{requirements_path}",
-            ["cat-file", "blob", f"{commit}:{requirements_path}"],
+            "candidate-blob:data-mesh-requirements.md",
+            ["cat-file", "blob", f"{commit}:data-mesh-requirements.md"],
             None,
         ),
     )
@@ -1505,24 +1504,10 @@ def validate_gate_h_signature_evidence(
         or source_freeze["requirements_size_bytes"] <= 0
     ):
         raise ResultsError("Gate-H signed requirements source binding is malformed")
-    signed_source = manifest.get("signed_source")
-    if not isinstance(signed_source, dict) or not isinstance(
-        signed_source.get("files"), list
-    ):
-        raise ResultsError("Gate-H signed source files are absent")
-    requirements_paths = [
-        binding["path"]
-        for binding in signed_source["files"]
-        if isinstance(binding, dict)
-        and binding.get("path") in ("DESIGN.md", "data-mesh-requirements.md")
-    ]
-    if len(requirements_paths) != 1:
-        raise ResultsError("signed source must contain exactly one requirements file")
     _validate_retained_source_freeze_git_commands(
         source_freeze.get("git_commands"),
         commit=candidate_commit,
         tree=source_freeze["candidate_tree"],
-        requirements_path=requirements_paths[0],
         requirements_blob=source_freeze["requirements_git_blob"],
         requirements_size=source_freeze["requirements_size_bytes"],
         trust=trust,

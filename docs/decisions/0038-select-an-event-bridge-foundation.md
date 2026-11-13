@@ -3,7 +3,7 @@
 
 - Status: Accepted for incremental selected-stack implementation
 - Date: 2026-08-31
-- Authority: [DESIGN.md](../../DESIGN.md)
+- Authority: [data-mesh-requirements.md](../../data-mesh-requirements.md)
 - Related: [Decision 0028](0028-selected-stack-implementation-boundary.md),
   [Decision 0033](0033-policy-selected-security-profiles.md),
   [Decision 0037](0037-bound-concurrent-lan-scale-baseline.md), and roadmap

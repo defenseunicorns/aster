@@ -3154,7 +3154,7 @@ def validate_selected_nat_commit_inputs(
         "lab/Dockerfile.selected-nat",
         "lab/Dockerfile.dockerignore",
         "lab/debian.sources",
-        "DESIGN.md",
+        "data-mesh-requirements.md",
     ]
     result = ctx.runner.run(
         [
@@ -3258,11 +3258,11 @@ def selected_nat_source_identity(ctx: RunContext) -> dict[str, Any]:
         )
     build_inputs = collect_selected_nat_build_inputs()
     validate_selected_nat_tracked_inputs(ctx, git, build_inputs)
-    requirements_content = (WORKSPACE / "DESIGN.md").read_bytes()
+    requirements_content = (WORKSPACE / "data-mesh-requirements.md").read_bytes()
     authority_inputs = [
         *build_inputs,
         BuildInput(
-            "DESIGN.md",
+            "data-mesh-requirements.md",
             requirements_content,
             hashlib.sha256(requirements_content).hexdigest(),
         ),

@@ -3688,44 +3688,6 @@ class SelectedIrohNatReceiptTests(unittest.TestCase):
             with self.assertRaises(CHECKER.ReceiptViolation):
                 CHECKER.verify_source_checkout(Path(temporary).resolve(), forged)
 
-            for requirements_paths in (
-                ("DESIGN.md",),
-                ("data-mesh-requirements.md", "DESIGN.md"),
-                (),
-            ):
-                with self.subTest(requirements_paths=requirements_paths):
-                    renamed_objects = {
-                        path: object_ids[path] for path in build_paths
-                    }
-                    renamed_objects.update(
-                        (path, object_ids["data-mesh-requirements.md"])
-                        for path in requirements_paths
-                    )
-                    tree, tree_objects, _ = git_tree_fixture(renamed_objects)
-                    commit_content = (
-                        f"tree {tree}\n".encode("ascii")
-                        + commit_content.split(b"\n", 1)[1]
-                    )
-                    commit = hashlib.sha1(
-                        f"commit {len(commit_content)}\0".encode("ascii")
-                        + commit_content
-                    ).hexdigest()
-                    document["source"].update({"commit": commit, "tree": tree})
-                    if len(requirements_paths) != 1:
-                        with self.assertRaisesRegex(
-                            CHECKER.ReceiptViolation, "exactly one requirements document"
-                        ):
-                            CHECKER.verify_source_checkout(Path(temporary).resolve(), document)
-                    else:
-                        authority = CHECKER.verify_source_checkout(
-                            Path(temporary).resolve(), document
-                        )
-                        self.assertEqual(
-                            authority["requirements_sha256"],
-                            document["source"]["requirements_sha256"],
-                        )
-                        self.assertEqual(authority["build_input_manifest_sha256"], input_digest)
-
     def test_source_git_disables_replacements_and_untrusted_global_config(self) -> None:
         completed = mock.Mock(returncode=0, stdout=b"ok", stderr=b"")
         injected = {
@@ -3777,7 +3739,6 @@ class SelectedIrohNatReceiptTests(unittest.TestCase):
             f"crates/cap/file-{index:04d}": "1" * 40
             for index in range(CHECKER.MAX_COMMITTED_INPUTS + 1)
         }
-        object_ids["DESIGN.md"] = "2" * 40
         tree, tree_objects, _tree_paths = git_tree_fixture(object_ids)
         commit_content = (
             f"tree {tree}\nauthor Fixture <fixture@example.test> 0 +0000\n"

@@ -3,7 +3,7 @@
 - Status: accepted, implemented, and physically compared within a bounded
   two-CM4 engineering matrix
 - Date: 2026-10-04
-- Authority: [`DESIGN.md`](../../DESIGN.md)
+- Authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Related: [Decision 0009](0009-public-api-boundary.md),
   [Decision 0012](0012-content-committing-pq-batches.md),
   [Decision 0030](0030-event-first-local-connect-agent.md), and

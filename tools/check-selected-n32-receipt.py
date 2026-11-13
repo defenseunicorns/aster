@@ -601,18 +601,10 @@ def validate_source(source: Path, expected_commit: str) -> dict[str, Any]:
     if GIT_OBJECT.fullmatch(tree) is None:
         fail("source commit returned a malformed tree identifier")
 
-    requirements_paths = run_git(
-        source,
-        ["ls-tree", "--name-only", expected_commit, "--", "DESIGN.md", "data-mesh-requirements.md"],
-        "requirements path validation",
-    ).decode("ascii", errors="strict").splitlines()
-    if len(requirements_paths) != 1:
-        fail("source commit must contain exactly one requirements document")
-
     public_hashes: dict[str, str] = {}
     for field, relative in (
         ("cargo_lock_sha256", "Cargo.lock"),
-        ("requirements_sha256", requirements_paths[0]),
+        ("requirements_sha256", "data-mesh-requirements.md"),
     ):
         content = run_git(
             source,

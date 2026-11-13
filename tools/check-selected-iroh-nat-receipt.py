@@ -7818,10 +7818,7 @@ def verify_source_checkout(source: Path, document: dict[str, Any]) -> dict[str, 
         "lab/Dockerfile.dockerignore",
         "lab/debian.sources",
     }
-    requirements_paths = {"DESIGN.md", "data-mesh-requirements.md"} & all_committed.keys()
-    if len(requirements_paths) != 1:
-        fail("reviewer source commit must contain exactly one requirements document")
-    requirements_path = requirements_paths.pop()
+    requirements_path = "data-mesh-requirements.md"
     admitted_paths = {
         relative
         for relative in all_committed
