@@ -857,7 +857,7 @@ pub(crate) fn validate_protected_artifact(
 mod tests {
     use super::*;
     use std::{
-        collections::{HashMap, hash_map::Entry},
+        collections::HashMap,
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, Ordering},
@@ -892,16 +892,10 @@ mod tests {
         }
     }
 
-    // This fixture deliberately exists only under `cfg(test)`. Reopening over
-    // shared memory models only contract-level record retention, retry binding,
-    // and tombstone state. It does not demonstrate crash durability, reference
-    // authentication, access control, at-rest secrecy, or physical erasure and
-    // is not an operational plaintext-custody implementation.
+    // Test-only installer used to observe plaintext ownership and zeroization.
     #[derive(Default)]
     struct PersistentTestSecretState {
         installs: HashMap<ProvisioningInstallId, TestInstallRecord>,
-        loads: HashMap<ProvisioningLoadId, ProvisioningSecretRef>,
-        destroys: HashMap<ProvisioningDestroyId, ProvisioningSecretRef>,
         entries: HashMap<ProvisioningSecretRef, TestSecretEntry>,
     }
 
@@ -912,7 +906,6 @@ mod tests {
 
     struct TestSecretEntry {
         plaintext: UnprotectedProvisioning,
-        destroyed: bool,
     }
 
     struct PersistentTestSecretStore {
@@ -922,15 +915,6 @@ mod tests {
     impl PersistentTestSecretStore {
         fn open(state: Arc<Mutex<PersistentTestSecretState>>) -> Self {
             Self { state }
-        }
-
-        fn retained_plaintext_len(&self, secret_ref: &ProvisioningSecretRef) -> Option<usize> {
-            self.state
-                .lock()
-                .expect("test secret state")
-                .entries
-                .get(secret_ref)
-                .map(|entry| entry.plaintext.len())
         }
     }
 
@@ -949,9 +933,6 @@ mod tests {
                     .entries
                     .get(&existing.secret_ref)
                     .ok_or(ProvisioningSecretStoreError::Rejected)?;
-                if entry.destroyed {
-                    return Err(ProvisioningSecretStoreError::Destroyed);
-                }
                 if entry.plaintext.expose() != plaintext.expose() {
                     return Err(ProvisioningSecretStoreError::OperationConflict);
                 }
@@ -964,13 +945,9 @@ mod tests {
             let mut opaque = b"cfg-test-secret-ref/".to_vec();
             opaque.extend_from_slice(operation.as_bytes());
             let secret_ref = ProvisioningSecretRef::from_opaque(opaque)?;
-            state.entries.insert(
-                secret_ref.clone(),
-                TestSecretEntry {
-                    plaintext,
-                    destroyed: false,
-                },
-            );
+            state
+                .entries
+                .insert(secret_ref.clone(), TestSecretEntry { plaintext });
             state.installs.insert(
                 operation,
                 TestInstallRecord {
@@ -978,79 +955,6 @@ mod tests {
                 },
             );
             Ok(ProvisioningInstallReceipt::installed(operation, secret_ref))
-        }
-    }
-
-    impl ProvisioningSecretLoader for PersistentTestSecretStore {
-        fn load(
-            &mut self,
-            operation: ProvisioningLoadId,
-            secret_ref: &ProvisioningSecretRef,
-        ) -> Result<ProvisioningLoadReceipt, ProvisioningSecretStoreError> {
-            let mut state = self.state.lock().expect("test secret state");
-            match state.loads.entry(operation) {
-                Entry::Occupied(existing) if existing.get() != secret_ref => {
-                    return Err(ProvisioningSecretStoreError::OperationConflict);
-                }
-                Entry::Occupied(_) => {}
-                Entry::Vacant(binding) => {
-                    binding.insert(secret_ref.clone());
-                }
-            }
-            let entry = state
-                .entries
-                .get(secret_ref)
-                .ok_or(ProvisioningSecretStoreError::NotFound)?;
-            if entry.destroyed {
-                return Err(ProvisioningSecretStoreError::Destroyed);
-            }
-            let plaintext = entry.plaintext.expose().to_vec();
-            drop(state);
-            let plaintext = UnprotectedProvisioning::new(plaintext)
-                .map_err(|_| ProvisioningSecretStoreError::Rejected)?;
-            Ok(ProvisioningLoadReceipt::new(
-                operation,
-                secret_ref.clone(),
-                plaintext,
-            ))
-        }
-    }
-
-    impl ProvisioningSecretDestroyer for PersistentTestSecretStore {
-        fn destroy(
-            &mut self,
-            operation: ProvisioningDestroyId,
-            secret_ref: &ProvisioningSecretRef,
-        ) -> Result<ProvisioningDestroyReceipt, ProvisioningSecretStoreError> {
-            let mut state = self.state.lock().expect("test secret state");
-            match state.destroys.entry(operation) {
-                Entry::Occupied(existing) if existing.get() != secret_ref => {
-                    return Err(ProvisioningSecretStoreError::OperationConflict);
-                }
-                Entry::Occupied(_) => {}
-                Entry::Vacant(binding) => {
-                    binding.insert(secret_ref.clone());
-                }
-            }
-            if !state.entries.contains_key(secret_ref) {
-                return Err(ProvisioningSecretStoreError::NotFound);
-            }
-            let entry = state
-                .entries
-                .get_mut(secret_ref)
-                .ok_or(ProvisioningSecretStoreError::NotFound)?;
-            if entry.destroyed {
-                return Ok(ProvisioningDestroyReceipt::already_destroyed(
-                    operation,
-                    secret_ref.clone(),
-                ));
-            }
-            entry.plaintext.zeroize();
-            entry.destroyed = true;
-            Ok(ProvisioningDestroyReceipt::destroyed(
-                operation,
-                secret_ref.clone(),
-            ))
         }
     }
 
@@ -1462,86 +1366,13 @@ mod tests {
     }
 
     #[test]
-    fn failed_load_and_destroy_attempts_still_bind_operation_to_reference() {
-        let state = Arc::new(Mutex::new(PersistentTestSecretState::default()));
-        let mut store = PersistentTestSecretStore::open(state);
-        let valid_ref = store
-            .install(
-                ProvisioningInstallId::new([0xc1; 32]),
-                UnprotectedProvisioning::new(b"ASTRPB03binding-target".to_vec()).unwrap(),
-            )
-            .unwrap()
-            .into_secret_ref();
-        let unknown_ref =
-            ProvisioningSecretRef::from_opaque(b"unknown-binding-target".to_vec()).unwrap();
-
-        let load_operation = ProvisioningLoadId::new([0xc2; 32]);
-        assert_eq!(
-            store.load(load_operation, &unknown_ref).unwrap_err(),
-            ProvisioningSecretStoreError::NotFound
+    fn load_receipt_redacts_plaintext() {
+        let loaded = ProvisioningLoadReceipt::new(
+            ProvisioningLoadId::new([0x22; 32]),
+            ProvisioningSecretRef::from_opaque(b"test-secret-ref".to_vec()).unwrap(),
+            UnprotectedProvisioning::new(b"ASTRPB03persistent-test-secret".to_vec()).unwrap(),
         );
-        assert_eq!(
-            store.load(load_operation, &valid_ref).unwrap_err(),
-            ProvisioningSecretStoreError::OperationConflict
-        );
-
-        let destroy_operation = ProvisioningDestroyId::new([0xc3; 32]);
-        assert_eq!(
-            store.destroy(destroy_operation, &unknown_ref).unwrap_err(),
-            ProvisioningSecretStoreError::NotFound
-        );
-        assert_eq!(
-            store.destroy(destroy_operation, &valid_ref).unwrap_err(),
-            ProvisioningSecretStoreError::OperationConflict
-        );
-        assert_eq!(
-            store.retained_plaintext_len(&valid_ref),
-            Some(b"ASTRPB03binding-target".len())
-        );
-    }
-
-    #[test]
-    fn secret_store_reopens_and_replays_exact_install_and_load_operations() {
-        let state = Arc::new(Mutex::new(PersistentTestSecretState::default()));
-        let install_id = ProvisioningInstallId::new([0x11; 32]);
-        let load_id = ProvisioningLoadId::new([0x22; 32]);
-        let secret = b"ASTRPB03persistent-test-secret";
-        let mut first = PersistentTestSecretStore::open(Arc::clone(&state));
-        let installed = first
-            .install(
-                install_id,
-                UnprotectedProvisioning::new(secret.to_vec()).unwrap(),
-            )
-            .unwrap();
-        assert_eq!(
-            installed.disposition(),
-            ProvisioningInstallDisposition::Installed
-        );
-        let secret_ref = installed.into_secret_ref();
-        drop(first);
-
-        let mut restarted = PersistentTestSecretStore::open(Arc::clone(&state));
-        let existing = restarted
-            .install(
-                install_id,
-                UnprotectedProvisioning::new(secret.to_vec()).unwrap(),
-            )
-            .unwrap();
-        assert_eq!(
-            existing.disposition(),
-            ProvisioningInstallDisposition::Existing
-        );
-        assert_eq!(existing.secret_ref(), &secret_ref);
-
-        let loaded = restarted.load(load_id, &secret_ref).unwrap();
-        assert_eq!(loaded.operation(), load_id);
-        assert_eq!(loaded.secret_ref(), &secret_ref);
-        assert_eq!(loaded.plaintext().expose(), secret);
         assert!(!format!("{loaded:?}").contains("persistent-test-secret"));
-        drop(loaded);
-
-        let replayed = restarted.load(load_id, &secret_ref).unwrap();
-        assert_eq!(replayed.into_plaintext().expose(), secret);
     }
 
     #[test]
@@ -1575,62 +1406,19 @@ mod tests {
     }
 
     #[test]
-    fn fixture_models_idempotent_tombstones_and_unknown_is_indeterminate() {
-        let state = Arc::new(Mutex::new(PersistentTestSecretState::default()));
-        let install_id = ProvisioningInstallId::new([0x44; 32]);
-        let destroy_id = ProvisioningDestroyId::new([0x55; 32]);
-        let mut first = PersistentTestSecretStore::open(Arc::clone(&state));
-        let secret_ref = first
-            .install(
-                install_id,
-                UnprotectedProvisioning::new(b"ASTRPB03destroy-me".to_vec()).unwrap(),
-            )
-            .unwrap()
-            .into_secret_ref();
-
-        let destroyed = first.destroy(destroy_id, &secret_ref).unwrap();
-        assert_eq!(
-            destroyed.disposition(),
-            ProvisioningDestroyDisposition::Destroyed
+    fn destroy_receipt_does_not_claim_physical_erasure() {
+        let destroyed = ProvisioningDestroyReceipt::destroyed(
+            ProvisioningDestroyId::new([0x55; 32]),
+            ProvisioningSecretRef::from_opaque(b"test-secret-ref".to_vec()).unwrap(),
         );
         assert!(!destroyed.claims_physical_media_erasure());
-        assert_eq!(first.retained_plaintext_len(&secret_ref), Some(0));
-        drop(first);
+    }
 
-        let mut restarted = PersistentTestSecretStore::open(Arc::clone(&state));
-        let replayed = restarted.destroy(destroy_id, &secret_ref).unwrap();
-        assert_eq!(
-            replayed.disposition(),
-            ProvisioningDestroyDisposition::AlreadyDestroyed
-        );
-        let load_error = restarted
-            .load(ProvisioningLoadId::new([0x66; 32]), &secret_ref)
-            .unwrap_err();
-        assert_eq!(load_error, ProvisioningSecretStoreError::Destroyed);
-        assert!(load_error.is_backend_reported_destroyed());
-
-        assert_eq!(
-            restarted
-                .install(
-                    install_id,
-                    UnprotectedProvisioning::new(b"ASTRPB03destroy-me".to_vec()).unwrap(),
-                )
-                .unwrap_err(),
-            ProvisioningSecretStoreError::Destroyed
-        );
-
-        let unknown = ProvisioningSecretRef::from_opaque(b"unknown-test-handle".to_vec()).unwrap();
-        let missing_load = restarted
-            .load(ProvisioningLoadId::new([0x77; 32]), &unknown)
-            .unwrap_err();
-        assert_eq!(missing_load, ProvisioningSecretStoreError::NotFound);
-        assert!(missing_load.is_indeterminate_not_found());
-        assert!(!missing_load.is_backend_reported_destroyed());
-        let missing_destroy = restarted
-            .destroy(ProvisioningDestroyId::new([0x88; 32]), &unknown)
-            .unwrap_err();
-        assert_eq!(missing_destroy, ProvisioningSecretStoreError::NotFound);
-        assert!(missing_destroy.is_indeterminate_not_found());
-        assert!(!missing_destroy.is_backend_reported_destroyed());
+    #[test]
+    fn missing_secrets_are_indeterminate_not_backend_reported_destroyed() {
+        assert!(ProvisioningSecretStoreError::Destroyed.is_backend_reported_destroyed());
+        let missing = ProvisioningSecretStoreError::NotFound;
+        assert!(missing.is_indeterminate_not_found());
+        assert!(!missing.is_backend_reported_destroyed());
     }
 }

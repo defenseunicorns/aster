@@ -2,31 +2,15 @@
 
 The `CI` GitHub Actions workflow runs the repository's established validation
 commands on pushes to `main`, pull requests targeting `main`, merge queues, and
-manual dispatches. Configure branch protection or a ruleset to require the
-single stable check name **`CI / required`**.
+manual dispatches. Each validation job reports its own status.
 
 ## Compose-provider checks
 
 The Compose-provider checks are daemon-free: normal CI runs
-`python3 tools/test_aster_compose_delivery.py` and
-`python3 tools/test_inspect_aster_compose_oci.py` to validate the canonical
-model, generation descriptors, immutable image-reference form,
-manual-delivery/release policy, deterministic redacted plan, and synthetic OCI
+`python3 tools/test_inspect_aster_compose_oci.py` to validate synthetic OCI
 archive safety boundaries. These checks do not call the Docker CLI,
 connect to a Docker socket, execute a lifecycle, clean up Docker resources, or
 produce a host-qualification receipt.
-
-Because the manual packaging workflow intentionally has one fixed shape and
-the repository does not pin a YAML or shell AST dependency for this check, the
-validator binds its reviewed bytes to a checked SHA-256 constant after narrowly
-normalizing the full commit SHA and adjacent version comment for each approved
-Action invocation. Action identities, order, inputs, commands, permissions,
-triggers, jobs, and all other workflow bytes remain hash-bound. Every Action
-must still use a full lowercase 40-character commit SHA, and maintainers must
-review upstream Action changes; a syntactically valid SHA is not proof of
-equivalent behavior. Any non-pin workflow edit requires an intentional constant
-update plus renewed policy-test and reviewer scrutiny; semantic checks remain
-independent defense in depth.
 
 This statement is intentionally scoped to the Compose-provider checks. Other
 repository jobs, including the existing path-lab jobs, use Docker for their own
@@ -58,7 +42,7 @@ mandatory-access-control profile. The manual operator procedure is
 | Check | Runner | Purpose |
 | --- | --- | --- |
 | `Cargo lockfiles` | `ubuntu-24.04` | Checks every committed Cargo graph with `cargo fetch --locked` before Cargo builds start, and tests rejection of stale or missing lockfiles offline. |
-| `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, exact 348-row implementation-requirements traceability, the selected-node dependency boundary, the vendored netlink dependency source-equivalence/compatibility gate, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
+| `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, the selected-node dependency boundary, the vendored netlink dependency source-equivalence/compatibility gate, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
 | `Rust Clippy` | `ubuntu-24.04` | Runs locked Clippy for every workspace target and feature, with warnings denied. |
 | `Rust tests (1/2)` and `Rust tests (2/2)` | `ubuntu-24.04` | Run two disjoint nextest partitions covering the complete locked, all-feature Rust workspace suite. Partition 1 also runs all workspace doctests with Cargo. Both start independently of Clippy and use the existing resource wrapper. |
 | `macOS compatibility` | `macos-15` | Compiles and links every all-feature Rust workspace test target, then runs focused macOS/non-Linux custody-clock, finite-TTL, Blob staging/read, and credential-provider contracts. |
@@ -66,13 +50,11 @@ mandatory-access-control profile. The manual operator procedure is
 | `dependency policy` | `ubuntu-24.04` | Applies `deny.toml` to the root and fuzz dependency graphs, and audits both lockfiles against a freshly downloaded RustSec database. |
 | `age reference interoperability` | `ubuntu-24.04` | Installs exact `govulncheck` v1.6.0, runs `mise run age-reference-audit`, then runs `mise run age-reference-interop`: the Go oracle's reachable vulnerability and compiled-module license gates must pass before exact reference Go `filippo.io/age` v1.3.1 and the Rust provider exchange classic-X25519 artifacts in both directions, compare recovered plaintext, and agree on the recipient. |
 | `bounded fuzz smoke` | `ubuntu-24.04` | Runs all nine fixed 10,000-case hostile-input campaigns with the pinned nightly toolchain and `cargo-fuzz`: semantic wire decode, fragment decode, reference-envelope inspection, selected mechanics-frame decode, selected Negentropy, classical-profile decode, systemd credential decode, systemd admin-record decode, and systemd backup decode. |
-| `required` | `ubuntu-24.04` | Fails unless every validation lane completed successfully; this is the branch-protection check. |
 
 The `Cargo lockfiles` lane runs `sh tools/check-cargo-lockfiles.sh` against the
 root, fuzz, and standalone conformance-runner manifests with Rust 1.97.1. It
 reports each failing graph without regenerating lockfiles. Cargo build lanes
-wait for it; the `required` aggregation explicitly requires its success, so a
-failed gate and skipped dependent jobs cannot produce a successful aggregate.
+wait for it and are skipped if it fails.
 Each build runner still acquires its own dependencies before offline checks.
 
 Dependabot uses one Cargo configuration covering `/` and `/fuzz`, grouped by
@@ -113,7 +95,7 @@ feature selection, so the focused contracts execute the already-linked test
 binaries instead of compiling the dependency graph again. The complete macOS
 workspace suite remains available in the separate `macOS full suite` workflow,
 which runs weekly and on manual dispatch. That workflow is diagnostic and is
-not part of `CI / required`.
+not part of the `CI` workflow.
 
 ### Test classes and timing evidence
 
@@ -202,13 +184,11 @@ while `quality` runs `check-foundation-core` and the integration segment. The
 required `cargo-lockfiles` prerequisite owns the Cargo graph validation in CI;
 the local `check-foundation` aggregate composes `check-lockfiles`,
 `check-foundation-core`, and `check-compose-policy`, so local coverage remains
-complete without repeating the prerequisite in `quality`. CI retains the
-explicit fail-closed Compose policy step required by its release validator;
-those suites are excluded from the foundation core and execute once. Locally,
+complete without repeating the prerequisite in `quality`. CI runs the Compose
+OCI inspection suite separately from the foundation core so it executes once. Locally,
 `mise run check-workspace-tests` executes the complete suite without
 partitioning and then all doctests.
-The stable `required` job fails unless Clippy, both test partitions, and every
-other validation lane succeed. No test, feature set, receipt assertion, binding check,
+No test, feature set, receipt assertion, binding check,
 conformance check, or process smoke is omitted. This removes the Clippy wait
 before workspace tests and distributes test execution at the cost of extra
 runner setup and potentially duplicated cold-cache compilation; compare cold
@@ -275,7 +255,7 @@ Caches are optional acceleration: an absent entry rebuilds the tools. Measure
 a cold and warm hosted run before claiming a speedup. These setup changes
 reduce repeated work in the affected lanes; separating Clippy and partitioning
 the tests targets the previous longest lane. Shared checkout, mise, and sccache steps use YAML
-anchors. The validation commands and stable `CI / required` check are retained.
+anchors. The validation commands are retained.
 
 ### Deferred options
 
@@ -297,7 +277,7 @@ This independent workflow runs `mise run build` on Ubuntu 24.04 to build `aster`
 (package `aster-node`) and `aster-agent` (package `aster-agent`) for
 `x86_64-unknown-linux-gnu` in release mode. Download `aster-linux-x86_64-<commit SHA>`
 from the run's **Artifacts** section; it contains `aster-linux-x86_64.tar` and
-is retained for 14 days. The build is manual and is not part of `CI / required`.
+is retained for 14 days. The build is manual and is not part of the `CI` workflow.
 
 ## Manual Ubuntu Debian packages
 
@@ -311,7 +291,7 @@ select the source branch:
 
 These are independent `workflow_dispatch` workflows. Starting one does not
 start or cancel the other. Their files must be present on the default branch
-for their manual launch buttons to appear. They are not part of `CI / required`.
+for their manual launch buttons to appear. They are not part of the `CI` workflow.
 The runner labels follow the [GitHub-hosted runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 
 Both use the same `debian/build.sh` and Debian rules: acquire locked Cargo
@@ -1935,7 +1915,6 @@ python3 .github/scripts/summarize-nextest-junit.py \
 
 # Reporter selection, warning, and malformed-input contracts.
 python3 .github/scripts/test-nextest-timing.py
-python3 .github/scripts/test-ci-test-lanes.py
 ```
 
 A `Duration problems (> 10.000s)` table or `Rust test duration` annotation is

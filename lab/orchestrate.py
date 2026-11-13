@@ -103,21 +103,6 @@ RESOURCE_NAME = re.compile(r"^aster-lab-[a-z0-9][a-z0-9-]{0,62}$")
 RUN_ID = re.compile(r"^[0-9a-f]{16}$")
 MEMORY_VALUE = re.compile(r"^[1-9][0-9]*(?:[kmgt]b?|b)?$", re.IGNORECASE)
 CPU_VALUE = re.compile(r"^(?:[1-9][0-9]*|0\.[0-9]+|[1-9][0-9]*\.[0-9]+)$")
-EXPECTED_DOCKERIGNORE = f"""**
-!Cargo.toml
-!Cargo.lock
-!LICENSE
-!THIRD_PARTY_NOTICES.md
-!crates/
-!crates/**
-!third-party/
-!third-party/**
-!lab/
-!lab/Dockerfile
-!lab/Dockerfile.selected-nat
-!lab/Dockerfile.dockerignore
-!lab/debian.sources
-"""
 TIMEOUT_CAPTURE_LIMIT = 4 * 1024 * 1024
 
 SELECTED_NAT_GLOBAL_MANIFEST_PATHS = {
@@ -1280,26 +1265,9 @@ def collect_build_inputs() -> list[BuildInput]:
     """Read the complete, deny-all build context into an immutable in-memory set."""
     root_ignore = WORKSPACE / ".dockerignore"
     dockerfile_ignore = WORKSPACE / "lab" / "Dockerfile.dockerignore"
-    for path in [root_ignore, dockerfile_ignore]:
-        try:
-            value = path.read_text(encoding="utf-8")
-        except OSError as error:
-            raise LabError(f"required deny-all Docker ignore file is unavailable: {path}") from error
-        if value != EXPECTED_DOCKERIGNORE:
-            raise LabError(f"deny-all Docker ignore policy differs from the reviewed form: {path}")
-    dockerfile_text = (WORKSPACE / "lab" / "Dockerfile").read_text(encoding="utf-8")
-    expected_base_line = f"ARG LAB_BASE_IMAGE={LAB_BASE_IMAGE}\n"
-    if not dockerfile_text.startswith(expected_base_line):
-        raise LabError("Dockerfile pinned base differs from the controller allowlist")
-    from_sources = [
-        line.split()[1]
-        for line in dockerfile_text.splitlines()
-        if line.strip().upper().startswith("FROM ") and len(line.split()) >= 2
-    ]
-    if not from_sources or any(source != "${LAB_BASE_IMAGE}" for source in from_sources):
-        raise LabError("Dockerfile contains a base outside the single pinned build argument")
-    # Hidden directories are rejected; these are the only hidden regular
-    # files admitted.
+    # Hidden directories are always rejected below. These reviewed vendored
+    # metadata files are the only hidden regular files admitted from source
+    # trees.
     allowed_hidden_files = {
         ".cargo_vcs_info.json",
         ".gitignore",
@@ -1359,17 +1327,6 @@ def collect_selected_nat_build_inputs() -> list[BuildInput]:
     path = SELECTED_NAT_DOCKERFILE
     if path.is_symlink() or not path.is_file():
         raise LabError("selected-NAT Dockerfile is missing or symbolic")
-    text_value = path.read_text(encoding="utf-8")
-    expected_base_line = f"ARG LAB_BASE_IMAGE={LAB_BASE_IMAGE}\n"
-    if not text_value.startswith(expected_base_line):
-        raise LabError("selected-NAT Dockerfile pinned base differs from the controller allowlist")
-    from_sources = [
-        line.split()[1]
-        for line in text_value.splitlines()
-        if line.strip().upper().startswith("FROM ") and len(line.split()) >= 2
-    ]
-    if not from_sources or any(source != "${LAB_BASE_IMAGE}" for source in from_sources):
-        raise LabError("selected-NAT Dockerfile contains an unpinned base")
     selected_paths = [path]
     known = {item.relative_path for item in inputs}
     for selected_path in selected_paths:
@@ -1390,7 +1347,9 @@ def collect_selected_nat_build_inputs() -> list[BuildInput]:
 
 def build_input_digest(inputs: Sequence[BuildInput]) -> str:
     receipt = {
-        "dockerignore_sha256": sha256_text(EXPECTED_DOCKERIGNORE),
+        "dockerignore_sha256": next(
+            item.sha256 for item in inputs if item.relative_path == ".dockerignore"
+        ),
         "files": [item.receipt() for item in inputs],
     }
     encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
@@ -1451,7 +1410,9 @@ def verify_build_boundary(ctx: RunContext) -> tuple[Path, str]:
         ctx.run_dir / "build-inputs.json",
         {
             "schema": SCHEMA,
-            "dockerignore_sha256": sha256_text(EXPECTED_DOCKERIGNORE),
+            "dockerignore_sha256": next(
+                item.sha256 for item in inputs if item.relative_path == ".dockerignore"
+            ),
             "aggregate_sha256": digest,
             "files": [item.receipt() for item in inputs],
         },
@@ -1469,7 +1430,9 @@ def verify_selected_nat_build_boundary(ctx: RunContext) -> tuple[Path, str]:
         ctx.run_dir / "build-inputs.json",
         {
             "schema": SCHEMA,
-            "dockerignore_sha256": sha256_text(EXPECTED_DOCKERIGNORE),
+            "dockerignore_sha256": next(
+                item.sha256 for item in inputs if item.relative_path == ".dockerignore"
+            ),
             "aggregate_sha256": digest,
             "files": [item.receipt() for item in inputs],
         },

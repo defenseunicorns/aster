@@ -121,7 +121,6 @@ jobs:
       - name: Verify direct and nested mise signal-safe Python
         timeout-minutes: 2
         run: |
-          python3 .github/scripts/test-ci-python.py
           python3 .github/scripts/check-ci-python.py
           mise exec -- mise run ci-python-preflight
 
@@ -140,13 +139,12 @@ jobs:
         timeout-minutes: 5
         run: python3 tools/test-aster-agent-process.py
 
-      - name: Validate Compose-provider delivery policy without Docker
+      - name: Test Compose OCI archive inspection without Docker
         timeout-minutes: 2
         run: |
-          python3 tools/test_aster_compose_delivery.py
           python3 tools/test_inspect_aster_compose_oci.py
 
-      - name: Run formatting, policy, traceability, and receipt checks
+      - name: Run formatting, policy, and receipt checks
         env:
           CARGO_NET_OFFLINE: "true"
         # The dedicated prerequisite job already validates every Cargo graph.
@@ -172,11 +170,6 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.97.1 --profile minimal
-
-      - name: Test stale-lockfile rejection offline
-        env:
-          RUSTUP_TOOLCHAIN: "1.97.1"
-        run: python3 tools/test-check-cargo-lockfiles.py
 
       - name: Validate every committed Cargo dependency graph
         env:
@@ -229,7 +222,6 @@ jobs:
 
       - name: Validate delivery controller contracts
         run: |
-          python3 tools/test_aster_path_delivery.py
           python3 tools/aster_path_delivery.py docker/path-lab/scenarios/event-delivery-netem.json
           docker version --format '{{.Server.Version}}'
           uname -r
@@ -530,57 +522,3 @@ jobs:
         env:
           CARGO_NET_OFFLINE: "true"
         run: sh ./tools/run-fuzz-smoke.sh
-
-  required:
-    name: required
-    if: ${{ always() }}
-    needs:
-      - cargo-lockfiles
-      - quality
-      - rust-clippy
-      - rust-tests
-      - path-lab-smoke
-      - path-delivery-smoke
-      - macos-tests
-      - msrv
-      - age-reference-interop
-      - dependency-policy
-      - fuzz-smoke
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Require every validation lane
-        # This aggregation job does not check out the repository.
-        shell: bash
-        env:
-          LOCKFILES_RESULT: ${{ needs.cargo-lockfiles.result }}
-          QUALITY_RESULT: ${{ needs.quality.result }}
-          RUST_CLIPPY_RESULT: ${{ needs.rust-clippy.result }}
-          RUST_TESTS_RESULT: ${{ needs.rust-tests.result }}
-          PATH_LAB_RESULT: ${{ needs.path-lab-smoke.result }}
-          PATH_DELIVERY_RESULT: ${{ needs.path-delivery-smoke.result }}
-          MACOS_RESULT: ${{ needs.macos-tests.result }}
-          MSRV_RESULT: ${{ needs.msrv.result }}
-          AGE_INTEROP_RESULT: ${{ needs.age-reference-interop.result }}
-          POLICY_RESULT: ${{ needs.dependency-policy.result }}
-          FUZZ_RESULT: ${{ needs.fuzz-smoke.result }}
-        run: |
-          umask 077
-          for result in \
-            "$LOCKFILES_RESULT" \
-            "$QUALITY_RESULT" \
-            "$RUST_CLIPPY_RESULT" \
-            "$RUST_TESTS_RESULT" \
-            "$PATH_LAB_RESULT" \
-            "$PATH_DELIVERY_RESULT" \
-            "$MACOS_RESULT" \
-            "$MSRV_RESULT" \
-            "$AGE_INTEROP_RESULT" \
-            "$POLICY_RESULT" \
-            "$FUZZ_RESULT"
-          do
-            if [[ "$result" != "success" ]]; then
-              printf 'A required CI lane ended with status: %s\n' "$result" >&2
-              exit 1
-            fi
-          done

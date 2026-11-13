@@ -20,10 +20,9 @@ through the authenticated status API. Rollback is explicit and valid only
 while an external authority says the retained prior generation is still
 authorized.
 
-The daemon-free plan validator binds the selected schema-v2 configuration to
-`ASTER_AGENT_CONFIG_SHA256`. Preflight and runtime independently hash the exact
-mounted bytes they parse and fail closed on mismatch, closing replacement
-between plan validation and activation.
+Preflight and runtime independently hash the exact mounted schema-v2
+configuration bytes they parse and fail closed if they differ from the reviewed
+`ASTER_AGENT_CONFIG_SHA256`.
 
 The selected deployment unit is one Compose project containing one Aster agent,
 one credential generation, one configuration, and one project-scoped state

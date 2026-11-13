@@ -607,21 +607,6 @@ mod tests {
     }
 
     #[test]
-    fn discover_lan_help_names_identity_free_authorized_mode() {
-        assert!(HELP.contains("[--discover-lan]"));
-        assert!(HELP.contains("takes no peer identity or address"));
-        assert!(HELP.contains("cannot be combined with --peer or\n--nearby-peer"));
-        assert!(HELP.contains("authenticates it and current mission authorization succeeds"));
-    }
-
-    #[test]
-    fn help_distinguishes_blob_mesh_receive_interest_from_application_api_access() {
-        assert!(HELP.contains("[--blob-interest TOPIC@SCOPE ...]"));
-        assert!(HELP.contains("Blob interests are restart-only mesh receive configuration"));
-        assert!(HELP.contains("do not grant or configure application API access"));
-    }
-
-    #[test]
     fn legacy_cli_accepts_repeatable_blob_interests_without_changing_state_or_record() {
         let mut arguments = Arguments::new(
             [

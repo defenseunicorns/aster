@@ -139,8 +139,7 @@ SBOM retains its binary component identity, carries the corresponding OCI
 digest as an explicit property, passes schema and root/dependency license
 checks, and is listed in the release manifest. The bundle also retains
 `LICENSE`, notices, `compose.yaml`, the opt-in `compose.remote-mesh.yaml`, the
-`agent.example.json` configuration template, and
-`aster_compose_delivery.py` validator, their digests, architecture, source
+`agent.example.json` configuration template, their digests, architecture, source
 revision, builder versions,
 checksums, and build provenance. A repository-owned bounded static
 inspector selects the requested Linux `amd64` or Linux `arm64` image manifest
@@ -177,9 +176,9 @@ chmod 0600 "$ASTER_TOKEN_INPUT" "$ASTER_BUNDLE_INPUT"
 
 Protect both inputs under site policy. The generation creator wraps the token
 for the provider-aware agent, while Compose mounts the owner-only plaintext
-`ASTER_TOKEN_INPUT` only into the one-shot `asterctl` service. The validator
-requires this input to be an absolute, singly linked, owner-matched regular
-file with mode `0400` or `0600` and valid token contents. Confirm that both
+`ASTER_TOKEN_INPUT` only into the one-shot `asterctl` service. Supply this input
+as an absolute, singly linked, owner-matched regular file with mode `0400` or
+`0600` and valid token contents. Confirm that both
 inputs belong to the intended issuance and authorization transaction before
 creation.
 
@@ -215,7 +214,7 @@ find "$ASTER_CREDENTIAL_GENERATION_DIR" -maxdepth 1 -printf '%u:%g %m %f\n'
 
 The host-side `chmod` is idempotent and closes the directory if a desktop
 bind-mount implementation did not preserve the creator container's final
-`0500` mode. Stop if ownership, file modes, or the validator still disagree.
+`0500` mode. Stop if ownership or file modes do not match these requirements.
 
 ## Configure and validate without a daemon lifecycle test
 
@@ -232,17 +231,13 @@ export ASTER_AGENT_CONFIG_SHA256='<reviewed-64-lowercase-hex>'
 : "${ASTER_AGENT_IMAGE_DIGEST:?set verified local image ID or registry digest}"
 : "${ASTER_ADMIN_IMAGE_DIGEST:?set verified local image ID or registry digest}"
 export COMPOSE_PROJECT_NAME=aster-site-a
-python3 ./aster_compose_delivery.py ./compose.yaml
 docker compose -f ./compose.yaml config --format json \
   > /tmp/aster-compose.rendered.json
 ```
 
-The validator rejects a missing, relative, unreadable, non-regular, oversized,
-or non-schema-v2 configuration file and requires its SHA-256 to equal
-`ASTER_AGENT_CONFIG_SHA256`; it records that digest, but not the path, in the
-redacted plan. Preflight and the agent hash the exact bytes they parse and fail
-closed if Compose later mounts different bytes. The validator also rejects a missing or malformed project name
-and records the name. The render command is `docker compose config --format json`;
+Preflight and the agent hash the exact configuration bytes they parse and fail
+closed if they differ from `ASTER_AGENT_CONFIG_SHA256`.
+The render command is `docker compose config --format json`;
 the explicit file option above selects the checked-in model. Confirm
 that the rendered state mount binds the exact reviewed `ASTER_STATE_DIR` to
 `/var/lib/aster`, the CLI transfer mount binds the exact reviewed
@@ -258,7 +253,7 @@ or Swarm `deploy` configuration.
 
 ## Run preflight
 
-The validator requires `ASTER_STATE_DIR` and `ASTER_TRANSFER_DIR` to be
+Create and inspect `ASTER_STATE_DIR` and `ASTER_TRANSFER_DIR` as
 absolute, non-symlinked directories owned by `ASTER_UID:ASTER_GID` with exact
 mode `0700`. No service runs as container root and no service receives an added
 capability.

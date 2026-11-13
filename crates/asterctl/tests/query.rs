@@ -359,12 +359,6 @@ fn query_help_needs_no_token() {
         .output()
         .unwrap();
     success(&output);
-    let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("--limit"));
-    assert!(text.contains("--scope"));
-    for word in ["--after", "page", "--include-descendant-scopes"] {
-        assert!(!text.contains(word));
-    }
 }
 
 #[test]

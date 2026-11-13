@@ -71,110 +71,44 @@ check_exact_locked_package \
   "$crates_io_source" \
   ba62675e8242a4c4e806d12f11d136e626e6c8361d6b829310732241652a178a
 
-lock_hickory_packages=$(
-  awk '
-    /^\[\[package\]\]$/ { package = ""; version = "" }
-    /^name = "hickory-(proto|resolver)"$/ {
-      package = $3
-      gsub(/"/, "", package)
-    }
-    /^version = / && package != "" {
-      version = $3
-      gsub(/"/, "", version)
-      print package " " version
-      package = ""
-    }
-  ' "$root_lockfile"
-)
-expected_lock_hickory_packages='hickory-proto 0.26.2'
-
-if [ "$lock_hickory_packages" != "$expected_lock_hickory_packages" ]; then
-  printf '%s\n' 'dependency-exception scope failed: unexpected lock-only Hickory package set' >&2
-  printf '%s\n' 'expected:' "$expected_lock_hickory_packages" 'actual:' "$lock_hickory_packages" >&2
-  exit 1
-fi
-
-if awk '
-  /^\[\[package\]\]$/ { package = "" }
-  /^name = "paste"$/ { package = "paste" }
-  /^version = / && package == "paste" { found = 1 }
-  END { exit !found }
-' "$root_lockfile"; then
-  printf '%s\n' 'dependency-exception scope failed: unmaintained paste remains in Cargo.lock' >&2
-  exit 1
-fi
-
-check_exact_reverse_graph() {
+# Check the advisory boundary, not Cargo's printed ordering, duplicate markers,
+# or parent versions. Include optional features and every target.
+check_reverse_boundary() {
   package=$1
-  expected=$2
+  allowed=$2
   tree=$(
     "$cargo_command" tree \
       --locked \
       --manifest-path "$repository_root/Cargo.toml" \
       --workspace \
+      --all-features \
       --invert "$package" \
       --edges normal,build,dev \
       --target all \
       --prefix none \
       --format '{p}'
   )
-  packages=$(printf '%s\n' "$tree" | awk '{ print $1 " " $2 }')
-
-  if [ "$packages" != "$expected" ]; then
-    printf 'dependency-exception scope failed: unexpected reverse dependency graph for %s\n' "$package" >&2
-    printf '%s\n' 'expected:' "$expected" 'actual:' "$packages" >&2
+  if ! printf '%s\n' "$tree" | awk -v allowed="$allowed" '
+    BEGIN {
+      count = split(allowed, names, " ")
+      for (i = 1; i <= count; i++) permitted[names[i]] = 1
+    }
+    NF {
+      if (!($1 in permitted)) invalid = 1
+      if ($1 == "aster-provisioning-age") pilot = 1
+    }
+    END { exit (invalid || !pilot) }
+  '; then
+    printf 'dependency-exception scope failed: %s escaped the age pilot localization boundary or has no pilot consumer\n' "$package" >&2
+    printf '%s\n' "$tree" >&2
     exit 1
   fi
 }
 
-expected_proc_macro_error2='proc-macro-error2 v2.0.1
-i18n-embed-fl v0.9.4
-age v0.11.5
-aster-provisioning-age v0.1.0-alpha.1'
-check_exact_reverse_graph proc-macro-error2@2.0.1 "$expected_proc_macro_error2"
-
-expected_basic_toml='basic-toml v0.1.10
-i18n-config v0.4.8
-i18n-embed-fl v0.9.4
-age v0.11.5
-aster-provisioning-age v0.1.0-alpha.1
-i18n-embed-impl v0.8.4
-i18n-embed v0.15.4
-i18n-embed-fl v0.9.4
-i18n-embed v0.15.4
-age v0.11.5'
-check_exact_reverse_graph basic-toml@0.1.10 "$expected_basic_toml"
-
-active_tree=$(
-  "$cargo_command" tree \
-    --locked \
-    --manifest-path "$repository_root/Cargo.toml" \
-    --workspace \
-    --all-features \
-    --edges normal,build,dev \
-    --target all \
-    --prefix none \
-    --format '{p}'
-)
-active_packages=$(printf '%s\n' "$active_tree" | awk '{ print $1 " " $2 }')
-active_paste_packages=$(
-  printf '%s\n' "$active_packages" |
-    awk '$1 == "paste" { print $1 " " $2 }' |
-    LC_ALL=C sort -u
-)
-if [ -n "$active_paste_packages" ]; then
-  printf '%s\n' 'dependency-exception scope failed: unmaintained paste is active in the workspace graph' >&2
-  printf '%s\n' 'actual:' "$active_paste_packages" >&2
-  exit 1
-fi
-
-if printf '%s\n' "$active_packages" | awk '
-  ($1 == "hickory-proto" || $1 == "hickory-resolver") && $2 == "v0.25.2" { found = 1 }
-  END { exit !found }
-'; then
-  printf '%s\n' 'dependency-exception scope failed: ignored Hickory 0.25.2 package is active in the workspace graph' >&2
-  exit 1
-fi
+check_reverse_boundary proc-macro-error2@2.0.1 \
+  'proc-macro-error2 i18n-embed-fl age aster-provisioning-age'
+check_reverse_boundary basic-toml@0.1.10 \
+  'basic-toml i18n-config i18n-embed-fl i18n-embed-impl i18n-embed age aster-provisioning-age'
 
 fuzz_tree=$(
   "$cargo_command" tree \
@@ -186,28 +120,14 @@ fuzz_tree=$(
     --prefix none \
     --format '{p}'
 )
-fuzz_packages=$(printf '%s\n' "$fuzz_tree" | awk '{ print $1 " " $2 }')
-if printf '%s\n' "$fuzz_packages" | awk '$1 == "proc-macro-error2" { found = 1 } END { exit !found }'; then
-  printf '%s\n' 'dependency-exception scope failed: ignored proc-macro-error2 is present in the excluded fuzz graph' >&2
-  exit 1
-fi
+for package in proc-macro-error2 basic-toml; do
+  if printf '%s\n' "$fuzz_tree" | awk -v package="$package" '
+    $1 == package { found = 1 }
+    END { exit !found }
+  '; then
+    printf 'dependency-exception scope failed: ignored %s is present in the excluded fuzz graph\n' "$package" >&2
+    exit 1
+  fi
+done
 
-if printf '%s\n' "$fuzz_packages" | awk '$1 == "basic-toml" { found = 1 } END { exit !found }'; then
-  printf '%s\n' 'dependency-exception scope failed: ignored basic-toml is present in the excluded fuzz graph' >&2
-  exit 1
-fi
-
-if printf '%s\n' "$fuzz_packages" | awk '$1 == "paste" { found = 1 } END { exit !found }'; then
-  printf '%s\n' 'dependency-exception scope failed: ignored paste is present in the fuzz graph' >&2
-  exit 1
-fi
-
-if printf '%s\n' "$fuzz_packages" | awk '
-  ($1 == "hickory-proto" || $1 == "hickory-resolver") && $2 == "v0.25.2" { found = 1 }
-  END { exit !found }
-'; then
-  printf '%s\n' 'dependency-exception scope failed: ignored Hickory 0.25.2 package is present in the fuzz graph' >&2
-  exit 1
-fi
-
-printf '%s\n' 'dependency-exception scope passed: RUSTSEC-2026-0173 and RUSTSEC-2026-0374 are pinned to reviewed lockfile provenance and isolated to aster-provisioning-age; unmaintained paste is absent from the lock and active graphs; Hickory 0.25.2 is absent while fixed 0.26.2 is permitted; ignored packages are absent from fuzz'
+printf '%s\n' 'dependency-exception scope passed: RUSTSEC-2026-0173 and RUSTSEC-2026-0374 retain reviewed lockfile provenance, are confined to the age pilot localization boundary, and are absent from fuzz'

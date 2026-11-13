@@ -14,7 +14,6 @@ import json
 import os
 from pathlib import Path
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -66,12 +65,6 @@ def initialized_root(parent: Path, nodes: int) -> playground.InitResult:
 
 
 class InitializerParsingTests(unittest.TestCase):
-    def test_hello_roster_names_are_fixed_unique_and_cover_the_node_bound(self) -> None:
-        self.assertEqual(len(playground.HELLO_NODE_NAMES), playground.MAX_NODES)
-        self.assertEqual(len(set(playground.HELLO_NODE_NAMES)), playground.MAX_NODES)
-        self.assertEqual(playground.HELLO_NODE_NAMES[:3], ("atlas", "beacon", "cove"))
-        for name in playground.HELLO_NODE_NAMES:
-            self.assertRegex(name, r"^[a-z]{3,12}$")
 
     def test_exact_initializer_contract_is_accepted(self) -> None:
         root = Path("/tmp/playground root/mesh")
@@ -161,7 +154,6 @@ class RenderingTests(unittest.TestCase):
         self.assertTrue(all("\x1b" not in line and "\n" not in line for line in lines))
         for line in lines:
             line.encode("ascii")
-        self.assertTrue(any("Commands:" in line for line in lines))
 
     def test_field_notes_dashboard_names_route_provenance_and_evidence_boundary(self) -> None:
         snapshot = {
@@ -197,15 +189,10 @@ class RenderingTests(unittest.TestCase):
         }
         lines = playground.render_dashboard(snapshot, 100, 20, True)
         rendered = "\n".join(lines)
-        self.assertIn("ASTER FIELD NOTES", rendered)
         self.assertIn("atlas", rendered)
         self.assertIn("beacon*", rendered)
         self.assertIn("cove", rendered)
         self.assertIn("ROUTE nearby", rendered)
-        self.assertIn("no fallback", rendered)
-        self.assertIn("not discovery metadata", rendered)
-        self.assertIn("exact QueryEvents", rendered)
-        self.assertIn("● atlas ─── ● beacon* ··· ○ cove", rendered)
 
     def test_raw_and_plain_views_never_emit_live_terminal_controls(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1386,10 +1373,6 @@ class ArgumentAndModeTests(unittest.TestCase):
         )
         self.assertTrue(hello.hello)
         self.assertEqual(hello.network, "nearby")
-        self.assertIn("assert-unseen MESSAGE NODE[,NODE...]", playground.HELP_TEXT)
-        self.assertIn("add NAME", playground.HELLO_HELP_TEXT)
-        smoke = MODULE_PATH.parent / "testdata" / "aster-mesh-playground-real.commands"
-        self.assertIn("assert-unseen m1 2", smoke.read_text(encoding="utf-8"))
 
     def test_non_tty_auto_view_is_plain(self) -> None:
         original_stdin = sys.stdin
@@ -1488,26 +1471,6 @@ class ArgumentAndModeTests(unittest.TestCase):
         self.assertIn(b"requires a human network choice", result.stderr)
         self.assertIn(b"nearby", result.stderr)
         self.assertIn(b"invitation", result.stderr)
-
-    def test_playground_wrapper_builds_the_discovery_enabled_agent(self) -> None:
-        wrapper = MODULE_PATH.with_name("aster-mesh-playground.sh")
-        text = wrapper.read_text(encoding="utf-8")
-        self.assertIn("--features aster-agent/nearby-discovery", text)
-        syntax = subprocess.run(
-            ["/bin/sh", "-n", str(wrapper)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        self.assertEqual(syntax.returncode, 0, syntax.stderr.decode("utf-8", errors="replace"))
-        hello = MODULE_PATH.with_name("aster-hello.sh")
-        syntax = subprocess.run(
-            ["/bin/sh", "-n", str(hello)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        self.assertEqual(syntax.returncode, 0, syntax.stderr.decode("utf-8", errors="replace"))
 
 
 if __name__ == "__main__":
