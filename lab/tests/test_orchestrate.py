@@ -613,10 +613,10 @@ curl\t8.0
             ):
                 (workspace / relative).write_text("fixture\n", encoding="utf-8")
             (workspace / ".dockerignore").write_text(
-                orchestrate.EXPECTED_DOCKERIGNORE, encoding="utf-8"
+                "**\n", encoding="utf-8"
             )
             (workspace / "lab/Dockerfile.dockerignore").write_text(
-                orchestrate.EXPECTED_DOCKERIGNORE, encoding="utf-8"
+                "**\n", encoding="utf-8"
             )
             (workspace / "lab/Dockerfile").write_text(
                 f"ARG LAB_BASE_IMAGE={orchestrate.LAB_BASE_IMAGE}\n"
