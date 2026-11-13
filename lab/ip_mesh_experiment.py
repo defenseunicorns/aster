@@ -1608,9 +1608,20 @@ def source_freeze(
     )
     if execute and status:
         raise ExperimentError("formal execution requires a clean candidate worktree")
+    # Retain the existing blob receipts; replay binds their path to the signed tree.
+    requirements_path = checked_local_command(
+        [
+            "git", "ls-tree", "--name-only", "--full-tree", commit, "--",
+            "DESIGN.md", "data-mesh-requirements.md",
+        ],
+        context="candidate-requirements-path",
+        **{**command_args, "command_log": None},
+    )
+    if requirements_path not in ("DESIGN.md", "data-mesh-requirements.md"):
+        raise ExperimentError("candidate must contain exactly one requirements file")
     _requirements_blob, requirements_bytes = checked_candidate_blob(
         commit,
-        "data-mesh-requirements.md",
+        requirements_path,
         git_binary=git_binary,
         environment=environment,
         signature_trust=signature_trust,
@@ -2373,11 +2384,23 @@ def validate_gate_h_fault_receipt(
         or not Path(value["candidate_binary"]).is_absolute()
     ):
         raise ExperimentError("Gate-H fault receipt names the wrong candidate binary")
+    requirements_paths = [
+        binding["path"]
+        for binding in fault_signed_source["files"]
+        if binding["path"] in ("DESIGN.md", "data-mesh-requirements.md")
+    ]
+    if len(requirements_paths) != 1:
+        raise ExperimentError("signed source must contain exactly one requirements file")
+    requirements_path = requirements_paths[0]
+    expected_source_paths = [
+        requirements_path if relative == "DESIGN.md" else relative
+        for relative in gate_h_fault_contract.SOURCE_PATHS
+    ]
     source_files = value.get("source_files")
     if (
         not isinstance(source_files, list)
         or [binding.get("path") for binding in source_files if isinstance(binding, dict)]
-        != list(gate_h_fault_contract.SOURCE_PATHS)
+        != expected_source_paths
     ):
         raise ExperimentError("Gate-H fault receipt has the wrong bound source set")
     candidate_sources: dict[str, bytes] = {}
@@ -2403,7 +2426,7 @@ def validate_gate_h_fault_receipt(
             raise ExperimentError(f"Gate-H fault source binding differs: {relative}")
     source_by_path = {binding["path"]: binding for binding in source_files}
     if (
-        source_by_path["data-mesh-requirements.md"]["sha256"]
+        source_by_path[requirements_path]["sha256"]
         != REQUIREMENTS_SHA256
         or value.get("proposal_0004_sha256")
         != source_by_path["docs/proposals/0004-shared-node-libp2p-retest.md"][

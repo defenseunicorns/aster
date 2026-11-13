@@ -1,41 +1,55 @@
 # Contributing to Aster
 
-## Local verification
+Thank you for helping improve Aster.
 
-Install the exact development tools declared in `mise.toml`, then run the
-complete local gate:
+Repository: [Aster](https://github.com/defenseunicorns/aster).
+
+Open pull requests against `main`.
+
+Follow the product requirements in [DESIGN.md](DESIGN.md) and read the
+[documentation](docs/README.md) relevant to your change.
+
+## Setup
+
+Install the tools listed in `mise.toml`:
 
 ```sh
 mise install
+```
+
+## Testing
+
+After changing code, run:
+
+```sh
 mise run check
 ```
 
-The gate checks formatting, strict Clippy warnings, all workspace tests, the C
-and C++ headers, the Rust conformance runner, the Python wire oracle and
-bindings, and the Go bindings.
-
-Run the bounded hostile-input campaigns when changing parsers, framing,
-envelopes, fragmentation, or related limits:
+Also run fuzz tests after changing parsers, framing, envelopes, fragmentation,
+or their input limits:
 
 ```sh
-cargo install cargo-fuzz --version 0.13.2 --locked
-rustup toolchain install nightly-2026-08-18 --profile minimal
 mise run fuzz-smoke
 ```
 
-## Change discipline
+## Reporting issues
 
-- Keep `Cargo.lock` and `fuzz/Cargo.lock` synchronized with intentional manifest
-  changes. Run `sh tools/check-cargo-lockfiles.sh` to validate all committed Cargo
-  graphs without regenerating their lockfiles. Their dependency sets may differ.
-- Preserve wire compatibility or update the versioned protocol, conformance
-  vectors, and compatibility tests in the same change.
-- Add deterministic regression tests for every corrected defect.
-- Do not commit credentials, mission data, local environment files, build
-  output, fuzz crashes, or generated binaries.
-- Keep pull requests narrowly scoped and explain security, compatibility,
-  resource, and migration effects.
+Check existing issues before opening a new one. For bug reports, explain how
+to reproduce the problem, what you expected, what happened, and the environment
+you used. Discuss larger changes before starting work.
 
-All GitHub Actions execute untrusted pull requests without repository secrets
-and with a read-only token. See `docs/validation/ci.md` before changing workflow files or
-tool pins.
+## Pull requests
+
+Keep each pull request focused on one change. Explain the problem, describe
+your solution, and summarize your testing. Link related issues and address
+review feedback.
+
+## Versioning and changelog
+
+Use [Semantic Versioning](https://semver.org/spec/v2.0.0.html) for releases and
+[Keep a Changelog](https://keepachangelog.com/en/2.0.0/) for changelog entries.
+
+## Other ways to contribute
+
+You can also help by improving documentation, reproducing reported bugs,
+suggesting clearer text, or helping other users get started.

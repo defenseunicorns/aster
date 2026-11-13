@@ -19,7 +19,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-REQUIREMENTS = ROOT / "data-mesh-requirements.md"
+REQUIREMENTS = ROOT / "DESIGN.md"
 MATRIX = ROOT / "docs/validation/requirements-matrix.csv"
 TRACE = ROOT / "docs/validation/requirements-implementation.csv"
 LEDGER = ROOT / "docs/validation/requirements-status.md"
@@ -1802,12 +1802,12 @@ RELEVANT_ARTIFACTS = {
     "DM-2-03": "bindings/c; bindings/go; bindings/python",
     "DM-2-04": "docs/bindings/pattern.md",
     "DM-2-07": "docs/validation/conformance.md; crates/aster-conformance; conformance",
-    "DM-2-08": "data-mesh-requirements.md",
-    "DM-2-09": "data-mesh-requirements.md",
-    "DM-2-10": "data-mesh-requirements.md",
-    "DM-2-11": "data-mesh-requirements.md",
-    "DM-2-12": "data-mesh-requirements.md",
-    "DM-2-13": "data-mesh-requirements.md",
+    "DM-2-08": "DESIGN.md",
+    "DM-2-09": "DESIGN.md",
+    "DM-2-10": "DESIGN.md",
+    "DM-2-11": "DESIGN.md",
+    "DM-2-12": "DESIGN.md",
+    "DM-2-13": "DESIGN.md",
     "DM-5.5-09": HIERARCHY_MVP_ARTIFACT,
     "DM-5.5-10": HIERARCHY_MVP_ARTIFACT,
     "DM-5.5-11": HIERARCHY_MVP_ARTIFACT,

@@ -58,7 +58,7 @@ The third CM4 is a declared spare/support node, not a third required
 participant. `x86_64` and 8-/20-node scale are post-MVP.
 
 This milestone is narrower than the complete product MVP in
-`data-mesh-requirements.md`. It does not authorize production use, BTLE, other
+`DESIGN.md`. It does not authorize production use, BTLE, other
 data classes, dynamic routing, or a general radio-silence claim.
 
 ## How the work reaches a decision

@@ -4,7 +4,7 @@
 
 - Status: Accepted for implementation; deployment and release gates remain open
 - Date: 2026-09-05
-- Authority: [data-mesh-requirements.md](../../data-mesh-requirements.md)
+- Authority: [DESIGN.md](../../DESIGN.md)
 - Supersedes: only the load-once, health, lifecycle, and local-security
   follow-on statements in [Decision 0030](0030-event-first-local-connect-agent.md)
 - Related: [Decision 0009](0009-public-api-boundary.md),

@@ -418,7 +418,7 @@ SOURCE_PATHS = (
     "Cargo.lock",
     "rust-toolchain.toml",
     "mise.toml",
-    "data-mesh-requirements.md",
+    "DESIGN.md",
     "docs/protocol.md",
     "docs/proposals/0004-shared-node-libp2p-retest.md",
     "crates/aster-core/Cargo.toml",
@@ -796,7 +796,7 @@ def freeze_candidate(
                 "formal Gate-H faults require a valid signed candidate commit"
             )
 
-    requirements = WORKSPACE / "data-mesh-requirements.md"
+    requirements = WORKSPACE / "DESIGN.md"
     requirements_sha256 = sha256_file(requirements)
     if requirements_sha256 != REQUIREMENTS_SHA256:
         raise GateHFaultError("requirements digest differs from the Proposal 0004 baseline")

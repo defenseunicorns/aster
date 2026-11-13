@@ -4,7 +4,7 @@
 
 - Status: accepted — Iroh-first implementation migration; release admission gates open
 - Date: 2026-08-23
-- Authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
+- Authority: [`DESIGN.md`](../../DESIGN.md)
 - Related: [Decision 0002](0002-dependency-admission.md),
   [Decision 0025](0025-requirements-first-foss-architecture-evaluation.md),
   [Proposal 0006](../../archive/research/proposals/0006-selected-foss-reference-stack.md), and

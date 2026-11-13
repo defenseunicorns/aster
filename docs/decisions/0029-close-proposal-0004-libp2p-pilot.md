@@ -4,7 +4,7 @@
 
 - Status: accepted — Proposal 0004 closed; no provider selected
 - Date: 2026-08-23
-- Authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
+- Authority: [`DESIGN.md`](../../DESIGN.md)
 - Related:
   [Proposal 0004](../../archive/research/proposals/0004-shared-node-libp2p-retest.md),
   [Proposal 0004 result](../../archive/research/proposals/0004-shared-node-libp2p-retest-results.md),

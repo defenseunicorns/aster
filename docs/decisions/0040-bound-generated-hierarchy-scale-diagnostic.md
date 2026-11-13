@@ -5,7 +5,7 @@
 - Status: Accepted for a bounded development diagnostic
 - Date: 2026-08-31
 - Amended: 2026-09-01 — ordered the two bounded follow-on increments
-- Authority: [data-mesh-requirements.md](../../data-mesh-requirements.md)
+- Authority: [DESIGN.md](../../DESIGN.md)
 - Related: [Decision 0037](0037-bound-concurrent-lan-scale-baseline.md),
   [Decision 0039](0039-compose-a-static-event-hierarchy-over-semantic-v6.md),
   and roadmap action `P2-2`

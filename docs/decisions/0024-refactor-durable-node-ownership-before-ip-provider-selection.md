@@ -6,7 +6,7 @@
 - Date: 2026-08-21
 - Follow-on experiment: [Proposal 0004](../../archive/research/proposals/0004-shared-node-libp2p-retest.md)
 - Requirements baseline:
-  [`data-mesh-requirements.md`](../../data-mesh-requirements.md), SHA-256
+  [`DESIGN.md`](../../DESIGN.md), SHA-256
   `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
 - Preserves: Decisions [0002](0002-dependency-admission.md),
   0014 (“Build versus buy is governed by total assurance cost”; privileged local
@@ -92,7 +92,7 @@ selects no IP provider and closes no product requirement.
 ## Requirements traceability
 
 The frozen requirements baseline defines required outcomes, not implementation
-architecture ([§1](../../data-mesh-requirements.md#1-project-brief)). This
+architecture ([§1](../../DESIGN.md#1-project-brief)). This
 decision therefore distinguishes the direct obligations below from the Aster
 architecture selected to satisfy and verify them. The derived controls are
 binding on the next Aster implementation through this decision, but are not
@@ -101,34 +101,34 @@ design.
 
 | Decision element | Direct requirements anchor | Relationship |
 |---|---|---|
-| Authenticate and revalidate before Aster data exchange | Networks are untrusted ([§3](../../data-mesh-requirements.md#3-operating-environment--assumptions)); peers mutually authenticate before exchanging data ([§5.7](../../data-mesh-requirements.md#57-discovery--peering)); transport security grants no authority, and node identity, revocation, and freshness remain Aster concerns ([§6](../../data-mesh-requirements.md#6-security-requirements)). | Authentication before data exchange is direct. A transactional admission barrier, its placement before durable replay or mutation, and a hard pre-authentication deadline are derived controls for making that obligation enforceable under resource pressure. |
-| One durable authority, cheap contact sessions, and coherent state fanout | Reachable nodes converge, durable state survives disconnection, and partial progress resumes with any peer ([§5.2](../../data-mesh-requirements.md#52-synchronization--consistency)); relay quotas are configurable ([§5.5](../../data-mesh-requirements.md#55-scoping--propagation-control)); revocation and rekey propagate through the mesh ([§6](../../data-mesh-requirements.md#6-security-requirements)). | Coherent durable, authorization, and quota outcomes are direct. Exactly one process-owned `Node` and borrowed session objects are the selected remedy for the observed implementation; the baseline does not prescribe a singleton object model. |
-| One aggregate resource budget | Relay storage/bandwidth quotas are configurable ([§5.5](../../data-mesh-requirements.md#55-scoping--propagation-control)); Tier-2 binary, RAM, and core targets, near-zero idle cost, low-rate operation, scale, and bounded local storage apply to the node as a whole ([§9](../../data-mesh-requirements.md#9-performance--resource-targets)). | The externally measurable node bound is direct. Budget categories for pre-authentication work, contacts, streams, frames, tasks, descriptors, deadlines, and relay reservations are derived accounting controls needed to demonstrate that bound across concurrent contacts. |
-| Provider-neutral seam and a libp2p-first revisit | Transports are pluggable and must not change the protocol ([§5.8](../../data-mesh-requirements.md#58-transports)); the public API does not expose transport selection ([§7](../../data-mesh-requirements.md#7-developer-experience--embeddability)); dependencies must pass governance constraints and well-maintained FOSS is preferred where it meets requirements ([§8](../../data-mesh-requirements.md#8-implementation-constraints)). | The provider-neutral boundary follows directly from those outcomes. The exact `MeshHost` ownership split, native control, and ordering libp2p before Iroh are architecture and evidence-based experiment choices, not product requirements or a provider selection. |
-| Authenticated continuity across replacement streams and path/address changes | Nodes move among untrusted transports ([§3](../../data-mesh-requirements.md#3-operating-environment--assumptions)) and peers authenticate before data exchange ([§5.7](../../data-mesh-requirements.md#57-discovery--peering), [§6](../../data-mesh-requirements.md#6-security-requirements)). | Continuing authenticated authority is direct. Fresh Aster authentication on every replacement stream and path/address transition is this decision's conservative acceptance control, not baseline wording; a future design may propose cryptographically bound continuity only if it proves equivalent authorization and revocation revalidation. |
+| Authenticate and revalidate before Aster data exchange | Networks are untrusted ([§3](../../DESIGN.md#3-operating-environment--assumptions)); peers mutually authenticate before exchanging data ([§5.7](../../DESIGN.md#57-discovery--peering)); transport security grants no authority, and node identity, revocation, and freshness remain Aster concerns ([§6](../../DESIGN.md#6-security-requirements)). | Authentication before data exchange is direct. A transactional admission barrier, its placement before durable replay or mutation, and a hard pre-authentication deadline are derived controls for making that obligation enforceable under resource pressure. |
+| One durable authority, cheap contact sessions, and coherent state fanout | Reachable nodes converge, durable state survives disconnection, and partial progress resumes with any peer ([§5.2](../../DESIGN.md#52-synchronization--consistency)); relay quotas are configurable ([§5.5](../../DESIGN.md#55-scoping--propagation-control)); revocation and rekey propagate through the mesh ([§6](../../DESIGN.md#6-security-requirements)). | Coherent durable, authorization, and quota outcomes are direct. Exactly one process-owned `Node` and borrowed session objects are the selected remedy for the observed implementation; the baseline does not prescribe a singleton object model. |
+| One aggregate resource budget | Relay storage/bandwidth quotas are configurable ([§5.5](../../DESIGN.md#55-scoping--propagation-control)); Tier-2 binary, RAM, and core targets, near-zero idle cost, low-rate operation, scale, and bounded local storage apply to the node as a whole ([§9](../../DESIGN.md#9-performance--resource-targets)). | The externally measurable node bound is direct. Budget categories for pre-authentication work, contacts, streams, frames, tasks, descriptors, deadlines, and relay reservations are derived accounting controls needed to demonstrate that bound across concurrent contacts. |
+| Provider-neutral seam and a libp2p-first revisit | Transports are pluggable and must not change the protocol ([§5.8](../../DESIGN.md#58-transports)); the public API does not expose transport selection ([§7](../../DESIGN.md#7-developer-experience--embeddability)); dependencies must pass governance constraints and well-maintained FOSS is preferred where it meets requirements ([§8](../../DESIGN.md#8-implementation-constraints)). | The provider-neutral boundary follows directly from those outcomes. The exact `MeshHost` ownership split, native control, and ordering libp2p before Iroh are architecture and evidence-based experiment choices, not product requirements or a provider selection. |
+| Authenticated continuity across replacement streams and path/address changes | Nodes move among untrusted transports ([§3](../../DESIGN.md#3-operating-environment--assumptions)) and peers authenticate before data exchange ([§5.7](../../DESIGN.md#57-discovery--peering), [§6](../../DESIGN.md#6-security-requirements)). | Continuing authenticated authority is direct. Fresh Aster authentication on every replacement stream and path/address transition is this decision's conservative acceptance control, not baseline wording; a future design may propose cryptographically bound continuity only if it proves equivalent authorization and revocation revalidation. |
 
 This decision closes none of the associated product requirements. A future IP
 profile must still produce acceptance evidence for:
 
 - durable convergence, difference-proportional anti-entropy, and resumable
-  contact across peers ([§5.2](../../data-mesh-requirements.md#52-synchronization--consistency));
+  contact across peers ([§5.2](../../DESIGN.md#52-synchronization--consistency));
 - infrastructure-free direct sync, intermittent multi-hop custody, and bounded
-  duplicate/loop propagation ([§5.6](../../data-mesh-requirements.md#56-peer-to-peer--store-and-forward));
+  duplicate/loop propagation ([§5.6](../../DESIGN.md#56-peer-to-peer--store-and-forward));
 - automatic and manual peering, discovery silence under emission constraints,
-  and mutual authentication ([§5.7](../../data-mesh-requirements.md#57-discovery--peering));
+  and mutual authentication ([§5.7](../../DESIGN.md#57-discovery--peering));
 - pluggable IP operation across NAT, infrastructure-free traversal where the
   network permits, and relay fallback without making infrastructure a local-mesh
-  dependency ([§5.8](../../data-mesh-requirements.md#58-transports));
+  dependency ([§5.8](../../DESIGN.md#58-transports));
 - end-to-end and metadata protection, identity, revocation/rekey, and replay
-  resistance ([§6](../../data-mesh-requirements.md#6-security-requirements)); and
+  resistance ([§6](../../DESIGN.md#6-security-requirements)); and
 - the Tier-2 resource, idle, impaired-link, 100-node-per-scope, 1,000-node
   bridged-scope, and bounded-storage targets
-  ([§9](../../data-mesh-requirements.md#9-performance--resource-targets)), plus
+  ([§9](../../DESIGN.md#9-performance--resource-targets)), plus
   the corresponding release scenarios
-  ([§12](../../data-mesh-requirements.md#12-acceptance-scenarios-illustrative-the-release-must-pass-equivalents)).
+  ([§12](../../DESIGN.md#12-acceptance-scenarios-illustrative-the-release-must-pass-equivalents)).
 
 The bracketed numeric targets remain stakeholder-validation placeholders under
-[§14](../../data-mesh-requirements.md#14-open-items-for-the-team--stakeholders).
+[§14](../../DESIGN.md#14-open-items-for-the-team--stakeholders).
 
 ## Provider disposition after the refactor
 

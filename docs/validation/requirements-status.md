@@ -26,7 +26,7 @@ The current default semantic offer is [9, 8, 7, 6, 5, 4, 3, 2, 1]. Semantic v9 s
 <!-- ASTER-BLOB-CAPABILITY:END -->
 
 - Status date: 2026-10-08
-- Requirements authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
+- Requirements authority: [`DESIGN.md`](../../DESIGN.md)
 - Requirements SHA-256: `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
 - Planning view: [`capability-roadmap.md`](capability-roadmap.md)
 - Atomic requirements index: [`requirements-matrix.csv`](requirements-matrix.csv)

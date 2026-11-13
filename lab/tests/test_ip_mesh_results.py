@@ -342,6 +342,13 @@ def fake_signature_runner(
     elif context == "source-freeze:status":
         stdout = b""
         stderr = b""
+    elif context == "candidate-requirements-path":
+        stdout = b"".join(
+            (relative + "\n").encode("utf-8")
+            for relative in ("DESIGN.md", "data-mesh-requirements.md")
+            if relative in FAULT_SOURCE_BYTES
+        )
+        stderr = b""
     elif context == "candidate-tree":
         stdout = (SIGNED_SOURCE_TREE + "\n").encode("utf-8")
         stderr = b""
@@ -569,7 +576,7 @@ def passing_gate_h_fault_receipt(
             "sha256": hashlib.sha256(FAULT_SOURCE_BYTES[relative]).hexdigest(),
             "size_bytes": len(FAULT_SOURCE_BYTES[relative]),
         }
-        for relative in contract.SOURCE_PATHS
+        for relative in FAULT_SOURCE_BYTES
     ]
     source_by_path = {binding["path"]: binding for binding in source_files}
     source_digest = contract.canonical_sha256(source_files)
@@ -959,6 +966,11 @@ def make_run(
             run_command=fake_signature_runner,
         )
         source_freeze_git_commands = []
+        requirements_path = next(
+            relative
+            for relative in ("DESIGN.md", "data-mesh-requirements.md")
+            if relative in FAULT_SOURCE_BYTES
+        )
         for context, arguments in (
             ("source-freeze:head", ["rev-parse", "HEAD"]),
             (
@@ -970,18 +982,18 @@ def make_run(
                 ["status", "--porcelain=v1", "--untracked-files=all"],
             ),
             (
-                "candidate-blob-id:data-mesh-requirements.md",
+                f"candidate-blob-id:{requirements_path}",
                 [
                     "rev-parse",
-                    f"{'c' * 40}:data-mesh-requirements.md",
+                    f"{'c' * 40}:{requirements_path}",
                 ],
             ),
             (
-                "candidate-blob:data-mesh-requirements.md",
+                f"candidate-blob:{requirements_path}",
                 [
                     "cat-file",
                     "blob",
-                    f"{'c' * 40}:data-mesh-requirements.md",
+                    f"{'c' * 40}:{requirements_path}",
                 ],
             ),
         ):
@@ -1018,10 +1030,10 @@ def make_run(
                     live_signature_trust
                 ),
                 "requirements_git_blob": _git_blob_id(
-                    FAULT_SOURCE_BYTES["data-mesh-requirements.md"]
+                    FAULT_SOURCE_BYTES[requirements_path]
                 ),
                 "requirements_size_bytes": len(
-                    FAULT_SOURCE_BYTES["data-mesh-requirements.md"]
+                    FAULT_SOURCE_BYTES[requirements_path]
                 ),
                 "git_commands": source_freeze_git_commands,
             }
@@ -1550,7 +1562,7 @@ def make_run(
         candidate_git_specs = [
             ("candidate-tree", ["rev-parse", f"{'c' * 40}^{{tree}}"])
         ]
-        for relative in results.gate_h_fault_contract.SOURCE_PATHS:
+        for relative in FAULT_SOURCE_BYTES:
             candidate_git_specs.extend(
                 (
                     (
@@ -2789,6 +2801,80 @@ class IpMeshResultsTests(unittest.TestCase):
                 results.aggregate([root])
 
     def test_gate_h_fault_receipt_is_bound_to_complete_logs_and_commit_blobs(self):
+        for requirements_path in ("DESIGN.md", "data-mesh-requirements.md"):
+            source_bytes = {
+                requirements_path if path == "DESIGN.md" else path: value
+                for path, value in FAULT_SOURCE_BYTES.items()
+            }
+            signed_bytes = {
+                requirements_path if path == "DESIGN.md" else path: value
+                for path, value in SIGNED_SOURCE_BYTES.items()
+            }
+            signed_bindings = sorted(
+                [
+                    {**binding, "path": requirements_path}
+                    if binding["path"] == "DESIGN.md" else binding
+                    for binding in SIGNED_SOURCE_BINDINGS
+                ],
+                key=lambda binding: binding["path"],
+            )
+            tree = results.gate_h_source._tree_id(signed_bindings)
+            with (
+                self.subTest(requirements_path=requirements_path),
+                tempfile.TemporaryDirectory() as temporary,
+                mock.patch.dict(FAULT_SOURCE_BYTES, source_bytes, clear=True),
+                mock.patch.dict(SIGNED_SOURCE_BYTES, signed_bytes, clear=True),
+                mock.patch.dict(
+                    globals(), SIGNED_SOURCE_BINDINGS=signed_bindings,
+                    SIGNED_SOURCE_TREE=tree,
+                ),
+                mock.patch.object(
+                    results.gate_h_experiment_contract, "checked_candidate_tree",
+                    return_value=tree,
+                ),
+            ):
+                root = Path(temporary) / "requirements-path"
+                make_run(
+                    root, scenario="gate-h", trial_passes=(True,) * 10,
+                    arm="native", payload_bytes=1_048_576,
+                )
+                manifest = json.loads((root / "manifest.json").read_text())
+                freeze = results.gate_h_experiment_contract.source_freeze(
+                    execute=True, build_command="fixture build",
+                    environment=manifest["host_execution"]["environment"],
+                    signature_trust=manifest["signature_trust"],
+                )
+                self.assertEqual(freeze["requirements_sha256"], results.REQUIREMENTS_SHA256)
+                results.aggregate([root])
+                other_path = (
+                    "data-mesh-requirements.md"
+                    if requirements_path == "DESIGN.md" else "DESIGN.md"
+                )
+                for command in manifest["source_freeze"]["git_commands"][-2:]:
+                    command["context"] = command["context"].replace(
+                        requirements_path, other_path
+                    )
+                    command["argv"][-1] = f"{'c' * 40}:{other_path}"
+                with self.assertRaisesRegex(results.ResultsError, "source-freeze"):
+                    results.validate_gate_h_signature_evidence(
+                        root, manifest, candidate_commit="c" * 40,
+                        source_freeze=manifest["source_freeze"],
+                    )
+                for paths in ((), ("DESIGN.md", "data-mesh-requirements.md")):
+                    invalid_sources = {
+                        path: source_bytes[requirements_path] for path in paths
+                    }
+                    with mock.patch.dict(FAULT_SOURCE_BYTES, invalid_sources, clear=True):
+                        with self.assertRaisesRegex(
+                            results.gate_h_experiment_contract.ExperimentError,
+                            "exactly one requirements file",
+                        ):
+                            results.gate_h_experiment_contract.source_freeze(
+                                execute=True, build_command="fixture build",
+                                environment=manifest["host_execution"]["environment"],
+                                signature_trust=manifest["signature_trust"],
+                            )
+
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "fault-timeout"
             make_run(

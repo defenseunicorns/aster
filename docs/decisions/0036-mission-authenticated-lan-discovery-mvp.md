@@ -4,7 +4,7 @@
 
 - Status: Accepted for the Event mesh MVP
 - Date: 2026-08-31
-- Authority: [data-mesh-requirements.md](../../data-mesh-requirements.md)
+- Authority: [DESIGN.md](../../DESIGN.md)
 - Related: [Decision 0030](0030-event-first-local-connect-agent.md) and
   [Decision 0034](0034-short-lived-iroh-nearby-discovery.md)
 

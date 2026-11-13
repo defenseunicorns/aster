@@ -10,7 +10,7 @@ Customer feedback is **advisory input**. A feedback record or recommendation:
 
 - is not a requirement, roadmap commitment, acceptance criterion, evidence
   receipt, or release authorization;
-- does not change `data-mesh-requirements.md`, an atomic requirement status,
+- does not change `DESIGN.md`, an atomic requirement status,
   capability maturity, or a supported profile;
 - may identify alignment with existing capability actions without advancing
   those actions or their evidence; and

@@ -3,7 +3,7 @@
 
 - Status: Accepted for exploratory development feedback
 - Date: 2026-08-31
-- Authority: [data-mesh-requirements.md](../../data-mesh-requirements.md)
+- Authority: [DESIGN.md](../../DESIGN.md)
 - Related: [Decision 0036](0036-mission-authenticated-lan-discovery-mvp.md)
   and roadmap action `P2-2`
 
