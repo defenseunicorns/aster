@@ -1,53 +1,39 @@
 # Aster repository instructions
 
-## Required repository protocol
+Follow the project's Clean Room policy and source exclusions.
 
-- Before doing any work, read and follow `CONTRIBUTING.md`.
-- If that file is missing or unreadable, stop and ask the user before
-  proceeding.
+## Before editing
 
-## Planning and requirements
+- Work on a dedicated branch for the task.
+- Read `CONTRIBUTING.md` before making changes.
+- Follow the product requirements in `DESIGN.md`.
 
-Read these before selecting implementation work:
+## Code
 
-1. `docs/validation/capability-roadmap.md`
-2. `docs/validation/requirements-status.md`
-3. `README.md#current-implementation-boundary`
-4. `data-mesh-requirements.md`
-5. `.github/pull_request_template.md`
+- **Make simple tasks simple:** Don’t turn small changes into large refactors or
+  elaborate workflows.
+- **Less is more:** Prefer the smallest clear solution that meets the requirements.
+- **Avoid unnecessary abstractions:** Don’t introduce design patterns or
+  abstractions unless they are genuinely needed.
+- **Build for current requirements:** Don’t add features or flexibility for
+  hypothetical future needs.
+- **Keep code readable:** Prefer straightforward solutions that are easy to
+  understand and maintain.
+- **Keep Functions Short:** Keep each function focused on one task and easy to read.
+- **Use Familiar Constructs:** Stick to patterns and data structures that are
+  widely recognized in your language's ecosystem.
+- **Simple Algorithms:** Choose straightforward algorithms when they meet
+  performance requirements.
+- **Reuse existing solutions:** Use existing code and standard tools when they
+  fit the task.
+- **Don't Oversimplify Critical Systems:** Don’t sacrifice correctness, security,
+  or reliability for shorter code.
 
-Use the capability roadmap as the planning and PR-review view.
+## Tests and checks
 
-- Do not treat the 348 atomic requirements as a flat backlog, estimate,
-  completion percentage, or a requirement that one PR complete an entire
-  capability.
-- Preserve the hash-bound requirements baseline and historical evidence.
-- Prefer coherent, demonstrable capability increments over isolated
-  mechanisms.
-- Keep implementation and evidence claims no broader than the code, tests,
-  environment, and retained receipts support.
-- Update exact requirement IDs only when their implementation or evidence
-  boundary genuinely changes.
-- Future, provisional, stakeholder, and external-gate rows do not automatically
-  block unrelated incremental merges.
+- Reuse or extend existing tests before adding new ones.
+- Avoid tests that rerun suites and duplicate CI execution.
 
-## Workspace discipline
+## Documentation
 
-- Inspect repository status and active work before editing.
-- Use an isolated worktree when the current workspace is dirty or another
-  effort is active.
-- Preserve unrelated user changes.
-- Inspect open PRs and relevant active branches before starting substantial
-  work to avoid duplication.
-- Keep each PR focused on one capability outcome or one clearly bounded
-  maintenance concern.
-
-## Verification
-
-- Run `python3 tools/check-implementation-requirements.py` whenever requirements
-  evidence or traceability changes.
-- Run focused regression and failure-path tests appropriate to the change.
-- Run `mise run check` before handing off a substantive code change.
-- Run `mise run fuzz-smoke` when changing parsers, framing, envelopes,
-  fragmentation, or related hostile-input boundaries.
-- Use `.github/pull_request_template.md` when preparing a PR.
+- Use plain language and established terms. Avoid repetition and unnecessary disclaimers.
