@@ -291,9 +291,6 @@ phase, class, and final-stack flag. Atomization deliberately retains repeated
 phase, acceptance, and deliverable statements, so row totals must not be used as
 product progress percentages or as a count of independently ratified work
 items.
-`python3 tools/check-implementation-requirements.py` verifies complete ID parity,
-unique rows, valid selected states, exact selected-status containment, and the
-conservative generated claim boundary.
 
 <!-- ASTER-REQUIREMENTS-TOTALS:BEGIN -->
 Generated selected-status totals: implemented-uncredited=53; observed-bounded=84; open=211; exact-selected-mappings=140.

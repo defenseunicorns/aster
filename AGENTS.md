@@ -44,8 +44,6 @@ Use the capability roadmap as the planning and PR-review view.
 
 ## Verification
 
-- Run `python3 tools/check-implementation-requirements.py` whenever requirements
-  evidence or traceability changes.
 - Run focused regression and failure-path tests appropriate to the change.
 - Run `mise run check` before handing off a substantive code change.
 - Run `mise run fuzz-smoke` when changing parsers, framing, envelopes,

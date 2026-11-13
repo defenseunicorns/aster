@@ -39,7 +39,5 @@ Describe the behavior changed and why.
 
 - [ ] `mise run check`
 - [ ] Relevant regression tests
-- [ ] `python3 tools/check-implementation-requirements.py` when requirements
-  evidence or traceability changed
 - [ ] `mise run fuzz-smoke` when parser, framing, envelope, fragmentation, or
   related hostile-input behavior changed

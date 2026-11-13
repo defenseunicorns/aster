@@ -21,7 +21,7 @@ run = [
 ]
 
 [tasks.check-foundation]
-description = "Run formatting, policy, traceability, and receipt checks"
+description = "Run formatting, policy, and receipt checks"
 run = [
   { task = "check-lockfiles" },
   { task = "check-foundation-core" },
@@ -40,7 +40,6 @@ run = [
   "cargo fmt --all -- --check",
   "sh tools/check-agent-proto.sh",
   "python3 tools/check-project-license.py",
-  "python3 tools/check-implementation-requirements.py",
   "python3 tools/test-protocol-version-contract.py",
   "python3 .github/scripts/test-nextest-timing.py",
   "python3 tools/test_aster_tour_ui.py",

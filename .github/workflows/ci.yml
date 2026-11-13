@@ -144,7 +144,7 @@ jobs:
         run: |
           python3 tools/test_inspect_aster_compose_oci.py
 
-      - name: Run formatting, policy, traceability, and receipt checks
+      - name: Run formatting, policy, and receipt checks
         env:
           CARGO_NET_OFFLINE: "true"
         # The dedicated prerequisite job already validates every Cargo graph.
