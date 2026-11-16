@@ -83,6 +83,7 @@ use aster_mesh::{
     VerifiedControlPrincipal, VerifiedCustodyClaims, VersionVector,
 };
 use aster_profile::{InventorySnapshot, ItemId};
+use redb::backends::FileBackend;
 use redb::{
     Database, Durability, MultimapTableHandle, ReadableDatabase, ReadableTable,
     ReadableTableMetadata, TableDefinition, TableHandle,
@@ -5663,7 +5664,7 @@ fn database_from_store_backing(
     #[cfg(unix)]
     let path = backing.path;
     let process_writer_lock = acquire_process_writer_lock(&backing.file)?;
-    let database = match Database::builder().create_file(backing.file) {
+    let database = match Database::builder().create_with_backend(FileBackend::new(backing.file)?) {
         Ok(database) => database,
         Err(redb::DatabaseError::DatabaseAlreadyOpen) => return Err(StoreError::StoreInUse),
         Err(error) => return Err(error.into()),
@@ -5708,7 +5709,7 @@ fn require_exact_writer_exclusion(
         Ok(()) => Err(StoreError::ProcessExclusiveLockUnavailable),
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    match Database::builder().create_file(backing.file) {
+    match Database::builder().create_with_backend(FileBackend::new(backing.file)?) {
         Err(redb::DatabaseError::DatabaseAlreadyOpen) => Ok(ProcessExclusiveLockProof(())),
         Err(error) => Err(error.into()),
         Ok(second_writer) => {
@@ -6243,7 +6244,8 @@ impl Store {
                         "publication preflight source length changed",
                     ));
                 }
-                let database = redb::Builder::new().create_file(temporary.file)?;
+                let database =
+                    redb::Builder::new().create_with_backend(FileBackend::new(temporary.file)?)?;
                 check(&database.begin_read()?)?;
                 drop(database);
                 drop(cleanup);

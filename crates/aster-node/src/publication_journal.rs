@@ -13,6 +13,7 @@ use crate::application::{
     NumberedEventPublishRequest, Priority, Scope, SelectedEventHandle, SelectedEventNode, Topic,
 };
 use crate::journal_directory::JournalDirectory;
+use redb::backends::FileBackend;
 use redb::{Database, Durability, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::{error::Error, path::Path};
@@ -250,7 +251,8 @@ impl Journal {
         client: &[u8],
         sync_parent: impl FnOnce(&JournalDirectory) -> Result<()>,
     ) -> Result<()> {
-        let database = redb::Builder::new().create_file(directory.file(path, true)?)?;
+        let database = redb::Builder::new()
+            .create_with_backend(FileBackend::new(directory.file(path, true)?)?)?;
         let journal = Self {
             poisoned: std::cell::Cell::new(false),
             database,
@@ -279,7 +281,8 @@ impl Journal {
         Self::open_in(JournalDirectory::from_file(directory, name)?, name, client)
     }
     fn open_in(directory: JournalDirectory, path: &Path, client: &[u8]) -> Result<Self> {
-        let database = redb::Builder::new().create_file(directory.file(path, false)?)?;
+        let database = redb::Builder::new()
+            .create_with_backend(FileBackend::new(directory.file(path, false)?)?)?;
         let read = database.begin_read()?;
         let table = read.open_table(CHECKPOINT)?;
         let raw = table.get("state")?.ok_or("journal metadata missing")?;

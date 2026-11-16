@@ -79,6 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed redb 4.5 compatibility in Store and publication journals.
 - Fixed unused-field warnings in `aster-node` builds.
 
 ### Security
