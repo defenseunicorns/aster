@@ -20,6 +20,7 @@ use tokio::{
 
 pub(crate) const INITIAL_RESOLVER_RETRY: Duration = Duration::from_millis(250);
 const MAXIMUM_RESOLVER_RETRY: Duration = Duration::from_secs(30);
+const MAX_EVENTS_PER_BATCH: usize = 128;
 
 type ResolverFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ResolverFailure>> + Send + 'a>>;
 type ResolverEventFuture<'a> = Pin<Box<dyn Future<Output = Option<ResolverEvent>> + Send + 'a>>;
@@ -369,7 +370,7 @@ impl ResolverSession for BluezResolverSession {
 
     fn next_event(&mut self) -> ResolverEventFuture<'_> {
         Box::pin(async move {
-            loop {
+            for _ in 0..MAX_EVENTS_PER_BATCH {
                 tokio::select! {
                     event = self.session_events.next() => {
                         return match event {
@@ -392,6 +393,7 @@ impl ResolverSession for BluezResolverSession {
                     }
                 }
             }
+            Some(ResolverEvent::InventoryChanged { removed: None })
         })
     }
 }
@@ -456,7 +458,7 @@ struct ResolverActor {
     updates: watch::Sender<ControllerResolutionSnapshot>,
     cancellation: LifecycleCancellation,
     owner: Option<ControllerEpochOwner>,
-    cursor: Option<usize>,
+    cursor: Option<String>,
     inventory_generation: u64,
     backoff: CappedBackoff,
     #[cfg(test)]
@@ -467,10 +469,6 @@ enum SessionAction {
     Sweep,
     Lost,
     Cancelled,
-}
-
-struct SweepResult {
-    retry_without_event: bool,
 }
 
 impl ResolverActor {
@@ -549,10 +547,10 @@ impl ResolverActor {
                 ));
             }
 
-            let sweep = match self.probe_sweep(observed).await {
-                Some(result) => result,
+            match self.probe_sweep(observed).await {
+                Some(()) => {}
                 None => return SessionAction::Cancelled,
-            };
+            }
             if self.owner.is_some() {
                 self.backoff.reset();
                 match self.wait_healthy_event(session).await {
@@ -561,25 +559,21 @@ impl ResolverActor {
                 }
             }
 
-            match self
-                .wait_pending_sweep(session, sweep.retry_without_event)
-                .await
-            {
+            match self.wait_pending_sweep(session).await {
                 SessionAction::Sweep => {}
                 outcome => return outcome,
             }
         }
     }
 
-    async fn probe_sweep(&mut self, observed: ObservedInventory) -> Option<SweepResult> {
+    async fn probe_sweep(&mut self, observed: ObservedInventory) -> Option<()> {
         if observed.controllers.is_empty() {
+            self.cursor = None;
             self.publish(ControllerResolutionSnapshot::unavailable(
                 ProbeDisposition::Indeterminate(ProbeReason::BluezUnavailable),
                 None,
             ));
-            return Some(SweepResult {
-                retry_without_event: true,
-            });
+            return Some(());
         }
 
         let admissions: Vec<_> = observed
@@ -588,11 +582,16 @@ impl ResolverActor {
             .map(|controller| self.policy.admit(&controller.fingerprint))
             .collect();
         let mut order: Vec<_> = (0..observed.controllers.len()).collect();
-        if let Some(cursor) = self.cursor {
-            if let Some(position) = order.iter().position(|index| *index == cursor) {
-                order.rotate_left(position);
-            }
+        let resumed = self.cursor.as_deref().and_then(|cursor| {
+            order
+                .iter()
+                .position(|index| observed.controllers[*index].candidate.name() == cursor)
+        });
+        if let Some(position) = resumed {
+            let next = (position + 1) % order.len();
+            order.rotate_left(next);
         } else {
+            self.cursor = None;
             order.sort_by_key(|index| {
                 if admissions[*index].support() == SupportTag::Qualified {
                     0
@@ -607,9 +606,9 @@ impl ResolverActor {
             ProbeDisposition::Indeterminate(ProbeReason::BluezUnavailable),
             None,
         );
-        let mut transient = false;
+        let mut sweep_unfinished = false;
 
-        for (position, index) in order.iter().copied().enumerate() {
+        for index in order.iter().copied() {
             let controller = &observed.controllers[index];
             let admission = admissions[index];
             if admission.disposition() != ProbeDisposition::Compatible {
@@ -622,11 +621,11 @@ impl ResolverActor {
 
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                self.cursor = Some(index);
-                transient = true;
+                sweep_unfinished = true;
                 break;
             }
             let candidate_limit = remaining.min(self.limits.candidate());
+            self.cursor = Some(controller.candidate.name().to_owned());
             let disposition = tokio::select! {
                 biased;
                 () = self.cancellation.cancelled() => return None,
@@ -642,27 +641,22 @@ impl ResolverActor {
                 self.cursor = None;
                 let support = admission.support();
                 self.select(controller.clone(), support);
-                return Some(SweepResult {
-                    retry_without_event: false,
-                });
+                return Some(());
             }
 
-            transient |= matches!(disposition, ProbeDisposition::Indeterminate(_));
             last =
                 ControllerResolutionSnapshot::unavailable(disposition, Some(admission.support()));
             if Instant::now() >= deadline {
-                self.cursor = Some(order[(position + 1) % order.len()]);
+                sweep_unfinished = true;
                 break;
-            }
-            if position + 1 == order.len() {
-                self.cursor = None;
             }
         }
 
+        if !sweep_unfinished {
+            self.cursor = None;
+        }
         self.publish(last);
-        Some(SweepResult {
-            retry_without_event: transient,
-        })
+        Some(())
     }
 
     fn select(&mut self, controller: ObservedController, support: SupportTag) {
@@ -689,13 +683,31 @@ impl ResolverActor {
         let Some(event) = event else {
             return SessionAction::Lost;
         };
-        self.apply_event(event);
-        loop {
+        self.consume_event_batch(session, event).await
+    }
+
+    async fn consume_event_batch(
+        &mut self,
+        session: &mut dyn ResolverSession,
+        first: ResolverEvent,
+    ) -> SessionAction {
+        if self.cancellation.is_cancelled() {
+            return SessionAction::Cancelled;
+        }
+        self.apply_event(first);
+        for _ in 1..MAX_EVENTS_PER_BATCH {
+            if self.cancellation.is_cancelled() {
+                return SessionAction::Cancelled;
+            }
             match session.next_event().now_or_never() {
                 Some(Some(event)) => self.apply_event(event),
                 Some(None) => return SessionAction::Lost,
-                None => break,
+                None => return SessionAction::Sweep,
             }
+        }
+        tokio::task::yield_now().await;
+        if self.cancellation.is_cancelled() {
+            return SessionAction::Cancelled;
         }
         SessionAction::Sweep
     }
@@ -716,41 +728,16 @@ impl ResolverActor {
         }
     }
 
-    async fn wait_pending_sweep(
-        &mut self,
-        session: &mut dyn ResolverSession,
-        retry_without_event: bool,
-    ) -> SessionAction {
-        let mut pending_sweep = retry_without_event;
-        let mut delay =
-            pending_sweep.then(|| Box::pin(tokio::time::sleep(self.backoff.next_delay())));
-        loop {
-            if let Some(wait) = delay.as_mut() {
-                tokio::select! {
-                    biased;
-                    () = self.cancellation.cancelled() => return SessionAction::Cancelled,
-                    () = wait => return SessionAction::Sweep,
-                    event = session.next_event() => {
-                        if event.is_none() {
-                            return SessionAction::Lost;
-                        }
-                        pending_sweep = true;
-                    }
-                }
-            } else {
-                let event = tokio::select! {
-                    biased;
-                    () = self.cancellation.cancelled() => return SessionAction::Cancelled,
-                    event = session.next_event() => event,
-                };
-                if event.is_none() {
-                    return SessionAction::Lost;
-                }
-                pending_sweep = true;
-                delay = Some(Box::pin(tokio::time::sleep(self.backoff.next_delay())));
-            }
-            debug_assert!(pending_sweep);
-        }
+    async fn wait_pending_sweep(&mut self, session: &mut dyn ResolverSession) -> SessionAction {
+        let event = tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => return SessionAction::Cancelled,
+            event = session.next_event() => event,
+        };
+        let Some(event) = event else {
+            return SessionAction::Lost;
+        };
+        self.consume_event_batch(session, event).await
     }
 
     fn publish(&self, snapshot: ControllerResolutionSnapshot) {
@@ -919,6 +906,71 @@ mod tests {
         controllers: Arc<Mutex<Vec<ObservedController>>>,
         events: mpsc::UnboundedReceiver<ResolverEvent>,
         observations: Arc<AtomicUsize>,
+    }
+
+    struct PendingBluezSession;
+
+    impl BluezSession for PendingBluezSession {
+        fn subscribe(&self) -> crate::controller::BluezFuture<'_, SessionStream> {
+            Box::pin(std::future::pending())
+        }
+
+        fn adapter_names(&self) -> crate::controller::BluezFuture<'_, Vec<String>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn adapter<'a>(
+            &'a self,
+            _name: &'a str,
+        ) -> crate::controller::BluezFuture<'a, Box<dyn crate::controller::BluezAdapter>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    struct CancellationStormSession {
+        cancellation: LifecycleCancellation,
+        events: Arc<AtomicUsize>,
+    }
+
+    struct AlwaysReadySession {
+        observations: Arc<AtomicUsize>,
+    }
+
+    impl ResolverSession for CancellationStormSession {
+        fn observe<'a>(
+            &'a mut self,
+            _selected: Option<&'a str>,
+        ) -> ResolverFuture<'a, ObservedInventory> {
+            Box::pin(async { Ok(ObservedInventory::bounded(Vec::new())) })
+        }
+
+        fn next_event(&mut self) -> ResolverEventFuture<'_> {
+            Box::pin(async move {
+                let event = self.events.fetch_add(1, Ordering::SeqCst);
+                if event == 0 {
+                    self.cancellation.cancel();
+                }
+                if event < 1_024 {
+                    Some(ResolverEvent::InventoryChanged { removed: None })
+                } else {
+                    std::future::pending().await
+                }
+            })
+        }
+    }
+
+    impl ResolverSession for AlwaysReadySession {
+        fn observe<'a>(
+            &'a mut self,
+            _selected: Option<&'a str>,
+        ) -> ResolverFuture<'a, ObservedInventory> {
+            self.observations.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(ObservedInventory::bounded(Vec::new())) })
+        }
+
+        fn next_event(&mut self) -> ResolverEventFuture<'_> {
+            Box::pin(async { Some(ResolverEvent::InventoryChanged { removed: None }) })
+        }
     }
 
     impl ResolverSession for FakeSession {
@@ -1164,6 +1216,24 @@ mod tests {
 
     async fn stop(resolver: LinuxControllerResolver) {
         resolver.shutdown().await.unwrap();
+    }
+
+    fn test_actor(cancellation: LifecycleCancellation) -> ResolverActor {
+        let (updates, _) = tokio::sync::watch::channel(ControllerResolutionSnapshot::initial());
+        ResolverActor {
+            policy: ControllerAdmissionPolicy::default(),
+            limits: limits(),
+            platform: Arc::new(FakePlatform::new([])),
+            probe: Arc::new(FakeProbe::compatible()),
+            output: BtleOperatorOutput::discard(),
+            updates,
+            cancellation,
+            owner: None,
+            cursor: None,
+            inventory_generation: 0,
+            backoff: CappedBackoff::new(INITIAL_RESOLVER_RETRY, MAXIMUM_RESOLVER_RETRY),
+            epoch_updates: None,
+        }
     }
 
     #[tokio::test]
@@ -1417,7 +1487,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn unfinished_candidates_rotate_to_next_sweep() {
         let qualified = fingerprint("qualified");
-        let (_harness, session) = Harness::session(vec![
+        let (harness, session) = Harness::session(vec![
             controller("hci0", 1, fingerprint("a")),
             controller("hci1", 2, qualified.clone()),
         ]);
@@ -1441,7 +1511,7 @@ mod tests {
         probe.wait_for_calls(1).await;
 
         tokio::time::advance(Duration::from_secs(1)).await;
-        tokio::time::advance(INITIAL_RESOLVER_RETRY).await;
+        harness.event(ResolverEvent::ControllerChanged("hci1".to_owned()));
         probe.wait_for_calls(2).await;
 
         assert_eq!(probe.calls(), vec!["hci1", "hci0"]);
@@ -1450,7 +1520,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn change_storm_coalesces_and_honors_backoff() {
+    async fn change_storm_coalesces_into_one_pending_sweep() {
         let (harness, session) = Harness::session(vec![controller("hci0", 1, fingerprint("a"))]);
         let probe = Arc::new(FakeProbe::with(
             "hci0",
@@ -1469,16 +1539,217 @@ mod tests {
         for _ in 0..100 {
             harness.event(ResolverEvent::ControllerChanged("hci0".to_owned()));
         }
-        tokio::task::yield_now().await;
-        assert_eq!(probe.calls().len(), 1);
-
-        tokio::time::advance(INITIAL_RESOLVER_RETRY - Duration::from_millis(1)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(probe.calls().len(), 1);
-
-        tokio::time::advance(Duration::from_millis(1)).await;
         probe.wait_for_calls(2).await;
+        tokio::task::yield_now().await;
         assert_eq!(probe.calls().len(), 2);
+        stop(resolver).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn healthy_event_stream_never_polls_empty_or_indeterminate_state() {
+        let (empty_harness, empty_session) = Harness::session(Vec::new());
+        let (empty, _epochs) = spawn(
+            ControllerAdmissionPolicy::default(),
+            limits(),
+            Arc::new(FakePlatform::new([Ok(empty_session)])),
+            Arc::new(FakeProbe::compatible()),
+        );
+        while empty_harness.observation_count() < 1 {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(Duration::from_secs(300)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(empty_harness.observation_count(), 1);
+        empty_harness.event(ResolverEvent::InventoryChanged { removed: None });
+        while empty_harness.observation_count() < 2 {
+            tokio::task::yield_now().await;
+        }
+        stop(empty).await;
+
+        let (indeterminate_harness, indeterminate_session) =
+            Harness::session(vec![controller("hci0", 1, fingerprint("a"))]);
+        let probe = Arc::new(FakeProbe::with(
+            "hci0",
+            ProbeBehavior::Immediate(ProbeDisposition::Indeterminate(
+                ProbeReason::ResourceExhausted,
+            )),
+        ));
+        let (indeterminate, _epochs) = spawn(
+            ControllerAdmissionPolicy::default(),
+            limits(),
+            Arc::new(FakePlatform::new([Ok(indeterminate_session)])),
+            probe.clone(),
+        );
+        probe.wait_for_calls(1).await;
+
+        tokio::time::advance(Duration::from_secs(300)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(probe.calls().len(), 1);
+        assert_eq!(indeterminate_harness.observation_count(), 1);
+        indeterminate_harness.event(ResolverEvent::ControllerChanged("hci0".to_owned()));
+        probe.wait_for_calls(2).await;
+        stop(indeterminate).await;
+    }
+
+    #[tokio::test]
+    async fn production_unrelated_event_batch_is_bounded() {
+        let mut adapter_events = SelectAll::new();
+        adapter_events.push(
+            futures::stream::iter(
+                std::iter::repeat_n(AdapterSignal::Unrelated, 1_024)
+                    .map(|event| ("hci0".to_owned(), Some(event))),
+            )
+            .chain(futures::stream::pending())
+            .boxed(),
+        );
+        let mut session = BluezResolverSession {
+            session: Box::new(PendingBluezSession),
+            session_events: Box::pin(futures::stream::pending()),
+            adapter_events,
+        };
+
+        let event = tokio::time::timeout(Duration::from_millis(20), session.next_event()).await;
+
+        assert!(
+            event.is_ok(),
+            "one call must yield after bounded ready work"
+        );
+        assert!(event.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn continuously_ready_events_preserve_cancel_and_shutdown_progress() {
+        let cancellation = LifecycleCancellation::new();
+        let events = Arc::new(AtomicUsize::new(0));
+        let mut session = CancellationStormSession {
+            cancellation: cancellation.clone(),
+            events: events.clone(),
+        };
+        let mut actor = test_actor(cancellation);
+
+        let outcome = actor.wait_healthy_event(&mut session).await;
+
+        assert!(matches!(outcome, SessionAction::Cancelled));
+        assert!(events.load(Ordering::SeqCst) <= 32);
+    }
+
+    #[tokio::test]
+    async fn continuously_ready_batches_yield_for_sweeps_and_external_cancellation() {
+        let cancellation = LifecycleCancellation::new();
+        let observations = Arc::new(AtomicUsize::new(0));
+        let mut actor = test_actor(cancellation.clone());
+        let session_observations = observations.clone();
+        let actor_task = tokio::spawn(async move {
+            let mut session = AlwaysReadySession {
+                observations: session_observations,
+            };
+            actor.run_session(&mut session).await
+        });
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while observations.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bounded ready batches must yield after making sweep progress");
+        cancellation.cancel();
+        let outcome = tokio::time::timeout(Duration::from_millis(100), actor_task)
+            .await
+            .expect("cancellation must join a continuously-ready session")
+            .expect("actor task must not panic");
+
+        assert!(matches!(outcome, SessionAction::Cancelled));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fairness_cursor_tracks_identity_across_reorder_and_addition() {
+        let qualified = fingerprint("qualified-hci1");
+        let (harness, session) = Harness::session(vec![
+            controller("hci1", 1, qualified.clone()),
+            controller("hci2", 2, fingerprint("compatible")),
+        ]);
+        let probe = Arc::new(FakeProbe::with("hci1", ProbeBehavior::Pending));
+        let tight = ControllerProbeLimits::new(
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+            Duration::from_secs(1),
+        );
+        let (resolver, _epochs) = spawn(
+            ControllerAdmissionPolicy::with_rows(
+                false,
+                vec![SupportRow::exact(qualified.clone())],
+                Vec::new(),
+            ),
+            tight,
+            Arc::new(FakePlatform::new([Ok(session)])),
+            probe.clone(),
+        );
+        probe.wait_for_calls(1).await;
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        harness.replace(
+            vec![
+                controller("hci0", 3, fingerprint("new")),
+                controller("hci1", 1, qualified),
+                controller("hci2", 2, fingerprint("compatible")),
+            ],
+            ResolverEvent::InventoryChanged { removed: None },
+        );
+        probe.wait_for_calls(2).await;
+
+        assert_eq!(probe.calls(), vec!["hci1", "hci2"]);
+        stop(resolver).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disappeared_fairness_cursor_restores_qualified_first_order() {
+        let removed = fingerprint("qualified-removed");
+        let new_qualified = fingerprint("qualified-new");
+        let (harness, session) = Harness::session(vec![
+            controller("hci1", 1, removed.clone()),
+            controller("hci2", 2, fingerprint("compatible")),
+        ]);
+        let probe = Arc::new(FakeProbe::with("hci1", ProbeBehavior::Pending));
+        probe
+            .behaviors
+            .lock()
+            .unwrap()
+            .insert("hci0".to_owned(), ProbeBehavior::Pending);
+        let tight = ControllerProbeLimits::new(
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+            Duration::from_secs(1),
+        );
+        let (resolver, _epochs) = spawn(
+            ControllerAdmissionPolicy::with_rows(
+                false,
+                vec![
+                    SupportRow::exact(removed),
+                    SupportRow::exact(new_qualified.clone()),
+                ],
+                Vec::new(),
+            ),
+            tight,
+            Arc::new(FakePlatform::new([Ok(session)])),
+            probe.clone(),
+        );
+        probe.wait_for_calls(1).await;
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        harness.replace(
+            vec![
+                controller("hci0", 3, new_qualified),
+                controller("hci2", 2, fingerprint("compatible")),
+            ],
+            ResolverEvent::InventoryChanged {
+                removed: Some("hci1".to_owned()),
+            },
+        );
+        probe.wait_for_calls(2).await;
+
+        assert_eq!(probe.calls(), vec!["hci1", "hci0"]);
         stop(resolver).await;
     }
 
