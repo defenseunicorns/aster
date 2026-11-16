@@ -79,6 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed Store inspection, Event-operation audits, and compatibility checks to
+  read validated file descriptors instead of reopening paths.
 - Fixed redb 4.5 compatibility in Store and publication journals.
 - Fixed unused-field warnings in `aster-node` builds.
 

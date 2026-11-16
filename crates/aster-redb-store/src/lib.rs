@@ -5571,8 +5571,19 @@ fn reject_legacy_subscriptions_read(read: &redb::ReadTransaction) -> Result<(), 
     Ok(())
 }
 
+#[cfg(all(test, unix))]
+thread_local! {
+    static READ_ONLY_BACKING_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn open_read_only_store_backing(path: &Path) -> Result<OpenedStoreBacking, StoreError> {
-    validate_nonempty_store_backing(open_store_backing_file(path, false, true)?)
+    let backing = validate_nonempty_store_backing(open_store_backing_file(path, false, true)?)?;
+    #[cfg(all(test, unix))]
+    if let Some(hook) = READ_ONLY_BACKING_TEST_HOOK.take() {
+        hook();
+    }
+    Ok(backing)
 }
 
 fn validate_nonempty_store_backing(
@@ -6205,7 +6216,11 @@ impl Store {
             Ok(_) => {}
         }
         let mut backing = open_read_only_store_backing(path)?;
-        match redb::Builder::new().open_read_only(path) {
+        // Only one database uses this open file description. Keep the original
+        // descriptor solely to copy its bytes if the read-only open needs repair;
+        // never use the duplicate to open a second database handle.
+        let file = backing.file.try_clone().map_err(StoreError::StorePath)?;
+        match redb::Builder::new().open_read_only_with_backend(FileBackend::new(file)?) {
             Ok(database) => check(&database.begin_read()?)?,
             Err(error) => {
                 let error = StoreError::from(error);
@@ -6234,6 +6249,7 @@ impl Store {
                     std::fs::remove_file(&temporary_path).map_err(StoreError::StorePath)?;
                     cleanup.0 = None;
                 }
+                std::io::Seek::rewind(&mut backing.file).map_err(StoreError::StorePath)?;
                 let copied = std::io::copy(
                     &mut std::io::Read::take(&mut backing.file, backing.length.saturating_add(1)),
                     &mut temporary.file,
@@ -6268,8 +6284,10 @@ impl Store {
     /// so an absent store is never created as a side effect of inspection.
     pub fn inspect_existing(path: impl AsRef<Path>) -> Result<StoreInspection, StoreError> {
         let path = std::path::absolute(path).map_err(StoreError::StorePath)?;
-        let before = open_read_only_store_backing(&path)?.identity;
-        let database = redb::Builder::new().open_read_only(&path)?;
+        let backing = open_read_only_store_backing(&path)?;
+        let before = backing.identity;
+        let database =
+            redb::Builder::new().open_read_only_with_backend(FileBackend::new(backing.file)?)?;
         let after = open_read_only_store_backing(&path)?.identity;
         if before != after {
             return Err(StoreError::StoreBackingInvariant(
@@ -25208,6 +25226,8 @@ mod tests {
     mod event_operation_publication;
     mod event_operation_retirement;
     mod event_subscription_listing;
+    #[cfg(unix)]
+    mod read_only_backing;
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
