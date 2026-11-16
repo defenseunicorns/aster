@@ -12,7 +12,7 @@ default = ["server", "systemd-provider"]
 nearby-discovery = ["aster-node/nearby-discovery"]
 server = ["connectrpc/server"]
 client = ["connectrpc/client"]
-systemd-provider = ["dep:aster-systemd-credentials"]
+systemd-provider = ["dep:aster-host", "dep:aster-systemd-credentials"]
 acceptance-test-provider = []
 # Internal integration-test controls; absent from default/customer builds.
 sdk-test-support = []
@@ -30,6 +30,7 @@ required-features = ["client", "acceptance-test-provider"]
 [dependencies]
 aster-mesh = { package = "aster-core", path = "../aster-core", default-features = false, features = ["reference-session"] }
 aster-iroh = { path = "../aster-iroh" }
+aster-host = { path = "../aster-host", optional = true }
 aster-node = { path = "../aster-node" }
 aster-redb-store = { path = "../aster-redb-store" }
 aster-systemd-credentials = { path = "../aster-systemd-credentials", optional = true }
@@ -59,6 +60,7 @@ rustix.workspace = true
 connectrpc-build.workspace = true
 
 [dev-dependencies]
+aster-host = { path = "../aster-host", features = ["test-support"] }
 aster-profile = { path = "../aster-profile" }
 memchr.workspace = true
 connectrpc = { workspace = true, features = ["client", "json", "server"] }

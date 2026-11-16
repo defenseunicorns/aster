@@ -1,5 +1,9 @@
 # Proposal 0004: Shared-node rust-libp2p retest
 
+> Historical scope: the subsequent retirement of `aster-lab`, `aster-host`,
+> and the native/Gate H controllers supersedes their retention and execution
+> instructions below. Recorded results remain bound to their original revisions.
+
 > ****
 
 - Status: superseded — stopped before formal Phase 0; no arm selected and

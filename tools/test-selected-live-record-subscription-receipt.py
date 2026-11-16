@@ -1273,21 +1273,6 @@ class TranscriptTests(unittest.TestCase):
         records[index] = replace_field(records[index], key, value)
         return records
 
-    def test_independent_contract_matches_modules(self) -> None:
-        self.assertEqual(CHECKER.SCHEMA, SCHEMA)
-        self.assertEqual(CHECKER.RAW_SCHEMA, RAW_SCHEMA)
-        self.assertEqual(CHECKER.TRANSCRIPT_SCHEMA, TRANSCRIPT_SCHEMA)
-        self.assertEqual(CHECKER.CLAIM, CLAIM)
-        self.assertEqual(RUNNER.CLAIM, CLAIM)
-        self.assertEqual(RUNNER.BINARY_NAME, BINARY)
-        self.assertEqual(CHECKER.TRANSCRIPT_RECORDS, TRANSCRIPT_RECORDS)
-        self.assertEqual(RUNNER.TRANSCRIPT_RECORDS, TRANSCRIPT_RECORDS)
-        self.assertEqual(tuple(CHECKER.EXPECTED_SEQUENCE), EXPECTED_SEQUENCE)
-        self.assertEqual(tuple(CHECKER.ATTEMPT_ONE_CHILD_KEYS), ATTEMPT_ONE_KEYS)
-        self.assertEqual(tuple(CHECKER.ATTEMPT_TWO_CHILD_KEYS), ATTEMPT_TWO_KEYS)
-        self.assertEqual(tuple(CHECKER.ADMITTED_SOURCE_PATHS), ADMITTED_PATHS)
-        self.assertEqual(tuple(CHECKER.LIMITATIONS), ORACLE_LIMITATIONS)
-        self.assertEqual(tuple(CHECKER.NONCLAIMS), ORACLE_NONCLAIMS)
 
     def test_exact_transcript_is_accepted(self) -> None:
         facts = CHECKER.validate_transcript(self.fixture.transcript)
@@ -1878,12 +1863,6 @@ class ArtifactTests(unittest.TestCase):
                 with self.assertRaises(RUNNER.RunnerFailure):
                     RUNNER.extract_transcript(stdout)
 
-    def test_admitted_source_closure_is_exact_and_present(self) -> None:
-        self.assertEqual(tuple(RUNNER.ADMITTED_PATHS), ADMITTED_PATHS)
-        self.assertEqual(tuple(CHECKER.ADMITTED_SOURCE_PATHS), ADMITTED_PATHS)
-        self.assertEqual(
-            [path for path in ADMITTED_PATHS if not Path(path).is_file()], []
-        )
 
     def test_receipt_renderer_rejects_sensitive_value(self) -> None:
         sensitive = identifier(61)

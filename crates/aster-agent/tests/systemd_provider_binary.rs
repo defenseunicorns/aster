@@ -92,6 +92,46 @@ fn customer_binary_statically_selects_the_systemd_provider() {
 }
 
 #[test]
+fn enabled_btle_binary_uses_real_systemd_wrapper_and_fails_closed_when_source_is_missing() {
+    // Break caught: unit-testing only an injected startup closure could leave
+    // the packaged binary disconnected from the exact systemd roster loader.
+    let fixture = BinaryFixture::new();
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&fs::read(&fixture.config).expect("read systemd config"))
+            .expect("parse systemd config");
+    config["btle"] = serde_json::json!({
+        "enabled": true,
+        "peer": "aa".repeat(32),
+        "deployment_scope_id": "42".repeat(32),
+        "policy": "rostered",
+        "emission_policy": "normal",
+        "priority": 100,
+        "credential": "aster-btle-roster"
+    });
+    fs::write(&fixture.config, config.to_string()).expect("enable BTLE policy");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster-agent"))
+        .arg("--config")
+        .arg(&fixture.config)
+        .env_remove("CREDENTIALS_DIRECTORY")
+        .output()
+        .expect("run enabled customer binary");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("UTF-8 stderr"),
+        "ERROR BTLE startup credential validation failed\n"
+    );
+    assert!(
+        fs::read_dir(&fixture.state)
+            .expect("inspect state directory")
+            .next()
+            .is_none(),
+        "missing roster source must not publish checkpoint state"
+    );
+}
+
+#[test]
 fn systemd_binary_accepts_only_schema_v1_and_has_no_compose_contract() {
     // Break caught: admitting schema v2 or linking the Compose provider would
     // turn provider choice into a runtime/configuration property.

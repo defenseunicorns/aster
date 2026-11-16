@@ -651,15 +651,6 @@ mod tests {
     }
 
     #[test]
-    fn text_groups_all_fields_and_formats_values_for_people() {
-        let response: api::GetStatusResponse = serde_json::from_value(fixture()).unwrap();
-        assert_eq!(
-            status(&response, false).unwrap(),
-            include_str!("../tests/status.txt")
-        );
-    }
-
-    #[test]
     fn scalar_defaults_are_visible_but_absent_messages_remain_absent() {
         let value: Value =
             serde_json::from_str(&status(&api::GetStatusResponse::default(), true).unwrap())

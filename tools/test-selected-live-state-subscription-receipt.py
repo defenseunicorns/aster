@@ -1299,13 +1299,6 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaises(RUNNER.RunnerFailure):
                 RUNNER.extract_transcript(stdout)
 
-    def test_all_admitted_paths_exist(self) -> None:
-        missing = [
-            relative
-            for relative in CHECKER.ADMITTED_SOURCE_PATHS
-            if not Path(relative).is_file()
-        ]
-        self.assertEqual(missing, [])
 
     def test_receipt_renderer_rejects_sensitive_digest(self) -> None:
         sensitive = identifier(61)

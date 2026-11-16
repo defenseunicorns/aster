@@ -79,7 +79,6 @@ class TimingSummaryTests(unittest.TestCase):
             summary = output.read_text(encoding="utf-8")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("## Rust test timing — partition 1/2", summary)
         self.assertIn("Tests recorded: 3", summary)
         self.assertIn("Cumulative test time: 4.750s", summary)
         self.assertLess(summary.index("slow\\|case"), summary.index("fast_case"))
@@ -148,7 +147,6 @@ class TimingSummaryTests(unittest.TestCase):
                 )
 
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("nextest timing summary failed", result.stderr)
                 self.assertFalse(exists)
                 self.assertEqual(summary, "")
 

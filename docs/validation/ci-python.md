@@ -166,6 +166,6 @@ interpreter, and the real local interpreter's supported-or-rejected outcome.
 | Existing repository quality gate | `mise run check` | Existing locked/offline Rust quality behavior retained. |
 | Stock real-process and Go client recovery smoke | `mise run agent-process-smoke` | Existing fixture build, prepare contract, checker, and cleanup unchanged. |
 
-`required` already demands literal success from `quality`. No conditional bypass
-or `continue-on-error` is added. Independent review must precede commit/push;
+The `quality` job reports failures directly. No conditional bypass or
+`continue-on-error` is added. Independent review must precede commit/push;
 actual Linux execution remains necessary before claiming this gate passes.

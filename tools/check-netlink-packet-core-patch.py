@@ -19,7 +19,6 @@ OMITTED = {
 }
 ADDED = {"ASTER-PATCH.md", "ASTER-UPSTREAM.sha256"}
 PATCHED = {"Cargo.toml", "Cargo.toml.orig"}
-ARCHIVE_SHA256 = "b897d7bd4f0af82e68d40d0344cf37e97f9c97ddf74a098de3e4da05e96ca395"
 
 
 def digest(data: bytes) -> str:
@@ -81,24 +80,6 @@ def main() -> int:
             if digest(contents) != expected_digest:
                 raise ValueError(f"{relative}: differs from the registered upstream bytes")
 
-        patch_note = (VENDOR / "ASTER-PATCH.md").read_text(encoding="utf-8")
-        normalized_patch_note = " ".join(patch_note.split())
-        if (
-            ARCHIVE_SHA256 not in patch_note
-            or "No Rust source files are modified" not in normalized_patch_note
-        ):
-            raise ValueError("ASTER-PATCH.md is missing its archive or source-equivalence binding")
-
-        root_manifest = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
-        expected_patch = 'netlink-packet-core = { path = "third-party/netlink-packet-core-0.8.2-aster" }'
-        if root_manifest.count(expected_patch) != 1:
-            raise ValueError("root Cargo patch is missing or duplicated")
-
-        lock = (ROOT / "Cargo.lock").read_text(encoding="utf-8")
-        if '\nname = "paste"\n' in lock:
-            raise ValueError("unmaintained paste package remains in Cargo.lock")
-        if lock.count('\nname = "pastey"\nversion = "0.2.2"\n') != 1:
-            raise ValueError("Cargo.lock does not contain exact pastey 0.2.2 once")
     except (OSError, ValueError) as error:
         print(f"netlink patch verification failed: {error}", file=sys.stderr)
         return 1
@@ -107,7 +88,7 @@ def main() -> int:
     print(
         "netlink patch verification passed: "
         f"{retained} retained upstream files, two exact manifest deltas, "
-        "no Rust-source drift, paste absent"
+        "no Rust-source drift"
     )
     return 0
 

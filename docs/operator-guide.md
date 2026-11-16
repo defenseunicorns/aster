@@ -455,7 +455,6 @@ export ASTER_ADMIN_IMAGE_DIGEST='sha256:<verified-admin-image-id>'
 export ASTER_ARTIFACT_DIR='/absolute/path/to/verified-compose-artifact'
 export ASTER_COMPOSE_FILE="$ASTER_ARTIFACT_DIR/compose.yaml"
 export ASTER_REMOTE_MESH_FILE="$ASTER_ARTIFACT_DIR/compose.remote-mesh.yaml"
-export ASTER_VALIDATOR="$ASTER_ARTIFACT_DIR/aster_compose_delivery.py"
 ```
 
 These files and the `asterctl`-containing admin image come from the same
@@ -535,7 +534,6 @@ Keep the container state and credential paths from the template unchanged.
 Add only reviewed peers, Blob interests, and capacity values. Then run:
 
 ```sh
-python3 "$ASTER_VALIDATOR" "$ASTER_COMPOSE_FILE"
 docker compose -f "$ASTER_COMPOSE_FILE" config --format json \
   > /tmp/aster-compose.rendered.json
 docker compose -f "$ASTER_COMPOSE_FILE" run --rm preflight
@@ -662,15 +660,14 @@ sha256sum "$ASTER_AGENT_CONFIG_FILE"
 export ASTER_AGENT_CONFIG_SHA256='<reviewed-64-lowercase-hex>'
 ```
 
-Bind the mesh port only to this host's ZeroTier IPv4. Validate the packaged
-Compose file, render the remote-mesh composition, run its preflight, and
+Bind the mesh port only to this host's ZeroTier IPv4. Render the remote-mesh
+composition, run its preflight, and
 force-recreate the Docker agent so the edited configuration is active. Keep
 the override on every lifecycle command:
 
 ```sh
 export ASTER_MESH_BIND_ADDRESS='<THIS_HOST_ZEROTIER_IPV4>'
 export ASTER_MESH_PUBLISHED_PORT=8183
-python3 "$ASTER_VALIDATOR" "$ASTER_COMPOSE_FILE"
 docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \
   config --format json > /tmp/aster-compose.remote.rendered.json
 docker compose -f "$ASTER_COMPOSE_FILE" -f "$ASTER_REMOTE_MESH_FILE" \

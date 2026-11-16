@@ -24,6 +24,7 @@ name = "blob_stream_transport_benchmark"
 required-features = ["device-validation"]
 
 [dependencies]
+aster-contact = { path = "../aster-contact" }
 aster-iroh = { path = "../aster-iroh" }
 aster-mesh = { package = "aster-core", path = "../aster-core", default-features = false, features = ["reference-session"] }
 aster-negentropy = { path = "../aster-negentropy" }
@@ -42,6 +43,7 @@ libc.workspace = true
 rustix = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
+aster-ble-l2cap = { path = "../aster-ble-l2cap" }
 aster-mesh = { package = "aster-core", path = "../aster-core", default-features = false, features = ["reference-session", "test-utils"] }
 aster-iroh = { path = "../aster-iroh", features = ["test-utils"] }
 aster-redb-store = { path = "../aster-redb-store", features = ["test-utils"] }

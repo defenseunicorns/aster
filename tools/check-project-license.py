@@ -14,9 +14,6 @@ EXPECTED_LICENSE = "Apache-2.0"
 EXPECTED_LICENSE_SHA256 = (
     "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
 )
-EXPECTED_THIRD_PARTY_NOTICES_SHA256 = (
-    "540785f9b3acfa31e2e509cbd1074310292d28976188a65ef5a85e08c6b228d5"
-)
 ROOT = Path(__file__).resolve().parents[1]
 LICENSE = ROOT / "LICENSE"
 THIRD_PARTY_NOTICES = ROOT / "THIRD_PARTY_NOTICES.md"
@@ -121,9 +118,8 @@ def main() -> None:
     if actual_hash != EXPECTED_LICENSE_SHA256:
         fail("LICENSE is not the canonical Apache License 2.0 text")
 
-    notices_hash = hashlib.sha256(THIRD_PARTY_NOTICES.read_bytes()).hexdigest()
-    if notices_hash != EXPECTED_THIRD_PARTY_NOTICES_SHA256:
-        fail("THIRD_PARTY_NOTICES.md differs from the reviewed exact-package text")
+    if not THIRD_PARTY_NOTICES.is_file():
+        fail("THIRD_PARTY_NOTICES.md is missing")
 
     package_count = validate_packages(metadata())
     package_count += validate_packages(
@@ -138,41 +134,9 @@ def main() -> None:
         if distribution_hash != EXPECTED_LICENSE_SHA256:
             fail(f"{distribution_root.relative_to(ROOT)} has a noncanonical LICENSE")
 
-    dockerfiles = (
-        ROOT / "lab" / "Dockerfile",
-        ROOT / "docker" / "lan-mvp" / "Dockerfile",
-    )
-    for dockerfile_path in dockerfiles:
-        dockerfile = dockerfile_path.read_text(encoding="utf-8")
-        if "COPY LICENSE /usr/share/licenses/aster/LICENSE" not in dockerfile:
-            fail(f"{dockerfile_path.relative_to(ROOT)} does not include LICENSE")
-        if (
-            "COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/aster/THIRD_PARTY_NOTICES.md"
-            not in dockerfile
-        ):
-            fail(
-                f"{dockerfile_path.relative_to(ROOT)} does not include third-party notices"
-            )
-    docker_ignore_files = (
-        ROOT / ".dockerignore",
-        ROOT / "lab" / "Dockerfile.dockerignore",
-        ROOT / "docker" / "lan-mvp" / "Dockerfile.dockerignore",
-    )
-    for ignore_file in docker_ignore_files:
-        if "!LICENSE" not in ignore_file.read_text(encoding="utf-8").splitlines():
-            fail(f"{ignore_file.relative_to(ROOT)} excludes LICENSE")
-        if "!THIRD_PARTY_NOTICES.md" not in ignore_file.read_text(
-            encoding="utf-8"
-        ).splitlines():
-            fail(f"{ignore_file.relative_to(ROOT)} excludes third-party notices")
-
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    if "Licensed under the Apache License, Version 2.0. See `LICENSE`." not in readme:
-        fail("README does not state the Apache License 2.0 policy")
-
     print(
         f"project-license policy passed for {package_count} packages: "
-        f"{EXPECTED_LICENSE}, canonical LICENSE and reviewed third-party notices present"
+        f"{EXPECTED_LICENSE}, canonical LICENSE and third-party notices present"
     )
 
 

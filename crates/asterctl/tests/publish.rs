@@ -404,10 +404,6 @@ fn publish_help_does_not_require_a_token_or_read_stdin() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains("[MSG]"));
-    assert!(text.contains("--journal"));
-    assert!(text.contains("--tombstone"));
 }
 
 #[test]

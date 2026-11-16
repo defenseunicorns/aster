@@ -710,9 +710,7 @@ CI entry point must run:
   out-of-root writes;
 - generic-schema versus exact-v0.1 overlay separation tests;
 - deterministic repeated-report byte comparison;
-- repository formatting/linting;
-- `python3 tools/check-implementation-requirements.py` only if a later change
-  updates trace/evidence; and
+- repository formatting/linting; and
 - `mise run check` before handoff.
 
 Synthetic fixtures must be generated inside the test workspace, remain clearly

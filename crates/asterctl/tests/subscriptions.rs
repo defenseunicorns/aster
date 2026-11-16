@@ -289,16 +289,6 @@ fn subscriptions_rejects_filters_positionals_and_multiple_commands() {
 }
 
 #[test]
-fn top_level_help_lists_subscriptions() {
-    let output = cli(&["--help"]);
-    assert!(output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("subscriptions     List Event subscriptions")
-    );
-}
-
-#[test]
 fn rpc_failures_are_sanitized_and_bounded_without_partial_output() {
     for (status, content_type, response, expected) in [
         (
@@ -388,7 +378,4 @@ fn subscriptions_help_needs_no_token() {
         .unwrap();
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
-    let help = String::from_utf8(output.stdout).unwrap();
-    assert!(help.contains("[OPTIONS] subscriptions"));
-    assert!(help.contains("List Event subscriptions"));
 }

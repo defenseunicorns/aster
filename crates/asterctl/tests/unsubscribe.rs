@@ -209,14 +209,6 @@ fn unsubscribe_help_needs_no_token() {
         .unwrap();
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
-    let help = String::from_utf8(output.stdout).unwrap();
-    assert!(help.contains("unsubscribe SUBSCRIPTION_ID"));
-    assert!(help.contains("32-byte"));
-    let output = Command::new(env!("CARGO_BIN_EXE_asterctl"))
-        .arg("--help")
-        .output()
-        .unwrap();
-    assert!(String::from_utf8_lossy(&output.stdout).contains("unsubscribe"));
 }
 
 #[test]

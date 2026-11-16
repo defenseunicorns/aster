@@ -360,24 +360,12 @@ func writeResult(output io.Writer, value result) error {
 	return nil
 }
 
-func renderResult(value result, _ string) string {
-	encoded, err := encodeResult(value)
-	if err != nil {
-		return "{\"status\":\"error\",\"code\":\"internal\"}"
-	}
-	return string(encoded)
-}
-
 func encodeResult(value result) ([]byte, error) {
 	encoded, err := json.Marshal(value)
 	if err != nil || len(encoded) > maxOutputBytes {
 		return nil, errors.New("invalid result")
 	}
 	return encoded, nil
-}
-
-func resultFixture() result {
-	return result{"status": "ok"}
 }
 
 func emissionMode(value applicationv1alpha1.EmissionMode) (string, error) {

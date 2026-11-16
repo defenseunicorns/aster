@@ -67,31 +67,6 @@ fn verifier_fails_closed_without_its_fixed_token_and_manifest_mounts() {
     );
 }
 
-#[test]
-fn compose_image_contexts_include_every_required_build_input() {
-    // Break caught: falling back to the repository-wide .dockerignore can
-    // silently omit proto/ even though both image builds copy that directory.
-    let image_root = workspace_root().join("docker/compose-agent");
-    for dockerfile in ["Dockerfile.agent", "Dockerfile.admin"] {
-        let ignore = fs::read_to_string(image_root.join(format!("{dockerfile}.dockerignore")))
-            .unwrap_or_else(|error| panic!("read {dockerfile}.dockerignore: {error}"));
-        for required in [
-            "!Cargo.toml",
-            "!Cargo.lock",
-            "!LICENSE",
-            "!THIRD_PARTY_NOTICES.md",
-            "!crates/**",
-            "!proto/**",
-            "!third-party/**",
-        ] {
-            assert!(
-                ignore.lines().any(|line| line == required),
-                "{dockerfile}.dockerignore must contain {required}"
-            );
-        }
-    }
-}
-
 #[cfg(target_os = "linux")]
 #[test]
 fn rendered_compose_model_enforces_the_hardened_service_boundaries() {

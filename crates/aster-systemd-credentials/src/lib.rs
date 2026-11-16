@@ -10,6 +10,7 @@ use aster_mesh::{
     ProvisioningLoadReceipt, ProvisioningSecretLoader, ProvisioningSecretRef,
     ProvisioningSecretStoreError, UnprotectedProvisioning,
 };
+use std::{error::Error, fmt};
 use zeroize::Zeroizing;
 
 #[cfg(target_os = "linux")]
@@ -26,6 +27,38 @@ pub const PROVIDER_CONTRACT: &str = "aster-systemd-credential-store/v2";
 
 /// Fixed systemd service credential consumed by the Aster agent.
 pub const CREDENTIAL_NAME: &str = "aster-provisioning.bundle";
+
+/// Exact logical systemd credential containing one ASTRBD02 artifact.
+pub const BTLE_ROSTER_CREDENTIAL_NAME: &str = "aster-btle-roster";
+
+/// Largest canonical two-generation ASTRBD02 artifact.
+pub const MAX_BTLE_ROSTER_CREDENTIAL_BYTES: usize = 145;
+
+/// Closed, secret-free roster credential source failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BtleRosterCredentialError {
+    /// The exact systemd credential is absent or unreadable.
+    Unavailable,
+    /// The credential source or descriptor custody is not acceptable.
+    Rejected,
+    /// The credential exceeds the canonical artifact bound.
+    TooLarge,
+    /// This move-only loader has already transferred its artifact.
+    Consumed,
+}
+
+impl fmt::Display for BtleRosterCredentialError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Unavailable => "BTLE roster credential is unavailable",
+            Self::Rejected => "BTLE roster credential source is rejected",
+            Self::TooLarge => "BTLE roster credential exceeds its bound",
+            Self::Consumed => "BTLE roster credential was already consumed",
+        })
+    }
+}
+
+impl Error for BtleRosterCredentialError {}
 
 /// Exact size of the random identity in a v2 provider reference.
 pub const PROVIDER_REFERENCE_ID_BYTES: usize = 32;
@@ -123,6 +156,8 @@ fn widen_stat_field(value: impl Into<u64>) -> u64 {
 enum RuntimeCredentialPresentation {
     SecureRamfs,
     SystemdAclTmpfs,
+    #[cfg(test)]
+    TestOwnerOnly,
 }
 
 #[cfg(target_os = "linux")]
@@ -152,18 +187,9 @@ impl SystemdCredentialLoader {
     /// `CREDENTIALS_DIRECTORY`, refusing absent, relative, traversing, or
     /// symlinked paths.
     pub fn from_environment() -> Result<Self, ProvisioningSecretStoreError> {
-        let path = env::var_os(CREDENTIALS_DIRECTORY_ENV)
-            .ok_or(ProvisioningSecretStoreError::Unavailable)?;
-        let path = Path::new(&path);
-        let directory = open_credential_directory(path).map_err(map_credential_source_error)?;
-        let presentation =
-            classify_runtime_presentation(&directory, path, rustix::process::geteuid().as_raw())
-                .map_err(map_credential_source_error)?;
         Ok(Self {
-            source: CredentialSource::Runtime {
-                directory,
-                presentation,
-            },
+            source: runtime_credential_source_from_environment()
+                .map_err(map_credential_source_error)?,
             consumed: false,
         })
     }
@@ -197,14 +223,105 @@ impl SystemdCredentialLoader {
             CredentialSource::Runtime {
                 directory,
                 presentation,
-            } => read_runtime_credential(directory, *presentation)
-                .map_err(map_credential_source_error),
+            } => read_runtime_credential(
+                directory,
+                *presentation,
+                CREDENTIAL_NAME,
+                MAX_CREDENTIAL_ENVELOPE_BYTES,
+            )
+            .map_err(map_credential_source_error),
             #[cfg(test)]
             CredentialSource::Test(encoded) => encoded
                 .take()
                 .ok_or(ProvisioningSecretStoreError::OperationConflict),
         }
     }
+}
+
+/// Move-only loader for the exact `aster-btle-roster` systemd credential.
+#[cfg(target_os = "linux")]
+pub struct SystemdBtleRosterCredentialLoader {
+    source: CredentialSource,
+    consumed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for SystemdBtleRosterCredentialLoader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SystemdBtleRosterCredentialLoader([REDACTED])")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SystemdBtleRosterCredentialLoader {
+    /// Opens PID 1's credential directory without reading any credential.
+    pub fn from_environment() -> Result<Self, BtleRosterCredentialError> {
+        Ok(Self {
+            source: runtime_credential_source_from_environment().map_err(map_btle_source_error)?,
+            consumed: false,
+        })
+    }
+
+    #[cfg(test)]
+    fn from_directory_for_test(path: &Path) -> Result<Self, BtleRosterCredentialError> {
+        let directory = open_credential_directory(path).map_err(map_btle_source_error)?;
+        Ok(Self {
+            source: CredentialSource::Runtime {
+                directory,
+                presentation: RuntimeCredentialPresentation::SecureRamfs,
+            },
+            consumed: false,
+        })
+    }
+
+    #[cfg(test)]
+    fn from_owner_only_directory_for_test(path: &Path) -> Result<Self, BtleRosterCredentialError> {
+        let directory = open_credential_directory(path).map_err(map_btle_source_error)?;
+        Ok(Self {
+            source: CredentialSource::Runtime {
+                directory,
+                presentation: RuntimeCredentialPresentation::TestOwnerOnly,
+            },
+            consumed: false,
+        })
+    }
+
+    /// Moves the exact bounded raw artifact to the host authority once.
+    pub fn load_artifact(&mut self) -> Result<Zeroizing<Vec<u8>>, BtleRosterCredentialError> {
+        if self.consumed {
+            return Err(BtleRosterCredentialError::Consumed);
+        }
+        self.consumed = true;
+        match &mut self.source {
+            CredentialSource::Runtime {
+                directory,
+                presentation,
+            } => read_runtime_credential(
+                directory,
+                *presentation,
+                BTLE_ROSTER_CREDENTIAL_NAME,
+                MAX_BTLE_ROSTER_CREDENTIAL_BYTES,
+            )
+            .map_err(map_btle_source_error),
+            #[cfg(test)]
+            CredentialSource::Test(encoded) => {
+                encoded.take().ok_or(BtleRosterCredentialError::Consumed)
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_credential_source_from_environment() -> Result<CredentialSource, CredentialSourceError> {
+    let path = env::var_os(CREDENTIALS_DIRECTORY_ENV).ok_or(CredentialSourceError::Directory)?;
+    let path = Path::new(&path);
+    let directory = open_credential_directory(path)?;
+    let presentation =
+        classify_runtime_presentation(&directory, path, rustix::process::geteuid().as_raw())?;
+    Ok(CredentialSource::Runtime {
+        directory,
+        presentation,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -256,10 +373,13 @@ fn open_credential_directory(path: &Path) -> Result<OwnedFd, CredentialSourceErr
 fn read_runtime_credential(
     directory: &OwnedFd,
     presentation: RuntimeCredentialPresentation,
+    name: &str,
+    maximum_bytes: usize,
 ) -> Result<Zeroizing<Vec<u8>>, CredentialSourceError> {
+    validate_credential_basename(name)?;
     let descriptor = rustix::fs::openat(
         directory,
-        CREDENTIAL_NAME,
+        name,
         rustix::fs::OFlags::RDONLY
             | rustix::fs::OFlags::CLOEXEC
             | rustix::fs::OFlags::NOFOLLOW
@@ -280,16 +400,16 @@ fn read_runtime_credential(
     let filesystem = rustix::fs::fstatfs(&file).map_err(|_| CredentialSourceError::File)?;
     validate_runtime_credential(&file, &before, filesystem.f_type as i64, presentation)?;
     let declared = usize::try_from(before.size).map_err(|_| CredentialSourceError::TooLarge)?;
-    if declared > MAX_CREDENTIAL_ENVELOPE_BYTES {
+    if declared > maximum_bytes {
         return Err(CredentialSourceError::TooLarge);
     }
 
     let mut encoded = Zeroizing::new(Vec::with_capacity(declared));
     (&mut file)
-        .take((MAX_CREDENTIAL_ENVELOPE_BYTES + 1) as u64)
+        .take((maximum_bytes + 1) as u64)
         .read_to_end(&mut encoded)
         .map_err(|_| CredentialSourceError::File)?;
-    if encoded.len() > MAX_CREDENTIAL_ENVELOPE_BYTES {
+    if encoded.len() > maximum_bytes {
         return Err(CredentialSourceError::TooLarge);
     }
 
@@ -302,6 +422,15 @@ fn read_runtime_credential(
         return Err(CredentialSourceError::Changed);
     }
     Ok(encoded)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_credential_basename(name: &str) -> Result<(), CredentialSourceError> {
+    let mut components = Path::new(name).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(CredentialSourceError::Directory);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -372,7 +501,26 @@ fn validate_runtime_credential(
                 true,
             )
         }
+        #[cfg(test)]
+        RuntimeCredentialPresentation::TestOwnerOnly => {
+            validate_test_owner_only_credential(metadata, service_uid)
+        }
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn validate_test_owner_only_credential(
+    metadata: &CredentialFileMetadata,
+    expected_owner: u32,
+) -> Result<(), CredentialSourceError> {
+    if !metadata.regular
+        || metadata.owner != expected_owner
+        || metadata.mode != 0o400
+        || metadata.links != 1
+    {
+        return Err(CredentialSourceError::Insecure);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -564,10 +712,37 @@ const fn map_credential_source_error(error: CredentialSourceError) -> Provisioni
     }
 }
 
+#[cfg(target_os = "linux")]
+const fn map_btle_source_error(error: CredentialSourceError) -> BtleRosterCredentialError {
+    match error {
+        CredentialSourceError::TooLarge => BtleRosterCredentialError::TooLarge,
+        CredentialSourceError::Directory | CredentialSourceError::File => {
+            BtleRosterCredentialError::Unavailable
+        }
+        CredentialSourceError::Insecure
+        | CredentialSourceError::Weak
+        | CredentialSourceError::Changed => BtleRosterCredentialError::Rejected,
+    }
+}
+
 /// Non-Linux builds are outside the selected D06 profile and always fail
 /// closed before attempting to load a credential.
 #[cfg(not(target_os = "linux"))]
 pub struct SystemdCredentialLoader;
+
+#[cfg(not(target_os = "linux"))]
+pub struct SystemdBtleRosterCredentialLoader;
+
+#[cfg(not(target_os = "linux"))]
+impl SystemdBtleRosterCredentialLoader {
+    pub fn from_environment() -> Result<Self, BtleRosterCredentialError> {
+        Err(BtleRosterCredentialError::Unavailable)
+    }
+
+    pub fn load_artifact(&mut self) -> Result<Zeroizing<Vec<u8>>, BtleRosterCredentialError> {
+        Err(BtleRosterCredentialError::Unavailable)
+    }
+}
 
 #[cfg(not(target_os = "linux"))]
 impl SystemdCredentialLoader {
@@ -797,9 +972,11 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{
-        CredentialFileMetadata, CredentialSourceError, MAX_CREDENTIAL_ENVELOPE_BYTES,
-        PROVIDER_REFERENCE_ID_BYTES, RAMFS_MAGIC, SystemdCredentialLoader, TMPFS_MAGIC,
-        decode_credential_envelope, encode_credential_envelope, metadata_is_stable,
+        BTLE_ROSTER_CREDENTIAL_NAME, BtleRosterCredentialError, CredentialFileMetadata,
+        CredentialSourceError, MAX_BTLE_ROSTER_CREDENTIAL_BYTES, MAX_CREDENTIAL_ENVELOPE_BYTES,
+        PROVIDER_REFERENCE_ID_BYTES, RAMFS_MAGIC, SystemdBtleRosterCredentialLoader,
+        SystemdCredentialLoader, TMPFS_MAGIC, decode_credential_envelope,
+        encode_credential_envelope, metadata_is_stable,
         mountinfo_bytes_have_exactly_one_selected_systemd_tmpfs,
         mountinfo_line_is_selected_systemd_tmpfs, open_credential_directory,
         provisioning_secret_ref, validate_credential_metadata,
@@ -1289,6 +1466,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn btle_roster_loader_is_exact_bounded_non_aliasing_and_one_shot() {
+        // Break caught: accepting a configurable/fallback basename could
+        // alias mission provisioning; an unbounded or reusable load could
+        // retain or duplicate discovery secret material.
+        assert_ne!(BTLE_ROSTER_CREDENTIAL_NAME, super::CREDENTIAL_NAME);
+        let fixture = RuntimeFixture::new();
+        let roster = vec![0x42; MAX_BTLE_ROSTER_CREDENTIAL_BYTES];
+        fixture.write_named(BTLE_ROSTER_CREDENTIAL_NAME, &roster, 0o400);
+        fixture.write_named(super::CREDENTIAL_NAME, &[0x99; 109], 0o400);
+        let mut loader =
+            SystemdBtleRosterCredentialLoader::from_owner_only_directory_for_test(&fixture.root)
+                .expect("open exact-name test directory");
+        assert_eq!(
+            format!("{loader:?}"),
+            "SystemdBtleRosterCredentialLoader([REDACTED])"
+        );
+        assert_eq!(loader.load_artifact().unwrap().as_slice(), roster);
+        assert_eq!(
+            loader.load_artifact().unwrap_err(),
+            BtleRosterCredentialError::Consumed
+        );
+
+        fs::remove_file(fixture.named(BTLE_ROSTER_CREDENTIAL_NAME)).unwrap();
+        let mut absent =
+            SystemdBtleRosterCredentialLoader::from_owner_only_directory_for_test(&fixture.root)
+                .unwrap();
+        assert_eq!(
+            absent.load_artifact().unwrap_err(),
+            BtleRosterCredentialError::Unavailable
+        );
+
+        fixture.write_named(
+            BTLE_ROSTER_CREDENTIAL_NAME,
+            &[0x55; MAX_BTLE_ROSTER_CREDENTIAL_BYTES + 1],
+            0o400,
+        );
+        let mut oversized =
+            SystemdBtleRosterCredentialLoader::from_owner_only_directory_for_test(&fixture.root)
+                .unwrap();
+        assert_eq!(
+            oversized.load_artifact().unwrap_err(),
+            BtleRosterCredentialError::TooLarge
+        );
+    }
+
+    #[test]
+    fn btle_roster_loader_rejects_symlink_traversal_and_wrong_runtime_storage() {
+        // Break caught: the roster credential must inherit the production
+        // no-traversal/no-symlink/tmpfs custody boundary rather than becoming
+        // an ordinary-file secret fallback.
+        let fixture = RuntimeFixture::new();
+        fixture.write_named("credential-target", &[0x42; 109], 0o400);
+        symlink(
+            fixture.named("credential-target"),
+            fixture.named(BTLE_ROSTER_CREDENTIAL_NAME),
+        )
+        .unwrap();
+        let mut symlinked =
+            SystemdBtleRosterCredentialLoader::from_owner_only_directory_for_test(&fixture.root)
+                .unwrap();
+        assert_eq!(
+            symlinked.load_artifact().unwrap_err(),
+            BtleRosterCredentialError::Rejected
+        );
+
+        fs::remove_file(fixture.named(BTLE_ROSTER_CREDENTIAL_NAME)).unwrap();
+        fixture.write_named(BTLE_ROSTER_CREDENTIAL_NAME, &[0x42; 109], 0o400);
+        let mut weak = SystemdBtleRosterCredentialLoader::from_directory_for_test(&fixture.root)
+            .expect("open ordinary directory descriptor");
+        assert_eq!(
+            weak.load_artifact().unwrap_err(),
+            BtleRosterCredentialError::Rejected
+        );
+
+        for rejected in ["../aster-btle-roster", "subdir/aster-btle-roster", ""] {
+            assert_eq!(
+                super::validate_credential_basename(rejected).unwrap_err(),
+                CredentialSourceError::Directory
+            );
+        }
+    }
+
     struct RuntimeFixture {
         root: std::path::PathBuf,
     }
@@ -1308,6 +1568,16 @@ mod tests {
 
         fn credential(&self) -> std::path::PathBuf {
             self.root.join(super::CREDENTIAL_NAME)
+        }
+
+        fn named(&self, name: &str) -> std::path::PathBuf {
+            self.root.join(name)
+        }
+
+        fn write_named(&self, name: &str, bytes: &[u8], mode: u32) {
+            fs::write(self.named(name), bytes).expect("write named credential");
+            fs::set_permissions(self.named(name), fs::Permissions::from_mode(mode))
+                .expect("set named credential mode");
         }
 
         fn write_credential(&self, bytes: &[u8], mode: u32) {

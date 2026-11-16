@@ -1,0 +1,21 @@
+[package]
+name = "aster-ble-l2cap"
+description = "Bounded adapter-neutral LE L2CAP ordered contact for Aster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+fuzzing = []
+
+[dependencies]
+aster-contact = { path = "../aster-contact" }
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros"] }
+
+[lints]
+workspace = true

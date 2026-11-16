@@ -22,6 +22,9 @@ systemd_credential_corpus="$fuzz_smoke_dir/systemd-credential-corpus"
 systemd_admin_record_corpus="$fuzz_smoke_dir/systemd-admin-record-corpus"
 systemd_backup_corpus="$fuzz_smoke_dir/systemd-backup-corpus"
 stream_transfer_corpus="$fuzz_smoke_dir/stream-transfer-corpus"
+ble_l2cap_record_corpus="$fuzz_smoke_dir/ble-l2cap-record-corpus"
+ble_roster_beacon_corpus="$fuzz_smoke_dir/ble-roster-beacon-corpus"
+ble_discovery_credential_corpus="$fuzz_smoke_dir/ble-discovery-credential-corpus"
 wire_artifacts="$fuzz_smoke_dir/wire-artifacts"
 fragment_artifacts="$fuzz_smoke_dir/fragment-artifacts"
 envelope_artifacts="$fuzz_smoke_dir/envelope-artifacts"
@@ -32,6 +35,9 @@ systemd_credential_artifacts="$fuzz_smoke_dir/systemd-credential-artifacts"
 systemd_admin_record_artifacts="$fuzz_smoke_dir/systemd-admin-record-artifacts"
 systemd_backup_artifacts="$fuzz_smoke_dir/systemd-backup-artifacts"
 stream_transfer_artifacts="$fuzz_smoke_dir/stream-transfer-artifacts"
+ble_l2cap_record_artifacts="$fuzz_smoke_dir/ble-l2cap-record-artifacts"
+ble_roster_beacon_artifacts="$fuzz_smoke_dir/ble-roster-beacon-artifacts"
+ble_discovery_credential_artifacts="$fuzz_smoke_dir/ble-discovery-credential-artifacts"
 mkdir -p "$wire_corpus" "$fragment_corpus" "$envelope_corpus" \
     "$selected_frame_corpus" "$selected_negentropy_corpus" "$classical_profile_corpus" \
     "$systemd_credential_corpus" "$systemd_admin_record_corpus" "$stream_transfer_corpus" \
@@ -39,7 +45,9 @@ mkdir -p "$wire_corpus" "$fragment_corpus" "$envelope_corpus" \
     "$selected_frame_artifacts" "$selected_negentropy_artifacts" \
     "$classical_profile_artifacts" "$systemd_credential_artifacts" \
     "$systemd_admin_record_artifacts" "$systemd_backup_corpus" "$systemd_backup_artifacts" \
-    "$stream_transfer_artifacts"
+    "$stream_transfer_artifacts" "$ble_l2cap_record_corpus" "$ble_l2cap_record_artifacts" \
+    "$ble_roster_beacon_corpus" "$ble_roster_beacon_artifacts" \
+    "$ble_discovery_credential_corpus" "$ble_discovery_credential_artifacts"
 cp -R "$project_dir/fuzz/corpus/wire_decode/." "$wire_corpus/"
 cp -R "$project_dir/fuzz/corpus/fragment_decode/." "$fragment_corpus/"
 cp -R "$project_dir/fuzz/corpus/envelope_inspect/." "$envelope_corpus/"
@@ -47,6 +55,9 @@ cp -R "$project_dir/fuzz/corpus/selected_frame_decode/." "$selected_frame_corpus
 cp -R "$project_dir/fuzz/corpus/classical_profile_decode/." "$classical_profile_corpus/"
 cp -R "$project_dir/fuzz/corpus/systemd_credential_decode/." "$systemd_credential_corpus/"
 cp -R "$project_dir/fuzz/corpus/stream_transfer_decode/." "$stream_transfer_corpus/"
+cp -R "$project_dir/fuzz/corpus/ble_l2cap_record/." "$ble_l2cap_record_corpus/"
+cp -R "$project_dir/fuzz/corpus/ble_roster_beacon/." "$ble_roster_beacon_corpus/"
+cp -R "$project_dir/fuzz/corpus/ble_discovery_credential/." "$ble_discovery_credential_corpus/"
 
 cd "$project_dir"
 cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz wire_decode "$wire_corpus" -- \
@@ -73,6 +84,15 @@ cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz systemd_credential_decode "$s
 cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz stream_transfer_decode "$stream_transfer_corpus" -- \
     -runs=10000 -max_len=1052672 -seed=2026102201 \
     -artifact_prefix="$stream_transfer_artifacts/" -print_final_stats=1
+cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz ble_l2cap_record "$ble_l2cap_record_corpus" -- \
+    -runs=10000 -max_len=2097157 -seed=2026110301 \
+    -artifact_prefix="$ble_l2cap_record_artifacts/" -print_final_stats=1
+cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz ble_roster_beacon "$ble_roster_beacon_corpus" -- \
+    -runs=10000 -max_len=256 -seed=2026110601 \
+    -artifact_prefix="$ble_roster_beacon_artifacts/" -print_final_stats=1
+cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz ble_discovery_credential "$ble_discovery_credential_corpus" -- \
+    -runs=10000 -max_len=256 -seed=2026110602 \
+    -artifact_prefix="$ble_discovery_credential_artifacts/" -print_final_stats=1
 if [ "$(uname -s)" = Linux ]; then
   cargo +nightly-2026-08-18 fuzz run --fuzz-dir fuzz systemd_admin_record_decode "$systemd_admin_record_corpus" -- \
     -runs=10000 -max_len=262144 -seed=2026090802 \

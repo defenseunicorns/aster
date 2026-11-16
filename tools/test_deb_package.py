@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import shlex
 import struct
 import subprocess
 import sys
@@ -16,11 +17,23 @@ package = Path(sys.argv[1])
 metadata = Path(sys.argv[3]) if len(sys.argv) > 3 else Path("target/deb-metadata")
 architecture = sys.argv[2]
 machine = {"amd64": 62, "arm64": 183}[architecture]
+
+
+def shell_function(script, name):
+    start = script.index(f"{name}() {{\n")
+    end = script.index("\n}\n", start) + 3
+    return script[start:end]
+
+
 def field(name):
     return subprocess.check_output(["dpkg-deb", "-f", str(package), name], text=True).strip()
 assert field("Package") == "aster"
 assert field("Architecture") == architecture
-assert "libc6" in field("Depends") and "systemd" in field("Depends")
+dependencies = field("Depends")
+assert all(
+    dependency in dependencies
+    for dependency in ("libc6", "systemd", "acl", "adduser")
+)
 archive = subprocess.check_output(["dpkg-deb", "--fsys-tarfile", str(package)])
 with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
     members = {m.name.removeprefix("./"): m for m in tar.getmembers()}
@@ -54,6 +67,68 @@ with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
     assert members["var/lib/aster/provisioning-systemd"].mode == 0o700
     assert members["var/lib/aster-agent"].mode == 0o700
     assert "etc/aster/agent.json" not in members
-    assert any(name.endswith("/systemd/system/aster-agent.service") for name in members)
+    service_paths = [
+        name
+        for name in members
+        if name.endswith("/systemd/system/aster-agent.service")
+    ]
+    assert len(service_paths) == 1
+    service = read(service_paths[0]).decode().lower().splitlines()
+    for directive in ("capabilityboundingset=", "ambientcapabilities="):
+        assert [line for line in service if line.startswith(directive)] == [directive]
+    assert service.count(
+        "restrictaddressfamilies=af_unix af_inet af_inet6 af_netlink"
+    ) == 1
+    assert not any(
+        value in "\n".join(service)
+        for value in (
+            "aster-btle-roster",
+            "af_bluetooth",
+            "cap_net_admin",
+            "cap_net_raw",
+        )
+    )
+    policy_roots = (
+        "etc/dbus-1/system.d/",
+        "usr/share/dbus-1/system.d/",
+        "etc/polkit-1/",
+        "usr/share/polkit-1/",
+    )
+    assert not any(name.startswith(policy_roots) for name in members)
+    packaged_tmpfiles = read("usr/lib/tmpfiles.d/aster.conf").decode().splitlines()
+    packaged_tmpfiles = [
+        shlex.split(line)
+        for line in packaged_tmpfiles
+        if line and not line.startswith("#")
+    ]
+    assert packaged_tmpfiles == [
+        ["d", "/run/aster-agent", "0755", "root", "root", "-"],
+        ["f", "/run/aster-agent/btle-authority.lock", "0440", "root", "root", "-"],
+        [
+            "a",
+            "/run/aster-agent/btle-authority.lock",
+            "-",
+            "-",
+            "-",
+            "-",
+            "u::r--,u:aster:r--,g::---,m::r--,o::---",
+        ],
+    ]
     assert not any("non-production" in name or name.endswith(".bundle") for name in members)
+
+control_archive = subprocess.check_output(["dpkg-deb", "--ctrl-tarfile", str(package)])
+with tarfile.open(fileobj=io.BytesIO(control_archive)) as tar:
+    members = {m.name.removeprefix("./"): m for m in tar.getmembers()}
+    postinst_member = members["postinst"]
+    assert postinst_member.isfile()
+    postinst = tar.extractfile(postinst_member).read().decode()
+    assert postinst.count("check_btle_authority_hierarchy allow-missing") == 1
+    assert postinst.count("check_btle_authority_hierarchy require-present") == 1
+    assert shell_function(postinst, "check_btle_authority_hierarchy") == """\
+check_btle_authority_hierarchy() {
+    check_btle_authority_ancestor
+    check_btle_authority_directory "$1"
+    check_btle_authority_lock "$1"
+}
+"""
 print("Package payload, manual page, ELF architecture, external SBOMs and checksums: OK")

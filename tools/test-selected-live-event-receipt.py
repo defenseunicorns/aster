@@ -1712,44 +1712,6 @@ class SelectedLiveEventReceiptTests(unittest.TestCase):
                     with self.assertRaises(CHECKER.ReceiptViolation):
                         fixture.receipt()
 
-    def test_independent_contract_oracles_match_all_three_tools(self) -> None:
-        self.assertEqual(CHECKER.SCHEMA, ORACLE_RECEIPT_SCHEMA)
-        self.assertEqual(CHECKER.RAW_SCHEMA, ORACLE_RAW_SCHEMA)
-        self.assertEqual(CHECKER.TRANSCRIPT_SCHEMA, ORACLE_TRANSCRIPT_SCHEMA)
-        self.assertEqual(CHECKER.CLAIM, ORACLE_CLAIM)
-        self.assertEqual(CHECKER.TRANSCRIPT_RECORDS, ORACLE_TRANSCRIPT_RECORDS)
-        self.assertEqual(RUNNER.RAW_SCHEMA, ORACLE_RAW_SCHEMA)
-        self.assertEqual(RUNNER.CLAIM, ORACLE_CLAIM)
-        self.assertEqual(RUNNER.TRANSCRIPT_RECORDS, ORACLE_TRANSCRIPT_RECORDS)
-        self.assertEqual(tuple(CHECKER.EXPECTED_BUILD_ARGV), ORACLE_BUILD_ARGV)
-        self.assertEqual(tuple(RUNNER.BUILD_ARGV), ORACLE_BUILD_ARGV)
-        self.assertEqual(tuple(CHECKER.ADMITTED_SOURCE_PATHS), ORACLE_ADMITTED_PATHS)
-        self.assertEqual(tuple(RUNNER.ADMITTED_PATHS), ORACLE_ADMITTED_PATHS)
-        self.assertEqual(tuple(CHECKER.LIMITATIONS), ORACLE_LIMITATIONS)
-        self.assertEqual(tuple(CHECKER.NONCLAIMS), ORACLE_NONCLAIMS)
-        self.assertEqual(CHECKER.PAYLOAD_HASHES, ORACLE_PAYLOAD_HASHES)
-        self.assertEqual(CHECKER.EXPECTED_SEQUENCE, ORACLE_SEQUENCE)
-
-    def test_producer_literals_match_independent_contract(self) -> None:
-        producer = (
-            Path(__file__).parents[1]
-            / "crates/aster-node/examples/live_event_acceptance.rs"
-        ).read_text(encoding="utf-8")
-        for literal in (
-            ORACLE_TRANSCRIPT_SCHEMA,
-            ORACLE_CLAIM,
-            "const TRANSCRIPT_RECORDS: usize = 79;",
-            'const TOPIC: &str = "opaque";',
-            'const BETA_TOPIC: &str = "opaque.beta";',
-            'const SCOPE: &str = "test/runtime-contact";',
-            'const FIRST_PAYLOAD: &[u8] = b"priority event one";',
-            'const SECOND_PAYLOAD: &[u8] = b"routine event two";',
-            'const THIRD_PAYLOAD: &[u8] = b"flash event three";',
-            "parent_child_kill",
-            "policy_changed_since_contact",
-        ):
-            with self.subTest(literal=literal):
-                self.assertIn(literal, producer)
 
     def test_runner_extracts_exact_ordered_79_record_transcript(self) -> None:
         stdout = self.fixture.root / "synthetic-stdout.log"

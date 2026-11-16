@@ -15,6 +15,75 @@ check_directory() {
     fi
 }
 
+btle_authority_access_acl() {
+    LC_ALL=C getfacl --access --absolute-names --omit-header -- "$1"
+}
+
+btle_authority_default_acl() {
+    LC_ALL=C getfacl --default --absolute-names --omit-header -- "$1"
+}
+
+check_btle_authority_ancestor() {
+    path=/run
+    test ! -L "$path" && test -d "$path" || {
+        echo 'aster: unsafe BTLE authority ancestor' >&2
+        exit 1
+    }
+    test "$(stat -c '%u:%g:%a' -- "$path")" = 0:0:755 &&
+        test "$(btle_authority_access_acl "$path")" = "$(printf '%s\n' \
+            'user::rwx' 'group::r-x' 'other::r-x')" &&
+        test -z "$(btle_authority_default_acl "$path")" || {
+        echo 'aster: unsafe BTLE authority ancestor custody' >&2
+        exit 1
+    }
+}
+
+check_btle_authority_directory() {
+    path=/run/aster-agent
+    if test ! -e "$path" && test ! -L "$path"; then
+        test "$1" = allow-missing && return 0
+        echo 'aster: missing BTLE authority directory' >&2
+        exit 1
+    fi
+    test ! -L "$path" && test -d "$path" || {
+        echo 'aster: unsafe BTLE authority directory' >&2
+        exit 1
+    }
+    test "$(stat -c '%u:%g:%a' -- "$path")" = 0:0:755 &&
+        test "$(btle_authority_access_acl "$path")" = "$(printf '%s\n' \
+            'user::rwx' 'group::r-x' 'other::r-x')" &&
+        test -z "$(btle_authority_default_acl "$path")" || {
+        echo 'aster: unsafe BTLE authority directory custody' >&2
+        exit 1
+    }
+}
+
+check_btle_authority_lock() {
+    path=/run/aster-agent/btle-authority.lock
+    if test ! -e "$path" && test ! -L "$path"; then
+        test "$1" = allow-missing && return 0
+        echo 'aster: missing BTLE authority lock' >&2
+        exit 1
+    fi
+    test ! -L "$path" && test -f "$path" || {
+        echo 'aster: unsafe BTLE authority lock type' >&2
+        exit 1
+    }
+    test "$(stat -c '%u:%g:%a:%s:%h' -- "$path")" = 0:0:440:0:1 &&
+        test "$(btle_authority_access_acl "$path")" = "$(printf '%s\n' \
+            'user::r--' 'user:aster:r--' 'group::---' 'mask::r--' 'other::---')" &&
+        test -z "$(btle_authority_default_acl "$path")" || {
+        echo 'aster: unsafe BTLE authority lock custody' >&2
+        exit 1
+    }
+}
+
+check_btle_authority_hierarchy() {
+    check_btle_authority_ancestor
+    check_btle_authority_directory "$1"
+    check_btle_authority_lock "$1"
+}
+
 if [ "$1" = configure ]; then
     if ! getent passwd aster >/dev/null; then
         adduser --system --group --home /var/lib/aster-agent --no-create-home \
@@ -28,6 +97,9 @@ if [ "$1" = configure ]; then
         echo 'aster: existing account is not the package service account' >&2
         exit 1
     fi
+    # Reject unsafe existing volatile custody before debhelper invokes
+    # systemd-tmpfiles. Missing objects are created by the packaged policy.
+    check_btle_authority_hierarchy allow-missing
     # Validate ancestors before operating on package directories.
     for path in / /etc /var /var/lib; do
         check_directory "$path" 0
@@ -49,3 +121,8 @@ if [ "$1" = configure ]; then
 EOF
 fi
 #DEBHELPER#
+if [ "$1" = configure ]; then
+    # Prove that the debhelper-created volatile objects match the host
+    # credential authority before allowing installation to succeed.
+    check_btle_authority_hierarchy require-present
+fi

@@ -18,7 +18,7 @@ FROM ${ASTER_LAN_BASE_IMAGE} AS runtime
 ENV PATH="/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     PYTHONDONTWRITEBYTECODE=1 \
     HOME=/tmp
-COPY lab/debian.sources /etc/apt/sources.list.d/debian.sources
+COPY docker/debian.sources /etc/apt/sources.list.d/debian.sources
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends python3 \
     && install -d -m 0755 /usr/share/licenses/aster \

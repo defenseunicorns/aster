@@ -133,13 +133,6 @@ func TestTokenIsReadFromOwnerOnlyFile(t *testing.T) {
 	}
 }
 
-func TestResultNeverPrintsAuthorization(t *testing.T) {
-	got := renderResult(resultFixture(), "Bearer SECRET_TOKEN_CANARY")
-	if strings.Contains(got, "SECRET_TOKEN_CANARY") {
-		t.Fatal("authorization value exposed")
-	}
-}
-
 func TestTokenValidationAcceptsOnlyBoundedOwnerOnlyRegularFile(t *testing.T) {
 	valid := writeToken(t, 0o600)
 	if err := validateTokenFile(valid); err != nil {
@@ -314,15 +307,6 @@ func TestRecoveredEventMatchIsSensitiveToEveryExposedField(t *testing.T) {
 		matched, err := eventMatches(changed, expected)
 		if err != nil || matched {
 			t.Fatalf("mutation %d was not detected: matched=%v err=%v", index, matched, err)
-		}
-	}
-}
-
-func TestQueryEvidenceContainsNoEventValues(t *testing.T) {
-	got := renderResult(result{"status": "ok", "exact_match": true, "count": 1, "has_more": false}, "Bearer SECRET_TOKEN_CANARY")
-	for _, secret := range []string{"SECRET_TOKEN_CANARY", "SECRET_TOPIC_CANARY", "SECRET_SCOPE_CANARY", "SECRET_PAYLOAD_CANARY"} {
-		if strings.Contains(got, secret) {
-			t.Fatalf("query evidence exposed %s", secret)
 		}
 	}
 }

@@ -367,9 +367,8 @@ Before device work, run the focused contract checks:
 
 ```sh
 python3 conformance/blob_stream_oracle.py
-python3 tools/check-protocol-version-contract.py
+cargo test --locked -p aster-node --features fuzzing transcript_seed_expectations_match_model_and_production_states -- --nocapture
 python3 tools/test-protocol-version-contract.py
-python3 tools/test-run-fuzz-smoke.py
 tools/run-fuzz-smoke.sh
 ```
 

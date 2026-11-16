@@ -1,5 +1,9 @@
 # Decision 0045: Remove the experimental libp2p test oracle
 
+> Historical scope: the subsequent retirement of `aster-lab`, `aster-host`,
+> and the native/Gate H controllers supersedes their retention and execution
+> instructions below. Recorded results remain bound to their original revisions.
+
 - Status: accepted — bounded test and dependency maintenance
 - Date: 2026-10-14
 - Supersedes: Decision 0029's retained-oracle boundary and Decision 0026's

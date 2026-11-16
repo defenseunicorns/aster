@@ -1,5 +1,9 @@
 # Decision 0024: Refactor durable node ownership before selecting an IP provider
 
+> Historical scope: the subsequent retirement of `aster-lab`, `aster-host`,
+> and the native/Gate H controllers supersedes their retention and execution
+> instructions below. Recorded results remain bound to their original revisions.
+
 > ****
 
 - Status: accepted — no provider selected

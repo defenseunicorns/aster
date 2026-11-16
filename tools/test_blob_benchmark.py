@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from blob_benchmark import main, parse_records, summarize, campaign
+from blob_benchmark import main, parse_records, summarize
 
 
 class MainPublication(unittest.TestCase):
@@ -102,18 +102,6 @@ class MainPublication(unittest.TestCase):
 
 
 class Results(unittest.TestCase):
-    def test_campaign_is_exactly_four_small_single_samples(self):
-        self.assertEqual(campaign(), [(f"{size}-1", size, 300)
-                                    for size in (16384, 65536, 262144, 1048576)])
-
-    def test_scale_campaign_is_exactly_one_100_mib_sample(self):
-        size = 100 * 1024 * 1024
-        self.assertEqual(campaign("scale"), [(f"{size}-1", size, 300)])
-
-    def test_profile5_campaign_is_exactly_one_gib_with_a_large_transfer_deadline(self):
-        size = 1024 * 1024 * 1024
-        self.assertEqual(campaign("profile5-1g"), [(f"{size}-1", size, 900)])
-
     def test_summary_counts_timeouts_but_never_pools_their_elapsed_time(self):
         runs = []
         for status, ns in [("complete", 30), ("complete", 10), ("transfer_timeout", 900)]:

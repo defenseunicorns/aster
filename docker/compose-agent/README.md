@@ -8,10 +8,7 @@ fixed credential mounts. Application and health listeners stay on container
 loopback; only the separate mesh listener is exposed to the Compose network.
 
 `compose.yaml` is intentionally canonical JSON-form YAML: JSON is a YAML subset
-accepted by Docker Compose. The daemon-free validator validates only the exact
-checked-in canonical JSON encoding and its strict object model. General YAML,
-aliases, merge keys, duplicate keys, and semantically equivalent rewrites are
-outside that validation boundary.
+accepted by Docker Compose.
 
 The host generation files must already be owned by the invoking user's nonzero
 runtime UID/GID and mode `0400` or `0600`. Compose does not enforce `uid`, `gid`,
@@ -19,21 +16,19 @@ or `mode` for file-backed secrets. The generation directory and exact
 user-owned `ASTER_STATE_DIR` remain in the site's custody boundary. A separate
 user-owned `ASTER_TRANSFER_DIR` is mounted at `/transfer` only in the one-shot
 CLI service for Blob input and output. Use a unique
-Compose project name for each isolated deployment; the validator requires and
-records that name but does not create persistent host paths.
+Compose project name for each isolated deployment and create its persistent
+host paths before activation.
 One project deploys exactly one agent; it is not valid to scale the service or
 share its credential generation and state directory with another agent. Multiple
 agents require separate deployment projects and separately designed site
-networking, which this profile does not qualify. The validator does not execute
-Compose, inspect a Docker host, validate project cleanup, or qualify lifecycle
-behavior.
+networking, which this profile does not qualify.
 
 No Docker host profile is qualified. Rootless Docker, Docker Desktop, remote
 contexts, user namespace remapping, and other host variants are unqualified;
 there is no runtime harness that automatically accepts or rejects them. Docker
 Swarm is excluded. See the complete [manual operator procedure](../../docs/release/docker-compose.md).
-The CI artifact includes this Compose model, its remote-mesh override,
-configuration template, and daemon-free validator; operator use requires no
+The CI artifact includes this Compose model, its remote-mesh override, and
+configuration template; operator use requires no
 source checkout or local image build.
 
 ## Example image build commands
@@ -85,8 +80,7 @@ if the mounted bytes differ. Also set `ASTER_UID`, `ASTER_GID`, `ASTER_STATE_DIR
 `ASTER_CREDENTIAL_GENERATION_DIR`, and a unique
 `COMPOSE_PROJECT_NAME`. The image
 variables must contain immutable digest references such as
-`registry.example/aster-agent@sha256:<64-hex>`. The daemon-free validator
-rejects mutable tags before it emits a redacted plan.
+`registry.example/aster-agent@sha256:<64-hex>`. Do not use mutable tags.
 Render and inspect before activation:
 
 ```sh
@@ -122,9 +116,8 @@ token and selected non-secret manifest, and has no state-directory access.
 
 All services run as the invoking user's numeric UID/GID with every capability
 dropped. The operator creates `ASTER_STATE_DIR` and `ASTER_TRANSFER_DIR` with
-mode `0700`; the validator rejects missing, relative, symlinked, differently
-owned, or differently moded paths. It also validates the owner-only plaintext
-`ASTER_TOKEN_INPUT`; the CLI service mounts that input through the distinct
+mode `0700`; use absolute, non-symlinked paths owned by that user. Supply the
+owner-only plaintext `ASTER_TOKEN_INPUT`; the CLI service mounts that input through the distinct
 `aster-operator-client-token` secret because the generation-bound token is a
 provider envelope. The CLI otherwise receives only the transfer bind, shares
 the agent network namespace, and prefixes each command with

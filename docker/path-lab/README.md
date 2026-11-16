@@ -320,13 +320,12 @@ expanded root `.dockerignore`. Its deny-all allowlist admits only the local
 `COPY` inputs (the Rust/proto/vendor trees, manifests, notices, Debian sources,
 two controller modules, and four named delivery helpers) plus their parent
 directories. Re-including a parent alone also re-includes descendants under
-Docker's matching rules: `lab/**`, `tools/**`, `docker/**`, and
+Docker's matching rules: `tools/**`, `docker/**`, and
 `docker/path-lab/**` therefore re-exclude descendants immediately after each
 parent entry, before the exact required files are re-included. The complete
 `crates`, `proto`, and `third-party` trees intentionally remain admitted; this
 is not a credential filter within those required trees. There is no wildcard
-re-inclusion of other tools, scenarios, or `delivery-*.py` files. The root and
-`lab/Dockerfile.dockerignore` retain the exact reviewed lab contract. Docker
+re-inclusion of other tools, scenarios, or `delivery-*.py` files. Docker
 still sends the selected Dockerfile and ignore file as build metadata even
 though they are not admitted as copyable context inputs.
 
@@ -344,7 +343,7 @@ Docker Engine/CLI ([Moby](https://github.com/moby/moby)), Linux network namespac
 and netem, and Debian `iproute2`/Python. No new package resolver or topology
 framework is introduced. The image retains the repository's exact Rust base
 SHA-256 and the existing Debian bookworm snapshot `20260803T000000Z` from
-[`lab/debian.sources`](../../lab/debian.sources). Exact installed iproute2 and
+[`docker/debian.sources`](../../docker/debian.sources). Exact installed iproute2 and
 Python versions are written to
 `/usr/share/licenses/aster/runtime-package-inventory.tsv` during image build.
 Docker Engine and kernel versions are printed by the delivery CI job; they are

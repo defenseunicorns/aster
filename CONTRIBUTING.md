@@ -11,6 +11,9 @@ Follow the product requirements in [DESIGN.md](DESIGN.md) and read the
 
 ## Setup
 
+On Linux, install `pkg-config` and the D-Bus development headers used by the
+evaluation-only BlueZ adapter (`libdbus-1-dev` on Ubuntu/Debian).
+
 Install the tools listed in `mise.toml`:
 
 ```sh

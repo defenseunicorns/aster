@@ -9,9 +9,8 @@
 !proto/**
 !third-party/
 !third-party/**
-!lab/
-!lab/debian.sources
 !docker/
+!docker/debian.sources
 !docker/lan-mvp/
 !docker/lan-mvp/**
 !docker/lan-scale/

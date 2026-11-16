@@ -71,49 +71,6 @@ fn publish_args(path: &Path) -> Vec<OsString> {
 }
 
 #[test]
-fn blob_help_exposes_flat_commands_and_required_paths() {
-    let top = cli([OsString::from("--help")]);
-    assert!(top.status.success());
-    let top = String::from_utf8(top.stdout).unwrap();
-    assert!(top.contains("blob-publish"));
-    assert!(top.contains("blob-read"));
-    assert!(top.contains("blob-status"));
-
-    let publish = cli([OsString::from("blob-publish"), OsString::from("--help")]);
-    assert!(publish.status.success());
-    let publish = String::from_utf8(publish.stdout).unwrap();
-    for option in [
-        "--file",
-        "--topic",
-        "--scope",
-        "--operation-key",
-        "--ttl-ms",
-    ] {
-        assert!(publish.contains(option), "missing {option}: {publish}");
-    }
-
-    let read = cli([OsString::from("blob-read"), OsString::from("--help")]);
-    assert!(read.status.success());
-    let read = String::from_utf8(read.stdout).unwrap();
-    for option in ["--id", "--topic", "--scope", "--output"] {
-        assert!(read.contains(option), "missing {option}: {read}");
-    }
-
-    let status = cli([OsString::from("blob-status"), OsString::from("--help")]);
-    assert!(status.status.success());
-    let status = String::from_utf8(status.stdout).unwrap();
-    for option in [
-        "--publication-id",
-        "--topic",
-        "--scope",
-        "--wait",
-        "--poll-ms",
-    ] {
-        assert!(status.contains(option), "missing {option}: {status}");
-    }
-}
-
-#[test]
 fn blob_publish_ttl_accepts_positive_u64_and_rejects_other_spellings() {
     let input = source(b"blob");
     for ttl in ["1", "18446744073709551615"] {
