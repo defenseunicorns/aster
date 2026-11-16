@@ -8,8 +8,9 @@ use crate::{
     },
     controller_probe::{BluezControllerProbeBackend, probe_controller},
     controller_selection::{MAX_CONTROLLER_CANDIDATES, normalize_controller_inventory},
-    policy::CappedBackoff,
+    policy::{CappedBackoff, LifecycleCancellationObserver},
 };
+use bluer::{Address, AddressType};
 use futures::{FutureExt, Stream, StreamExt, stream::SelectAll};
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use tokio::{
@@ -26,6 +27,62 @@ type ResolverFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ResolverFailu
 type ResolverEventFuture<'a> = Pin<Box<dyn Future<Output = Option<ResolverEvent>> + Send + 'a>>;
 type ResolverProbeFuture<'a> = Pin<Box<dyn Future<Output = ProbeDisposition> + Send + 'a>>;
 type NamedAdapterStream = Pin<Box<dyn Stream<Item = (String, Option<AdapterSignal>)> + Send>>;
+pub(crate) type OperationalEpochFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Borrowed exact controller epoch offered synchronously to operational activation.
+pub(crate) struct ControllerEpochView<'a> {
+    adapter_name: &'a str,
+    address: Address,
+    address_type: AddressType,
+    inventory_generation: u64,
+    cancellation: LifecycleCancellationObserver,
+}
+
+impl ControllerEpochView<'_> {
+    pub(crate) const fn adapter_name(&self) -> &str {
+        self.adapter_name
+    }
+
+    pub(crate) const fn address(&self) -> Address {
+        self.address
+    }
+
+    pub(crate) const fn address_type(&self) -> AddressType {
+        self.address_type
+    }
+
+    pub(crate) const fn inventory_generation(&self) -> u64 {
+        self.inventory_generation
+    }
+
+    pub(crate) fn cancellation(&self) -> LifecycleCancellationObserver {
+        self.cancellation.clone()
+    }
+}
+
+/// Capacity-one operational state reported by one selected controller epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum OperationalEpochState {
+    Starting,
+    Available,
+    Degraded,
+    Unavailable,
+}
+
+pub(crate) trait OperationalControllerEpoch: Send {
+    fn status(&self) -> watch::Receiver<OperationalEpochState>;
+    fn quiesce(&mut self) -> OperationalEpochFuture<'_, Result<(), DriverError>>;
+    fn cancel(&self);
+    fn join(self: Box<Self>) -> OperationalEpochFuture<'static, Result<(), DriverError>>;
+}
+
+pub(crate) trait ControllerEpochActivator: Send + Sync {
+    fn activate(
+        &self,
+        epoch: ControllerEpochView<'_>,
+    ) -> Result<Box<dyn OperationalControllerEpoch>, DriverError>;
+}
 
 /// Runtime state of automatic Linux controller resolution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,6 +93,17 @@ pub enum RuntimeAvailability {
     Available,
     /// Operator-only degraded state; not selected as available unless the full path is usable.
     Degraded,
+}
+
+pub(crate) const fn runtime_is_selector_available(
+    availability: RuntimeAvailability,
+    complete_event_path: bool,
+) -> bool {
+    complete_event_path
+        && matches!(
+            availability,
+            RuntimeAvailability::Available | RuntimeAvailability::Degraded
+        )
 }
 
 /// Redacted automatic-controller status safe for selector and operator surfaces.
@@ -88,7 +156,7 @@ impl ControllerResolutionSnapshot {
 }
 
 /// Single-owner controller epoch authority retained only by the resolver actor.
-pub struct ControllerEpochOwner {
+pub(crate) struct ControllerEpochOwner {
     candidate: ControllerCandidate,
     fingerprint: ControllerFingerprint,
     support: SupportTag,
@@ -113,6 +181,28 @@ impl ControllerEpochOwner {
 
     fn name(&self) -> &str {
         self.candidate.name()
+    }
+
+    fn view(&self) -> Result<ControllerEpochView<'_>, DriverError> {
+        let address = self.candidate.address().ok_or_else(|| {
+            DriverError::new(
+                DriverErrorKind::Unavailable,
+                "selected controller has no exact address snapshot",
+            )
+        })?;
+        let address_type = self.candidate.address_type().ok_or_else(|| {
+            DriverError::new(
+                DriverErrorKind::Unavailable,
+                "selected controller has no exact address type snapshot",
+            )
+        })?;
+        Ok(ControllerEpochView {
+            adapter_name: self.candidate.name(),
+            address,
+            address_type,
+            inventory_generation: self.inventory_generation,
+            cancellation: self.cancellation.observer(),
+        })
     }
 
     #[allow(dead_code)]
@@ -168,6 +258,14 @@ impl LinuxControllerResolver {
 
     /// Cancels and joins the serialized probe actor and its controller epoch.
     pub async fn shutdown(self) -> Result<(), DriverError> {
+        self.shutdown_with_stop_event(true).await
+    }
+
+    pub(crate) async fn shutdown_for_supervisor(self) -> Result<(), DriverError> {
+        self.shutdown_with_stop_event(false).await
+    }
+
+    async fn shutdown_with_stop_event(self, emit_stop: bool) -> Result<(), DriverError> {
         self.cancel();
         self.task.await.map_err(|_| {
             DriverError::new(
@@ -175,7 +273,9 @@ impl LinuxControllerResolver {
                 "automatic controller resolver task stopped",
             )
         })?;
-        self.output.emit(BtleOperatorEvent::Stopped);
+        if emit_stop {
+            self.output.emit(BtleOperatorEvent::Stopped);
+        }
         Ok(())
     }
 }
@@ -192,6 +292,24 @@ pub fn spawn_linux_controller_resolver(
         output,
         Arc::new(BluezResolverPlatform::new(Arc::new(ProductionBluez))),
         Arc::new(ProductionResolverProbe),
+        None,
+        None,
+    )
+}
+
+pub(crate) fn spawn_linux_controller_resolver_with_activation(
+    policy: ControllerAdmissionPolicy,
+    limits: ControllerProbeLimits,
+    output: BtleOperatorOutput,
+    activator: Arc<dyn ControllerEpochActivator>,
+) -> LinuxControllerResolver {
+    spawn_resolver(
+        policy,
+        limits,
+        output,
+        Arc::new(BluezResolverPlatform::new(Arc::new(ProductionBluez))),
+        Arc::new(ProductionResolverProbe),
+        Some(activator),
         None,
     )
 }
@@ -454,15 +572,18 @@ struct ResolverActor {
     limits: ControllerProbeLimits,
     platform: Arc<dyn ResolverPlatform>,
     probe: Arc<dyn ResolverProbe>,
+    activator: Option<Arc<dyn ControllerEpochActivator>>,
     output: BtleOperatorOutput,
     updates: watch::Sender<ControllerResolutionSnapshot>,
     cancellation: LifecycleCancellation,
     owner: Option<ControllerEpochOwner>,
+    operational: Option<Box<dyn OperationalControllerEpoch>>,
+    operational_status: Option<watch::Receiver<OperationalEpochState>>,
     cursor: Option<String>,
     inventory_generation: u64,
     backoff: CappedBackoff,
     #[cfg(test)]
-    epoch_updates: Option<tokio::sync::mpsc::UnboundedSender<LifecycleCancellation>>,
+    epoch_updates: Option<tokio::sync::mpsc::Sender<LifecycleCancellationObserver>>,
 }
 
 enum SessionAction {
@@ -490,7 +611,7 @@ impl ResolverActor {
                 Ok(session) => session,
                 Err(ResolverFailure::Cancelled) => break,
                 Err(failure) => {
-                    self.invalidate_owner(failure.disposition());
+                    self.invalidate_owner(failure.disposition()).await;
                     if wait_delay(&self.cancellation, self.backoff.next_delay()).await {
                         break;
                     }
@@ -503,7 +624,8 @@ impl ResolverActor {
                 SessionAction::Lost => {
                     self.invalidate_owner(ProbeDisposition::Indeterminate(
                         ProbeReason::BluezUnavailable,
-                    ));
+                    ))
+                    .await;
                     if wait_delay(&self.cancellation, self.backoff.next_delay()).await {
                         break;
                     }
@@ -511,7 +633,8 @@ impl ResolverActor {
                 SessionAction::Sweep => unreachable!("session runner consumes sweep actions"),
             }
         }
-        self.owner.take();
+        self.invalidate_owner(ProbeDisposition::Indeterminate(ProbeReason::Cancelled))
+            .await;
     }
 
     async fn run_session(&mut self, session: &mut dyn ResolverSession) -> SessionAction {
@@ -544,7 +667,8 @@ impl ResolverActor {
                 }
                 self.invalidate_owner(ProbeDisposition::Indeterminate(
                     ProbeReason::BluezUnavailable,
-                ));
+                ))
+                .await;
             }
 
             match self.probe_sweep(observed).await {
@@ -640,7 +764,7 @@ impl ResolverActor {
             if disposition == ProbeDisposition::Compatible {
                 self.cursor = None;
                 let support = admission.support();
-                self.select(controller.clone(), support);
+                self.select(controller.clone(), support).await;
                 return Some(());
             }
 
@@ -659,31 +783,120 @@ impl ResolverActor {
         Some(())
     }
 
-    fn select(&mut self, controller: ObservedController, support: SupportTag) {
+    async fn select(&mut self, controller: ObservedController, support: SupportTag) {
         let owner = ControllerEpochOwner::new(controller, support, self.inventory_generation);
         #[cfg(test)]
         if let Some(updates) = &self.epoch_updates {
-            let _ = updates.send(owner.cancellation.clone());
+            let _ = updates.try_send(owner.cancellation.observer());
         }
+        let operational = match &self.activator {
+            Some(activator) => match owner.view().and_then(|view| activator.activate(view)) {
+                Ok(operational) => Some(operational),
+                Err(_) => {
+                    self.publish(ControllerResolutionSnapshot::unavailable(
+                        ProbeDisposition::Indeterminate(ProbeReason::UnknownPlatformError),
+                        Some(support),
+                    ));
+                    return;
+                }
+            },
+            None => None,
+        };
+        self.operational_status = operational.as_ref().map(|owner| owner.status());
+        self.operational = operational;
         self.owner = Some(owner);
-        self.publish(ControllerResolutionSnapshot::available(support));
+        self.publish(ControllerResolutionSnapshot::unavailable(
+            ProbeDisposition::Compatible,
+            Some(support),
+        ));
     }
 
-    fn invalidate_owner(&mut self, disposition: ProbeDisposition) {
-        self.owner.take();
+    async fn invalidate_owner(&mut self, disposition: ProbeDisposition) {
         self.publish(ControllerResolutionSnapshot::unavailable(disposition, None));
+        if let Some(operational) = self.operational.as_mut() {
+            let _ = operational.quiesce().await;
+        }
+        if let Some(owner) = self.owner.as_ref() {
+            owner.cancellation.cancel();
+        }
+        if let Some(operational) = self.operational.take() {
+            operational.cancel();
+            let _ = operational.join().await;
+        }
+        self.operational_status.take();
+        self.owner.take();
     }
 
     async fn wait_healthy_event(&mut self, session: &mut dyn ResolverSession) -> SessionAction {
-        let event = tokio::select! {
-            biased;
-            () = self.cancellation.cancelled() => return SessionAction::Cancelled,
-            event = session.next_event() => event,
-        };
-        let Some(event) = event else {
-            return SessionAction::Lost;
-        };
-        self.consume_event_batch(session, event).await
+        loop {
+            enum HealthyEvent {
+                Cancelled,
+                Platform(Option<ResolverEvent>),
+                Operational(Result<(), watch::error::RecvError>),
+            }
+
+            let event = if let Some(status) = self.operational_status.as_mut() {
+                tokio::select! {
+                    biased;
+                    () = self.cancellation.cancelled() => HealthyEvent::Cancelled,
+                    event = session.next_event() => HealthyEvent::Platform(event),
+                    changed = status.changed() => HealthyEvent::Operational(changed),
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    () = self.cancellation.cancelled() => HealthyEvent::Cancelled,
+                    event = session.next_event() => HealthyEvent::Platform(event),
+                }
+            };
+
+            match event {
+                HealthyEvent::Cancelled => return SessionAction::Cancelled,
+                HealthyEvent::Platform(Some(event)) => {
+                    return self.consume_event_batch(session, event).await;
+                }
+                HealthyEvent::Platform(None) => return SessionAction::Lost,
+                HealthyEvent::Operational(Err(_)) => {
+                    self.invalidate_owner(ProbeDisposition::Indeterminate(
+                        ProbeReason::BluezUnavailable,
+                    ))
+                    .await;
+                    return SessionAction::Sweep;
+                }
+                HealthyEvent::Operational(Ok(())) => {
+                    let state = *self
+                        .operational_status
+                        .as_mut()
+                        .expect("operational status exists after change")
+                        .borrow_and_update();
+                    let event_path_available = matches!(
+                        state,
+                        OperationalEpochState::Available | OperationalEpochState::Degraded
+                    );
+                    let runtime = match state {
+                        OperationalEpochState::Starting | OperationalEpochState::Unavailable => {
+                            RuntimeAvailability::Unavailable
+                        }
+                        OperationalEpochState::Available => RuntimeAvailability::Available,
+                        OperationalEpochState::Degraded => RuntimeAvailability::Degraded,
+                    };
+                    if runtime_is_selector_available(runtime, event_path_available) {
+                        let support = self
+                            .owner
+                            .as_ref()
+                            .expect("operational state has a controller owner")
+                            .support();
+                        self.publish(ControllerResolutionSnapshot::available(support));
+                    } else if state == OperationalEpochState::Unavailable {
+                        self.invalidate_owner(ProbeDisposition::Indeterminate(
+                            ProbeReason::BluezUnavailable,
+                        ))
+                        .await;
+                        return SessionAction::Sweep;
+                    }
+                }
+            }
+        }
     }
 
     async fn consume_event_batch(
@@ -694,37 +907,38 @@ impl ResolverActor {
         if self.cancellation.is_cancelled() {
             return SessionAction::Cancelled;
         }
-        self.apply_event(first);
+        let mut invalidated = self.apply_event(first);
         for _ in 1..MAX_EVENTS_PER_BATCH {
             if self.cancellation.is_cancelled() {
                 return SessionAction::Cancelled;
             }
             match session.next_event().now_or_never() {
-                Some(Some(event)) => self.apply_event(event),
+                Some(Some(event)) => invalidated |= self.apply_event(event),
                 Some(None) => return SessionAction::Lost,
-                None => return SessionAction::Sweep,
+                None => break,
             }
         }
         tokio::task::yield_now().await;
         if self.cancellation.is_cancelled() {
             return SessionAction::Cancelled;
         }
+        if invalidated {
+            self.invalidate_owner(ProbeDisposition::Indeterminate(
+                ProbeReason::BluezUnavailable,
+            ))
+            .await;
+        }
         SessionAction::Sweep
     }
 
-    fn apply_event(&mut self, event: ResolverEvent) {
+    fn apply_event(&self, event: ResolverEvent) -> bool {
         let selected = self.owner.as_ref().map(|owner| owner.name());
-        let invalidates = match &event {
+        match &event {
             ResolverEvent::InventoryChanged {
                 removed: Some(name),
             } => selected == Some(name.as_str()),
             ResolverEvent::ControllerChanged(name) => selected == Some(name.as_str()),
             ResolverEvent::InventoryChanged { removed: None } => false,
-        };
-        if invalidates {
-            self.invalidate_owner(ProbeDisposition::Indeterminate(
-                ProbeReason::BluezUnavailable,
-            ));
         }
     }
 
@@ -802,7 +1016,8 @@ fn spawn_resolver(
     output: BtleOperatorOutput,
     platform: Arc<dyn ResolverPlatform>,
     probe: Arc<dyn ResolverProbe>,
-    #[cfg(test)] epoch_updates: Option<tokio::sync::mpsc::UnboundedSender<LifecycleCancellation>>,
+    activator: Option<Arc<dyn ControllerEpochActivator>>,
+    #[cfg(test)] epoch_updates: Option<tokio::sync::mpsc::Sender<LifecycleCancellationObserver>>,
     #[cfg(not(test))] _epoch_updates: Option<()>,
 ) -> LinuxControllerResolver {
     let cancellation = LifecycleCancellation::new();
@@ -812,10 +1027,13 @@ fn spawn_resolver(
         limits,
         platform,
         probe,
+        activator,
         output: output.clone(),
         updates,
         cancellation: cancellation.clone(),
         owner: None,
+        operational: None,
+        operational_status: None,
         cursor: None,
         inventory_generation: 0,
         backoff: CappedBackoff::new(INITIAL_RESOLVER_RETRY, MAXIMUM_RESOLVER_RETRY),
@@ -832,6 +1050,70 @@ fn spawn_resolver(
 }
 
 #[cfg(test)]
+struct TestOperationalActivator;
+
+#[cfg(test)]
+impl ControllerEpochActivator for TestOperationalActivator {
+    fn activate(
+        &self,
+        _epoch: ControllerEpochView<'_>,
+    ) -> Result<Box<dyn OperationalControllerEpoch>, DriverError> {
+        let (updates, status) = watch::channel(OperationalEpochState::Starting);
+        let cancellation = LifecycleCancellation::new();
+        let task_cancellation = cancellation.clone();
+        let task_updates = updates.clone();
+        let task = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            task_updates.send_replace(OperationalEpochState::Available);
+            task_cancellation.cancelled().await;
+            Ok(())
+        });
+        Ok(Box::new(TestOperationalEpoch {
+            updates,
+            status,
+            cancellation,
+            task,
+        }))
+    }
+}
+
+#[cfg(test)]
+struct TestOperationalEpoch {
+    updates: watch::Sender<OperationalEpochState>,
+    status: watch::Receiver<OperationalEpochState>,
+    cancellation: LifecycleCancellation,
+    task: JoinHandle<Result<(), DriverError>>,
+}
+
+#[cfg(test)]
+impl OperationalControllerEpoch for TestOperationalEpoch {
+    fn status(&self) -> watch::Receiver<OperationalEpochState> {
+        self.status.clone()
+    }
+
+    fn quiesce(&mut self) -> OperationalEpochFuture<'_, Result<(), DriverError>> {
+        self.updates
+            .send_replace(OperationalEpochState::Unavailable);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    fn join(self: Box<Self>) -> OperationalEpochFuture<'static, Result<(), DriverError>> {
+        Box::pin(async move {
+            self.task.await.map_err(|_| {
+                DriverError::new(
+                    DriverErrorKind::Transport,
+                    "test operational controller epoch stopped",
+                )
+            })?
+        })
+    }
+}
+
+#[cfg(test)]
 fn spawn_linux_controller_resolver_with(
     policy: ControllerAdmissionPolicy,
     limits: ControllerProbeLimits,
@@ -840,11 +1122,19 @@ fn spawn_linux_controller_resolver_with(
     probe: Arc<dyn ResolverProbe>,
 ) -> (
     LinuxControllerResolver,
-    tokio::sync::mpsc::UnboundedReceiver<LifecycleCancellation>,
+    tokio::sync::mpsc::Receiver<LifecycleCancellationObserver>,
 ) {
-    let (epoch_updates, epochs) = tokio::sync::mpsc::unbounded_channel();
+    let (epoch_updates, epochs) = tokio::sync::mpsc::channel(8);
     (
-        spawn_resolver(policy, limits, output, platform, probe, Some(epoch_updates)),
+        spawn_resolver(
+            policy,
+            limits,
+            output,
+            platform,
+            probe,
+            Some(Arc::new(TestOperationalActivator)),
+            Some(epoch_updates),
+        ),
         epochs,
     )
 }
@@ -1091,6 +1381,91 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingActivator {
+        states: Mutex<Vec<watch::Sender<OperationalEpochState>>>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        quiesce_gate: Mutex<Option<Arc<Notify>>>,
+    }
+
+    impl RecordingActivator {
+        fn latest_state(&self, state: OperationalEpochState) {
+            self.states
+                .lock()
+                .unwrap()
+                .last()
+                .expect("one selected controller epoch")
+                .send_replace(state);
+        }
+
+        fn activation_count(&self) -> usize {
+            self.states.lock().unwrap().len()
+        }
+
+        fn events(&self) -> Vec<&'static str> {
+            self.events.lock().unwrap().clone()
+        }
+
+        fn block_quiesce(&self, gate: Arc<Notify>) {
+            *self.quiesce_gate.lock().unwrap() = Some(gate);
+        }
+
+        fn allow_future_quiesce(&self) {
+            *self.quiesce_gate.lock().unwrap() = None;
+        }
+    }
+
+    impl ControllerEpochActivator for RecordingActivator {
+        fn activate(
+            &self,
+            _epoch: ControllerEpochView<'_>,
+        ) -> Result<Box<dyn OperationalControllerEpoch>, DriverError> {
+            let (updates, status) = watch::channel(OperationalEpochState::Starting);
+            self.states.lock().unwrap().push(updates.clone());
+            Ok(Box::new(RecordingOperationalEpoch {
+                updates,
+                status,
+                events: self.events.clone(),
+                quiesce_gate: self.quiesce_gate.lock().unwrap().clone(),
+            }))
+        }
+    }
+
+    struct RecordingOperationalEpoch {
+        updates: watch::Sender<OperationalEpochState>,
+        status: watch::Receiver<OperationalEpochState>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        quiesce_gate: Option<Arc<Notify>>,
+    }
+
+    impl OperationalControllerEpoch for RecordingOperationalEpoch {
+        fn status(&self) -> watch::Receiver<OperationalEpochState> {
+            self.status.clone()
+        }
+
+        fn quiesce(&mut self) -> OperationalEpochFuture<'_, Result<(), DriverError>> {
+            self.events.lock().unwrap().push("quiesce");
+            self.updates
+                .send_replace(OperationalEpochState::Unavailable);
+            let gate = self.quiesce_gate.clone();
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+                Ok(())
+            })
+        }
+
+        fn cancel(&self) {
+            self.events.lock().unwrap().push("cancel");
+        }
+
+        fn join(self: Box<Self>) -> OperationalEpochFuture<'static, Result<(), DriverError>> {
+            self.events.lock().unwrap().push("join");
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     struct Harness {
         controllers: Arc<Mutex<Vec<ObservedController>>>,
         events: Option<mpsc::UnboundedSender<ResolverEvent>>,
@@ -1177,7 +1552,7 @@ mod tests {
         probe: Arc<FakeProbe>,
     ) -> (
         LinuxControllerResolver,
-        mpsc::UnboundedReceiver<LifecycleCancellation>,
+        mpsc::Receiver<LifecycleCancellationObserver>,
     ) {
         spawn_linux_controller_resolver_with(
             policy,
@@ -1186,6 +1561,41 @@ mod tests {
             platform,
             probe,
         )
+    }
+
+    fn spawn_with_activator(
+        policy: ControllerAdmissionPolicy,
+        limits: ControllerProbeLimits,
+        platform: Arc<FakePlatform>,
+        probe: Arc<FakeProbe>,
+        activator: Option<Arc<dyn ControllerEpochActivator>>,
+    ) -> (
+        LinuxControllerResolver,
+        mpsc::Receiver<LifecycleCancellationObserver>,
+    ) {
+        let (epoch_updates, epochs) = mpsc::channel(8);
+        (
+            spawn_resolver(
+                policy,
+                limits,
+                BtleOperatorOutput::discard(),
+                platform,
+                probe,
+                activator,
+                Some(epoch_updates),
+            ),
+            epochs,
+        )
+    }
+
+    async fn wait_for_events(activator: &RecordingActivator, count: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while activator.events().len() < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("operational lifecycle events must make progress");
     }
 
     async fn wait_for_status(
@@ -1225,15 +1635,194 @@ mod tests {
             limits: limits(),
             platform: Arc::new(FakePlatform::new([])),
             probe: Arc::new(FakeProbe::compatible()),
+            activator: Some(Arc::new(TestOperationalActivator)),
             output: BtleOperatorOutput::discard(),
             updates,
             cancellation,
             owner: None,
+            operational: None,
+            operational_status: None,
             cursor: None,
             inventory_generation: 0,
             backoff: CappedBackoff::new(INITIAL_RESOLVER_RETRY, MAXIMUM_RESOLVER_RETRY),
             epoch_updates: None,
         }
+    }
+
+    #[tokio::test]
+    async fn automatic_controller_passive_selection_stays_unavailable() {
+        let (_harness, session) = Harness::session(vec![controller("hci0", 1, fingerprint("a"))]);
+        let (resolver, mut epochs) = spawn_with_activator(
+            ControllerAdmissionPolicy::default(),
+            limits(),
+            Arc::new(FakePlatform::new([Ok(session)])),
+            Arc::new(FakeProbe::compatible()),
+            None,
+        );
+        let mut status = resolver.status();
+
+        let selected = wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
+
+        assert_eq!(selected.availability(), RuntimeAvailability::Unavailable);
+        assert_eq!(selected.support(), Some(SupportTag::Unqualified));
+        assert!(!epochs.recv().await.unwrap().is_cancelled());
+        stop(resolver).await;
+    }
+
+    #[tokio::test]
+    async fn automatic_controller_operational_start_transitions_to_available() {
+        let (_harness, session) = Harness::session(vec![controller("hci0", 1, fingerprint("a"))]);
+        let activator = Arc::new(RecordingActivator::default());
+        let (resolver, _epochs) = spawn_with_activator(
+            ControllerAdmissionPolicy::default(),
+            limits(),
+            Arc::new(FakePlatform::new([Ok(session)])),
+            Arc::new(FakeProbe::compatible()),
+            Some(activator.clone()),
+        );
+        let mut status = resolver.status();
+        let selected = wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
+        assert_eq!(selected.availability(), RuntimeAvailability::Unavailable);
+
+        activator.latest_state(OperationalEpochState::Available);
+        let available = wait_for_status(&mut status, RuntimeAvailability::Available).await;
+
+        assert_eq!(available.disposition(), ProbeDisposition::Compatible);
+        assert_eq!(activator.activation_count(), 1);
+        stop(resolver).await;
+    }
+
+    #[tokio::test]
+    async fn automatic_controller_unrelated_event_retains_operational_handle() {
+        let selected = controller("hci0", 1, fingerprint("a"));
+        let (harness, session) = Harness::session(vec![selected.clone()]);
+        let activator = Arc::new(RecordingActivator::default());
+        let (resolver, _epochs) = spawn_with_activator(
+            ControllerAdmissionPolicy::default(),
+            limits(),
+            Arc::new(FakePlatform::new([Ok(session)])),
+            Arc::new(FakeProbe::compatible()),
+            Some(activator.clone()),
+        );
+        let mut status = resolver.status();
+        wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
+        activator.latest_state(OperationalEpochState::Available);
+        wait_for_status(&mut status, RuntimeAvailability::Available).await;
+
+        harness.replace(
+            vec![selected, controller("hci1", 2, fingerprint("b"))],
+            ResolverEvent::InventoryChanged { removed: None },
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while harness.observation_count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unrelated inventory change must be observed");
+
+        assert_eq!(
+            status.borrow().availability(),
+            RuntimeAvailability::Available
+        );
+        assert_eq!(activator.activation_count(), 1);
+        assert!(activator.events().is_empty());
+        stop(resolver).await;
+    }
+
+    #[tokio::test]
+    async fn automatic_controller_selected_loss_is_unavailable_before_child_drain() {
+        let selected = controller("hci0", 1, fingerprint("a"));
+        let replacement = controller("hci1", 2, fingerprint("b"));
+        let (harness, session) = Harness::session(vec![selected]);
+        let activator = Arc::new(RecordingActivator::default());
+        let drain_gate = Arc::new(Notify::new());
+        activator.block_quiesce(drain_gate.clone());
+        let (resolver, mut epochs) = spawn_with_activator(
+            ControllerAdmissionPolicy::default(),
+            limits(),
+            Arc::new(FakePlatform::new([Ok(session)])),
+            Arc::new(FakeProbe::compatible()),
+            Some(activator.clone()),
+        );
+        let mut status = resolver.status();
+        wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
+        let epoch = epochs.recv().await.unwrap();
+        activator.latest_state(OperationalEpochState::Available);
+        wait_for_status(&mut status, RuntimeAvailability::Available).await;
+
+        harness.replace(
+            vec![replacement],
+            ResolverEvent::InventoryChanged {
+                removed: Some("hci0".to_owned()),
+            },
+        );
+        wait_for_status(&mut status, RuntimeAvailability::Unavailable).await;
+        wait_for_events(&activator, 1).await;
+
+        assert_eq!(activator.events(), vec!["quiesce"]);
+        assert!(!epoch.is_cancelled());
+
+        activator.allow_future_quiesce();
+        drain_gate.notify_waiters();
+        wait_for_events(&activator, 3).await;
+        assert_eq!(&activator.events()[..3], ["quiesce", "cancel", "join"]);
+        assert!(epoch.is_cancelled());
+        stop(resolver).await;
+    }
+
+    #[tokio::test]
+    async fn automatic_controller_child_loss_is_unavailable_before_epoch_cancel() {
+        let (_harness, session) = Harness::session(vec![controller("hci0", 1, fingerprint("a"))]);
+        let activator = Arc::new(RecordingActivator::default());
+        let drain_gate = Arc::new(Notify::new());
+        activator.block_quiesce(drain_gate.clone());
+        let (resolver, mut epochs) = spawn_with_activator(
+            ControllerAdmissionPolicy::default(),
+            limits(),
+            Arc::new(FakePlatform::new([Ok(session)])),
+            Arc::new(FakeProbe::compatible()),
+            Some(activator.clone()),
+        );
+        let mut status = resolver.status();
+        wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
+        let epoch = epochs.recv().await.unwrap();
+        activator.latest_state(OperationalEpochState::Available);
+        wait_for_status(&mut status, RuntimeAvailability::Available).await;
+
+        activator.latest_state(OperationalEpochState::Unavailable);
+        wait_for_status(&mut status, RuntimeAvailability::Unavailable).await;
+        wait_for_events(&activator, 1).await;
+
+        assert_eq!(activator.events(), vec!["quiesce"]);
+        assert!(!epoch.is_cancelled());
+
+        activator.allow_future_quiesce();
+        drain_gate.notify_waiters();
+        wait_for_events(&activator, 3).await;
+        assert!(epoch.is_cancelled());
+        stop(resolver).await;
+    }
+
+    #[tokio::test]
+    async fn automatic_controller_shutdown_joins_operational_epoch() {
+        let (_harness, session) = Harness::session(vec![controller("hci0", 1, fingerprint("a"))]);
+        let activator = Arc::new(RecordingActivator::default());
+        let (resolver, mut epochs) = spawn_with_activator(
+            ControllerAdmissionPolicy::default(),
+            limits(),
+            Arc::new(FakePlatform::new([Ok(session)])),
+            Arc::new(FakeProbe::compatible()),
+            Some(activator.clone()),
+        );
+        let mut status = resolver.status();
+        wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
+        let epoch = epochs.recv().await.unwrap();
+
+        resolver.shutdown().await.unwrap();
+
+        assert!(epoch.is_cancelled());
+        assert_eq!(activator.events(), vec!["quiesce", "cancel", "join"]);
     }
 
     #[tokio::test]

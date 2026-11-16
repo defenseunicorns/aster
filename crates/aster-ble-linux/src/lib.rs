@@ -18,10 +18,11 @@ mod rostered_lifecycle;
 mod stream;
 
 pub use config::{
-    AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH, ContactLimits, ControllerConfig, DriverConfig,
-    FixedRole, LinkConfig, OpenRequest, RING1_MAXIMUM_DEADLINE, RING1_MAXIMUM_EXCHANGE_BYTES,
-    RING1_MAXIMUM_FRAME_BYTES, RosteredAdapterConfig, RosteredDiscoveryConfig,
-    RosteredSupervisorConfig, SupervisorConfig, ValidatedConfig, ValidatedContactLimits,
+    AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH, AutomaticRosteredSupervisorConfig, ContactLimits,
+    ControllerConfig, DriverConfig, FixedRole, LinkConfig, OpenRequest, RING1_MAXIMUM_DEADLINE,
+    RING1_MAXIMUM_EXCHANGE_BYTES, RING1_MAXIMUM_FRAME_BYTES, RosteredAdapterConfig,
+    RosteredDiscoveryConfig, RosteredSupervisorConfig, SupervisorConfig,
+    ValidatedAutomaticRosteredSupervisorConfig, ValidatedConfig, ValidatedContactLimits,
     ValidatedControllerConfig, ValidatedLinkConfig, ValidatedRosteredDiscoveryConfig,
     ValidatedRosteredSupervisorConfig, ValidatedSupervisorConfig,
 };
@@ -34,8 +35,8 @@ pub use controller_probe::{
     ControllerProbeFuture, ControllerProbeLimits, probe_controller,
 };
 pub use controller_resolver::{
-    ControllerEpochOwner, ControllerResolutionSnapshot, LinuxControllerResolver,
-    RuntimeAvailability, spawn_linux_controller_resolver,
+    ControllerResolutionSnapshot, LinuxControllerResolver, RuntimeAvailability,
+    spawn_linux_controller_resolver,
 };
 pub use controller_selection::{
     ControllerAdmission, ControllerAdmissionPolicy, ControllerCandidate, ControllerFingerprint,

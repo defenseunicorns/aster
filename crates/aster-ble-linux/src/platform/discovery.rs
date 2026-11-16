@@ -741,6 +741,7 @@ impl BluezDiscoveryPlatform {
         &self,
         controller: &ValidatedControllerConfig,
     ) -> Result<bluer::Adapter, DriverError> {
+        controller.ensure_current()?;
         let names = self
             .session
             .adapter_names()
@@ -749,12 +750,16 @@ impl BluezDiscoveryPlatform {
         if !names.iter().any(|name| name == controller.adapter_name()) {
             return Err(controller_unavailable());
         }
+        controller.ensure_current()?;
         let adapter = self
             .session
             .adapter(controller.adapter_name())
             .map_err(map_bluer_error)?;
+        controller.ensure_current()?;
         let powered = adapter.is_powered().await.map_err(map_bluer_error)?;
+        controller.ensure_current()?;
         let address = adapter.address().await.map_err(map_bluer_error)?;
+        controller.ensure_current()?;
         let address_type = adapter.address_type().await.map_err(map_bluer_error)?;
         if !powered
             || address != controller.local_address()
@@ -774,25 +779,30 @@ impl DiscoveryPlatform for BluezDiscoveryPlatform {
     ) -> PlatformFuture<'a, Box<dyn OwnedAdvertisement>> {
         Box::pin(async move {
             let adapter = self.adapter(controller).await?;
+            controller.ensure_current()?;
             let supported = adapter
                 .supported_advertising_instances()
                 .await
                 .map_err(map_bluer_error)?;
+            controller.ensure_current()?;
             let active = adapter
                 .active_advertising_instances()
                 .await
                 .map_err(map_bluer_error)?;
+            controller.ensure_current()?;
             let channels = adapter
                 .supported_advertising_secondary_channels()
                 .await
                 .map_err(map_bluer_error)?
                 .ok_or_else(advertising_unsupported)?;
+            controller.ensure_current()?;
             let capabilities = adapter
                 .supported_advertising_capabilities()
                 .await
                 .map_err(map_bluer_error)?
                 .ok_or_else(advertising_unsupported)?;
             validate_advertising_support(supported, active, &channels, &capabilities)?;
+            controller.ensure_current()?;
             let handle = adapter
                 .advertise(bluez_advertisement(advertisement))
                 .await
@@ -812,6 +822,7 @@ impl DiscoveryPlatform for BluezDiscoveryPlatform {
     ) -> PlatformFuture<'a, StartedScan> {
         Box::pin(async move {
             let adapter = self.adapter(controller).await?;
+            controller.ensure_current()?;
             BluezScanBackend::start(adapter, self.owner_loss.subscribe())
                 .await
                 .map(spawn_scan_owner)

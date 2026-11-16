@@ -1,11 +1,14 @@
-use crate::{DriverError, LeasedDiscoveryCredentialSet, configuration};
+use crate::{
+    ControllerAdmissionPolicy, ControllerProbeLimits, DriverError, LeasedDiscoveryCredentialSet,
+    configuration, policy::LifecycleCancellationObserver,
+};
 use aster_contact::TransientLocator;
 use aster_mesh::NodeId;
 use bluer::{
     Address, AddressType,
     l2cap::{PSM_LE_DYN_START, PSM_LE_MAX, SocketAddr},
 };
-use std::{cmp::Ordering, fmt, time::Duration};
+use std::{cmp::Ordering, fmt, sync::Arc, time::Duration};
 
 /// Largest protected carrier frame admitted by the Ring-1 evaluation profile.
 pub const RING1_MAXIMUM_FRAME_BYTES: usize = 2 * 1024 * 1024;
@@ -386,7 +389,10 @@ impl ControllerConfig {
             self.local_address,
             self.local_address_type,
         )?;
-        Ok(ValidatedControllerConfig(self))
+        Ok(ValidatedControllerConfig {
+            config: self,
+            epoch: None,
+        })
     }
 }
 
@@ -401,28 +407,72 @@ impl fmt::Debug for ControllerConfig {
 }
 
 /// Validated exact local controller selection.
-pub struct ValidatedControllerConfig(ControllerConfig);
+pub struct ValidatedControllerConfig {
+    config: ControllerConfig,
+    epoch: Option<ControllerEpochBinding>,
+}
+
+struct ControllerEpochBinding {
+    generation: u64,
+    cancellation: LifecycleCancellationObserver,
+}
 
 impl ValidatedControllerConfig {
+    pub(crate) fn for_epoch(
+        adapter_name: String,
+        local_address: Address,
+        local_address_type: AddressType,
+        generation: u64,
+        cancellation: LifecycleCancellationObserver,
+    ) -> Result<Self, DriverError> {
+        let config = ControllerConfig {
+            adapter_name,
+            local_address,
+            local_address_type,
+        }
+        .validate()?;
+        Ok(Self {
+            config: config.config,
+            epoch: Some(ControllerEpochBinding {
+                generation,
+                cancellation,
+            }),
+        })
+    }
+
+    pub(crate) fn ensure_current(&self) -> Result<(), DriverError> {
+        if self
+            .epoch
+            .as_ref()
+            .is_some_and(|epoch| epoch.generation == 0 || epoch.cancellation.is_cancelled())
+        {
+            return Err(DriverError::new(
+                crate::DriverErrorKind::Cancelled,
+                "controller epoch is stale",
+            ));
+        }
+        Ok(())
+    }
+
     /// Exact BlueZ controller name.
     pub fn adapter_name(&self) -> &str {
-        &self.0.adapter_name
+        &self.config.adapter_name
     }
 
     /// Exact local controller address.
     pub const fn local_address(&self) -> Address {
-        self.0.local_address
+        self.config.local_address
     }
 
     /// Exact local controller LE address type.
     pub const fn local_address_type(&self) -> AddressType {
-        self.0.local_address_type
+        self.config.local_address_type
     }
 }
 
 impl fmt::Debug for ValidatedControllerConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
+        self.config.fmt(formatter)
     }
 }
 
@@ -527,6 +577,81 @@ pub struct RosteredSupervisorConfig {
     pub contact_limits: ContactLimits,
 }
 
+/// Automatic rostered Linux policy with no detected controller identity.
+pub struct AutomaticRosteredSupervisorConfig {
+    /// Immutable controller admission and support policy.
+    pub controller_policy: ControllerAdmissionPolicy,
+    /// Bounds for one serialized compatibility-probe sweep.
+    pub controller_probe_limits: ControllerProbeLimits,
+    /// Fixed discovery policy and leased credentials.
+    pub discovery: RosteredDiscoveryConfig,
+    /// Local authenticated mission identity.
+    pub local_mission_id: NodeId,
+    /// Exact authenticated mission peer identity.
+    pub peer_mission_id: NodeId,
+    /// Delay between successful preferred-direction contacts.
+    pub contact_cadence: Duration,
+    /// Existing protected-contact limits.
+    pub contact_limits: ContactLimits,
+}
+
+impl AutomaticRosteredSupervisorConfig {
+    /// Validates immutable policy without requiring present Bluetooth hardware.
+    pub fn validate(self) -> Result<ValidatedAutomaticRosteredSupervisorConfig, DriverError> {
+        let Self {
+            controller_policy,
+            controller_probe_limits,
+            discovery,
+            local_mission_id,
+            peer_mission_id,
+            contact_cadence,
+            contact_limits,
+        } = self;
+        validate_probe_limits(controller_probe_limits)?;
+        validate_contact_cadence(contact_cadence)?;
+        let role = derive_role(local_mission_id, peer_mission_id)?;
+        Ok(ValidatedAutomaticRosteredSupervisorConfig {
+            controller_policy,
+            controller_probe_limits,
+            discovery: Arc::new(discovery.validate()),
+            local_mission_id,
+            peer_mission_id,
+            role,
+            contact_cadence,
+            contact_limits: contact_limits.validate()?,
+        })
+    }
+}
+
+impl fmt::Debug for AutomaticRosteredSupervisorConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AutomaticRosteredSupervisorConfig")
+            .field("controller_policy", &self.controller_policy)
+            .field("controller_probe_limits", &self.controller_probe_limits)
+            .field("discovery", &self.discovery)
+            .field("role", &"derived after validation")
+            .field("contact_cadence", &self.contact_cadence)
+            .field("contact_limits", &self.contact_limits)
+            .field("transient_and_mission_material", &"[REDACTED]")
+            .finish()
+    }
+}
+
+fn validate_probe_limits(limits: ControllerProbeLimits) -> Result<(), DriverError> {
+    if limits.operation().is_zero()
+        || limits.candidate().is_zero()
+        || limits.sweep().is_zero()
+        || limits.operation() > limits.candidate()
+        || limits.candidate() > limits.sweep()
+    {
+        return Err(configuration(
+            "controller probe limits must be nonzero and monotonically bounded",
+        ));
+    }
+    Ok(())
+}
+
 impl RosteredSupervisorConfig {
     /// Validates only local controller, mission, and existing contact policy.
     pub fn validate(self) -> Result<ValidatedRosteredSupervisorConfig, DriverError> {
@@ -539,7 +664,7 @@ impl RosteredSupervisorConfig {
             contact_limits,
         } = self;
         let controller = controller.validate()?;
-        let discovery = discovery.validate();
+        let discovery = Arc::new(discovery.validate());
         let contact_limits = contact_limits.validate()?;
         validate_contact_cadence(contact_cadence)?;
         let role = derive_role(local_mission_id, peer_mission_id)?;
@@ -573,12 +698,91 @@ impl fmt::Debug for RosteredSupervisorConfig {
 /// Fully validated rostered Linux supervisor input.
 pub struct ValidatedRosteredSupervisorConfig {
     controller: ValidatedControllerConfig,
-    discovery: ValidatedRosteredDiscoveryConfig,
+    discovery: Arc<ValidatedRosteredDiscoveryConfig>,
     local_mission_id: NodeId,
     peer_mission_id: NodeId,
     role: FixedRole,
     contact_cadence: Duration,
     contact_limits: ValidatedContactLimits,
+}
+
+/// Validated automatic roster policy containing no detected controller identity.
+pub struct ValidatedAutomaticRosteredSupervisorConfig {
+    controller_policy: ControllerAdmissionPolicy,
+    controller_probe_limits: ControllerProbeLimits,
+    discovery: Arc<ValidatedRosteredDiscoveryConfig>,
+    local_mission_id: NodeId,
+    peer_mission_id: NodeId,
+    role: FixedRole,
+    contact_cadence: Duration,
+    contact_limits: ValidatedContactLimits,
+}
+
+impl ValidatedAutomaticRosteredSupervisorConfig {
+    /// Immutable controller admission policy.
+    pub const fn controller_policy(&self) -> &ControllerAdmissionPolicy {
+        &self.controller_policy
+    }
+
+    /// Serialized compatibility-probe bounds.
+    pub const fn controller_probe_limits(&self) -> ControllerProbeLimits {
+        self.controller_probe_limits
+    }
+
+    /// Local authenticated mission identity.
+    pub const fn local_mission_id(&self) -> NodeId {
+        self.local_mission_id
+    }
+
+    /// Exact authenticated mission peer identity.
+    pub const fn peer_mission_id(&self) -> NodeId {
+        self.peer_mission_id
+    }
+
+    /// Preferred direction derived solely from full mission identities.
+    pub const fn role(&self) -> FixedRole {
+        self.role
+    }
+
+    pub(crate) fn for_controller(
+        &self,
+        adapter_name: String,
+        local_address: Address,
+        local_address_type: AddressType,
+        generation: u64,
+        cancellation: LifecycleCancellationObserver,
+    ) -> Result<ValidatedRosteredSupervisorConfig, DriverError> {
+        Ok(ValidatedRosteredSupervisorConfig {
+            controller: ValidatedControllerConfig::for_epoch(
+                adapter_name,
+                local_address,
+                local_address_type,
+                generation,
+                cancellation,
+            )?,
+            discovery: self.discovery.clone(),
+            local_mission_id: self.local_mission_id,
+            peer_mission_id: self.peer_mission_id,
+            role: self.role,
+            contact_cadence: self.contact_cadence,
+            contact_limits: self.contact_limits,
+        })
+    }
+}
+
+impl fmt::Debug for ValidatedAutomaticRosteredSupervisorConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ValidatedAutomaticRosteredSupervisorConfig")
+            .field("controller_policy", &self.controller_policy)
+            .field("controller_probe_limits", &self.controller_probe_limits)
+            .field("discovery", &self.discovery)
+            .field("role", &self.role)
+            .field("contact_cadence", &self.contact_cadence)
+            .field("contact_limits", &self.contact_limits)
+            .field("transient_and_mission_material", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl ValidatedRosteredSupervisorConfig {
@@ -638,7 +842,7 @@ impl ValidatedRosteredSupervisorConfig {
     }
 
     /// Host-authorized discovery credentials owned by this adapter epoch.
-    pub const fn discovery_credentials(&self) -> &LeasedDiscoveryCredentialSet {
+    pub fn discovery_credentials(&self) -> &LeasedDiscoveryCredentialSet {
         self.discovery.credentials()
     }
 
@@ -648,8 +852,8 @@ impl ValidatedRosteredSupervisorConfig {
     }
 
     /// Fixed discovery profile and leased credential owner.
-    pub const fn discovery(&self) -> &ValidatedRosteredDiscoveryConfig {
-        &self.discovery
+    pub fn discovery(&self) -> &ValidatedRosteredDiscoveryConfig {
+        self.discovery.as_ref()
     }
 
     /// Existing validated protected-contact bounds.
@@ -701,8 +905,8 @@ pub enum OpenRequest {
 mod tests {
     use super::*;
     use crate::{
-        DiscoveryCredential, DiscoveryGeneration, DiscoverySecret, DriverErrorKind,
-        LeasedDiscoveryCredentialSet,
+        ControllerAdmissionPolicy, ControllerProbeLimits, DiscoveryCredential, DiscoveryGeneration,
+        DiscoverySecret, DriverErrorKind, LeasedDiscoveryCredentialSet,
     };
     use bluer::{Address, AddressType};
     use std::{
@@ -760,6 +964,80 @@ mod tests {
                 operation_timeout: Duration::from_secs(30),
             },
         }))
+    }
+
+    fn automatic_rostered(
+        local_mission_id: NodeId,
+        peer_mission_id: NodeId,
+    ) -> AutomaticRosteredSupervisorConfig {
+        let credentials = LeasedDiscoveryCredentialSet::new(
+            DiscoveryCredential::new(
+                DiscoveryGeneration::new(7).unwrap(),
+                DiscoverySecret::new([0x42; 32]).unwrap(),
+            ),
+            None,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+        AutomaticRosteredSupervisorConfig {
+            controller_policy: ControllerAdmissionPolicy::default(),
+            controller_probe_limits: ControllerProbeLimits::new(
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(8),
+            ),
+            discovery: RosteredDiscoveryConfig { credentials },
+            local_mission_id,
+            peer_mission_id,
+            contact_cadence: Duration::from_secs(60),
+            contact_limits: ContactLimits {
+                maximum_frame_bytes: RING1_MAXIMUM_FRAME_BYTES,
+                maximum_exchange_bytes: RING1_MAXIMUM_EXCHANGE_BYTES,
+                open_timeout: Duration::from_secs(5),
+                operation_timeout: Duration::from_secs(30),
+            },
+        }
+    }
+
+    mod automatic_controller {
+        use super::*;
+
+        #[test]
+        fn automatic_config_validates_without_present_controller() {
+            let validated = automatic_rostered([0x11; 32], [0x22; 32])
+                .validate()
+                .unwrap();
+
+            assert_eq!(validated.role(), FixedRole::Initiator);
+            assert_eq!(validated.local_mission_id(), [0x11; 32]);
+            assert_eq!(validated.peer_mission_id(), [0x22; 32]);
+        }
+
+        #[test]
+        fn automatic_config_contains_no_adapter_name_or_address() {
+            let debug = format!(
+                "{:?}",
+                automatic_rostered([0x11; 32], [0x22; 32])
+                    .validate()
+                    .unwrap()
+            );
+
+            assert!(!debug.contains("hci"));
+            assert!(!debug.contains("02:00:00"));
+            assert!(debug.contains("transient_and_mission_material"));
+        }
+
+        #[test]
+        fn fixed_evaluation_config_remains_exact_controller_bound() {
+            let validated = rostered([0x11; 32], [0x22; 32])
+                .validate()
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(validated.adapter_name(), "hci7");
+            assert_eq!(validated.local_address(), address("02:00:00:00:00:01"));
+            assert_eq!(validated.local_address_type(), AddressType::LeRandom);
+        }
     }
 
     #[test]

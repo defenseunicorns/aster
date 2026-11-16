@@ -61,9 +61,12 @@ impl RosteredSocketFactory for BluezRosteredSocketFactory {
         controller: &'a ValidatedControllerConfig,
     ) -> RosteredBindFuture<'a, Self::Listener> {
         Box::pin(async move {
+            controller.ensure_current()?;
             let session = bluer::Session::new().await.map_err(map_bluer_error)?;
             let local = rostered_local_address(controller);
+            controller.ensure_current()?;
             verify_adapter(&session, controller.adapter_name(), local).await?;
+            controller.ensure_current()?;
             let socket = Socket::<Stream>::new_stream().map_err(map_io_error)?;
             socket.bind(local).map_err(map_io_error)?;
             let allocated_psm = socket.local_addr().map_err(map_io_error)?.psm;
@@ -84,11 +87,15 @@ impl RosteredSocketFactory for BluezRosteredSocketFactory {
                     "advertised LE PSM is outside the dynamic range",
                 ));
             }
+            controller.ensure_current()?;
             let session = bluer::Session::new().await.map_err(map_bluer_error)?;
             let (local, peer) = rostered_socket_addresses(controller, locator, advertised_psm);
+            controller.ensure_current()?;
             verify_adapter(&session, controller.adapter_name(), local).await?;
+            controller.ensure_current()?;
             let socket = Socket::<Stream>::new_stream().map_err(map_io_error)?;
             socket.bind(local).map_err(map_io_error)?;
+            controller.ensure_current()?;
             let stream = socket.connect(peer).await.map_err(map_io_error)?;
             wait_for_l2cap_readiness(|| stream.as_ref().send_mtu()).await?;
             Ok(SocketOpen::from_bluez(stream))

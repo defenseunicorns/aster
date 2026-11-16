@@ -35,8 +35,35 @@ impl LifecycleCancellation {
         *self.cancelled.borrow()
     }
 
+    pub(crate) fn observer(&self) -> LifecycleCancellationObserver {
+        LifecycleCancellationObserver {
+            cancelled: self.cancelled.subscribe(),
+        }
+    }
+
     pub async fn cancelled(&self) {
         let mut cancelled = self.cancelled.subscribe();
+        while !*cancelled.borrow_and_update() {
+            if cancelled.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Non-authoritative observation of one lifecycle cancellation generation.
+#[derive(Clone, Debug)]
+pub(crate) struct LifecycleCancellationObserver {
+    cancelled: watch::Receiver<bool>,
+}
+
+impl LifecycleCancellationObserver {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        *self.cancelled.borrow()
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        let mut cancelled = self.cancelled.clone();
         while !*cancelled.borrow_and_update() {
             if cancelled.changed().await.is_err() {
                 return;
