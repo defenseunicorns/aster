@@ -1,9 +1,18 @@
 # Production BTLE carrier design after semantic v9
 
+Clean Room — Privileged
+
 **Status:** maintained architecture authority; no production authorization
 
 **Capability track:** P1-4 reachability and carrier portability, followed by
 all-class and cross-platform qualification.
+
+**Selected Linux activation policy (2026-11-16):** runtime compatibility is
+established by bounded, non-destructive probing. A previously unknown controller
+that passes the required probe may activate automatically. “Officially
+supported” remains a separate, evidence-backed release designation; absence from
+the support matrix is not a runtime block. Exact known-unsafe combinations and
+explicit deployment policy may still narrow the usable set.
 
 This document defines future BTLE architecture and release gates. Current
 evaluation claims are owned by
@@ -181,10 +190,10 @@ release owned platform work within a declared bound.
 Startup must tolerate missing hardware, a stopped BlueZ service, denied optional
 permissions, and later hotplug. Those conditions make BTLE unavailable; they do
 not make the node or durable publication unavailable. Platform drivers probe
-hardware automatically and select only controllers admitted by the qualified
-support matrix. An explicit controller override may exist as a diagnostic or
-deployment policy control, but is not required for normal operation and cannot
-turn unqualified hardware into supported hardware.
+hardware automatically and select a controller that passes the required
+compatibility probe. An explicit controller override may exist as a diagnostic
+or deployment policy control, but is not required for normal operation and
+cannot turn unqualified hardware into officially supported hardware.
 
 The stock dependency graph deliberately carries no BTLE-local forks. Stock
 `bluer` does not by itself establish acknowledged, cancellation-safe
@@ -420,19 +429,124 @@ firmware, driver build, role, lifecycle mode, MTU/rate/resource bounds,
 conformance scenario, artifact identity, and known exclusion. One successful
 controller does not qualify neighboring hardware.
 
-Runtime discovery is broader than the support claim: an unknown controller may
-be observed, but it remains unavailable unless its OS/driver/controller row is
-admitted. The package must not silently treat successful probing as production
-qualification. Operator status reports adapter type and sanitized reason codes,
-never raw transient Bluetooth addresses, PSMs, discovery proofs, or credentials.
+Runtime compatibility and official support are separate decisions. The Linux
+driver enumerates available BlueZ controllers and runs a bounded,
+non-destructive probe against each candidate. The required startup probe checks
+that the service identity can open a BlueZ session, read the controller's
+powered/address/type inventory, create and LE-address-bind a socket, validate its
+dynamic PSM, listen, and close within bounds. Those typed public operations—not
+metadata heuristics—establish inventory visibility, passive local CoC behavior,
+and the permissions required for that preflight. This is local compatibility
+preflight only; it does not prove radio operation, peer interoperability,
+negotiated MTU, restart behavior, or safe advertisement and scan teardown. It
+does not reset or power a controller, pair or bond a device, remove a device,
+disconnect another owner's peer, mutate host-wide configuration, or emit RF
+activity. Advertisement and scan capability and permission are established only
+by actual operational registration when the emission policy permits it; passive
+probing cannot violate `ReceiveOnly` or `PassiveOnly` policy.
 
-The release carries a signed, package-bound support matrix. A driver probes the
-OS, architecture, kernel/framework, controller vendor/product and revision,
-firmware, and driver identity and requires one exact non-revoked row. Missing,
-ambiguous, or conflicting fields yield `unqualified`. Among multiple qualified
-controllers the BTLE adapter chooses by row priority then stable platform ID; an
-operator override may only narrow that set. One controller is active in the
-initial profile. Replacement creates a new epoch and drains the prior owner.
+A candidate that passes every required preflight gate is `compatible` and may
+attempt operational activation whether or not it already has a support-matrix
+row. The host still sees BTLE as unavailable until every policy-permitted,
+role-required listener, advertisement, or scan owner has started successfully.
+A compatible candidate is tagged `qualified` when its exact fingerprint has
+retained release evidence, otherwise `unqualified`; this tag informs selection
+and operator status but is not an activation gate. A deployment may opt into a
+`qualified-only` hardening policy. An exact package-bound known-unsafe or revoked
+rule blocks activation, but a missing support row does not. Missing or ambiguous
+fields that could overlap a known-unsafe rule fail closed as `blocked` rather
+than silently bypassing the rule. Successful probing never creates an official
+support claim.
+
+The initial implementation examines at most eight controllers per probe sweep,
+probes at most one concurrently, and activates at most one. Eight is an
+implementation resource bound—not a protocol or support limit—chosen to cover
+ordinary multi-controller Linux hosts while bounding downstream socket, retry,
+snapshot, and log work after BlueZ returns its inventory. BlueZ and system D-Bus
+ingress limits remain part of the trusted platform and confinement boundary.
+Names are length-bounded, canonicalized, validated, deduplicated, and ordered;
+the healthy selected controller and an explicit diagnostic override are retained
+before filling remaining slots. Overflow is reported once as `8+`, without
+per-entry logs, and ignored deterministically. The constant may change without
+compatibility impact.
+
+Selection is private to the adapter and does not inspect mission authority.
+Candidates are filtered by required compatibility, emission policy,
+known-unsafe rules, and local policy, then ranked by explicit local narrowing,
+an existing healthy selection, current health, qualification as a tie-breaker,
+and an epoch-local canonical key. The outer adapter owner separately gates
+activation and contact admission on policy, credentials, and peer authority.
+An unrelated controller addition must not disrupt a healthy selected
+controller. The driver coalesces state changes and allows one probe sweep at a
+time. It re-probes after BlueZ owner loss, relevant selected-controller change,
+inventory change, or package/policy generation change, and drains the current
+owner only when that controller is lost, blocked, explicitly replaced, or has a
+relevant identity or capability change. In the first increment, package and
+policy generation changes are observed only on process restart; live
+authenticated reload is future work.
+
+The compatibility fingerprint contains only the OS and architecture,
+kernel/BlueZ version, controller vendor/product/revision, and firmware or driver
+identity when the platform exposes them. Every field is typed, canonically
+parsed, and length- and cardinality-bounded before comparison or reporting. It
+excludes Bluetooth addresses, USB serial numbers, transient device paths,
+allocated PSMs, peer identifiers, and credentials. The epoch-local canonical
+adapter name or index may break selection ties but is never persisted or
+exported and need not remain stable across restart. Missing optional fingerprint
+fields make the support tag unqualified unless they create ambiguous overlap
+with a safety rule; they do not otherwise fail successful compatibility
+preflight.
+
+Static validated policy contains no detected controller identity and remains
+valid without present hardware. The resolver issues one ephemeral, non-cloneable
+`ControllerEpochOwner` containing the adapter name, address and type needed for
+local socket operations, inventory generation, bounded fingerprint, and support
+tag. It retains the lease while platform startup calls borrow a redacted,
+immutable snapshot. Exact name/address/type is rechecked immediately before each
+platform operation. Listener, advertisement, scan, and socket child owners do
+not clone or retain the lease; each observes the epoch-generation cancellation
+signal and closes when its owner becomes stale. The existing exact configured
+controller tuple is retained only for evaluation and explicit diagnostic
+narrowing; production automatic activation obtains it from the resolver owner.
+
+State is represented on three independent axes. `ProbeDisposition` is
+`Compatible`, `Incompatible(reason)`, `Blocked(reason)`, or
+`Indeterminate(reason)`; probing itself is transient lifecycle, not a result.
+`SupportTag` is `Qualified` or `Unqualified` and applies only to compatible
+candidates. `RuntimeAvailability` is `Unavailable`, `Available`, or
+operator-only `Degraded`. In the initial Event integration, `Degraded` maps to
+selector `Available` only when the complete Event path is usable; otherwise it
+maps to selector `Unavailable`. Unsupported address family, protocol, or LE CoC
+maps to `Incompatible`. BlueZ loss, hotplug, power, permission, resource
+exhaustion, deadline, cancellation, or unknown platform error maps to
+`Indeterminate` and runtime `Unavailable` with capped retry. Package safety
+rules and explicit local policy map to `Blocked`. Mapping uses typed platform
+errors and never parses error messages. The initial selector receives only
+`Available` or `Unavailable`. `Degraded` and its closed reason exist only on the
+redacted operator/status surface; it maps to selector `Available` only while the
+full Event path is operational. Controller lifecycle remains private to the
+Linux adapter.
+
+The serialized probe has explicit per-operation, per-candidate, and whole-sweep
+deadlines. Cancellation, deadline, cleanup failure, or an incomplete sweep never
+asserts incompatibility. Every acquired socket or platform owner is closed and
+joined within its declared bound before the candidate may be retried. The
+whole-sweep budget gives every admitted candidate one bounded attempt; if that
+cannot be maintained, a retained rotating cursor makes unfinished candidates
+lead the next sweep. State changes collapse into one pending sweep, and repeated
+inventory or property churn cannot exceed the adapter's capped retry/backoff
+budget.
+
+The first Linux increment compiles immutable generated support rows and exact
+known-unsafe rules into the signed package. A separately updateable signed
+artifact is future work. Lab evidence promotes an exact fingerprint to
+`qualified` and records its tested roles, bounds, scenarios, artifact identity,
+and known issues. Safety rules use only reliably obtainable bounded fields and
+may define explicit bounded ranges; ambiguous overlap fails closed. Among
+probe-passing controllers, a qualified row is preferable but not required under
+the default policy. Operator status reports adapter type, qualification tag,
+and sanitized closed reason codes, never raw transient Bluetooth addresses,
+PSMs, discovery proofs, or credentials.
 
 The Linux service remains the existing non-root `aster-agent`. BTLE packaging
 adds only the least privileges needed by the qualified BlueZ path, including
@@ -457,6 +571,34 @@ kind. They omit peer/controller addresses, PSMs, role/roster membership,
 discovery material, transfer identifiers/counts, retry detail, and secrets.
 BTLE output uses the node's redaction sink rather than direct process logging.
 
+Compatibility observations are process-memory-only and replaced on inventory
+epochs as one bounded current snapshot per examined controller, not an
+unbounded history. Persistence requires a separate privacy and retention design.
+A sanitized compatibility report is generated only by an explicit operator
+action and is never uploaded or exported automatically. Its bounded kernel,
+controller, firmware, and driver tuple is potentially linkable operational
+metadata even after direct identifiers are removed. The report may contain that
+fingerprint, closed probe outcomes, support tag, and software artifact identity;
+it excludes the epoch-local key and all fields prohibited above. This report is
+evidence input, not authority to alter runtime policy or the support matrix.
+
+## Clean-room provenance guardrail
+
+All design, implementation, review, and evidence work follows the current OPI
+clean-room guardrail and exclusion list. Inputs are limited to clean Aster
+source, public standards and public BlueZ/Linux APIs, public pinned dependency
+sources, and clean hardware or ZeroTier lab observations. External components
+used in the implementation or evidence record their name, version, and public
+source in the resource log. Blocked repositories, packages, credentials,
+excluded-person input, and proprietary implementation material are not accessed
+or used.
+
+Before commit, the staged diff, dependency graph, and newly introduced source
+URLs are screened for excluded provenance. The retained receipt records only
+that screening completed and any public sources admitted; it never copies
+protected content. Suspected excluded provenance pauses the affected work and is
+quarantined and escalated under the guardrail rather than silently removed.
+
 ## Required evidence and governance
 
 Ring 1 retains exact source/build, two Linux hosts, controllers, configuration,
@@ -470,6 +612,23 @@ floor, dynamic lifecycle, duplicate-contact vectors, packet and resource
 evidence, approved emission semantics, support rows, signed semantic minimum,
 durable per-identity high-water, authenticated rollback, dependency/SBOM
 admission, independent review, and release authorization.
+
+Linux automatic-probe evidence covers zero controllers, one and multiple
+controllers, malformed and duplicate inventories, eight-versus-nine selection,
+a huge fake inventory proving downstream work remains bounded, missing and
+ambiguous optional fingerprint fields, every closed disposition/error mapping,
+deterministic ranking and selected-controller stickiness, non-disruptive
+controller addition, hotplug and BlueZ restart re-probe, deadline/cancellation
+and cleanup at every probe step, an early hung candidate followed by a compatible
+candidate, sustained inventory-change storms, safety-rule ambiguity, and proof
+that passive probing emits no RF activity. It covers an unknown compatible
+controller attempting activation under the default policy, host availability
+only after all required operational owners start, the same controller rejected
+by `qualified-only` policy, and exact known-unsafe blocking. Fake platform tests
+provide deterministic failure injection; physical evidence covers the actual
+packaged service identity, controller coexistence without mutation, process and
+controller restart, CM4 cold/warm/hotplug behavior, and Pixel-to-Linux Event
+transfer. No requirement evidence advances from mechanism tests alone.
 
 Automatic-selection evidence adds two eligible physical adapters, zero-adapter
 startup and hotplug, fair Event-only/all-class pending work, inbound/outbound
