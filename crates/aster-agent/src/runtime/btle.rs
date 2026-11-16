@@ -25,6 +25,8 @@ use aster_host::{
     ActiveDiscoveryCredentialAuthority, DiscoveryCredentialArtifactProvider,
     DiscoveryCredentialMaterialParts, PreparedDiscoveryCredential, TrustedClock,
 };
+#[cfg(feature = "sdk-test-support")]
+use aster_node::RunningAutomaticEventTransportHandle;
 #[cfg(any(
     feature = "sdk-test-support",
     all(feature = "systemd-provider", target_os = "linux")
@@ -34,9 +36,7 @@ use aster_node::{
 };
 #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
 use aster_node::{EventAdapterRegistration, EventEmissionPolicy, OrderedEventContactHandle};
-use aster_node::{
-    EventPeerEligibility, EventTransportKind, RunningAutomaticEventTransportHandle, RunningNode,
-};
+use aster_node::{EventPeerEligibility, EventTransportKind, RunningNode};
 #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
