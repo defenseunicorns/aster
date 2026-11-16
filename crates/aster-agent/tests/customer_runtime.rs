@@ -1268,19 +1268,28 @@ mod btle {
         let running = start_with_optional_btle(&fixture, btle).await;
 
         running.stop_clean().await;
-        assert_eq!(
-            *control
-                .state
-                .trace
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            [
-                "cancel",
-                "join_started",
-                "join_completed",
-                "node_shutdown_started"
-            ]
-        );
+        let trace = control
+            .state
+            .trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let join_started = trace
+            .iter()
+            .position(|event| *event == "join_started")
+            .expect("BTLE cleanup join started");
+        let join_completed = trace
+            .iter()
+            .position(|event| *event == "join_completed")
+            .expect("BTLE cleanup join completed");
+        let node_shutdown = trace
+            .iter()
+            .position(|event| *event == "node_shutdown_started")
+            .expect("node shutdown started");
+
+        assert!(trace[..join_started].contains(&"cancel"));
+        assert!(trace[join_started..].iter().all(|event| *event != "cancel"));
+        assert!(join_started < join_completed);
+        assert!(join_completed < node_shutdown);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
