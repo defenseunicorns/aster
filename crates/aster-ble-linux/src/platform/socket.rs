@@ -1,7 +1,9 @@
 use super::{map_bluer_error, map_io_error};
 use crate::{
     CanonicalLocator, DriverError, DriverErrorKind, OpenCancellation, OpenRequest, ValidatedConfig,
-    ValidatedControllerConfig, ValidatedRosteredSupervisorConfig, configuration,
+    ValidatedControllerConfig, ValidatedRosteredSupervisorConfig,
+    config::ControllerOperationBinding,
+    configuration,
     controller_probe::ControllerProbeError,
     stream::{MtuBoundedStream, MtuProbe, NegotiatedMtu, SocketOpen},
 };
@@ -54,7 +56,7 @@ pub(crate) trait RosteredSocketFactory: Send + Sync {
 pub(crate) struct BluezRosteredSocketFactory;
 
 impl RosteredSocketFactory for BluezRosteredSocketFactory {
-    type Listener = StreamListener;
+    type Listener = BluezRosteredListener;
 
     fn bind_dynamic_listener<'a>(
         &'a self,
@@ -62,16 +64,38 @@ impl RosteredSocketFactory for BluezRosteredSocketFactory {
     ) -> RosteredBindFuture<'a, Self::Listener> {
         Box::pin(async move {
             controller.ensure_current()?;
+            let binding = controller.operation_binding();
             let session = bluer::Session::new().await.map_err(map_bluer_error)?;
             let local = rostered_local_address(controller);
-            controller.ensure_current()?;
-            verify_adapter(&session, controller.adapter_name(), local).await?;
-            controller.ensure_current()?;
             let socket = Socket::<Stream>::new_stream().map_err(map_io_error)?;
-            socket.bind(local).map_err(map_io_error)?;
+            final_controller_io(
+                &binding,
+                || async {
+                    verify_adapter(&session, binding.adapter_name(), local)
+                        .await
+                        .map(|_| ())
+                },
+                || async { socket.bind(local).map_err(map_io_error) },
+            )
+            .await?;
             let allocated_psm = socket.local_addr().map_err(map_io_error)?.psm;
-            let listener = socket.listen(1).map_err(map_io_error)?;
-            BoundRosteredListener::new(listener, allocated_psm)
+            let listener = final_controller_io(
+                &binding,
+                || async {
+                    verify_adapter(&session, binding.adapter_name(), local)
+                        .await
+                        .map(|_| ())
+                },
+                || async { socket.listen(1).map_err(map_io_error) },
+            )
+            .await?;
+            BoundRosteredListener::new(
+                BluezRosteredListener {
+                    listener,
+                    controller: controller.operation_binding(),
+                },
+                allocated_psm,
+            )
         })
     }
 
@@ -88,15 +112,30 @@ impl RosteredSocketFactory for BluezRosteredSocketFactory {
                 ));
             }
             controller.ensure_current()?;
+            let binding = controller.operation_binding();
             let session = bluer::Session::new().await.map_err(map_bluer_error)?;
             let (local, peer) = rostered_socket_addresses(controller, locator, advertised_psm);
-            controller.ensure_current()?;
-            verify_adapter(&session, controller.adapter_name(), local).await?;
-            controller.ensure_current()?;
             let socket = Socket::<Stream>::new_stream().map_err(map_io_error)?;
-            socket.bind(local).map_err(map_io_error)?;
-            controller.ensure_current()?;
-            let stream = socket.connect(peer).await.map_err(map_io_error)?;
+            final_controller_io(
+                &binding,
+                || async {
+                    verify_adapter(&session, binding.adapter_name(), local)
+                        .await
+                        .map(|_| ())
+                },
+                || async { socket.bind(local).map_err(map_io_error) },
+            )
+            .await?;
+            let stream = final_controller_io(
+                &binding,
+                || async {
+                    verify_adapter(&session, binding.adapter_name(), local)
+                        .await
+                        .map(|_| ())
+                },
+                || async { socket.connect(peer).await.map_err(map_io_error) },
+            )
+            .await?;
             wait_for_l2cap_readiness(|| stream.as_ref().send_mtu()).await?;
             Ok(SocketOpen::from_bluez(stream))
         })
@@ -104,7 +143,19 @@ impl RosteredSocketFactory for BluezRosteredSocketFactory {
 
     fn accept<'a>(&'a self, listener: &'a Self::Listener) -> RosteredAcceptFuture<'a> {
         Box::pin(async move {
-            let (stream, peer) = listener.accept().await.map_err(map_io_error)?;
+            listener.controller.ensure_current()?;
+            let session = bluer::Session::new().await.map_err(map_bluer_error)?;
+            let local = rostered_binding_address(&listener.controller);
+            let (stream, peer) = final_controller_io(
+                &listener.controller,
+                || async {
+                    verify_adapter(&session, listener.controller.adapter_name(), local)
+                        .await
+                        .map(|_| ())
+                },
+                || async { listener.listener.accept().await.map_err(map_io_error) },
+            )
+            .await?;
             let locator = CanonicalLocator::new(peer.addr, peer.addr_type).map_err(|_| {
                 DriverError::new(
                     DriverErrorKind::Transport,
@@ -114,6 +165,28 @@ impl RosteredSocketFactory for BluezRosteredSocketFactory {
             Ok((SocketOpen::from_bluez(stream), locator))
         })
     }
+}
+
+async fn final_controller_io<T, Verify, VerifyFuture, Operation, OperationFuture>(
+    controller: &ControllerOperationBinding,
+    verify: Verify,
+    operation: Operation,
+) -> Result<T, DriverError>
+where
+    Verify: FnOnce() -> VerifyFuture,
+    VerifyFuture: Future<Output = Result<(), DriverError>>,
+    Operation: FnOnce() -> OperationFuture,
+    OperationFuture: Future<Output = Result<T, DriverError>>,
+{
+    controller.ensure_current()?;
+    verify().await?;
+    controller.ensure_current()?;
+    operation().await
+}
+
+pub(crate) struct BluezRosteredListener {
+    listener: StreamListener,
+    controller: ControllerOperationBinding,
 }
 
 fn rostered_socket_addresses(
@@ -128,6 +201,14 @@ fn rostered_socket_addresses(
 }
 
 fn rostered_local_address(controller: &ValidatedControllerConfig) -> SocketAddr {
+    SocketAddr::new(
+        controller.local_address(),
+        controller.local_address_type(),
+        0,
+    )
+}
+
+fn rostered_binding_address(controller: &ControllerOperationBinding) -> SocketAddr {
     SocketAddr::new(
         controller.local_address(),
         controller.local_address_type(),
@@ -481,6 +562,19 @@ mod tests {
     };
     use tokio::sync::Notify;
 
+    fn automatic_controller(
+        cancellation: &crate::LifecycleCancellation,
+    ) -> ValidatedControllerConfig {
+        ValidatedControllerConfig::for_epoch(
+            "hci7".to_owned(),
+            address("02:00:00:00:00:01"),
+            AddressType::LeRandom,
+            1,
+            cancellation.observer(),
+        )
+        .unwrap()
+    }
+
     fn address(value: &str) -> Address {
         Address::from_str(value).expect("test Bluetooth address")
     }
@@ -609,6 +703,54 @@ mod tests {
         assert_eq!(peer.addr, locator.address());
         assert_eq!(peer.addr_type, locator.address_type());
         assert_eq!(peer.psm, 0x0081);
+    }
+
+    #[tokio::test]
+    async fn cancelled_between_exact_verification_and_socket_io_blocks_platform_call() {
+        let cancellation = crate::LifecycleCancellation::new();
+        let binding = automatic_controller(&cancellation).operation_binding();
+        let calls = AtomicUsize::new(0);
+
+        let result = final_controller_io(
+            &binding,
+            || async {
+                cancellation.cancel();
+                Ok(())
+            },
+            || async {
+                calls.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().kind(), DriverErrorKind::Cancelled);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn exact_identity_change_before_socket_io_blocks_platform_call() {
+        let cancellation = crate::LifecycleCancellation::new();
+        let binding = automatic_controller(&cancellation).operation_binding();
+        let calls = AtomicUsize::new(0);
+
+        let result = final_controller_io(
+            &binding,
+            || async {
+                Err(DriverError::new(
+                    DriverErrorKind::Unavailable,
+                    "test controller identity changed",
+                ))
+            },
+            || async {
+                calls.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().kind(), DriverErrorKind::Unavailable);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
     }
 
     #[test]

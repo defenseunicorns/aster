@@ -242,7 +242,7 @@ pub struct LinuxControllerResolver {
     status: watch::Receiver<ControllerResolutionSnapshot>,
     cancellation: LifecycleCancellation,
     output: BtleOperatorOutput,
-    task: JoinHandle<()>,
+    task: JoinHandle<Result<(), DriverError>>,
 }
 
 impl LinuxControllerResolver {
@@ -272,7 +272,7 @@ impl LinuxControllerResolver {
                 DriverErrorKind::Transport,
                 "automatic controller resolver task stopped",
             )
-        })?;
+        })??;
         if emit_stop {
             self.output.emit(BtleOperatorEvent::Stopped);
         }
@@ -582,18 +582,21 @@ struct ResolverActor {
     cursor: Option<String>,
     inventory_generation: u64,
     backoff: CappedBackoff,
+    operational_backoff: CappedBackoff,
     #[cfg(test)]
     epoch_updates: Option<tokio::sync::mpsc::Sender<LifecycleCancellationObserver>>,
 }
 
 enum SessionAction {
     Sweep,
+    OperationalRetry,
     Lost,
     Cancelled,
+    Terminal(DriverError),
 }
 
 impl ResolverActor {
-    async fn run(mut self) {
+    async fn run(mut self) -> Result<(), DriverError> {
         self.output.emit(BtleOperatorEvent::AdapterUnavailable(
             crate::AvailabilityReason::BluezUnavailable,
         ));
@@ -611,7 +614,7 @@ impl ResolverActor {
                 Ok(session) => session,
                 Err(ResolverFailure::Cancelled) => break,
                 Err(failure) => {
-                    self.invalidate_owner(failure.disposition()).await;
+                    self.invalidate_owner(failure.disposition()).await?;
                     if wait_delay(&self.cancellation, self.backoff.next_delay()).await {
                         break;
                     }
@@ -621,20 +624,23 @@ impl ResolverActor {
 
             match self.run_session(session.as_mut()).await {
                 SessionAction::Cancelled => break,
+                SessionAction::Terminal(error) => return Err(error),
                 SessionAction::Lost => {
                     self.invalidate_owner(ProbeDisposition::Indeterminate(
                         ProbeReason::BluezUnavailable,
                     ))
-                    .await;
+                    .await?;
                     if wait_delay(&self.cancellation, self.backoff.next_delay()).await {
                         break;
                     }
                 }
-                SessionAction::Sweep => unreachable!("session runner consumes sweep actions"),
+                SessionAction::Sweep | SessionAction::OperationalRetry => {
+                    unreachable!("session runner consumes retry actions")
+                }
             }
         }
         self.invalidate_owner(ProbeDisposition::Indeterminate(ProbeReason::Cancelled))
-            .await;
+            .await
     }
 
     async fn run_session(&mut self, session: &mut dyn ResolverSession) -> SessionAction {
@@ -662,13 +668,23 @@ impl ResolverActor {
                     self.backoff.reset();
                     match self.wait_healthy_event(session).await {
                         SessionAction::Sweep => continue,
+                        SessionAction::OperationalRetry => {
+                            match self.wait_operational_retry(session).await {
+                                SessionAction::Sweep => continue,
+                                outcome => return outcome,
+                            }
+                        }
                         outcome => return outcome,
                     }
                 }
-                self.invalidate_owner(ProbeDisposition::Indeterminate(
-                    ProbeReason::BluezUnavailable,
-                ))
-                .await;
+                if let Err(error) = self
+                    .invalidate_owner(ProbeDisposition::Indeterminate(
+                        ProbeReason::BluezUnavailable,
+                    ))
+                    .await
+                {
+                    return SessionAction::Terminal(error);
+                }
             }
 
             match self.probe_sweep(observed).await {
@@ -679,6 +695,12 @@ impl ResolverActor {
                 self.backoff.reset();
                 match self.wait_healthy_event(session).await {
                     SessionAction::Sweep => continue,
+                    SessionAction::OperationalRetry => {
+                        match self.wait_operational_retry(session).await {
+                            SessionAction::Sweep => continue,
+                            outcome => return outcome,
+                        }
+                    }
                     outcome => return outcome,
                 }
             }
@@ -811,20 +833,28 @@ impl ResolverActor {
         ));
     }
 
-    async fn invalidate_owner(&mut self, disposition: ProbeDisposition) {
+    async fn invalidate_owner(&mut self, disposition: ProbeDisposition) -> Result<(), DriverError> {
         self.publish(ControllerResolutionSnapshot::unavailable(disposition, None));
-        if let Some(operational) = self.operational.as_mut() {
-            let _ = operational.quiesce().await;
+        let mut cleanup_error = None;
+        if let Some(operational) = self.operational.as_mut()
+            && let Err(error) = operational.quiesce().await
+        {
+            cleanup_error = Some(error);
         }
         if let Some(owner) = self.owner.as_ref() {
             owner.cancellation.cancel();
         }
         if let Some(operational) = self.operational.take() {
             operational.cancel();
-            let _ = operational.join().await;
+            if let Err(error) = operational.join().await
+                && cleanup_error.is_none()
+            {
+                cleanup_error = Some(error);
+            }
         }
         self.operational_status.take();
         self.owner.take();
+        cleanup_error.map_or(Ok(()), Err)
     }
 
     async fn wait_healthy_event(&mut self, session: &mut dyn ResolverSession) -> SessionAction {
@@ -857,11 +887,15 @@ impl ResolverActor {
                 }
                 HealthyEvent::Platform(None) => return SessionAction::Lost,
                 HealthyEvent::Operational(Err(_)) => {
-                    self.invalidate_owner(ProbeDisposition::Indeterminate(
-                        ProbeReason::BluezUnavailable,
-                    ))
-                    .await;
-                    return SessionAction::Sweep;
+                    if let Err(error) = self
+                        .invalidate_owner(ProbeDisposition::Indeterminate(
+                            ProbeReason::BluezUnavailable,
+                        ))
+                        .await
+                    {
+                        return SessionAction::Terminal(error);
+                    }
+                    return SessionAction::OperationalRetry;
                 }
                 HealthyEvent::Operational(Ok(())) => {
                     let state = *self
@@ -881,6 +915,7 @@ impl ResolverActor {
                         OperationalEpochState::Degraded => RuntimeAvailability::Degraded,
                     };
                     if runtime_is_selector_available(runtime, event_path_available) {
+                        self.operational_backoff.reset();
                         let support = self
                             .owner
                             .as_ref()
@@ -888,11 +923,15 @@ impl ResolverActor {
                             .support();
                         self.publish(ControllerResolutionSnapshot::available(support));
                     } else if state == OperationalEpochState::Unavailable {
-                        self.invalidate_owner(ProbeDisposition::Indeterminate(
-                            ProbeReason::BluezUnavailable,
-                        ))
-                        .await;
-                        return SessionAction::Sweep;
+                        if let Err(error) = self
+                            .invalidate_owner(ProbeDisposition::Indeterminate(
+                                ProbeReason::BluezUnavailable,
+                            ))
+                            .await
+                        {
+                            return SessionAction::Terminal(error);
+                        }
+                        return SessionAction::OperationalRetry;
                     }
                 }
             }
@@ -922,11 +961,14 @@ impl ResolverActor {
         if self.cancellation.is_cancelled() {
             return SessionAction::Cancelled;
         }
-        if invalidated {
-            self.invalidate_owner(ProbeDisposition::Indeterminate(
-                ProbeReason::BluezUnavailable,
-            ))
-            .await;
+        if invalidated
+            && let Err(error) = self
+                .invalidate_owner(ProbeDisposition::Indeterminate(
+                    ProbeReason::BluezUnavailable,
+                ))
+                .await
+        {
+            return SessionAction::Terminal(error);
         }
         SessionAction::Sweep
     }
@@ -952,6 +994,26 @@ impl ResolverActor {
             return SessionAction::Lost;
         };
         self.consume_event_batch(session, event).await
+    }
+
+    async fn wait_operational_retry(&mut self, session: &mut dyn ResolverSession) -> SessionAction {
+        let delay = self.operational_backoff.next_delay();
+        let deadline = Instant::now() + delay;
+        loop {
+            let event = tokio::select! {
+                biased;
+                () = self.cancellation.cancelled() => return SessionAction::Cancelled,
+                event = session.next_event() => event,
+                () = tokio::time::sleep_until(deadline) => return SessionAction::Sweep,
+            };
+            let Some(event) = event else {
+                return SessionAction::Lost;
+            };
+            match self.consume_event_batch(session, event).await {
+                SessionAction::Sweep => {}
+                outcome => return outcome,
+            }
+        }
     }
 
     fn publish(&self, snapshot: ControllerResolutionSnapshot) {
@@ -1037,6 +1099,7 @@ fn spawn_resolver(
         cursor: None,
         inventory_generation: 0,
         backoff: CappedBackoff::new(INITIAL_RESOLVER_RETRY, MAXIMUM_RESOLVER_RETRY),
+        operational_backoff: CappedBackoff::new(INITIAL_RESOLVER_RETRY, MAXIMUM_RESOLVER_RETRY),
         #[cfg(test)]
         epoch_updates,
     };
@@ -1386,6 +1449,7 @@ mod tests {
         states: Mutex<Vec<watch::Sender<OperationalEpochState>>>,
         events: Arc<Mutex<Vec<&'static str>>>,
         quiesce_gate: Mutex<Option<Arc<Notify>>>,
+        fail_join: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl RecordingActivator {
@@ -1413,6 +1477,10 @@ mod tests {
         fn allow_future_quiesce(&self) {
             *self.quiesce_gate.lock().unwrap() = None;
         }
+
+        fn fail_join(&self) {
+            self.fail_join.store(true, Ordering::Release);
+        }
     }
 
     impl ControllerEpochActivator for RecordingActivator {
@@ -1427,6 +1495,7 @@ mod tests {
                 status,
                 events: self.events.clone(),
                 quiesce_gate: self.quiesce_gate.lock().unwrap().clone(),
+                fail_join: self.fail_join.clone(),
             }))
         }
     }
@@ -1436,6 +1505,7 @@ mod tests {
         status: watch::Receiver<OperationalEpochState>,
         events: Arc<Mutex<Vec<&'static str>>>,
         quiesce_gate: Option<Arc<Notify>>,
+        fail_join: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl OperationalControllerEpoch for RecordingOperationalEpoch {
@@ -1462,7 +1532,17 @@ mod tests {
 
         fn join(self: Box<Self>) -> OperationalEpochFuture<'static, Result<(), DriverError>> {
             self.events.lock().unwrap().push("join");
-            Box::pin(async { Ok(()) })
+            if self.fail_join.load(Ordering::Acquire) {
+                self.events.lock().unwrap().push("force");
+                Box::pin(async {
+                    Err(DriverError::new(
+                        DriverErrorKind::Transport,
+                        "test operational cleanup unconfirmed",
+                    ))
+                })
+            } else {
+                Box::pin(async { Ok(()) })
+            }
         }
     }
 
@@ -1645,6 +1725,7 @@ mod tests {
             cursor: None,
             inventory_generation: 0,
             backoff: CappedBackoff::new(INITIAL_RESOLVER_RETRY, MAXIMUM_RESOLVER_RETRY),
+            operational_backoff: CappedBackoff::new(INITIAL_RESOLVER_RETRY, MAXIMUM_RESOLVER_RETRY),
             epoch_updates: None,
         }
     }
@@ -1690,6 +1771,88 @@ mod tests {
         assert_eq!(available.disposition(), ProbeDisposition::Compatible);
         assert_eq!(activator.activation_count(), 1);
         stop(resolver).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automatic_controller_persistent_operational_denial_uses_capped_retry() {
+        let (harness, session) = Harness::session(vec![controller("hci0", 1, fingerprint("a"))]);
+        let activator = Arc::new(RecordingActivator::default());
+        let probe = Arc::new(FakeProbe::compatible());
+        let (resolver, _epochs) = spawn_with_activator(
+            ControllerAdmissionPolicy::default(),
+            limits(),
+            Arc::new(FakePlatform::new([Ok(session)])),
+            probe.clone(),
+            Some(activator.clone()),
+        );
+        let mut status = resolver.status();
+        wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
+
+        activator.latest_state(OperationalEpochState::Unavailable);
+        wait_for_events(&activator, 3).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(activator.activation_count(), 1);
+        assert_eq!(probe.calls(), ["hci0"]);
+
+        tokio::time::advance(Duration::from_millis(100)).await;
+        harness.event(ResolverEvent::InventoryChanged { removed: None });
+        tokio::task::yield_now().await;
+        assert_eq!(activator.activation_count(), 1);
+        tokio::time::advance(INITIAL_RESOLVER_RETRY - Duration::from_millis(101)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(activator.activation_count(), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        while activator.activation_count() < 2 {
+            tokio::task::yield_now().await;
+        }
+
+        activator.latest_state(OperationalEpochState::Unavailable);
+        wait_for_events(&activator, 6).await;
+        tokio::time::advance(INITIAL_RESOLVER_RETRY * 2 - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(activator.activation_count(), 2);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        while activator.activation_count() < 3 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(probe.calls(), ["hci0", "hci0", "hci0"]);
+        stop(resolver).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automatic_controller_join_failure_is_terminal_and_forces_after_unavailable() {
+        let (_harness, session) = Harness::session(vec![controller("hci0", 1, fingerprint("a"))]);
+        let activator = Arc::new(RecordingActivator::default());
+        let quiesce = Arc::new(Notify::new());
+        activator.block_quiesce(quiesce.clone());
+        activator.fail_join();
+        let (resolver, _epochs) = spawn_with_activator(
+            ControllerAdmissionPolicy::default(),
+            limits(),
+            Arc::new(FakePlatform::new([Ok(session)])),
+            Arc::new(FakeProbe::compatible()),
+            Some(activator.clone()),
+        );
+        let mut status = resolver.status();
+        wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
+        activator.latest_state(OperationalEpochState::Available);
+        wait_for_status(&mut status, RuntimeAvailability::Available).await;
+
+        activator.latest_state(OperationalEpochState::Unavailable);
+        wait_for_status(&mut status, RuntimeAvailability::Unavailable).await;
+        wait_for_events(&activator, 1).await;
+        assert_eq!(activator.events(), ["quiesce"]);
+        quiesce.notify_one();
+        wait_for_events(&activator, 4).await;
+        assert_eq!(activator.events(), ["quiesce", "cancel", "join", "force"]);
+
+        tokio::time::advance(INITIAL_RESOLVER_RETRY * 4).await;
+        tokio::task::yield_now().await;
+        assert_eq!(activator.activation_count(), 1);
+        assert!(resolver.shutdown().await.is_err());
     }
 
     #[tokio::test]

@@ -417,6 +417,51 @@ struct ControllerEpochBinding {
     cancellation: LifecycleCancellationObserver,
 }
 
+#[derive(Clone)]
+pub(crate) struct ControllerOperationBinding {
+    adapter_name: String,
+    local_address: Address,
+    local_address_type: AddressType,
+    epoch: Option<ControllerEpochBinding>,
+}
+
+impl Clone for ControllerEpochBinding {
+    fn clone(&self) -> Self {
+        Self {
+            generation: self.generation,
+            cancellation: self.cancellation.clone(),
+        }
+    }
+}
+
+impl ControllerOperationBinding {
+    pub(crate) fn ensure_current(&self) -> Result<(), DriverError> {
+        ensure_epoch_current(self.epoch.as_ref())
+    }
+
+    pub(crate) fn adapter_name(&self) -> &str {
+        &self.adapter_name
+    }
+
+    pub(crate) const fn local_address(&self) -> Address {
+        self.local_address
+    }
+
+    pub(crate) const fn local_address_type(&self) -> AddressType {
+        self.local_address_type
+    }
+}
+
+fn ensure_epoch_current(epoch: Option<&ControllerEpochBinding>) -> Result<(), DriverError> {
+    if epoch.is_some_and(|epoch| epoch.generation == 0 || epoch.cancellation.is_cancelled()) {
+        return Err(DriverError::new(
+            crate::DriverErrorKind::Cancelled,
+            "controller epoch is stale",
+        ));
+    }
+    Ok(())
+}
+
 impl ValidatedControllerConfig {
     pub(crate) fn for_epoch(
         adapter_name: String,
@@ -441,17 +486,16 @@ impl ValidatedControllerConfig {
     }
 
     pub(crate) fn ensure_current(&self) -> Result<(), DriverError> {
-        if self
-            .epoch
-            .as_ref()
-            .is_some_and(|epoch| epoch.generation == 0 || epoch.cancellation.is_cancelled())
-        {
-            return Err(DriverError::new(
-                crate::DriverErrorKind::Cancelled,
-                "controller epoch is stale",
-            ));
+        ensure_epoch_current(self.epoch.as_ref())
+    }
+
+    pub(crate) fn operation_binding(&self) -> ControllerOperationBinding {
+        ControllerOperationBinding {
+            adapter_name: self.config.adapter_name.clone(),
+            local_address: self.config.local_address,
+            local_address_type: self.config.local_address_type,
+            epoch: self.epoch.clone(),
         }
-        Ok(())
     }
 
     /// Exact BlueZ controller name.
@@ -664,7 +708,7 @@ impl RosteredSupervisorConfig {
             contact_limits,
         } = self;
         let controller = controller.validate()?;
-        let discovery = Arc::new(discovery.validate());
+        let discovery = RosteredDiscoveryStorage::Fixed(discovery.validate());
         let contact_limits = contact_limits.validate()?;
         validate_contact_cadence(contact_cadence)?;
         let role = derive_role(local_mission_id, peer_mission_id)?;
@@ -698,12 +742,26 @@ impl fmt::Debug for RosteredSupervisorConfig {
 /// Fully validated rostered Linux supervisor input.
 pub struct ValidatedRosteredSupervisorConfig {
     controller: ValidatedControllerConfig,
-    discovery: Arc<ValidatedRosteredDiscoveryConfig>,
+    discovery: RosteredDiscoveryStorage,
     local_mission_id: NodeId,
     peer_mission_id: NodeId,
     role: FixedRole,
     contact_cadence: Duration,
     contact_limits: ValidatedContactLimits,
+}
+
+enum RosteredDiscoveryStorage {
+    Fixed(ValidatedRosteredDiscoveryConfig),
+    Automatic(Arc<ValidatedRosteredDiscoveryConfig>),
+}
+
+impl fmt::Debug for RosteredDiscoveryStorage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fixed(discovery) => discovery.fmt(formatter),
+            Self::Automatic(discovery) => discovery.fmt(formatter),
+        }
+    }
 }
 
 /// Validated automatic roster policy containing no detected controller identity.
@@ -760,7 +818,7 @@ impl ValidatedAutomaticRosteredSupervisorConfig {
                 generation,
                 cancellation,
             )?,
-            discovery: self.discovery.clone(),
+            discovery: RosteredDiscoveryStorage::Automatic(self.discovery.clone()),
             local_mission_id: self.local_mission_id,
             peer_mission_id: self.peer_mission_id,
             role: self.role,
@@ -842,8 +900,8 @@ impl ValidatedRosteredSupervisorConfig {
     }
 
     /// Host-authorized discovery credentials owned by this adapter epoch.
-    pub fn discovery_credentials(&self) -> &LeasedDiscoveryCredentialSet {
-        self.discovery.credentials()
+    pub const fn discovery_credentials(&self) -> &LeasedDiscoveryCredentialSet {
+        self.discovery().credentials()
     }
 
     /// Validated local controller selection passed to Linux platform seams.
@@ -852,8 +910,20 @@ impl ValidatedRosteredSupervisorConfig {
     }
 
     /// Fixed discovery profile and leased credential owner.
-    pub fn discovery(&self) -> &ValidatedRosteredDiscoveryConfig {
-        self.discovery.as_ref()
+    pub const fn discovery(&self) -> &ValidatedRosteredDiscoveryConfig {
+        match &self.discovery {
+            RosteredDiscoveryStorage::Fixed(discovery) => discovery,
+            RosteredDiscoveryStorage::Automatic(_) => {
+                panic!("automatic epoch discovery is crate-private")
+            }
+        }
+    }
+
+    pub(crate) fn epoch_discovery_credentials(&self) -> &LeasedDiscoveryCredentialSet {
+        match &self.discovery {
+            RosteredDiscoveryStorage::Fixed(discovery) => discovery.credentials(),
+            RosteredDiscoveryStorage::Automatic(discovery) => discovery.credentials(),
+        }
     }
 
     /// Existing validated protected-contact bounds.
@@ -1002,6 +1072,15 @@ mod tests {
     mod automatic_controller {
         use super::*;
 
+        const fn fixed_discovery_accessors_are_const(
+            config: &ValidatedRosteredSupervisorConfig,
+        ) -> (
+            &LeasedDiscoveryCredentialSet,
+            &ValidatedRosteredDiscoveryConfig,
+        ) {
+            (config.discovery_credentials(), config.discovery())
+        }
+
         #[test]
         fn automatic_config_validates_without_present_controller() {
             let validated = automatic_rostered([0x11; 32], [0x22; 32])
@@ -1037,6 +1116,7 @@ mod tests {
             assert_eq!(validated.adapter_name(), "hci7");
             assert_eq!(validated.local_address(), address("02:00:00:00:00:01"));
             assert_eq!(validated.local_address_type(), AddressType::LeRandom);
+            let _ = fixed_discovery_accessors_are_const(&validated);
         }
     }
 
