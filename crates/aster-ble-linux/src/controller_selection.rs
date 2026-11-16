@@ -214,6 +214,7 @@ pub struct ControllerAdmissionPolicy {
     qualified_only: bool,
     support_rows: BoundedRows<SupportRow>,
     unsafe_rules: BoundedRows<UnsafeRule>,
+    unsafe_overflowed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -249,17 +250,19 @@ impl ControllerAdmissionPolicy {
 
     /// Creates a policy from injected rows, retaining at most [`MAX_ADMISSION_ROWS`] per table.
     ///
-    /// Rows after the fixed bound are ignored so admission work stays bounded even when a
-    /// caller supplies an oversized test or generated table.
+    /// Missing support evidence remains unqualified. Missing safety evidence fails closed for
+    /// every controller because an omitted unsafe row cannot be distinguished from a match.
     pub fn with_rows(
         qualified_only: bool,
         support_rows: Vec<SupportRow>,
         unsafe_rules: Vec<UnsafeRule>,
     ) -> Self {
+        let unsafe_overflowed = unsafe_rules.len() > MAX_ADMISSION_ROWS;
         Self {
             qualified_only,
             support_rows: BoundedRows::from_vec(support_rows),
             unsafe_rules: BoundedRows::from_vec(unsafe_rules),
+            unsafe_overflowed,
         }
     }
 
@@ -289,7 +292,9 @@ impl ControllerAdmissionPolicy {
                 MatchKind::None => {}
             }
         }
-        let disposition = if exact_unsafe {
+        let disposition = if self.unsafe_overflowed {
+            ProbeDisposition::Blocked(ProbeReason::AmbiguousUnsafeOverlap)
+        } else if exact_unsafe {
             ProbeDisposition::Blocked(ProbeReason::KnownUnsafe)
         } else if ambiguous_unsafe {
             ProbeDisposition::Blocked(ProbeReason::AmbiguousUnsafeOverlap)
@@ -718,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn admission_rows_are_bounded_without_scanning_an_unbounded_tail() {
+    fn unsafe_row_overflow_blocks_every_controller() {
         let candidate = fingerprint();
         let mut non_matching = candidate.clone();
         non_matching.set_firmware(Some("other-firmware"));
@@ -726,10 +731,16 @@ mod tests {
         unsafe_rules.push(UnsafeRule::exact(candidate.clone()));
 
         let policy = ControllerAdmissionPolicy::with_rows(false, vec![], unsafe_rules);
+        let mut unrelated = candidate.clone();
+        unrelated.set_firmware(Some("unrelated"));
 
         assert_eq!(
             policy.admit(&candidate).disposition(),
-            ProbeDisposition::Compatible
+            ProbeDisposition::Blocked(ProbeReason::AmbiguousUnsafeOverlap)
+        );
+        assert_eq!(
+            policy.admit(&unrelated).disposition(),
+            ProbeDisposition::Blocked(ProbeReason::AmbiguousUnsafeOverlap)
         );
     }
 
