@@ -405,6 +405,7 @@ struct EpochSignals {
     available_started: Option<oneshot::Sender<Instant>>,
     operational: Option<watch::Sender<OperationalEpochState>>,
     availability_fence: Option<Arc<AvailabilityFence>>,
+    supervisor_availability_fence: Option<Arc<AvailabilityFence>>,
 }
 
 #[derive(Default)]
@@ -430,6 +431,7 @@ impl EpochSignals {
             available_started: Some(available_started),
             operational: None,
             availability_fence: None,
+            supervisor_availability_fence: None,
         }
     }
 
@@ -437,6 +439,7 @@ impl EpochSignals {
         publisher: Arc<AdapterAvailabilityPublisher>,
         operational: watch::Sender<OperationalEpochState>,
         availability_fence: Arc<AvailabilityFence>,
+        supervisor_availability_fence: Arc<AvailabilityFence>,
     ) -> Self {
         Self {
             availability: None,
@@ -444,11 +447,26 @@ impl EpochSignals {
             available_started: None,
             operational: Some(operational),
             availability_fence: Some(availability_fence),
+            supervisor_availability_fence: Some(supervisor_availability_fence),
         }
     }
 
     fn publish(&self, availability: crate::BtleAvailability) -> Result<(), SupervisorError> {
-        let _available_guard = if availability == crate::BtleAvailability::Available {
+        let _supervisor_available_guard = if availability == crate::BtleAvailability::Available {
+            let guard = self.supervisor_availability_fence.as_ref().map(|fence| {
+                fence
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            });
+            if guard.as_deref().is_some_and(|quiesced| *quiesced) {
+                return Err(SupervisorError::TaskStopped);
+            }
+            guard
+        } else {
+            None
+        };
+        let _epoch_available_guard = if availability == crate::BtleAvailability::Available {
             let guard = self.availability_fence.as_ref().map(|fence| {
                 fence
                     .0
@@ -943,6 +961,7 @@ struct RosteredEpochActivator {
     mode: Arc<AsyncMutex<EpochContactMode>>,
     publisher: Arc<AdapterAvailabilityPublisher>,
     platform_owner: Arc<PlatformOwner>,
+    supervisor_availability_fence: Arc<AvailabilityFence>,
 }
 
 impl ControllerEpochActivator for RosteredEpochActivator {
@@ -968,6 +987,7 @@ impl ControllerEpochActivator for RosteredEpochActivator {
         let mode = self.mode.clone();
         let publisher = self.publisher.clone();
         let platform_owner = self.platform_owner.clone();
+        let supervisor_availability_fence = self.supervisor_availability_fence.clone();
         let task_updates = updates.clone();
         let task = tokio::spawn(async move {
             let epoch = async {
@@ -1002,6 +1022,7 @@ impl ControllerEpochActivator for RosteredEpochActivator {
                         publisher.clone(),
                         task_updates.clone(),
                         task_availability_fence,
+                        supervisor_availability_fence,
                     ),
                     observer.clone(),
                 )
@@ -1043,7 +1064,7 @@ impl ControllerEpochActivator for RosteredEpochActivator {
             commands,
             availability_fence,
             cancellation,
-            task,
+            task: Some(task),
             platform_owner: self.platform_owner.clone(),
             unavailable: self.publisher.unavailable_only(),
         }))
@@ -1092,7 +1113,7 @@ struct RosteredOperationalEpoch {
     commands: mpsc::Sender<OperationalEpochCommand>,
     availability_fence: Arc<AvailabilityFence>,
     cancellation: LifecycleCancellation,
-    task: JoinHandle<Result<(), DriverError>>,
+    task: Option<JoinHandle<Result<(), DriverError>>>,
     platform_owner: Arc<PlatformOwner>,
     unavailable: UnavailableAvailabilityPublisher,
 }
@@ -1126,10 +1147,16 @@ impl OperationalControllerEpoch for RosteredOperationalEpoch {
         self.cancellation.cancel();
     }
 
-    fn join(self: Box<Self>) -> OperationalEpochFuture<'static, Result<(), DriverError>> {
+    fn join(mut self: Box<Self>) -> OperationalEpochFuture<'static, Result<(), DriverError>> {
         Box::pin(async move {
             self.availability_fence.quiesce();
-            match self.task.await {
+            let task_result = self
+                .task
+                .as_mut()
+                .expect("operational epoch task retained")
+                .await;
+            let _ = self.task.take();
+            match task_result {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(error)) => {
                     let _ = self.unavailable.publish();
@@ -1153,6 +1180,19 @@ impl RosteredOperationalEpoch {
     fn publish_unavailable_after_failure(&self, message: &'static str) -> DriverError {
         let _ = self.unavailable.publish();
         DriverError::new(DriverErrorKind::Transport, message)
+    }
+}
+
+impl Drop for RosteredOperationalEpoch {
+    fn drop(&mut self) {
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        self.availability_fence.quiesce();
+        self.cancellation.cancel();
+        let _ = self.unavailable.publish();
+        self.platform_owner.force_loss();
+        task.abort();
     }
 }
 
@@ -1196,6 +1236,7 @@ pub fn spawn_automatic_linux_rostered_btle_event_supervisor(
         config.role(),
     ));
     let platform_owner = Arc::new(PlatformOwner::default());
+    let supervisor_availability_fence = Arc::new(AvailabilityFence::default());
     let activator = Arc::new(RosteredEpochActivator {
         config: config.clone(),
         contacts: Arc::new(contacts),
@@ -1204,6 +1245,7 @@ pub fn spawn_automatic_linux_rostered_btle_event_supervisor(
         )))),
         publisher: publisher.clone(),
         platform_owner: platform_owner.clone(),
+        supervisor_availability_fence: supervisor_availability_fence.clone(),
     });
     let resolver = spawn_linux_controller_resolver_with_activation(
         config.controller_policy().clone(),
@@ -1220,6 +1262,7 @@ pub fn spawn_automatic_linux_rostered_btle_event_supervisor(
             status,
             task_cancellation,
             expires_at,
+            supervisor_availability_fence,
             publisher.unavailable_only(),
             async move { resolver.shutdown_for_supervisor().await },
         )
@@ -1240,6 +1283,7 @@ async fn run_automatic_resolver_owner<T, F>(
     mut status: watch::Receiver<T>,
     cancellation: LifecycleCancellation,
     expires_at: Instant,
+    supervisor_availability_fence: Arc<AvailabilityFence>,
     unavailable: UnavailableAvailabilityPublisher,
     shutdown: F,
 ) -> Result<(), SupervisorError>
@@ -1259,14 +1303,29 @@ where
         () = resolver_stopped => Wake::Stop,
         () = tokio::time::sleep_until(tokio::time::Instant::from_std(expires_at)) => Wake::Expired,
     };
-    if matches!(wake, Wake::Expired) {
+    let publication_error = if matches!(wake, Wake::Expired) {
+        supervisor_availability_fence.quiesce();
         unavailable
             .publish()
-            .map_err(|_| SupervisorError::TaskStopped)?;
+            .err()
+            .map(|_| SupervisorError::TaskStopped)
+    } else {
+        None
+    };
+    let shutdown_result = if matches!(wake, Wake::Expired) {
+        timeout(OWNER_LOSS_AFTER, shutdown)
+            .await
+            .map_err(|_| SupervisorError::PlatformCleanupUnconfirmed)
+            .and_then(|result| result.map_err(|_| SupervisorError::PlatformCleanupUnconfirmed))
+    } else {
+        shutdown
+            .await
+            .map_err(|_| SupervisorError::PlatformCleanupUnconfirmed)
+    };
+    shutdown_result?;
+    if let Some(error) = publication_error {
+        return Err(error);
     }
-    shutdown
-        .await
-        .map_err(|_| SupervisorError::PlatformCleanupUnconfirmed)?;
     if matches!(wake, Wake::Expired) {
         cancellation.cancelled().await;
     }
@@ -3388,17 +3447,55 @@ mod tests {
             commands,
             availability_fence: Arc::new(AvailabilityFence::default()),
             cancellation: LifecycleCancellation::new(),
-            task: tokio::spawn(async {
+            task: Some(tokio::spawn(async {
                 Err(DriverError::new(
                     DriverErrorKind::Transport,
                     "test platform cleanup unconfirmed",
                 ))
-            }),
+            })),
             platform_owner,
             unavailable: test_unavailable_publisher(),
         };
 
         assert!(Box::new(epoch).join().await.is_err());
+        assert_eq!(force_count.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_operational_epoch_contains_task_custody() {
+        let force_count = Arc::new(AtomicU8::new(0));
+        let platform_owner = Arc::new(PlatformOwner::default());
+        platform_owner.replace(RecordingOwnerLoss {
+            force_count: force_count.clone(),
+            release: None,
+        });
+        let secret_drops = Arc::new(AtomicU8::new(0));
+        let secret_owner = RecordDrop(secret_drops.clone());
+        let (_updates, status) = watch::channel(OperationalEpochState::Unavailable);
+        let (commands, _requests) = mpsc::channel(1);
+        let epoch = RosteredOperationalEpoch {
+            status,
+            commands,
+            availability_fence: Arc::new(AvailabilityFence::default()),
+            cancellation: LifecycleCancellation::new(),
+            task: Some(tokio::spawn(async move {
+                let _secret_owner = secret_owner;
+                pending::<Result<(), DriverError>>().await
+            })),
+            platform_owner,
+            unavailable: test_unavailable_publisher(),
+        };
+        tokio::task::yield_now().await;
+
+        drop(epoch);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while secret_drops.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping operational epoch contains task custody");
+
         assert_eq!(force_count.load(Ordering::Acquire), 1);
     }
 
@@ -3413,6 +3510,7 @@ mod tests {
                 status,
                 cancellation,
                 Instant::now() + Duration::from_secs(60),
+                Arc::new(AvailabilityFence::default()),
                 test_unavailable_publisher(),
                 async {
                     Err(DriverError::new(
@@ -3452,6 +3550,7 @@ mod tests {
                 status,
                 task_cancellation,
                 Instant::now() + Duration::from_secs(5),
+                Arc::new(AvailabilityFence::default()),
                 unavailable,
                 async move {
                     let _secret_owner = secret_owner;
@@ -3475,6 +3574,134 @@ mod tests {
             "expired supervisor remains nonterminal"
         );
 
+        cancellation.cancel();
+        assert_eq!(task.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expiry_publication_rejection_still_completes_resolver_shutdown() {
+        let cancellation = LifecycleCancellation::new();
+        let (_status_updates, status) = watch::channel(OperationalEpochState::Starting);
+        let control = Arc::new(RecordingEventAdapterControl {
+            snapshots: Mutex::new(Vec::new()),
+            accepts: false,
+        });
+        let (availability_updates, _availability) =
+            watch::channel(crate::BtleAvailability::Available);
+        let unavailable = AdapterAvailabilityPublisher::automatic(
+            control,
+            availability_updates,
+            crate::BtleOperatorOutput::discard(),
+            FixedRole::Initiator,
+        )
+        .unavailable_only();
+        let shutdown_completed = Arc::new(AtomicU8::new(0));
+        let task_shutdown_completed = shutdown_completed.clone();
+        let secret_drops = Arc::new(AtomicU8::new(0));
+        let secret_owner = RecordDrop(secret_drops.clone());
+        let task = tokio::spawn(run_automatic_resolver_owner(
+            status,
+            cancellation,
+            Instant::now() + Duration::from_secs(5),
+            Arc::new(AvailabilityFence::default()),
+            unavailable,
+            async move {
+                let _secret_owner = secret_owner;
+                task_shutdown_completed.store(1, Ordering::Release);
+                Ok(())
+            },
+        ));
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        assert_eq!(task.await.unwrap(), Err(SupervisorError::TaskStopped));
+        assert_eq!(shutdown_completed.load(Ordering::Acquire), 1);
+        assert_eq!(secret_drops.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expiry_bounds_hung_resolver_cleanup_and_releases_custody() {
+        let cancellation = LifecycleCancellation::new();
+        let (_status_updates, status) = watch::channel(OperationalEpochState::Starting);
+        let secret_drops = Arc::new(AtomicU8::new(0));
+        let secret_owner = RecordDrop(secret_drops.clone());
+        let shutdown_started = Arc::new(AtomicU8::new(0));
+        let task_shutdown_started = shutdown_started.clone();
+        let task = tokio::spawn(run_automatic_resolver_owner(
+            status,
+            cancellation,
+            Instant::now() + Duration::from_secs(5),
+            Arc::new(AvailabilityFence::default()),
+            test_unavailable_publisher(),
+            async move {
+                let _secret_owner = secret_owner;
+                task_shutdown_started.store(1, Ordering::Release);
+                pending::<Result<(), DriverError>>().await
+            },
+        ));
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(5) + Duration::from_millis(1)).await;
+        while shutdown_started.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(OWNER_LOSS_AFTER + Duration::from_millis(1)).await;
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("expiry bounds resolver cleanup custody")
+                .unwrap(),
+            Err(SupervisorError::PlatformCleanupUnconfirmed)
+        );
+        assert_eq!(secret_drops.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expiry_fences_a_concurrent_late_available_publication() {
+        let cancellation = LifecycleCancellation::new();
+        let task_cancellation = cancellation.clone();
+        let (_status_updates, status) = watch::channel(OperationalEpochState::Starting);
+        let (availability_updates, mut availability) =
+            watch::channel(crate::BtleAvailability::Available);
+        let publisher = Arc::new(AdapterAvailabilityPublisher::fixed(
+            availability_updates,
+            crate::BtleOperatorOutput::discard(),
+        ));
+        let expiry_fence = Arc::new(AvailabilityFence::default());
+        let (operational, _operational_updates) = watch::channel(OperationalEpochState::Starting);
+        let signals = EpochSignals::operational(
+            publisher.clone(),
+            operational,
+            Arc::new(AvailabilityFence::default()),
+            expiry_fence.clone(),
+        );
+        let (late_result_updates, late_result) = oneshot::channel();
+        let task = tokio::spawn(run_automatic_resolver_owner(
+            status,
+            task_cancellation,
+            Instant::now() + Duration::from_secs(5),
+            expiry_fence,
+            publisher.unavailable_only(),
+            async move {
+                let _ =
+                    late_result_updates.send(signals.publish(crate::BtleAvailability::Available));
+                Ok(())
+            },
+        ));
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        assert_eq!(
+            late_result.await.unwrap(),
+            Err(SupervisorError::TaskStopped)
+        );
+        assert_eq!(
+            *availability.borrow_and_update(),
+            crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable)
+        );
         cancellation.cancel();
         assert_eq!(task.await.unwrap(), Ok(()));
     }
@@ -5355,7 +5582,7 @@ mod tests {
                 commands,
                 availability_fence: Arc::new(AvailabilityFence::default()),
                 cancellation: LifecycleCancellation::new(),
-                task: tokio::spawn(async { panic!("test operational panic") }),
+                task: Some(tokio::spawn(async { panic!("test operational panic") })),
                 platform_owner,
                 unavailable: publisher.unavailable_only(),
             };
@@ -5417,7 +5644,7 @@ mod tests {
                 commands,
                 availability_fence: Arc::new(AvailabilityFence::default()),
                 cancellation: cancellation.clone(),
-                task,
+                task: Some(task),
                 platform_owner,
                 unavailable: publisher.unavailable_only(),
             };
@@ -5570,8 +5797,12 @@ mod tests {
             let (control, publisher, availability, _available_started) = publisher();
             let (updates, status) = watch::channel(OperationalEpochState::Starting);
             let fence = Arc::new(AvailabilityFence::default());
-            let signals =
-                EpochSignals::operational(publisher.clone(), updates.clone(), fence.clone());
+            let signals = EpochSignals::operational(
+                publisher.clone(),
+                updates.clone(),
+                fence.clone(),
+                Arc::new(AvailabilityFence::default()),
+            );
             let cancellation = LifecycleCancellation::new();
             let task_cancellation = cancellation.clone();
             let (commands, mut requests) = mpsc::channel(1);
@@ -5591,7 +5822,7 @@ mod tests {
                 commands,
                 availability_fence: fence,
                 cancellation,
-                task,
+                task: Some(task),
                 platform_owner: Arc::new(PlatformOwner::default()),
                 unavailable: publisher.unavailable_only(),
             };

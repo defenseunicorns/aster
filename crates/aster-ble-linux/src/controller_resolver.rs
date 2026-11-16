@@ -245,7 +245,7 @@ pub struct LinuxControllerResolver {
     status: watch::Receiver<ControllerResolutionSnapshot>,
     cancellation: LifecycleCancellation,
     output: BtleOperatorOutput,
-    task: JoinHandle<Result<(), DriverError>>,
+    task: Option<JoinHandle<Result<(), DriverError>>>,
 }
 
 impl LinuxControllerResolver {
@@ -268,9 +268,11 @@ impl LinuxControllerResolver {
         self.shutdown_with_stop_event(false).await
     }
 
-    async fn shutdown_with_stop_event(self, emit_stop: bool) -> Result<(), DriverError> {
+    async fn shutdown_with_stop_event(mut self, emit_stop: bool) -> Result<(), DriverError> {
         self.cancel();
-        self.task.await.map_err(|_| {
+        let task_result = self.task.as_mut().expect("resolver task retained").await;
+        let _ = self.task.take();
+        task_result.map_err(|_| {
             DriverError::new(
                 DriverErrorKind::Transport,
                 "automatic controller resolver task stopped",
@@ -280,6 +282,15 @@ impl LinuxControllerResolver {
             self.output.emit(BtleOperatorEvent::Stopped);
         }
         Ok(())
+    }
+}
+
+impl Drop for LinuxControllerResolver {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -1365,7 +1376,7 @@ fn spawn_resolver(
         status,
         cancellation,
         output,
-        task,
+        task: Some(task),
     }
 }
 
@@ -3569,5 +3580,29 @@ mod tests {
 
         assert!(epoch.is_cancelled());
         assert_eq!(probe.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_resolver_releases_active_probe_custody() {
+        let (_harness, session) =
+            Harness::session(vec![controller("hci0", 1, fingerprint("pending-probe"))]);
+        let probe = Arc::new(FakeProbe::with("hci0", ProbeBehavior::Pending));
+        let (resolver, _epochs) = spawn(
+            ControllerAdmissionPolicy::default(),
+            limits(),
+            Arc::new(FakePlatform::new([Ok(session)])),
+            probe.clone(),
+        );
+        probe.wait_for_calls(1).await;
+        assert_eq!(probe.active.load(Ordering::SeqCst), 1);
+
+        drop(resolver);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while probe.active.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping resolver releases active probe custody");
     }
 }
