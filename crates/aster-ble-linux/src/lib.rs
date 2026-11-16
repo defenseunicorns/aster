@@ -5,6 +5,7 @@
 
 mod config;
 mod controller;
+mod controller_selection;
 mod discovery;
 mod discovery_record;
 mod lifecycle;
@@ -25,6 +26,12 @@ pub use config::{
 pub use controller::{
     AvailabilityReason, BTLE_OPERATOR_OUTPUT_CAPACITY, BtleAvailability, BtleOperatorEvent,
     BtleOperatorOutput,
+};
+pub use controller_selection::{
+    ControllerAdmission, ControllerAdmissionPolicy, ControllerCandidate, ControllerFingerprint,
+    ControllerInventory, ControllerSnapshot, MAX_ADAPTER_NAME_BYTES, MAX_CONTROLLER_CANDIDATES,
+    ProbeDisposition, ProbeReason, SupportRow, SupportTag, UnsafeRule,
+    normalize_controller_inventory,
 };
 pub use discovery::{
     AttemptKind, CanonicalLocator, CanonicalLocatorError, DiscoveryAdmission, DiscoveryCandidate,
