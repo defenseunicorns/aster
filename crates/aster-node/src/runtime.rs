@@ -3833,6 +3833,8 @@ pub struct RunningNode {
     nearby_discovery_stop: Option<NearbyDiscoveryControl>,
     #[cfg(test)]
     handles_sigint: bool,
+    #[cfg(unix)]
+    embedded_zeroization: Option<EmbeddedZeroizationSender>,
     shutdown: Option<mpsc::Sender<()>>,
     task: Option<JoinHandle<Result<NodeReceipt, NodeError>>>,
 }
@@ -4698,6 +4700,47 @@ impl RunningNode {
     /// owners, then consume the node through [`Self::shutdown`].
     pub fn close_admission(&self) {
         close_node_admission(&self.application_admission, &self.transport_admission);
+    }
+
+    /// Requests terminal software zeroization for an embedding-owned local node.
+    /// The same actor preflight, admission closure, drain, and durable erasure
+    /// used by local IPC apply. The exact retained mission artifact must match.
+    /// Await shutdown afterwards to join the actor and its workers.
+    pub async fn zeroize_embedded(&self, mission_bundle: &Path) -> Result<(), NodeError> {
+        #[cfg(unix)]
+        {
+            let sender = self.embedded_zeroization.as_ref().ok_or_else(|| {
+                NodeError::Configuration("node does not use embedded zeroization".into())
+            })?;
+            let state = local_state_identity_following_pinned_authority(&self.state_root.path)?;
+            let (store_device, store_inode) =
+                local_store_identity(&self.state_root.path.join(STORE_FILE))?;
+            let mission = local_mission_request_identity(mission_bundle)?;
+            let (response, received) = oneshot::channel();
+            sender
+                .send(Ok(LocalZeroizationRequest {
+                    response: LocalZeroizationResponse::Embedded(response),
+                    binding: LocalZeroizationBinding {
+                        state,
+                        store_device,
+                        store_inode,
+                        mission,
+                    },
+                }))
+                .await
+                .map_err(|_| {
+                    NodeError::Configuration("embedded zeroization admission closed".into())
+                })?;
+            let response = received.await.map_err(|_| {
+                NodeError::Configuration("embedded zeroization response closed".into())
+            })?;
+            require_live_zeroization_success(&response)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = mission_bundle;
+            Err(SoftwareErasureError::PlatformUnavailable.into())
+        }
     }
 
     /// Requests graceful shutdown, closes command admission, and waits for cleanup.
@@ -15217,9 +15260,22 @@ struct LocalZeroizationControl {
 
 #[cfg(unix)]
 struct LocalZeroizationRequest {
-    stream: UnixStream,
+    response: LocalZeroizationResponse,
     binding: LocalZeroizationBinding,
 }
+
+#[cfg(unix)]
+enum LocalZeroizationResponse {
+    Socket(UnixStream),
+    Embedded(oneshot::Sender<String>),
+}
+
+#[cfg(unix)]
+type EmbeddedZeroizationSender =
+    mpsc::Sender<Result<LocalZeroizationRequest, LocalZeroizationAcceptError>>;
+#[cfg(unix)]
+type EmbeddedZeroizationReceiver =
+    mpsc::Receiver<Result<LocalZeroizationRequest, LocalZeroizationAcceptError>>;
 
 #[derive(Debug)]
 struct LocalZeroizationAcceptError {
@@ -15366,7 +15422,10 @@ impl LocalZeroizationControl {
                 ),
             ));
         }
-        Ok(LocalZeroizationRequest { stream, binding })
+        Ok(LocalZeroizationRequest {
+            response: LocalZeroizationResponse::Socket(stream),
+            binding,
+        })
     }
 
     fn revalidate(&self) -> Result<(), NodeError> {
@@ -15477,15 +15536,25 @@ impl LocalZeroizationRequest {
             && self.binding.mission.inode == inode
     }
 
-    async fn respond(mut self, response: &str) -> Result<(), NodeError> {
-        timeout(
-            LOCAL_ZEROIZATION_IO_DEADLINE,
-            write_local_zeroization_response(&mut self.stream, response),
-        )
-        .await
-        .map_err(|_| {
-            NodeError::Configuration("local zeroization response exceeded its deadline".into())
-        })??;
+    async fn respond(self, response: &str) -> Result<(), NodeError> {
+        match self.response {
+            LocalZeroizationResponse::Socket(mut stream) => {
+                timeout(
+                    LOCAL_ZEROIZATION_IO_DEADLINE,
+                    write_local_zeroization_response(&mut stream, response),
+                )
+                .await
+                .map_err(|_| {
+                    NodeError::Configuration(
+                        "local zeroization response exceeded its deadline".into(),
+                    )
+                })??;
+            }
+            LocalZeroizationResponse::Embedded(sender) => {
+                // Cleanup must complete even when the embedding drops its waiter.
+                let _ = sender.send(response.to_owned());
+            }
+        }
         Ok(())
     }
 }
@@ -17165,6 +17234,25 @@ pub async fn start_externally_supervised_transport_neutral_node(
     .await
 }
 
+/// Starts an embedding-owned local node with explicit durable admission limits.
+/// No transport, local administration socket, or process signal handler is installed.
+/// Use [`RunningNode::zeroize_embedded`] for the terminal lifecycle hook.
+pub async fn start_externally_supervised_local_node(
+    config: TransportNeutralNodeConfig,
+    forwarding: SelectedForwardingConfig,
+    output_policy: NodeOperatorOutputPolicy,
+) -> Result<RunningNode, NodeError> {
+    start_node_with_shutdown_ownership(
+        config.into_node_config(),
+        forwarding,
+        NodeOperatorOutput::process(output_policy),
+        false,
+        false,
+        InitialTransportAdmission::Embedded,
+    )
+    .await
+}
+
 async fn start_externally_supervised_transport_neutral_node_with_output(
     config: TransportNeutralNodeConfig,
     output: NodeOperatorOutput,
@@ -17249,6 +17337,7 @@ pub async fn start_supervised_node_with_forwarding_and_output_policy(
 #[derive(Clone, Copy)]
 enum InitialTransportAdmission {
     Open,
+    Embedded,
     SupervisedClosed,
 }
 
@@ -17265,7 +17354,9 @@ async fn start_node_with_shutdown_ownership(
     let (application_sender, application_receiver) = mpsc::channel(APPLICATION_COMMAND_CAPACITY);
     let application_admission = Arc::new(AtomicBool::new(true));
     let transport_admission = Arc::new(match initial_transport_admission {
-        InitialTransportAdmission::Open => TransportAdmission::open(),
+        InitialTransportAdmission::Open | InitialTransportAdmission::Embedded => {
+            TransportAdmission::open()
+        }
         InitialTransportAdmission::SupervisedClosed => TransportAdmission::startup_closed(),
     });
     let selected_events = SelectedEventHandle::new(
@@ -17318,6 +17409,17 @@ async fn start_node_with_shutdown_ownership(
         shutdown_receiver,
         ready_sender,
     );
+    #[cfg(unix)]
+    let embedded_zeroization = if matches!(
+        initial_transport_admission,
+        InitialTransportAdmission::Embedded
+    ) {
+        let (sender, receiver) = mpsc::channel(1);
+        channels.embedded_zeroization = Some((sender.clone(), receiver));
+        Some(sender)
+    } else {
+        None
+    };
     channels.handle_sigint = handle_sigint;
     channels.iroh_transport_enabled = iroh_transport_enabled;
     channels.automatic_event_transports = Some(automatic_event_transports.clone());
@@ -17363,6 +17465,8 @@ async fn start_node_with_shutdown_ownership(
         nearby_discovery_stop: ready.nearby_discovery_stop,
         #[cfg(test)]
         handles_sigint: handle_sigint,
+        #[cfg(unix)]
+        embedded_zeroization,
         shutdown: Some(shutdown_sender),
         task: Some(task),
     })
@@ -17711,6 +17815,8 @@ struct EventOperationAuditTestControl {
 }
 
 struct NodeActorChannels {
+    #[cfg(unix)]
+    embedded_zeroization: Option<(EmbeddedZeroizationSender, EmbeddedZeroizationReceiver)>,
     handle_sigint: bool,
     iroh_transport_enabled: bool,
     automatic_event_transports: Option<RunningAutomaticEventTransportHandle>,
@@ -18030,6 +18136,8 @@ impl NodeActorChannels {
             handle_sigint: true,
             iroh_transport_enabled: true,
             automatic_event_transports: None,
+            #[cfg(unix)]
+            embedded_zeroization: None,
             application_admission,
             transport_admission,
             control_receiver,
@@ -18113,6 +18221,8 @@ async fn run_node_actor_inner(
     channels: NodeActorChannels,
 ) -> Result<NodeReceipt, NodeError> {
     let NodeActorChannels {
+        #[cfg(unix)]
+        embedded_zeroization,
         handle_sigint,
         iroh_transport_enabled,
         automatic_event_transports,
@@ -18363,7 +18473,14 @@ async fn run_node_actor_inner(
         ));
     }
     #[cfg(unix)]
-    let zeroization_control = LocalZeroizationControl::bind_pinned(&state_root.path, &store_path)?;
+    let zeroization_control = if embedded_zeroization.is_none() {
+        Some(LocalZeroizationControl::bind_pinned(
+            &state_root.path,
+            &store_path,
+        )?)
+    } else {
+        None
+    };
     let endpoint = if iroh_transport_enabled {
         let endpoint_config = EndpointConfig::direct(config.bind);
         Some(match &forwarding.controlled_relay {
@@ -18452,6 +18569,10 @@ async fn run_node_actor_inner(
         mpsc::channel(MAX_AUTOMATIC_NEARBY_CANDIDATES);
     #[cfg(not(feature = "nearby-discovery"))]
     let _automatic_event_sender_guard = automatic_event_sender;
+    #[cfg(unix)]
+    let (zeroization_sender, mut zeroization_receiver) =
+        embedded_zeroization.unwrap_or_else(|| mpsc::channel(1));
+    #[cfg(not(unix))]
     let (zeroization_sender, mut zeroization_receiver) = mpsc::channel(1);
     let bound_sockets = endpoint
         .as_ref()
@@ -18688,29 +18809,27 @@ async fn run_node_actor_inner(
         blob_application.set_final_read_gate(reached, release);
     }
     #[cfg(all(test, unix))]
-    let mut zeroization_task = if owner_ready {
-        Some(tokio::spawn(inherit_node_output(
-            run_local_zeroization_accept_loop(
-                zeroization_control,
-                zeroization_sender,
-                zeroization_queued,
-            ),
+    let mut zeroization_task = zeroization_control.filter(|_| owner_ready).map(|control| {
+        tokio::spawn(inherit_node_output(run_local_zeroization_accept_loop(
+            control,
+            zeroization_sender.clone(),
+            zeroization_queued,
         )))
-    } else {
-        None
-    };
+    });
     #[cfg(all(not(test), unix))]
-    let mut zeroization_task = if owner_ready {
-        Some(tokio::spawn(inherit_node_output(
-            run_local_zeroization_accept_loop(zeroization_control, zeroization_sender),
+    let mut zeroization_task = zeroization_control.filter(|_| owner_ready).map(|control| {
+        tokio::spawn(inherit_node_output(run_local_zeroization_accept_loop(
+            control,
+            zeroization_sender.clone(),
         )))
-    } else {
-        None
-    };
-    #[cfg(not(unix))]
-    let _zeroization_sender_guard = zeroization_sender;
+    });
     #[cfg(not(unix))]
     let mut zeroization_task = None::<tokio::task::JoinHandle<()>>;
+    let _zeroization_sender_guard = if zeroization_task.is_none() {
+        Some(zeroization_sender)
+    } else {
+        None
+    };
 
     let blob_operational_priority = BlobOperationalPriorityGate::default();
     #[cfg(all(test, unix))]
@@ -35896,6 +36015,8 @@ mod tests {
                 handle_sigint: false,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
+                #[cfg(unix)]
+                embedded_zeroization: None,
                 application_receiver,
                 application_admission,
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -36143,6 +36264,8 @@ mod tests {
                 handle_sigint: false,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
+                #[cfg(unix)]
+                embedded_zeroization: None,
                 application_receiver,
                 application_admission,
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -36240,6 +36363,8 @@ mod tests {
                 handle_sigint: false,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
+                #[cfg(unix)]
+                embedded_zeroization: None,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -40544,6 +40669,8 @@ mod tests {
                 handle_sigint: false,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
+                #[cfg(unix)]
+                embedded_zeroization: None,
                 application_receiver,
                 application_admission,
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -40789,6 +40916,8 @@ mod tests {
                 handle_sigint: false,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
+                #[cfg(unix)]
+                embedded_zeroization: None,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -47268,6 +47397,8 @@ mod tests {
                 handle_sigint: true,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
+                #[cfg(unix)]
+                embedded_zeroization: None,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -47416,6 +47547,8 @@ mod tests {
                 handle_sigint: true,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
+                #[cfg(unix)]
+                embedded_zeroization: None,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -47983,6 +48116,8 @@ mod tests {
                 handle_sigint: false,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
+                #[cfg(unix)]
+                embedded_zeroization: None,
                 application_receiver,
                 application_admission,
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -48146,6 +48281,8 @@ mod tests {
                 handle_sigint: false,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
+                #[cfg(unix)]
+                embedded_zeroization: None,
                 application_receiver,
                 application_admission,
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -48311,6 +48448,8 @@ mod tests {
                 handle_sigint: false,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
+                #[cfg(unix)]
+                embedded_zeroization: None,
                 application_receiver,
                 application_admission,
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -49784,6 +49923,8 @@ mod tests {
                 handle_sigint: false,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
+                #[cfg(unix)]
+                embedded_zeroization: None,
                 application_receiver: receiver,
                 application_admission: admission,
                 transport_admission: Arc::new(TransportAdmission::open()),
@@ -54086,6 +54227,8 @@ mod tests {
                 handle_sigint: true,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
+                #[cfg(unix)]
+                embedded_zeroization: None,
                 application_receiver,
                 application_admission: application_admission.clone(),
                 transport_admission: Arc::new(TransportAdmission::open()),

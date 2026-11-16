@@ -192,6 +192,15 @@ and release authorization remain open. Existing evidence statuses do not move.
 
 ## Current capability outcomes
 
+The bounded ABI v2 maintenance increment moves local C/Python/Go operations to
+`aster-node` and redb, including exact-key State/Record, guarded resolution,
+numbered Event recovery, Blob streams/lifetime, and safe lifecycle. It opens no
+transport or administration socket and uses the unprotected reference artifact
+backend. This advances the local adopter surface within P2-3; it does not close
+the complete binding outcome or change retained requirement credit. Old batch
+and dynamic bridge administration contracts remain removed. See the
+[ABI boundary](../../bindings/c/README.md).
+
 Blob finite custody and the complete local-agent/`asterctl` file workflow in
 the rows below are selected Linux mechanisms. On non-Linux hosts, the agent's
 `ReadBlob` RPC remains available to a capable native-gRPC client, but secure

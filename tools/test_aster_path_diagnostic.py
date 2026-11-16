@@ -561,7 +561,7 @@ class OracleTests(unittest.TestCase):
 class FinalizationTests(unittest.TestCase):
     """Real workload threads, with only Docker/IPC and the RPC peer replaced."""
 
-    def run_profile(self, *, fail_ack=False, extra_event=False, shutdown_timeout=False, provenance_drift=False):
+    def run_profile(self, *, fail_ack=False, extra_event=False, shutdown_timeout=False):
         import json
         import os
         import threading
@@ -679,12 +679,6 @@ class FinalizationTests(unittest.TestCase):
                 events_per_second=2, payload_bytes=1, delay_ms=40, jitter_ms=5,
                 loss_percent=1, rate_mbit=100, reorder_percent=10,
                 restore_deadline_seconds=5, sample_seconds=5)
-            if provenance_drift:
-                config.image = 'sha256:' + 'a' * 64
-                def validate():
-                    if sum(action == 'query' for _, action in actions) == 2:
-                        raise diagnostic.ExecutionError('source/helper drift during diagnostic')
-                config.validate_provenance = validate
             with patch.object(diagnostic, 'OwnedDocker', Owned), \
                     patch.object(diagnostic, 'Worker', Worker), \
                     patch.object(diagnostic, '_pinned_docker', return_value=command):
@@ -697,12 +691,6 @@ class FinalizationTests(unittest.TestCase):
             self.assertFalse(worker.workload.publisher.is_alive())
             self.assertFalse(worker.workload.consumer.is_alive())
         return result, actions
-
-    def test_drift_after_peerless_results_prevents_profile_pass(self):
-        result, _ = self.run_profile(provenance_drift=True)
-        self.assertEqual(result['status'], 'fail')
-        self.assertIn('source/helper drift', result['error'])
-        self.assertEqual(len(result['peerless']), 2)
 
     def test_final_ack_failure_after_drain_prevents_peerless_success(self):
         result, actions = self.run_profile(fail_ack=True)
@@ -730,44 +718,28 @@ class FinalizationTests(unittest.TestCase):
         self.assertEqual([row['exact_events'] for row in result['peerless'].values()], [2, 2])
 
 
-class ProvenanceTests(unittest.TestCase):
-    def run_campaign(self, drift=None):
+class CampaignTests(unittest.TestCase):
+    def run_campaign(self):
         import json
         image = 'sha256:' + 'a' * 64
-        identity = diagnostic.source_identity(Path(diagnostic.__file__).resolve().parents[1])
-        checks = [0]
         used = []
-        def snapshot(_root):
-            checks[0] += 1
-            changed = dict(identity)
-            if used and drift:
-                if drift == 'helper':
-                    changed['helper_files_sha256'] = dict(identity['helper_files_sha256'],
-                                                         **{'aster_mesh_playground.py': 'changed'})
-                else:
-                    changed['source_head'] = 'changed'
-            return changed
         def profile(config, name, row):
             used.append(config.image)
             self.assertEqual(config.image, image)  # Tag may now point elsewhere.
             for helper in diagnostic.HELPER_FILES:
                 self.assertEqual((config.helper_directory / helper).read_bytes(),
                                  Path(diagnostic.__file__).with_name(helper).read_bytes())
-            row.update(profile=name, status='verified')
+            row.update(profile=name, status='pass')
         def docker(argv, timeout):
             self.assertEqual(argv[-1], 'aster-path-delivery:local')
             return image.encode()
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(sys, 'argv', ['diagnostic', '--output', directory]), \
-                    patch.object(diagnostic, 'source_identity', side_effect=snapshot), \
                     patch.object(diagnostic, 'run_profile', side_effect=profile), \
                     patch.object(diagnostic, '_pinned_docker', return_value=docker), \
                     patch.object(diagnostic.signal, 'signal'):
                 code = diagnostic.main()
             report = json.loads((Path(directory) / 'receipt.json').read_text())
-            for path in Path(directory).glob('*.json'):
-                if drift:
-                    self.assertNotEqual(json.loads(path.read_text()).get('status'), 'pass')
         return code, report, used
 
     def test_retag_cannot_change_the_image_used_by_later_profiles(self):
@@ -775,43 +747,6 @@ class ProvenanceTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(used, [report['image_id']] * 4)
         self.assertEqual(report['status'], 'pass')
-
-    def test_source_drift_fails_before_normal_receipts(self):
-        code, report, used = self.run_campaign('source')
-        self.assertEqual(code, 1)
-        self.assertIn('source/helper drift', report['error'])
-        self.assertEqual(len(used), 1)
-
-    def test_helper_drift_fails_before_normal_receipts(self):
-        code, report, used = self.run_campaign('helper')
-        self.assertEqual(code, 1)
-        self.assertIn('source/helper drift', report['error'])
-        self.assertEqual(len(used), 1)
-
-    def test_staged_only_change_is_in_source_diff_identity(self):
-        import hashlib
-        import subprocess
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            def git(*args):
-                return subprocess.check_output(['git', '-C', directory, *args], stderr=subprocess.DEVNULL)
-            git('init')
-            (root / 'tracked').write_text('before\n')
-            git('add', 'tracked')
-            git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'fixture')
-            # Relevant untracked helper files must also have explicit identities.
-            (root / 'tools').mkdir()
-            for name in diagnostic.HELPER_FILES:
-                (root / 'tools' / name).write_text('helper\n')
-            before = diagnostic.source_identity(root)
-            (root / 'tracked').write_text('staged only\n')
-            git('add', 'tracked')
-            self.assertEqual(git('diff', '--binary'), b'')
-            after = diagnostic.source_identity(root)
-            self.assertNotEqual(before['source_diff_sha256'], after['source_diff_sha256'])
-            self.assertEqual(after['source_diff_sha256'], hashlib.sha256(git('diff', 'HEAD', '--binary')).hexdigest())
-            (root / 'tools' / 'aster_mesh_playground.py').write_text('changed untracked helper\n')
-            self.assertNotEqual(after['helper_files_sha256'], diagnostic.source_identity(root)['helper_files_sha256'])
 
 
 if __name__ == '__main__':

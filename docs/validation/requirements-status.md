@@ -114,6 +114,17 @@ Use the capability roadmap for planning and merge review. The rows below are an
 exhaustive evidence trace, not a flat backlog, a completion denominator, or a
 release score.
 
+### Local ABI v2 maintenance boundary
+
+C/Python/Go now use the selected node's local redb-backed application actor,
+including exact-key mutable contracts, opaque Record guards, numbered Event
+recovery, Blob lifetime/streams, and embedded shutdown/zeroization. The runtime
+opens no transport or administration socket. This is local implementation/test
+evidence, with unprotected reference-file provisioning; no retained receipt,
+atomic requirement status, network qualification, or release credit changes.
+Historical binding exclusions below retain their original source/evidence scope.
+The current contract is documented in [the C ABI guide](../../bindings/c/README.md).
+
 ### Current semantic-v9/profile-5 Blob implementation boundary
 
 Current code keeps one canonical Blob publication authority. Semantic-v9 peers
