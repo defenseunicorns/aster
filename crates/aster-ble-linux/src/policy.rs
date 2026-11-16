@@ -2,19 +2,25 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
 
 #[derive(Clone, Debug)]
-pub(crate) struct LifecycleCancellation {
+pub struct LifecycleCancellation {
     cancelled: Arc<watch::Sender<bool>>,
 }
 
-impl LifecycleCancellation {
-    pub(crate) fn new() -> Self {
+impl Default for LifecycleCancellation {
+    fn default() -> Self {
         let (cancelled, _) = watch::channel(false);
         Self {
             cancelled: Arc::new(cancelled),
         }
     }
+}
 
-    pub(crate) fn cancel(&self) {
+impl LifecycleCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
         self.cancelled.send_if_modified(|cancelled| {
             if *cancelled {
                 false
@@ -25,11 +31,11 @@ impl LifecycleCancellation {
         });
     }
 
-    pub(crate) fn is_cancelled(&self) -> bool {
+    pub fn is_cancelled(&self) -> bool {
         *self.cancelled.borrow()
     }
 
-    pub(crate) async fn cancelled(&self) {
+    pub async fn cancelled(&self) {
         let mut cancelled = self.cancelled.subscribe();
         while !*cancelled.borrow_and_update() {
             if cancelled.changed().await.is_err() {
@@ -98,5 +104,10 @@ mod tests {
 
         observer.cancelled().await;
         assert!(observer.is_cancelled());
+    }
+
+    #[test]
+    fn lifecycle_cancellation_default_starts_active() {
+        assert!(!LifecycleCancellation::default().is_cancelled());
     }
 }

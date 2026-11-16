@@ -2,6 +2,7 @@ use super::{map_bluer_error, map_io_error};
 use crate::{
     CanonicalLocator, DriverError, DriverErrorKind, OpenCancellation, OpenRequest, ValidatedConfig,
     ValidatedControllerConfig, ValidatedRosteredSupervisorConfig, configuration,
+    controller_probe::ControllerProbeError,
     stream::{MtuBoundedStream, MtuProbe, NegotiatedMtu, SocketOpen},
 };
 use aster_ble_l2cap::BleL2capContact;
@@ -134,7 +135,7 @@ pub(crate) struct BoundRosteredListener<L> {
 
 impl<L> BoundRosteredListener<L> {
     pub(crate) fn new(listener: L, allocated_psm: u16) -> Result<Self, DriverError> {
-        if !(PSM_LE_DYN_START..=PSM_LE_MAX).contains(&allocated_psm) {
+        if validate_dynamic_le_psm(allocated_psm).is_err() {
             return Err(configuration(
                 "kernel allocated LE PSM is outside the dynamic range",
             ));
@@ -151,6 +152,60 @@ impl<L> BoundRosteredListener<L> {
 
     pub(crate) fn into_listener(self) -> L {
         self.listener
+    }
+}
+
+/// Validates the unprivileged dynamically allocated LE PSM range.
+pub(crate) fn validate_dynamic_le_psm(psm: u16) -> Result<(), ()> {
+    if (PSM_LE_DYN_START..=PSM_LE_MAX).contains(&psm) {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// Maps a kernel error into the closed passive controller-probe boundary.
+pub(crate) fn map_probe_io_error(error: io::Error) -> ControllerProbeError {
+    match error.kind() {
+        io::ErrorKind::PermissionDenied => ControllerProbeError::PermissionDenied,
+        io::ErrorKind::TimedOut => ControllerProbeError::DeadlineExceeded,
+        io::ErrorKind::AddrInUse | io::ErrorKind::WouldBlock => {
+            ControllerProbeError::ResourceExhausted
+        }
+        io::ErrorKind::Unsupported => ControllerProbeError::UnsupportedLeCoc,
+        io::ErrorKind::AddrNotAvailable
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::HostUnreachable
+        | io::ErrorKind::NetworkUnreachable
+        | io::ErrorKind::NotConnected
+        | io::ErrorKind::NotFound => ControllerProbeError::Removed,
+        _ => ControllerProbeError::UnknownPlatformError,
+    }
+}
+
+/// Maps a BlueZ error into the closed passive controller-probe boundary.
+pub(crate) fn map_probe_bluer_error(error: bluer::Error) -> ControllerProbeError {
+    use bluer::{ErrorKind, InternalErrorKind};
+
+    match error.kind {
+        ErrorKind::DoesNotExist | ErrorKind::NotFound | ErrorKind::NotReady => {
+            ControllerProbeError::Removed
+        }
+        ErrorKind::NotAvailable => ControllerProbeError::BluezUnavailable,
+        ErrorKind::NotAuthorized | ErrorKind::NotPermitted => {
+            ControllerProbeError::PermissionDenied
+        }
+        ErrorKind::AuthenticationTimeout => ControllerProbeError::DeadlineExceeded,
+        ErrorKind::NotSupported => ControllerProbeError::UnsupportedProtocol,
+        ErrorKind::Internal(InternalErrorKind::DBusConnectionLost) => {
+            ControllerProbeError::BluezUnavailable
+        }
+        ErrorKind::Internal(InternalErrorKind::Io(kind)) => {
+            map_probe_io_error(io::Error::from(kind))
+        }
+        _ => ControllerProbeError::UnknownPlatformError,
     }
 }
 
@@ -699,6 +754,17 @@ mod tests {
                 message: "sensitive invalid detail".to_owned(),
             }),
             DriverError::new(DriverErrorKind::Configuration, "BlueZ operation failed")
+        );
+    }
+
+    #[test]
+    fn passive_probe_maps_bluez_unavailability_to_a_closed_error() {
+        assert_eq!(
+            map_probe_bluer_error(bluer::Error {
+                kind: bluer::ErrorKind::NotAvailable,
+                message: "sensitive capability detail".to_owned(),
+            }),
+            ControllerProbeError::BluezUnavailable
         );
     }
 
