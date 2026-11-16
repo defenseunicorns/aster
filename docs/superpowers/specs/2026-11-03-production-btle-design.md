@@ -158,9 +158,12 @@ budgets. Every resulting contact then enters node-global admission before the
 Aster mission handshake. The initial composition admits one mission
 handshake/contact across inbound and outbound automatic paths; excess candidates
 are closed without unbounded queues. `ReceiveOnly` admits bounded inbound work
-but originates none; `PassiveOnly` admits no session contact. Later concurrency
-requires measured global/per-adapter bounds and authenticated duplicate
-arbitration first.
+but originates none; `PassiveOnly` admits no session contact. That is the target
+profile behavior. The current source-level Linux agent keeps BTLE unavailable
+and radio-inert for `ReceiveOnly`, because its automatic rostered supervisor
+requires advertisement and scan, and the agent exposes no `PassiveOnly` option.
+Later concurrency requires measured global/per-adapter bounds and authenticated
+duplicate arbitration first.
 
 When no adapter is eligible or available, the node remains application-ready,
 accepts durable publication, reports sanitized unavailability, and waits for an
@@ -223,11 +226,14 @@ replay state, pre-authentication slots, handshakes, retries, negative caches,
 windows, and retained bytes are bounded. Discovery exposes no `NodeId`, mission
 identifier, topic, scope, priority, inventory, data class, or payload.
 
-The current provisional `ReceiveOnly` behavior originates no discretionary
-scan, advertisement, contact, inventory, reconciliation, administration, or
+The target `ReceiveOnly` behavior originates no discretionary scan,
+advertisement, contact, inventory, reconciliation, administration, or
 application payload, while allowing protocol-required responses on an admitted
-inbound contact. `PassiveOnly` emits no framework bytes and cannot run an
-ordinary L2CAP session. Final names and doctrine remain a profile decision.
+inbound contact. The current Linux agent does not yet have that non-originating
+BTLE discovery/listener path: it registers the lane unavailable and starts no
+automatic radio owner for `ReceiveOnly`. `PassiveOnly` emits no framework bytes
+and cannot run an ordinary L2CAP session, but is not a current agent
+configuration option. Final names and doctrine remain a profile decision.
 
 ### `AsterRosterBeaconV1`
 
@@ -305,8 +311,10 @@ peer, one dynamic PSM, and one active Event contact. Lower complete mission
 fixed locator when rostered discovery fails. The future host composition defined
 here may schedule a fresh attempt on another independently eligible transport
 after a safely scoped transport failure; the current evaluation binary cannot.
-Multiple peers, duplicate arbitration, automatic BTLE controller selection,
-other classes, packaging, and production approval remain open.
+Source-level automatic Linux controller resolution/composition is now
+implemented and tested separately from that explicit-controller evaluator.
+Multiple peers, duplicate arbitration, other classes, packaged activation,
+physical automatic-path qualification, and production approval remain open.
 
 ## Contacts, channels, and data classes
 
@@ -452,23 +460,26 @@ role-required listener, advertisement, or scan owner has started successfully.
 A compatible candidate is tagged `qualified` when its exact fingerprint has
 retained release evidence, otherwise `unqualified`; this tag informs selection
 and operator status but is not an activation gate. A deployment may opt into a
-`qualified-only` hardening policy. An exact package-bound known-unsafe or revoked
-rule blocks activation, but a missing support row does not. Missing or ambiguous
-fields that could overlap a known-unsafe rule fail closed as `blocked` rather
-than silently bypassing the rule. Successful probing never creates an official
-support claim.
+`qualified-only` hardening policy. That policy exists in the current driver API
+and tests but is not exposed by agent configuration. An exact package-bound
+known-unsafe or revoked rule blocks activation, but a missing support row does
+not. Missing or ambiguous fields that could overlap a known-unsafe rule fail
+closed as `blocked` rather than silently bypassing the rule. Successful probing
+never creates an official support claim.
 
 The initial implementation examines at most eight controllers per probe sweep,
-probes at most one concurrently, and activates at most one. Eight is an
-implementation resource bound—not a protocol or support limit—chosen to cover
-ordinary multi-controller Linux hosts while bounding downstream socket, retry,
-snapshot, and log work after BlueZ returns its inventory. BlueZ and system D-Bus
-ingress limits remain part of the trusted platform and confinement boundary.
-Names are length-bounded, canonicalized, validated, deduplicated, and ordered;
-the healthy selected controller and an explicit diagnostic override are retained
-before filling remaining slots. Overflow is reported once as `8+`, without
-per-entry logs, and ignored deterministically. The constant may change without
-compatibility impact.
+probes at most one concurrently, activates at most one, and accepts canonical
+adapter names of at most 64 UTF-8 bytes. Eight and 64 are implementation
+resource bounds—not protocol or support limits—chosen to cover ordinary
+multi-controller Linux hosts and adapter names while bounding downstream
+socket, probe, retry, memory, snapshot, and log work and rejecting pathological
+identifiers after BlueZ returns its inventory. BlueZ and system D-Bus ingress
+limits remain part of the trusted platform and confinement boundary. Names are
+canonicalized, validated, deduplicated, and ordered; the healthy selected
+controller and an explicit diagnostic override are retained before filling
+remaining slots. Overflow is reported once as `8+`, without per-entry logs,
+and ignored deterministically. Either constant may change without compatibility
+impact.
 
 Selection is private to the adapter and does not inspect mission authority.
 Candidates are filtered by required compatibility, emission policy,
@@ -537,25 +548,31 @@ lead the next sweep. State changes collapse into one pending sweep, and repeated
 inventory or property churn cannot exceed the adapter's capped retry/backoff
 budget.
 
-The first Linux increment compiles immutable generated support rows and exact
-known-unsafe rules into the signed package. A separately updateable signed
-artifact is future work. Lab evidence promotes an exact fingerprint to
-`qualified` and records its tested roles, bounds, scenarios, artifact identity,
-and known issues. Safety rules use only reliably obtainable bounded fields and
-may define explicit bounded ranges; ambiguous overlap fails closed. Among
-probe-passing controllers, a qualified row is preferable but not required under
-the default policy. Operator status reports adapter type, qualification tag,
-and sanitized closed reason codes, never raw transient Bluetooth addresses,
-PSMs, discovery proofs, or credentials.
+The current production source composition uses immutable empty support and
+known-unsafe tables; the future signed qualified package compiles generated
+rows into those bounded tables. A separately updateable signed artifact is
+future work. Lab evidence
+promotes an exact fingerprint to `qualified` and records its tested roles,
+bounds, scenarios, artifact identity, and known issues. Safety rules use only
+reliably obtainable bounded fields and may define explicit bounded ranges;
+ambiguous overlap fails closed. Among probe-passing controllers, a qualified
+row is preferable but not required under the default policy. Target operator
+status reports adapter type, qualification tag, and sanitized closed reason
+codes, never raw transient Bluetooth addresses, PSMs, discovery proofs, or
+credentials.
 
-The Linux service remains the existing non-root `aster-agent`. BTLE packaging
-adds only the least privileges needed by the qualified BlueZ path, including
-`AF_BLUETOOTH` where socket-family confinement is used; it grants no controller
-reset, host pairing, or root authority. Roster-discovery credentials are
-systemd-managed encrypted credentials in production, not environment variables,
-CLI arguments, or ordinary configuration files. Configuration validation checks
-policy and credential references without requiring present hardware. Service
-readiness and health distinguish node readiness from per-adapter availability.
+The Linux service remains the existing non-root `aster-agent`. A future
+qualified BTLE package adds only the least privileges needed by the BlueZ path,
+including `AF_BLUETOOTH` where socket-family confinement is used; it grants no
+controller reset, host pairing, or root authority. The currently shipped Debian
+unit is still radio-inert and unqualified: it does not bind
+`aster-btle-roster`, excludes `AF_BLUETOOTH`, and adds no BlueZ D-Bus or Polkit
+policy. Iroh remains that package's only selectable adapter. Roster-discovery
+credentials are systemd-managed encrypted credentials in a qualified
+production profile, not environment variables, CLI arguments, or ordinary
+configuration files. Configuration validation checks policy and credential
+references without requiring present hardware. Service readiness and health
+distinguish node readiness from per-adapter availability.
 
 Linux qualification freezes the exact BlueZ D-Bus interfaces and methods used
 for property reads, discovery filtering/windows, and advertisement registration.
@@ -570,6 +587,9 @@ available/degraded/unavailable reason, bounded counters, and current selected
 kind. They omit peer/controller addresses, PSMs, role/roster membership,
 discovery material, transfer identifiers/counts, retry detail, and secrets.
 BTLE output uses the node's redaction sink rather than direct process logging.
+The current production agent passes a discard sink, so detailed driver operator
+events are not customer status or log fields; only coarse sanitized registry
+availability crosses that composition boundary.
 
 Compatibility observations are process-memory-only and replaced on inventory
 epochs as one bounded current snapshot per examined controller, not an

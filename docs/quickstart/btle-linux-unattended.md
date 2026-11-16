@@ -5,16 +5,48 @@ mission peer per process, and semantic-v9 Event data. The transport-neutral
 node starts before its Linux/BlueZ supervisor and remains usable while BTLE is
 absent. This is evaluation, not a production deployment.
 
-This explicit-controller evaluator remains separate from the packaged agent.
-The current local agent may retain prepared optional BTLE custody and register
-a `BLE_L2CAP_V1` lane, but that lane is fixed `Unavailable`, never selected,
-and performs no BlueZ, Bluetooth, or controller work. Package sources specify
-a custody-only tmpfiles anchor; the base service does not bind the BTLE roster
-or gain `AF_BLUETOOTH` or Linux capabilities, and the package adds no BlueZ,
-D-Bus, or Polkit policy. This does not prove that the service identity cannot
-reach the system bus. The disposable-VM package assertions have not been
-executed, and this runbook does not close the automatic-controller,
-support-matrix, exact-confinement, or physical production gates.
+This explicit-controller evaluator remains separate from both the source-level
+automatic agent composition and the packaged agent. On Linux builds with
+`systemd-provider`, an enabled BTLE policy and prepared roster credential now
+compose an automatic `BLE_L2CAP_V1` lane. Under `Normal` policy it starts
+`Unavailable`, inventories and passively probes compatible controllers, and
+may activate at most one only after its operational listener, advertisement,
+and scan owners are ready. No controller or transport is required for node
+readiness or durable publication. `ReceiveOnly` registers the unavailable lane
+but remains radio-inert because the current automatic supervisor advertises and
+scans; `PassiveOnly` is not an agent configuration option.
+
+The shipped Debian service remains radio-inert and unqualified. It does not
+bind `aster-btle-roster`, excludes `AF_BLUETOOTH`, and adds no BlueZ D-Bus or
+Polkit policy; Iroh remains its only selectable adapter. This does not prove
+that the service identity cannot reach the system bus. The disposable-VM
+package assertions have not been executed, and this runbook does not close the
+package-confinement, support-matrix, or physical production gates.
+
+## Verify the source-level automatic composition
+
+These deterministic source tests exercise automatic registration, zero-
+controller readiness, coarse availability propagation only after operational
+startup, and shutdown ownership without using a controller or emitting RF:
+
+```console
+cargo test --locked -p aster-agent --features sdk-test-support btle --lib
+cargo test --locked -p aster-agent --features sdk-test-support \
+  --test customer_runtime no_controller_keeps_node_ready_and_publication_durable
+cargo test --locked -p aster-agent --features sdk-test-support \
+  --test customer_runtime composition_boundary_propagates_availability_and_loss
+cargo test --locked -p aster-agent --features sdk-test-support \
+  --test customer_runtime runtime_shutdown_cancels_btle_before_node
+cargo test --locked -p aster-agent --features sdk-test-support \
+  --test customer_runtime receive_only_keeps_btle_unavailable_without_operational_activation
+cargo test --locked -p aster-ble-linux controller_resolver --lib
+```
+
+They do not run the Debian unit, validate the package service identity, or
+qualify hardware. The production agent intentionally discards detailed Linux
+driver operator events. Automatic availability is coarse and sanitized; do not
+expect customer status or logs to expose controller names, addresses, PSMs,
+peer IDs, credentials, or detailed probe results.
 
 ## Modes and limits
 
@@ -22,10 +54,10 @@ support-matrix, exact-confinement, or physical production gates.
 - `--transport rostered`: authenticated transient discovery and a
   kernel-allocated listener PSM.
 
-Modes are explicit and mutually exclusive. Failure never starts the other mode
-or an IP carrier. There is no pairing workflow, automatic controller choice,
-multi-peer operation, daemon mode, State/Record/Blob transfer, requirement
-credit, support promise, or production authorization.
+Evaluator modes are explicit and mutually exclusive. Failure never starts the
+other mode or an IP carrier. This evaluator has no pairing workflow, automatic
+controller choice, multi-peer operation, daemon mode, State/Record/Blob
+transfer, requirement credit, support promise, or production authorization.
 
 The lower complete 32-byte mission `NodeId` initiates; the higher listens. This
 Linux role rule is not protocol behavior and there is no `--role` option.
@@ -212,11 +244,20 @@ deduplication evidence.
 
 ## Evidence and claim boundary
 
-Retain source/artifact identity; Linux, kernel, BlueZ, controller/firmware, and
-driver versions; mode, address types, PSM, role, MTUs, Event size, cadence;
-availability/contact/recovery/shutdown timestamps; application receipt; and
-sanitized cleanup/resource observations. Keep addresses, mission IDs, paths,
+For an explicit evaluator run, retain source/artifact identity; bounded host and
+controller-version fields; mode, address-type class, role, MTUs, Event size,
+and cadence; availability/contact/recovery/shutdown timestamps; application
+receipt; and sanitized cleanup/resource observations. Keep addresses, adapter
+names or indexes, serials, transient paths, allocated PSMs, mission or peer IDs,
 credentials, and payloads out of shared records.
+
+A manually generated automatic-compatibility report is narrower still. It may
+contain bounded OS/architecture, kernel/BlueZ, vendor/product/revision, and
+firmware/driver fields when exposed, plus the closed outcome/reason and support
+tag. It must exclude every direct or transient identifier listed above and is
+evidence input only: it neither changes runtime policy nor creates a support
+row. The current implementation does not upload or export such a report
+automatically.
 
 See the concise [Ring-1 Event](../validation/evidence/2026-11-05-cm4-btle-ring1-event-validation.md),
 [affected-kernel diagnostic](../validation/evidence/2026-11-06-cm4-btle-clean-restart-diagnostic.md),
