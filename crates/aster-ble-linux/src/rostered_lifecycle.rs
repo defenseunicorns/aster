@@ -1281,8 +1281,13 @@ async fn contain_operational_epoch_task(
     mut task: JoinHandle<OperationalEpochOutcome>,
     platform_owner: Arc<PlatformOwner>,
 ) {
-    if timeout(OWNER_LOSS_AFTER, &mut task).await.is_ok() {
-        return;
+    match timeout(OWNER_LOSS_AFTER, &mut task).await {
+        Ok(Ok(OperationalEpochOutcome::Retryable)) => return,
+        Ok(Ok(OperationalEpochOutcome::Terminal(_)) | Err(_)) => {
+            platform_owner.force_loss();
+            return;
+        }
+        Err(_) => {}
     }
     platform_owner.force_loss();
     if timeout(OWNER_LOSS_JOIN_DEADLINE, &mut task).await.is_err() {
@@ -3644,6 +3649,43 @@ mod tests {
             Box::new(epoch).join().await,
             OperationalEpochOutcome::Terminal(_)
         ));
+        assert_eq!(force_count.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn operational_epoch_containment_forces_owner_on_prompt_terminal_outcome() {
+        let force_count = Arc::new(AtomicU8::new(0));
+        let platform_owner = Arc::new(PlatformOwner::default());
+        platform_owner.replace(RecordingOwnerLoss {
+            force_count: force_count.clone(),
+            release: None,
+        });
+        let task = tokio::spawn(async {
+            OperationalEpochOutcome::Terminal(DriverError::new(
+                DriverErrorKind::Transport,
+                "test terminal operational outcome",
+            ))
+        });
+
+        contain_operational_epoch_task(task, platform_owner).await;
+
+        assert_eq!(force_count.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn operational_epoch_containment_forces_owner_on_prompt_join_error() {
+        let force_count = Arc::new(AtomicU8::new(0));
+        let platform_owner = Arc::new(PlatformOwner::default());
+        platform_owner.replace(RecordingOwnerLoss {
+            force_count: force_count.clone(),
+            release: None,
+        });
+        let task: JoinHandle<OperationalEpochOutcome> = tokio::spawn(async {
+            panic!("test operational epoch panic");
+        });
+
+        contain_operational_epoch_task(task, platform_owner).await;
+
         assert_eq!(force_count.load(Ordering::Acquire), 1);
     }
 
