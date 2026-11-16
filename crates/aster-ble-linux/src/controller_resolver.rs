@@ -68,11 +68,16 @@ pub(crate) enum OperationalEpochState {
     Unavailable,
 }
 
+pub(crate) enum OperationalEpochOutcome {
+    Retryable,
+    Terminal(DriverError),
+}
+
 pub(crate) trait OperationalControllerEpoch: Send {
     fn status(&self) -> watch::Receiver<OperationalEpochState>;
     fn quiesce(&mut self) -> OperationalEpochFuture<'_, Result<(), DriverError>>;
     fn cancel(&self);
-    fn join(self: Box<Self>) -> OperationalEpochFuture<'static, Result<(), DriverError>>;
+    fn join(self: Box<Self>) -> OperationalEpochFuture<'static, OperationalEpochOutcome>;
 }
 
 pub(crate) trait ControllerEpochActivator: Send + Sync {
@@ -193,29 +198,8 @@ impl ControllerEpochOwner {
         })
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn candidate(&self) -> &ControllerCandidate {
-        &self.candidate
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn fingerprint(&self) -> &ControllerFingerprint {
-        &self.fingerprint
-    }
-
-    #[allow(dead_code)]
-    pub(crate) const fn support(&self) -> SupportTag {
+    const fn support(&self) -> SupportTag {
         self.support
-    }
-
-    #[allow(dead_code)]
-    pub(crate) const fn inventory_generation(&self) -> u64 {
-        self.inventory_generation
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn cancellation(&self) -> &LifecycleCancellation {
-        &self.cancellation
     }
 }
 
@@ -884,10 +868,8 @@ impl ResolverActor {
         }
         if let Some(operational) = self.operational.take() {
             operational.cancel();
-            if let Err(error) = operational.join().await
-                && cleanup_error.is_none()
-            {
-                cleanup_error = Some(error);
+            if let OperationalEpochOutcome::Terminal(error) = operational.join().await {
+                cleanup_error.get_or_insert(error);
             }
         }
         self.operational_status.take();
@@ -1341,14 +1323,16 @@ impl OperationalControllerEpoch for TestOperationalEpoch {
         self.cancellation.cancel();
     }
 
-    fn join(self: Box<Self>) -> OperationalEpochFuture<'static, Result<(), DriverError>> {
+    fn join(self: Box<Self>) -> OperationalEpochFuture<'static, OperationalEpochOutcome> {
         Box::pin(async move {
-            self.task.await.map_err(|_| {
-                DriverError::new(
+            match self.task.await {
+                Ok(Ok(())) => OperationalEpochOutcome::Retryable,
+                Ok(Err(error)) => OperationalEpochOutcome::Terminal(error),
+                Err(_) => OperationalEpochOutcome::Terminal(DriverError::new(
                     DriverErrorKind::Transport,
                     "test operational controller epoch stopped",
-                )
-            })?
+                )),
+            }
         })
     }
 }
@@ -1901,12 +1885,12 @@ mod tests {
             self.events.lock().unwrap().push("cancel");
         }
 
-        fn join(self: Box<Self>) -> OperationalEpochFuture<'static, Result<(), DriverError>> {
+        fn join(self: Box<Self>) -> OperationalEpochFuture<'static, OperationalEpochOutcome> {
             self.events.lock().unwrap().push("join");
             self.events.lock().unwrap().push("force");
             self.forced.store(true, Ordering::Release);
             Box::pin(async {
-                Err(DriverError::new(
+                OperationalEpochOutcome::Terminal(DriverError::new(
                     DriverErrorKind::Transport,
                     "test operational cleanup unconfirmed",
                 ))
@@ -1936,18 +1920,18 @@ mod tests {
             self.events.lock().unwrap().push("cancel");
         }
 
-        fn join(self: Box<Self>) -> OperationalEpochFuture<'static, Result<(), DriverError>> {
+        fn join(self: Box<Self>) -> OperationalEpochFuture<'static, OperationalEpochOutcome> {
             self.events.lock().unwrap().push("join");
             if self.fail_join.load(Ordering::Acquire) {
                 self.events.lock().unwrap().push("force");
                 Box::pin(async {
-                    Err(DriverError::new(
+                    OperationalEpochOutcome::Terminal(DriverError::new(
                         DriverErrorKind::Transport,
                         "test operational cleanup unconfirmed",
                     ))
                 })
             } else {
-                Box::pin(async { Ok(()) })
+                Box::pin(async { OperationalEpochOutcome::Retryable })
             }
         }
     }
@@ -2744,6 +2728,8 @@ mod tests {
         let mut status = resolver.status();
         wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
         let epoch = epochs.recv().await.unwrap();
+        activator.latest_state(OperationalEpochState::Available);
+        wait_for_status(&mut status, RuntimeAvailability::Available).await;
 
         resolver.shutdown().await.unwrap();
 

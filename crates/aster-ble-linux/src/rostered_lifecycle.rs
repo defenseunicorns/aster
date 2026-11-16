@@ -4,7 +4,7 @@ use crate::{
     ValidatedAutomaticRosteredSupervisorConfig, ValidatedRosteredSupervisorConfig,
     controller_resolver::{
         ControllerEpochActivator, ControllerEpochView, OperationalControllerEpoch,
-        OperationalEpochFuture, OperationalEpochState,
+        OperationalEpochFuture, OperationalEpochOutcome, OperationalEpochState,
         spawn_linux_controller_resolver_with_activation,
     },
     discovery::{SCAN_ACTIVE_INTERVAL, SCAN_IDLE_INTERVAL},
@@ -33,10 +33,7 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Instant,
 };
 use tokio::{
@@ -294,7 +291,7 @@ struct AvailabilityPublication {
     control: Option<Arc<dyn EventAvailabilityControl>>,
     updates: watch::Sender<crate::BtleAvailability>,
     output: crate::BtleOperatorOutput,
-    epoch: AtomicU64,
+    epoch: Mutex<u64>,
 }
 
 #[derive(Clone)]
@@ -312,7 +309,7 @@ impl AdapterAvailabilityPublisher {
                 control: None,
                 updates,
                 output,
-                epoch: AtomicU64::new(crate::AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH),
+                epoch: Mutex::new(crate::AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH),
             }),
             selector_can_originate: false,
         }
@@ -329,7 +326,7 @@ impl AdapterAvailabilityPublisher {
                 control: Some(control),
                 updates,
                 output,
-                epoch: AtomicU64::new(crate::AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH),
+                epoch: Mutex::new(crate::AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH),
             }),
             selector_can_originate: role == FixedRole::Initiator,
         }
@@ -370,12 +367,15 @@ impl AvailabilityPublication {
         availability: crate::BtleAvailability,
         state: EventAdapterState,
     ) -> Result<(), AvailabilityPublishError> {
+        let mut current_epoch = self
+            .epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if *self.updates.borrow() == availability {
             return Ok(());
         }
         if let Some(control) = &self.control {
-            let current = self.epoch.load(Ordering::Acquire);
-            let epoch = current
+            let epoch = (*current_epoch)
                 .checked_add(1)
                 .ok_or(AvailabilityPublishError::EpochExhausted)?;
             if !control.publish_availability(EventAdapterSnapshot::new(
@@ -387,7 +387,7 @@ impl AvailabilityPublication {
             )) {
                 return Err(AvailabilityPublishError::RegistrationRejected);
             }
-            self.epoch.store(epoch, Ordering::Release);
+            *current_epoch = epoch;
         }
         self.updates.send_replace(availability);
         self.output
@@ -813,7 +813,8 @@ pub struct LinuxRosteredBtleEventSupervisor {
     cancellation: LifecycleCancellation,
     platform_owner: Arc<PlatformOwner>,
     output: crate::BtleOperatorOutput,
-    task: JoinHandle<Result<(), SupervisorError>>,
+    failure_park: Option<(Arc<AvailabilityFence>, UnavailableAvailabilityPublisher)>,
+    task: Option<JoinHandle<Result<(), SupervisorError>>>,
     abort_on_unconfirmed_cleanup: bool,
 }
 
@@ -876,6 +877,18 @@ impl LinuxRosteredBtleEventSupervisor {
         self.cancellation.cancel();
     }
 
+    /// Fences late availability and publishes the adapter unavailable before
+    /// an authority failure begins cleanup.
+    pub fn park_unavailable(&self) -> Result<(), SupervisorError> {
+        let Some((fence, publisher)) = &self.failure_park else {
+            return Ok(());
+        };
+        fence.quiesce();
+        publisher
+            .publish()
+            .map_err(|_| SupervisorError::TaskStopped)
+    }
+
     /// Waits until the owned rostered lifecycle reaches a terminal result.
     pub async fn wait_for_completion(&self) {
         let mut completion = self.completion.clone();
@@ -887,9 +900,9 @@ impl LinuxRosteredBtleEventSupervisor {
     }
 
     /// Consumes the supervisor and joins its owned lifecycle work.
-    pub async fn shutdown(self) -> Result<(), SupervisorError> {
+    pub async fn shutdown(mut self) -> Result<(), SupervisorError> {
         self.cancel();
-        let mut task = self.task;
+        let mut task = self.task.take().expect("supervisor task retained");
         match timeout(OWNER_LOSS_AFTER, &mut task).await {
             Ok(result) => {
                 let result = result.map_err(|_| SupervisorError::TaskStopped)?;
@@ -915,12 +928,51 @@ impl LinuxRosteredBtleEventSupervisor {
                     Err(_) => {
                         self.output
                             .emit(crate::BtleOperatorEvent::CleanupUnconfirmed);
-                        drop(task);
+                        retain_task_custody(task);
                         Err(SupervisorError::PlatformCleanupUnconfirmed)
                     }
                 }
             }
         }
+    }
+}
+
+impl Drop for LinuxRosteredBtleEventSupervisor {
+    fn drop(&mut self) {
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        let _ = self.park_unavailable();
+        self.cancellation.cancel();
+        let platform_owner = self.platform_owner.clone();
+        let output = self.output.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                contain_supervisor_task(task, platform_owner, output).await;
+            });
+        }
+    }
+}
+
+fn retain_task_custody(task: JoinHandle<Result<(), SupervisorError>>) {
+    tokio::spawn(async move {
+        let _ = task.await;
+    });
+}
+
+async fn contain_supervisor_task(
+    mut task: JoinHandle<Result<(), SupervisorError>>,
+    platform_owner: Arc<PlatformOwner>,
+    output: crate::BtleOperatorOutput,
+) {
+    if timeout(OWNER_LOSS_AFTER, &mut task).await.is_ok() {
+        return;
+    }
+    platform_owner.force_loss();
+    output.emit(crate::BtleOperatorEvent::CleanupForced);
+    if timeout(OWNER_LOSS_JOIN_DEADLINE, &mut task).await.is_err() {
+        output.emit(crate::BtleOperatorEvent::CleanupUnconfirmed);
+        let _ = task.await;
     }
 }
 
@@ -951,6 +1003,23 @@ pub fn spawn_linux_rostered_btle_event_supervisor(
         None,
         crate::BtleOperatorOutput::discard(),
     )
+}
+
+/// Starts the compatibility automatic-contact supervisor for one exact controller.
+pub fn spawn_automatic_linux_rostered_btle_event_supervisor(
+    config: ValidatedRosteredSupervisorConfig,
+    contacts: OrderedEventContactHandle,
+    registration: EventAdapterRegistration,
+    output: crate::BtleOperatorOutput,
+) -> Result<LinuxRosteredBtleEventSupervisor, AutomaticBtleRegistrationError> {
+    let (adapter_control, attempts) = validate_automatic_registration(registration)?;
+    Ok(spawn_rostered_btle_event_supervisor(
+        config,
+        contacts,
+        EpochContactMode::automatic(Box::new(attempts)),
+        Some(Arc::new(adapter_control)),
+        output,
+    ))
 }
 
 struct RosteredEpochActivator {
@@ -1069,15 +1138,31 @@ impl ControllerEpochActivator for RosteredEpochActivator {
 fn finish_operational_epoch_result(
     result: Result<(), SupervisorError>,
     platform_owner: &PlatformOwner,
-) -> Result<(), DriverError> {
-    if matches!(result, Err(SupervisorError::PlatformCleanupUnconfirmed)) {
-        Err(DriverError::new(
+) -> OperationalEpochOutcome {
+    let terminal = match result {
+        Ok(()) | Err(SupervisorError::Controller(_)) => None,
+        Err(SupervisorError::PlatformCleanupUnconfirmed) => Some(DriverError::new(
             DriverErrorKind::Transport,
-            "automatic rostered Event epoch stopped",
-        ))
+            "automatic rostered Event cleanup was not confirmed",
+        )),
+        Err(
+            SupervisorError::Configuration
+            | SupervisorError::AdmissionClosed
+            | SupervisorError::ActorUnavailable
+            | SupervisorError::ActorStopped
+            | SupervisorError::ContactSuppressed(_)
+            | SupervisorError::ContactTerminal(_)
+            | SupervisorError::TaskStopped,
+        ) => Some(DriverError::new(
+            DriverErrorKind::Transport,
+            "automatic rostered Event operation terminated",
+        )),
+    };
+    if let Some(error) = terminal {
+        OperationalEpochOutcome::Terminal(error)
     } else {
         platform_owner.clear();
-        Ok(())
+        OperationalEpochOutcome::Retryable
     }
 }
 
@@ -1105,7 +1190,7 @@ struct RosteredOperationalEpoch {
     quiesce: mpsc::Sender<oneshot::Sender<Result<(), DriverError>>>,
     availability_fence: Arc<AvailabilityFence>,
     cancellation: LifecycleCancellation,
-    task: Option<JoinHandle<Result<(), DriverError>>>,
+    task: Option<JoinHandle<OperationalEpochOutcome>>,
     platform_owner: Arc<PlatformOwner>,
     unavailable: UnavailableAvailabilityPublisher,
 }
@@ -1136,7 +1221,7 @@ impl OperationalControllerEpoch for RosteredOperationalEpoch {
         self.cancellation.cancel();
     }
 
-    fn join(mut self: Box<Self>) -> OperationalEpochFuture<'static, Result<(), DriverError>> {
+    fn join(mut self: Box<Self>) -> OperationalEpochFuture<'static, OperationalEpochOutcome> {
         Box::pin(async move {
             self.availability_fence.quiesce();
             let task_result = self
@@ -1146,16 +1231,16 @@ impl OperationalControllerEpoch for RosteredOperationalEpoch {
                 .await;
             let _ = self.task.take();
             match task_result {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => {
+                Ok(OperationalEpochOutcome::Retryable) => OperationalEpochOutcome::Retryable,
+                Ok(OperationalEpochOutcome::Terminal(error)) => {
                     let _ = self.unavailable.publish();
                     self.platform_owner.force_loss();
-                    Err(error)
+                    OperationalEpochOutcome::Terminal(error)
                 }
                 Err(_) => {
                     let _ = self.unavailable.publish();
                     self.platform_owner.force_loss();
-                    Err(DriverError::new(
+                    OperationalEpochOutcome::Terminal(DriverError::new(
                         DriverErrorKind::Transport,
                         "automatic rostered Event epoch cleanup was not confirmed",
                     ))
@@ -1181,7 +1266,9 @@ impl Drop for RosteredOperationalEpoch {
         self.cancellation.cancel();
         let _ = self.unavailable.publish();
         self.platform_owner.force_loss();
-        task.abort();
+        tokio::spawn(async move {
+            let _ = task.await;
+        });
     }
 }
 
@@ -1191,7 +1278,7 @@ impl Drop for RosteredOperationalEpoch {
 /// `BLE_L2CAP_V1` adapter snapshot at epoch zero. This owner retains the
 /// registration control and consumes the corresponding single-owner attempt
 /// receiver until shutdown.
-pub fn spawn_automatic_linux_rostered_btle_event_supervisor(
+pub fn spawn_resolving_linux_rostered_btle_event_supervisor(
     config: ValidatedAutomaticRosteredSupervisorConfig,
     contacts: OrderedEventContactHandle,
     registration: EventAdapterRegistration,
@@ -1229,6 +1316,10 @@ pub fn spawn_automatic_linux_rostered_btle_event_supervisor(
     );
     let (completion_updates, completion) = watch::channel(false);
     let task_cancellation = cancellation.clone();
+    let failure_park = (
+        supervisor_availability_fence.clone(),
+        publisher.unavailable_only(),
+    );
     let task = tokio::spawn(async move {
         let _completion = CompletionOnDrop(completion_updates);
         let status = resolver.status();
@@ -1248,7 +1339,8 @@ pub fn spawn_automatic_linux_rostered_btle_event_supervisor(
         cancellation,
         platform_owner,
         output,
-        task,
+        failure_park: Some(failure_park),
+        task: Some(task),
         abort_on_unconfirmed_cleanup: false,
     })
 }
@@ -1351,7 +1443,8 @@ fn spawn_rostered_btle_event_supervisor(
         cancellation,
         platform_owner,
         output,
-        task,
+        failure_park: None,
+        task: Some(task),
         abort_on_unconfirmed_cleanup: true,
     }
 }
@@ -2486,10 +2579,11 @@ fn admit_platform_observation(
 mod tests {
     use super::*;
     use crate::{
-        ContactLimits, ControllerConfig, DiscoveryCredential, DiscoveryGeneration, DiscoverySecret,
-        LeasedDiscoveryCredentialSet, RING1_MAXIMUM_EXCHANGE_BYTES, RING1_MAXIMUM_FRAME_BYTES,
-        RosteredAdapterConfig, RosteredDiscoveryConfig, RosteredSupervisorConfig,
-        ValidatedControllerConfig, ValidatedRosteredSupervisorConfig,
+        AutomaticRosteredSupervisorConfig, ContactLimits, ControllerAdmissionPolicy,
+        ControllerConfig, ControllerProbeLimits, DiscoveryCredential, DiscoveryGeneration,
+        DiscoverySecret, LeasedDiscoveryCredentialSet, RING1_MAXIMUM_EXCHANGE_BYTES,
+        RING1_MAXIMUM_FRAME_BYTES, RosteredAdapterConfig, RosteredDiscoveryConfig,
+        RosteredSupervisorConfig, ValidatedControllerConfig, ValidatedRosteredSupervisorConfig,
         platform::{
             discovery::{
                 DiscoveryPlatform, OwnedAdvertisement, OwnedScan, PlatformFuture,
@@ -2516,6 +2610,17 @@ mod tests {
         time::{Duration, Instant},
     };
     use tokio::sync::{Notify, mpsc, oneshot};
+
+    fn assert_legacy_automatic_spawn_signature(
+        _spawn: fn(
+            ValidatedRosteredSupervisorConfig,
+            OrderedEventContactHandle,
+            EventAdapterRegistration,
+            crate::BtleOperatorOutput,
+        )
+            -> Result<LinuxRosteredBtleEventSupervisor, AutomaticBtleRegistrationError>,
+    ) {
+    }
 
     fn config() -> ValidatedRosteredSupervisorConfig {
         config_with_ids([0x11; 32], [0x22; 32])
@@ -2561,6 +2666,38 @@ mod tests {
         }))
         .validate()
         .unwrap()
+        .unwrap()
+    }
+
+    fn automatic_config() -> ValidatedAutomaticRosteredSupervisorConfig {
+        let credentials = LeasedDiscoveryCredentialSet::new(
+            DiscoveryCredential::new(
+                DiscoveryGeneration::new(7).unwrap(),
+                DiscoverySecret::new([0x42; 32]).unwrap(),
+            ),
+            None,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+        AutomaticRosteredSupervisorConfig {
+            controller_policy: ControllerAdmissionPolicy::default(),
+            controller_probe_limits: ControllerProbeLimits::new(
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(3),
+            ),
+            discovery: RosteredDiscoveryConfig { credentials },
+            local_mission_id: [0x11; 32],
+            peer_mission_id: [0x22; 32],
+            contact_cadence: Duration::from_secs(60),
+            contact_limits: ContactLimits {
+                maximum_frame_bytes: RING1_MAXIMUM_FRAME_BYTES,
+                maximum_exchange_bytes: RING1_MAXIMUM_EXCHANGE_BYTES,
+                open_timeout: Duration::from_secs(5),
+                operation_timeout: Duration::from_secs(30),
+            },
+        }
+        .validate()
         .unwrap()
     }
 
@@ -3266,7 +3403,8 @@ mod tests {
             cancellation: LifecycleCancellation::new(),
             platform_owner,
             output: crate::BtleOperatorOutput::discard(),
-            task,
+            failure_park: None,
+            task: Some(task),
             abort_on_unconfirmed_cleanup: true,
         }
     }
@@ -3407,6 +3545,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_supervisor_cancels_and_retains_task_until_cleanup_finishes() {
+        let cancellation = LifecycleCancellation::new();
+        let task_cancellation = cancellation.clone();
+        let cancellation_seen = Arc::new(AtomicU8::new(0));
+        let task_cancellation_seen = cancellation_seen.clone();
+        let release = Arc::new(Notify::new());
+        let task_release = release.clone();
+        let secret_drops = Arc::new(AtomicU8::new(0));
+        let secret_owner = RecordDrop(secret_drops.clone());
+        let (_availability_updates, availability) = watch::channel(
+            crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable),
+        );
+        let (_completion_updates, completion) = watch::channel(false);
+        let supervisor = LinuxRosteredBtleEventSupervisor {
+            availability,
+            completion,
+            cancellation,
+            platform_owner: Arc::new(PlatformOwner::default()),
+            output: crate::BtleOperatorOutput::discard(),
+            failure_park: None,
+            task: Some(tokio::spawn(async move {
+                let _secret_owner = secret_owner;
+                task_cancellation.cancelled().await;
+                task_cancellation_seen.store(1, Ordering::Release);
+                task_release.notified().await;
+                Ok(())
+            })),
+            abort_on_unconfirmed_cleanup: true,
+        };
+        tokio::task::yield_now().await;
+
+        drop(supervisor);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while cancellation_seen.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drop must synchronously signal supervisor cancellation");
+        assert_eq!(secret_drops.load(Ordering::Acquire), 0);
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while secret_drops.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup custody releases secrets only after task completion");
+    }
+
+    #[tokio::test]
     async fn operational_cleanup_error_forces_retained_owner_and_propagates() {
         let force_count = Arc::new(AtomicU8::new(0));
         let platform_owner = Arc::new(PlatformOwner::default());
@@ -3422,7 +3612,7 @@ mod tests {
             availability_fence: Arc::new(AvailabilityFence::default()),
             cancellation: LifecycleCancellation::new(),
             task: Some(tokio::spawn(async {
-                Err(DriverError::new(
+                OperationalEpochOutcome::Terminal(DriverError::new(
                     DriverErrorKind::Transport,
                     "test platform cleanup unconfirmed",
                 ))
@@ -3431,12 +3621,15 @@ mod tests {
             unavailable: test_unavailable_publisher(),
         };
 
-        assert!(Box::new(epoch).join().await.is_err());
+        assert!(matches!(
+            Box::new(epoch).join().await,
+            OperationalEpochOutcome::Terminal(_)
+        ));
         assert_eq!(force_count.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]
-    async fn dropping_operational_epoch_contains_task_custody() {
+    async fn dropping_operational_epoch_retains_task_custody_until_cleanup_finishes() {
         let force_count = Arc::new(AtomicU8::new(0));
         let platform_owner = Arc::new(PlatformOwner::default());
         platform_owner.replace(RecordingOwnerLoss {
@@ -3445,6 +3638,8 @@ mod tests {
         });
         let secret_drops = Arc::new(AtomicU8::new(0));
         let secret_owner = RecordDrop(secret_drops.clone());
+        let release = Arc::new(Notify::new());
+        let task_release = release.clone();
         let (_updates, status) = watch::channel(OperationalEpochState::Unavailable);
         let (quiesce, _requests) = mpsc::channel(1);
         let epoch = RosteredOperationalEpoch {
@@ -3454,7 +3649,8 @@ mod tests {
             cancellation: LifecycleCancellation::new(),
             task: Some(tokio::spawn(async move {
                 let _secret_owner = secret_owner;
-                pending::<Result<(), DriverError>>().await
+                task_release.notified().await;
+                OperationalEpochOutcome::Retryable
             })),
             platform_owner,
             unavailable: test_unavailable_publisher(),
@@ -3462,15 +3658,18 @@ mod tests {
         tokio::task::yield_now().await;
 
         drop(epoch);
+        tokio::task::yield_now().await;
+        assert_eq!(secret_drops.load(Ordering::Acquire), 0);
+        assert_eq!(force_count.load(Ordering::Acquire), 1);
+
+        release.notify_one();
         tokio::time::timeout(Duration::from_secs(1), async {
             while secret_drops.load(Ordering::Acquire) == 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("dropping operational epoch contains task custody");
-
-        assert_eq!(force_count.load(Ordering::Acquire), 1);
+        .expect("operational cleanup custody releases after task completion");
     }
 
     #[tokio::test]
@@ -3506,7 +3705,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn automatic_expiry_publishes_unavailable_drops_secret_owner_and_parks() {
+    async fn automatic_expiry_publishes_unavailable_releases_config_and_parks() {
         let cancellation = LifecycleCancellation::new();
         let task_cancellation = cancellation.clone();
         let (_status_updates, status) = watch::channel(OperationalEpochState::Starting);
@@ -3517,8 +3716,8 @@ mod tests {
             crate::BtleOperatorOutput::discard(),
         )
         .unavailable_only();
-        let secret_drops = Arc::new(AtomicU8::new(0));
-        let secret_owner = RecordDrop(secret_drops.clone());
+        let config = Arc::new(automatic_config());
+        let config_weak = Arc::downgrade(&config);
         let task = tokio::spawn(async move {
             run_automatic_resolver_owner(
                 status,
@@ -3527,7 +3726,7 @@ mod tests {
                 Arc::new(AvailabilityFence::default()),
                 unavailable,
                 async move {
-                    let _secret_owner = secret_owner;
+                    drop(config);
                     Ok(())
                 },
             )
@@ -3542,7 +3741,10 @@ mod tests {
             *availability.borrow_and_update(),
             crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable)
         );
-        assert_eq!(secret_drops.load(Ordering::Acquire), 1);
+        assert!(
+            config_weak.upgrade().is_none(),
+            "expired automatic configuration must release credential custody"
+        );
         assert!(
             !task.is_finished(),
             "expired supervisor remains nonterminal"
@@ -5343,11 +5545,112 @@ mod tests {
         accepts: bool,
     }
 
+    #[test]
+    fn legacy_automatic_supervisor_entry_retains_its_fixed_config_signature() {
+        assert_legacy_automatic_spawn_signature(
+            spawn_automatic_linux_rostered_btle_event_supervisor,
+        );
+    }
+
+    #[test]
+    fn authenticated_terminal_operational_result_remains_terminal() {
+        let platform_owner = PlatformOwner::default();
+
+        assert!(matches!(
+            finish_operational_epoch_result(
+                Err(SupervisorError::ContactTerminal(
+                    ContactReason::ProtocolViolation,
+                )),
+                &platform_owner,
+            ),
+            OperationalEpochOutcome::Terminal(_)
+        ));
+        assert!(matches!(
+            finish_operational_epoch_result(Err(SupervisorError::AdmissionClosed), &platform_owner),
+            OperationalEpochOutcome::Terminal(_)
+        ));
+    }
+
     impl EventAvailabilityControl for RecordingEventAdapterControl {
         fn publish_availability(&self, snapshot: aster_node::EventAdapterSnapshot) -> bool {
             self.snapshots.lock().unwrap().push(snapshot);
             self.accepts
         }
+    }
+
+    struct BlockingFirstAvailabilityControl {
+        snapshots: Mutex<Vec<EventAdapterSnapshot>>,
+        entered: std::sync::mpsc::Sender<()>,
+        release_first: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl EventAvailabilityControl for BlockingFirstAvailabilityControl {
+        fn publish_availability(&self, snapshot: EventAdapterSnapshot) -> bool {
+            let release = self.release_first.lock().unwrap().take();
+            self.entered.send(()).unwrap();
+            if let Some(release) = release {
+                release.recv().unwrap();
+            }
+            let mut snapshots = self.snapshots.lock().unwrap();
+            if snapshots
+                .iter()
+                .any(|current| current.availability_epoch() == snapshot.availability_epoch())
+            {
+                return false;
+            }
+            snapshots.push(snapshot);
+            true
+        }
+    }
+
+    #[test]
+    fn concurrent_availability_publications_use_distinct_epochs_and_preserve_unavailable() {
+        let (entered_send, entered) = std::sync::mpsc::channel();
+        let (release_send, release) = std::sync::mpsc::channel();
+        let control = Arc::new(BlockingFirstAvailabilityControl {
+            snapshots: Mutex::new(Vec::new()),
+            entered: entered_send,
+            release_first: Mutex::new(Some(release)),
+        });
+        let (updates, availability) = watch::channel(crate::BtleAvailability::Unavailable(
+            crate::AvailabilityReason::ControllerUnpowered,
+        ));
+        let publisher = Arc::new(AdapterAvailabilityPublisher::automatic(
+            control.clone(),
+            updates,
+            crate::BtleOperatorOutput::discard(),
+            FixedRole::Initiator,
+        ));
+
+        let available_publisher = publisher.clone();
+        let available = std::thread::spawn(move || {
+            available_publisher.publish(crate::BtleAvailability::Available)
+        });
+        entered.recv().unwrap();
+        let unavailable_publisher = publisher.clone();
+        let unavailable = std::thread::spawn(move || {
+            unavailable_publisher.publish(crate::BtleAvailability::Unavailable(
+                crate::AvailabilityReason::BluezUnavailable,
+            ))
+        });
+        let second_entered = entered.recv_timeout(Duration::from_millis(50)).is_ok();
+        release_send.send(()).unwrap();
+        if !second_entered {
+            entered.recv().unwrap();
+        }
+
+        assert_eq!(available.join().unwrap(), Ok(()));
+        assert_eq!(unavailable.join().unwrap(), Ok(()));
+        let snapshots = control.snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert_ne!(
+            snapshots[0].availability_epoch(),
+            snapshots[1].availability_epoch()
+        );
+        assert_eq!(
+            *availability.borrow(),
+            crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable)
+        );
     }
 
     #[test]
@@ -5484,7 +5787,7 @@ mod tests {
                 control: Some(control.clone()),
                 updates,
                 output: crate::BtleOperatorOutput::discard(),
-                epoch: AtomicU64::new(u64::MAX),
+                epoch: Mutex::new(u64::MAX),
             }),
             selector_can_originate: true,
         };
@@ -5561,7 +5864,10 @@ mod tests {
                 unavailable: publisher.unavailable_only(),
             };
 
-            assert!(Box::new(epoch).join().await.is_err());
+            assert!(matches!(
+                Box::new(epoch).join().await,
+                OperationalEpochOutcome::Terminal(_)
+            ));
             assert_eq!(
                 *availability.borrow(),
                 crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable,)
@@ -5628,7 +5934,10 @@ mod tests {
             tokio::task::yield_now().await;
             tokio::time::advance(OWNED_STOP_DEADLINE + Duration::from_millis(1)).await;
 
-            assert!(Box::new(epoch).join().await.is_err());
+            assert!(matches!(
+                Box::new(epoch).join().await,
+                OperationalEpochOutcome::Terminal(_)
+            ));
             assert_eq!(force_count.load(Ordering::Acquire), 1);
             assert_eq!(
                 *availability.borrow(),
@@ -5767,11 +6076,11 @@ mod tests {
             let task_updates = updates.clone();
             let task = tokio::spawn(async move {
                 let Some(acknowledged) = requests.recv().await else {
-                    return Ok(());
+                    return OperationalEpochOutcome::Retryable;
                 };
                 acknowledge_operational_quiesce(&task_publisher, &task_updates, acknowledged);
                 task_cancellation.cancel();
-                Ok(())
+                OperationalEpochOutcome::Retryable
             });
             let mut epoch = RosteredOperationalEpoch {
                 status,
@@ -5795,7 +6104,10 @@ mod tests {
                 crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable)
             );
             epoch.cancel();
-            Box::new(epoch).join().await.unwrap();
+            assert!(matches!(
+                Box::new(epoch).join().await,
+                OperationalEpochOutcome::Retryable
+            ));
         }
 
         #[tokio::test]

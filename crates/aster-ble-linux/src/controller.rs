@@ -651,6 +651,37 @@ mod tests {
     };
     use tokio::sync::{Notify, mpsc, watch};
 
+    fn bluez_error(kind: bluer::ErrorKind) -> bluer::Error {
+        bluer::Error {
+            kind,
+            message: "sensitive BlueZ detail".to_owned(),
+        }
+    }
+
+    #[test]
+    fn production_bluez_boundaries_map_to_closed_failures() {
+        assert_eq!(
+            session_failure(bluez_error(bluer::ErrorKind::NotAuthorized)),
+            BluezFailure::ControllerUnauthorized
+        );
+        assert_eq!(
+            session_failure(bluez_error(bluer::ErrorKind::NotFound)),
+            BluezFailure::BluezUnavailable
+        );
+        assert_eq!(
+            adapter_failure(bluez_error(bluer::ErrorKind::NotPermitted)),
+            BluezFailure::ControllerUnauthorized
+        );
+        assert_eq!(
+            adapter_failure(bluez_error(bluer::ErrorKind::DoesNotExist)),
+            BluezFailure::ControllerAbsent
+        );
+        assert_eq!(
+            adapter_failure(bluez_error(bluer::ErrorKind::NotAvailable)),
+            BluezFailure::BluezUnavailable
+        );
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Call {
         OpenSession,

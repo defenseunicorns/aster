@@ -10,7 +10,14 @@ mod tests {
         normalize_controller_inventory,
     };
     use bluer::{Address, AddressType, l2cap::SocketAddr};
-    use std::{str::FromStr, sync::Mutex, time::Duration};
+    use std::{
+        str::FromStr,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Operation {
@@ -31,8 +38,20 @@ mod tests {
         address: Address,
         address_type: AddressType,
         failure: Mutex<Option<(Operation, ControllerProbeError)>>,
+        pending: Option<Operation>,
         bound: Mutex<Option<SocketAddr>>,
+        socket_dropped: Arc<AtomicBool>,
     }
+
+    struct FakeSocket(Arc<AtomicBool>);
+
+    impl Drop for FakeSocket {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    struct FakeListener(FakeSocket);
 
     impl FakeBackend {
         fn compatible() -> Self {
@@ -42,13 +61,22 @@ mod tests {
                 address: address(),
                 address_type: AddressType::LeRandom,
                 failure: Mutex::new(None),
+                pending: None,
                 bound: Mutex::new(None),
+                socket_dropped: Arc::new(AtomicBool::new(false)),
             }
         }
 
         fn with_failure(operation: Operation, error: ControllerProbeError) -> Self {
             Self {
                 failure: Mutex::new(Some((operation, error))),
+                ..Self::compatible()
+            }
+        }
+
+        fn pending_after_bind(operation: Operation) -> Self {
+            Self {
+                pending: Some(operation),
                 ..Self::compatible()
             }
         }
@@ -68,8 +96,8 @@ mod tests {
 
     impl ControllerProbeBackend for FakeBackend {
         type Session = ();
-        type Socket = ();
-        type Listener = ();
+        type Socket = FakeSocket;
+        type Listener = FakeListener;
 
         fn open_session(&self) -> ControllerProbeFuture<'_, Self::Session> {
             Box::pin(async move {
@@ -114,7 +142,7 @@ mod tests {
         fn create_socket(&self) -> ControllerProbeFuture<'_, Self::Socket> {
             Box::pin(async move {
                 self.record(Operation::CreateSocket)?;
-                Ok(())
+                Ok(FakeSocket(self.socket_dropped.clone()))
             })
         }
 
@@ -133,19 +161,23 @@ mod tests {
         fn local_psm<'a>(&'a self, _socket: &'a Self::Socket) -> ControllerProbeFuture<'a, u16> {
             Box::pin(async move {
                 self.record(Operation::LocalPsm)?;
+                if self.pending == Some(Operation::LocalPsm) {
+                    std::future::pending::<()>().await;
+                }
                 Ok(0x0081)
             })
         }
 
-        fn listen(&self, _socket: Self::Socket) -> ControllerProbeFuture<'_, Self::Listener> {
+        fn listen(&self, socket: Self::Socket) -> ControllerProbeFuture<'_, Self::Listener> {
             Box::pin(async move {
                 self.record(Operation::Listen)?;
-                Ok(())
+                Ok(FakeListener(socket))
             })
         }
 
-        fn close(&self, _listener: Self::Listener) -> ControllerProbeFuture<'_, ()> {
+        fn close(&self, listener: Self::Listener) -> ControllerProbeFuture<'_, ()> {
             Box::pin(async move {
+                let FakeListener(_socket) = listener;
                 self.record(Operation::Close)?;
                 Ok(())
             })
@@ -375,6 +407,47 @@ mod tests {
                 .unwrap()
                 .contains(&Operation::CreateSocket)
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_bind_drops_the_bound_probe_socket() {
+        let backend = Arc::new(FakeBackend::pending_after_bind(Operation::LocalPsm));
+        let cancellation = LifecycleCancellation::new();
+        let task_backend = backend.clone();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            probe_controller(
+                task_backend.as_ref(),
+                &candidate(),
+                &ControllerFingerprint::default(),
+                &ControllerAdmissionPolicy::default(),
+                &task_cancellation,
+                limits(),
+            )
+            .await
+        });
+        while backend.bound.lock().unwrap().is_none() {
+            tokio::task::yield_now().await;
+        }
+
+        cancellation.cancel();
+        assert_eq!(
+            task.await.expect("probe task"),
+            ProbeDisposition::Indeterminate(ProbeReason::Cancelled)
+        );
+        assert!(backend.socket_dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_after_bind_drops_the_bound_probe_socket() {
+        let backend = FakeBackend::pending_after_bind(Operation::LocalPsm);
+
+        assert_eq!(
+            probe(&backend).await,
+            ProbeDisposition::Indeterminate(ProbeReason::DeadlineExceeded)
+        );
+        assert!(backend.bound.lock().unwrap().is_some());
+        assert!(backend.socket_dropped.load(Ordering::Acquire));
     }
 
     #[tokio::test]

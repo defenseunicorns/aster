@@ -907,14 +907,72 @@ mod tests {
     }
 
     #[test]
-    fn passive_probe_maps_bluez_unavailability_to_a_closed_error() {
-        assert_eq!(
-            map_probe_bluer_error(bluer::Error {
-                kind: bluer::ErrorKind::NotAvailable,
-                message: "sensitive capability detail".to_owned(),
-            }),
-            ControllerProbeError::BluezUnavailable
-        );
+    fn passive_probe_maps_socket_and_bluez_failures_to_closed_errors() {
+        for (kind, expected) in [
+            (
+                io::ErrorKind::PermissionDenied,
+                ControllerProbeError::PermissionDenied,
+            ),
+            (
+                io::ErrorKind::TimedOut,
+                ControllerProbeError::DeadlineExceeded,
+            ),
+            (
+                io::ErrorKind::AddrInUse,
+                ControllerProbeError::ResourceExhausted,
+            ),
+            (
+                io::ErrorKind::Unsupported,
+                ControllerProbeError::UnsupportedLeCoc,
+            ),
+            (io::ErrorKind::NotFound, ControllerProbeError::Removed),
+            (
+                io::ErrorKind::Other,
+                ControllerProbeError::UnknownPlatformError,
+            ),
+        ] {
+            assert_eq!(map_probe_io_error(io::Error::from(kind)), expected);
+        }
+
+        for (kind, expected) in [
+            (bluer::ErrorKind::NotFound, ControllerProbeError::Removed),
+            (
+                bluer::ErrorKind::NotAvailable,
+                ControllerProbeError::BluezUnavailable,
+            ),
+            (
+                bluer::ErrorKind::NotAuthorized,
+                ControllerProbeError::PermissionDenied,
+            ),
+            (
+                bluer::ErrorKind::AuthenticationTimeout,
+                ControllerProbeError::DeadlineExceeded,
+            ),
+            (
+                bluer::ErrorKind::NotSupported,
+                ControllerProbeError::UnsupportedProtocol,
+            ),
+            (
+                bluer::ErrorKind::Internal(bluer::InternalErrorKind::DBusConnectionLost),
+                ControllerProbeError::BluezUnavailable,
+            ),
+            (
+                bluer::ErrorKind::Internal(bluer::InternalErrorKind::Io(io::ErrorKind::AddrInUse)),
+                ControllerProbeError::ResourceExhausted,
+            ),
+            (
+                bluer::ErrorKind::InvalidArguments,
+                ControllerProbeError::UnknownPlatformError,
+            ),
+        ] {
+            assert_eq!(
+                map_probe_bluer_error(bluer::Error {
+                    kind,
+                    message: "sensitive platform detail".to_owned(),
+                }),
+                expected
+            );
+        }
     }
 
     #[test]

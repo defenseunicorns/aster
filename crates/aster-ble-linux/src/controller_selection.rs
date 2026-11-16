@@ -273,11 +273,11 @@ impl ControllerAdmissionPolicy {
 
     /// Evaluates support and safety policy for a typed fingerprint.
     pub fn admit(&self, fingerprint: &ControllerFingerprint) -> ControllerAdmission {
-        let support = if self
-            .support_rows
-            .iter()
-            .any(|row| exact_match(&row.fingerprint, fingerprint))
-        {
+        let support = if self.support_rows.iter().any(|row| {
+            row.fingerprint.is_complete()
+                && fingerprint.is_complete()
+                && exact_match(&row.fingerprint, fingerprint)
+        }) {
             SupportTag::Qualified
         } else {
             SupportTag::Unqualified
@@ -585,6 +585,9 @@ fn canonical_name(raw_name: &str) -> Option<String> {
     if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
+    if index.len() > 1 && index.starts_with('0') {
+        return None;
+    }
     Some(name.to_owned())
 }
 
@@ -690,6 +693,7 @@ mod tests {
                 "".to_owned(),
                 "HCI0".to_owned(),
                 "hci-1".to_owned(),
+                "hci01".to_owned(),
                 overlong,
                 "hci0".to_owned(),
             ],
@@ -719,6 +723,46 @@ mod tests {
         assert_eq!(
             admission.disposition(),
             ProbeDisposition::Blocked(ProbeReason::QualifiedOnly)
+        );
+    }
+
+    #[test]
+    fn qualification_requires_complete_support_and_observed_fingerprints() {
+        let complete = fingerprint();
+        let mut partial_observed = complete.clone();
+        partial_observed.set_firmware(None);
+        let mut partial_row = complete.clone();
+        partial_row.set_firmware(None);
+
+        assert_eq!(
+            ControllerAdmissionPolicy::with_rows(
+                false,
+                vec![SupportRow::exact(complete.clone())],
+                Vec::new(),
+            )
+            .admit(&partial_observed)
+            .support(),
+            SupportTag::Unqualified
+        );
+        assert_eq!(
+            ControllerAdmissionPolicy::with_rows(
+                false,
+                vec![SupportRow::exact(partial_row.clone())],
+                Vec::new(),
+            )
+            .admit(&partial_row)
+            .support(),
+            SupportTag::Unqualified
+        );
+        assert_eq!(
+            ControllerAdmissionPolicy::with_rows(
+                false,
+                vec![SupportRow::exact(complete.clone())],
+                Vec::new(),
+            )
+            .admit(&complete)
+            .support(),
+            SupportTag::Qualified
         );
     }
 

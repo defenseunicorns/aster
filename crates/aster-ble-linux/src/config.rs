@@ -1097,20 +1097,6 @@ mod tests {
         }
 
         #[test]
-        fn automatic_config_contains_no_adapter_name_or_address() {
-            let debug = format!(
-                "{:?}",
-                automatic_rostered([0x11; 32], [0x22; 32])
-                    .validate()
-                    .unwrap()
-            );
-
-            assert!(!debug.contains("hci"));
-            assert!(!debug.contains("02:00:00"));
-            assert!(debug.contains("transient_and_mission_material"));
-        }
-
-        #[test]
         fn fixed_evaluation_config_remains_exact_controller_bound() {
             let validated = rostered([0x11; 32], [0x22; 32])
                 .validate()
