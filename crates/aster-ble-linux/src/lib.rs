@@ -6,6 +6,7 @@
 mod config;
 mod controller;
 mod controller_probe;
+mod controller_resolver;
 mod controller_selection;
 mod discovery;
 mod discovery_record;
@@ -31,6 +32,10 @@ pub use controller::{
 pub use controller_probe::{
     BluezControllerProbeBackend, ControllerProbeBackend, ControllerProbeError,
     ControllerProbeFuture, ControllerProbeLimits, probe_controller,
+};
+pub use controller_resolver::{
+    ControllerEpochOwner, ControllerResolutionSnapshot, LinuxControllerResolver,
+    RuntimeAvailability, spawn_linux_controller_resolver,
 };
 pub use controller_selection::{
     ControllerAdmission, ControllerAdmissionPolicy, ControllerCandidate, ControllerFingerprint,

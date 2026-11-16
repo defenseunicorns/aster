@@ -91,12 +91,13 @@ pub(crate) const fn availability_event(availability: BtleAvailability) -> BtleOp
 
 pub(crate) type MonitorFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), DriverError>> + Send + 'a>>;
-type BluezFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, BluezFailure>> + Send + 'a>>;
-type SessionStream = Pin<Box<dyn Stream<Item = SessionSignal> + Send>>;
-type AdapterStream = Pin<Box<dyn Stream<Item = AdapterSignal> + Send>>;
+pub(crate) type BluezFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, BluezFailure>> + Send + 'a>>;
+pub(crate) type SessionStream = Pin<Box<dyn Stream<Item = SessionSignal> + Send>>;
+pub(crate) type AdapterStream = Pin<Box<dyn Stream<Item = AdapterSignal> + Send>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BluezFailure {
+pub(crate) enum BluezFailure {
     BluezUnavailable,
     ControllerAbsent,
     ControllerUnauthorized,
@@ -114,35 +115,35 @@ impl BluezFailure {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum SessionSignal {
+pub(crate) enum SessionSignal {
     AdapterAdded(String),
     AdapterRemoved(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AdapterSignal {
+pub(crate) enum AdapterSignal {
     PropertiesChanged,
     Unrelated,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct AdapterSnapshot {
-    powered: bool,
-    address: Address,
-    address_type: AddressType,
+pub(crate) struct AdapterSnapshot {
+    pub(crate) powered: bool,
+    pub(crate) address: Address,
+    pub(crate) address_type: AddressType,
 }
 
-trait BluezBackend: Send + Sync {
+pub(crate) trait BluezBackend: Send + Sync {
     fn open_session(&self) -> BluezFuture<'_, Box<dyn BluezSession>>;
 }
 
-trait BluezSession: Send + Sync {
+pub(crate) trait BluezSession: Send + Sync {
     fn subscribe(&self) -> BluezFuture<'_, SessionStream>;
     fn adapter_names(&self) -> BluezFuture<'_, Vec<String>>;
     fn adapter<'a>(&'a self, name: &'a str) -> BluezFuture<'a, Box<dyn BluezAdapter>>;
 }
 
-trait BluezAdapter: Send + Sync {
+pub(crate) trait BluezAdapter: Send + Sync {
     fn subscribe(&self) -> BluezFuture<'_, AdapterStream>;
     fn snapshot(&self) -> BluezFuture<'_, AdapterSnapshot>;
 }
@@ -532,7 +533,7 @@ fn publish(
     }
 }
 
-struct ProductionBluez;
+pub(crate) struct ProductionBluez;
 
 impl BluezBackend for ProductionBluez {
     fn open_session(&self) -> BluezFuture<'_, Box<dyn BluezSession>> {

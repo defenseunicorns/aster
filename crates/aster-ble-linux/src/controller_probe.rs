@@ -548,6 +548,18 @@ impl ControllerProbeLimits {
             sweep,
         }
     }
+
+    pub(crate) const fn operation(self) -> Duration {
+        self.operation
+    }
+
+    pub(crate) const fn candidate(self) -> Duration {
+        self.candidate
+    }
+
+    pub(crate) const fn sweep(self) -> Duration {
+        self.sweep
+    }
 }
 
 /// Production backend using only passive public BlueZ and kernel operations.
