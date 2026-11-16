@@ -869,8 +869,8 @@ impl ResolverActor {
                 tokio::select! {
                     biased;
                     () = self.cancellation.cancelled() => HealthyEvent::Cancelled,
-                    event = session.next_event() => HealthyEvent::Platform(event),
                     changed = status.changed() => HealthyEvent::Operational(changed),
+                    event = session.next_event() => HealthyEvent::Platform(event),
                 }
             } else {
                 tokio::select! {
@@ -883,58 +883,85 @@ impl ResolverActor {
             match event {
                 HealthyEvent::Cancelled => return SessionAction::Cancelled,
                 HealthyEvent::Platform(Some(event)) => {
-                    return self.consume_event_batch(session, event).await;
+                    match self.consume_event_batch(session, event).await {
+                        SessionAction::Sweep => {}
+                        outcome => return outcome,
+                    }
+                    if self.cancellation.is_cancelled() {
+                        return SessionAction::Cancelled;
+                    }
+                    if let Some(changed) = self.ready_operational_change()
+                        && let Some(outcome) = self.handle_operational_change(changed).await
+                    {
+                        return outcome;
+                    }
+                    return SessionAction::Sweep;
                 }
                 HealthyEvent::Platform(None) => return SessionAction::Lost,
-                HealthyEvent::Operational(Err(_)) => {
-                    if let Err(error) = self
-                        .invalidate_owner(ProbeDisposition::Indeterminate(
-                            ProbeReason::BluezUnavailable,
-                        ))
-                        .await
-                    {
-                        return SessionAction::Terminal(error);
-                    }
-                    return SessionAction::OperationalRetry;
-                }
-                HealthyEvent::Operational(Ok(())) => {
-                    let state = *self
-                        .operational_status
-                        .as_mut()
-                        .expect("operational status exists after change")
-                        .borrow_and_update();
-                    let event_path_available = matches!(
-                        state,
-                        OperationalEpochState::Available | OperationalEpochState::Degraded
-                    );
-                    let runtime = match state {
-                        OperationalEpochState::Starting | OperationalEpochState::Unavailable => {
-                            RuntimeAvailability::Unavailable
-                        }
-                        OperationalEpochState::Available => RuntimeAvailability::Available,
-                        OperationalEpochState::Degraded => RuntimeAvailability::Degraded,
-                    };
-                    if runtime_is_selector_available(runtime, event_path_available) {
-                        self.operational_backoff.reset();
-                        let support = self
-                            .owner
-                            .as_ref()
-                            .expect("operational state has a controller owner")
-                            .support();
-                        self.publish(ControllerResolutionSnapshot::available(support));
-                    } else if state == OperationalEpochState::Unavailable {
-                        if let Err(error) = self
-                            .invalidate_owner(ProbeDisposition::Indeterminate(
-                                ProbeReason::BluezUnavailable,
-                            ))
-                            .await
-                        {
-                            return SessionAction::Terminal(error);
-                        }
-                        return SessionAction::OperationalRetry;
+                HealthyEvent::Operational(changed) => {
+                    if let Some(outcome) = self.handle_operational_change(changed).await {
+                        return outcome;
                     }
                 }
             }
+        }
+    }
+
+    fn ready_operational_change(&mut self) -> Option<Result<(), watch::error::RecvError>> {
+        let status = self.operational_status.as_mut()?;
+        match status.has_changed() {
+            Ok(true) => Some(Ok(())),
+            Ok(false) => None,
+            Err(error) => Some(Err(error)),
+        }
+    }
+
+    async fn handle_operational_change(
+        &mut self,
+        changed: Result<(), watch::error::RecvError>,
+    ) -> Option<SessionAction> {
+        if changed.is_err() {
+            return Some(self.invalidate_failed_operational_epoch().await);
+        }
+        let state = *self
+            .operational_status
+            .as_mut()
+            .expect("operational status exists after change")
+            .borrow_and_update();
+        let event_path_available = matches!(
+            state,
+            OperationalEpochState::Available | OperationalEpochState::Degraded
+        );
+        let runtime = match state {
+            OperationalEpochState::Starting | OperationalEpochState::Unavailable => {
+                RuntimeAvailability::Unavailable
+            }
+            OperationalEpochState::Available => RuntimeAvailability::Available,
+            OperationalEpochState::Degraded => RuntimeAvailability::Degraded,
+        };
+        if runtime_is_selector_available(runtime, event_path_available) {
+            self.operational_backoff.reset();
+            let support = self
+                .owner
+                .as_ref()
+                .expect("operational state has a controller owner")
+                .support();
+            self.publish(ControllerResolutionSnapshot::available(support));
+        } else if state == OperationalEpochState::Unavailable {
+            return Some(self.invalidate_failed_operational_epoch().await);
+        }
+        None
+    }
+
+    async fn invalidate_failed_operational_epoch(&mut self) -> SessionAction {
+        match self
+            .invalidate_owner(ProbeDisposition::Indeterminate(
+                ProbeReason::BluezUnavailable,
+            ))
+            .await
+        {
+            Ok(()) => SessionAction::OperationalRetry,
+            Err(error) => SessionAction::Terminal(error),
         }
     }
 
@@ -1212,9 +1239,9 @@ fn spawn_linux_controller_resolver_with(
 mod tests {
     use super::*;
     use crate::{
-        BtleOperatorOutput, ControllerAdmissionPolicy, ControllerCandidate, ControllerFingerprint,
-        ControllerProbeLimits, ControllerSnapshot, LifecycleCancellation, ProbeDisposition,
-        ProbeReason, RuntimeAvailability, SupportRow, SupportTag, UnsafeRule,
+        BtleOperatorEvent, BtleOperatorOutput, ControllerAdmissionPolicy, ControllerCandidate,
+        ControllerFingerprint, ControllerProbeLimits, ControllerSnapshot, LifecycleCancellation,
+        ProbeDisposition, ProbeReason, RuntimeAvailability, SupportRow, SupportTag, UnsafeRule,
     };
     use bluer::{Address, AddressType};
     use std::{
@@ -1222,7 +1249,7 @@ mod tests {
         str::FromStr,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -1299,6 +1326,12 @@ mod tests {
         events: Arc<AtomicUsize>,
     }
 
+    struct HealthyEventFloodSession {
+        controller: ObservedController,
+        flooding: watch::Receiver<bool>,
+        events: Arc<AtomicUsize>,
+    }
+
     impl ResolverSession for CancellationStormSession {
         fn observe<'a>(
             &'a mut self,
@@ -1347,6 +1380,28 @@ mod tests {
         fn next_event(&mut self) -> ResolverEventFuture<'_> {
             self.events.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Some(ResolverEvent::InventoryChanged { removed: None }) })
+        }
+    }
+
+    impl ResolverSession for HealthyEventFloodSession {
+        fn observe<'a>(
+            &'a mut self,
+            _selected: Option<&'a str>,
+        ) -> ResolverFuture<'a, ObservedInventory> {
+            let controller = self.controller.clone();
+            Box::pin(async move { Ok(ObservedInventory::bounded(vec![controller])) })
+        }
+
+        fn next_event(&mut self) -> ResolverEventFuture<'_> {
+            Box::pin(async move {
+                while !*self.flooding.borrow_and_update() {
+                    if self.flooding.changed().await.is_err() {
+                        return None;
+                    }
+                }
+                self.events.fetch_add(1, Ordering::SeqCst);
+                Some(ResolverEvent::InventoryChanged { removed: None })
+            })
         }
     }
 
@@ -1530,6 +1585,78 @@ mod tests {
         events: Arc<Mutex<Vec<&'static str>>>,
         quiesce_gate: Option<Arc<Notify>>,
         fail_join: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[derive(Default)]
+    struct ClosingStatusActivator {
+        status: Mutex<Option<watch::Sender<OperationalEpochState>>>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        activations: AtomicUsize,
+        forced: Arc<AtomicBool>,
+    }
+
+    impl ClosingStatusActivator {
+        fn publish(&self, state: OperationalEpochState) {
+            self.status
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("one live operational status")
+                .send_replace(state);
+        }
+
+        fn close_status(&self) {
+            self.status.lock().unwrap().take();
+        }
+    }
+
+    impl ControllerEpochActivator for ClosingStatusActivator {
+        fn activate(
+            &self,
+            _epoch: ControllerEpochView<'_>,
+        ) -> Result<Box<dyn OperationalControllerEpoch>, DriverError> {
+            self.activations.fetch_add(1, Ordering::SeqCst);
+            let (updates, status) = watch::channel(OperationalEpochState::Starting);
+            *self.status.lock().unwrap() = Some(updates);
+            Ok(Box::new(ClosingStatusOperationalEpoch {
+                status,
+                events: self.events.clone(),
+                forced: self.forced.clone(),
+            }))
+        }
+    }
+
+    struct ClosingStatusOperationalEpoch {
+        status: watch::Receiver<OperationalEpochState>,
+        events: Arc<Mutex<Vec<&'static str>>>,
+        forced: Arc<AtomicBool>,
+    }
+
+    impl OperationalControllerEpoch for ClosingStatusOperationalEpoch {
+        fn status(&self) -> watch::Receiver<OperationalEpochState> {
+            self.status.clone()
+        }
+
+        fn quiesce(&mut self) -> OperationalEpochFuture<'_, Result<(), DriverError>> {
+            self.events.lock().unwrap().push("unavailable");
+            Box::pin(async { Ok(()) })
+        }
+
+        fn cancel(&self) {
+            self.events.lock().unwrap().push("cancel");
+        }
+
+        fn join(self: Box<Self>) -> OperationalEpochFuture<'static, Result<(), DriverError>> {
+            self.events.lock().unwrap().push("join");
+            self.events.lock().unwrap().push("force");
+            self.forced.store(true, Ordering::Release);
+            Box::pin(async {
+                Err(DriverError::new(
+                    DriverErrorKind::Transport,
+                    "test operational cleanup unconfirmed",
+                ))
+            })
+        }
     }
 
     impl OperationalControllerEpoch for RecordingOperationalEpoch {
@@ -1877,6 +2004,92 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(activator.activation_count(), 1);
         assert!(resolver.shutdown().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn operational_status_closure_preempts_continuously_ready_unrelated_inventory() {
+        let selected = controller("hci0", 1, fingerprint("a"));
+        let (flood_updates, flooding) = watch::channel(false);
+        let inventory_events = Arc::new(AtomicUsize::new(0));
+        let session: Box<dyn ResolverSession> = Box::new(HealthyEventFloodSession {
+            controller: selected,
+            flooding,
+            events: inventory_events.clone(),
+        });
+        let activator = Arc::new(ClosingStatusActivator::default());
+        let (output, mut operator_events) = BtleOperatorOutput::bounded();
+        let resolver = spawn_resolver(
+            ControllerAdmissionPolicy::default(),
+            limits(),
+            output,
+            Arc::new(FakePlatform::new([Ok(session)])),
+            Arc::new(FakeProbe::compatible()),
+            Some(activator.clone()),
+            None,
+        );
+        let mut status = resolver.status();
+        let mut terminal_status = resolver.status();
+        let (completion_updates, mut completion) = watch::channel(false);
+        let outer = tokio::spawn(async move {
+            while terminal_status.changed().await.is_ok() {}
+            let result = resolver.shutdown_for_supervisor().await;
+            completion_updates.send_replace(true);
+            result
+        });
+
+        wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
+        activator.publish(OperationalEpochState::Available);
+        wait_for_status(&mut status, RuntimeAvailability::Available).await;
+        flood_updates.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while inventory_events.load(Ordering::SeqCst) < MAX_EVENTS_PER_BATCH {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unrelated inventory flood must become continuously ready");
+        let events_before_close = inventory_events.load(Ordering::SeqCst);
+
+        activator.close_status();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !*completion.borrow_and_update() {
+                completion
+                    .changed()
+                    .await
+                    .expect("outer owner still running");
+            }
+        })
+        .await
+        .expect("operational status closure must wake outer completion");
+        assert!(outer.await.unwrap().is_err());
+        assert_eq!(
+            status.borrow().availability(),
+            RuntimeAvailability::Unavailable
+        );
+        assert!(activator.forced.load(Ordering::Acquire));
+        assert_eq!(
+            *activator.events.lock().unwrap(),
+            ["unavailable", "cancel", "join", "force"]
+        );
+        assert_eq!(activator.activations.load(Ordering::SeqCst), 1);
+        assert!(
+            inventory_events.load(Ordering::SeqCst) - events_before_close <= MAX_EVENTS_PER_BATCH,
+            "operational closure must be observed within one bounded inventory batch"
+        );
+        let mut emitted = Vec::new();
+        while let Ok(event) = operator_events.try_recv() {
+            emitted.push(event);
+        }
+        let available = emitted
+            .iter()
+            .position(|event| *event == BtleOperatorEvent::AdapterAvailable)
+            .expect("host must first publish Available");
+        assert!(
+            emitted[available + 1..]
+                .iter()
+                .any(|event| { matches!(event, BtleOperatorEvent::AdapterUnavailable(_)) })
+        );
     }
 
     #[tokio::test]
