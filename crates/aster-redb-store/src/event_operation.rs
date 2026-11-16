@@ -126,8 +126,10 @@ impl crate::Store {
         F: FnMut(EventOperationAuditProgress),
     {
         let path = std::path::absolute(path).map_err(StoreError::StorePath)?;
-        let before = crate::open_read_only_store_backing(&path)?.identity;
-        let database = redb::Builder::new().open_read_only(&path)?;
+        let backing = crate::open_read_only_store_backing(&path)?;
+        let before = backing.identity;
+        let database = redb::Builder::new()
+            .open_read_only_with_backend(redb::backends::FileBackend::new(backing.file)?)?;
         if before != crate::open_read_only_store_backing(&path)?.identity {
             return Err(StoreError::StoreBackingInvariant(
                 "backing path changed during read-only audit",

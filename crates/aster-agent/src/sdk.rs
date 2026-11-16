@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use connectrpc::client::{ClientTransport, UnaryResponse};
+use redb::backends::FileBackend;
 use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
 };
@@ -466,8 +467,8 @@ impl PublicationJournal {
         let file = directory
             .file(path, true)
             .map_err(|error| journal_error(path, "create journal", error))?;
-        let database = redb::Builder::new()
-            .create_file(file)
+        let database = FileBackend::new(file)
+            .and_then(|backend| redb::Builder::new().create_with_backend(backend))
             .map_err(|error| journal_error(path, "initialize", error))?;
         let state = JournalState {
             reconstructing: reconstruction_session.is_some(),
@@ -512,11 +513,11 @@ impl PublicationJournal {
         validate_client_id(client_id)?;
         let path = path.as_ref().to_path_buf();
         let file = open_journal_file(&path, false)?;
-        // create_file keeps the already validated descriptor and redb's writer
+        // FileBackend keeps the already validated descriptor and redb's writer
         // exclusion. Empty existing files are refused by open_journal_file, so
         // this cannot silently initialize a missing or empty journal.
-        let database = redb::Builder::new()
-            .create_file(file)
+        let database = FileBackend::new(file)
+            .and_then(|backend| redb::Builder::new().create_with_backend(backend))
             .map_err(|error| journal_error(&path, "open exclusively", error))?;
         let journal = Self { database, path };
         let state = journal.read_state()?;
