@@ -7,6 +7,7 @@ mod tests {
     use crate::{
         ControllerAdmissionPolicy, ControllerCandidate, ControllerFingerprint,
         LifecycleCancellation, ProbeDisposition, ProbeReason, UnsafeRule,
+        normalize_controller_inventory,
     };
     use bluer::{Address, AddressType, l2cap::SocketAddr};
     use std::{str::FromStr, sync::Mutex, time::Duration};
@@ -27,6 +28,7 @@ mod tests {
     struct FakeBackend {
         operations: Mutex<Vec<Operation>>,
         powered: bool,
+        address: Address,
         address_type: AddressType,
         failure: Mutex<Option<(Operation, ControllerProbeError)>>,
         bound: Mutex<Option<SocketAddr>>,
@@ -37,6 +39,7 @@ mod tests {
             Self {
                 operations: Mutex::new(Vec::new()),
                 powered: true,
+                address: address(),
                 address_type: AddressType::LeRandom,
                 failure: Mutex::new(None),
                 bound: Mutex::new(None),
@@ -93,7 +96,7 @@ mod tests {
         ) -> ControllerProbeFuture<'a, Address> {
             Box::pin(async move {
                 self.record(Operation::ReadAddress)?;
-                Ok(address())
+                Ok(self.address)
             })
         }
 
@@ -154,7 +157,11 @@ mod tests {
     }
 
     fn candidate() -> ControllerCandidate {
-        ControllerCandidate::new("hci0".to_owned(), address(), AddressType::LeRandom)
+        candidate_with(address(), AddressType::LeRandom)
+    }
+
+    fn candidate_with(address: Address, address_type: AddressType) -> ControllerCandidate {
+        ControllerCandidate::new("hci0".to_owned(), address, address_type)
     }
 
     fn limits() -> ControllerProbeLimits {
@@ -193,7 +200,15 @@ mod tests {
         };
 
         assert_eq!(
-            probe(&backend).await,
+            probe_controller(
+                &backend,
+                &candidate_with(address(), AddressType::BrEdr),
+                &ControllerFingerprint::default(),
+                &ControllerAdmissionPolicy::default(),
+                &LifecycleCancellation::new(),
+                limits(),
+            )
+            .await,
             ProbeDisposition::Incompatible(ProbeReason::UnsupportedAddressFamily)
         );
     }
@@ -301,6 +316,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wildcard_observed_address_is_indeterminate_before_socket_creation() {
+        let backend = FakeBackend {
+            address: Address::any(),
+            ..FakeBackend::compatible()
+        };
+
+        assert_eq!(
+            probe(&backend).await,
+            ProbeDisposition::Indeterminate(ProbeReason::UnknownPlatformError)
+        );
+        assert!(
+            !backend
+                .operations
+                .lock()
+                .unwrap()
+                .contains(&Operation::CreateSocket)
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_without_snapshot_is_indeterminate_before_session_creation() {
+        let backend = FakeBackend::compatible();
+        let candidate = normalize_controller_inventory(vec!["hci0".to_owned()], None, None)
+            .candidates()[0]
+            .clone();
+
+        assert_eq!(
+            probe_controller(
+                &backend,
+                &candidate,
+                &ControllerFingerprint::default(),
+                &ControllerAdmissionPolicy::default(),
+                &LifecycleCancellation::new(),
+                limits(),
+            )
+            .await,
+            ProbeDisposition::Indeterminate(ProbeReason::BluezUnavailable)
+        );
+        assert!(backend.operations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn observed_identity_mismatch_is_indeterminate_before_socket_creation() {
+        let backend = FakeBackend {
+            address: Address::from_str("02:00:00:00:00:09").unwrap(),
+            ..FakeBackend::compatible()
+        };
+
+        assert_eq!(
+            probe(&backend).await,
+            ProbeDisposition::Indeterminate(ProbeReason::BluezUnavailable)
+        );
+        assert!(
+            !backend
+                .operations
+                .lock()
+                .unwrap()
+                .contains(&Operation::CreateSocket)
+        );
+    }
+
+    #[tokio::test]
     async fn probe_runs_passive_local_operations_in_order() {
         let backend = FakeBackend::compatible();
 
@@ -331,8 +408,8 @@ mod tests {
     }
 }
 use crate::{
-    ControllerAdmissionPolicy, ControllerCandidate, ControllerFingerprint, LifecycleCancellation,
-    ProbeDisposition, ProbeReason,
+    ControllerAdmissionPolicy, ControllerCandidate, ControllerFingerprint, ControllerSnapshot,
+    LifecycleCancellation, ProbeDisposition, ProbeReason,
     platform::socket::{map_probe_bluer_error, map_probe_io_error, validate_dynamic_le_psm},
 };
 use bluer::{
@@ -576,6 +653,9 @@ pub async fn probe_controller<B: ControllerProbeBackend>(
     if cancellation.is_cancelled() {
         return ControllerProbeError::Cancelled.disposition();
     }
+    let Some(snapshot) = candidate.snapshot() else {
+        return ControllerProbeError::Removed.disposition();
+    };
     let admission = policy.admit(fingerprint);
     if admission.disposition() != ProbeDisposition::Compatible {
         return admission.disposition();
@@ -584,7 +664,7 @@ pub async fn probe_controller<B: ControllerProbeBackend>(
     tokio::select! {
         biased;
         () = cancellation.cancelled() => ControllerProbeError::Cancelled.disposition(),
-        result = timeout(limits.sweep, timeout(limits.candidate, probe_candidate(backend, candidate, cancellation, limits.operation))) => {
+        result = timeout(limits.sweep, timeout(limits.candidate, probe_candidate(backend, candidate, snapshot, cancellation, limits.operation))) => {
             match result {
                 Err(_) | Ok(Err(_)) => ControllerProbeError::DeadlineExceeded.disposition(),
                 Ok(Ok(result)) => result.unwrap_or_else(ControllerProbeError::disposition),
@@ -596,6 +676,7 @@ pub async fn probe_controller<B: ControllerProbeBackend>(
 async fn probe_candidate<B: ControllerProbeBackend>(
     backend: &B,
     candidate: &ControllerCandidate,
+    snapshot: ControllerSnapshot,
     cancellation: &LifecycleCancellation,
     operation_limit: Duration,
 ) -> Result<ProbeDisposition, ControllerProbeError> {
@@ -621,6 +702,12 @@ async fn probe_candidate<B: ControllerProbeBackend>(
         backend.address_type(&session, candidate),
     )
     .await?;
+    if address == Address::any() {
+        return Err(ControllerProbeError::UnknownPlatformError);
+    }
+    if address != snapshot.address() || address_type != snapshot.address_type() {
+        return Err(ControllerProbeError::Removed);
+    }
     if !matches!(address_type, AddressType::LePublic | AddressType::LeRandom) {
         return Err(ControllerProbeError::UnsupportedAddressFamily);
     }
