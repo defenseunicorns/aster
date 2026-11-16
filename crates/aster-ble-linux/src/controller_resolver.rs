@@ -82,6 +82,9 @@ pub(crate) trait ControllerEpochActivator: Send + Sync {
         &self,
         epoch: ControllerEpochView<'_>,
     ) -> Result<Box<dyn OperationalControllerEpoch>, DriverError>;
+
+    #[cfg(test)]
+    fn operational_change_handled(&self, _state: OperationalEpochState) {}
 }
 
 /// Runtime state of automatic Linux controller resolution.
@@ -595,6 +598,12 @@ enum SessionAction {
     Terminal(DriverError),
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ReadyInventoryCheck {
+    Required,
+    AlreadyDrained,
+}
+
 impl ResolverActor {
     async fn run(mut self) -> Result<(), DriverError> {
         self.output.emit(BtleOperatorEvent::AdapterUnavailable(
@@ -891,7 +900,13 @@ impl ResolverActor {
                         return SessionAction::Cancelled;
                     }
                     if let Some(changed) = self.ready_operational_change()
-                        && let Some(outcome) = self.handle_operational_change(changed).await
+                        && let Some(outcome) = self
+                            .handle_operational_change(
+                                session,
+                                changed,
+                                ReadyInventoryCheck::AlreadyDrained,
+                            )
+                            .await
                     {
                         return outcome;
                     }
@@ -899,7 +914,10 @@ impl ResolverActor {
                 }
                 HealthyEvent::Platform(None) => return SessionAction::Lost,
                 HealthyEvent::Operational(changed) => {
-                    if let Some(outcome) = self.handle_operational_change(changed).await {
+                    if let Some(outcome) = self
+                        .handle_operational_change(session, changed, ReadyInventoryCheck::Required)
+                        .await
+                    {
                         return outcome;
                     }
                 }
@@ -918,16 +936,69 @@ impl ResolverActor {
 
     async fn handle_operational_change(
         &mut self,
+        session: &mut dyn ResolverSession,
         changed: Result<(), watch::error::RecvError>,
+        inventory_check: ReadyInventoryCheck,
     ) -> Option<SessionAction> {
         if changed.is_err() {
+            return Some(self.invalidate_failed_operational_epoch().await);
+        }
+
+        if self.cancellation.is_cancelled() {
+            return Some(SessionAction::Cancelled);
+        }
+        let observed_state = *self
+            .operational_status
+            .as_ref()
+            .expect("operational status exists after change")
+            .borrow();
+        if observed_state == OperationalEpochState::Unavailable {
+            self.operational_status
+                .as_mut()
+                .expect("operational status exists after change")
+                .borrow_and_update();
+            #[cfg(test)]
+            if let Some(activator) = &self.activator {
+                activator.operational_change_handled(observed_state);
+            }
+            return Some(self.invalidate_failed_operational_epoch().await);
+        }
+
+        let mut inventory_consumed = false;
+        if inventory_check == ReadyInventoryCheck::Required
+            && let Some(outcome) = self.consume_ready_event_batch(session).await
+        {
+            match outcome {
+                SessionAction::Sweep => {
+                    if self.owner.is_none() {
+                        return Some(SessionAction::Sweep);
+                    }
+                    inventory_consumed = true;
+                }
+                outcome => return Some(outcome),
+            }
+        }
+        if self.cancellation.is_cancelled() {
+            return Some(SessionAction::Cancelled);
+        }
+        if self
+            .operational_status
+            .as_mut()
+            .expect("selected owner retains operational status")
+            .has_changed()
+            .is_err()
+        {
             return Some(self.invalidate_failed_operational_epoch().await);
         }
         let state = *self
             .operational_status
             .as_mut()
-            .expect("operational status exists after change")
+            .expect("selected owner retains operational status")
             .borrow_and_update();
+        #[cfg(test)]
+        if let Some(activator) = &self.activator {
+            activator.operational_change_handled(state);
+        }
         let event_path_available = matches!(
             state,
             OperationalEpochState::Available | OperationalEpochState::Degraded
@@ -950,7 +1021,17 @@ impl ResolverActor {
         } else if state == OperationalEpochState::Unavailable {
             return Some(self.invalidate_failed_operational_epoch().await);
         }
-        None
+        inventory_consumed.then_some(SessionAction::Sweep)
+    }
+
+    async fn consume_ready_event_batch(
+        &mut self,
+        session: &mut dyn ResolverSession,
+    ) -> Option<SessionAction> {
+        match session.next_event().now_or_never()? {
+            Some(event) => Some(self.consume_event_batch(session, event).await),
+            None => Some(SessionAction::Lost),
+        }
     }
 
     async fn invalidate_failed_operational_epoch(&mut self) -> SessionAction {
@@ -1529,6 +1610,8 @@ mod tests {
         events: Arc<Mutex<Vec<&'static str>>>,
         quiesce_gate: Mutex<Option<Arc<Notify>>>,
         fail_join: Arc<std::sync::atomic::AtomicBool>,
+        nonterminal_flood_remaining: AtomicUsize,
+        operational_changes_handled: AtomicUsize,
     }
 
     impl RecordingActivator {
@@ -1560,6 +1643,15 @@ mod tests {
         fn fail_join(&self) {
             self.fail_join.store(true, Ordering::Release);
         }
+
+        fn flood_nonterminal_states(&self, additional_updates: usize) {
+            self.nonterminal_flood_remaining
+                .store(additional_updates, Ordering::SeqCst);
+        }
+
+        fn operational_changes_handled(&self) -> usize {
+            self.operational_changes_handled.load(Ordering::SeqCst)
+        }
     }
 
     impl ControllerEpochActivator for RecordingActivator {
@@ -1576,6 +1668,31 @@ mod tests {
                 quiesce_gate: self.quiesce_gate.lock().unwrap().clone(),
                 fail_join: self.fail_join.clone(),
             }))
+        }
+
+        fn operational_change_handled(&self, state: OperationalEpochState) {
+            self.operational_changes_handled
+                .fetch_add(1, Ordering::SeqCst);
+            if self
+                .nonterminal_flood_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                let next = match state {
+                    OperationalEpochState::Starting => OperationalEpochState::Available,
+                    OperationalEpochState::Available => OperationalEpochState::Degraded,
+                    OperationalEpochState::Degraded => OperationalEpochState::Starting,
+                    OperationalEpochState::Unavailable => OperationalEpochState::Starting,
+                };
+                self.states
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .expect("one selected controller epoch")
+                    .send_replace(next);
+            }
         }
     }
 
@@ -1922,6 +2039,130 @@ mod tests {
         assert_eq!(available.disposition(), ProbeDisposition::Compatible);
         assert_eq!(activator.activation_count(), 1);
         stop(resolver).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn simultaneous_available_and_selected_removal_never_publishes_available() {
+        let selected = controller("hci0", 1, fingerprint("a"));
+        let (harness, session) = Harness::session(vec![selected]);
+        let activator = Arc::new(RecordingActivator::default());
+        let drain_gate = Arc::new(Notify::new());
+        activator.block_quiesce(drain_gate.clone());
+        let (output, mut operator_events) = BtleOperatorOutput::bounded();
+        let (epoch_updates, mut epochs) = mpsc::channel(8);
+        let resolver = spawn_resolver(
+            ControllerAdmissionPolicy::default(),
+            limits(),
+            output,
+            Arc::new(FakePlatform::new([Ok(session)])),
+            Arc::new(FakeProbe::compatible()),
+            Some(activator.clone()),
+            Some(epoch_updates),
+        );
+        let mut status = resolver.status();
+        wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
+        let epoch = epochs.recv().await.unwrap();
+        while operator_events.try_recv().is_ok() {}
+
+        activator.latest_state(OperationalEpochState::Available);
+        harness.replace(
+            Vec::new(),
+            ResolverEvent::InventoryChanged {
+                removed: Some("hci0".to_owned()),
+            },
+        );
+
+        wait_for_events(&activator, 1).await;
+        let unavailable_before_cleanup =
+            status.borrow().availability() == RuntimeAvailability::Unavailable;
+        let not_cancelled_before_cleanup = !epoch.is_cancelled();
+        let lifecycle_before_cleanup = activator.events();
+        let mut emitted_before_cleanup = Vec::new();
+        while let Ok(event) = operator_events.try_recv() {
+            emitted_before_cleanup.push(event);
+        }
+        let unavailable_emitted_before_cleanup = emitted_before_cleanup
+            .iter()
+            .any(|event| matches!(event, BtleOperatorEvent::AdapterUnavailable(_)));
+        drain_gate.notify_waiters();
+        wait_for_events(&activator, 3).await;
+        let cancelled_after_cleanup = epoch.is_cancelled();
+        let lifecycle = activator.events();
+        stop(resolver).await;
+
+        let mut emitted = emitted_before_cleanup;
+        while let Ok(event) = operator_events.try_recv() {
+            emitted.push(event);
+        }
+        assert!(
+            !emitted.contains(&BtleOperatorEvent::AdapterAvailable),
+            "selected removal already ready with Available must suppress availability: {emitted:?}"
+        );
+        assert!(unavailable_before_cleanup);
+        assert!(unavailable_emitted_before_cleanup);
+        assert_eq!(lifecycle_before_cleanup, ["quiesce"]);
+        assert!(not_cancelled_before_cleanup);
+        assert_eq!(&lifecycle[..3], ["quiesce", "cancel", "join"]);
+        assert!(cancelled_after_cleanup);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_removal_preempts_continuous_nonterminal_status_flood() {
+        const MAX_NONTERMINAL_UPDATES_BEFORE_INVENTORY: usize = 1;
+
+        let selected = controller("hci0", 1, fingerprint("a"));
+        let (harness, session) = Harness::session(vec![selected]);
+        let activator = Arc::new(RecordingActivator::default());
+        let (output, mut operator_events) = BtleOperatorOutput::bounded();
+        let (epoch_updates, mut epochs) = mpsc::channel(8);
+        let resolver = spawn_resolver(
+            ControllerAdmissionPolicy::default(),
+            limits(),
+            output,
+            Arc::new(FakePlatform::new([Ok(session)])),
+            Arc::new(FakeProbe::compatible()),
+            Some(activator.clone()),
+            Some(epoch_updates),
+        );
+        let mut status = resolver.status();
+        wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
+        let epoch = epochs.recv().await.unwrap();
+        while operator_events.try_recv().is_ok() {}
+        activator.flood_nonterminal_states(MAX_EVENTS_PER_BATCH + 1);
+
+        activator.latest_state(OperationalEpochState::Starting);
+        harness.replace(
+            Vec::new(),
+            ResolverEvent::InventoryChanged {
+                removed: Some("hci0".to_owned()),
+            },
+        );
+
+        wait_for_events(&activator, 3).await;
+        let handled = activator.operational_changes_handled();
+        let lifecycle = activator.events();
+        let epoch_cancelled = epoch.is_cancelled();
+        resolver.cancel();
+        tokio::time::timeout(Duration::from_secs(1), resolver.shutdown())
+            .await
+            .expect("cancellation must join after removal during a status flood")
+            .unwrap();
+        let mut emitted = Vec::new();
+        while let Ok(event) = operator_events.try_recv() {
+            emitted.push(event);
+        }
+
+        assert!(
+            handled <= MAX_NONTERMINAL_UPDATES_BEFORE_INVENTORY,
+            "selected removal consumed only after {handled} nonterminal status updates"
+        );
+        assert!(
+            !emitted.contains(&BtleOperatorEvent::AdapterAvailable),
+            "status flood must not flap availability before selected removal: {emitted:?}"
+        );
+        assert_eq!(&lifecycle[..3], ["quiesce", "cancel", "join"]);
+        assert!(epoch_cancelled);
+        assert_eq!(activator.activation_count(), 1);
     }
 
     #[tokio::test(start_paused = true)]
