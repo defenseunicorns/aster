@@ -288,11 +288,20 @@ impl EventAvailabilityControl for EventAdapterControl {
 }
 
 struct AdapterAvailabilityPublisher {
-    control: Option<Arc<dyn EventAvailabilityControl>>,
+    publication: Arc<AvailabilityPublication>,
     selector_can_originate: bool,
+}
+
+struct AvailabilityPublication {
+    control: Option<Arc<dyn EventAvailabilityControl>>,
     updates: watch::Sender<crate::BtleAvailability>,
     output: crate::BtleOperatorOutput,
     epoch: AtomicU64,
+}
+
+#[derive(Clone)]
+struct UnavailableAvailabilityPublisher {
+    publication: Arc<AvailabilityPublication>,
 }
 
 impl AdapterAvailabilityPublisher {
@@ -301,11 +310,13 @@ impl AdapterAvailabilityPublisher {
         output: crate::BtleOperatorOutput,
     ) -> Self {
         Self {
-            control: None,
+            publication: Arc::new(AvailabilityPublication {
+                control: None,
+                updates,
+                output,
+                epoch: AtomicU64::new(crate::AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH),
+            }),
             selector_can_originate: false,
-            updates,
-            output,
-            epoch: AtomicU64::new(crate::AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH),
         }
     }
 
@@ -316,17 +327,50 @@ impl AdapterAvailabilityPublisher {
         role: FixedRole,
     ) -> Self {
         Self {
-            control: Some(control),
+            publication: Arc::new(AvailabilityPublication {
+                control: Some(control),
+                updates,
+                output,
+                epoch: AtomicU64::new(crate::AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH),
+            }),
             selector_can_originate: role == FixedRole::Initiator,
-            updates,
-            output,
-            epoch: AtomicU64::new(crate::AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH),
+        }
+    }
+
+    fn unavailable_only(&self) -> UnavailableAvailabilityPublisher {
+        UnavailableAvailabilityPublisher {
+            publication: self.publication.clone(),
         }
     }
 
     fn publish(
         &self,
         availability: crate::BtleAvailability,
+    ) -> Result<(), AvailabilityPublishError> {
+        let state =
+            if self.selector_can_originate && availability == crate::BtleAvailability::Available {
+                EventAdapterState::Available
+            } else {
+                EventAdapterState::Unavailable
+            };
+        self.publication.publish(availability, state)
+    }
+}
+
+impl UnavailableAvailabilityPublisher {
+    fn publish(&self) -> Result<(), AvailabilityPublishError> {
+        self.publication.publish(
+            crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable),
+            EventAdapterState::Unavailable,
+        )
+    }
+}
+
+impl AvailabilityPublication {
+    fn publish(
+        &self,
+        availability: crate::BtleAvailability,
+        state: EventAdapterState,
     ) -> Result<(), AvailabilityPublishError> {
         if *self.updates.borrow() == availability {
             return Ok(());
@@ -336,13 +380,6 @@ impl AdapterAvailabilityPublisher {
             let epoch = current
                 .checked_add(1)
                 .ok_or(AvailabilityPublishError::EpochExhausted)?;
-            let state = if self.selector_can_originate
-                && availability == crate::BtleAvailability::Available
-            {
-                EventAdapterState::Available
-            } else {
-                EventAdapterState::Unavailable
-            };
             if !control.publish_availability(EventAdapterSnapshot::new(
                 EventTransportKind::BLE_L2CAP_V1,
                 epoch,
@@ -957,14 +994,7 @@ impl ControllerEpochActivator for RosteredEpochActivator {
                 )
                 .await;
                 complete_pending_after_epoch(&mut mode, &observer, &result);
-                if matches!(result, Err(SupervisorError::PlatformCleanupUnconfirmed)) {
-                    Err(supervisor_driver_error(
-                        SupervisorError::PlatformCleanupUnconfirmed,
-                    ))
-                } else {
-                    platform_owner.clear();
-                    Ok(())
-                }
+                finish_operational_epoch_result(result, platform_owner.as_ref())
             };
             tokio::pin!(epoch);
             let (result, quiesced) = tokio::select! {
@@ -1002,7 +1032,22 @@ impl ControllerEpochActivator for RosteredEpochActivator {
             cancellation,
             task,
             platform_owner: self.platform_owner.clone(),
+            unavailable: self.publisher.unavailable_only(),
         }))
+    }
+}
+
+fn finish_operational_epoch_result(
+    result: Result<(), SupervisorError>,
+    platform_owner: &PlatformOwner,
+) -> Result<(), DriverError> {
+    if matches!(result, Err(SupervisorError::PlatformCleanupUnconfirmed)) {
+        Err(supervisor_driver_error(
+            SupervisorError::PlatformCleanupUnconfirmed,
+        ))
+    } else {
+        platform_owner.clear();
+        Ok(())
     }
 }
 
@@ -1036,6 +1081,7 @@ struct RosteredOperationalEpoch {
     cancellation: LifecycleCancellation,
     task: JoinHandle<Result<(), DriverError>>,
     platform_owner: Arc<PlatformOwner>,
+    unavailable: UnavailableAvailabilityPublisher,
 }
 
 impl OperationalControllerEpoch for RosteredOperationalEpoch {
@@ -1051,14 +1097,12 @@ impl OperationalControllerEpoch for RosteredOperationalEpoch {
                 .send(OperationalEpochCommand::Quiesce(acknowledged))
                 .await
                 .map_err(|_| {
-                    DriverError::new(
-                        DriverErrorKind::Transport,
+                    self.publish_unavailable_after_failure(
                         "automatic rostered Event epoch quiesce channel closed",
                     )
                 })?;
             acknowledgement.await.map_err(|_| {
-                DriverError::new(
-                    DriverErrorKind::Transport,
+                self.publish_unavailable_after_failure(
                     "automatic rostered Event epoch quiesce was not acknowledged",
                 )
             })?
@@ -1071,13 +1115,16 @@ impl OperationalControllerEpoch for RosteredOperationalEpoch {
 
     fn join(self: Box<Self>) -> OperationalEpochFuture<'static, Result<(), DriverError>> {
         Box::pin(async move {
+            self.availability_fence.quiesce();
             match self.task.await {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(error)) => {
+                    let _ = self.unavailable.publish();
                     self.platform_owner.force_loss();
                     Err(error)
                 }
                 Err(_) => {
+                    let _ = self.unavailable.publish();
                     self.platform_owner.force_loss();
                     Err(DriverError::new(
                         DriverErrorKind::Transport,
@@ -1086,6 +1133,13 @@ impl OperationalControllerEpoch for RosteredOperationalEpoch {
                 }
             }
         })
+    }
+}
+
+impl RosteredOperationalEpoch {
+    fn publish_unavailable_after_failure(&self, message: &'static str) -> DriverError {
+        let _ = self.unavailable.publish();
+        DriverError::new(DriverErrorKind::Transport, message)
     }
 }
 
@@ -1147,11 +1201,11 @@ pub fn spawn_automatic_linux_rostered_btle_event_supervisor(
     let task_cancellation = cancellation.clone();
     let task = tokio::spawn(async move {
         let _completion = CompletionOnDrop(completion_updates);
-        task_cancellation.cancelled().await;
-        resolver
-            .shutdown_for_supervisor()
-            .await
-            .map_err(|_| SupervisorError::PlatformCleanupUnconfirmed)
+        let status = resolver.status();
+        run_automatic_resolver_owner(status, task_cancellation, async move {
+            resolver.shutdown_for_supervisor().await
+        })
+        .await
     });
     Ok(LinuxRosteredBtleEventSupervisor {
         availability,
@@ -1162,6 +1216,26 @@ pub fn spawn_automatic_linux_rostered_btle_event_supervisor(
         task,
         abort_on_unconfirmed_cleanup: false,
     })
+}
+
+async fn run_automatic_resolver_owner<T, F>(
+    mut status: watch::Receiver<T>,
+    cancellation: LifecycleCancellation,
+    shutdown: F,
+) -> Result<(), SupervisorError>
+where
+    T: Send + Sync + 'static,
+    F: Future<Output = Result<(), DriverError>>,
+{
+    let resolver_stopped = async { while status.changed().await.is_ok() {} };
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {}
+        () = resolver_stopped => {}
+    }
+    shutdown
+        .await
+        .map_err(|_| SupervisorError::PlatformCleanupUnconfirmed)
 }
 
 fn spawn_rostered_btle_event_supervisor(
@@ -1511,7 +1585,7 @@ where
         )
         .await;
         drop(listener);
-        cleanup.map_err(supervisor_error)?;
+        cleanup.map_err(owned_cleanup_unconfirmed)?;
         return Err(SupervisorError::Controller(DriverErrorKind::Unavailable));
     }
     let started_scan = match await_epoch_platform(
@@ -1532,7 +1606,7 @@ where
             )
             .await;
             drop(listener);
-            cleanup.map_err(supervisor_error)?;
+            cleanup.map_err(owned_cleanup_unconfirmed)?;
             return Err(error);
         }
     };
@@ -1548,8 +1622,8 @@ where
         );
         let (scan_result, advertisement_result) = tokio::join!(scan_cleanup, advertisement_cleanup);
         drop(listener);
-        scan_result.map_err(supervisor_error)?;
-        advertisement_result.map_err(supervisor_error)?;
+        scan_result.map_err(owned_cleanup_unconfirmed)?;
+        advertisement_result.map_err(owned_cleanup_unconfirmed)?;
         return Err(SupervisorError::Controller(DriverErrorKind::Unavailable));
     }
     let (scan, observations) = started_scan.into_parts();
@@ -1669,7 +1743,7 @@ where
                 EpochEvent::AdvertisementRotation => {
                     let mut previous = advertisement.take().expect("advertisement is live");
                     if let Err(error) = release_advertisement(previous.as_mut()).await {
-                        break Err(supervisor_error(error));
+                        break Err(owned_cleanup_unconfirmed(error));
                     }
                     owner_loss_required = false;
                     break Err(SupervisorError::Controller(DriverErrorKind::Transport));
@@ -1681,7 +1755,7 @@ where
                     if matches!(outcome, ObservationOutcome::StopWindow(_)) {
                         if let Err(error) = stop_active_scan(&mut scan_phase, &mut admission).await
                         {
-                            break Err(supervisor_error(error));
+                            break Err(error);
                         }
                     } else if outcome == ObservationOutcome::Accepted
                         && (mode.is_automatic() || config.role() == FixedRole::Initiator)
@@ -1701,7 +1775,7 @@ where
                         {
                             Ok(Some(phase)) => contact_phase = phase,
                             Ok(None) => {}
-                            Err(error) => break Err(supervisor_error(error)),
+                            Err(error) => break Err(error),
                         }
                     }
                 }
@@ -1735,7 +1809,7 @@ where
                         Err(error) => break Err(supervisor_error(error)),
                     };
                     if let Err(error) = stop_active_scan(&mut scan_phase, &mut admission).await {
-                        break Err(supervisor_error(error));
+                        break Err(error);
                     }
                     admission.enter_authenticated_contact(now);
                     contact_phase = ContactPhase::admitted(
@@ -1762,7 +1836,7 @@ where
                     {
                         Ok(Some(phase)) => contact_phase = phase,
                         Ok(None) => {}
-                        Err(error) => break Err(supervisor_error(error)),
+                        Err(error) => break Err(error),
                     }
                 }
                 EpochEvent::CoordinatorAttempt(Some(attempt)) => {
@@ -1783,7 +1857,7 @@ where
                             {
                                 Ok(Some(phase)) => contact_phase = phase,
                                 Ok(None) => {}
-                                Err(error) => break Err(supervisor_error(error)),
+                                Err(error) => break Err(error),
                             }
                         }
                     }
@@ -1851,7 +1925,7 @@ where
                 }
                 EpochEvent::ScanDeadline => {
                     if let Err(error) = stop_active_scan(&mut scan_phase, &mut admission).await {
-                        break Err(supervisor_error(error));
+                        break Err(error);
                     }
                 }
                 EpochEvent::ScanIdleDeadline => {
@@ -1868,7 +1942,7 @@ where
                     if lifecycle_now() >= expires_at {
                         let (mut owner, _) = started_scan.into_parts();
                         if let Err(error) = stop_scan(owner.as_mut()).await {
-                            break Err(supervisor_error(error));
+                            break Err(owned_cleanup_unconfirmed(error));
                         }
                         break Err(SupervisorError::Controller(DriverErrorKind::Unavailable));
                     }
@@ -1920,12 +1994,12 @@ where
         tokio::join!(contact_join, scan_cleanup, advertisement_cleanup);
     complete_interrupted_contact(contact_outcome, contact_termination);
     drop(listener);
-    if result.is_ok() && (scan_stop.is_err() || advertisement_release.is_err()) {
+    if scan_stop.is_err() || advertisement_release.is_err() {
         discovery.force_owner_loss();
+        return Err(SupervisorError::PlatformCleanupUnconfirmed);
     }
     result?;
-    scan_stop.map_err(supervisor_error)?;
-    advertisement_release.map_err(supervisor_error)
+    Ok(())
 }
 
 struct OutboundSchedule<'a> {
@@ -2060,7 +2134,7 @@ async fn begin_outbound_contact<S>(
     candidate_pending: &mut bool,
     outbound_delay: &mut OutboundDelay,
     mode: &mut EpochContactMode,
-) -> Result<Option<ContactPhase>, DriverError>
+) -> Result<Option<ContactPhase>, SupervisorError>
 where
     S: RosteredSocketFactory + 'static,
 {
@@ -2103,7 +2177,7 @@ fn idle_scan_phase() -> ScanPhase {
 async fn stop_active_scan(
     phase: &mut ScanPhase,
     admission: &mut DiscoveryAdmission,
-) -> Result<(), DriverError> {
+) -> Result<(), SupervisorError> {
     let now = lifecycle_now();
     let idle = ScanPhase::Idle {
         deadline: tokio::time::Instant::now() + SCAN_IDLE_INTERVAL,
@@ -2113,7 +2187,11 @@ async fn stop_active_scan(
     };
     let result = stop_scan(scan.owner.as_mut()).await;
     admission.stop_scan(now);
-    result
+    result.map_err(owned_cleanup_unconfirmed)
+}
+
+fn owned_cleanup_unconfirmed(_: DriverError) -> SupervisorError {
+    SupervisorError::PlatformCleanupUnconfirmed
 }
 
 fn finish_ended_scan(phase: &mut ScanPhase, admission: &mut DiscoveryAdmission) {
@@ -3008,6 +3086,14 @@ mod tests {
         }
     }
 
+    fn test_unavailable_publisher() -> UnavailableAvailabilityPublisher {
+        let (updates, _availability) = watch::channel(crate::BtleAvailability::Unavailable(
+            crate::AvailabilityReason::BluezUnavailable,
+        ));
+        AdapterAvailabilityPublisher::fixed(updates, crate::BtleOperatorOutput::discard())
+            .unavailable_only()
+    }
+
     #[test]
     fn nonce_source_rejects_reuse_and_exhausts_three_redraws() {
         let source = UniqueNonceSource::new(FakeRandom(Mutex::new(
@@ -3157,10 +3243,36 @@ mod tests {
                 ))
             }),
             platform_owner,
+            unavailable: test_unavailable_publisher(),
         };
 
         assert!(Box::new(epoch).join().await.is_err());
         assert_eq!(force_count.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn spontaneous_resolver_failure_wakes_automatic_completion_without_shutdown() {
+        let cancellation = LifecycleCancellation::new();
+        let (status_updates, status) = watch::channel(OperationalEpochState::Starting);
+        let (completion_updates, mut completion) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let _completion = CompletionOnDrop(completion_updates);
+            run_automatic_resolver_owner(status, cancellation, async {
+                Err(DriverError::new(
+                    DriverErrorKind::Transport,
+                    "test spontaneous resolver failure",
+                ))
+            })
+            .await
+        });
+
+        drop(status_updates);
+        completion.changed().await.unwrap();
+        assert!(*completion.borrow_and_update());
+        assert_eq!(
+            task.await.unwrap(),
+            Err(SupervisorError::PlatformCleanupUnconfirmed)
+        );
     }
 
     #[test]
@@ -4060,10 +4172,7 @@ mod tests {
             .unwrap()
             .unwrap_err();
 
-        assert_eq!(
-            outcome,
-            SupervisorError::Controller(DriverErrorKind::Transport)
-        );
+        assert_eq!(outcome, SupervisorError::PlatformCleanupUnconfirmed);
         assert_eq!(owner_loss_forced.load(Ordering::Acquire), 1);
     }
 
@@ -4174,7 +4283,10 @@ mod tests {
 
         assert_eq!(owner_loss_forced.load(Ordering::Acquire), 1);
         assert!(task.is_finished(), "owner loss must release the epoch");
-        assert!(task.await.unwrap().is_err());
+        assert_eq!(
+            task.await.unwrap(),
+            Err(SupervisorError::PlatformCleanupUnconfirmed)
+        );
         assert_eq!(
             events
                 .lock()
@@ -4792,11 +4904,13 @@ mod tests {
             crate::AvailabilityReason::BluezUnavailable,
         ));
         let publisher = AdapterAvailabilityPublisher {
-            control: Some(control.clone()),
+            publication: Arc::new(AvailabilityPublication {
+                control: Some(control.clone()),
+                updates,
+                output: crate::BtleOperatorOutput::discard(),
+                epoch: AtomicU64::new(u64::MAX),
+            }),
             selector_can_originate: true,
-            updates,
-            output: crate::BtleOperatorOutput::discard(),
-            epoch: AtomicU64::new(u64::MAX),
         };
 
         assert_eq!(
@@ -4825,6 +4939,135 @@ mod tests {
                 });
                 true
             }
+        }
+
+        struct OrderedOwnerLoss {
+            events: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        impl PlatformOwnerLoss for OrderedOwnerLoss {
+            fn force(&self) {
+                self.events.lock().unwrap().push("force");
+            }
+        }
+
+        #[tokio::test]
+        async fn operational_panic_publishes_unavailable_before_forcing_owner_loss() {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let control = Arc::new(OrderedAvailabilityControl {
+                events: events.clone(),
+            });
+            let (updates, availability) = watch::channel(crate::BtleAvailability::Unavailable(
+                crate::AvailabilityReason::BluezUnavailable,
+            ));
+            let publisher = Arc::new(AdapterAvailabilityPublisher::automatic(
+                control,
+                updates,
+                crate::BtleOperatorOutput::discard(),
+                FixedRole::Initiator,
+            ));
+            publisher
+                .publish(crate::BtleAvailability::Available)
+                .unwrap();
+            let platform_owner = Arc::new(PlatformOwner::default());
+            platform_owner.replace(OrderedOwnerLoss {
+                events: events.clone(),
+            });
+            let (_updates, status) = watch::channel(OperationalEpochState::Available);
+            let (commands, _requests) = mpsc::channel(1);
+            let epoch = RosteredOperationalEpoch {
+                status,
+                commands,
+                availability_fence: Arc::new(AvailabilityFence::default()),
+                cancellation: LifecycleCancellation::new(),
+                task: tokio::spawn(async { panic!("test operational panic") }),
+                platform_owner,
+                unavailable: publisher.unavailable_only(),
+            };
+
+            assert!(Box::new(epoch).join().await.is_err());
+            assert_eq!(
+                *availability.borrow(),
+                crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable,)
+            );
+            assert_eq!(
+                *events.lock().unwrap(),
+                ["available", "unavailable", "force"]
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn operational_wrapper_retains_force_loss_after_owned_cleanup_timeout() {
+            let discovery = Arc::new(BarrierDiscovery {
+                events: Arc::new(Mutex::new(Vec::new())),
+                advertisement_release_completed: None,
+                advertisement_terminated: Arc::new(Notify::new()),
+                scan_started: Arc::new(Notify::new()),
+                owner_loss_forced: Arc::new(AtomicU8::new(0)),
+                observation_sender: Mutex::new(None),
+            });
+            let (control, publisher, availability, available_started) = publisher();
+            let force_count = Arc::new(AtomicU8::new(0));
+            let platform_owner = Arc::new(PlatformOwner::default());
+            platform_owner.replace(RecordingOwnerLoss {
+                force_count: force_count.clone(),
+                release: None,
+            });
+            let cancellation = LifecycleCancellation::new();
+            let task_cancellation = cancellation.clone();
+            let task_owner = platform_owner.clone();
+            let task_publisher = publisher.clone();
+            let task_discovery = discovery.clone();
+            let (_attempt_sender, attempts) = coordinator_attempt_channel();
+            let task = tokio::spawn(async move {
+                let result = run_automatic_available_epoch(
+                    Arc::new(config()),
+                    Arc::new(FakeSockets {
+                        events: Arc::new(Mutex::new(Vec::new())),
+                    }),
+                    task_discovery,
+                    Arc::new(FixedNonce([0x5d; 16])),
+                    recording_admission(),
+                    attempts,
+                    EpochSignals::with_publisher(task_publisher, available_started),
+                    task_cancellation,
+                )
+                .await;
+                finish_operational_epoch_result(result, task_owner.as_ref())
+            });
+            let (_updates, status) = watch::channel(OperationalEpochState::Available);
+            let (commands, _requests) = mpsc::channel(1);
+            let epoch = RosteredOperationalEpoch {
+                status,
+                commands,
+                availability_fence: Arc::new(AvailabilityFence::default()),
+                cancellation: cancellation.clone(),
+                task,
+                platform_owner,
+                unavailable: publisher.unavailable_only(),
+            };
+
+            discovery.scan_started.notified().await;
+            cancellation.cancel();
+            tokio::task::yield_now().await;
+            tokio::time::advance(OWNED_STOP_DEADLINE + Duration::from_millis(1)).await;
+
+            assert!(Box::new(epoch).join().await.is_err());
+            assert_eq!(force_count.load(Ordering::Acquire), 1);
+            assert_eq!(
+                *availability.borrow(),
+                crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable,)
+            );
+            assert_eq!(
+                control
+                    .snapshots
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(EventAdapterSnapshot::state)
+                    .collect::<Vec<_>>(),
+                [EventAdapterState::Available, EventAdapterState::Unavailable]
+            );
         }
 
         fn publisher() -> (
@@ -4975,6 +5218,7 @@ mod tests {
                 cancellation,
                 task,
                 platform_owner: Arc::new(PlatformOwner::default()),
+                unavailable: publisher.unavailable_only(),
             };
 
             epoch.quiesce().await.unwrap();
@@ -5455,7 +5699,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancellation_remains_cancellation_when_owned_cleanup_fails() {
+    async fn owned_cleanup_timeout_overrides_cancellation_as_unconfirmed() {
         let locator = crate::CanonicalLocator::new(
             Address::new([2, 0, 0, 0, 0, 0x7a]),
             AddressType::LeRandom,
@@ -5501,7 +5745,7 @@ mod tests {
 
         assert_eq!(
             task.await.unwrap().unwrap_err(),
-            SupervisorError::Controller(DriverErrorKind::Transport)
+            SupervisorError::PlatformCleanupUnconfirmed
         );
         assert_eq!(counters.cancellations.load(Ordering::Acquire), 1);
         assert_eq!(counters.carrier_failures.load(Ordering::Acquire), 0);
@@ -5564,7 +5808,7 @@ mod tests {
 
         assert_eq!(
             task.await.unwrap().unwrap_err(),
-            SupervisorError::Controller(DriverErrorKind::Transport)
+            SupervisorError::PlatformCleanupUnconfirmed
         );
         assert_eq!(counters.cancellations.load(Ordering::Acquire), 1);
         assert_eq!(counters.carrier_failures.load(Ordering::Acquire), 0);

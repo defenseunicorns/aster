@@ -1000,11 +1000,17 @@ impl ResolverActor {
         let delay = self.operational_backoff.next_delay();
         let deadline = Instant::now() + delay;
         loop {
+            if self.cancellation.is_cancelled() {
+                return SessionAction::Cancelled;
+            }
+            if Instant::now() >= deadline {
+                return SessionAction::Sweep;
+            }
             let event = tokio::select! {
                 biased;
                 () = self.cancellation.cancelled() => return SessionAction::Cancelled,
-                event = session.next_event() => event,
                 () = tokio::time::sleep_until(deadline) => return SessionAction::Sweep,
+                event = session.next_event() => event,
             };
             let Some(event) = event else {
                 return SessionAction::Lost;
@@ -1289,6 +1295,10 @@ mod tests {
         observations: Arc<AtomicUsize>,
     }
 
+    struct OperationalRetryFloodSession {
+        events: Arc<AtomicUsize>,
+    }
+
     impl ResolverSession for CancellationStormSession {
         fn observe<'a>(
             &'a mut self,
@@ -1322,6 +1332,20 @@ mod tests {
         }
 
         fn next_event(&mut self) -> ResolverEventFuture<'_> {
+            Box::pin(async { Some(ResolverEvent::InventoryChanged { removed: None }) })
+        }
+    }
+
+    impl ResolverSession for OperationalRetryFloodSession {
+        fn observe<'a>(
+            &'a mut self,
+            _selected: Option<&'a str>,
+        ) -> ResolverFuture<'a, ObservedInventory> {
+            unreachable!("operational retry does not poll healthy inventory")
+        }
+
+        fn next_event(&mut self) -> ResolverEventFuture<'_> {
+            self.events.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Some(ResolverEvent::InventoryChanged { removed: None }) })
         }
     }
@@ -2413,6 +2437,60 @@ mod tests {
             .expect("actor task must not panic");
 
         assert!(matches!(outcome, SessionAction::Cancelled));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn operational_retry_deadline_wins_over_continuously_ready_unrelated_events() {
+        let cancellation = LifecycleCancellation::new();
+        let events = Arc::new(AtomicUsize::new(0));
+        let mut actor = test_actor(cancellation);
+        let task_events = events.clone();
+        let retry = tokio::spawn(async move {
+            let mut session = OperationalRetryFloodSession {
+                events: task_events,
+            };
+            actor.wait_operational_retry(&mut session).await
+        });
+
+        while events.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(INITIAL_RESOLVER_RETRY - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(!retry.is_finished());
+        let before_deadline = events.load(Ordering::SeqCst);
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            retry.is_finished(),
+            "expired retry must not lose to event flood"
+        );
+        let outcome = retry.await.unwrap();
+        assert!(matches!(outcome, SessionAction::Sweep));
+        assert!(
+            events.load(Ordering::SeqCst) - before_deadline <= MAX_EVENTS_PER_BATCH,
+            "deadline check must bound post-expiry event drainage"
+        );
+    }
+
+    #[tokio::test]
+    async fn operational_retry_cancellation_wins_over_continuously_ready_events() {
+        let cancellation = LifecycleCancellation::new();
+        let events = Arc::new(AtomicUsize::new(0));
+        let mut session = CancellationStormSession {
+            cancellation: cancellation.clone(),
+            events: events.clone(),
+        };
+        let mut actor = test_actor(cancellation);
+
+        let outcome = actor.wait_operational_retry(&mut session).await;
+
+        assert!(matches!(outcome, SessionAction::Cancelled));
+        assert!(events.load(Ordering::SeqCst) <= MAX_EVENTS_PER_BATCH);
     }
 
     #[tokio::test(start_paused = true)]
