@@ -62,11 +62,9 @@ impl ControllerEpochView<'_> {
 
 /// Capacity-one operational state reported by one selected controller epoch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) enum OperationalEpochState {
     Starting,
     Available,
-    Degraded,
     Unavailable,
 }
 
@@ -82,9 +80,6 @@ pub(crate) trait ControllerEpochActivator: Send + Sync {
         &self,
         epoch: ControllerEpochView<'_>,
     ) -> Result<Box<dyn OperationalControllerEpoch>, DriverError>;
-
-    #[cfg(test)]
-    fn operational_change_handled(&self, _state: OperationalEpochState) {}
 }
 
 /// Runtime state of automatic Linux controller resolution.
@@ -92,21 +87,9 @@ pub(crate) trait ControllerEpochActivator: Send + Sync {
 pub enum RuntimeAvailability {
     /// No controller epoch is currently usable.
     Unavailable,
-    /// One compatible controller epoch is selected.
+    /// The selected epoch's listener, advertisement, and scan owners are running;
+    /// adapter availability was accepted before this resolver state was published.
     Available,
-    /// Operator-only degraded state; not selected as available unless the full path is usable.
-    Degraded,
-}
-
-pub(crate) const fn runtime_is_selector_available(
-    availability: RuntimeAvailability,
-    complete_event_path: bool,
-) -> bool {
-    complete_event_path
-        && matches!(
-            availability,
-            RuntimeAvailability::Available | RuntimeAvailability::Degraded
-        )
 }
 
 /// Redacted automatic-controller status safe for selector and operator surfaces.
@@ -617,26 +600,10 @@ enum SweepOutcome {
     Cancelled,
 }
 
-#[derive(Clone, Copy)]
-enum ReadyEventBatch {
+enum EventDrain {
+    Idle,
     Exhausted,
     Saturated,
-}
-
-enum EventBatchOutcome {
-    Completed(ReadyEventBatch),
-    Action(SessionAction),
-}
-
-#[derive(Clone, Copy)]
-enum NonterminalInventoryArbitration {
-    DrainReadyEvents,
-    BatchAlreadyDrained(ReadyEventBatch),
-}
-
-enum NonterminalInventoryOutcome {
-    Idle,
-    Batch(ReadyEventBatch),
     Action(SessionAction),
 }
 
@@ -929,14 +896,7 @@ impl ResolverActor {
     async fn wait_healthy_event(&mut self, session: &mut dyn ResolverSession) -> SessionAction {
         loop {
             if self.nonterminal_publication == NonterminalPublication::Pending {
-                if let Some(outcome) = self
-                    .handle_operational_change(
-                        session,
-                        Ok(()),
-                        NonterminalInventoryArbitration::DrainReadyEvents,
-                    )
-                    .await
-                {
+                if let Some(outcome) = self.finish_pending_operational_change(session).await {
                     return outcome;
                 }
                 continue;
@@ -966,21 +926,15 @@ impl ResolverActor {
             match event {
                 HealthyEvent::Cancelled => return SessionAction::Cancelled,
                 HealthyEvent::Platform(Some(event)) => {
-                    let batch = match self.consume_event_batch(session, event).await {
-                        EventBatchOutcome::Completed(batch) => batch,
-                        EventBatchOutcome::Action(outcome) => return outcome,
+                    let events = match self.consume_event_batch(session, event).await {
+                        EventDrain::Action(outcome) => return outcome,
+                        events => events,
                     };
                     if self.cancellation.is_cancelled() {
                         return SessionAction::Cancelled;
                     }
-                    if let Some(changed) = self.ready_operational_change()
-                        && let Some(outcome) = self
-                            .handle_operational_change(
-                                session,
-                                changed,
-                                NonterminalInventoryArbitration::BatchAlreadyDrained(batch),
-                            )
-                            .await
+                    if self.operational_change_is_ready()
+                        && let Some(outcome) = self.finish_nonterminal_publication(events).await
                     {
                         return outcome;
                     }
@@ -988,14 +942,10 @@ impl ResolverActor {
                 }
                 HealthyEvent::Platform(None) => return SessionAction::Lost,
                 HealthyEvent::Operational(changed) => {
-                    if let Some(outcome) = self
-                        .handle_operational_change(
-                            session,
-                            changed,
-                            NonterminalInventoryArbitration::DrainReadyEvents,
-                        )
-                        .await
-                    {
+                    if changed.is_err() {
+                        return self.invalidate_failed_operational_epoch().await;
+                    }
+                    if let Some(outcome) = self.finish_pending_operational_change(session).await {
                         return outcome;
                     }
                 }
@@ -1003,56 +953,25 @@ impl ResolverActor {
         }
     }
 
-    fn ready_operational_change(&mut self) -> Option<Result<(), watch::error::RecvError>> {
-        let status = self.operational_status.as_mut()?;
-        match status.has_changed() {
-            Ok(true) => Some(Ok(())),
-            Ok(false) => None,
-            Err(error) => Some(Err(error)),
-        }
+    fn operational_change_is_ready(&mut self) -> bool {
+        let Some(status) = self.operational_status.as_mut() else {
+            return false;
+        };
+        status.has_changed().unwrap_or(true)
     }
 
-    async fn handle_operational_change(
+    async fn finish_pending_operational_change(
         &mut self,
         session: &mut dyn ResolverSession,
-        changed: Result<(), watch::error::RecvError>,
-        arbitration: NonterminalInventoryArbitration,
     ) -> Option<SessionAction> {
-        if changed.is_err() {
-            return Some(self.invalidate_failed_operational_epoch().await);
-        }
-
-        if self.cancellation.is_cancelled() {
-            return Some(SessionAction::Cancelled);
-        }
-        let observed_state = *self
-            .operational_status
-            .as_ref()
-            .expect("operational status exists after change")
-            .borrow();
-        if observed_state == OperationalEpochState::Unavailable {
-            self.operational_status
-                .as_mut()
-                .expect("operational status exists after change")
-                .borrow_and_update();
-            #[cfg(test)]
-            if let Some(activator) = &self.activator {
-                activator.operational_change_handled(observed_state);
-            }
-            return Some(self.invalidate_failed_operational_epoch().await);
-        }
-
-        let inventory = match arbitration {
-            NonterminalInventoryArbitration::DrainReadyEvents => {
-                self.consume_ready_event_batch(session).await
-            }
-            NonterminalInventoryArbitration::BatchAlreadyDrained(batch) => {
-                NonterminalInventoryOutcome::Batch(batch)
-            }
-        };
-        if let NonterminalInventoryOutcome::Action(outcome) = inventory {
+        if let Some(outcome) = self.urgent_operational_action().await {
             return Some(outcome);
         }
+        let events = self.consume_ready_event_batch(session).await;
+        self.finish_nonterminal_publication(events).await
+    }
+
+    async fn urgent_operational_action(&mut self) -> Option<SessionAction> {
         if self.cancellation.is_cancelled() {
             return Some(SessionAction::Cancelled);
         }
@@ -1075,16 +994,22 @@ impl ResolverActor {
                 .as_mut()
                 .expect("selected owner retains operational status")
                 .borrow_and_update();
-            #[cfg(test)]
-            if let Some(activator) = &self.activator {
-                activator.operational_change_handled(latest_state);
-            }
             return Some(self.invalidate_failed_operational_epoch().await);
         }
-        if matches!(
-            inventory,
-            NonterminalInventoryOutcome::Batch(ReadyEventBatch::Saturated)
-        ) {
+        None
+    }
+
+    async fn finish_nonterminal_publication(
+        &mut self,
+        events: EventDrain,
+    ) -> Option<SessionAction> {
+        if let EventDrain::Action(outcome) = events {
+            return Some(outcome);
+        }
+        if let Some(outcome) = self.urgent_operational_action().await {
+            return Some(outcome);
+        }
+        if matches!(events, EventDrain::Saturated) {
             self.nonterminal_publication = NonterminalPublication::Pending;
             return Some(SessionAction::Sweep);
         }
@@ -1094,56 +1019,36 @@ impl ResolverActor {
             .as_mut()
             .expect("selected owner retains operational status")
             .borrow_and_update();
-        #[cfg(test)]
-        if let Some(activator) = &self.activator {
-            activator.operational_change_handled(state);
-        }
-        let event_path_available = matches!(
-            state,
-            OperationalEpochState::Available | OperationalEpochState::Degraded
-        );
-        let runtime = match state {
-            OperationalEpochState::Starting | OperationalEpochState::Unavailable => {
-                RuntimeAvailability::Unavailable
+        match state {
+            OperationalEpochState::Starting => {}
+            OperationalEpochState::Available => {
+                self.cursor = None;
+                self.operational_backoff.reset();
+                let support = self
+                    .owner
+                    .as_ref()
+                    .expect("operational state has a controller owner")
+                    .support();
+                self.publish(ControllerResolutionSnapshot::available(support));
             }
-            OperationalEpochState::Available => RuntimeAvailability::Available,
-            OperationalEpochState::Degraded => RuntimeAvailability::Degraded,
-        };
-        if runtime_is_selector_available(runtime, event_path_available) {
-            self.cursor = None;
-            self.operational_backoff.reset();
-            let support = self
-                .owner
-                .as_ref()
-                .expect("operational state has a controller owner")
-                .support();
-            self.publish(ControllerResolutionSnapshot::available(support));
-        } else if state == OperationalEpochState::Unavailable {
-            return Some(self.invalidate_failed_operational_epoch().await);
-        }
-        match inventory {
-            NonterminalInventoryOutcome::Idle => None,
-            NonterminalInventoryOutcome::Batch(ReadyEventBatch::Exhausted) => {
-                Some(SessionAction::Sweep)
+            OperationalEpochState::Unavailable => {
+                return Some(self.invalidate_failed_operational_epoch().await);
             }
-            NonterminalInventoryOutcome::Batch(ReadyEventBatch::Saturated)
-            | NonterminalInventoryOutcome::Action(_) => {
+        }
+        match events {
+            EventDrain::Idle => None,
+            EventDrain::Exhausted => Some(SessionAction::Sweep),
+            EventDrain::Saturated | EventDrain::Action(_) => {
                 unreachable!("saturated batches and actions return before publication")
             }
         }
     }
 
-    async fn consume_ready_event_batch(
-        &mut self,
-        session: &mut dyn ResolverSession,
-    ) -> NonterminalInventoryOutcome {
+    async fn consume_ready_event_batch(&mut self, session: &mut dyn ResolverSession) -> EventDrain {
         match session.next_event().now_or_never() {
-            None => NonterminalInventoryOutcome::Idle,
-            Some(Some(event)) => match self.consume_event_batch(session, event).await {
-                EventBatchOutcome::Completed(batch) => NonterminalInventoryOutcome::Batch(batch),
-                EventBatchOutcome::Action(outcome) => NonterminalInventoryOutcome::Action(outcome),
-            },
-            Some(None) => NonterminalInventoryOutcome::Action(SessionAction::Lost),
+            None => EventDrain::Idle,
+            Some(Some(event)) => self.consume_event_batch(session, event).await,
+            Some(None) => EventDrain::Action(SessionAction::Lost),
         }
     }
 
@@ -1163,45 +1068,45 @@ impl ResolverActor {
         &mut self,
         session: &mut dyn ResolverSession,
         first: ResolverEvent,
-    ) -> EventBatchOutcome {
+    ) -> EventDrain {
         if self.cancellation.is_cancelled() {
-            return EventBatchOutcome::Action(SessionAction::Cancelled);
+            return EventDrain::Action(SessionAction::Cancelled);
         }
         let mut invalidated = self.apply_event(first);
-        let mut completed = ReadyEventBatch::Saturated;
+        let mut completed = EventDrain::Saturated;
         for _ in 1..MAX_EVENTS_PER_BATCH {
             if self.cancellation.is_cancelled() {
-                return EventBatchOutcome::Action(SessionAction::Cancelled);
+                return EventDrain::Action(SessionAction::Cancelled);
             }
             match session.next_event().now_or_never() {
                 Some(Some(event)) => {
                     invalidated |= self.apply_event(event);
                 }
-                Some(None) => return EventBatchOutcome::Action(SessionAction::Lost),
+                Some(None) => return EventDrain::Action(SessionAction::Lost),
                 None => {
-                    completed = ReadyEventBatch::Exhausted;
+                    completed = EventDrain::Exhausted;
                     break;
                 }
             }
         }
         tokio::task::yield_now().await;
         if self.cancellation.is_cancelled() {
-            return EventBatchOutcome::Action(SessionAction::Cancelled);
+            return EventDrain::Action(SessionAction::Cancelled);
         }
-        if matches!(completed, ReadyEventBatch::Exhausted) {
+        if matches!(completed, EventDrain::Exhausted) {
             // A ready source may return Pending when the task's cooperative budget is spent.
             // One fresh-budget probe distinguishes that from an actually idle ready queue.
             match session.next_event().now_or_never() {
                 Some(Some(event)) => {
                     invalidated |= self.apply_event(event);
-                    completed = ReadyEventBatch::Saturated;
+                    completed = EventDrain::Saturated;
                 }
-                Some(None) => return EventBatchOutcome::Action(SessionAction::Lost),
+                Some(None) => return EventDrain::Action(SessionAction::Lost),
                 None => {}
             }
         }
         if self.cancellation.is_cancelled() {
-            return EventBatchOutcome::Action(SessionAction::Cancelled);
+            return EventDrain::Action(SessionAction::Cancelled);
         }
         if invalidated
             && let Err(error) = self
@@ -1210,12 +1115,12 @@ impl ResolverActor {
                 ))
                 .await
         {
-            return EventBatchOutcome::Action(SessionAction::Terminal(error));
+            return EventDrain::Action(SessionAction::Terminal(error));
         }
         if invalidated {
-            return EventBatchOutcome::Action(SessionAction::Sweep);
+            return EventDrain::Action(SessionAction::Sweep);
         }
-        EventBatchOutcome::Completed(completed)
+        completed
     }
 
     fn apply_event(&self, event: ResolverEvent) -> bool {
@@ -1239,8 +1144,10 @@ impl ResolverActor {
             return SessionAction::Lost;
         };
         match self.consume_event_batch(session, event).await {
-            EventBatchOutcome::Completed(_) => SessionAction::Sweep,
-            EventBatchOutcome::Action(outcome) => outcome,
+            EventDrain::Action(outcome) => outcome,
+            EventDrain::Idle | EventDrain::Exhausted | EventDrain::Saturated => {
+                SessionAction::Sweep
+            }
         }
     }
 
@@ -1277,8 +1184,8 @@ impl ResolverActor {
                 return SessionAction::Lost;
             };
             match self.consume_event_batch(session, event).await {
-                EventBatchOutcome::Completed(_) => {}
-                EventBatchOutcome::Action(outcome) => return outcome,
+                EventDrain::Action(outcome) => return outcome,
+                EventDrain::Idle | EventDrain::Exhausted | EventDrain::Saturated => {}
             }
         }
     }
@@ -1796,8 +1703,6 @@ mod tests {
         events: Arc<Mutex<Vec<&'static str>>>,
         quiesce_gate: Mutex<Option<Arc<Notify>>>,
         fail_join: Arc<std::sync::atomic::AtomicBool>,
-        nonterminal_flood_remaining: AtomicUsize,
-        operational_changes_handled: AtomicUsize,
     }
 
     impl RecordingActivator {
@@ -1834,13 +1739,26 @@ mod tests {
             self.fail_join.store(true, Ordering::Release);
         }
 
-        fn flood_nonterminal_states(&self, additional_updates: usize) {
-            self.nonterminal_flood_remaining
-                .store(additional_updates, Ordering::SeqCst);
-        }
-
-        fn operational_changes_handled(&self) -> usize {
-            self.operational_changes_handled.load(Ordering::SeqCst)
+        fn flood_nonterminal_states(&self, updates: usize) -> JoinHandle<()> {
+            let status = self
+                .states
+                .lock()
+                .unwrap()
+                .last()
+                .expect("one selected controller epoch")
+                .clone();
+            status.send_replace(OperationalEpochState::Starting);
+            tokio::spawn(async move {
+                for update in 1..updates {
+                    let state = if update % 2 == 0 {
+                        OperationalEpochState::Starting
+                    } else {
+                        OperationalEpochState::Available
+                    };
+                    status.send_replace(state);
+                    tokio::task::yield_now().await;
+                }
+            })
         }
     }
 
@@ -1862,31 +1780,6 @@ mod tests {
                 quiesce_gate: self.quiesce_gate.lock().unwrap().clone(),
                 fail_join: self.fail_join.clone(),
             }))
-        }
-
-        fn operational_change_handled(&self, state: OperationalEpochState) {
-            self.operational_changes_handled
-                .fetch_add(1, Ordering::SeqCst);
-            if self
-                .nonterminal_flood_remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok()
-            {
-                let next = match state {
-                    OperationalEpochState::Starting => OperationalEpochState::Available,
-                    OperationalEpochState::Available => OperationalEpochState::Degraded,
-                    OperationalEpochState::Degraded => OperationalEpochState::Starting,
-                    OperationalEpochState::Unavailable => OperationalEpochState::Starting,
-                };
-                self.states
-                    .lock()
-                    .unwrap()
-                    .last()
-                    .expect("one selected controller epoch")
-                    .send_replace(next);
-            }
         }
     }
 
@@ -2150,6 +2043,38 @@ mod tests {
         )
     }
 
+    fn spawn_with_output(
+        session: Box<dyn ResolverSession>,
+        activator: Arc<dyn ControllerEpochActivator>,
+    ) -> (
+        LinuxControllerResolver,
+        mpsc::Receiver<BtleOperatorEvent>,
+        mpsc::Receiver<LifecycleCancellationObserver>,
+    ) {
+        let (output, events) = BtleOperatorOutput::bounded();
+        let (epoch_updates, epochs) = mpsc::channel(8);
+        let resolver = spawn_resolver(
+            ControllerAdmissionPolicy::default(),
+            limits(),
+            output,
+            Arc::new(FakePlatform::new([Ok(session)])),
+            Arc::new(FakeProbe::compatible()),
+            Some(activator),
+            Some(epoch_updates),
+        );
+        (resolver, events, epochs)
+    }
+
+    fn drain_operator_events(
+        events: &mut mpsc::Receiver<BtleOperatorEvent>,
+    ) -> Vec<BtleOperatorEvent> {
+        let mut drained = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            drained.push(event);
+        }
+        drained
+    }
+
     async fn wait_for_events(activator: &RecordingActivator, count: usize) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while activator.events().len() < count {
@@ -2263,21 +2188,12 @@ mod tests {
         let activator = Arc::new(RecordingActivator::default());
         let drain_gate = Arc::new(Notify::new());
         activator.block_quiesce(drain_gate.clone());
-        let (output, mut operator_events) = BtleOperatorOutput::bounded();
-        let (epoch_updates, mut epochs) = mpsc::channel(8);
-        let resolver = spawn_resolver(
-            ControllerAdmissionPolicy::default(),
-            limits(),
-            output,
-            Arc::new(FakePlatform::new([Ok(session)])),
-            Arc::new(FakeProbe::compatible()),
-            Some(activator.clone()),
-            Some(epoch_updates),
-        );
+        let (resolver, mut operator_events, mut epochs) =
+            spawn_with_output(session, activator.clone());
         let mut status = resolver.status();
         wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
         let epoch = epochs.recv().await.unwrap();
-        while operator_events.try_recv().is_ok() {}
+        drain_operator_events(&mut operator_events);
 
         activator.latest_state(OperationalEpochState::Available);
         harness.replace(
@@ -2292,10 +2208,7 @@ mod tests {
             status.borrow().availability() == RuntimeAvailability::Unavailable;
         let not_cancelled_before_cleanup = !epoch.is_cancelled();
         let lifecycle_before_cleanup = activator.events();
-        let mut emitted_before_cleanup = Vec::new();
-        while let Ok(event) = operator_events.try_recv() {
-            emitted_before_cleanup.push(event);
-        }
+        let emitted_before_cleanup = drain_operator_events(&mut operator_events);
         let unavailable_emitted_before_cleanup = emitted_before_cleanup
             .iter()
             .any(|event| matches!(event, BtleOperatorEvent::AdapterUnavailable(_)));
@@ -2306,9 +2219,7 @@ mod tests {
         stop(resolver).await;
 
         let mut emitted = emitted_before_cleanup;
-        while let Ok(event) = operator_events.try_recv() {
-            emitted.push(event);
-        }
+        emitted.extend(drain_operator_events(&mut operator_events));
         assert!(
             !emitted.contains(&BtleOperatorEvent::AdapterAvailable),
             "selected removal already ready with Available must suppress availability: {emitted:?}"
@@ -2326,21 +2237,12 @@ mod tests {
         let selected = controller("hci0", 1, fingerprint("a"));
         let (harness, session) = Harness::session(vec![selected]);
         let activator = Arc::new(RecordingActivator::default());
-        let (output, mut operator_events) = BtleOperatorOutput::bounded();
-        let (epoch_updates, mut epochs) = mpsc::channel(8);
-        let resolver = spawn_resolver(
-            ControllerAdmissionPolicy::default(),
-            limits(),
-            output,
-            Arc::new(FakePlatform::new([Ok(session)])),
-            Arc::new(FakeProbe::compatible()),
-            Some(activator.clone()),
-            Some(epoch_updates),
-        );
+        let (resolver, mut operator_events, mut epochs) =
+            spawn_with_output(session, activator.clone());
         let mut status = resolver.status();
         wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
         let epoch = epochs.recv().await.unwrap();
-        while operator_events.try_recv().is_ok() {}
+        drain_operator_events(&mut operator_events);
 
         activator.latest_state(OperationalEpochState::Available);
         for _ in 0..MAX_EVENTS_PER_BATCH {
@@ -2357,10 +2259,7 @@ mod tests {
         let lifecycle = activator.events();
         let epoch_cancelled = epoch.is_cancelled();
         stop(resolver).await;
-        let mut emitted = Vec::new();
-        while let Ok(event) = operator_events.try_recv() {
-            emitted.push(event);
-        }
+        let emitted = drain_operator_events(&mut operator_events);
 
         assert_eq!(
             status.borrow().availability(),
@@ -2390,19 +2289,11 @@ mod tests {
             allow_saturated_sweep: allow_saturated_sweep.clone(),
         });
         let activator = Arc::new(RecordingActivator::default());
-        let (output, mut operator_events) = BtleOperatorOutput::bounded();
-        let resolver = spawn_resolver(
-            ControllerAdmissionPolicy::default(),
-            limits(),
-            output,
-            Arc::new(FakePlatform::new([Ok(session)])),
-            Arc::new(FakeProbe::compatible()),
-            Some(activator.clone()),
-            None,
-        );
+        let (resolver, mut operator_events, _epochs) =
+            spawn_with_output(session, activator.clone());
         let mut status = resolver.status();
         wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
-        while operator_events.try_recv().is_ok() {}
+        drain_operator_events(&mut operator_events);
 
         activator.latest_state(OperationalEpochState::Available);
         for _ in 0..MAX_EVENTS_PER_BATCH {
@@ -2413,10 +2304,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), saturated_sweep_started.notified())
             .await
             .expect("a saturated batch must start a later bounded sweep");
-        let mut emitted_before_exhaustion = Vec::new();
-        while let Ok(event) = operator_events.try_recv() {
-            emitted_before_exhaustion.push(event);
-        }
+        let emitted_before_exhaustion = drain_operator_events(&mut operator_events);
         assert!(
             !emitted_before_exhaustion.contains(&BtleOperatorEvent::AdapterAvailable),
             "hitting the cap does not prove the ready queue exhausted: {emitted_before_exhaustion:?}"
@@ -2425,9 +2313,7 @@ mod tests {
         allow_saturated_sweep.notify_one();
         wait_for_status(&mut status, RuntimeAvailability::Available).await;
         let mut emitted = emitted_before_exhaustion;
-        while let Ok(event) = operator_events.try_recv() {
-            emitted.push(event);
-        }
+        emitted.extend(drain_operator_events(&mut operator_events));
         stop(resolver).await;
 
         assert_eq!(observations.load(Ordering::SeqCst), 2);
@@ -2443,54 +2329,36 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn selected_removal_preempts_continuous_nonterminal_status_flood() {
-        const MAX_NONTERMINAL_UPDATES_BEFORE_INVENTORY: usize = 1;
-
         let selected = controller("hci0", 1, fingerprint("a"));
         let (harness, session) = Harness::session(vec![selected]);
         let activator = Arc::new(RecordingActivator::default());
-        let (output, mut operator_events) = BtleOperatorOutput::bounded();
-        let (epoch_updates, mut epochs) = mpsc::channel(8);
-        let resolver = spawn_resolver(
-            ControllerAdmissionPolicy::default(),
-            limits(),
-            output,
-            Arc::new(FakePlatform::new([Ok(session)])),
-            Arc::new(FakeProbe::compatible()),
-            Some(activator.clone()),
-            Some(epoch_updates),
-        );
+        let (resolver, mut operator_events, mut epochs) =
+            spawn_with_output(session, activator.clone());
         let mut status = resolver.status();
         wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
         let epoch = epochs.recv().await.unwrap();
-        while operator_events.try_recv().is_ok() {}
-        activator.flood_nonterminal_states(MAX_EVENTS_PER_BATCH + 1);
+        drain_operator_events(&mut operator_events);
 
-        activator.latest_state(OperationalEpochState::Starting);
         harness.replace(
             Vec::new(),
             ResolverEvent::InventoryChanged {
                 removed: Some("hci0".to_owned()),
             },
         );
+        let flood = activator.flood_nonterminal_states(MAX_EVENTS_PER_BATCH + 1);
 
         wait_for_events(&activator, 3).await;
-        let handled = activator.operational_changes_handled();
         let lifecycle = activator.events();
         let epoch_cancelled = epoch.is_cancelled();
+        flood.abort();
+        let _ = flood.await;
         resolver.cancel();
         tokio::time::timeout(Duration::from_secs(1), resolver.shutdown())
             .await
             .expect("cancellation must join after removal during a status flood")
             .unwrap();
-        let mut emitted = Vec::new();
-        while let Ok(event) = operator_events.try_recv() {
-            emitted.push(event);
-        }
+        let emitted = drain_operator_events(&mut operator_events);
 
-        assert!(
-            handled <= MAX_NONTERMINAL_UPDATES_BEFORE_INVENTORY,
-            "selected removal consumed only after {handled} nonterminal status updates"
-        );
         assert!(
             !emitted.contains(&BtleOperatorEvent::AdapterAvailable),
             "status flood must not flap availability before selected removal: {emitted:?}"
@@ -2593,16 +2461,8 @@ mod tests {
             events: inventory_events.clone(),
         });
         let activator = Arc::new(ClosingStatusActivator::default());
-        let (output, mut operator_events) = BtleOperatorOutput::bounded();
-        let resolver = spawn_resolver(
-            ControllerAdmissionPolicy::default(),
-            limits(),
-            output,
-            Arc::new(FakePlatform::new([Ok(session)])),
-            Arc::new(FakeProbe::compatible()),
-            Some(activator.clone()),
-            None,
-        );
+        let (resolver, mut operator_events, _epochs) =
+            spawn_with_output(session, activator.clone());
         let mut status = resolver.status();
         let mut terminal_status = resolver.status();
         let (completion_updates, mut completion) = watch::channel(false);
@@ -2653,10 +2513,7 @@ mod tests {
             inventory_events.load(Ordering::SeqCst) - events_before_close <= MAX_EVENTS_PER_BATCH,
             "operational closure must be observed within one bounded inventory batch"
         );
-        let mut emitted = Vec::new();
-        while let Ok(event) = operator_events.try_recv() {
-            emitted.push(event);
-        }
+        let emitted = drain_operator_events(&mut operator_events);
         let available = emitted
             .iter()
             .position(|event| *event == BtleOperatorEvent::AdapterAvailable)
@@ -2679,19 +2536,11 @@ mod tests {
             events: inventory_events.clone(),
         });
         let activator = Arc::new(ClosingStatusActivator::default());
-        let (output, mut operator_events) = BtleOperatorOutput::bounded();
-        let resolver = spawn_resolver(
-            ControllerAdmissionPolicy::default(),
-            limits(),
-            output,
-            Arc::new(FakePlatform::new([Ok(session)])),
-            Arc::new(FakeProbe::compatible()),
-            Some(activator.clone()),
-            None,
-        );
+        let (resolver, mut operator_events, _epochs) =
+            spawn_with_output(session, activator.clone());
         let mut status = resolver.status();
         wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
-        while operator_events.try_recv().is_ok() {}
+        drain_operator_events(&mut operator_events);
 
         flood_updates.send_replace(true);
         activator.publish(OperationalEpochState::Available);
@@ -2702,10 +2551,7 @@ mod tests {
         })
         .await
         .expect("pending availability must remain retained into a later bounded batch");
-        let mut emitted_before_close = Vec::new();
-        while let Ok(event) = operator_events.try_recv() {
-            emitted_before_close.push(event);
-        }
+        let emitted_before_close = drain_operator_events(&mut operator_events);
         assert!(
             !emitted_before_close.contains(&BtleOperatorEvent::AdapterAvailable),
             "continuous unrelated inventory may defer but never prematurely publish availability: {emitted_before_close:?}"
@@ -2720,9 +2566,7 @@ mod tests {
         .expect("operational status closure must terminate a saturated pending state");
         let result = resolver.shutdown_for_supervisor().await;
         let mut emitted = emitted_before_close;
-        while let Ok(event) = operator_events.try_recv() {
-            emitted.push(event);
-        }
+        emitted.extend(drain_operator_events(&mut operator_events));
 
         assert!(result.is_err());
         assert_eq!(

@@ -1,5 +1,3 @@
-#[cfg(test)]
-use crate::controller_resolver::runtime_is_selector_available;
 use crate::{
     AsterRosterBeaconV1, AttemptKind, DiscoveryAdmission, DiscoveryCandidate, DiscoveryRecordError,
     DriverError, DriverErrorKind, FixedRole, ObservationOutcome, SupervisorError,
@@ -982,7 +980,7 @@ impl ControllerEpochActivator for RosteredEpochActivator {
         let task_cancellation = cancellation.clone();
         let availability_fence = Arc::new(AvailabilityFence::default());
         let task_availability_fence = availability_fence.clone();
-        let (commands, mut command_requests) = mpsc::channel(1);
+        let (quiesce, mut quiesce_requests) = mpsc::channel(1);
         let contacts = self.contacts.clone();
         let mode = self.mode.clone();
         let publisher = self.publisher.clone();
@@ -1033,8 +1031,8 @@ impl ControllerEpochActivator for RosteredEpochActivator {
             tokio::pin!(epoch);
             let (result, quiesced) = tokio::select! {
                 biased;
-                command = command_requests.recv() => {
-                    if let Some(OperationalEpochCommand::Quiesce(acknowledged)) = command {
+                request = quiesce_requests.recv() => {
+                    if let Some(acknowledged) = request {
                         acknowledge_operational_quiesce(
                             &publisher,
                             &task_updates,
@@ -1050,10 +1048,7 @@ impl ControllerEpochActivator for RosteredEpochActivator {
                 crate::AvailabilityReason::BluezUnavailable,
             ));
             task_updates.send_replace(OperationalEpochState::Unavailable);
-            if !quiesced
-                && let Some(OperationalEpochCommand::Quiesce(acknowledged)) =
-                    command_requests.recv().await
-            {
+            if !quiesced && let Some(acknowledged) = quiesce_requests.recv().await {
                 acknowledge_operational_quiesce(&publisher, &task_updates, acknowledged);
                 task_cancellation.cancel();
             }
@@ -1061,7 +1056,7 @@ impl ControllerEpochActivator for RosteredEpochActivator {
         });
         Ok(Box::new(RosteredOperationalEpoch {
             status,
-            commands,
+            quiesce,
             availability_fence,
             cancellation,
             task: Some(task),
@@ -1076,17 +1071,14 @@ fn finish_operational_epoch_result(
     platform_owner: &PlatformOwner,
 ) -> Result<(), DriverError> {
     if matches!(result, Err(SupervisorError::PlatformCleanupUnconfirmed)) {
-        Err(supervisor_driver_error(
-            SupervisorError::PlatformCleanupUnconfirmed,
+        Err(DriverError::new(
+            DriverErrorKind::Transport,
+            "automatic rostered Event epoch stopped",
         ))
     } else {
         platform_owner.clear();
         Ok(())
     }
-}
-
-enum OperationalEpochCommand {
-    Quiesce(oneshot::Sender<Result<(), DriverError>>),
 }
 
 fn acknowledge_operational_quiesce(
@@ -1110,7 +1102,7 @@ fn acknowledge_operational_quiesce(
 
 struct RosteredOperationalEpoch {
     status: watch::Receiver<OperationalEpochState>,
-    commands: mpsc::Sender<OperationalEpochCommand>,
+    quiesce: mpsc::Sender<oneshot::Sender<Result<(), DriverError>>>,
     availability_fence: Arc<AvailabilityFence>,
     cancellation: LifecycleCancellation,
     task: Option<JoinHandle<Result<(), DriverError>>>,
@@ -1127,14 +1119,11 @@ impl OperationalControllerEpoch for RosteredOperationalEpoch {
         self.availability_fence.quiesce();
         Box::pin(async move {
             let (acknowledged, acknowledgement) = oneshot::channel();
-            self.commands
-                .send(OperationalEpochCommand::Quiesce(acknowledged))
-                .await
-                .map_err(|_| {
-                    self.publish_unavailable_after_failure(
-                        "automatic rostered Event epoch quiesce channel closed",
-                    )
-                })?;
+            self.quiesce.send(acknowledged).await.map_err(|_| {
+                self.publish_unavailable_after_failure(
+                    "automatic rostered Event epoch quiesce channel closed",
+                )
+            })?;
             acknowledgement.await.map_err(|_| {
                 self.publish_unavailable_after_failure(
                     "automatic rostered Event epoch quiesce was not acknowledged",
@@ -1194,21 +1183,6 @@ impl Drop for RosteredOperationalEpoch {
         self.platform_owner.force_loss();
         task.abort();
     }
-}
-
-fn supervisor_driver_error(error: SupervisorError) -> DriverError {
-    let kind = match error {
-        SupervisorError::Configuration => DriverErrorKind::Configuration,
-        SupervisorError::Controller(kind) => kind,
-        SupervisorError::AdmissionClosed
-        | SupervisorError::ActorUnavailable
-        | SupervisorError::ActorStopped
-        | SupervisorError::ContactSuppressed(_)
-        | SupervisorError::ContactTerminal(_)
-        | SupervisorError::TaskStopped
-        | SupervisorError::PlatformCleanupUnconfirmed => DriverErrorKind::Transport,
-    };
-    DriverError::new(kind, "automatic rostered Event epoch stopped")
 }
 
 /// Starts one automatic rostered Linux BTLE Event adapter.
@@ -3441,10 +3415,10 @@ mod tests {
             release: None,
         });
         let (_updates, status) = watch::channel(OperationalEpochState::Unavailable);
-        let (commands, _requests) = mpsc::channel(1);
+        let (quiesce, _requests) = mpsc::channel(1);
         let epoch = RosteredOperationalEpoch {
             status,
-            commands,
+            quiesce,
             availability_fence: Arc::new(AvailabilityFence::default()),
             cancellation: LifecycleCancellation::new(),
             task: Some(tokio::spawn(async {
@@ -3472,10 +3446,10 @@ mod tests {
         let secret_drops = Arc::new(AtomicU8::new(0));
         let secret_owner = RecordDrop(secret_drops.clone());
         let (_updates, status) = watch::channel(OperationalEpochState::Unavailable);
-        let (commands, _requests) = mpsc::channel(1);
+        let (quiesce, _requests) = mpsc::channel(1);
         let epoch = RosteredOperationalEpoch {
             status,
-            commands,
+            quiesce,
             availability_fence: Arc::new(AvailabilityFence::default()),
             cancellation: LifecycleCancellation::new(),
             task: Some(tokio::spawn(async move {
@@ -5576,10 +5550,10 @@ mod tests {
                 events: events.clone(),
             });
             let (_updates, status) = watch::channel(OperationalEpochState::Available);
-            let (commands, _requests) = mpsc::channel(1);
+            let (quiesce, _requests) = mpsc::channel(1);
             let epoch = RosteredOperationalEpoch {
                 status,
-                commands,
+                quiesce,
                 availability_fence: Arc::new(AvailabilityFence::default()),
                 cancellation: LifecycleCancellation::new(),
                 task: Some(tokio::spawn(async { panic!("test operational panic") })),
@@ -5638,10 +5612,10 @@ mod tests {
                 finish_operational_epoch_result(result, task_owner.as_ref())
             });
             let (_updates, status) = watch::channel(OperationalEpochState::Available);
-            let (commands, _requests) = mpsc::channel(1);
+            let (quiesce, _requests) = mpsc::channel(1);
             let epoch = RosteredOperationalEpoch {
                 status,
-                commands,
+                quiesce,
                 availability_fence: Arc::new(AvailabilityFence::default()),
                 cancellation: cancellation.clone(),
                 task: Some(task),
@@ -5695,6 +5669,35 @@ mod tests {
             (control, publisher, availability, available_started)
         }
 
+        async fn assert_startup_denial_stays_unavailable<D>(discovery: Arc<D>)
+        where
+            D: DiscoveryPlatform,
+        {
+            let (control, publisher, availability, available_started) = publisher();
+            let result = run_available_epoch(
+                Arc::new(config()),
+                Arc::new(FakeSockets {
+                    events: Arc::new(Mutex::new(Vec::new())),
+                }),
+                discovery,
+                Arc::new(FixedNonce([0x52; 16])),
+                recording_admission(),
+                EpochSignals::with_publisher(publisher, available_started),
+                LifecycleCancellation::new(),
+            )
+            .await;
+
+            assert_eq!(
+                result,
+                Err(SupervisorError::Controller(DriverErrorKind::Unavailable))
+            );
+            assert!(control.snapshots.lock().unwrap().is_empty());
+            assert_eq!(
+                *availability.borrow(),
+                crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable)
+            );
+        }
+
         #[tokio::test]
         async fn probe_pass_stays_unavailable_until_required_owners_start() {
             let events = Arc::new(Mutex::new(Vec::new()));
@@ -5737,59 +5740,13 @@ mod tests {
         #[tokio::test]
         async fn scan_denial_stays_unavailable() {
             let events = Arc::new(Mutex::new(Vec::new()));
-            let discovery = Arc::new(FailingScanDiscovery { events });
-            let (control, publisher, availability, available_started) = publisher();
-
-            let result = run_available_epoch(
-                Arc::new(config()),
-                Arc::new(FakeSockets {
-                    events: Arc::new(Mutex::new(Vec::new())),
-                }),
-                discovery,
-                Arc::new(FixedNonce([0x52; 16])),
-                recording_admission(),
-                EpochSignals::with_publisher(publisher, available_started),
-                LifecycleCancellation::new(),
-            )
-            .await;
-
-            assert_eq!(
-                result,
-                Err(SupervisorError::Controller(DriverErrorKind::Unavailable))
-            );
-            assert!(control.snapshots.lock().unwrap().is_empty());
-            assert_eq!(
-                *availability.borrow(),
-                crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable)
-            );
+            assert_startup_denial_stays_unavailable(Arc::new(FailingScanDiscovery { events }))
+                .await;
         }
 
         #[tokio::test]
         async fn advertisement_denial_stays_unavailable() {
-            let (control, publisher, availability, available_started) = publisher();
-
-            let result = run_available_epoch(
-                Arc::new(config()),
-                Arc::new(FakeSockets {
-                    events: Arc::new(Mutex::new(Vec::new())),
-                }),
-                Arc::new(FailingAdvertisementDiscovery),
-                Arc::new(FixedNonce([0x52; 16])),
-                recording_admission(),
-                EpochSignals::with_publisher(publisher, available_started),
-                LifecycleCancellation::new(),
-            )
-            .await;
-
-            assert_eq!(
-                result,
-                Err(SupervisorError::Controller(DriverErrorKind::Unavailable))
-            );
-            assert!(control.snapshots.lock().unwrap().is_empty());
-            assert_eq!(
-                *availability.borrow(),
-                crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable)
-            );
+            assert_startup_denial_stays_unavailable(Arc::new(FailingAdvertisementDiscovery)).await;
         }
 
         #[tokio::test]
@@ -5805,12 +5762,11 @@ mod tests {
             );
             let cancellation = LifecycleCancellation::new();
             let task_cancellation = cancellation.clone();
-            let (commands, mut requests) = mpsc::channel(1);
+            let (quiesce, mut requests) = mpsc::channel(1);
             let task_publisher = publisher.clone();
             let task_updates = updates.clone();
             let task = tokio::spawn(async move {
-                let Some(OperationalEpochCommand::Quiesce(acknowledged)) = requests.recv().await
-                else {
+                let Some(acknowledged) = requests.recv().await else {
                     return Ok(());
                 };
                 acknowledge_operational_quiesce(&task_publisher, &task_updates, acknowledged);
@@ -5819,7 +5775,7 @@ mod tests {
             });
             let mut epoch = RosteredOperationalEpoch {
                 status,
-                commands,
+                quiesce,
                 availability_fence: fence,
                 cancellation,
                 task: Some(task),
@@ -5951,30 +5907,6 @@ mod tests {
                 .unwrap();
 
             assert_eq!(control.snapshots.lock().unwrap().len(), 1);
-        }
-
-        #[test]
-        fn degraded_operator_status_maps_to_available_only_with_complete_event_path() {
-            assert!(!runtime_is_selector_available(
-                crate::RuntimeAvailability::Degraded,
-                false
-            ));
-            assert!(runtime_is_selector_available(
-                crate::RuntimeAvailability::Degraded,
-                true
-            ));
-            assert!(!runtime_is_selector_available(
-                crate::RuntimeAvailability::Available,
-                false
-            ));
-            assert!(runtime_is_selector_available(
-                crate::RuntimeAvailability::Available,
-                true
-            ));
-            assert!(!runtime_is_selector_available(
-                crate::RuntimeAvailability::Unavailable,
-                true
-            ));
         }
     }
 
