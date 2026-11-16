@@ -2,13 +2,14 @@ use std::{
     collections::BTreeSet, env, net::SocketAddr, path::PathBuf, process::ExitCode, time::Duration,
 };
 
+#[cfg(target_os = "linux")]
+use aster_agent::config::ValidatedBtlePolicy;
 use aster_agent::{
     BoundAgent, ClientToken,
-    config::{
-        ValidatedBtlePolicy, ValidatedSystemdAgentConfig, check_config, load_and_validate_config,
-    },
+    config::{ValidatedSystemdAgentConfig, check_config, load_and_validate_config},
     runtime::{AgentExit, AgentSignal, BtleRuntimeStartup, run_customer_agent_with_btle},
 };
+#[cfg(target_os = "linux")]
 use aster_host::{
     BoundedDiscoveryCredentialArtifact, DiscoveryCredentialArtifactProvider,
     DiscoveryCredentialError, PreparedDiscoveryCredential, TrustedClock, TrustedClockSample,
@@ -22,17 +23,21 @@ use aster_node::{
 };
 #[cfg(feature = "nearby-discovery")]
 use aster_node::{MissionNearbyPeer, SelectedForwardingConfig, start_node_with_forwarding};
-use aster_systemd_credentials::{SystemdBtleRosterCredentialLoader, SystemdCredentialLoader};
+#[cfg(target_os = "linux")]
+use aster_systemd_credentials::SystemdBtleRosterCredentialLoader;
+use aster_systemd_credentials::SystemdCredentialLoader;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 const MAX_BLOB_INTERESTS: usize = 256;
 
+#[cfg(target_os = "linux")]
 const _: () = assert!(const_str_equal(
     aster_agent::config::BTLE_ROSTER_CREDENTIAL_NAME,
     aster_systemd_credentials::BTLE_ROSTER_CREDENTIAL_NAME,
 ));
 
+#[cfg(target_os = "linux")]
 const fn const_str_equal(left: &str, right: &str) -> bool {
     let left = left.as_bytes();
     let right = right.as_bytes();
@@ -51,19 +56,29 @@ const fn const_str_equal(left: &str, right: &str) -> bool {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BtleStartupError {
+    #[cfg(target_os = "linux")]
     Credential,
+    #[cfg(not(target_os = "linux"))]
+    UnsupportedPlatform,
 }
 
 impl std::fmt::Display for BtleStartupError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("BTLE startup credential validation failed")
+        formatter.write_str(match self {
+            #[cfg(target_os = "linux")]
+            Self::Credential => "BTLE startup credential validation failed",
+            #[cfg(not(target_os = "linux"))]
+            Self::UnsupportedPlatform => "BTLE startup is unavailable on this platform",
+        })
     }
 }
 
 impl std::error::Error for BtleStartupError {}
 
+#[cfg(target_os = "linux")]
 struct SystemdBtleArtifactLoader(SystemdBtleRosterCredentialLoader);
 
+#[cfg(target_os = "linux")]
 impl DiscoveryCredentialArtifactProvider for SystemdBtleArtifactLoader {
     fn load_bounded_artifact(
         &mut self,
@@ -77,8 +92,10 @@ impl DiscoveryCredentialArtifactProvider for SystemdBtleArtifactLoader {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct SystemTrustedClock;
 
+#[cfg(target_os = "linux")]
 impl TrustedClock for SystemTrustedClock {
     fn sample(&mut self) -> Result<TrustedClockSample, DiscoveryCredentialError> {
         let wall_unix_seconds = std::time::SystemTime::now()
@@ -92,6 +109,7 @@ impl TrustedClock for SystemTrustedClock {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn load_optional_btle_credential<T, F>(
     config: &ValidatedSystemdAgentConfig,
     load: F,
@@ -105,6 +123,7 @@ where
     load(policy, config.state()).map(Some)
 }
 
+#[cfg(target_os = "linux")]
 fn load_btle_startup_credential(
     config: &ValidatedSystemdAgentConfig,
 ) -> Result<
@@ -122,6 +141,36 @@ fn load_btle_startup_credential(
     )
 }
 
+#[cfg(target_os = "linux")]
+fn compose_btle_runtime(
+    config: &ValidatedSystemdAgentConfig,
+) -> Result<BtleRuntimeStartup, BoxError> {
+    match config.btle_policy() {
+        Some(policy) => {
+            let prepared =
+                load_btle_startup_credential(config)?.ok_or(BtleStartupError::Credential)?;
+            Ok(BtleRuntimeStartup::automatic_linux(
+                prepared,
+                *policy,
+                config.state(),
+            )?)
+        }
+        None => Ok(BtleRuntimeStartup::disabled()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn compose_btle_runtime(
+    config: &ValidatedSystemdAgentConfig,
+) -> Result<BtleRuntimeStartup, BoxError> {
+    if config.btle_policy().is_some() {
+        Err(Box::new(BtleStartupError::UnsupportedPlatform))
+    } else {
+        Ok(BtleRuntimeStartup::disabled())
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn load_btle_startup_credential_with<L, C, F>(
     config: &ValidatedSystemdAgentConfig,
     open_provider: F,
@@ -140,6 +189,7 @@ where
     )
 }
 
+#[cfg(target_os = "linux")]
 fn load_btle_startup_credential_with_preparer<L, C, F, A>(
     config: &ValidatedSystemdAgentConfig,
     open_provider: F,
@@ -228,14 +278,7 @@ async fn run() -> Result<Option<AgentExit>, BoxError> {
             // Roster credential renewal is restart-based. The move-only lease
             // is validated and durably checkpointed before ownership reaches
             // the adapter; there is deliberately no live replacement here.
-            let btle_runtime = match config.btle_policy() {
-                Some(policy) => {
-                    let prepared = load_btle_startup_credential(&config)?
-                        .ok_or(BtleStartupError::Credential)?;
-                    BtleRuntimeStartup::automatic_linux(prepared, *policy, config.state())?
-                }
-                None => BtleRuntimeStartup::disabled(),
-            };
+            let btle_runtime = compose_btle_runtime(&config)?;
             let mut loader = SystemdCredentialLoader::from_environment()?;
             let signals = translated_signals()?;
             Ok(Some(
@@ -589,12 +632,11 @@ impl Arguments {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs::OpenOptions,
-        os::unix::fs::PermissionsExt as _,
-        sync::atomic::{AtomicBool, Ordering},
-        time::Instant,
-    };
+    #[cfg(target_os = "linux")]
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    #[cfg(target_os = "linux")]
+    use std::{fs::OpenOptions, os::unix::fs::PermissionsExt as _, time::Instant};
 
     use super::*;
 
@@ -818,6 +860,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn optional_btle_startup_skips_credentials_when_policy_is_absent() {
         // Break caught: a deployment without BTLE authority must start without
@@ -833,6 +876,7 @@ mod tests {
         assert!(!called.load(Ordering::SeqCst));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn enabled_btle_startup_fails_closed_and_passes_exact_state_authority() {
         // Break caught: an enabled policy must not silently become unavailable
@@ -867,8 +911,10 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     struct TestArtifactProvider(Option<Vec<u8>>);
 
+    #[cfg(target_os = "linux")]
     impl DiscoveryCredentialArtifactProvider for TestArtifactProvider {
         fn load_bounded_artifact(
             &mut self,
@@ -881,14 +927,17 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     struct TestClock(TrustedClockSample);
 
+    #[cfg(target_os = "linux")]
     impl TrustedClock for TestClock {
         fn sample(&mut self) -> Result<TrustedClockSample, DiscoveryCredentialError> {
             Ok(self.0)
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn prepare_test_btle_credential<L, C>(
         loader: L,
         clock: C,
@@ -914,6 +963,7 @@ mod tests {
         aster_host::prepare_discovery_credential_for_test(loader, clock, scope, state, anchor)
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn enabled_btle_startup_inner_commits_and_returns_real_authority_lease() {
         // Break caught: testing only the optional gate can miss production
@@ -957,6 +1007,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn enabled_btle_startup_inner_collapses_invalid_artifact_failure() {
         // Break caught: the production inner path must fail closed and expose
@@ -981,6 +1032,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn enabled_btle_startup_inner_collapses_checkpoint_custody_failure() {
         // Break caught: an enabled policy must not continue when its durable
@@ -1004,6 +1056,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn production_authority_custody_failure_is_fixed_and_redacted() {
         // The unprivileged test environment cannot create the root-owned
@@ -1033,6 +1086,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     fn valid_btle_json() -> serde_json::Value {
         serde_json::json!({
             "enabled": true,
@@ -1045,6 +1099,7 @@ mod tests {
         })
     }
 
+    #[cfg(target_os = "linux")]
     fn valid_btle_artifact() -> Vec<u8> {
         let mut bytes = Vec::with_capacity(109);
         bytes.extend_from_slice(b"ASTRBD02");
@@ -1059,6 +1114,7 @@ mod tests {
         bytes
     }
 
+    #[cfg(target_os = "linux")]
     fn btle_state_fixture(label: &str, mode: u32) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "aster-agent-main-btle-{label}-{}-{}",

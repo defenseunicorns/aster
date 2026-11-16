@@ -391,7 +391,7 @@ async fn cleanup_node_with_btle(node: RunningNode, btle: &mut ActiveBtleRuntime,
         None => (true, false),
     };
     if btle_timed_out {
-        abort_btle_task(&mut btle_task).await;
+        abort_btle_waiter(&mut btle_task).await;
     } else {
         btle_task.take();
     }
@@ -531,7 +531,7 @@ async fn drain(
             }
             _ = &mut health_task => {
                 server_task.abort();
-                abort_btle_task(&mut btle_task).await;
+                abort_btle_waiter(&mut btle_task).await;
                 node_task.abort();
                 let _ = status.fail(FailureReason::Shutdown);
                 emit_lifecycle(
@@ -601,7 +601,7 @@ async fn force_shutdown(
 ) {
     let _ = server_stop_send.send(ServerStop::Force);
     server_task.abort();
-    abort_btle_task(btle_task).await;
+    abort_btle_waiter(btle_task).await;
     node_task.abort();
     stop_health(health_stop_send, health_task).await;
 }
@@ -615,7 +615,7 @@ async fn wait_btle_task(
     }
 }
 
-async fn abort_btle_task(task: &mut Option<JoinHandle<Result<(), BtleRuntimeOwnerError>>>) {
+async fn abort_btle_waiter(task: &mut Option<JoinHandle<Result<(), BtleRuntimeOwnerError>>>) {
     if let Some(mut task) = task.take() {
         task.abort();
         let _ = (&mut task).await;

@@ -913,7 +913,11 @@ async fn closed_signal_task_propagates_only_a_bounded_failure_reason() {
     );
 }
 
-#[cfg(feature = "sdk-test-support")]
+#[cfg(all(
+    feature = "sdk-test-support",
+    feature = "systemd-provider",
+    target_os = "linux"
+))]
 mod btle {
     use super::*;
 
@@ -940,7 +944,88 @@ mod btle {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[cfg(feature = "sdk-test-support")]
+    async fn unconfirmed_cleanup_retains_authority_until_actual_terminal_signal() {
+        // Break caught: a bounded supervisor join can return while its detached
+        // lifecycle still uses credential material, releasing rollback custody.
+        if !socket_access_available() {
+            return;
+        }
+        struct UnconfirmedOwner {
+            completion: tokio::sync::watch::Receiver<bool>,
+            cancelled: Arc<AtomicBool>,
+            _adapter: EventAdapterControl,
+            _attempts: EventAttemptReceiver,
+        }
+
+        impl BtleRuntimeOwner for UnconfirmedOwner {
+            fn completion(&self) -> tokio::sync::watch::Receiver<bool> {
+                self.completion.clone()
+            }
+
+            fn cancel(&self) {
+                self.cancelled.store(true, Ordering::Release);
+            }
+
+            fn join(self: Box<Self>) -> BoxFuture<'static, Result<(), BtleRuntimeOwnerError>> {
+                Box::pin(async { Err(BtleRuntimeOwnerError::Cleanup) })
+            }
+        }
+
+        let fixture = CustomerFixture::with_shutdown_grace(50);
+        let policy = fixture.enable_btle_policy();
+        let prepared = prepare_customer_btle_credential(&fixture, "unconfirmed-cleanup")
+            .expect("prepared discovery credential");
+        let (completion_send, completion) = tokio::sync::watch::channel(false);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let owner_cancelled = cancelled.clone();
+        let (btle, _) = BtleRuntimeStartup::automatic_linux_with_test_supervisor(
+            prepared,
+            policy,
+            fixture.state(),
+            move |_config, _contacts, registration| {
+                let (_, adapter, attempts) = registration.into_parts();
+                Ok(Box::new(UnconfirmedOwner {
+                    completion,
+                    cancelled: owner_cancelled,
+                    _adapter: adapter,
+                    _attempts: attempts,
+                }))
+            },
+        )
+        .expect("automatic Linux startup composition");
+        let running = start_with_optional_btle(&fixture, btle).await;
+
+        running
+            .signals
+            .send(AgentSignal::Terminate)
+            .await
+            .expect("begin drain");
+        assert_eq!(running.finish().await, AgentExit::Forced);
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(matches!(
+            prepare_customer_btle_credential(&fixture, "unconfirmed-cleanup"),
+            Err(DiscoveryCredentialError::CheckpointUnavailable)
+        ));
+
+        completion_send
+            .send(true)
+            .expect("announce actual lifecycle terminal state");
+        let release_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(authority) = prepare_customer_btle_credential(&fixture, "unconfirmed-cleanup")
+            {
+                drop(authority);
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < release_deadline,
+                "actual terminal state did not release credential authority"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn automatic_startup_registers_epoch_zero_unavailable() {
         // Break caught: registering the production lane as initially available can
         // dispatch durable work before a compatible operational epoch exists.
@@ -975,11 +1060,10 @@ mod btle {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[cfg(feature = "sdk-test-support")]
-    async fn automatic_selection_tracks_compatible_controller_and_loss() {
+    async fn composition_boundary_propagates_availability_and_loss() {
         // Break caught: the agent composition can retain a permanently unavailable
-        // registration even while the Linux supervisor reports a usable epoch, or
-        // leave it available after that epoch is lost.
+        // registration when its supervisor reports availability, or leave it
+        // available after the supervisor withdraws that availability.
         if !socket_access_available() {
             return;
         }
@@ -996,7 +1080,7 @@ mod btle {
         control.publish(1, EventAdapterState::Available);
         let selected = tokio::time::timeout(Duration::from_secs(2), control.recv_attempt())
             .await
-            .expect("compatible controller selection deadline")
+            .expect("available composition lane selection deadline")
             .expect("available lane remains registered");
         selected.fail_carrier_open();
         control.publish(2, EventAdapterState::Unavailable);
@@ -1010,13 +1094,12 @@ mod btle {
             tokio::time::timeout(Duration::from_millis(100), control.recv_attempt())
                 .await
                 .is_err(),
-            "lost controller must leave durable work pending"
+            "withdrawn availability must leave durable work pending"
         );
         running.stop_clean().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[cfg(feature = "sdk-test-support")]
     async fn no_controller_keeps_node_ready_and_publication_durable() {
         // Break caught: treating BlueZ/controller absence as composition failure
         // prevents a transport-neutral node from reaching Ready or publishing.
@@ -1036,7 +1119,6 @@ mod btle {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[cfg(feature = "sdk-test-support")]
     async fn credential_or_binding_failure_fails_startup_closed() {
         // Break caught: accepting a credential authority prepared for a different
         // state root can bind live discovery material to the wrong rollback domain.
@@ -1056,7 +1138,6 @@ mod btle {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[cfg(feature = "sdk-test-support")]
     async fn runtime_shutdown_cancels_btle_before_node() {
         // Break caught: closing the node before cancelling and joining BTLE can
         // leave the platform owner using admission or contacts after teardown.
@@ -1087,7 +1168,6 @@ mod btle {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[cfg(feature = "sdk-test-support")]
     async fn receive_only_keeps_btle_unavailable_without_operational_activation() {
         // Break caught: composing the normal automatic supervisor under
         // ReceiveOnly can start discretionary scanning or advertising.
@@ -1299,7 +1379,13 @@ async fn startup_deadline_aborts_blocked_btle_cleanup() {
         run_with_optional_btle(&fixture, btle).await,
         Err(AgentRuntimeError::Lifecycle(FailureReason::Startup))
     );
-    assert!(prepared_dropped.load(Ordering::Acquire));
+    assert!(control.state.cancelled.load(Ordering::Acquire));
+    assert!(
+        !prepared_dropped.load(Ordering::Acquire),
+        "startup deadline must not release custody while cleanup is stalled"
+    );
+    control.release_cleanup();
+    wait_for_atomic(&prepared_dropped).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1500,7 +1586,17 @@ async fn assert_forced_btle_cleanup(block_join: bool, force: DrainForce) {
             .expect("force drain");
     }
     assert_eq!(running.finish().await, AgentExit::Forced);
-    assert!(prepared_dropped.load(Ordering::Acquire));
+    if block_join {
+        assert!(control.state.cancelled.load(Ordering::Acquire));
+        assert!(
+            !prepared_dropped.load(Ordering::Acquire),
+            "forced outer wait must retain owner custody"
+        );
+        control.release_cleanup();
+        wait_for_atomic(&prepared_dropped).await;
+    } else {
+        assert!(prepared_dropped.load(Ordering::Acquire));
+    }
     drop(stalled);
 }
 
@@ -1850,7 +1946,7 @@ impl InjectedBtleState {
 struct InjectedBtleControl {
     completion: tokio::sync::watch::Sender<bool>,
     state: Arc<InjectedBtleState>,
-    _blocked_join: Option<tokio::sync::oneshot::Sender<()>>,
+    blocked_join: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 #[cfg(feature = "sdk-test-support")]
@@ -1873,6 +1969,16 @@ impl InjectedBtleControl {
                     1,
                 ))
         );
+    }
+
+    fn release_cleanup(&self) {
+        self.blocked_join
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("blocked cleanup release")
+            .send(())
+            .expect("cleanup remains owned");
     }
 }
 
@@ -1963,7 +2069,7 @@ fn injected_btle_runtime(
     let control = InjectedBtleControl {
         completion: completion_send,
         state: Arc::clone(&state),
-        _blocked_join: blocked_join_hold,
+        blocked_join: Mutex::new(blocked_join_hold),
     };
     let node_shutdown_state = Arc::clone(&state);
     let cleanup_retired_state = Arc::clone(&state);

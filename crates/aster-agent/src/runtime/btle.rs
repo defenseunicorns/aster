@@ -271,8 +271,7 @@ impl BtleRuntimeStartup {
         Ok((startup, observed))
     }
 
-    /// Creates the exact production radio-inert owner plus its real selector
-    /// handle for integration observation.
+    /// Creates a test-only unavailable owner plus its real selector handle.
     #[cfg(feature = "sdk-test-support")]
     #[doc(hidden)]
     pub fn radio_inert_with_test_observer<P>(
@@ -560,9 +559,16 @@ impl ActiveBtleRuntime {
         &mut self,
     ) -> Option<JoinHandle<Result<(), BtleRuntimeOwnerError>>> {
         let owner = self.owner.take()?;
+        owner.cancel();
+        let (result_send, result_receive) = tokio::sync::oneshot::channel();
+        // The inner task owns custody; only the outer result waiter may be aborted.
+        tokio::spawn(async move {
+            let _ = result_send.send(owner.join().await);
+        });
         Some(tokio::spawn(async move {
-            owner.cancel();
-            owner.join().await
+            result_receive
+                .await
+                .unwrap_or(Err(BtleRuntimeOwnerError::Cleanup))
         }))
     }
 
@@ -669,7 +675,15 @@ where
                 _policy_authority,
                 _authority_guard,
             } = *self;
+            let mut completion = supervisor.completion();
             let result = supervisor.join().await;
+            if result.is_err() {
+                while !*completion.borrow_and_update() {
+                    if completion.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
             drop((_policy_authority, _authority_guard));
             result
         })
@@ -741,6 +755,7 @@ impl fmt::Debug for BtleRuntimeStartup {
 mod tests {
     use super::*;
 
+    #[cfg(all(target_os = "linux", feature = "systemd-provider"))]
     #[test]
     fn automatic_btle_credential_adapter_rejects_invalid_material() {
         // Break caught: forwarding an invalid generation or all-zero secret
@@ -774,5 +789,77 @@ mod tests {
         let rendered = format!("{startup:?}");
         assert_eq!(rendered, "BtleRuntimeStartup { enabled: true, .. }");
         assert!(!rendered.contains("prepared-secret-canary"));
+    }
+
+    struct StalledCleanupOwner {
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+        completion: tokio::sync::watch::Receiver<bool>,
+    }
+
+    impl Drop for StalledCleanupOwner {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    impl BtleRuntimeOwner for StalledCleanupOwner {
+        fn completion(&self) -> tokio::sync::watch::Receiver<bool> {
+            self.completion.clone()
+        }
+
+        fn cancel(&self) {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        fn join(mut self: Box<Self>) -> BoxFuture<'static, Result<(), BtleRuntimeOwnerError>> {
+            let release = self.release.take().expect("single cleanup join");
+            Box::pin(async move {
+                let _owner = self;
+                let _ = release.await;
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_cancels_synchronously_and_waiter_abort_retains_owner() {
+        // Break caught: an immediate force can abort an unpolled cleanup task,
+        // skipping cancellation and dropping authority while RF work is live.
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (release_send, release_receive) = tokio::sync::oneshot::channel();
+        let (_completion_send, completion) = tokio::sync::watch::channel(false);
+        let owner = StalledCleanupOwner {
+            cancelled: cancelled.clone(),
+            dropped: dropped.clone(),
+            release: Some(release_receive),
+            completion,
+        };
+        let mut active = ActiveBtleRuntime::new(
+            Some(Box::new(owner)),
+            #[cfg(feature = "sdk-test-support")]
+            None,
+            #[cfg(feature = "sdk-test-support")]
+            None,
+        );
+
+        let mut waiter = active.begin_cleanup().expect("cleanup owner");
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+        waiter.abort();
+        let _ = (&mut waiter).await;
+        assert!(!dropped.load(std::sync::atomic::Ordering::Acquire));
+
+        release_send.send(()).expect("release actual cleanup");
+        for _ in 0..16 {
+            if dropped.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("owner custody was not released after actual cleanup terminated");
     }
 }
