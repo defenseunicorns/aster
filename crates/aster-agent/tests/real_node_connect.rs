@@ -557,12 +557,16 @@ fn real_node_blob_publish_read_preserves_ttl_and_status_distinctions() {
         .expect("pending upload acquired server staging and the singleton permit");
         cancelled.abort();
         assert!(cancelled.await.unwrap_err().is_cancelled());
-        let recovered_cancelled = tokio::time::timeout(Duration::from_secs(2), async {
+        // Aborting the client task precedes HTTP/2 cancellation and the
+        // server's asynchronous cleanup. Pace retries so rejected RPCs do not
+        // compete continuously with that cleanup on a busy CI runner. Keep a
+        // bounded wait and require successful publication of the exact key.
+        let recovered_cancelled = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match publish_frames!(client, one_byte_upload(b"real-node-blob-cancelled", 1)) {
                     Ok(response) => break response,
                     Err(error) if error.code == ErrorCode::ResourceExhausted => {
-                        tokio::task::yield_now().await;
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                     Err(error) => panic!("cancel recovery failed: {error:?}"),
                 }
