@@ -5,29 +5,29 @@ mission peer per process, and semantic-v9 Event data. The transport-neutral
 node starts before its Linux/BlueZ supervisor and remains usable while BTLE is
 absent. This is evaluation, not a production deployment.
 
-This explicit-controller evaluator remains separate from both the source-level
-automatic agent composition and the packaged agent. On Linux builds with
-`systemd-provider`, an enabled BTLE policy and prepared roster credential now
-compose an automatic `BLE_L2CAP_V1` lane. Under `Normal` policy it starts
-`Unavailable`, inventories and passively probes compatible controllers, and
-may activate at most one only after its operational listener, advertisement,
-and scan owners are ready. No controller or transport is required for node
-readiness or durable publication. `ReceiveOnly` registers the unavailable lane
-but remains radio-inert because the current automatic supervisor advertises and
-scans; `PassiveOnly` is not an agent configuration option.
+This explicit-controller evaluator remains separate from both the current
+source-level automatic agent composition and the packaged agent. Under
+`Normal`, the source composition can start at most one rostered operational
+epoch; the selector does not see `Available` until its listener,
+advertisement, and scan owners are ready. No controller or transport is
+required for node readiness or durable publication. See the
+[carrier guide](../transports.md#source-level-automatic-linux-btle-composition)
+for current policy and package status and the
+[design](../superpowers/specs/2026-11-03-production-btle-design.md#platform-qualification-and-support)
+for detailed resolver mechanics.
 
-The shipped Debian service remains radio-inert and unqualified. It does not
-bind `aster-btle-roster`, excludes `AF_BLUETOOTH`, and adds no BlueZ D-Bus or
-Polkit policy; Iroh remains its only selectable adapter. This does not prove
-that the service identity cannot reach the system bus. The disposable-VM
-package assertions have not been executed, and this runbook does not close the
-package-confinement, support-matrix, or physical production gates.
+The shipped Debian service remains radio-inert and unqualified, with Iroh as
+its only selectable adapter. This runbook does not execute package assertions
+or close the package-confinement, support-matrix, or physical qualification
+gates; the carrier guide records the specific service-profile gaps.
 
 ## Verify the source-level automatic composition
 
-These deterministic source tests exercise automatic registration, zero-
-controller readiness, coarse availability propagation only after operational
-startup, and shutdown ownership without using a controller or emitting RF:
+These deterministic source tests cover automatic registration, zero-controller
+readiness, injected coarse availability and loss propagation, shutdown
+ownership, `ReceiveOnly`, and resolver behavior without using a controller or
+emitting RF. The final focused driver test covers lifecycle publication of
+`Available` after the operational owners start:
 
 ```console
 cargo test --locked -p aster-agent --features sdk-test-support btle --lib
@@ -40,10 +40,12 @@ cargo test --locked -p aster-agent --features sdk-test-support \
 cargo test --locked -p aster-agent --features sdk-test-support \
   --test customer_runtime receive_only_keeps_btle_unavailable_without_operational_activation
 cargo test --locked -p aster-ble-linux controller_resolver --lib
+cargo test --locked -p aster-ble-linux \
+  operational_event_path_publishes_available_once --lib
 ```
 
 They do not run the Debian unit, validate the package service identity, or
-qualify hardware. The production agent intentionally discards detailed Linux
+qualify hardware. The current agent intentionally discards detailed Linux
 driver operator events. Automatic availability is coarse and sanitized; do not
 expect customer status or logs to expose controller names, addresses, PSMs,
 peer IDs, credentials, or detailed probe results.
@@ -244,20 +246,19 @@ deduplication evidence.
 
 ## Evidence and claim boundary
 
-For an explicit evaluator run, retain source/artifact identity; bounded host and
-controller-version fields; mode, address-type class, role, MTUs, Event size,
+For an explicit evaluator run, retain source/artifact identity; OS and
+architecture, kernel and BlueZ, controller vendor/product/revision, and
+firmware/driver when exposed; mode, address-type class, role, MTUs, Event size,
 and cadence; availability/contact/recovery/shutdown timestamps; application
-receipt; and sanitized cleanup/resource observations. Keep addresses, adapter
-names or indexes, serials, transient paths, allocated PSMs, mission or peer IDs,
-credentials, and payloads out of shared records.
+receipt; and sanitized cleanup/resource observations. Keep hostname, machine
+ID, addresses, adapter names or indexes, serials, transient paths, allocated
+PSMs, mission or peer IDs, credentials, and payloads out of shared records.
 
-A manually generated automatic-compatibility report is narrower still. It may
-contain bounded OS/architecture, kernel/BlueZ, vendor/product/revision, and
-firmware/driver fields when exposed, plus the closed outcome/reason and support
-tag. It must exclude every direct or transient identifier listed above and is
-evidence input only: it neither changes runtime policy nor creates a support
-row. The current implementation does not upload or export such a report
-automatically.
+There is no current compatibility-report command, export, or customer-status
+surface. The privacy schema in the
+[design](../superpowers/specs/2026-11-03-production-btle-design.md#platform-qualification-and-support)
+is guidance for a future explicitly authorized manual evidence workflow only;
+it is not runtime authority and cannot create a support row.
 
 See the concise [Ring-1 Event](../validation/evidence/2026-11-05-cm4-btle-ring1-event-validation.md),
 [affected-kernel diagnostic](../validation/evidence/2026-11-06-cm4-btle-clean-restart-diagnostic.md),

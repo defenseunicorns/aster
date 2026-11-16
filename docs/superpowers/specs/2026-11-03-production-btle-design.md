@@ -548,7 +548,7 @@ lead the next sweep. State changes collapse into one pending sweep, and repeated
 inventory or property churn cannot exceed the adapter's capped retry/backoff
 budget.
 
-The current production source composition uses immutable empty support and
+The current source composition uses immutable empty support and
 known-unsafe tables; the future signed qualified package compiles generated
 rows into those bounded tables. A separately updateable signed artifact is
 future work. Lab evidence
@@ -587,20 +587,22 @@ available/degraded/unavailable reason, bounded counters, and current selected
 kind. They omit peer/controller addresses, PSMs, role/roster membership,
 discovery material, transfer identifiers/counts, retry detail, and secrets.
 BTLE output uses the node's redaction sink rather than direct process logging.
-The current production agent passes a discard sink, so detailed driver operator
+The current agent passes a discard sink, so detailed driver operator
 events are not customer status or log fields; only coarse sanitized registry
 availability crosses that composition boundary.
 
 Compatibility observations are process-memory-only and replaced on inventory
 epochs as one bounded current snapshot per examined controller, not an
 unbounded history. Persistence requires a separate privacy and retention design.
-A sanitized compatibility report is generated only by an explicit operator
-action and is never uploaded or exported automatically. Its bounded kernel,
-controller, firmware, and driver tuple is potentially linkable operational
-metadata even after direct identifiers are removed. The report may contain that
-fingerprint, closed probe outcomes, support tag, and software artifact identity;
-it excludes the epoch-local key and all fields prohibited above. This report is
-evidence input, not authority to alter runtime policy or the support matrix.
+No compatibility-report command, export, customer-status field, or log field
+exists today. A future explicitly authorized manual evidence workflow may use
+only a bounded non-identifying tuple—OS and architecture, kernel and BlueZ,
+controller vendor/product/revision, and firmware/driver when exposed—plus
+closed probe outcomes, support tag, and software artifact identity. Even that
+tuple is potentially linkable operational metadata. The workflow must exclude
+hostname, machine ID, the epoch-local key, and all fields prohibited above;
+its output is evidence input, not authority to alter runtime policy or the
+support matrix.
 
 ## Clean-room provenance guardrail
 

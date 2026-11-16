@@ -332,7 +332,7 @@ attempt operational activation as `Unqualified`. That means only that the
 typed local preflight passed; it does not establish support, qualification,
 interoperability, or safe RF lifecycle. A `qualified-only` admission mode
 exists in the driver policy API and tests, but the agent configuration does not
-expose it. The production agent also discards detailed driver operator events;
+expose it. The current agent also discards detailed driver operator events;
 its registry consumes only coarse, sanitized availability, not controller
 names, addresses, PSMs, peer IDs, credentials, or detailed probe status.
 
