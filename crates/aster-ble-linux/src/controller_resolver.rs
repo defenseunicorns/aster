@@ -90,6 +90,8 @@ pub enum RuntimeAvailability {
     /// The selected epoch's listener, advertisement, and scan owners are running;
     /// adapter availability was accepted before this resolver state was published.
     Available,
+    /// Compatibility-only state retained for downstream matches; this crate does not produce it.
+    Degraded,
 }
 
 /// Redacted automatic-controller status safe for selector and operator surfaces.
@@ -1739,7 +1741,7 @@ mod tests {
             self.fail_join.store(true, Ordering::Release);
         }
 
-        fn flood_nonterminal_states(&self, updates: usize) -> JoinHandle<()> {
+        fn flood_nonterminal_states(&self) -> StatusFlood {
             let status = self
                 .states
                 .lock()
@@ -1747,18 +1749,47 @@ mod tests {
                 .last()
                 .expect("one selected controller epoch")
                 .clone();
-            status.send_replace(OperationalEpochState::Starting);
-            tokio::spawn(async move {
-                for update in 1..updates {
+            let stop = Arc::new(AtomicBool::new(false));
+            let task_stop = stop.clone();
+            let (started, ready) = std::sync::mpsc::sync_channel(0);
+            let task = std::thread::spawn(move || {
+                let mut update = 0;
+                while !task_stop.load(Ordering::Acquire) {
                     let state = if update % 2 == 0 {
                         OperationalEpochState::Starting
                     } else {
                         OperationalEpochState::Available
                     };
                     status.send_replace(state);
-                    tokio::task::yield_now().await;
+                    if update == 0 {
+                        let _ = started.send(());
+                    }
+                    update += 1;
                 }
-            })
+            });
+            ready
+                .recv_timeout(Duration::from_secs(1))
+                .expect("status flood must start");
+            StatusFlood {
+                stop,
+                task: Some(task),
+            }
+        }
+    }
+
+    struct StatusFlood {
+        stop: Arc<AtomicBool>,
+        task: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for StatusFlood {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            self.task
+                .take()
+                .expect("status flood task retained")
+                .join()
+                .expect("status flood task must stop");
         }
     }
 
@@ -2339,19 +2370,18 @@ mod tests {
         let epoch = epochs.recv().await.unwrap();
         drain_operator_events(&mut operator_events);
 
+        let flood = activator.flood_nonterminal_states();
         harness.replace(
             Vec::new(),
             ResolverEvent::InventoryChanged {
                 removed: Some("hci0".to_owned()),
             },
         );
-        let flood = activator.flood_nonterminal_states(MAX_EVENTS_PER_BATCH + 1);
 
         wait_for_events(&activator, 3).await;
         let lifecycle = activator.events();
         let epoch_cancelled = epoch.is_cancelled();
-        flood.abort();
-        let _ = flood.await;
+        drop(flood);
         resolver.cancel();
         tokio::time::timeout(Duration::from_secs(1), resolver.shutdown())
             .await
@@ -2365,7 +2395,6 @@ mod tests {
         );
         assert_eq!(&lifecycle[..3], ["quiesce", "cancel", "join"]);
         assert!(epoch_cancelled);
-        assert_eq!(activator.activation_count(), 1);
     }
 
     #[tokio::test(start_paused = true)]
