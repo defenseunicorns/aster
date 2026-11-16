@@ -29,8 +29,8 @@ pub use controller::{
 };
 pub use controller_selection::{
     ControllerAdmission, ControllerAdmissionPolicy, ControllerCandidate, ControllerFingerprint,
-    ControllerInventory, ControllerSnapshot, MAX_ADAPTER_NAME_BYTES, MAX_CONTROLLER_CANDIDATES,
-    ProbeDisposition, ProbeReason, SupportRow, SupportTag, UnsafeRule,
+    ControllerInventory, ControllerSnapshot, MAX_ADAPTER_NAME_BYTES, MAX_ADMISSION_ROWS,
+    MAX_CONTROLLER_CANDIDATES, ProbeDisposition, ProbeReason, SupportRow, SupportTag, UnsafeRule,
     normalize_controller_inventory,
 };
 pub use discovery::{

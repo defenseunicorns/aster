@@ -7,6 +7,9 @@ pub const MAX_CONTROLLER_CANDIDATES: usize = 8;
 /// Maximum UTF-8 byte length of one canonical BlueZ adapter name.
 pub const MAX_ADAPTER_NAME_BYTES: usize = 64;
 
+/// Maximum support or safety rows retained by one admission policy.
+pub const MAX_ADMISSION_ROWS: usize = 32;
+
 /// Closed reason attached to a controller probe or admission result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProbeReason {
@@ -209,8 +212,27 @@ impl ControllerAdmission {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControllerAdmissionPolicy {
     qualified_only: bool,
-    support_rows: Vec<SupportRow>,
-    unsafe_rules: Vec<UnsafeRule>,
+    support_rows: BoundedRows<SupportRow>,
+    unsafe_rules: BoundedRows<UnsafeRule>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoundedRows<T> {
+    rows: [Option<T>; MAX_ADMISSION_ROWS],
+}
+
+impl<T> BoundedRows<T> {
+    fn from_vec(values: Vec<T>) -> Self {
+        let mut rows = std::array::from_fn(|_| None);
+        for (index, value) in values.into_iter().take(MAX_ADMISSION_ROWS).enumerate() {
+            rows[index] = Some(value);
+        }
+        Self { rows }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &T> {
+        self.rows.iter().filter_map(Option::as_ref)
+    }
 }
 
 impl Default for ControllerAdmissionPolicy {
@@ -225,7 +247,10 @@ impl ControllerAdmissionPolicy {
         Self::with_rows(qualified_only, Vec::new(), Vec::new())
     }
 
-    /// Creates a policy from bounded injected rows, primarily for deterministic tests.
+    /// Creates a policy from injected rows, retaining at most [`MAX_ADMISSION_ROWS`] per table.
+    ///
+    /// Rows after the fixed bound are ignored so admission work stays bounded even when a
+    /// caller supplies an oversized test or generated table.
     pub fn with_rows(
         qualified_only: bool,
         support_rows: Vec<SupportRow>,
@@ -233,8 +258,8 @@ impl ControllerAdmissionPolicy {
     ) -> Self {
         Self {
             qualified_only,
-            support_rows,
-            unsafe_rules,
+            support_rows: BoundedRows::from_vec(support_rows),
+            unsafe_rules: BoundedRows::from_vec(unsafe_rules),
         }
     }
 
@@ -257,7 +282,7 @@ impl ControllerAdmissionPolicy {
 
         let mut exact_unsafe = false;
         let mut ambiguous_unsafe = false;
-        for rule in &self.unsafe_rules {
+        for rule in self.unsafe_rules.iter() {
             match overlap(&rule.fingerprint, fingerprint) {
                 MatchKind::Exact => exact_unsafe = true,
                 MatchKind::Ambiguous => ambiguous_unsafe = true,
@@ -401,15 +426,13 @@ impl ControllerCandidate {
     }
 
     /// Exact transient controller address, when a property snapshot is present.
-    pub fn address(&self) -> Address {
-        self.snapshot
-            .map_or(Address::any(), ControllerSnapshot::address)
+    pub fn address(&self) -> Option<Address> {
+        self.snapshot.map(ControllerSnapshot::address)
     }
 
     /// Exact typed controller address family, when present.
-    pub fn address_type(&self) -> AddressType {
-        self.snapshot
-            .map_or(AddressType::LeRandom, ControllerSnapshot::address_type)
+    pub fn address_type(&self) -> Option<AddressType> {
+        self.snapshot.map(ControllerSnapshot::address_type)
     }
 
     /// Current typed property snapshot, if one has been read.
@@ -695,6 +718,22 @@ mod tests {
     }
 
     #[test]
+    fn admission_rows_are_bounded_without_scanning_an_unbounded_tail() {
+        let candidate = fingerprint();
+        let mut non_matching = candidate.clone();
+        non_matching.set_firmware(Some("other-firmware"));
+        let mut unsafe_rules = vec![UnsafeRule::exact(non_matching); MAX_ADMISSION_ROWS];
+        unsafe_rules.push(UnsafeRule::exact(candidate.clone()));
+
+        let policy = ControllerAdmissionPolicy::with_rows(false, vec![], unsafe_rules);
+
+        assert_eq!(
+            policy.admit(&candidate).disposition(),
+            ProbeDisposition::Compatible
+        );
+    }
+
+    #[test]
     fn exact_unsafe_rule_blocks_candidate() {
         let fingerprint = fingerprint();
         let policy = ControllerAdmissionPolicy::with_rows(
@@ -735,7 +774,17 @@ mod tests {
             AddressType::LeRandom,
         );
 
-        assert_eq!(candidate.address_type(), AddressType::LeRandom);
-        assert_eq!(candidate.address(), Address::new([2, 0, 0, 0, 0, 1]));
+        assert_eq!(candidate.address_type(), Some(AddressType::LeRandom));
+        assert_eq!(candidate.address(), Some(Address::new([2, 0, 0, 0, 0, 1])));
+    }
+
+    #[test]
+    fn inventory_candidates_do_not_fabricate_address_identity() {
+        let inventory = normalize_controller_inventory(vec!["hci0".to_owned()], None, None);
+        let candidate = &inventory.candidates()[0];
+
+        assert_eq!(candidate.address(), None);
+        assert_eq!(candidate.address_type(), None);
+        assert_eq!(candidate.snapshot(), None);
     }
 }
