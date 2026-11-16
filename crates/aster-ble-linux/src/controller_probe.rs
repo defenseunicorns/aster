@@ -56,11 +56,11 @@ mod tests {
         fn record(&self, operation: Operation) -> Result<(), ControllerProbeError> {
             self.operations.lock().unwrap().push(operation);
             let mut failure = self.failure.lock().unwrap();
-            if let Some((failed_operation, error)) = *failure {
-                if failed_operation == operation {
-                    *failure = None;
-                    return Err(error);
-                }
+            if let Some((failed_operation, error)) = *failure
+                && failed_operation == operation
+            {
+                *failure = None;
+                return Err(error);
             }
             Ok(())
         }

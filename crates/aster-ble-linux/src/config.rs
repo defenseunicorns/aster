@@ -802,6 +802,10 @@ impl ValidatedAutomaticRosteredSupervisorConfig {
         self.role
     }
 
+    pub(crate) fn discovery_credentials_expires_at(&self) -> std::time::Instant {
+        self.discovery.credentials().expires_at()
+    }
+
     pub(crate) fn for_controller(
         &self,
         adapter_name: String,
