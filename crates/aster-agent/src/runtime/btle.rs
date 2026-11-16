@@ -20,7 +20,7 @@ use aster_ble_linux::{
     BtleOperatorOutput, LinuxRosteredBtleEventSupervisor,
     spawn_automatic_linux_rostered_btle_event_supervisor,
 };
-#[cfg(feature = "systemd-provider")]
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
 use aster_host::{
     ActiveDiscoveryCredentialAuthority, DiscoveryCredentialArtifactProvider,
     DiscoveryCredentialMaterialParts, PreparedDiscoveryCredential, TrustedClock,
@@ -28,13 +28,18 @@ use aster_host::{
 #[cfg(feature = "sdk-test-support")]
 use aster_node::RunningAutomaticEventTransportHandle;
 use aster_node::RunningNode;
-#[cfg(any(feature = "systemd-provider", feature = "sdk-test-support"))]
+#[cfg(any(
+    feature = "sdk-test-support",
+    all(feature = "systemd-provider", target_os = "linux")
+))]
 use aster_node::{
     EventAdapterControl, EventAdapterSnapshot, EventAdapterState, EventAttemptReceiver,
     EventTransportKind,
 };
-#[cfg(feature = "systemd-provider")]
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
 use aster_node::{EventAdapterRegistration, EventEmissionPolicy, OrderedEventContactHandle};
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+use futures::FutureExt as _;
 use futures::future::BoxFuture;
 use tokio::task::JoinHandle;
 
@@ -560,15 +565,14 @@ impl ActiveBtleRuntime {
     ) -> Option<JoinHandle<Result<(), BtleRuntimeOwnerError>>> {
         let owner = self.owner.take()?;
         owner.cancel();
-        let (result_send, result_receive) = tokio::sync::oneshot::channel();
-        // The inner task owns custody; only the outer result waiter may be aborted.
-        tokio::spawn(async move {
-            let _ = result_send.send(owner.join().await);
-        });
+        let custody = tokio::spawn(async move { owner.join().await });
+        // The inner task owns custody; the returned task is only an abortable result waiter.
         Some(tokio::spawn(async move {
-            result_receive
-                .await
-                .unwrap_or(Err(BtleRuntimeOwnerError::Cleanup))
+            match custody.await {
+                Ok(result) => result,
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                Err(_) => Err(BtleRuntimeOwnerError::Cleanup),
+            }
         }))
     }
 
@@ -676,8 +680,10 @@ where
                 _authority_guard,
             } = *self;
             let mut completion = supervisor.completion();
-            let result = supervisor.join().await;
-            if result.is_err() {
+            let result = std::panic::AssertUnwindSafe(supervisor.join())
+                .catch_unwind()
+                .await;
+            if !matches!(result, Ok(Ok(()))) {
                 while !*completion.borrow_and_update() {
                     if completion.changed().await.is_err() {
                         break;
@@ -685,7 +691,10 @@ where
                 }
             }
             drop((_policy_authority, _authority_guard));
-            result
+            match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(_)) | Err(_) => Err(BtleRuntimeOwnerError::Cleanup),
+            }
         })
     }
 }
@@ -713,7 +722,10 @@ impl BtleRuntimeOwner for LinuxSupervisorRuntimeOwner {
     }
 }
 
-#[cfg(any(feature = "systemd-provider", feature = "sdk-test-support"))]
+#[cfg(any(
+    feature = "sdk-test-support",
+    all(feature = "systemd-provider", target_os = "linux")
+))]
 struct UnavailableBtleRuntimeOwner<P> {
     _adapter_registration: EventAdapterControl,
     _attempt_mailbox: EventAttemptReceiver,
@@ -723,7 +735,10 @@ struct UnavailableBtleRuntimeOwner<P> {
     _authority_guard: P,
 }
 
-#[cfg(any(feature = "systemd-provider", feature = "sdk-test-support"))]
+#[cfg(any(
+    feature = "sdk-test-support",
+    all(feature = "systemd-provider", target_os = "linux")
+))]
 impl<P> BtleRuntimeOwner for UnavailableBtleRuntimeOwner<P>
 where
     P: Send + 'static,
@@ -861,5 +876,42 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("owner custody was not released after actual cleanup terminated");
+    }
+
+    struct PanickingCleanupOwner {
+        completion: tokio::sync::watch::Receiver<bool>,
+    }
+
+    impl BtleRuntimeOwner for PanickingCleanupOwner {
+        fn completion(&self) -> tokio::sync::watch::Receiver<bool> {
+            self.completion.clone()
+        }
+
+        fn cancel(&self) {}
+
+        fn join(self: Box<Self>) -> BoxFuture<'static, Result<(), BtleRuntimeOwnerError>> {
+            Box::pin(async { panic!("fixed test cleanup panic") })
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_join_panic_remains_a_task_failure() {
+        // Break caught: losing the detached custody task must not convert a
+        // cleanup panic into an ordinary fixed owner error.
+        let (_completion_send, completion) = tokio::sync::watch::channel(false);
+        let mut active = ActiveBtleRuntime::new(
+            Some(Box::new(PanickingCleanupOwner { completion })),
+            #[cfg(feature = "sdk-test-support")]
+            None,
+            #[cfg(feature = "sdk-test-support")]
+            None,
+        );
+
+        let result = active
+            .begin_cleanup()
+            .expect("cleanup owner")
+            .await
+            .expect_err("cleanup panic must remain a task failure");
+        assert!(result.is_panic());
     }
 }

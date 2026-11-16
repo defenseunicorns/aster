@@ -10,7 +10,11 @@ use std::{
     time::Duration,
 };
 
-#[cfg(feature = "sdk-test-support")]
+#[cfg(all(
+    feature = "sdk-test-support",
+    feature = "systemd-provider",
+    target_os = "linux"
+))]
 use std::{fs::OpenOptions, time::Instant};
 
 #[cfg(feature = "sdk-test-support")]
@@ -30,7 +34,11 @@ use aster_agent::{
         run_customer_agent_with_credentials,
     },
 };
-#[cfg(feature = "sdk-test-support")]
+#[cfg(all(
+    feature = "sdk-test-support",
+    feature = "systemd-provider",
+    target_os = "linux"
+))]
 use aster_host::{
     BoundedDiscoveryCredentialArtifact, DiscoveryCredentialArtifactProvider,
     DiscoveryCredentialError, PreparedDiscoveryCredential, TrustedClock, TrustedClockSample,
@@ -1026,6 +1034,116 @@ mod btle {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panicking_cleanup_retains_authority_until_actual_terminal_signal() {
+        // Break caught: unwinding a supervisor join must not release credential
+        // authority while its detached lifecycle remains nonterminal.
+        if !socket_access_available() {
+            return;
+        }
+        struct PanickingOwner {
+            completion: tokio::sync::watch::Receiver<bool>,
+            cancelled: Arc<AtomicBool>,
+            panicked: Arc<AtomicBool>,
+            _adapter: EventAdapterControl,
+            _attempts: EventAttemptReceiver,
+        }
+
+        impl BtleRuntimeOwner for PanickingOwner {
+            fn completion(&self) -> tokio::sync::watch::Receiver<bool> {
+                self.completion.clone()
+            }
+
+            fn cancel(&self) {
+                self.cancelled.store(true, Ordering::Release);
+            }
+
+            fn join(self: Box<Self>) -> BoxFuture<'static, Result<(), BtleRuntimeOwnerError>> {
+                Box::pin(async move {
+                    self.panicked.store(true, Ordering::Release);
+                    std::panic::resume_unwind(Box::new(()))
+                })
+            }
+        }
+
+        let fixture = CustomerFixture::with_shutdown_grace(5_000);
+        let policy = fixture.enable_btle_policy();
+        let prepared = prepare_customer_btle_credential(&fixture, "panicking-cleanup")
+            .expect("prepared discovery credential");
+        let (completion_send, completion) = tokio::sync::watch::channel(false);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let panicked = Arc::new(AtomicBool::new(false));
+        let owner_cancelled = cancelled.clone();
+        let owner_panicked = panicked.clone();
+        let (btle, _) = BtleRuntimeStartup::automatic_linux_with_test_supervisor(
+            prepared,
+            policy,
+            fixture.state(),
+            move |_config, _contacts, registration| {
+                let (_, adapter, attempts) = registration.into_parts();
+                Ok(Box::new(PanickingOwner {
+                    completion,
+                    cancelled: owner_cancelled,
+                    panicked: owner_panicked,
+                    _adapter: adapter,
+                    _attempts: attempts,
+                }))
+            },
+        )
+        .expect("automatic Linux startup composition");
+        let running = start_with_optional_btle(&fixture, btle).await;
+
+        running
+            .signals
+            .send(AgentSignal::Terminate)
+            .await
+            .expect("begin drain");
+        wait_for_atomic(&panicked).await;
+        let released_early = tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if let Ok(authority) =
+                    prepare_customer_btle_credential(&fixture, "panicking-cleanup")
+                {
+                    drop(authority);
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        let _ = running.signals.send(AgentSignal::Terminate).await;
+        let exit = running.finish().await;
+
+        assert!(
+            !released_early,
+            "supervisor panic released credential authority before terminal state"
+        );
+        assert_eq!(exit, AgentExit::Forced);
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(matches!(
+            prepare_customer_btle_credential(&fixture, "panicking-cleanup"),
+            Err(DiscoveryCredentialError::CheckpointUnavailable)
+        ));
+
+        completion_send
+            .send(true)
+            .expect("announce actual lifecycle terminal state");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(authority) =
+                    prepare_customer_btle_credential(&fixture, "panicking-cleanup")
+                {
+                    drop(authority);
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual terminal state releases credential authority");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn automatic_startup_registers_epoch_zero_unavailable() {
         // Break caught: registering the production lane as initially available can
         // dispatch durable work before a compatible operational epoch exists.
@@ -1701,10 +1819,18 @@ impl Drop for PreparedBtleProbe {
     }
 }
 
-#[cfg(feature = "sdk-test-support")]
+#[cfg(all(
+    feature = "sdk-test-support",
+    feature = "systemd-provider",
+    target_os = "linux"
+))]
 struct TestBtleArtifactProvider(Option<Vec<u8>>);
 
-#[cfg(feature = "sdk-test-support")]
+#[cfg(all(
+    feature = "sdk-test-support",
+    feature = "systemd-provider",
+    target_os = "linux"
+))]
 impl DiscoveryCredentialArtifactProvider for TestBtleArtifactProvider {
     fn load_bounded_artifact(
         &mut self,
@@ -1717,17 +1843,29 @@ impl DiscoveryCredentialArtifactProvider for TestBtleArtifactProvider {
     }
 }
 
-#[cfg(feature = "sdk-test-support")]
+#[cfg(all(
+    feature = "sdk-test-support",
+    feature = "systemd-provider",
+    target_os = "linux"
+))]
 struct TestBtleClock;
 
-#[cfg(feature = "sdk-test-support")]
+#[cfg(all(
+    feature = "sdk-test-support",
+    feature = "systemd-provider",
+    target_os = "linux"
+))]
 impl TrustedClock for TestBtleClock {
     fn sample(&mut self) -> Result<TrustedClockSample, DiscoveryCredentialError> {
         Ok(TrustedClockSample::new(1_800_000_010, Instant::now()))
     }
 }
 
-#[cfg(feature = "sdk-test-support")]
+#[cfg(all(
+    feature = "sdk-test-support",
+    feature = "systemd-provider",
+    target_os = "linux"
+))]
 fn prepare_customer_btle_credential(
     fixture: &CustomerFixture,
     label: &str,
@@ -1756,7 +1894,11 @@ fn prepare_customer_btle_credential(
     )
 }
 
-#[cfg(feature = "sdk-test-support")]
+#[cfg(all(
+    feature = "sdk-test-support",
+    feature = "systemd-provider",
+    target_os = "linux"
+))]
 fn test_btle_artifact() -> Vec<u8> {
     let mut bytes = Vec::with_capacity(109);
     bytes.extend_from_slice(b"ASTRBD02");
@@ -1771,14 +1913,22 @@ fn test_btle_artifact() -> Vec<u8> {
     bytes
 }
 
-#[cfg(feature = "sdk-test-support")]
+#[cfg(all(
+    feature = "sdk-test-support",
+    feature = "systemd-provider",
+    target_os = "linux"
+))]
 struct AutomaticTestState {
     adapter: Mutex<Option<EventAdapterControl>>,
     attempts: tokio::sync::Mutex<Option<EventAttemptReceiver>>,
     trace: Mutex<Vec<&'static str>>,
 }
 
-#[cfg(feature = "sdk-test-support")]
+#[cfg(all(
+    feature = "sdk-test-support",
+    feature = "systemd-provider",
+    target_os = "linux"
+))]
 impl AutomaticTestState {
     fn trace(&self, event: &'static str) {
         self.trace
@@ -1788,12 +1938,20 @@ impl AutomaticTestState {
     }
 }
 
-#[cfg(feature = "sdk-test-support")]
+#[cfg(all(
+    feature = "sdk-test-support",
+    feature = "systemd-provider",
+    target_os = "linux"
+))]
 struct AutomaticTestControl {
     state: Arc<AutomaticTestState>,
 }
 
-#[cfg(feature = "sdk-test-support")]
+#[cfg(all(
+    feature = "sdk-test-support",
+    feature = "systemd-provider",
+    target_os = "linux"
+))]
 impl AutomaticTestControl {
     fn publish(&self, epoch: u64, availability: EventAdapterState) {
         let adapter = self
@@ -1827,14 +1985,22 @@ impl AutomaticTestControl {
     }
 }
 
-#[cfg(feature = "sdk-test-support")]
+#[cfg(all(
+    feature = "sdk-test-support",
+    feature = "systemd-provider",
+    target_os = "linux"
+))]
 struct AutomaticTestOwner {
     completion: tokio::sync::watch::Receiver<bool>,
     _completion_guard: tokio::sync::watch::Sender<bool>,
     state: Arc<AutomaticTestState>,
 }
 
-#[cfg(feature = "sdk-test-support")]
+#[cfg(all(
+    feature = "sdk-test-support",
+    feature = "systemd-provider",
+    target_os = "linux"
+))]
 impl BtleRuntimeOwner for AutomaticTestOwner {
     fn completion(&self) -> tokio::sync::watch::Receiver<bool> {
         self.completion.clone()
@@ -1859,7 +2025,11 @@ impl BtleRuntimeOwner for AutomaticTestOwner {
     }
 }
 
-#[cfg(feature = "sdk-test-support")]
+#[cfg(all(
+    feature = "sdk-test-support",
+    feature = "systemd-provider",
+    target_os = "linux"
+))]
 fn automatic_test_runtime(
     fixture: &CustomerFixture,
     label: &str,
