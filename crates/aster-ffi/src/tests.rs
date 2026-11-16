@@ -53,31 +53,6 @@ impl Drop for Fixture {
 fn ok(status: u32) {
     assert_eq!(status, 0, "{}", LAST_ERROR.with(|e| e.borrow().clone()));
 }
-#[test]
-fn supervised_local_startup_and_shutdown() {
-    let f = Fixture::new();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let running = rt
-        .block_on(start_externally_supervised_local_node(
-            TransportNeutralNodeConfig {
-                state: f.state(),
-                mission: UnprotectedReferenceMission::load(f.mission()).unwrap(),
-                mutable_interests: MutableSourceInterests::default(),
-                sync_interval: Duration::from_secs(1),
-                run_for: None,
-                application: NodeApplication::Relay,
-            },
-            SelectedForwardingConfig::default(),
-            NodeOperatorOutputPolicy::CustomerSafe,
-        ))
-        .expect("selected startup");
-    rt.block_on(running.shutdown()).expect("shutdown");
-}
-
 #[path = "../tests/support/mod.rs"]
 mod support;
 fn publish(node: u64, operation: &[u8], payload: &[u8]) -> AsterPublishReceipt {

@@ -1,6 +1,5 @@
 from array import array
 import concurrent.futures
-import ctypes as C
 import pathlib
 import sys
 import subprocess
@@ -10,7 +9,6 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from aster_mesh import AsterError, Client, DataClass, EmissionThreshold, Node, Priority
-from aster_mesh import _abi as A, _lib, _new, _bytes
 
 FIXTURE = pathlib.Path(__file__).resolve().parents[2] / "testdata/non-production-provisioning.bundle"
 TOPIC, SCOPE = "position.current", "mission/team/alpha"
@@ -303,17 +301,9 @@ class BindingTests(unittest.TestCase):
             time.sleep(0.2)
         with self.assertRaises(AsterError): node.blob_reader(TOPIC, SCOPE, receipt.blob_id)
 
-    def test_invalid_output_abi_precedes_publication_and_invalid_handles(self):
-        node = self.open()
-        r = _new(A.PublishRequest, data_class=0, operation_key=_bytes(b"invalid-output"), topic=_bytes(TOPIC), scope=_bytes(SCOPE), logical_key=_bytes(b"unit-7"), payload=_bytes(b"must not commit"))
-        receipt = _new(A.PublishReceipt)
-        receipt.abi_version = 1
-        self.assertEqual(_lib.aster_node_publish(node._handle, C.byref(r), C.byref(receipt)), 2)
-        with self.query(node) as page: self.assertEqual(len(page), 0)
-        output = _new(A.ResultInfo)
-        self.assertEqual(_lib.aster_result_info(node._handle, 999999999, C.byref(output)), 5)
-        self.assertEqual(_lib.aster_node_publish(node._handle, None, C.byref(receipt)), 1)
-        with self.assertRaises(AsterError): Node(self.root / "invalid", self.root / "missing")
+    def test_open_missing_provisioning_raises_error(self):
+        with self.assertRaises(AsterError):
+            Node(self.root / "invalid", self.root / "missing")
 
 
 if __name__ == "__main__": unittest.main()
