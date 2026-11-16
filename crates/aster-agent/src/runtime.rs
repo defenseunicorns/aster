@@ -270,6 +270,7 @@ where
     // has not yet returned.
     let startup_ready = !btle_runtime.is_terminal()
         && node.open_transport_admission()
+        && btle_runtime.install_eligibility().is_ok()
         && status.transition(LifecycleState::Ready).is_ok();
     if !startup_ready {
         let _ = server_stop_send.send(ServerStop::Force);

@@ -1153,8 +1153,7 @@ mod btle {
         let fixture = CustomerFixture::new();
         let (btle, control, automatic) = automatic_test_runtime(&fixture, "initial-unavailable");
         let running = start_with_optional_btle(&fixture, btle).await;
-        let automatic = automatic.await.expect("automatic handle observed");
-        install_test_btle_eligibility(&automatic);
+        automatic.await.expect("automatic handle observed");
         assert_eq!(
             publish_event_status(fixture.application(), fixture.token_bytes()).await,
             200
@@ -1188,8 +1187,7 @@ mod btle {
         let fixture = CustomerFixture::new();
         let (btle, control, automatic) = automatic_test_runtime(&fixture, "selection");
         let running = start_with_optional_btle(&fixture, btle).await;
-        let automatic = automatic.await.expect("automatic handle observed");
-        install_test_btle_eligibility(&automatic);
+        automatic.await.expect("automatic handle observed");
         assert_eq!(
             publish_event_status(fixture.application(), fixture.token_bytes()).await,
             200
@@ -1308,8 +1306,7 @@ mod btle {
         )
         .expect("receive-only unavailable composition");
         let running = start_with_optional_btle(&fixture, btle).await;
-        let automatic = automatic.await.expect("automatic handle observed");
-        install_test_btle_eligibility(&automatic);
+        automatic.await.expect("automatic handle observed");
 
         assert!(activation_receive.try_recv().is_err());
         assert_eq!(health_status(fixture.health(), "/readyz").await, 200);
@@ -2071,26 +2068,6 @@ fn automatic_test_runtime(
     )
     .expect("automatic Linux startup composition");
     (startup, AutomaticTestControl { state }, automatic)
-}
-
-#[cfg(feature = "sdk-test-support")]
-fn install_test_btle_eligibility(automatic: &RunningAutomaticEventTransportHandle) {
-    let mission = aster_node::mission::UnprotectedReferenceMission::from_bytes(
-        include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle").to_vec(),
-    )
-    .expect("public test mission");
-    assert_eq!(
-        automatic.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
-            mission.mission_authority_id(),
-            [0xaa; 32],
-            EventTransportKind::BLE_L2CAP_V1,
-            true,
-            1,
-            0,
-            None,
-        )]),
-        Some(aster_node::AutomaticEventRosterStatus::Scheduled)
-    );
 }
 
 #[cfg(feature = "sdk-test-support")]

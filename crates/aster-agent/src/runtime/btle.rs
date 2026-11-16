@@ -25,19 +25,18 @@ use aster_host::{
     ActiveDiscoveryCredentialAuthority, DiscoveryCredentialArtifactProvider,
     DiscoveryCredentialMaterialParts, PreparedDiscoveryCredential, TrustedClock,
 };
-#[cfg(feature = "sdk-test-support")]
-use aster_node::RunningAutomaticEventTransportHandle;
-use aster_node::RunningNode;
 #[cfg(any(
     feature = "sdk-test-support",
     all(feature = "systemd-provider", target_os = "linux")
 ))]
 use aster_node::{
     EventAdapterControl, EventAdapterSnapshot, EventAdapterState, EventAttemptReceiver,
-    EventTransportKind,
 };
 #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
 use aster_node::{EventAdapterRegistration, EventEmissionPolicy, OrderedEventContactHandle};
+use aster_node::{
+    EventPeerEligibility, EventTransportKind, RunningAutomaticEventTransportHandle, RunningNode,
+};
 #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
 use futures::FutureExt as _;
 use futures::future::BoxFuture;
@@ -137,6 +136,7 @@ pub struct BtleRuntimeStartup {
     policy: Option<ValidatedBtlePolicy>,
     authority_state_root: Option<PathBuf>,
     start: Option<BtleRuntimeStart>,
+    installs_peer_eligibility: bool,
     #[cfg(feature = "sdk-test-support")]
     node_shutdown_observer: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     #[cfg(feature = "sdk-test-support")]
@@ -150,6 +150,7 @@ impl BtleRuntimeStartup {
             policy: None,
             authority_state_root: None,
             start: None,
+            installs_peer_eligibility: false,
             #[cfg(feature = "sdk-test-support")]
             node_shutdown_observer: None,
             #[cfg(feature = "sdk-test-support")]
@@ -177,6 +178,7 @@ impl BtleRuntimeStartup {
             start: Some(Box::new(move |node| {
                 start(prepared, node.automatic_event_transports())
             })),
+            installs_peer_eligibility: false,
             node_shutdown_observer: None,
             cleanup_retired_observer: None,
         }
@@ -387,6 +389,7 @@ impl BtleRuntimeStartup {
                     _authority_guard: authority,
                 }))
             })),
+            installs_peer_eligibility: true,
             #[cfg(feature = "sdk-test-support")]
             node_shutdown_observer: None,
             #[cfg(feature = "sdk-test-support")]
@@ -447,6 +450,7 @@ impl BtleRuntimeStartup {
                     _authority_guard: prepared,
                 }))
             })),
+            installs_peer_eligibility: false,
             #[cfg(feature = "sdk-test-support")]
             node_shutdown_observer: None,
             #[cfg(feature = "sdk-test-support")]
@@ -478,17 +482,34 @@ impl BtleRuntimeStartup {
         node: &RunningNode,
     ) -> Result<ActiveBtleRuntime, BtleRuntimeOwnerError> {
         let Self {
-            policy: _,
+            policy,
             authority_state_root: _,
             start,
+            installs_peer_eligibility,
             #[cfg(feature = "sdk-test-support")]
             node_shutdown_observer,
             #[cfg(feature = "sdk-test-support")]
             cleanup_retired_observer,
         } = self;
         let owner = start.map(|start| start(node)).transpose()?;
+        let eligibility =
+            policy
+                .filter(|_| installs_peer_eligibility)
+                .map(|policy| PendingBtleEligibility {
+                    automatic: node.automatic_event_transports(),
+                    entry: EventPeerEligibility::provisioned_exact_peer(
+                        node.selected_events().mission_authority(),
+                        policy.peer(),
+                        EventTransportKind::BLE_L2CAP_V1,
+                        true,
+                        1,
+                        0,
+                        None,
+                    ),
+                });
         Ok(ActiveBtleRuntime::new(
             owner,
+            eligibility,
             #[cfg(feature = "sdk-test-support")]
             node_shutdown_observer,
             #[cfg(feature = "sdk-test-support")]
@@ -497,11 +518,26 @@ impl BtleRuntimeStartup {
     }
 }
 
+struct PendingBtleEligibility {
+    automatic: aster_node::RunningAutomaticEventTransportHandle,
+    entry: EventPeerEligibility,
+}
+
+impl PendingBtleEligibility {
+    fn install(self) -> Result<(), BtleRuntimeOwnerError> {
+        self.automatic
+            .replace_eligibility(vec![self.entry])
+            .map(|_| ())
+            .ok_or(BtleRuntimeOwnerError::Startup)
+    }
+}
+
 /// Running BTLE owner and its terminal signal, kept together so orchestration
 /// cannot cancel, join, or observe one without the other.
 pub(super) struct ActiveBtleRuntime {
     owner: Option<Box<dyn BtleRuntimeOwner>>,
     completion: Option<tokio::sync::watch::Receiver<bool>>,
+    eligibility: Option<PendingBtleEligibility>,
     #[cfg(feature = "sdk-test-support")]
     node_shutdown_observer: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     #[cfg(feature = "sdk-test-support")]
@@ -513,6 +549,7 @@ impl ActiveBtleRuntime {
         Self {
             owner: None,
             completion: None,
+            eligibility: None,
             #[cfg(feature = "sdk-test-support")]
             node_shutdown_observer: None,
             #[cfg(feature = "sdk-test-support")]
@@ -522,6 +559,7 @@ impl ActiveBtleRuntime {
 
     fn new(
         owner: Option<Box<dyn BtleRuntimeOwner>>,
+        eligibility: Option<PendingBtleEligibility>,
         #[cfg(feature = "sdk-test-support")] node_shutdown_observer: Option<
             std::sync::Arc<dyn Fn() + Send + Sync>,
         >,
@@ -533,6 +571,7 @@ impl ActiveBtleRuntime {
         Self {
             owner,
             completion,
+            eligibility,
             #[cfg(feature = "sdk-test-support")]
             node_shutdown_observer,
             #[cfg(feature = "sdk-test-support")]
@@ -542,6 +581,14 @@ impl ActiveBtleRuntime {
 
     pub(super) const fn is_present(&self) -> bool {
         self.completion.is_some()
+    }
+
+    pub(super) fn install_eligibility(&mut self) -> Result<(), BtleRuntimeOwnerError> {
+        self.eligibility
+            .take()
+            .map(PendingBtleEligibility::install)
+            .transpose()
+            .map(|_| ())
     }
 
     pub(super) fn is_terminal(&mut self) -> bool {
@@ -795,6 +842,7 @@ mod tests {
                 drop(prepared);
                 Err(BtleRuntimeOwnerError::Startup)
             })),
+            installs_peer_eligibility: false,
             #[cfg(feature = "sdk-test-support")]
             node_shutdown_observer: None,
             #[cfg(feature = "sdk-test-support")]
@@ -856,6 +904,7 @@ mod tests {
         };
         let mut active = ActiveBtleRuntime::new(
             Some(Box::new(owner)),
+            None,
             #[cfg(feature = "sdk-test-support")]
             None,
             #[cfg(feature = "sdk-test-support")]
@@ -901,6 +950,7 @@ mod tests {
         let (_completion_send, completion) = tokio::sync::watch::channel(false);
         let mut active = ActiveBtleRuntime::new(
             Some(Box::new(PanickingCleanupOwner { completion })),
+            None,
             #[cfg(feature = "sdk-test-support")]
             None,
             #[cfg(feature = "sdk-test-support")]
