@@ -1263,12 +1263,31 @@ impl Drop for RosteredOperationalEpoch {
             return;
         };
         self.availability_fence.quiesce();
-        self.cancellation.cancel();
         let _ = self.unavailable.publish();
-        self.platform_owner.force_loss();
-        tokio::spawn(async move {
-            let _ = task.await;
-        });
+        self.cancellation.cancel();
+        let platform_owner = self.platform_owner.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                contain_operational_epoch_task(task, platform_owner).await;
+            });
+        } else {
+            platform_owner.force_loss();
+            task.abort();
+        }
+    }
+}
+
+async fn contain_operational_epoch_task(
+    mut task: JoinHandle<OperationalEpochOutcome>,
+    platform_owner: Arc<PlatformOwner>,
+) {
+    if timeout(OWNER_LOSS_AFTER, &mut task).await.is_ok() {
+        return;
+    }
+    platform_owner.force_loss();
+    if timeout(OWNER_LOSS_JOIN_DEADLINE, &mut task).await.is_err() {
+        task.abort();
+        let _ = task.await;
     }
 }
 
@@ -3628,48 +3647,121 @@ mod tests {
         assert_eq!(force_count.load(Ordering::Acquire), 1);
     }
 
-    #[tokio::test]
-    async fn dropping_operational_epoch_retains_task_custody_until_cleanup_finishes() {
+    #[tokio::test(start_paused = true)]
+    async fn dropping_operational_epoch_bounds_credential_config_custody() {
         let force_count = Arc::new(AtomicU8::new(0));
         let platform_owner = Arc::new(PlatformOwner::default());
         platform_owner.replace(RecordingOwnerLoss {
             force_count: force_count.clone(),
             release: None,
         });
-        let secret_drops = Arc::new(AtomicU8::new(0));
-        let secret_owner = RecordDrop(secret_drops.clone());
-        let release = Arc::new(Notify::new());
-        let task_release = release.clone();
-        let (_updates, status) = watch::channel(OperationalEpochState::Unavailable);
+        let epoch_cancellation = LifecycleCancellation::new();
+        let cancellation = epoch_cancellation.observer();
+        let config = Arc::new(
+            automatic_config()
+                .for_controller(
+                    "hci0".to_owned(),
+                    Address::new([2, 0, 0, 0, 0, 1]),
+                    AddressType::LeRandom,
+                    1,
+                    LifecycleCancellation::new().observer(),
+                )
+                .unwrap(),
+        );
+        let config_weak = Arc::downgrade(&config);
+        let (availability_updates, availability) =
+            watch::channel(crate::BtleAvailability::Available);
+        let publisher = AdapterAvailabilityPublisher::fixed(
+            availability_updates,
+            crate::BtleOperatorOutput::discard(),
+        );
+        let (_updates, status) = watch::channel(OperationalEpochState::Available);
         let (quiesce, _requests) = mpsc::channel(1);
         let epoch = RosteredOperationalEpoch {
             status,
             quiesce,
             availability_fence: Arc::new(AvailabilityFence::default()),
-            cancellation: LifecycleCancellation::new(),
+            cancellation: epoch_cancellation,
             task: Some(tokio::spawn(async move {
-                let _secret_owner = secret_owner;
-                task_release.notified().await;
-                OperationalEpochOutcome::Retryable
+                let _config = config;
+                pending::<OperationalEpochOutcome>().await
             })),
             platform_owner,
-            unavailable: test_unavailable_publisher(),
+            unavailable: publisher.unavailable_only(),
         };
         tokio::task::yield_now().await;
 
         drop(epoch);
         tokio::task::yield_now().await;
-        assert_eq!(secret_drops.load(Ordering::Acquire), 0);
-        assert_eq!(force_count.load(Ordering::Acquire), 1);
+        assert!(cancellation.is_cancelled());
+        assert_eq!(
+            *availability.borrow(),
+            crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable)
+        );
+        assert_eq!(force_count.load(Ordering::Acquire), 0);
+        assert!(config_weak.upgrade().is_some());
 
-        release.notify_one();
+        tokio::time::advance(OWNER_LOSS_AFTER - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(force_count.load(Ordering::Acquire), 0);
+        assert!(config_weak.upgrade().is_some());
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(force_count.load(Ordering::Acquire), 1);
+        assert!(config_weak.upgrade().is_some());
+
+        tokio::time::advance(OWNER_LOSS_JOIN_DEADLINE).await;
         tokio::time::timeout(Duration::from_secs(1), async {
-            while secret_drops.load(Ordering::Acquire) == 0 {
+            while config_weak.upgrade().is_some() {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("operational cleanup custody releases after task completion");
+        .expect("abortable operational cleanup must release credential custody after the bound");
+    }
+
+    #[test]
+    fn dropping_operational_epoch_without_an_entered_runtime_fails_closed() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let force_count = Arc::new(AtomicU8::new(0));
+        let platform_owner = Arc::new(PlatformOwner::default());
+        platform_owner.replace(RecordingOwnerLoss {
+            force_count: force_count.clone(),
+            release: None,
+        });
+        let cancellation = LifecycleCancellation::new();
+        let cancellation_observer = cancellation.observer();
+        let (availability_updates, availability) =
+            watch::channel(crate::BtleAvailability::Available);
+        let publisher = AdapterAvailabilityPublisher::fixed(
+            availability_updates,
+            crate::BtleOperatorOutput::discard(),
+        );
+        let (_updates, status) = watch::channel(OperationalEpochState::Available);
+        let (quiesce, _requests) = mpsc::channel(1);
+        let epoch = RosteredOperationalEpoch {
+            status,
+            quiesce,
+            availability_fence: Arc::new(AvailabilityFence::default()),
+            cancellation,
+            task: Some(runtime.spawn(pending::<OperationalEpochOutcome>())),
+            platform_owner,
+            unavailable: publisher.unavailable_only(),
+        };
+
+        drop(epoch);
+
+        assert!(cancellation_observer.is_cancelled());
+        assert_eq!(
+            *availability.borrow(),
+            crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable)
+        );
+        assert_eq!(force_count.load(Ordering::Acquire), 1);
+        runtime.block_on(tokio::task::yield_now());
     }
 
     #[tokio::test]
@@ -5604,7 +5696,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_availability_publications_use_distinct_epochs_and_preserve_unavailable() {
+    fn expiry_waits_for_an_in_flight_available_transaction_before_publishing_unavailable() {
         let (entered_send, entered) = std::sync::mpsc::channel();
         let (release_send, release) = std::sync::mpsc::channel();
         let control = Arc::new(BlockingFirstAvailabilityControl {
@@ -5621,32 +5713,61 @@ mod tests {
             crate::BtleOperatorOutput::discard(),
             FixedRole::Initiator,
         ));
+        let supervisor_fence = Arc::new(AvailabilityFence::default());
+        let (operational, _operational_status) = watch::channel(OperationalEpochState::Starting);
+        let signals = EpochSignals::operational(
+            publisher.clone(),
+            operational,
+            Arc::new(AvailabilityFence::default()),
+            supervisor_fence.clone(),
+        );
 
-        let available_publisher = publisher.clone();
-        let available = std::thread::spawn(move || {
-            available_publisher.publish(crate::BtleAvailability::Available)
-        });
+        let available =
+            std::thread::spawn(move || signals.publish(crate::BtleAvailability::Available));
         entered.recv().unwrap();
-        let unavailable_publisher = publisher.clone();
-        let unavailable = std::thread::spawn(move || {
-            unavailable_publisher.publish(crate::BtleAvailability::Unavailable(
-                crate::AvailabilityReason::BluezUnavailable,
-            ))
+        assert!(matches!(
+            supervisor_fence.0.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+
+        let (expiry_started_send, expiry_started) = std::sync::mpsc::channel();
+        let (expiry_finished_send, expiry_finished) = std::sync::mpsc::channel();
+        let expiry_fence = supervisor_fence.clone();
+        let unavailable = publisher.unavailable_only();
+        let expiry = std::thread::spawn(move || {
+            expiry_started_send.send(()).unwrap();
+            expiry_fence.quiesce();
+            expiry_finished_send.send(unavailable.publish()).unwrap();
         });
-        let second_entered = entered.recv_timeout(Duration::from_millis(50)).is_ok();
+        expiry_started.recv().unwrap();
+        assert!(matches!(
+            expiry_finished.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(control.snapshots.lock().unwrap().is_empty());
+        assert_eq!(
+            *availability.borrow(),
+            crate::BtleAvailability::Unavailable(crate::AvailabilityReason::ControllerUnpowered)
+        );
+
         release_send.send(()).unwrap();
-        if !second_entered {
-            entered.recv().unwrap();
-        }
 
         assert_eq!(available.join().unwrap(), Ok(()));
-        assert_eq!(unavailable.join().unwrap(), Ok(()));
+        expiry.join().unwrap();
+        entered.recv().unwrap();
+        assert_eq!(expiry_finished.recv().unwrap(), Ok(()));
         let snapshots = control.snapshots.lock().unwrap();
         assert_eq!(snapshots.len(), 2);
-        assert_ne!(
+        assert_eq!(
             snapshots[0].availability_epoch(),
-            snapshots[1].availability_epoch()
+            crate::AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH + 1
         );
+        assert_eq!(snapshots[0].state(), EventAdapterState::Available);
+        assert_eq!(
+            snapshots[1].availability_epoch(),
+            crate::AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH + 2
+        );
+        assert_eq!(snapshots[1].state(), EventAdapterState::Unavailable);
         assert_eq!(
             *availability.borrow(),
             crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable)
