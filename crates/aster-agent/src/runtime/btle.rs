@@ -4,10 +4,26 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+use std::time::Duration;
+
+#[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+use aster_ble_linux::{
+    AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH, AutomaticRosteredSupervisorConfig, ContactLimits,
+    ControllerAdmissionPolicy, ControllerProbeLimits, DiscoveryCredential, DiscoveryGeneration,
+    DiscoverySecret, LeasedDiscoveryCredentialSet, RING1_MAXIMUM_DEADLINE,
+    RING1_MAXIMUM_EXCHANGE_BYTES, RING1_MAXIMUM_FRAME_BYTES, RosteredDiscoveryConfig,
+    ValidatedAutomaticRosteredSupervisorConfig,
+};
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+use aster_ble_linux::{
+    BtleOperatorOutput, LinuxRosteredBtleEventSupervisor,
+    spawn_automatic_linux_rostered_btle_event_supervisor,
+};
 #[cfg(feature = "systemd-provider")]
 use aster_host::{
     ActiveDiscoveryCredentialAuthority, DiscoveryCredentialArtifactProvider,
-    PreparedDiscoveryCredential, TrustedClock,
+    DiscoveryCredentialMaterialParts, PreparedDiscoveryCredential, TrustedClock,
 };
 #[cfg(feature = "sdk-test-support")]
 use aster_node::RunningAutomaticEventTransportHandle;
@@ -17,10 +33,12 @@ use aster_node::{
     EventAdapterControl, EventAdapterSnapshot, EventAdapterState, EventAttemptReceiver,
     EventTransportKind,
 };
+#[cfg(feature = "systemd-provider")]
+use aster_node::{EventAdapterRegistration, EventEmissionPolicy, OrderedEventContactHandle};
 use futures::future::BoxFuture;
 use tokio::task::JoinHandle;
 
-#[cfg(any(feature = "systemd-provider", feature = "sdk-test-support"))]
+#[cfg(feature = "sdk-test-support")]
 use super::{LifecycleState, emit_lifecycle};
 use crate::config::ValidatedBtlePolicy;
 
@@ -32,7 +50,6 @@ pub enum BtleRuntimeOwnerError {
     #[cfg(any(feature = "systemd-provider", feature = "sdk-test-support", test))]
     Startup,
     /// The active owner could not confirm bounded cleanup.
-    #[cfg(any(feature = "sdk-test-support", test))]
     Cleanup,
 }
 
@@ -69,7 +86,17 @@ type BtleRuntimeStart = Box<
     dyn FnOnce(&RunningNode) -> Result<Box<dyn BtleRuntimeOwner>, BtleRuntimeOwnerError> + Send,
 >;
 
-#[cfg(any(feature = "systemd-provider", feature = "sdk-test-support"))]
+#[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+type AutomaticLinuxSupervisorStart = Box<
+    dyn FnOnce(
+            ValidatedAutomaticRosteredSupervisorConfig,
+            OrderedEventContactHandle,
+            EventAdapterRegistration,
+        ) -> Result<Box<dyn BtleRuntimeOwner>, BtleRuntimeOwnerError>
+        + Send,
+>;
+
+#[cfg(feature = "sdk-test-support")]
 type PreparedNodeValidation<P> =
     Box<dyn FnOnce(&P, &RunningNode) -> Result<(), BtleRuntimeOwnerError> + Send>;
 
@@ -173,12 +200,9 @@ impl BtleRuntimeStartup {
         self
     }
 
-    /// Validates the prepared credential's policy/state binding, immediately
-    /// retires its unused key material, and retains exclusive authority custody
-    /// in a radio-inert owner. This is the only enabled profile until qualified
-    /// automatic controller selection and confinement are composed.
-    #[cfg(feature = "systemd-provider")]
-    pub fn radio_inert<L, C>(
+    /// Composes the production automatic Linux BTLE owner.
+    #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+    pub fn automatic_linux<L, C>(
         prepared: PreparedDiscoveryCredential<L, C>,
         policy: ValidatedBtlePolicy,
         state_root: &Path,
@@ -187,33 +211,64 @@ impl BtleRuntimeStartup {
         L: DiscoveryCredentialArtifactProvider + Send + 'static,
         C: TrustedClock + Send + 'static,
     {
-        if !prepared
-            .matches_binding(*policy.deployment_scope_id(), state_root)
-            .map_err(|_| BtleRuntimeOwnerError::Startup)?
-        {
-            return Err(BtleRuntimeOwnerError::Startup);
-        }
-        let scope = *policy.deployment_scope_id();
-        let authority = prepared.retire_material();
-        let validate: PreparedNodeValidation<ActiveDiscoveryCredentialAuthority<L, C>> =
-            Box::new(move |authority, node| {
-                if authority
-                    .matches_pinned_binding(scope, node.state_root())
-                    .map_err(|_| BtleRuntimeOwnerError::Startup)?
-                {
-                    Ok(())
-                } else {
-                    Err(BtleRuntimeOwnerError::Startup)
-                }
-            });
-        Ok(Self::radio_inert_inner(
-            authority,
+        Self::automatic_linux_inner(
+            prepared,
             policy,
-            Some(state_root.to_path_buf()),
-            Some(validate),
+            state_root,
+            Box::new(|config, contacts, registration| {
+                let supervisor = spawn_automatic_linux_rostered_btle_event_supervisor(
+                    config,
+                    contacts,
+                    registration,
+                    BtleOperatorOutput::discard(),
+                )
+                .map_err(|_| BtleRuntimeOwnerError::Startup)?;
+                Ok(Box::new(LinuxSupervisorRuntimeOwner(supervisor)))
+            }),
             #[cfg(feature = "sdk-test-support")]
             None,
-        ))
+        )
+    }
+
+    /// Composes the production boundary with a deterministic test supervisor.
+    #[cfg(all(
+        feature = "sdk-test-support",
+        feature = "systemd-provider",
+        target_os = "linux"
+    ))]
+    #[doc(hidden)]
+    pub fn automatic_linux_with_test_supervisor<L, C, F>(
+        prepared: PreparedDiscoveryCredential<L, C>,
+        policy: ValidatedBtlePolicy,
+        state_root: &Path,
+        start_supervisor: F,
+    ) -> Result<
+        (
+            Self,
+            tokio::sync::oneshot::Receiver<RunningAutomaticEventTransportHandle>,
+        ),
+        BtleRuntimeOwnerError,
+    >
+    where
+        L: DiscoveryCredentialArtifactProvider + Send + 'static,
+        C: TrustedClock + Send + 'static,
+        F: FnOnce(
+                ValidatedAutomaticRosteredSupervisorConfig,
+                OrderedEventContactHandle,
+                EventAdapterRegistration,
+            ) -> Result<Box<dyn BtleRuntimeOwner>, BtleRuntimeOwnerError>
+            + Send
+            + 'static,
+    {
+        let (observe, observed) = tokio::sync::oneshot::channel();
+        let startup = Self::automatic_linux_inner(
+            prepared,
+            policy,
+            state_root,
+            Box::new(start_supervisor),
+            Some(observe),
+        )?;
+        Ok((startup, observed))
     }
 
     /// Creates the exact production radio-inert owner plus its real selector
@@ -237,7 +292,105 @@ impl BtleRuntimeStartup {
         )
     }
 
-    #[cfg(any(feature = "systemd-provider", feature = "sdk-test-support"))]
+    #[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+    fn automatic_linux_inner<L, C>(
+        prepared: PreparedDiscoveryCredential<L, C>,
+        policy: ValidatedBtlePolicy,
+        state_root: &Path,
+        start_supervisor: AutomaticLinuxSupervisorStart,
+        #[cfg(feature = "sdk-test-support")] observer: Option<
+            tokio::sync::oneshot::Sender<RunningAutomaticEventTransportHandle>,
+        >,
+    ) -> Result<Self, BtleRuntimeOwnerError>
+    where
+        L: DiscoveryCredentialArtifactProvider + Send + 'static,
+        C: TrustedClock + Send + 'static,
+    {
+        let scope = *policy.deployment_scope_id();
+        if !prepared
+            .matches_binding(scope, state_root)
+            .map_err(|_| BtleRuntimeOwnerError::Startup)?
+        {
+            return Err(BtleRuntimeOwnerError::Startup);
+        }
+        let configured_priority = policy.configured_priority();
+        let authority_state_root = state_root.to_path_buf();
+        Ok(Self {
+            policy: Some(policy),
+            authority_state_root: Some(authority_state_root),
+            start: Some(Box::new(move |node| {
+                let automatic = node.automatic_event_transports();
+                let registration = automatic
+                    .register_paired(EventAdapterSnapshot::new(
+                        EventTransportKind::BLE_L2CAP_V1,
+                        AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH,
+                        EventAdapterState::Unavailable,
+                        true,
+                        configured_priority,
+                    ))
+                    .ok_or(BtleRuntimeOwnerError::Startup)?;
+                if matches!(policy.emission_policy(), EventEmissionPolicy::ReceiveOnly) {
+                    let authority = prepared.retire_material();
+                    validate_active_authority(&authority, scope, node)?;
+                    let (_, adapter, attempts) = registration.into_parts();
+                    #[cfg(feature = "sdk-test-support")]
+                    if let Some(observer) = observer {
+                        let _ = observer.send(automatic);
+                    }
+                    let (completion_guard, completion) = tokio::sync::watch::channel(false);
+                    return Ok(Box::new(UnavailableBtleRuntimeOwner {
+                        _adapter_registration: adapter,
+                        _attempt_mailbox: attempts,
+                        _completion_guard: completion_guard,
+                        completion,
+                        _policy_authority: policy,
+                        _authority_guard: authority,
+                    }));
+                }
+
+                let (material, authority) = prepared.into_parts();
+                validate_active_authority(&authority, scope, node)?;
+                let credentials = adopt_discovery_credentials(material)?;
+                let config = AutomaticRosteredSupervisorConfig {
+                    controller_policy: ControllerAdmissionPolicy::default(),
+                    controller_probe_limits: ControllerProbeLimits::new(
+                        Duration::from_secs(1),
+                        Duration::from_secs(2),
+                        Duration::from_secs(8),
+                    ),
+                    discovery: RosteredDiscoveryConfig { credentials },
+                    local_mission_id: node.local_mission_id(),
+                    peer_mission_id: policy.peer(),
+                    contact_cadence: Duration::from_secs(60),
+                    contact_limits: ContactLimits {
+                        maximum_frame_bytes: RING1_MAXIMUM_FRAME_BYTES,
+                        maximum_exchange_bytes: RING1_MAXIMUM_EXCHANGE_BYTES,
+                        open_timeout: Duration::from_secs(5),
+                        operation_timeout: RING1_MAXIMUM_DEADLINE,
+                    },
+                }
+                .validate()
+                .map_err(|_| BtleRuntimeOwnerError::Startup)?;
+                let supervisor =
+                    start_supervisor(config, node.ordered_event_contacts(), registration)?;
+                #[cfg(feature = "sdk-test-support")]
+                if let Some(observer) = observer {
+                    let _ = observer.send(automatic);
+                }
+                Ok(Box::new(AuthorityBtleRuntimeOwner {
+                    supervisor,
+                    _policy_authority: policy,
+                    _authority_guard: authority,
+                }))
+            })),
+            #[cfg(feature = "sdk-test-support")]
+            node_shutdown_observer: None,
+            #[cfg(feature = "sdk-test-support")]
+            cleanup_retired_observer: None,
+        })
+    }
+
+    #[cfg(feature = "sdk-test-support")]
     fn radio_inert_inner<P>(
         prepared: P,
         policy: ValidatedBtlePolicy,
@@ -281,7 +434,7 @@ impl BtleRuntimeStartup {
                     false,
                     503,
                 );
-                Ok(Box::new(RadioInertBtleRuntimeOwner {
+                Ok(Box::new(UnavailableBtleRuntimeOwner {
                     _adapter_registration: adapter,
                     _attempt_mailbox: attempts,
                     _completion_guard: completion_send,
@@ -447,8 +600,107 @@ pub(super) fn completion_is_terminal_after_read(
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+fn validate_active_authority<L, C>(
+    authority: &ActiveDiscoveryCredentialAuthority<L, C>,
+    scope: [u8; 32],
+    node: &RunningNode,
+) -> Result<(), BtleRuntimeOwnerError>
+where
+    L: DiscoveryCredentialArtifactProvider,
+    C: TrustedClock,
+{
+    if authority
+        .matches_pinned_binding(scope, node.state_root())
+        .map_err(|_| BtleRuntimeOwnerError::Startup)?
+    {
+        Ok(())
+    } else {
+        Err(BtleRuntimeOwnerError::Startup)
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+fn adopt_discovery_credentials(
+    material: DiscoveryCredentialMaterialParts,
+) -> Result<LeasedDiscoveryCredentialSet, BtleRuntimeOwnerError> {
+    let (emitting, overlap, expires_at) = material.into_adapter_parts();
+    let emitting = adopt_discovery_credential(emitting)?;
+    let overlap = overlap.map(adopt_discovery_credential).transpose()?;
+    LeasedDiscoveryCredentialSet::new(emitting, overlap, expires_at)
+        .map_err(|_| BtleRuntimeOwnerError::Startup)
+}
+
+#[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+fn adopt_discovery_credential(
+    (generation, secret): (u32, zeroize::Zeroizing<[u8; 32]>),
+) -> Result<DiscoveryCredential, BtleRuntimeOwnerError> {
+    let generation =
+        DiscoveryGeneration::new(generation).map_err(|_| BtleRuntimeOwnerError::Startup)?;
+    let secret =
+        DiscoverySecret::from_zeroizing(secret).map_err(|_| BtleRuntimeOwnerError::Startup)?;
+    Ok(DiscoveryCredential::new(generation, secret))
+}
+
+#[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+struct AuthorityBtleRuntimeOwner<A> {
+    supervisor: Box<dyn BtleRuntimeOwner>,
+    _policy_authority: ValidatedBtlePolicy,
+    _authority_guard: A,
+}
+
+#[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+impl<A> BtleRuntimeOwner for AuthorityBtleRuntimeOwner<A>
+where
+    A: Send + 'static,
+{
+    fn completion(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.supervisor.completion()
+    }
+
+    fn cancel(&self) {
+        self.supervisor.cancel();
+    }
+
+    fn join(self: Box<Self>) -> BoxFuture<'static, Result<(), BtleRuntimeOwnerError>> {
+        Box::pin(async move {
+            let Self {
+                supervisor,
+                _policy_authority,
+                _authority_guard,
+            } = *self;
+            let result = supervisor.join().await;
+            drop((_policy_authority, _authority_guard));
+            result
+        })
+    }
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+struct LinuxSupervisorRuntimeOwner(LinuxRosteredBtleEventSupervisor);
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+impl BtleRuntimeOwner for LinuxSupervisorRuntimeOwner {
+    fn completion(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.0.completion()
+    }
+
+    fn cancel(&self) {
+        self.0.cancel();
+    }
+
+    fn join(self: Box<Self>) -> BoxFuture<'static, Result<(), BtleRuntimeOwnerError>> {
+        Box::pin(async move {
+            self.0
+                .shutdown()
+                .await
+                .map_err(|_| BtleRuntimeOwnerError::Cleanup)
+        })
+    }
+}
+
 #[cfg(any(feature = "systemd-provider", feature = "sdk-test-support"))]
-struct RadioInertBtleRuntimeOwner<P> {
+struct UnavailableBtleRuntimeOwner<P> {
     _adapter_registration: EventAdapterControl,
     _attempt_mailbox: EventAttemptReceiver,
     _completion_guard: tokio::sync::watch::Sender<bool>,
@@ -458,7 +710,7 @@ struct RadioInertBtleRuntimeOwner<P> {
 }
 
 #[cfg(any(feature = "systemd-provider", feature = "sdk-test-support"))]
-impl<P> BtleRuntimeOwner for RadioInertBtleRuntimeOwner<P>
+impl<P> BtleRuntimeOwner for UnavailableBtleRuntimeOwner<P>
 where
     P: Send + 'static,
 {
@@ -488,6 +740,20 @@ impl fmt::Debug for BtleRuntimeStartup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_btle_credential_adapter_rejects_invalid_material() {
+        // Break caught: forwarding an invalid generation or all-zero secret
+        // into the Linux driver would bypass fail-closed host composition.
+        assert_eq!(
+            adopt_discovery_credential((0, zeroize::Zeroizing::new([0x11; 32]))).unwrap_err(),
+            BtleRuntimeOwnerError::Startup
+        );
+        assert_eq!(
+            adopt_discovery_credential((7, zeroize::Zeroizing::new([0; 32]))).unwrap_err(),
+            BtleRuntimeOwnerError::Startup
+        );
+    }
 
     #[test]
     fn startup_debug_does_not_expose_prepared_authority() {

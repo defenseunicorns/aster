@@ -264,6 +264,7 @@ dependencies = [
 name = "aster-agent"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "aster-ble-linux",
  "aster-core",
  "aster-host",
  "aster-iroh",

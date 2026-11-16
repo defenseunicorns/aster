@@ -11,6 +11,9 @@ use std::{
 };
 
 #[cfg(feature = "sdk-test-support")]
+use std::{fs::OpenOptions, time::Instant};
+
+#[cfg(feature = "sdk-test-support")]
 use aster_agent::runtime::{
     BtleRuntimeOwner, BtleRuntimeOwnerError, BtleRuntimeStartup, run_customer_agent_with_btle,
 };
@@ -26,6 +29,11 @@ use aster_agent::{
         AgentExit, AgentRuntimeError, AgentSignal, TokenReloadPolicy, run_customer_agent,
         run_customer_agent_with_credentials,
     },
+};
+#[cfg(feature = "sdk-test-support")]
+use aster_host::{
+    BoundedDiscoveryCredentialArtifact, DiscoveryCredentialArtifactProvider,
+    DiscoveryCredentialError, PreparedDiscoveryCredential, TrustedClock, TrustedClockSample,
 };
 use aster_mesh::{
     ProvisioningLoadId, ProvisioningLoadReceipt, ProvisioningSecretLoader, ProvisioningSecretRef,
@@ -905,6 +913,216 @@ async fn closed_signal_task_propagates_only_a_bounded_failure_reason() {
     );
 }
 
+#[cfg(feature = "sdk-test-support")]
+mod btle {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn automatic_startup_consumes_material_once_and_retains_authority() {
+        // Break caught: splitting the prepared credential without retaining its
+        // authority guard releases rollback custody while adapter material is live.
+        if !socket_access_available() {
+            return;
+        }
+        let fixture = CustomerFixture::new();
+        let (btle, _control, _automatic) = automatic_test_runtime(&fixture, "authority");
+        let running = start_with_optional_btle(&fixture, btle).await;
+
+        assert!(matches!(
+            prepare_customer_btle_credential(&fixture, "authority"),
+            Err(DiscoveryCredentialError::CheckpointUnavailable)
+        ));
+        running.stop_clean().await;
+        drop(
+            prepare_customer_btle_credential(&fixture, "authority")
+                .expect("shutdown releases exclusive credential authority"),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "sdk-test-support")]
+    async fn automatic_startup_registers_epoch_zero_unavailable() {
+        // Break caught: registering the production lane as initially available can
+        // dispatch durable work before a compatible operational epoch exists.
+        if !socket_access_available() {
+            return;
+        }
+        let fixture = CustomerFixture::new();
+        let (btle, control, automatic) = automatic_test_runtime(&fixture, "initial-unavailable");
+        let running = start_with_optional_btle(&fixture, btle).await;
+        let automatic = automatic.await.expect("automatic handle observed");
+        install_test_btle_eligibility(&automatic);
+        assert_eq!(
+            publish_event_status(fixture.application(), fixture.token_bytes()).await,
+            200
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), control.recv_attempt())
+                .await
+                .is_err(),
+            "epoch-zero unavailable lane must not receive durable work"
+        );
+        control.publish(1, EventAdapterState::Available);
+        let selected = tokio::time::timeout(Duration::from_secs(2), control.recv_attempt())
+            .await
+            .expect("available lane selection deadline")
+            .expect("available lane remains registered");
+        assert_eq!(selected.transport_kind(), EventTransportKind::BLE_L2CAP_V1);
+        assert_eq!(selected.peer(), [0xaa; 32]);
+        selected.cancel_carrier_open();
+        running.stop_clean().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "sdk-test-support")]
+    async fn automatic_selection_tracks_compatible_controller_and_loss() {
+        // Break caught: the agent composition can retain a permanently unavailable
+        // registration even while the Linux supervisor reports a usable epoch, or
+        // leave it available after that epoch is lost.
+        if !socket_access_available() {
+            return;
+        }
+        let fixture = CustomerFixture::new();
+        let (btle, control, automatic) = automatic_test_runtime(&fixture, "selection");
+        let running = start_with_optional_btle(&fixture, btle).await;
+        let automatic = automatic.await.expect("automatic handle observed");
+        install_test_btle_eligibility(&automatic);
+        assert_eq!(
+            publish_event_status(fixture.application(), fixture.token_bytes()).await,
+            200
+        );
+
+        control.publish(1, EventAdapterState::Available);
+        let selected = tokio::time::timeout(Duration::from_secs(2), control.recv_attempt())
+            .await
+            .expect("compatible controller selection deadline")
+            .expect("available lane remains registered");
+        selected.fail_carrier_open();
+        control.publish(2, EventAdapterState::Unavailable);
+        tokio::task::yield_now().await;
+        assert_eq!(health_status(fixture.health(), "/readyz").await, 200);
+        assert_eq!(
+            publish_event_status(fixture.application(), fixture.token_bytes()).await,
+            200
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), control.recv_attempt())
+                .await
+                .is_err(),
+            "lost controller must leave durable work pending"
+        );
+        running.stop_clean().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "sdk-test-support")]
+    async fn no_controller_keeps_node_ready_and_publication_durable() {
+        // Break caught: treating BlueZ/controller absence as composition failure
+        // prevents a transport-neutral node from reaching Ready or publishing.
+        if !socket_access_available() {
+            return;
+        }
+        let fixture = CustomerFixture::new();
+        let (btle, _control, _automatic) = automatic_test_runtime(&fixture, "no-controller");
+        let running = start_with_optional_btle(&fixture, btle).await;
+
+        assert_eq!(health_status(fixture.health(), "/readyz").await, 200);
+        assert_eq!(
+            publish_event_status(fixture.application(), fixture.token_bytes()).await,
+            200
+        );
+        running.stop_clean().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "sdk-test-support")]
+    async fn credential_or_binding_failure_fails_startup_closed() {
+        // Break caught: accepting a credential authority prepared for a different
+        // state root can bind live discovery material to the wrong rollback domain.
+        let fixture = CustomerFixture::new();
+        let policy = fixture.enable_btle_policy();
+        let prepared = prepare_customer_btle_credential(&fixture, "binding-failure")
+            .expect("prepared discovery credential");
+        let foreign = fixture.root.join("foreign-state");
+        fs::create_dir(&foreign).expect("create foreign state");
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o700))
+            .expect("protect foreign state");
+
+        let error = BtleRuntimeStartup::automatic_linux(prepared, policy, &foreign)
+            .expect_err("mismatched authority binding must fail closed");
+        assert_eq!(error, BtleRuntimeOwnerError::Startup);
+        assert_eq!(error.to_string(), "BTLE runtime owner failed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "sdk-test-support")]
+    async fn runtime_shutdown_cancels_btle_before_node() {
+        // Break caught: closing the node before cancelling and joining BTLE can
+        // leave the platform owner using admission or contacts after teardown.
+        if !socket_access_available() {
+            return;
+        }
+        let fixture = CustomerFixture::new();
+        let (btle, control, _automatic) = automatic_test_runtime(&fixture, "shutdown-order");
+        let shutdown_state = Arc::clone(&control.state);
+        let btle =
+            btle.with_node_shutdown_observer(move || shutdown_state.trace("node_shutdown_started"));
+        let running = start_with_optional_btle(&fixture, btle).await;
+
+        running.stop_clean().await;
+        assert_eq!(
+            *control
+                .state
+                .trace
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            [
+                "cancel",
+                "join_started",
+                "join_completed",
+                "node_shutdown_started"
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "sdk-test-support")]
+    async fn receive_only_keeps_btle_unavailable_without_operational_activation() {
+        // Break caught: composing the normal automatic supervisor under
+        // ReceiveOnly can start discretionary scanning or advertising.
+        if !socket_access_available() {
+            return;
+        }
+        let fixture = CustomerFixture::new();
+        let policy = fixture.enable_receive_only_btle_policy();
+        let prepared = prepare_customer_btle_credential(&fixture, "receive-only")
+            .expect("prepared discovery credential");
+        let (activation_send, mut activation_receive) = tokio::sync::mpsc::unbounded_channel();
+        let (btle, automatic) = BtleRuntimeStartup::automatic_linux_with_test_supervisor(
+            prepared,
+            policy,
+            fixture.state(),
+            move |_config, _contacts, _registration| {
+                let _ = activation_send.send(());
+                Err(BtleRuntimeOwnerError::Startup)
+            },
+        )
+        .expect("receive-only unavailable composition");
+        let running = start_with_optional_btle(&fixture, btle).await;
+        let automatic = automatic.await.expect("automatic handle observed");
+        install_test_btle_eligibility(&automatic);
+
+        assert!(activation_receive.try_recv().is_err());
+        assert_eq!(health_status(fixture.health(), "/readyz").await, 200);
+        assert_eq!(
+            publish_event_status(fixture.application(), fixture.token_bytes()).await,
+            200
+        );
+        running.stop_clean().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "sdk-test-support")]
 async fn radio_inert_btle_lane_stays_unselected_for_real_durable_work() {
@@ -1388,6 +1606,228 @@ impl Drop for PreparedBtleProbe {
 }
 
 #[cfg(feature = "sdk-test-support")]
+struct TestBtleArtifactProvider(Option<Vec<u8>>);
+
+#[cfg(feature = "sdk-test-support")]
+impl DiscoveryCredentialArtifactProvider for TestBtleArtifactProvider {
+    fn load_bounded_artifact(
+        &mut self,
+    ) -> Result<BoundedDiscoveryCredentialArtifact, DiscoveryCredentialError> {
+        BoundedDiscoveryCredentialArtifact::from_zeroizing(zeroize::Zeroizing::new(
+            self.0
+                .take()
+                .ok_or(DiscoveryCredentialError::ArtifactUnavailable)?,
+        ))
+    }
+}
+
+#[cfg(feature = "sdk-test-support")]
+struct TestBtleClock;
+
+#[cfg(feature = "sdk-test-support")]
+impl TrustedClock for TestBtleClock {
+    fn sample(&mut self) -> Result<TrustedClockSample, DiscoveryCredentialError> {
+        Ok(TrustedClockSample::new(1_800_000_010, Instant::now()))
+    }
+}
+
+#[cfg(feature = "sdk-test-support")]
+fn prepare_customer_btle_credential(
+    fixture: &CustomerFixture,
+    label: &str,
+) -> Result<
+    PreparedDiscoveryCredential<TestBtleArtifactProvider, TestBtleClock>,
+    DiscoveryCredentialError,
+> {
+    let authority_path = fixture.root.join(format!("btle-authority-{label}.lock"));
+    if !authority_path.exists() {
+        fs::write(&authority_path, [])
+            .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?;
+        fs::set_permissions(&authority_path, fs::Permissions::from_mode(0o600))
+            .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?;
+    }
+    let authority = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(authority_path)
+        .map_err(|_| DiscoveryCredentialError::CheckpointUnavailable)?;
+    aster_host::prepare_discovery_credential_for_test(
+        TestBtleArtifactProvider(Some(test_btle_artifact())),
+        TestBtleClock,
+        [0x42; 32],
+        fixture.state(),
+        authority,
+    )
+}
+
+#[cfg(feature = "sdk-test-support")]
+fn test_btle_artifact() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(109);
+    bytes.extend_from_slice(b"ASTRBD02");
+    bytes.extend_from_slice(&1_u64.to_be_bytes());
+    bytes.push(1);
+    bytes.extend_from_slice(&1_800_000_000_u64.to_be_bytes());
+    bytes.extend_from_slice(&1_800_000_060_u64.to_be_bytes());
+    bytes.extend_from_slice(&0_u64.to_be_bytes());
+    bytes.extend_from_slice(&[0x42; 32]);
+    bytes.extend_from_slice(&7_u32.to_be_bytes());
+    bytes.extend_from_slice(&[0x11; 32]);
+    bytes
+}
+
+#[cfg(feature = "sdk-test-support")]
+struct AutomaticTestState {
+    adapter: Mutex<Option<EventAdapterControl>>,
+    attempts: tokio::sync::Mutex<Option<EventAttemptReceiver>>,
+    trace: Mutex<Vec<&'static str>>,
+}
+
+#[cfg(feature = "sdk-test-support")]
+impl AutomaticTestState {
+    fn trace(&self, event: &'static str) {
+        self.trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+    }
+}
+
+#[cfg(feature = "sdk-test-support")]
+struct AutomaticTestControl {
+    state: Arc<AutomaticTestState>,
+}
+
+#[cfg(feature = "sdk-test-support")]
+impl AutomaticTestControl {
+    fn publish(&self, epoch: u64, availability: EventAdapterState) {
+        let adapter = self
+            .state
+            .adapter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            adapter
+                .as_ref()
+                .expect("active automatic adapter")
+                .publish_availability(EventAdapterSnapshot::new(
+                    EventTransportKind::BLE_L2CAP_V1,
+                    epoch,
+                    availability,
+                    true,
+                    100,
+                ))
+        );
+    }
+
+    async fn recv_attempt(&self) -> Option<aster_node::EventOutboundAttempt> {
+        self.state
+            .attempts
+            .lock()
+            .await
+            .as_mut()
+            .expect("active automatic attempt mailbox")
+            .recv()
+            .await
+    }
+}
+
+#[cfg(feature = "sdk-test-support")]
+struct AutomaticTestOwner {
+    completion: tokio::sync::watch::Receiver<bool>,
+    _completion_guard: tokio::sync::watch::Sender<bool>,
+    state: Arc<AutomaticTestState>,
+}
+
+#[cfg(feature = "sdk-test-support")]
+impl BtleRuntimeOwner for AutomaticTestOwner {
+    fn completion(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.completion.clone()
+    }
+
+    fn cancel(&self) {
+        self.state.trace("cancel");
+    }
+
+    fn join(self: Box<Self>) -> BoxFuture<'static, Result<(), BtleRuntimeOwnerError>> {
+        Box::pin(async move {
+            self.state.trace("join_started");
+            self.state
+                .adapter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            self.state.attempts.lock().await.take();
+            self.state.trace("join_completed");
+            Ok(())
+        })
+    }
+}
+
+#[cfg(feature = "sdk-test-support")]
+fn automatic_test_runtime(
+    fixture: &CustomerFixture,
+    label: &str,
+) -> (
+    BtleRuntimeStartup,
+    AutomaticTestControl,
+    tokio::sync::oneshot::Receiver<RunningAutomaticEventTransportHandle>,
+) {
+    let policy = fixture.enable_btle_policy();
+    let prepared =
+        prepare_customer_btle_credential(fixture, label).expect("prepared discovery credential");
+    let state = Arc::new(AutomaticTestState {
+        adapter: Mutex::new(None),
+        attempts: tokio::sync::Mutex::new(None),
+        trace: Mutex::new(Vec::new()),
+    });
+    let owner_state = Arc::clone(&state);
+    let (startup, automatic) = BtleRuntimeStartup::automatic_linux_with_test_supervisor(
+        prepared,
+        policy,
+        fixture.state(),
+        move |_config, _contacts, registration| {
+            let (_, adapter, attempts) = registration.into_parts();
+            *owner_state
+                .adapter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(adapter);
+            *owner_state
+                .attempts
+                .try_lock()
+                .expect("new automatic mailbox is uncontended") = Some(attempts);
+            let (completion_guard, completion) = tokio::sync::watch::channel(false);
+            Ok(Box::new(AutomaticTestOwner {
+                completion,
+                _completion_guard: completion_guard,
+                state: owner_state,
+            }))
+        },
+    )
+    .expect("automatic Linux startup composition");
+    (startup, AutomaticTestControl { state }, automatic)
+}
+
+#[cfg(feature = "sdk-test-support")]
+fn install_test_btle_eligibility(automatic: &RunningAutomaticEventTransportHandle) {
+    let mission = aster_node::mission::UnprotectedReferenceMission::from_bytes(
+        include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle").to_vec(),
+    )
+    .expect("public test mission");
+    assert_eq!(
+        automatic.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+            mission.mission_authority_id(),
+            [0xaa; 32],
+            EventTransportKind::BLE_L2CAP_V1,
+            true,
+            1,
+            0,
+            None,
+        )]),
+        Some(aster_node::AutomaticEventRosterStatus::Scheduled)
+    );
+}
+
+#[cfg(feature = "sdk-test-support")]
 struct InjectedBtleState {
     adapter: Mutex<Option<EventAdapterControl>>,
     cancelled: AtomicBool,
@@ -1610,6 +2050,8 @@ async fn wait_for_atomic(value: &AtomicBool) {
 
 struct CustomerFixture {
     root: PathBuf,
+    #[cfg(feature = "sdk-test-support")]
+    state: PathBuf,
     config: PathBuf,
     token: PathBuf,
     mission_reference: PathBuf,
@@ -1671,6 +2113,8 @@ impl CustomerFixture {
 
         Self {
             root,
+            #[cfg(feature = "sdk-test-support")]
+            state,
             config,
             token,
             mission_reference,
@@ -1694,6 +2138,11 @@ impl CustomerFixture {
 
     fn health(&self) -> SocketAddr {
         self.health
+    }
+
+    #[cfg(feature = "sdk-test-support")]
+    fn state(&self) -> &Path {
+        &self.state
     }
 
     fn token_bytes(&self) -> &[u8] {
@@ -1725,18 +2174,33 @@ impl CustomerFixture {
     }
 
     fn enable_btle_policy(&self) -> ValidatedBtlePolicy {
-        self.enable_btle_policy_with_priority(100)
+        self.enable_btle_policy_with_priority_and_emission(100, "normal")
     }
 
+    #[cfg(feature = "sdk-test-support")]
     fn enable_btle_policy_with_priority(&self, priority: u16) -> ValidatedBtlePolicy {
+        self.enable_btle_policy_with_priority_and_emission(priority, "normal")
+    }
+
+    #[cfg(feature = "sdk-test-support")]
+    fn enable_receive_only_btle_policy(&self) -> ValidatedBtlePolicy {
+        self.enable_btle_policy_with_priority_and_emission(100, "receive_only")
+    }
+
+    fn enable_btle_policy_with_priority_and_emission(
+        &self,
+        priority: u16,
+        emission_policy: &str,
+    ) -> ValidatedBtlePolicy {
         let mut config: serde_json::Value =
             serde_json::from_slice(&fs::read(&self.config).expect("read customer config"))
                 .expect("parse customer config");
+        config["mesh"]["emission_policy"] = emission_policy.into();
         config["btle"] = serde_json::json!({
             "peer": "aa".repeat(32),
             "deployment_scope_id": "42".repeat(32),
             "policy": "rostered",
-            "emission_policy": "normal",
+            "emission_policy": emission_policy,
             "priority": priority,
             "credential": "aster-btle-roster"
         });

@@ -12,7 +12,7 @@ default = ["server", "systemd-provider"]
 nearby-discovery = ["aster-node/nearby-discovery"]
 server = ["connectrpc/server"]
 client = ["connectrpc/client"]
-systemd-provider = ["dep:aster-host", "dep:aster-systemd-credentials"]
+systemd-provider = ["dep:aster-ble-linux", "dep:aster-host", "dep:aster-systemd-credentials"]
 acceptance-test-provider = []
 # Internal integration-test controls; absent from default/customer builds.
 sdk-test-support = []
@@ -55,6 +55,9 @@ zeroize.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 rustix.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aster-ble-linux = { path = "../aster-ble-linux", optional = true }
 
 [build-dependencies]
 connectrpc-build.workspace = true

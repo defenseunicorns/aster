@@ -850,6 +850,11 @@ impl LinuxRosteredBtleEventSupervisor {
         self.availability.clone()
     }
 
+    /// Returns the coarse terminal supervisor signal.
+    pub fn completion(&self) -> watch::Receiver<bool> {
+        self.completion.clone()
+    }
+
     /// Requests idempotent cancellation of all owned rostered lifecycle work.
     pub fn cancel(&self) {
         self.cancellation.cancel();

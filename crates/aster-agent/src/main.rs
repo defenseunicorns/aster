@@ -232,7 +232,7 @@ async fn run() -> Result<Option<AgentExit>, BoxError> {
                 Some(policy) => {
                     let prepared = load_btle_startup_credential(&config)?
                         .ok_or(BtleStartupError::Credential)?;
-                    BtleRuntimeStartup::radio_inert(prepared, *policy, config.state())?
+                    BtleRuntimeStartup::automatic_linux(prepared, *policy, config.state())?
                 }
                 None => BtleRuntimeStartup::disabled(),
             };

@@ -3825,6 +3825,7 @@ pub struct RunningNode {
     selected_controls: SelectedControlHandle,
     ordered_event_contacts: OrderedEventContactHandle,
     automatic_event_transports: RunningAutomaticEventTransportHandle,
+    local_mission_id: NodeId,
     state_root: PinnedNodeStateRoot,
     application_admission: Arc<AtomicBool>,
     transport_admission: Arc<TransportAdmission>,
@@ -4624,6 +4625,11 @@ impl RunningNode {
     /// choose the selected transport.
     pub fn automatic_event_transports(&self) -> RunningAutomaticEventTransportHandle {
         self.automatic_event_transports.clone()
+    }
+
+    /// Returns this running node's local mission identity.
+    pub const fn local_mission_id(&self) -> NodeId {
+        self.local_mission_id
     }
 
     /// Returns the exact directory authority used by this node's durable store.
@@ -17355,6 +17361,7 @@ async fn start_node_with_shutdown_ownership(
         selected_controls,
         ordered_event_contacts,
         automatic_event_transports,
+        local_mission_id: identity,
         state_root: ready.state_root,
         application_admission,
         transport_admission,
