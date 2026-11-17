@@ -13,7 +13,7 @@ mise run check
 ```
 
 The gate checks formatting, strict Clippy warnings, all workspace tests, the C
-and C++ headers, the Rust conformance runner, the Python wire oracle and
+runtime smoke test, the Rust conformance runner, the Python wire oracle and
 bindings, and the Go bindings.
 
 Run the bounded hostile-input campaigns when changing parsers, framing,

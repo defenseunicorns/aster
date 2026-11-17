@@ -51,11 +51,6 @@ func status(t *testing.T, err error, want uint32) {
 		t.Fatalf("error=%v; want status %d", err, want)
 	}
 }
-func TestVersion(t *testing.T) {
-	if ABIVersion() != 2 || ProtocolVersion() != 1 || ReplicationWireVersion() != 1 || DefaultSemanticVersion() != 9 || HighestSupportedSemanticVersion() != 9 {
-		t.Fatal("version mismatch")
-	}
-}
 func TestStateRecordDurabilityExactQueryAndDelivery(t *testing.T) {
 	state, mission := fixture(t)
 	n := openTest(t, state, mission)

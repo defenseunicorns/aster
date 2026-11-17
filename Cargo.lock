@@ -481,6 +481,7 @@ dependencies = [
  "age",
  "age-core",
  "aster-core",
+ "aster-node",
  "zeroize",
 ]
 

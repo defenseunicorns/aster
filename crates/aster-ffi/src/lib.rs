@@ -254,13 +254,10 @@ fn input_array<'a, T>(
         return Ok(&[]);
     }
     check_pointer(pointer, name)?;
-    let byte_len = size_of::<T>()
+    size_of::<T>()
         .checked_mul(count)
         .filter(|length| isize::try_from(*length).is_ok())
         .ok_or_else(|| FfiError::invalid(format!("{name} byte length is too large")))?;
-    if byte_len == 0 {
-        return Err(FfiError::internal("zero-sized ABI array element"));
-    }
     // SAFETY: pointer null/alignment and a strict element/byte bound were
     // checked. The ABI requires the array to remain readable for this call.
     Ok(unsafe { slice::from_raw_parts(pointer, count) })

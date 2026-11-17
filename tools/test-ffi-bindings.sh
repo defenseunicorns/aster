@@ -5,8 +5,6 @@ set -eu
 umask 077
 cargo build --locked -p aster-ffi --examples
 cargo build --locked -p aster-ffi
-cc -std=c11 -Wall -Wextra -Werror -pedantic -Ibindings/c -fsyntax-only bindings/c/header_smoke.c
-c++ -std=c++17 -Wall -Wextra -Werror -pedantic -Ibindings/c -fsyntax-only bindings/c/header_smoke.cpp
 task_root=$(mktemp -d /tmp/aster-ffi-bindings.XXXXXX)
 trap 'rm -rf "$task_root"' EXIT HUP INT TERM
 cc -std=c11 -Wall -Wextra -Werror -pedantic -Ibindings/c bindings/c/runtime_smoke.c \

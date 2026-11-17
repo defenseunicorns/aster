@@ -28,7 +28,7 @@ ownership reference; `aster_mesh.h` declares the exact layouts.
    length; writes/read pages are bounded. Reopen an identical operation and
    resume at its reported durable offset after an interrupted stream.
 8. Build and execute examples and foreign-language behavioral tests against the
-   real native library. Compile both C and C++ headers and check exported symbols.
+   real native library.
 
 The current startup accepts an owner-only reference artifact path. Protected
 provisioning/SecretStore callbacks remain a separate unimplemented binding gate.
