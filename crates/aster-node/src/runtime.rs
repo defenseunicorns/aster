@@ -3992,6 +3992,9 @@ pub enum AutomaticEventAttemptOutcome {
     PeerUnavailable,
 }
 
+type AutomaticEventAttemptFuture =
+    Pin<Box<dyn Future<Output = Result<(), ContactOutcome>> + Send + 'static>>;
+
 impl RunningAutomaticEventTransportHandle {
     fn new(
         admission: Arc<TransportAdmission>,
@@ -4226,12 +4229,8 @@ impl RunningAutomaticEventTransportHandle {
     fn event_attempt_runner(
         &self,
         peer: NodeId,
-    ) -> impl Fn(
-        Arc<dyn OrderedContact>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), ContactOutcome>> + Send + 'static>>
-    + Send
-    + Sync
-    + 'static {
+    ) -> impl Fn(Arc<dyn OrderedContact>) -> AutomaticEventAttemptFuture + Send + Sync + 'static
+    {
         let ordered_contacts = self.ordered_contacts.clone();
         move |contact: Arc<dyn OrderedContact>| {
             let ordered_contacts = ordered_contacts.clone();
