@@ -2294,47 +2294,35 @@ fn finish_contact_attempt(
             }
         }
         ContactAttemptOutcome::Cancelled => {}
-        ContactAttemptOutcome::Completed(result) => {
-            finish_contact_result(config, admission, result.map(|_| ()), now, schedule)?
-        }
+        ContactAttemptOutcome::Completed(result) => match *result {
+            Ok(_receipt) => {
+                if schedule.self_schedule && config.role() == FixedRole::Initiator {
+                    schedule.backoff.reset();
+                    *schedule.candidate_pending = admission.selected_candidate(now).is_some();
+                    *schedule.delay =
+                        OutboundDelay::CadenceUntil(now + config.contact_cadence());
+                }
+            }
+            Err(outcome) if outcome.reason() == ContactReason::AdmissionClosed => {
+                return Err(SupervisorError::AdmissionClosed);
+            }
+            Err(outcome) if outcome.reason() == ContactReason::ActorUnavailable => {
+                return Err(SupervisorError::ActorUnavailable);
+            }
+            Err(outcome) if outcome.reason() == ContactReason::ActorStopped => {
+                return Err(SupervisorError::ActorStopped);
+            }
+            Err(outcome) => finish_contact_disposition(
+                config,
+                admission,
+                outcome.disposition(),
+                outcome.reason(),
+                now,
+                schedule,
+            )?,
+        },
     }
     Ok(())
-}
-
-fn finish_contact_result(
-    config: &ValidatedRosteredSupervisorConfig,
-    admission: &mut DiscoveryAdmission,
-    result: Result<(), ContactOutcome>,
-    now: Instant,
-    schedule: &mut OutboundSchedule<'_>,
-) -> Result<(), SupervisorError> {
-    match result {
-        Ok(()) => {
-            if schedule.self_schedule && config.role() == FixedRole::Initiator {
-                schedule.backoff.reset();
-                *schedule.candidate_pending = admission.selected_candidate(now).is_some();
-                *schedule.delay = OutboundDelay::CadenceUntil(now + config.contact_cadence());
-            }
-            Ok(())
-        }
-        Err(outcome) if outcome.reason() == ContactReason::AdmissionClosed => {
-            Err(SupervisorError::AdmissionClosed)
-        }
-        Err(outcome) if outcome.reason() == ContactReason::ActorUnavailable => {
-            Err(SupervisorError::ActorUnavailable)
-        }
-        Err(outcome) if outcome.reason() == ContactReason::ActorStopped => {
-            Err(SupervisorError::ActorStopped)
-        }
-        Err(outcome) => finish_contact_disposition(
-            config,
-            admission,
-            outcome.disposition(),
-            outcome.reason(),
-            now,
-            schedule,
-        ),
-    }
 }
 
 fn finish_contact_disposition(
@@ -5348,6 +5336,7 @@ mod tests {
         started: Option<Arc<Notify>>,
         release: Option<Arc<Notify>>,
         completed: Arc<AtomicU8>,
+        completion: Arc<Notify>,
         revocation: Option<watch::Receiver<Option<ContactOutcome>>>,
         run_result: Result<(), ContactOutcome>,
         finished_revocation: Arc<Mutex<Option<ContactOutcome>>>,
@@ -5386,6 +5375,7 @@ mod tests {
         fn finish_revoked(self: Box<Self>, outcome: ContactOutcome) {
             *self.finished_revocation.lock().unwrap() = Some(outcome);
             self.completed.store(1, Ordering::Release);
+            self.completion.notify_one();
         }
 
         fn run(self: Box<Self>, _contact: Arc<dyn OrderedContact>) -> CoordinatorAttemptFuture {
@@ -5398,6 +5388,7 @@ mod tests {
                     release.notified().await;
                 }
                 self.completed.store(1, Ordering::Release);
+                self.completion.notify_one();
                 self.run_result
             })
         }
@@ -5455,6 +5446,7 @@ mod tests {
             started: None,
             release: None,
             completed,
+            completion: Arc::new(Notify::new()),
             revocation: None,
             run_result: Ok(()),
             finished_revocation: Arc::new(Mutex::new(None)),
@@ -5468,6 +5460,7 @@ mod tests {
         ambiguous_failures: Arc<AtomicU8>,
         cancellations: Arc<AtomicU8>,
         completed: Arc<AtomicU8>,
+        completion: Arc<Notify>,
         finished_revocation: Arc<Mutex<Option<ContactOutcome>>>,
     }
 
@@ -5487,6 +5480,7 @@ mod tests {
             started: None,
             release: None,
             completed: counters.completed.clone(),
+            completion: counters.completion.clone(),
             revocation: None,
             run_result: Ok(()),
             finished_revocation: counters.finished_revocation.clone(),
@@ -5510,8 +5504,33 @@ mod tests {
             started: None,
             release: None,
             completed: counters.completed.clone(),
+            completion: counters.completion.clone(),
             revocation: Some(revocation),
             run_result: Ok(()),
+            finished_revocation: counters.finished_revocation.clone(),
+        })
+    }
+
+    fn outcome_attempt(
+        mission: [u8; 32],
+        peer: [u8; 32],
+        counters: &TestAttemptCounters,
+        outcome: ContactOutcome,
+    ) -> Box<dyn CoordinatorAttempt> {
+        Box::new(TestCoordinatorAttempt {
+            mission,
+            peer,
+            kind: EventTransportKind::BLE_L2CAP_V1,
+            runs: counters.runs.clone(),
+            carrier_failures: counters.carrier_failures.clone(),
+            ambiguous_failures: counters.ambiguous_failures.clone(),
+            cancellations: counters.cancellations.clone(),
+            started: None,
+            release: None,
+            completed: counters.completed.clone(),
+            completion: counters.completion.clone(),
+            revocation: None,
+            run_result: Err(outcome),
             finished_revocation: counters.finished_revocation.clone(),
         })
     }
@@ -5705,12 +5724,9 @@ mod tests {
 
         discovery.scan_started.notified().await;
         received.notified().await;
-        for _ in 0..8 {
-            if counters.completed.load(Ordering::Acquire) == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        timeout(Duration::from_secs(1), counters.completion.notified())
+            .await
+            .expect("pending revocation completion deadline");
         assert_eq!(*counters.finished_revocation.lock().unwrap(), Some(revoked));
         assert_eq!(counters.runs.load(Ordering::Acquire), 0);
         assert!(sockets.connected.lock().unwrap().is_empty());
@@ -5783,12 +5799,9 @@ mod tests {
         send_observation(&discovery, &config(), locator).await;
         connect_started.notified().await;
         revoke.send(Some(revoked)).unwrap();
-        for _ in 0..8 {
-            if first.completed.load(Ordering::Acquire) == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        timeout(Duration::from_secs(1), first.completion.notified())
+            .await
+            .expect("active revocation completion deadline");
         assert_eq!(*first.finished_revocation.lock().unwrap(), Some(revoked));
         assert_eq!(first.runs.load(Ordering::Acquire), 0);
 
@@ -5857,12 +5870,9 @@ mod tests {
 
         discovery.scan_started.notified().await;
         send_observation(&discovery, &config(), locator).await;
-        for _ in 0..8 {
-            if first.completed.load(Ordering::Acquire) == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        timeout(Duration::from_secs(1), first.completion.notified())
+            .await
+            .expect("authority revocation completion deadline");
         assert_eq!(*first.finished_revocation.lock().unwrap(), Some(revoked));
         assert!(sockets.connected.lock().unwrap().is_empty());
 
@@ -5875,12 +5885,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        for _ in 0..8 {
-            if replacement.completed.load(Ordering::Acquire) == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        timeout(Duration::from_secs(1), replacement.completion.notified())
+            .await
+            .expect("replacement attempt completion deadline");
         assert_eq!(replacement.runs.load(Ordering::Acquire), 1);
         assert_eq!(sockets.connected.lock().unwrap().len(), 1);
         assert!(!task.is_finished());
@@ -5896,36 +5903,16 @@ mod tests {
         assert_eq!(suppressed.disposition(), ContactDisposition::Suppress);
         production.shutdown().await;
 
-        let now = Instant::now();
-        let mut admission = DiscoveryAdmission::new();
-        let mut delay = OutboundDelay::Ready;
-        let mut pending = false;
-        let mut backoff = CappedBackoff::new(INITIAL_EPOCH_RETRY, MAXIMUM_EPOCH_RETRY);
-        let mut schedule = OutboundSchedule {
-            delay: &mut delay,
-            candidate_pending: &mut pending,
-            backoff: &mut backoff,
-            self_schedule: false,
-        };
-
-        assert_eq!(
-            finish_contact_attempt(
-                &config(),
-                &mut admission,
-                ContactAttemptOutcome::CoordinatorCompleted(Err(suppressed)),
-                now,
-                &mut schedule,
-            ),
-            Ok(())
-        );
-        assert!(!pending);
-        assert_eq!(delay.deadline(now), now);
+        assert_coordinator_outcome_is_contained(suppressed).await;
     }
 
-    #[test]
-    fn terminal_contact_outcome_does_not_terminate_transport_neutral_service() {
+    #[tokio::test]
+    async fn terminal_contact_outcome_does_not_terminate_transport_neutral_service() {
         let terminal = ContactOutcome::admission_closed();
         assert_eq!(terminal.disposition(), ContactDisposition::Terminal);
+
+        assert_coordinator_outcome_is_contained(terminal).await;
+
         let now = Instant::now();
         let mut admission = DiscoveryAdmission::new();
         let mut delay = OutboundDelay::Ready;
@@ -5938,16 +5925,6 @@ mod tests {
             self_schedule: false,
         };
 
-        assert_eq!(
-            finish_contact_attempt(
-                &config(),
-                &mut admission,
-                ContactAttemptOutcome::CoordinatorCompleted(Err(terminal)),
-                now,
-                &mut schedule,
-            ),
-            Ok(())
-        );
         assert_eq!(
             finish_contact_attempt(
                 &config(),
@@ -5958,6 +5935,90 @@ mod tests {
             ),
             Err(SupervisorError::AdmissionClosed)
         );
+    }
+
+    async fn assert_coordinator_outcome_is_contained(outcome: ContactOutcome) {
+        let locator = crate::CanonicalLocator::new(
+            Address::new([2, 0, 0, 0, 0, 0x44]),
+            AddressType::LeRandom,
+        )
+        .unwrap();
+        let (stream, _peer) = tokio::io::duplex(4096);
+        let opened = crate::platform::socket::opened_rostered_contact(
+            &config(),
+            locator,
+            SocketOpen::with_observed_mtu(Box::new(stream), 128, 96).unwrap(),
+        )
+        .unwrap();
+        let direct = TestAttemptCounters::default();
+        let mut contact = ContactPhase::admitted_coordinator(
+            outcome_attempt([0x11; 32], [0x22; 32], &direct, outcome),
+            opened,
+        );
+        assert!(matches!(
+            contact.next().await,
+            EpochEvent::ContactFinished(ContactAttemptOutcome::CoordinatorCompleted(Err(actual)))
+                if actual == outcome
+        ));
+
+        let sockets = Arc::new(ConnectingSockets {
+            connected: Mutex::new(Vec::new()),
+        });
+        let discovery = Arc::new(FakeDiscovery {
+            events: Arc::new(Mutex::new(Vec::new())),
+            advertisements: Arc::new(Mutex::new(Vec::new())),
+            scan_started: Arc::new(Notify::new()),
+            observation_sender: Mutex::new(None),
+        });
+        let (attempt_sender, attempts) = coordinator_attempt_channel();
+        let first = TestAttemptCounters::default();
+        attempt_sender
+            .send(outcome_attempt(
+                [0x11; 32],
+                [0x22; 32],
+                &first,
+                outcome,
+            ))
+            .await
+            .unwrap();
+        let cancellation = LifecycleCancellation::new();
+        let task = tokio::spawn(run_automatic_available_epoch(
+            Arc::new(config()),
+            sockets.clone(),
+            discovery.clone(),
+            Arc::new(FixedNonce([0x44; 16])),
+            recording_admission(),
+            attempts,
+            EpochSignals::default(),
+            cancellation.clone(),
+        ));
+
+        discovery.scan_started.notified().await;
+        send_observation(&discovery, &config(), locator).await;
+        timeout(Duration::from_secs(1), first.completion.notified())
+            .await
+            .expect("coordinator outcome completion deadline");
+        assert_eq!(first.runs.load(Ordering::Acquire), 1);
+        assert!(!task.is_finished());
+
+        let replacement = TestAttemptCounters::default();
+        attempt_sender
+            .send(instrumented_attempt(
+                [0x11; 32],
+                [0x22; 32],
+                &replacement,
+            ))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), replacement.completion.notified())
+            .await
+            .expect("replacement coordinator attempt completion deadline");
+        assert_eq!(replacement.runs.load(Ordering::Acquire), 1);
+        assert_eq!(sockets.connected.lock().unwrap().len(), 2);
+        assert!(!task.is_finished());
+
+        cancellation.cancel();
+        task.await.unwrap().unwrap();
     }
 
     fn coordinator_attempt_channel() -> (
@@ -7478,6 +7539,7 @@ mod tests {
                 started: Some(started.clone()),
                 release: Some(release.clone()),
                 completed: completed.clone(),
+                completion: Arc::new(Notify::new()),
                 revocation: None,
                 run_result: Ok(()),
                 finished_revocation: Arc::new(Mutex::new(None)),
