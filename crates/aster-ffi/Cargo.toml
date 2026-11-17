@@ -11,7 +11,7 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 aster-core = { version = "=0.1.0-alpha.1", path = "../aster-core", default-features = false, features = ["reference-session"] }
-aster-node = { path = "../aster-node" }
+aster-node = { version = "=0.1.0-alpha.1", path = "../aster-node" }
 tokio.workspace = true
 zeroize.workspace = true
 
