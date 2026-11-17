@@ -1141,6 +1141,10 @@ fn finish_operational_epoch_result(
 ) -> OperationalEpochOutcome {
     let terminal = match result {
         Ok(()) | Err(SupervisorError::Controller(_)) => None,
+        Err(SupervisorError::ContactSuppressed(_)) => {
+            platform_owner.clear();
+            return OperationalEpochOutcome::Suppressed;
+        }
         Err(SupervisorError::PlatformCleanupUnconfirmed) => Some(DriverError::new(
             DriverErrorKind::Transport,
             "automatic rostered Event cleanup was not confirmed",
@@ -1150,7 +1154,6 @@ fn finish_operational_epoch_result(
             | SupervisorError::AdmissionClosed
             | SupervisorError::ActorUnavailable
             | SupervisorError::ActorStopped
-            | SupervisorError::ContactSuppressed(_)
             | SupervisorError::ContactTerminal(_)
             | SupervisorError::TaskStopped,
         ) => Some(DriverError::new(
@@ -1232,6 +1235,10 @@ impl OperationalControllerEpoch for RosteredOperationalEpoch {
             let _ = self.task.take();
             match task_result {
                 Ok(OperationalEpochOutcome::Retryable) => OperationalEpochOutcome::Retryable,
+                Ok(OperationalEpochOutcome::Suppressed) => {
+                    self.platform_owner.clear();
+                    OperationalEpochOutcome::Suppressed
+                }
                 Ok(OperationalEpochOutcome::Terminal(error)) => {
                     let _ = self.unavailable.publish();
                     self.platform_owner.force_loss();
@@ -1282,7 +1289,7 @@ async fn contain_operational_epoch_task(
     platform_owner: Arc<PlatformOwner>,
 ) {
     match timeout(OWNER_LOSS_AFTER, &mut task).await {
-        Ok(Ok(OperationalEpochOutcome::Retryable)) => return,
+        Ok(Ok(OperationalEpochOutcome::Retryable | OperationalEpochOutcome::Suppressed)) => return,
         Ok(Ok(OperationalEpochOutcome::Terminal(_)) | Err(_)) => {
             platform_owner.force_loss();
             return;
@@ -3653,6 +3660,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operational_suppression_releases_retained_owner_without_forcing() {
+        let force_count = Arc::new(AtomicU8::new(0));
+        let platform_owner = Arc::new(PlatformOwner::default());
+        platform_owner.replace(RecordingOwnerLoss {
+            force_count: force_count.clone(),
+            release: None,
+        });
+        let (_updates, status) = watch::channel(OperationalEpochState::Unavailable);
+        let (quiesce, _requests) = mpsc::channel(1);
+        let epoch = RosteredOperationalEpoch {
+            status,
+            quiesce,
+            availability_fence: Arc::new(AvailabilityFence::default()),
+            cancellation: LifecycleCancellation::new(),
+            task: Some(tokio::spawn(async { OperationalEpochOutcome::Suppressed })),
+            platform_owner: platform_owner.clone(),
+            unavailable: test_unavailable_publisher(),
+        };
+
+        assert!(matches!(
+            Box::new(epoch).join().await,
+            OperationalEpochOutcome::Suppressed
+        ));
+        assert_eq!(force_count.load(Ordering::Acquire), 0);
+        assert!(!platform_owner.force_loss());
+    }
+
+    #[tokio::test]
     async fn operational_epoch_containment_forces_owner_on_prompt_terminal_outcome() {
         let force_count = Arc::new(AtomicU8::new(0));
         let platform_owner = Arc::new(PlatformOwner::default());
@@ -5703,6 +5738,28 @@ mod tests {
             finish_operational_epoch_result(Err(SupervisorError::AdmissionClosed), &platform_owner),
             OperationalEpochOutcome::Terminal(_)
         ));
+    }
+
+    #[test]
+    fn authenticated_suppression_is_a_distinct_operational_outcome() {
+        let platform_owner = PlatformOwner::default();
+        let force_count = Arc::new(AtomicU8::new(0));
+        platform_owner.replace(RecordingOwnerLoss {
+            force_count: force_count.clone(),
+            release: None,
+        });
+
+        assert!(matches!(
+            finish_operational_epoch_result(
+                Err(SupervisorError::ContactSuppressed(
+                    ContactReason::PolicyRejected,
+                )),
+                &platform_owner,
+            ),
+            OperationalEpochOutcome::Suppressed
+        ));
+        assert!(!platform_owner.force_loss());
+        assert_eq!(force_count.load(Ordering::Acquire), 0);
     }
 
     impl EventAvailabilityControl for RecordingEventAdapterControl {

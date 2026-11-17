@@ -70,6 +70,7 @@ pub(crate) enum OperationalEpochState {
 
 pub(crate) enum OperationalEpochOutcome {
     Retryable,
+    Suppressed,
     Terminal(DriverError),
 }
 
@@ -574,9 +575,15 @@ struct ResolverActor {
 enum SessionAction {
     Sweep,
     OperationalRetry,
+    Suppressed,
     Lost,
     Cancelled,
     Terminal(DriverError),
+}
+
+enum InvalidationOutcome {
+    Clean,
+    Suppressed,
 }
 
 enum SweepOutcome {
@@ -618,7 +625,8 @@ impl ResolverActor {
                 Ok(session) => session,
                 Err(ResolverFailure::Cancelled) => break,
                 Err(failure) => {
-                    self.invalidate_owner(failure.disposition()).await?;
+                    let outcome = self.invalidate_owner(failure.disposition()).await?;
+                    debug_assert!(matches!(outcome, InvalidationOutcome::Clean));
                     if wait_delay(&self.cancellation, self.backoff.next_delay()).await {
                         break;
                     }
@@ -629,11 +637,23 @@ impl ResolverActor {
             match self.run_session(session.as_mut()).await {
                 SessionAction::Cancelled => break,
                 SessionAction::Terminal(error) => return Err(error),
+                SessionAction::Suppressed => {
+                    drop(session);
+                    self.cancellation.cancelled().await;
+                    break;
+                }
                 SessionAction::Lost => {
-                    self.invalidate_owner(ProbeDisposition::Indeterminate(
-                        ProbeReason::BluezUnavailable,
-                    ))
-                    .await?;
+                    if matches!(
+                        self.invalidate_owner(ProbeDisposition::Indeterminate(
+                            ProbeReason::BluezUnavailable,
+                        ))
+                        .await?,
+                        InvalidationOutcome::Suppressed
+                    ) {
+                        drop(session);
+                        self.cancellation.cancelled().await;
+                        break;
+                    }
                     if wait_delay(&self.cancellation, self.backoff.next_delay()).await {
                         break;
                     }
@@ -645,6 +665,7 @@ impl ResolverActor {
         }
         self.invalidate_owner(ProbeDisposition::Indeterminate(ProbeReason::Cancelled))
             .await
+            .map(|_| ())
     }
 
     async fn run_session(&mut self, session: &mut dyn ResolverSession) -> SessionAction {
@@ -681,13 +702,15 @@ impl ResolverActor {
                         outcome => return outcome,
                     }
                 }
-                if let Err(error) = self
+                match self
                     .invalidate_owner(ProbeDisposition::Indeterminate(
                         ProbeReason::BluezUnavailable,
                     ))
                     .await
                 {
-                    return SessionAction::Terminal(error);
+                    Ok(InvalidationOutcome::Clean) => {}
+                    Ok(InvalidationOutcome::Suppressed) => return SessionAction::Suppressed,
+                    Err(error) => return SessionAction::Terminal(error),
                 }
             }
 
@@ -854,10 +877,14 @@ impl ResolverActor {
         true
     }
 
-    async fn invalidate_owner(&mut self, disposition: ProbeDisposition) -> Result<(), DriverError> {
+    async fn invalidate_owner(
+        &mut self,
+        disposition: ProbeDisposition,
+    ) -> Result<InvalidationOutcome, DriverError> {
         self.nonterminal_publication = NonterminalPublication::Settled;
         self.publish(ControllerResolutionSnapshot::unavailable(disposition, None));
         let mut cleanup_error = None;
+        let mut outcome = InvalidationOutcome::Clean;
         if let Some(operational) = self.operational.as_mut()
             && let Err(error) = operational.quiesce().await
         {
@@ -868,13 +895,19 @@ impl ResolverActor {
         }
         if let Some(operational) = self.operational.take() {
             operational.cancel();
-            if let OperationalEpochOutcome::Terminal(error) = operational.join().await {
-                cleanup_error.get_or_insert(error);
+            match operational.join().await {
+                OperationalEpochOutcome::Retryable => {}
+                OperationalEpochOutcome::Suppressed => {
+                    outcome = InvalidationOutcome::Suppressed;
+                }
+                OperationalEpochOutcome::Terminal(error) => {
+                    cleanup_error.get_or_insert(error);
+                }
             }
         }
         self.operational_status.take();
         self.owner.take();
-        cleanup_error.map_or(Ok(()), Err)
+        cleanup_error.map_or(Ok(outcome), Err)
     }
 
     async fn wait_healthy_event(&mut self, session: &mut dyn ResolverSession) -> SessionAction {
@@ -1043,7 +1076,8 @@ impl ResolverActor {
             ))
             .await
         {
-            Ok(()) => SessionAction::OperationalRetry,
+            Ok(InvalidationOutcome::Clean) => SessionAction::OperationalRetry,
+            Ok(InvalidationOutcome::Suppressed) => SessionAction::Suppressed,
             Err(error) => SessionAction::Terminal(error),
         }
     }
@@ -1092,17 +1126,19 @@ impl ResolverActor {
         if self.cancellation.is_cancelled() {
             return EventDrain::Action(SessionAction::Cancelled);
         }
-        if invalidated
-            && let Err(error) = self
-                .invalidate_owner(ProbeDisposition::Indeterminate(
-                    ProbeReason::BluezUnavailable,
-                ))
-                .await
-        {
-            return EventDrain::Action(SessionAction::Terminal(error));
-        }
         if invalidated {
-            return EventDrain::Action(SessionAction::Sweep);
+            return EventDrain::Action(
+                match self
+                    .invalidate_owner(ProbeDisposition::Indeterminate(
+                        ProbeReason::BluezUnavailable,
+                    ))
+                    .await
+                {
+                    Ok(InvalidationOutcome::Clean) => SessionAction::Sweep,
+                    Ok(InvalidationOutcome::Suppressed) => SessionAction::Suppressed,
+                    Err(error) => SessionAction::Terminal(error),
+                },
+            );
         }
         completed
     }
@@ -1422,6 +1458,17 @@ mod tests {
         observations: Arc<AtomicUsize>,
     }
 
+    struct DropWitnessSession {
+        inner: Box<dyn ResolverSession>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for DropWitnessSession {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
     struct PendingBluezSession;
 
     impl BluezSession for PendingBluezSession {
@@ -1582,6 +1629,19 @@ mod tests {
         }
     }
 
+    impl ResolverSession for DropWitnessSession {
+        fn observe<'a>(
+            &'a mut self,
+            selected: Option<&'a str>,
+        ) -> ResolverFuture<'a, ObservedInventory> {
+            self.inner.observe(selected)
+        }
+
+        fn next_event(&mut self) -> ResolverEventFuture<'_> {
+            self.inner.next_event()
+        }
+    }
+
     #[derive(Clone)]
     enum ProbeBehavior {
         Immediate(ProbeDisposition),
@@ -1689,6 +1749,7 @@ mod tests {
         events: Arc<Mutex<Vec<&'static str>>>,
         quiesce_gate: Mutex<Option<Arc<Notify>>>,
         fail_join: Arc<std::sync::atomic::AtomicBool>,
+        suppress_join: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl RecordingActivator {
@@ -1723,6 +1784,10 @@ mod tests {
 
         fn fail_join(&self) {
             self.fail_join.store(true, Ordering::Release);
+        }
+
+        fn suppress_join(&self) {
+            self.suppress_join.store(true, Ordering::Release);
         }
 
         fn flood_nonterminal_states(&self) -> StatusFlood {
@@ -1794,6 +1859,7 @@ mod tests {
                 events: self.events.clone(),
                 quiesce_gate: self.quiesce_gate.lock().unwrap().clone(),
                 fail_join: self.fail_join.clone(),
+                suppress_join: self.suppress_join.clone(),
             }))
         }
     }
@@ -1824,6 +1890,7 @@ mod tests {
         events: Arc<Mutex<Vec<&'static str>>>,
         quiesce_gate: Option<Arc<Notify>>,
         fail_join: Arc<std::sync::atomic::AtomicBool>,
+        suppress_join: Arc<std::sync::atomic::AtomicBool>,
     }
 
     #[derive(Default)]
@@ -1922,7 +1989,9 @@ mod tests {
 
         fn join(self: Box<Self>) -> OperationalEpochFuture<'static, OperationalEpochOutcome> {
             self.events.lock().unwrap().push("join");
-            if self.fail_join.load(Ordering::Acquire) {
+            if self.suppress_join.load(Ordering::Acquire) {
+                Box::pin(async { OperationalEpochOutcome::Suppressed })
+            } else if self.fail_join.load(Ordering::Acquire) {
                 self.events.lock().unwrap().push("force");
                 Box::pin(async {
                     OperationalEpochOutcome::Terminal(DriverError::new(
@@ -2428,6 +2497,47 @@ mod tests {
 
         assert_eq!(probe.calls(), ["hci0", "hci0", "hci0"]);
         stop(resolver).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automatic_controller_suppression_parks_unavailable_until_shutdown() {
+        let (_harness, session) = Harness::session(vec![controller("hci0", 1, fingerprint("a"))]);
+        let session_dropped = Arc::new(AtomicBool::new(false));
+        let session: Box<dyn ResolverSession> = Box::new(DropWitnessSession {
+            inner: session,
+            dropped: session_dropped.clone(),
+        });
+        let activator = Arc::new(RecordingActivator::default());
+        activator.suppress_join();
+        let platform = Arc::new(FakePlatform::new([Ok(session)]));
+        let (resolver, _epochs) = spawn_with_activator(
+            ControllerAdmissionPolicy::default(),
+            limits(),
+            platform.clone(),
+            Arc::new(FakeProbe::compatible()),
+            Some(activator.clone()),
+        );
+        let mut status = resolver.status();
+        wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
+        activator.latest_state(OperationalEpochState::Available);
+        wait_for_status(&mut status, RuntimeAvailability::Available).await;
+
+        activator.latest_state(OperationalEpochState::Unavailable);
+        wait_for_status(&mut status, RuntimeAvailability::Unavailable).await;
+        wait_for_events(&activator, 3).await;
+        assert_eq!(activator.events(), ["quiesce", "cancel", "join"]);
+
+        tokio::time::advance(MAXIMUM_RESOLVER_RETRY * 4).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(session_dropped.load(Ordering::Acquire));
+        assert_eq!(activator.activation_count(), 1);
+        assert_eq!(platform.open_count(), 1);
+        assert!(!resolver.task.as_ref().unwrap().is_finished());
+
+        resolver.shutdown().await.unwrap();
+        assert_eq!(activator.events(), ["quiesce", "cancel", "join"]);
     }
 
     #[tokio::test(start_paused = true)]
