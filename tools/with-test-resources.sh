@@ -36,9 +36,7 @@ case "$online_cpus" in
 esac
 export RUST_TEST_THREADS="${RUST_TEST_THREADS:-$default_test_threads}"
 
-# The 256-pair TCP relay fixture alone holds 1,024 socket descriptors (both
-# clients and both accepted sockets per pair), plus its listener/runtime files.
-# Leave room for the other parallel fixtures. Change only this process's soft
+# Leave room for parallel network fixtures. Change only this process's soft
 # limit; never lower a larger existing limit or modify the hard limit.
 minimum=4096
 current=$(ulimit -S -n)
