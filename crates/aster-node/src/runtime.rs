@@ -4110,14 +4110,15 @@ impl RunningAutomaticEventTransportHandle {
         if !self.admission.is_open() {
             return None;
         }
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !state.requested_generation.contains_key(&peer) {
-            return None;
+        {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.requested_generation.contains_key(&peer) {
+                return None;
+            }
         }
-        drop(state);
         let (admission, observation) = self.coordinator.request_observed_attempt(
             self.mission,
             peer,

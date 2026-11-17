@@ -642,6 +642,7 @@ pub(super) struct ActiveBtleRuntime {
     completion: Option<tokio::sync::watch::Receiver<bool>>,
     eligibility: Option<PendingBtleEligibility>,
     schedule: Option<JoinHandle<()>>,
+    unexpected_schedule_exit: bool,
     #[cfg(feature = "sdk-test-support")]
     node_shutdown_observer: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     #[cfg(feature = "sdk-test-support")]
@@ -655,6 +656,7 @@ impl ActiveBtleRuntime {
             completion: None,
             eligibility: None,
             schedule: None,
+            unexpected_schedule_exit: false,
             #[cfg(feature = "sdk-test-support")]
             node_shutdown_observer: None,
             #[cfg(feature = "sdk-test-support")]
@@ -678,6 +680,7 @@ impl ActiveBtleRuntime {
             completion,
             eligibility,
             schedule: None,
+            unexpected_schedule_exit: false,
             #[cfg(feature = "sdk-test-support")]
             node_shutdown_observer,
             #[cfg(feature = "sdk-test-support")]
@@ -701,17 +704,62 @@ impl ActiveBtleRuntime {
     }
 
     pub(super) fn is_terminal(&mut self) -> bool {
-        completion_is_terminal_after_read(&mut self.completion, || {})
+        if self.unexpected_schedule_exit
+            || self.schedule.as_ref().is_some_and(JoinHandle::is_finished)
+        {
+            self.unexpected_schedule_exit = true;
+            return true;
+        }
+        if completion_is_terminal_after_read(&mut self.completion, || {}) {
+            return true;
+        }
+        if self.schedule.as_ref().is_some_and(JoinHandle::is_finished) {
+            self.unexpected_schedule_exit = true;
+            return true;
+        }
+        false
     }
 
     pub(super) async fn wait_terminal(&mut self) {
-        let Some(completion) = self.completion.as_mut() else {
-            std::future::pending::<()>().await;
-            return;
-        };
+        enum TerminalObservation {
+            Owner(bool),
+            Schedule,
+        }
+
         loop {
-            if *completion.borrow_and_update() || completion.changed().await.is_err() {
+            if self.is_terminal() {
                 return;
+            }
+            let observation = {
+                let completion = &mut self.completion;
+                let schedule = &mut self.schedule;
+                tokio::select! {
+                    biased;
+                    owner_terminal = async {
+                        let Some(completion) = completion.as_mut() else {
+                            return std::future::pending::<bool>().await;
+                        };
+                        if *completion.borrow_and_update() {
+                            return true;
+                        }
+                        completion.changed().await.is_err() || *completion.borrow_and_update()
+                    } => TerminalObservation::Owner(owner_terminal),
+                    _ = async {
+                        let Some(schedule) = schedule.as_mut() else {
+                            return std::future::pending::<()>().await;
+                        };
+                        let _ = schedule.await;
+                    } => TerminalObservation::Schedule,
+                }
+            };
+            match observation {
+                TerminalObservation::Owner(true) => return,
+                TerminalObservation::Owner(false) => {}
+                TerminalObservation::Schedule => {
+                    self.schedule.take();
+                    self.unexpected_schedule_exit = true;
+                    return;
+                }
             }
         }
     }
@@ -720,24 +768,27 @@ impl ActiveBtleRuntime {
         &mut self,
     ) -> Option<JoinHandle<Result<(), BtleRuntimeOwnerError>>> {
         let schedule = self.schedule.take();
-        if let Some(schedule) = &schedule {
-            schedule.abort();
-        }
+        let had_schedule = schedule.is_some();
+        let unexpected_schedule_exit = self.unexpected_schedule_exit;
         let owner = self.owner.take();
-        if let Some(owner) = &owner {
+        if !had_schedule && let Some(owner) = &owner {
             owner.cancel();
         }
-        if schedule.is_none() && owner.is_none() {
+        if !had_schedule && owner.is_none() && !unexpected_schedule_exit {
             return None;
         }
         let custody = tokio::spawn(async move {
-            let schedule_clean = match schedule {
-                Some(schedule) => match schedule.await {
-                    Ok(()) => true,
-                    Err(error) => error.is_cancelled(),
-                },
-                None => true,
+            let schedule_clean = if unexpected_schedule_exit {
+                if let Some(schedule) = schedule {
+                    let _ = schedule.await;
+                }
+                false
+            } else {
+                stop_event_schedule(schedule).await
             };
+            if had_schedule && let Some(owner) = &owner {
+                owner.cancel();
+            }
             let owner = match owner {
                 Some(owner) => owner.join().await,
                 None => Ok(()),
@@ -774,27 +825,43 @@ impl ActiveBtleRuntime {
 impl Drop for ActiveBtleRuntime {
     fn drop(&mut self) {
         let schedule = self.schedule.take();
-        if let Some(schedule) = &schedule {
-            schedule.abort();
-        }
+        let had_schedule = schedule.is_some();
         let owner = self.owner.take();
         if let Some(owner) = &owner {
             let _ = owner.park_unavailable();
-            owner.cancel();
+            if !had_schedule {
+                owner.cancel();
+            }
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                if let Some(schedule) = schedule {
-                    let _ = schedule.await;
+                let _ = stop_event_schedule(schedule).await;
+                if had_schedule && let Some(owner) = &owner {
+                    owner.cancel();
                 }
                 if let Some(owner) = owner {
                     let _ = owner.join().await;
                 }
             });
         } else if let Some(owner) = owner {
+            if let Some(schedule) = schedule {
+                schedule.abort();
+            }
             std::mem::forget(owner);
         }
     }
+}
+
+async fn stop_event_schedule(schedule: Option<JoinHandle<()>>) -> bool {
+    let Some(schedule) = schedule else {
+        return true;
+    };
+    if schedule.is_finished() {
+        let _ = schedule.await;
+        return false;
+    }
+    schedule.abort();
+    matches!(schedule.await, Err(error) if error.is_cancelled())
 }
 
 pub(super) fn completion_is_terminal_after_read(

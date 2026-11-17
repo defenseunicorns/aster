@@ -2252,7 +2252,9 @@ fn finish_contact_attempt(
         ContactAttemptOutcome::Opened { .. } => {
             unreachable!("opened contact is handled in the epoch")
         }
-        ContactAttemptOutcome::CoordinatorCompleted(_) => {}
+        ContactAttemptOutcome::CoordinatorCompleted(result) => {
+            let _ = result;
+        }
         ContactAttemptOutcome::OpenFailed(failure) => {
             let ContactOpenFailure {
                 candidate,
