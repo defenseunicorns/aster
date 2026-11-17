@@ -8,10 +8,13 @@ use std::{
 use std::time::Duration;
 
 #[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+mod schedule;
+
+#[cfg(all(target_os = "linux", feature = "systemd-provider"))]
 use aster_ble_linux::{
     AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH, AutomaticRosteredSupervisorConfig, ContactLimits,
     ControllerAdmissionPolicy, ControllerProbeLimits, DiscoveryCredential, DiscoveryGeneration,
-    DiscoverySecret, LeasedDiscoveryCredentialSet, RING1_MAXIMUM_DEADLINE,
+    DiscoverySecret, FixedRole, LeasedDiscoveryCredentialSet, RING1_MAXIMUM_DEADLINE,
     RING1_MAXIMUM_EXCHANGE_BYTES, RING1_MAXIMUM_FRAME_BYTES, RosteredDiscoveryConfig,
     ValidatedAutomaticRosteredSupervisorConfig,
 };
@@ -63,6 +66,13 @@ impl fmt::Display for BtleRuntimeOwnerError {
 
 impl Error for BtleRuntimeOwnerError {}
 
+#[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+type EventScheduleRole = FixedRole;
+
+#[cfg(not(all(target_os = "linux", feature = "systemd-provider")))]
+#[derive(Clone, Copy)]
+enum EventScheduleRole {}
+
 /// Active BTLE-specific lifecycle owned by the agent process.
 ///
 /// Adapter availability is deliberately absent: the owner publishes it
@@ -90,8 +100,30 @@ pub trait BtleRuntimeOwner: Send {
     fn join(self: Box<Self>) -> BoxFuture<'static, Result<(), BtleRuntimeOwnerError>>;
 }
 
+struct StartedBtleRuntime {
+    owner: Box<dyn BtleRuntimeOwner>,
+    schedule_role: Option<EventScheduleRole>,
+}
+
+impl StartedBtleRuntime {
+    fn without_schedule(owner: Box<dyn BtleRuntimeOwner>) -> Self {
+        Self {
+            owner,
+            schedule_role: None,
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+    fn with_event_schedule(owner: Box<dyn BtleRuntimeOwner>, role: FixedRole) -> Self {
+        Self {
+            owner,
+            schedule_role: Some(role),
+        }
+    }
+}
+
 type BtleRuntimeStart = Box<
-    dyn FnOnce(&RunningNode) -> Result<Box<dyn BtleRuntimeOwner>, BtleRuntimeOwnerError> + Send,
+    dyn FnOnce(&RunningNode) -> Result<StartedBtleRuntime, BtleRuntimeOwnerError> + Send,
 >;
 
 #[cfg(all(target_os = "linux", feature = "systemd-provider"))]
@@ -181,6 +213,7 @@ impl BtleRuntimeStartup {
             authority_state_root: None,
             start: Some(Box::new(move |node| {
                 start(prepared, node.automatic_event_transports())
+                    .map(StartedBtleRuntime::without_schedule)
             })),
             installs_peer_eligibility: false,
             node_shutdown_observer: None,
@@ -249,8 +282,8 @@ impl BtleRuntimeStartup {
                     .ok_or(BtleRuntimeOwnerError::Startup)?;
                 let (_, adapter, attempts) = registration.into_parts();
                 let owner = unavailable_owner(adapter, attempts, ());
-                Ok(Box::new(AuthorityBtleRuntimeOwner::start(
-                    owner, policy, authority,
+                Ok(StartedBtleRuntime::without_schedule(Box::new(
+                    AuthorityBtleRuntimeOwner::start(owner, policy, authority),
                 )))
             })),
             installs_peer_eligibility: false,
@@ -398,8 +431,8 @@ impl BtleRuntimeStartup {
                         let _ = observer.send(automatic);
                     }
                     let owner = unavailable_owner(adapter, attempts, ());
-                    return Ok(Box::new(AuthorityBtleRuntimeOwner::start(
-                        owner, policy, authority,
+                    return Ok(StartedBtleRuntime::without_schedule(Box::new(
+                        AuthorityBtleRuntimeOwner::start(owner, policy, authority),
                     )));
                 }
 
@@ -418,7 +451,7 @@ impl BtleRuntimeStartup {
                     local_mission_id: selected_events.identity(),
                     local_mission_authority_id: selected_events.mission_authority(),
                     peer_mission_id: policy.peer(),
-                    contact_cadence: Duration::from_secs(60),
+                    contact_cadence: schedule::EVENT_CONTACT_CADENCE,
                     contact_limits: ContactLimits {
                         maximum_frame_bytes: RING1_MAXIMUM_FRAME_BYTES,
                         maximum_exchange_bytes: RING1_MAXIMUM_EXCHANGE_BYTES,
@@ -428,15 +461,19 @@ impl BtleRuntimeStartup {
                 }
                 .validate()
                 .map_err(|_| BtleRuntimeOwnerError::Startup)?;
+                let role = config.role();
                 let supervisor =
                     start_supervisor(config, node.ordered_event_contacts(), registration)?;
                 #[cfg(feature = "sdk-test-support")]
                 if let Some(observer) = observer {
                     let _ = observer.send(automatic);
                 }
-                Ok(Box::new(AuthorityBtleRuntimeOwner::start(
-                    supervisor, policy, authority,
-                )))
+                Ok(StartedBtleRuntime::with_event_schedule(
+                    Box::new(AuthorityBtleRuntimeOwner::start(
+                        supervisor, policy, authority,
+                    )),
+                    role,
+                ))
             })),
             installs_peer_eligibility: true,
             #[cfg(feature = "sdk-test-support")]
@@ -489,7 +526,11 @@ impl BtleRuntimeStartup {
                     false,
                     503,
                 );
-                Ok(unavailable_owner(adapter, attempts, (policy, prepared)))
+                Ok(StartedBtleRuntime::without_schedule(unavailable_owner(
+                    adapter,
+                    attempts,
+                    (policy, prepared),
+                )))
             })),
             installs_peer_eligibility: false,
             #[cfg(feature = "sdk-test-support")]
@@ -532,22 +573,27 @@ impl BtleRuntimeStartup {
             #[cfg(feature = "sdk-test-support")]
             cleanup_retired_observer,
         } = self;
-        let owner = start.map(|start| start(node)).transpose()?;
-        let eligibility =
-            policy
-                .filter(|_| installs_peer_eligibility)
-                .map(|policy| PendingBtleEligibility {
-                    automatic: node.automatic_event_transports(),
-                    entry: EventPeerEligibility::provisioned_exact_peer(
-                        node.selected_events().mission_authority(),
-                        policy.peer(),
-                        EventTransportKind::BLE_L2CAP_V1,
-                        true,
-                        1,
-                        0,
-                        None,
-                    ),
-                });
+        let started = start.map(|start| start(node)).transpose()?;
+        let (owner, schedule_role) = started.map_or((None, None), |started| {
+            (Some(started.owner), started.schedule_role)
+        });
+        let eligibility = policy
+            .filter(|_| installs_peer_eligibility)
+            .zip(schedule_role)
+            .map(|(policy, role)| PendingBtleEligibility {
+                automatic: node.automatic_event_transports(),
+                peer: policy.peer(),
+                role,
+                entry: EventPeerEligibility::provisioned_exact_peer(
+                    node.selected_events().mission_authority(),
+                    policy.peer(),
+                    EventTransportKind::BLE_L2CAP_V1,
+                    true,
+                    1,
+                    0,
+                    None,
+                ),
+            });
         Ok(ActiveBtleRuntime::new(
             owner,
             eligibility,
@@ -562,14 +608,30 @@ impl BtleRuntimeStartup {
 struct PendingBtleEligibility {
     automatic: aster_node::RunningAutomaticEventTransportHandle,
     entry: EventPeerEligibility,
+    peer: aster_mesh::NodeId,
+    role: EventScheduleRole,
 }
 
 impl PendingBtleEligibility {
-    fn install(self) -> Result<(), BtleRuntimeOwnerError> {
-        self.automatic
-            .replace_eligibility(vec![self.entry])
-            .map(|_| ())
-            .ok_or(BtleRuntimeOwnerError::Startup)
+    fn install(self) -> Result<Option<JoinHandle<()>>, BtleRuntimeOwnerError> {
+        let Self {
+            automatic,
+            entry,
+            peer,
+            role,
+        } = self;
+        automatic
+            .replace_eligibility(vec![entry])
+            .ok_or(BtleRuntimeOwnerError::Startup)?;
+        #[cfg(all(target_os = "linux", feature = "systemd-provider"))]
+        {
+            Ok(schedule::spawn_event_schedule(automatic, peer, role))
+        }
+        #[cfg(not(all(target_os = "linux", feature = "systemd-provider")))]
+        {
+            let _ = (automatic, peer, role);
+            Ok(None)
+        }
     }
 }
 
@@ -579,6 +641,7 @@ pub(super) struct ActiveBtleRuntime {
     owner: Option<Box<dyn BtleRuntimeOwner>>,
     completion: Option<tokio::sync::watch::Receiver<bool>>,
     eligibility: Option<PendingBtleEligibility>,
+    schedule: Option<JoinHandle<()>>,
     #[cfg(feature = "sdk-test-support")]
     node_shutdown_observer: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     #[cfg(feature = "sdk-test-support")]
@@ -591,6 +654,7 @@ impl ActiveBtleRuntime {
             owner: None,
             completion: None,
             eligibility: None,
+            schedule: None,
             #[cfg(feature = "sdk-test-support")]
             node_shutdown_observer: None,
             #[cfg(feature = "sdk-test-support")]
@@ -613,6 +677,7 @@ impl ActiveBtleRuntime {
             owner,
             completion,
             eligibility,
+            schedule: None,
             #[cfg(feature = "sdk-test-support")]
             node_shutdown_observer,
             #[cfg(feature = "sdk-test-support")]
@@ -625,11 +690,14 @@ impl ActiveBtleRuntime {
     }
 
     pub(super) fn install_eligibility(&mut self) -> Result<(), BtleRuntimeOwnerError> {
-        self.eligibility
-            .take()
-            .map(PendingBtleEligibility::install)
-            .transpose()
-            .map(|_| ())
+        if self.schedule.is_some() {
+            return Ok(());
+        }
+        let Some(eligibility) = self.eligibility.take() else {
+            return Ok(());
+        };
+        self.schedule = eligibility.install()?;
+        Ok(())
     }
 
     pub(super) fn is_terminal(&mut self) -> bool {
@@ -651,9 +719,35 @@ impl ActiveBtleRuntime {
     pub(super) fn begin_cleanup(
         &mut self,
     ) -> Option<JoinHandle<Result<(), BtleRuntimeOwnerError>>> {
-        let owner = self.owner.take()?;
-        owner.cancel();
-        let custody = tokio::spawn(async move { owner.join().await });
+        let schedule = self.schedule.take();
+        if let Some(schedule) = &schedule {
+            schedule.abort();
+        }
+        let owner = self.owner.take();
+        if let Some(owner) = &owner {
+            owner.cancel();
+        }
+        if schedule.is_none() && owner.is_none() {
+            return None;
+        }
+        let custody = tokio::spawn(async move {
+            let schedule_clean = match schedule {
+                Some(schedule) => match schedule.await {
+                    Ok(()) => true,
+                    Err(error) => error.is_cancelled(),
+                },
+                None => true,
+            };
+            let owner = match owner {
+                Some(owner) => owner.join().await,
+                None => Ok(()),
+            };
+            if schedule_clean {
+                owner
+            } else {
+                Err(BtleRuntimeOwnerError::Cleanup)
+            }
+        });
         // The inner task owns custody; the returned task is only an abortable result waiter.
         Some(tokio::spawn(async move {
             match custody.await {
@@ -679,16 +773,25 @@ impl ActiveBtleRuntime {
 
 impl Drop for ActiveBtleRuntime {
     fn drop(&mut self) {
-        let Some(owner) = self.owner.take() else {
-            return;
-        };
-        let _ = owner.park_unavailable();
-        owner.cancel();
+        let schedule = self.schedule.take();
+        if let Some(schedule) = &schedule {
+            schedule.abort();
+        }
+        let owner = self.owner.take();
+        if let Some(owner) = &owner {
+            let _ = owner.park_unavailable();
+            owner.cancel();
+        }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let _ = owner.join().await;
+                if let Some(schedule) = schedule {
+                    let _ = schedule.await;
+                }
+                if let Some(owner) = owner {
+                    let _ = owner.join().await;
+                }
             });
-        } else {
+        } else if let Some(owner) = owner {
             std::mem::forget(owner);
         }
     }
