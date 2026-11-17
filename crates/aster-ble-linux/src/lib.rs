@@ -55,7 +55,6 @@ pub use platform::{
 pub(crate) use policy::LifecycleCancellation;
 pub use rostered_lifecycle::{
     AutomaticBtleRegistrationError, LinuxRosteredBtleEventSupervisor,
-    spawn_automatic_linux_rostered_btle_event_supervisor,
     spawn_linux_rostered_btle_event_supervisor,
     spawn_resolving_linux_rostered_btle_event_supervisor,
 };

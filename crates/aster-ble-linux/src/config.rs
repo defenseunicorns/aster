@@ -631,6 +631,8 @@ pub struct AutomaticRosteredSupervisorConfig {
     pub discovery: RosteredDiscoveryConfig,
     /// Local authenticated mission identity.
     pub local_mission_id: NodeId,
+    /// Stable local mission authority that scopes automatic coordinator tickets.
+    pub local_mission_authority_id: NodeId,
     /// Exact authenticated mission peer identity.
     pub peer_mission_id: NodeId,
     /// Delay between successful preferred-direction contacts.
@@ -647,6 +649,7 @@ impl AutomaticRosteredSupervisorConfig {
             controller_probe_limits,
             discovery,
             local_mission_id,
+            local_mission_authority_id,
             peer_mission_id,
             contact_cadence,
             contact_limits,
@@ -659,6 +662,7 @@ impl AutomaticRosteredSupervisorConfig {
             controller_probe_limits,
             discovery: Arc::new(discovery.validate()),
             local_mission_id,
+            local_mission_authority_id,
             peer_mission_id,
             role,
             contact_cadence,
@@ -674,6 +678,7 @@ impl fmt::Debug for AutomaticRosteredSupervisorConfig {
             .field("controller_policy", &self.controller_policy)
             .field("controller_probe_limits", &self.controller_probe_limits)
             .field("discovery", &self.discovery)
+            .field("local_mission_authority_id", &"[REDACTED]")
             .field("role", &"derived after validation")
             .field("contact_cadence", &self.contact_cadence)
             .field("contact_limits", &self.contact_limits)
@@ -716,6 +721,7 @@ impl RosteredSupervisorConfig {
             controller,
             discovery,
             local_mission_id,
+            local_mission_authority_id: local_mission_id,
             peer_mission_id,
             role,
             contact_cadence,
@@ -744,6 +750,7 @@ pub struct ValidatedRosteredSupervisorConfig {
     controller: ValidatedControllerConfig,
     discovery: RosteredDiscoveryStorage,
     local_mission_id: NodeId,
+    local_mission_authority_id: NodeId,
     peer_mission_id: NodeId,
     role: FixedRole,
     contact_cadence: Duration,
@@ -770,6 +777,7 @@ pub struct ValidatedAutomaticRosteredSupervisorConfig {
     controller_probe_limits: ControllerProbeLimits,
     discovery: Arc<ValidatedRosteredDiscoveryConfig>,
     local_mission_id: NodeId,
+    local_mission_authority_id: NodeId,
     peer_mission_id: NodeId,
     role: FixedRole,
     contact_cadence: Duration,
@@ -790,6 +798,11 @@ impl ValidatedAutomaticRosteredSupervisorConfig {
     /// Local authenticated mission identity.
     pub const fn local_mission_id(&self) -> NodeId {
         self.local_mission_id
+    }
+
+    /// Stable local mission authority that scopes automatic coordinator tickets.
+    pub const fn local_mission_authority_id(&self) -> NodeId {
+        self.local_mission_authority_id
     }
 
     /// Exact authenticated mission peer identity.
@@ -824,6 +837,7 @@ impl ValidatedAutomaticRosteredSupervisorConfig {
             )?,
             discovery: RosteredDiscoveryStorage::Automatic(self.discovery.clone()),
             local_mission_id: self.local_mission_id,
+            local_mission_authority_id: self.local_mission_authority_id,
             peer_mission_id: self.peer_mission_id,
             role: self.role,
             contact_cadence: self.contact_cadence,
@@ -866,6 +880,10 @@ impl ValidatedRosteredSupervisorConfig {
     /// Local authenticated mission identity.
     pub const fn local_mission_id(&self) -> NodeId {
         self.local_mission_id
+    }
+
+    pub(crate) const fn local_mission_authority_id(&self) -> NodeId {
+        self.local_mission_authority_id
     }
 
     /// Exact mission peer identity required after carrier discovery.
@@ -1042,6 +1060,7 @@ mod tests {
 
     fn automatic_rostered(
         local_mission_id: NodeId,
+        local_mission_authority_id: NodeId,
         peer_mission_id: NodeId,
     ) -> AutomaticRosteredSupervisorConfig {
         let credentials = LeasedDiscoveryCredentialSet::new(
@@ -1062,6 +1081,7 @@ mod tests {
             ),
             discovery: RosteredDiscoveryConfig { credentials },
             local_mission_id,
+            local_mission_authority_id,
             peer_mission_id,
             contact_cadence: Duration::from_secs(60),
             contact_limits: ContactLimits {
@@ -1087,12 +1107,13 @@ mod tests {
 
         #[test]
         fn automatic_config_validates_without_present_controller() {
-            let validated = automatic_rostered([0x11; 32], [0x22; 32])
+            let validated = automatic_rostered([0x11; 32], [0x33; 32], [0x22; 32])
                 .validate()
                 .unwrap();
 
             assert_eq!(validated.role(), FixedRole::Initiator);
             assert_eq!(validated.local_mission_id(), [0x11; 32]);
+            assert_eq!(validated.local_mission_authority_id(), [0x33; 32]);
             assert_eq!(validated.peer_mission_id(), [0x22; 32]);
         }
 

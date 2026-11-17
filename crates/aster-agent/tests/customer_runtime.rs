@@ -2046,6 +2046,16 @@ fn automatic_test_runtime(
     tokio::sync::oneshot::Receiver<RunningAutomaticEventTransportHandle>,
 ) {
     let policy = fixture.enable_btle_policy();
+    let mission = aster_node::mission::UnprotectedReferenceMission::from_bytes(
+        include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle").to_vec(),
+    )
+    .expect("public test mission");
+    let expected_local_mission_id = mission.identity();
+    let expected_local_mission_authority_id = mission.mission_authority_id();
+    assert_ne!(
+        expected_local_mission_id, expected_local_mission_authority_id,
+        "production wiring fixture must distinguish member identity from mission authority"
+    );
     let prepared =
         prepare_customer_btle_credential(fixture, label).expect("prepared discovery credential");
     let state = Arc::new(AutomaticTestState {
@@ -2058,7 +2068,12 @@ fn automatic_test_runtime(
         prepared,
         policy,
         fixture.state(),
-        move |_config, _contacts, registration| {
+        move |config, _contacts, registration| {
+            assert_eq!(config.local_mission_id(), expected_local_mission_id);
+            assert_eq!(
+                config.local_mission_authority_id(),
+                expected_local_mission_authority_id
+            );
             let (_, adapter, attempts) = registration.into_parts();
             *owner_state
                 .adapter

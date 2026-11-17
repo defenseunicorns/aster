@@ -206,7 +206,7 @@ impl EpochContactMode {
         attempt: Box<dyn CoordinatorAttempt>,
     ) -> bool {
         let matches = attempt.transport_kind() == EventTransportKind::BLE_L2CAP_V1
-            && attempt.mission() == config.local_mission_id()
+            && attempt.mission() == config.local_mission_authority_id()
             && attempt.peer() == config.peer_mission_id();
         let Self::Automatic { pending, .. } = self else {
             attempt.cancel_carrier_open();
@@ -1003,23 +1003,6 @@ pub fn spawn_linux_rostered_btle_event_supervisor(
         None,
         crate::BtleOperatorOutput::discard(),
     )
-}
-
-/// Starts the compatibility automatic-contact supervisor for one exact controller.
-pub fn spawn_automatic_linux_rostered_btle_event_supervisor(
-    config: ValidatedRosteredSupervisorConfig,
-    contacts: OrderedEventContactHandle,
-    registration: EventAdapterRegistration,
-    output: crate::BtleOperatorOutput,
-) -> Result<LinuxRosteredBtleEventSupervisor, AutomaticBtleRegistrationError> {
-    let (adapter_control, attempts) = validate_automatic_registration(registration)?;
-    Ok(spawn_rostered_btle_event_supervisor(
-        config,
-        contacts,
-        EpochContactMode::automatic(Box::new(attempts)),
-        Some(Arc::new(adapter_control)),
-        output,
-    ))
 }
 
 struct RosteredEpochActivator {
@@ -2642,17 +2625,6 @@ mod tests {
     };
     use tokio::sync::{Notify, mpsc, oneshot};
 
-    fn assert_legacy_automatic_spawn_signature(
-        _spawn: fn(
-            ValidatedRosteredSupervisorConfig,
-            OrderedEventContactHandle,
-            EventAdapterRegistration,
-            crate::BtleOperatorOutput,
-        )
-            -> Result<LinuxRosteredBtleEventSupervisor, AutomaticBtleRegistrationError>,
-    ) {
-    }
-
     fn config() -> ValidatedRosteredSupervisorConfig {
         config_with_ids([0x11; 32], [0x22; 32])
     }
@@ -2719,6 +2691,7 @@ mod tests {
             ),
             discovery: RosteredDiscoveryConfig { credentials },
             local_mission_id: [0x11; 32],
+            local_mission_authority_id: [0x33; 32],
             peer_mission_id: [0x22; 32],
             contact_cadence: Duration::from_secs(60),
             contact_limits: ContactLimits {
@@ -5595,7 +5568,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_outbound_open_requires_a_matching_coordinator_ticket() {
+    async fn automatic_outbound_open_requires_matching_authority_and_peer() {
+        let local_member = [0x11; 32];
+        let local_authority = [0x33; 32];
+        let configured_peer = [0x22; 32];
+        let wrong_peer = [0x44; 32];
         let locator = crate::CanonicalLocator::new(
             Address::new([2, 0, 0, 0, 0, 0x72]),
             AddressType::LeRandom,
@@ -5610,10 +5587,25 @@ mod tests {
             scan_started: Arc::new(Notify::new()),
             observation_sender: Mutex::new(None),
         });
-        let (attempt_sender, attempts) = coordinator_attempt_channel();
+        let (attempt_sender, attempt_receiver) = mpsc::channel(1);
+        let attempt_received = Arc::new(Notify::new());
+        let attempts: Box<dyn CoordinatorAttemptSource> = Box::new(TestCoordinatorAttemptSource {
+            attempts: attempt_receiver,
+            received: Some(attempt_received.clone()),
+        });
         let cancellation = LifecycleCancellation::new();
         let task = tokio::spawn(run_automatic_available_epoch(
-            Arc::new(config()),
+            Arc::new(
+                automatic_config()
+                    .for_controller(
+                        "hci7".to_owned(),
+                        Address::new([2, 0, 0, 0, 0, 1]),
+                        AddressType::LeRandom,
+                        1,
+                        cancellation.observer(),
+                    )
+                    .unwrap(),
+            ),
             sockets.clone(),
             discovery.clone(),
             Arc::new(FixedNonce([0x32; 16])),
@@ -5628,43 +5620,53 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(sockets.connected.lock().unwrap().is_empty());
 
-        let mismatched_runs = Arc::new(AtomicU8::new(0));
         attempt_sender
             .send(test_attempt(
-                [0x11; 32],
-                [0x44; 32],
-                mismatched_runs.clone(),
+                local_member,
+                configured_peer,
+                Arc::new(AtomicU8::new(0)),
                 Arc::new(AtomicU8::new(0)),
                 Arc::new(AtomicU8::new(0)),
             ))
             .await
             .unwrap();
+        attempt_received.notified().await;
         tokio::task::yield_now().await;
         assert!(sockets.connected.lock().unwrap().is_empty());
-        assert_eq!(mismatched_runs.load(Ordering::Acquire), 0);
 
-        let matching_runs = Arc::new(AtomicU8::new(0));
-        let completed = Arc::new(AtomicU8::new(0));
         attempt_sender
             .send(test_attempt(
-                [0x11; 32],
-                [0x22; 32],
-                matching_runs.clone(),
+                local_authority,
+                wrong_peer,
                 Arc::new(AtomicU8::new(0)),
-                completed.clone(),
+                Arc::new(AtomicU8::new(0)),
+                Arc::new(AtomicU8::new(0)),
             ))
             .await
             .unwrap();
+        attempt_received.notified().await;
+        tokio::task::yield_now().await;
+        assert!(sockets.connected.lock().unwrap().is_empty());
+
+        attempt_sender
+            .send(test_attempt(
+                local_authority,
+                configured_peer,
+                Arc::new(AtomicU8::new(0)),
+                Arc::new(AtomicU8::new(0)),
+                Arc::new(AtomicU8::new(0)),
+            ))
+            .await
+            .unwrap();
+        attempt_received.notified().await;
         for _ in 0..8 {
-            if completed.load(Ordering::Acquire) == 1 {
+            if !sockets.connected.lock().unwrap().is_empty() {
                 break;
             }
             tokio::task::yield_now().await;
         }
 
         assert_eq!(*sockets.connected.lock().unwrap(), [(locator, 0x0083)]);
-        assert_eq!(matching_runs.load(Ordering::Acquire), 1);
-        assert_eq!(completed.load(Ordering::Acquire), 1);
         cancellation.cancel();
         task.await.unwrap().unwrap();
     }
@@ -5712,13 +5714,6 @@ mod tests {
     struct RecordingEventAdapterControl {
         snapshots: Mutex<Vec<aster_node::EventAdapterSnapshot>>,
         accepts: bool,
-    }
-
-    #[test]
-    fn legacy_automatic_supervisor_entry_retains_its_fixed_config_signature() {
-        assert_legacy_automatic_spawn_signature(
-            spawn_automatic_linux_rostered_btle_event_supervisor,
-        );
     }
 
     #[test]

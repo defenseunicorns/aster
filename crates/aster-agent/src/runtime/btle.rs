@@ -406,6 +406,7 @@ impl BtleRuntimeStartup {
                 let (material, authority) = prepared.into_parts();
                 validate_active_authority(&authority, scope, node)?;
                 let credentials = adopt_discovery_credentials(material)?;
+                let selected_events = node.selected_events();
                 let config = AutomaticRosteredSupervisorConfig {
                     controller_policy: ControllerAdmissionPolicy::default(),
                     controller_probe_limits: ControllerProbeLimits::new(
@@ -414,7 +415,8 @@ impl BtleRuntimeStartup {
                         Duration::from_secs(8),
                     ),
                     discovery: RosteredDiscoveryConfig { credentials },
-                    local_mission_id: node.local_mission_id(),
+                    local_mission_id: selected_events.identity(),
+                    local_mission_authority_id: selected_events.mission_authority(),
                     peer_mission_id: policy.peer(),
                     contact_cadence: Duration::from_secs(60),
                     contact_limits: ContactLimits {
