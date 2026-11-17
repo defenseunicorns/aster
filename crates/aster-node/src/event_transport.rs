@@ -1021,6 +1021,7 @@ pub struct EventOutboundAttempt {
     retention: EventAttemptRetention,
     completion: EventAttemptCompletionSource,
     revocation: watch::Receiver<Option<ContactOutcome>>,
+    bound_revocation: Option<ContactOutcome>,
     failed_instances: BTreeMap<EventTransportKind, EventAdapterInstance>,
     completed: bool,
 }
@@ -1057,6 +1058,9 @@ impl EventOutboundAttempt {
     }
 
     fn current_revocation_outcome(&self) -> Option<ContactOutcome> {
+        if let Some(outcome) = self.bound_revocation {
+            return Some(outcome);
+        }
         if let Some(outcome) = *self.revocation.borrow() {
             return Some(outcome);
         }
@@ -1094,33 +1098,56 @@ impl EventOutboundAttempt {
             })
     }
 
+    fn bind_revocation_outcome(&mut self, proposed: ContactOutcome) -> ContactOutcome {
+        if let Some(outcome) = self.bound_revocation.or(*self.revocation.borrow()) {
+            self.bound_revocation = Some(outcome);
+            return outcome;
+        }
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.owns_in_flight_slot(&state)
+            && let Some(attempt) = &state.attempt_in_flight
+        {
+            revoke_attempt(attempt, proposed);
+        }
+        let outcome = (*self.revocation.borrow()).unwrap_or(proposed);
+        drop(state);
+        self.bound_revocation = Some(outcome);
+        outcome
+    }
+
     /// Waits for the typed lifecycle outcome that revokes this issued attempt.
     #[doc(hidden)]
     pub async fn revocation_outcome(&mut self) -> ContactOutcome {
         loop {
             if let Some(outcome) = self.current_revocation_outcome() {
-                return outcome;
+                return self.bind_revocation_outcome(outcome);
             }
             let Some(expiry) = next_event_cohort_expiry(&self.authority) else {
                 if self.revocation.changed().await.is_err() {
-                    return ContactOutcome::shutdown();
+                    return self.bind_revocation_outcome(ContactOutcome::shutdown());
                 }
                 continue;
             };
             let Ok(until_expiry) = expiry.duration_since((self.shared.clock)()) else {
-                return ContactOutcome::authority_changed(
+                let outcome = ContactOutcome::authority_changed(
                     event_cohort_authority_generation(&self.authority),
                 );
+                return self.bind_revocation_outcome(outcome);
             };
             tokio::select! {
                 _ = tokio::time::sleep(until_expiry) => {
-                    return ContactOutcome::authority_changed(
+                    let outcome = ContactOutcome::authority_changed(
                         event_cohort_authority_generation(&self.authority),
                     );
+                    return self.bind_revocation_outcome(outcome);
                 }
                 changed = self.revocation.changed() => {
                     if changed.is_err() {
-                        return ContactOutcome::shutdown();
+                        return self.bind_revocation_outcome(ContactOutcome::shutdown());
                     }
                 }
             }
@@ -1137,6 +1164,11 @@ impl EventOutboundAttempt {
 
     /// Runs this fresh contact through the node-owned ordered Event admission.
     pub async fn run(mut self, contact: Arc<dyn OrderedContact>) -> Result<(), ContactOutcome> {
+        if let Some(outcome) = self.current_revocation_outcome() {
+            let outcome = self.bind_revocation_outcome(outcome);
+            contact.close();
+            return self.complete_run(&Err(outcome), contact.as_ref(), true);
+        }
         let runner = (Arc::clone(&self.runner))(Arc::clone(&contact));
         tokio::pin!(runner);
         let (result, contact_closed) = tokio::select! {
@@ -1256,7 +1288,7 @@ impl EventOutboundAttempt {
             .unwrap_or_else(|error| error.into_inner());
         self.completed = true;
         if !self.owns_in_flight_slot(&state) {
-            if self.revocation.borrow().is_some()
+            if (self.bound_revocation.is_some() || self.revocation.borrow().is_some())
                 && let Some(contact) = close_on_revocation
             {
                 contact.close();
@@ -1264,10 +1296,12 @@ impl EventOutboundAttempt {
             let completed = *self.completion.borrow();
             return completed.unwrap_or(*proposed);
         }
-        let revocation = state
-            .attempt_in_flight
-            .as_ref()
-            .and_then(|attempt| *attempt.revocation.borrow());
+        let revocation = self.bound_revocation.or_else(|| {
+            state
+                .attempt_in_flight
+                .as_ref()
+                .and_then(|attempt| *attempt.revocation.borrow())
+        });
         if revocation.is_some()
             && let Some(contact) = close_on_revocation
         {
@@ -1482,6 +1516,7 @@ fn transition(
                 retention: pending.retention,
                 completion: pending.completion.clone(),
                 revocation: revocation_receiver,
+                bound_revocation: None,
                 failed_instances: pending.failed_instances.clone(),
                 completed: false,
             };
@@ -1992,6 +2027,75 @@ mod tests {
         assert_eq!(run.await.expect("attempt task"), Err(outcome));
         assert_eq!(observation.wait().await, Err(outcome));
         assert!(closed.load(Ordering::Acquire));
+        let state = handle.shared.state.lock().unwrap();
+        assert!(state.pending.is_empty());
+        assert!(state.attempt_in_flight.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pre_revoked_ticket_does_not_construct_the_runner_future() {
+        let (handle, _control, mut attempts) = eligible_ble_handle();
+        let constructions = Arc::new(AtomicU64::new(0));
+        let observed_constructions = Arc::clone(&constructions);
+        let (admission, observation) =
+            handle.request_observed_attempt(MISSION, PEER, move |_contact| {
+                observed_constructions.fetch_add(1, Ordering::AcqRel);
+                std::future::ready(Ok(()))
+            });
+        assert_eq!(admission, EventAttemptAdmission::Accepted);
+        let ticket = attempts.recv().await.expect("caller-owned attempt");
+        handle.set_outbound_suspended(true);
+        let outcome = ContactOutcome::policy_suspended(1);
+        let closed = Arc::new(AtomicBool::new(false));
+
+        assert_eq!(
+            ticket
+                .run(Arc::new(CloseTrackingContact {
+                    closed: Arc::clone(&closed),
+                }))
+                .await,
+            Err(outcome)
+        );
+
+        assert_eq!(observation.wait().await, Err(outcome));
+        assert_eq!(constructions.load(Ordering::Acquire), 0);
+        assert!(closed.load(Ordering::Acquire));
+        let state = handle.shared.state.lock().unwrap();
+        assert!(state.pending.is_empty());
+        assert!(state.attempt_in_flight.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timer_revocation_stays_bound_when_wall_clock_does_not_advance() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let handle = AutomaticEventTransportHandle::with_clock(move || now);
+        assert!(handle.replace_eligibility(vec![provisioned_eligibility(
+            EventTransportKind::BLE_L2CAP_V1,
+            1,
+            0,
+            Some(now + Duration::from_secs(1)),
+        )]));
+        let (_control, mut attempts) =
+            register_available(&handle, EventTransportKind::BLE_L2CAP_V1, 10);
+        assert_eq!(
+            handle.request_attempt_admission(MISSION, PEER, |_contact| async { Ok(()) }),
+            EventAttemptAdmission::Accepted
+        );
+        let mut ticket = attempts.recv().await.expect("durable attempt");
+        let (admission, observation) =
+            handle.request_observed_attempt(MISSION, PEER, |_contact| async { Ok(()) });
+        assert_eq!(admission, EventAttemptAdmission::Retained);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            ticket.revocation_outcome(),
+        )
+        .await
+        .expect("Tokio authority deadline fires");
+        assert_eq!(outcome, ContactOutcome::authority_changed(1));
+        ticket.finish_revoked(outcome);
+
+        assert_eq!(observation.wait().await, Err(outcome));
         let state = handle.shared.state.lock().unwrap();
         assert!(state.pending.is_empty());
         assert!(state.attempt_in_flight.is_none());
