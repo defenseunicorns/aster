@@ -23,16 +23,17 @@ gates; the carrier guide records the specific service-profile gaps.
 
 ## Verify the source-level automatic composition
 
-These deterministic source tests cover automatic registration, zero-controller
-readiness, injected coarse availability and loss propagation, shutdown
-ownership, `ReceiveOnly`, and resolver behavior without using a controller or
-emitting RF. The final focused driver test covers lifecycle publication of
-`Available` after the operational owners start:
+These deterministic source tests cover automatic registration, readiness with
+an injected unavailable supervisor, injected coarse availability and loss
+propagation, shutdown ownership, and `ReceiveOnly` without using a controller
+or emitting RF. The driver resolver suite separately covers a stable empty
+controller inventory. The final focused driver test covers lifecycle
+publication of `Available` after the operational owners start:
 
 ```console
 cargo test --locked -p aster-agent --features sdk-test-support btle --lib
 cargo test --locked -p aster-agent --features sdk-test-support \
-  --test customer_runtime no_controller_keeps_node_ready_and_publication_durable
+  --test customer_runtime unavailable_supervisor_keeps_node_ready_and_publication_durable
 cargo test --locked -p aster-agent --features sdk-test-support \
   --test customer_runtime composition_boundary_propagates_availability_and_loss
 cargo test --locked -p aster-agent --features sdk-test-support \

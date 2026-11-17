@@ -1216,9 +1216,10 @@ mod btle {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn no_controller_keeps_node_ready_and_publication_durable() {
-        // Break caught: treating BlueZ/controller absence as composition failure
-        // prevents a transport-neutral node from reaching Ready or publishing.
+    async fn unavailable_supervisor_keeps_node_ready_and_publication_durable() {
+        // Break caught: treating a nonterminal unavailable BTLE supervisor as a
+        // composition failure prevents a transport-neutral node from reaching
+        // Ready or publishing.
         if !socket_access_available() {
             return;
         }

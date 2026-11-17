@@ -511,32 +511,31 @@ preflight.
 Static validated policy contains no detected controller identity and remains
 valid without present hardware. The resolver issues one ephemeral, non-cloneable
 `ControllerEpochOwner` containing the adapter name, address and type needed for
-local socket operations, inventory generation, bounded fingerprint, and support
-tag. It retains the lease while platform startup calls borrow a redacted,
-immutable snapshot. Exact name/address/type is rechecked immediately before each
-platform operation. Listener, advertisement, scan, and socket child owners do
-not clone or retain the lease; each observes the epoch-generation cancellation
-signal and closes when its owner becomes stale. The existing exact configured
-controller tuple is retained only for evaluation and explicit diagnostic
-narrowing; production automatic activation obtains it from the resolver owner.
+local socket operations, inventory generation, and bounded fingerprint. It
+retains the lease while platform startup calls borrow a redacted, immutable
+snapshot. Exact name/address/type is rechecked immediately before each platform
+operation. Listener, advertisement, scan, and socket child owners do not clone
+or retain the lease; each observes the epoch-generation cancellation signal and
+closes when its owner becomes stale. The existing exact configured controller
+tuple is retained only for evaluation and explicit diagnostic narrowing;
+production automatic activation obtains it from the resolver owner.
 
 State is represented on three independent axes. `ProbeDisposition` is
 `Compatible`, `Incompatible(reason)`, `Blocked(reason)`, or
 `Indeterminate(reason)`; probing itself is transient lifecycle, not a result.
 `SupportTag` is `Qualified` or `Unqualified` and applies only to compatible
-candidates. `RuntimeAvailability` is `Unavailable`, `Available`, or
-operator-only `Degraded`. In the initial Event integration, `Degraded` maps to
-selector `Available` only when the complete Event path is usable; otherwise it
-maps to selector `Unavailable`. Unsupported address family, protocol, or LE CoC
-maps to `Incompatible`. BlueZ loss, hotplug, power, permission, resource
-exhaustion, deadline, cancellation, or unknown platform error maps to
-`Indeterminate` and runtime `Unavailable` with capped retry. Package safety
-rules and explicit local policy map to `Blocked`. Mapping uses typed platform
-errors and never parses error messages. The initial selector receives only
-`Available` or `Unavailable`. `Degraded` and its closed reason exist only on the
-redacted operator/status surface; it maps to selector `Available` only while the
-full Event path is operational. Controller lifecycle remains private to the
-Linux adapter.
+candidates. `RuntimeAvailability` is a private two-state model: `Unavailable`
+or `Available`. `Available` is published only after the selected controller's
+listener, advertisement, and scan owners are running and adapter availability
+has been accepted. Initial, probing, policy-rejected, operational-starting,
+loss, retry, and failure states remain `Unavailable`. Unsupported address
+family, protocol, or LE CoC maps to `Incompatible`. BlueZ loss, hotplug, power,
+permission, resource exhaustion, deadline, cancellation, or unknown platform
+error maps to `Indeterminate` and runtime `Unavailable` with capped retry.
+Package safety rules and explicit local policy map to `Blocked`. Mapping uses
+typed platform errors and never parses error messages. The selector receives
+only `Available` or `Unavailable`; no protocol or wire representation changes.
+Controller lifecycle remains private to the Linux adapter.
 
 The serialized probe has explicit per-operation, per-candidate, and whole-sweep
 deadlines. Cancellation, deadline, cleanup failure, or an incomplete sweep never
@@ -583,8 +582,8 @@ enforce it, that composition is not qualified. Socket and D-Bus denial tests run
 as the actual service identity.
 
 Status, logs, and metrics share one metadata budget: adapter kind, coarse
-available/degraded/unavailable reason, bounded counters, and current selected
-kind. They omit peer/controller addresses, PSMs, role/roster membership,
+available/unavailable reason, bounded counters, and current selected kind. They
+omit peer/controller addresses, PSMs, role/roster membership,
 discovery material, transfer identifiers/counts, retry detail, and secrets.
 BTLE output uses the node's redaction sink rather than direct process logging.
 The current agent passes a discard sink, so detailed driver operator

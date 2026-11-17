@@ -1,3 +1,345 @@
+use crate::{
+    ControllerAdmissionPolicy, ControllerCandidate, ControllerFingerprint, ControllerSnapshot,
+    LifecycleCancellation, ProbeDisposition, ProbeReason,
+    platform::socket::{map_probe_bluer_error, map_probe_io_error, validate_dynamic_le_psm},
+};
+use bluer::{
+    Address, AddressType,
+    l2cap::{Socket, SocketAddr, Stream, StreamListener},
+};
+use std::{future::Future, pin::Pin, time::Duration};
+use tokio::time::timeout;
+
+/// Closed controller-probe failures produced at the BlueZ and kernel boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ControllerProbeError {
+    /// The address family is not LE public or LE random.
+    UnsupportedAddressFamily,
+    /// BlueZ does not support the required protocol operation.
+    UnsupportedProtocol,
+    /// The kernel does not support LE connection-oriented channels.
+    UnsupportedLeCoc,
+    /// BlueZ or its D-Bus session became unavailable.
+    BluezUnavailable,
+    /// The controller was not powered during the probe.
+    ControllerUnpowered,
+    /// The service identity was denied the required operation.
+    PermissionDenied,
+    /// A local bounded resource was unavailable.
+    ResourceExhausted,
+    /// A deadline expired before an operation completed.
+    DeadlineExceeded,
+    /// The candidate disappeared while its properties were being read.
+    Removed,
+    /// A cancellation signal ended the probe.
+    Cancelled,
+    /// An otherwise unclassified typed platform failure occurred.
+    UnknownPlatformError,
+}
+
+impl ControllerProbeError {
+    const fn disposition(self) -> ProbeDisposition {
+        match self {
+            Self::UnsupportedAddressFamily => {
+                ProbeDisposition::Incompatible(ProbeReason::UnsupportedAddressFamily)
+            }
+            Self::UnsupportedProtocol => {
+                ProbeDisposition::Incompatible(ProbeReason::UnsupportedProtocol)
+            }
+            Self::UnsupportedLeCoc => ProbeDisposition::Incompatible(ProbeReason::UnsupportedLeCoc),
+            Self::BluezUnavailable | Self::Removed => {
+                ProbeDisposition::Indeterminate(ProbeReason::BluezUnavailable)
+            }
+            Self::ControllerUnpowered => {
+                ProbeDisposition::Indeterminate(ProbeReason::ControllerUnpowered)
+            }
+            Self::PermissionDenied => {
+                ProbeDisposition::Indeterminate(ProbeReason::PermissionDenied)
+            }
+            Self::ResourceExhausted => {
+                ProbeDisposition::Indeterminate(ProbeReason::ResourceExhausted)
+            }
+            Self::DeadlineExceeded => {
+                ProbeDisposition::Indeterminate(ProbeReason::DeadlineExceeded)
+            }
+            Self::Cancelled => ProbeDisposition::Indeterminate(ProbeReason::Cancelled),
+            Self::UnknownPlatformError => {
+                ProbeDisposition::Indeterminate(ProbeReason::UnknownPlatformError)
+            }
+        }
+    }
+}
+
+/// Boxed asynchronous passive controller-probe operation.
+pub(crate) type ControllerProbeFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, ControllerProbeError>> + Send + 'a>>;
+
+/// Passive BlueZ and kernel operations required to preflight one controller.
+///
+/// Deliberately absent: advertisement, scanning, power/reset, pairing/bonding,
+/// device mutation, disconnect, and configuration operations.
+pub(crate) trait ControllerProbeBackend: Send + Sync {
+    /// Opaque BlueZ session retained for all property reads in one attempt.
+    type Session: Send;
+    /// Opaque unconnected LE CoC socket.
+    type Socket: Send;
+    /// Opaque passive listener that owns the acquired socket.
+    type Listener: Send;
+
+    /// Opens a BlueZ session.
+    fn open_session(&self) -> ControllerProbeFuture<'_, Self::Session>;
+    /// Reads the controller powered property.
+    fn powered<'a>(
+        &'a self,
+        session: &'a Self::Session,
+        candidate: &'a ControllerCandidate,
+    ) -> ControllerProbeFuture<'a, bool>;
+    /// Reads the exact controller address.
+    fn address<'a>(
+        &'a self,
+        session: &'a Self::Session,
+        candidate: &'a ControllerCandidate,
+    ) -> ControllerProbeFuture<'a, Address>;
+    /// Reads the controller address family.
+    fn address_type<'a>(
+        &'a self,
+        session: &'a Self::Session,
+        candidate: &'a ControllerCandidate,
+    ) -> ControllerProbeFuture<'a, AddressType>;
+    /// Creates an unconnected LE CoC socket.
+    fn create_socket(&self) -> ControllerProbeFuture<'_, Self::Socket>;
+    /// Binds the socket to the observed LE address with PSM zero.
+    fn bind<'a>(
+        &'a self,
+        socket: &'a Self::Socket,
+        local: SocketAddr,
+    ) -> ControllerProbeFuture<'a, ()>;
+    /// Reads the dynamically allocated local PSM after bind.
+    fn local_psm<'a>(&'a self, socket: &'a Self::Socket) -> ControllerProbeFuture<'a, u16>;
+    /// Listens on the dynamically allocated PSM.
+    fn listen(&self, socket: Self::Socket) -> ControllerProbeFuture<'_, Self::Listener>;
+    /// Closes the listener and its socket.
+    fn close(&self, listener: Self::Listener) -> ControllerProbeFuture<'_, ()>;
+}
+
+/// Caller-supplied bounds for one serialized passive probe sweep.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ControllerProbeLimits {
+    operation: Duration,
+    candidate: Duration,
+    sweep: Duration,
+}
+
+impl ControllerProbeLimits {
+    /// Creates operation, candidate, and whole-sweep bounds in that order.
+    pub const fn new(operation: Duration, candidate: Duration, sweep: Duration) -> Self {
+        Self {
+            operation,
+            candidate,
+            sweep,
+        }
+    }
+
+    pub(crate) const fn operation(self) -> Duration {
+        self.operation
+    }
+
+    pub(crate) const fn candidate(self) -> Duration {
+        self.candidate
+    }
+
+    pub(crate) const fn sweep(self) -> Duration {
+        self.sweep
+    }
+}
+
+/// Production backend using only passive public BlueZ and kernel operations.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BluezControllerProbeBackend;
+
+impl ControllerProbeBackend for BluezControllerProbeBackend {
+    type Session = bluer::Session;
+    type Socket = Socket<Stream>;
+    type Listener = StreamListener;
+
+    fn open_session(&self) -> ControllerProbeFuture<'_, Self::Session> {
+        Box::pin(async { bluer::Session::new().await.map_err(map_probe_bluer_error) })
+    }
+
+    fn powered<'a>(
+        &'a self,
+        session: &'a Self::Session,
+        candidate: &'a ControllerCandidate,
+    ) -> ControllerProbeFuture<'a, bool> {
+        Box::pin(async move {
+            session
+                .adapter(candidate.name())
+                .map_err(map_probe_bluer_error)?
+                .is_powered()
+                .await
+                .map_err(map_probe_bluer_error)
+        })
+    }
+
+    fn address<'a>(
+        &'a self,
+        session: &'a Self::Session,
+        candidate: &'a ControllerCandidate,
+    ) -> ControllerProbeFuture<'a, Address> {
+        Box::pin(async move {
+            session
+                .adapter(candidate.name())
+                .map_err(map_probe_bluer_error)?
+                .address()
+                .await
+                .map_err(map_probe_bluer_error)
+        })
+    }
+
+    fn address_type<'a>(
+        &'a self,
+        session: &'a Self::Session,
+        candidate: &'a ControllerCandidate,
+    ) -> ControllerProbeFuture<'a, AddressType> {
+        Box::pin(async move {
+            session
+                .adapter(candidate.name())
+                .map_err(map_probe_bluer_error)?
+                .address_type()
+                .await
+                .map_err(map_probe_bluer_error)
+        })
+    }
+
+    fn create_socket(&self) -> ControllerProbeFuture<'_, Self::Socket> {
+        Box::pin(async { Socket::<Stream>::new_stream().map_err(map_probe_io_error) })
+    }
+
+    fn bind<'a>(
+        &'a self,
+        socket: &'a Self::Socket,
+        local: SocketAddr,
+    ) -> ControllerProbeFuture<'a, ()> {
+        Box::pin(async move { socket.bind(local).map_err(map_probe_io_error) })
+    }
+
+    fn local_psm<'a>(&'a self, socket: &'a Self::Socket) -> ControllerProbeFuture<'a, u16> {
+        Box::pin(async move {
+            socket
+                .local_addr()
+                .map(|address| address.psm)
+                .map_err(map_probe_io_error)
+        })
+    }
+
+    fn listen(&self, socket: Self::Socket) -> ControllerProbeFuture<'_, Self::Listener> {
+        Box::pin(async move { socket.listen(1).map_err(map_probe_io_error) })
+    }
+
+    fn close(&self, listener: Self::Listener) -> ControllerProbeFuture<'_, ()> {
+        Box::pin(async move {
+            drop(listener);
+            Ok(())
+        })
+    }
+}
+
+/// Runs a bounded, non-RF passive compatibility probe for one candidate.
+pub(crate) async fn probe_controller<B: ControllerProbeBackend>(
+    backend: &B,
+    candidate: &ControllerCandidate,
+    fingerprint: &ControllerFingerprint,
+    policy: &ControllerAdmissionPolicy,
+    cancellation: &LifecycleCancellation,
+    limits: ControllerProbeLimits,
+) -> ProbeDisposition {
+    if cancellation.is_cancelled() {
+        return ControllerProbeError::Cancelled.disposition();
+    }
+    let Some(snapshot) = candidate.snapshot() else {
+        return ControllerProbeError::Removed.disposition();
+    };
+    let admission = policy.admit(fingerprint);
+    if admission.disposition() != ProbeDisposition::Compatible {
+        return admission.disposition();
+    }
+
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => ControllerProbeError::Cancelled.disposition(),
+        result = timeout(limits.sweep, timeout(limits.candidate, probe_candidate(backend, candidate, snapshot, cancellation, limits.operation))) => {
+            match result {
+                Err(_) | Ok(Err(_)) => ControllerProbeError::DeadlineExceeded.disposition(),
+                Ok(Ok(result)) => result.unwrap_or_else(ControllerProbeError::disposition),
+            }
+        }
+    }
+}
+
+async fn probe_candidate<B: ControllerProbeBackend>(
+    backend: &B,
+    candidate: &ControllerCandidate,
+    snapshot: ControllerSnapshot,
+    cancellation: &LifecycleCancellation,
+    operation_limit: Duration,
+) -> Result<ProbeDisposition, ControllerProbeError> {
+    let session = probe_operation(cancellation, operation_limit, backend.open_session()).await?;
+    if !probe_operation(
+        cancellation,
+        operation_limit,
+        backend.powered(&session, candidate),
+    )
+    .await?
+    {
+        return Err(ControllerProbeError::ControllerUnpowered);
+    }
+    let address = probe_operation(
+        cancellation,
+        operation_limit,
+        backend.address(&session, candidate),
+    )
+    .await?;
+    let address_type = probe_operation(
+        cancellation,
+        operation_limit,
+        backend.address_type(&session, candidate),
+    )
+    .await?;
+    if address == Address::any() {
+        return Err(ControllerProbeError::UnknownPlatformError);
+    }
+    if address != snapshot.address() || address_type != snapshot.address_type() {
+        return Err(ControllerProbeError::Removed);
+    }
+    if !matches!(address_type, AddressType::LePublic | AddressType::LeRandom) {
+        return Err(ControllerProbeError::UnsupportedAddressFamily);
+    }
+    let socket = probe_operation(cancellation, operation_limit, backend.create_socket()).await?;
+    probe_operation(
+        cancellation,
+        operation_limit,
+        backend.bind(&socket, SocketAddr::new(address, address_type, 0)),
+    )
+    .await?;
+    let psm = probe_operation(cancellation, operation_limit, backend.local_psm(&socket)).await?;
+    validate_dynamic_le_psm(psm).map_err(|()| ControllerProbeError::UnsupportedLeCoc)?;
+    let listener = probe_operation(cancellation, operation_limit, backend.listen(socket)).await?;
+    probe_operation(cancellation, operation_limit, backend.close(listener)).await?;
+    Ok(ProbeDisposition::Compatible)
+}
+
+async fn probe_operation<T>(
+    cancellation: &LifecycleCancellation,
+    operation_limit: Duration,
+    operation: ControllerProbeFuture<'_, T>,
+) -> Result<T, ControllerProbeError> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(ControllerProbeError::Cancelled),
+        result = timeout(operation_limit, operation) => result.unwrap_or(Err(ControllerProbeError::DeadlineExceeded)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -478,346 +820,5 @@ mod tests {
                 .map(|local| local.psm),
             Some(0)
         );
-    }
-}
-use crate::{
-    ControllerAdmissionPolicy, ControllerCandidate, ControllerFingerprint, ControllerSnapshot,
-    LifecycleCancellation, ProbeDisposition, ProbeReason,
-    platform::socket::{map_probe_bluer_error, map_probe_io_error, validate_dynamic_le_psm},
-};
-use bluer::{
-    Address, AddressType,
-    l2cap::{Socket, SocketAddr, Stream, StreamListener},
-};
-use std::{future::Future, pin::Pin, time::Duration};
-use tokio::time::timeout;
-
-/// Closed controller-probe failures produced at the BlueZ and kernel boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ControllerProbeError {
-    /// The address family is not LE public or LE random.
-    UnsupportedAddressFamily,
-    /// BlueZ does not support the required protocol operation.
-    UnsupportedProtocol,
-    /// The kernel does not support LE connection-oriented channels.
-    UnsupportedLeCoc,
-    /// BlueZ or its D-Bus session became unavailable.
-    BluezUnavailable,
-    /// The controller was not powered during the probe.
-    ControllerUnpowered,
-    /// The service identity was denied the required operation.
-    PermissionDenied,
-    /// A local bounded resource was unavailable.
-    ResourceExhausted,
-    /// A deadline expired before an operation completed.
-    DeadlineExceeded,
-    /// The candidate disappeared while its properties were being read.
-    Removed,
-    /// A cancellation signal ended the probe.
-    Cancelled,
-    /// An otherwise unclassified typed platform failure occurred.
-    UnknownPlatformError,
-}
-
-impl ControllerProbeError {
-    const fn disposition(self) -> ProbeDisposition {
-        match self {
-            Self::UnsupportedAddressFamily => {
-                ProbeDisposition::Incompatible(ProbeReason::UnsupportedAddressFamily)
-            }
-            Self::UnsupportedProtocol => {
-                ProbeDisposition::Incompatible(ProbeReason::UnsupportedProtocol)
-            }
-            Self::UnsupportedLeCoc => ProbeDisposition::Incompatible(ProbeReason::UnsupportedLeCoc),
-            Self::BluezUnavailable | Self::Removed => {
-                ProbeDisposition::Indeterminate(ProbeReason::BluezUnavailable)
-            }
-            Self::ControllerUnpowered => {
-                ProbeDisposition::Indeterminate(ProbeReason::ControllerUnpowered)
-            }
-            Self::PermissionDenied => {
-                ProbeDisposition::Indeterminate(ProbeReason::PermissionDenied)
-            }
-            Self::ResourceExhausted => {
-                ProbeDisposition::Indeterminate(ProbeReason::ResourceExhausted)
-            }
-            Self::DeadlineExceeded => {
-                ProbeDisposition::Indeterminate(ProbeReason::DeadlineExceeded)
-            }
-            Self::Cancelled => ProbeDisposition::Indeterminate(ProbeReason::Cancelled),
-            Self::UnknownPlatformError => {
-                ProbeDisposition::Indeterminate(ProbeReason::UnknownPlatformError)
-            }
-        }
-    }
-}
-
-/// Boxed asynchronous passive controller-probe operation.
-pub type ControllerProbeFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, ControllerProbeError>> + Send + 'a>>;
-
-/// Passive BlueZ and kernel operations required to preflight one controller.
-///
-/// Deliberately absent: advertisement, scanning, power/reset, pairing/bonding,
-/// device mutation, disconnect, and configuration operations.
-pub trait ControllerProbeBackend: Send + Sync {
-    /// Opaque BlueZ session retained for all property reads in one attempt.
-    type Session: Send;
-    /// Opaque unconnected LE CoC socket.
-    type Socket: Send;
-    /// Opaque passive listener that owns the acquired socket.
-    type Listener: Send;
-
-    /// Opens a BlueZ session.
-    fn open_session(&self) -> ControllerProbeFuture<'_, Self::Session>;
-    /// Reads the controller powered property.
-    fn powered<'a>(
-        &'a self,
-        session: &'a Self::Session,
-        candidate: &'a ControllerCandidate,
-    ) -> ControllerProbeFuture<'a, bool>;
-    /// Reads the exact controller address.
-    fn address<'a>(
-        &'a self,
-        session: &'a Self::Session,
-        candidate: &'a ControllerCandidate,
-    ) -> ControllerProbeFuture<'a, Address>;
-    /// Reads the controller address family.
-    fn address_type<'a>(
-        &'a self,
-        session: &'a Self::Session,
-        candidate: &'a ControllerCandidate,
-    ) -> ControllerProbeFuture<'a, AddressType>;
-    /// Creates an unconnected LE CoC socket.
-    fn create_socket(&self) -> ControllerProbeFuture<'_, Self::Socket>;
-    /// Binds the socket to the observed LE address with PSM zero.
-    fn bind<'a>(
-        &'a self,
-        socket: &'a Self::Socket,
-        local: SocketAddr,
-    ) -> ControllerProbeFuture<'a, ()>;
-    /// Reads the dynamically allocated local PSM after bind.
-    fn local_psm<'a>(&'a self, socket: &'a Self::Socket) -> ControllerProbeFuture<'a, u16>;
-    /// Listens on the dynamically allocated PSM.
-    fn listen(&self, socket: Self::Socket) -> ControllerProbeFuture<'_, Self::Listener>;
-    /// Closes the listener and its socket.
-    fn close(&self, listener: Self::Listener) -> ControllerProbeFuture<'_, ()>;
-}
-
-/// Caller-supplied bounds for one serialized passive probe sweep.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ControllerProbeLimits {
-    operation: Duration,
-    candidate: Duration,
-    sweep: Duration,
-}
-
-impl ControllerProbeLimits {
-    /// Creates operation, candidate, and whole-sweep bounds in that order.
-    pub const fn new(operation: Duration, candidate: Duration, sweep: Duration) -> Self {
-        Self {
-            operation,
-            candidate,
-            sweep,
-        }
-    }
-
-    pub(crate) const fn operation(self) -> Duration {
-        self.operation
-    }
-
-    pub(crate) const fn candidate(self) -> Duration {
-        self.candidate
-    }
-
-    pub(crate) const fn sweep(self) -> Duration {
-        self.sweep
-    }
-}
-
-/// Production backend using only passive public BlueZ and kernel operations.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct BluezControllerProbeBackend;
-
-impl ControllerProbeBackend for BluezControllerProbeBackend {
-    type Session = bluer::Session;
-    type Socket = Socket<Stream>;
-    type Listener = StreamListener;
-
-    fn open_session(&self) -> ControllerProbeFuture<'_, Self::Session> {
-        Box::pin(async { bluer::Session::new().await.map_err(map_probe_bluer_error) })
-    }
-
-    fn powered<'a>(
-        &'a self,
-        session: &'a Self::Session,
-        candidate: &'a ControllerCandidate,
-    ) -> ControllerProbeFuture<'a, bool> {
-        Box::pin(async move {
-            session
-                .adapter(candidate.name())
-                .map_err(map_probe_bluer_error)?
-                .is_powered()
-                .await
-                .map_err(map_probe_bluer_error)
-        })
-    }
-
-    fn address<'a>(
-        &'a self,
-        session: &'a Self::Session,
-        candidate: &'a ControllerCandidate,
-    ) -> ControllerProbeFuture<'a, Address> {
-        Box::pin(async move {
-            session
-                .adapter(candidate.name())
-                .map_err(map_probe_bluer_error)?
-                .address()
-                .await
-                .map_err(map_probe_bluer_error)
-        })
-    }
-
-    fn address_type<'a>(
-        &'a self,
-        session: &'a Self::Session,
-        candidate: &'a ControllerCandidate,
-    ) -> ControllerProbeFuture<'a, AddressType> {
-        Box::pin(async move {
-            session
-                .adapter(candidate.name())
-                .map_err(map_probe_bluer_error)?
-                .address_type()
-                .await
-                .map_err(map_probe_bluer_error)
-        })
-    }
-
-    fn create_socket(&self) -> ControllerProbeFuture<'_, Self::Socket> {
-        Box::pin(async { Socket::<Stream>::new_stream().map_err(map_probe_io_error) })
-    }
-
-    fn bind<'a>(
-        &'a self,
-        socket: &'a Self::Socket,
-        local: SocketAddr,
-    ) -> ControllerProbeFuture<'a, ()> {
-        Box::pin(async move { socket.bind(local).map_err(map_probe_io_error) })
-    }
-
-    fn local_psm<'a>(&'a self, socket: &'a Self::Socket) -> ControllerProbeFuture<'a, u16> {
-        Box::pin(async move {
-            socket
-                .local_addr()
-                .map(|address| address.psm)
-                .map_err(map_probe_io_error)
-        })
-    }
-
-    fn listen(&self, socket: Self::Socket) -> ControllerProbeFuture<'_, Self::Listener> {
-        Box::pin(async move { socket.listen(1).map_err(map_probe_io_error) })
-    }
-
-    fn close(&self, listener: Self::Listener) -> ControllerProbeFuture<'_, ()> {
-        Box::pin(async move {
-            drop(listener);
-            Ok(())
-        })
-    }
-}
-
-/// Runs a bounded, non-RF passive compatibility probe for one candidate.
-pub async fn probe_controller<B: ControllerProbeBackend>(
-    backend: &B,
-    candidate: &ControllerCandidate,
-    fingerprint: &ControllerFingerprint,
-    policy: &ControllerAdmissionPolicy,
-    cancellation: &LifecycleCancellation,
-    limits: ControllerProbeLimits,
-) -> ProbeDisposition {
-    if cancellation.is_cancelled() {
-        return ControllerProbeError::Cancelled.disposition();
-    }
-    let Some(snapshot) = candidate.snapshot() else {
-        return ControllerProbeError::Removed.disposition();
-    };
-    let admission = policy.admit(fingerprint);
-    if admission.disposition() != ProbeDisposition::Compatible {
-        return admission.disposition();
-    }
-
-    tokio::select! {
-        biased;
-        () = cancellation.cancelled() => ControllerProbeError::Cancelled.disposition(),
-        result = timeout(limits.sweep, timeout(limits.candidate, probe_candidate(backend, candidate, snapshot, cancellation, limits.operation))) => {
-            match result {
-                Err(_) | Ok(Err(_)) => ControllerProbeError::DeadlineExceeded.disposition(),
-                Ok(Ok(result)) => result.unwrap_or_else(ControllerProbeError::disposition),
-            }
-        }
-    }
-}
-
-async fn probe_candidate<B: ControllerProbeBackend>(
-    backend: &B,
-    candidate: &ControllerCandidate,
-    snapshot: ControllerSnapshot,
-    cancellation: &LifecycleCancellation,
-    operation_limit: Duration,
-) -> Result<ProbeDisposition, ControllerProbeError> {
-    let session = probe_operation(cancellation, operation_limit, backend.open_session()).await?;
-    if !probe_operation(
-        cancellation,
-        operation_limit,
-        backend.powered(&session, candidate),
-    )
-    .await?
-    {
-        return Err(ControllerProbeError::ControllerUnpowered);
-    }
-    let address = probe_operation(
-        cancellation,
-        operation_limit,
-        backend.address(&session, candidate),
-    )
-    .await?;
-    let address_type = probe_operation(
-        cancellation,
-        operation_limit,
-        backend.address_type(&session, candidate),
-    )
-    .await?;
-    if address == Address::any() {
-        return Err(ControllerProbeError::UnknownPlatformError);
-    }
-    if address != snapshot.address() || address_type != snapshot.address_type() {
-        return Err(ControllerProbeError::Removed);
-    }
-    if !matches!(address_type, AddressType::LePublic | AddressType::LeRandom) {
-        return Err(ControllerProbeError::UnsupportedAddressFamily);
-    }
-    let socket = probe_operation(cancellation, operation_limit, backend.create_socket()).await?;
-    probe_operation(
-        cancellation,
-        operation_limit,
-        backend.bind(&socket, SocketAddr::new(address, address_type, 0)),
-    )
-    .await?;
-    let psm = probe_operation(cancellation, operation_limit, backend.local_psm(&socket)).await?;
-    validate_dynamic_le_psm(psm).map_err(|()| ControllerProbeError::UnsupportedLeCoc)?;
-    let listener = probe_operation(cancellation, operation_limit, backend.listen(socket)).await?;
-    probe_operation(cancellation, operation_limit, backend.close(listener)).await?;
-    Ok(ProbeDisposition::Compatible)
-}
-
-async fn probe_operation<T>(
-    cancellation: &LifecycleCancellation,
-    operation_limit: Duration,
-    operation: ControllerProbeFuture<'_, T>,
-) -> Result<T, ControllerProbeError> {
-    tokio::select! {
-        biased;
-        () = cancellation.cancelled() => Err(ControllerProbeError::Cancelled),
-        result = timeout(operation_limit, operation) => result.unwrap_or(Err(ControllerProbeError::DeadlineExceeded)),
     }
 }

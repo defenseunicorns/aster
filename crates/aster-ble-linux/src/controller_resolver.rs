@@ -90,22 +90,19 @@ pub(crate) trait ControllerEpochActivator: Send + Sync {
 
 /// Runtime state of automatic Linux controller resolution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RuntimeAvailability {
+pub(crate) enum RuntimeAvailability {
     /// No controller epoch is currently usable.
     Unavailable,
     /// The selected epoch's listener, advertisement, and scan owners are running;
     /// adapter availability was accepted before this resolver state was published.
     Available,
-    /// Compatibility-only state retained for downstream matches; this crate does not produce it.
-    Degraded,
 }
 
 /// Redacted automatic-controller status safe for selector and operator surfaces.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ControllerResolutionSnapshot {
+pub(crate) struct ControllerResolutionSnapshot {
     availability: RuntimeAvailability,
     disposition: ProbeDisposition,
-    support: Option<SupportTag>,
 }
 
 impl ControllerResolutionSnapshot {
@@ -113,39 +110,33 @@ impl ControllerResolutionSnapshot {
         Self {
             availability: RuntimeAvailability::Unavailable,
             disposition: ProbeDisposition::Indeterminate(ProbeReason::BluezUnavailable),
-            support: None,
         }
     }
 
-    const fn unavailable(disposition: ProbeDisposition, support: Option<SupportTag>) -> Self {
+    const fn unavailable(disposition: ProbeDisposition) -> Self {
         Self {
             availability: RuntimeAvailability::Unavailable,
             disposition,
-            support,
         }
     }
 
-    const fn available(support: SupportTag) -> Self {
+    const fn available() -> Self {
         Self {
             availability: RuntimeAvailability::Available,
             disposition: ProbeDisposition::Compatible,
-            support: Some(support),
         }
     }
 
     /// Coarse runtime availability without controller identity.
-    pub const fn availability(self) -> RuntimeAvailability {
+    #[cfg(test)]
+    pub(crate) const fn availability(self) -> RuntimeAvailability {
         self.availability
     }
 
     /// Last closed compatibility or policy result.
-    pub const fn disposition(self) -> ProbeDisposition {
+    #[cfg(test)]
+    pub(crate) const fn disposition(self) -> ProbeDisposition {
         self.disposition
-    }
-
-    /// Support evidence tag when one candidate was evaluated.
-    pub const fn support(self) -> Option<SupportTag> {
-        self.support
     }
 }
 
@@ -153,17 +144,15 @@ impl ControllerResolutionSnapshot {
 pub(crate) struct ControllerEpochOwner {
     candidate: ControllerCandidate,
     fingerprint: ControllerFingerprint,
-    support: SupportTag,
     inventory_generation: u64,
     cancellation: LifecycleCancellation,
 }
 
 impl ControllerEpochOwner {
-    fn new(controller: ObservedController, support: SupportTag, inventory_generation: u64) -> Self {
+    fn new(controller: ObservedController, inventory_generation: u64) -> Self {
         Self {
             candidate: controller.candidate,
             fingerprint: controller.fingerprint,
-            support,
             inventory_generation,
             cancellation: LifecycleCancellation::new(),
         }
@@ -198,10 +187,6 @@ impl ControllerEpochOwner {
             cancellation: self.cancellation.observer(),
         })
     }
-
-    const fn support(&self) -> SupportTag {
-        self.support
-    }
 }
 
 impl Drop for ControllerEpochOwner {
@@ -211,7 +196,7 @@ impl Drop for ControllerEpochOwner {
 }
 
 /// Owned automatic Linux controller resolver lifecycle.
-pub struct LinuxControllerResolver {
+pub(crate) struct LinuxControllerResolver {
     status: watch::Receiver<ControllerResolutionSnapshot>,
     cancellation: LifecycleCancellation,
     output: BtleOperatorOutput,
@@ -220,17 +205,18 @@ pub struct LinuxControllerResolver {
 
 impl LinuxControllerResolver {
     /// Returns a redacted receiver for automatic controller status.
-    pub fn status(&self) -> watch::Receiver<ControllerResolutionSnapshot> {
+    pub(crate) fn status(&self) -> watch::Receiver<ControllerResolutionSnapshot> {
         self.status.clone()
     }
 
     /// Requests idempotent cancellation of all resolver work.
-    pub fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         self.cancellation.cancel();
     }
 
     /// Cancels and joins the serialized probe actor and its controller epoch.
-    pub async fn shutdown(self) -> Result<(), DriverError> {
+    #[cfg(test)]
+    pub(crate) async fn shutdown(self) -> Result<(), DriverError> {
         self.shutdown_with_stop_event(true).await
     }
 
@@ -264,24 +250,7 @@ impl Drop for LinuxControllerResolver {
     }
 }
 
-/// Starts the production automatic Linux controller resolver.
-pub fn spawn_linux_controller_resolver(
-    policy: ControllerAdmissionPolicy,
-    limits: ControllerProbeLimits,
-    output: BtleOperatorOutput,
-) -> LinuxControllerResolver {
-    spawn_resolver(
-        policy,
-        limits,
-        output,
-        Arc::new(BluezResolverPlatform::new(Arc::new(ProductionBluez))),
-        Arc::new(ProductionResolverProbe),
-        None,
-        None,
-    )
-}
-
-pub(crate) fn spawn_linux_controller_resolver_with_activation(
+pub(crate) fn spawn_linux_controller_resolver(
     policy: ControllerAdmissionPolicy,
     limits: ControllerProbeLimits,
     output: BtleOperatorOutput,
@@ -293,7 +262,7 @@ pub(crate) fn spawn_linux_controller_resolver_with_activation(
         output,
         Arc::new(BluezResolverPlatform::new(Arc::new(ProductionBluez))),
         Arc::new(ProductionResolverProbe),
-        Some(activator),
+        activator,
         None,
     )
 }
@@ -556,7 +525,7 @@ struct ResolverActor {
     limits: ControllerProbeLimits,
     platform: Arc<dyn ResolverPlatform>,
     probe: Arc<dyn ResolverProbe>,
-    activator: Option<Arc<dyn ControllerEpochActivator>>,
+    activator: Arc<dyn ControllerEpochActivator>,
     output: BtleOperatorOutput,
     updates: watch::Sender<ControllerResolutionSnapshot>,
     cancellation: LifecycleCancellation,
@@ -746,7 +715,6 @@ impl ResolverActor {
             self.cursor = None;
             self.publish(ControllerResolutionSnapshot::unavailable(
                 ProbeDisposition::Indeterminate(ProbeReason::BluezUnavailable),
-                None,
             ));
             return SweepOutcome::Stable;
         }
@@ -777,10 +745,9 @@ impl ResolverActor {
         }
 
         let deadline = Instant::now() + self.limits.sweep();
-        let mut last = ControllerResolutionSnapshot::unavailable(
-            ProbeDisposition::Indeterminate(ProbeReason::BluezUnavailable),
-            None,
-        );
+        let mut last = ControllerResolutionSnapshot::unavailable(ProbeDisposition::Indeterminate(
+            ProbeReason::BluezUnavailable,
+        ));
         let mut sweep_unfinished = false;
         let mut retryable = false;
 
@@ -788,10 +755,7 @@ impl ResolverActor {
             let controller = &observed.controllers[index];
             let admission = admissions[index];
             if admission.disposition() != ProbeDisposition::Compatible {
-                last = ControllerResolutionSnapshot::unavailable(
-                    admission.disposition(),
-                    Some(admission.support()),
-                );
+                last = ControllerResolutionSnapshot::unavailable(admission.disposition());
                 continue;
             }
 
@@ -814,20 +778,17 @@ impl ResolverActor {
                 )) => result.unwrap_or(ProbeDisposition::Indeterminate(ProbeReason::DeadlineExceeded)),
             };
             if disposition == ProbeDisposition::Compatible {
-                let support = admission.support();
-                if self.select(controller.clone(), support).await {
+                if self.select(controller.clone()).await {
                     return SweepOutcome::Selected;
                 }
                 retryable = true;
-                last = ControllerResolutionSnapshot::unavailable(
-                    ProbeDisposition::Indeterminate(ProbeReason::UnknownPlatformError),
-                    Some(support),
-                );
+                last = ControllerResolutionSnapshot::unavailable(ProbeDisposition::Indeterminate(
+                    ProbeReason::UnknownPlatformError,
+                ));
                 continue;
             }
 
-            last =
-                ControllerResolutionSnapshot::unavailable(disposition, Some(admission.support()));
+            last = ControllerResolutionSnapshot::unavailable(disposition);
             retryable |= matches!(disposition, ProbeDisposition::Indeterminate(_));
             if Instant::now() >= deadline {
                 sweep_unfinished = true;
@@ -847,32 +808,27 @@ impl ResolverActor {
         }
     }
 
-    async fn select(&mut self, controller: ObservedController, support: SupportTag) -> bool {
-        let owner = ControllerEpochOwner::new(controller, support, self.inventory_generation);
+    async fn select(&mut self, controller: ObservedController) -> bool {
+        let owner = ControllerEpochOwner::new(controller, self.inventory_generation);
         #[cfg(test)]
         if let Some(updates) = &self.epoch_updates {
             let _ = updates.try_send(owner.cancellation.observer());
         }
-        let operational = match &self.activator {
-            Some(activator) => match owner.view().and_then(|view| activator.activate(view)) {
-                Ok(operational) => Some(operational),
-                Err(_) => {
-                    self.publish(ControllerResolutionSnapshot::unavailable(
-                        ProbeDisposition::Indeterminate(ProbeReason::UnknownPlatformError),
-                        Some(support),
-                    ));
-                    return false;
-                }
-            },
-            None => None,
+        let operational = match owner.view().and_then(|view| self.activator.activate(view)) {
+            Ok(operational) => operational,
+            Err(_) => {
+                self.publish(ControllerResolutionSnapshot::unavailable(
+                    ProbeDisposition::Indeterminate(ProbeReason::UnknownPlatformError),
+                ));
+                return false;
+            }
         };
-        self.operational_status = operational.as_ref().map(|owner| owner.status());
-        self.operational = operational;
+        self.operational_status = Some(operational.status());
+        self.operational = Some(operational);
         self.owner = Some(owner);
         self.nonterminal_publication = NonterminalPublication::Settled;
         self.publish(ControllerResolutionSnapshot::unavailable(
             ProbeDisposition::Compatible,
-            Some(support),
         ));
         true
     }
@@ -882,7 +838,7 @@ impl ResolverActor {
         disposition: ProbeDisposition,
     ) -> Result<InvalidationOutcome, DriverError> {
         self.nonterminal_publication = NonterminalPublication::Settled;
-        self.publish(ControllerResolutionSnapshot::unavailable(disposition, None));
+        self.publish(ControllerResolutionSnapshot::unavailable(disposition));
         let mut cleanup_error = None;
         let mut outcome = InvalidationOutcome::Clean;
         if let Some(operational) = self.operational.as_mut()
@@ -1041,12 +997,7 @@ impl ResolverActor {
             OperationalEpochState::Available => {
                 self.cursor = None;
                 self.operational_backoff.reset();
-                let support = self
-                    .owner
-                    .as_ref()
-                    .expect("operational state has a controller owner")
-                    .support();
-                self.publish(ControllerResolutionSnapshot::available(support));
+                self.publish(ControllerResolutionSnapshot::available());
             }
             OperationalEpochState::Unavailable => {
                 return Some(self.invalidate_failed_operational_epoch().await);
@@ -1272,7 +1223,7 @@ fn spawn_resolver(
     output: BtleOperatorOutput,
     platform: Arc<dyn ResolverPlatform>,
     probe: Arc<dyn ResolverProbe>,
-    activator: Option<Arc<dyn ControllerEpochActivator>>,
+    activator: Arc<dyn ControllerEpochActivator>,
     #[cfg(test)] epoch_updates: Option<tokio::sync::mpsc::Sender<LifecycleCancellationObserver>>,
     #[cfg(not(test))] _epoch_updates: Option<()>,
 ) -> LinuxControllerResolver {
@@ -1392,7 +1343,7 @@ fn spawn_linux_controller_resolver_with(
             output,
             platform,
             probe,
-            Some(Arc::new(TestOperationalActivator)),
+            Arc::new(TestOperationalActivator),
             Some(epoch_updates),
         ),
         epochs,
@@ -1405,7 +1356,7 @@ mod tests {
     use crate::{
         BtleOperatorEvent, BtleOperatorOutput, ControllerAdmissionPolicy, ControllerCandidate,
         ControllerFingerprint, ControllerProbeLimits, ControllerSnapshot, LifecycleCancellation,
-        ProbeDisposition, ProbeReason, RuntimeAvailability, SupportRow, SupportTag, UnsafeRule,
+        ProbeDisposition, ProbeReason, SupportRow, SupportTag, UnsafeRule,
     };
     use bluer::{Address, AddressType};
     use std::{
@@ -2107,7 +2058,7 @@ mod tests {
         limits: ControllerProbeLimits,
         platform: Arc<FakePlatform>,
         probe: Arc<FakeProbe>,
-        activator: Option<Arc<dyn ControllerEpochActivator>>,
+        activator: Arc<dyn ControllerEpochActivator>,
     ) -> (
         LinuxControllerResolver,
         mpsc::Receiver<LifecycleCancellationObserver>,
@@ -2143,7 +2094,7 @@ mod tests {
             output,
             Arc::new(FakePlatform::new([Ok(session)])),
             Arc::new(FakeProbe::compatible()),
-            Some(activator),
+            activator,
             Some(epoch_updates),
         );
         (resolver, events, epochs)
@@ -2206,7 +2157,7 @@ mod tests {
             limits: limits(),
             platform: Arc::new(FakePlatform::new([])),
             probe: Arc::new(FakeProbe::compatible()),
-            activator: Some(Arc::new(TestOperationalActivator)),
+            activator: Arc::new(TestOperationalActivator),
             output: BtleOperatorOutput::discard(),
             updates,
             cancellation,
@@ -2223,21 +2174,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_controller_passive_selection_stays_unavailable() {
+    async fn automatic_controller_starting_operational_epoch_stays_unavailable() {
         let (_harness, session) = Harness::session(vec![controller("hci0", 1, fingerprint("a"))]);
+        let activator = Arc::new(RecordingActivator::default());
         let (resolver, mut epochs) = spawn_with_activator(
             ControllerAdmissionPolicy::default(),
             limits(),
             Arc::new(FakePlatform::new([Ok(session)])),
             Arc::new(FakeProbe::compatible()),
-            None,
+            activator,
         );
         let mut status = resolver.status();
 
         let selected = wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
 
         assert_eq!(selected.availability(), RuntimeAvailability::Unavailable);
-        assert_eq!(selected.support(), Some(SupportTag::Unqualified));
         assert!(!epochs.recv().await.unwrap().is_cancelled());
         stop(resolver).await;
     }
@@ -2251,7 +2202,7 @@ mod tests {
             limits(),
             Arc::new(FakePlatform::new([Ok(session)])),
             Arc::new(FakeProbe::compatible()),
-            Some(activator.clone()),
+            activator.clone(),
         );
         let mut status = resolver.status();
         let selected = wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
@@ -2460,7 +2411,7 @@ mod tests {
             limits(),
             Arc::new(FakePlatform::new([Ok(session)])),
             probe.clone(),
-            Some(activator.clone()),
+            activator.clone(),
         );
         let mut status = resolver.status();
         wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
@@ -2515,7 +2466,7 @@ mod tests {
             limits(),
             platform.clone(),
             Arc::new(FakeProbe::compatible()),
-            Some(activator.clone()),
+            activator.clone(),
         );
         let mut status = resolver.status();
         wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
@@ -2552,7 +2503,7 @@ mod tests {
             limits(),
             Arc::new(FakePlatform::new([Ok(session)])),
             Arc::new(FakeProbe::compatible()),
-            Some(activator.clone()),
+            activator.clone(),
         );
         let mut status = resolver.status();
         wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
@@ -2722,7 +2673,7 @@ mod tests {
             limits(),
             Arc::new(FakePlatform::new([Ok(session)])),
             Arc::new(FakeProbe::compatible()),
-            Some(activator.clone()),
+            activator.clone(),
         );
         let mut status = resolver.status();
         wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
@@ -2763,7 +2714,7 @@ mod tests {
             limits(),
             Arc::new(FakePlatform::new([Ok(session)])),
             Arc::new(FakeProbe::compatible()),
-            Some(activator.clone()),
+            activator.clone(),
         );
         let mut status = resolver.status();
         wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
@@ -2802,7 +2753,7 @@ mod tests {
             limits(),
             Arc::new(FakePlatform::new([Ok(session)])),
             Arc::new(FakeProbe::compatible()),
-            Some(activator.clone()),
+            activator.clone(),
         );
         let mut status = resolver.status();
         wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
@@ -2833,7 +2784,7 @@ mod tests {
             limits(),
             Arc::new(FakePlatform::new([Ok(session)])),
             Arc::new(FakeProbe::compatible()),
-            Some(activator.clone()),
+            activator.clone(),
         );
         let mut status = resolver.status();
         wait_for_disposition(&mut status, ProbeDisposition::Compatible).await;
@@ -2863,7 +2814,6 @@ mod tests {
         let selected = wait_for_status(&mut status, RuntimeAvailability::Available).await;
 
         assert_eq!(selected.disposition(), ProbeDisposition::Compatible);
-        assert_eq!(selected.support(), Some(SupportTag::Unqualified));
         assert_eq!(harness.observation_count(), 1);
         stop(resolver).await;
     }
@@ -2887,7 +2837,6 @@ mod tests {
 
         let selected = wait_for_status(&mut status, RuntimeAvailability::Available).await;
 
-        assert_eq!(selected.support(), Some(SupportTag::Qualified));
         assert_eq!(probe.calls().first().map(String::as_str), Some("hci1"));
         assert_eq!(harness.observation_count(), 1);
         stop(resolver).await;
@@ -2912,7 +2861,6 @@ mod tests {
         )
         .await;
 
-        assert_eq!(rejected.support(), Some(SupportTag::Unqualified));
         assert_eq!(
             rejected.disposition(),
             ProbeDisposition::Blocked(ProbeReason::QualifiedOnly)
@@ -3230,7 +3178,7 @@ mod tests {
             limits(),
             Arc::new(FakePlatform::new([Ok(session)])),
             probe.clone(),
-            Some(Arc::new(FailFirstActivator::default())),
+            Arc::new(FailFirstActivator::default()),
         );
         let mut status = resolver.status();
 
@@ -3257,7 +3205,7 @@ mod tests {
             limits(),
             Arc::new(FakePlatform::new([Ok(session)])),
             Arc::new(FakeProbe::compatible()),
-            Some(activator.clone()),
+            activator.clone(),
         );
         while activator.activation_count() < 1 {
             tokio::task::yield_now().await;

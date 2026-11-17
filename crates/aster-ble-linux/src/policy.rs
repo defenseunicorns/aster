@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
 
 #[derive(Clone, Debug)]
-pub struct LifecycleCancellation {
+pub(crate) struct LifecycleCancellation {
     cancelled: Arc<watch::Sender<bool>>,
 }
 
@@ -16,11 +16,11 @@ impl Default for LifecycleCancellation {
 }
 
 impl LifecycleCancellation {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         self.cancelled.send_if_modified(|cancelled| {
             if *cancelled {
                 false
@@ -31,7 +31,7 @@ impl LifecycleCancellation {
         });
     }
 
-    pub fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         *self.cancelled.borrow()
     }
 
@@ -41,7 +41,7 @@ impl LifecycleCancellation {
         }
     }
 
-    pub async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         let mut cancelled = self.cancelled.subscribe();
         while !*cancelled.borrow_and_update() {
             if cancelled.changed().await.is_err() {

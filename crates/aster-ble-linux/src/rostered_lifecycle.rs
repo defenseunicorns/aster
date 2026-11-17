@@ -5,7 +5,7 @@ use crate::{
     controller_resolver::{
         ControllerEpochActivator, ControllerEpochView, OperationalControllerEpoch,
         OperationalEpochFuture, OperationalEpochOutcome, OperationalEpochState,
-        spawn_linux_controller_resolver_with_activation,
+        spawn_linux_controller_resolver,
     },
     discovery::{SCAN_ACTIVE_INTERVAL, SCAN_IDLE_INTERVAL},
     lifecycle::{ContactAdmission, ContactScheduleEffect, contact_schedule_effect},
@@ -1339,7 +1339,7 @@ pub fn spawn_resolving_linux_rostered_btle_event_supervisor(
         platform_owner: platform_owner.clone(),
         supervisor_availability_fence: supervisor_availability_fence.clone(),
     });
-    let resolver = spawn_linux_controller_resolver_with_activation(
+    let resolver = spawn_linux_controller_resolver(
         config.controller_policy().clone(),
         config.controller_probe_limits(),
         output.clone(),

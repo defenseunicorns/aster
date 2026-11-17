@@ -30,14 +30,7 @@ pub use controller::{
     AvailabilityReason, BTLE_OPERATOR_OUTPUT_CAPACITY, BtleAvailability, BtleOperatorEvent,
     BtleOperatorOutput,
 };
-pub use controller_probe::{
-    BluezControllerProbeBackend, ControllerProbeBackend, ControllerProbeError,
-    ControllerProbeFuture, ControllerProbeLimits, probe_controller,
-};
-pub use controller_resolver::{
-    ControllerResolutionSnapshot, LinuxControllerResolver, RuntimeAvailability,
-    spawn_linux_controller_resolver,
-};
+pub use controller_probe::ControllerProbeLimits;
 pub use controller_selection::{
     ControllerAdmission, ControllerAdmissionPolicy, ControllerCandidate, ControllerFingerprint,
     ControllerInventory, ControllerSnapshot, MAX_ADAPTER_NAME_BYTES, MAX_ADMISSION_ROWS,
@@ -59,7 +52,7 @@ pub use platform::{
     BluezSocketFactory, OpenFuture, OpenedContact, SocketFactory, open_contact,
     open_contact_with_factory,
 };
-pub use policy::LifecycleCancellation;
+pub(crate) use policy::LifecycleCancellation;
 pub use rostered_lifecycle::{
     AutomaticBtleRegistrationError, LinuxRosteredBtleEventSupervisor,
     spawn_automatic_linux_rostered_btle_event_supervisor,
