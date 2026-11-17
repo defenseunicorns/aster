@@ -21,7 +21,6 @@ REQUIRED = {
 }
 FORBIDDEN = {
     "aster-host",
-    "aster-ip",
     "aster-libp2p-provider",
     "libsqlite3-sys",
     "rusqlite",

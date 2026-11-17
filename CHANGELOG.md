@@ -50,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Removed `aster-ip` and the `aster-relay` binary.
 - Hardened publication journals against parent-directory renames and replacement.
 - Removed `MeshService` and updated tests.
 - Restored runtime-volume diagnostics using Aster/Iroh.

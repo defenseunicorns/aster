@@ -27,6 +27,13 @@ credit channels and permits GATT fallback. Simulation verifies protocol
 behavior; physical BlueZ/platform evidence remains a release gate and is not
 replaced by a fake hardware claim.
 
+## IP reference retirement
+
+The standalone `aster-ip` adapter and `aster-relay` binary have been retired.
+The IP rationale above records the original reference design, not a current
+implementation or migration source. The BTLE reference and selected-node
+amendment below remain in scope.
+
 ## Selected-node ordered BTLE amendment
 
 The accepted semantic/reference `BleRadio` and `BleLink` path above remains

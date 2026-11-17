@@ -278,8 +278,10 @@ v4-v9 automation does not alter any retained v1-v3 receipt.
 
 The selected node's normal dependency graph contains neither SQLite nor
 `rusqlite`. The old caller-ID opaque `put` path remains isolated for compatibility
-and is not reconciled by the selected Event protocol. No old semantic path has
-been deleted.
+and is not reconciled by the selected Event protocol. The standalone IP
+reference and its relay binary have been retired; the trace no longer lists
+them as current migration sources. Selected requirement statuses and historical
+evidence remain unchanged.
 
 ## Production-lane requirements trace
 
