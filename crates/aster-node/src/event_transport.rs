@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex, Weak},
@@ -205,17 +205,111 @@ fn select_event_adapter(
         .filter(|adapter| {
             adapter.state == EventAdapterState::Available
                 && adapter.event_capable
-                && eligibility.iter().any(|entry| {
-                    entry.mission == mission
-                        && entry.peer == peer
-                        && entry.kind == adapter.kind
-                        && entry.event_capable
-                        && entry.authority_generation > entry.revocation_generation
-                        && entry.expires_at.is_none_or(|expiry| now < expiry)
-                })
+                && select_event_eligibility(eligibility, mission, peer, adapter.kind, now).is_some()
         })
         .min_by_key(|adapter| (Reverse(adapter.configured_priority), adapter.kind))
         .map(|adapter| adapter.kind)
+}
+
+fn event_eligibility_is_current(entry: &EventPeerEligibility, now: SystemTime) -> bool {
+    entry.event_capable
+        && entry.authority_generation > entry.revocation_generation
+        && entry.expires_at.is_none_or(|expiry| now < expiry)
+}
+
+fn select_event_eligibility(
+    eligibility: &[EventPeerEligibility],
+    mission: NodeId,
+    peer: NodeId,
+    kind: EventTransportKind,
+    now: SystemTime,
+) -> Option<EventPeerEligibility> {
+    eligibility
+        .iter()
+        .copied()
+        .filter(|entry| {
+            entry.mission == mission
+                && entry.peer == peer
+                && entry.kind == kind
+                && event_eligibility_is_current(entry, now)
+        })
+        .max_by_key(|entry| (entry.authority_generation, entry.revocation_generation))
+}
+
+fn event_cohort_authority_generation(
+    eligibility: &[EventPeerEligibility],
+    key: EventCohortKey,
+    now: SystemTime,
+) -> Option<u64> {
+    eligibility
+        .iter()
+        .filter(|entry| {
+            entry.mission == key.mission
+                && entry.peer == key.peer
+                && event_eligibility_is_current(entry, now)
+        })
+        .map(|entry| entry.authority_generation)
+        .max()
+}
+
+fn event_authority_change_generation(
+    eligibility: &[EventPeerEligibility],
+    key: EventCohortKey,
+) -> u64 {
+    eligibility
+        .iter()
+        .filter(|entry| entry.mission == key.mission && entry.peer == key.peer)
+        .map(|entry| entry.authority_generation.max(entry.revocation_generation))
+        .max()
+        .unwrap_or(0)
+}
+
+fn pending_event_cohort_is_current(
+    cohort: &PendingEventCohort,
+    eligibility: &[EventPeerEligibility],
+    now: SystemTime,
+) -> bool {
+    event_cohort_authority_generation(eligibility, cohort.key, now)
+        == Some(cohort.authority_generation)
+}
+
+fn revoke_attempt(attempt: &InFlightEventAttempt, outcome: ContactOutcome) {
+    attempt.revocation.send_if_modified(|current| {
+        if current.is_some() {
+            return false;
+        }
+        *current = Some(outcome);
+        true
+    });
+}
+
+fn prune_invalid_pending_cohorts(
+    state: &mut AutomaticEventTransportState,
+    now: SystemTime,
+    previous_eligibility: Option<&[EventPeerEligibility]>,
+) -> bool {
+    let AutomaticEventTransportState {
+        eligibility,
+        pending,
+        ..
+    } = state;
+    let pending_before = pending.len();
+    pending.retain(|cohort| {
+        let current = pending_event_cohort_is_current(cohort, eligibility, now);
+        if !current {
+            let previous_generation = previous_eligibility
+                .map(|previous| event_authority_change_generation(previous, cohort.key))
+                .unwrap_or(cohort.authority_generation);
+            let generation = event_authority_change_generation(eligibility, cohort.key)
+                .max(previous_generation);
+            complete_attempt(
+                &cohort.completion,
+                Err(ContactOutcome::authority_changed(generation)),
+            );
+        }
+        current
+    });
+    pending.len() < pending_before
 }
 
 type EventAttemptFuture =
@@ -232,6 +326,9 @@ struct EventCohortKey {
 struct PendingEventCohort {
     key: EventCohortKey,
     runner: EventAttemptRunner,
+    retention: EventAttemptRetention,
+    authority_generation: u64,
+    completion: EventAttemptCompletionSource,
     failed_instances: BTreeMap<EventTransportKind, EventAdapterInstance>,
     mailbox_full_instances: BTreeMap<EventTransportKind, EventAdapterInstance>,
     ready_at: Option<tokio::time::Instant>,
@@ -301,6 +398,12 @@ struct EventAttemptIdentity;
 struct InFlightEventAttempt {
     identity: Arc<EventAttemptIdentity>,
     key: EventCohortKey,
+    kind: EventTransportKind,
+    registration_identity: Arc<EventAdapterRegistrationIdentity>,
+    availability_epoch: u64,
+    eligibility: EventPeerEligibility,
+    completion: EventAttemptCompletionSource,
+    revocation: watch::Sender<Option<ContactOutcome>>,
 }
 
 #[derive(Default)]
@@ -309,6 +412,9 @@ struct AutomaticEventTransportState {
     eligibility: Vec<EventPeerEligibility>,
     pending: VecDeque<PendingEventCohort>,
     attempt_in_flight: Option<InFlightEventAttempt>,
+    outbound_suspended: bool,
+    outbound_policy_generation: u64,
+    shutdown: bool,
     transition_count: u64,
 }
 
@@ -321,7 +427,60 @@ struct AutomaticEventTransportShared {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EventAttemptAdmission {
     Accepted,
+    Retained,
     CapacityFull,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventAttemptRetention {
+    DurableGeneration,
+    CallerOwned,
+}
+
+type EventAttemptResult = Result<(), ContactOutcome>;
+type EventAttemptCompletionSource = watch::Sender<Option<EventAttemptResult>>;
+
+pub(crate) struct EventAttemptObservation {
+    receiver: watch::Receiver<Option<Result<(), ContactOutcome>>>,
+}
+
+impl EventAttemptObservation {
+    pub(crate) async fn wait(mut self) -> Result<(), ContactOutcome> {
+        loop {
+            if let Some(result) = *self.receiver.borrow_and_update() {
+                return result;
+            }
+            if self.receiver.changed().await.is_err() {
+                return Err(ContactOutcome::shutdown());
+            }
+        }
+    }
+}
+
+fn event_attempt_completion() -> (EventAttemptCompletionSource, EventAttemptObservation) {
+    let (completion, receiver) = watch::channel(None);
+    (completion, EventAttemptObservation { receiver })
+}
+
+fn observe_completion(completion: &EventAttemptCompletionSource) -> EventAttemptObservation {
+    EventAttemptObservation {
+        receiver: completion.subscribe(),
+    }
+}
+
+fn complete_attempt(completion: &EventAttemptCompletionSource, result: EventAttemptResult) {
+    completion.send_if_modified(|current| {
+        if current.is_some() {
+            return false;
+        }
+        *current = Some(result);
+        true
+    });
+}
+
+fn completed_observation(result: EventAttemptResult) -> EventAttemptObservation {
+    let (_sender, receiver) = watch::channel(Some(result));
+    EventAttemptObservation { receiver }
 }
 
 /// Cloneable host handle for exact-peer Event adapter selection.
@@ -429,31 +588,28 @@ impl AutomaticEventTransportHandle {
         if eligibility.len() > MAX_EVENT_PEER_ELIGIBILITY {
             return false;
         }
-        let current_cohorts = eligibility
-            .iter()
-            .map(|entry| EventCohortKey {
-                mission: entry.mission,
-                peer: entry.peer,
-            })
-            .collect::<BTreeSet<_>>();
         let mut state = self
             .shared
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        state.eligibility = eligibility;
-        let pending_before = state.pending.len();
-        state
-            .pending
-            .retain(|cohort| current_cohorts.contains(&cohort.key));
-        let revoked_in_flight = state
-            .attempt_in_flight
-            .as_ref()
-            .is_some_and(|attempt| !current_cohorts.contains(&attempt.key));
-        if revoked_in_flight {
-            state.attempt_in_flight = None;
+        let old_eligibility = std::mem::replace(&mut state.eligibility, eligibility);
+        let now = (self.shared.clock)();
+        if let Some(attempt) = &state.attempt_in_flight
+            && select_event_eligibility(
+                &state.eligibility,
+                attempt.key.mission,
+                attempt.key.peer,
+                attempt.kind,
+                now,
+            ) != Some(attempt.eligibility)
+        {
+            let generation = event_authority_change_generation(&state.eligibility, attempt.key)
+                .max(event_authority_change_generation(&old_eligibility, attempt.key));
+            revoke_attempt(attempt, ContactOutcome::authority_changed(generation));
         }
-        let released_capacity = state.pending.len() < pending_before || revoked_in_flight;
+        let released_capacity =
+            prune_invalid_pending_cohorts(&mut state, now, Some(&old_eligibility));
         transition(&self.shared, &mut state);
         drop(state);
         if released_capacity {
@@ -484,30 +640,180 @@ impl AutomaticEventTransportHandle {
         F: Fn(Arc<dyn OrderedContact>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), ContactOutcome>> + Send + 'static,
     {
+        self.request_attempt_admission_inner(
+            mission,
+            peer,
+            EventAttemptRetention::DurableGeneration,
+            false,
+            runner,
+        )
+        .0
+    }
+
+    pub(crate) fn request_observed_attempt<F, Fut>(
+        &self,
+        mission: NodeId,
+        peer: NodeId,
+        runner: F,
+    ) -> (EventAttemptAdmission, EventAttemptObservation)
+    where
+        F: Fn(Arc<dyn OrderedContact>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), ContactOutcome>> + Send + 'static,
+    {
+        let (admission, observation) = self.request_attempt_admission_inner(
+            mission,
+            peer,
+            EventAttemptRetention::CallerOwned,
+            true,
+            runner,
+        );
+        (
+            admission,
+            observation.expect("observed attempts always return their completion observation"),
+        )
+    }
+
+    fn request_attempt_admission_inner<F, Fut>(
+        &self,
+        mission: NodeId,
+        peer: NodeId,
+        retention: EventAttemptRetention,
+        observed: bool,
+        runner: F,
+    ) -> (EventAttemptAdmission, Option<EventAttemptObservation>)
+    where
+        F: Fn(Arc<dyn OrderedContact>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), ContactOutcome>> + Send + 'static,
+    {
         let mut state = self
             .shared
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let key = EventCohortKey { mission, peer };
+        if state.shutdown {
+            let observation =
+                observed.then(|| completed_observation(Err(ContactOutcome::shutdown())));
+            return (EventAttemptAdmission::Retained, observation);
+        }
+        let now = (self.shared.clock)();
+        if prune_invalid_pending_cohorts(&mut state, now, None) {
+            notify_capacity_progress(&self.shared);
+        }
+        let Some(authority_generation) =
+            event_cohort_authority_generation(&state.eligibility, key, now)
+        else {
+            let generation = event_authority_change_generation(&state.eligibility, key);
+            let observation = observed.then(|| {
+                completed_observation(Err(ContactOutcome::authority_changed(generation)))
+            });
+            return (EventAttemptAdmission::Retained, observation);
+        };
+        if observed {
+            if let Some(in_flight) = state
+                .attempt_in_flight
+                .as_ref()
+                .filter(|attempt| attempt.key == key)
+            {
+                return (
+                    EventAttemptAdmission::Retained,
+                    Some(observe_completion(&in_flight.completion)),
+                );
+            }
+            if let Some(pending) = state.pending.iter().find(|cohort| cohort.key == key) {
+                return (
+                    EventAttemptAdmission::Retained,
+                    Some(observe_completion(&pending.completion)),
+                );
+            }
+        }
         if state.pending.len() + usize::from(state.attempt_in_flight.is_some())
             >= MAX_PENDING_EVENT_COHORTS
         {
-            return EventAttemptAdmission::CapacityFull;
+            let completion = observed
+                .then(|| completed_observation(Err(ContactOutcome::admission_busy())));
+            return (EventAttemptAdmission::CapacityFull, completion);
         }
         let runner: EventAttemptRunner = Arc::new(move |contact| Box::pin(runner(contact)));
+        let (completion, observation) = event_attempt_completion();
         state.pending.push_back(PendingEventCohort {
-            key: EventCohortKey { mission, peer },
+            key,
             runner,
+            retention,
+            authority_generation,
+            completion,
             failed_instances: BTreeMap::new(),
             mailbox_full_instances: BTreeMap::new(),
             ready_at: None,
         });
         transition(&self.shared, &mut state);
-        EventAttemptAdmission::Accepted
+        (
+            EventAttemptAdmission::Accepted,
+            observed.then_some(observation),
+        )
     }
 
     pub(crate) fn subscribe_capacity_progress(&self) -> watch::Receiver<u64> {
         self.shared.capacity_progress.subscribe()
+    }
+
+    pub(crate) fn set_outbound_suspended(&self, suspended: bool) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.outbound_suspended == suspended {
+            return;
+        }
+        state.outbound_suspended = suspended;
+        state.outbound_policy_generation = state.outbound_policy_generation.saturating_add(1);
+        let outcome = ContactOutcome::policy_suspended(state.outbound_policy_generation);
+        let pending_before = state.pending.len();
+        if suspended {
+            if let Some(attempt) = &state.attempt_in_flight {
+                revoke_attempt(attempt, outcome);
+            }
+            state.pending.retain_mut(|cohort| {
+                complete_attempt(&cohort.completion, Err(outcome));
+                if cohort.retention == EventAttemptRetention::DurableGeneration {
+                    cohort.completion = event_attempt_completion().0;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+        let released_capacity = state.pending.len() < pending_before;
+        transition(&self.shared, &mut state);
+        drop(state);
+        if released_capacity {
+            notify_capacity_progress(&self.shared);
+        }
+    }
+
+    pub(crate) fn shutdown(&self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.shutdown {
+            return;
+        }
+        state.shutdown = true;
+        let outcome = ContactOutcome::shutdown();
+        if let Some(attempt) = &state.attempt_in_flight {
+            revoke_attempt(attempt, outcome);
+        }
+        let released_capacity = !state.pending.is_empty();
+        for cohort in state.pending.drain(..) {
+            complete_attempt(&cohort.completion, Err(outcome));
+        }
+        drop(state);
+        if released_capacity {
+            notify_capacity_progress(&self.shared);
+        }
     }
 
     #[allow(dead_code)] // Task 3 uses this deterministic no-spin observation in runtime tests.
@@ -583,6 +889,18 @@ impl EventAdapterControl {
             snapshot.event_capable,
             adapter.snapshot.configured_priority,
         );
+        if let Some(attempt) = &state.attempt_in_flight
+            && attempt.kind == self.kind
+            && Arc::ptr_eq(
+                &attempt.registration_identity,
+                &self.registration_identity,
+            )
+        {
+            revoke_attempt(
+                attempt,
+                ContactOutcome::adapter_epoch_ended(attempt.availability_epoch),
+            );
+        }
         transition(&shared, &mut state);
         true
     }
@@ -600,6 +918,18 @@ impl Drop for EventAdapterControl {
         if state.adapters.get(&self.kind).is_some_and(|adapter| {
             Arc::ptr_eq(&adapter.registration_identity, &self.registration_identity)
         }) {
+            if let Some(attempt) = &state.attempt_in_flight
+                && attempt.kind == self.kind
+                && Arc::ptr_eq(
+                    &attempt.registration_identity,
+                    &self.registration_identity,
+                )
+            {
+                revoke_attempt(
+                    attempt,
+                    ContactOutcome::adapter_epoch_ended(attempt.availability_epoch),
+                );
+            }
             state.adapters.remove(&self.kind);
             transition(&shared, &mut state);
         }
@@ -648,7 +978,12 @@ pub struct EventOutboundAttempt {
     kind: EventTransportKind,
     registration_identity: Arc<EventAdapterRegistrationIdentity>,
     availability_epoch: u64,
+    eligibility: EventPeerEligibility,
     runner: EventAttemptRunner,
+    retention: EventAttemptRetention,
+    authority_generation: u64,
+    completion: EventAttemptCompletionSource,
+    revocation: watch::Receiver<Option<ContactOutcome>>,
     failed_instances: BTreeMap<EventTransportKind, EventAdapterInstance>,
     completed: bool,
 }
@@ -678,8 +1013,96 @@ impl EventOutboundAttempt {
         self.key.peer
     }
 
+    /// Returns whether current authority still permits this carrier open.
+    #[doc(hidden)]
+    pub fn carrier_open_is_authorized(&self) -> bool {
+        self.current_revocation_outcome().is_none()
+    }
+
+    fn current_revocation_outcome(&self) -> Option<ContactOutcome> {
+        if let Some(outcome) = *self.revocation.borrow() {
+            return Some(outcome);
+        }
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !self.owns_in_flight_slot(&state) || state.shutdown {
+            return Some(ContactOutcome::shutdown());
+        }
+        if state.outbound_suspended {
+            return Some(ContactOutcome::policy_suspended(
+                state.outbound_policy_generation,
+            ));
+        }
+        if !state.adapters.get(&self.kind).is_some_and(|adapter| {
+            Arc::ptr_eq(&adapter.registration_identity, &self.registration_identity)
+                && adapter.snapshot.availability_epoch == self.availability_epoch
+                && adapter.snapshot.state == EventAdapterState::Available
+                && adapter.snapshot.event_capable
+        })
+        {
+            return Some(ContactOutcome::adapter_epoch_ended(
+                self.availability_epoch,
+            ));
+        }
+        (select_event_eligibility(
+            &state.eligibility,
+            self.key.mission,
+            self.key.peer,
+            self.kind,
+            (self.shared.clock)(),
+        ) != Some(self.eligibility))
+        .then(|| ContactOutcome::authority_changed(self.eligibility.authority_generation))
+    }
+
+    /// Waits for the typed lifecycle outcome that revokes this issued attempt.
+    #[doc(hidden)]
+    pub async fn revocation_outcome(&mut self) -> ContactOutcome {
+        loop {
+            if let Some(outcome) = self.current_revocation_outcome() {
+                return outcome;
+            }
+            let Some(expiry) = self.eligibility.expires_at else {
+                if self.revocation.changed().await.is_err() {
+                    return ContactOutcome::shutdown();
+                }
+                continue;
+            };
+            let Ok(until_expiry) = expiry.duration_since((self.shared.clock)()) else {
+                return ContactOutcome::authority_changed(
+                    self.eligibility.authority_generation,
+                );
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(until_expiry) => {
+                    return ContactOutcome::authority_changed(
+                        self.eligibility.authority_generation,
+                    );
+                }
+                changed = self.revocation.changed() => {
+                    if changed.is_err() {
+                        return ContactOutcome::shutdown();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Completes an issued ticket with the exact lifecycle revocation observed.
+    #[doc(hidden)]
+    pub fn finish_revoked(mut self, outcome: ContactOutcome) {
+        self.complete(&Err(outcome));
+    }
+
     /// Runs this fresh contact through the node-owned ordered Event admission.
     pub async fn run(mut self, contact: Arc<dyn OrderedContact>) -> Result<(), ContactOutcome> {
+        if let Some(outcome) = self.current_revocation_outcome() {
+            contact.close();
+            self.complete(&Err(outcome));
+            return Err(outcome);
+        }
         let result = (Arc::clone(&self.runner))(contact).await;
         self.complete(&result);
         result
@@ -687,15 +1110,17 @@ impl EventOutboundAttempt {
 
     /// Completes carrier opening with locally proven adapter unavailability.
     pub fn fail_carrier_open(mut self) -> ContactOutcome {
-        let outcome = ContactOutcome::carrier_open_unavailable();
+        let outcome = self
+            .current_revocation_outcome()
+            .unwrap_or_else(ContactOutcome::carrier_open_unavailable);
         self.complete(&Err(outcome));
         outcome
     }
 
     /// Completes an ambiguous or unauthenticated carrier-open failure.
     ///
-    /// This retains durable work for a later operation but never authorizes an
-    /// immediate alternate-carrier selection.
+    /// This never authorizes immediate alternate-carrier selection. Durable
+    /// work remains retained only under the generic custody rules.
     pub fn fail_unauthenticated_carrier_open(
         mut self,
         failure: UnauthenticatedCarrierOpenFailure,
@@ -706,14 +1131,18 @@ impl EventOutboundAttempt {
             }
             UnauthenticatedCarrierOpenFailure::TimedOut => ContactReason::TransportTimeout,
         };
-        let outcome = ContactOutcome::unauthenticated_carrier_open(reason);
+        let outcome = self
+            .current_revocation_outcome()
+            .unwrap_or_else(|| ContactOutcome::unauthenticated_carrier_open(reason));
         self.complete(&Err(outcome));
         outcome
     }
 
     /// Completes caller cancellation while the carrier is still opening.
     pub fn cancel_carrier_open(mut self) -> ContactOutcome {
-        let outcome = ContactOutcome::caller_cancelled(ContactStage::CarrierOpen);
+        let outcome = self
+            .current_revocation_outcome()
+            .unwrap_or_else(|| ContactOutcome::caller_cancelled(ContactStage::CarrierOpen));
         self.complete(&Err(outcome));
         outcome
     }
@@ -724,9 +1153,46 @@ impl EventOutboundAttempt {
         })
     }
 
+    fn retain_durable_generation(
+        &mut self,
+        state: &mut AutomaticEventTransportState,
+        ready_at: Option<tokio::time::Instant>,
+        exclude_selected_instance: bool,
+    ) -> bool {
+        if self.retention != EventAttemptRetention::DurableGeneration
+            || event_cohort_authority_generation(
+                &state.eligibility,
+                self.key,
+                (self.shared.clock)(),
+            ) != Some(self.authority_generation)
+        {
+            return false;
+        }
+        if exclude_selected_instance {
+            self.failed_instances.insert(
+                self.kind,
+                EventAdapterInstance::new(
+                    &self.registration_identity,
+                    self.availability_epoch,
+                ),
+            );
+        }
+        state.pending.push_back(PendingEventCohort {
+            key: self.key,
+            runner: Arc::clone(&self.runner),
+            retention: self.retention,
+            authority_generation: self.authority_generation,
+            completion: event_attempt_completion().0,
+            failed_instances: std::mem::take(&mut self.failed_instances),
+            mailbox_full_instances: BTreeMap::new(),
+            ready_at,
+        });
+        true
+    }
+
     fn complete(&mut self, result: &Result<(), ContactOutcome>) {
-        let mut state = self
-            .shared
+        let shared = Arc::clone(&self.shared);
+        let mut state = shared
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -735,63 +1201,31 @@ impl EventOutboundAttempt {
             return;
         }
         state.attempt_in_flight = None;
+        complete_attempt(&self.completion, *result);
         let mut retry_deadline = None;
-        let released_capacity =
-            match result {
-                Ok(()) => {
-                    transition(&self.shared, &mut state);
-                    true
+        let retained = match result {
+            Err(outcome) if outcome.permits_reselection() => {
+                self.retain_durable_generation(&mut state, None, true)
+            }
+            Err(outcome) if outcome.disposition() == ContactDisposition::RetryLater => {
+                let ready_at = tokio::time::Instant::now() + RETRY_LATER_READINESS_DELAY;
+                let retained =
+                    self.retain_durable_generation(&mut state, Some(ready_at), false);
+                if retained {
+                    retry_deadline = Some(ready_at);
                 }
-                Err(outcome) if outcome.permits_reselection() => {
-                    let still_current = state.eligibility.iter().any(|entry| {
-                        entry.mission == self.key.mission && entry.peer == self.key.peer
-                    });
-                    if still_current {
-                        self.failed_instances.insert(
-                            self.kind,
-                            EventAdapterInstance::new(
-                                &self.registration_identity,
-                                self.availability_epoch,
-                            ),
-                        );
-                        state.pending.push_front(PendingEventCohort {
-                            key: self.key,
-                            runner: Arc::clone(&self.runner),
-                            failed_instances: std::mem::take(&mut self.failed_instances),
-                            mailbox_full_instances: BTreeMap::new(),
-                            ready_at: None,
-                        });
-                    }
-                    transition(&self.shared, &mut state);
-                    !still_current
-                }
-                Err(outcome) if outcome.disposition() == ContactDisposition::RetryLater => {
-                    let still_current = state.eligibility.iter().any(|entry| {
-                        entry.mission == self.key.mission && entry.peer == self.key.peer
-                    });
-                    if still_current {
-                        let ready_at = tokio::time::Instant::now() + RETRY_LATER_READINESS_DELAY;
-                        state.pending.push_back(PendingEventCohort {
-                            key: self.key,
-                            runner: Arc::clone(&self.runner),
-                            failed_instances: std::mem::take(&mut self.failed_instances),
-                            mailbox_full_instances: BTreeMap::new(),
-                            ready_at: Some(ready_at),
-                        });
-                        retry_deadline = Some(ready_at);
-                    }
-                    transition(&self.shared, &mut state);
-                    !still_current
-                }
-                Err(_) => {
-                    transition(&self.shared, &mut state);
-                    true
-                }
-            };
+                retained
+            }
+            Err(outcome) if outcome.reason() == ContactReason::PolicySuspended => {
+                self.retain_durable_generation(&mut state, None, false)
+            }
+            Ok(()) | Err(_) => false,
+        };
+        transition(&shared, &mut state);
         drop(state);
         if let Some(deadline) = retry_deadline {
             schedule_retry_later_readiness(&self.shared, deadline);
-        } else if released_capacity {
+        } else if !retained {
             notify_capacity_progress(&self.shared);
         }
     }
@@ -802,19 +1236,10 @@ impl Drop for EventOutboundAttempt {
         if self.completed {
             return;
         }
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        self.completed = true;
-        if !self.owns_in_flight_slot(&state) {
-            return;
-        }
-        state.attempt_in_flight = None;
-        transition(&self.shared, &mut state);
-        drop(state);
-        notify_capacity_progress(&self.shared);
+        let outcome = self
+            .current_revocation_outcome()
+            .unwrap_or_else(|| ContactOutcome::caller_cancelled(ContactStage::Candidate));
+        self.complete(&Err(outcome));
     }
 }
 
@@ -854,10 +1279,13 @@ fn transition(
     state: &mut AutomaticEventTransportState,
 ) {
     state.transition_count = state.transition_count.saturating_add(1);
-    if state.attempt_in_flight.is_some() {
+    let now = (shared.clock)();
+    if prune_invalid_pending_cohorts(state, now, None) {
+        notify_capacity_progress(shared);
+    }
+    if state.attempt_in_flight.is_some() || state.outbound_suspended || state.shutdown {
         return;
     }
-    let now = (shared.clock)();
     let readiness_now = tokio::time::Instant::now();
     let pending_count = state.pending.len();
     for _ in 0..pending_count {
@@ -905,7 +1333,17 @@ fn transition(
             else {
                 continue;
             };
+            let Some(eligibility) = select_event_eligibility(
+                &state.eligibility,
+                pending.key.mission,
+                pending.key.peer,
+                kind,
+                now,
+            ) else {
+                continue;
+            };
             let identity = Arc::new(EventAttemptIdentity);
+            let (revocation, revocation_receiver) = watch::channel(None);
             let attempt = EventOutboundAttempt {
                 shared: Arc::clone(shared),
                 identity: Arc::clone(&identity),
@@ -913,7 +1351,12 @@ fn transition(
                 kind,
                 registration_identity: Arc::clone(&registration_identity),
                 availability_epoch,
+                eligibility,
                 runner: Arc::clone(&pending.runner),
+                retention: pending.retention,
+                authority_generation: pending.authority_generation,
+                completion: pending.completion.clone(),
+                revocation: revocation_receiver,
                 failed_instances: pending.failed_instances.clone(),
                 completed: false,
             };
@@ -922,6 +1365,12 @@ fn transition(
                     state.attempt_in_flight = Some(InFlightEventAttempt {
                         identity,
                         key: pending.key,
+                        kind,
+                        registration_identity,
+                        availability_epoch,
+                        eligibility,
+                        completion: pending.completion,
+                        revocation,
                     });
                     return;
                 }
@@ -1006,6 +1455,329 @@ mod tests {
         }
 
         fn close(&self) {}
+    }
+
+    fn provisioned_eligibility(
+        kind: EventTransportKind,
+        authority_generation: u64,
+        revocation_generation: u64,
+        expires_at: Option<SystemTime>,
+    ) -> EventPeerEligibility {
+        EventPeerEligibility::provisioned_exact_peer(
+            MISSION,
+            PEER,
+            kind,
+            true,
+            authority_generation,
+            revocation_generation,
+            expires_at,
+        )
+    }
+
+    fn register_available(
+        handle: &AutomaticEventTransportHandle,
+        kind: EventTransportKind,
+        priority: u16,
+    ) -> (EventAdapterControl, EventAttemptReceiver) {
+        handle
+            .register(EventAdapterSnapshot::new(
+                kind,
+                1,
+                EventAdapterState::Available,
+                true,
+                priority,
+            ))
+            .expect("available test adapter")
+    }
+
+    fn eligible_ble_handle() -> (
+        AutomaticEventTransportHandle,
+        EventAdapterControl,
+        EventAttemptReceiver,
+    ) {
+        let handle = AutomaticEventTransportHandle::new();
+        assert!(handle.replace_eligibility(vec![provisioned_eligibility(
+            EventTransportKind::BLE_L2CAP_V1,
+            1,
+            0,
+            None,
+        )]));
+        let (control, attempts) =
+            register_available(&handle, EventTransportKind::BLE_L2CAP_V1, 10);
+        (handle, control, attempts)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_observer_receives_the_issued_attempt_completion() {
+        let (handle, _control, mut attempts) = eligible_ble_handle();
+        assert_eq!(
+            handle.request_attempt_admission(MISSION, PEER, |_contact| async { Ok(()) }),
+            EventAttemptAdmission::Accepted
+        );
+        let ticket = attempts.recv().await.expect("durable attempt is issued");
+        let unused_runner = Arc::new(AtomicU64::new(0));
+        let observed_runner = Arc::clone(&unused_runner);
+
+        let (admission, observation) =
+            handle.request_observed_attempt(MISSION, PEER, move |_contact| {
+                let observed_runner = Arc::clone(&observed_runner);
+                async move {
+                    observed_runner.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                }
+            });
+        assert_eq!(admission, EventAttemptAdmission::Retained);
+        assert_eq!(ticket.run(Arc::new(TestOrderedContact)).await, Ok(()));
+        assert_eq!(observation.wait().await, Ok(()));
+        assert_eq!(unused_runner.load(Ordering::Acquire), 0);
+
+        let state = handle.shared.state.lock().unwrap();
+        assert!(state.pending.is_empty());
+        assert!(state.attempt_in_flight.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn caller_owned_attempt_is_one_shot_but_durable_generation_remains_pending() {
+        let (handle, _control, mut attempts) = eligible_ble_handle();
+        let caller_runs = Arc::new(AtomicU64::new(0));
+        let observed_caller_runs = Arc::clone(&caller_runs);
+        let retry_later = ContactOutcome::pre_auth_remote(ContactReason::AuthenticationFailed);
+        let (admission, observation) =
+            handle.request_observed_attempt(MISSION, PEER, move |_contact| {
+                let observed_caller_runs = Arc::clone(&observed_caller_runs);
+                async move {
+                    observed_caller_runs.fetch_add(1, Ordering::AcqRel);
+                    Err(retry_later)
+                }
+            });
+        assert_eq!(admission, EventAttemptAdmission::Accepted);
+
+        let durable_runs = Arc::new(AtomicU64::new(0));
+        let observed_durable_runs = Arc::clone(&durable_runs);
+        assert_eq!(
+            handle.request_attempt_admission(MISSION, PEER, move |_contact| {
+                let observed_durable_runs = Arc::clone(&observed_durable_runs);
+                async move {
+                    observed_durable_runs.fetch_add(1, Ordering::AcqRel);
+                    Err(retry_later)
+                }
+            }),
+            EventAttemptAdmission::Accepted
+        );
+
+        assert_eq!(
+            attempts
+                .recv()
+                .await
+                .expect("caller-owned attempt")
+                .run(Arc::new(TestOrderedContact))
+                .await,
+            Err(retry_later)
+        );
+        assert_eq!(observation.wait().await, Err(retry_later));
+        assert_eq!(caller_runs.load(Ordering::Acquire), 1);
+
+        let durable = attempts
+            .recv()
+            .await
+            .expect("durable generation retains independent custody");
+        assert_eq!(
+            durable.run(Arc::new(TestOrderedContact)).await,
+            Err(retry_later)
+        );
+        assert_eq!(durable_runs.load(Ordering::Acquire), 1);
+        let state = handle.shared.state.lock().unwrap();
+        assert_eq!(state.pending.len(), 1);
+        assert!(state.attempt_in_flight.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adapter_epoch_revocation_releases_slot_and_retains_durable_generation() {
+        let (handle, control, mut attempts) = eligible_ble_handle();
+        let runs = Arc::new(AtomicU64::new(0));
+        let observed_runs = Arc::clone(&runs);
+        assert_eq!(
+            handle.request_attempt_admission(MISSION, PEER, move |_contact| {
+                let observed_runs = Arc::clone(&observed_runs);
+                async move {
+                    observed_runs.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                }
+            }),
+            EventAttemptAdmission::Accepted
+        );
+        let mut ticket = attempts.recv().await.expect("issued durable attempt");
+        let (admission, observation) =
+            handle.request_observed_attempt(MISSION, PEER, |_contact| async { Ok(()) });
+        assert_eq!(admission, EventAttemptAdmission::Retained);
+
+        assert!(control.publish_availability(EventAdapterSnapshot::new(
+            EventTransportKind::BLE_L2CAP_V1,
+            2,
+            EventAdapterState::Unavailable,
+            true,
+            10,
+        )));
+        let outcome = ticket.revocation_outcome().await;
+        assert_eq!(outcome, ContactOutcome::adapter_epoch_ended(1));
+        ticket.finish_revoked(outcome);
+        assert_eq!(observation.wait().await, Err(outcome));
+        assert_eq!(runs.load(Ordering::Acquire), 0);
+        {
+            let state = handle.shared.state.lock().unwrap();
+            assert_eq!(state.pending.len(), 1);
+            assert!(state.attempt_in_flight.is_none());
+        }
+
+        assert!(control.publish_availability(EventAdapterSnapshot::new(
+            EventTransportKind::BLE_L2CAP_V1,
+            3,
+            EventAdapterState::Available,
+            true,
+            10,
+        )));
+        let replacement = attempts
+            .recv()
+            .await
+            .expect("released slot admits the retained durable generation");
+        assert_eq!(replacement.transport_kind(), EventTransportKind::BLE_L2CAP_V1);
+        assert_eq!(replacement.peer(), PEER);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_authority_revocation_releases_capacity_without_running() {
+        let handle = AutomaticEventTransportHandle::new();
+        assert!(handle.replace_eligibility(vec![provisioned_eligibility(
+            EventTransportKind::BLE_L2CAP_V1,
+            1,
+            0,
+            None,
+        )]));
+        let runs = Arc::new(AtomicU64::new(0));
+        let observed_runs = Arc::clone(&runs);
+        let (admission, observation) =
+            handle.request_observed_attempt(MISSION, PEER, move |_contact| {
+                let observed_runs = Arc::clone(&observed_runs);
+                async move {
+                    observed_runs.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                }
+            });
+        assert_eq!(admission, EventAttemptAdmission::Accepted);
+        for _ in 1..MAX_PENDING_EVENT_COHORTS {
+            assert_eq!(
+                handle.request_attempt_admission(MISSION, PEER, |_contact| async { Ok(()) }),
+                EventAttemptAdmission::Accepted
+            );
+        }
+        assert_eq!(
+            handle.request_attempt_admission(MISSION, PEER, |_contact| async { Ok(()) }),
+            EventAttemptAdmission::CapacityFull
+        );
+        let mut progress = handle.subscribe_capacity_progress();
+
+        assert!(handle.replace_eligibility(Vec::new()));
+        progress
+            .changed()
+            .await
+            .expect("authority pruning reports bounded-capacity progress");
+        assert_eq!(
+            observation.wait().await,
+            Err(ContactOutcome::authority_changed(1))
+        );
+        assert_eq!(runs.load(Ordering::Acquire), 0);
+        {
+            let state = handle.shared.state.lock().unwrap();
+            assert!(state.pending.is_empty());
+            assert!(state.attempt_in_flight.is_none());
+        }
+
+        let replacement_peer = [0x33; 32];
+        assert!(handle.replace_eligibility(vec![
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                replacement_peer,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                2,
+                0,
+                None,
+            ),
+        ]));
+        assert_eq!(
+            handle.request_attempt_admission(MISSION, replacement_peer, |_contact| async {
+                Ok(())
+            }),
+            EventAttemptAdmission::Accepted
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_and_revoked_peers_cannot_fill_pending_capacity() {
+        let now = UNIX_EPOCH + Duration::from_secs(100);
+        let handle = AutomaticEventTransportHandle::with_clock(move || now);
+        let expired_peer = [0x33; 32];
+        let revoked_peer = [0x44; 32];
+        assert!(handle.replace_eligibility(vec![
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                expired_peer,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                2,
+                0,
+                Some(now),
+            ),
+            EventPeerEligibility::provisioned_exact_peer(
+                MISSION,
+                revoked_peer,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                3,
+                3,
+                None,
+            ),
+        ]));
+        let runs = Arc::new(AtomicU64::new(0));
+
+        for (peer, generation) in [(expired_peer, 2), (revoked_peer, 3)]
+            .into_iter()
+            .cycle()
+            .take(MAX_PENDING_EVENT_COHORTS * 2)
+        {
+            let observed_runs = Arc::clone(&runs);
+            let (admission, observation) =
+                handle.request_observed_attempt(MISSION, peer, move |_contact| {
+                    let observed_runs = Arc::clone(&observed_runs);
+                    async move {
+                        observed_runs.fetch_add(1, Ordering::AcqRel);
+                        Ok(())
+                    }
+                });
+            assert_eq!(admission, EventAttemptAdmission::Retained);
+            assert_eq!(
+                observation.wait().await,
+                Err(ContactOutcome::authority_changed(generation))
+            );
+        }
+        assert_eq!(runs.load(Ordering::Acquire), 0);
+        {
+            let state = handle.shared.state.lock().unwrap();
+            assert!(state.pending.is_empty());
+            assert!(state.attempt_in_flight.is_none());
+        }
+
+        assert!(handle.replace_eligibility(vec![provisioned_eligibility(
+            EventTransportKind::BLE_L2CAP_V1,
+            4,
+            0,
+            None,
+        )]));
+        assert_eq!(
+            handle.request_attempt_admission(MISSION, PEER, |_contact| async { Ok(()) }),
+            EventAttemptAdmission::Accepted
+        );
+        assert_eq!(handle.shared.state.lock().unwrap().pending.len(), 1);
     }
 
     #[test]
@@ -1913,6 +2685,90 @@ mod tests {
         assert!(iroh_attempts.receiver.try_recv().is_err());
     }
 
+    #[tokio::test]
+    async fn same_peer_authority_replacement_revokes_issued_ticket() {
+        let handle = AutomaticEventTransportHandle::new();
+        let eligibility = |authority_generation, revocation_generation| {
+            provisioned_eligibility(
+                EventTransportKind::BLE_L2CAP_V1,
+                authority_generation,
+                revocation_generation,
+                None,
+            )
+        };
+        handle.replace_eligibility(vec![eligibility(1, 0)]);
+        let (_control, mut attempts) =
+            register_available(&handle, EventTransportKind::BLE_L2CAP_V1, 10);
+        let runs = Arc::new(AtomicU64::new(0));
+        let observed = Arc::clone(&runs);
+        let (admission, observation) =
+            handle.request_observed_attempt(MISSION, PEER, move |_contact| {
+                let observed = Arc::clone(&observed);
+                async move {
+                    observed.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                }
+            });
+        assert_eq!(admission, EventAttemptAdmission::Accepted);
+        let mut ticket = attempts.recv().await.unwrap();
+
+        handle.replace_eligibility(vec![eligibility(1, 1)]);
+
+        let outcome = ticket.revocation_outcome().await;
+        assert_eq!(outcome, ContactOutcome::authority_changed(1));
+        ticket.finish_revoked(outcome);
+        assert_eq!(observation.wait().await, Err(outcome));
+        assert_eq!(runs.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn outbound_policy_suspension_revokes_and_reversibly_gates_selection() {
+        let (handle, _control, mut attempts) = eligible_ble_handle();
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
+        let mut ticket = attempts.recv().await.unwrap();
+
+        handle.set_outbound_suspended(true);
+        let outcome = ticket.revocation_outcome().await;
+        assert_eq!(outcome, ContactOutcome::policy_suspended(1));
+        ticket.finish_revoked(outcome);
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
+        assert!(attempts.receiver.try_recv().is_err());
+
+        handle.set_outbound_suspended(false);
+        attempts
+            .recv()
+            .await
+            .expect("resuming outbound selection releases retained work");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eligibility_expiry_after_issue_revokes_ticket_before_run() {
+        let now = Arc::new(Mutex::new(UNIX_EPOCH + Duration::from_secs(100)));
+        let clock = Arc::clone(&now);
+        let handle = AutomaticEventTransportHandle::with_clock(move || {
+            *clock.lock().unwrap_or_else(|error| error.into_inner())
+        });
+        handle.replace_eligibility(vec![provisioned_eligibility(
+            EventTransportKind::BLE_L2CAP_V1,
+            1,
+            0,
+            Some(UNIX_EPOCH + Duration::from_secs(101)),
+        )]);
+        let (_control, mut attempts) =
+            register_available(&handle, EventTransportKind::BLE_L2CAP_V1, 10);
+        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
+        let mut ticket = attempts.recv().await.unwrap();
+
+        *now.lock().unwrap_or_else(|error| error.into_inner()) =
+            UNIX_EPOCH + Duration::from_secs(101);
+        let outcome = ticket.revocation_outcome().await;
+        assert_eq!(outcome, ContactOutcome::authority_changed(1));
+        ticket.finish_revoked(outcome);
+        let state = handle.shared.state.lock().unwrap();
+        assert!(state.pending.is_empty());
+        assert!(state.attempt_in_flight.is_none());
+    }
+
     #[test]
     fn paired_registration_retains_the_exact_initial_snapshot() {
         let handle = AutomaticEventTransportHandle::new();
@@ -2422,7 +3278,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removed_in_flight_attempt_releases_slot_before_obsolete_ticket_drop() {
+    async fn removed_in_flight_attempt_retains_slot_until_obsolete_ticket_drops() {
         let replacement_peer = [0x33; 32];
         let eligibility = |peer| {
             EventPeerEligibility::provisioned_exact_peer(
@@ -2453,13 +3309,17 @@ mod tests {
         assert_eq!(obsolete.peer(), PEER);
 
         assert!(handle.replace_eligibility(vec![eligibility(replacement_peer)]));
+        assert!(
+            attempts.receiver.try_recv().is_err(),
+            "revocation must not admit a concurrent carrier open while the obsolete ticket lives"
+        );
+        drop(obsolete);
         let current = attempts
-            .receiver
-            .try_recv()
-            .expect("removal releases the sole slot before the obsolete ticket resolves");
+            .recv()
+            .await
+            .expect("replacement runs after obsolete ticket custody is released");
         assert_eq!(current.peer(), replacement_peer);
 
-        drop(obsolete);
         assert!(
             attempts.receiver.try_recv().is_err(),
             "late obsolete drop must not release the newer in-flight owner"
@@ -2476,7 +3336,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dequeue_of_buffered_obsolete_attempt_wakes_replacement_without_other_event() {
+    async fn finishing_buffered_revocation_wakes_replacement_without_other_event() {
         let replacement_peer = [0x33; 32];
         let eligibility = |peer| {
             EventPeerEligibility::provisioned_exact_peer(
@@ -2504,20 +3364,23 @@ mod tests {
         assert!(handle.request_attempt(MISSION, replacement_peer, |_contact| async { Ok(()) }));
 
         assert!(handle.replace_eligibility(vec![eligibility(replacement_peer)]));
-        let obsolete = attempts
+        let mut obsolete = attempts
             .recv()
             .await
             .expect("buffered obsolete ticket remains adapter-visible");
         assert_eq!(obsolete.peer(), PEER);
+        let outcome = obsolete.revocation_outcome().await;
+        assert_eq!(outcome, ContactOutcome::authority_changed(1));
+        obsolete.finish_revoked(outcome);
         let replacement = attempts
-            .receiver
-            .try_recv()
-            .expect("dequeue alone must wake the replacement cohort");
+            .recv()
+            .await
+            .expect("typed revocation completion wakes the replacement cohort");
         assert_eq!(replacement.peer(), replacement_peer);
     }
 
     #[tokio::test]
-    async fn full_obsolete_mailbox_falls_through_to_available_alternate_adapter() {
+    async fn obsolete_mailbox_preserves_the_global_slot_until_revocation_finishes() {
         let replacement_peer = [0x33; 32];
         let eligibility = |peer, kind| {
             EventPeerEligibility::provisioned_exact_peer(MISSION, peer, kind, true, 1, 0, None)
@@ -2553,20 +3416,22 @@ mod tests {
             eligibility(replacement_peer, EventTransportKind::IROH_QUIC_V1),
             eligibility(replacement_peer, EventTransportKind::BLE_L2CAP_V1),
         ]));
-        let alternate = ble_attempts
-            .receiver
-            .try_recv()
-            .expect("a full stale Iroh mailbox must not block available BLE");
-        assert_eq!(alternate.peer(), replacement_peer);
-        assert_eq!(alternate.transport_kind(), EventTransportKind::BLE_L2CAP_V1);
-        assert_eq!(
-            iroh_attempts
-                .receiver
-                .try_recv()
-                .expect("obsolete Iroh ticket remains buffered")
-                .peer(),
-            PEER
-        );
+        assert!(ble_attempts.receiver.try_recv().is_err());
+        let mut obsolete = iroh_attempts
+            .recv()
+            .await
+            .expect("obsolete Iroh ticket remains buffered");
+        assert_eq!(obsolete.peer(), PEER);
+        let outcome = obsolete.revocation_outcome().await;
+        assert_eq!(outcome, ContactOutcome::authority_changed(1));
+        obsolete.finish_revoked(outcome);
+        let replacement = iroh_attempts
+            .recv()
+            .await
+            .expect("ordinary selection resumes after typed revocation completion");
+        assert_eq!(replacement.peer(), replacement_peer);
+        assert_eq!(replacement.transport_kind(), EventTransportKind::IROH_QUIC_V1);
+        assert!(ble_attempts.receiver.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -2602,7 +3467,10 @@ mod tests {
             eligibility(EventTransportKind::IROH_QUIC_V1),
             eligibility(EventTransportKind::BLE_L2CAP_V1),
         ]));
-        assert!(obsolete.fail_carrier_open().permits_reselection());
+        assert_eq!(
+            obsolete.fail_carrier_open(),
+            ContactOutcome::authority_changed(1)
+        );
 
         assert!(
             iroh_attempts.receiver.try_recv().is_err(),
@@ -2620,88 +3488,6 @@ mod tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .pending
                 .is_empty()
-        );
-    }
-
-    async fn same_key_ownership_scenario() -> (
-        EventAdapterControl,
-        EventAttemptReceiver,
-        EventOutboundAttempt,
-        EventOutboundAttempt,
-    ) {
-        let eligibility = EventPeerEligibility::provisioned_exact_peer(
-            MISSION,
-            PEER,
-            EventTransportKind::IROH_QUIC_V1,
-            true,
-            1,
-            0,
-            None,
-        );
-        let handle = AutomaticEventTransportHandle::new();
-        assert!(handle.replace_eligibility(vec![eligibility]));
-        let (control, mut attempts) = handle
-            .register(EventAdapterSnapshot::new(
-                EventTransportKind::IROH_QUIC_V1,
-                1,
-                EventAdapterState::Available,
-                true,
-                10,
-            ))
-            .expect("adapter registration");
-        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
-        let obsolete = attempts.recv().await.expect("obsolete ticket");
-
-        assert!(handle.replace_eligibility(Vec::new()));
-        assert!(handle.replace_eligibility(vec![eligibility]));
-        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
-        let fresh = attempts.recv().await.expect("fresh same-key ticket");
-        assert!(
-            !Arc::ptr_eq(&obsolete.identity, &fresh.identity),
-            "attempt ownership identities must never be reused"
-        );
-        assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
-
-        (control, attempts, obsolete, fresh)
-    }
-
-    #[tokio::test]
-    async fn obsolete_completion_cannot_release_fresh_same_key_owner() {
-        let (_control, mut attempts, obsolete, fresh) = same_key_ownership_scenario().await;
-
-        assert!(obsolete.fail_carrier_open().permits_reselection());
-        assert!(
-            attempts.receiver.try_recv().is_err(),
-            "obsolete completion must not clear or requeue over the fresh owner"
-        );
-        drop(fresh);
-        assert_eq!(
-            attempts
-                .recv()
-                .await
-                .expect("fresh owner drop releases queued work")
-                .peer(),
-            PEER
-        );
-    }
-
-    #[tokio::test]
-    async fn obsolete_drop_cannot_release_fresh_same_key_owner() {
-        let (_control, mut attempts, obsolete, fresh) = same_key_ownership_scenario().await;
-
-        drop(obsolete);
-        assert!(
-            attempts.receiver.try_recv().is_err(),
-            "obsolete drop must not clear, requeue, or release the fresh owner"
-        );
-        drop(fresh);
-        assert_eq!(
-            attempts
-                .recv()
-                .await
-                .expect("fresh owner drop releases queued work")
-                .peer(),
-            PEER
         );
     }
 
@@ -2752,7 +3538,7 @@ mod tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .pending
                 .len(),
-            1
+            0
         );
     }
 }
