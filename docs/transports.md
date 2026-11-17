@@ -497,13 +497,26 @@ outcomes, and checkpoint carry-forward, but they are not product transport
 support. This milestone claims automatic selection of the sole shipped Iroh
 adapter and authenticated Iroh reopen. It does not claim best-available
 cross-transport selection or failover because no second production adapter or
-physical cross-transport scenario has been validated. Until a later protocol
-increment coordinates adapter choice across peers, production composition must
-make exactly one contact-agreed adapter eligible; local multi-registration tests
-are extension-seam evidence, not permission to enable competing adapters on a
-contact. When another adapter is implemented, it uses the same registry and
-must not create a second persistence, reconciliation, authentication, or
-scheduling authority. Use the
+physical cross-transport scenario has been validated. Semantic v9 already
+permits local selection among independently eligible adapters before each fresh
+contact; it does not coordinate local ranking across peers. Every selected
+contact performs a complete mission handshake and remains bound to one adapter.
+Keys, replay state, provisional authorization, frames, and other non-durable
+attempt or session state never transfer between adapters; only an existing
+receiver-owned Profile-5 durable checkpoint may inform a fresh attempt.
+
+Cross-carrier reselection is permitted only after locally proven adapter
+unavailability, link loss, or a transport deadline. A remote or ambiguous
+pre-authentication failure neither suppresses the expected peer nor triggers
+reselection. Production composition must not enable competing adapters until
+the full [BTLE evidence and governance gates](superpowers/specs/2026-11-03-production-btle-design.md#required-evidence-and-governance)
+are satisfied. The closed `ContactOutcome` mappings, peer-indexed eligibility,
+node-global admission and duplicate arbitration, operational and physical
+evidence, independent review, and release authorization are necessary parts of
+those gates. Local multi-registration tests are not evidence that competing
+adapters may be enabled in a production composition. When another adapter is
+implemented, it uses the same registry and must not create a second persistence,
+reconciliation, authentication, or scheduling authority. Use the
 [binding pattern](bindings/pattern.md) for a language API.
 
 ## Semantic protocol versions you may see
