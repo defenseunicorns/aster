@@ -148,7 +148,7 @@ impl ContactOutcome {
     }
 
     pub(crate) const fn unauthenticated_carrier_open(reason: ContactReason) -> Self {
-        debug_assert!(matches!(
+        assert!(matches!(
             reason,
             ContactReason::TransportInterrupted | ContactReason::TransportTimeout
         ));
@@ -174,6 +174,7 @@ impl ContactOutcome {
     }
 
     pub(crate) const fn pre_auth_remote(reason: ContactReason) -> Self {
+        Self::assert_legacy_reason(reason);
         Self {
             stage: ContactStage::MissionHandshake,
             scope: ContactScope::Locator,
@@ -190,6 +191,7 @@ impl ContactOutcome {
         disposition: ContactDisposition,
         reason: ContactReason,
     ) -> Self {
+        Self::assert_legacy_reason(reason);
         debug_assert!(matches!(
             scope,
             ContactScope::AdapterEpoch | ContactScope::Attempt
@@ -213,6 +215,7 @@ impl ContactOutcome {
         disposition: ContactDisposition,
         reason: ContactReason,
     ) -> Self {
+        Self::assert_legacy_reason(reason);
         debug_assert!(matches!(
             scope,
             ContactScope::ExpectedPeer
@@ -236,6 +239,7 @@ impl ContactOutcome {
         disposition: ContactDisposition,
         reason: ContactReason,
     ) -> Self {
+        Self::assert_legacy_reason(reason);
         debug_assert!(matches!(
             scope,
             ContactScope::AdapterEpoch | ContactScope::Attempt
@@ -321,6 +325,7 @@ impl ContactOutcome {
     }
 
     const fn local_admission(disposition: ContactDisposition, reason: ContactReason) -> Self {
+        Self::assert_legacy_reason(reason);
         Self {
             stage: ContactStage::Candidate,
             scope: ContactScope::Attempt,
@@ -329,6 +334,16 @@ impl ContactOutcome {
             reason,
             generation: None,
         }
+    }
+
+    const fn assert_legacy_reason(reason: ContactReason) {
+        assert!(!matches!(
+            reason,
+            ContactReason::AdapterEpochEnded
+                | ContactReason::AuthorityChanged
+                | ContactReason::PolicySuspended
+                | ContactReason::Shutdown
+        ));
     }
 
     /// Returns the last trusted transition reached by the attempt.
@@ -433,5 +448,49 @@ mod tests {
         assert_eq!(outcome.reason(), ContactReason::Shutdown);
         assert_eq!(outcome.generation(), None);
         assert!(!outcome.permits_reselection());
+    }
+
+    #[test]
+    fn lifecycle_reasons_require_their_typed_constructors() {
+        for reason in [
+            ContactReason::AdapterEpochEnded,
+            ContactReason::AuthorityChanged,
+            ContactReason::PolicySuspended,
+            ContactReason::Shutdown,
+        ] {
+            assert!(std::panic::catch_unwind(|| ContactOutcome::pre_auth_remote(reason)).is_err());
+            assert!(
+                std::panic::catch_unwind(|| {
+                    ContactOutcome::pre_auth_transport(
+                        ContactScope::Attempt,
+                        ContactProvenance::UnauthenticatedRemote,
+                        ContactDisposition::RetryLater,
+                        reason,
+                    )
+                })
+                .is_err()
+            );
+            assert!(
+                std::panic::catch_unwind(|| {
+                    ContactOutcome::authenticated_session(
+                        ContactScope::Mission,
+                        ContactDisposition::Suppress,
+                        reason,
+                    )
+                })
+                .is_err()
+            );
+            assert!(
+                std::panic::catch_unwind(|| {
+                    ContactOutcome::authenticated_transport(
+                        ContactScope::Attempt,
+                        ContactProvenance::AuthenticatedMission,
+                        ContactDisposition::RetryLater,
+                        reason,
+                    )
+                })
+                .is_err()
+            );
+        }
     }
 }
