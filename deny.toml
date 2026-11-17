@@ -13,6 +13,9 @@ ignore = [
   # unmaintained. The scope checker enforces its exact version, registry source,
   # checksum, and reverse dependency graph; ADR 0018 records migration and exit.
   "RUSTSEC-2026-0374",
+  # chrono is unmaintained; upstream ACME and Windows dependencies require it.
+  # Review by 2026-12-17; remove when both dependency paths drop chrono.
+  "RUSTSEC-2026-0543",
 ]
 
 [licenses]
