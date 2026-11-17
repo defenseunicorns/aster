@@ -43796,8 +43796,9 @@ mod tests {
         let closed = pending_shutdown
             .run(closed_contact.clone())
             .await
-            .expect_err("shutdown closes automatic contact admission");
-        assert_eq!(closed.reason(), ContactReason::AdmissionClosed);
+            .expect_err("adapter shutdown revokes the pending automatic ticket");
+        assert_eq!(closed.reason(), ContactReason::AdapterEpochEnded);
+        assert_eq!(closed.disposition(), ContactDisposition::Reselect);
         assert_eq!(closed_contact.operations(), 0);
         assert_eq!(closed_contact.closes(), 1);
 
@@ -44475,7 +44476,23 @@ mod tests {
         .await
         .expect("start automatic capacity node");
         let automatic = node.automatic_event_transports();
+        let eligibility = |peer| {
+            EventPeerEligibility::provisioned_exact_peer(
+                mission,
+                peer,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            )
+        };
         automatic.note_durable_work();
+        assert!(
+            automatic
+                .coordinator
+                .replace_eligibility(vec![eligibility(filler_peer), eligibility(target_peer),])
+        );
         for _ in 0..MAX_PENDING_EVENT_COHORTS {
             assert_eq!(
                 automatic.coordinator.request_attempt_admission(
@@ -44495,17 +44512,6 @@ mod tests {
                 10,
             ))
             .expect("fake capacity adapter");
-        let eligibility = |peer| {
-            EventPeerEligibility::provisioned_exact_peer(
-                mission,
-                peer,
-                EventTransportKind::BLE_L2CAP_V1,
-                true,
-                1,
-                0,
-                None,
-            )
-        };
         assert_eq!(
             automatic.replace_eligibility(vec![eligibility(filler_peer), eligibility(target_peer)]),
             Some(AutomaticEventRosterStatus::PendingCapacity),
