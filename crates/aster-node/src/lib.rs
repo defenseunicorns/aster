@@ -81,8 +81,11 @@ pub use control_admin::{
     RevocationRequest, ScopeRekeyRequest, SelectedControlAdmin, SelectedControlHandle,
 };
 pub use event_transport::{
-    AutomaticEventTransportHandle, ContactDisposition, ContactOutcome, ContactProvenance,
-    ContactReason, ContactScope, ContactStage, EventAdapterControl, EventAdapterRegistration,
+    ContactDisposition, ContactOutcome, ContactProvenance, ContactReason, ContactScope,
+    ContactStage,
+};
+pub use event_transport::{
+    AutomaticEventTransportHandle, EventAdapterControl, EventAdapterRegistration,
     EventAdapterSnapshot, EventAdapterState, EventAttemptReceiver, EventOutboundAttempt,
     EventPeerEligibility, EventPeerEligibilitySource, EventTransportKind,
     MAX_EVENT_PEER_ELIGIBILITY, MAX_PENDING_EVENT_COHORTS, UnauthenticatedCarrierOpenFailure,

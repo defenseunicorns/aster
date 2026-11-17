@@ -805,13 +805,19 @@ fn map_ordered_contact_error(outcome: ContactOutcome) -> ValidatorError {
         | ContactReason::ActorUnavailable
         | ContactReason::ActorStopped
         | ContactReason::CallerCancelled
+        | ContactReason::AdapterEpochEnded
+        | ContactReason::Shutdown
         | ContactReason::CarrierUnavailable
         | ContactReason::TransportInterrupted
         | ContactReason::TransportTimeout => ValidatorErrorCategory::Unavailable,
-        ContactReason::IdentityMismatch | ContactReason::AuthenticationFailed => {
+        ContactReason::IdentityMismatch
+        | ContactReason::AuthenticationFailed
+        | ContactReason::AuthorityChanged => {
             ValidatorErrorCategory::Authentication
         }
-        ContactReason::PolicyRejected | ContactReason::ProtocolViolation => {
+        ContactReason::PolicyRejected
+        | ContactReason::PolicySuspended
+        | ContactReason::ProtocolViolation => {
             ValidatorErrorCategory::Protocol
         }
         ContactReason::LocalInvariant => ValidatorErrorCategory::Internal,
