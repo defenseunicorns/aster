@@ -623,6 +623,12 @@ fn validate_runtime<C>(raw: RawAgentConfig<C>) -> Result<ValidatedRuntimeConfig,
     let mutable_interests = MutableSourceInterests::default().with_blob(blob_interests);
     let emission_policy = raw.mesh.emission_policy.into();
     let btle = validate_btle_policy(raw.btle, emission_policy)?;
+    if btle
+        .as_ref()
+        .is_some_and(|policy| peers.iter().any(|peer| peer.mission == policy.peer()))
+    {
+        return Err(ConfigError::new(ConfigReason::DuplicatePeerMission));
+    }
     let forwarding = validate_forwarding(raw.storage, emission_policy, raw.mesh.relay)?;
     let limits = validate_limits(raw.limits)?;
 
@@ -1102,6 +1108,29 @@ mod tests {
         assert_reason(
             config_with_btle(with_controller),
             ConfigReason::UnknownField,
+        );
+    }
+
+    #[test]
+    fn btle_policy_rejects_peer_already_rostered_for_iroh() {
+        // Break caught: admitting the same mission through legacy Iroh and
+        // automatic BTLE would let their independent schedulers start
+        // concurrent mission handshakes for one peer.
+        assert_reason(
+            config_with_btle_and_iroh_peer("aa"),
+            ConfigReason::DuplicatePeerMission,
+        );
+    }
+
+    #[test]
+    fn btle_policy_accepts_distinct_iroh_peer() {
+        // Break caught: the duplicate-peer guard must not disable mixed
+        // transport deployments whose roster entries name different peers.
+        let config = validate_json(config_with_btle_and_iroh_peer("bb"))
+            .expect("distinct Iroh and BTLE mission peers");
+        assert_eq!(
+            config.btle_policy().expect("enabled BTLE policy").peer(),
+            [0xaa; 32]
         );
     }
 
@@ -1746,6 +1775,15 @@ mod tests {
         let mut config: serde_json::Value =
             serde_json::from_str(&config_with_storage(4_161, 17_891_328)).unwrap();
         config["btle"] = policy;
+        config.to_string()
+    }
+
+    fn config_with_btle_and_iroh_peer(peer_mission_byte: &str) -> String {
+        let carrier = aster_iroh::SecretKey::from_bytes(&[10; 32]).public();
+        let peer = format!("{carrier}@127.0.0.1:9001={}", peer_mission_byte.repeat(32));
+        let mut config: serde_json::Value =
+            serde_json::from_str(&config_with_btle(valid_btle_policy())).unwrap();
+        config["mesh"]["peers"] = serde_json::json!([peer]);
         config.to_string()
     }
 

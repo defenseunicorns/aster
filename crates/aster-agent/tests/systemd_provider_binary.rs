@@ -132,6 +132,51 @@ fn enabled_btle_binary_uses_real_systemd_wrapper_and_fails_closed_when_source_is
 }
 
 #[test]
+fn customer_startup_rejects_duplicate_iroh_and_btle_peer_before_btle_credentials() {
+    // Break caught: normal packaged startup must reject an unsafe
+    // mixed-transport roster before the missing BTLE credential source can
+    // replace the duplicate-mission error or create durable state.
+    let fixture = BinaryFixture::new();
+    let carrier = aster_iroh::SecretKey::from_bytes(&[11; 32]).public();
+    let iroh_peer = format!("{carrier}@127.0.0.1:9001={}", "aa".repeat(32));
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&fs::read(&fixture.config).expect("read systemd config"))
+            .expect("parse systemd config");
+    config["mesh"]["peers"] = serde_json::json!([iroh_peer]);
+    config["btle"] = serde_json::json!({
+        "enabled": true,
+        "peer": "aa".repeat(32),
+        "deployment_scope_id": "42".repeat(32),
+        "policy": "rostered",
+        "emission_policy": "normal",
+        "priority": 100,
+        "credential": "aster-btle-roster"
+    });
+    fs::write(&fixture.config, config.to_string()).expect("write overlapping roster");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_aster-agent"))
+        .arg("--config")
+        .arg(&fixture.config)
+        .env_remove("CREDENTIALS_DIRECTORY")
+        .output()
+        .expect("run packaged customer startup");
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("UTF-8 stderr"),
+        "ERROR configuration contains a duplicate peer mission\n"
+    );
+    assert!(
+        fs::read_dir(&fixture.state)
+            .expect("inspect state directory")
+            .next()
+            .is_none(),
+        "rejected configuration must not create durable state"
+    );
+}
+
+#[test]
 fn systemd_binary_accepts_only_schema_v1_and_has_no_compose_contract() {
     // Break caught: admitting schema v2 or linking the Compose provider would
     // turn provider choice into a runtime/configuration property.
