@@ -440,6 +440,7 @@ struct InFlightEventAttempt {
     registration_identity: Arc<EventAdapterRegistrationIdentity>,
     availability_epoch: u64,
     authority: EventCohortAuthority,
+    retention: EventAttemptRetention,
     completion: EventAttemptCompletionSource,
     revocation: watch::Sender<Option<ContactOutcome>>,
 }
@@ -474,7 +475,7 @@ struct AutomaticEventTransportShared {
 pub(crate) enum EventAttemptAdmission {
     /// A new bounded cohort owns custody.
     Accepted,
-    /// The observer subscribed to an existing current cohort.
+    /// The request joined an existing current cohort.
     Retained,
     /// Admission completed immediately without retaining custody.
     Closed,
@@ -794,6 +795,25 @@ impl AutomaticEventTransportHandle {
             let observation = observed.then(|| completed_observation(Err(outcome)));
             return (EventAttemptAdmission::Closed, observation);
         }
+        if retention == EventAttemptRetention::DurableGeneration {
+            if let Some(attempt) = state.attempt_in_flight.as_mut().filter(|attempt| {
+                attempt.key == key
+                    && attempt.authority == authority
+                    && attempt.retention == EventAttemptRetention::CallerOwned
+                    && attempt.revocation.borrow().is_none()
+            }) {
+                attempt.retention = EventAttemptRetention::DurableGeneration;
+                return (EventAttemptAdmission::Retained, None);
+            }
+            if let Some(pending) = state.pending.iter_mut().find(|cohort| {
+                cohort.key == key
+                    && cohort.authority == authority
+                    && cohort.retention == EventAttemptRetention::CallerOwned
+            }) {
+                pending.retention = EventAttemptRetention::DurableGeneration;
+                return (EventAttemptAdmission::Retained, None);
+            }
+        }
         if observed {
             if let Some(in_flight) = state.attempt_in_flight.as_ref().filter(|attempt| {
                 attempt.key == key
@@ -1074,7 +1094,6 @@ pub struct EventOutboundAttempt {
     availability_epoch: u64,
     authority: EventCohortAuthority,
     runner: EventAttemptRunner,
-    retention: EventAttemptRetention,
     completion: EventAttemptCompletionSource,
     revocation: watch::Receiver<Option<ContactOutcome>>,
     bound_revocation: Option<ContactOutcome>,
@@ -1278,9 +1297,10 @@ impl EventOutboundAttempt {
     fn retain_durable_generation(
         &mut self,
         state: &mut AutomaticEventTransportState,
+        retention: EventAttemptRetention,
         exclude_selected_instance: bool,
     ) -> bool {
-        if self.retention != EventAttemptRetention::DurableGeneration
+        if retention != EventAttemptRetention::DurableGeneration
             || event_cohort_authority(&state.eligibility, self.key, (self.shared.clock)())
                 != self.authority
         {
@@ -1295,7 +1315,7 @@ impl EventOutboundAttempt {
         state.pending.push_back(PendingEventCohort {
             key: self.key,
             runner: Arc::clone(&self.runner),
-            retention: self.retention,
+            retention,
             authority: self.authority.clone(),
             completion: event_attempt_completion().0,
             failed_instances: std::mem::take(&mut self.failed_instances),
@@ -1354,6 +1374,11 @@ impl EventOutboundAttempt {
             contact.close();
         }
         let result = revocation.map_or(*proposed, Err);
+        let retention = state
+            .attempt_in_flight
+            .as_ref()
+            .expect("owned attempt retains its in-flight state")
+            .retention;
         state.attempt_in_flight = None;
         complete_attempt(&self.completion, result);
         let authenticated_suppression = result.err().filter(|outcome| {
@@ -1380,10 +1405,10 @@ impl EventOutboundAttempt {
         }
         let retained = match &result {
             Err(outcome) if outcome.permits_reselection() => {
-                self.retain_durable_generation(&mut state, true)
+                self.retain_durable_generation(&mut state, retention, true)
             }
             Err(outcome) if outcome.reason() == ContactReason::PolicySuspended => {
-                self.retain_durable_generation(&mut state, false)
+                self.retain_durable_generation(&mut state, retention, false)
             }
             Ok(()) | Err(_) => false,
         };
@@ -1538,7 +1563,6 @@ fn transition(
                 availability_epoch,
                 authority: pending.authority.clone(),
                 runner: Arc::clone(&pending.runner),
-                retention: pending.retention,
                 completion: pending.completion.clone(),
                 revocation: revocation_receiver,
                 bound_revocation: None,
@@ -1554,6 +1578,7 @@ fn transition(
                         registration_identity,
                         availability_epoch,
                         authority: pending.authority,
+                        retention: pending.retention,
                         completion: pending.completion,
                         revocation,
                     });
@@ -1875,17 +1900,16 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn retry_later_releases_caller_owned_and_durable_coordinator_custody() {
-        let (handle, _control, mut attempts) = eligible_ble_handle();
+    async fn durable_admission_upgrades_existing_caller_owned_attempt() {
+        let (handle, control, mut attempts) = eligible_ble_handle();
         let caller_runs = Arc::new(AtomicU64::new(0));
         let observed_caller_runs = Arc::clone(&caller_runs);
-        let retry_later = ContactOutcome::pre_auth_remote(ContactReason::AuthenticationFailed);
         let (admission, observation) =
             handle.request_observed_attempt(MISSION, PEER, move |_contact| {
                 let observed_caller_runs = Arc::clone(&observed_caller_runs);
                 async move {
                     observed_caller_runs.fetch_add(1, Ordering::AcqRel);
-                    Err(retry_later)
+                    Ok(())
                 }
             });
         assert_eq!(admission, EventAttemptAdmission::Accepted);
@@ -1897,36 +1921,45 @@ mod tests {
                 let observed_durable_runs = Arc::clone(&observed_durable_runs);
                 async move {
                     observed_durable_runs.fetch_add(1, Ordering::AcqRel);
-                    Err(retry_later)
+                    Ok(())
                 }
             }),
-            EventAttemptAdmission::Accepted
+            EventAttemptAdmission::Retained
         );
 
+        let outcome = attempts
+            .recv()
+            .await
+            .expect("caller-owned attempt")
+            .fail_carrier_open();
+        assert_eq!(outcome, ContactOutcome::carrier_open_unavailable());
+        assert_eq!(observation.wait().await, Err(outcome));
+        assert_eq!(caller_runs.load(Ordering::Acquire), 0);
+        assert_eq!(durable_runs.load(Ordering::Acquire), 0);
+        {
+            let state = handle.shared.state.lock().unwrap();
+            assert_eq!(state.pending.len(), 1);
+            assert!(state.attempt_in_flight.is_none());
+        }
+
+        assert!(control.publish_availability(EventAdapterSnapshot::new(
+            EventTransportKind::BLE_L2CAP_V1,
+            2,
+            EventAdapterState::Available,
+            true,
+            10,
+        )));
         assert_eq!(
             attempts
                 .recv()
                 .await
-                .expect("caller-owned attempt")
+                .expect("promoted durable replacement")
                 .run(Arc::new(TestOrderedContact))
                 .await,
-            Err(retry_later)
+            Ok(())
         );
-        assert_eq!(observation.wait().await, Err(retry_later));
         assert_eq!(caller_runs.load(Ordering::Acquire), 1);
-
-        let durable = attempts
-            .recv()
-            .await
-            .expect("durable generation retains independent custody");
-        assert_eq!(
-            durable.run(Arc::new(TestOrderedContact)).await,
-            Err(retry_later)
-        );
-        assert_eq!(durable_runs.load(Ordering::Acquire), 1);
-        let state = handle.shared.state.lock().unwrap();
-        assert!(state.pending.is_empty());
-        assert!(state.attempt_in_flight.is_none());
+        assert_eq!(durable_runs.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2005,6 +2038,10 @@ mod tests {
                 }
             });
         assert_eq!(admission, EventAttemptAdmission::Accepted);
+        assert_eq!(
+            handle.request_attempt_admission(MISSION, PEER, |_contact| async { Ok(()) }),
+            EventAttemptAdmission::Retained
+        );
         for _ in 1..MAX_PENDING_EVENT_COHORTS {
             assert_eq!(
                 handle.request_attempt_admission(MISSION, PEER, |_contact| async { Ok(()) }),
