@@ -2833,7 +2833,9 @@ fn application_error(operation: &'static str, error: NodeError) -> ApplicationEr
         }
         NodeError::SourceEnvelope(_) => ApplicationErrorKind::Integrity,
         NodeError::Store(error) => store_error_kind(&error),
-        NodeError::EmissionPolicyChanged => ApplicationErrorKind::PolicyUnsettled,
+        NodeError::EmissionPolicyChanged | NodeError::EmissionPolicyRestartRequired => {
+            ApplicationErrorKind::PolicyUnsettled
+        }
         NodeError::CustodySendSkipped => ApplicationErrorKind::ExpiredOrRetired,
         NodeError::Protocol(message) if message == EVENT_OPERATION_CONFLICT => {
             ApplicationErrorKind::Conflict
@@ -3215,6 +3217,22 @@ mod tests {
         assert_eq!(ordinary.operation(), "Blob publication admission");
         assert!(std::error::Error::source(&ordinary).is_none());
         assert!(!format!("{ordinary:?}").contains("cause"));
+    }
+
+    #[test]
+    fn emission_policy_restart_requirement_is_projected_as_unsettled_policy() {
+        let error = application_error(
+            "publish",
+            NodeError::EmissionPolicyRestartRequired,
+        );
+
+        assert_eq!(error.kind(), ApplicationErrorKind::PolicyUnsettled);
+        assert_eq!(error.operation(), "publish");
+        assert_eq!(
+            error.to_string(),
+            "selected application publish failed: mission policy is not settled"
+        );
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]

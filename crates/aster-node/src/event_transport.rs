@@ -240,7 +240,18 @@ fn select_event_eligibility(
         .max_by_key(|entry| (entry.authority_generation, entry.revocation_generation))
 }
 
-type EventCohortAuthority = BTreeMap<EventTransportKind, EventPeerEligibility>;
+/// Exact selected per-transport authority for one mission peer cohort.
+pub(crate) type EventCohortAuthority = BTreeMap<EventTransportKind, EventPeerEligibility>;
+
+/// Selects the exact current authority used to bind one runtime peer cohort.
+pub(crate) fn event_cohort_authority_for_peer(
+    eligibility: &[EventPeerEligibility],
+    mission: NodeId,
+    peer: NodeId,
+    now: SystemTime,
+) -> EventCohortAuthority {
+    event_cohort_authority(eligibility, EventCohortKey { mission, peer }, now)
+}
 
 fn event_cohort_authority(
     eligibility: &[EventPeerEligibility],
@@ -871,6 +882,17 @@ impl AutomaticEventTransportHandle {
         if released_capacity {
             notify_capacity_progress(&self.shared);
         }
+    }
+
+    /// Reports queued and active attempts for deterministic runtime tests.
+    #[cfg(test)]
+    pub(crate) fn pending_attempt_count(&self) -> usize {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.pending.len() + usize::from(state.attempt_in_flight.is_some())
     }
 
     #[allow(dead_code)] // Task 3 uses this deterministic no-spin observation in runtime tests.

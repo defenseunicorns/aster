@@ -160,8 +160,8 @@ use crate::{
     event_transport::{
         AutomaticEventTransportHandle, ContactDisposition, ContactOutcome, ContactProvenance,
         ContactReason, ContactScope, ContactStage, EventAdapterControl, EventAdapterSnapshot,
-        EventAttemptAdmission, EventAttemptReceiver, EventPeerEligibility,
-        event_eligibility_is_current,
+        EventAttemptAdmission, EventAttemptReceiver, EventCohortAuthority, EventPeerEligibility,
+        event_cohort_authority_for_peer, event_eligibility_is_current,
     },
     format_node_id, format_path_field, format_receipt_field,
     frame::{
@@ -3948,7 +3948,12 @@ pub enum OrderedEventContactRole {
 #[derive(Default)]
 struct AutomaticEventRuntimeState {
     durable_generation: u64,
-    requested_generation: BTreeMap<NodeId, u64>,
+    requested_generation: BTreeMap<NodeId, RequestedEventGeneration>,
+}
+
+struct RequestedEventGeneration {
+    authority: EventCohortAuthority,
+    generation: u64,
 }
 
 /// Runtime-owned automatic Event transport registration and eligibility facade.
@@ -4043,6 +4048,10 @@ impl RunningAutomaticEventTransportHandle {
         &self,
         eligibility: Vec<EventPeerEligibility>,
     ) -> Option<AutomaticEventRosterStatus> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !self.admission.is_open() {
             return None;
         }
@@ -4054,6 +4063,16 @@ impl RunningAutomaticEventTransportHandle {
             })
             .map(EventPeerEligibility::peer)
             .collect::<BTreeSet<_>>();
+        let current_authority = current_peers
+            .iter()
+            .copied()
+            .map(|peer| {
+                (
+                    peer,
+                    event_cohort_authority_for_peer(&eligibility, self.mission, peer, now),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let mut state = self
             .state
             .lock()
@@ -4063,9 +4082,19 @@ impl RunningAutomaticEventTransportHandle {
         }
         state
             .requested_generation
-            .retain(|peer, _| current_peers.contains(peer));
-        for peer in &current_peers {
-            state.requested_generation.entry(*peer).or_default();
+            .retain(|peer, requested| {
+                current_authority
+                    .get(peer)
+                    .is_some_and(|authority| authority == &requested.authority)
+            });
+        for (peer, authority) in current_authority {
+            state
+                .requested_generation
+                .entry(peer)
+                .or_insert(RequestedEventGeneration {
+                    authority,
+                    generation: 0,
+                });
         }
         let pending_capacity = self.schedule_current_generation(&mut state);
         Some(if pending_capacity {
@@ -4151,18 +4180,30 @@ impl RunningAutomaticEventTransportHandle {
             || state
                 .requested_generation
                 .get(&peer)
-                .is_some_and(|requested| *requested >= generation)
+                .is_some_and(|requested| requested.generation >= generation)
         {
             return true;
         }
-        let admission = self.request_peer_attempt(peer);
+        let admission = self.coordinator.request_attempt_admission(
+            self.mission,
+            peer,
+            self.event_attempt_runner(peer),
+        );
         match admission {
             EventAttemptAdmission::Accepted => {
-                state.requested_generation.insert(peer, generation);
+                state
+                    .requested_generation
+                    .get_mut(&peer)
+                    .expect("scheduled peer retains current authority")
+                    .generation = generation;
                 true
             }
             EventAttemptAdmission::Retained => {
-                state.requested_generation.insert(peer, generation);
+                state
+                    .requested_generation
+                    .get_mut(&peer)
+                    .expect("retained peer retains current authority")
+                    .generation = generation;
                 true
             }
             EventAttemptAdmission::Closed => {
@@ -4171,14 +4212,6 @@ impl RunningAutomaticEventTransportHandle {
             }
             EventAttemptAdmission::CapacityFull => false,
         }
-    }
-
-    fn request_peer_attempt(&self, peer: NodeId) -> EventAttemptAdmission {
-        self.coordinator.request_attempt_admission(
-            self.mission,
-            peer,
-            self.event_attempt_runner(peer),
-        )
     }
 
     fn event_attempt_runner(
@@ -4231,6 +4264,15 @@ impl RunningAutomaticEventTransportHandle {
             stop.stop();
         }
         Ok(update.snapshot.revision)
+    }
+
+    fn close(&self) {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.admission.close();
+        self.coordinator.shutdown();
     }
 
     #[cfg(test)]
@@ -4807,9 +4849,10 @@ impl RunningNode {
     /// work.
     ///
     /// Embeddings use this before cancelling and joining in-process transport
-    /// owners while their application server finishes draining.
+    /// owners while their application server finishes draining. Pending
+    /// automatic attempt observations complete with a shutdown outcome.
     pub fn close_transport_admission(&self) {
-        self.transport_admission.close();
+        self.automatic_event_transports.close();
     }
 
     /// Opens transport admission after supervised startup has composed every
@@ -4828,7 +4871,11 @@ impl RunningNode {
     /// Embeddings use this before cancelling and joining in-process transport
     /// owners, then consume the node through [`Self::shutdown`].
     pub fn close_admission(&self) {
-        close_node_admission(&self.application_admission, &self.transport_admission);
+        close_node_admission(
+            &self.application_admission,
+            &self.transport_admission,
+            Some(&self.automatic_event_transports),
+        );
     }
 
     /// Requests graceful shutdown, closes command admission, and waits for cleanup.
@@ -4854,8 +4901,16 @@ impl RunningNode {
     }
 }
 
-fn close_node_admission(application: &AtomicBool, transport: &TransportAdmission) {
-    transport.close();
+fn close_node_admission(
+    application: &AtomicBool,
+    transport: &TransportAdmission,
+    automatic: Option<&RunningAutomaticEventTransportHandle>,
+) {
+    if let Some(automatic) = automatic {
+        automatic.close();
+    } else {
+        transport.close();
+    }
     application.store(false, Ordering::Release);
 }
 
@@ -19136,7 +19191,11 @@ async fn run_node_actor_inner(
                         &request,
                     ) {
                         Ok(plan) => {
-                            close_node_admission(&application_admission, &transport_admission);
+                            close_node_admission(
+                                &application_admission,
+                                &transport_admission,
+                                automatic_event_transports.as_ref(),
+                            );
                             live_zeroization = Some((request, plan));
                             break;
                         }
@@ -19184,7 +19243,11 @@ async fn run_node_actor_inner(
             completion = &mut blob_worker_completion_receiver,
                 if blob_worker_completion_open => {
                 blob_worker_completion_open = false;
-                close_node_admission(&application_admission, &transport_admission);
+                close_node_admission(
+                    &application_admission,
+                    &transport_admission,
+                    automatic_event_transports.as_ref(),
+                );
                 fatal_error = Some(match completion {
                     Ok(Err(error)) => error,
                     Ok(Ok(())) => NodeError::Protocol(
@@ -20668,7 +20731,11 @@ async fn run_node_actor_inner(
         }
     }
 
-    close_node_admission(&application_admission, &transport_admission);
+    close_node_admission(
+        &application_admission,
+        &transport_admission,
+        automatic_event_transports.as_ref(),
+    );
     // Closing progress unblocks blocking_send and cancels at the next bounded
     // page checkpoint. Join before zeroization or releasing the store owner.
     audit_progress_receiver.close();
@@ -44006,11 +44073,12 @@ mod tests {
             )]),
             Some(AutomaticEventRosterStatus::Scheduled)
         );
-        let observed = tokio::spawn({
-            let automatic = automatic.clone();
-            async move { automatic.run_peer_attempt(peer).await }
-        });
-        tokio::task::yield_now().await;
+        let mut observed = Box::pin(automatic.run_peer_attempt(peer));
+        tokio::select! {
+            biased;
+            result = &mut observed => panic!("observer completed before adapter availability: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
         assert!(control.publish_availability(EventAdapterSnapshot::new(
             EventTransportKind::BLE_L2CAP_V1,
             2,
@@ -44019,15 +44087,77 @@ mod tests {
             10,
         )));
         let attempt = attempts.recv().await.expect("one shared durable attempt");
-        tokio::select! {
-            _duplicate = attempts.recv() => panic!("observer created a second attempt mode"),
-            () = tokio::task::yield_now() => {}
-        }
-        let outcome = attempt.fail_carrier_open();
+        let outcome = attempt.cancel_carrier_open();
         assert_eq!(
-            observed.await.expect("observer task joined"),
+            timeout(Duration::from_secs(1), &mut observed)
+                .await
+                .expect("observer completion deadline"),
             Some(Err(outcome))
         );
+        assert_eq!(automatic.coordinator.pending_attempt_count(), 0);
+        assert!(
+            timeout(Duration::from_millis(10), attempts.recv())
+                .await
+                .is_err(),
+            "observer created queued follow-on work"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_transport_closure_completes_waiting_peer_attempt_with_shutdown() {
+        let test_root = root("automatic-attempt-terminal-closure");
+        fs::create_dir_all(&test_root).expect("terminal closure state");
+        #[cfg(unix)]
+        fs::set_permissions(&test_root, fs::Permissions::from_mode(0o700))
+            .expect("owner-only terminal closure state");
+        let local = issue_missions(1).remove(0);
+        let mission = local.credentials.mission_authority_id();
+        let peer = [0xc3; 32];
+        let node = start_transport_neutral_node(TransportNeutralNodeConfig {
+            state: test_root.clone(),
+            mission: local.credentials,
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start terminal closure node");
+        let automatic = node.automatic_event_transports();
+        automatic.note_durable_work();
+        assert_eq!(
+            automatic.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                mission,
+                peer,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            )]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+        let mut observed = Box::pin(automatic.run_peer_attempt(peer));
+        tokio::select! {
+            biased;
+            result = &mut observed => panic!("attempt completed before terminal closure: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        assert_eq!(automatic.coordinator.pending_attempt_count(), 1);
+
+        node.close_transport_admission();
+
+        let outcome = timeout(Duration::from_secs(1), &mut observed)
+            .await
+            .expect("shutdown observation deadline")
+            .expect("current peer attempt exists")
+            .expect_err("terminal closure must cancel the attempt");
+        assert_eq!(outcome.reason(), ContactReason::Shutdown);
+        assert_eq!(outcome.disposition(), ContactDisposition::Cancelled);
+        assert_eq!(automatic.coordinator.pending_attempt_count(), 0);
+
+        node.shutdown().await.expect("terminal closure shutdown");
+        fs::remove_dir_all(test_root).expect("terminal closure cleanup");
     }
 
     #[tokio::test]
@@ -44148,14 +44278,95 @@ mod tests {
             true,
             10,
         )));
+        let attempt = attempts.recv().await.expect("current exact-peer attempt");
+        assert_eq!(attempt.peer(), current_peer);
         assert_eq!(
-            attempts.recv().await.expect("current exact-peer attempt").peer(),
-            current_peer
+            attempt.cancel_carrier_open().disposition(),
+            ContactDisposition::Cancelled
         );
-        tokio::select! {
-            _attempt = attempts.recv() => panic!("stale or foreign authority was scheduled"),
-            () = tokio::task::yield_now() => {}
-        }
+        assert_eq!(automatic.coordinator.pending_attempt_count(), 0);
+        assert!(
+            timeout(Duration::from_millis(10), attempts.recv())
+                .await
+                .is_err(),
+            "stale or foreign authority remained queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_peer_authority_replacement_rearms_current_durable_generation_once() {
+        let mission = [0xd1; 32];
+        let peer = [0xd2; 32];
+        let admission = Arc::new(TransportAdmission::open());
+        let (ordered_sender, _ordered_receiver) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
+        let automatic = RunningAutomaticEventTransportHandle::new(
+            admission.clone(),
+            mission,
+            OrderedEventContactHandle {
+                sender: ordered_sender,
+                admission,
+                session_permit: Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY)),
+            },
+            true,
+        );
+        automatic.note_durable_work();
+        let (_control, mut attempts) = automatic
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("authority replacement adapter");
+        let eligibility = |authority_generation| {
+            EventPeerEligibility::provisioned_exact_peer(
+                mission,
+                peer,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                authority_generation,
+                0,
+                None,
+            )
+        };
+        assert_eq!(
+            automatic.replace_eligibility(vec![eligibility(1)]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+        let mut old_attempt = attempts.recv().await.expect("old-authority attempt");
+
+        assert_eq!(
+            automatic.replace_eligibility(vec![eligibility(2)]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+        assert_eq!(automatic.coordinator.pending_attempt_count(), 2);
+        assert_eq!(
+            automatic.replace_eligibility(vec![eligibility(2)]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+        assert_eq!(
+            automatic.coordinator.pending_attempt_count(),
+            2,
+            "unchanged authority replay must not duplicate admission"
+        );
+
+        let revoked = old_attempt.revocation_outcome().await;
+        assert_eq!(revoked.reason(), ContactReason::AuthorityChanged);
+        old_attempt.finish_revoked(revoked);
+        let current_attempt = attempts.recv().await.expect("current-authority attempt");
+        assert!(current_attempt.carrier_open_is_authorized());
+        assert_eq!(
+            current_attempt.cancel_carrier_open().disposition(),
+            ContactDisposition::Cancelled
+        );
+        assert_eq!(automatic.coordinator.pending_attempt_count(), 0);
+        assert!(
+            timeout(Duration::from_millis(10), attempts.recv())
+                .await
+                .is_err(),
+            "authority replay left duplicate custody queued"
+        );
     }
 
     #[tokio::test]
@@ -44290,8 +44501,11 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert_eq!(
-                state.requested_generation.get(&target_peer),
-                Some(&state.durable_generation),
+                state
+                    .requested_generation
+                    .get(&target_peer)
+                    .map(|requested| requested.generation),
+                Some(state.durable_generation),
                 "capacity progress never admitted the retained target generation"
             );
         }

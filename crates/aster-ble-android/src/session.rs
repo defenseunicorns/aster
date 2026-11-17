@@ -792,6 +792,7 @@ fn map_node_error(error: NodeError) -> ValidatorError {
         NodeError::Reconciliation(_)
         | NodeError::Protocol(_)
         | NodeError::EmissionPolicyChanged
+        | NodeError::EmissionPolicyRestartRequired
         | NodeError::CustodySendSkipped => ValidatorErrorCategory::Protocol,
         NodeError::Identity(_) | NodeError::Demo(_) => ValidatorErrorCategory::Internal,
     };
@@ -842,6 +843,14 @@ mod tests {
     use tokio::io::AsyncReadExt as _;
 
     static NEXT_PATH: AtomicUsize = AtomicUsize::new(1);
+
+    #[test]
+    fn emission_policy_restart_requirement_is_sanitized_as_protocol_failure() {
+        let error = map_node_error(NodeError::EmissionPolicyRestartRequired);
+
+        assert_eq!(error.category(), ValidatorErrorCategory::Protocol);
+        assert_eq!(error.to_string(), "validator protected Event session failed");
+    }
 
     struct RecordingSink {
         events: Mutex<Vec<SessionEvent>>,
