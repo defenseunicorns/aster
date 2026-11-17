@@ -1555,7 +1555,9 @@ mod tests {
         controllers: Arc<Mutex<Vec<ObservedController>>>,
         events: mpsc::UnboundedReceiver<ResolverEvent>,
         delivered_events: Arc<AtomicUsize>,
+        delivered_event: Arc<Notify>,
         observations: Arc<AtomicUsize>,
+        observation: Arc<Notify>,
     }
 
     struct DropWitnessSession {
@@ -1718,6 +1720,7 @@ mod tests {
         ) -> ResolverFuture<'a, ObservedInventory> {
             Box::pin(async move {
                 self.observations.fetch_add(1, Ordering::SeqCst);
+                self.observation.notify_waiters();
                 Ok(ObservedInventory::bounded(
                     self.controllers.lock().unwrap().clone(),
                 ))
@@ -1729,6 +1732,7 @@ mod tests {
                 let event = self.events.recv().await;
                 if event.is_some() {
                     self.delivered_events.fetch_add(1, Ordering::SeqCst);
+                    self.delivered_event.notify_waiters();
                 }
                 event
             })
@@ -2115,27 +2119,35 @@ mod tests {
         controllers: Arc<Mutex<Vec<ObservedController>>>,
         events: Option<mpsc::UnboundedSender<ResolverEvent>>,
         delivered_events: Arc<AtomicUsize>,
+        delivered_event: Arc<Notify>,
         observations: Arc<AtomicUsize>,
+        observation: Arc<Notify>,
     }
 
     impl Harness {
         fn session(controllers: Vec<ObservedController>) -> (Self, Box<dyn ResolverSession>) {
             let controllers = Arc::new(Mutex::new(controllers));
             let delivered_events = Arc::new(AtomicUsize::new(0));
+            let delivered_event = Arc::new(Notify::new());
             let observations = Arc::new(AtomicUsize::new(0));
+            let observation = Arc::new(Notify::new());
             let (events, receiver) = mpsc::unbounded_channel();
             (
                 Self {
                     controllers: controllers.clone(),
                     events: Some(events),
                     delivered_events: delivered_events.clone(),
+                    delivered_event: delivered_event.clone(),
                     observations: observations.clone(),
+                    observation: observation.clone(),
                 },
                 Box::new(FakeSession {
                     controllers,
                     events: receiver,
                     delivered_events,
+                    delivered_event,
                     observations,
+                    observation,
                 }),
             )
         }
@@ -2159,6 +2171,26 @@ mod tests {
 
         fn delivered_event_count(&self) -> usize {
             self.delivered_events.load(Ordering::SeqCst)
+        }
+
+        async fn wait_for_delivered_events(&self, count: usize) {
+            loop {
+                let notified = self.delivered_event.notified();
+                if self.delivered_event_count() >= count {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        async fn wait_for_observations(&self, count: usize) {
+            loop {
+                let notified = self.observation.notified();
+                if self.observation_count() >= count {
+                    return;
+                }
+                notified.await;
+            }
         }
     }
 
@@ -3479,18 +3511,30 @@ mod tests {
             Arc::new(FakePlatform::new([Ok(empty_session)])),
             Arc::new(FakeProbe::compatible()),
         );
-        while empty_harness.observation_count() < 1 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            empty_harness.wait_for_observations(1),
+        )
+        .await
+        .expect("initial empty inventory must be observed");
 
         tokio::time::advance(Duration::from_secs(300)).await;
         tokio::task::yield_now().await;
         assert_eq!(empty_harness.observation_count(), 1);
         empty_harness.event(ResolverEvent::InventoryChanged { removed: None });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            empty_harness.wait_for_delivered_events(1),
+        )
+        .await
+        .expect("inventory change must reach the resolver");
         tokio::time::advance(Duration::from_millis(250)).await;
-        while empty_harness.observation_count() < 2 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            empty_harness.wait_for_observations(2),
+        )
+        .await
+        .expect("inventory change must trigger a bounded sweep");
         stop(empty).await;
     }
 
