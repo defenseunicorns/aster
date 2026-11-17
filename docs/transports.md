@@ -340,10 +340,11 @@ names, addresses, PSMs, peer IDs, credentials, or detailed probe status.
 current automatic supervisor advertises and scans. `PassiveOnly` is not an
 agent configuration option. Per sweep, the resolver retains at most eight
 controller candidates and accepts canonical adapter names of at most 64 UTF-8
-bytes. These transport-local bounds cap socket, probe, retry, memory, and log
-work and reject pathological identifiers while covering ordinary Linux adapter
-names; they are neither protocol nor support limits and may change without
-compatibility impact.
+bytes. BlueZ materializes the adapter-name vector before these limits apply, so
+they bound downstream retained candidates and socket, probe, retry, snapshot,
+and log work, not BlueZ or D-Bus ingress allocation. They reject pathological
+identifiers while covering ordinary Linux adapter names; they are neither
+protocol nor support limits and may change without compatibility impact.
 
 This source composition is not the shipped package profile. The Debian unit
 does not bind `aster-btle-roster`, excludes `AF_BLUETOOTH`, and adds no BlueZ

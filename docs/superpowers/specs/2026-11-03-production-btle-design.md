@@ -472,14 +472,18 @@ probes at most one concurrently, activates at most one, and accepts canonical
 adapter names of at most 64 UTF-8 bytes. Eight and 64 are implementation
 resource bounds—not protocol or support limits—chosen to cover ordinary
 multi-controller Linux hosts and adapter names while bounding downstream
-socket, probe, retry, memory, snapshot, and log work and rejecting pathological
-identifiers after BlueZ returns its inventory. BlueZ and system D-Bus ingress
-limits remain part of the trusted platform and confinement boundary. Names are
+retained candidates and socket, probe, retry, snapshot, and log work and
+rejecting pathological identifiers after BlueZ returns its fully materialized
+inventory. They do not bound that initial BlueZ or system D-Bus ingress
+allocation, which remains part of the trusted platform and confinement
+boundary. Names are
 canonicalized, validated, deduplicated, and ordered; the healthy selected
 controller and an explicit diagnostic override are retained before filling
-remaining slots. Overflow is reported once as `8+`, without per-entry logs,
-and ignored deterministically. Either constant may change without compatibility
-impact.
+remaining slots. Normalization reduces overflow to one redacted bit (exposed by
+the bounded inventory only as zero or one); the current resolver then discards
+that bit and no operator surface reports it. Extra entries are ignored
+deterministically without per-entry logs. Either constant may change without
+compatibility impact.
 
 Selection is private to the adapter and does not inspect mission authority.
 Candidates are filtered by required compatibility, emission policy,
@@ -488,13 +492,16 @@ an existing healthy selection, current health, qualification as a tie-breaker,
 and an epoch-local canonical key. The outer adapter owner separately gates
 activation and contact admission on policy, credentials, and peer authority.
 An unrelated controller addition must not disrupt a healthy selected
-controller. The driver coalesces state changes and allows one probe sweep at a
-time. It re-probes after BlueZ owner loss, relevant selected-controller change,
-inventory change, or package/policy generation change, and drains the current
-owner only when that controller is lost, blocked, explicitly replaced, or has a
-relevant identity or capability change. In the first increment, package and
-policy generation changes are observed only on process restart; live
-authenticated reload is future work.
+controller. The driver coalesces harmless state changes behind a fixed 250 ms
+minimum before the next full observation and allows one probe sweep at a time.
+A selected-controller removal or relevant property change publishes
+`Unavailable` and drains its owner immediately; replacement observation still
+waits for the fixed coalescing boundary. It re-probes after BlueZ owner loss,
+relevant selected-controller change, inventory change, or package/policy
+generation change, and drains the current owner only when that controller is
+lost, blocked, explicitly replaced, or has a relevant identity or capability
+change. In the first increment, package and policy generation changes are
+observed only on process restart; live authenticated reload is future work.
 
 The compatibility fingerprint contains only the OS and architecture,
 kernel/BlueZ version, controller vendor/product/revision, and firmware or driver
@@ -543,9 +550,9 @@ asserts incompatibility. Every acquired socket or platform owner is closed and
 joined within its declared bound before the candidate may be retried. The
 whole-sweep budget gives every admitted candidate one bounded attempt; if that
 cannot be maintained, a retained rotating cursor makes unfinished candidates
-lead the next sweep. State changes collapse into one pending sweep, and repeated
-inventory or property churn cannot exceed the adapter's capped retry/backoff
-budget.
+lead the next sweep. State changes collapse into one pending sweep. Harmless
+inventory or property churn permits at most four full observations per second;
+transient failures remain subject to capped retry/backoff.
 
 The current source composition uses immutable empty support and
 known-unsafe tables; the future signed qualified package compiles generated
