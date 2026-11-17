@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[cfg(feature = "systemd-provider")]
+#[cfg(any(feature = "systemd-provider", test))]
 use std::time::Duration;
 
 #[cfg(all(target_os = "linux", feature = "systemd-provider"))]
@@ -50,7 +50,6 @@ use crate::config::ValidatedBtlePolicy;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BtleRuntimeOwnerError {
     /// The owner could not be created after node startup.
-    #[cfg(any(feature = "systemd-provider", feature = "sdk-test-support", test))]
     Startup,
     /// The active owner could not confirm bounded cleanup.
     Cleanup,
@@ -1009,10 +1008,7 @@ impl BtleRuntimeOwner for LinuxSupervisorRuntimeOwner {
     }
 }
 
-#[cfg(any(
-    feature = "sdk-test-support",
-    all(feature = "systemd-provider", target_os = "linux")
-))]
+#[cfg(any(feature = "sdk-test-support", feature = "systemd-provider"))]
 struct UnavailableBtleRuntimeOwner<P> {
     _adapter_registration: EventAdapterControl,
     _attempt_mailbox: EventAttemptReceiver,
@@ -1040,10 +1036,7 @@ where
     })
 }
 
-#[cfg(any(
-    feature = "sdk-test-support",
-    all(feature = "systemd-provider", target_os = "linux")
-))]
+#[cfg(any(feature = "sdk-test-support", feature = "systemd-provider"))]
 impl<P> BtleRuntimeOwner for UnavailableBtleRuntimeOwner<P>
 where
     P: Send + 'static,
