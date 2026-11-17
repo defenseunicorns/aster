@@ -629,6 +629,9 @@ fn validate_runtime<C>(raw: RawAgentConfig<C>) -> Result<ValidatedRuntimeConfig,
     {
         return Err(ConfigError::new(ConfigReason::DuplicatePeerMission));
     }
+    if btle.is_some() && peers.len() >= MAX_CONFIGURED_PEERS {
+        return Err(ConfigError::new(ConfigReason::TooManyPeers));
+    }
     let forwarding = validate_forwarding(raw.storage, emission_policy, raw.mesh.relay)?;
     let limits = validate_limits(raw.limits)?;
 
@@ -1132,6 +1135,51 @@ mod tests {
             config.btle_policy().expect("enabled BTLE policy").peer(),
             [0xaa; 32]
         );
+    }
+
+    #[test]
+    fn enabled_btle_policy_reserves_one_shared_peer_slot() {
+        // Break caught: accepting 256 Iroh peers plus BTLE exceeds the node's
+        // shared configured-peer admission bound.
+        validate_json(config_with_iroh_peers(256, None)).expect("256 Iroh peers without BTLE");
+        assert_reason(
+            config_with_iroh_peers(256, Some(valid_btle_policy())),
+            ConfigReason::TooManyPeers,
+        );
+        validate_json(config_with_iroh_peers(255, Some(valid_btle_policy())))
+            .expect("255 Iroh peers plus one BTLE peer");
+        validate_json(config_with_iroh_peers(
+            256,
+            Some(serde_json::json!({"enabled": false})),
+        ))
+        .expect("disabled BTLE does not reserve a peer slot");
+    }
+
+    #[test]
+    fn receive_only_btle_policy_still_reserves_one_shared_peer_slot() {
+        // Break caught: receive-only changes emission, not the exact peer
+        // authority admitted through the shared runtime roster.
+        let mut policy = valid_btle_policy();
+        policy["emission_policy"] = serde_json::json!("receive_only");
+        assert_reason(
+            config_with_iroh_peers(256, Some(policy)),
+            ConfigReason::TooManyPeers,
+        );
+    }
+
+    #[test]
+    fn duplicate_btle_mission_precedes_shared_peer_capacity_error() {
+        // Break caught: the more specific authority conflict must remain
+        // visible when the Iroh roster is also at the shared capacity edge.
+        let mut config: serde_json::Value =
+            serde_json::from_str(&config_with_iroh_peers(256, Some(valid_btle_policy()))).unwrap();
+        let peer = config["mesh"]["peers"][0]
+            .as_str()
+            .expect("generated Iroh peer");
+        let (carrier, _) = peer.rsplit_once('=').expect("mission-qualified peer");
+        config["mesh"]["peers"][0] = serde_json::json!(format!("{carrier}={}", "aa".repeat(32)));
+
+        assert_reason(config.to_string(), ConfigReason::DuplicatePeerMission);
     }
 
     #[test]
@@ -1784,6 +1832,28 @@ mod tests {
         let mut config: serde_json::Value =
             serde_json::from_str(&config_with_btle(valid_btle_policy())).unwrap();
         config["mesh"]["peers"] = serde_json::json!([peer]);
+        config.to_string()
+    }
+
+    fn config_with_iroh_peers(count: usize, btle: Option<serde_json::Value>) -> String {
+        let peers = (0..count)
+            .map(|index| {
+                let mut secret = [0x5a; 32];
+                secret[..8].copy_from_slice(
+                    &u64::try_from(index)
+                        .expect("configured peer fixture index fits u64")
+                        .to_le_bytes(),
+                );
+                let carrier = aster_iroh::SecretKey::from_bytes(&secret).public();
+                format!("{carrier}@127.0.0.1:9001={index:064x}")
+            })
+            .collect::<Vec<_>>();
+        let mut config: serde_json::Value =
+            serde_json::from_str(&config_with_storage(4_161, 17_891_328)).unwrap();
+        config["mesh"]["peers"] = serde_json::json!(peers);
+        if let Some(policy) = btle {
+            config["btle"] = policy;
+        }
         config.to_string()
     }
 
