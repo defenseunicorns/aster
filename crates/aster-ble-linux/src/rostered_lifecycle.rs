@@ -77,7 +77,7 @@ enum EpochEvent {
     InboundAccepted(Result<(crate::SocketOpen, crate::CanonicalLocator), DriverError>),
     InboundAcceptReady,
     OutboundRetry,
-    CoordinatorAttempt(Option<Box<dyn CoordinatorAttempt>>),
+    CoordinatorAttempt(CoordinatorAttemptEvent),
     ContactFinished(ContactAttemptOutcome),
     CredentialExpired,
 }
@@ -90,14 +90,23 @@ type InboundAcceptFuture = Pin<
             + Send,
     >,
 >;
-type CoordinatorAttemptFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+type CoordinatorAttemptFuture = Pin<Box<dyn Future<Output = Result<(), ContactOutcome>> + Send>>;
+type CoordinatorRevocationFuture<'a> =
+    Pin<Box<dyn Future<Output = ContactOutcome> + Send + 'a>>;
 type CoordinatorAttemptReceiveFuture<'a> =
     Pin<Box<dyn Future<Output = Option<Box<dyn CoordinatorAttempt>>> + Send + 'a>>;
+
+enum CoordinatorAttemptEvent {
+    Received(Option<Box<dyn CoordinatorAttempt>>),
+    Revoked(ContactOutcome),
+}
 
 trait CoordinatorAttempt: Send {
     fn transport_kind(&self) -> EventTransportKind;
     fn mission(&self) -> NodeId;
     fn peer(&self) -> NodeId;
+    fn revocation_outcome(&mut self) -> CoordinatorRevocationFuture<'_>;
+    fn finish_revoked(self: Box<Self>, outcome: ContactOutcome);
     fn run(self: Box<Self>, contact: Arc<dyn OrderedContact>) -> CoordinatorAttemptFuture;
     fn fail_carrier_open(self: Box<Self>);
     fn fail_unauthenticated_carrier_open(
@@ -120,10 +129,16 @@ impl CoordinatorAttempt for EventOutboundAttempt {
         self.peer()
     }
 
+    fn revocation_outcome(&mut self) -> CoordinatorRevocationFuture<'_> {
+        Box::pin(EventOutboundAttempt::revocation_outcome(self))
+    }
+
+    fn finish_revoked(self: Box<Self>, outcome: ContactOutcome) {
+        EventOutboundAttempt::finish_revoked(*self, outcome);
+    }
+
     fn run(self: Box<Self>, contact: Arc<dyn OrderedContact>) -> CoordinatorAttemptFuture {
-        Box::pin(async move {
-            let _ = EventOutboundAttempt::run(*self, contact).await;
-        })
+        Box::pin(async move { EventOutboundAttempt::run(*self, contact).await })
     }
 
     fn fail_carrier_open(self: Box<Self>) {
@@ -189,14 +204,17 @@ impl EpochContactMode {
         }
     }
 
-    fn receive_enabled(&self) -> bool {
-        matches!(self, Self::Automatic { pending: None, .. })
-    }
-
-    async fn recv(&mut self) -> Option<Box<dyn CoordinatorAttempt>> {
+    async fn next_coordinator_event(&mut self) -> CoordinatorAttemptEvent {
         match self {
             Self::FixedEvaluation => std::future::pending().await,
-            Self::Automatic { attempts, .. } => attempts.recv().await,
+            Self::Automatic {
+                pending: Some(attempt),
+                ..
+            } => CoordinatorAttemptEvent::Revoked(attempt.revocation_outcome().await),
+            Self::Automatic {
+                attempts,
+                pending: None,
+            } => CoordinatorAttemptEvent::Received(attempts.recv().await),
         }
     }
 
@@ -249,6 +267,14 @@ impl EpochContactMode {
             && let Some(attempt) = pending.take()
         {
             attempt.fail_carrier_open();
+        }
+    }
+
+    fn finish_pending_revoked(&mut self, outcome: ContactOutcome) {
+        if let Self::Automatic { pending, .. } = self
+            && let Some(attempt) = pending.take()
+        {
+            attempt.finish_revoked(outcome);
         }
     }
 
@@ -554,7 +580,7 @@ enum ContactAttemptOutcome {
         owner: OutboundAttemptOwner,
     },
     Completed(Box<Result<PeerReceipt, ContactOutcome>>),
-    CoordinatorCompleted,
+    CoordinatorCompleted(Result<(), ContactOutcome>),
     OpenFailed(Box<ContactOpenFailure>),
     Cancelled,
 }
@@ -613,7 +639,7 @@ impl ContactPhase {
         config: Arc<ValidatedRosteredSupervisorConfig>,
         sockets: Arc<S>,
         candidate: DiscoveryCandidate,
-        owner: OutboundAttemptOwner,
+        mut owner: OutboundAttemptOwner,
     ) -> Self
     where
         S: RosteredSocketFactory + 'static,
@@ -623,14 +649,35 @@ impl ContactPhase {
         Self::Active {
             cancellation,
             work: Box::pin(async move {
-                match open_candidate(
+                let open = open_candidate(
                     config.as_ref(),
                     sockets.as_ref(),
                     candidate,
                     &work_cancellation,
-                )
-                .await
-                {
+                );
+                tokio::pin!(open);
+                let opened = match &mut owner {
+                    OutboundAttemptOwner::FixedEvaluation => Ok(open.as_mut().await),
+                    OutboundAttemptOwner::Coordinator(attempt) => {
+                        tokio::select! {
+                            biased;
+                            outcome = attempt.revocation_outcome() => Err(outcome),
+                            result = open.as_mut() => Ok(result),
+                        }
+                    }
+                };
+                let opened = match opened {
+                    Ok(opened) => opened,
+                    Err(outcome) => {
+                        work_cancellation.cancel();
+                        let _ = timeout(CONTACT_DRAIN_DEADLINE, open.as_mut()).await;
+                        if let OutboundAttemptOwner::Coordinator(attempt) = owner {
+                            attempt.finish_revoked(outcome);
+                        }
+                        return ContactAttemptOutcome::CoordinatorCompleted(Err(outcome));
+                    }
+                };
+                match opened {
                     Ok(opened) => ContactAttemptOutcome::Opened {
                         opened: Box::new(opened),
                         owner,
@@ -731,7 +778,7 @@ fn complete_interrupted_contact(
         Some(ContactAttemptOutcome::OpenFailed(failure)) => Some(failure.owner),
         Some(
             ContactAttemptOutcome::Completed(_)
-            | ContactAttemptOutcome::CoordinatorCompleted
+            | ContactAttemptOutcome::CoordinatorCompleted(_)
             | ContactAttemptOutcome::Cancelled,
         )
         | None => None,
@@ -1849,7 +1896,7 @@ where
             let contact_is_free = contact_phase.is_free();
             let outbound_retry_enabled =
                 contact_is_free && outbound_candidate_pending && mode.can_open_outbound(&config);
-            let coordinator_receive_enabled = mode.receive_enabled();
+            let coordinator_event_enabled = mode.is_automatic();
             let outbound_retry_deadline =
                 tokio::time::Instant::from_std(outbound_delay.deadline(lifecycle_now()));
             let event = match &mut scan_phase {
@@ -1869,8 +1916,8 @@ where
                         },
                         () = advertisement_terminated => EpochEvent::AdvertisementTerminated,
                         reason = scan_terminated => EpochEvent::ScanTerminated(reason),
-                        attempt = mode.recv(), if coordinator_receive_enabled => {
-                            EpochEvent::CoordinatorAttempt(attempt)
+                        event = mode.next_coordinator_event(), if coordinator_event_enabled => {
+                            EpochEvent::CoordinatorAttempt(event)
                         },
                         () = tokio::time::sleep_until(outbound_retry_deadline), if outbound_retry_enabled => {
                             EpochEvent::OutboundRetry
@@ -1895,8 +1942,8 @@ where
                             EpochEvent::AdvertisementRotation
                         },
                         () = advertisement_terminated => EpochEvent::AdvertisementTerminated,
-                        attempt = mode.recv(), if coordinator_receive_enabled => {
-                            EpochEvent::CoordinatorAttempt(attempt)
+                        event = mode.next_coordinator_event(), if coordinator_event_enabled => {
+                            EpochEvent::CoordinatorAttempt(event)
                         },
                         () = tokio::time::sleep_until(outbound_retry_deadline), if outbound_retry_enabled => {
                             EpochEvent::OutboundRetry
@@ -2021,7 +2068,7 @@ where
                         Err(error) => break Err(error),
                     }
                 }
-                EpochEvent::CoordinatorAttempt(Some(attempt)) => {
+                EpochEvent::CoordinatorAttempt(CoordinatorAttemptEvent::Received(Some(attempt))) => {
                     if mode.accept_attempt(&config, attempt) {
                         outbound_candidate_pending =
                             admission.selected_candidate(lifecycle_now()).is_some();
@@ -2044,7 +2091,13 @@ where
                         }
                     }
                 }
-                EpochEvent::CoordinatorAttempt(None) => break Ok(()),
+                EpochEvent::CoordinatorAttempt(CoordinatorAttemptEvent::Received(None)) => {
+                    break Ok(());
+                }
+                EpochEvent::CoordinatorAttempt(CoordinatorAttemptEvent::Revoked(outcome)) => {
+                    mode.finish_pending_revoked(outcome);
+                    outbound_candidate_pending = false;
+                }
                 EpochEvent::ContactFinished(outcome) => {
                     let now = lifecycle_now();
                     let outcome = match outcome {
@@ -2083,10 +2136,6 @@ where
                                 }
                             };
                             continue;
-                        }
-                        ContactAttemptOutcome::CoordinatorCompleted => {
-                            outbound_candidate_pending = false;
-                            ContactAttemptOutcome::Cancelled
                         }
                         outcome => outcome,
                     };
@@ -2203,9 +2252,7 @@ fn finish_contact_attempt(
         ContactAttemptOutcome::Opened { .. } => {
             unreachable!("opened contact is handled in the epoch")
         }
-        ContactAttemptOutcome::CoordinatorCompleted => {
-            unreachable!("coordinator completion is handled in the epoch")
-        }
+        ContactAttemptOutcome::CoordinatorCompleted(_) => {}
         ContactAttemptOutcome::OpenFailed(failure) => {
             let ContactOpenFailure {
                 candidate,
@@ -2247,34 +2294,47 @@ fn finish_contact_attempt(
             }
         }
         ContactAttemptOutcome::Cancelled => {}
-        ContactAttemptOutcome::Completed(result) => match *result {
-            Ok(_receipt) => {
-                if schedule.self_schedule && config.role() == FixedRole::Initiator {
-                    schedule.backoff.reset();
-                    *schedule.candidate_pending = admission.selected_candidate(now).is_some();
-                    *schedule.delay = OutboundDelay::CadenceUntil(now + config.contact_cadence());
-                }
-            }
-            Err(outcome) if outcome.reason() == ContactReason::AdmissionClosed => {
-                return Err(SupervisorError::AdmissionClosed);
-            }
-            Err(outcome) if outcome.reason() == ContactReason::ActorUnavailable => {
-                return Err(SupervisorError::ActorUnavailable);
-            }
-            Err(outcome) if outcome.reason() == ContactReason::ActorStopped => {
-                return Err(SupervisorError::ActorStopped);
-            }
-            Err(outcome) => finish_contact_disposition(
-                config,
-                admission,
-                outcome.disposition(),
-                outcome.reason(),
-                now,
-                schedule,
-            )?,
-        },
+        ContactAttemptOutcome::Completed(result) => {
+            finish_contact_result(config, admission, result.map(|_| ()), now, schedule)?
+        }
     }
     Ok(())
+}
+
+fn finish_contact_result(
+    config: &ValidatedRosteredSupervisorConfig,
+    admission: &mut DiscoveryAdmission,
+    result: Result<(), ContactOutcome>,
+    now: Instant,
+    schedule: &mut OutboundSchedule<'_>,
+) -> Result<(), SupervisorError> {
+    match result {
+        Ok(()) => {
+            if schedule.self_schedule && config.role() == FixedRole::Initiator {
+                schedule.backoff.reset();
+                *schedule.candidate_pending = admission.selected_candidate(now).is_some();
+                *schedule.delay = OutboundDelay::CadenceUntil(now + config.contact_cadence());
+            }
+            Ok(())
+        }
+        Err(outcome) if outcome.reason() == ContactReason::AdmissionClosed => {
+            Err(SupervisorError::AdmissionClosed)
+        }
+        Err(outcome) if outcome.reason() == ContactReason::ActorUnavailable => {
+            Err(SupervisorError::ActorUnavailable)
+        }
+        Err(outcome) if outcome.reason() == ContactReason::ActorStopped => {
+            Err(SupervisorError::ActorStopped)
+        }
+        Err(outcome) => finish_contact_disposition(
+            config,
+            admission,
+            outcome.disposition(),
+            outcome.reason(),
+            now,
+            schedule,
+        ),
+    }
 }
 
 fn finish_contact_disposition(
@@ -2494,9 +2554,9 @@ async fn run_coordinator_contact(
             let _ = timeout(CONTACT_DRAIN_DEADLINE, &mut completion).await;
             ContactAttemptOutcome::Cancelled
         }
-        () = &mut completion => {
+        result = &mut completion => {
             contact.close();
-            ContactAttemptOutcome::CoordinatorCompleted
+            ContactAttemptOutcome::CoordinatorCompleted(result)
         }
     };
     drop(completion);
@@ -2610,8 +2670,11 @@ mod tests {
     };
     use aster_contact::OrderedContact;
     use aster_node::{
-        AutomaticEventTransportHandle, ContactOutcome, MissionPeerExpectation,
-        OrderedEventContactRole, PeerReceipt,
+        AutomaticEventTransportHandle, ContactOutcome, EventAdapterControl,
+        EventAdapterSnapshot, EventAdapterState, EventAttemptReceiver, EventOutboundAttempt,
+        EventPeerEligibility, EventTransportKind, MissionPeerExpectation, MutableSourceInterests,
+        NodeApplication, OrderedEventContactRole, PeerReceipt, RunningAutomaticEventTransportHandle,
+        RunningNode, TransportNeutralNodeConfig, start_transport_neutral_node,
     };
     use bluer::{Address, AddressType};
     use std::{
@@ -2619,7 +2682,7 @@ mod tests {
         future::pending,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicU8, Ordering},
+            atomic::{AtomicU8, AtomicU64, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -5285,6 +5348,9 @@ mod tests {
         started: Option<Arc<Notify>>,
         release: Option<Arc<Notify>>,
         completed: Arc<AtomicU8>,
+        revocation: Option<watch::Receiver<Option<ContactOutcome>>>,
+        run_result: Result<(), ContactOutcome>,
+        finished_revocation: Arc<Mutex<Option<ContactOutcome>>>,
     }
 
     impl CoordinatorAttempt for TestCoordinatorAttempt {
@@ -5300,6 +5366,28 @@ mod tests {
             self.peer
         }
 
+        fn revocation_outcome(&mut self) -> CoordinatorRevocationFuture<'_> {
+            Box::pin(async move {
+                let Some(revocation) = self.revocation.as_mut() else {
+                    return pending().await;
+                };
+                loop {
+                    if let Some(outcome) = *revocation.borrow() {
+                        return outcome;
+                    }
+                    revocation
+                        .changed()
+                        .await
+                        .expect("test revocation source remains live");
+                }
+            })
+        }
+
+        fn finish_revoked(self: Box<Self>, outcome: ContactOutcome) {
+            *self.finished_revocation.lock().unwrap() = Some(outcome);
+            self.completed.store(1, Ordering::Release);
+        }
+
         fn run(self: Box<Self>, _contact: Arc<dyn OrderedContact>) -> CoordinatorAttemptFuture {
             Box::pin(async move {
                 self.runs.fetch_add(1, Ordering::AcqRel);
@@ -5310,6 +5398,7 @@ mod tests {
                     release.notified().await;
                 }
                 self.completed.store(1, Ordering::Release);
+                self.run_result
             })
         }
 
@@ -5366,6 +5455,9 @@ mod tests {
             started: None,
             release: None,
             completed,
+            revocation: None,
+            run_result: Ok(()),
+            finished_revocation: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -5376,6 +5468,7 @@ mod tests {
         ambiguous_failures: Arc<AtomicU8>,
         cancellations: Arc<AtomicU8>,
         completed: Arc<AtomicU8>,
+        finished_revocation: Arc<Mutex<Option<ContactOutcome>>>,
     }
 
     fn instrumented_attempt(
@@ -5394,7 +5487,477 @@ mod tests {
             started: None,
             release: None,
             completed: counters.completed.clone(),
+            revocation: None,
+            run_result: Ok(()),
+            finished_revocation: counters.finished_revocation.clone(),
         })
+    }
+
+    fn revocable_attempt(
+        mission: [u8; 32],
+        peer: [u8; 32],
+        counters: &TestAttemptCounters,
+        revocation: watch::Receiver<Option<ContactOutcome>>,
+    ) -> Box<dyn CoordinatorAttempt> {
+        Box::new(TestCoordinatorAttempt {
+            mission,
+            peer,
+            kind: EventTransportKind::BLE_L2CAP_V1,
+            runs: counters.runs.clone(),
+            carrier_failures: counters.carrier_failures.clone(),
+            ambiguous_failures: counters.ambiguous_failures.clone(),
+            cancellations: counters.cancellations.clone(),
+            started: None,
+            release: None,
+            completed: counters.completed.clone(),
+            revocation: Some(revocation),
+            run_result: Ok(()),
+            finished_revocation: counters.finished_revocation.clone(),
+        })
+    }
+
+    struct ProductionAttemptFixture {
+        state: std::path::PathBuf,
+        node: RunningNode,
+        automatic: RunningAutomaticEventTransportHandle,
+        control: EventAdapterControl,
+        attempts: EventAttemptReceiver,
+        mission: [u8; 32],
+        peer: [u8; 32],
+    }
+
+    impl ProductionAttemptFixture {
+        async fn new() -> Self {
+            static NEXT_STATE: AtomicU64 = AtomicU64::new(1);
+            let state = std::env::temp_dir().join(format!(
+                "aster-ble-linux-attempt-{}-{}",
+                std::process::id(),
+                NEXT_STATE.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&state).expect("test state root");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))
+                    .expect("owner-only test state root");
+            }
+            let mission_bundle = aster_node::mission::UnprotectedReferenceMission::from_bytes(
+                include_bytes!(
+                    "../../../bindings/testdata/non-production-provisioning.bundle"
+                )
+                .to_vec(),
+            )
+            .expect("test mission");
+            let mission = mission_bundle.identity();
+            let node = start_transport_neutral_node(TransportNeutralNodeConfig {
+                state: state.clone(),
+                mission: mission_bundle,
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            })
+            .await
+            .expect("transport-neutral node");
+            let automatic = node.automatic_event_transports();
+            let (control, attempts) = automatic
+                .register(EventAdapterSnapshot::new(
+                    EventTransportKind::BLE_L2CAP_V1,
+                    1,
+                    EventAdapterState::Available,
+                    true,
+                    10,
+                ))
+                .expect("test adapter");
+            let peer = [0xff; 32];
+            assert!(automatic
+                .replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                    mission,
+                    peer,
+                    EventTransportKind::BLE_L2CAP_V1,
+                    true,
+                    1,
+                    0,
+                    None,
+                )])
+                .is_some());
+            Self {
+                state,
+                node,
+                automatic,
+                control,
+                attempts,
+                mission,
+                peer,
+            }
+        }
+
+        async fn issue(
+            &mut self,
+        ) -> (
+            EventOutboundAttempt,
+            JoinHandle<Option<Result<(), ContactOutcome>>>,
+        ) {
+            let automatic = self.automatic.clone();
+            let peer = self.peer;
+            let observer = tokio::spawn(async move { automatic.run_peer_attempt(peer).await });
+            let attempt = self.attempts.recv().await.expect("issued test attempt");
+            (attempt, observer)
+        }
+
+        async fn adapter_epoch_outcome(&mut self) -> ContactOutcome {
+            let (mut attempt, observer) = self.issue().await;
+            assert!(self.control.publish_availability(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                2,
+                EventAdapterState::Unavailable,
+                true,
+                10,
+            )));
+            let outcome = attempt.revocation_outcome().await;
+            attempt.finish_revoked(outcome);
+            assert_eq!(observer.await.unwrap(), Some(Err(outcome)));
+            outcome
+        }
+
+        async fn authority_change_outcome(&mut self) -> ContactOutcome {
+            let (mut attempt, observer) = self.issue().await;
+            assert!(self
+                .automatic
+                .replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                    self.mission,
+                    self.peer,
+                    EventTransportKind::BLE_L2CAP_V1,
+                    true,
+                    2,
+                    0,
+                    None,
+                )])
+                .is_some());
+            let outcome = attempt.revocation_outcome().await;
+            attempt.finish_revoked(outcome);
+            assert_eq!(observer.await.unwrap(), Some(Err(outcome)));
+            outcome
+        }
+
+        async fn shutdown(self) {
+            let Self {
+                state,
+                node,
+                automatic,
+                control,
+                attempts,
+                ..
+            } = self;
+            drop(attempts);
+            drop(control);
+            drop(automatic);
+            node.shutdown().await.expect("test node shutdown");
+            std::fs::remove_dir_all(state).expect("test state cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_ticket_revocation_completes_without_discovery_candidate() {
+        let mut production = ProductionAttemptFixture::new().await;
+        let revoked = production.adapter_epoch_outcome().await;
+        assert_eq!(revoked.disposition(), ContactDisposition::Reselect);
+        assert_eq!(revoked.reason(), ContactReason::AdapterEpochEnded);
+        production.shutdown().await;
+
+        let sockets = Arc::new(ConnectingSockets {
+            connected: Mutex::new(Vec::new()),
+        });
+        let discovery = Arc::new(FakeDiscovery {
+            events: Arc::new(Mutex::new(Vec::new())),
+            advertisements: Arc::new(Mutex::new(Vec::new())),
+            scan_started: Arc::new(Notify::new()),
+            observation_sender: Mutex::new(None),
+        });
+        let (attempt_sender, attempt_receiver) = mpsc::channel(1);
+        let received = Arc::new(Notify::new());
+        let attempts: Box<dyn CoordinatorAttemptSource> = Box::new(TestCoordinatorAttemptSource {
+            attempts: attempt_receiver,
+            received: Some(received.clone()),
+        });
+        let counters = TestAttemptCounters::default();
+        let (_revocation_guard, revocation) = watch::channel(Some(revoked));
+        attempt_sender
+            .send(revocable_attempt(
+                [0x11; 32],
+                [0x22; 32],
+                &counters,
+                revocation,
+            ))
+            .await
+            .unwrap();
+        let cancellation = LifecycleCancellation::new();
+        let task = tokio::spawn(run_automatic_available_epoch(
+            Arc::new(config()),
+            sockets.clone(),
+            discovery.clone(),
+            Arc::new(FixedNonce([0x41; 16])),
+            recording_admission(),
+            attempts,
+            EpochSignals::default(),
+            cancellation.clone(),
+        ));
+
+        discovery.scan_started.notified().await;
+        received.notified().await;
+        for _ in 0..8 {
+            if counters.completed.load(Ordering::Acquire) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*counters.finished_revocation.lock().unwrap(), Some(revoked));
+        assert_eq!(counters.runs.load(Ordering::Acquire), 0);
+        assert!(sockets.connected.lock().unwrap().is_empty());
+
+        let replacement = TestAttemptCounters::default();
+        attempt_sender
+            .send(instrumented_attempt(
+                [0x11; 32],
+                [0x22; 32],
+                &replacement,
+            ))
+            .await
+            .unwrap();
+        received.notified().await;
+        assert!(!task.is_finished());
+
+        cancellation.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn adapter_epoch_loss_reports_reselect_and_keeps_supervisor_recoverable() {
+        let mut production = ProductionAttemptFixture::new().await;
+        let revoked = production.adapter_epoch_outcome().await;
+        assert_eq!(revoked.disposition(), ContactDisposition::Reselect);
+        assert_eq!(revoked.reason(), ContactReason::AdapterEpochEnded);
+        production.shutdown().await;
+
+        let locator = crate::CanonicalLocator::new(
+            Address::new([2, 0, 0, 0, 0, 0x42]),
+            AddressType::LeRandom,
+        )
+        .unwrap();
+        let connect_started = Arc::new(Notify::new());
+        let sockets = Arc::new(PendingConnectSockets {
+            connected: Mutex::new(Vec::new()),
+            started: connect_started.clone(),
+        });
+        let discovery = Arc::new(FakeDiscovery {
+            events: Arc::new(Mutex::new(Vec::new())),
+            advertisements: Arc::new(Mutex::new(Vec::new())),
+            scan_started: Arc::new(Notify::new()),
+            observation_sender: Mutex::new(None),
+        });
+        let (attempt_sender, attempts) = coordinator_attempt_channel();
+        let first = TestAttemptCounters::default();
+        let (revoke, revocation) = watch::channel(None);
+        attempt_sender
+            .send(revocable_attempt(
+                [0x11; 32],
+                [0x22; 32],
+                &first,
+                revocation,
+            ))
+            .await
+            .unwrap();
+        let cancellation = LifecycleCancellation::new();
+        let task = tokio::spawn(run_automatic_available_epoch(
+            Arc::new(config()),
+            sockets.clone(),
+            discovery.clone(),
+            Arc::new(FixedNonce([0x42; 16])),
+            recording_admission(),
+            attempts,
+            EpochSignals::default(),
+            cancellation.clone(),
+        ));
+
+        discovery.scan_started.notified().await;
+        send_observation(&discovery, &config(), locator).await;
+        connect_started.notified().await;
+        revoke.send(Some(revoked)).unwrap();
+        for _ in 0..8 {
+            if first.completed.load(Ordering::Acquire) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*first.finished_revocation.lock().unwrap(), Some(revoked));
+        assert_eq!(first.runs.load(Ordering::Acquire), 0);
+
+        let replacement = TestAttemptCounters::default();
+        attempt_sender
+            .send(instrumented_attempt(
+                [0x11; 32],
+                [0x22; 32],
+                &replacement,
+            ))
+            .await
+            .unwrap();
+        connect_started.notified().await;
+        assert_eq!(sockets.connected.lock().unwrap().len(), 2);
+        assert!(!task.is_finished());
+
+        cancellation.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn authority_change_never_opens_a_carrier_or_pins_the_attempt_lane() {
+        let mut production = ProductionAttemptFixture::new().await;
+        let revoked = production.authority_change_outcome().await;
+        assert_eq!(revoked.disposition(), ContactDisposition::Suppress);
+        assert_eq!(revoked.reason(), ContactReason::AuthorityChanged);
+        production.shutdown().await;
+
+        let locator = crate::CanonicalLocator::new(
+            Address::new([2, 0, 0, 0, 0, 0x43]),
+            AddressType::LeRandom,
+        )
+        .unwrap();
+        let sockets = Arc::new(ConnectingSockets {
+            connected: Mutex::new(Vec::new()),
+        });
+        let discovery = Arc::new(FakeDiscovery {
+            events: Arc::new(Mutex::new(Vec::new())),
+            advertisements: Arc::new(Mutex::new(Vec::new())),
+            scan_started: Arc::new(Notify::new()),
+            observation_sender: Mutex::new(None),
+        });
+        let (attempt_sender, attempts) = coordinator_attempt_channel();
+        let first = TestAttemptCounters::default();
+        let (_revocation_guard, revocation) = watch::channel(Some(revoked));
+        attempt_sender
+            .send(revocable_attempt(
+                [0x11; 32],
+                [0x22; 32],
+                &first,
+                revocation,
+            ))
+            .await
+            .unwrap();
+        let cancellation = LifecycleCancellation::new();
+        let task = tokio::spawn(run_automatic_available_epoch(
+            Arc::new(config()),
+            sockets.clone(),
+            discovery.clone(),
+            Arc::new(FixedNonce([0x43; 16])),
+            recording_admission(),
+            attempts,
+            EpochSignals::default(),
+            cancellation.clone(),
+        ));
+
+        discovery.scan_started.notified().await;
+        send_observation(&discovery, &config(), locator).await;
+        for _ in 0..8 {
+            if first.completed.load(Ordering::Acquire) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*first.finished_revocation.lock().unwrap(), Some(revoked));
+        assert!(sockets.connected.lock().unwrap().is_empty());
+
+        let replacement = TestAttemptCounters::default();
+        attempt_sender
+            .send(instrumented_attempt(
+                [0x11; 32],
+                [0x22; 32],
+                &replacement,
+            ))
+            .await
+            .unwrap();
+        for _ in 0..8 {
+            if replacement.completed.load(Ordering::Acquire) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(replacement.runs.load(Ordering::Acquire), 1);
+        assert_eq!(sockets.connected.lock().unwrap().len(), 1);
+        assert!(!task.is_finished());
+
+        cancellation.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_suppression_parks_external_schedule_without_terminating_epoch() {
+        let mut production = ProductionAttemptFixture::new().await;
+        let suppressed = production.authority_change_outcome().await;
+        assert_eq!(suppressed.disposition(), ContactDisposition::Suppress);
+        production.shutdown().await;
+
+        let now = Instant::now();
+        let mut admission = DiscoveryAdmission::new();
+        let mut delay = OutboundDelay::Ready;
+        let mut pending = false;
+        let mut backoff = CappedBackoff::new(INITIAL_EPOCH_RETRY, MAXIMUM_EPOCH_RETRY);
+        let mut schedule = OutboundSchedule {
+            delay: &mut delay,
+            candidate_pending: &mut pending,
+            backoff: &mut backoff,
+            self_schedule: false,
+        };
+
+        assert_eq!(
+            finish_contact_attempt(
+                &config(),
+                &mut admission,
+                ContactAttemptOutcome::CoordinatorCompleted(Err(suppressed)),
+                now,
+                &mut schedule,
+            ),
+            Ok(())
+        );
+        assert!(!pending);
+        assert_eq!(delay.deadline(now), now);
+    }
+
+    #[test]
+    fn terminal_contact_outcome_does_not_terminate_transport_neutral_service() {
+        let terminal = ContactOutcome::admission_closed();
+        assert_eq!(terminal.disposition(), ContactDisposition::Terminal);
+        let now = Instant::now();
+        let mut admission = DiscoveryAdmission::new();
+        let mut delay = OutboundDelay::Ready;
+        let mut pending = false;
+        let mut backoff = CappedBackoff::new(INITIAL_EPOCH_RETRY, MAXIMUM_EPOCH_RETRY);
+        let mut schedule = OutboundSchedule {
+            delay: &mut delay,
+            candidate_pending: &mut pending,
+            backoff: &mut backoff,
+            self_schedule: false,
+        };
+
+        assert_eq!(
+            finish_contact_attempt(
+                &config(),
+                &mut admission,
+                ContactAttemptOutcome::CoordinatorCompleted(Err(terminal)),
+                now,
+                &mut schedule,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            finish_contact_attempt(
+                &config(),
+                &mut admission,
+                ContactAttemptOutcome::Completed(Box::new(Err(terminal))),
+                now,
+                &mut schedule,
+            ),
+            Err(SupervisorError::AdmissionClosed)
+        );
     }
 
     fn coordinator_attempt_channel() -> (
@@ -6915,6 +7478,9 @@ mod tests {
                 started: Some(started.clone()),
                 release: Some(release.clone()),
                 completed: completed.clone(),
+                revocation: None,
+                run_result: Ok(()),
+                finished_revocation: Arc::new(Mutex::new(None)),
             }))
             .await
             .unwrap();
