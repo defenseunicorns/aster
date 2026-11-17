@@ -128,9 +128,6 @@ maturity. A requirement keeps credit only when its original behavioral
 assertions remain in a default correctness test or the applicable retained
 evidence; moving physical scale to qualification does not add credit, and
 reducing a fixture without changing its semantic boundary does not remove it.
-The assertion mapping and the complete initial over-target inventory are
-retained in
-[`2026-10-20-fast-test-baseline.md`](../superpowers/reports/2026-10-20-fast-test-baseline.md).
 
 The two Linux nextest partitions use the `ci` profile in
 `.config/nextest.toml`. Each partition writes one bounded JUnit report without
