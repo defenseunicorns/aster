@@ -161,6 +161,7 @@ use crate::{
         AutomaticEventTransportHandle, ContactDisposition, ContactOutcome, ContactProvenance,
         ContactReason, ContactScope, ContactStage, EventAdapterControl, EventAdapterSnapshot,
         EventAttemptAdmission, EventAttemptReceiver, EventPeerEligibility,
+        event_eligibility_is_current,
     },
     format_node_id, format_path_field, format_receipt_field,
     frame::{
@@ -3959,6 +3960,7 @@ struct AutomaticEventRuntimeState {
 pub struct RunningAutomaticEventTransportHandle {
     coordinator: AutomaticEventTransportHandle,
     admission: Arc<TransportAdmission>,
+    lifecycle: Arc<StdMutex<()>>,
     state: Arc<StdMutex<AutomaticEventRuntimeState>>,
     mission: NodeId,
     ordered_contacts: OrderedEventContactHandle,
@@ -3978,10 +3980,14 @@ impl RunningAutomaticEventTransportHandle {
         admission: Arc<TransportAdmission>,
         mission: NodeId,
         ordered_contacts: OrderedEventContactHandle,
+        outbound_enabled: bool,
     ) -> Self {
+        let coordinator = AutomaticEventTransportHandle::new();
+        coordinator.set_outbound_suspended(!outbound_enabled);
         Self {
-            coordinator: AutomaticEventTransportHandle::new(),
+            coordinator,
             admission,
+            lifecycle: Arc::new(StdMutex::new(())),
             state: Arc::new(StdMutex::new(AutomaticEventRuntimeState::default())),
             mission,
             ordered_contacts,
@@ -3999,6 +4005,10 @@ impl RunningAutomaticEventTransportHandle {
         &self,
         snapshot: EventAdapterSnapshot,
     ) -> Option<(EventAdapterControl, EventAttemptReceiver)> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.admission
             .allows_composition()
             .then(|| self.coordinator.register(snapshot))
@@ -4013,6 +4023,10 @@ impl RunningAutomaticEventTransportHandle {
         &self,
         snapshot: EventAdapterSnapshot,
     ) -> Option<crate::EventAdapterRegistration> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.admission
             .allows_composition()
             .then(|| self.coordinator.register_paired(snapshot))
@@ -4032,9 +4046,12 @@ impl RunningAutomaticEventTransportHandle {
         if !self.admission.is_open() {
             return None;
         }
+        let now = self.coordinator.authority_time();
         let current_peers = eligibility
             .iter()
-            .filter(|entry| entry.mission() == self.mission)
+            .filter(|entry| {
+                entry.mission() == self.mission && event_eligibility_is_current(entry, now)
+            })
             .map(EventPeerEligibility::peer)
             .collect::<BTreeSet<_>>();
         let mut state = self
@@ -4056,6 +4073,34 @@ impl RunningAutomaticEventTransportHandle {
         } else {
             AutomaticEventRosterStatus::Scheduled
         })
+    }
+
+    /// Runs one transport-owner request for a current exact peer.
+    #[doc(hidden)]
+    pub async fn run_peer_attempt(&self, peer: NodeId) -> Option<Result<(), ContactOutcome>> {
+        if !self.admission.is_open() {
+            return None;
+        }
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.requested_generation.contains_key(&peer) {
+            return None;
+        }
+        drop(state);
+        let (admission, observation) = self.coordinator.request_observed_attempt(
+            self.mission,
+            peer,
+            self.event_attempt_runner(peer),
+        );
+        let immediate_error = match admission {
+            EventAttemptAdmission::Accepted | EventAttemptAdmission::Retained => false,
+            EventAttemptAdmission::Closed | EventAttemptAdmission::CapacityFull => true,
+        };
+        let result = observation.wait().await;
+        debug_assert!(!immediate_error || result.is_err());
+        Some(result)
     }
 
     fn note_durable_work(&self) {
@@ -4110,27 +4155,82 @@ impl RunningAutomaticEventTransportHandle {
         {
             return true;
         }
-        let ordered_contacts = self.ordered_contacts.clone();
-        let accepted =
-            self.coordinator
-                .request_attempt_admission(self.mission, peer, move |contact| {
-                    let ordered_contacts = ordered_contacts.clone();
-                    async move {
-                        let expectation =
-                            MissionPeerExpectation::new(contact.peer_evidence(), peer);
-                        ordered_contacts
-                            .run(OrderedEventContactRole::Initiator, contact, expectation)
-                            .await
-                            .map(|_| ())
-                    }
-                });
-        match accepted {
+        let admission = self.request_peer_attempt(peer);
+        match admission {
             EventAttemptAdmission::Accepted => {
                 state.requested_generation.insert(peer, generation);
                 true
             }
+            EventAttemptAdmission::Retained => {
+                state.requested_generation.insert(peer, generation);
+                true
+            }
+            EventAttemptAdmission::Closed => {
+                state.requested_generation.remove(&peer);
+                true
+            }
             EventAttemptAdmission::CapacityFull => false,
         }
+    }
+
+    fn request_peer_attempt(&self, peer: NodeId) -> EventAttemptAdmission {
+        self.coordinator.request_attempt_admission(
+            self.mission,
+            peer,
+            self.event_attempt_runner(peer),
+        )
+    }
+
+    fn event_attempt_runner(
+        &self,
+        peer: NodeId,
+    ) -> impl Fn(
+        Arc<dyn OrderedContact>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ContactOutcome>> + Send + 'static>>
+    + Send
+    + Sync
+    + 'static {
+        let ordered_contacts = self.ordered_contacts.clone();
+        move |contact: Arc<dyn OrderedContact>| {
+            let ordered_contacts = ordered_contacts.clone();
+            Box::pin(async move {
+                let expectation = MissionPeerExpectation::new(contact.peer_evidence(), peer);
+                ordered_contacts
+                    .run(OrderedEventContactRole::Initiator, contact, expectation)
+                    .await
+                    .map(|_| ())
+            })
+        }
+    }
+
+    fn update_emission_policy(
+        &self,
+        emission_policy: &LiveEmissionPolicy,
+        policy: EventEmissionPolicy,
+        #[cfg(feature = "nearby-discovery")] nearby_discovery_stop: Option<&NearbyDiscoveryControl>,
+    ) -> Result<u64, NodeError> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = emission_policy.snapshot()?;
+        if current.policy != policy
+            && self
+                .coordinator
+                .has_registration(crate::EventTransportKind::BLE_L2CAP_V1)
+        {
+            return Err(NodeError::EmissionPolicyRestartRequired);
+        }
+        let update = emission_policy.update(policy)?;
+        self.coordinator
+            .set_outbound_suspended(!policy.permits_contact_initiation());
+        #[cfg(feature = "nearby-discovery")]
+        if policy != EventEmissionPolicy::Normal
+            && let Some(stop) = nearby_discovery_stop
+        {
+            stop.stop();
+        }
+        Ok(update.snapshot.revision)
     }
 
     #[cfg(test)]
@@ -4298,7 +4398,9 @@ fn ordered_contact_failure(
                 ContactDisposition::Reselect,
                 ContactReason::TransportInterrupted,
             ),
-            NodeError::EmissionPolicyChanged | NodeError::CustodySendSkipped => {
+            NodeError::EmissionPolicyChanged
+            | NodeError::EmissionPolicyRestartRequired
+            | NodeError::CustodySendSkipped => {
                 ContactOutcome::authenticated_session(
                     ContactScope::Policy,
                     ContactDisposition::RetryLater,
@@ -4356,7 +4458,9 @@ fn ordered_contact_failure(
             | NodeError::Protocol(_) => {
                 ContactOutcome::pre_auth_remote(ContactReason::ProtocolViolation)
             }
-            NodeError::EmissionPolicyChanged | NodeError::CustodySendSkipped => {
+            NodeError::EmissionPolicyChanged
+            | NodeError::EmissionPolicyRestartRequired
+            | NodeError::CustodySendSkipped => {
                 ContactOutcome::local_policy(ContactStage::MissionHandshake)
             }
             NodeError::Configuration(_)
@@ -4682,21 +4786,20 @@ impl RunningNode {
 
     /// Atomically replaces the live emission policy.
     ///
+    /// A differing policy requires a controlled restart while a BTLE owner is
+    /// composed; rejection leaves the policy, gate, discovery, and ownership
+    /// state unchanged.
+    ///
     /// In-flight contacts recheck this revision immediately before every
     /// application/control frame send and durable receive commit. A changed
     /// revision closes that contact so later work starts from a fresh policy.
     pub fn set_event_emission_policy(&self, policy: EventEmissionPolicy) -> Result<u64, NodeError> {
-        let update = self.emission_policy.update(policy)?;
-        #[cfg(feature = "nearby-discovery")]
-        if policy != EventEmissionPolicy::Normal
-            && let Some(stop) = &self.nearby_discovery_stop
-        {
-            // Clear the lookup registry and drop its provider before this
-            // public policy mutation returns. Once stopped, a nearby window
-            // cannot be reopened by returning to Normal.
-            stop.stop();
-        }
-        Ok(update.snapshot.revision)
+        self.automatic_event_transports.update_emission_policy(
+            self.emission_policy.as_ref(),
+            policy,
+            #[cfg(feature = "nearby-discovery")]
+            self.nearby_discovery_stop.as_ref(),
+        )
     }
 
     /// Idempotently closes contact and automatic-adapter admission without
@@ -5342,6 +5445,8 @@ pub enum NodeError {
     Carrier(CarrierError),
     /// Live Event emission policy changed after a contact captured its revision.
     EmissionPolicyChanged,
+    /// A composed BTLE owner requires a controlled restart for policy changes.
+    EmissionPolicyRestartRequired,
     /// A custody item became routinely unsendable before carrier acquisition.
     CustodySendSkipped,
     /// Strict mechanics-frame failure.
@@ -5377,6 +5482,8 @@ impl fmt::Display for NodeError {
             Self::EmissionPolicyChanged => {
                 formatter.write_str("live Event emission policy changed; reconnect required")
             }
+            Self::EmissionPolicyRestartRequired => formatter
+                .write_str("BTLE emission policy changes require a controlled node restart"),
             Self::CustodySendSkipped => {
                 formatter.write_str("custody Event became unsendable before carrier acquisition")
             }
@@ -5405,6 +5512,7 @@ impl Error for NodeError {
             Self::Configuration(_)
             | Self::Revoked(_)
             | Self::EmissionPolicyChanged
+            | Self::EmissionPolicyRestartRequired
             | Self::CustodySendSkipped
             | Self::Protocol(_)
             | Self::FatalBlobCoherence(_)
@@ -17329,14 +17437,15 @@ async fn start_node_with_shutdown_ownership(
         admission: transport_admission.clone(),
         session_permit: Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY)),
     };
+    let emission_policy = Arc::new(LiveEmissionPolicy::new(forwarding.emission_policy()));
     let automatic_event_transports = RunningAutomaticEventTransportHandle::new(
         transport_admission.clone(),
         mission_authority,
         ordered_event_contacts.clone(),
+        forwarding.emission_policy().permits_contact_initiation(),
     );
     let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
     let (ready_sender, ready_receiver) = oneshot::channel();
-    let emission_policy = Arc::new(LiveEmissionPolicy::new(forwarding.emission_policy()));
     let mut channels = NodeActorChannels::new(
         application_receiver,
         application_admission.clone(),
@@ -35273,6 +35382,7 @@ mod tests {
     use std::sync::{Barrier, mpsc as std_mpsc};
 
     use super::*;
+    use crate::{EventAdapterState, EventTransportKind};
     use aster_ble_l2cap::BleL2capContact;
     use aster_contact::{CarrierPeerEvidence, TransientLocator};
     use tokio::io::{AsyncReadExt as _, duplex};
@@ -43663,25 +43773,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_event_transport_full_roster_schedules_each_current_peer_once() {
-        use crate::{
-            EventAdapterSnapshot, EventAdapterState, EventPeerEligibility, EventTransportKind,
-        };
-
-        let mission = [0x81; 32];
-        let first_peer = [0x82; 32];
-        let second_peer = [0x83; 32];
-        let foreign_peer = [0x84; 32];
-        let admission = Arc::new(TransportAdmission::open());
-        let (ordered_sender, _ordered_receiver) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
+    async fn initial_receive_only_suspends_automatic_selection_before_admission_opens() {
+        let mission = [0xa1; 32];
+        let peer = [0xa2; 32];
+        let admission = Arc::new(TransportAdmission::startup_closed());
+        let (ordered_sender, _ordered) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
         let automatic = RunningAutomaticEventTransportHandle::new(
             admission.clone(),
             mission,
             OrderedEventContactHandle {
                 sender: ordered_sender,
-                admission,
+                admission: admission.clone(),
                 session_permit: Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY)),
             },
+            false,
         );
         automatic.note_durable_work();
         let (_control, mut attempts) = automatic
@@ -43692,26 +43797,321 @@ mod tests {
                 true,
                 10,
             ))
-            .expect("fake adapter registration");
-        let first = EventPeerEligibility::provisioned_exact_peer(
+            .expect("receive-only startup adapter");
+        let eligibility = EventPeerEligibility::provisioned_exact_peer(
             mission,
-            first_peer,
+            peer,
             EventTransportKind::BLE_L2CAP_V1,
             true,
             1,
             0,
             None,
         );
+        assert!(automatic.replace_eligibility(vec![eligibility]).is_none());
+        assert!(admission.open_initial());
+        assert_eq!(
+            automatic.replace_eligibility(vec![eligibility]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+        tokio::select! {
+            _attempt = attempts.recv() => panic!("receive-only startup selected an outbound adapter"),
+            () = tokio::task::yield_now() => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn btle_composition_rejects_live_policy_change_before_either_state_changes() {
+        let test_root = root("btle-live-policy-restart-required");
+        fs::create_dir_all(&test_root).expect("policy test state");
+        #[cfg(unix)]
+        fs::set_permissions(&test_root, fs::Permissions::from_mode(0o700))
+            .expect("owner-only policy test state");
+        let local = issue_missions(1).remove(0);
+        let mission = local.credentials.mission_authority_id();
+        let peer = [0xb1; 32];
+        let node = start_transport_neutral_node(TransportNeutralNodeConfig {
+            state: test_root.clone(),
+            mission: local.credentials,
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start policy test node");
+        let automatic = node.automatic_event_transports();
+        let (_control, mut attempts) = automatic
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("live BTLE registration");
+        let original = node.event_emission_policy().expect("initial policy");
+
+        assert!(matches!(
+            node.set_event_emission_policy(EventEmissionPolicy::ReceiveOnly),
+            Err(NodeError::EmissionPolicyRestartRequired)
+        ));
+        assert_eq!(node.event_emission_policy().expect("unchanged policy"), original);
+
+        automatic.note_durable_work();
+        assert_eq!(
+            automatic.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                mission,
+                peer,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            )]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+        assert_eq!(
+            attempts.recv().await.expect("unchanged outbound gate").peer(),
+            peer
+        );
+
+        node.shutdown().await.expect("policy test shutdown");
+        fs::remove_dir_all(test_root).expect("policy test cleanup");
+    }
+
+    #[tokio::test]
+    async fn concurrent_rejected_policy_writers_leave_policy_and_transport_gate_consistent() {
+        let test_root = root("btle-concurrent-policy-restart-required");
+        fs::create_dir_all(&test_root).expect("concurrent policy state");
+        #[cfg(unix)]
+        fs::set_permissions(&test_root, fs::Permissions::from_mode(0o700))
+            .expect("owner-only concurrent policy state");
+        let local = issue_missions(1).remove(0);
+        let mission = local.credentials.mission_authority_id();
+        let peer = [0xb2; 32];
+        let node = start_transport_neutral_node(TransportNeutralNodeConfig {
+            state: test_root.clone(),
+            mission: local.credentials,
+            mutable_interests: MutableSourceInterests::default(),
+            sync_interval: Duration::from_secs(60),
+            run_for: None,
+            application: NodeApplication::Relay,
+        })
+        .await
+        .expect("start concurrent policy node");
+        let automatic = node.automatic_event_transports();
+        let (_control, mut attempts) = automatic
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Available,
+                true,
+                10,
+            ))
+            .expect("live BTLE registration");
+        let original = node.event_emission_policy().expect("initial policy");
+        let policies = [
+            EventEmissionPolicy::ReceiveOnly,
+            EventEmissionPolicy::at_least(Priority::Flash),
+            EventEmissionPolicy::at_least(Priority::Immediate),
+            EventEmissionPolicy::at_least(Priority::Priority),
+            EventEmissionPolicy::ReceiveOnly,
+            EventEmissionPolicy::at_least(Priority::Flash),
+        ];
+        let barrier = Arc::new(Barrier::new(policies.len()));
+        std::thread::scope(|scope| {
+            let mut writers = Vec::new();
+            for policy in policies {
+                let barrier = Arc::clone(&barrier);
+                let node = &node;
+                writers.push(scope.spawn(move || {
+                    barrier.wait();
+                    node.set_event_emission_policy(policy)
+                }));
+            }
+            for writer in writers {
+                assert!(matches!(
+                    writer.join().expect("policy writer joined"),
+                    Err(NodeError::EmissionPolicyRestartRequired)
+                ));
+            }
+        });
+        assert_eq!(
+            node.event_emission_policy().expect("stable policy"),
+            original,
+            "rejected writers must preserve both policy and revision"
+        );
+
+        automatic.note_durable_work();
+        assert_eq!(
+            automatic.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                mission,
+                peer,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            )]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+        assert_eq!(
+            attempts
+                .recv()
+                .await
+                .expect("original outbound gate remains open")
+                .peer(),
+            peer
+        );
+
+        node.shutdown().await.expect("concurrent policy shutdown");
+        fs::remove_dir_all(test_root).expect("concurrent policy cleanup");
+    }
+
+    #[tokio::test]
+    async fn run_peer_attempt_observes_existing_durable_attempt_without_a_second_mode() {
+        let mission = [0xc1; 32];
+        let peer = [0xc2; 32];
+        let admission = Arc::new(TransportAdmission::open());
+        let (ordered_sender, _ordered_receiver) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
+        let automatic = RunningAutomaticEventTransportHandle::new(
+            admission.clone(),
+            mission,
+            OrderedEventContactHandle {
+                sender: ordered_sender,
+                admission,
+                session_permit: Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY)),
+            },
+            true,
+        );
+        automatic.note_durable_work();
+        let (control, mut attempts) = automatic
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Unavailable,
+                true,
+                10,
+            ))
+            .expect("attempt observer adapter");
+        assert_eq!(
+            automatic.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                mission,
+                peer,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            )]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+        let observed = tokio::spawn({
+            let automatic = automatic.clone();
+            async move { automatic.run_peer_attempt(peer).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(control.publish_availability(EventAdapterSnapshot::new(
+            EventTransportKind::BLE_L2CAP_V1,
+            2,
+            EventAdapterState::Available,
+            true,
+            10,
+        )));
+        let attempt = attempts.recv().await.expect("one shared durable attempt");
+        tokio::select! {
+            _duplicate = attempts.recv() => panic!("observer created a second attempt mode"),
+            () = tokio::task::yield_now() => {}
+        }
+        let outcome = attempt.fail_carrier_open();
+        assert_eq!(
+            observed.await.expect("observer task joined"),
+            Some(Err(outcome))
+        );
+    }
+
+    #[tokio::test]
+    async fn eligibility_replacement_schedules_only_current_exact_peers() {
+        use crate::{
+            EventAdapterSnapshot, EventAdapterState, EventPeerEligibility, EventTransportKind,
+        };
+
+        let mission = [0x81; 32];
+        let retired_peer = [0x82; 32];
+        let current_peer = [0x83; 32];
+        let revoked_peer = [0x84; 32];
+        let expired_peer = [0x85; 32];
+        let incapable_peer = [0x86; 32];
+        let foreign_peer = [0x87; 32];
+        let admission = Arc::new(TransportAdmission::open());
+        let (ordered_sender, _ordered_receiver) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
+        let automatic = RunningAutomaticEventTransportHandle::new(
+            admission.clone(),
+            mission,
+            OrderedEventContactHandle {
+                sender: ordered_sender,
+                admission,
+                session_permit: Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY)),
+            },
+            true,
+        );
+        automatic.note_durable_work();
+        let (control, mut attempts) = automatic
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                1,
+                EventAdapterState::Unavailable,
+                true,
+                10,
+            ))
+            .expect("fake adapter registration");
+        assert_eq!(
+            automatic.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                mission,
+                retired_peer,
+                EventTransportKind::BLE_L2CAP_V1,
+                true,
+                1,
+                0,
+                None,
+            )]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
         assert_eq!(
             automatic.replace_eligibility(vec![
-                first,
-                first,
                 EventPeerEligibility::provisioned_exact_peer(
                     mission,
-                    second_peer,
+                    current_peer,
                     EventTransportKind::BLE_L2CAP_V1,
                     true,
-                    1,
+                    2,
+                    0,
+                    None,
+                ),
+                EventPeerEligibility::provisioned_exact_peer(
+                    mission,
+                    revoked_peer,
+                    EventTransportKind::BLE_L2CAP_V1,
+                    true,
+                    3,
+                    3,
+                    None,
+                ),
+                EventPeerEligibility::provisioned_exact_peer(
+                    mission,
+                    expired_peer,
+                    EventTransportKind::BLE_L2CAP_V1,
+                    true,
+                    4,
+                    0,
+                    Some(std::time::UNIX_EPOCH),
+                ),
+                EventPeerEligibility::provisioned_exact_peer(
+                    mission,
+                    incapable_peer,
+                    EventTransportKind::BLE_L2CAP_V1,
+                    false,
+                    5,
                     0,
                     None,
                 ),
@@ -43727,17 +44127,33 @@ mod tests {
             ]),
             Some(AutomaticEventRosterStatus::Scheduled)
         );
-
-        let first_attempt = attempts.recv().await.expect("first unique peer ticket");
-        let mut scheduled = BTreeSet::from([first_attempt.peer()]);
-        drop(first_attempt);
-        let second_attempt = attempts.recv().await.expect("second unique peer ticket");
-        assert!(scheduled.insert(second_attempt.peer()));
-        drop(second_attempt);
-        assert_eq!(scheduled, BTreeSet::from([first_peer, second_peer]));
+        {
+            let state = automatic
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                state
+                    .requested_generation
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![current_peer]
+            );
+        }
+        assert!(control.publish_availability(EventAdapterSnapshot::new(
+            EventTransportKind::BLE_L2CAP_V1,
+            2,
+            EventAdapterState::Available,
+            true,
+            10,
+        )));
+        assert_eq!(
+            attempts.recv().await.expect("current exact-peer attempt").peer(),
+            current_peer
+        );
         tokio::select! {
-            biased;
-            _attempt = attempts.recv() => panic!("duplicate or foreign-mission peer was scheduled"),
+            _attempt = attempts.recv() => panic!("stale or foreign authority was scheduled"),
             () = tokio::task::yield_now() => {}
         }
     }
@@ -43759,6 +44175,7 @@ mod tests {
                 admission,
                 session_permit: Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY)),
             },
+            true,
         );
         automatic.note_durable_work();
         let eligibility = |peer| {

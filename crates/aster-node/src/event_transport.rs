@@ -211,7 +211,11 @@ fn select_event_adapter(
         .map(|adapter| adapter.kind)
 }
 
-fn event_eligibility_is_current(entry: &EventPeerEligibility, now: SystemTime) -> bool {
+/// Returns whether one peer-authority entry is current at the supplied time.
+pub(crate) fn event_eligibility_is_current(
+    entry: &EventPeerEligibility,
+    now: SystemTime,
+) -> bool {
     entry.event_capable
         && entry.authority_generation > entry.revocation_generation
         && entry.expires_at.is_none_or(|expiry| now < expiry)
@@ -537,6 +541,21 @@ impl AutomaticEventTransportHandle {
                 capacity_progress,
             }),
         }
+    }
+
+    /// Returns the coordinator's authority clock reading.
+    pub(crate) fn authority_time(&self) -> SystemTime {
+        (self.shared.clock)()
+    }
+
+    /// Returns whether a live adapter owns the requested transport kind.
+    pub(crate) fn has_registration(&self, kind: EventTransportKind) -> bool {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .adapters
+            .contains_key(&kind)
     }
 
     #[cfg(test)]
