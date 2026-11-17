@@ -643,6 +643,7 @@ pub(super) struct ActiveBtleRuntime {
     eligibility: Option<PendingBtleEligibility>,
     schedule: Option<JoinHandle<()>>,
     unexpected_schedule_exit: bool,
+    cleanup_runtime: Option<tokio::runtime::Handle>,
     #[cfg(feature = "sdk-test-support")]
     node_shutdown_observer: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     #[cfg(feature = "sdk-test-support")]
@@ -657,6 +658,7 @@ impl ActiveBtleRuntime {
             eligibility: None,
             schedule: None,
             unexpected_schedule_exit: false,
+            cleanup_runtime: None,
             #[cfg(feature = "sdk-test-support")]
             node_shutdown_observer: None,
             #[cfg(feature = "sdk-test-support")]
@@ -681,6 +683,7 @@ impl ActiveBtleRuntime {
             eligibility,
             schedule: None,
             unexpected_schedule_exit: false,
+            cleanup_runtime: tokio::runtime::Handle::try_current().ok(),
             #[cfg(feature = "sdk-test-support")]
             node_shutdown_observer,
             #[cfg(feature = "sdk-test-support")]
@@ -827,13 +830,17 @@ impl Drop for ActiveBtleRuntime {
         let schedule = self.schedule.take();
         let had_schedule = schedule.is_some();
         let owner = self.owner.take();
+        let cleanup_runtime = self
+            .cleanup_runtime
+            .take()
+            .or_else(|| tokio::runtime::Handle::try_current().ok());
         if let Some(owner) = &owner {
             let _ = owner.park_unavailable();
             if !had_schedule {
                 owner.cancel();
             }
         }
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        if let Some(runtime) = cleanup_runtime {
             runtime.spawn(async move {
                 let _ = stop_event_schedule(schedule).await;
                 if had_schedule && let Some(owner) = &owner {

@@ -579,6 +579,49 @@ mod tests {
         assert!(dropped.load(Ordering::Acquire));
     }
 
+    #[test]
+    fn drop_outside_entered_runtime_retains_cleanup_custody() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("cleanup runtime");
+        let (active, schedule_abort, cancelled, cancelled_signal, dropped) = {
+            let _entered = runtime.enter();
+            let schedule = tokio::spawn(std::future::pending::<()>());
+            let schedule_abort = schedule.abort_handle();
+            let (owner, cancelled, cancelled_signal, dropped) =
+                cleanup_owner(schedule_abort.clone());
+            let mut active = ActiveBtleRuntime::new(
+                Some(Box::new(owner)),
+                None,
+                #[cfg(feature = "sdk-test-support")]
+                None,
+                #[cfg(feature = "sdk-test-support")]
+                None,
+            );
+            active.schedule = Some(schedule);
+            (
+                active,
+                schedule_abort,
+                cancelled,
+                cancelled_signal,
+                dropped,
+            )
+        };
+
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        drop(active);
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), cancelled_signal.notified())
+                .await
+                .expect("captured runtime cancelled owner");
+        });
+
+        assert!(schedule_abort.is_finished());
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
     #[cfg(feature = "sdk-test-support")]
     struct ListenerArtifactProvider(Option<Vec<u8>>);
 
