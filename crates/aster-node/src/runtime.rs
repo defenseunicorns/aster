@@ -3850,6 +3850,21 @@ struct TransportAdmission {
     changes: watch::Sender<()>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrderedContactAdmissionRejection {
+    StartupClosed,
+    TerminalClosed,
+}
+
+impl OrderedContactAdmissionRejection {
+    fn outcome(self) -> ContactOutcome {
+        match self {
+            Self::StartupClosed => ContactOutcome::admission_busy(),
+            Self::TerminalClosed => ContactOutcome::admission_closed(),
+        }
+    }
+}
+
 impl TransportAdmission {
     fn open() -> Self {
         Self::new(TRANSPORT_ADMISSION_OPEN)
@@ -3869,6 +3884,19 @@ impl TransportAdmission {
 
     fn is_open(&self) -> bool {
         self.state.load(Ordering::Acquire) == TRANSPORT_ADMISSION_OPEN
+    }
+
+    fn ordered_contact_rejection(&self) -> Option<OrderedContactAdmissionRejection> {
+        match self.state.load(Ordering::Acquire) {
+            TRANSPORT_ADMISSION_OPEN => None,
+            TRANSPORT_ADMISSION_STARTUP_CLOSED => {
+                Some(OrderedContactAdmissionRejection::StartupClosed)
+            }
+            TRANSPORT_ADMISSION_TERMINAL_CLOSED => {
+                Some(OrderedContactAdmissionRejection::TerminalClosed)
+            }
+            _ => Some(OrderedContactAdmissionRejection::TerminalClosed),
+        }
     }
 
     fn allows_composition(&self) -> bool {
@@ -4395,9 +4423,9 @@ impl OrderedEventContactHandle {
         contact: Arc<dyn OrderedContact>,
         peer: MissionPeerExpectation,
     ) -> Result<PeerReceipt, ContactOutcome> {
-        if !self.admission.is_open() {
+        if let Some(rejection) = self.admission.ordered_contact_rejection() {
             contact.close();
-            return Err(ContactOutcome::admission_closed());
+            return Err(rejection.outcome());
         }
         let session_permit = self
             .session_permit
@@ -35247,7 +35275,7 @@ mod tests {
     use super::*;
     use aster_ble_l2cap::BleL2capContact;
     use aster_contact::{CarrierPeerEvidence, TransientLocator};
-    use tokio::io::duplex;
+    use tokio::io::{AsyncReadExt as _, duplex};
 
     #[test]
     fn profile5_blob_error_boundary_does_not_expose_internal_detail() {
@@ -41992,34 +42020,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordered_contact_closed_is_typed() {
-        let (sender, receiver) = mpsc::channel(1);
-        drop(receiver);
+    async fn ordered_contact_startup_and_terminal_rejections_are_distinct() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let admission = Arc::new(TransportAdmission::startup_closed());
         let handle = OrderedEventContactHandle {
             sender,
-            admission: Arc::new(TransportAdmission::startup_closed()),
+            admission: admission.clone(),
             session_permit: Arc::new(Semaphore::new(1)),
         };
         let peer = issue_missions(1).remove(0);
-        let contact = Arc::new(StalledOrderedContact::default());
+        let (startup_stream, mut startup_remote) = duplex(64);
+        let startup_contact = Arc::new(
+            BleL2capContact::new(
+                startup_stream,
+                TransientLocator::new(b"startup-closed-contact".to_vec()).unwrap(),
+                1024,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
 
-        let error = handle
+        let startup = handle
             .run(
                 OrderedEventContactRole::Initiator,
-                contact.clone(),
-                MissionPeerExpectation::new(contact.peer_evidence(), peer.identity),
+                startup_contact.clone(),
+                MissionPeerExpectation::new(startup_contact.peer_evidence(), peer.identity),
             )
             .await
-            .expect_err("closed admission must reject the ordered contact");
+            .expect_err("startup-closed admission must reject the ordered contact");
 
-        assert_eq!(error.stage(), ContactStage::Candidate);
-        assert_eq!(error.scope(), ContactScope::Attempt);
-        assert_eq!(error.provenance(), ContactProvenance::Local);
-        assert_eq!(error.disposition(), ContactDisposition::Terminal);
-        assert_eq!(error.reason(), ContactReason::AdmissionClosed);
-        assert!(!error.permits_reselection());
-        assert_eq!(contact.operations(), 0);
-        assert_eq!(contact.closes(), 1);
+        assert_eq!(startup.stage(), ContactStage::Candidate);
+        assert_eq!(startup.scope(), ContactScope::Attempt);
+        assert_eq!(startup.provenance(), ContactProvenance::Local);
+        assert_eq!(startup.disposition(), ContactDisposition::RetryLater);
+        assert_eq!(startup.reason(), ContactReason::AdmissionBusy);
+        assert!(!startup.permits_reselection());
+        let mut startup_byte = [0; 1];
+        assert_eq!(
+            timeout(
+                Duration::from_secs(1),
+                startup_remote.read(&mut startup_byte)
+            )
+            .await
+            .expect("startup-closed carrier close deadline")
+            .expect("startup-closed carrier read"),
+            0,
+            "startup rejection closes the remote carrier"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        assert!(admission.open_initial());
+        admission.close();
+        assert!(
+            !admission.open_initial(),
+            "terminal transport admission cannot be reopened"
+        );
+        let (terminal_stream, mut terminal_remote) = duplex(64);
+        let terminal_contact = Arc::new(
+            BleL2capContact::new(
+                terminal_stream,
+                TransientLocator::new(b"terminal-closed-contact".to_vec()).unwrap(),
+                1024,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
+
+        let terminal = handle
+            .run(
+                OrderedEventContactRole::Initiator,
+                terminal_contact.clone(),
+                MissionPeerExpectation::new(terminal_contact.peer_evidence(), peer.identity),
+            )
+            .await
+            .expect_err("terminal admission must reject the ordered contact");
+
+        assert_eq!(terminal.stage(), ContactStage::Candidate);
+        assert_eq!(terminal.scope(), ContactScope::Attempt);
+        assert_eq!(terminal.provenance(), ContactProvenance::Local);
+        assert_eq!(terminal.disposition(), ContactDisposition::Terminal);
+        assert_eq!(terminal.reason(), ContactReason::AdmissionClosed);
+        assert!(!terminal.permits_reselection());
+        let mut terminal_byte = [0; 1];
+        assert_eq!(
+            timeout(
+                Duration::from_secs(1),
+                terminal_remote.read(&mut terminal_byte)
+            )
+            .await
+            .expect("terminal carrier close deadline")
+            .expect("terminal carrier read"),
+            0,
+            "terminal rejection closes the remote carrier"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
