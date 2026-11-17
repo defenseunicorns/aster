@@ -1,5 +1,20 @@
 //! ABI v2 layouts. Keep synchronized with `bindings/c/aster_mesh.h`.
 use super::{ABI_VERSION, struct_size};
+// Initialize each field through its typed Default, including nested ABI headers.
+macro_rules! abi_default {
+    ($name:ident { $($field:ident),* $(,)? }) => {
+        impl Default for $name {
+            fn default() -> Self {
+                Self {
+                    abi_version: ABI_VERSION,
+                    struct_size: struct_size::<Self>(),
+                    $($field: Default::default(),)*
+                }
+            }
+        }
+    };
+}
+
 pub type AsterHandle = u64;
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -27,17 +42,11 @@ pub struct AsterOwnedBuffer {
     pub len: usize,
 }
 
-impl Default for AsterOwnedBuffer {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            allocation: Default::default(),
-            data: std::ptr::null_mut(),
-            len: Default::default(),
-        }
-    }
-}
+abi_default!(AsterOwnedBuffer {
+    allocation,
+    data,
+    len,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -54,22 +63,16 @@ pub struct AsterNodeOptions {
     pub emission_threshold: u32,
 }
 
-impl Default for AsterNodeOptions {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            state_path: AsterBytes::default(),
-            provisioning_path: AsterBytes::default(),
-            max_items: Default::default(),
-            max_bytes: Default::default(),
-            max_blob_bytes: Default::default(),
-            max_blob_chunks: Default::default(),
-            max_blob_variants: Default::default(),
-            emission_threshold: Default::default(),
-        }
-    }
-}
+abi_default!(AsterNodeOptions {
+    state_path,
+    provisioning_path,
+    max_items,
+    max_bytes,
+    max_blob_bytes,
+    max_blob_chunks,
+    max_blob_variants,
+    emission_threshold,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -87,16 +90,10 @@ pub struct AsterRecoveryRequest {
     pub claim_nonce: AsterBytes,
 }
 
-impl Default for AsterRecoveryRequest {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            client: AsterClient::default(),
-            claim_nonce: AsterBytes::default(),
-        }
-    }
-}
+abi_default!(AsterRecoveryRequest {
+    client,
+    claim_nonce,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -109,18 +106,12 @@ pub struct AsterRecovery {
     pub results: AsterHandle,
 }
 
-impl Default for AsterRecovery {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            session: Default::default(),
-            allocated_through: Default::default(),
-            snapshot_revision: Default::default(),
-            results: AsterHandle::default(),
-        }
-    }
-}
+abi_default!(AsterRecovery {
+    session,
+    allocated_through,
+    snapshot_revision,
+    results,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -131,16 +122,10 @@ pub struct AsterCompleteRecoveryRequest {
     pub snapshot_revision: u64,
 }
 
-impl Default for AsterCompleteRecoveryRequest {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            client: AsterClient::default(),
-            snapshot_revision: Default::default(),
-        }
-    }
-}
+abi_default!(AsterCompleteRecoveryRequest {
+    client,
+    snapshot_revision,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -151,16 +136,7 @@ pub struct AsterEventResultRequest {
     pub sequence: u64,
 }
 
-impl Default for AsterEventResultRequest {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            client: AsterClient::default(),
-            sequence: Default::default(),
-        }
-    }
-}
+abi_default!(AsterEventResultRequest { client, sequence });
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -183,28 +159,22 @@ pub struct AsterPublishRequest {
     pub ttl_ms: u64,
 }
 
-impl Default for AsterPublishRequest {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            data_class: Default::default(),
-            priority: Default::default(),
-            operation_key: AsterBytes::default(),
-            client: AsterClient::default(),
-            sequence: Default::default(),
-            topic: AsterBytes::default(),
-            scope: AsterBytes::default(),
-            logical_key: AsterBytes::default(),
-            payload: AsterBytes::default(),
-            predecessor: [0; 32],
-            has_predecessor: Default::default(),
-            tombstone: Default::default(),
-            has_ttl: Default::default(),
-            ttl_ms: Default::default(),
-        }
-    }
-}
+abi_default!(AsterPublishRequest {
+    data_class,
+    priority,
+    operation_key,
+    client,
+    sequence,
+    topic,
+    scope,
+    logical_key,
+    payload,
+    predecessor,
+    has_predecessor,
+    tombstone,
+    has_ttl,
+    ttl_ms,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -224,25 +194,19 @@ pub struct AsterPublishReceipt {
     pub content_retired: u8,
 }
 
-impl Default for AsterPublishReceipt {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            item_id: [0; 32],
-            blob_id: [0; 32],
-            publisher: [0; 32],
-            publisher_counter: Default::default(),
-            sequence: Default::default(),
-            acceptance_marker: Default::default(),
-            total_len: Default::default(),
-            ttl_ms: Default::default(),
-            has_ttl: Default::default(),
-            inserted: Default::default(),
-            content_retired: Default::default(),
-        }
-    }
-}
+abi_default!(AsterPublishReceipt {
+    item_id,
+    blob_id,
+    publisher,
+    publisher_counter,
+    sequence,
+    acceptance_marker,
+    total_len,
+    ttl_ms,
+    has_ttl,
+    inserted,
+    content_retired,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -260,23 +224,17 @@ pub struct AsterQueryRequest {
     pub limit: u64,
 }
 
-impl Default for AsterQueryRequest {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            data_class: Default::default(),
-            topic: AsterBytes::default(),
-            scope: AsterBytes::default(),
-            logical_key: AsterBytes::default(),
-            include_descendant_scopes: Default::default(),
-            include_recoverable_versions: Default::default(),
-            after_acceptance_marker: Default::default(),
-            before_acceptance_marker: Default::default(),
-            limit: Default::default(),
-        }
-    }
-}
+abi_default!(AsterQueryRequest {
+    data_class,
+    topic,
+    scope,
+    logical_key,
+    include_descendant_scopes,
+    include_recoverable_versions,
+    after_acceptance_marker,
+    before_acceptance_marker,
+    limit,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -288,17 +246,11 @@ pub struct AsterResultInfo {
     pub has_more: u8,
 }
 
-impl Default for AsterResultInfo {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            len: Default::default(),
-            scanned_through: Default::default(),
-            has_more: Default::default(),
-        }
-    }
-}
+abi_default!(AsterResultInfo {
+    len,
+    scanned_through,
+    has_more,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -319,26 +271,20 @@ pub struct AsterEntry {
     pub token: AsterOwnedBuffer,
 }
 
-impl Default for AsterEntry {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            item_count: Default::default(),
-            id: [0; 32],
-            attempt: Default::default(),
-            kind: Default::default(),
-            retirement_reason: Default::default(),
-            retirement_generation: Default::default(),
-            has_guard: Default::default(),
-            topic: AsterOwnedBuffer::default(),
-            scope: AsterOwnedBuffer::default(),
-            logical_key: AsterOwnedBuffer::default(),
-            sibling_ids: AsterOwnedBuffer::default(),
-            token: AsterOwnedBuffer::default(),
-        }
-    }
-}
+abi_default!(AsterEntry {
+    item_count,
+    id,
+    attempt,
+    kind,
+    retirement_reason,
+    retirement_generation,
+    has_guard,
+    topic,
+    scope,
+    logical_key,
+    sibling_ids,
+    token,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -366,33 +312,27 @@ pub struct AsterItem {
     pub schema_id: AsterOwnedBuffer,
 }
 
-impl Default for AsterItem {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            id: [0; 32],
-            blob_id: [0; 32],
-            publisher: [0; 32],
-            publisher_counter: Default::default(),
-            data_class: Default::default(),
-            priority: Default::default(),
-            disposition: Default::default(),
-            event_sequence: Default::default(),
-            acceptance_marker: Default::default(),
-            total_len: Default::default(),
-            ttl_ms: Default::default(),
-            has_ttl: Default::default(),
-            tombstone: Default::default(),
-            topic: AsterOwnedBuffer::default(),
-            scope: AsterOwnedBuffer::default(),
-            logical_key: AsterOwnedBuffer::default(),
-            payload: AsterOwnedBuffer::default(),
-            media_type: AsterOwnedBuffer::default(),
-            schema_id: AsterOwnedBuffer::default(),
-        }
-    }
-}
+abi_default!(AsterItem {
+    id,
+    blob_id,
+    publisher,
+    publisher_counter,
+    data_class,
+    priority,
+    disposition,
+    event_sequence,
+    acceptance_marker,
+    total_len,
+    ttl_ms,
+    has_ttl,
+    tombstone,
+    topic,
+    scope,
+    logical_key,
+    payload,
+    media_type,
+    schema_id,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -407,20 +347,14 @@ pub struct AsterSubscribeRequest {
     pub include_descendant_scopes: u8,
 }
 
-impl Default for AsterSubscribeRequest {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            data_class: Default::default(),
-            client: AsterClient::default(),
-            operation_key: AsterBytes::default(),
-            topic: AsterBytes::default(),
-            scope: AsterBytes::default(),
-            include_descendant_scopes: Default::default(),
-        }
-    }
-}
+abi_default!(AsterSubscribeRequest {
+    data_class,
+    client,
+    operation_key,
+    topic,
+    scope,
+    include_descendant_scopes,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -440,18 +374,12 @@ pub struct AsterPollRequest {
     pub scan_limit: u64,
 }
 
-impl Default for AsterPollRequest {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            subscription: AsterSubscription::default(),
-            client: AsterClient::default(),
-            delivery_limit: Default::default(),
-            scan_limit: Default::default(),
-        }
-    }
-}
+abi_default!(AsterPollRequest {
+    subscription,
+    client,
+    delivery_limit,
+    scan_limit,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -464,18 +392,12 @@ pub struct AsterAckRequest {
     pub token: AsterBytes,
 }
 
-impl Default for AsterAckRequest {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            subscription: AsterSubscription::default(),
-            client: AsterClient::default(),
-            id: [0; 32],
-            token: AsterBytes::default(),
-        }
-    }
-}
+abi_default!(AsterAckRequest {
+    subscription,
+    client,
+    id,
+    token,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -486,16 +408,10 @@ pub struct AsterUnsubscribeRequest {
     pub client: AsterClient,
 }
 
-impl Default for AsterUnsubscribeRequest {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            subscription: AsterSubscription::default(),
-            client: AsterClient::default(),
-        }
-    }
-}
+abi_default!(AsterUnsubscribeRequest {
+    subscription,
+    client,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -510,20 +426,14 @@ pub struct AsterResolveRequest {
     pub tombstone: u8,
 }
 
-impl Default for AsterResolveRequest {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            guard: AsterHandle::default(),
-            entry: Default::default(),
-            operation_key: AsterBytes::default(),
-            payload: AsterBytes::default(),
-            priority: Default::default(),
-            tombstone: Default::default(),
-        }
-    }
-}
+abi_default!(AsterResolveRequest {
+    guard,
+    entry,
+    operation_key,
+    payload,
+    priority,
+    tombstone,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -541,23 +451,17 @@ pub struct AsterBlobPublishOptions {
     pub has_ttl: u8,
 }
 
-impl Default for AsterBlobPublishOptions {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            operation_key: AsterBytes::default(),
-            topic: AsterBytes::default(),
-            scope: AsterBytes::default(),
-            media_type: AsterBytes::default(),
-            schema_id: AsterBytes::default(),
-            priority: Default::default(),
-            total_len: Default::default(),
-            ttl_ms: Default::default(),
-            has_ttl: Default::default(),
-        }
-    }
-}
+abi_default!(AsterBlobPublishOptions {
+    operation_key,
+    topic,
+    scope,
+    media_type,
+    schema_id,
+    priority,
+    total_len,
+    ttl_ms,
+    has_ttl,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -568,16 +472,10 @@ pub struct AsterBlobWriterInfo {
     pub durable_offset: u64,
 }
 
-impl Default for AsterBlobWriterInfo {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            writer: AsterHandle::default(),
-            durable_offset: Default::default(),
-        }
-    }
-}
+abi_default!(AsterBlobWriterInfo {
+    writer,
+    durable_offset,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -589,17 +487,11 @@ pub struct AsterBlobReadRequest {
     pub blob_id: [u8; 32],
 }
 
-impl Default for AsterBlobReadRequest {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            topic: AsterBytes::default(),
-            scope: AsterBytes::default(),
-            blob_id: [0; 32],
-        }
-    }
-}
+abi_default!(AsterBlobReadRequest {
+    topic,
+    scope,
+    blob_id,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -612,18 +504,12 @@ pub struct AsterPeerSnapshot {
     pub last_contact: u32,
 }
 
-impl Default for AsterPeerSnapshot {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            peer: [0; 32],
-            contacts: Default::default(),
-            authorization: Default::default(),
-            last_contact: Default::default(),
-        }
-    }
-}
+abi_default!(AsterPeerSnapshot {
+    peer,
+    contacts,
+    authorization,
+    last_contact,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -633,15 +519,7 @@ pub struct AsterPeerRequest {
     pub peer: [u8; 32],
 }
 
-impl Default for AsterPeerRequest {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            peer: [0; 32],
-        }
-    }
-}
+abi_default!(AsterPeerRequest { peer });
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -655,19 +533,13 @@ pub struct AsterDeliveryStatus {
     pub selector_generation: u64,
 }
 
-impl Default for AsterDeliveryStatus {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            subscriptions: Default::default(),
-            pending_deliveries: Default::default(),
-            acknowledged_deliveries: Default::default(),
-            delivery_cursors: Default::default(),
-            selector_generation: Default::default(),
-        }
-    }
-}
+abi_default!(AsterDeliveryStatus {
+    subscriptions,
+    pending_deliveries,
+    acknowledged_deliveries,
+    delivery_cursors,
+    selector_generation,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -700,20 +572,14 @@ pub struct AsterRekeyRequest {
     pub recipient_count: usize,
 }
 
-impl Default for AsterRekeyRequest {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            signed_public_registry: AsterBytes::default(),
-            minimum_registry_generation: Default::default(),
-            scope: AsterBytes::default(),
-            epoch: Default::default(),
-            recipients: std::ptr::null(),
-            recipient_count: Default::default(),
-        }
-    }
-}
+abi_default!(AsterRekeyRequest {
+    signed_public_registry,
+    minimum_registry_generation,
+    scope,
+    epoch,
+    recipients,
+    recipient_count,
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -726,15 +592,9 @@ pub struct AsterControlReceipt {
     pub emitted: u8,
 }
 
-impl Default for AsterControlReceipt {
-    fn default() -> Self {
-        Self {
-            abi_version: ABI_VERSION,
-            struct_size: struct_size::<Self>(),
-            transfer_id: [0; 32],
-            sequence: Default::default(),
-            activated: Default::default(),
-            emitted: Default::default(),
-        }
-    }
-}
+abi_default!(AsterControlReceipt {
+    transfer_id,
+    sequence,
+    activated,
+    emitted,
+});

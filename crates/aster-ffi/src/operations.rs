@@ -26,6 +26,22 @@ use super::{
     sequence, take_handle, versioned, versioned_mut, wait, with_node, write_output,
 };
 
+fn mutable_receipt(
+    item_id: [u8; 32],
+    publisher: [u8; 32],
+    publisher_counter: u64,
+    acceptance_marker: u64,
+    inserted: bool,
+) -> AsterPublishReceipt {
+    AsterPublishReceipt {
+        item_id,
+        publisher,
+        publisher_counter,
+        acceptance_marker,
+        inserted: u8::from(inserted),
+        ..Default::default()
+    }
+}
 fn numbered_receipt(r: NumberedEventResult, inserted: bool) -> AsterPublishReceipt {
     AsterPublishReceipt {
         item_id: *r.receipt.semantic_id.as_bytes(),
@@ -50,48 +66,34 @@ fn blob_receipt(r: &BlobPublishResult) -> AsterPublishReceipt {
         ..Default::default()
     }
 }
-fn state_item(i: StateItem) -> Item {
-    Item {
-        id: *i.id.as_bytes(),
-        publisher: i.publisher,
-        counter: i.publisher_counter,
-        class: 0,
-        priority: i.priority as u32,
-        disposition: match i.disposition {
-            StateVersionDisposition::Current => 0,
-            StateVersionDisposition::Concurrent => 1,
-            StateVersionDisposition::Superseded => 2,
-        },
-        marker: i.acceptance_marker,
-        tombstone: i.tombstone,
-        topic: i.topic.as_str().into(),
-        scope: i.scope.as_str().into(),
-        key: i.logical_key,
-        payload: Zeroizing::new(i.payload),
-        ..Default::default()
-    }
+// State and Record share the mutable-item ABI shape, but retain typed dispositions.
+macro_rules! mutable_item {
+    ($function:ident, $type:ty, $disposition:ident, $class:literal) => {
+        fn $function(i: $type) -> Item {
+            Item {
+                id: *i.id.as_bytes(),
+                publisher: i.publisher,
+                counter: i.publisher_counter,
+                class: $class,
+                priority: i.priority as u32,
+                disposition: match i.disposition {
+                    $disposition::Current => 0,
+                    $disposition::Concurrent => 1,
+                    $disposition::Superseded => 2,
+                },
+                marker: i.acceptance_marker,
+                tombstone: i.tombstone,
+                topic: i.topic.as_str().into(),
+                scope: i.scope.as_str().into(),
+                key: i.logical_key,
+                payload: Zeroizing::new(i.payload),
+                ..Default::default()
+            }
+        }
+    };
 }
-fn record_item(i: RecordItem) -> Item {
-    Item {
-        id: *i.id.as_bytes(),
-        publisher: i.publisher,
-        counter: i.publisher_counter,
-        class: 2,
-        priority: i.priority as u32,
-        disposition: match i.disposition {
-            RecordVersionDisposition::Current => 0,
-            RecordVersionDisposition::Concurrent => 1,
-            RecordVersionDisposition::Superseded => 2,
-        },
-        marker: i.acceptance_marker,
-        tombstone: i.tombstone,
-        topic: i.topic.as_str().into(),
-        scope: i.scope.as_str().into(),
-        key: i.logical_key,
-        payload: Zeroizing::new(i.payload),
-        ..Default::default()
-    }
-}
+mutable_item!(state_item, StateItem, StateVersionDisposition, 0);
+mutable_item!(record_item, RecordItem, RecordVersionDisposition, 2);
 fn event_item(i: EventItem) -> Item {
     Item {
         id: *i.id.as_bytes(),
@@ -270,14 +272,13 @@ pub extern "C" fn aster_node_publish(
                             payload,
                             tombstone,
                         }))??;
-                    AsterPublishReceipt {
-                        item_id: *v.id.as_bytes(),
-                        publisher: v.publisher,
-                        publisher_counter: v.publisher_counter,
-                        acceptance_marker: v.acceptance_marker,
-                        inserted: u8::from(v.inserted),
-                        ..Default::default()
-                    }
+                    mutable_receipt(
+                        *v.id.as_bytes(),
+                        v.publisher,
+                        v.publisher_counter,
+                        v.acceptance_marker,
+                        v.inserted,
+                    )
                 }
                 2 => {
                     let v = n.wait(n.running()?.selected_records().publish(
@@ -291,14 +292,13 @@ pub extern "C" fn aster_node_publish(
                             tombstone,
                         },
                     ))??;
-                    AsterPublishReceipt {
-                        item_id: *v.id.as_bytes(),
-                        publisher: v.publisher,
-                        publisher_counter: v.publisher_counter,
-                        acceptance_marker: v.acceptance_marker,
-                        inserted: u8::from(v.inserted),
-                        ..Default::default()
-                    }
+                    mutable_receipt(
+                        *v.id.as_bytes(),
+                        v.publisher,
+                        v.publisher_counter,
+                        v.acceptance_marker,
+                        v.inserted,
+                    )
                 }
                 1 => {
                     let c = client(r.client)?;
@@ -539,14 +539,13 @@ pub extern "C" fn aster_node_resolve(
                         tombstone: boolean(r.tombstone, "tombstone")?,
                     }),
             )??;
-            *out = AsterPublishReceipt {
-                item_id: *v.id.as_bytes(),
-                publisher: v.publisher,
-                publisher_counter: v.publisher_counter,
-                acceptance_marker: v.acceptance_marker,
-                inserted: u8::from(v.inserted),
-                ..Default::default()
-            };
+            *out = mutable_receipt(
+                *v.id.as_bytes(),
+                v.publisher,
+                v.publisher_counter,
+                v.acceptance_marker,
+                v.inserted,
+            );
             Ok(())
         })
     })
@@ -641,8 +640,8 @@ pub extern "C" fn aster_node_poll(
     boundary(|| {
         let r = versioned(request, "poll")?;
         empty_handle(out, "result")?;
-        let delivery_limit = bounded(r.delivery_limit, 64, "delivery_limit")?;
-        let scan_limit = bounded(r.scan_limit, 4096, "scan_limit")?;
+        let delivery_limit = index(r.delivery_limit)?;
+        let scan_limit = index(r.scan_limit)?;
         with_node(node, |n| {
             capacity(n.results.len())?;
             let (entries, more) = match r.subscription.data_class {
@@ -979,18 +978,15 @@ pub extern "C" fn aster_blob_writer_write(
 ) -> u32 {
     boundary(|| {
         let bytes = input_bytes(bytes, "Blob bytes")?;
-        let segment = aster_mesh::BLOB_STREAM_SEGMENT_BYTES as u64;
-        if bytes.len() as u64 > segment - offset % segment {
-            return Err(FfiError::invalid(
-                "Blob write crosses a 1 MiB segment boundary",
-            ));
+        // Bound the owned copy before enqueueing; the node validates the offset
+        // and whether this write fits the current segment.
+        if bytes.len() > aster_mesh::BLOB_STREAM_SEGMENT_BYTES {
+            return Err(FfiError::invalid("Blob write exceeds one segment"));
         }
         with_node(node, |n| {
             let w = n.writers.get_mut(&writer).ok_or_else(closed)?;
-            if w.finished.is_some() || offset != w.offset {
-                return Err(FfiError::invalid(
-                    "writer is finished or offset is not its accepted offset",
-                ));
+            if w.finished.is_some() {
+                return Err(FfiError::invalid("writer is finished"));
             }
             let stream = w
                 .stream
