@@ -81,14 +81,14 @@ pub use control_admin::{
     RevocationRequest, ScopeRekeyRequest, SelectedControlAdmin, SelectedControlHandle,
 };
 pub use event_transport::{
-    ContactDisposition, ContactOutcome, ContactProvenance, ContactReason, ContactScope,
-    ContactStage,
-};
-pub use event_transport::{
     AutomaticEventTransportHandle, EventAdapterControl, EventAdapterRegistration,
     EventAdapterSnapshot, EventAdapterState, EventAttemptReceiver, EventOutboundAttempt,
-    EventPeerEligibility, EventPeerEligibilitySource, EventTransportKind,
-    MAX_EVENT_PEER_ELIGIBILITY, MAX_PENDING_EVENT_COHORTS, UnauthenticatedCarrierOpenFailure,
+    EventPeerEligibility, EventTransportKind, MAX_EVENT_PEER_ELIGIBILITY,
+    MAX_PENDING_EVENT_COHORTS, UnauthenticatedCarrierOpenFailure,
+};
+pub use event_transport::{
+    ContactDisposition, ContactOutcome, ContactProvenance, ContactReason, ContactScope,
+    ContactStage,
 };
 pub use identity::{IdentityError, NodeIdentity};
 pub use mission::{
@@ -99,17 +99,18 @@ pub use mission::{
     respond_classical_over_iroh, respond_over_contact,
 };
 pub use runtime::{
-    AutomaticEventRosterStatus, ControlPublicationReceipt, DemoScenario, EventEmissionPolicy,
-    MAX_CUSTODY_FINALIZATION_CHARGE_MS, MissionExpectedPeer, MutableSourceInterests,
-    NodeApplication, NodeBootstrapError, NodeBootstrapErrorKind, NodeConfig, NodeConfigOptions,
-    NodeError, NodeOperatorOutputPolicy, NodeReceipt, OrderedEventContactHandle,
-    OrderedEventContactRole, PeerReceipt, RunningAutomaticEventTransportHandle, RunningNode,
-    SelectedForwardingConfig, SoftwareZeroizationPathState, SoftwareZeroizationReceipt,
-    SoftwareZeroizationState, SourceInterestSelector, StoreReceipt, TransportNeutralNodeConfig,
-    audit_store_event_operations, ensure_state_accepts_normal_operation,
-    format_control_transfer_id, inspect_store, put_opaque, run_demo, run_demo_scenario, run_node,
-    run_node_with_forwarding, start_externally_supervised_transport_neutral_node, start_node,
-    start_node_with_forwarding, start_node_with_forwarding_and_output_policy,
+    AutomaticEventAttemptOutcome, AutomaticEventRosterStatus, ControlPublicationReceipt,
+    DemoScenario, EventEmissionPolicy, MAX_CUSTODY_FINALIZATION_CHARGE_MS, MissionExpectedPeer,
+    MutableSourceInterests, NodeApplication, NodeBootstrapError, NodeBootstrapErrorKind,
+    NodeConfig, NodeConfigOptions, NodeError, NodeOperatorOutputPolicy, NodeReceipt,
+    OrderedEventContactHandle, OrderedEventContactRole, PeerReceipt,
+    RunningAutomaticEventTransportHandle, RunningNode, SelectedForwardingConfig,
+    SoftwareZeroizationPathState, SoftwareZeroizationReceipt, SoftwareZeroizationState,
+    SourceInterestSelector, StoreReceipt, TransportNeutralNodeConfig, audit_store_event_operations,
+    ensure_state_accepts_normal_operation, format_control_transfer_id, inspect_store, put_opaque,
+    run_demo, run_demo_scenario, run_node, run_node_with_forwarding,
+    start_externally_supervised_transport_neutral_node, start_node, start_node_with_forwarding,
+    start_node_with_forwarding_and_output_policy,
     start_supervised_node_with_forwarding_and_output_policy, start_transport_neutral_node,
     zeroize_node,
 };

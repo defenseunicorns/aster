@@ -161,7 +161,7 @@ use crate::{
         AutomaticEventTransportHandle, ContactDisposition, ContactOutcome, ContactProvenance,
         ContactReason, ContactScope, ContactStage, EventAdapterControl, EventAdapterSnapshot,
         EventAttemptAdmission, EventAttemptReceiver, EventCohortAuthority, EventPeerEligibility,
-        event_cohort_authority_for_peer, event_eligibility_is_current,
+        MAX_EVENT_PEER_ELIGIBILITY, event_cohort_authority_for_peer,
     },
     format_node_id, format_path_field, format_receipt_field,
     frame::{
@@ -3980,6 +3980,18 @@ pub enum AutomaticEventRosterStatus {
     PendingCapacity,
 }
 
+/// Result of one transport-owner request for an automatic Event attempt.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutomaticEventAttemptOutcome {
+    /// The admitted attempt completed with its typed contact result.
+    Completed(Result<(), ContactOutcome>),
+    /// Node transport admission was closed before a request could run.
+    AdmissionClosed,
+    /// The requested peer no longer had current eligibility.
+    PeerUnavailable,
+}
+
 impl RunningAutomaticEventTransportHandle {
     fn new(
         admission: Arc<TransportAdmission>,
@@ -4055,22 +4067,20 @@ impl RunningAutomaticEventTransportHandle {
         if !self.admission.is_open() {
             return None;
         }
+        if eligibility.len() > MAX_EVENT_PEER_ELIGIBILITY {
+            return None;
+        }
         let now = self.coordinator.authority_time();
-        let current_peers = eligibility
+        let current_authority = eligibility
             .iter()
-            .filter(|entry| {
-                entry.mission() == self.mission && event_eligibility_is_current(entry, now)
-            })
+            .filter(|entry| entry.mission() == self.mission)
             .map(EventPeerEligibility::peer)
-            .collect::<BTreeSet<_>>();
-        let current_authority = current_peers
-            .iter()
-            .copied()
-            .map(|peer| {
-                (
-                    peer,
-                    event_cohort_authority_for_peer(&eligibility, self.mission, peer, now),
-                )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|peer| {
+                let authority =
+                    event_cohort_authority_for_peer(&eligibility, self.mission, peer, now);
+                (!authority.is_empty()).then_some((peer, authority))
             })
             .collect::<BTreeMap<_, _>>();
         let mut state = self
@@ -4080,13 +4090,11 @@ impl RunningAutomaticEventTransportHandle {
         if !self.coordinator.replace_eligibility(eligibility) {
             return None;
         }
-        state
-            .requested_generation
-            .retain(|peer, requested| {
-                current_authority
-                    .get(peer)
-                    .is_some_and(|authority| authority == &requested.authority)
-            });
+        state.requested_generation.retain(|peer, requested| {
+            current_authority
+                .get(peer)
+                .is_some_and(|authority| authority == &requested.authority)
+        });
         for (peer, authority) in current_authority {
             state
                 .requested_generation
@@ -4106,9 +4114,9 @@ impl RunningAutomaticEventTransportHandle {
 
     /// Runs one transport-owner request for a current exact peer.
     #[doc(hidden)]
-    pub async fn run_peer_attempt(&self, peer: NodeId) -> Option<Result<(), ContactOutcome>> {
+    pub async fn run_peer_attempt(&self, peer: NodeId) -> AutomaticEventAttemptOutcome {
         if !self.admission.is_open() {
-            return None;
+            return AutomaticEventAttemptOutcome::AdmissionClosed;
         }
         {
             let state = self
@@ -4116,7 +4124,7 @@ impl RunningAutomaticEventTransportHandle {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !state.requested_generation.contains_key(&peer) {
-                return None;
+                return AutomaticEventAttemptOutcome::PeerUnavailable;
             }
         }
         let (admission, observation) = self.coordinator.request_observed_attempt(
@@ -4130,7 +4138,7 @@ impl RunningAutomaticEventTransportHandle {
         };
         let result = observation.wait().await;
         debug_assert!(!immediate_error || result.is_err());
-        Some(result)
+        AutomaticEventAttemptOutcome::Completed(result)
     }
 
     fn note_durable_work(&self) {
@@ -4310,24 +4318,6 @@ fn mark_ordered_contact_authenticated() {
         .try_with(|authenticated| authenticated.store(true, Ordering::Release));
 }
 
-#[allow(dead_code)] // The automatic attempt ticket calls this boundary in Task 2.
-fn classify_ordered_contact_carrier_open<T>(
-    opened: Result<T, ContactError>,
-) -> Result<T, ContactOutcome> {
-    opened.map_err(|error| match error.kind() {
-        ContactErrorKind::Unavailable => ContactOutcome::carrier_open_unavailable(),
-        ContactErrorKind::Configuration
-        | ContactErrorKind::Bounds
-        | ContactErrorKind::Timeout
-        | ContactErrorKind::Transport
-        | ContactErrorKind::Unauthorized
-        | ContactErrorKind::Protocol
-        | ContactErrorKind::Unsupported => {
-            ContactOutcome::local_invariant(ContactStage::CarrierOpen)
-        }
-    })
-}
-
 async fn await_ordered_contact_response<F>(
     mut response: oneshot::Sender<Result<PeerReceipt, ContactOutcome>>,
     session: F,
@@ -4443,13 +4433,11 @@ fn ordered_contact_failure(
             ),
             NodeError::EmissionPolicyChanged
             | NodeError::EmissionPolicyRestartRequired
-            | NodeError::CustodySendSkipped => {
-                ContactOutcome::authenticated_session(
-                    ContactScope::Policy,
-                    ContactDisposition::RetryLater,
-                    ContactReason::PolicyRejected,
-                )
-            }
+            | NodeError::CustodySendSkipped => ContactOutcome::authenticated_session(
+                ContactScope::Policy,
+                ContactDisposition::RetryLater,
+                ContactReason::PolicyRejected,
+            ),
             NodeError::Revoked(_) => ContactOutcome::authenticated_session(
                 ContactScope::ExpectedPeer,
                 ContactDisposition::Suppress,
@@ -35453,7 +35441,7 @@ mod tests {
     use crate::{EventAdapterState, EventTransportKind};
     use aster_ble_l2cap::BleL2capContact;
     use aster_contact::{CarrierPeerEvidence, TransientLocator};
-    use tokio::io::{AsyncReadExt as _, duplex};
+    use tokio::io::duplex;
 
     #[test]
     fn profile5_blob_error_boundary_does_not_expose_internal_detail() {
@@ -42430,25 +42418,6 @@ mod tests {
         assert!(!outcome.permits_reselection());
     }
 
-    #[tokio::test]
-    async fn ordered_contact_carrier_open_unavailability_permits_reselection() {
-        let open = async {
-            Err::<(), _>(ContactError::new(
-                ContactErrorKind::Unavailable,
-                "synthetic locally observed adapter-open failure",
-            ))
-        };
-        let outcome = classify_ordered_contact_carrier_open(open.await)
-            .expect_err("adapter-open failure must be classified at carrier-open");
-
-        assert_eq!(outcome.stage(), ContactStage::CarrierOpen);
-        assert_eq!(outcome.scope(), ContactScope::AdapterEpoch);
-        assert_eq!(outcome.provenance(), ContactProvenance::Adapter);
-        assert_eq!(outcome.disposition(), ContactDisposition::Reselect);
-        assert_eq!(outcome.reason(), ContactReason::CarrierUnavailable);
-        assert!(outcome.permits_reselection());
-    }
-
     #[test]
     fn ordered_contact_mission_identity_mismatch_is_pre_auth_and_not_reselectable() {
         let failure = ordered_contact_failure(
@@ -43923,7 +43892,10 @@ mod tests {
             node.set_event_emission_policy(EventEmissionPolicy::ReceiveOnly),
             Err(NodeError::EmissionPolicyRestartRequired)
         ));
-        assert_eq!(node.event_emission_policy().expect("unchanged policy"), original);
+        assert_eq!(
+            node.event_emission_policy().expect("unchanged policy"),
+            original
+        );
 
         automatic.note_durable_work();
         assert_eq!(
@@ -43939,7 +43911,11 @@ mod tests {
             Some(AutomaticEventRosterStatus::Scheduled)
         );
         assert_eq!(
-            attempts.recv().await.expect("unchanged outbound gate").peer(),
+            attempts
+                .recv()
+                .await
+                .expect("unchanged outbound gate")
+                .peer(),
             peer
         );
 
@@ -44093,15 +44069,14 @@ mod tests {
             timeout(Duration::from_secs(1), &mut observed)
                 .await
                 .expect("observer completion deadline"),
-            Some(Err(outcome))
+            AutomaticEventAttemptOutcome::Completed(Err(outcome))
         );
         assert_eq!(automatic.coordinator.pending_attempt_count(), 0);
-        assert!(
-            timeout(Duration::from_millis(10), attempts.recv())
-                .await
-                .is_err(),
-            "observer created queued follow-on work"
-        );
+        tokio::select! {
+            biased;
+            _attempt = attempts.recv() => panic!("observer created queued follow-on work"),
+            () = tokio::task::yield_now() => {}
+        }
     }
 
     #[tokio::test]
@@ -44150,9 +44125,10 @@ mod tests {
 
         let outcome = timeout(Duration::from_secs(1), &mut observed)
             .await
-            .expect("shutdown observation deadline")
-            .expect("current peer attempt exists")
-            .expect_err("terminal closure must cancel the attempt");
+            .expect("shutdown observation deadline");
+        let AutomaticEventAttemptOutcome::Completed(Err(outcome)) = outcome else {
+            panic!("terminal closure must complete the current attempt: {outcome:?}");
+        };
         assert_eq!(outcome.reason(), ContactReason::Shutdown);
         assert_eq!(outcome.disposition(), ContactDisposition::Cancelled);
         assert_eq!(automatic.coordinator.pending_attempt_count(), 0);
@@ -44286,11 +44262,59 @@ mod tests {
             ContactDisposition::Cancelled
         );
         assert_eq!(automatic.coordinator.pending_attempt_count(), 0);
-        assert!(
-            timeout(Duration::from_millis(10), attempts.recv())
-                .await
-                .is_err(),
-            "stale or foreign authority remained queued"
+        tokio::select! {
+            biased;
+            _attempt = attempts.recv() => panic!("stale or foreign authority remained queued"),
+            () = tokio::task::yield_now() => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn running_facade_rejects_oversized_eligibility_without_replacing_roster() {
+        let mission = [0xb1; 32];
+        let peer = [0xb2; 32];
+        let admission = Arc::new(TransportAdmission::open());
+        let (ordered_sender, _ordered_receiver) = mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
+        let automatic = RunningAutomaticEventTransportHandle::new(
+            admission.clone(),
+            mission,
+            OrderedEventContactHandle {
+                sender: ordered_sender,
+                admission,
+                session_permit: Arc::new(Semaphore::new(ORDERED_EVENT_CONTACT_CAPACITY)),
+            },
+            true,
+        );
+        automatic.note_durable_work();
+        let eligible = EventPeerEligibility::provisioned_exact_peer(
+            mission,
+            peer,
+            EventTransportKind::BLE_L2CAP_V1,
+            true,
+            1,
+            0,
+            None,
+        );
+        assert_eq!(
+            automatic.replace_eligibility(vec![eligible]),
+            Some(AutomaticEventRosterStatus::Scheduled)
+        );
+
+        assert_eq!(
+            automatic.replace_eligibility(vec![eligible; MAX_EVENT_PEER_ELIGIBILITY + 1]),
+            None
+        );
+        let state = automatic
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            state
+                .requested_generation
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![peer]
         );
     }
 
@@ -44354,7 +44378,7 @@ mod tests {
 
         let revoked = old_attempt.revocation_outcome().await;
         assert_eq!(revoked.reason(), ContactReason::AuthorityChanged);
-        old_attempt.finish_revoked(revoked);
+        old_attempt.finish_revoked();
         let current_attempt = attempts.recv().await.expect("current-authority attempt");
         assert!(current_attempt.carrier_open_is_authorized());
         assert_eq!(
@@ -44362,12 +44386,11 @@ mod tests {
             ContactDisposition::Cancelled
         );
         assert_eq!(automatic.coordinator.pending_attempt_count(), 0);
-        assert!(
-            timeout(Duration::from_millis(10), attempts.recv())
-                .await
-                .is_err(),
-            "authority replay left duplicate custody queued"
-        );
+        tokio::select! {
+            biased;
+            _attempt = attempts.recv() => panic!("authority replay left duplicate custody queued"),
+            () = tokio::task::yield_now() => {}
+        }
     }
 
     #[tokio::test]

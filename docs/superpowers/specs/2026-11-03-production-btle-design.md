@@ -65,6 +65,115 @@ compatible with v9. Live-contact migration, transfer of attempt/session state,
 cross-carrier continuation not already owned by a durable class authority, and
 intra-record resume require a later semantic design; v9 does not infer them.
 
+## Delivery model and capability ledger
+
+This document is the single architecture and delivery authority for BTLE. The
+selected delivery model keeps the architecture, current status, increment
+boundaries, and release gates together here. A separate implementation roadmap
+was rejected because it would duplicate status and drift from the architecture;
+review-finding-driven implementation was rejected because local fixes do not
+define the product boundary.
+
+The first production-qualified data type is **Event** in the systemd-managed
+Linux agent. State, Record, Blob, other Linux hardware, macOS, Android, and iOS
+remain designed parts of this same architecture and advance only through their
+named capability exits. “Production-ready BTLE” without a qualifier means the
+complete ledger; “Linux Event production profile” means only the first release
+boundary defined below.
+
+Status has the following fixed meaning:
+
+- **Designed:** architecture and exit are defined, with no implementation claim.
+- **Source:** production code exists but has not passed the complete exit.
+- **Review blocked:** source exists, but an identified correctness, security, or
+  architecture issue prevents verification credit.
+- **Verified:** deterministic source verification for the capability passes.
+- **Physical:** retained target-device evidence passes, but release gates may
+  remain.
+- **Qualified:** the exact release profile has passed every applicable package,
+  security, support, evidence, and authorization gate.
+
+Status is monotonic only for an immutable artifact and profile. A later change
+can return the capability to Source or Review blocked. Every implementation PR
+updates affected rows in the same change and links each claimed status to its
+evidence; absence of evidence means the lower status applies.
+
+| ID | Capability and owner | First measurable exit | Current status (2026-11-17) |
+| --- | --- | --- | --- |
+| **BT-A0** | Transport-neutral application readiness and durable publication, owned by the node/store | With zero eligible transports, startup succeeds, publication is durable, and later adapter availability wakes work without republishing | **Verified** for the merged Event evaluation path; production profile remains unqualified |
+| **BT-A1** | Adapter-neutral bounded contact and mission authentication, owned by the node | BTLE supplies only transient carrier evidence; the exact mission peer authenticates before inventory or data; no Bluetooth value grants identity | **Physical** for bounded Event evaluation; not release-qualified |
+| **BT-A2** | Adapter registry, eligibility, ranking, and node-global admission, owned by the transport-neutral node | Current exact authority and sanitized availability select one bounded fresh attempt; no adapter lifecycle or class retry policy enters the core | **Source**; automatic multi-adapter selection is not physically qualified |
+| **BT-A3** | Closed attempt outcome and custody contract, shared at the node/adapter boundary | Typed authority, policy, adapter-epoch, transient, authenticated, cancellation, and shutdown outcomes preserve durable work, release custody, and authorize only the permitted retry/reselection action | **Review blocked** pending Task 7 fix re-review and focused verification; the earlier custody, revocation, observation, policy, and suppression defects have source fixes |
+| **BT-L0** | Bounded Linux controller inventory, passive compatibility probe, and sticky selection, owned by `aster-ble-linux` | Zero/many controllers, hotplug, BlueZ restart, timeouts, churn, unsafe rules, and unknown compatible hardware satisfy the defined deterministic bounds | **Source** with focused verification; physical automatic-path evidence remains open |
+| **BT-L1** | Rostered Linux discovery and controller-epoch lifecycle, owned by `aster-ble-linux` | Listener, advertisement, scan, candidate, socket, credential, cancellation, and cleanup owners are bounded and joined; discovery remains locator-only | **Source**; fixed-controller physical evidence is scoped to BT-E0, while stock teardown-ingress and working-secret lifetime gates block this exit |
+| **BT-L2** | Linux Event contact scheduling, owned by the BTLE runtime owner | The validated lower member schedules remote-only contact; success delays from completion, transient local failures back off, authenticated suppression parks only BTLE scheduling, and durable work survives adapter epochs | **Review blocked** pending Task 7 fix re-review and focused verification; Linux owns cadence/backoff and the node owns generic custody and selection |
+| **BT-L3** | Emission-policy lifecycle, owned by the BTLE composition root | Configured startup `Normal` owns the rostered radio lifecycle; configured startup `ReceiveOnly` is radio-inert. For the first profile, unsupported live changes are rejected and a controlled restart rebuilds radio and credentials atomically; later live reload must provide the same stop/join/restart guarantee | **Review blocked** pending Task 7 fix re-review and focused verification; live mutation is rejected before either policy state changes |
+| **BT-L4** | Linux production credential, package, and confinement profile | `aster-btle-roster`, rollback-safe renewal, non-root BlueZ/socket least privilege, denial tests, shutdown ordering, upgrade/rollback, and operator status pass as the packaged service identity | **Designed**; shipped package remains radio-inert |
+| **BT-E0** | Fixed-controller semantic-v9 Event vertical slice | Two Linux nodes exchange and durably consume a protected Event larger than the minimum MTU through disconnect and restart | **Physical** evaluation only |
+| **BT-E1** | Automatic Linux Event production profile | BT-A0–A3, BT-L0–L4, BT-O0, and BT-Q0 are Qualified for one exact peer and the declared supported hardware rows | **Source**; supporting production code exists, but this first release boundary has not passed its composite exit |
+| **BT-SR0** | State and Record over the qualified class-neutral contact | Convergence, interruption, restart, withdrawal/tombstone behavior, priority, and resource bounds pass without BTLE-specific semantic records | **Designed** |
+| **BT-B0** | Blob Profile-5 DATA/CONTROL over BTLE | Exact canonical records, bounded channel association, interruption, record-level durable resume, and control-liveness/resource exits pass | **Designed** |
+| **BT-P0** | Additional Linux hardware and desktop/mobile foreground drivers | Each exact platform/hardware row passes the Linux-reference interoperability and lifecycle profile without changing application semantics | **Designed**; Pixel/Linux Event evidence is evaluation-only |
+| **BT-P1** | Background mobile profiles | Explicit OS background constraints, permission lifecycle, packaging, energy, and availability semantics pass separately per platform | **Designed**; scheduled only after foreground platform qualification |
+| **BT-O0** | Sanitized operability and support evidence | Readiness is separate from adapter availability; bounded status/reason/support fields obey the metadata budget and never expose locators, roster, PSM, peer, or credential data | **Source**; coarse availability crosses the boundary, while detailed BTLE events are currently discarded |
+| **BT-Q0** | Production qualification and authorization | Supported artifact, SBOM/license admission, dependency gates, hostile-peer/resource evidence, independent architecture/security review, reproducible package evidence, and signed release authorization pass | **Designed**; every release gate remains open |
+
+### First production release boundary: Linux Event
+
+The first production release is one exact-peer, Event-only,
+systemd-managed Linux profile. It requires BT-A0 through BT-A3, BT-L0 through
+BT-L4, BT-O0, and BT-Q0 to be Qualified for each named support row. It includes
+automatic compatible-controller discovery and selection, zero-controller
+readiness, hotplug/restart recovery, exact-peer authentication, durable Event
+delivery, bounded retry and cleanup, correct configured startup behavior for
+`Normal` and `ReceiveOnly`, explicit rejection of unsupported live policy
+mutation, protected credential renewal or controlled restart, least-privilege
+packaging, and actionable sanitized status.
+
+It does not claim State, Record, Blob, multiple peers, live contact migration,
+live emission-policy reload, background mobile operation, an unlisted support
+row, or production authorization for source builds. Those exclusions narrow the
+first release profile; they do not remove the corresponding capabilities from
+the architecture.
+
+### Aligned increments
+
+| Increment | Capability IDs | Exit before the next increment |
+| --- | --- | --- |
+| **E0 — Event carrier baseline** | BT-A0, BT-A1, BT-E0 | Merged non-IP adapter path and retained Linux/Android evaluation evidence; no production claim |
+| **E1 — automatic Linux hardware owner** | BT-A2, BT-L0, BT-L1 | Bounded probe/selection/activation source path is statically clean, deterministically verified, and its remaining physical/package gaps are explicit |
+| **E2 — attempt and Event scheduling contract** | BT-A3, BT-L2, BT-L3 | Durable work survives every typed local lifecycle transition; suppression affects only its authorized scope; pending and active custody drain; generic node owns no BTLE cadence; unsupported live policy changes fail explicitly |
+| **E3 — production Linux service profile** | BT-L4, BT-O0 | Credential renewal/restart, confinement, denial tests, status, upgrade/rollback, and signed package inputs pass as the service identity |
+| **E4 — Event qualification and authorization** | BT-E1, BT-Q0 | Named hardware rows pass physical, interoperability, hostile, restart, resource, dependency, independent-review, and release gates |
+| **SR1 — State/Record qualification** | BT-SR0 | Qualified Event contact carries State and Record convergence scenarios without carrier-specific semantics |
+| **B1 — Blob qualification** | BT-B0 | Profile-5 channel, checkpoint, interruption, and resource exits pass |
+| **P1 — platform expansion** | BT-P0, then BT-P1 | Exact additional platform rows pass foreground, then separately background, qualification |
+
+E1 and E2 may share a PR only if the combined diff remains independently
+reviewable and both exits pass; otherwise E1 closes first. No later increment
+may be used to waive an earlier exit. A reviewer finding changes an increment
+only when it maps to one of these capability invariants; otherwise it is either
+deferred to its named capability or rejected as unrelated scope.
+
+### Observable execution rules
+
+Every implementation increment must expose, in its PR description:
+
+1. capability IDs advanced and the exact old/new status;
+2. production invariants exercised and explicit non-goals;
+3. production-code and behavior-test delta, with no source-text/name tests;
+4. static architecture, security, and quality review disposition;
+5. focused verification, followed by one coordinated full check only when the
+   PR candidate is otherwise publishable;
+6. physical evidence required now versus deferred to qualification;
+7. OPI provenance screening and dependency/source changes; and
+8. signed commits and the exact upstream base.
+
+The current Task 7 candidate is not yet publishable. The implementation has
+source fixes for the earlier E2 blockers and the latest whole-candidate review
+findings, but independent fix re-review and the focused verification gate are
+still pending. It receives no additional status credit until those gates pass.
+
 ## Architecture
 
 ```text
@@ -234,6 +343,25 @@ BTLE discovery/listener path: it registers the lane unavailable and starts no
 automatic radio owner for `ReceiveOnly`. `PassiveOnly` emits no framework bytes
 and cannot run an ordinary L2CAP session, but is not a current agent
 configuration option. Final names and doctrine remain a profile decision.
+
+The first Linux Event production profile accepts exactly `Normal` and
+`ReceiveOnly` as restart-only configured startup states. `Normal` may acquire
+the roster credential, probe and select a controller, start the role-required
+radio owners, and let the lower mission member originate automatic Event
+contacts. `ReceiveOnly` leaves BTLE unavailable and radio-inert in this first
+profile; it may still receive through another eligible adapter, and all local
+publication remains durable. It does not claim BTLE inbound reception until a
+separately designed non-originating listener path exists. `PassiveOnly` and
+threshold policies are outside this profile.
+
+While BTLE is composed, a live emission-policy mutation is rejected before
+either the node policy or BTLE owner changes. The operator changes validated
+configuration and performs a controlled service restart; startup then builds
+the new policy, credential, radio, registry, and admission state as one
+composition. Credential renewal may use the same controlled restart without a
+policy change. A later live-reload increment must replace this rejection with
+one serialized revision-coupled stop, join, credential swap, rebuild, and
+publish transition; independent policy and transport-gate writes are forbidden.
 
 ### `AsterRosterBeaconV1`
 
@@ -410,17 +538,41 @@ and a sanitized reason. Mappings are owned as follows:
 - only locally proven adapter unavailability, link loss, or transport deadline
   permits reselection. Cancellation remains cancellation.
 
+A successfully settled contact returns a separate bounded completion containing
+the settled durable generation and completion time; success is not a failure
+disposition. The first profile's failure-disposition vocabulary is closed and
+local to the implementation, not a wire allocation:
+
+| Disposition | Transport-neutral custody and selection effect | Initiating owner effect |
+| --- | --- | --- |
+| `RetryLater` | Release attempt-local custody, retain durable work, and do not wake another adapter solely because of the failure | The BTLE owner may submit a later independent request after its bounded jittered backoff |
+| `Reselect` | After validating local adapter/attempt provenance, release custody and wake ordinary fresh selection; no session or attempt state transfers | End the affected BTLE attempt or epoch and wait for registry selection |
+| `Suppress` | Record only the authenticated expected-peer, mission, or policy scope against its authority generation; retain durable work | For the first Linux Event profile, park only the affected BTLE schedule until controlled restart; the adapter and node remain alive. A later administrative retry or generation-triggered wake is an implementation extension, not a wire change |
+| `Cancelled` | Release custody without changing eligibility, suppression, delivery, or retry state | End only an explicitly caller-cancelled operation or coordinated shutdown operation; lifecycle, authority, and policy changes must use their typed outcome instead |
+| `Terminal` | Release custody and retain undelivered durable work; authorize no automatic retry | End that operation. Only an independently proven node-local invariant may enter node-fatal handling; no peer or adapter outcome may terminate the transport-neutral service |
+
+The transport-neutral coordinator validates the tuple, owns custody release,
+authority-generation suppression, and a reselection wake. It owns no BTLE timer,
+success cadence, jitter, or retry count. The Linux BTLE runtime owner consumes
+completion, `RetryLater`, and the parked/unparked state to implement its local
+Event schedule. A pending ticket observes authority, policy, adapter epoch, and
+shutdown changes until it is issued or closed; late observers attach to the one
+shared completion object rather than creating a second scheduling mode.
+
 Locally proven adapter unavailability before a mission handshake may still wake
 ordinary selection because it identifies no remote peer. A remote or ambiguous
 pre-authentication failure ends that scheduled operation and enters bounded
 locator backoff; a later operation is independently selected rather than being
-failure-driven fallback. Expected-peer, mission, and policy suppressions last
-until their authenticated authority generation changes or an explicit
-administrative retry; transient transport state uses bounded backoff. The
-selector never parses error text.
-This outcome contract must replace the current coarse error collapse before a
-second production adapter is enabled, preventing both cross-carrier probing and
-attacker-selected peer suppression.
+failure-driven fallback. Expected-peer, mission, and policy suppressions retain
+their authority generation in the coordinator. The first Linux Event schedule
+stays parked until controlled restart; a later generation-triggered wake or
+administrative retry can be added locally without changing the wire protocol.
+Transient transport state uses bounded backoff. The selector never parses error
+text.
+
+This outcome contract replaces coarse error collapse before a second production
+adapter is enabled, preventing both cross-carrier probing and attacker-selected
+peer suppression.
 
 Process restart reconstructs availability from platform state and protocol
 progress only from mission-bound durable authorities. Platform callback queues,
@@ -624,8 +776,13 @@ or used.
 Before commit, the staged diff, dependency graph, and newly introduced source
 URLs are screened for excluded provenance. The retained receipt records only
 that screening completed and any public sources admitted; it never copies
-protected content. Suspected excluded provenance pauses the affected work and is
-quarantined and escalated under the guardrail rather than silently removed.
+protected content. Each increment refreshes the shared guardrail and exclusion
+list before screening. Its sanitized receipt records the policy revision,
+applicable rule ID or `unknown`, match kind, affected file hash and location,
+screening method/version, and scope. A lexical or delegated-review flag is a
+candidate for contextual classification, not proof of exposure. Suspected
+excluded provenance pauses the affected work and is quarantined and escalated
+under the guardrail rather than silently removed.
 
 ## Required evidence and governance
 

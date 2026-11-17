@@ -3221,10 +3221,7 @@ mod tests {
 
     #[test]
     fn emission_policy_restart_requirement_is_projected_as_unsettled_policy() {
-        let error = application_error(
-            "publish",
-            NodeError::EmissionPolicyRestartRequired,
-        );
+        let error = application_error("publish", NodeError::EmissionPolicyRestartRequired);
 
         assert_eq!(error.kind(), ApplicationErrorKind::PolicyUnsettled);
         assert_eq!(error.operation(), "publish");

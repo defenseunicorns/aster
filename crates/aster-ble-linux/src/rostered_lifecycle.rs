@@ -91,14 +91,13 @@ type InboundAcceptFuture = Pin<
     >,
 >;
 type CoordinatorAttemptFuture = Pin<Box<dyn Future<Output = Result<(), ContactOutcome>> + Send>>;
-type CoordinatorRevocationFuture<'a> =
-    Pin<Box<dyn Future<Output = ContactOutcome> + Send + 'a>>;
+type CoordinatorRevocationFuture<'a> = Pin<Box<dyn Future<Output = ContactOutcome> + Send + 'a>>;
 type CoordinatorAttemptReceiveFuture<'a> =
     Pin<Box<dyn Future<Output = Option<Box<dyn CoordinatorAttempt>>> + Send + 'a>>;
 
 enum CoordinatorAttemptEvent {
     Received(Option<Box<dyn CoordinatorAttempt>>),
-    Revoked(ContactOutcome),
+    Revoked,
 }
 
 trait CoordinatorAttempt: Send {
@@ -106,7 +105,7 @@ trait CoordinatorAttempt: Send {
     fn mission(&self) -> NodeId;
     fn peer(&self) -> NodeId;
     fn revocation_outcome(&mut self) -> CoordinatorRevocationFuture<'_>;
-    fn finish_revoked(self: Box<Self>, outcome: ContactOutcome);
+    fn finish_revoked(self: Box<Self>);
     fn run(self: Box<Self>, contact: Arc<dyn OrderedContact>) -> CoordinatorAttemptFuture;
     fn fail_carrier_open(self: Box<Self>);
     fn fail_unauthenticated_carrier_open(
@@ -133,8 +132,8 @@ impl CoordinatorAttempt for EventOutboundAttempt {
         Box::pin(EventOutboundAttempt::revocation_outcome(self))
     }
 
-    fn finish_revoked(self: Box<Self>, outcome: ContactOutcome) {
-        EventOutboundAttempt::finish_revoked(*self, outcome);
+    fn finish_revoked(self: Box<Self>) {
+        EventOutboundAttempt::finish_revoked(*self);
     }
 
     fn run(self: Box<Self>, contact: Arc<dyn OrderedContact>) -> CoordinatorAttemptFuture {
@@ -210,7 +209,10 @@ impl EpochContactMode {
             Self::Automatic {
                 pending: Some(attempt),
                 ..
-            } => CoordinatorAttemptEvent::Revoked(attempt.revocation_outcome().await),
+            } => {
+                attempt.revocation_outcome().await;
+                CoordinatorAttemptEvent::Revoked
+            }
             Self::Automatic {
                 attempts,
                 pending: None,
@@ -270,11 +272,11 @@ impl EpochContactMode {
         }
     }
 
-    fn finish_pending_revoked(&mut self, outcome: ContactOutcome) {
+    fn finish_pending_revoked(&mut self) {
         if let Self::Automatic { pending, .. } = self
             && let Some(attempt) = pending.take()
         {
-            attempt.finish_revoked(outcome);
+            attempt.finish_revoked();
         }
     }
 
@@ -672,7 +674,7 @@ impl ContactPhase {
                         work_cancellation.cancel();
                         let _ = timeout(CONTACT_DRAIN_DEADLINE, open.as_mut()).await;
                         if let OutboundAttemptOwner::Coordinator(attempt) = owner {
-                            attempt.finish_revoked(outcome);
+                            attempt.finish_revoked();
                         }
                         return ContactAttemptOutcome::CoordinatorCompleted(Err(outcome));
                     }
@@ -2068,7 +2070,9 @@ where
                         Err(error) => break Err(error),
                     }
                 }
-                EpochEvent::CoordinatorAttempt(CoordinatorAttemptEvent::Received(Some(attempt))) => {
+                EpochEvent::CoordinatorAttempt(CoordinatorAttemptEvent::Received(Some(
+                    attempt,
+                ))) => {
                     if mode.accept_attempt(&config, attempt) {
                         outbound_candidate_pending =
                             admission.selected_candidate(lifecycle_now()).is_some();
@@ -2094,8 +2098,8 @@ where
                 EpochEvent::CoordinatorAttempt(CoordinatorAttemptEvent::Received(None)) => {
                     break Ok(());
                 }
-                EpochEvent::CoordinatorAttempt(CoordinatorAttemptEvent::Revoked(outcome)) => {
-                    mode.finish_pending_revoked(outcome);
+                EpochEvent::CoordinatorAttempt(CoordinatorAttemptEvent::Revoked) => {
+                    mode.finish_pending_revoked();
                     outbound_candidate_pending = false;
                 }
                 EpochEvent::ContactFinished(outcome) => {
@@ -2301,8 +2305,7 @@ fn finish_contact_attempt(
                 if schedule.self_schedule && config.role() == FixedRole::Initiator {
                     schedule.backoff.reset();
                     *schedule.candidate_pending = admission.selected_candidate(now).is_some();
-                    *schedule.delay =
-                        OutboundDelay::CadenceUntil(now + config.contact_cadence());
+                    *schedule.delay = OutboundDelay::CadenceUntil(now + config.contact_cadence());
                 }
             }
             Err(outcome) if outcome.reason() == ContactReason::AdmissionClosed => {
@@ -2660,11 +2663,12 @@ mod tests {
     };
     use aster_contact::OrderedContact;
     use aster_node::{
-        AutomaticEventTransportHandle, ContactOutcome, EventAdapterControl,
-        EventAdapterSnapshot, EventAdapterState, EventAttemptReceiver, EventOutboundAttempt,
-        EventPeerEligibility, EventTransportKind, MissionPeerExpectation, MutableSourceInterests,
-        NodeApplication, OrderedEventContactRole, PeerReceipt, RunningAutomaticEventTransportHandle,
-        RunningNode, TransportNeutralNodeConfig, start_transport_neutral_node,
+        AutomaticEventAttemptOutcome, AutomaticEventTransportHandle, ContactOutcome,
+        EventAdapterControl, EventAdapterSnapshot, EventAdapterState, EventAttemptReceiver,
+        EventOutboundAttempt, EventPeerEligibility, EventTransportKind, MissionPeerExpectation,
+        MutableSourceInterests, NodeApplication, OrderedEventContactRole, PeerReceipt,
+        RunningAutomaticEventTransportHandle, RunningNode, TransportNeutralNodeConfig,
+        start_transport_neutral_node,
     };
     use bluer::{Address, AddressType};
     use std::{
@@ -5364,6 +5368,7 @@ mod tests {
                 };
                 loop {
                     if let Some(outcome) = *revocation.borrow() {
+                        *self.finished_revocation.lock().unwrap() = Some(outcome);
                         return outcome;
                     }
                     revocation
@@ -5374,8 +5379,7 @@ mod tests {
             })
         }
 
-        fn finish_revoked(self: Box<Self>, outcome: ContactOutcome) {
-            *self.finished_revocation.lock().unwrap() = Some(outcome);
+        fn finish_revoked(self: Box<Self>) {
             self.completed.store(1, Ordering::Release);
             self.completion.notify_one();
         }
@@ -5563,13 +5567,11 @@ mod tests {
                     .expect("owner-only test state root");
             }
             let mission_bundle = aster_node::mission::UnprotectedReferenceMission::from_bytes(
-                include_bytes!(
-                    "../../../bindings/testdata/non-production-provisioning.bundle"
-                )
-                .to_vec(),
+                include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle")
+                    .to_vec(),
             )
             .expect("test mission");
-            let mission = mission_bundle.identity();
+            let mission = mission_bundle.mission_authority_id();
             let node = start_transport_neutral_node(TransportNeutralNodeConfig {
                 state: state.clone(),
                 mission: mission_bundle,
@@ -5591,17 +5593,19 @@ mod tests {
                 ))
                 .expect("test adapter");
             let peer = [0xff; 32];
-            assert!(automatic
-                .replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
-                    mission,
-                    peer,
-                    EventTransportKind::BLE_L2CAP_V1,
-                    true,
-                    1,
-                    0,
-                    None,
-                )])
-                .is_some());
+            assert!(
+                automatic
+                    .replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                        mission,
+                        peer,
+                        EventTransportKind::BLE_L2CAP_V1,
+                        true,
+                        1,
+                        0,
+                        None,
+                    )])
+                    .is_some()
+            );
             Self {
                 state,
                 node,
@@ -5617,12 +5621,15 @@ mod tests {
             &mut self,
         ) -> (
             EventOutboundAttempt,
-            JoinHandle<Option<Result<(), ContactOutcome>>>,
+            JoinHandle<AutomaticEventAttemptOutcome>,
         ) {
             let automatic = self.automatic.clone();
             let peer = self.peer;
             let observer = tokio::spawn(async move { automatic.run_peer_attempt(peer).await });
-            let attempt = self.attempts.recv().await.expect("issued test attempt");
+            let attempt = timeout(Duration::from_secs(1), self.attempts.recv())
+                .await
+                .expect("issued test attempt deadline")
+                .expect("issued test attempt");
             (attempt, observer)
         }
 
@@ -5635,29 +5642,46 @@ mod tests {
                 true,
                 10,
             )));
-            let outcome = attempt.revocation_outcome().await;
-            attempt.finish_revoked(outcome);
-            assert_eq!(observer.await.unwrap(), Some(Err(outcome)));
+            let outcome = timeout(Duration::from_secs(1), attempt.revocation_outcome())
+                .await
+                .expect("adapter revocation deadline");
+            attempt.finish_revoked();
+            assert_eq!(
+                timeout(Duration::from_secs(1), observer)
+                    .await
+                    .expect("adapter revocation observer deadline")
+                    .unwrap(),
+                AutomaticEventAttemptOutcome::Completed(Err(outcome))
+            );
             outcome
         }
 
         async fn authority_change_outcome(&mut self) -> ContactOutcome {
             let (mut attempt, observer) = self.issue().await;
-            assert!(self
-                .automatic
-                .replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
-                    self.mission,
-                    self.peer,
-                    EventTransportKind::BLE_L2CAP_V1,
-                    true,
-                    2,
-                    0,
-                    None,
-                )])
-                .is_some());
-            let outcome = attempt.revocation_outcome().await;
-            attempt.finish_revoked(outcome);
-            assert_eq!(observer.await.unwrap(), Some(Err(outcome)));
+            assert!(
+                self.automatic
+                    .replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
+                        self.mission,
+                        self.peer,
+                        EventTransportKind::BLE_L2CAP_V1,
+                        true,
+                        2,
+                        0,
+                        None,
+                    )])
+                    .is_some()
+            );
+            let outcome = timeout(Duration::from_secs(1), attempt.revocation_outcome())
+                .await
+                .expect("authority revocation deadline");
+            attempt.finish_revoked();
+            assert_eq!(
+                timeout(Duration::from_secs(1), observer)
+                    .await
+                    .expect("authority revocation observer deadline")
+                    .unwrap(),
+                AutomaticEventAttemptOutcome::Completed(Err(outcome))
+            );
             outcome
         }
 
@@ -5673,7 +5697,10 @@ mod tests {
             drop(attempts);
             drop(control);
             drop(automatic);
-            node.shutdown().await.expect("test node shutdown");
+            timeout(Duration::from_secs(1), node.shutdown())
+                .await
+                .expect("test node shutdown deadline")
+                .expect("test node shutdown");
             std::fs::remove_dir_all(state).expect("test state cleanup");
         }
     }
@@ -5705,10 +5732,7 @@ mod tests {
         let (_revocation_guard, revocation) = watch::channel(Some(revoked));
         attempt_sender
             .send(revocable_attempt(
-                [0x11; 32],
-                [0x22; 32],
-                &counters,
-                revocation,
+                [0x11; 32], [0x22; 32], &counters, revocation,
             ))
             .await
             .unwrap();
@@ -5735,11 +5759,7 @@ mod tests {
 
         let replacement = TestAttemptCounters::default();
         attempt_sender
-            .send(instrumented_attempt(
-                [0x11; 32],
-                [0x22; 32],
-                &replacement,
-            ))
+            .send(instrumented_attempt([0x11; 32], [0x22; 32], &replacement))
             .await
             .unwrap();
         received.notified().await;
@@ -5778,10 +5798,7 @@ mod tests {
         let (revoke, revocation) = watch::channel(None);
         attempt_sender
             .send(revocable_attempt(
-                [0x11; 32],
-                [0x22; 32],
-                &first,
-                revocation,
+                [0x11; 32], [0x22; 32], &first, revocation,
             ))
             .await
             .unwrap();
@@ -5809,11 +5826,7 @@ mod tests {
 
         let replacement = TestAttemptCounters::default();
         attempt_sender
-            .send(instrumented_attempt(
-                [0x11; 32],
-                [0x22; 32],
-                &replacement,
-            ))
+            .send(instrumented_attempt([0x11; 32], [0x22; 32], &replacement))
             .await
             .unwrap();
         connect_started.notified().await;
@@ -5851,10 +5864,7 @@ mod tests {
         let (_revocation_guard, revocation) = watch::channel(Some(revoked));
         attempt_sender
             .send(revocable_attempt(
-                [0x11; 32],
-                [0x22; 32],
-                &first,
-                revocation,
+                [0x11; 32], [0x22; 32], &first, revocation,
             ))
             .await
             .unwrap();
@@ -5880,11 +5890,7 @@ mod tests {
 
         let replacement = TestAttemptCounters::default();
         attempt_sender
-            .send(instrumented_attempt(
-                [0x11; 32],
-                [0x22; 32],
-                &replacement,
-            ))
+            .send(instrumented_attempt([0x11; 32], [0x22; 32], &replacement))
             .await
             .unwrap();
         timeout(Duration::from_secs(1), replacement.completion.notified())
@@ -5975,12 +5981,7 @@ mod tests {
         let (attempt_sender, attempts) = coordinator_attempt_channel();
         let first = TestAttemptCounters::default();
         attempt_sender
-            .send(outcome_attempt(
-                [0x11; 32],
-                [0x22; 32],
-                &first,
-                outcome,
-            ))
+            .send(outcome_attempt([0x11; 32], [0x22; 32], &first, outcome))
             .await
             .unwrap();
         let cancellation = LifecycleCancellation::new();
@@ -6005,11 +6006,7 @@ mod tests {
 
         let replacement = TestAttemptCounters::default();
         attempt_sender
-            .send(instrumented_attempt(
-                [0x11; 32],
-                [0x22; 32],
-                &replacement,
-            ))
+            .send(instrumented_attempt([0x11; 32], [0x22; 32], &replacement))
             .await
             .unwrap();
         timeout(Duration::from_secs(1), replacement.completion.notified())

@@ -1504,7 +1504,7 @@ mod tests {
     use crate::{
         BtleOperatorEvent, BtleOperatorOutput, ControllerAdmissionPolicy, ControllerCandidate,
         ControllerFingerprint, ControllerProbeLimits, ControllerSnapshot, LifecycleCancellation,
-        ProbeDisposition, ProbeReason, SupportRow, SupportTag, UnsafeRule,
+        ProbeDisposition, ProbeReason, SupportRow, UnsafeRule,
     };
     use bluer::{Address, AddressType};
     use std::{
@@ -3199,7 +3199,7 @@ mod tests {
         let (resolver, _epochs) = spawn(policy, limits(), platform, probe.clone());
         let mut status = resolver.status();
 
-        let selected = wait_for_status(&mut status, RuntimeAvailability::Available).await;
+        wait_for_status(&mut status, RuntimeAvailability::Available).await;
 
         assert_eq!(probe.calls().first().map(String::as_str), Some("hci1"));
         assert_eq!(harness.observation_count(), 1);
@@ -3611,10 +3611,10 @@ mod tests {
             adapter_events,
         };
 
-        let event = tokio::time::timeout(Duration::from_millis(20), session.next_event()).await;
+        let event = session.next_event().now_or_never();
 
         assert!(
-            event.is_ok(),
+            event.is_some(),
             "one call must yield after bounded ready work"
         );
         assert!(event.unwrap().is_some());

@@ -135,7 +135,6 @@ impl ContactOutcome {
     }
 
     /// Creates the fixed local outcome for a proven unavailable adapter epoch.
-    #[allow(dead_code)] // Consumed by the automatic attempt ticket in Task 2.
     pub(crate) const fn carrier_open_unavailable() -> Self {
         Self {
             stage: ContactStage::CarrierOpen,

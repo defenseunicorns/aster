@@ -1,9 +1,14 @@
 use std::time::Duration;
 
 use aster_ble_linux::FixedRole;
-use aster_node::{ContactDisposition, ContactOutcome, RunningAutomaticEventTransportHandle};
+use aster_node::{
+    AutomaticEventAttemptOutcome, ContactDisposition, ContactOutcome,
+    RunningAutomaticEventTransportHandle,
+};
 use futures::future::BoxFuture;
 use tokio::task::JoinHandle;
+
+use super::EventScheduleExit;
 
 pub(super) const EVENT_CONTACT_CADENCE: Duration = Duration::from_secs(60);
 const EVENT_RETRY_INITIAL: Duration = Duration::from_secs(5);
@@ -20,32 +25,35 @@ pub(super) fn spawn_event_schedule(
     automatic: RunningAutomaticEventTransportHandle,
     peer: aster_mesh::NodeId,
     role: FixedRole,
-) -> Option<JoinHandle<()>> {
-    matches!(role, FixedRole::Initiator)
-        .then(|| tokio::spawn(run_event_schedule(automatic, peer)))
+) -> Option<JoinHandle<EventScheduleExit>> {
+    matches!(role, FixedRole::Initiator).then(|| tokio::spawn(run_event_schedule(automatic, peer)))
 }
 
 async fn run_event_schedule(
     automatic: RunningAutomaticEventTransportHandle,
     peer: aster_mesh::NodeId,
-) {
+) -> EventScheduleExit {
     run_event_schedule_with(peer, move |peer| {
         let automatic = automatic.clone();
         Box::pin(async move { automatic.run_peer_attempt(peer).await })
     })
-    .await;
+    .await
 }
 
 async fn run_event_schedule_with(
     peer: aster_mesh::NodeId,
-    mut run_attempt: impl FnMut(
-        aster_mesh::NodeId,
-    ) -> BoxFuture<'static, Option<Result<(), ContactOutcome>>>,
-) {
+    mut run_attempt: impl FnMut(aster_mesh::NodeId) -> BoxFuture<'static, AutomaticEventAttemptOutcome>,
+) -> EventScheduleExit {
     let mut failures = 0_u32;
     loop {
-        let Some(result) = run_attempt(peer).await else {
-            return;
+        let result = match run_attempt(peer).await {
+            AutomaticEventAttemptOutcome::Completed(result) => result,
+            AutomaticEventAttemptOutcome::AdmissionClosed => {
+                return EventScheduleExit::AdmissionClosed;
+            }
+            AutomaticEventAttemptOutcome::PeerUnavailable => {
+                return EventScheduleExit::PeerUnavailable;
+            }
         };
         match next_delay(peer, &mut failures, result) {
             ScheduleAction::After(delay) => tokio::time::sleep(delay).await,
@@ -96,9 +104,7 @@ fn retry_delay(peer: aster_mesh::NodeId, failures: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::btle::{
-        ActiveBtleRuntime, BtleRuntimeOwner, BtleRuntimeOwnerError,
-    };
+    use crate::runtime::btle::{ActiveBtleRuntime, BtleRuntimeOwner, BtleRuntimeOwnerError};
     #[cfg(feature = "sdk-test-support")]
     use crate::runtime::btle::{BtleRuntimeStartup, unavailable_owner};
     use aster_node::{
@@ -120,12 +126,12 @@ mod tests {
 
     struct ControlledAttempt {
         peer: aster_mesh::NodeId,
-        result: tokio::sync::oneshot::Sender<Option<Result<(), ContactOutcome>>>,
+        result: tokio::sync::oneshot::Sender<Result<(), ContactOutcome>>,
         observed: tokio::sync::oneshot::Receiver<()>,
     }
 
     impl ControlledAttempt {
-        async fn finish(self, result: Option<Result<(), ContactOutcome>>) {
+        async fn finish(self, result: Result<(), ContactOutcome>) {
             self.result.send(result).expect("live schedule attempt");
             self.observed.await.expect("schedule observed completion");
             tokio::task::yield_now().await;
@@ -135,7 +141,7 @@ mod tests {
     fn controlled_schedule(
         peer: aster_mesh::NodeId,
     ) -> (
-        JoinHandle<()>,
+        JoinHandle<EventScheduleExit>,
         tokio::sync::mpsc::UnboundedReceiver<ControlledAttempt>,
     ) {
         let (request, requests) = tokio::sync::mpsc::unbounded_channel();
@@ -146,18 +152,18 @@ mod tests {
                 let (observed, observed_receiver) = tokio::sync::oneshot::channel();
                 assert!(
                     request
-                    .send(ControlledAttempt {
-                        peer,
-                        result,
-                        observed: observed_receiver,
-                    })
-                    .is_ok(),
+                        .send(ControlledAttempt {
+                            peer,
+                            result,
+                            observed: observed_receiver,
+                        })
+                        .is_ok(),
                     "controlled attempt receiver"
                 );
                 let result = result_receiver.await.expect("controlled attempt result");
                 let _ = observed.send(());
-                result
-            }) as BoxFuture<'static, Option<Result<(), ContactOutcome>>>
+                AutomaticEventAttemptOutcome::Completed(result)
+            }) as BoxFuture<'static, AutomaticEventAttemptOutcome>
         }));
         (schedule, requests)
     }
@@ -204,7 +210,7 @@ mod tests {
         state: PathBuf,
         node: RunningNode,
         automatic: aster_node::RunningAutomaticEventTransportHandle,
-        schedule: Option<JoinHandle<()>>,
+        schedule: Option<JoinHandle<EventScheduleExit>>,
         control: EventAdapterControl,
         attempts: EventAttemptReceiver,
     }
@@ -264,14 +270,17 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(17)).await;
         let completed = tokio::time::Instant::now();
-        first.finish(Some(Ok(()))).await;
+        first.finish(Ok(())).await;
 
         tokio::time::advance(Duration::from_millis(59_999)).await;
         assert!(requests.recv().now_or_never().is_none());
         tokio::time::advance(Duration::from_millis(1)).await;
         let second = requests.recv().await.expect("post-success attempt");
         assert_eq!(second.peer, PEER);
-        assert_eq!(tokio::time::Instant::now() - completed, EVENT_CONTACT_CADENCE);
+        assert_eq!(
+            tokio::time::Instant::now() - completed,
+            EVENT_CONTACT_CADENCE
+        );
 
         drop(second);
         schedule.abort();
@@ -301,7 +310,7 @@ mod tests {
             .recv()
             .await
             .expect("first live retry attempt")
-            .finish(Some(retry))
+            .finish(retry)
             .await;
         tokio::time::advance(Duration::from_millis(6_193)).await;
         assert!(requests.recv().now_or_never().is_none());
@@ -323,24 +332,32 @@ mod tests {
         assert_eq!(outcome.disposition(), ContactDisposition::Reselect);
         // No await has yielded to the schedule yet: publish Unavailable before
         // it observes completion and submits the one replacement request.
-        assert!(fixture.control.publish_availability(EventAdapterSnapshot::new(
-            EventTransportKind::BLE_L2CAP_V1,
-            2,
-            EventAdapterState::Unavailable,
-            true,
-            10,
-        )));
+        assert!(
+            fixture
+                .control
+                .publish_availability(EventAdapterSnapshot::new(
+                    EventTransportKind::BLE_L2CAP_V1,
+                    2,
+                    EventAdapterState::Unavailable,
+                    true,
+                    10,
+                ))
+        );
         tokio::task::yield_now().await;
 
         tokio::time::advance(Duration::from_secs(3_600)).await;
         assert!(fixture.attempts.recv().now_or_never().is_none());
-        assert!(fixture.control.publish_availability(EventAdapterSnapshot::new(
-            EventTransportKind::BLE_L2CAP_V1,
-            3,
-            EventAdapterState::Available,
-            true,
-            10,
-        )));
+        assert!(
+            fixture
+                .control
+                .publish_availability(EventAdapterSnapshot::new(
+                    EventTransportKind::BLE_L2CAP_V1,
+                    3,
+                    EventAdapterState::Available,
+                    true,
+                    10,
+                ))
+        );
         let selected = fixture.attempts.recv().await.expect("held fresh request");
         assert_eq!(selected.peer(), PEER);
         assert!(fixture.attempts.recv().now_or_never().is_none());
@@ -359,25 +376,29 @@ mod tests {
             .expect("withdraw exact authority");
         let suppressed = attempt.revocation_outcome().await;
         assert_eq!(suppressed.disposition(), ContactDisposition::Suppress);
-        attempt.finish_revoked(suppressed);
+        attempt.finish_revoked();
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(3_600)).await;
         assert!(fixture.attempts.recv().now_or_never().is_none());
         assert!(!fixture.schedule.as_ref().expect("schedule").is_finished());
-        assert!(fixture.control.publish_availability(EventAdapterSnapshot::new(
-            EventTransportKind::BLE_L2CAP_V1,
-            2,
-            EventAdapterState::Available,
-            true,
-            10,
-        )));
+        assert!(
+            fixture
+                .control
+                .publish_availability(EventAdapterSnapshot::new(
+                    EventTransportKind::BLE_L2CAP_V1,
+                    2,
+                    EventAdapterState::Available,
+                    true,
+                    10,
+                ))
+        );
 
         let (terminal_schedule, mut terminal_requests) = controlled_schedule(PEER);
         terminal_requests
             .recv()
             .await
             .expect("terminal live attempt")
-            .finish(Some(Err(ContactOutcome::admission_closed())))
+            .finish(Err(ContactOutcome::admission_closed()))
             .await;
         tokio::time::advance(Duration::from_secs(3_600)).await;
         assert!(terminal_requests.recv().now_or_never().is_none());
@@ -477,15 +498,17 @@ mod tests {
         let mut fixture = ScheduleFixture::new().await;
         let attempt = fixture.attempts.recv().await.expect("initial attempt");
         let cancelled_outcome = attempt.cancel_carrier_open();
-        assert_eq!(cancelled_outcome.disposition(), ContactDisposition::Cancelled);
+        assert_eq!(
+            cancelled_outcome.disposition(),
+            ContactDisposition::Cancelled
+        );
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(3_600)).await;
         assert!(fixture.attempts.recv().now_or_never().is_none());
 
         let schedule = fixture.schedule.take().expect("initiator schedule");
         let schedule_abort = schedule.abort_handle();
-        let (owner, cancelled, _cancelled_signal, dropped) =
-            cleanup_owner(schedule_abort.clone());
+        let (owner, cancelled, _cancelled_signal, dropped) = cleanup_owner(schedule_abort.clone());
         let mut active = ActiveBtleRuntime::new(
             Some(Box::new(owner)),
             None,
@@ -510,6 +533,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinated_cleanup_accepts_schedule_exit_after_admission_closes() {
+        let mut fixture = ScheduleFixture::new().await;
+        fixture.node.close_transport_admission();
+        let schedule = fixture.schedule.take().expect("initiator schedule");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !schedule.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("schedule observes closed admission");
+
+        let schedule_abort = schedule.abort_handle();
+        let (owner, cancelled, _cancelled_signal, dropped) = cleanup_owner(schedule_abort);
+        let mut active = ActiveBtleRuntime::new(
+            Some(Box::new(owner)),
+            None,
+            #[cfg(feature = "sdk-test-support")]
+            None,
+            #[cfg(feature = "sdk-test-support")]
+            None,
+        );
+        active.schedule = Some(schedule);
+
+        active
+            .begin_cleanup()
+            .expect("closed-admission cleanup")
+            .await
+            .expect("cleanup result task")
+            .expect("normal schedule exit remains a clean shutdown");
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(dropped.load(Ordering::Acquire));
+
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_rejects_schedule_exit_for_missing_current_peer() {
+        let mut fixture = ScheduleFixture::new().await;
+        fixture
+            .automatic
+            .replace_eligibility(Vec::new())
+            .expect("remove current peer while admission stays open");
+        let schedule = fixture.schedule.take().expect("initiator schedule");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !schedule.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("schedule observes missing peer");
+
+        let schedule_abort = schedule.abort_handle();
+        let (owner, cancelled, _cancelled_signal, dropped) = cleanup_owner(schedule_abort);
+        let mut active = ActiveBtleRuntime::new(
+            Some(Box::new(owner)),
+            None,
+            #[cfg(feature = "sdk-test-support")]
+            None,
+            #[cfg(feature = "sdk-test-support")]
+            None,
+        );
+        active.schedule = Some(schedule);
+
+        assert_eq!(
+            active
+                .begin_cleanup()
+                .expect("missing-peer cleanup")
+                .await
+                .expect("cleanup result task"),
+            Err(BtleRuntimeOwnerError::Cleanup)
+        );
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(dropped.load(Ordering::Acquire));
+
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn production_monitor_ignores_admission_closed_schedule_exit() {
+        let (release, released) = tokio::sync::oneshot::channel();
+        let schedule = tokio::spawn(async move {
+            released.await.expect("release schedule");
+            EventScheduleExit::AdmissionClosed
+        });
+        let schedule_abort = schedule.abort_handle();
+        let (owner, cancelled, _cancelled_signal, dropped) = cleanup_owner(schedule_abort);
+        let owner_completion = owner._completion_guard.clone();
+        let mut active = ActiveBtleRuntime::new(
+            Some(Box::new(owner)),
+            None,
+            #[cfg(feature = "sdk-test-support")]
+            None,
+            #[cfg(feature = "sdk-test-support")]
+            None,
+        );
+        active.schedule = Some(schedule);
+        let mut monitor = Box::pin(active.wait_terminal());
+
+        release.send(()).expect("release schedule exit");
+        tokio::select! {
+            biased;
+            () = &mut monitor => panic!("admission closure became a fatal runtime transition"),
+            () = tokio::task::yield_now() => {}
+        }
+        owner_completion
+            .send(true)
+            .expect("publish owner completion");
+        (&mut monitor).await;
+        drop(monitor);
+
+        active
+            .begin_cleanup()
+            .expect("owner cleanup")
+            .await
+            .expect("cleanup result task")
+            .expect("admission closure remains a clean runtime exit");
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
     async fn unexpected_schedule_exit_marks_active_runtime_terminal() {
         let (entered, entered_observer) = tokio::sync::oneshot::channel();
         let (release, release_observer) = tokio::sync::oneshot::channel();
@@ -525,8 +670,8 @@ mod tests {
                 if let Some(release_observer) = release_observer {
                     let _ = release_observer.await;
                 }
-                None
-            }) as BoxFuture<'static, Option<Result<(), ContactOutcome>>>
+                AutomaticEventAttemptOutcome::PeerUnavailable
+            }) as BoxFuture<'static, AutomaticEventAttemptOutcome>
         }));
         let schedule_abort = schedule.abort_handle();
         let (owner, _cancelled, _cancelled_signal, _dropped) = cleanup_owner(schedule_abort);
@@ -556,10 +701,9 @@ mod tests {
 
     #[tokio::test]
     async fn drop_joins_schedule_before_owner_cancellation() {
-        let schedule = tokio::spawn(std::future::pending::<()>());
+        let schedule = tokio::spawn(std::future::pending::<EventScheduleExit>());
         let schedule_abort = schedule.abort_handle();
-        let (owner, cancelled, cancelled_signal, dropped) =
-            cleanup_owner(schedule_abort.clone());
+        let (owner, cancelled, cancelled_signal, dropped) = cleanup_owner(schedule_abort.clone());
         let mut active = ActiveBtleRuntime::new(
             Some(Box::new(owner)),
             None,
@@ -587,7 +731,7 @@ mod tests {
             .expect("cleanup runtime");
         let (active, schedule_abort, cancelled, cancelled_signal, dropped) = {
             let _entered = runtime.enter();
-            let schedule = tokio::spawn(std::future::pending::<()>());
+            let schedule = tokio::spawn(std::future::pending::<EventScheduleExit>());
             let schedule_abort = schedule.abort_handle();
             let (owner, cancelled, cancelled_signal, dropped) =
                 cleanup_owner(schedule_abort.clone());
@@ -600,13 +744,7 @@ mod tests {
                 None,
             );
             active.schedule = Some(schedule);
-            (
-                active,
-                schedule_abort,
-                cancelled,
-                cancelled_signal,
-                dropped,
-            )
+            (active, schedule_abort, cancelled, cancelled_signal, dropped)
         };
 
         assert!(tokio::runtime::Handle::try_current().is_err());
@@ -633,13 +771,11 @@ mod tests {
             aster_host::BoundedDiscoveryCredentialArtifact,
             aster_host::DiscoveryCredentialError,
         > {
-            aster_host::BoundedDiscoveryCredentialArtifact::from_zeroizing(
-                zeroize::Zeroizing::new(
-                    self.0
-                        .take()
-                        .ok_or(aster_host::DiscoveryCredentialError::ArtifactUnavailable)?,
-                ),
-            )
+            aster_host::BoundedDiscoveryCredentialArtifact::from_zeroizing(zeroize::Zeroizing::new(
+                self.0
+                    .take()
+                    .ok_or(aster_host::DiscoveryCredentialError::ArtifactUnavailable)?,
+            ))
         }
     }
 
@@ -681,7 +817,10 @@ mod tests {
     ) -> crate::config::ValidatedBtlePolicy {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let peer = peer.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let peer = peer
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         let config_path = state.join("listener-config.json");
         let config = serde_json::json!({
             "schema_version": 1,
@@ -717,8 +856,11 @@ mod tests {
                 "credential": "aster-btle-roster"
             }
         });
-        std::fs::write(&config_path, serde_json::to_vec(&config).expect("listener config"))
-            .expect("write listener config");
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec(&config).expect("listener config"),
+        )
+        .expect("write listener config");
         std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
             .expect("protect listener config");
         let validated = crate::config::load_and_validate_config(&config_path)

@@ -122,9 +122,8 @@ impl StartedBtleRuntime {
     }
 }
 
-type BtleRuntimeStart = Box<
-    dyn FnOnce(&RunningNode) -> Result<StartedBtleRuntime, BtleRuntimeOwnerError> + Send,
->;
+type BtleRuntimeStart =
+    Box<dyn FnOnce(&RunningNode) -> Result<StartedBtleRuntime, BtleRuntimeOwnerError> + Send>;
 
 #[cfg(all(target_os = "linux", feature = "systemd-provider"))]
 type AutomaticLinuxSupervisorStart = Box<
@@ -612,8 +611,14 @@ struct PendingBtleEligibility {
     role: EventScheduleRole,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventScheduleExit {
+    AdmissionClosed,
+    PeerUnavailable,
+}
+
 impl PendingBtleEligibility {
-    fn install(self) -> Result<Option<JoinHandle<()>>, BtleRuntimeOwnerError> {
+    fn install(self) -> Result<Option<JoinHandle<EventScheduleExit>>, BtleRuntimeOwnerError> {
         let Self {
             automatic,
             entry,
@@ -641,7 +646,7 @@ pub(super) struct ActiveBtleRuntime {
     owner: Option<Box<dyn BtleRuntimeOwner>>,
     completion: Option<tokio::sync::watch::Receiver<bool>>,
     eligibility: Option<PendingBtleEligibility>,
-    schedule: Option<JoinHandle<()>>,
+    schedule: Option<JoinHandle<EventScheduleExit>>,
     unexpected_schedule_exit: bool,
     cleanup_runtime: Option<tokio::runtime::Handle>,
     #[cfg(feature = "sdk-test-support")]
@@ -707,17 +712,10 @@ impl ActiveBtleRuntime {
     }
 
     pub(super) fn is_terminal(&mut self) -> bool {
-        if self.unexpected_schedule_exit
-            || self.schedule.as_ref().is_some_and(JoinHandle::is_finished)
-        {
-            self.unexpected_schedule_exit = true;
+        if self.unexpected_schedule_exit {
             return true;
         }
         if completion_is_terminal_after_read(&mut self.completion, || {}) {
-            return true;
-        }
-        if self.schedule.as_ref().is_some_and(JoinHandle::is_finished) {
-            self.unexpected_schedule_exit = true;
             return true;
         }
         false
@@ -726,7 +724,7 @@ impl ActiveBtleRuntime {
     pub(super) async fn wait_terminal(&mut self) {
         enum TerminalObservation {
             Owner(bool),
-            Schedule,
+            Schedule(Result<EventScheduleExit, tokio::task::JoinError>),
         }
 
         loop {
@@ -747,19 +745,22 @@ impl ActiveBtleRuntime {
                         }
                         completion.changed().await.is_err() || *completion.borrow_and_update()
                     } => TerminalObservation::Owner(owner_terminal),
-                    _ = async {
+                    result = async {
                         let Some(schedule) = schedule.as_mut() else {
-                            return std::future::pending::<()>().await;
+                            return std::future::pending().await;
                         };
-                        let _ = schedule.await;
-                    } => TerminalObservation::Schedule,
+                        schedule.await
+                    } => TerminalObservation::Schedule(result),
                 }
             };
             match observation {
                 TerminalObservation::Owner(true) => return,
                 TerminalObservation::Owner(false) => {}
-                TerminalObservation::Schedule => {
+                TerminalObservation::Schedule(result) => {
                     self.schedule.take();
+                    if matches!(result, Ok(EventScheduleExit::AdmissionClosed)) {
+                        continue;
+                    }
                     self.unexpected_schedule_exit = true;
                     return;
                 }
@@ -859,16 +860,19 @@ impl Drop for ActiveBtleRuntime {
     }
 }
 
-async fn stop_event_schedule(schedule: Option<JoinHandle<()>>) -> bool {
+async fn stop_event_schedule(schedule: Option<JoinHandle<EventScheduleExit>>) -> bool {
     let Some(schedule) = schedule else {
         return true;
     };
     if schedule.is_finished() {
-        let _ = schedule.await;
-        return false;
+        return matches!(schedule.await, Ok(EventScheduleExit::AdmissionClosed));
     }
     schedule.abort();
-    matches!(schedule.await, Err(error) if error.is_cancelled())
+    match schedule.await {
+        Ok(EventScheduleExit::AdmissionClosed) => true,
+        Ok(EventScheduleExit::PeerUnavailable) => false,
+        Err(error) => error.is_cancelled(),
+    }
 }
 
 pub(super) fn completion_is_terminal_after_read(

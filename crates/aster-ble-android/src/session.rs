@@ -813,14 +813,10 @@ fn map_ordered_contact_error(outcome: ContactOutcome) -> ValidatorError {
         | ContactReason::TransportTimeout => ValidatorErrorCategory::Unavailable,
         ContactReason::IdentityMismatch
         | ContactReason::AuthenticationFailed
-        | ContactReason::AuthorityChanged => {
-            ValidatorErrorCategory::Authentication
-        }
+        | ContactReason::AuthorityChanged => ValidatorErrorCategory::Authentication,
         ContactReason::PolicyRejected
         | ContactReason::PolicySuspended
-        | ContactReason::ProtocolViolation => {
-            ValidatorErrorCategory::Protocol
-        }
+        | ContactReason::ProtocolViolation => ValidatorErrorCategory::Protocol,
         ContactReason::LocalInvariant => ValidatorErrorCategory::Internal,
     };
     ValidatorError::new(category, "validator ordered Event contact failed")
@@ -849,7 +845,10 @@ mod tests {
         let error = map_node_error(NodeError::EmissionPolicyRestartRequired);
 
         assert_eq!(error.category(), ValidatorErrorCategory::Protocol);
-        assert_eq!(error.to_string(), "validator protected Event session failed");
+        assert_eq!(
+            error.to_string(),
+            "validator protected Event session failed"
+        );
     }
 
     struct RecordingSink {

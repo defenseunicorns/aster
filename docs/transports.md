@@ -353,10 +353,12 @@ together.
 
 This E1/E2 boundary is source plus targeted test-target compilation only until
 the focused/full verification and exact-device gates run. It changes no
-semantic-v9 bytes or dependencies and advances no requirement credit. The
-shipped package, supported-hardware rows, physical qualification, and
-production authorization remain open; State, Record, and Blob over this
-automatic path are not claimed.
+semantic-v9 bytes and adds no third-party dependency. Production composition
+adds the existing workspace `aster-ble-linux` edge to the agent's Linux
+feature; the lockfile records that internal edge. The increment advances no
+requirement credit. The shipped package, supported-hardware rows, physical
+qualification, and production authorization remain open; State, Record, and
+Blob over this automatic path are not claimed.
 
 The default driver policy permits an unknown probe-compatible controller to
 attempt operational activation as `Unqualified`. That means only that the
