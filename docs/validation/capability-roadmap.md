@@ -16,7 +16,7 @@
 Local Blob publication commits without waiting for a peer. Rust, the native-gRPC agent, and asterctl implement bounded Blob publication and authenticated reads. blob-status reports receiver-local durable state, not remote delivery, peer status, or convergence. CLI download resume is post-merge work; an interrupted download restarts at byte zero.
 <!-- ASTER-BLOB-CAPABILITY:END -->
 
-- Status date: 2026-11-16
+- Status date: 2026-11-17
 - Product-intent authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Security-profile applicability:
   [`security-profile-requirements-disposition.md`](security-profile-requirements-disposition.md)
@@ -76,6 +76,40 @@ for detailed policy and resource bounds.
 The shipped Debian profile remains radio-inert, unqualified, and Iroh-only.
 Package confinement, support-matrix population, and physical qualification
 remain open; the source mechanism advances no support or requirement credit.
+
+## Current Linux BTLE Event E1/E2 planning boundary
+
+This increment combines E1 (automatic Linux hardware ownership: BT-A2, BT-L0,
+and BT-L1) with E2 (the typed attempt and Event scheduling contract: BT-A3,
+BT-L2, and BT-L3). BT-O0 is in the review boundary because only coarse,
+sanitized availability crosses the existing operator surface; detailed BTLE
+events remain unexposed. The candidate contains source and targeted test-target
+compilation receipts only. Task 7 must complete focused behavior verification,
+the coordinated full gate, and final independent review before any exact row
+may advance to `Verified`; Task 8 separately gates physical evidence for the
+exact signed bytes.
+
+| Capability | Status entering Task 6 | Status after Task 6 |
+|---|---|---|
+| BT-A2 | `Source` | `Source` |
+| BT-A3 | `Review blocked` | `Review blocked` |
+| BT-L0 | `Source` | `Source` |
+| BT-L1 | `Source` | `Source` |
+| BT-L2 | `Review blocked` | `Review blocked` |
+| BT-L3 | `Review blocked` | `Review blocked` |
+| BT-O0 | `Source` | `Source` |
+
+The schedule is one exact-peer, Event-only Linux source path. Zero eligible
+transports do not block readiness or durable publication. Success re-arms 60
+seconds after completion; typed transient outcomes use bounded retry or fresh
+reselection; authenticated suppression parks only the affected BTLE schedule;
+and configured policy changes require a controlled restart. This planning
+record changes no semantic-v9 behavior, dependency, atomic requirement status,
+or retained evidence. `DM-5.8-11`, `DM-11-04`, and `DM-12-01` remain `open`.
+There is no package, hardware-support, State, Record, Blob, or production
+authorization claim. E3 package/credential/operability work and E4 physical,
+interoperability, dependency, independent-review, and authorization gates are
+deferred.
 
 ## Purpose
 

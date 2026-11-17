@@ -327,6 +327,33 @@ role-required listener, advertisement, and scan owners are ready. BlueZ,
 controller, or transport absence leaves the node ready and local publication
 durable.
 
+For the one-exact-peer Event profile, only the validated lower mission member
+runs the automatic outbound schedule. It submits one contact request to the
+node coordinator and waits for the closed typed outcome; the coordinator keeps
+durable custody, selection, and admission authority. The generic node owns no
+BTLE cadence, and the Linux role is not derived from raw NodeID ordering. A
+successful contact re-arms 60 seconds after completion. `RetryLater` uses
+capped, deterministically jittered backoff, while `Reselect` immediately
+submits one fresh Event request. `Suppress`, `Terminal`, and `Cancelled` park
+only that outbound BTLE schedule: the adapter owner and transport-neutral
+service remain alive, and undelivered Event work remains durable.
+
+If no eligible transport is available, the node remains ready, publication
+remains durable, and the request waits for availability without polling. This
+schedule is Linux BTLE policy, not a wire protocol rule. The first profile
+accepts configured startup `Normal` and radio-inert `ReceiveOnly`; it rejects a
+live BTLE emission-policy change before either the node policy or BTLE owner
+changes. The operator must change validated configuration and restart the
+agent, rebuilding the policy, credential, radio, registry, and admission state
+together.
+
+This E1/E2 boundary is source plus targeted test-target compilation only until
+the focused/full verification and exact-device gates run. It changes no
+semantic-v9 bytes or dependencies and advances no requirement credit. The
+shipped package, supported-hardware rows, physical qualification, and
+production authorization remain open; State, Record, and Blob over this
+automatic path are not claimed.
+
 The default driver policy permits an unknown probe-compatible controller to
 attempt operational activation as `Unqualified`. That means only that the
 typed local preflight passed; it does not establish support, qualification,
