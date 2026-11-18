@@ -1,10 +1,10 @@
-# Python selected-node binding
+# Python binding
 
 Clean Room — Privileged.
 
-The standard-library `ctypes` package wraps C ABI v2 and the selected redb-backed
-node. Build `aster-ffi`, put `bindings/python` on `PYTHONPATH`, and optionally set
-`ASTER_MESH_LIBRARY` to its shared library. The header and library must match.
+The standard-library `ctypes` package wraps C ABI v2 and the redb-backed
+`aster-node` runtime. Build `aster-ffi`, put `bindings/python` on `PYTHONPATH`,
+and optionally set `ASTER_MESH_LIBRARY` to its shared library. The header and library must match.
 
 ```python
 from aster_mesh import DataClass, Node
@@ -46,12 +46,11 @@ Resume from `.offset`, write bytes, and finish for an immutable receipt.
 remain available. Errors expose a numeric `.status`.
 
 Close releases the runtime and invalidates child handles. Zeroize also destroys
-the selected provisioning artifact and terminalizes the state; caller-owned
+the retained provisioning artifact and terminalizes the state; caller-owned
 Python byte copies remain caller custody. The node binds no sockets or signal
 handlers. Raw reference provisioning remains an evaluation boundary.
 
-ABI v1's batch policies, batch operations, dynamic bridge operations, broad
-State/Record queries, retention options and SQLite paths are absent. See the
-[full ABI contract](../c/README.md) for ownership, recovery, limits and failures.
+See the [full ABI contract](../c/README.md) for ownership, recovery, limits
+and failures.
 Run `sh tools/with-test-resources.sh sh tools/test-ffi-bindings.sh` from the
 repository root to build the fixture helper and exercise all real bindings.

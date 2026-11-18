@@ -26,8 +26,8 @@ numbered-client recovery. Blob streams retain bounded writes/reads and explicit
 length/resume semantics.
 
 See [the C reference](../../bindings/c/README.md) for every operation, ownership
-rule and status. ABI v1 batch and dynamic bridge contracts have been removed.
-The selected local runtime binds no sockets or process signal handlers. Its
+rule and status.
+The local runtime binds no sockets or process signal handlers. Its
 reference provisioning and local tests do not establish release qualification.
 
 ```sh

@@ -2,7 +2,7 @@
 
 Clean Room — Privileged.
 
-The Python binding embeds the selected node using C ABI v2 and redb. Build and
+The Python binding embeds `aster-node` using C ABI v2 and redb. Build and
 run the shipped example with a private copy of the disposable public fixture:
 
 ```sh

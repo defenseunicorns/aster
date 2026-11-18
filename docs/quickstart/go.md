@@ -2,7 +2,7 @@
 
 Clean Room — Privileged.
 
-The cgo binding embeds the selected redb node through C ABI v2:
+The cgo binding embeds the redb-backed `aster-node` runtime through C ABI v2:
 
 ```sh
 mise exec -- sh tools/with-test-resources.sh cargo build --locked -p aster-ffi

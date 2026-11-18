@@ -1,8 +1,7 @@
 # Rust quickstart
 
 Embed `aster-node` to use the same actor and redb store as the local agent and
-C, Python, and Go bindings. The former `aster-core::ApplicationNode` API and
-its SQLite store have been removed; there is no SQLite data migration.
+C, Python, and Go bindings.
 
 ## Choose a data class
 

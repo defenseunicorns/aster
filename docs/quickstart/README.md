@@ -44,8 +44,7 @@ capacity, or release authorization.
 
 The Rust handles and C/Go/Python bindings use the same `aster-node` actor and
 redb store. The bindings run inside the caller's process without network
-contacts; they do not connect to an agent. ABI v1 and the SQLite-backed
-`ApplicationNode` API have been removed without data migration. The Linux local
+contacts; they do not connect to an agent. The Linux local
 agent exposes Event operations and local status plus native-gRPC Blob
 publish/read streams consumed by `asterctl`; State and Record RPCs and Blob
 subscription/status operations remain open.

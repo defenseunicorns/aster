@@ -38,7 +38,8 @@ guide.
 A successful publish confirms a local durable commit. It does not confirm that
 a peer received the item or that all reachable nodes converged.
 
-Use a stable operation key for an exact retry. Repeating the same operation
+Use a stable operation key for State, Record, and Blob retries. Events use a
+recovered client session and numbered sequence. Repeating the same operation
 recovers the committed result; reusing the key with different content or
 identity metadata fails as a conflict. Topic, scope, logical key, priority, and
 TTL are separate application choices.
@@ -53,9 +54,9 @@ Selected runnable examples:
 ## Query local data
 
 A query is a bounded snapshot of the local store. It does not contact peers.
-Select the exact class, topic, scope, and logical key whenever possible. Read a
-scope subtree or recoverable history only when the application explicitly
-needs that broader result.
+State and Record queries require an exact topic, scope, and logical key;
+request recovery history when needed. Event queries support bounded pages and
+scope selection. Blob queries require an exact content ID.
 
 Peer/contact status is not proof that a particular item converged. Use the
 class-specific query or delivery result for application decisions.
@@ -83,7 +84,7 @@ delivery guides.
 
 ## Stream Blob content safely
 
-The broad bindings use `blob_writer`/`BlobWriter`-style streaming. The legacy
+The language bindings use `blob_writer`/`BlobWriter`-style streaming. The legacy
 selected Rust live-file facade publishes an owned regular file, reads
 authenticated pages of at most 64 KiB, and retains its 64-MiB ceiling. The
 Linux local agent and `asterctl` use resumable 512-KiB application frames over
@@ -128,17 +129,16 @@ exact head-set guard. If another revision arrives first, the stale guard fails
 instead of discarding it.
 
 Replicated ingestion never executes application merge code. The application
-computes and submits the resolution; the retired merge-policy registration API
-is not exposed by the selected runtime.
+computes and submits the resolution.
 
-## Use tombstones, batches, and emission policy
+## Use tombstones and emission policy
 
-- A tombstone is a replicated update, not immediate physical deletion. Older
-  data can reappear after the configured retention boundary if a long-absent
-  node returns.
-- Atomic publication batches, Blob batches, and dynamic bridge administration
-  were removed with the SQLite-backed API. Repeated publication calls are not
-  an atomic replacement.
+- A State or Record tombstone is a replicated update, not immediate physical
+  deletion. The runtime retains these tombstones and does not provide
+  retention-driven collection. A concurrent update can still remain visible
+  under the class’s conflict rules.
+- Each publication commits independently; multiple calls do not form an
+  all-or-nothing transaction.
 - Emission policy changes what a node may send; it does not rewrite priority,
   delete queued data, or broaden authorization.
 - `ReceiveOnly` suppresses Aster contact initiation and data disclosure while
@@ -157,8 +157,8 @@ Use the class-specific Rust guides above and the current binding references:
 
 State and Record publication use stable operation keys. Event publication uses
 numbered client sessions with explicit recovery. Blob publication uses a
-streaming writer. Record conflict inspection is a query projection, not a
-separate `conflicts` call. ABI v1 calls are not compatible with ABI v2.
+streaming writer. Record conflict inspection returns a query projection with
+an opaque resolution guard. ABI v1 calls are not compatible with ABI v2.
 
 For protocol semantics use the [protocol specification](protocol.md). For
 networking and synchronization use [Carriers and contacts](transports.md). For

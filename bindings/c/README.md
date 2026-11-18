@@ -1,4 +1,4 @@
-# Selected-node C ABI v2
+# C ABI v2
 
 Clean Room — Privileged.
 
@@ -15,15 +15,13 @@ not configure network contacts or claim remote delivery/convergence.
 Initialize versioned structures to zero, then set `abi_version` and
 `struct_size = sizeof(structure)`. `AsterBytes`, `AsterClient`,
 `AsterSubscription`, and `AsterRekeyRecipient` are embedded values without
-headers. `aster_node_options_init` supplies the selected store/depot defaults.
+headers. `aster_node_options_init` supplies the store/depot defaults.
 
-`state_path` is an absolute state **directory**, not a SQLite filename.
+`state_path` is an absolute state **directory**.
 `provisioning_path` names an absolute owner-only Aster reference mission file.
 The reference backend reads the artifact itself and retains its exact identity.
-No SQLite migration, in-memory SQLite mode, or protected-provider callback is
-provided. State/Record retention settings and the old local priority cap were
-removed; the selected node's authorization and lifecycle rules apply. Aggregate
-store and Blob depot admission limits remain configurable.
+The binding does not expose a protected-provider callback. Aggregate store
+and Blob depot admission limits are configurable.
 
 Input byte slices are borrowed for the call; nonempty slices require valid
 storage. Output handles must start at zero. Output buffers must start empty.
@@ -45,12 +43,12 @@ prevent stale copied buffers from freeing a newly reused allocation address.
 Release each allocation exactly once; do not alter its pointer, length, or ID.
 
 `aster_node_zeroize` consumes the handle even on failure. It asks the same
-selected actor to check the retained artifact, close admission, drain workers,
-and perform durable software erasure. It destroys the selected provisioning
+actor to check the retained artifact, close admission, drain workers,
+and perform durable software erasure. It destroys the retained provisioning
 artifact and permanently terminalizes the state. A replaced artifact fails
 preflight rather than erasing another file. This does not erase caller copies
 or establish physical-media sanitization. Platform limitations remain those of
-the selected node; the exercised environment is Linux.
+the node; the exercised environment is Linux.
 
 ## Operations
 
@@ -61,13 +59,17 @@ the selected node; the exercised environment is Linux.
 | Event | Publish requires durable client ID, recovered session and positive sequence. Persist a claim nonce before `begin_recovery`, reconcile every outstanding receipt with local intent, then `complete_recovery`. Acknowledge a publication result only after retaining/applying it. `abandon_publication` explicitly advances a sequence without an Event. Ordinary operation-key publication is absent. |
 | Query pages | Event `limit` bounds rows scanned. Continue from `scanned_through` while `has_more`, even for empty pages. State/Record projections cannot be truncated: leave limit/markers zero and descendant selection false. |
 | Subscriptions | Explicit class, topic/scope and operation key; Event additionally requires client/session. Persist the returned 32-byte subscription ID. Poll returns complete entries, attempt counts and `has_more`. Record entries contain the entire active-head projection, even at delivery limit one. State/Record/Blob acknowledgements require the exact returned token and delivery ID. Event acknowledgements use its semantic ID and owner session. Unsubscribe is idempotent. |
-| Blob | Writer open requires operation key and total length; the selected native stream owns encrypted staging. Write at the exact accepted offset, without crossing a 1 MiB segment boundary (maximum `1048576 - offset % 1048576` bytes per call). Python and Go split arbitrary buffers at these boundaries. Reopening the same operation replaces the prior stream and reports `durable_offset`; resume the source there. Finish requires all bytes, and successful finish can be repeated. After a storage/actor failure during write or finish, reopen the identical operation (temporary state-unavailable can require retry). Close drops the live session; durable checkpoints remain owned by selected lifecycle rules. |
+| Blob | Writer open requires operation key and total length; the native stream owns encrypted staging. Write at the exact accepted offset, without crossing a 1 MiB segment boundary (maximum `1048576 - offset % 1048576` bytes per call). Python and Go split arbitrary buffers at these boundaries. Reopening the same operation replaces the prior stream and reports `durable_offset`; resume the source there. Finish requires all bytes, and successful finish can be repeated. After a storage/actor failure during write or finish, reopen the identical operation (temporary state-unavailable can require retry). Close drops the live session; durable checkpoints remain owned by the node’s lifecycle rules. |
 | Blob reads/status | Reader pages are bounded to 512 KiB (`ASTER_BLOB_READ_PAGE_BYTES`) and freshly authorized. EOF is empty; zero-length publications have authenticated empty EOF. Exact Blob query takes the 32-byte content ID as logical key and returns metadata, without plaintext/manifests. `item.id` is zero for that content lookup because it is not an exact-publication lookup. Publication receipts and deliveries retain exact publication IDs. |
 | Blob lifetime/delivery | Durable or positive finite TTL is supported. Receipts/metadata echo original TTL. Delivery `kind=0` is content; `kind=1` is retirement, with generation and reason (1 expired, 2 invalidated, 3 evicted). Retirement replaces an outstanding content delivery; acknowledged content does not receive a later notice. Content and retirement notices share token-based acknowledgement. |
 | Status/control | Local delivery-ledger status for State/Record/Blob; authenticated Event peer observations; emission threshold 0–3 or ReceiveOnly 4; authority scope rekey with signed public registry, independent generation witness and explicit recipients. Empty recipient topic lists mean route-only. Unknown peers return not-found, never fabricated convergence. |
 
-`aster_result_info` reports entry count and pagination. Use `aster_result_entry`
-then `aster_result_item(result, entry, version)` for projections/deliveries.
+`aster_result_info(node, result, &info)` reports entry count and pagination.
+Use `aster_result_entry(node, result, entry_index, &entry)` then
+`aster_result_item(node, result, entry_index, item_index, &item)` for
+projections/deliveries. Initialize `info`, `entry`, and `item` as versioned
+`AsterResultInfo`, `AsterEntry`, and `AsterItem` structures and check each status.
+Free copied entries/items with `aster_entry_free` / `aster_item_free`.
 Recovery results instead use `aster_result_receipt`; peer results use
 `aster_result_peer`. Item dispositions are 0 current, 1 concurrent, 2 superseded.
 Record sibling buffers are concatenated 32-byte IDs. Keep query results open
@@ -81,10 +83,6 @@ close/zeroize calls. Freeing an invalid multi-buffer structure can release valid
 fields before reporting the invalid field. Capture `aster_last_error` immediately on the same OS thread;
 error retrieval/free preserve the diagnostic. Errors are sanitized and panics
 are contained. Header constants enumerate the stable status categories.
-
-The old atomic batch/Blob batch operations, RetainedDual/BatchOnly contracts,
-and dynamic bridge administration have been removed. They have no compatibility
-stubs or replacement implementations.
 
 ## Build and exercise
 

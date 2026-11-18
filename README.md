@@ -17,8 +17,7 @@ constrained, and disconnected operation.
 > production-authorized system. Event, State, Record, and Blob have live Rust
 > APIs; Event and Blob also have a local agent API. Review the
 > [current implementation boundary](#current-implementation-boundary),
-> [security gates](docs/security.md), [conformance status](docs/validation/conformance.md),
-> and [requirements status](docs/validation/requirements-status.md) before
+> [security gates](docs/security.md), and [conformance status](docs/validation/conformance.md) before
 > planning a deployment.
 
 The current public Blob capability boundary is machine checked:
@@ -126,8 +125,8 @@ require a hosted Buf Schema Registry.
 | **Rust selected node** | [Selected Event API](docs/quickstart/selected-event-api.md) | Live Event publish, query, durable delivery, gaps, and status |
 | **State or Record in Rust** | [State](docs/quickstart/selected-state-api.md) and [Record](docs/quickstart/selected-record-api.md) | Cloneable live handles and exclusive stopped facades; direct-Iroh reconciliation; State latest-value and Record conflict-preserving delivery |
 | **Blob in Rust** | [Blob](docs/quickstart/selected-blob-api.md) | Cloneable `RunningNode::selected_blobs()` handle for durable or finite-TTL file publication, bounded pages, tagged content/retirement delivery, and local durable transfer progress, plus an exclusive stopped facade; semantic v9/profile 5 provides bounded checkpointed large-object streaming, while v7/v8 profile 4 remains the compatibility path |
-| **Rust semantic API** | [Rust quickstart](docs/quickstart/rust.md) | Broader proven semantic surface used as the migration source |
-| **Python, Go, or C** | [Language quickstarts](docs/quickstart/README.md) | Offline semantic API through the current C ABI, not the selected live node |
+| **Embedded Rust runtime** | [Rust quickstart](docs/quickstart/rust.md) | Class-specific handles over the `aster-node` actor and redb store |
+| **Python, Go, or C** | [Language quickstarts](docs/quickstart/README.md) | Local Event, State, Record, and Blob operations through C ABI v2 over `aster-node`; no network contacts |
 
 ### Download and run the Compose images
 
@@ -149,7 +148,7 @@ verification, import, credential-generation, activation, and Event-validation
 commands.
 
 The [application recipes](docs/application-recipes.md) show all four data
-classes, queries, subscriptions, batches, deletion, conflicts, and emission
+classes, queries, subscriptions, deletion, conflicts, and emission
 policy. Kubernetes, Zarf, and UDS integrations should treat the ConnectRPC
 agent as the application boundary; deployment packaging and protected
 provisioning remain open work.
@@ -166,14 +165,13 @@ provisioning remain open work.
 | **Security profiles** | Stock hybrid-PQ profile `0x0001`; additive P-256 Event/control profile `0x0002` with an exporter-bound two-node Iroh path | Stock runtime/CLI selection for `0x0002`, general negotiation, complete classical data/lifecycle coverage, and rollback policy |
 | **Operations** | Manually admitted direct addresses, one operator-pinned controlled relay, default-off time-windowed mDNS with bounded Aster admission, reference provisioning, and same-UID Unix software zeroization | Protected operational provisioning, hostile-LAN discovery, public/default relay selection, BTLE integration, and physical sanitization |
 
-C ABI v2 and its Python/Go wrappers now embed the selected redb node for local
-Event, State, Record, and Blob operations. They include numbered Event recovery,
-exact-key mutable projections, guarded Record resolution, complete deliveries,
-finite Blob lifetime, emission/peer observation, rekey, and joined lifecycle.
-They bind no transport or administration socket. Reference-file provisioning
-remains unprotected, and no networked-binding or release qualification is claimed.
-See the [ABI contract](bindings/c/README.md). Retired batch and dynamic bridge
-administration APIs are absent.
+C ABI v2 and its Python/Go wrappers embed `aster-node` inside the caller’s
+process for local Event, State, Record, and Blob operations. They use redb for
+durable state and expose numbered Event recovery, guarded Record resolution,
+subscriptions, finite Blob TTL, and scope rekey. Closing a node waits for its
+actor and workers. The bindings open no transport or administration socket.
+Reference-file provisioning is unprotected. See the
+[ABI contract](bindings/c/README.md) for ownership and supported operations.
 
 Blob has one canonical publication authority. Provisional local uploads,
 lifecycle-owned provisional network sources, and completed native packs share
@@ -213,11 +211,10 @@ local implementation detail: it adds no wire-visible batch size or receipt.
 
 ## Product readiness
 
-The first supportable profile is deliberately narrower than the implemented
-surface. Use the [capability roadmap](docs/validation/capability-roadmap.md) for
-planning and PR review, and
-[requirements status](docs/validation/requirements-status.md) for exact
-credited behavior and open gates.
+Implemented APIs do not establish deployment readiness. Review the
+[security boundaries](docs/security.md) and
+[conformance status](docs/validation/conformance.md) alongside the
+platform-specific validation records below.
 
 For the Linux Event MVP, [Decision
 0043](docs/decisions/0043-authorize-linux-event-mvp-validation.md) records the
@@ -269,7 +266,7 @@ conventional database or broker will usually be simpler.
 | Understand trust and component boundaries | [Selected architecture](docs/architecture.md) |
 | Connect nodes or evaluate carriers | [Carriers and contacts](docs/transports.md) |
 | Implement compatible protocol bytes | [Protocol](docs/protocol.md), [wire grammar](docs/wire.cddl), and [security objects](docs/envelope.md) |
-| Assess progress or readiness | [Capability roadmap](docs/validation/capability-roadmap.md), [requirements status](docs/validation/requirements-status.md), [conformance](docs/validation/conformance.md), and [security](docs/security.md) |
+| Assess progress or readiness | [Implementation boundary](#current-implementation-boundary), [conformance](docs/validation/conformance.md), and [security](docs/security.md) |
 | Deploy the Compose container profile | [Compose operator procedure](docs/release/docker-compose.md) and [schema v2](docs/reference/aster-agent-config-v2.md) |
 | Install and operate a packaged node | [Human operator guide](docs/operator-guide.md) |
 | Browse current product documentation | [Documentation map](docs/README.md) |
@@ -282,8 +279,8 @@ conventional database or broker will usually be simpler.
 | [`bindings`](bindings) | C ABI plus Go and Python wrappers |
 | [`docs`](docs) | Current product guides, concepts, specifications, and decisions |
 | [`docs/mvp`](docs/mvp) | MVP operating procedures |
-| [`docs/validation`](docs/validation) | Capability planning, requirements trace, conformance status, and retained evidence |
-| [`lab`](lab) | Controlled network and impairment experiments |
+| [`docs/validation`](docs/validation) | Conformance status, validation runbooks, and retained evidence |
+| [`docker/path-lab`](docker/path-lab) | Controlled network and impairment experiments |
 | [`fuzz`](fuzz) | Parser and protocol robustness targets |
 
 ## Build and verify

@@ -1,9 +1,9 @@
-# Go selected-node binding
+# Go binding
 
 Clean Room — Privileged.
 
-This cgo package wraps the selected redb-backed node through C ABI v2. It requires
-the matching `aster_ffi` library. `-tags aster_workspace` adds the repository's
+This cgo package wraps the redb-backed `aster-node` runtime through C ABI v2.
+It requires the matching `aster_ffi` library. `-tags aster_workspace` adds the repository's
 `target/debug` library directory; downstream packages configure their link path.
 
 ```go
@@ -39,13 +39,11 @@ the goroutine to the originating OS thread.
 
 Explicit `Close` is required for nodes/results/readers/writers; finalizers are
 only a leak backstop. Node closure invalidates its children and joins native
-work. `Zeroize` consumes the node, destroys its selected provisioning artifact,
+work. `Zeroize` consumes the node, destroys its retained provisioning artifact,
 and terminalizes the state. Caller-owned Go copies survive. No transport or
 process signal handler is installed by the binding.
 
-ABI v1 batch policies/operations and dynamic bridge administration are removed.
-SQLite paths, broad State/Record queries, retention knobs and raw provisioning
-byte arguments do not carry forward. See the [ABI contract](../c/README.md),
+See the [ABI contract](../c/README.md),
 [Go sample](../../examples/go_basic.go), and [quickstart](../../docs/quickstart/go.md).
 Run the real suite from the repository root:
 

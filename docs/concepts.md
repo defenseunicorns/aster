@@ -127,11 +127,9 @@ decide whether one update supersedes another.
 ### Deletion with tombstones
 
 A State or Record deletion is a replicated tombstone, not a local row removal.
-The former SQLite store's retention options and collection API have been
-removed.
+The runtime does not provide retention-driven State or Record collection.
 
-The selected runtime does not provide retention-driven State or Record
-collection. Blob maintenance reclaims exact already-unreferenced staging and
+Blob maintenance reclaims exact already-unreferenced staging and
 completed variants, atomically retires current-policy-invalidated publications
 and their aliases, and expires those retained retirement records after 45 days
 of accumulated conservative lower-bound age. Blob admission can also perform
@@ -176,11 +174,10 @@ network failures. Current class-specific eviction and deferral behavior is
 documented in [Architecture](architecture.md) and the
 [protocol](protocol.md#11-priority-retry-eviction-and-emissions).
 
-### Atomic batches
+### Publication atomicity
 
-Atomic publication batches and Blob batches were removed with the
-SQLite-backed application API. Independent publication calls do not provide an
-all-or-nothing batch guarantee.
+Each publication commits independently. Multiple publication calls do not
+provide an all-or-nothing transaction.
 
 ## Routing and propagation
 
