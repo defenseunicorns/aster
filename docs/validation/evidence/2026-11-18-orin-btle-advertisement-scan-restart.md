@@ -112,6 +112,55 @@ were used.
 This operator-attested follow-up exercises discovery, selection, and activation
 of the one present controller through the source agent composition. It does not
 exercise multiple-controller selection, the customer binary's systemd
-credential presentation, packaged service identity, same-state process restart,
-Event transfer, or controller hotplug. The disposable example source, binary,
-state, logs, and credentials were removed after the run.
+credential presentation, packaged service identity, Event transfer, or
+controller hotplug. The disposable example source, binary, state, logs, and
+credentials were removed after the run.
+
+### Same-state restart follow-up
+
+At signed production source `433e0b1ab1ed1ec450e1fc02691eef2130ecaf3f`, a
+corrected disposable example repeated the automatic composition against one
+state root. The first validation attempt had used the earlier disposable
+example, which called `mkdir` on its already-existing harness root and failed
+with `EEXIST` before Aster startup. A GDB `mkdirat` catch confirmed that
+harness-only cause. No production-code or durable-state failure was observed in
+that attempt.
+
+The corrected example used `create_dir_all` only for its disposable fixture
+root. Host `cargo check --locked -p aster-agent --example
+orin_restart_harness` passed. The ARM64 example was then built offline with the
+temporary vendored `libdbus-sys` feature recorded above:
+
+```text
+CARGO_BUILD_JOBS=2 \
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+cargo build --offline -p aster-agent --example orin_restart_harness \
+  --target aarch64-unknown-linux-gnu
+```
+
+The build-only manifest and lock changes were reverted. Its stripped SHA-256 was
+`57c55c4f58631d0f6d943e80ac1ef66831b686f5a67ba2a740c2cf2f6ca99c93`,
+and the local and remote hashes matched.
+
+Two successive 20-second runs used the identical
+`/tmp/aster-orin-restart-state-433e0b1` state root. The harness owned the
+20-second stop; an outer 30-second watchdog bounded each invocation:
+
+```text
+/tmp/orin_restart_harness /tmp/aster-orin-restart-state-433e0b1 \
+  /tmp/mission.bundle
+```
+
+Each run reached agent readiness,
+reported `ActiveInstances = 1` and `Discovering = true`, later ended its bounded
+scan, logged clean drain and shutdown, returned `HARNESS exit=Clean`, and left
+`ActiveInstances = 0` plus `Discovering = false`. The second run reopened the
+first run's node and discovery-checkpoint state; the state root was not removed
+or replaced between runs.
+
+This is source-composition evidence that automatic single-controller
+availability reconstructs across one clean same-state process restart. It is
+not packaged-service, credential-presentation, Event-transfer, controller
+hotplug, multiple-controller, soak, or hardware-qualification evidence. The
+corrected example source, binaries, state, logs, mission fixture, and temporary
+build-only changes were removed after the observation.
