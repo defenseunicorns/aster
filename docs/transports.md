@@ -11,7 +11,6 @@ node, topic, or scope are new.
 |---|---|
 | Run the selected networked implementation | [Selected direct-Iroh contact](#selected-direct-iroh-contact) |
 | Inspect the reference components | [Current semantic/reference carrier composition](#current-semanticreference-carrier-composition) |
-| Configure UDP/IP | [Current semantic IP example](#current-semantic-ip-example) |
 | Implement a platform BTLE adapter | [Current semantic BTLE integration seam](#current-semantic-btle-integration-seam) |
 | Add another carrier | [Carrier migration and extension](#carrier-migration-and-extension) |
 | Plan an operational deployment | [Before a real deployment](#before-a-real-deployment) |
@@ -100,8 +99,6 @@ The selected `aster-node` composition owns semantic-v9/profile-5 streaming.
 | Selected controlled Iroh relay | One operator-pinned HTTPS relay with explicit trust, alongside an initial direct locator or with IP disabled | No public/default relay selection; the relay is transport infrastructure rather than an Aster mission or payload-blind application relay |
 | Selected node and CLI | Networked Event, State, and Record reconciliation; semantic-v9/profile-5 checkpointed Blob streaming plus semantic-v7/v8 profile-4 compatibility; live and stopped Rust APIs; bounded application delivery; payload-blind Event relay; restart/idempotency; Unix zeroization | Reference provisioning; no cross-transport failover, dynamic application-driven network interests, automatic Record merge, route-only Blob custody, finite State/Record TTL, public Blob lifecycle controls, generalized control administration, or production authorization |
 | Current semantic in-memory link | High-level host contact, authentication, reconciliation, resume, and failure behavior | Reference carrier; not wired to the selected composition |
-| Current semantic UDP/IP | Nonblocking link, manual endpoint mapping, protected local discovery, rendezvous helpers, opaque relay components | Migration onto the selected node; full host acceptance on physical or operational networks |
-| Current semantic NAT/rendezvous and relay | Bounded rendezvous, endpoint-punching, and opaque-relay helpers | Not integrated into the selected node |
 | Linux BlueZ Event evaluation | Fixed-locator Ring 1 uses one exact controller and provisioned peer per process, event-driven availability, deterministic Linux role, bounded retry, and one semantic-v9 ordered Event contact. A separate source-present rostered evaluator adds authenticated transient discovery, a dynamic listener PSM, bounded credential/candidate state, and the same one-peer Event boundary. The Linux `systemd-provider` composition additionally implements bounded automatic controller inventory, passive compatibility probing, sticky selection, and one operational rostered epoch for `Normal` policy. | [Bounded Ring-1 CM4 evidence](validation/evidence/2026-11-05-cm4-btle-ring1-event-validation.md) is evaluation-only. The process-restart failure was bound to CVE-2026-72333 on Linux 6.18.39 by the [clean-restart diagnostic](validation/evidence/2026-11-06-cm4-btle-clean-restart-diagnostic.md); the [fixed-kernel record](validation/evidence/2026-11-06-cm4-btle-clean-restart-validation.md) then observed zero-work restart on Linux 6.18.60 without a controller epoch change. The Debian source profile now presents an optional encrypted roster credential, admits Bluetooth sockets without raw/admin capabilities, and restricts the service user to the exact BlueZ methods used by the adapter. Package construction and payload checks pass, while installed-service execution and qualification remain open: stock `bluer` does not establish acknowledged cancellation-safe advertisement/discovery teardown or a bounded first D-Bus ingress queue, and stock `hmac` does not establish erasure of constructor-derived key/IPAD/OPAD temporaries. No cross-transport fallback, other data class, requirement credit, support claim, or production authorization is claimed. |
 | Current semantic BTLE | MTU-aware link, unicast plus an advertisement primitive, disconnect handling, platform `BleRadio` seam | Selected-node integration; a shipped Android, iOS, Linux, or controller-specific radio driver; complete one-to-many profile |
 | LoRa, serial, file | The requirements and semantic design do not preclude them | No selected adapters ship |
@@ -243,80 +240,11 @@ The repository also retains the current semantic application and host surfaces:
 - `ApplicationNode` is the offline application surface.
 - Shared core and binding batch, bridge, and merge APIs remain available.
   The native laboratory host composition and Gate H have been retired.
-- `IpLink` and `BleLink` implement the same opaque-fragment contract.
+- `BleLink` implements the opaque-fragment contract.
 - The maintained [implementation-boundary table](../README.md#current-implementation-boundary)
   records which operations each Rust and language-binding surface exposes.
 
-## Current semantic IP example
-
-`IpLink` uses nonblocking UDP. The simplest integration uses known peer socket
-addresses and distinct provisioned mission identities, `alice_node_id` and
-`bob_node_id`:
-
-```rust
-use aster_ip::IpLink;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-let loopback_port = || SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-
-// This token groups protected discovery traffic. It is never transmitted, and
-// IpLink rejects an all-zero value.
-let discovery_token = [0x42; 16];
-let discovery_target = None; // Use Some(multicast_addr) for broadcast discovery.
-
-let alice_link = IpLink::bind(
-    "alice-to-bob", loopback_port(), discovery_token, discovery_target,
-)?;
-let bob_link = IpLink::bind(
-    "bob-to-alice", loopback_port(), discovery_token, discovery_target,
-)?;
-
-// Manual peering binds the expected authenticated NodeID to a UDP endpoint.
-// Authentication still happens in Aster; this map does not replace it.
-alice_link.register_peer(bob_node_id, bob_link.local_addr()?)?;
-bob_link.register_peer(alice_node_id, alice_link.local_addr()?)?;
-```
-
-`IpLink::bind`'s fourth argument is `discovery_target`. `None` disables the
-announcement/broadcast destination, as in the manual-peering example. `Some`
-provides the address used by `announce()` and peerless link sends. When that
-address is an IPv4 multicast address, `bind` also joins that group on the
-unspecified interface and enables multicast loopback. Other `Some` addresses
-are send targets only; the deployment remains responsible for any corresponding
-receive-side network setup.
-
-The 16-byte discovery token is provisioned group material, not a NodeID or a
-bearer value. It is never transmitted: discovery packets carry fresh nonces and
-derived proofs. `IpLink::bind` rejects the all-zero token, including when manual
-peering uses `discovery_target = None`.
-
-These are carrier primitives, not a complete application host. The native
-laboratory and its `SharedNodeContactSupervisor`/`MeshHost` composition have
-been retired. A local publish result does not promise remote delivery.
-
-### Current semantic discovery, rendezvous, and relay
-
-The IP crate provides separate tools for three deployment situations:
-
-- **Known address:** register a provisioned peer NodeID and socket address
-  directly. This is the smallest path and the best place to begin.
-- **Local discovery:** announcements use a provisioned opaque discovery token,
-  fresh nonces, and a challenge/response before an endpoint becomes a candidate.
-  Discovery does not replace authenticated session identity.
-- **NAT/rendezvous:** rendezvous helpers can coordinate endpoint punching where
-  the network permits it. NAT behavior is environmental; success is never
-  universal.
-- **Opaque relay:** the relay path can forward protected Aster traffic when
-  direct reachability fails. A relay is useful infrastructure, not part of data
-  correctness and not automatically a content reader.
-
-These semantic/reference helpers are migration sources, not the selected
-controlled-Iroh relay path above.
-
-Start with manually known addresses. Add discovery or rendezvous only after the
-authenticated two-node path is understood and measured in the target network.
-
-## Source-level automatic Linux BTLE composition
+## Automatic Linux BTLE Event composition
 
 On Linux builds with `systemd-provider`, an enabled BTLE policy and prepared
 roster credential compose `BLE_L2CAP_V1` at epoch zero as `Unavailable`.
@@ -351,14 +279,11 @@ changes. The operator must change validated configuration and restart the
 agent, rebuilding the policy, credential, radio, registry, and admission state
 together.
 
-This E1/E2 boundary is source plus targeted test-target compilation only until
-the focused/full verification and exact-device gates run. It changes no
-semantic-v9 bytes and adds no third-party dependency. Production composition
-adds the existing workspace `aster-ble-linux` edge to the agent's Linux
-feature; the lockfile records that internal edge. The increment advances no
-requirement credit. The shipped package, supported-hardware rows, physical
-qualification, and production authorization remain open; State, Record, and
-Blob over this automatic path are not claimed.
+This composition changes no semantic-v9 bytes and adds no new third-party
+package to the workspace lock graph. It advances no requirement credit.
+Installed-service execution, supported-hardware rows, physical qualification,
+and production authorization remain open; State, Record, and Blob over this
+automatic path are not claimed.
 
 The default driver policy permits an unknown probe-compatible controller to
 attempt operational activation as `Unqualified`. That means only that the
@@ -499,7 +424,7 @@ conflict resolution, or treat transport security as Aster authentication. The
 core owns fragmentation, handshake, replay defense, exact reconciliation,
 source verification, and reducers.
 
-Use the `Link` trait and existing IP/BTLE adapters as semantic and test migration
+Use the `Link` trait and retained BTLE adapters as semantic and test migration
 sources. The selected node now has an adapter-neutral stream registry and
 deterministic selector. The Linux `systemd-provider` composition may register
 `BLE_L2CAP_V1` when optional BTLE policy and credential preparation succeed,

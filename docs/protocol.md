@@ -1952,8 +1952,13 @@ must not be treated as broadcast validation.
 
 ## 16. Discovery and link profiles
 
-Every IP local-discovery packet is exactly 64 bytes and has mandatory zero
-padding. An advertisement is `type=1 u8 || nonce[16] || proof[16] || zero[31]`.
+`aster-ip` and `aster-relay` no longer ship. The IP discovery, rendezvous, and
+framing descriptions in this section are retained only as historical protocol
+rationale; they are not current implementation or conformance claims.
+
+Every retired IP local-discovery packet was exactly 64 bytes and had mandatory
+zero padding. An advertisement was
+`type=1 u8 || nonce[16] || proof[16] || zero[31]`.
 The nonce is fresh OS cryptographic randomness. The provisioned 128-bit
 discovery token is never transmitted. The proof is the 16-byte output of
 HKDF-SHA-256 with salt `"aster/ip-discovery-proof/v1"`, IKM equal to the
@@ -2007,10 +2012,11 @@ a transport for an item. The reference runtime consumes MTU and retry timing;
 the high-level host currently selects configured carriers round-robin and does
 not yet optimize for cost, bandwidth, emission, or broadcast capability.
 
-The IP adapter prefixes opaque data with `type=0 u8` and accepts UDP datagrams no
-larger than 65,507 bytes only from an explicitly registered endpoint. A DATA
-datagram from any other source is discarded before route construction or core
-delivery. Explicit registration is either direct `register_peer` provisioning or
+The retired IP adapter prefixed opaque data with `type=0 u8` and accepted UDP
+datagrams no larger than 65,507 bytes only from an explicitly registered
+endpoint. A DATA datagram from any other source is discarded before route
+construction or core delivery. Explicit registration is either direct
+`register_peer` provisioning or
 an embedding's `register_endpoint` call after it selects a discovery- or
 rendezvous-produced candidate; discovering an address does not register its DATA
 route automatically. One nonblocking receive poll examines at most 64 UDP
@@ -2280,19 +2286,10 @@ outbound, and replay limits:
 | streamed Blob publication | zero through 8 GiB and at most 8,192 native 1-MiB `ASTRBS02` segments | one bounded map/reorder/sink pipeline writes the same authenticated pack records later carried by DATA; provisional bytes remain charged until atomic lifecycle promotion; exact operation retry recovers durable local progress |
 | live Blob plaintext page | `1..=64 KiB`, spanning at most two canonical chunks | zero or overbound requests are rejected; the returned allocation zeroizes on drop; durable/cache/depot coherence loss is actor-fatal |
 | logical sends per pump | 128 | remaining due work keeps its monotonic deadline |
-| UDP datagrams examined per adapter poll | 64 | yields `None`; a later poll may continue queued input |
 | discardable unauthenticated carrier failures per runtime pump | 64 | yields with the contact intact; subsequent valid input can progress |
 | durable/deferred WANTs | 10,000 objects by default | compact metadata remains retryable without retaining ciphertext or payload |
 | incomplete fragment transfers | 16 transfers, 4 MiB aggregate, 10-minute idle TTL | exact per-transfer routes prevent cross-route assembly; idle/least-recently-active partial route and reassembly state are evicted together |
 | completed transfer records | 1,024 entries | FIFO eviction; conflicting unauthenticated route/transfer-ID reuse is discarded within the per-pump failure budget |
-| discovery recent announcements | 128 entries, 30-second TTL | new announcement returns backpressure until an entry expires |
-| discovery pending confirmations | 256 globally, 8 per canonical source IP, 30-second TTL | exact source-socket/announcement key; excess admission is ignored |
-| discovery emitted responses | 1,024 globally, 32 per canonical source IP, 30-second TTL | exact source-socket/announcement/challenge key; excess admission is ignored |
-| rendezvous client attempts | 128 entries, 120-second TTL | zero tokens reject; responses are one-shot and bound to the attempt's server and selected peer endpoint |
-| rendezvous waiting registrations | 4,096 globally, 64 per canonical source IP, absolute 120-second TTL | at most 64 datagrams are processed per poll; duplicates cannot refresh lifetime; excess admission is ignored |
-| rendezvous global response egress | 4,096-byte burst, 1,024 bytes/second monotonic refill | both replies atomically reserve their exact combined payload bytes; exhaustion retains the first registration |
-| rendezvous per-source response egress | 1,024-byte burst, 256 bytes/second monotonic refill per distinct canonical source; 4,096 entries; 120-second idle TTL | each distinct source is charged the full pair once; IPv4-mapped IPv6 is canonicalized; shared NATs share a budget; source state is created only on successful atomic reservation |
-| relay inbound header/body | 120-second header; body is 30 seconds plus length at 1,024 bps (542 seconds maximum) | deadline closes the client link and releases queued capacity |
 | DATA production per WANT | 16 messages of at most 64 KiB payload each | each backend batch is queued before expanding the next WANT; excess returns backpressure |
 | INTEREST selectors | 256 topics, 256 scopes, 4,096 topic-by-scope work units | rejected before inventory selection |
 | policy-filtered inventory snapshot | 100,000 metadata objects | SQLite reads at most cap plus one in one query; cap-plus-one and over-limit custom-store results reject the exchange rather than truncate |

@@ -363,17 +363,6 @@ are recorded separately in the
 - Decode bounds precede allocation. Malformed input cannot panic the safe core.
 - Adapter endpoint handles are routing-only local hints; only the authenticated
   session NodeID may authorize peer state, grants, inventory, or DATA.
-- Local discovery requires a fresh receiver challenge cryptographically bound to
-  the announcement and response role, then locally matched to the apparent
-  source socket, before an address becomes a candidate. All discovery packets
-  are strict, zero-padded 64-byte records, so a response does not amplify the
-  request by payload or ordinary IP/UDP wire size. Discovery does not register a
-  DATA route or authenticate a peer.
-- UDP DATA from an unregistered source socket is dropped before route
-  construction or core delivery. One receive poll processes at most 64
-  datagrams before yielding, so ignored traffic cannot monopolize one host pump
-  call. Manual provisioning or an explicit embedding decision must register a
-  discovery/rendezvous candidate first.
 - Adapter routes remain untrusted local routing hints after registration. A
   configured or fully authenticated route is exact, including anonymous versus
   routed delivery; a mismatch is discarded before fragment decoding and neither
@@ -822,87 +811,9 @@ not retire the probe retry. This removes deep wire traversal for small
 snapshots, not the O(k) identifier validation or O(N) local snapshot build.
 Larger snapshots retain the 66-level exact tree path.
 
-Discovery holds at most 128 recent local announcements, 256 pending challenges,
-and 1,024 emitted-response records; each class is pruned at 30 seconds before
-lookup or reuse. Pending records use `(exact source socket, announcement)` and
-retain a fresh challenge; only a matching response from that socket consumes the
-record. Emitted responses use `(exact source socket, announcement, challenge)`.
-A replay from another socket therefore cannot collide with or directly consume
-the legitimate socket's exact record. Pending and emitted-response admission is
-additionally limited to 8 and 32 records, respectively, per canonical source
-IP; IPv4 and its IPv4-mapped IPv6 form share one quota. This contains
-source-port churn while preserving the global 256/1,024 bounds, but distributed
-replay can fill those shared caches and delay legitimate discovery until the
-30-second expiry; large shared-NAT populations also contend for the same
-per-source limits. It blocks passive replay redirection but not an active,
-bidirectional live relay of the challenge and response; only the subsequent
-hybrid handshake authenticates the peer.
-
-Advertisement, challenge, and response packets are all strict, zero-padded
-64-byte records, so reflected discovery traffic does not exceed the inducing
-packet by payload size or ordinary IPv4/IPv6 UDP wire size. Equal sizing does not
-prove source ownership. A captured valid announcement—or an announcement made
-by a discovery-token holder—with a spoofed source can still consume that
-apparent victim's bounded per-source pending quota and the global quota. Public
-or hostile-link deployments require source anti-spoofing and ingress rate
-controls.
-
-Rendezvous rejects a zero pairing token. Client attempts are bounded at 128,
-expire after 120 seconds, and bind the expected server per token. A server peer
-response is consumed once; only its selected endpoint may then present the
-corresponding punch, except for an endpoint explicitly authorized with
-`accept_punch`. Failed registration sends restore prior client state. The server
-examines at most 64 datagrams per poll, retains at most 4,096 waiting tokens and
-64 per canonical source IP, and maintains those source counts incrementally.
-The absolute 120-second waiting lifetime cannot be refreshed by duplicate
-registration. Registration is a strict 160-byte packet with 127 zero padding
-bytes; the prior 33- and 64-byte forms fail closed. Under a conservative
-48-byte IPv6 UDP/IP-header model, the 208-byte registration wire cost exceeds
-the largest 181-byte reflected response-plus-punch chain: a 52-byte IPv6 peer
-response and 33-byte punch, each with a 48-byte header.
-
-Before sending either reply, the server atomically reserves their exact
-combined payload size from one global 4,096-byte bucket refilling at 1,024 bytes
-per second and from a 1,024-byte bucket refilling at 256 bytes per second for
-each distinct canonical source IP. Endpoints sharing one canonical IP charge
-that source once; different sources each pay the full pair. Source-budget state
-is capped at 4,096 entries and expires after 120 idle seconds. Missing state is
-created only after every required bucket can pay. A denied reservation spends
-nothing; a send failure conservatively spends the reservation but preserves
-waiting and source-count invariants for retry. These controls bound state,
-per-poll work, repeated completed-pair egress, and one canonical source's share
-without byte amplification. Shared-NAT clients share a budget. Rotating spoofed
-source IPs can still fill the finite source-budget table, and these controls do
-not prove a UDP source address was not spoofed; public exposure still requires
-deployment anti-spoofing and rate controls. The visible high-entropy token
-remains a capability, not peer authentication.
-
-The TCP ciphertext relay defaults to 256 active pairs, 64 accepted sockets per
-source IP across validation/waiting/active states, and a 120-second active-pair
-idle timeout reset by actual I/O. Client queues are independently bounded in
-both directions at 256 frames and 4 MiB. `send` only performs nonblocking local
-queue admission; saturation returns `WouldBlock`, while asynchronous write
-failure closes the link and makes later sends fail. One pair whose endpoints
-share a public NAT normally consumes two source admissions. Operators can raise
-that limit for large shared NATs, trading away some per-source denial-of-service
-containment while retaining the global active-pair bound. Inbound clients must
-complete a four-byte frame header within 120 seconds. A body gets 30 seconds
-plus its encoded length at 1,024 bits per second, or 542 seconds for the maximum
-65,535-byte frame; expiry closes the link and releases its bounded queue state.
-Zero or monotonic-clock-unrepresentable active-pair idle durations fail
-configuration, and runtime deadline construction is checked.
-
-These relay bounds are containment, not complete slow-client resistance. Any
-successful byte transfer resets the active idle timer, so coordinated sources
-can retain the finite global slots by sending periodic traffic; a healthy pair
-that is completely quiet for the configured interval is also disconnected and
-must be re-established by its embedding. Deployment-layer source controls and
-reconnection policy remain release gates.
-
 A stateless pre-response cookie format is not implemented, so amplification
 resistance for the large PQ response remains a deployment/release gate.
-Discovery and rendezvous rate limits
-belong to their carrier profiles and are not provided by the fixed handshake.
+Carrier discovery rate limits are not provided by the fixed handshake.
 The mission proof prevents a party without mission material from creating a new
 accepted flight 1, but a captured valid flight 1 remains replayable and can
 trigger a fresh bounded response. On an unknown responder it can also pin that
@@ -971,10 +882,8 @@ exist.
 
 Packet-capture canary checks can show that selected protected fields were not
 found in captured Aster carrier bytes. They cannot establish resistance to
-correlation through pre-session IP or rendezvous identifiers and do not hide
-timing, direction, size, RF energy, or protocol presence. Local discovery sends
-fresh truncated token-derived proofs; these establish reachability at the
-apparent socket, not peer identity or resistance to an active real-time relay.
+correlation through carrier identifiers and do not hide timing, direction,
+size, RF energy, or protocol presence.
 
 The complete test matrix, credited evidence, and open production gates live in
 [requirements status](validation/requirements-status.md) and

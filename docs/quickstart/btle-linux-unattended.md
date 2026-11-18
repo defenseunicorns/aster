@@ -11,7 +11,7 @@ source-level automatic agent composition and the packaged agent. Under
 epoch; the selector does not see `Available` until its listener,
 advertisement, and scan owners are ready. No controller or transport is
 required for node readiness or durable publication. See the
-[carrier guide](../transports.md#source-level-automatic-linux-btle-composition)
+[carrier guide](../transports.md#automatic-linux-btle-event-composition)
 for current policy and package status and the
 [design](../superpowers/specs/2026-11-03-production-btle-design.md#platform-qualification-and-support)
 for detailed resolver mechanics.

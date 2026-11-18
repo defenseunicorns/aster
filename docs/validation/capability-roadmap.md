@@ -68,7 +68,7 @@ starts at most one rostered operational epoch under `Normal`. Focused tests
 cover that mechanism and withholding selector `Available` until the required
 operational owners are ready; node readiness and durable publication require
 neither a controller nor a transport. See the
-[carrier guide](../transports.md#source-level-automatic-linux-btle-composition)
+[carrier guide](../transports.md#automatic-linux-btle-event-composition)
 for current behavior and the
 [design](../superpowers/specs/2026-11-03-production-btle-design.md#platform-qualification-and-support)
 for detailed policy and resource bounds.
