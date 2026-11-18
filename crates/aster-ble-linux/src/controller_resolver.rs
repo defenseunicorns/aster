@@ -6,6 +6,9 @@ use crate::{
         AdapterSignal, BluezBackend, BluezFailure, BluezSession, ProductionBluez, SessionSignal,
         SessionStream,
     },
+    controller_fingerprint::{
+        ControllerFingerprintCollector, ProductionControllerFingerprintCollector,
+    },
     controller_probe::{BluezControllerProbeBackend, probe_controller},
     controller_selection::{MAX_CONTROLLER_CANDIDATES, normalize_controller_inventory},
     policy::{CappedBackoff, LifecycleCancellationObserver},
@@ -376,11 +379,15 @@ enum ResolverEvent {
 
 struct BluezResolverPlatform {
     backend: Arc<dyn BluezBackend>,
+    fingerprints: Arc<dyn ControllerFingerprintCollector>,
 }
 
 impl BluezResolverPlatform {
     fn new(backend: Arc<dyn BluezBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            fingerprints: Arc::new(ProductionControllerFingerprintCollector::default()),
+        }
     }
 }
 
@@ -393,6 +400,7 @@ impl ResolverPlatform for BluezResolverPlatform {
                 session,
                 session_events,
                 adapter_events: SelectAll::new(),
+                fingerprints: self.fingerprints.clone(),
             }) as Box<dyn ResolverSession>)
         })
     }
@@ -402,6 +410,7 @@ struct BluezResolverSession {
     session: Box<dyn BluezSession>,
     session_events: SessionStream,
     adapter_events: SelectAll<NamedAdapterStream>,
+    fingerprints: Arc<dyn ControllerFingerprintCollector>,
 }
 
 impl ResolverSession for BluezResolverSession {
@@ -412,7 +421,7 @@ impl ResolverSession for BluezResolverSession {
         Box::pin(async move {
             let names = self.session.adapter_names().await?;
             let inventory = normalize_controller_inventory(names, selected, None);
-            let mut controllers = Vec::with_capacity(inventory.candidates().len());
+            let mut observed = Vec::with_capacity(inventory.candidates().len());
             let mut adapter_events = SelectAll::new();
 
             for named in inventory.candidates() {
@@ -431,20 +440,37 @@ impl ResolverSession for BluezResolverSession {
                     Err(BluezFailure::ControllerAbsent) => continue,
                     Err(failure) => return Err(failure.into()),
                 };
-                let name = named.name().to_owned();
+                observed.push((named.name().to_owned(), adapter, events, snapshot));
+            }
+
+            let names: Vec<_> = observed
+                .iter()
+                .map(|(name, _, _, _)| name.clone())
+                .collect();
+            let fingerprints = self.fingerprints.collect(&names).await;
+            let mut controllers = Vec::with_capacity(observed.len());
+            for ((name, adapter, events, snapshot), fingerprint) in
+                observed.into_iter().zip(fingerprints)
+            {
+                let confirmed = match adapter.snapshot().await {
+                    Ok(confirmed) if confirmed == snapshot => confirmed,
+                    Ok(_) | Err(BluezFailure::ControllerAbsent) => continue,
+                    Err(failure) => return Err(failure.into()),
+                };
                 let event_name = name.clone();
+                let end_name = name.clone();
                 adapter_events.push(
                     events
                         .map(move |event| (event_name.clone(), Some(event)))
-                        .chain(futures::stream::once(async move { (name.clone(), None) }))
+                        .chain(futures::stream::once(async move { (end_name, None) }))
                         .boxed(),
                 );
                 controllers.push(ObservedController::new(
                     ControllerCandidate::from_snapshot(
-                        named.name().to_owned(),
-                        ControllerSnapshot::new(snapshot.address, snapshot.address_type),
+                        name,
+                        ControllerSnapshot::new(confirmed.address, confirmed.address_type),
                     ),
-                    platform_fingerprint(),
+                    fingerprint,
                 ));
             }
 
@@ -494,20 +520,6 @@ async fn next_adapter_event(
             .await
             .expect("non-empty adapter stream set yields an end marker")
     }
-}
-
-fn platform_fingerprint() -> ControllerFingerprint {
-    ControllerFingerprint::new(
-        Some(std::env::consts::OS),
-        Some(std::env::consts::ARCH),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
 }
 
 struct ProductionResolverProbe;
@@ -1639,6 +1651,27 @@ mod tests {
 
     struct PendingBluezSession;
 
+    struct OneAdapterBluezSession;
+
+    struct OneAdapterBluezAdapter;
+
+    struct ReplacingAdapterBluezSession;
+
+    struct ReplacingBluezAdapter {
+        snapshots: Mutex<VecDeque<crate::controller::AdapterSnapshot>>,
+    }
+
+    struct FixedFingerprintCollector(ControllerFingerprint);
+
+    impl crate::controller_fingerprint::ControllerFingerprintCollector for FixedFingerprintCollector {
+        fn collect<'a>(
+            &'a self,
+            adapter_names: &'a [String],
+        ) -> crate::controller_fingerprint::FingerprintFuture<'a> {
+            Box::pin(async move { adapter_names.iter().map(|_| self.0.clone()).collect() })
+        }
+    }
+
     impl BluezSession for PendingBluezSession {
         fn subscribe(&self) -> crate::controller::BluezFuture<'_, SessionStream> {
             Box::pin(std::future::pending())
@@ -1653,6 +1686,106 @@ mod tests {
             _name: &'a str,
         ) -> crate::controller::BluezFuture<'a, Box<dyn crate::controller::BluezAdapter>> {
             Box::pin(std::future::pending())
+        }
+    }
+
+    impl BluezSession for OneAdapterBluezSession {
+        fn subscribe(&self) -> crate::controller::BluezFuture<'_, SessionStream> {
+            Box::pin(async { Ok(Box::pin(futures::stream::pending()) as SessionStream) })
+        }
+
+        fn adapter_names(&self) -> crate::controller::BluezFuture<'_, Vec<String>> {
+            Box::pin(async { Ok(vec!["hci0".to_owned()]) })
+        }
+
+        fn adapter<'a>(
+            &'a self,
+            _name: &'a str,
+        ) -> crate::controller::BluezFuture<'a, Box<dyn crate::controller::BluezAdapter>> {
+            Box::pin(async {
+                Ok(Box::new(OneAdapterBluezAdapter) as Box<dyn crate::controller::BluezAdapter>)
+            })
+        }
+    }
+
+    impl crate::controller::BluezAdapter for OneAdapterBluezAdapter {
+        fn subscribe(
+            &self,
+        ) -> crate::controller::BluezFuture<'_, crate::controller::AdapterStream> {
+            Box::pin(async {
+                Ok(Box::pin(futures::stream::pending()) as crate::controller::AdapterStream)
+            })
+        }
+
+        fn snapshot(
+            &self,
+        ) -> crate::controller::BluezFuture<'_, crate::controller::AdapterSnapshot> {
+            Box::pin(async {
+                Ok(crate::controller::AdapterSnapshot {
+                    powered: true,
+                    address: Address::from_str("02:00:00:00:00:01").unwrap(),
+                    address_type: AddressType::LePublic,
+                })
+            })
+        }
+    }
+
+    impl BluezSession for ReplacingAdapterBluezSession {
+        fn subscribe(&self) -> crate::controller::BluezFuture<'_, SessionStream> {
+            Box::pin(async { Ok(Box::pin(futures::stream::pending()) as SessionStream) })
+        }
+
+        fn adapter_names(&self) -> crate::controller::BluezFuture<'_, Vec<String>> {
+            Box::pin(async { Ok(vec!["hci0".to_owned()]) })
+        }
+
+        fn adapter<'a>(
+            &'a self,
+            _name: &'a str,
+        ) -> crate::controller::BluezFuture<'a, Box<dyn crate::controller::BluezAdapter>> {
+            Box::pin(async {
+                Ok(Box::new(ReplacingBluezAdapter {
+                    snapshots: Mutex::new(
+                        [
+                            crate::controller::AdapterSnapshot {
+                                powered: true,
+                                address: Address::from_str("02:00:00:00:00:01").unwrap(),
+                                address_type: AddressType::LePublic,
+                            },
+                            crate::controller::AdapterSnapshot {
+                                powered: true,
+                                address: Address::from_str("02:00:00:00:00:02").unwrap(),
+                                address_type: AddressType::LePublic,
+                            },
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+                })
+                    as Box<dyn crate::controller::BluezAdapter>)
+            })
+        }
+    }
+
+    impl crate::controller::BluezAdapter for ReplacingBluezAdapter {
+        fn subscribe(
+            &self,
+        ) -> crate::controller::BluezFuture<'_, crate::controller::AdapterStream> {
+            Box::pin(async {
+                Ok(Box::pin(futures::stream::pending()) as crate::controller::AdapterStream)
+            })
+        }
+
+        fn snapshot(
+            &self,
+        ) -> crate::controller::BluezFuture<'_, crate::controller::AdapterSnapshot> {
+            Box::pin(async {
+                self.snapshots
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .ok_or(BluezFailure::ControllerAbsent)
+            })
         }
     }
 
@@ -3973,6 +4106,7 @@ mod tests {
             session: Box::new(PendingBluezSession),
             session_events: Box::pin(futures::stream::pending()),
             adapter_events,
+            fingerprints: Arc::new(FixedFingerprintCollector(fingerprint("unused"))),
         };
 
         let event = session.next_event().now_or_never();
@@ -3982,6 +4116,45 @@ mod tests {
             "one call must yield after bounded ready work"
         );
         assert!(event.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn production_observation_uses_the_collected_controller_fingerprint() {
+        let expected = fingerprint("collected");
+        let mut session = BluezResolverSession {
+            session: Box::new(OneAdapterBluezSession),
+            session_events: Box::pin(futures::stream::pending()),
+            adapter_events: SelectAll::new(),
+            fingerprints: Arc::new(FixedFingerprintCollector(expected.clone())),
+        };
+        let inventory = session.observe(None).await.unwrap();
+        let policy = ControllerAdmissionPolicy::new(
+            false,
+            vec![ControllerSupportRow::exact(expected)],
+            vec![],
+        );
+
+        assert_eq!(inventory.controllers.len(), 1);
+        assert_eq!(
+            policy
+                .admit(&inventory.controllers[0].fingerprint)
+                .support(),
+            SupportTag::Qualified
+        );
+    }
+
+    #[tokio::test]
+    async fn production_observation_discards_a_controller_replaced_during_collection() {
+        let mut session = BluezResolverSession {
+            session: Box::new(ReplacingAdapterBluezSession),
+            session_events: Box::pin(futures::stream::pending()),
+            adapter_events: SelectAll::new(),
+            fingerprints: Arc::new(FixedFingerprintCollector(fingerprint("first"))),
+        };
+
+        let inventory = session.observe(None).await.unwrap();
+
+        assert!(inventory.controllers.is_empty());
     }
 
     #[tokio::test]

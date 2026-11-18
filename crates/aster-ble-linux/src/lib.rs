@@ -5,6 +5,7 @@
 
 mod config;
 mod controller;
+mod controller_fingerprint;
 mod controller_probe;
 mod controller_resolver;
 mod controller_selection;

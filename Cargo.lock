@@ -337,6 +337,7 @@ dependencies = [
  "futures",
  "getrandom 0.4.3",
  "hmac 0.13.0",
+ "rustix",
  "sha2 0.11.1",
  "subtle",
  "tokio",

@@ -661,6 +661,24 @@ fields make the support tag unqualified unless they create ambiguous overlap
 with a safety rule; they do not otherwise fail successful compatibility
 preflight.
 
+The initial Linux implementation obtains the kernel release from its fixed proc
+entry, the BlueZ version from a fixed absolute `bluetoothd` path with no shell or
+`PATH` lookup, and physical controller identity from each retained candidate's
+bounded sysfs device entries. The direct command and its inherited output pipe
+share a private 250 ms deadline. One single-flight collection batch has a 500 ms
+deadline: half is reserved for that command and half for the bounded proc/sysfs
+work across the at-most-eight retained candidates, leaving half of the default
+one-second resolver operation bound for BlueZ inventory and identity
+revalidation. Accepted identity atoms are at most 64 bytes; transient sysfs link
+reads are capped at 512 bytes before only their bounded basename is retained.
+The collector pins one device, driver, and module generation while reading and
+then revalidates those objects plus the BlueZ snapshot before admission.
+Missing, changed, malformed, oversized, or unavailable values remain absent and
+therefore cannot create a qualified support row. A timeout returns incomplete
+fingerprints while retaining at most one underlying blocking worker, so
+collection failure is non-fatal to compatibility probing and transport-neutral
+readiness.
+
 Static validated policy contains no detected controller identity and remains
 valid without present hardware. The resolver issues one ephemeral, non-cloneable
 `ControllerEpochOwner` containing the adapter name, address and type needed for

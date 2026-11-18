@@ -25,6 +25,7 @@ aster-node = { path = "../aster-node" }
 futures.workspace = true
 getrandom.workspace = true
 hmac.workspace = true
+rustix.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 tokio = { workspace = true, features = ["macros"] }
