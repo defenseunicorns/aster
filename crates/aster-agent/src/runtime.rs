@@ -221,6 +221,12 @@ where
             return Err(AgentRuntimeError::Lifecycle(FailureReason::Startup));
         }
     };
+    #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+    let _btle_status_output = BtleStatusOutputCloseOnDrop::new(
+        btle_runtime
+            .is_present()
+            .then(|| process_btle_status_output().clone()),
+    );
     let state_root = node.state_root().to_path_buf();
     let application = match BoundAgent::bind(application_address).await {
         Ok(application) => application,
@@ -707,18 +713,214 @@ fn lifecycle_record(
 
 #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
 pub(super) fn emit_btle_status(status: aster_ble_linux::BtleCurrentStatus) {
-    if let Some(output) = process_btle_status_output() {
-        output.send_replace(btle_status_record(status).to_string());
+    let output = process_btle_status_output().clone();
+    if output.send_replace_with(
+        btle_status_record(status).to_string(),
+        spawn_process_btle_status_output,
+    ) {
+        schedule_btle_status_output_retry(output);
     }
 }
 
 #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
-fn process_btle_status_output() -> Option<&'static ProcessBtleStatusOutput> {
-    static OUTPUT: std::sync::OnceLock<Option<ProcessBtleStatusOutput>> =
+fn process_btle_status_output() -> &'static std::sync::Arc<ProcessBtleStatusOutputSlot> {
+    static OUTPUT: std::sync::OnceLock<std::sync::Arc<ProcessBtleStatusOutputSlot>> =
         std::sync::OnceLock::new();
-    OUTPUT
-        .get_or_init(|| spawn_btle_status_output(|record| println!("{record}")))
-        .as_ref()
+    OUTPUT.get_or_init(|| std::sync::Arc::new(ProcessBtleStatusOutputSlot::default()))
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+// Four attempts per second bounds a failed sink without making ordinary
+// operator output recovery visibly sluggish. This is a private process limit.
+const BTLE_STATUS_OUTPUT_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+fn write_btle_status_record(record: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    stdout.write_all(record.as_bytes())?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+fn spawn_process_btle_status_output() -> Option<ProcessBtleStatusOutput> {
+    spawn_btle_status_output(BTLE_STATUS_OUTPUT_RETRY, write_btle_status_record)
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+fn schedule_btle_status_output_retry(output: std::sync::Arc<ProcessBtleStatusOutputSlot>) {
+    schedule_btle_status_output_retry_with(
+        output,
+        BTLE_STATUS_OUTPUT_RETRY,
+        spawn_process_btle_status_output,
+    );
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+fn schedule_btle_status_output_retry_with(
+    output: std::sync::Arc<ProcessBtleStatusOutputSlot>,
+    retry_delay: std::time::Duration,
+    spawn: impl Fn() -> Option<ProcessBtleStatusOutput> + Send + 'static,
+) {
+    tokio::spawn(drive_btle_status_output_retry(output, retry_delay, spawn));
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+async fn drive_btle_status_output_retry(
+    output: std::sync::Arc<ProcessBtleStatusOutputSlot>,
+    retry_delay: std::time::Duration,
+    spawn: impl Fn() -> Option<ProcessBtleStatusOutput>,
+) {
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(retry_delay) => {}
+            () = output.closed.notified() => return,
+        }
+        if !output.retry_with(&spawn) {
+            return;
+        }
+    }
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+#[derive(Default)]
+struct ProcessBtleStatusOutputSlot {
+    state: std::sync::Mutex<ProcessBtleStatusOutputSlotState>,
+    closed: tokio::sync::Notify,
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+#[derive(Default)]
+struct ProcessBtleStatusOutputSlotState {
+    output: Option<ProcessBtleStatusOutput>,
+    latest: Option<String>,
+    retry_scheduled: bool,
+    closed: bool,
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+impl ProcessBtleStatusOutputSlot {
+    fn send_replace_with(
+        &self,
+        record: String,
+        spawn: impl FnOnce() -> Option<ProcessBtleStatusOutput>,
+    ) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed {
+            return false;
+        }
+        if let Some(output) = state.output.as_ref() {
+            match output.send_replace(record) {
+                Ok(()) => return false,
+                Err(record) => {
+                    state.output = None;
+                    state.latest = Some(record);
+                    return schedule_output_retry(&mut state);
+                }
+            }
+        }
+
+        state.latest = Some(record);
+        if state.retry_scheduled {
+            return false;
+        }
+        match spawn() {
+            Some(output) => {
+                if let Some(record) = state.latest.take()
+                    && let Err(record) = output.send_replace(record)
+                {
+                    state.latest = Some(record);
+                    return schedule_output_retry(&mut state);
+                }
+                state.output = Some(output);
+                false
+            }
+            None => schedule_output_retry(&mut state),
+        }
+    }
+
+    fn retry_with(&self, spawn: impl FnOnce() -> Option<ProcessBtleStatusOutput>) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed || state.output.is_some() || state.latest.is_none() {
+            state.retry_scheduled = false;
+            return false;
+        }
+        match spawn() {
+            Some(output) => {
+                let record = state.latest.take().expect("checked retained record");
+                match output.send_replace(record) {
+                    Ok(()) => {
+                        state.output = Some(output);
+                        state.retry_scheduled = false;
+                        false
+                    }
+                    Err(record) => {
+                        state.latest = Some(record);
+                        true
+                    }
+                }
+            }
+            None => true,
+        }
+    }
+
+    fn close(&self) {
+        let output = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.closed {
+                return;
+            }
+            state.closed = true;
+            state.latest = None;
+            state.retry_scheduled = false;
+            state.output.take()
+        };
+        drop(output);
+        self.closed.notify_one();
+    }
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+fn schedule_output_retry(state: &mut ProcessBtleStatusOutputSlotState) -> bool {
+    if state.retry_scheduled {
+        false
+    } else {
+        state.retry_scheduled = true;
+        true
+    }
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+struct BtleStatusOutputCloseOnDrop {
+    output: Option<std::sync::Arc<ProcessBtleStatusOutputSlot>>,
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+impl BtleStatusOutputCloseOnDrop {
+    fn new(output: Option<std::sync::Arc<ProcessBtleStatusOutputSlot>>) -> Self {
+        Self { output }
+    }
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+impl Drop for BtleStatusOutputCloseOnDrop {
+    fn drop(&mut self) {
+        if let Some(output) = &self.output {
+            output.close();
+        }
+    }
 }
 
 #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
@@ -733,17 +935,22 @@ struct ProcessBtleStatusOutput {
 struct ProcessBtleStatusOutputState {
     latest: Option<String>,
     closed: bool,
+    running: bool,
 }
 
 #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
 impl ProcessBtleStatusOutput {
-    fn send_replace(&self, record: String) {
+    fn send_replace(&self, record: String) -> Result<(), String> {
         let (state, changed) = &*self.shared;
-        state
+        let mut state = state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .latest = Some(record);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed || !state.running {
+            return Err(record);
+        }
+        state.latest = Some(record);
         changed.notify_one();
+        Ok(())
     }
 }
 
@@ -761,12 +968,14 @@ impl Drop for ProcessBtleStatusOutput {
 
 #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
 fn spawn_btle_status_output(
-    mut write: impl FnMut(String) + Send + 'static,
+    retry_delay: std::time::Duration,
+    mut write: impl FnMut(&str) -> std::io::Result<()> + Send + 'static,
 ) -> Option<ProcessBtleStatusOutput> {
     let shared = std::sync::Arc::new((
         std::sync::Mutex::new(ProcessBtleStatusOutputState {
             latest: None,
             closed: false,
+            running: true,
         }),
         std::sync::Condvar::new(),
     ));
@@ -774,9 +983,28 @@ fn spawn_btle_status_output(
     std::thread::Builder::new()
         .name("aster-btle-status".to_owned())
         .spawn(move || {
-            let (state, changed) = &*writer_shared;
+            struct WriterExit(
+                std::sync::Arc<(
+                    std::sync::Mutex<ProcessBtleStatusOutputState>,
+                    std::sync::Condvar,
+                )>,
+            );
+
+            impl Drop for WriterExit {
+                fn drop(&mut self) {
+                    let (state, changed) = &*self.0;
+                    state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .running = false;
+                    changed.notify_all();
+                }
+            }
+
+            let _exit = WriterExit(writer_shared.clone());
+            let (shared_state, changed) = &*writer_shared;
             loop {
-                let mut state = state
+                let mut state = shared_state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 while state.latest.is_none() && !state.closed {
@@ -790,7 +1018,27 @@ fn spawn_btle_status_output(
                 }
                 drop(state);
                 if let Some(record) = record {
-                    write(record);
+                    let result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write(&record)));
+                    if matches!(result, Ok(Ok(()))) {
+                        continue;
+                    }
+
+                    let mut state = shared_state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if state.closed {
+                        return;
+                    }
+                    if state.latest.is_none() {
+                        state.latest = Some(record);
+                    }
+                    let (state_after_wait, _) = changed
+                        .wait_timeout_while(state, retry_delay, |state| !state.closed)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if state_after_wait.closed {
+                        return;
+                    }
                 }
             }
         })
@@ -1071,8 +1319,8 @@ mod tests {
             std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let writer_release = release.clone();
         let mut first = true;
-        let output = spawn_btle_status_output(move |record| {
-            written.send(record).unwrap();
+        let output = spawn_btle_status_output(std::time::Duration::from_millis(1), move |record| {
+            written.send(record.to_owned()).unwrap();
             if first {
                 first = false;
                 started.send(()).unwrap();
@@ -1082,22 +1330,242 @@ mod tests {
                     released = wake.wait(released).unwrap();
                 }
             }
+            Ok(())
         })
         .expect("test status writer thread");
 
-        output.send_replace("first".to_owned());
+        output
+            .send_replace("first".to_owned())
+            .expect("live test writer");
         writer_started
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("writer entered the blocked output boundary");
-        output.send_replace("middle".to_owned());
-        output.send_replace("latest".to_owned());
+        output
+            .send_replace("middle".to_owned())
+            .expect("live test writer");
+        output
+            .send_replace("latest".to_owned())
+            .expect("live test writer");
 
         let (released, wake) = &*release;
         *released.lock().unwrap() = true;
         wake.notify_one();
-        assert_eq!(records.recv().unwrap(), "first");
-        assert_eq!(records.recv().unwrap(), "latest");
+        assert_eq!(
+            records
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("first record before the deadlock bound"),
+            "first"
+        );
+        assert_eq!(
+            records
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("coalesced record before the deadlock bound"),
+            "latest"
+        );
         drop(output);
+    }
+
+    #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+    #[test]
+    fn btle_status_output_guard_drains_final_record_before_exit() {
+        struct ExitSignal(Option<std::sync::mpsc::Sender<()>>);
+
+        impl Drop for ExitSignal {
+            fn drop(&mut self) {
+                let _ = self.0.take().expect("one exit signal").send(());
+            }
+        }
+
+        let slot = std::sync::Arc::new(ProcessBtleStatusOutputSlot::default());
+        let guard = BtleStatusOutputCloseOnDrop::new(Some(slot.clone()));
+        let (started, writer_started) = std::sync::mpsc::channel();
+        let (written, records) = std::sync::mpsc::channel();
+        let (exited, writer_exited) = std::sync::mpsc::channel();
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let writer_release = release.clone();
+        let exit = ExitSignal(Some(exited));
+        let mut first = true;
+
+        assert!(!slot.send_replace_with("first".to_owned(), || {
+            spawn_btle_status_output(std::time::Duration::from_millis(1), move |record| {
+                let _keep_until_writer_exit = &exit;
+                written.send(record.to_owned()).unwrap();
+                if first {
+                    first = false;
+                    started.send(()).unwrap();
+                    let (released, wake) = &*writer_release;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                }
+                Ok(())
+            })
+        }));
+        writer_started
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("writer entered the blocked output boundary");
+        assert!(!slot.send_replace_with("final".to_owned(), || {
+            panic!("live slot must not replace its writer")
+        }));
+        drop(guard);
+
+        let (released, wake) = &*release;
+        *released.lock().unwrap() = true;
+        wake.notify_one();
+
+        assert_eq!(
+            records
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("first record before the deadlock bound"),
+            "first"
+        );
+        assert_eq!(
+            records
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("final record before the deadlock bound"),
+            "final"
+        );
+        writer_exited
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("writer exited after draining the final record");
+    }
+
+    #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+    #[test]
+    fn btle_status_output_retries_failed_write_with_latest_record() {
+        let (failed, first_attempt) = std::sync::mpsc::channel();
+        let (replace_ready, replacement_enqueued) = std::sync::mpsc::channel();
+        let (written, records) = std::sync::mpsc::channel();
+        let mut fail_once = true;
+        let output =
+            spawn_btle_status_output(std::time::Duration::from_millis(10), move |record| {
+                if fail_once {
+                    fail_once = false;
+                    failed.send(record.to_owned()).unwrap();
+                    replacement_enqueued.recv().unwrap();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "injected output failure",
+                    ));
+                }
+                written.send(record.to_owned()).unwrap();
+                Ok(())
+            })
+            .expect("test status writer thread");
+
+        output
+            .send_replace("stale".to_owned())
+            .expect("live test writer");
+        assert_eq!(
+            first_attempt
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "stale"
+        );
+        output
+            .send_replace("latest".to_owned())
+            .expect("live test writer");
+        replace_ready.send(()).unwrap();
+        assert_eq!(
+            records
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "latest"
+        );
+        assert!(records.try_recv().is_err());
+        drop(output);
+    }
+
+    #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+    #[test]
+    fn btle_status_output_close_interrupts_failed_write_retry() {
+        struct ExitSignal(Option<std::sync::mpsc::Sender<()>>);
+
+        impl Drop for ExitSignal {
+            fn drop(&mut self) {
+                let _ = self.0.take().expect("one exit signal").send(());
+            }
+        }
+
+        let (attempted, first_attempt) = std::sync::mpsc::channel();
+        let (exited, writer_exited) = std::sync::mpsc::channel();
+        let exit = ExitSignal(Some(exited));
+        let output = spawn_btle_status_output(std::time::Duration::from_secs(30), move |_| {
+            let _keep_until_writer_exit = &exit;
+            attempted.send(()).unwrap();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected persistent output failure",
+            ))
+        })
+        .expect("test status writer thread");
+
+        output
+            .send_replace("unwritten".to_owned())
+            .expect("live test writer");
+        first_attempt
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("writer attempted output");
+        drop(output);
+        writer_exited
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("close interrupted retry wait");
+    }
+
+    #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+    #[tokio::test]
+    async fn btle_status_output_schedule_retries_initialization_without_new_status() {
+        let slot = std::sync::Arc::new(ProcessBtleStatusOutputSlot::default());
+        let (written, mut records) = tokio::sync::mpsc::unbounded_channel();
+
+        assert!(slot.send_replace_with("current".to_owned(), || None));
+        schedule_btle_status_output_retry_with(
+            slot.clone(),
+            std::time::Duration::from_millis(1),
+            move || {
+                let written = written.clone();
+                spawn_btle_status_output(std::time::Duration::from_millis(1), move |record| {
+                    written.send(record.to_owned()).unwrap();
+                    Ok(())
+                })
+            },
+        );
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), records.recv())
+                .await
+                .expect("retry produced output before the deadlock bound")
+                .expect("test output channel remained open"),
+            "current"
+        );
+        slot.close();
+    }
+
+    #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+    #[test]
+    fn btle_status_output_guard_close_is_terminal() {
+        let slot = std::sync::Arc::new(ProcessBtleStatusOutputSlot::default());
+        let (written, records) = std::sync::mpsc::channel();
+        assert!(!slot.send_replace_with("before-close".to_owned(), || {
+            spawn_btle_status_output(std::time::Duration::from_millis(1), move |record| {
+                written.send(record.to_owned()).unwrap();
+                Ok(())
+            })
+        }));
+        assert_eq!(
+            records
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "before-close"
+        );
+
+        drop(BtleStatusOutputCloseOnDrop::new(Some(slot.clone())));
+        assert!(!slot.send_replace_with("after-close".to_owned(), || {
+            panic!("closed slot must not spawn")
+        }));
+        assert!(records.try_recv().is_err());
     }
 
     #[test]

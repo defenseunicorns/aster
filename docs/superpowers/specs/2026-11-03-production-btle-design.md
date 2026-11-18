@@ -739,8 +739,11 @@ discovery material, transfer identifiers/counts, retry detail, and secrets.
 BTLE output passes through an allowlisting, coalescing process writer before it
 reaches standard output. The agent publishes one current record containing only
 timestamp, operation, adapter kind, availability, closed reason, and support
-tag. Detailed lifecycle edge events remain internal and do not become customer
-fields.
+tag. The writer retains at most the latest record, retries spawn or write
+failure at no more than four attempts per second, lets newer state replace a
+failed record, and interrupts retry on close. Sink failure never changes
+readiness, adapter availability, selection, or durable custody. Detailed
+lifecycle edge events remain internal and do not become customer fields.
 
 Compatibility observations are process-memory-only and replaced on inventory
 epochs as one bounded current snapshot per examined controller, not an
