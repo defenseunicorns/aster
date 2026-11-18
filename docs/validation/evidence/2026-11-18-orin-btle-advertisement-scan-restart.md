@@ -48,7 +48,7 @@ The observed properties were read with `busctl get-property` from
 disposable credentials were removed; exact `/tmp/aster-orin-*` searches were
 empty afterward.
 
-## Claim boundary
+## Explicit-controller claim boundary
 
 This shows that the executable produced from this signed source state, with the
 recorded build-only adjustment, can register the production advertisement and
@@ -62,3 +62,56 @@ package or service operation, least-privilege policy, soak behavior, full-suite
 status, hardware support, or production readiness. Start timestamps, raw
 stdout/stderr, a pre-run property snapshot, and a reproducible-build attestation
 were not retained.
+
+## Automatic agent composition follow-up
+
+Status: **operator-attested, non-reproducible source-composition observation**.
+The disposable example source and raw logs were not retained.
+
+At signed source `6cd44733e3dea4a53db99a786d5f3f2c817adb1f`, a disposable
+ARM64 example invoked the real `BtleRuntimeStartup::automatic_linux` and
+`run_customer_agent_with_btle` composition. It substituted
+`prepare_discovery_credential_for_test`, a one-shot in-memory `ASTRBD02`
+provider, a system-clock adapter, and an in-memory loader for the repository's
+non-production mission bundle. Customer policy contained no controller name or
+address.
+
+The example was built with Rust/Cargo 1.97.1 and Ubuntu
+`aarch64-linux-gnu-gcc` 15.2.0 using:
+
+```text
+CARGO_BUILD_JOBS=2 \
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+cargo build --offline -p aster-agent --example orin_auto_harness \
+  --target aarch64-unknown-linux-gnu
+```
+
+As in the explicit-controller build, `libdbus-sys = "=0.2.7"` temporarily
+used its `vendored` feature; the manifest and lock-file changes were reverted.
+The stripped executable SHA-256 was
+`9f9b30c2f4140459bea5a6216ffe591c6d16c6121d11e3bb10d56ba05b0c6fe8`;
+local and remote checksums matched. The two run arguments were:
+
+```text
+/tmp/aster-orin-auto-harness-6cd4473 \
+  /tmp/aster-orin-auto-state-6cd4473 \
+  /tmp/aster-orin-auto-mission.bundle
+/tmp/aster-orin-auto-harness-6cd4473 \
+  /tmp/aster-orin-auto-state2-6cd4473 \
+  /tmp/aster-orin-auto-mission.bundle
+```
+
+Two independent 20-second clean-state runs reached agent readiness and then
+reported one active BlueZ advertisement plus active discovery. Discovery later
+became inactive while the advertisement remained active, consistent with the
+configured bounded scan window. Both timed terminations logged clean shutdown,
+exited successfully, and left `ActiveInstances = 0` and
+`Discovering = false`. The same `busctl get-property` observations named above
+were used.
+
+This operator-attested follow-up exercises discovery, selection, and activation
+of the one present controller through the source agent composition. It does not
+exercise multiple-controller selection, the customer binary's systemd
+credential presentation, packaged service identity, same-state process restart,
+Event transfer, or controller hotplug. The disposable example source, binary,
+state, logs, and credentials were removed after the run.
