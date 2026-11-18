@@ -19,11 +19,6 @@ pub(crate) const DISCOVERY_OBSERVATION_QUEUE_CAPACITY: usize = 64;
 const DISCOVERY_DEVICE_WATCHER_CAPACITY: usize = 64;
 const DISCOVERY_INITIAL_DEVICE_INSPECTION_CAPACITY: usize = 256;
 const BACKEND_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
-// BlueZ reports the encoded advertisement capacity: flags (3 bytes), the
-// complete 128-bit service UUID field (18), and 128-bit service data carrying
-// the 40-byte roster record (58). This is a Linux adapter implementation bound,
-// not a protocol limit.
-const MIN_ROSTER_ADVERTISEMENT_BYTES: u8 = 79;
 
 pub(crate) type PlatformFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, DriverError>> + Send + 'a>>;
@@ -136,19 +131,18 @@ fn bluez_advertisement(roster: RosterAdvertisement) -> adv::Advertisement {
     }
 }
 
-fn validate_advertising_support(
-    supported_instances: u8,
-    active_instances: u8,
-    secondary_channels: &BTreeSet<adv::SecondaryChannel>,
-    capabilities: &adv::Capabilities,
-) -> Result<(), DriverError> {
-    if supported_instances <= active_instances
-        || !secondary_channels.contains(&adv::SecondaryChannel::OneM)
-        || capabilities.max_advertisement_length < MIN_ROSTER_ADVERTISEMENT_BYTES
-    {
-        return Err(advertising_unsupported());
+fn map_advertisement_registration_error(error: bluer::Error) -> DriverError {
+    if matches!(
+        &error.kind,
+        bluer::ErrorKind::InvalidArguments | bluer::ErrorKind::InvalidLength
+    ) {
+        DriverError::new(
+            DriverErrorKind::Unavailable,
+            "BlueZ advertisement registration rejected",
+        )
+    } else {
+        map_bluer_error(error)
     }
-    Ok(())
 }
 
 fn bluez_discovery_filter() -> bluer::DiscoveryFilter {
@@ -870,53 +864,9 @@ impl DiscoveryPlatform for BluezDiscoveryPlatform {
     ) -> PlatformFuture<'a, Box<dyn OwnedAdvertisement>> {
         Box::pin(async move {
             let guard = self.guard(controller);
-            let supported = final_discovery_io(
-                &guard.controller,
-                || guard.adapter(),
-                |adapter| async move {
-                    adapter
-                        .supported_advertising_instances()
-                        .await
-                        .map_err(map_bluer_error)
-                },
-            )
-            .await?;
-            let active = final_discovery_io(
-                &guard.controller,
-                || guard.adapter(),
-                |adapter| async move {
-                    adapter
-                        .active_advertising_instances()
-                        .await
-                        .map_err(map_bluer_error)
-                },
-            )
-            .await?;
-            let channels = final_discovery_io(
-                &guard.controller,
-                || guard.adapter(),
-                |adapter| async move {
-                    adapter
-                        .supported_advertising_secondary_channels()
-                        .await
-                        .map_err(map_bluer_error)
-                },
-            )
-            .await?
-            .ok_or_else(advertising_unsupported)?;
-            let capabilities = final_discovery_io(
-                &guard.controller,
-                || guard.adapter(),
-                |adapter| async move {
-                    adapter
-                        .supported_advertising_capabilities()
-                        .await
-                        .map_err(map_bluer_error)
-                },
-            )
-            .await?
-            .ok_or_else(advertising_unsupported)?;
-            validate_advertising_support(supported, active, &channels, &capabilities)?;
+            // Passive controller compatibility is established by controller_probe.
+            // Exact registration is the operational advertisement capability
+            // and permission check for this policy-authorized radio epoch.
             let handle = final_discovery_io(
                 &guard.controller,
                 || guard.adapter(),
@@ -924,7 +874,7 @@ impl DiscoveryPlatform for BluezDiscoveryPlatform {
                     adapter
                         .advertise(bluez_advertisement(advertisement))
                         .await
-                        .map_err(map_bluer_error)
+                        .map_err(map_advertisement_registration_error)
                 },
             )
             .await?;
@@ -957,13 +907,6 @@ fn controller_unavailable() -> DriverError {
     DriverError::new(
         DriverErrorKind::Unavailable,
         "configured Bluetooth controller is unavailable",
-    )
-}
-
-fn advertising_unsupported() -> DriverError {
-    DriverError::new(
-        DriverErrorKind::Unavailable,
-        "configured controller lacks rostered advertising support",
     )
 }
 
@@ -1264,18 +1207,33 @@ mod tests {
     }
 
     #[test]
-    fn advertising_eligibility_requires_capacity_instance_and_one_m_phy() {
-        let channels = [bluer::adv::SecondaryChannel::OneM].into_iter().collect();
-        let mut capabilities = bluer::adv::Capabilities::default();
-        capabilities.max_advertisement_length = MIN_ROSTER_ADVERTISEMENT_BYTES;
+    fn advertisement_registration_errors_preserve_operational_categories() {
+        for kind in [
+            bluer::ErrorKind::InvalidArguments,
+            bluer::ErrorKind::InvalidLength,
+        ] {
+            let error = map_advertisement_registration_error(bluer::Error {
+                kind,
+                message: "sensitive BlueZ detail".to_owned(),
+            });
 
-        assert!(validate_advertising_support(2, 1, &channels, &capabilities).is_ok());
-        assert!(validate_advertising_support(1, 1, &channels, &capabilities).is_err());
+            assert_eq!(
+                error,
+                DriverError::new(
+                    DriverErrorKind::Unavailable,
+                    "BlueZ advertisement registration rejected",
+                )
+            );
+        }
 
-        let mut short = bluer::adv::Capabilities::default();
-        short.max_advertisement_length = MIN_ROSTER_ADVERTISEMENT_BYTES - 1;
-        assert!(validate_advertising_support(2, 1, &channels, &short).is_err());
-        assert!(validate_advertising_support(2, 1, &Default::default(), &capabilities).is_err());
+        let timeout = map_advertisement_registration_error(bluer::Error {
+            kind: bluer::ErrorKind::AuthenticationTimeout,
+            message: "sensitive BlueZ detail".to_owned(),
+        });
+        assert_eq!(
+            timeout,
+            DriverError::new(DriverErrorKind::Timeout, "BlueZ operation failed")
+        );
     }
 
     #[test]
