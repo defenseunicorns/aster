@@ -174,11 +174,6 @@ network failures. Current class-specific eviction and deferral behavior is
 documented in [Architecture](architecture.md) and the
 [protocol](protocol.md#11-priority-retry-eviction-and-emissions).
 
-### Publication atomicity
-
-Each publication commits independently. Multiple publication calls do not
-provide an all-or-nothing transaction.
-
 ## Routing and propagation
 
 ### Contacts and carriers
