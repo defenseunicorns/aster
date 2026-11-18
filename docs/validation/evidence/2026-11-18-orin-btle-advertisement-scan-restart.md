@@ -187,3 +187,33 @@ its BlueZ resources. The synthetic peer was intentionally unmatched, so it adds
 no contact or Event-transfer evidence. The remote evaluator, mission fixture,
 credential, state, and logs were removed; no controller address, mission
 identifier, credential, or raw log is retained.
+
+### Automatic peer-observation follow-up
+
+At signed production source `1fa50a826c650c03fbad497c3c53a28e5072e13b`, a
+disposable harness invoked the automatic Linux/customer composition on a Linux
+workstation and this Orin. Both sides reached readiness and reported the BTLE
+adapter available, but a durable 65,536-byte Event was not delivered within the
+bounded 120-second observation. Temporary diagnostics categorized each Orin
+contact attempt as `AdapterEpochEnded`: no candidate completed during an
+advertisement epoch. This is an operator-attested source-composition
+observation; no reproducible package identity is retained.
+
+Peer-observation controls showed radio contact alongside the negative result:
+the Orin observed both legacy and extended UUID advertisements and an extended
+advertisement carrying one byte of service data. During continuous unfiltered
+scanning it observed eight bytes of service data, but not 16 bytes or the
+production 40-byte roster beacon; placing the same 40 bytes in scan response
+data did not change the result.
+
+The production roster beacon is exactly 40 bytes, so the evaluated Orin stack
+is not qualified for automatic rostered discovery. This does not invalidate the
+separate fixed-locator 65,536-byte Event transfer evidence. No fallback or wire
+protocol change was introduced: qualification requires peer observation of the
+complete production beacon. The current empty, open-support package does not
+block this fingerprint, so it may still attempt activation and report local
+availability; this observation grants it no support or release credit.
+Deployments requiring qualified hardware must select `qualified-only`, while
+exact known-unsafe rows remain the responsibility of the future signed
+qualification package. The harness, temporary diagnostics, build-only changes,
+fixtures, state, and logs were removed after the run.
