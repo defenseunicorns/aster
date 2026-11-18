@@ -105,3 +105,50 @@ unattended restart, non-root packaged service operation, State/Record/Blob
 transfer, performance or soak bounds, hostile-peer behavior, broad
 interoperability, or production readiness. The mouse connection is a diagnostic
 condition for this evidence, not an operational workaround or support policy.
+
+## Signed-source 65,536-byte Event follow-up
+
+At signed source `5ac6603ead4bc6ef64efc949921ee972bb43bda9`, the same endpoint
+and controller stacks transferred one precommitted semantic-v9 Event from the
+Orin to the subscribed Linux workstation. The payload contained 65,536 zero
+bytes, the maximum accepted by `asterctl publish`; its SHA-256 was
+`de2f256064a0af797747c2b97505dc0b9f3df0de4f489eac731c23ae9ca9cc31`.
+
+The artifact SHA-256 values for that source were:
+
+- x86-64 `aster-btle-event`:
+  `f2c2d5377ba27cc8390f321ee2511bc2d5e6111d8603d328e1941d9830705e09`;
+- ARM64 `aster-btle-event`:
+  `14a050a49502be97e65975be7d0007a6dd0d4a6170068b6336d8ccdf20ca8788`;
+- x86-64 `aster-agent` and `asterctl`:
+  `66165bfcdfa320126b009abbf3a3929d5f41b9ff70e89e658090e51d45d8b7e5`
+  and `c5fe98f623b7ee193088b164a6141a1c47d4077eec250d7f9039a332d9a585b3`;
+- ARM64 `aster-agent` and `asterctl`:
+  `d658b8b4097709b32b0bd5a314c9d88b89305000f29e74b39b4fa9493ebc255c`
+  and `7b45e650fad7db862b11bae39e0f6ea4f3c1e67181cc7fc0fd264a8a25e189f6`.
+
+No build-only source change was retained. The lower complete 32-byte mission
+`NodeId` was the Orin initiator and the higher `NodeId` was the Linux listener.
+Both used exact public controller addresses, PSM `0x81`, and a two-second
+evaluation cadence. The Orin reported `offered=1`; Linux reported `fetched=1
+inserted=1`. A later contact on both hosts reported zero offered, fetched, and
+inserted work. Both evaluators emitted `status=stopped` and exited zero.
+
+After shutdown, a peerless receiver agent reopened the Linux state. An exact
+topic-and-scope query returned one Event whose identifier matched the publisher
+receipt observed during the run. Its decoded payload length and SHA-256 matched
+the source payload. Final BlueZ reads on both hosts returned
+`ActiveInstances = 0` and `Discovering = false`.
+
+This is operator-attested, non-reproducible warm-controller point evidence. It
+does not add Ring-1, physical-qualification, requirement, support-row, or
+protocol-qualification credit. Negotiated MTUs, profile/digest parity,
+mission-before-data ordering, timestamps, and a sanitized receipt were not
+retained. Disconnect and reconnect, controller recovery, and process restart
+were not exercised. The unrelated workstation mouse remained connected, so the
+cold-controller race remains open. The other claim boundaries above continue
+to apply.
+
+The owner-only mission bundles, node credentials, tokens, journals, receipts,
+payloads, binaries, state, and raw logs were disposable. Their exact local and
+remote temporary roots were verified absent afterward.
