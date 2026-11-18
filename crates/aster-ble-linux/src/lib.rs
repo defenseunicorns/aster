@@ -27,8 +27,8 @@ pub use config::{
     ValidatedRosteredSupervisorConfig, ValidatedSupervisorConfig,
 };
 pub use controller::{
-    AvailabilityReason, BTLE_OPERATOR_OUTPUT_CAPACITY, BtleAvailability, BtleOperatorEvent,
-    BtleOperatorOutput,
+    AvailabilityReason, BTLE_OPERATOR_OUTPUT_CAPACITY, BtleAvailability, BtleCurrentStatus,
+    BtleOperatorEvent, BtleOperatorOutput, BtleSupport,
 };
 pub use controller_probe::ControllerProbeLimits;
 pub(crate) use controller_selection::{

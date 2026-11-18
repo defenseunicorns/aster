@@ -21,6 +21,8 @@ pub(crate) enum ProbeReason {
     UnsupportedLeCoc,
     /// BlueZ or its D-Bus session was unavailable.
     BluezUnavailable,
+    /// BlueZ was observed successfully but exposed no controller.
+    ControllerAbsent,
     /// The controller was not powered during evaluation.
     ControllerUnpowered,
     /// BlueZ denied the operation.

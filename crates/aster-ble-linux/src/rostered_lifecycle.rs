@@ -387,6 +387,10 @@ impl UnavailableAvailabilityPublisher {
             EventAdapterState::Unavailable,
         )
     }
+
+    fn publish_terminal(&self, terminal: crate::controller::TerminalAvailability) {
+        self.publication.output.publish_terminal(terminal);
+    }
 }
 
 impl AvailabilityPublication {
@@ -911,6 +915,13 @@ impl PlatformOwner {
 }
 
 impl LinuxRosteredBtleEventSupervisor {
+    fn report_cleanup_unconfirmed(&self) {
+        self.output
+            .emit(crate::BtleOperatorEvent::CleanupUnconfirmed);
+        self.output
+            .publish_terminal(crate::controller::TerminalAvailability::CleanupUnconfirmed);
+    }
+
     /// Returns coarse adapter availability without exposing discovery material.
     pub fn availability(&self) -> watch::Receiver<crate::BtleAvailability> {
         self.availability.clone()
@@ -936,6 +947,13 @@ impl LinuxRosteredBtleEventSupervisor {
         publisher
             .publish()
             .map_err(|_| SupervisorError::TaskStopped)
+    }
+
+    /// Fences late status and availability after discovery authority is lost.
+    pub fn park_authority_unavailable(&self) -> Result<(), SupervisorError> {
+        self.output
+            .publish_terminal(crate::controller::TerminalAvailability::CredentialUnavailable);
+        self.park_unavailable()
     }
 
     /// Waits until the owned rostered lifecycle reaches a terminal result.
@@ -970,13 +988,11 @@ impl LinuxRosteredBtleEventSupervisor {
                     Err(_) if self.abort_on_unconfirmed_cleanup => {
                         task.abort();
                         let _ = task.await;
-                        self.output
-                            .emit(crate::BtleOperatorEvent::CleanupUnconfirmed);
+                        self.report_cleanup_unconfirmed();
                         Err(SupervisorError::PlatformCleanupUnconfirmed)
                     }
                     Err(_) => {
-                        self.output
-                            .emit(crate::BtleOperatorEvent::CleanupUnconfirmed);
+                        self.report_cleanup_unconfirmed();
                         retain_task_custody(task);
                         Err(SupervisorError::PlatformCleanupUnconfirmed)
                     }
@@ -1345,9 +1361,19 @@ pub fn spawn_resolving_linux_rostered_btle_event_supervisor(
     config: ValidatedAutomaticRosteredSupervisorConfig,
     contacts: OrderedEventContactHandle,
     registration: EventAdapterRegistration,
-    output: crate::BtleOperatorOutput,
-) -> Result<LinuxRosteredBtleEventSupervisor, AutomaticBtleRegistrationError> {
+) -> Result<
+    (
+        LinuxRosteredBtleEventSupervisor,
+        watch::Receiver<crate::BtleCurrentStatus>,
+    ),
+    AutomaticBtleRegistrationError,
+> {
     let (adapter_control, attempts) = validate_automatic_registration(registration)?;
+    let initial_status = crate::BtleCurrentStatus::Unavailable {
+        reason: crate::AvailabilityReason::BluezUnavailable,
+        support: crate::BtleSupport::NotEvaluated,
+    };
+    let (output, status) = crate::BtleOperatorOutput::current_status(initial_status);
     let config = Arc::new(config);
     let expires_at = config.discovery_credentials_expires_at();
     let cancellation = LifecycleCancellation::new();
@@ -1356,7 +1382,7 @@ pub fn spawn_resolving_linux_rostered_btle_event_supervisor(
     let publisher = Arc::new(AdapterAvailabilityPublisher::automatic(
         Arc::new(adapter_control),
         availability_updates,
-        crate::BtleOperatorOutput::discard(),
+        output.clone(),
         config.role(),
     ));
     let platform_owner = Arc::new(PlatformOwner::default());
@@ -1396,16 +1422,19 @@ pub fn spawn_resolving_linux_rostered_btle_event_supervisor(
         )
         .await
     });
-    Ok(LinuxRosteredBtleEventSupervisor {
-        availability,
-        completion,
-        cancellation,
-        platform_owner,
-        output,
-        failure_park: Some(failure_park),
-        task: Some(task),
-        abort_on_unconfirmed_cleanup: false,
-    })
+    Ok((
+        LinuxRosteredBtleEventSupervisor {
+            availability,
+            completion,
+            cancellation,
+            platform_owner,
+            output,
+            failure_park: Some(failure_park),
+            task: Some(task),
+            abort_on_unconfirmed_cleanup: false,
+        },
+        status,
+    ))
 }
 
 async fn run_automatic_resolver_owner<T, F>(
@@ -1421,19 +1450,26 @@ where
     F: Future<Output = Result<(), DriverError>>,
 {
     enum Wake {
-        Stop,
+        Cancelled,
+        ResolverStopped,
         Expired,
     }
 
     let resolver_stopped = async { while status.changed().await.is_ok() {} };
     let wake = tokio::select! {
         biased;
-        () = cancellation.cancelled() => Wake::Stop,
-        () = resolver_stopped => Wake::Stop,
+        () = cancellation.cancelled() => Wake::Cancelled,
+        () = resolver_stopped => Wake::ResolverStopped,
         () = tokio::time::sleep_until(tokio::time::Instant::from_std(expires_at)) => Wake::Expired,
     };
-    let publication_error = if matches!(wake, Wake::Expired) {
-        supervisor_availability_fence.quiesce();
+    let publication_error = if matches!(wake, Wake::Expired | Wake::ResolverStopped) {
+        if matches!(wake, Wake::Expired) {
+            supervisor_availability_fence.quiesce();
+            unavailable
+                .publish_terminal(crate::controller::TerminalAvailability::CredentialExpired);
+        } else {
+            unavailable.publish_terminal(crate::controller::TerminalAvailability::PlatformFailure);
+        }
         unavailable
             .publish()
             .err()
@@ -1451,7 +1487,10 @@ where
             .await
             .map_err(|_| SupervisorError::PlatformCleanupUnconfirmed)
     };
-    shutdown_result?;
+    if let Err(error) = shutdown_result {
+        unavailable.publish_terminal(crate::controller::TerminalAvailability::CleanupUnconfirmed);
+        return Err(error);
+    }
     if let Some(error) = publication_error {
         return Err(error);
     }
@@ -3555,10 +3594,15 @@ mod tests {
             force_count: force_count.clone(),
             release: None,
         });
-        let supervisor = test_supervisor(
+        let mut supervisor = test_supervisor(
             tokio::spawn(async { pending::<Result<(), SupervisorError>>().await }),
             platform_owner,
         );
+        let (output, mut operator_status) =
+            crate::BtleOperatorOutput::current_status(crate::BtleCurrentStatus::Available {
+                support: crate::BtleSupport::Qualified,
+            });
+        supervisor.output = output;
         let shutdown = tokio::spawn(supervisor.shutdown());
         tokio::task::yield_now().await;
 
@@ -3573,6 +3617,37 @@ mod tests {
             Err(SupervisorError::PlatformCleanupUnconfirmed)
         );
         assert_eq!(force_count.load(Ordering::Acquire), 1);
+        assert_eq!(
+            *operator_status.borrow_and_update(),
+            crate::BtleCurrentStatus::Unavailable {
+                reason: crate::AvailabilityReason::CleanupUnconfirmed,
+                support: crate::BtleSupport::Qualified,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn authority_failure_fences_status_before_cleanup() {
+        let platform_owner = Arc::new(PlatformOwner::default());
+        let mut supervisor = test_supervisor(tokio::spawn(async { Ok(()) }), platform_owner);
+        let (output, status) =
+            crate::BtleOperatorOutput::current_status(crate::BtleCurrentStatus::Available {
+                support: crate::BtleSupport::Qualified,
+            });
+        supervisor.output = output.clone();
+
+        supervisor.park_authority_unavailable().unwrap();
+        output.publish_status(crate::BtleCurrentStatus::Available {
+            support: crate::BtleSupport::Unqualified,
+        });
+
+        assert_eq!(
+            *status.borrow(),
+            crate::BtleCurrentStatus::Unavailable {
+                reason: crate::AvailabilityReason::CredentialUnavailable,
+                support: crate::BtleSupport::Qualified,
+            }
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -3910,11 +3985,14 @@ mod tests {
         let (_status_updates, status) = watch::channel(OperationalEpochState::Starting);
         let (availability_updates, mut availability) =
             watch::channel(crate::BtleAvailability::Available);
-        let unavailable = AdapterAvailabilityPublisher::fixed(
-            availability_updates,
-            crate::BtleOperatorOutput::discard(),
-        )
-        .unavailable_only();
+        let (operator_output, mut operator_status) =
+            crate::BtleOperatorOutput::current_status(crate::BtleCurrentStatus::Available {
+                support: crate::BtleSupport::Qualified,
+            });
+        let shutdown_output = operator_output.clone();
+        let unavailable =
+            AdapterAvailabilityPublisher::fixed(availability_updates, operator_output)
+                .unavailable_only();
         let config = Arc::new(automatic_config());
         let config_weak = Arc::downgrade(&config);
         let task = tokio::spawn(async move {
@@ -3925,6 +4003,10 @@ mod tests {
                 Arc::new(AvailabilityFence::default()),
                 unavailable,
                 async move {
+                    shutdown_output.publish_status(crate::BtleCurrentStatus::Unavailable {
+                        reason: crate::AvailabilityReason::Cancelled,
+                        support: crate::BtleSupport::Qualified,
+                    });
                     drop(config);
                     Ok(())
                 },
@@ -3939,6 +4021,13 @@ mod tests {
         assert_eq!(
             *availability.borrow_and_update(),
             crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable)
+        );
+        assert_eq!(
+            *operator_status.borrow_and_update(),
+            crate::BtleCurrentStatus::Unavailable {
+                reason: crate::AvailabilityReason::CredentialExpired,
+                support: crate::BtleSupport::Qualified,
+            }
         );
         assert!(
             config_weak.upgrade().is_none(),

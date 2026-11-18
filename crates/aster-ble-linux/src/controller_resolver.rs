@@ -104,6 +104,7 @@ pub(crate) enum RuntimeAvailability {
 pub(crate) struct ControllerResolutionSnapshot {
     availability: RuntimeAvailability,
     disposition: ProbeDisposition,
+    support: Option<SupportTag>,
 }
 
 impl ControllerResolutionSnapshot {
@@ -111,6 +112,7 @@ impl ControllerResolutionSnapshot {
         Self {
             availability: RuntimeAvailability::Unavailable,
             disposition: ProbeDisposition::Indeterminate(ProbeReason::BluezUnavailable),
+            support: None,
         }
     }
 
@@ -118,13 +120,23 @@ impl ControllerResolutionSnapshot {
         Self {
             availability: RuntimeAvailability::Unavailable,
             disposition,
+            support: None,
         }
     }
 
-    const fn available() -> Self {
+    const fn unavailable_with_support(disposition: ProbeDisposition, support: SupportTag) -> Self {
+        Self {
+            availability: RuntimeAvailability::Unavailable,
+            disposition,
+            support: Some(support),
+        }
+    }
+
+    const fn available_with_support(support: SupportTag) -> Self {
         Self {
             availability: RuntimeAvailability::Available,
             disposition: ProbeDisposition::Compatible,
+            support: Some(support),
         }
     }
 
@@ -145,15 +157,17 @@ impl ControllerResolutionSnapshot {
 pub(crate) struct ControllerEpochOwner {
     candidate: ControllerCandidate,
     fingerprint: ControllerFingerprint,
+    support: SupportTag,
     inventory_generation: u64,
     cancellation: LifecycleCancellation,
 }
 
 impl ControllerEpochOwner {
-    fn new(controller: ObservedController, inventory_generation: u64) -> Self {
+    fn new(controller: ObservedController, support: SupportTag, inventory_generation: u64) -> Self {
         Self {
             candidate: controller.candidate,
             fingerprint: controller.fingerprint,
+            support,
             inventory_generation,
             cancellation: LifecycleCancellation::new(),
         }
@@ -165,6 +179,10 @@ impl ControllerEpochOwner {
 
     fn name(&self) -> &str {
         self.candidate.name()
+    }
+
+    const fn support(&self) -> SupportTag {
+        self.support
     }
 
     fn view(&self) -> Result<ControllerEpochView<'_>, DriverError> {
@@ -270,6 +288,7 @@ pub(crate) fn spawn_linux_controller_resolver(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResolverFailure {
     BluezUnavailable,
+    ControllerAbsent,
     ControllerUnauthorized,
     DeadlineExceeded,
     Cancelled,
@@ -279,6 +298,7 @@ impl ResolverFailure {
     const fn disposition(self) -> ProbeDisposition {
         let reason = match self {
             Self::BluezUnavailable => ProbeReason::BluezUnavailable,
+            Self::ControllerAbsent => ProbeReason::ControllerAbsent,
             Self::ControllerUnauthorized => ProbeReason::PermissionDenied,
             Self::DeadlineExceeded => ProbeReason::DeadlineExceeded,
             Self::Cancelled => ProbeReason::Cancelled,
@@ -291,9 +311,8 @@ impl From<BluezFailure> for ResolverFailure {
     fn from(failure: BluezFailure) -> Self {
         match failure {
             BluezFailure::ControllerUnauthorized => Self::ControllerUnauthorized,
-            BluezFailure::BluezUnavailable | BluezFailure::ControllerAbsent => {
-                Self::BluezUnavailable
-            }
+            BluezFailure::BluezUnavailable => Self::BluezUnavailable,
+            BluezFailure::ControllerAbsent => Self::ControllerAbsent,
         }
     }
 }
@@ -718,7 +737,7 @@ impl ResolverActor {
         if observed.controllers.is_empty() {
             self.cursor = None;
             self.publish(ControllerResolutionSnapshot::unavailable(
-                ProbeDisposition::Indeterminate(ProbeReason::BluezUnavailable),
+                ProbeDisposition::Indeterminate(ProbeReason::ControllerAbsent),
             ));
             return SweepOutcome::Stable;
         }
@@ -759,7 +778,10 @@ impl ResolverActor {
             let controller = &observed.controllers[index];
             let admission = admissions[index];
             if admission.disposition() != ProbeDisposition::Compatible {
-                last = ControllerResolutionSnapshot::unavailable(admission.disposition());
+                last = ControllerResolutionSnapshot::unavailable_with_support(
+                    admission.disposition(),
+                    admission.support(),
+                );
                 continue;
             }
 
@@ -781,17 +803,21 @@ impl ResolverActor {
                 )) => result.unwrap_or(ProbeDisposition::Indeterminate(ProbeReason::DeadlineExceeded)),
             };
             if disposition == ProbeDisposition::Compatible {
-                if self.select(controller.clone()).await {
+                if self.select(controller.clone(), admission.support()).await {
                     return SweepOutcome::Selected;
                 }
                 retryable = true;
-                last = ControllerResolutionSnapshot::unavailable(ProbeDisposition::Indeterminate(
-                    ProbeReason::UnknownPlatformError,
-                ));
+                last = ControllerResolutionSnapshot::unavailable_with_support(
+                    ProbeDisposition::Indeterminate(ProbeReason::UnknownPlatformError),
+                    admission.support(),
+                );
                 continue;
             }
 
-            last = ControllerResolutionSnapshot::unavailable(disposition);
+            last = ControllerResolutionSnapshot::unavailable_with_support(
+                disposition,
+                admission.support(),
+            );
             retryable |= matches!(disposition, ProbeDisposition::Indeterminate(_));
             if Instant::now() >= deadline {
                 sweep_unfinished = true;
@@ -811,13 +837,14 @@ impl ResolverActor {
         }
     }
 
-    async fn select(&mut self, controller: ObservedController) -> bool {
-        let owner = ControllerEpochOwner::new(controller, self.inventory_generation);
+    async fn select(&mut self, controller: ObservedController, support: SupportTag) -> bool {
+        let owner = ControllerEpochOwner::new(controller, support, self.inventory_generation);
         let operational = match owner.view().and_then(|view| self.activator.activate(view)) {
             Ok(operational) => operational,
             Err(_) => {
-                self.publish(ControllerResolutionSnapshot::unavailable(
+                self.publish(ControllerResolutionSnapshot::unavailable_with_support(
                     ProbeDisposition::Indeterminate(ProbeReason::UnknownPlatformError),
+                    support,
                 ));
                 return false;
             }
@@ -826,8 +853,9 @@ impl ResolverActor {
         self.operational = Some(operational);
         self.owner = Some(owner);
         self.nonterminal_publication = NonterminalPublication::Settled;
-        self.publish(ControllerResolutionSnapshot::unavailable(
+        self.publish(ControllerResolutionSnapshot::unavailable_with_support(
             ProbeDisposition::Compatible,
+            support,
         ));
         true
     }
@@ -837,7 +865,13 @@ impl ResolverActor {
         disposition: ProbeDisposition,
     ) -> Result<InvalidationOutcome, DriverError> {
         self.nonterminal_publication = NonterminalPublication::Settled;
-        self.publish(ControllerResolutionSnapshot::unavailable(disposition));
+        let support = self.owner.as_ref().map(ControllerEpochOwner::support);
+        self.publish(match support {
+            Some(support) => {
+                ControllerResolutionSnapshot::unavailable_with_support(disposition, support)
+            }
+            None => ControllerResolutionSnapshot::unavailable(disposition),
+        });
         let mut cleanup_error = None;
         let mut outcome = InvalidationOutcome::Clean;
         if let Some(operational) = self.operational.as_mut()
@@ -996,7 +1030,14 @@ impl ResolverActor {
             OperationalEpochState::Available => {
                 self.cursor = None;
                 self.operational_backoff.reset();
-                self.publish(ControllerResolutionSnapshot::available());
+                let support = self
+                    .owner
+                    .as_ref()
+                    .expect("available operational epoch retains controller owner")
+                    .support();
+                self.publish(ControllerResolutionSnapshot::available_with_support(
+                    support,
+                ));
             }
             OperationalEpochState::Unavailable => {
                 return Some(self.invalidate_failed_operational_epoch().await);
@@ -1304,27 +1345,55 @@ impl ResolverActor {
         });
         if changed {
             self.output.emit(operator_event(snapshot));
+            self.output.publish_status(operator_status(snapshot));
         }
     }
 }
 
 fn operator_event(snapshot: ControllerResolutionSnapshot) -> BtleOperatorEvent {
+    match operator_status(snapshot) {
+        crate::BtleCurrentStatus::Available { .. } => BtleOperatorEvent::AdapterAvailable,
+        crate::BtleCurrentStatus::Unavailable { reason, .. } => {
+            BtleOperatorEvent::AdapterUnavailable(reason)
+        }
+    }
+}
+
+fn operator_status(snapshot: ControllerResolutionSnapshot) -> crate::BtleCurrentStatus {
+    let support = match snapshot.support {
+        Some(SupportTag::Qualified) => crate::BtleSupport::Qualified,
+        Some(SupportTag::Unqualified) => crate::BtleSupport::Unqualified,
+        None => crate::BtleSupport::NotEvaluated,
+    };
     if snapshot.availability == RuntimeAvailability::Available {
-        return BtleOperatorEvent::AdapterAvailable;
+        return crate::BtleCurrentStatus::Available { support };
     }
     let reason = match snapshot.disposition {
-        ProbeDisposition::Indeterminate(ProbeReason::ControllerUnpowered) => {
-            crate::AvailabilityReason::ControllerUnpowered
-        }
-        ProbeDisposition::Indeterminate(ProbeReason::PermissionDenied) => {
-            crate::AvailabilityReason::ControllerUnauthorized
-        }
-        ProbeDisposition::Indeterminate(ProbeReason::BluezUnavailable) => {
-            crate::AvailabilityReason::BluezUnavailable
-        }
-        _ => crate::AvailabilityReason::ControllerIdentityMismatch,
+        ProbeDisposition::Compatible => crate::AvailabilityReason::Activating,
+        ProbeDisposition::Incompatible(reason)
+        | ProbeDisposition::Blocked(reason)
+        | ProbeDisposition::Indeterminate(reason) => match reason {
+            ProbeReason::UnsupportedAddressFamily => {
+                crate::AvailabilityReason::UnsupportedAddressFamily
+            }
+            ProbeReason::UnsupportedProtocol => crate::AvailabilityReason::UnsupportedProtocol,
+            ProbeReason::UnsupportedLeCoc => crate::AvailabilityReason::UnsupportedLeCoc,
+            ProbeReason::BluezUnavailable => crate::AvailabilityReason::BluezUnavailable,
+            ProbeReason::ControllerAbsent => crate::AvailabilityReason::ControllerAbsent,
+            ProbeReason::ControllerUnpowered => crate::AvailabilityReason::ControllerUnpowered,
+            ProbeReason::PermissionDenied => crate::AvailabilityReason::ControllerUnauthorized,
+            ProbeReason::ResourceExhausted => crate::AvailabilityReason::ResourceExhausted,
+            ProbeReason::DeadlineExceeded => crate::AvailabilityReason::DeadlineExceeded,
+            ProbeReason::Cancelled => crate::AvailabilityReason::Cancelled,
+            ProbeReason::UnknownPlatformError => crate::AvailabilityReason::PlatformFailure,
+            ProbeReason::QualifiedOnly => crate::AvailabilityReason::QualifiedOnly,
+            ProbeReason::KnownUnsafe => crate::AvailabilityReason::KnownUnsafe,
+            ProbeReason::AmbiguousUnsafeOverlap => {
+                crate::AvailabilityReason::AmbiguousUnsafeOverlap
+            }
+        },
     };
-    BtleOperatorEvent::AdapterUnavailable(reason)
+    crate::BtleCurrentStatus::Unavailable { reason, support }
 }
 
 async fn wait_platform<T>(
@@ -2413,6 +2482,199 @@ mod tests {
         resolver.shutdown().await.unwrap();
     }
 
+    async fn wait_for_operator_status(
+        status: &mut tokio::sync::watch::Receiver<crate::BtleCurrentStatus>,
+        expected: crate::BtleCurrentStatus,
+    ) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if *status.borrow_and_update() == expected {
+                    return;
+                }
+                status
+                    .changed()
+                    .await
+                    .expect("resolver still publishing status");
+            }
+        })
+        .await
+        .expect("operator status must make progress");
+    }
+
+    #[test]
+    fn every_probe_outcome_has_one_closed_operator_status_reason() {
+        // Break caught: adding or remapping a probe outcome to a generic
+        // identity failure hides the action an operator must take.
+        use crate::{AvailabilityReason, BtleCurrentStatus, BtleSupport};
+
+        let cases = [
+            (ProbeDisposition::Compatible, AvailabilityReason::Activating),
+            (
+                ProbeDisposition::Incompatible(ProbeReason::UnsupportedAddressFamily),
+                AvailabilityReason::UnsupportedAddressFamily,
+            ),
+            (
+                ProbeDisposition::Incompatible(ProbeReason::UnsupportedProtocol),
+                AvailabilityReason::UnsupportedProtocol,
+            ),
+            (
+                ProbeDisposition::Incompatible(ProbeReason::UnsupportedLeCoc),
+                AvailabilityReason::UnsupportedLeCoc,
+            ),
+            (
+                ProbeDisposition::Indeterminate(ProbeReason::BluezUnavailable),
+                AvailabilityReason::BluezUnavailable,
+            ),
+            (
+                ProbeDisposition::Indeterminate(ProbeReason::ControllerAbsent),
+                AvailabilityReason::ControllerAbsent,
+            ),
+            (
+                ProbeDisposition::Indeterminate(ProbeReason::ControllerUnpowered),
+                AvailabilityReason::ControllerUnpowered,
+            ),
+            (
+                ProbeDisposition::Indeterminate(ProbeReason::PermissionDenied),
+                AvailabilityReason::ControllerUnauthorized,
+            ),
+            (
+                ProbeDisposition::Indeterminate(ProbeReason::ResourceExhausted),
+                AvailabilityReason::ResourceExhausted,
+            ),
+            (
+                ProbeDisposition::Indeterminate(ProbeReason::DeadlineExceeded),
+                AvailabilityReason::DeadlineExceeded,
+            ),
+            (
+                ProbeDisposition::Indeterminate(ProbeReason::Cancelled),
+                AvailabilityReason::Cancelled,
+            ),
+            (
+                ProbeDisposition::Indeterminate(ProbeReason::UnknownPlatformError),
+                AvailabilityReason::PlatformFailure,
+            ),
+            (
+                ProbeDisposition::Blocked(ProbeReason::QualifiedOnly),
+                AvailabilityReason::QualifiedOnly,
+            ),
+            (
+                ProbeDisposition::Blocked(ProbeReason::KnownUnsafe),
+                AvailabilityReason::KnownUnsafe,
+            ),
+            (
+                ProbeDisposition::Blocked(ProbeReason::AmbiguousUnsafeOverlap),
+                AvailabilityReason::AmbiguousUnsafeOverlap,
+            ),
+        ];
+
+        for (disposition, reason) in cases {
+            assert_eq!(
+                operator_status(ControllerResolutionSnapshot::unavailable(disposition)),
+                BtleCurrentStatus::Unavailable {
+                    reason,
+                    support: BtleSupport::NotEvaluated,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn resolver_publication_updates_authoritative_current_status() {
+        // Break caught: resolver transitions emitted only as lossy edge events
+        // leave the authoritative current status stuck at its initial value.
+        let initial = crate::BtleCurrentStatus::Unavailable {
+            reason: crate::AvailabilityReason::BluezUnavailable,
+            support: crate::BtleSupport::NotEvaluated,
+        };
+        let (output, mut status) = BtleOperatorOutput::current_status(initial);
+        let mut actor = test_actor(LifecycleCancellation::new());
+        actor.output = output;
+
+        actor.publish(ControllerResolutionSnapshot::unavailable(
+            ProbeDisposition::Incompatible(ProbeReason::UnsupportedProtocol),
+        ));
+
+        assert!(status.has_changed().unwrap());
+        assert_eq!(
+            *status.borrow_and_update(),
+            crate::BtleCurrentStatus::Unavailable {
+                reason: crate::AvailabilityReason::UnsupportedProtocol,
+                support: crate::BtleSupport::NotEvaluated,
+            },
+        );
+    }
+
+    #[test]
+    fn selected_controller_support_survives_start_available_and_loss_status() {
+        // Break caught: dropping qualification at selection makes an exact
+        // supported controller indistinguishable from unqualified hardware.
+        for (internal, public) in [
+            (SupportTag::Qualified, crate::BtleSupport::Qualified),
+            (SupportTag::Unqualified, crate::BtleSupport::Unqualified),
+        ] {
+            assert_eq!(
+                operator_status(ControllerResolutionSnapshot::unavailable_with_support(
+                    ProbeDisposition::Compatible,
+                    internal,
+                )),
+                crate::BtleCurrentStatus::Unavailable {
+                    reason: crate::AvailabilityReason::Activating,
+                    support: public,
+                },
+            );
+            assert_eq!(
+                operator_status(ControllerResolutionSnapshot::available_with_support(
+                    internal,
+                )),
+                crate::BtleCurrentStatus::Available { support: public },
+            );
+            assert_eq!(
+                operator_status(ControllerResolutionSnapshot::unavailable_with_support(
+                    ProbeDisposition::Indeterminate(ProbeReason::BluezUnavailable),
+                    internal,
+                )),
+                crate::BtleCurrentStatus::Unavailable {
+                    reason: crate::AvailabilityReason::BluezUnavailable,
+                    support: public,
+                },
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn qualified_selection_publishes_qualified_current_status() {
+        // Break caught: the resolver computes a qualified admission but drops
+        // it before publishing the operational adapter's current status.
+        let qualified = fingerprint("qualified-status");
+        let (_harness, session) = Harness::session(vec![controller("hci0", 1, qualified.clone())]);
+        let initial = crate::BtleCurrentStatus::Unavailable {
+            reason: crate::AvailabilityReason::BluezUnavailable,
+            support: crate::BtleSupport::NotEvaluated,
+        };
+        let (output, mut current_status) = BtleOperatorOutput::current_status(initial);
+        let (resolver, _epochs) = spawn_linux_controller_resolver_with(
+            ControllerAdmissionPolicy::new(
+                false,
+                vec![ControllerSupportRow::exact(qualified)],
+                Vec::new(),
+            ),
+            limits(),
+            output,
+            Arc::new(FakePlatform::new([Ok(session)])),
+            Arc::new(FakeProbe::compatible()),
+        );
+
+        wait_for_operator_status(
+            &mut current_status,
+            crate::BtleCurrentStatus::Available {
+                support: crate::BtleSupport::Qualified,
+            },
+        )
+        .await;
+
+        stop(resolver).await;
+    }
+
     fn test_actor(cancellation: LifecycleCancellation) -> ResolverActor {
         let (updates, _) = tokio::sync::watch::channel(ControllerResolutionSnapshot::initial());
         ResolverActor {
@@ -3106,7 +3368,14 @@ mod tests {
             inner: Arc::new(TestOperationalActivator),
             epochs: epoch_updates,
         });
-        assert!(actor.select(controller("hci0", 1, fingerprint("a"))).await);
+        assert!(
+            actor
+                .select(
+                    controller("hci0", 1, fingerprint("a")),
+                    SupportTag::Unqualified,
+                )
+                .await
+        );
         let epoch = epochs.recv().await.unwrap();
         let operational_status = actor.operational_status.as_mut().unwrap();
         loop {
@@ -3115,7 +3384,9 @@ mod tests {
             }
             operational_status.changed().await.unwrap();
         }
-        actor.publish(ControllerResolutionSnapshot::available());
+        actor.publish(ControllerResolutionSnapshot::available_with_support(
+            SupportTag::Unqualified,
+        ));
         let status = actor.updates.subscribe();
         actor.refresh_not_before = Some(Instant::now() + Duration::from_millis(250));
         let (harness, mut session) =
@@ -3548,9 +3819,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stable_empty_inventory_waits_for_an_event() {
         let (empty_harness, empty_session) = Harness::session(Vec::new());
-        let (empty, _epochs) = spawn(
+        let initial = crate::BtleCurrentStatus::Unavailable {
+            reason: crate::AvailabilityReason::BluezUnavailable,
+            support: crate::BtleSupport::NotEvaluated,
+        };
+        let (output, mut status) = BtleOperatorOutput::current_status(initial);
+        let (empty, _epochs) = spawn_linux_controller_resolver_with(
             ControllerAdmissionPolicy::default(),
             limits(),
+            output,
             Arc::new(FakePlatform::new([Ok(empty_session)])),
             Arc::new(FakeProbe::compatible()),
         );
@@ -3560,6 +3837,14 @@ mod tests {
         )
         .await
         .expect("initial empty inventory must be observed");
+        wait_for_operator_status(
+            &mut status,
+            crate::BtleCurrentStatus::Unavailable {
+                reason: crate::AvailabilityReason::ControllerAbsent,
+                support: crate::BtleSupport::NotEvaluated,
+            },
+        )
+        .await;
 
         tokio::time::advance(Duration::from_secs(300)).await;
         tokio::task::yield_now().await;
@@ -3882,9 +4167,15 @@ mod tests {
         let (_second, second_session) =
             Harness::session(vec![controller("hci0", 1, fingerprint("a"))]);
         let platform = Arc::new(FakePlatform::new([Ok(first_session), Ok(second_session)]));
-        let (resolver, _epochs) = spawn(
+        let initial = crate::BtleCurrentStatus::Unavailable {
+            reason: crate::AvailabilityReason::ControllerAbsent,
+            support: crate::BtleSupport::NotEvaluated,
+        };
+        let (output, mut operator_status) = BtleOperatorOutput::current_status(initial);
+        let (resolver, _epochs) = spawn_linux_controller_resolver_with(
             ControllerAdmissionPolicy::default(),
             limits(),
+            output,
             platform.clone(),
             Arc::new(FakeProbe::compatible()),
         );
@@ -3893,6 +4184,14 @@ mod tests {
 
         first.lose_owner();
         wait_for_status(&mut status, RuntimeAvailability::Unavailable).await;
+        wait_for_operator_status(
+            &mut operator_status,
+            crate::BtleCurrentStatus::Unavailable {
+                reason: crate::AvailabilityReason::BluezUnavailable,
+                support: crate::BtleSupport::Unqualified,
+            },
+        )
+        .await;
 
         assert_eq!(platform.open_count(), 1);
         tokio::time::advance(INITIAL_RESOLVER_RETRY).await;

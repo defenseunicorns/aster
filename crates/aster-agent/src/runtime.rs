@@ -705,6 +705,164 @@ fn lifecycle_record(
     })
 }
 
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+pub(super) fn emit_btle_status(status: aster_ble_linux::BtleCurrentStatus) {
+    if let Some(output) = process_btle_status_output() {
+        output.send_replace(btle_status_record(status).to_string());
+    }
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+fn process_btle_status_output() -> Option<&'static ProcessBtleStatusOutput> {
+    static OUTPUT: std::sync::OnceLock<Option<ProcessBtleStatusOutput>> =
+        std::sync::OnceLock::new();
+    OUTPUT
+        .get_or_init(|| spawn_btle_status_output(|record| println!("{record}")))
+        .as_ref()
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+struct ProcessBtleStatusOutput {
+    shared: std::sync::Arc<(
+        std::sync::Mutex<ProcessBtleStatusOutputState>,
+        std::sync::Condvar,
+    )>,
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+struct ProcessBtleStatusOutputState {
+    latest: Option<String>,
+    closed: bool,
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+impl ProcessBtleStatusOutput {
+    fn send_replace(&self, record: String) {
+        let (state, changed) = &*self.shared;
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .latest = Some(record);
+        changed.notify_one();
+    }
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+impl Drop for ProcessBtleStatusOutput {
+    fn drop(&mut self) {
+        let (state, changed) = &*self.shared;
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed = true;
+        changed.notify_one();
+    }
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+fn spawn_btle_status_output(
+    mut write: impl FnMut(String) + Send + 'static,
+) -> Option<ProcessBtleStatusOutput> {
+    let shared = std::sync::Arc::new((
+        std::sync::Mutex::new(ProcessBtleStatusOutputState {
+            latest: None,
+            closed: false,
+        }),
+        std::sync::Condvar::new(),
+    ));
+    let writer_shared = shared.clone();
+    std::thread::Builder::new()
+        .name("aster-btle-status".to_owned())
+        .spawn(move || {
+            let (state, changed) = &*writer_shared;
+            loop {
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while state.latest.is_none() && !state.closed {
+                    state = changed
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                let record = state.latest.take();
+                if record.is_none() && state.closed {
+                    return;
+                }
+                drop(state);
+                if let Some(record) = record {
+                    write(record);
+                }
+            }
+        })
+        .ok()
+        .map(|_| ProcessBtleStatusOutput { shared })
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+fn btle_status_record(status: aster_ble_linux::BtleCurrentStatus) -> serde_json::Value {
+    use aster_ble_linux::BtleCurrentStatus;
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let (availability, reason, support) = match status {
+        BtleCurrentStatus::Available { support } => {
+            ("available", "available", btle_support_name(support))
+        }
+        BtleCurrentStatus::Unavailable { reason, support } => (
+            "unavailable",
+            btle_status_reason_name(reason),
+            btle_support_name(support),
+        ),
+    };
+    serde_json::json!({
+        "timestamp": timestamp,
+        "operation": "btle_status",
+        "adapter_kind": "ble_l2cap_v1",
+        "availability": availability,
+        "reason": reason,
+        "support": support,
+    })
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+const fn btle_support_name(support: aster_ble_linux::BtleSupport) -> &'static str {
+    match support {
+        aster_ble_linux::BtleSupport::NotEvaluated => "not_evaluated",
+        aster_ble_linux::BtleSupport::Qualified => "qualified",
+        aster_ble_linux::BtleSupport::Unqualified => "unqualified",
+    }
+}
+
+#[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+const fn btle_status_reason_name(reason: aster_ble_linux::AvailabilityReason) -> &'static str {
+    use aster_ble_linux::AvailabilityReason;
+
+    match reason {
+        AvailabilityReason::Activating => "activating",
+        AvailabilityReason::UnsupportedAddressFamily => "unsupported_address_family",
+        AvailabilityReason::UnsupportedProtocol => "unsupported_protocol",
+        AvailabilityReason::UnsupportedLeCoc => "unsupported_le_coc",
+        AvailabilityReason::BluezUnavailable => "bluez_unavailable",
+        AvailabilityReason::ControllerAbsent => "controller_absent",
+        AvailabilityReason::ControllerUnpowered => "controller_unpowered",
+        AvailabilityReason::ControllerUnauthorized => "controller_unauthorized",
+        AvailabilityReason::ControllerIdentityMismatch => "controller_identity_mismatch",
+        AvailabilityReason::ResourceExhausted => "resource_exhausted",
+        AvailabilityReason::DeadlineExceeded => "deadline_exceeded",
+        AvailabilityReason::Cancelled => "cancelled",
+        AvailabilityReason::PlatformFailure => "platform_failure",
+        AvailabilityReason::QualifiedOnly => "qualified_only",
+        AvailabilityReason::KnownUnsafe => "known_unsafe",
+        AvailabilityReason::AmbiguousUnsafeOverlap => "ambiguous_unsafe_overlap",
+        AvailabilityReason::CredentialExpired => "credential_expired",
+        AvailabilityReason::CredentialUnavailable => "credential_unavailable",
+        AvailabilityReason::CleanupUnconfirmed => "cleanup_unconfirmed",
+        AvailabilityReason::ReceiveOnlyPolicy => "receive_only_policy",
+    }
+}
+
 const fn lifecycle_state_name(state: LifecycleState) -> &'static str {
     match state {
         LifecycleState::Starting => "starting",
@@ -782,13 +940,6 @@ mod tests {
         use LifecycleState::{Draining, Failed, Ready, Starting, Stopped};
         let mut records = [
             (Starting, "startup", "started", false, 0),
-            (
-                Starting,
-                "btle_availability",
-                "unqualified_package",
-                false,
-                503,
-            ),
             (Ready, "readiness", "ready", false, 200),
             (Ready, "token_reload", "unsupported", false, 501),
             (Ready, "token_reload", "reloaded", false, 200),
@@ -865,14 +1016,88 @@ mod tests {
                 );
             }
         }
-        let btle = records
-            .iter()
-            .find(|record| record["operation"] == "btle_availability")
-            .expect("fixed BTLE lifecycle JSON");
-        assert_eq!(btle["operation"], "btle_availability");
-        assert_eq!(btle["reason"], "unqualified_package");
-        assert_eq!(btle["retryable"], false);
-        assert_eq!(btle["response_code"], 503);
+    }
+
+    #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+    #[test]
+    fn btle_current_status_record_has_one_bounded_allowlisted_shape() {
+        // Break caught: forwarding driver text or controller identity through
+        // the agent output boundary expands operator metadata beyond BT-O0.
+        let records = [
+            btle_status_record(aster_ble_linux::BtleCurrentStatus::Available {
+                support: aster_ble_linux::BtleSupport::Qualified,
+            }),
+            btle_status_record(aster_ble_linux::BtleCurrentStatus::Unavailable {
+                reason: aster_ble_linux::AvailabilityReason::CredentialExpired,
+                support: aster_ble_linux::BtleSupport::NotEvaluated,
+            }),
+        ];
+        let expected_fields = [
+            "timestamp",
+            "operation",
+            "adapter_kind",
+            "availability",
+            "reason",
+            "support",
+        ];
+
+        for record in &records {
+            assert!(record.to_string().len() < MAX_OPERATOR_RECORD_BYTES);
+            let object = record.as_object().expect("BTLE status JSON object");
+            assert_eq!(object.len(), expected_fields.len());
+            assert!(
+                object
+                    .keys()
+                    .all(|field| expected_fields.contains(&field.as_str()))
+            );
+            assert_eq!(record["operation"], "btle_status");
+            assert_eq!(record["adapter_kind"], "ble_l2cap_v1");
+        }
+
+        assert_eq!(records[0]["availability"], "available");
+        assert_eq!(records[0]["reason"], "available");
+        assert_eq!(records[0]["support"], "qualified");
+        assert_eq!(records[1]["availability"], "unavailable");
+        assert_eq!(records[1]["reason"], "credential_expired");
+        assert_eq!(records[1]["support"], "not_evaluated");
+    }
+
+    #[cfg(all(feature = "systemd-provider", target_os = "linux"))]
+    #[test]
+    fn btle_status_output_coalesces_while_process_writer_is_blocked() {
+        let (started, writer_started) = std::sync::mpsc::channel();
+        let (written, records) = std::sync::mpsc::channel();
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let writer_release = release.clone();
+        let mut first = true;
+        let output = spawn_btle_status_output(move |record| {
+            written.send(record).unwrap();
+            if first {
+                first = false;
+                started.send(()).unwrap();
+                let (released, wake) = &*writer_release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            }
+        })
+        .expect("test status writer thread");
+
+        output.send_replace("first".to_owned());
+        writer_started
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("writer entered the blocked output boundary");
+        output.send_replace("middle".to_owned());
+        output.send_replace("latest".to_owned());
+
+        let (released, wake) = &*release;
+        *released.lock().unwrap() = true;
+        wake.notify_one();
+        assert_eq!(records.recv().unwrap(), "first");
+        assert_eq!(records.recv().unwrap(), "latest");
+        drop(output);
     }
 
     #[test]
