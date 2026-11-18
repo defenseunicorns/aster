@@ -12,6 +12,7 @@ import struct
 import subprocess
 import sys
 import tarfile
+import xml.etree.ElementTree as ET
 
 package = Path(sys.argv[1])
 metadata = Path(sys.argv[3]) if len(sys.argv) > 3 else Path("target/deb-metadata")
@@ -32,8 +33,9 @@ assert field("Architecture") == architecture
 dependencies = field("Depends")
 assert all(
     dependency in dependencies
-    for dependency in ("libc6", "systemd", "acl", "adduser")
+    for dependency in ("libc6", "libdbus-1-3", "systemd", "acl", "adduser")
 )
+assert field("Suggests") == "bluez"
 archive = subprocess.check_output(["dpkg-deb", "--fsys-tarfile", str(package)])
 with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
     members = {m.name.removeprefix("./"): m for m in tar.getmembers()}
@@ -77,24 +79,48 @@ with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
     for directive in ("capabilityboundingset=", "ambientcapabilities="):
         assert [line for line in service if line.startswith(directive)] == [directive]
     assert service.count(
-        "restrictaddressfamilies=af_unix af_inet af_inet6 af_netlink"
+        "restrictaddressfamilies=af_unix af_inet af_inet6 af_netlink af_bluetooth"
     ) == 1
+    assert service.count("systemcallarchitectures=native") == 1
+    assert service.count("loadcredentialencrypted=aster-btle-roster") == 1
     assert not any(
         value in "\n".join(service)
-        for value in (
-            "aster-btle-roster",
-            "af_bluetooth",
-            "cap_net_admin",
-            "cap_net_raw",
-        )
+        for value in ("cap_net_admin", "cap_net_raw")
     )
-    policy_roots = (
-        "etc/dbus-1/system.d/",
-        "usr/share/dbus-1/system.d/",
-        "etc/polkit-1/",
-        "usr/share/polkit-1/",
+    bluez_policy = ET.fromstring(read("usr/share/dbus-1/system.d/aster-bluez.conf"))
+    aster_policies = [
+        policy for policy in bluez_policy.findall("policy")
+        if policy.attrib == {"user": "aster"}
+    ]
+    assert len(aster_policies) == 1
+    rules = [(rule.tag, rule.attrib) for rule in aster_policies[0]]
+    assert rules == [
+        ("deny", {"send_destination": "org.bluez", "send_type": "method_call"}),
+        *[
+            (
+                "allow",
+                {
+                    "send_destination": "org.bluez",
+                    "send_interface": interface,
+                    "send_member": member,
+                    "send_type": "method_call",
+                },
+            )
+            for interface, member in (
+                ("org.freedesktop.DBus.ObjectManager", "GetManagedObjects"),
+                ("org.freedesktop.DBus.Properties", "Get"),
+                ("org.bluez.Adapter1", "SetDiscoveryFilter"),
+                ("org.bluez.Adapter1", "StartDiscovery"),
+                ("org.bluez.Adapter1", "StopDiscovery"),
+                ("org.bluez.LEAdvertisingManager1", "RegisterAdvertisement"),
+                ("org.bluez.LEAdvertisingManager1", "UnregisterAdvertisement"),
+            )
+        ],
+    ]
+    assert not any(
+        name.startswith(("etc/polkit-1/", "usr/share/polkit-1/"))
+        for name in members
     )
-    assert not any(name.startswith(policy_roots) for name in members)
     packaged_tmpfiles = read("usr/lib/tmpfiles.d/aster.conf").decode().splitlines()
     packaged_tmpfiles = [
         shlex.split(line)

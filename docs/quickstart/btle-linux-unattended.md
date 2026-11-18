@@ -16,10 +16,13 @@ for current policy and package status and the
 [design](../superpowers/specs/2026-11-03-production-btle-design.md#platform-qualification-and-support)
 for detailed resolver mechanics.
 
-The shipped Debian service remains radio-inert and unqualified, with Iroh as
-its only selectable adapter. This runbook does not execute package assertions
-or close the package-confinement, support-matrix, or physical qualification
-gates; the carrier guide records the specific service-profile gaps.
+The Debian source profile can compose BTLE when complete policy and the optional
+encrypted roster credential are present; it remains unqualified. This runbook
+does not execute the package service identity or close the package-confinement,
+support-matrix, or physical qualification gates; the carrier guide records the
+specific service-profile gaps. `bluez` is only a Debian `Suggests`: Aster does
+not depend on or start it, though package managers configured to install
+suggested packages may install it.
 
 ## Verify the source-level automatic composition
 
@@ -46,10 +49,10 @@ cargo test --locked -p aster-ble-linux \
 ```
 
 They do not run the Debian unit, validate the package service identity, or
-qualify hardware. The current agent intentionally discards detailed Linux
-driver operator events. Automatic availability is coarse and sanitized; do not
-expect customer status or logs to expose controller names, addresses, PSMs,
-peer IDs, credentials, or detailed probe results.
+qualify hardware. The agent emits one coalesced allowlisted current-status
+record; detailed driver lifecycle edges remain internal. Do not expect status
+or logs to expose controller names, addresses, PSMs, peer IDs, credentials, or
+detailed probe state.
 
 ## Modes and limits
 

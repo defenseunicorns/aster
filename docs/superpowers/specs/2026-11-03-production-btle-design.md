@@ -98,7 +98,7 @@ can return the capability to Source or Review blocked. Every implementation PR
 updates affected rows in the same change and links each claimed status to its
 evidence; absence of evidence means the lower status applies.
 
-| ID | Capability and owner | First measurable exit | Current status (2026-11-17) |
+| ID | Capability and owner | First measurable exit | Current status (2026-11-18) |
 | --- | --- | --- | --- |
 | **BT-A0** | Transport-neutral application readiness and durable publication, owned by the node/store | With zero eligible transports, startup succeeds, publication is durable, and later adapter availability wakes work without republishing | **Verified** for the merged Event evaluation path; production profile remains unqualified |
 | **BT-A1** | Adapter-neutral bounded contact and mission authentication, owned by the node | BTLE supplies only transient carrier evidence; the exact mission peer authenticates before inventory or data; no Bluetooth value grants identity | **Physical** for bounded Event evaluation; not release-qualified |
@@ -108,14 +108,14 @@ evidence; absence of evidence means the lower status applies.
 | **BT-L1** | Rostered Linux discovery and controller-epoch lifecycle, owned by `aster-ble-linux` | Listener, advertisement, scan, candidate, socket, credential, cancellation, and cleanup owners are bounded and joined; discovery remains locator-only | **Source**; fixed-controller physical evidence is scoped to BT-E0, while stock teardown-ingress and working-secret lifetime gates block this exit |
 | **BT-L2** | Linux Event contact scheduling, owned by the BTLE runtime owner | The validated lower member schedules remote-only contact; success delays from completion, transient local failures back off, authenticated suppression parks only BTLE scheduling, and durable work survives adapter epochs | **Source** with focused verification; Linux owns cadence/backoff and the node owns generic custody and selection |
 | **BT-L3** | Emission-policy lifecycle, owned by the BTLE composition root | Configured startup `Normal` owns the rostered radio lifecycle; configured startup `ReceiveOnly` is radio-inert. For the first profile, unsupported live changes are rejected and a controlled restart rebuilds radio and credentials atomically; later live reload must provide the same stop/join/restart guarantee | **Source** with focused verification; live mutation is rejected before either policy state changes |
-| **BT-L4** | Linux production credential, package, and confinement profile | `aster-btle-roster`, rollback-safe renewal, non-root BlueZ/socket least privilege, denial tests, shutdown ordering, upgrade/rollback, and operator status pass as the packaged service identity | **Designed**; shipped package remains radio-inert |
+| **BT-L4** | Linux production credential, package, and confinement profile | `aster-btle-roster`, rollback-safe renewal, non-root BlueZ/socket least privilege, denial tests, shutdown ordering, upgrade/rollback, and operator status pass as the packaged service identity | **Source**; package construction and payload checks pass, while installed-service execution, physical qualification, and release gates remain open |
 | **BT-E0** | Fixed-controller semantic-v9 Event vertical slice | Two Linux nodes exchange and durably consume a protected Event larger than the minimum MTU through disconnect and restart | **Physical** evaluation only |
 | **BT-E1** | Automatic Linux Event production profile | BT-A0–A3, BT-L0–L4, BT-O0, and BT-Q0 are Qualified for one exact peer and the declared supported hardware rows | **Source**; supporting production code exists, but this first release boundary has not passed its composite exit |
 | **BT-SR0** | State and Record over the qualified class-neutral contact | Convergence, interruption, restart, withdrawal/tombstone behavior, priority, and resource bounds pass without BTLE-specific semantic records | **Designed** |
 | **BT-B0** | Blob Profile-5 DATA/CONTROL over BTLE | Exact canonical records, bounded channel association, interruption, record-level durable resume, and control-liveness/resource exits pass | **Designed** |
 | **BT-P0** | Additional Linux hardware and desktop/mobile foreground drivers | Each exact platform/hardware row passes the Linux-reference interoperability and lifecycle profile without changing application semantics | **Designed**; Pixel/Linux Event evidence is evaluation-only |
 | **BT-P1** | Background mobile profiles | Explicit OS background constraints, permission lifecycle, packaging, energy, and availability semantics pass separately per platform | **Designed**; scheduled only after foreground platform qualification |
-| **BT-O0** | Sanitized operability and support evidence | Readiness is separate from adapter availability; bounded status/reason/support fields obey the metadata budget and never expose locators, roster, PSM, peer, or credential data | **Source**; coarse availability crosses the boundary, while detailed BTLE events are currently discarded |
+| **BT-O0** | Sanitized operability and support evidence | Readiness is separate from adapter availability; bounded status/reason/support fields obey the metadata budget and never expose locators, roster, PSM, peer, or credential data | **Source**; authoritative current status crosses the process boundary, while an authenticated query surface remains open |
 | **BT-Q0** | Production qualification and authorization | Supported artifact, SBOM/license admission, dependency gates, hostile-peer/resource evidence, independent architecture/security review, reproducible package evidence, and signed release authorization pass | **Designed**; every release gate remains open |
 
 ### First production release boundary: Linux Event
@@ -713,18 +713,16 @@ status reports adapter type, qualification tag, and sanitized closed reason
 codes, never raw transient Bluetooth addresses, PSMs, discovery proofs, or
 credentials.
 
-The Linux service remains the existing non-root `aster-agent`. A future
-qualified BTLE package adds only the least privileges needed by the BlueZ path,
-including `AF_BLUETOOTH` where socket-family confinement is used; it grants no
-controller reset, host pairing, or root authority. The currently shipped Debian
-unit is still radio-inert and unqualified: it does not bind
-`aster-btle-roster`, excludes `AF_BLUETOOTH`, and adds no BlueZ D-Bus or Polkit
-policy. Iroh remains that package's only selectable adapter. Roster-discovery
-credentials are systemd-managed encrypted credentials in a qualified
-production profile, not environment variables, CLI arguments, or ordinary
-configuration files. Configuration validation checks policy and credential
-references without requiring present hardware. Service readiness and health
-distinguish node readiness from per-adapter availability.
+The Linux service remains the existing non-root `aster-agent`. Its Debian unit
+presents the optional systemd-encrypted `aster-btle-roster` credential and
+admits `AF_BLUETOOTH` without raw/admin capabilities. A user-specific D-Bus
+policy first denies BlueZ method calls, then allows only inventory/property
+reads, filtered discovery start/stop, and advertisement registration cleanup.
+It grants no controller power/reset, pairing, bonding, device connect/remove,
+or root authority; no additional Polkit grant is installed. Without complete
+BTLE configuration and a valid credential the radio path remains inert, and
+without compatible hardware the node remains ready. Configuration validation
+checks policy and credential references without requiring present hardware.
 
 Linux qualification freezes the exact BlueZ D-Bus interfaces and methods used
 for property reads, discovery filtering/windows, and advertisement registration.
@@ -738,10 +736,11 @@ Status, logs, and metrics share one metadata budget: adapter kind, coarse
 available/unavailable reason, bounded counters, and current selected kind. They
 omit peer/controller addresses, PSMs, role/roster membership,
 discovery material, transfer identifiers/counts, retry detail, and secrets.
-BTLE output uses the node's redaction sink rather than direct process logging.
-The current agent passes a discard sink, so detailed driver operator
-events are not customer status or log fields; only coarse sanitized registry
-availability crosses that composition boundary.
+BTLE output passes through an allowlisting, coalescing process writer before it
+reaches standard output. The agent publishes one current record containing only
+timestamp, operation, adapter kind, availability, closed reason, and support
+tag. Detailed lifecycle edge events remain internal and do not become customer
+fields.
 
 Compatibility observations are process-memory-only and replaced on inventory
 epochs as one bounded current snapshot per examined controller, not an

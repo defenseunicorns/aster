@@ -2,3 +2,4 @@ target/debian-install/bin/aster usr/bin
 target/debian-install/bin/aster-agent usr/bin
 target/debian-install/bin/asterctl usr/bin
 target/debian-install/bin/aster-credential-admin usr/sbin
+debian/aster-bluez.conf usr/share/dbus-1/system.d

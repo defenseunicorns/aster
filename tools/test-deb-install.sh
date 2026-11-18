@@ -15,11 +15,62 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 package=$(realpath "$1")
 dpkg -i "$package"
 lock_holder_pid=
+bluetoothd_pid=
+bluetoothd_log=
+bluez_call_output=
+btle_plain=
+btle_next_plain=
+btle_plain_directory=
+btle_next_directory=
+btle_initial_encrypted=
+btle_next_encrypted=
+btle_status_log=
 cleanup() {
     if [[ -n $lock_holder_pid ]]; then
         kill "$lock_holder_pid" 2>/dev/null || true
         wait "$lock_holder_pid" 2>/dev/null || true
         lock_holder_pid=
+    fi
+    if [[ -n $bluetoothd_pid ]]; then
+        kill "$bluetoothd_pid" 2>/dev/null || true
+        wait "$bluetoothd_pid" 2>/dev/null || true
+        bluetoothd_pid=
+    fi
+    if [[ -n $bluetoothd_log ]]; then
+        rm -f -- "$bluetoothd_log"
+        bluetoothd_log=
+    fi
+    if [[ -n $bluez_call_output ]]; then
+        rm -f -- "$bluez_call_output"
+        bluez_call_output=
+    fi
+    if [[ -n $btle_plain ]]; then
+        rm -f -- "$btle_plain"
+        btle_plain=
+    fi
+    if [[ -n $btle_next_plain ]]; then
+        rm -f -- "$btle_next_plain"
+        btle_next_plain=
+    fi
+    if [[ -n $btle_plain_directory ]]; then
+        rmdir -- "$btle_plain_directory" 2>/dev/null || true
+        btle_plain_directory=
+    fi
+    if [[ -n $btle_next_encrypted ]]; then
+        rm -f -- "$btle_next_encrypted"
+        btle_next_encrypted=
+    fi
+    if [[ -n $btle_initial_encrypted ]]; then
+        rm -f -- "$btle_initial_encrypted"
+        btle_initial_encrypted=
+    fi
+    if [[ -n $btle_next_directory ]]; then
+        rmdir -- "$btle_next_directory" 2>/dev/null || true
+        btle_next_directory=
+    fi
+    if [[ -n $btle_status_log ]]; then
+        rm -f -- "$btle_status_log"
+        btle_status_log=
     fi
     systemctl stop aster-agent.service || true
 }
@@ -92,6 +143,96 @@ assert_unsafe_directory_rejected() {
 }
 
 assert_btle_authority_lock
+
+# Confirm systemd loaded the packaged capability and socket boundary, not just
+# the source unit text. The agent needs AF_BLUETOOTH but no Linux capability or
+# raw packet socket family.
+[[ -z $(systemctl show aster-agent.service --property=CapabilityBoundingSet --value) ]]
+[[ -z $(systemctl show aster-agent.service --property=AmbientCapabilities --value) ]]
+loaded_address_families=$(systemctl show aster-agent.service \
+    --property=RestrictAddressFamilies --value)
+[[ $loaded_address_families == *AF_BLUETOOTH* ]]
+[[ $loaded_address_families != *AF_PACKET* ]]
+
+# Exercise the installed D-Bus policy against the real BlueZ daemon. The
+# disposable runner may have no controller, but BlueZ still exposes its object
+# manager, which is sufficient to distinguish an allowed production call from
+# an unrelated denied control-plane call under the actual service identity.
+if ! busctl --system status org.bluez >/dev/null 2>&1; then
+    bluetoothd_log=$(mktemp /tmp/aster-bluez.XXXXXX.log)
+    bluetoothd --nodetach >"$bluetoothd_log" 2>&1 &
+    bluetoothd_pid=$!
+    for _ in {1..50}; do
+        busctl --system status org.bluez >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+fi
+busctl --system status org.bluez >/dev/null
+bluez_call_output=$(mktemp)
+busctl --system --json=short call \
+    org.bluez / org.freedesktop.DBus.ObjectManager GetManagedObjects \
+    >"$bluez_call_output"
+python3 - "$bluez_call_output" <<'PY'
+import json, sys
+from pathlib import Path
+objects = json.loads(Path(sys.argv[1]).read_text())["data"][0]
+assert not any("org.bluez.Adapter1" in interfaces for interfaces in objects.values()), \
+    "package service test requires a controller-free runner"
+PY
+runuser -u aster -- busctl --system call \
+    org.bluez / org.freedesktop.DBus.ObjectManager GetManagedObjects >/dev/null
+assert_bluez_dispatch_allowed() {
+    : >"$bluez_call_output"
+    if runuser -u aster -- "$@" >"$bluez_call_output" 2>&1; then
+        return
+    fi
+    if grep -Eq 'AccessDenied|Rejected send message' "$bluez_call_output"; then
+        echo "Required BlueZ call was denied: $*" >&2
+        sed -n '1,4p' "$bluez_call_output" >&2
+        exit 1
+    fi
+    grep -Eqi 'Unknown object|UnknownObject|UnknownMethod|DoesNotExist|NotReady' \
+        "$bluez_call_output"
+}
+assert_bluez_call_denied() {
+    : >"$bluez_call_output"
+    if runuser -u aster -- "$@" >"$bluez_call_output" 2>&1; then
+        echo "Unrelated BlueZ call was allowed: $*" >&2
+        exit 1
+    fi
+    grep -Eq 'AccessDenied|Rejected send message' "$bluez_call_output"
+}
+
+# A nonexistent controller path exercises policy dispatch without radio side
+# effects: allowed methods reach BlueZ and return a BlueZ object/state error.
+bluez_test_path=/org/bluez/aster_policy_test
+assert_bluez_dispatch_allowed busctl --system call org.bluez "$bluez_test_path" \
+    org.freedesktop.DBus.Properties Get ss org.bluez.Adapter1 Address
+assert_bluez_dispatch_allowed busctl --system call org.bluez "$bluez_test_path" \
+    org.bluez.Adapter1 SetDiscoveryFilter 'a{sv}' 0
+assert_bluez_dispatch_allowed busctl --system call org.bluez "$bluez_test_path" \
+    org.bluez.Adapter1 StartDiscovery
+assert_bluez_dispatch_allowed busctl --system call org.bluez "$bluez_test_path" \
+    org.bluez.Adapter1 StopDiscovery
+assert_bluez_dispatch_allowed busctl --system call org.bluez "$bluez_test_path" \
+    org.bluez.LEAdvertisingManager1 RegisterAdvertisement 'oa{sv}' \
+    /org/aster/policy_test 0
+assert_bluez_dispatch_allowed busctl --system call org.bluez "$bluez_test_path" \
+    org.bluez.LEAdvertisingManager1 UnregisterAdvertisement o /org/aster/policy_test
+
+# Representative controller mutation, device control, and pairing methods must
+# be rejected by the bus before BlueZ sees them.
+assert_bluez_call_denied busctl --system call org.bluez /org/bluez \
+    org.bluez.AgentManager1 RegisterAgent os /org/aster/forbidden NoInputNoOutput
+assert_bluez_call_denied busctl --system call org.bluez "$bluez_test_path" \
+    org.freedesktop.DBus.Properties Set ssv org.bluez.Adapter1 Powered b true
+assert_bluez_call_denied busctl --system call org.bluez "$bluez_test_path" \
+    org.bluez.Device1 Connect
+assert_bluez_call_denied busctl --system call org.bluez "$bluez_test_path" \
+    org.bluez.Adapter1 RemoveDevice o /org/bluez/forbidden
+rm -- "$bluez_call_output"
+bluez_call_output=
+
 # The service account can open and exclusively lock the root-owned anchor, but
 # a second process cannot share authority while that lock remains held. The
 # coprocess pipe gives a bounded readiness/release handshake without polling.
@@ -321,13 +462,135 @@ subprocess.run(["asterctl", "--token-file", "/etc/aster/agent-credentials/client
     "--port", "8181", "publication-ack", *journal, "--sequence", "1"], check=True, capture_output=True)
 print("Protected local Event publish/delivery/ack: OK")
 PY
+
+# Present a provider-authenticated BTLE roster through the package's optional
+# encrypted credential binding. With no controller, the node must remain ready;
+# a newer renewal is accepted only across the designed controlled restart.
+install -d -o root -g root -m 0700 /etc/credstore.encrypted
+btle_plain_directory=$(mktemp -d /tmp/aster-btle-roster.XXXXXX)
+btle_plain=$btle_plain_directory/initial
+btle_next_plain=$btle_plain_directory/renewal
+btle_next_directory=$(mktemp -d /etc/credstore.encrypted/.aster-btle.XXXXXX)
+btle_initial_encrypted=$btle_next_directory/initial
+btle_next_encrypted=$btle_next_directory/renewal
+python3 - "$btle_plain" "$btle_next_plain" <<'PY'
+import os, struct, sys, time
+issued = int(time.time()) - 1
+scope = bytes([0x42]) * 32
+secret = os.urandom(32)
+def artifact(sequence, lease):
+    return b"".join((
+        b"ASTRBD02",
+        struct.pack(">Q", sequence),
+        b"\x01",
+        struct.pack(">Q", issued),
+        struct.pack(">Q", lease),
+        b"\x00" * 8,
+        scope,
+        struct.pack(">I", 7),
+        secret,
+    ))
+for path, sequence, lease in (
+    (sys.argv[1], 1, issued + 1800),
+    (sys.argv[2], 2, issued + 3600),
+):
+    with open(path, "wb") as stream:
+        stream.write(artifact(sequence, lease))
+    os.chmod(path, 0o600)
+PY
+systemd-creds encrypt --name=aster-btle-roster \
+    "$btle_plain" "$btle_initial_encrypted" >/dev/null
+systemd-creds encrypt --name=aster-btle-roster \
+    "$btle_next_plain" "$btle_next_encrypted" >/dev/null
+rm -- "$btle_plain" "$btle_next_plain"
+btle_plain=
+btle_next_plain=
+rmdir -- "$btle_plain_directory"
+btle_plain_directory=
+sync -f "$btle_initial_encrypted"
+mv -T -- "$btle_initial_encrypted" /etc/credstore.encrypted/aster-btle-roster
+btle_initial_encrypted=
+sync -f /etc/credstore.encrypted
+python3 - /etc/aster/agent.json <<'PY'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+config = json.loads(path.read_text())
+config["btle"] = {
+    "enabled": True,
+    "peer": "aa" * 32,
+    "deployment_scope_id": "42" * 32,
+    "policy": "rostered",
+    "emission_policy": "normal",
+    "priority": 100,
+    "credential": "aster-btle-roster",
+}
+path.write_text(json.dumps(config, indent=2) + "\n")
+PY
+btle_status_since=$(date --iso-8601=seconds)
 systemctl restart aster-agent.service
 wait_ready
+btle_status_log=$(mktemp)
+btle_status_observed=false
+for _ in {1..50}; do
+    journalctl --sync
+    journalctl --unit=aster-agent.service --since="$btle_status_since" \
+        --output=cat --no-pager >"$btle_status_log"
+    if python3 - "$btle_status_log" 2>/dev/null <<'PY'
+import json, sys
+from pathlib import Path
+records = []
+for line in Path(sys.argv[1]).read_text().splitlines():
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if record.get("operation") == "btle_status":
+        records.append(record)
+assert records and records[-1].get("availability") == "unavailable"
+assert records[-1].get("reason") == "controller_absent", records[-1]
+PY
+    then
+        btle_status_observed=true
+        break
+    fi
+    sleep 0.1
+done
+if [[ $btle_status_observed != true ]]; then
+    echo 'Packaged agent did not report controller_absent' >&2
+    sed -n '1,20p' "$btle_status_log" >&2
+    exit 1
+fi
+rm -- "$btle_status_log"
+btle_status_log=
+python3 - /var/lib/aster-agent/discovery-checkpoint <<'PY'
+import sys
+from pathlib import Path
+checkpoint = Path(sys.argv[1]).read_bytes()
+assert checkpoint[:8] == b"ASTRDC01"
+assert int.from_bytes(checkpoint[40:48], "big") == 1
+PY
+sync -f "$btle_next_encrypted"
+mv -T -- "$btle_next_encrypted" /etc/credstore.encrypted/aster-btle-roster
+btle_next_encrypted=
+rmdir -- "$btle_next_directory"
+btle_next_directory=
+sync -f /etc/credstore.encrypted
+systemctl restart aster-agent.service
+wait_ready
+python3 - /var/lib/aster-agent/discovery-checkpoint <<'PY'
+import sys
+from pathlib import Path
+checkpoint = Path(sys.argv[1]).read_bytes()
+assert checkpoint[:8] == b"ASTRDC01"
+assert int.from_bytes(checkpoint[40:48], "big") == 2
+PY
 printf 'preserve\n' > /var/lib/aster-agent/package-test-marker
 dpkg --remove aster
 ! systemctl is-active --quiet aster-agent.service
 test "$(cat /var/lib/aster-agent/package-test-marker)" = preserve
 test -f /etc/aster/provisioning/active/credential.cred
 test -f /var/lib/aster/provisioning-systemd/ledger
+cleanup
 trap - EXIT
 printf 'Installation, protected service, restart, removal and state preservation: OK\n'

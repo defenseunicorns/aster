@@ -35,7 +35,7 @@ jobs:
       - name: Provision build tools and locked Cargo dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y debhelper build-essential pkg-config python3-venv python3-dev libicu-dev
+          sudo apt-get install -y debhelper build-essential pkg-config python3-venv python3-dev libicu-dev libdbus-1-dev bluez
           cargo install --locked --version 0.5.9 cargo-cyclonedx --root "$RUNNER_TEMP/sbom-cargo"
           /usr/bin/python3 -m venv "$RUNNER_TEMP/sbom-python"
           "$RUNNER_TEMP/sbom-python/bin/pip" install cyclonedx-editor-validator==0.34.0
