@@ -164,3 +164,26 @@ not packaged-service, credential-presentation, Event-transfer, controller
 hotplug, multiple-controller, soak, or hardware-qualification evidence. The
 corrected example source, binaries, state, logs, mission fixture, and temporary
 build-only changes were removed after the observation.
+
+### Current evaluator follow-up
+
+After merging official `main`, the ARM64 `aster-btle-event` artifact from signed
+source `7a5f20d5007f3a45c83169a21cba367dda0bf36c` was replayed on the same Orin.
+The merge checkpoint `a0b9faf2094c1808c86aa5f4e4ddfa5210207369` does not change
+`aster-ble-linux` or `aster-agent`. The artifact SHA-256 was
+`a774175629b3316699f95f51c22e6fc74543563ad919f8830825563ad41cef17`.
+
+The repository non-production bundle and a disposable `ASTRBD02` credential
+were copied into one owner-only temporary directory. A same-state rostered
+repeat observed `ActiveInstances = 1` and `Discovering = true` at the second
+one-second sample. Timed SIGINT produced exit status zero and the final external
+read returned `ActiveInstances = 0` and `Discovering = false`. A preceding
+observed run reached the same active properties and was later confirmed exited
+with both properties released, although its exit status was not retained.
+
+This follow-up validates current evaluator advertisement/scan ownership and one
+successful same-state repeat after the preceding process exited and released
+its BlueZ resources. The synthetic peer was intentionally unmatched, so it adds
+no contact or Event-transfer evidence. The remote evaluator, mission fixture,
+credential, state, and logs were removed; no controller address, mission
+identifier, credential, or raw log is retained.
