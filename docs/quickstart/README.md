@@ -37,14 +37,15 @@ capacity, or release authorization.
 | Selected live or stopped State in Rust | `SelectedStateHandle` or `SelectedStateNode` | [State API](selected-state-api.md) |
 | Selected live or stopped Record in Rust | `SelectedRecordHandle` or `SelectedRecordNode` | [Record API](selected-record-api.md) |
 | Selected live or stopped Blob in Rust | `RunningNode::selected_blobs()` or `SelectedBlobNode` | [Blob API](selected-blob-api.md) |
-| Broader semantic Rust API | `ApplicationNode` | [Rust](rust.md) |
-| Broader semantic Python API | Dependency-free `ctypes` wrapper | [Python](python.md) |
-| Broader semantic Go API | cgo wrapper | [Go](go.md) |
-| Stable C-compatible interface | C ABI v1 | [C](c.md) |
+| Embedded Rust runtime | `aster-node` class-specific handles | [Rust](rust.md) |
+| Embedded Python API | Dependency-free `ctypes` wrapper | [Python](python.md) |
+| Embedded Go API | cgo wrapper | [Go](go.md) |
+| C-compatible interface | C ABI v2 | [C](c.md) |
 
-The selected Rust handles share the running node’s bounded actor and store
-authority. The broader Rust/C/Go/Python examples are offline semantic API
-exercises and are not selected-live-node bindings. The selected Linux local
+The Rust handles and C/Go/Python bindings use the same `aster-node` actor and
+redb store. The bindings run inside the caller's process without network
+contacts; they do not connect to an agent. ABI v1 and the SQLite-backed
+`ApplicationNode` API have been removed without data migration. The Linux local
 agent exposes Event operations and local status plus native-gRPC Blob
 publish/read streams consumed by `asterctl`; State and Record RPCs and Blob
 subscription/status operations remain open.

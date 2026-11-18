@@ -413,19 +413,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aster-ip"
-version = "0.1.0-alpha.1"
-dependencies = [
- "aster-core",
- "getrandom 0.4.3",
- "hkdf 0.13.0",
- "sha2 0.11.1",
- "socket2",
- "subtle",
- "tokio",
-]
-
-[[package]]
 name = "aster-iroh"
 version = "0.1.0-alpha.1"
 dependencies = [

@@ -492,11 +492,10 @@ recoverable until retention-driven garbage collection. Explicit resolution
 publishes a revision whose context covers the exact observed sibling set.
 
 Application policy is process-local and is not a replicated protocol object.
-The current reference can associate an application-supplied policy ID with a
-topic; `ApplicationNode::conflicts()` reports that ID while the registration
-remains live. Direct and forwarded replicated ingestion never execute the
-registered policy or publish an automatic resolution. Registration is not
-durable across restart. Applications may compute deterministic bytes from
+The selected runtime exposes concurrent heads and guarded explicit resolution,
+not the retired process-local merge-policy registration API. Direct and
+forwarded replicated ingestion never execute application policy or publish an
+automatic resolution. Applications may compute deterministic bytes from
 ascending full-ItemID-sorted sibling inputs and submit them through explicit
 resolution. Any such helper MUST return identical bytes for identical canonical
 inputs across every supported implementation and version; this is an

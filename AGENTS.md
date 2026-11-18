@@ -5,8 +5,8 @@ Follow the project's Clean Room policy and source exclusions.
 ## Before editing
 
 - Work on a dedicated branch for the task.
+- Use a worktree when the workspace is dirty or another effort is active.
 - Read `CONTRIBUTING.md` before making changes.
-- Follow the product requirements in `DESIGN.md`.
 
 ## Code
 

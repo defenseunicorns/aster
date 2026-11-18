@@ -193,9 +193,9 @@ This Rust-only provider is disabled by default and is not production admitted.
 review, exceptions, and exit gates.
 
 The profile is X25519 and ChaCha20-Poly1305 based. It provides no post-quantum
-artifact-confidentiality or FIPS 140-3 validation claim. The raw
-`ApplicationNode::open`, FFI, Go, and Python paths remain
-unprotected compatibility/test ingestion. The stock `aster node`,
+artifact-confidentiality or FIPS 140-3 validation claim. The C ABI v2, Go,
+and Python constructors use unprotected reference provisioning; they do not
+expose protected-provider callbacks. The stock `aster node`,
 `control-revoke`, and `control-rekey` CLI paths also still require an owner-only
 unprotected-reference bundle. A Rust embedding can instead construct a live
 `NodeConfig` from a protected file, protected bytes, or an exact opaque provider

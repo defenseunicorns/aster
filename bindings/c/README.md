@@ -92,9 +92,9 @@ stubs or replacement implementations.
 mise exec -- sh tools/with-test-resources.sh sh tools/test-ffi-bindings.sh
 ```
 
-The test script builds the library and disposable fixture helper, compiles C/C++
-headers, executes the C runtime probe, runs Python and Go against the real
-library, and executes all three public examples against shared durable state.
+The test script builds the library and disposable fixture helper, compiles and
+executes the C runtime probe, and runs Python and Go tests against the real
+library.
 See [the C sample](../../examples/c_basic.c) and
 [quickstart](../../docs/quickstart/c.md). No release qualification or requirements
 credit is inferred from these local tests.

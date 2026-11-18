@@ -238,83 +238,15 @@ or non-Unix platforms. Exact usage and the crash-resumption boundary are in the
 
 ## Current semantic/reference carrier composition
 
-The repository also retains the current semantic application and host surfaces:
+The embedded bindings use the selected runtime:
 
-- `ApplicationNode` is the offline application surface.
-- Shared core and binding batch, bridge, and merge APIs remain available.
-  The native laboratory host composition and Gate H have been retired.
-- `IpLink` and `BleLink` implement the same opaque-fragment contract.
+- C ABI v2, Go, and Python start a local `aster-node` actor without contacts.
+- `ApplicationNode`, atomic publication/Blob batches, and dynamic bridge
+  administration have been removed with the SQLite runtime.
+  The native laboratory host composition and Gate H have also been retired.
+- `BleLink` implements the opaque-fragment contract.
 - The maintained [implementation-boundary table](../README.md#current-implementation-boundary)
   records which operations each Rust and language-binding surface exposes.
-
-## Current semantic IP example
-
-`IpLink` uses nonblocking UDP. The simplest integration uses known peer socket
-addresses and distinct provisioned mission identities, `alice_node_id` and
-`bob_node_id`:
-
-```rust
-use aster_ip::IpLink;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-let loopback_port = || SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-
-// This token groups protected discovery traffic. It is never transmitted, and
-// IpLink rejects an all-zero value.
-let discovery_token = [0x42; 16];
-let discovery_target = None; // Use Some(multicast_addr) for broadcast discovery.
-
-let alice_link = IpLink::bind(
-    "alice-to-bob", loopback_port(), discovery_token, discovery_target,
-)?;
-let bob_link = IpLink::bind(
-    "bob-to-alice", loopback_port(), discovery_token, discovery_target,
-)?;
-
-// Manual peering binds the expected authenticated NodeID to a UDP endpoint.
-// Authentication still happens in Aster; this map does not replace it.
-alice_link.register_peer(bob_node_id, bob_link.local_addr()?)?;
-bob_link.register_peer(alice_node_id, alice_link.local_addr()?)?;
-```
-
-`IpLink::bind`'s fourth argument is `discovery_target`. `None` disables the
-announcement/broadcast destination, as in the manual-peering example. `Some`
-provides the address used by `announce()` and peerless link sends. When that
-address is an IPv4 multicast address, `bind` also joins that group on the
-unspecified interface and enables multicast loopback. Other `Some` addresses
-are send targets only; the deployment remains responsible for any corresponding
-receive-side network setup.
-
-The 16-byte discovery token is provisioned group material, not a NodeID or a
-bearer value. It is never transmitted: discovery packets carry fresh nonces and
-derived proofs. `IpLink::bind` rejects the all-zero token, including when manual
-peering uses `discovery_target = None`.
-
-These are carrier primitives, not a complete application host. The native
-laboratory and its `SharedNodeContactSupervisor`/`MeshHost` composition have
-been retired. A local publish result does not promise remote delivery.
-
-### Current semantic discovery, rendezvous, and relay
-
-The IP crate provides separate tools for three deployment situations:
-
-- **Known address:** register a provisioned peer NodeID and socket address
-  directly. This is the smallest path and the best place to begin.
-- **Local discovery:** announcements use a provisioned opaque discovery token,
-  fresh nonces, and a challenge/response before an endpoint becomes a candidate.
-  Discovery does not replace authenticated session identity.
-- **NAT/rendezvous:** rendezvous helpers can coordinate endpoint punching where
-  the network permits it. NAT behavior is environmental; success is never
-  universal.
-- **Opaque relay:** the relay path can forward protected Aster traffic when
-  direct reachability fails. A relay is useful infrastructure, not part of data
-  correctness and not automatically a content reader.
-
-These semantic/reference helpers are migration sources, not the selected
-controlled-Iroh relay path above.
-
-Start with manually known addresses. Add discovery or rendezvous only after the
-authenticated two-node path is understood and measured in the target network.
 
 ## Linux unattended BTLE Event evaluation
 
