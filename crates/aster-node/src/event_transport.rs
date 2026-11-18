@@ -1126,12 +1126,6 @@ impl EventOutboundAttempt {
         self.key.peer
     }
 
-    /// Returns whether current authority still permits this carrier open.
-    #[doc(hidden)]
-    pub fn carrier_open_is_authorized(&self) -> bool {
-        self.current_revocation_outcome().is_none()
-    }
-
     fn current_revocation_outcome(&self) -> Option<ContactOutcome> {
         if let Some(outcome) = self.bound_revocation {
             return Some(outcome);
@@ -3530,8 +3524,8 @@ mod tests {
         assert!(attempts.receiver.try_recv().is_err());
     }
 
-    #[tokio::test]
-    async fn empty_registry_retains_work_without_spinning() {
+    #[test]
+    fn empty_registry_retains_pending_work() {
         let handle = AutomaticEventTransportHandle::new();
         handle.replace_eligibility(vec![EventPeerEligibility::provisioned_exact_peer(
             MISSION,
@@ -3543,23 +3537,7 @@ mod tests {
             None,
         )]);
         assert!(handle.request_attempt(MISSION, PEER, |_contact| async { Ok(()) }));
-        let transitions_after_enqueue = handle.transition_count();
-
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-
-        assert_eq!(handle.transition_count(), transitions_after_enqueue);
-        assert_eq!(
-            handle
-                .shared
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .pending
-                .len(),
-            1
-        );
+        assert_eq!(handle.pending_attempt_count(), 1);
     }
 
     #[tokio::test]

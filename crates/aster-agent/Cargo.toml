@@ -65,7 +65,6 @@ connectrpc-build.workspace = true
 [dev-dependencies]
 aster-host = { path = "../aster-host", features = ["test-support"] }
 aster-profile = { path = "../aster-profile" }
-memchr.workspace = true
 connectrpc = { workspace = true, features = ["client", "json", "server"] }
 
 [lints]

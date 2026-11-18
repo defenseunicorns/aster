@@ -19,6 +19,11 @@ pub(crate) const DISCOVERY_OBSERVATION_QUEUE_CAPACITY: usize = 64;
 const DISCOVERY_DEVICE_WATCHER_CAPACITY: usize = 64;
 const DISCOVERY_INITIAL_DEVICE_INSPECTION_CAPACITY: usize = 256;
 const BACKEND_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+// BlueZ reports the encoded advertisement capacity: flags (3 bytes), the
+// complete 128-bit service UUID field (18), and 128-bit service data carrying
+// the 40-byte roster record (58). This is a Linux adapter implementation bound,
+// not a protocol limit.
+const MIN_ROSTER_ADVERTISEMENT_BYTES: u8 = 79;
 
 pub(crate) type PlatformFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, DriverError>> + Send + 'a>>;
@@ -139,7 +144,7 @@ fn validate_advertising_support(
 ) -> Result<(), DriverError> {
     if supported_instances <= active_instances
         || !secondary_channels.contains(&adv::SecondaryChannel::OneM)
-        || capabilities.max_advertisement_length < 79
+        || capabilities.max_advertisement_length < MIN_ROSTER_ADVERTISEMENT_BYTES
     {
         return Err(advertising_unsupported());
     }
@@ -1262,13 +1267,13 @@ mod tests {
     fn advertising_eligibility_requires_capacity_instance_and_one_m_phy() {
         let channels = [bluer::adv::SecondaryChannel::OneM].into_iter().collect();
         let mut capabilities = bluer::adv::Capabilities::default();
-        capabilities.max_advertisement_length = 79;
+        capabilities.max_advertisement_length = MIN_ROSTER_ADVERTISEMENT_BYTES;
 
         assert!(validate_advertising_support(2, 1, &channels, &capabilities).is_ok());
         assert!(validate_advertising_support(1, 1, &channels, &capabilities).is_err());
 
         let mut short = bluer::adv::Capabilities::default();
-        short.max_advertisement_length = 78;
+        short.max_advertisement_length = MIN_ROSTER_ADVERTISEMENT_BYTES - 1;
         assert!(validate_advertising_support(2, 1, &channels, &short).is_err());
         assert!(validate_advertising_support(2, 1, &Default::default(), &capabilities).is_err());
     }

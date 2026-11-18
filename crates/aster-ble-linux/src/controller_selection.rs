@@ -2,17 +2,17 @@ use bluer::{Address, AddressType};
 use std::fmt;
 
 /// Maximum number of controller candidates retained from one BlueZ sweep.
-pub const MAX_CONTROLLER_CANDIDATES: usize = 8;
+pub(crate) const MAX_CONTROLLER_CANDIDATES: usize = 8;
 
 /// Maximum UTF-8 byte length of one canonical BlueZ adapter name.
-pub const MAX_ADAPTER_NAME_BYTES: usize = 64;
+const MAX_ADAPTER_NAME_BYTES: usize = 64;
 
 /// Maximum support or safety rows retained by one admission policy.
-pub const MAX_ADMISSION_ROWS: usize = 32;
+const MAX_ADMISSION_ROWS: usize = 32;
 
 /// Closed reason attached to a controller probe or admission result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProbeReason {
+pub(crate) enum ProbeReason {
     /// The controller address family is not an LE address family.
     UnsupportedAddressFamily,
     /// The controller protocol is unavailable.
@@ -43,7 +43,7 @@ pub enum ProbeReason {
 
 /// Result of one bounded controller compatibility attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProbeDisposition {
+pub(crate) enum ProbeDisposition {
     /// Every required compatibility preflight gate passed.
     Compatible,
     /// The controller cannot provide a required protocol capability.
@@ -56,7 +56,7 @@ pub enum ProbeDisposition {
 
 /// Release-evidence tag for a compatible controller fingerprint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SupportTag {
+pub(crate) enum SupportTag {
     /// The exact fingerprint has retained release evidence.
     Qualified,
     /// No exact retained release evidence exists.
@@ -107,12 +107,13 @@ impl ControllerFingerprint {
     }
 
     /// Replaces the optional firmware identity with a bounded value.
-    pub fn set_firmware(&mut self, firmware: Option<&str>) {
+    #[cfg(test)]
+    pub(crate) fn set_firmware(&mut self, firmware: Option<&str>) {
         self.firmware = bounded_field(firmware);
     }
 
     /// Whether every field used to identify this fingerprint is present.
-    pub fn is_complete(&self) -> bool {
+    pub(crate) fn is_complete(&self) -> bool {
         [
             &self.os,
             &self.architecture,
@@ -165,11 +166,11 @@ fn bounded_field(value: Option<&str>) -> Option<String> {
 
 /// Immutable exact support evidence row.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SupportRow {
+pub struct ControllerSupportRow {
     fingerprint: ControllerFingerprint,
 }
 
-impl SupportRow {
+impl ControllerSupportRow {
     /// Creates an exact support row for one fingerprint.
     pub fn exact(fingerprint: ControllerFingerprint) -> Self {
         Self { fingerprint }
@@ -178,11 +179,11 @@ impl SupportRow {
 
 /// Immutable package-bound known-unsafe fingerprint rule.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UnsafeRule {
+pub struct ControllerUnsafeRule {
     fingerprint: ControllerFingerprint,
 }
 
-impl UnsafeRule {
+impl ControllerUnsafeRule {
     /// Creates an exact rule; missing candidate fields overlap ambiguously.
     pub fn exact(fingerprint: ControllerFingerprint) -> Self {
         Self { fingerprint }
@@ -191,29 +192,29 @@ impl UnsafeRule {
 
 /// Admission result kept separate from compatibility probing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ControllerAdmission {
+pub(crate) struct ControllerAdmission {
     support: SupportTag,
     disposition: ProbeDisposition,
 }
 
 impl ControllerAdmission {
     /// Support evidence tag.
-    pub const fn support(self) -> SupportTag {
+    pub(crate) const fn support(self) -> SupportTag {
         self.support
     }
 
     /// Policy disposition.
-    pub const fn disposition(self) -> ProbeDisposition {
+    pub(crate) const fn disposition(self) -> ProbeDisposition {
         self.disposition
     }
 }
 
-/// Local admission policy with immutable production tables and bounded test injection.
+/// Local admission policy with bounded immutable package-owned tables.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControllerAdmissionPolicy {
     qualified_only: bool,
-    support_rows: BoundedRows<SupportRow>,
-    unsafe_rules: BoundedRows<UnsafeRule>,
+    support_rows: BoundedRows<ControllerSupportRow>,
+    unsafe_rules: BoundedRows<ControllerUnsafeRule>,
     unsafe_overflowed: bool,
 }
 
@@ -238,24 +239,24 @@ impl<T> BoundedRows<T> {
 
 impl Default for ControllerAdmissionPolicy {
     fn default() -> Self {
-        Self::with_rows(false, Vec::new(), Vec::new())
+        Self {
+            qualified_only: false,
+            support_rows: BoundedRows::from_vec(Vec::new()),
+            unsafe_rules: BoundedRows::from_vec(Vec::new()),
+            unsafe_overflowed: false,
+        }
     }
 }
 
 impl ControllerAdmissionPolicy {
-    /// Creates the default policy with no retained support or unsafe rows.
-    pub fn with_qualified_only(qualified_only: bool) -> Self {
-        Self::with_rows(qualified_only, Vec::new(), Vec::new())
-    }
-
-    /// Creates a policy from injected rows, retaining at most [`MAX_ADMISSION_ROWS`] per table.
+    /// Creates a policy from package-owned rows, retaining at most 32 rows per table.
     ///
     /// Missing support evidence remains unqualified. Missing safety evidence fails closed for
     /// every controller because an omitted unsafe row cannot be distinguished from a match.
-    pub fn with_rows(
+    pub fn new(
         qualified_only: bool,
-        support_rows: Vec<SupportRow>,
-        unsafe_rules: Vec<UnsafeRule>,
+        support_rows: Vec<ControllerSupportRow>,
+        unsafe_rules: Vec<ControllerUnsafeRule>,
     ) -> Self {
         let unsafe_overflowed = unsafe_rules.len() > MAX_ADMISSION_ROWS;
         Self {
@@ -266,13 +267,8 @@ impl ControllerAdmissionPolicy {
         }
     }
 
-    /// Whether an exact support row is required for admission.
-    pub const fn qualified_only(&self) -> bool {
-        self.qualified_only
-    }
-
     /// Evaluates support and safety policy for a typed fingerprint.
-    pub fn admit(&self, fingerprint: &ControllerFingerprint) -> ControllerAdmission {
+    pub(crate) fn admit(&self, fingerprint: &ControllerFingerprint) -> ControllerAdmission {
         let support = if self.support_rows.iter().any(|row| {
             row.fingerprint.is_complete()
                 && fingerprint.is_complete()
@@ -351,8 +347,7 @@ fn overlap(expected: &ControllerFingerprint, actual: &ControllerFingerprint) -> 
 
 /// Typed address snapshot associated with one controller candidate.
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub struct ControllerSnapshot {
-    powered: bool,
+pub(crate) struct ControllerSnapshot {
     address: Address,
     address_type: AddressType,
 }
@@ -361,7 +356,6 @@ impl fmt::Debug for ControllerSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ControllerSnapshot")
-            .field("powered", &self.powered)
             .field("address", &"[REDACTED]")
             .field("address_type", &self.address_type)
             .finish()
@@ -370,48 +364,43 @@ impl fmt::Debug for ControllerSnapshot {
 
 impl ControllerSnapshot {
     /// Creates a snapshot from typed BlueZ properties.
-    pub const fn new(powered: bool, address: Address, address_type: AddressType) -> Self {
+    pub(crate) const fn new(address: Address, address_type: AddressType) -> Self {
         Self {
-            powered,
             address,
             address_type,
         }
     }
 
-    /// Whether BlueZ reported the controller powered.
-    pub const fn powered(self) -> bool {
-        self.powered
-    }
-
     /// Exact transient controller address.
-    pub const fn address(self) -> Address {
+    pub(crate) const fn address(self) -> Address {
         self.address
     }
 
     /// Exact typed controller address family.
-    pub const fn address_type(self) -> AddressType {
+    pub(crate) const fn address_type(self) -> AddressType {
         self.address_type
     }
 }
 
 /// Candidate retained from a bounded BlueZ inventory.
 #[derive(Clone, Eq, PartialEq)]
-pub struct ControllerCandidate {
+pub(crate) struct ControllerCandidate {
     name: String,
     snapshot: Option<ControllerSnapshot>,
 }
 
 impl ControllerCandidate {
     /// Creates a candidate with an exact typed controller address snapshot.
-    pub fn new(name: String, address: Address, address_type: AddressType) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(name: String, address: Address, address_type: AddressType) -> Self {
         Self {
             name,
-            snapshot: Some(ControllerSnapshot::new(true, address, address_type)),
+            snapshot: Some(ControllerSnapshot::new(address, address_type)),
         }
     }
 
     /// Creates a candidate from a snapshot without widening its fields.
-    pub fn from_snapshot(name: String, snapshot: ControllerSnapshot) -> Self {
+    pub(crate) fn from_snapshot(name: String, snapshot: ControllerSnapshot) -> Self {
         Self {
             name,
             snapshot: Some(snapshot),
@@ -426,22 +415,22 @@ impl ControllerCandidate {
     }
 
     /// Canonical epoch-local adapter name.
-    pub fn name(&self) -> &str {
+    pub(crate) fn name(&self) -> &str {
         &self.name
     }
 
     /// Exact transient controller address, when a property snapshot is present.
-    pub fn address(&self) -> Option<Address> {
+    pub(crate) fn address(&self) -> Option<Address> {
         self.snapshot.map(ControllerSnapshot::address)
     }
 
     /// Exact typed controller address family, when present.
-    pub fn address_type(&self) -> Option<AddressType> {
+    pub(crate) fn address_type(&self) -> Option<AddressType> {
         self.snapshot.map(ControllerSnapshot::address_type)
     }
 
     /// Current typed property snapshot, if one has been read.
-    pub const fn snapshot(&self) -> Option<ControllerSnapshot> {
+    pub(crate) const fn snapshot(&self) -> Option<ControllerSnapshot> {
         self.snapshot
     }
 }
@@ -458,33 +447,23 @@ impl fmt::Debug for ControllerCandidate {
 
 /// Bounded canonical controller inventory for one BlueZ sweep.
 #[derive(Clone, Eq, PartialEq)]
-pub struct ControllerInventory {
+pub(crate) struct ControllerInventory {
     candidates: Vec<ControllerCandidate>,
-    overflowed: bool,
 }
 
 impl ControllerInventory {
     /// Retained candidates in deterministic preference order.
-    pub fn candidates(&self) -> &[ControllerCandidate] {
+    pub(crate) fn candidates(&self) -> &[ControllerCandidate] {
         &self.candidates
     }
 
     /// Retained names, useful for deterministic diagnostics and tests.
-    pub fn names(&self) -> Vec<&str> {
+    #[cfg(test)]
+    fn names(&self) -> Vec<&str> {
         self.candidates
             .iter()
             .map(ControllerCandidate::name)
             .collect()
-    }
-
-    /// Whether at least one valid candidate was omitted by the eight-slot bound.
-    pub const fn overflowed(&self) -> bool {
-        self.overflowed
-    }
-
-    /// Redacted `8+` overflow count: zero or one, never per-entry cardinality.
-    pub const fn overflow_count(&self) -> u8 {
-        self.overflowed as u8
     }
 }
 
@@ -493,13 +472,12 @@ impl fmt::Debug for ControllerInventory {
         formatter
             .debug_struct("ControllerInventory")
             .field("retained", &self.candidates.len())
-            .field("overflowed", &self.overflowed)
             .finish()
     }
 }
 
 /// Canonicalizes, deduplicates, orders, and bounds one already-materialized BlueZ name vector.
-pub fn normalize_controller_inventory(
+pub(crate) fn normalize_controller_inventory(
     adapter_names: Vec<String>,
     selected: Option<&str>,
     diagnostic_override: Option<&str>,
@@ -507,7 +485,6 @@ pub fn normalize_controller_inventory(
     let selected = selected.and_then(canonical_name);
     let diagnostic_override = diagnostic_override.and_then(canonical_name);
     let mut retained = Vec::with_capacity(MAX_CONTROLLER_CANDIDATES);
-    let mut overflowed = false;
 
     for raw_name in adapter_names {
         let Some(name) = canonical_name(&raw_name) else {
@@ -553,7 +530,6 @@ pub fn normalize_controller_inventory(
         if let Some(index) = evict {
             retained[index] = ControllerCandidate::named(name);
         }
-        overflowed = true;
     }
 
     retained.sort_by(|left, right| {
@@ -572,7 +548,6 @@ pub fn normalize_controller_inventory(
 
     ControllerInventory {
         candidates: retained,
-        overflowed,
     }
 }
 
@@ -604,7 +579,6 @@ fn preference_rank(name: &str, selected: Option<&str>, override_name: Option<&st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bluer::{Address, AddressType};
 
     fn fingerprint() -> ControllerFingerprint {
         ControllerFingerprint::new(
@@ -635,7 +609,6 @@ mod tests {
         );
 
         assert_eq!(inventory.names(), &["hci0", "hci1", "hci2"]);
-        assert!(!inventory.overflowed());
     }
 
     #[test]
@@ -652,20 +625,6 @@ mod tests {
                 "hci10", "hci9", "hci0", "hci1", "hci2", "hci3", "hci4", "hci5"
             ]
         );
-        assert!(inventory.overflowed());
-    }
-
-    #[test]
-    fn inventory_reports_eight_plus_once() {
-        let inventory = normalize_controller_inventory(
-            (0..12).map(|index| format!("hci{index}")).collect(),
-            None,
-            None,
-        );
-
-        assert_eq!(inventory.candidates().len(), MAX_CONTROLLER_CANDIDATES);
-        assert!(inventory.overflowed());
-        assert_eq!(inventory.overflow_count(), 1);
     }
 
     #[test]
@@ -702,7 +661,6 @@ mod tests {
         );
 
         assert_eq!(inventory.names(), &["hci0"]);
-        assert!(!inventory.overflowed());
     }
 
     #[test]
@@ -716,7 +674,7 @@ mod tests {
 
     #[test]
     fn qualified_only_blocks_unqualified_candidate() {
-        let policy = ControllerAdmissionPolicy::with_qualified_only(true);
+        let policy = ControllerAdmissionPolicy::new(true, Vec::new(), Vec::new());
         let admission = policy.admit(&fingerprint());
 
         assert_eq!(admission.support(), SupportTag::Unqualified);
@@ -735,9 +693,9 @@ mod tests {
         partial_row.set_firmware(None);
 
         assert_eq!(
-            ControllerAdmissionPolicy::with_rows(
+            ControllerAdmissionPolicy::new(
                 false,
-                vec![SupportRow::exact(complete.clone())],
+                vec![ControllerSupportRow::exact(complete.clone())],
                 Vec::new(),
             )
             .admit(&partial_observed)
@@ -745,9 +703,9 @@ mod tests {
             SupportTag::Unqualified
         );
         assert_eq!(
-            ControllerAdmissionPolicy::with_rows(
+            ControllerAdmissionPolicy::new(
                 false,
-                vec![SupportRow::exact(partial_row.clone())],
+                vec![ControllerSupportRow::exact(partial_row.clone())],
                 Vec::new(),
             )
             .admit(&partial_row)
@@ -755,9 +713,9 @@ mod tests {
             SupportTag::Unqualified
         );
         assert_eq!(
-            ControllerAdmissionPolicy::with_rows(
+            ControllerAdmissionPolicy::new(
                 false,
-                vec![SupportRow::exact(complete.clone())],
+                vec![ControllerSupportRow::exact(complete.clone())],
                 Vec::new(),
             )
             .admit(&complete)
@@ -771,10 +729,10 @@ mod tests {
         let candidate = fingerprint();
         let mut non_matching = candidate.clone();
         non_matching.set_firmware(Some("other-firmware"));
-        let mut unsafe_rules = vec![UnsafeRule::exact(non_matching); MAX_ADMISSION_ROWS];
-        unsafe_rules.push(UnsafeRule::exact(candidate.clone()));
+        let mut unsafe_rules = vec![ControllerUnsafeRule::exact(non_matching); MAX_ADMISSION_ROWS];
+        unsafe_rules.push(ControllerUnsafeRule::exact(candidate.clone()));
 
-        let policy = ControllerAdmissionPolicy::with_rows(false, vec![], unsafe_rules);
+        let policy = ControllerAdmissionPolicy::new(false, vec![], unsafe_rules);
         let mut unrelated = candidate.clone();
         unrelated.set_firmware(Some("unrelated"));
 
@@ -791,10 +749,10 @@ mod tests {
     #[test]
     fn exact_unsafe_rule_blocks_candidate() {
         let fingerprint = fingerprint();
-        let policy = ControllerAdmissionPolicy::with_rows(
+        let policy = ControllerAdmissionPolicy::new(
             false,
             vec![],
-            vec![UnsafeRule::exact(fingerprint.clone())],
+            vec![ControllerUnsafeRule::exact(fingerprint.clone())],
         );
         let admission = policy.admit(&fingerprint);
 
@@ -808,10 +766,10 @@ mod tests {
     fn ambiguous_unsafe_overlap_fails_closed() {
         let mut candidate = fingerprint();
         candidate.set_firmware(None);
-        let policy = ControllerAdmissionPolicy::with_rows(
+        let policy = ControllerAdmissionPolicy::new(
             false,
             vec![],
-            vec![UnsafeRule::exact(fingerprint())],
+            vec![ControllerUnsafeRule::exact(fingerprint())],
         );
         let admission = policy.admit(&candidate);
 
@@ -819,18 +777,6 @@ mod tests {
             admission.disposition(),
             ProbeDisposition::Blocked(ProbeReason::AmbiguousUnsafeOverlap)
         );
-    }
-
-    #[test]
-    fn candidate_keeps_typed_address_snapshot() {
-        let candidate = ControllerCandidate::new(
-            "hci0".to_owned(),
-            Address::new([2, 0, 0, 0, 0, 1]),
-            AddressType::LeRandom,
-        );
-
-        assert_eq!(candidate.address_type(), Some(AddressType::LeRandom));
-        assert_eq!(candidate.address(), Some(Address::new([2, 0, 0, 0, 0, 1])));
     }
 
     #[test]

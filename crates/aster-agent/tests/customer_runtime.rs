@@ -1155,15 +1155,18 @@ mod btle {
         let running = start_with_optional_btle(&fixture, btle).await;
         automatic.await.expect("automatic handle observed");
         assert_eq!(
+            control.initial_snapshot(),
+            EventAdapterSnapshot::new(
+                EventTransportKind::BLE_L2CAP_V1,
+                0,
+                EventAdapterState::Unavailable,
+                true,
+                100,
+            )
+        );
+        assert_eq!(
             publish_event_status(fixture.application(), fixture.token_bytes()).await,
             200
-        );
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), control.recv_attempt())
-                .await
-                .is_err(),
-            "epoch-zero unavailable lane must not receive durable work"
         );
         control.publish(1, EventAdapterState::Available);
         let selected = tokio::time::timeout(Duration::from_secs(2), control.recv_attempt())
@@ -1187,7 +1190,7 @@ mod btle {
         let fixture = CustomerFixture::new();
         let (btle, control, automatic) = automatic_test_runtime(&fixture, "selection");
         let running = start_with_optional_btle(&fixture, btle).await;
-        automatic.await.expect("automatic handle observed");
+        let automatic = automatic.await.expect("automatic handle observed");
         assert_eq!(
             publish_event_status(fixture.application(), fixture.token_bytes()).await,
             200
@@ -1206,12 +1209,49 @@ mod btle {
             publish_event_status(fixture.application(), fixture.token_bytes()).await,
             200
         );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), control.recv_attempt())
-                .await
-                .is_err(),
-            "withdrawn availability must leave durable work pending"
+        let mission = aster_node::mission::UnprotectedReferenceMission::from_bytes(
+            include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle")
+                .to_vec(),
+        )
+        .expect("public test mission");
+        assert_eq!(
+            automatic.replace_eligibility(vec![
+                EventPeerEligibility::provisioned_exact_peer(
+                    mission.mission_authority_id(),
+                    [0xaa; 32],
+                    EventTransportKind::BLE_L2CAP_V1,
+                    true,
+                    1,
+                    0,
+                    None,
+                ),
+                EventPeerEligibility::provisioned_exact_peer(
+                    mission.mission_authority_id(),
+                    [0xaa; 32],
+                    EventTransportKind::IROH_QUIC_V1,
+                    true,
+                    1,
+                    0,
+                    None,
+                ),
+            ]),
+            Some(aster_node::AutomaticEventRosterStatus::Scheduled)
         );
+        let (_iroh_control, mut iroh_attempts) = automatic
+            .register(EventAdapterSnapshot::new(
+                EventTransportKind::IROH_QUIC_V1,
+                0,
+                EventAdapterState::Available,
+                true,
+                100,
+            ))
+            .expect("register available comparison lane");
+        let selected = tokio::time::timeout(Duration::from_secs(2), iroh_attempts.recv())
+            .await
+            .expect("pending durable work selects an available lane")
+            .expect("comparison lane remains registered");
+        assert_eq!(selected.transport_kind(), EventTransportKind::IROH_QUIC_V1);
+        selected.cancel_carrier_open();
         running.stop_clean().await;
     }
 
@@ -1926,6 +1966,7 @@ fn test_btle_artifact() -> Vec<u8> {
     target_os = "linux"
 ))]
 struct AutomaticTestState {
+    initial_snapshot: Mutex<Option<EventAdapterSnapshot>>,
     adapter: Mutex<Option<EventAdapterControl>>,
     attempts: tokio::sync::Mutex<Option<EventAttemptReceiver>>,
     trace: Mutex<Vec<&'static str>>,
@@ -1960,6 +2001,14 @@ struct AutomaticTestControl {
     target_os = "linux"
 ))]
 impl AutomaticTestControl {
+    fn initial_snapshot(&self) -> EventAdapterSnapshot {
+        self.state
+            .initial_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("automatic adapter initial snapshot")
+    }
+
     fn publish(&self, epoch: u64, availability: EventAdapterState) {
         let adapter = self
             .state
@@ -2059,6 +2108,7 @@ fn automatic_test_runtime(
     let prepared =
         prepare_customer_btle_credential(fixture, label).expect("prepared discovery credential");
     let state = Arc::new(AutomaticTestState {
+        initial_snapshot: Mutex::new(None),
         adapter: Mutex::new(None),
         attempts: tokio::sync::Mutex::new(None),
         trace: Mutex::new(Vec::new()),
@@ -2074,6 +2124,11 @@ fn automatic_test_runtime(
                 config.local_mission_authority_id(),
                 expected_local_mission_authority_id
             );
+            *owner_state
+                .initial_snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(registration.initial_snapshot());
             let (_, adapter, attempts) = registration.into_parts();
             *owner_state
                 .adapter

@@ -157,7 +157,7 @@ type PreparedNodeValidation<P> =
 /// use std::path::Path;
 ///
 /// fn cannot_bypass_prepared_authority(policy: ValidatedBtlePolicy) {
-///     let _ = BtleRuntimeStartup::radio_inert((), policy, Path::new("/var/lib/aster-agent"));
+///     let _ = BtleRuntimeStartup::automatic_linux((), policy, Path::new("/var/lib/aster-agent"));
 /// }
 /// ```
 #[cfg_attr(
@@ -241,56 +241,6 @@ impl BtleRuntimeStartup {
     ) -> Self {
         self.cleanup_retired_observer = Some(std::sync::Arc::new(observer));
         self
-    }
-
-    /// Retains the validated authority in an unavailable, RF-inert owner.
-    #[cfg(feature = "systemd-provider")]
-    pub fn radio_inert<L, C>(
-        prepared: PreparedDiscoveryCredential<L, C>,
-        policy: ValidatedBtlePolicy,
-        state_root: &Path,
-    ) -> Result<Self, BtleRuntimeOwnerError>
-    where
-        L: DiscoveryCredentialArtifactProvider + Send + 'static,
-        C: TrustedClock + Send + 'static,
-    {
-        let scope = *policy.deployment_scope_id();
-        if !prepared
-            .matches_binding(scope, state_root)
-            .map_err(|_| BtleRuntimeOwnerError::Startup)?
-        {
-            return Err(BtleRuntimeOwnerError::Startup);
-        }
-        let configured_priority = policy.configured_priority();
-        let authority_state_root = state_root.to_path_buf();
-        let authority = prepared.retire_material();
-        Ok(Self {
-            policy: Some(policy),
-            authority_state_root: Some(authority_state_root),
-            start: Some(Box::new(move |node| {
-                validate_active_authority(&authority, scope, node)?;
-                let registration = node
-                    .automatic_event_transports()
-                    .register_paired(EventAdapterSnapshot::new(
-                        EventTransportKind::BLE_L2CAP_V1,
-                        0,
-                        EventAdapterState::Unavailable,
-                        true,
-                        configured_priority,
-                    ))
-                    .ok_or(BtleRuntimeOwnerError::Startup)?;
-                let (_, adapter, attempts) = registration.into_parts();
-                let owner = unavailable_owner(adapter, attempts, ());
-                Ok(StartedBtleRuntime::without_schedule(Box::new(
-                    AuthorityBtleRuntimeOwner::start(owner, policy, authority),
-                )))
-            })),
-            installs_peer_eligibility: false,
-            #[cfg(feature = "sdk-test-support")]
-            node_shutdown_observer: None,
-            #[cfg(feature = "sdk-test-support")]
-            cleanup_retired_observer: None,
-        })
     }
 
     /// Composes the production automatic Linux BTLE owner.
@@ -758,11 +708,10 @@ impl ActiveBtleRuntime {
                 TerminalObservation::Owner(false) => {}
                 TerminalObservation::Schedule(result) => {
                     self.schedule.take();
-                    if matches!(result, Ok(EventScheduleExit::AdmissionClosed)) {
-                        continue;
+                    if !matches!(result, Ok(EventScheduleExit::AdmissionClosed)) {
+                        self.unexpected_schedule_exit = true;
+                        return;
                     }
-                    self.unexpected_schedule_exit = true;
-                    return;
                 }
             }
         }

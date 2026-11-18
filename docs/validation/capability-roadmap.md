@@ -83,9 +83,10 @@ The authoritative capability status, increment boundary, exclusions, and
 release gates are maintained in the
 [production BTLE design](../superpowers/specs/2026-11-03-production-btle-design.md#delivery-model-and-capability-ledger).
 This roadmap does not duplicate that ledger. The current candidate remains an
-exact-peer, Event-only Linux source path until Task 7 verification and Task 8
-exact-device evidence pass; it makes no package, hardware-support, other data
-type, requirement-credit, or production-authorization claim.
+exact-peer, Event-only Linux source path until the BT-E1 focused verification,
+exact-device evidence, package, and qualification exits pass. It makes no
+hardware-support, other data type, requirement-credit, or release-authorization
+claim.
 
 ## Purpose
 

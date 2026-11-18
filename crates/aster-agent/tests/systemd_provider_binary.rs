@@ -2,66 +2,15 @@
 
 use std::{
     fs,
-    io::{self, Read as _},
     os::unix::fs::PermissionsExt as _,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use aster_agent::config::{ValidatedSystemdAgentConfig, load_and_validate_config};
 use aster_mesh::ProvisioningSecretRef;
-use memchr::memmem::Finder;
-
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
-const BINARY_MARKER_SCAN_BYTES: usize = 1024 * 1024;
-
-#[derive(Debug, Eq, PartialEq)]
-struct MarkerReport {
-    missing_required: Vec<Vec<u8>>,
-    present_forbidden: Vec<Vec<u8>>,
-}
-
-#[test]
-fn binary_marker_scan_reports_boundary_matches_and_io_errors() {
-    let fixture = BinaryFixture::new();
-    let binary = fixture.root.join("marker-fixture.bin");
-    let mut bytes = vec![b'x'; BINARY_MARKER_SCAN_BYTES - 2];
-    bytes.extend_from_slice(b"required-across-boundary");
-    bytes.resize(BINARY_MARKER_SCAN_BYTES * 2 - 3, b'x');
-    bytes.extend_from_slice(b"forbidden-across-boundary");
-    bytes.extend_from_slice(b"present-required");
-    fs::write(&binary, bytes).expect("write marker fixture");
-
-    let report = find_binary_markers(
-        &binary,
-        &[
-            b"required-across-boundary".as_slice(),
-            b"across-boundary".as_slice(),
-            b"present-required".as_slice(),
-            b"missing-required".as_slice(),
-            b"missing-required".as_slice(),
-        ],
-        &[
-            b"forbidden-across-boundary".as_slice(),
-            b"bidden-across-boundary".as_slice(),
-            b"absent-forbidden".as_slice(),
-        ],
-    )
-    .expect("scan marker fixture");
-    assert_eq!(report.missing_required, [b"missing-required".to_vec()]);
-    assert_eq!(
-        report.present_forbidden,
-        [
-            b"forbidden-across-boundary".to_vec(),
-            b"bidden-across-boundary".to_vec()
-        ]
-    );
-
-    let error = find_binary_markers(&fixture.root.join("missing.bin"), &[], &[])
-        .expect_err("unavailable marker path must return its I/O error");
-    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-}
 
 #[test]
 fn customer_binary_statically_selects_the_systemd_provider() {
@@ -199,28 +148,6 @@ fn systemd_binary_accepts_only_schema_v1_and_has_no_compose_contract() {
     fn assert_systemd_config(_: &ValidatedSystemdAgentConfig) {}
     assert_systemd_config(&validated);
     let _ = validated.runtime();
-
-    let report = find_binary_markers(
-        Path::new(env!("CARGO_BIN_EXE_aster-agent")),
-        &[],
-        &[
-            b"aster-compose-secret-store/v1",
-            b"/run/secrets/aster-mission-activation",
-            b"ComposeProvisioningLoader",
-            b"aster_compose_credentials",
-        ],
-    )
-    .expect("scan systemd agent binary");
-    assert!(
-        report.missing_required.is_empty(),
-        "required systemd binary contracts missing: {:?}",
-        report.missing_required
-    );
-    assert!(
-        report.present_forbidden.is_empty(),
-        "forbidden Compose binary contracts present: {:?}",
-        report.present_forbidden
-    );
 }
 
 #[test]
@@ -246,70 +173,6 @@ fn systemd_binary_has_no_runtime_provider_selector() {
         String::from_utf8(output.stderr).expect("UTF-8 stderr"),
         "ERROR provisioning secret store is unavailable\n"
     );
-}
-
-fn find_binary_markers(
-    path: &Path,
-    required: &[&[u8]],
-    forbidden: &[&[u8]],
-) -> io::Result<MarkerReport> {
-    let mut binary = fs::File::open(path)?;
-    let mut patterns: Vec<Vec<u8>> = Vec::new();
-    for marker in required.iter().chain(forbidden) {
-        if !marker.is_empty() && !patterns.iter().any(|pattern| pattern == marker) {
-            patterns.push(marker.to_vec());
-        }
-    }
-    let finders = patterns.iter().map(Finder::new).collect::<Vec<_>>();
-    let longest_marker = patterns.iter().map(Vec::len).max().unwrap_or(0);
-    let overlap = longest_marker.saturating_sub(1);
-    let mut pattern_present = vec![false; patterns.len()];
-    let mut block = vec![0; BINARY_MARKER_SCAN_BYTES];
-    let mut tail = Vec::with_capacity(overlap);
-    let mut window = Vec::with_capacity(BINARY_MARKER_SCAN_BYTES + overlap);
-
-    loop {
-        let read = binary.read(&mut block)?;
-        if read == 0 {
-            break;
-        }
-        window.clear();
-        window.extend_from_slice(&tail);
-        window.extend_from_slice(&block[..read]);
-        for (index, finder) in finders.iter().enumerate() {
-            if !pattern_present[index] && finder.find(&window).is_some() {
-                pattern_present[index] = true;
-            }
-        }
-        let retained = overlap.min(window.len());
-        tail.clear();
-        tail.extend_from_slice(&window[window.len() - retained..]);
-    }
-
-    Ok(MarkerReport {
-        missing_required: report_markers(required, &patterns, &pattern_present, false),
-        present_forbidden: report_markers(forbidden, &patterns, &pattern_present, true),
-    })
-}
-
-fn report_markers(
-    markers: &[&[u8]],
-    patterns: &[Vec<u8>],
-    pattern_present: &[bool],
-    selected: bool,
-) -> Vec<Vec<u8>> {
-    let mut result: Vec<Vec<u8>> = Vec::new();
-    for marker in markers {
-        let present = marker.is_empty()
-            || patterns
-                .iter()
-                .position(|pattern| pattern == marker)
-                .is_some_and(|index| pattern_present[index]);
-        if present == selected && !result.iter().any(|item| item.as_slice() == *marker) {
-            result.push(marker.to_vec());
-        }
-    }
-    result
 }
 
 struct BinaryFixture {

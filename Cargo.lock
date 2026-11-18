@@ -283,7 +283,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
- "memchr",
  "redb",
  "rustix",
  "serde",

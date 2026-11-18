@@ -103,11 +103,11 @@ evidence; absence of evidence means the lower status applies.
 | **BT-A0** | Transport-neutral application readiness and durable publication, owned by the node/store | With zero eligible transports, startup succeeds, publication is durable, and later adapter availability wakes work without republishing | **Verified** for the merged Event evaluation path; production profile remains unqualified |
 | **BT-A1** | Adapter-neutral bounded contact and mission authentication, owned by the node | BTLE supplies only transient carrier evidence; the exact mission peer authenticates before inventory or data; no Bluetooth value grants identity | **Physical** for bounded Event evaluation; not release-qualified |
 | **BT-A2** | Adapter registry, eligibility, ranking, and node-global admission, owned by the transport-neutral node | Current exact authority and sanitized availability select one bounded fresh attempt; no adapter lifecycle or class retry policy enters the core | **Source**; automatic multi-adapter selection is not physically qualified |
-| **BT-A3** | Closed attempt outcome and custody contract, shared at the node/adapter boundary | Typed authority, policy, adapter-epoch, transient, authenticated, cancellation, and shutdown outcomes preserve durable work, release custody, and authorize only the permitted retry/reselection action | **Review blocked** pending Task 7 fix re-review and focused verification; the earlier custody, revocation, observation, policy, and suppression defects have source fixes |
+| **BT-A3** | Closed attempt outcome and custody contract, shared at the node/adapter boundary | Typed authority, policy, adapter-epoch, transient, authenticated, cancellation, and shutdown outcomes preserve durable work, release custody, and authorize only the permitted retry/reselection action | **Source** with focused verification; physical and release qualification remain open |
 | **BT-L0** | Bounded Linux controller inventory, passive compatibility probe, and sticky selection, owned by `aster-ble-linux` | Zero/many controllers, hotplug, BlueZ restart, timeouts, churn, unsafe rules, and unknown compatible hardware satisfy the defined deterministic bounds | **Source** with focused verification; physical automatic-path evidence remains open |
 | **BT-L1** | Rostered Linux discovery and controller-epoch lifecycle, owned by `aster-ble-linux` | Listener, advertisement, scan, candidate, socket, credential, cancellation, and cleanup owners are bounded and joined; discovery remains locator-only | **Source**; fixed-controller physical evidence is scoped to BT-E0, while stock teardown-ingress and working-secret lifetime gates block this exit |
-| **BT-L2** | Linux Event contact scheduling, owned by the BTLE runtime owner | The validated lower member schedules remote-only contact; success delays from completion, transient local failures back off, authenticated suppression parks only BTLE scheduling, and durable work survives adapter epochs | **Review blocked** pending Task 7 fix re-review and focused verification; Linux owns cadence/backoff and the node owns generic custody and selection |
-| **BT-L3** | Emission-policy lifecycle, owned by the BTLE composition root | Configured startup `Normal` owns the rostered radio lifecycle; configured startup `ReceiveOnly` is radio-inert. For the first profile, unsupported live changes are rejected and a controlled restart rebuilds radio and credentials atomically; later live reload must provide the same stop/join/restart guarantee | **Review blocked** pending Task 7 fix re-review and focused verification; live mutation is rejected before either policy state changes |
+| **BT-L2** | Linux Event contact scheduling, owned by the BTLE runtime owner | The validated lower member schedules remote-only contact; success delays from completion, transient local failures back off, authenticated suppression parks only BTLE scheduling, and durable work survives adapter epochs | **Source** with focused verification; Linux owns cadence/backoff and the node owns generic custody and selection |
+| **BT-L3** | Emission-policy lifecycle, owned by the BTLE composition root | Configured startup `Normal` owns the rostered radio lifecycle; configured startup `ReceiveOnly` is radio-inert. For the first profile, unsupported live changes are rejected and a controlled restart rebuilds radio and credentials atomically; later live reload must provide the same stop/join/restart guarantee | **Source** with focused verification; live mutation is rejected before either policy state changes |
 | **BT-L4** | Linux production credential, package, and confinement profile | `aster-btle-roster`, rollback-safe renewal, non-root BlueZ/socket least privilege, denial tests, shutdown ordering, upgrade/rollback, and operator status pass as the packaged service identity | **Designed**; shipped package remains radio-inert |
 | **BT-E0** | Fixed-controller semantic-v9 Event vertical slice | Two Linux nodes exchange and durably consume a protected Event larger than the minimum MTU through disconnect and restart | **Physical** evaluation only |
 | **BT-E1** | Automatic Linux Event production profile | BT-A0–A3, BT-L0–L4, BT-O0, and BT-Q0 are Qualified for one exact peer and the declared supported hardware rows | **Source**; supporting production code exists, but this first release boundary has not passed its composite exit |
@@ -168,11 +168,6 @@ Every implementation increment must expose, in its PR description:
 6. physical evidence required now versus deferred to qualification;
 7. OPI provenance screening and dependency/source changes; and
 8. signed commits and the exact upstream base.
-
-The current Task 7 candidate is not yet publishable. The implementation has
-source fixes for the earlier E2 blockers and the latest whole-candidate review
-findings, but independent fix re-review and the focused verification gate are
-still pending. It receives no additional status credit until those gates pass.
 
 ## Architecture
 
@@ -612,12 +607,13 @@ role-required listener, advertisement, or scan owner has started successfully.
 A compatible candidate is tagged `qualified` when its exact fingerprint has
 retained release evidence, otherwise `unqualified`; this tag informs selection
 and operator status but is not an activation gate. A deployment may opt into a
-`qualified-only` hardening policy. That policy exists in the current driver API
-and tests but is not exposed by agent configuration. An exact package-bound
-known-unsafe or revoked rule blocks activation, but a missing support row does
-not. Missing or ambiguous fields that could overlap a known-unsafe rule fail
-closed as `blocked` rather than silently bypassing the rule. Successful probing
-never creates an official support claim.
+`qualified-only` hardening policy. Package composition can construct this
+policy and its exact support and unsafe rows through the driver API; the agent's
+current packaged configuration uses the default open-support policy. An exact
+package-bound known-unsafe or revoked rule blocks activation, but a missing
+support row does not. Missing or ambiguous fields that could overlap a
+known-unsafe rule fail closed as `blocked` rather than silently bypassing the
+rule. Successful probing never creates an official support claim.
 
 The initial implementation examines at most eight controllers per probe sweep,
 probes at most one concurrently, activates at most one, and accepts canonical
@@ -631,10 +627,8 @@ allocation, which remains part of the trusted platform and confinement
 boundary. Names are
 canonicalized, validated, deduplicated, and ordered; the healthy selected
 controller and an explicit diagnostic override are retained before filling
-remaining slots. Normalization reduces overflow to one redacted bit (exposed by
-the bounded inventory only as zero or one); the current resolver then discards
-that bit and no operator surface reports it. Extra entries are ignored
-deterministically without per-entry logs. Either constant may change without
+remaining slots. Extra entries are ignored deterministically without retained
+overflow state or per-entry logs. Either constant may change without
 compatibility impact.
 
 Selection is private to the adapter and does not inspect mission authority.

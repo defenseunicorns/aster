@@ -44380,7 +44380,6 @@ mod tests {
         assert_eq!(revoked.reason(), ContactReason::AuthorityChanged);
         old_attempt.finish_revoked();
         let current_attempt = attempts.recv().await.expect("current-authority attempt");
-        assert!(current_attempt.carrier_open_is_authorized());
         assert_eq!(
             current_attempt.cancel_carrier_open().disposition(),
             ContactDisposition::Cancelled

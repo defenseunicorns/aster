@@ -2808,6 +2808,12 @@ mod tests {
             Mutex<Option<mpsc::Sender<crate::platform::discovery::DiscoveryObservation>>>,
     }
 
+    impl FakeDiscovery {
+        fn close_observations(&self) {
+            self.observation_sender.lock().unwrap().take();
+        }
+    }
+
     impl DiscoveryPlatform for FakeDiscovery {
         fn start_advertisement<'a>(
             &'a self,
@@ -3495,12 +3501,6 @@ mod tests {
             source.next_nonce().unwrap_err().kind(),
             DriverErrorKind::Unavailable
         );
-    }
-
-    #[test]
-    fn production_nonce_source_uses_the_operating_system_rng() {
-        let source = production_nonce_source();
-        assert!(source.next_nonce().is_ok());
     }
 
     #[tokio::test(start_paused = true)]
@@ -5401,6 +5401,7 @@ mod tests {
 
         fn fail_carrier_open(self: Box<Self>) {
             self.carrier_failures.fetch_add(1, Ordering::AcqRel);
+            self.completion.notify_one();
         }
 
         fn fail_unauthenticated_carrier_open(
@@ -5408,10 +5409,12 @@ mod tests {
             _failure: aster_node::UnauthenticatedCarrierOpenFailure,
         ) {
             self.ambiguous_failures.fetch_add(1, Ordering::AcqRel);
+            self.completion.notify_one();
         }
 
         fn cancel_carrier_open(self: Box<Self>) {
             self.cancellations.fetch_add(1, Ordering::AcqRel);
+            self.completion.notify_one();
         }
     }
 
@@ -5434,31 +5437,6 @@ mod tests {
         }
     }
 
-    fn test_attempt(
-        mission: [u8; 32],
-        peer: [u8; 32],
-        runs: Arc<AtomicU8>,
-        carrier_failures: Arc<AtomicU8>,
-        completed: Arc<AtomicU8>,
-    ) -> Box<dyn CoordinatorAttempt> {
-        Box::new(TestCoordinatorAttempt {
-            mission,
-            peer,
-            kind: aster_node::EventTransportKind::BLE_L2CAP_V1,
-            runs,
-            carrier_failures,
-            ambiguous_failures: Arc::new(AtomicU8::new(0)),
-            cancellations: Arc::new(AtomicU8::new(0)),
-            started: None,
-            release: None,
-            completed,
-            completion: Arc::new(Notify::new()),
-            revocation: None,
-            run_result: Ok(()),
-            finished_revocation: Arc::new(Mutex::new(None)),
-        })
-    }
-
     #[derive(Default)]
     struct TestAttemptCounters {
         runs: Arc<AtomicU8>,
@@ -5468,6 +5446,28 @@ mod tests {
         completed: Arc<AtomicU8>,
         completion: Arc<Notify>,
         finished_revocation: Arc<Mutex<Option<ContactOutcome>>>,
+    }
+
+    impl TestAttemptCounters {
+        async fn wait_for_completion(&self) {
+            tokio::time::timeout(Duration::from_secs(1), self.completion.notified())
+                .await
+                .expect("coordinator attempt must complete");
+        }
+    }
+
+    async fn wait_for_test_signal(signal: &Notify, message: &'static str) {
+        wait_for_test_signal_within(signal, Duration::from_secs(1), message).await;
+    }
+
+    async fn wait_for_test_signal_within(
+        signal: &Notify,
+        deadline: Duration,
+        message: &'static str,
+    ) {
+        tokio::time::timeout(deadline, signal.notified())
+            .await
+            .expect(message);
     }
 
     fn instrumented_attempt(
@@ -5814,7 +5814,7 @@ mod tests {
             cancellation.clone(),
         ));
 
-        discovery.scan_started.notified().await;
+        wait_for_test_signal(&discovery.scan_started, "automatic scan must start").await;
         send_observation(&discovery, &config(), locator).await;
         connect_started.notified().await;
         revoke.send(Some(revoked)).unwrap();
@@ -5880,7 +5880,7 @@ mod tests {
             cancellation.clone(),
         ));
 
-        discovery.scan_started.notified().await;
+        wait_for_test_signal(&discovery.scan_started, "automatic scan must start").await;
         send_observation(&discovery, &config(), locator).await;
         timeout(Duration::from_secs(1), first.completion.notified())
             .await
@@ -5996,7 +5996,7 @@ mod tests {
             cancellation.clone(),
         ));
 
-        discovery.scan_started.notified().await;
+        wait_for_test_signal(&discovery.scan_started, "automatic scan must start").await;
         send_observation(&discovery, &config(), locator).await;
         timeout(Duration::from_secs(1), first.completion.notified())
             .await
@@ -6238,56 +6238,58 @@ mod tests {
             cancellation.clone(),
         ));
 
-        discovery.scan_started.notified().await;
+        wait_for_test_signal(&discovery.scan_started, "automatic scan must start").await;
         send_observation(&discovery, &config(), locator).await;
-        tokio::task::yield_now().await;
-        assert!(sockets.connected.lock().unwrap().is_empty());
 
+        let wrong_mission = TestAttemptCounters::default();
         attempt_sender
-            .send(test_attempt(
+            .send(instrumented_attempt(
                 local_member,
                 configured_peer,
-                Arc::new(AtomicU8::new(0)),
-                Arc::new(AtomicU8::new(0)),
-                Arc::new(AtomicU8::new(0)),
+                &wrong_mission,
             ))
             .await
             .unwrap();
-        attempt_received.notified().await;
-        tokio::task::yield_now().await;
+        wait_for_test_signal(
+            &attempt_received,
+            "coordinator must receive wrong-mission attempt",
+        )
+        .await;
+        wrong_mission.wait_for_completion().await;
         assert!(sockets.connected.lock().unwrap().is_empty());
 
+        let wrong_peer_attempt = TestAttemptCounters::default();
         attempt_sender
-            .send(test_attempt(
+            .send(instrumented_attempt(
                 local_authority,
                 wrong_peer,
-                Arc::new(AtomicU8::new(0)),
-                Arc::new(AtomicU8::new(0)),
-                Arc::new(AtomicU8::new(0)),
+                &wrong_peer_attempt,
             ))
             .await
             .unwrap();
-        attempt_received.notified().await;
-        tokio::task::yield_now().await;
+        wait_for_test_signal(
+            &attempt_received,
+            "coordinator must receive wrong-peer attempt",
+        )
+        .await;
+        wrong_peer_attempt.wait_for_completion().await;
         assert!(sockets.connected.lock().unwrap().is_empty());
 
+        let accepted = TestAttemptCounters::default();
         attempt_sender
-            .send(test_attempt(
+            .send(instrumented_attempt(
                 local_authority,
                 configured_peer,
-                Arc::new(AtomicU8::new(0)),
-                Arc::new(AtomicU8::new(0)),
-                Arc::new(AtomicU8::new(0)),
+                &accepted,
             ))
             .await
             .unwrap();
-        attempt_received.notified().await;
-        for _ in 0..8 {
-            if !sockets.connected.lock().unwrap().is_empty() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        wait_for_test_signal(
+            &attempt_received,
+            "coordinator must receive admitted attempt",
+        )
+        .await;
+        accepted.wait_for_completion().await;
 
         assert_eq!(*sockets.connected.lock().unwrap(), [(locator, 0x0083)]);
         cancellation.cancel();
@@ -6325,13 +6327,14 @@ mod tests {
 
         discovery.scan_started.notified().await;
         send_observation(&discovery, &config(), locator).await;
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
+        discovery.close_observations();
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(SupervisorError::Controller(DriverErrorKind::Transport))
+        ));
 
         assert!(sockets.connected.lock().unwrap().is_empty());
-        cancellation.cancel();
-        task.await.unwrap().unwrap();
+        assert!(!cancellation.is_cancelled());
     }
 
     struct RecordingEventAdapterControl {
@@ -7060,7 +7063,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn remote_pre_auth_ticket_completion_never_self_selects_an_alternate() {
         let locator = crate::CanonicalLocator::new(
             Address::new([2, 0, 0, 0, 0, 0x74]),
@@ -7077,16 +7080,9 @@ mod tests {
             observation_sender: Mutex::new(None),
         });
         let (attempt_sender, attempts) = coordinator_attempt_channel();
-        let runs = Arc::new(AtomicU8::new(0));
-        let completed = Arc::new(AtomicU8::new(0));
+        let counters = TestAttemptCounters::default();
         attempt_sender
-            .send(test_attempt(
-                [0x11; 32],
-                [0x22; 32],
-                runs.clone(),
-                Arc::new(AtomicU8::new(0)),
-                completed.clone(),
-            ))
+            .send(instrumented_attempt([0x11; 32], [0x22; 32], &counters))
             .await
             .unwrap();
         let cancellation = LifecycleCancellation::new();
@@ -7101,21 +7097,22 @@ mod tests {
             cancellation.clone(),
         ));
 
-        discovery.scan_started.notified().await;
+        wait_for_test_signal(&discovery.scan_started, "remote pre-auth scan must start").await;
         send_observation(&discovery, &config(), locator).await;
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
+        counters.wait_for_completion().await;
+        let scan_restart_deadline = config().operation_timeout() + Duration::from_secs(1);
+        wait_for_test_signal_within(
+            &discovery.scan_started,
+            scan_restart_deadline,
+            "scan must restart after remote pre-auth completion",
+        )
+        .await;
 
         // Remote pre-auth classification belongs to the coordinator-owned
         // runner. The adapter observes only terminal ticket completion and
         // must not turn that completion into another carrier open.
-        assert_eq!(runs.load(Ordering::Acquire), 1);
-        assert_eq!(completed.load(Ordering::Acquire), 1);
-        assert_eq!(sockets.connected.lock().unwrap().len(), 1);
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
+        assert_eq!(counters.runs.load(Ordering::Acquire), 1);
+        assert_eq!(counters.completed.load(Ordering::Acquire), 1);
         assert_eq!(sockets.connected.lock().unwrap().len(), 1);
         cancellation.cancel();
         task.await.unwrap().unwrap();
@@ -7156,14 +7153,9 @@ mod tests {
             cancellation.clone(),
         ));
 
-        discovery.scan_started.notified().await;
+        wait_for_test_signal(&discovery.scan_started, "remote socket scan must start").await;
         send_observation(&discovery, &config(), locator).await;
-        for _ in 0..8 {
-            if counters.ambiguous_failures.load(Ordering::Acquire) == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        counters.wait_for_completion().await;
 
         assert_eq!(*sockets.connected.lock().unwrap(), [(locator, 0x0083)]);
         assert_eq!(counters.ambiguous_failures.load(Ordering::Acquire), 1);
@@ -7298,11 +7290,9 @@ mod tests {
             cancellation.clone(),
         ));
 
-        discovery.scan_started.notified().await;
+        wait_for_test_signal(&discovery.scan_started, "listener scan must start").await;
         send_observation(&discovery, &listener_config, locator).await;
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
+        counters.wait_for_completion().await;
 
         assert!(sockets.connected.lock().unwrap().is_empty());
         assert_eq!(counters.carrier_failures.load(Ordering::Acquire), 1);

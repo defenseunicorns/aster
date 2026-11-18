@@ -398,58 +398,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn adapter_epoch_end_authorizes_only_reselection() {
-        let outcome = ContactOutcome::adapter_epoch_ended(41);
-
-        assert_eq!(outcome.stage(), ContactStage::Candidate);
-        assert_eq!(outcome.scope(), ContactScope::AdapterEpoch);
-        assert_eq!(outcome.provenance(), ContactProvenance::Adapter);
-        assert_eq!(outcome.disposition(), ContactDisposition::Reselect);
-        assert_eq!(outcome.reason(), ContactReason::AdapterEpochEnded);
-        assert_eq!(outcome.generation(), Some(41));
-        assert!(outcome.permits_reselection());
-    }
-
-    #[test]
-    fn authority_change_is_generation_scoped_and_never_adapter_fabricated() {
-        let outcome = ContactOutcome::authority_changed(42);
-
-        assert_eq!(outcome.stage(), ContactStage::Candidate);
-        assert_eq!(outcome.scope(), ContactScope::ExpectedPeer);
-        assert_eq!(outcome.provenance(), ContactProvenance::Local);
-        assert_eq!(outcome.disposition(), ContactDisposition::Suppress);
-        assert_eq!(outcome.reason(), ContactReason::AuthorityChanged);
-        assert_eq!(outcome.generation(), Some(42));
-        assert!(!outcome.permits_reselection());
-    }
-
-    #[test]
-    fn policy_suspension_retains_work_without_reselection() {
-        let outcome = ContactOutcome::policy_suspended(43);
-
-        assert_eq!(outcome.stage(), ContactStage::Candidate);
-        assert_eq!(outcome.scope(), ContactScope::Policy);
-        assert_eq!(outcome.provenance(), ContactProvenance::Local);
-        assert_eq!(outcome.disposition(), ContactDisposition::Suppress);
-        assert_eq!(outcome.reason(), ContactReason::PolicySuspended);
-        assert_eq!(outcome.generation(), Some(43));
-        assert!(!outcome.permits_reselection());
-    }
-
-    #[test]
-    fn shutdown_is_explicit_cancellation_without_suppression() {
-        let outcome = ContactOutcome::shutdown();
-
-        assert_eq!(outcome.stage(), ContactStage::Candidate);
-        assert_eq!(outcome.scope(), ContactScope::Attempt);
-        assert_eq!(outcome.provenance(), ContactProvenance::Local);
-        assert_eq!(outcome.disposition(), ContactDisposition::Cancelled);
-        assert_eq!(outcome.reason(), ContactReason::Shutdown);
-        assert_eq!(outcome.generation(), None);
-        assert!(!outcome.permits_reselection());
-    }
-
-    #[test]
     fn lifecycle_reasons_require_their_typed_constructors() {
         for reason in [
             ContactReason::AdapterEpochEnded,

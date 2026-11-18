@@ -1,7 +1,7 @@
 use crate::{
-    BtleOperatorEvent, BtleOperatorOutput, ControllerAdmissionPolicy, ControllerCandidate,
-    ControllerFingerprint, ControllerProbeLimits, ControllerSnapshot, DriverError, DriverErrorKind,
-    LifecycleCancellation, ProbeDisposition, ProbeReason, SupportTag,
+    BtleOperatorEvent, BtleOperatorOutput, ControllerAdmission, ControllerAdmissionPolicy,
+    ControllerCandidate, ControllerFingerprint, ControllerProbeLimits, ControllerSnapshot,
+    DriverError, DriverErrorKind, LifecycleCancellation, ProbeDisposition, ProbeReason, SupportTag,
     controller::{
         AdapterSignal, BluezBackend, BluezFailure, BluezSession, ProductionBluez, SessionSignal,
         SessionStream,
@@ -264,7 +264,6 @@ pub(crate) fn spawn_linux_controller_resolver(
         Arc::new(BluezResolverPlatform::new(Arc::new(ProductionBluez))),
         Arc::new(ProductionResolverProbe),
         activator,
-        None,
     )
 }
 
@@ -315,8 +314,7 @@ trait ResolverProbe: Send + Sync {
     fn probe<'a>(
         &'a self,
         candidate: &'a ControllerCandidate,
-        fingerprint: &'a ControllerFingerprint,
-        policy: &'a ControllerAdmissionPolicy,
+        admission: ControllerAdmission,
         cancellation: &'a LifecycleCancellation,
         limits: ControllerProbeLimits,
     ) -> ResolverProbeFuture<'a>;
@@ -425,11 +423,7 @@ impl ResolverSession for BluezResolverSession {
                 controllers.push(ObservedController::new(
                     ControllerCandidate::from_snapshot(
                         named.name().to_owned(),
-                        ControllerSnapshot::new(
-                            snapshot.powered,
-                            snapshot.address,
-                            snapshot.address_type,
-                        ),
+                        ControllerSnapshot::new(snapshot.address, snapshot.address_type),
                     ),
                     platform_fingerprint(),
                 ));
@@ -505,16 +499,14 @@ impl ResolverProbe for ProductionResolverProbe {
     fn probe<'a>(
         &'a self,
         candidate: &'a ControllerCandidate,
-        fingerprint: &'a ControllerFingerprint,
-        policy: &'a ControllerAdmissionPolicy,
+        admission: ControllerAdmission,
         cancellation: &'a LifecycleCancellation,
         limits: ControllerProbeLimits,
     ) -> ResolverProbeFuture<'a> {
         Box::pin(probe_controller(
             &PRODUCTION_PROBE_BACKEND,
             candidate,
-            fingerprint,
-            policy,
+            admission,
             cancellation,
             limits,
         ))
@@ -539,8 +531,6 @@ struct ResolverActor {
     refresh_not_before: Option<Instant>,
     backoff: CappedBackoff,
     operational_backoff: CappedBackoff,
-    #[cfg(test)]
-    epoch_updates: Option<tokio::sync::mpsc::Sender<LifecycleCancellationObserver>>,
 }
 
 enum SessionAction {
@@ -785,8 +775,7 @@ impl ResolverActor {
                 () = self.cancellation.cancelled() => return SweepOutcome::Cancelled,
                 result = timeout(candidate_limit, self.probe.probe(
                     &controller.candidate,
-                    &controller.fingerprint,
-                    &self.policy,
+                    admission,
                     &self.cancellation,
                     self.limits,
                 )) => result.unwrap_or(ProbeDisposition::Indeterminate(ProbeReason::DeadlineExceeded)),
@@ -824,10 +813,6 @@ impl ResolverActor {
 
     async fn select(&mut self, controller: ObservedController) -> bool {
         let owner = ControllerEpochOwner::new(controller, self.inventory_generation);
-        #[cfg(test)]
-        if let Some(updates) = &self.epoch_updates {
-            let _ = updates.try_send(owner.cancellation.observer());
-        }
         let operational = match owner.view().and_then(|view| self.activator.activate(view)) {
             Ok(operational) => operational,
             Err(_) => {
@@ -1371,8 +1356,6 @@ fn spawn_resolver(
     platform: Arc<dyn ResolverPlatform>,
     probe: Arc<dyn ResolverProbe>,
     activator: Arc<dyn ControllerEpochActivator>,
-    #[cfg(test)] epoch_updates: Option<tokio::sync::mpsc::Sender<LifecycleCancellationObserver>>,
-    #[cfg(not(test))] _epoch_updates: Option<()>,
 ) -> LinuxControllerResolver {
     let cancellation = LifecycleCancellation::new();
     let (updates, status) = watch::channel(ControllerResolutionSnapshot::initial());
@@ -1394,8 +1377,6 @@ fn spawn_resolver(
         refresh_not_before: None,
         backoff: CappedBackoff::new(INITIAL_RESOLVER_RETRY, MAXIMUM_RESOLVER_RETRY),
         operational_backoff: CappedBackoff::new(INITIAL_RESOLVER_RETRY, MAXIMUM_RESOLVER_RETRY),
-        #[cfg(test)]
-        epoch_updates,
     };
     let task = tokio::spawn(actor.run());
     LinuxControllerResolver {
@@ -1408,6 +1389,23 @@ fn spawn_resolver(
 
 #[cfg(test)]
 struct TestOperationalActivator;
+
+#[cfg(test)]
+struct ObservingActivator {
+    inner: Arc<dyn ControllerEpochActivator>,
+    epochs: tokio::sync::mpsc::Sender<LifecycleCancellationObserver>,
+}
+
+#[cfg(test)]
+impl ControllerEpochActivator for ObservingActivator {
+    fn activate(
+        &self,
+        epoch: ControllerEpochView<'_>,
+    ) -> Result<Box<dyn OperationalControllerEpoch>, DriverError> {
+        let _ = self.epochs.try_send(epoch.cancellation());
+        self.inner.activate(epoch)
+    }
+}
 
 #[cfg(test)]
 impl ControllerEpochActivator for TestOperationalActivator {
@@ -1484,16 +1482,12 @@ fn spawn_linux_controller_resolver_with(
     tokio::sync::mpsc::Receiver<LifecycleCancellationObserver>,
 ) {
     let (epoch_updates, epochs) = tokio::sync::mpsc::channel(8);
+    let activator = Arc::new(ObservingActivator {
+        inner: Arc::new(TestOperationalActivator),
+        epochs: epoch_updates,
+    });
     (
-        spawn_resolver(
-            policy,
-            limits,
-            output,
-            platform,
-            probe,
-            Arc::new(TestOperationalActivator),
-            Some(epoch_updates),
-        ),
+        spawn_resolver(policy, limits, output, platform, probe, activator),
         epochs,
     )
 }
@@ -1504,7 +1498,8 @@ mod tests {
     use crate::{
         BtleOperatorEvent, BtleOperatorOutput, ControllerAdmissionPolicy, ControllerCandidate,
         ControllerFingerprint, ControllerProbeLimits, ControllerSnapshot, LifecycleCancellation,
-        ProbeDisposition, ProbeReason, SupportRow, UnsafeRule,
+        ProbeDisposition, ProbeReason,
+        controller_selection::{ControllerSupportRow, ControllerUnsafeRule},
     };
     use bluer::{Address, AddressType};
     use std::{
@@ -1563,11 +1558,13 @@ mod tests {
     struct DropWitnessSession {
         inner: Box<dyn ResolverSession>,
         dropped: Arc<AtomicBool>,
+        dropped_changed: Arc<Notify>,
     }
 
     impl Drop for DropWitnessSession {
         fn drop(&mut self) {
             self.dropped.store(true, Ordering::Release);
+            self.dropped_changed.notify_one();
         }
     }
 
@@ -1595,12 +1592,43 @@ mod tests {
         events: Arc<AtomicUsize>,
     }
 
+    #[derive(Default)]
+    struct AsyncCounter {
+        value: AtomicUsize,
+        changed: Notify,
+    }
+
+    impl AsyncCounter {
+        fn increment(&self) {
+            self.value.fetch_add(1, Ordering::SeqCst);
+            self.changed.notify_waiters();
+        }
+
+        fn load(&self) -> usize {
+            self.value.load(Ordering::SeqCst)
+        }
+
+        async fn wait_for(&self, count: usize) {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let changed = self.changed.notified();
+                    if self.load() >= count {
+                        return;
+                    }
+                    changed.await;
+                }
+            })
+            .await
+            .expect("test counter must reach its observation bound");
+        }
+    }
+
     struct AlwaysReadySession {
-        observations: Arc<AtomicUsize>,
+        observations: Arc<AsyncCounter>,
     }
 
     struct OperationalRetryFloodSession {
-        events: Arc<AtomicUsize>,
+        events: Arc<AsyncCounter>,
     }
 
     struct HealthyEventFloodSession {
@@ -1645,7 +1673,7 @@ mod tests {
             &'a mut self,
             _selected: Option<&'a str>,
         ) -> ResolverFuture<'a, ObservedInventory> {
-            self.observations.fetch_add(1, Ordering::SeqCst);
+            self.observations.increment();
             Box::pin(async { Ok(ObservedInventory::bounded(Vec::new())) })
         }
 
@@ -1663,7 +1691,7 @@ mod tests {
         }
 
         fn next_event(&mut self) -> ResolverEventFuture<'_> {
-            self.events.fetch_add(1, Ordering::SeqCst);
+            self.events.increment();
             Box::pin(async { Some(ResolverEvent::InventoryChanged { removed: None }) })
         }
     }
@@ -1815,8 +1843,7 @@ mod tests {
         fn probe<'a>(
             &'a self,
             candidate: &'a ControllerCandidate,
-            _fingerprint: &'a ControllerFingerprint,
-            _policy: &'a ControllerAdmissionPolicy,
+            _admission: ControllerAdmission,
             cancellation: &'a LifecycleCancellation,
             _limits: ControllerProbeLimits,
         ) -> ResolverProbeFuture<'a> {
@@ -1855,8 +1882,10 @@ mod tests {
     #[derive(Default)]
     struct RecordingActivator {
         states: Mutex<Vec<watch::Sender<OperationalEpochState>>>,
+        activation_changed: Notify,
         selected: Mutex<Vec<String>>,
         events: Arc<Mutex<Vec<&'static str>>>,
+        events_changed: Arc<Notify>,
         quiesce_gate: Mutex<Option<Arc<Notify>>>,
         fail_join: Arc<std::sync::atomic::AtomicBool>,
         suppress_join: Arc<std::sync::atomic::AtomicBool>,
@@ -1874,6 +1903,20 @@ mod tests {
 
         fn activation_count(&self) -> usize {
             self.states.lock().unwrap().len()
+        }
+
+        async fn wait_for_activations(&self, count: usize) {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let changed = self.activation_changed.notified();
+                    if self.activation_count() >= count {
+                        return;
+                    }
+                    changed.await;
+                }
+            })
+            .await
+            .expect("controller activation must make progress");
         }
 
         fn selected(&self) -> Vec<String> {
@@ -1963,10 +2006,12 @@ mod tests {
                 .unwrap()
                 .push(epoch.adapter_name().to_owned());
             self.states.lock().unwrap().push(updates.clone());
+            self.activation_changed.notify_waiters();
             Ok(Box::new(RecordingOperationalEpoch {
                 updates,
                 status,
                 events: self.events.clone(),
+                events_changed: self.events_changed.clone(),
                 quiesce_gate: self.quiesce_gate.lock().unwrap().clone(),
                 fail_join: self.fail_join.clone(),
                 suppress_join: self.suppress_join.clone(),
@@ -1998,6 +2043,7 @@ mod tests {
         updates: watch::Sender<OperationalEpochState>,
         status: watch::Receiver<OperationalEpochState>,
         events: Arc<Mutex<Vec<&'static str>>>,
+        events_changed: Arc<Notify>,
         quiesce_gate: Option<Arc<Notify>>,
         fail_join: Arc<std::sync::atomic::AtomicBool>,
         suppress_join: Arc<std::sync::atomic::AtomicBool>,
@@ -2082,6 +2128,7 @@ mod tests {
 
         fn quiesce(&mut self) -> OperationalEpochFuture<'_, Result<(), DriverError>> {
             self.events.lock().unwrap().push("quiesce");
+            self.events_changed.notify_waiters();
             self.updates
                 .send_replace(OperationalEpochState::Unavailable);
             let gate = self.quiesce_gate.clone();
@@ -2095,14 +2142,17 @@ mod tests {
 
         fn cancel(&self) {
             self.events.lock().unwrap().push("cancel");
+            self.events_changed.notify_waiters();
         }
 
         fn join(self: Box<Self>) -> OperationalEpochFuture<'static, OperationalEpochOutcome> {
             self.events.lock().unwrap().push("join");
+            self.events_changed.notify_waiters();
             if self.suppress_join.load(Ordering::Acquire) {
                 Box::pin(async { OperationalEpochOutcome::Suppressed })
             } else if self.fail_join.load(Ordering::Acquire) {
                 self.events.lock().unwrap().push("force");
+                self.events_changed.notify_waiters();
                 Box::pin(async {
                     OperationalEpochOutcome::Terminal(DriverError::new(
                         DriverErrorKind::Transport,
@@ -2174,23 +2224,31 @@ mod tests {
         }
 
         async fn wait_for_delivered_events(&self, count: usize) {
-            loop {
-                let notified = self.delivered_event.notified();
-                if self.delivered_event_count() >= count {
-                    return;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let notified = self.delivered_event.notified();
+                    if self.delivered_event_count() >= count {
+                        return;
+                    }
+                    notified.await;
                 }
-                notified.await;
-            }
+            })
+            .await
+            .expect("resolver event delivery must make progress");
         }
 
         async fn wait_for_observations(&self, count: usize) {
-            loop {
-                let notified = self.observation.notified();
-                if self.observation_count() >= count {
-                    return;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let notified = self.observation.notified();
+                    if self.observation_count() >= count {
+                        return;
+                    }
+                    notified.await;
                 }
-                notified.await;
-            }
+            })
+            .await
+            .expect("controller observation must make progress");
         }
     }
 
@@ -2216,7 +2274,7 @@ mod tests {
         ObservedController::new(
             ControllerCandidate::from_snapshot(
                 name.to_owned(),
-                ControllerSnapshot::new(true, address(last), AddressType::LeRandom),
+                ControllerSnapshot::new(address(last), AddressType::LeRandom),
             ),
             fingerprint,
         )
@@ -2259,6 +2317,10 @@ mod tests {
         mpsc::Receiver<LifecycleCancellationObserver>,
     ) {
         let (epoch_updates, epochs) = mpsc::channel(8);
+        let activator = Arc::new(ObservingActivator {
+            inner: activator,
+            epochs: epoch_updates,
+        });
         (
             spawn_resolver(
                 policy,
@@ -2267,7 +2329,6 @@ mod tests {
                 platform,
                 probe,
                 activator,
-                Some(epoch_updates),
             ),
             epochs,
         )
@@ -2283,6 +2344,10 @@ mod tests {
     ) {
         let (output, events) = BtleOperatorOutput::bounded();
         let (epoch_updates, epochs) = mpsc::channel(8);
+        let activator = Arc::new(ObservingActivator {
+            inner: activator,
+            epochs: epoch_updates,
+        });
         let resolver = spawn_resolver(
             ControllerAdmissionPolicy::default(),
             limits(),
@@ -2290,7 +2355,6 @@ mod tests {
             Arc::new(FakePlatform::new([Ok(session)])),
             Arc::new(FakeProbe::compatible()),
             activator,
-            Some(epoch_updates),
         );
         (resolver, events, epochs)
     }
@@ -2307,8 +2371,12 @@ mod tests {
 
     async fn wait_for_events(activator: &RecordingActivator, count: usize) {
         tokio::time::timeout(Duration::from_secs(1), async {
-            while activator.events().len() < count {
-                tokio::task::yield_now().await;
+            loop {
+                let changed = activator.events_changed.notified();
+                if activator.events.lock().unwrap().len() >= count {
+                    return;
+                }
+                changed.await;
             }
         })
         .await
@@ -2365,7 +2433,6 @@ mod tests {
             refresh_not_before: None,
             backoff: CappedBackoff::new(INITIAL_RESOLVER_RETRY, MAXIMUM_RESOLVER_RETRY),
             operational_backoff: CappedBackoff::new(INITIAL_RESOLVER_RETRY, MAXIMUM_RESOLVER_RETRY),
-            epoch_updates: None,
         }
     }
 
@@ -2614,9 +2681,6 @@ mod tests {
 
         activator.latest_state(OperationalEpochState::Unavailable);
         wait_for_events(&activator, 3).await;
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
         assert_eq!(activator.activation_count(), 1);
         assert_eq!(probe.calls(), ["hci0"]);
 
@@ -2634,9 +2698,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(activator.activation_count(), 1);
         tokio::time::advance(Duration::from_millis(1)).await;
-        while activator.activation_count() < 2 {
-            tokio::task::yield_now().await;
-        }
+        activator.wait_for_activations(2).await;
 
         activator.latest_state(OperationalEpochState::Unavailable);
         wait_for_events(&activator, 6).await;
@@ -2644,9 +2706,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(activator.activation_count(), 2);
         tokio::time::advance(Duration::from_millis(1)).await;
-        while activator.activation_count() < 3 {
-            tokio::task::yield_now().await;
-        }
+        activator.wait_for_activations(3).await;
 
         assert_eq!(probe.calls(), ["hci0", "hci0", "hci0"]);
         stop(resolver).await;
@@ -2656,9 +2716,11 @@ mod tests {
     async fn automatic_controller_suppression_parks_unavailable_until_shutdown() {
         let (_harness, session) = Harness::session(vec![controller("hci0", 1, fingerprint("a"))]);
         let session_dropped = Arc::new(AtomicBool::new(false));
+        let session_dropped_changed = Arc::new(Notify::new());
         let session: Box<dyn ResolverSession> = Box::new(DropWitnessSession {
             inner: session,
             dropped: session_dropped.clone(),
+            dropped_changed: session_dropped_changed.clone(),
         });
         let activator = Arc::new(RecordingActivator::default());
         activator.suppress_join();
@@ -2681,8 +2743,10 @@ mod tests {
         assert_eq!(activator.events(), ["quiesce", "cancel", "join"]);
 
         tokio::time::advance(MAXIMUM_RESOLVER_RETRY * 4).await;
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
+        if !session_dropped.load(Ordering::Acquire) {
+            tokio::time::timeout(Duration::from_secs(1), session_dropped_changed.notified())
+                .await
+                .expect("suppressed resolver session must be released");
         }
         assert!(session_dropped.load(Ordering::Acquire));
         assert_eq!(activator.activation_count(), 1);
@@ -2886,13 +2950,9 @@ mod tests {
             vec![selected, controller("hci1", 2, fingerprint("b"))],
             ResolverEvent::InventoryChanged { removed: None },
         );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while harness.observation_count() < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("unrelated inventory change must be observed");
+        tokio::time::timeout(Duration::from_secs(1), harness.wait_for_observations(2))
+            .await
+            .expect("unrelated inventory change must be observed");
 
         assert_eq!(
             status.borrow().availability(),
@@ -2905,7 +2965,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn continuous_refresh_events_allow_at_most_four_refresh_observations_per_second() {
-        let observations = Arc::new(AtomicUsize::new(0));
+        let observations = Arc::new(AsyncCounter::default());
         let session: Box<dyn ResolverSession> = Box::new(AlwaysReadySession {
             observations: observations.clone(),
         });
@@ -2915,32 +2975,24 @@ mod tests {
             Arc::new(FakePlatform::new([Ok(session)])),
             Arc::new(FakeProbe::compatible()),
         );
-        while observations.load(Ordering::SeqCst) < 1 {
-            tokio::task::yield_now().await;
-        }
-        let initial_observations = observations.load(Ordering::SeqCst);
+        observations.wait_for(1).await;
+        let initial_observations = observations.load();
 
         for completed_intervals in 0..4 {
             tokio::time::advance(Duration::from_millis(249)).await;
             tokio::task::yield_now().await;
             assert_eq!(
-                observations.load(Ordering::SeqCst),
+                observations.load(),
                 initial_observations + completed_intervals
             );
 
             tokio::time::advance(Duration::from_millis(1)).await;
-            while observations.load(Ordering::SeqCst)
-                < initial_observations + completed_intervals + 1
-            {
-                tokio::task::yield_now().await;
-            }
-            tokio::task::yield_now().await;
+            observations
+                .wait_for(initial_observations + completed_intervals + 1)
+                .await;
         }
 
-        assert_eq!(
-            observations.load(Ordering::SeqCst) - initial_observations,
-            4
-        );
+        assert_eq!(observations.load() - initial_observations, 4);
         stop(resolver).await;
     }
 
@@ -2970,9 +3022,9 @@ mod tests {
             },
         );
         wait_for_status(&mut status, RuntimeAvailability::Unavailable).await;
-        while !epoch.is_cancelled() {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(Duration::from_secs(1), epoch.cancelled())
+            .await
+            .expect("selected epoch must be cancelled before replacement");
 
         assert_eq!(harness.observation_count(), 1);
         assert_eq!(activator.activation_count(), 1);
@@ -2982,9 +3034,7 @@ mod tests {
         assert_eq!(activator.activation_count(), 1);
 
         tokio::time::advance(Duration::from_millis(1)).await;
-        while activator.activation_count() < 2 {
-            tokio::task::yield_now().await;
-        }
+        activator.wait_for_activations(2).await;
         assert_eq!(activator.selected(), vec!["hci0", "hci1"]);
         stop(resolver).await;
     }
@@ -3008,9 +3058,9 @@ mod tests {
 
         let delivered_before_refresh = harness.delivered_event_count();
         harness.event(ResolverEvent::InventoryChanged { removed: None });
-        while harness.delivered_event_count() == delivered_before_refresh {
-            tokio::task::yield_now().await;
-        }
+        harness
+            .wait_for_delivered_events(delivered_before_refresh + 1)
+            .await;
         tokio::time::advance(Duration::from_millis(100)).await;
         tokio::task::yield_now().await;
         assert_eq!(harness.observation_count(), 1);
@@ -3024,9 +3074,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(activator.activation_count(), 1);
         tokio::time::advance(Duration::from_millis(1)).await;
-        while activator.activation_count() < 2 {
-            tokio::task::yield_now().await;
-        }
+        activator.wait_for_activations(2).await;
 
         stop(resolver).await;
     }
@@ -3041,7 +3089,7 @@ mod tests {
         drop(operational);
         tokio::time::advance(Duration::from_millis(250)).await;
         let mut session = AlwaysReadySession {
-            observations: Arc::new(AtomicUsize::new(0)),
+            observations: Arc::new(AsyncCounter::default()),
         };
 
         let outcome = actor.wait_refresh_debounce(&mut session).await;
@@ -3054,7 +3102,10 @@ mod tests {
         let cancellation = LifecycleCancellation::new();
         let mut actor = test_actor(cancellation);
         let (epoch_updates, mut epochs) = mpsc::channel(1);
-        actor.epoch_updates = Some(epoch_updates);
+        actor.activator = Arc::new(ObservingActivator {
+            inner: Arc::new(TestOperationalActivator),
+            epochs: epoch_updates,
+        });
         assert!(actor.select(controller("hci0", 1, fingerprint("a"))).await);
         let epoch = epochs.recv().await.unwrap();
         let operational_status = actor.operational_status.as_mut().unwrap();
@@ -3221,9 +3272,9 @@ mod tests {
             controller("hci0", 1, fingerprint("unknown")),
             controller("hci1", 2, qualified.clone()),
         ]);
-        let policy = ControllerAdmissionPolicy::with_rows(
+        let policy = ControllerAdmissionPolicy::new(
             false,
-            vec![SupportRow::exact(qualified)],
+            vec![ControllerSupportRow::exact(qualified)],
             Vec::new(),
         );
         let platform = Arc::new(FakePlatform::new([Ok(session)]));
@@ -3244,7 +3295,7 @@ mod tests {
         let platform = Arc::new(FakePlatform::new([Ok(session)]));
         let probe = Arc::new(FakeProbe::compatible());
         let (resolver, _epochs) = spawn(
-            ControllerAdmissionPolicy::with_qualified_only(true),
+            ControllerAdmissionPolicy::new(true, Vec::new(), Vec::new()),
             limits(),
             platform,
             probe.clone(),
@@ -3270,10 +3321,10 @@ mod tests {
         let blocked_fingerprint = fingerprint("blocked");
         let (_blocked_harness, blocked_session) =
             Harness::session(vec![controller("hci0", 1, blocked_fingerprint.clone())]);
-        let blocked_policy = ControllerAdmissionPolicy::with_rows(
+        let blocked_policy = ControllerAdmissionPolicy::new(
             false,
             Vec::new(),
-            vec![UnsafeRule::exact(blocked_fingerprint)],
+            vec![ControllerUnsafeRule::exact(blocked_fingerprint)],
         );
         let (blocked, _epochs) = spawn(
             blocked_policy,
@@ -3361,15 +3412,7 @@ mod tests {
             vec![selected, controller("hci1", 2, fingerprint("b"))],
             ResolverEvent::InventoryChanged { removed: None },
         );
-        for _ in 1..100 {
-            harness.event(ResolverEvent::InventoryChanged { removed: None });
-        }
-        while harness.observation_count() < 2 {
-            tokio::task::yield_now().await;
-        }
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        harness.wait_for_observations(2).await;
 
         assert_eq!(
             status.borrow().availability(),
@@ -3453,9 +3496,9 @@ mod tests {
             Duration::from_secs(1),
         );
         let (resolver, _epochs) = spawn(
-            ControllerAdmissionPolicy::with_rows(
+            ControllerAdmissionPolicy::new(
                 false,
-                vec![SupportRow::exact(qualified)],
+                vec![ControllerSupportRow::exact(qualified)],
                 Vec::new(),
             ),
             tight,
@@ -3616,20 +3659,12 @@ mod tests {
             Arc::new(FakeProbe::compatible()),
             activator.clone(),
         );
-        while activator.activation_count() < 1 {
-            tokio::task::yield_now().await;
-        }
+        activator.wait_for_activations(1).await;
 
         activator.latest_state(OperationalEpochState::Unavailable);
         wait_for_events(&activator, 3).await;
         tokio::time::advance(INITIAL_RESOLVER_RETRY).await;
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while activator.activation_count() < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("operational failure rotates without a platform event");
+        activator.wait_for_activations(2).await;
 
         assert_eq!(activator.selected(), vec!["hci0", "hci1"]);
         activator.latest_state(OperationalEpochState::Available);
@@ -3683,7 +3718,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn continuously_ready_batches_yield_for_sweeps_and_external_cancellation() {
         let cancellation = LifecycleCancellation::new();
-        let observations = Arc::new(AtomicUsize::new(0));
+        let observations = Arc::new(AsyncCounter::default());
         let mut actor = test_actor(cancellation.clone());
         let session_observations = observations.clone();
         let actor_task = tokio::spawn(async move {
@@ -3693,16 +3728,12 @@ mod tests {
             actor.run_session(&mut session).await
         });
 
-        while observations.load(Ordering::SeqCst) < 1 {
-            tokio::task::yield_now().await;
-        }
+        observations.wait_for(1).await;
         tokio::time::advance(Duration::from_millis(249)).await;
         tokio::task::yield_now().await;
-        assert_eq!(observations.load(Ordering::SeqCst), 1);
+        assert_eq!(observations.load(), 1);
         tokio::time::advance(Duration::from_millis(1)).await;
-        while observations.load(Ordering::SeqCst) < 2 {
-            tokio::task::yield_now().await;
-        }
+        observations.wait_for(2).await;
 
         cancellation.cancel();
         let outcome = actor_task.await.expect("actor task must not panic");
@@ -3713,7 +3744,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn operational_retry_deadline_wins_over_continuously_ready_unrelated_events() {
         let cancellation = LifecycleCancellation::new();
-        let events = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(AsyncCounter::default());
         let mut actor = test_actor(cancellation);
         let task_events = events.clone();
         let retry = tokio::spawn(async move {
@@ -3723,29 +3754,19 @@ mod tests {
             actor.wait_operational_retry(&mut session).await
         });
 
-        while events.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
+        events.wait_for(1).await;
+        let overrun = events.load() + MAX_EVENTS_PER_BATCH + 1;
 
-        tokio::time::advance(INITIAL_RESOLVER_RETRY - Duration::from_millis(1)).await;
-        tokio::task::yield_now().await;
-        assert!(!retry.is_finished());
-        let before_deadline = events.load(Ordering::SeqCst);
+        tokio::time::advance(INITIAL_RESOLVER_RETRY).await;
 
-        tokio::time::advance(Duration::from_millis(1)).await;
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            retry.is_finished(),
-            "expired retry must not lose to event flood"
-        );
-        let outcome = retry.await.unwrap();
+        let outcome = tokio::select! {
+            biased;
+            outcome = retry => outcome.expect("retry task must not panic"),
+            () = events.wait_for(overrun) => {
+                panic!("expired retry processed another full event batch")
+            }
+        };
         assert!(matches!(outcome, SessionAction::Sweep));
-        assert!(
-            events.load(Ordering::SeqCst) - before_deadline <= MAX_EVENTS_PER_BATCH,
-            "deadline check must bound post-expiry event drainage"
-        );
     }
 
     #[tokio::test]
@@ -3778,9 +3799,9 @@ mod tests {
             Duration::from_secs(1),
         );
         let (resolver, _epochs) = spawn(
-            ControllerAdmissionPolicy::with_rows(
+            ControllerAdmissionPolicy::new(
                 false,
-                vec![SupportRow::exact(qualified.clone())],
+                vec![ControllerSupportRow::exact(qualified.clone())],
                 Vec::new(),
             ),
             tight,
@@ -3824,11 +3845,11 @@ mod tests {
             Duration::from_secs(1),
         );
         let (resolver, _epochs) = spawn(
-            ControllerAdmissionPolicy::with_rows(
+            ControllerAdmissionPolicy::new(
                 false,
                 vec![
-                    SupportRow::exact(removed),
-                    SupportRow::exact(new_qualified.clone()),
+                    ControllerSupportRow::exact(removed),
+                    ControllerSupportRow::exact(new_qualified.clone()),
                 ],
                 Vec::new(),
             ),

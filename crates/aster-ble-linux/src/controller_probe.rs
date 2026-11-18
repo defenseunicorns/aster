@@ -1,6 +1,6 @@
 use crate::{
-    ControllerAdmissionPolicy, ControllerCandidate, ControllerFingerprint, ControllerSnapshot,
-    LifecycleCancellation, ProbeDisposition, ProbeReason,
+    ControllerAdmission, ControllerCandidate, ControllerSnapshot, LifecycleCancellation,
+    ProbeDisposition, ProbeReason,
     platform::socket::{map_probe_bluer_error, map_probe_io_error, validate_dynamic_le_psm},
 };
 use bluer::{
@@ -248,8 +248,7 @@ impl ControllerProbeBackend for BluezControllerProbeBackend {
 pub(crate) async fn probe_controller<B: ControllerProbeBackend>(
     backend: &B,
     candidate: &ControllerCandidate,
-    fingerprint: &ControllerFingerprint,
-    policy: &ControllerAdmissionPolicy,
+    admission: ControllerAdmission,
     cancellation: &LifecycleCancellation,
     limits: ControllerProbeLimits,
 ) -> ProbeDisposition {
@@ -259,7 +258,6 @@ pub(crate) async fn probe_controller<B: ControllerProbeBackend>(
     let Some(snapshot) = candidate.snapshot() else {
         return ControllerProbeError::Removed.disposition();
     };
-    let admission = policy.admit(fingerprint);
     if admission.disposition() != ProbeDisposition::Compatible {
         return admission.disposition();
     }
@@ -347,9 +345,9 @@ mod tests {
         probe_controller,
     };
     use crate::{
-        ControllerAdmissionPolicy, ControllerCandidate, ControllerFingerprint,
-        LifecycleCancellation, ProbeDisposition, ProbeReason, UnsafeRule,
-        normalize_controller_inventory,
+        ControllerAdmission, ControllerAdmissionPolicy, ControllerCandidate, ControllerFingerprint,
+        LifecycleCancellation, ProbeDisposition, ProbeReason,
+        controller_selection::{ControllerUnsafeRule, normalize_controller_inventory},
     };
     use bluer::{Address, AddressType, l2cap::SocketAddr};
     use std::{
@@ -360,6 +358,7 @@ mod tests {
         },
         time::Duration,
     };
+    use tokio::sync::Notify;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Operation {
@@ -382,6 +381,7 @@ mod tests {
         failure: Mutex<Option<(Operation, ControllerProbeError)>>,
         pending: Option<Operation>,
         bound: Mutex<Option<SocketAddr>>,
+        bound_changed: Notify,
         socket_dropped: Arc<AtomicBool>,
     }
 
@@ -405,8 +405,23 @@ mod tests {
                 failure: Mutex::new(None),
                 pending: None,
                 bound: Mutex::new(None),
+                bound_changed: Notify::new(),
                 socket_dropped: Arc::new(AtomicBool::new(false)),
             }
+        }
+
+        async fn wait_until_bound(&self) {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let changed = self.bound_changed.notified();
+                    if self.bound.lock().unwrap().is_some() {
+                        return;
+                    }
+                    changed.await;
+                }
+            })
+            .await
+            .expect("probe socket must reach the bound state");
         }
 
         fn with_failure(operation: Operation, error: ControllerProbeError) -> Self {
@@ -496,6 +511,7 @@ mod tests {
             Box::pin(async move {
                 self.record(Operation::Bind)?;
                 *self.bound.lock().unwrap() = Some(local);
+                self.bound_changed.notify_waiters();
                 Ok(())
             })
         }
@@ -546,12 +562,15 @@ mod tests {
         )
     }
 
+    fn admitted() -> ControllerAdmission {
+        ControllerAdmissionPolicy::default().admit(&ControllerFingerprint::default())
+    }
+
     async fn probe(backend: &FakeBackend) -> ProbeDisposition {
         probe_controller(
             backend,
             &candidate(),
-            &ControllerFingerprint::default(),
-            &ControllerAdmissionPolicy::default(),
+            admitted(),
             &LifecycleCancellation::new(),
             limits(),
         )
@@ -577,8 +596,7 @@ mod tests {
             probe_controller(
                 &backend,
                 &candidate_with(address(), AddressType::BrEdr),
-                &ControllerFingerprint::default(),
-                &ControllerAdmissionPolicy::default(),
+                admitted(),
                 &LifecycleCancellation::new(),
                 limits(),
             )
@@ -622,15 +640,7 @@ mod tests {
         cancellation.cancel();
 
         assert_eq!(
-            probe_controller(
-                &backend,
-                &candidate(),
-                &ControllerFingerprint::default(),
-                &ControllerAdmissionPolicy::default(),
-                &cancellation,
-                limits(),
-            )
-            .await,
+            probe_controller(&backend, &candidate(), admitted(), &cancellation, limits(),).await,
             ProbeDisposition::Indeterminate(ProbeReason::Cancelled)
         );
     }
@@ -657,18 +667,17 @@ mod tests {
     #[tokio::test]
     async fn unsafe_rule_blocks_before_socket_open() {
         let backend = FakeBackend::compatible();
-        let policy = ControllerAdmissionPolicy::with_rows(
+        let policy = ControllerAdmissionPolicy::new(
             false,
             Vec::new(),
-            vec![UnsafeRule::exact(ControllerFingerprint::default())],
+            vec![ControllerUnsafeRule::exact(ControllerFingerprint::default())],
         );
 
         assert_eq!(
             probe_controller(
                 &backend,
                 &candidate(),
-                &ControllerFingerprint::default(),
-                &policy,
+                policy.admit(&ControllerFingerprint::default()),
                 &LifecycleCancellation::new(),
                 limits(),
             )
@@ -720,8 +729,7 @@ mod tests {
             probe_controller(
                 &backend,
                 &candidate,
-                &ControllerFingerprint::default(),
-                &ControllerAdmissionPolicy::default(),
+                admitted(),
                 &LifecycleCancellation::new(),
                 limits(),
             )
@@ -761,16 +769,13 @@ mod tests {
             probe_controller(
                 task_backend.as_ref(),
                 &candidate(),
-                &ControllerFingerprint::default(),
-                &ControllerAdmissionPolicy::default(),
+                admitted(),
                 &task_cancellation,
                 limits(),
             )
             .await
         });
-        while backend.bound.lock().unwrap().is_none() {
-            tokio::task::yield_now().await;
-        }
+        backend.wait_until_bound().await;
 
         cancellation.cancel();
         assert_eq!(

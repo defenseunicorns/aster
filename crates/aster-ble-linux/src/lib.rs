@@ -31,11 +31,12 @@ pub use controller::{
     BtleOperatorOutput,
 };
 pub use controller_probe::ControllerProbeLimits;
+pub(crate) use controller_selection::{
+    ControllerAdmission, ControllerCandidate, ControllerSnapshot, ProbeDisposition, ProbeReason,
+    SupportTag,
+};
 pub use controller_selection::{
-    ControllerAdmission, ControllerAdmissionPolicy, ControllerCandidate, ControllerFingerprint,
-    ControllerInventory, ControllerSnapshot, MAX_ADAPTER_NAME_BYTES, MAX_ADMISSION_ROWS,
-    MAX_CONTROLLER_CANDIDATES, ProbeDisposition, ProbeReason, SupportRow, SupportTag, UnsafeRule,
-    normalize_controller_inventory,
+    ControllerAdmissionPolicy, ControllerFingerprint, ControllerSupportRow, ControllerUnsafeRule,
 };
 pub use discovery::{
     AttemptKind, CanonicalLocator, CanonicalLocatorError, DiscoveryAdmission, DiscoveryCandidate,

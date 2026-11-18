@@ -533,7 +533,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coordinated_cleanup_accepts_schedule_exit_after_admission_closes() {
+    async fn admission_closed_schedule_keeps_monitoring_owner_until_clean_completion() {
         let mut fixture = ScheduleFixture::new().await;
         fixture.node.close_transport_admission();
         let schedule = fixture.schedule.take().expect("initiator schedule");
@@ -547,6 +547,7 @@ mod tests {
 
         let schedule_abort = schedule.abort_handle();
         let (owner, cancelled, _cancelled_signal, dropped) = cleanup_owner(schedule_abort);
+        let owner_completion = owner._completion_guard.clone();
         let mut active = ActiveBtleRuntime::new(
             Some(Box::new(owner)),
             None,
@@ -557,6 +558,15 @@ mod tests {
         );
         active.schedule = Some(schedule);
 
+        assert!(active.wait_terminal().now_or_never().is_none());
+        assert!(active.schedule.is_none());
+        assert!(!active.is_terminal());
+
+        owner_completion.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), active.wait_terminal())
+            .await
+            .expect("owner completion must terminate monitoring");
+        assert!(active.is_terminal());
         active
             .begin_cleanup()
             .expect("closed-admission cleanup")
@@ -609,49 +619,6 @@ mod tests {
         assert!(dropped.load(Ordering::Acquire));
 
         fixture.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn production_monitor_ignores_admission_closed_schedule_exit() {
-        let (release, released) = tokio::sync::oneshot::channel();
-        let schedule = tokio::spawn(async move {
-            released.await.expect("release schedule");
-            EventScheduleExit::AdmissionClosed
-        });
-        let schedule_abort = schedule.abort_handle();
-        let (owner, cancelled, _cancelled_signal, dropped) = cleanup_owner(schedule_abort);
-        let owner_completion = owner._completion_guard.clone();
-        let mut active = ActiveBtleRuntime::new(
-            Some(Box::new(owner)),
-            None,
-            #[cfg(feature = "sdk-test-support")]
-            None,
-            #[cfg(feature = "sdk-test-support")]
-            None,
-        );
-        active.schedule = Some(schedule);
-        let mut monitor = Box::pin(active.wait_terminal());
-
-        release.send(()).expect("release schedule exit");
-        tokio::select! {
-            biased;
-            () = &mut monitor => panic!("admission closure became a fatal runtime transition"),
-            () = tokio::task::yield_now() => {}
-        }
-        owner_completion
-            .send(true)
-            .expect("publish owner completion");
-        (&mut monitor).await;
-        drop(monitor);
-
-        active
-            .begin_cleanup()
-            .expect("owner cleanup")
-            .await
-            .expect("cleanup result task")
-            .expect("admission closure remains a clean runtime exit");
-        assert!(cancelled.load(Ordering::Acquire));
-        assert!(dropped.load(Ordering::Acquire));
     }
 
     #[tokio::test]
