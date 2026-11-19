@@ -87,11 +87,10 @@ status counters/capacities. Application delivery backlog is **not an Iroh send
 queue**. Monotonic phase timings, configured arguments, qdisc readback, accepted
 and rejected publications, exact deliveries, restart results and cleanup errors
 are retained in JSON even when a profile fails. `receipt.json` records the image
-ID, source HEAD, complete tracked delta against HEAD (including staged changes),
-and individual helper digests (including relevant untracked helpers). Source
-and helper identities are rechecked throughout and after cleanup; profile PASS
-receipts are withheld until final campaign validation succeeds. The provisioner
-wipes private credentials;
+ID. The diagnostic copies the four helpers into a temporary directory and mounts
+those copies into the containers. It does not hash helpers or read Git HEAD or
+the repository diff; edits to the checkout do not invalidate a running campaign.
+The provisioner wipes private credentials;
 owned-resource cleanup must then succeed before ownership metadata is removed.
 Failed cleanup retains its ownership locator. No credentials are included in the receipt.
 

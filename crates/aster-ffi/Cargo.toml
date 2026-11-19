@@ -1,6 +1,6 @@
 [package]
 name = "aster-ffi"
-description = "C ABI for the Aster Mesh reference framework"
+description = "C ABI for the selected redb-backed Aster node"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,10 @@ license.workspace = true
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-aster-core = { version = "=0.1.0-alpha.1", path = "../aster-core", features = ["adapter-sdk"] }
+aster-core = { version = "=0.1.0-alpha.1", path = "../aster-core", default-features = false, features = ["reference-session"] }
+aster-node = { version = "=0.1.0-alpha.1", path = "../aster-node" }
+tokio.workspace = true
+zeroize.workspace = true
 
 [lints.rust]
 # FFI pointer validation necessarily uses narrowly scoped unsafe blocks. The
@@ -21,3 +24,6 @@ missing_docs = "warn"
 [lints.clippy]
 all = "warn"
 pedantic = "warn"
+
+[dev-dependencies]
+aster-redb-store = { path = "../aster-redb-store" }

@@ -365,6 +365,7 @@ impl SparseInventory {
         self.ids.is_empty()
     }
 
+    #[cfg(test)]
     pub(crate) fn filtered_for_semantic_version(&self, semantic_version: u16) -> Self {
         Self::from_ids(
             self.ids
