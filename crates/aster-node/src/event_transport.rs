@@ -1228,6 +1228,15 @@ impl EventOutboundAttempt {
         }
     }
 
+    /// Completes a node-owned native carrier session without changing that
+    /// carrier's framing or forcing it through the ordered-contact runner.
+    pub(crate) fn finish_native(
+        mut self,
+        result: Result<(), ContactOutcome>,
+    ) -> Result<(), ContactOutcome> {
+        self.complete(&result)
+    }
+
     /// Runs this fresh contact through the node-owned ordered Event admission.
     pub async fn run(mut self, contact: Arc<dyn OrderedContact>) -> Result<(), ContactOutcome> {
         if let Some(outcome) = self.current_revocation_outcome() {
@@ -3289,6 +3298,34 @@ mod tests {
         ticket.finish_revoked();
         assert_eq!(observation.wait().await, Err(outcome));
         assert_eq!(runs.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn native_success_finalization_yields_to_concurrent_revocation() {
+        let handle = AutomaticEventTransportHandle::new();
+        handle.replace_eligibility(vec![provisioned_eligibility(
+            EventTransportKind::IROH_QUIC_V1,
+            1,
+            0,
+            None,
+        )]);
+        let (_control, mut attempts) =
+            register_available(&handle, EventTransportKind::IROH_QUIC_V1, 10);
+        let (admission, observation) =
+            handle.request_observed_attempt(MISSION, PEER, |_contact| async { Ok(()) });
+        assert_eq!(admission, EventAttemptAdmission::Accepted);
+        let ticket = attempts.recv().await.expect("native Iroh ticket");
+
+        handle.replace_eligibility(vec![provisioned_eligibility(
+            EventTransportKind::IROH_QUIC_V1,
+            1,
+            1,
+            None,
+        )]);
+
+        let finalized = ticket.finish_native(Ok(()));
+        assert_eq!(finalized, Err(ContactOutcome::authority_changed(1)));
+        assert_eq!(observation.wait().await, finalized);
     }
 
     #[tokio::test]

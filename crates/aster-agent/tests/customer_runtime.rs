@@ -929,6 +929,23 @@ async fn closed_signal_task_propagates_only_a_bounded_failure_reason() {
 mod btle {
     use super::*;
 
+    fn install_deterministic_local_initiator_pair(
+        state: &Path,
+    ) -> (aster_iroh::EndpointId, aster_iroh::SecretKey) {
+        let first = aster_iroh::SecretKey::from_bytes(&[0x31; 32]);
+        let second = aster_iroh::SecretKey::from_bytes(&[0x72; 32]);
+        let (local, peer) = if first.public() < second.public() {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let identity_path = state.join("identity.key");
+        fs::write(&identity_path, local.to_bytes()).expect("install deterministic local carrier");
+        fs::set_permissions(&identity_path, fs::Permissions::from_mode(0o600))
+            .expect("protect deterministic local carrier");
+        (local.public(), peer)
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn automatic_startup_consumes_material_once_and_retains_authority() {
         // Break caught: splitting the prepared credential without retaining its
@@ -1177,6 +1194,139 @@ mod btle {
         assert_eq!(selected.peer(), [0xaa; 32]);
         selected.cancel_carrier_open();
         running.stop_clean().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overlapping_iroh_and_btle_policy_installs_one_production_roster() {
+        // Break caught: bypassing the startup-composition overlap check installs
+        // only the unavailable BTLE entry, so durable work cannot select the
+        // configured Iroh route for the same exact mission peer.
+        if !socket_access_available() {
+            return;
+        }
+        let fixture = CustomerFixture::new();
+        let (local_carrier, peer_secret) =
+            install_deterministic_local_initiator_pair(fixture.state());
+        let peer_endpoint = aster_iroh::Endpoint::bind(
+            peer_secret.clone(),
+            aster_iroh::EndpointConfig::direct(SocketAddr::from(([127, 0, 0, 1], 0))),
+        )
+        .await
+        .expect("bind automatic Iroh peer");
+        let peer_carrier = peer_secret.public();
+        let peer_address = peer_endpoint
+            .bound_sockets()
+            .into_iter()
+            .find(SocketAddr::is_ipv4)
+            .expect("automatic Iroh peer IPv4 socket");
+
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.config_path()).expect("read customer config"))
+                .expect("parse customer config");
+        config["mesh"]["peers"] =
+            serde_json::json!([format!("{peer_carrier}@{peer_address}={}", "aa".repeat(32))]);
+        fs::write(
+            fixture.config_path(),
+            serde_json::to_vec(&config).expect("encode customer config"),
+        )
+        .expect("write overlapping Iroh peer");
+
+        let accept = tokio::spawn({
+            let peer_endpoint = peer_endpoint.clone();
+            async move {
+                let connection = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    peer_endpoint.accept(&std::collections::BTreeSet::from([local_carrier])),
+                )
+                .await
+                .expect("production roster selected Iroh before deadline")
+                .expect("accept automatic Iroh carrier");
+                connection.close();
+            }
+        });
+        let (btle, _control, automatic) = automatic_test_runtime(&fixture, "union-roster");
+        let running = start_with_optional_btle(&fixture, btle).await;
+        let automatic = automatic.await.expect("automatic handle observed");
+        accept.await.expect("automatic Iroh peer task");
+
+        let selector_attempt =
+            tokio::spawn(async move { automatic.run_peer_attempt([0xaa; 32]).await });
+        let selected = tokio::time::timeout(
+            Duration::from_secs(2),
+            peer_endpoint.accept(&std::collections::BTreeSet::from([local_carrier])),
+        )
+        .await
+        .expect("selector-issued Iroh carrier deadline")
+        .expect("selector-issued Iroh carrier");
+        selected.close();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), selector_attempt)
+                .await
+                .expect("selector attempt completion deadline")
+                .expect("selector attempt task"),
+            aster_node::AutomaticEventAttemptOutcome::Completed(Err(_))
+        ));
+
+        assert_eq!(health_status(fixture.health(), "/readyz").await, 200);
+        running.stop_clean().await;
+        peer_endpoint.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn higher_priority_btle_wins_the_production_overlap_selector() {
+        if !socket_access_available() {
+            return;
+        }
+        let fixture = CustomerFixture::new();
+        let (local_carrier, peer_secret) =
+            install_deterministic_local_initiator_pair(fixture.state());
+        let peer_endpoint = aster_iroh::Endpoint::bind(
+            peer_secret.clone(),
+            aster_iroh::EndpointConfig::direct(SocketAddr::from(([127, 0, 0, 1], 0))),
+        )
+        .await
+        .expect("bind competing Iroh peer");
+        let peer_carrier = peer_secret.public();
+        let peer_address = peer_endpoint
+            .bound_sockets()
+            .into_iter()
+            .find(SocketAddr::is_ipv4)
+            .expect("competing Iroh peer IPv4 socket");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.config_path()).expect("read customer config"))
+                .expect("parse customer config");
+        config["mesh"]["peers"] =
+            serde_json::json!([format!("{peer_carrier}@{peer_address}={}", "aa".repeat(32))]);
+        fs::write(
+            fixture.config_path(),
+            serde_json::to_vec(&config).expect("encode customer config"),
+        )
+        .expect("write competing Iroh peer");
+
+        let (btle, control, automatic) =
+            automatic_test_runtime_with_options(&fixture, "btle-wins-overlap", 101, true);
+        let running = start_with_optional_btle(&fixture, btle).await;
+        automatic.await.expect("automatic handle observed");
+
+        let selected = tokio::time::timeout(Duration::from_secs(2), control.recv_attempt())
+            .await
+            .expect("production overlap selection deadline")
+            .expect("BTLE attempt lane remains registered");
+        assert_eq!(selected.transport_kind(), EventTransportKind::BLE_L2CAP_V1);
+        assert_eq!(selected.peer(), [0xaa; 32]);
+        selected.cancel_carrier_open();
+
+        let maintenance = tokio::time::timeout(
+            Duration::from_secs(2),
+            peer_endpoint.accept(&std::collections::BTreeSet::from([local_carrier])),
+        )
+        .await
+        .expect("periodic Iroh maintenance deadline")
+        .expect("periodic Iroh maintenance carrier");
+        maintenance.close();
+
+        running.stop_clean().await;
+        peer_endpoint.close().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1993,6 +2143,7 @@ impl AutomaticTestState {
 ))]
 struct AutomaticTestControl {
     state: Arc<AutomaticTestState>,
+    configured_priority: u16,
 }
 
 #[cfg(all(
@@ -2024,7 +2175,7 @@ impl AutomaticTestControl {
                     epoch,
                     availability,
                     true,
-                    100,
+                    self.configured_priority,
                 ))
         );
     }
@@ -2094,7 +2245,25 @@ fn automatic_test_runtime(
     AutomaticTestControl,
     tokio::sync::oneshot::Receiver<RunningAutomaticEventTransportHandle>,
 ) {
-    let policy = fixture.enable_btle_policy();
+    automatic_test_runtime_with_options(fixture, label, 100, false)
+}
+
+#[cfg(all(
+    feature = "sdk-test-support",
+    feature = "systemd-provider",
+    target_os = "linux"
+))]
+fn automatic_test_runtime_with_options(
+    fixture: &CustomerFixture,
+    label: &str,
+    configured_priority: u16,
+    available_on_start: bool,
+) -> (
+    BtleRuntimeStartup,
+    AutomaticTestControl,
+    tokio::sync::oneshot::Receiver<RunningAutomaticEventTransportHandle>,
+) {
+    let policy = fixture.enable_btle_policy_with_priority(configured_priority);
     let mission = aster_node::mission::UnprotectedReferenceMission::from_bytes(
         include_bytes!("../../../bindings/testdata/non-production-provisioning.bundle").to_vec(),
     )
@@ -2130,6 +2299,15 @@ fn automatic_test_runtime(
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 Some(registration.initial_snapshot());
             let (_, adapter, attempts) = registration.into_parts();
+            if available_on_start {
+                assert!(adapter.publish_availability(EventAdapterSnapshot::new(
+                    EventTransportKind::BLE_L2CAP_V1,
+                    1,
+                    EventAdapterState::Available,
+                    true,
+                    configured_priority,
+                )));
+            }
             *owner_state
                 .adapter
                 .lock()
@@ -2147,7 +2325,14 @@ fn automatic_test_runtime(
         },
     )
     .expect("automatic Linux startup composition");
-    (startup, AutomaticTestControl { state }, automatic)
+    (
+        startup,
+        AutomaticTestControl {
+            state,
+            configured_priority,
+        },
+        automatic,
+    )
 }
 
 #[cfg(feature = "sdk-test-support")]

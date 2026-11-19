@@ -763,8 +763,10 @@ fn internal_subscription_error() -> ValidatorError {
 
 fn map_contact_error(error: aster_contact::ContactError) -> ValidatorError {
     let category = match error.kind() {
-        ContactErrorKind::Configuration => ValidatorErrorCategory::Configuration,
-        ContactErrorKind::Bounds => ValidatorErrorCategory::Bounds,
+        ContactErrorKind::Configuration | ContactErrorKind::Invariant => {
+            ValidatorErrorCategory::Configuration
+        }
+        ContactErrorKind::Bounds | ContactErrorKind::RemoteBounds => ValidatorErrorCategory::Bounds,
         ContactErrorKind::Unavailable | ContactErrorKind::Transport => {
             ValidatorErrorCategory::Unavailable
         }

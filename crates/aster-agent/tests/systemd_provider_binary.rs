@@ -81,10 +81,10 @@ fn enabled_btle_binary_uses_real_systemd_wrapper_and_fails_closed_when_source_is
 }
 
 #[test]
-fn customer_startup_rejects_duplicate_iroh_and_btle_peer_before_btle_credentials() {
-    // Break caught: normal packaged startup must reject an unsafe
-    // mixed-transport roster before the missing BTLE credential source can
-    // replace the duplicate-mission error or create durable state.
+fn customer_startup_accepts_shared_iroh_btle_peer_before_btle_credentials() {
+    // Break caught: the packaged composition must admit one exact peer through
+    // both transports, then fail at the independently required credential
+    // boundary without creating durable state.
     let fixture = BinaryFixture::new();
     let carrier = aster_iroh::SecretKey::from_bytes(&[11; 32]).public();
     let iroh_peer = format!("{carrier}@127.0.0.1:9001={}", "aa".repeat(32));
@@ -114,14 +114,14 @@ fn customer_startup_rejects_duplicate_iroh_and_btle_peer_before_btle_credentials
     assert!(output.stdout.is_empty());
     assert_eq!(
         String::from_utf8(output.stderr).expect("UTF-8 stderr"),
-        "ERROR configuration contains a duplicate peer mission\n"
+        "ERROR BTLE startup credential validation failed\n"
     );
     assert!(
         fs::read_dir(&fixture.state)
             .expect("inspect state directory")
             .next()
             .is_none(),
-        "rejected configuration must not create durable state"
+        "missing roster source must not create durable state"
     );
 }
 

@@ -587,8 +587,12 @@ impl EndpointConfig {
 /// Carrier failure at a bounded, operator-visible stage.
 #[derive(Debug)]
 pub enum CarrierError {
-    /// Invalid local or peer configuration.
+    /// Invalid local carrier configuration.
     Configuration(String),
+    /// The authenticated peer emitted bytes that violate carrier framing.
+    Protocol(String),
+    /// The local adapter violated its own lifecycle or sequencing invariant.
+    Invariant(String),
     /// An Iroh or QUIC operation failed.
     Transport(String),
     /// A bounded operation made no progress before its deadline.
@@ -600,12 +604,18 @@ pub enum CarrierError {
     FrameTooLarge { actual: usize, maximum: usize },
     /// One length-delimited turn exceeded the caller-owned aggregate byte bound.
     TurnTooLarge { actual: u64, maximum: u64 },
+    /// A peer-advertised frame length exceeded the local receive bound.
+    RemoteFrameTooLarge { actual: usize, maximum: usize },
+    /// Peer frames exceeded the local aggregate receive bound for one turn.
+    RemoteTurnTooLarge { actual: u64, maximum: u64 },
 }
 
 impl fmt::Display for CarrierError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Configuration(message) => write!(formatter, "carrier configuration: {message}"),
+            Self::Protocol(message) => write!(formatter, "carrier protocol: {message}"),
+            Self::Invariant(message) => write!(formatter, "carrier invariant: {message}"),
             Self::Transport(message) => write!(formatter, "carrier transport: {message}"),
             Self::Timeout(stage) => write!(formatter, "carrier timed out during {stage}"),
             Self::UnauthorizedPeer(peer) => write!(formatter, "unauthorized carrier peer {peer}"),
@@ -621,6 +631,14 @@ impl fmt::Display for CarrierError {
                     "carrier turn is at least {actual} bytes; maximum is {maximum}"
                 )
             }
+            Self::RemoteFrameTooLarge { actual, maximum } => write!(
+                formatter,
+                "peer carrier frame is at least {actual} bytes; maximum is {maximum}"
+            ),
+            Self::RemoteTurnTooLarge { actual, maximum } => write!(
+                formatter,
+                "peer carrier turn is at least {actual} bytes; maximum is {maximum}"
+            ),
         }
     }
 }
@@ -756,7 +774,7 @@ impl InboundAcceptor {
         match completed {
             Ok((_, result)) => Some(result),
             Err(error) if error.is_cancelled() => None,
-            Err(_) => Some(Err(CarrierError::Transport(
+            Err(_) => Some(Err(CarrierError::Invariant(
                 "inbound handshake task stopped unexpectedly".into(),
             ))),
         }
@@ -1873,7 +1891,7 @@ impl Endpoint {
             return Ok(());
         }
         connection.close(1u8.into(), b"carrier profile mismatch");
-        Err(CarrierError::Transport(
+        Err(CarrierError::Protocol(
             "negotiated carrier security profile mismatch".into(),
         ))
     }
@@ -1997,7 +2015,7 @@ impl UniTurnState {
                 *self = Self::SendingSecond;
                 Ok(UniTurnPosition::Second)
             }
-            _ => Err(CarrierError::Transport(
+            _ => Err(CarrierError::Invariant(
                 "unidirectional turn send is concurrent, reordered, or extra".into(),
             )),
         }
@@ -2013,7 +2031,7 @@ impl UniTurnState {
                 *self = Self::ReceivingSecond;
                 Ok(UniTurnPosition::Second)
             }
-            _ => Err(CarrierError::Transport(
+            _ => Err(CarrierError::Invariant(
                 "unidirectional turn receive is concurrent, reordered, or extra".into(),
             )),
         }
@@ -2029,7 +2047,7 @@ impl UniTurnState {
                 *self = Self::Complete;
                 Ok(())
             }
-            _ => Err(CarrierError::Transport(
+            _ => Err(CarrierError::Invariant(
                 "unidirectional send turn completed out of phase".into(),
             )),
         }
@@ -2045,7 +2063,7 @@ impl UniTurnState {
                 *self = Self::Complete;
                 Ok(())
             }
-            _ => Err(CarrierError::Transport(
+            _ => Err(CarrierError::Invariant(
                 "unidirectional receive turn completed out of phase".into(),
             )),
         }
@@ -2065,7 +2083,7 @@ impl UniTurnState {
                 *self = Self::Complete;
                 Ok(())
             }
-            _ => Err(CarrierError::Transport(
+            _ => Err(CarrierError::Invariant(
                 "unidirectional turn skip is concurrent or extra".into(),
             )),
         }
@@ -2081,7 +2099,7 @@ fn lock_uni_turn_state(
 ) -> Result<std::sync::MutexGuard<'_, UniTurnState>, CarrierError> {
     state
         .lock()
-        .map_err(|_| CarrierError::Transport("unidirectional turn state is poisoned".into()))
+        .map_err(|_| CarrierError::Invariant("unidirectional turn state is poisoned".into()))
 }
 
 /// Owned sender for one ordered, bounded unidirectional carrier turn.
@@ -2238,16 +2256,16 @@ impl Connection {
     pub fn begin_additional_uni_pair(&self) -> Result<(), CarrierError> {
         let mut state = lock_uni_turn_state(&self.uni_turn_state)?;
         if *state != UniTurnState::Complete {
-            return Err(CarrierError::Transport(
+            return Err(CarrierError::Invariant(
                 "previous uni-turn pair is incomplete".into(),
             ));
         }
         let mut admission = self
             .additional_uni_pair
             .lock()
-            .map_err(|_| CarrierError::Transport("uni-turn pair admission lock poisoned".into()))?;
+            .map_err(|_| CarrierError::Invariant("uni-turn pair admission lock poisoned".into()))?;
         let role = admission.take().ok_or_else(|| {
-            CarrierError::Transport("additional uni-turn pair already admitted".into())
+            CarrierError::Invariant("additional uni-turn pair already admitted".into())
         })?;
         *state = UniTurnState::initial(role);
         Ok(())
@@ -2307,7 +2325,7 @@ impl Connection {
                 &exporter_context,
             )
             .map_err(|_| {
-                CarrierError::Transport("QUIC TLS channel-binding derivation failed".into())
+                CarrierError::Invariant("QUIC TLS channel-binding derivation failed".into())
             })?;
         Ok(ChannelBinding(binding))
     }
@@ -2681,7 +2699,7 @@ impl Connection {
                 .await
                 .map_err(|error| map_read_error(error, RESPONSE_CONSUMED_MARKER.len()))?;
             if marker != RESPONSE_CONSUMED_MARKER {
-                return Err(CarrierError::Transport(
+                return Err(CarrierError::Protocol(
                     "invalid session completion marker".into(),
                 ));
             }
@@ -2750,7 +2768,7 @@ impl BoundedSendStream {
         body: &[u8],
     ) -> Result<(), CarrierError> {
         if self.complete {
-            return Err(CarrierError::Transport(
+            return Err(CarrierError::Invariant(
                 "stream direction is complete".into(),
             ));
         }
@@ -2801,7 +2819,7 @@ impl BoundedSendStream {
 
     pub async fn finish(&mut self) -> Result<(), CarrierError> {
         if self.complete {
-            return Err(CarrierError::Transport(
+            return Err(CarrierError::Invariant(
                 "stream direction is complete".into(),
             ));
         }
@@ -2877,14 +2895,14 @@ impl BoundedReceiveStream {
         let mut offset = 0;
         while offset < observed.len() {
             let Some(read) = self.read_some(&mut observed[offset..]).await? else {
-                return Err(CarrierError::Transport(
+                return Err(CarrierError::Protocol(
                     "truncated stream-pair preamble".into(),
                 ));
             };
             offset += read;
         }
         if &observed != self.magic {
-            return Err(CarrierError::Transport("stream-pair role mismatch".into()));
+            return Err(CarrierError::Protocol("stream-pair role mismatch".into()));
         }
         self.started = true;
         Ok(())
@@ -2895,7 +2913,7 @@ impl BoundedReceiveStream {
             return Ok(None);
         }
         if self.complete {
-            return Err(CarrierError::Transport("stream direction failed".into()));
+            return Err(CarrierError::Invariant("stream direction failed".into()));
         }
         self.ensure_started().await?;
         let mut length = [0u8; 4];
@@ -2908,7 +2926,7 @@ impl BoundedReceiveStream {
                     return Ok(None);
                 }
                 None => {
-                    return Err(CarrierError::Transport(
+                    return Err(CarrierError::Protocol(
                         "truncated stream frame length".into(),
                     ));
                 }
@@ -2916,21 +2934,22 @@ impl BoundedReceiveStream {
             }
         }
         let frame_len = decode_uni_frame_length(length, self.max_frame_bytes)?;
-        let encoded = 4_u64
-            .checked_add(frame_len as u64)
-            .ok_or(CarrierError::TurnTooLarge {
-                actual: u64::MAX,
-                maximum: self.max_stream_bytes,
-            })?;
-        let next = self
-            .read_bytes
-            .checked_add(encoded)
-            .ok_or(CarrierError::TurnTooLarge {
-                actual: u64::MAX,
-                maximum: self.max_stream_bytes,
-            })?;
+        let encoded =
+            4_u64
+                .checked_add(frame_len as u64)
+                .ok_or(CarrierError::RemoteTurnTooLarge {
+                    actual: u64::MAX,
+                    maximum: self.max_stream_bytes,
+                })?;
+        let next =
+            self.read_bytes
+                .checked_add(encoded)
+                .ok_or(CarrierError::RemoteTurnTooLarge {
+                    actual: u64::MAX,
+                    maximum: self.max_stream_bytes,
+                })?;
         if next > self.max_stream_bytes {
-            return Err(CarrierError::TurnTooLarge {
+            return Err(CarrierError::RemoteTurnTooLarge {
                 actual: next,
                 maximum: self.max_stream_bytes,
             });
@@ -2939,9 +2958,7 @@ impl BoundedReceiveStream {
         let mut offset = 0;
         while offset < frame.len() {
             let Some(read) = self.read_some(&mut frame[offset..]).await? else {
-                return Err(CarrierError::Transport(
-                    "truncated stream frame body".into(),
-                ));
+                return Err(CarrierError::Protocol("truncated stream frame body".into()));
             };
             offset += read;
         }
@@ -2980,12 +2997,12 @@ impl SendUniTurn {
         E: From<CarrierError>,
     {
         if self.complete {
-            return Err(E::from(CarrierError::Transport(
+            return Err(E::from(CarrierError::Invariant(
                 "unidirectional send turn is already complete".into(),
             )));
         }
         if frame.is_empty() {
-            return Err(E::from(CarrierError::Transport(
+            return Err(E::from(CarrierError::Invariant(
                 "unidirectional frame must be nonempty".into(),
             )));
         }
@@ -3075,7 +3092,7 @@ impl SendUniTurn {
     /// Finishes this transport stream without waiting for a peer receipt.
     pub async fn finish(&mut self) -> Result<(), CarrierError> {
         if self.complete {
-            return Err(CarrierError::Transport(
+            return Err(CarrierError::Invariant(
                 "unidirectional send turn is already complete".into(),
             ));
         }
@@ -3118,7 +3135,7 @@ impl ReceiveUniTurn {
             match self.read_some(&mut magic[read..]).await? {
                 Some(count) => read += count,
                 None => {
-                    return Err(self.fail_with(CarrierError::Transport(
+                    return Err(self.fail_with(CarrierError::Protocol(
                         "truncated unidirectional turn preamble".into(),
                     )));
                 }
@@ -3133,7 +3150,7 @@ impl ReceiveUniTurn {
             return Ok(None);
         }
         if self.complete {
-            return Err(CarrierError::Transport(
+            return Err(CarrierError::Invariant(
                 "unidirectional receive turn failed before EOF".into(),
             ));
         }
@@ -3150,8 +3167,9 @@ impl ReceiveUniTurn {
                     return Ok(None);
                 }
                 None => {
-                    return Err(self
-                        .fail_with(CarrierError::Transport("truncated uni frame length".into())));
+                    return Err(
+                        self.fail_with(CarrierError::Protocol("truncated uni frame length".into()))
+                    );
                 }
                 Some(read) => length_read += read,
             }
@@ -3162,19 +3180,19 @@ impl ReceiveUniTurn {
         let encoded_bytes = std::mem::size_of::<u32>()
             .checked_add(frame_len)
             .ok_or_else(|| {
-                self.fail_with(CarrierError::TurnTooLarge {
+                self.fail_with(CarrierError::RemoteTurnTooLarge {
                     actual: usize::MAX as u64,
                     maximum: self.max_turn_bytes as u64,
                 })
             })?;
         let next_total = self.read_bytes.checked_add(encoded_bytes).ok_or_else(|| {
-            self.fail_with(CarrierError::TurnTooLarge {
+            self.fail_with(CarrierError::RemoteTurnTooLarge {
                 actual: usize::MAX as u64,
                 maximum: self.max_turn_bytes as u64,
             })
         })?;
         if next_total > self.max_turn_bytes {
-            return Err(self.fail_with(CarrierError::TurnTooLarge {
+            return Err(self.fail_with(CarrierError::RemoteTurnTooLarge {
                 actual: next_total as u64,
                 maximum: self.max_turn_bytes as u64,
             }));
@@ -3187,7 +3205,7 @@ impl ReceiveUniTurn {
                 Some(read) => frame_read += read,
                 None => {
                     return Err(
-                        self.fail_with(CarrierError::Transport("truncated uni frame body".into()))
+                        self.fail_with(CarrierError::Protocol("truncated uni frame body".into()))
                     );
                 }
             }
@@ -3251,7 +3269,7 @@ fn validate_uni_turn_magic(magic: &[u8; UNI_TURN_MAGIC.len()]) -> Result<(), Car
     if magic == UNI_TURN_MAGIC {
         Ok(())
     } else {
-        Err(CarrierError::Transport(
+        Err(CarrierError::Protocol(
             "invalid unidirectional turn preamble".into(),
         ))
     }
@@ -3262,13 +3280,15 @@ fn decode_uni_frame_length(
     maximum: usize,
 ) -> Result<usize, CarrierError> {
     let actual = usize::try_from(u32::from_be_bytes(encoded))
-        .map_err(|_| CarrierError::Transport("uni frame length overflows".into()))?;
+        .map_err(|_| CarrierError::Protocol("uni frame length overflows".into()))?;
     if actual == 0 {
-        return Err(CarrierError::Transport(
+        return Err(CarrierError::Protocol(
             "unidirectional frame must be nonempty".into(),
         ));
     }
-    ensure_frame_bound(actual, maximum)?;
+    if actual > maximum {
+        return Err(CarrierError::RemoteFrameTooLarge { actual, maximum });
+    }
     Ok(actual)
 }
 
@@ -3329,7 +3349,7 @@ fn ensure_frame_bound(actual: usize, maximum: usize) -> Result<(), CarrierError>
 
 fn map_read_error(error: ReadToEndError, maximum: usize) -> CarrierError {
     match error {
-        ReadToEndError::TooLong => CarrierError::FrameTooLarge {
+        ReadToEndError::TooLong => CarrierError::RemoteFrameTooLarge {
             actual: maximum.saturating_add(1),
             maximum,
         },
@@ -5456,7 +5476,7 @@ mod tests {
                 pair.data.read_bytes = prior;
                 assert!(matches!(
                     pair.data.read_frame().await,
-                    Err(CarrierError::TurnTooLarge { actual, maximum: bound })
+                    Err(CarrierError::RemoteTurnTooLarge { actual, maximum: bound })
                         if actual == expected_actual && bound == maximum
                 ));
                 assert_eq!(pair.data.read_bytes, prior);
@@ -5628,7 +5648,7 @@ mod tests {
             .expect("accept malformed turn");
         assert!(matches!(
             turn.read_frame().await,
-            Err(CarrierError::Transport(message)) if message.contains("truncated uni frame length")
+            Err(CarrierError::Protocol(message)) if message.contains("truncated uni frame length")
         ));
 
         sender_connection.close();
@@ -5657,7 +5677,7 @@ mod tests {
             .expect("accept truncated body");
         assert!(matches!(
             turn.read_frame().await,
-            Err(CarrierError::Transport(message)) if message.contains("truncated uni frame body")
+            Err(CarrierError::Protocol(message)) if message.contains("truncated uni frame body")
         ));
         sender_connection.close();
         client.close().await;
@@ -5687,7 +5707,7 @@ mod tests {
         );
         assert!(matches!(
             turn.read_frame().await,
-            Err(CarrierError::Transport(message)) if message.contains("truncated uni frame length")
+            Err(CarrierError::Protocol(message)) if message.contains("truncated uni frame length")
         ));
         sender_connection.close();
         client.close().await;
@@ -5811,7 +5831,7 @@ mod tests {
             .expect("accept oversized stream");
         assert!(matches!(
             turn.read_frame().await,
-            Err(CarrierError::FrameTooLarge {
+            Err(CarrierError::RemoteFrameTooLarge {
                 actual,
                 maximum: DEFAULT_MAX_EXCHANGE_BYTES
             }) if actual == DEFAULT_MAX_EXCHANGE_BYTES + 1
@@ -5847,7 +5867,7 @@ mod tests {
         );
         assert!(matches!(
             turn.read_frame().await,
-            Err(CarrierError::TurnTooLarge {
+            Err(CarrierError::RemoteTurnTooLarge {
                 actual: 13,
                 maximum: 8
             })
@@ -5940,7 +5960,7 @@ mod tests {
         ));
         assert!(matches!(
             map_read_error(ReadToEndError::TooLong, 8),
-            CarrierError::FrameTooLarge {
+            CarrierError::RemoteFrameTooLarge {
                 actual: 9,
                 maximum: 8
             }

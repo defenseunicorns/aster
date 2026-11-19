@@ -105,14 +105,14 @@ impl BleL2capContact {
             .lock()
             .map_err(|_| {
                 ContactError::new(
-                    ContactErrorKind::Transport,
+                    ContactErrorKind::Invariant,
                     "LE L2CAP contact stream lock is poisoned",
                 )
             })?
             .take()
             .ok_or_else(|| {
                 ContactError::new(
-                    ContactErrorKind::Unavailable,
+                    ContactErrorKind::Invariant,
                     "LE L2CAP contact stream is unavailable",
                 )
             })
@@ -139,7 +139,7 @@ impl BleL2capContact {
             .is_err()
         {
             return Err(ContactError::new(
-                ContactErrorKind::Unavailable,
+                ContactErrorKind::Invariant,
                 "LE L2CAP contact already has an active operation",
             ));
         }
@@ -209,11 +209,14 @@ fn decode_record_header(
 ) -> Result<(u8, usize), ContactError> {
     let length = u32::from_be_bytes(header[1..].try_into().expect("four-byte length"));
     let length = usize::try_from(length).map_err(|_| {
-        ContactError::new(ContactErrorKind::Bounds, "LE L2CAP frame length overflow")
+        ContactError::new(
+            ContactErrorKind::RemoteBounds,
+            "LE L2CAP frame length overflow",
+        )
     })?;
     if length > maximum {
         return Err(ContactError::new(
-            ContactErrorKind::Bounds,
+            ContactErrorKind::RemoteBounds,
             "LE L2CAP peer frame exceeds its bound",
         ));
     }
@@ -306,7 +309,7 @@ impl OrderedContact for BleL2capContact {
                         Ok(response)
                     }
                     TAG_REJECT_BOUNDS => Err(ContactError::new(
-                        ContactErrorKind::Bounds,
+                        ContactErrorKind::RemoteBounds,
                         "LE L2CAP peer rejected exchange bounds",
                     )),
                     TAG_REJECT_PROTOCOL => Err(ContactError::new(
@@ -530,7 +533,7 @@ mod tests {
             .request_with_total_limit(b"four", 7)
             .await
             .unwrap_err();
-        assert_eq!(error.kind(), ContactErrorKind::Bounds);
+        assert_eq!(error.kind(), ContactErrorKind::RemoteBounds);
         assert_eq!(task.await.unwrap().kind(), ContactErrorKind::Bounds);
     }
 
@@ -596,7 +599,7 @@ mod tests {
             .respond_once_with_total_limit(8, Box::new(|_| panic!("handler must not run")))
             .await
             .unwrap_err();
-        assert_eq!(error.kind(), ContactErrorKind::Bounds);
+        assert_eq!(error.kind(), ContactErrorKind::RemoteBounds);
         assert_eq!(
             contact
                 .respond_once_with_total_limit(8, Box::new(|_| Ok((Vec::new(), true))))

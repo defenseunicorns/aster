@@ -161,6 +161,25 @@ impl ContactOutcome {
         }
     }
 
+    /// Creates a pre-mission outcome for an authenticated carrier identity that
+    /// cannot be admitted as the configured endpoint.
+    pub(crate) const fn rejected_carrier_open(reason: ContactReason) -> Self {
+        assert!(matches!(
+            reason,
+            ContactReason::IdentityMismatch
+                | ContactReason::AuthenticationFailed
+                | ContactReason::ProtocolViolation
+        ));
+        Self {
+            stage: ContactStage::CarrierOpen,
+            scope: ContactScope::Locator,
+            provenance: ContactProvenance::UnauthenticatedRemote,
+            disposition: ContactDisposition::RetryLater,
+            reason,
+            generation: None,
+        }
+    }
+
     pub(crate) const fn caller_cancelled(stage: ContactStage) -> Self {
         Self {
             stage,

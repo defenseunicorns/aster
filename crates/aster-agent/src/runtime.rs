@@ -5,6 +5,7 @@ use std::{error::Error, fmt, path::PathBuf, time::Duration};
 use aster_mesh::ProvisioningSecretLoader;
 use aster_node::{
     NodeBootstrapErrorKind, NodeError, NodeOperatorOutputPolicy, RunningNode,
+    start_supervised_node_with_automatic_iroh_event_peer,
     start_supervised_node_with_forwarding_and_output_policy,
 };
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -185,6 +186,7 @@ where
     let health_address = config.health();
     let forwarding = config.forwarding();
     let configured_emission_policy = config.emission_policy();
+    let automatic_iroh_event_peer = config.automatic_iroh_event_peer();
     let credential_generation = credentials.generation();
     let limits = *config.limits();
     let node_config = open_node_config(&config, &credentials, loader)
@@ -198,13 +200,26 @@ where
     emit_lifecycle(LifecycleState::Starting, "startup", "started", false, 0);
     tokio::task::yield_now().await;
 
-    let node = match start_supervised_node_with_forwarding_and_output_policy(
-        node_config,
-        forwarding,
-        customer_node_output_policy(),
-    )
-    .await
-    {
+    let node_start = match automatic_iroh_event_peer {
+        Some(peer) => {
+            start_supervised_node_with_automatic_iroh_event_peer(
+                node_config,
+                forwarding,
+                customer_node_output_policy(),
+                peer,
+            )
+            .await
+        }
+        None => {
+            start_supervised_node_with_forwarding_and_output_policy(
+                node_config,
+                forwarding,
+                customer_node_output_policy(),
+            )
+            .await
+        }
+    };
+    let node = match node_start {
         Ok(node) => node,
         Err(error) => {
             let kind = classify_node_startup(&error);
@@ -274,9 +289,14 @@ where
     // Completion observed here is startup failure; completion published after
     // it is a runtime failure even if the synchronous Ready transition below
     // has not yet returned.
-    let startup_ready = !btle_runtime.is_terminal()
-        && node.open_transport_admission()
+    let startup_composed = !btle_runtime.is_terminal()
         && btle_runtime.install_eligibility().is_ok()
+        && node.open_transport_admission();
+    if startup_composed {
+        btle_runtime.start_schedule();
+    }
+    let startup_ready = startup_composed
+        && !btle_runtime.is_terminal()
         && status.transition(LifecycleState::Ready).is_ok();
     if !startup_ready {
         let _ = server_stop_send.send(ServerStop::Force);

@@ -102,7 +102,7 @@ evidence; absence of evidence means the lower status applies.
 | --- | --- | --- | --- |
 | **BT-A0** | Transport-neutral application readiness and durable publication, owned by the node/store | With zero eligible transports, startup succeeds, publication is durable, and later adapter availability wakes work without republishing | **Verified** for the merged Event evaluation path; production profile remains unqualified |
 | **BT-A1** | Adapter-neutral bounded contact and mission authentication, owned by the node | BTLE supplies only transient carrier evidence; the exact mission peer authenticates before inventory or data; no Bluetooth value grants identity | **Physical** for bounded Event evaluation; not release-qualified |
-| **BT-A2** | Adapter registry, eligibility, ranking, and node-global admission, owned by the transport-neutral node | Current exact authority and sanitized availability select one bounded fresh attempt; no adapter lifecycle or class retry policy enters the core | **Source**; automatic multi-adapter selection is not physically qualified |
+| **BT-A2** | Adapter registry, eligibility, ranking, and node-global admission, owned by the transport-neutral node | Current exact authority and sanitized availability select one bounded fresh attempt; no adapter lifecycle or class retry policy enters the core | **Source**; the Linux Event composition installs one common exact-peer Iroh/BTLE roster and shared admission, while physical multi-adapter qualification remains open |
 | **BT-A3** | Closed attempt outcome and custody contract, shared at the node/adapter boundary | Typed authority, policy, adapter-epoch, transient, authenticated, cancellation, and shutdown outcomes preserve durable work, release custody, and authorize only the permitted retry/reselection action | **Source** with focused verification; physical and release qualification remain open |
 | **BT-L0** | Bounded Linux controller inventory, passive compatibility probe, and sticky selection, owned by `aster-ble-linux` | Zero/many controllers, hotplug, BlueZ restart, timeouts, churn, unsafe rules, and unknown compatible hardware satisfy the defined deterministic bounds | **Source** with focused verification; physical automatic-path evidence remains open |
 | **BT-L1** | Rostered Linux discovery and controller-epoch lifecycle, owned by `aster-ble-linux` | Listener, advertisement, scan, candidate, socket, credential, cancellation, and cleanup owners are bounded and joined; discovery remains locator-only | **Source**; fixed-controller physical evidence is scoped to BT-E0, while the stock teardown-ingress gate still blocks this exit; the working-secret lifetime gate is closed in source |
@@ -222,6 +222,26 @@ not vary with detected hardware. It is the same node process whether the host
 has an IP interface, a Bluetooth controller, both, or neither; there is no
 companion BTLE daemon.
 
+For the initial Linux Event implementation under semantic v9, a BTLE policy may
+name the same mission peer as one configured Iroh route. The composition root
+then registers that Iroh route in the automatic selector, installs Iroh and
+BTLE entries in one complete eligibility replacement, and removes forced Event
+wakes for that route from the legacy scheduler. The Iroh-specific periodic
+maintenance cadence remains so State, Record, Blob, and receive-side work are
+not stranded when Event selection prefers BTLE. Both selector-issued and
+periodic coordinated Iroh contacts share the same capacity-one Event-session
+admission with BTLE and require semantic v9; Iroh retains its existing ALPN,
+native unidirectional Event turns, and post-Event lanes. Because that periodic
+contact is the existing indivisible all-class semantic session, it may also
+reconcile Event; BTLE priority governs selector-issued automatic Event attempts,
+not suppression of native Iroh cadence. Making maintenance post-Event-only
+would require a separately designed protocol capability and is not part of this
+v9 implementation. Other Iroh peers retain their existing lifecycle.
+Semantic-v8 Iroh remains supported only when that route is not coordinated with
+BTLE; an overlapping configuration requires the peer to negotiate semantic v9.
+This does not generalize transport lifecycle or change protocol bytes; it is
+replaceable composition policy.
+
 Each adapter owns its platform lifecycle and independently reports a bounded,
 sanitized availability snapshot to the host registry. A snapshot includes the
 adapter kind, availability/health, qualified capabilities, and policy inputs
@@ -251,15 +271,20 @@ For every fresh outbound pending-work cohort, the selector:
 3. admits one bounded attempt through the adapter-neutral contact port.
 
 The initial automatic composition admits one establishing or active outbound
-contact per node; already durable local application work is unaffected. The
-coordinator schedules peer/class cohorts with bounded fair rotation so an
-Event-only adapter cannot indefinitely strand State, Record, or Blob work. The
-exact ranking, fairness weights, and admission bound are replaceable local
-implementation details, not wire behavior. Normal configuration expresses
-policy—allow/deny, emission constraints, and optional priority/cost
-preferences—not controller addresses, interface names, or detected hardware.
-Applications publish and observe durable results; they cannot select a
-transport.
+Event contact per node; already durable local application work is unaffected.
+The Event coordinator ranks only Event-capable adapters. The Iroh adapter keeps
+its bounded periodic all-class maintenance cadence and enters the same shared
+contact admission, so preferring an Event-only adapter cannot indefinitely
+strand Iroh's State, Record, or Blob lanes. This existing all-class session may
+also reconcile Event; configured priority ranks only selector-issued automatic
+Event attempts. Future adapters that carry other classes must provide their own
+bounded class scheduling rather than extending the Event selector into a
+generic transport lifecycle. Exact ranking, cadence, and admission bounds are
+replaceable local implementation details, not wire behavior. Normal
+configuration expresses policy—allow/deny, emission constraints, and optional
+priority/cost preferences—not controller addresses, interface names, or
+detected hardware. Applications publish and observe durable results; they
+cannot select a transport.
 
 All eligible adapters may listen concurrently. Each adapter first enforces its
 own pre-contact connection, carrier-cryptography, socket, byte, task, and rate
@@ -281,15 +306,19 @@ Hotplug, permission, driver, and link changes wake selection through adapter
 events. A new adapter or controller epoch never inherits a prior contact's
 mission keys, replay state, or provisional authorization.
 
-The composition root owns order: open the durable node, start adapters, then
-open contact admission; on shutdown, close admission, cancel and join adapters,
-then close the node. An embedded host supplies equivalent adapter and credential
-providers. The Linux service and later mobile applications are composition
-profiles of this contract, not separate transport authorities. The first
-BTLE-qualified production profile is the systemd-managed Linux agent. Container
-builds exclude BTLE until an equally protected credential provider, BlueZ/device
-access model, reload/rollback authority, and confinement profile are separately
-qualified.
+The composition root owns order: open the durable node with transport admission
+closed, start adapters, install the complete exact-peer roster, open contact
+admission, then start outbound scheduling. On shutdown it revokes selector
+tickets before publishing terminal admission, cancels and joins adapters, then
+closes the node. Collision arbitration is local cancellation, never transport
+failure evidence for reselection, and a waiter must recheck terminal admission
+after acquiring shared capacity. An embedded host supplies equivalent adapter
+and credential providers. The Linux service and later mobile applications are
+composition profiles of this contract, not separate transport authorities. The
+first BTLE-qualified production profile is the systemd-managed Linux agent.
+Container builds exclude BTLE until an equally protected credential provider,
+BlueZ/device access model, reload/rollback authority, and confinement profile
+are separately qualified.
 
 ## Platform boundary
 

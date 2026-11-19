@@ -97,9 +97,9 @@ The selected `aster-node` composition owns semantic-v9/profile-5 streaming.
 | Selected direct Iroh | Manually admitted exact endpoint ID and socket, authenticated direct UDP/QUIC, and bounded exchange | Carrier identity is separate from mission and data authorization; no address discovery, port mapping, dynamic-NAT policy, or multi-carrier failover |
 | Selected nearby Iroh discovery | Feature-gated Iroh mDNS lookup using an exact roster or mission-authenticated `--discover-lan`; each window is at most 30 seconds | Default off; upstream observations are not globally capped, so this is not a hostile-LAN or production discovery service |
 | Selected controlled Iroh relay | One operator-pinned HTTPS relay with explicit trust, alongside an initial direct locator or with IP disabled | No public/default relay selection; the relay is transport infrastructure rather than an Aster mission or payload-blind application relay |
-| Selected node and CLI | Networked Event, State, and Record reconciliation; semantic-v9/profile-5 checkpointed Blob streaming plus semantic-v7/v8 profile-4 compatibility; live and stopped Rust APIs; bounded application delivery; payload-blind Event relay; restart/idempotency; Unix zeroization | Reference provisioning; no cross-transport failover, dynamic application-driven network interests, automatic Record merge, route-only Blob custody, finite State/Record TTL, public Blob lifecycle controls, generalized control administration, or production authorization |
+| Selected node and CLI | Networked Event, State, and Record reconciliation; semantic-v9/profile-5 checkpointed Blob streaming plus semantic-v7/v8 profile-4 compatibility; live and stopped Rust APIs; bounded application delivery; payload-blind Event relay; restart/idempotency; Unix zeroization | Reference provisioning; no physically qualified cross-transport failover, dynamic application-driven network interests, automatic Record merge, route-only Blob custody, finite State/Record TTL, public Blob lifecycle controls, generalized control administration, or production authorization |
 | Current semantic in-memory link | High-level host contact, authentication, reconciliation, resume, and failure behavior | Reference carrier; not wired to the selected composition |
-| Linux BlueZ Event evaluation | Fixed-locator Ring 1 uses one exact controller and provisioned peer per process, event-driven availability, deterministic Linux role, bounded retry, and one semantic-v9 ordered Event contact. A separate source-present rostered evaluator adds authenticated transient discovery, a dynamic listener PSM, bounded credential/candidate state, and the same one-peer Event boundary. The Linux `systemd-provider` composition additionally implements bounded automatic controller inventory, passive compatibility probing, sticky selection, and one operational rostered epoch for `Normal` policy. | [Bounded Ring-1 CM4 evidence](validation/evidence/2026-11-05-cm4-btle-ring1-event-validation.md) is evaluation-only. The process-restart failure was bound to CVE-2026-72333 on Linux 6.18.39 by the [clean-restart diagnostic](validation/evidence/2026-11-06-cm4-btle-clean-restart-diagnostic.md); the [fixed-kernel record](validation/evidence/2026-11-06-cm4-btle-clean-restart-validation.md) then observed zero-work restart on Linux 6.18.60 without a controller epoch change. The Debian source profile now presents an optional encrypted roster credential, admits Bluetooth sockets without raw/admin capabilities, and restricts the service user to the exact BlueZ methods used by the adapter. Discovery-secret HMAC pads, hash state, and intermediate digests use zeroize-on-drop storage with frozen byte vectors. Package construction and payload checks pass, while installed-service execution and qualification remain open because stock `bluer` does not establish acknowledged cancellation-safe advertisement/discovery teardown or a bounded first D-Bus ingress queue. No cross-transport fallback, other data class, requirement credit, support claim, or production authorization is claimed. |
+| Linux BlueZ Event evaluation | Fixed-locator Ring 1 uses one exact controller and provisioned peer per process, event-driven availability, deterministic Linux role, bounded retry, and one semantic-v9 ordered Event contact. A separate source-present rostered evaluator adds authenticated transient discovery, a dynamic listener PSM, bounded credential/candidate state, and the same one-peer Event boundary. The Linux `systemd-provider` composition additionally implements bounded automatic controller inventory, passive compatibility probing, sticky selection, and one operational rostered epoch for `Normal` policy. | [Bounded Ring-1 CM4 evidence](validation/evidence/2026-11-05-cm4-btle-ring1-event-validation.md) is evaluation-only. The process-restart failure was bound to CVE-2026-72333 on Linux 6.18.39 by the [clean-restart diagnostic](validation/evidence/2026-11-06-cm4-btle-clean-restart-diagnostic.md); the [fixed-kernel record](validation/evidence/2026-11-06-cm4-btle-clean-restart-validation.md) then observed zero-work restart on Linux 6.18.60 without a controller epoch change. The Debian source profile now presents an optional encrypted roster credential, admits Bluetooth sockets without raw/admin capabilities, and restricts the service user to the exact BlueZ methods used by the adapter. Discovery-secret HMAC pads, hash state, and intermediate digests use zeroize-on-drop storage with frozen byte vectors. Package construction and payload checks pass, while installed-service execution and qualification remain open because stock `bluer` does not establish acknowledged cancellation-safe advertisement/discovery teardown or a bounded first D-Bus ingress queue. No physically validated cross-transport fallback, other data class, requirement credit, support claim, or production authorization is claimed. |
 | Current semantic BTLE | MTU-aware link, unicast plus an advertisement primitive, disconnect handling, platform `BleRadio` seam | Selected-node integration; a shipped Android, iOS, Linux, or controller-specific radio driver; complete one-to-many profile |
 | LoRa, serial, file | The requirements and semantic design do not preclude them | No selected adapters ship |
 
@@ -248,6 +248,26 @@ The repository also retains the current semantic application and host surfaces:
 
 On Linux builds with `systemd-provider`, an enabled BTLE policy and prepared
 roster credential compose `BLE_L2CAP_V1` at epoch zero as `Unavailable`.
+Under semantic v9, when that BTLE policy names an already configured Iroh
+mission peer, the agent also places that exact Iroh route in the same
+eligibility roster and automatic selector. Forced Event wakes for the
+coordinated route leave the legacy scheduler, while Iroh keeps its bounded
+periodic all-class maintenance cadence so its State, Record, Blob, and
+receive-side work cannot be stranded by a higher-priority Event-only adapter.
+Selector-issued and periodic coordinated Iroh contacts share capacity-one
+Event-session admission with BTLE while retaining the existing Iroh ALPN,
+native unidirectional Event turns, and post-Event lanes. The periodic Iroh
+contact is the existing indivisible all-class semantic session and may also
+reconcile Event; configured priority ranks selector-issued automatic Event
+attempts, not suppression of the native Iroh cadence. A post-Event-only
+maintenance contact would require a separately designed protocol capability and
+is outside semantic v9. Other Iroh peers retain the legacy lifecycle.
+Semantic-v8 Iroh remains supported only for routes that are not coordinated
+with BTLE; an overlapping configuration requires semantic v9. Equal
+configured priority selects the stable lower adapter kind (`IROH_QUIC_V1`), and
+a higher BTLE priority selects BTLE for selector-issued automatic Event
+attempts. This is a local first-release Event composition rule, not semantic-v9
+wire behavior.
 `Normal` policy then inventories BlueZ controllers, performs a bounded passive
 LE CoC compatibility probe, keeps a healthy choice sticky, and starts at most
 one rostered Event epoch. The selector does not see `Available` until the
@@ -449,18 +469,28 @@ and stable adapter ID. Exactly one adapter carries a logical attempt. Iroh
 direct versus relay remains an Iroh-local path observation, not two selectable
 Aster transports.
 
-The supervised agent keeps both built-in Iroh contact and adapter selection
-closed while authorized transports publish their initial availability, then
-opens contact admission once before reporting Ready. Terminal drain closes the
-same gate permanently. This ordering is a local runtime detail, not protocol.
+The supervised agent keeps built-in Iroh and adapter selection closed while
+authorized transports publish their initial availability and the composition
+root installs the complete exact-peer roster. It then opens contact admission,
+starts the outbound schedule, and reports Ready. For one BTLE policy that
+overlaps an Iroh peer, both adapter registrations share one exact-peer
+eligibility roster, one attempt slot, and one Event-session permit. Terminal
+drain revokes selector tickets before notifying the permanently closed contact
+gate. This ordering is a local runtime detail, not protocol.
+
+Inbound collision arbitration may cancel the duplicate outbound Iroh task, but
+that local action remains `Cancelled`; it is never reclassified as link loss or
+used to authorize cross-carrier reselection. A collision waiter observes
+terminal admission while waiting for the shared permit and cannot enter a
+session after drain begins.
 
 Fake adapters validate multi-registration ranking, requirement and policy
 filtering, adapter-owned attempt creation, retry, cancellation, terminal
 outcomes, and checkpoint carry-forward, but they are not product transport
-support. This milestone claims automatic selection of the sole shipped Iroh
-adapter and authenticated Iroh reopen. It does not claim best-available
-cross-transport selection or failover because no second production adapter or
-physical cross-transport scenario has been validated. Semantic v9 already
+support. The Linux Event composition now supplies source-level common
+Iroh/BTLE selection for one exact peer. It does not claim physical
+best-available failover or release qualification because no physical
+cross-transport scenario has passed the production gates. Semantic v9 already
 permits local selection among independently eligible adapters before each fresh
 contact; it does not coordinate local ranking across peers. Every selected
 contact performs a complete mission handshake and remains bound to one adapter.
@@ -471,8 +501,8 @@ receiver-owned Profile-5 durable checkpoint may inform a fresh attempt.
 Cross-carrier reselection is permitted only after locally proven adapter
 unavailability, link loss, or a transport deadline. A remote or ambiguous
 pre-authentication failure neither suppresses the expected peer nor triggers
-reselection. Production composition must not enable competing adapters until
-the full [BTLE evidence and governance gates](superpowers/specs/2026-11-03-production-btle-design.md#required-evidence-and-governance)
+reselection. Common source-level composition must not be presented as supported
+or release-qualified until the full [BTLE evidence and governance gates](superpowers/specs/2026-11-03-production-btle-design.md#required-evidence-and-governance)
 are satisfied. The closed `ContactOutcome` mappings, peer-indexed eligibility,
 node-global admission and duplicate arbitration, operational and physical
 evidence, independent review, and release authorization are necessary parts of

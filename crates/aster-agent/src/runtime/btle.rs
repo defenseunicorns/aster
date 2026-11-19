@@ -34,7 +34,7 @@ use aster_host::{
 };
 #[cfg(feature = "sdk-test-support")]
 use aster_node::RunningAutomaticEventTransportHandle;
-#[cfg(any(feature = "sdk-test-support", feature = "systemd-provider"))]
+#[cfg(any(test, feature = "sdk-test-support", feature = "systemd-provider"))]
 use aster_node::{
     EventAdapterControl, EventAdapterSnapshot, EventAdapterState, EventAttemptReceiver,
 };
@@ -529,19 +529,19 @@ impl BtleRuntimeStartup {
         let eligibility = policy
             .filter(|_| installs_peer_eligibility)
             .zip(schedule_role)
-            .map(|(policy, role)| PendingBtleEligibility {
-                automatic: node.automatic_event_transports(),
-                peer: policy.peer(),
-                role,
-                entry: EventPeerEligibility::provisioned_exact_peer(
-                    node.selected_events().mission_authority(),
+            .map(|(policy, role)| {
+                let mission = node.selected_events().mission_authority();
+                let entries = automatic_event_peer_eligibility(
+                    mission,
                     policy.peer(),
-                    EventTransportKind::BLE_L2CAP_V1,
-                    true,
-                    1,
-                    0,
-                    None,
-                ),
+                    node.automatic_iroh_event_peer() == Some(policy.peer()),
+                );
+                PendingAutomaticEventRoster {
+                    automatic: node.automatic_event_transports(),
+                    peer: policy.peer(),
+                    role,
+                    entries,
+                }
             });
         Ok(ActiveBtleRuntime::new(
             owner,
@@ -554,9 +554,37 @@ impl BtleRuntimeStartup {
     }
 }
 
-struct PendingBtleEligibility {
+fn automatic_event_peer_eligibility(
+    mission: aster_mesh::NodeId,
+    peer: aster_mesh::NodeId,
+    include_iroh: bool,
+) -> Vec<EventPeerEligibility> {
+    let mut entries = vec![EventPeerEligibility::provisioned_exact_peer(
+        mission,
+        peer,
+        EventTransportKind::BLE_L2CAP_V1,
+        true,
+        1,
+        0,
+        None,
+    )];
+    if include_iroh {
+        entries.push(EventPeerEligibility::provisioned_exact_peer(
+            mission,
+            peer,
+            EventTransportKind::IROH_QUIC_V1,
+            true,
+            1,
+            0,
+            None,
+        ));
+    }
+    entries
+}
+
+struct PendingAutomaticEventRoster {
     automatic: aster_node::RunningAutomaticEventTransportHandle,
-    entry: EventPeerEligibility,
+    entries: Vec<EventPeerEligibility>,
     peer: aster_mesh::NodeId,
     role: EventScheduleRole,
 }
@@ -567,25 +595,46 @@ enum EventScheduleExit {
     PeerUnavailable,
 }
 
-impl PendingBtleEligibility {
-    fn install(self) -> Result<Option<JoinHandle<EventScheduleExit>>, BtleRuntimeOwnerError> {
+impl PendingAutomaticEventRoster {
+    fn install(self) -> Result<InstalledAutomaticEventSchedule, BtleRuntimeOwnerError> {
         let Self {
             automatic,
-            entry,
+            entries,
             peer,
             role,
         } = self;
         automatic
-            .replace_eligibility(vec![entry])
+            .replace_eligibility(entries)
             .ok_or(BtleRuntimeOwnerError::Startup)?;
+        Ok(InstalledAutomaticEventSchedule {
+            automatic,
+            peer,
+            role,
+        })
+    }
+}
+
+struct InstalledAutomaticEventSchedule {
+    automatic: aster_node::RunningAutomaticEventTransportHandle,
+    peer: aster_mesh::NodeId,
+    role: EventScheduleRole,
+}
+
+impl InstalledAutomaticEventSchedule {
+    fn start(self) -> Option<JoinHandle<EventScheduleExit>> {
+        let Self {
+            automatic,
+            peer,
+            role,
+        } = self;
         #[cfg(all(target_os = "linux", feature = "systemd-provider"))]
         {
-            Ok(schedule::spawn_event_schedule(automatic, peer, role))
+            schedule::spawn_event_schedule(automatic, peer, role)
         }
         #[cfg(not(all(target_os = "linux", feature = "systemd-provider")))]
         {
             let _ = (automatic, peer, role);
-            Ok(None)
+            None
         }
     }
 }
@@ -595,7 +644,8 @@ impl PendingBtleEligibility {
 pub(super) struct ActiveBtleRuntime {
     owner: Option<Box<dyn BtleRuntimeOwner>>,
     completion: Option<tokio::sync::watch::Receiver<bool>>,
-    eligibility: Option<PendingBtleEligibility>,
+    eligibility: Option<PendingAutomaticEventRoster>,
+    schedule_start: Option<InstalledAutomaticEventSchedule>,
     schedule: Option<JoinHandle<EventScheduleExit>>,
     unexpected_schedule_exit: bool,
     cleanup_runtime: Option<tokio::runtime::Handle>,
@@ -611,6 +661,7 @@ impl ActiveBtleRuntime {
             owner: None,
             completion: None,
             eligibility: None,
+            schedule_start: None,
             schedule: None,
             unexpected_schedule_exit: false,
             cleanup_runtime: None,
@@ -623,7 +674,7 @@ impl ActiveBtleRuntime {
 
     fn new(
         owner: Option<Box<dyn BtleRuntimeOwner>>,
-        eligibility: Option<PendingBtleEligibility>,
+        eligibility: Option<PendingAutomaticEventRoster>,
         #[cfg(feature = "sdk-test-support")] node_shutdown_observer: Option<
             std::sync::Arc<dyn Fn() + Send + Sync>,
         >,
@@ -636,6 +687,7 @@ impl ActiveBtleRuntime {
             owner,
             completion,
             eligibility,
+            schedule_start: None,
             schedule: None,
             unexpected_schedule_exit: false,
             cleanup_runtime: tokio::runtime::Handle::try_current().ok(),
@@ -651,14 +703,22 @@ impl ActiveBtleRuntime {
     }
 
     pub(super) fn install_eligibility(&mut self) -> Result<(), BtleRuntimeOwnerError> {
-        if self.schedule.is_some() {
+        if self.schedule_start.is_some() || self.schedule.is_some() {
             return Ok(());
         }
         let Some(eligibility) = self.eligibility.take() else {
             return Ok(());
         };
-        self.schedule = eligibility.install()?;
+        self.schedule_start = Some(eligibility.install()?);
         Ok(())
+    }
+
+    pub(super) fn start_schedule(&mut self) {
+        if self.schedule.is_none()
+            && let Some(schedule) = self.schedule_start.take()
+        {
+            self.schedule = schedule.start();
+        }
     }
 
     pub(super) fn is_terminal(&mut self) -> bool {

@@ -111,6 +111,7 @@ pub use runtime::{
     run_demo, run_demo_scenario, run_node, run_node_with_forwarding,
     start_externally_supervised_transport_neutral_node, start_node, start_node_with_forwarding,
     start_node_with_forwarding_and_output_policy,
+    start_supervised_node_with_automatic_iroh_event_peer,
     start_supervised_node_with_forwarding_and_output_policy, start_transport_neutral_node,
     zeroize_node,
 };
