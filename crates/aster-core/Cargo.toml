@@ -9,32 +9,16 @@ license.workspace = true
 [lib]
 name = "aster_mesh"
 
-[[example]]
-name = "basic"
-required-features = ["sqlite-store"]
-
 [features]
-# The all-features-off combination is intentionally unsupported: Cargo's
-# additive features cannot preserve the historical SQLite API there while also
-# keeping the reference-session composition SQLite-free. Ordinary/default and
-# adapter consumers retain the SQLite-backed surface; minimal consumers must
-# use `--no-default-features --features reference-session`.
-default = ["sqlite-store"]
-# Protocol internals used by separately versioned transport adapters,
-# conformance tooling, and the native boundary. Application code should use
-# the default high-level surface.
-adapter-sdk = ["sqlite-store"]
-# Proven reference provisioning, hybrid-authenticated session, and protected
-# frame surface without the legacy SQLite-backed runtime composition.
+default = ["reference-session"]
+# Protocol contracts used by transport adapters and conformance tooling.
+adapter-sdk = ["reference-session"]
+# Reference provisioning, authenticated sessions, and protected source adapters.
 reference-session = []
 # Deterministic authenticated-session fixtures used only by the separate fuzz crate.
 fuzzing = ["reference-session"]
-# Non-default compatibility seams used only by downstream authenticated
-# transport tests. Production callers cannot select session semantics.
+# Compatibility seams for downstream authenticated transport tests.
 test-utils = ["reference-session"]
-# Durable legacy/reference runtime. Kept in the default set so existing users
-# retain the exact API, persistence implementation, and behavior.
-sqlite-store = ["dep:rusqlite"]
 
 [dependencies]
 aes-gcm.workspace = true
@@ -45,7 +29,6 @@ ml-kem.workspace = true
 minicbor.workspace = true
 p256.workspace = true
 rand_core.workspace = true
-rusqlite = { workspace = true, optional = true }
 sha2.workspace = true
 zeroize.workspace = true
 

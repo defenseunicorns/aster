@@ -126,18 +126,10 @@ decide whether one update supersedes another.
 
 ### Deletion with tombstones
 
-A deletion in the broader semantic `ApplicationNode` API is a replicated
-tombstone, not a local row removal. It prevents an offline node from
-reintroducing an older value only within the configured retention window. The
-default for that store is 45 days: 30 days of offline tolerance plus a 15-day
-margin. Returning after that boundary can resurrect data.
+A State or Record deletion is a replicated tombstone, not a local row removal.
+The runtime does not provide retention-driven State or Record collection.
 
-Configure tombstone and superseded-version retention through
-[`ApplicationNodeOptions`](../crates/aster-core/src/api.rs) and align it with
-the deployment’s actual offline tolerance.
-
-The selected runtime does not provide retention-driven State or Record
-collection. Blob maintenance reclaims exact already-unreferenced staging and
+Blob maintenance reclaims exact already-unreferenced staging and
 completed variants, atomically retires current-policy-invalidated publications
 and their aliases, and expires those retained retirement records after 45 days
 of accumulated conservative lower-bound age. Blob admission can also perform
@@ -146,7 +138,7 @@ lower-priority Blob work. The selected Rust API activates finite Blob TTL and
 tagged retirement notices on the selected Linux path. On Linux, the local agent
 and `asterctl` expose bounded Blob publish/read operations with durable or
 finite TTL. Route-only custody, public GC controls, Blob subscription/status
-RPCs and CLI commands, and Blob lifetime fields in the FFI remain open. See the
+RPCs and CLI commands remain open. ABI v2 exposes Blob lifetime fields. See the
 [current implementation boundary](../README.md#current-implementation-boundary).
 
 ### Priority and TTL
@@ -181,14 +173,6 @@ in-flight work. Capacity errors are policy or resource signals, not transient
 network failures. Current class-specific eviction and deferral behavior is
 documented in [Architecture](architecture.md) and the
 [protocol](protocol.md#11-priority-retry-eviction-and-emissions).
-
-### Atomic batches
-
-The broader semantic `ApplicationNode` API supports an explicit batch of 2–64
-ordered items with one publisher, data class, topic, scope, and active epoch.
-Either every member commits or none does. Blob batches atomically finalize
-distinct streaming writers without exposing manifests or route commitments to
-application code.
 
 ## Routing and propagation
 
