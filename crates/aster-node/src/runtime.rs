@@ -21528,17 +21528,29 @@ async fn sync_automatic_iroh_with_forwarding(
         }
     };
 
-    let _session_permit = match event_sessions.try_reserve_native_iroh() {
-        Ok(permit) => permit,
-        Err(outcome) => {
-            connection.close();
-            let _ = attempt.take().finish_native(Err(outcome));
-            return Err(NodeError::Protocol(
-                "shared Event contact admission is busy".into(),
-            ));
+    let mut close_on_cancel = IrohConnectionCloseGuard(Some(connection.clone()));
+    let _session_permit = {
+        let reservation = event_sessions.reserve_event_session();
+        tokio::pin!(reservation);
+        tokio::select! {
+            biased;
+            _ = attempt.current().revocation_outcome() => {
+                attempt.take().finish_revoked();
+                return Err(NodeError::Carrier(CarrierError::Transport(
+                    "automatic Iroh attempt revoked while waiting for Event admission".into(),
+                )));
+            }
+            result = &mut reservation => match result {
+                Ok(permit) => permit,
+                Err(outcome) => {
+                    let _ = attempt.take().finish_native(Err(outcome));
+                    return Err(NodeError::Protocol(
+                        "shared Event contact admission closed while waiting".into(),
+                    ));
+                }
+            }
         }
     };
-    let mut close_on_cancel = IrohConnectionCloseGuard(Some(connection.clone()));
     let session = COORDINATED_IROH_EVENT_V9.scope(
         (),
         EVENT_CONTACT_EXACT_AUTHENTICATED.scope(
@@ -45567,34 +45579,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_iroh_event_peer_consumes_common_attempt_when_btle_is_unavailable() {
+    async fn automatic_iroh_waits_for_shared_event_session_after_carrier_open() {
         let test_root = root("automatic-iroh-event-peer");
-        fs::create_dir_all(&test_root).expect("automatic Iroh state");
-        #[cfg(unix)]
-        fs::set_permissions(&test_root, fs::Permissions::from_mode(0o700))
-            .expect("owner-only automatic Iroh state");
-        let local_carrier = NodeIdentity::load_or_create(&test_root)
+        let local_state = test_root.join("local");
+        let peer_state = test_root.join("peer");
+        for state in [&local_state, &peer_state] {
+            fs::create_dir_all(state).expect("automatic Iroh state");
+            #[cfg(unix)]
+            fs::set_permissions(state, fs::Permissions::from_mode(0o700))
+                .expect("owner-only automatic Iroh state");
+        }
+        let local_carrier = NodeIdentity::load_or_create(&local_state)
             .expect("automatic Iroh local carrier")
             .id();
-        let peer_secret = aster_iroh::SecretKey::generate();
-        let peer_endpoint = Endpoint::bind(
-            peer_secret.clone(),
-            EndpointConfig::direct(SocketAddr::from(([127, 0, 0, 1], 0))),
-        )
-        .await
-        .expect("bind automatic Iroh peer");
-        let peer_carrier = peer_secret.public();
-        let peer_address = peer_endpoint
-            .bound_sockets()
-            .into_iter()
-            .find(SocketAddr::is_ipv4)
-            .expect("automatic Iroh peer IPv4 socket");
+        let peer_carrier = NodeIdentity::load_or_create(&peer_state)
+            .expect("automatic Iroh peer carrier")
+            .id();
+        let placeholder = SocketAddr::from(([127, 0, 0, 1], 9));
         let mut issued = issue_missions(2);
         let local = issued.remove(0);
         let peer = issued.remove(0);
+        let peer_identity = peer.identity;
+        let peer_node = start_supervised_node_with_forwarding_and_output_policy(
+            NodeConfig {
+                state: peer_state,
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: peer.credentials,
+                peers: vec![MissionExpectedPeer {
+                    carrier: ExpectedPeer {
+                        id: local_carrier,
+                        address: placeholder,
+                    },
+                    mission: local.identity,
+                }],
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            SelectedForwardingConfig::default()
+                .with_emission_policy(EventEmissionPolicy::ReceiveOnly),
+            NodeOperatorOutputPolicy::default(),
+        )
+        .await
+        .expect("start automatic Iroh peer node");
+        let peer_address = peer_node
+            .bound_sockets
+            .iter()
+            .copied()
+            .find(SocketAddr::is_ipv4)
+            .expect("automatic Iroh peer IPv4 socket");
         let node = start_supervised_node_with_automatic_iroh_event_peer(
             NodeConfig {
-                state: test_root.clone(),
+                state: local_state,
                 bind: SocketAddr::from(([127, 0, 0, 1], 0)),
                 mission: local.credentials,
                 peers: vec![MissionExpectedPeer {
@@ -45611,12 +45648,12 @@ mod tests {
             },
             SelectedForwardingConfig::default(),
             NodeOperatorOutputPolicy::default(),
-            peer.identity,
+            peer_identity,
         )
         .await
         .expect("start automatic Iroh node");
 
-        assert_eq!(node.automatic_iroh_event_peer(), Some(peer.identity));
+        assert_eq!(node.automatic_iroh_event_peer(), Some(peer_identity));
         assert!(
             node.automatic_event_transports()
                 .register(EventAdapterSnapshot::new(
@@ -45644,7 +45681,7 @@ mod tests {
             automatic.replace_eligibility(vec![
                 EventPeerEligibility::provisioned_exact_peer(
                     node.selected_events().mission_authority(),
-                    peer.identity,
+                    peer_identity,
                     EventTransportKind::IROH_QUIC_V1,
                     true,
                     1,
@@ -45653,7 +45690,7 @@ mod tests {
                 ),
                 EventPeerEligibility::provisioned_exact_peer(
                     node.selected_events().mission_authority(),
-                    peer.identity,
+                    peer_identity,
                     EventTransportKind::BLE_L2CAP_V1,
                     true,
                     1,
@@ -45669,58 +45706,43 @@ mod tests {
             .clone()
             .try_acquire_owned()
             .expect("hold shared Event session permit");
-        let busy = tokio::time::timeout(Duration::from_secs(2), async {
-            let peer_task = tokio::spawn({
-                let peer_endpoint = peer_endpoint.clone();
-                async move {
-                    let connection = peer_endpoint
-                        .accept(&BTreeSet::from([local_carrier]))
-                        .await
-                        .expect("accept automatic Iroh carrier");
-                    connection.close();
-                }
-            });
-            let outcome = automatic.run_peer_attempt(peer.identity).await;
-            peer_task.await.expect("automatic Iroh peer task");
-            outcome
+        assert!(peer_node.open_transport_admission());
+        timeout(Duration::from_secs(2), async {
+            while peer_node.contact_activity_snapshot().launched == 0 {
+                tokio::task::yield_now().await;
+            }
         })
         .await
-        .expect("busy native Iroh attempt completed");
-        let AutomaticEventAttemptOutcome::Completed(Err(busy)) = busy else {
-            panic!("shared Event permit must reject the native Iroh attempt")
-        };
-        assert_eq!(busy.reason(), ContactReason::AdmissionBusy);
-        drop(held_event_session);
-
-        let outcome = tokio::time::timeout(Duration::from_secs(2), async {
-            let peer_task = tokio::spawn({
-                let peer_endpoint = peer_endpoint.clone();
-                async move {
-                    let connection = peer_endpoint
-                        .accept(&BTreeSet::from([local_carrier]))
-                        .await
-                        .expect("accept admitted automatic Iroh carrier");
-                    connection.close();
-                }
-            });
-            let outcome = automatic.run_peer_attempt(peer.identity).await;
-            peer_task.await.expect("admitted automatic Iroh peer task");
-            outcome
-        })
-        .await
-        .expect("admitted native Iroh attempt completed");
-        assert!(matches!(
-            outcome,
-            AutomaticEventAttemptOutcome::Completed(Err(_))
-        ));
-        assert_eq!(
-            node.contact_activity_snapshot().launched,
-            2,
-            "the selector launched one rejected and one admitted native Iroh contact"
+        .expect("automatic Iroh carrier-open deadline");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                wait_for_authenticated_contacts(&peer_node.selected_events(), 1, "held admission"),
+            )
+            .await
+            .is_err(),
+            "an opened automatic Iroh carrier cannot authenticate before shared Event admission"
         );
 
-        node.shutdown().await.expect("automatic Iroh shutdown");
-        peer_endpoint.close().await;
+        drop(held_event_session);
+        wait_for_authenticated_contacts(&node.selected_events(), 1, "automatic Iroh local").await;
+        wait_for_authenticated_contacts(&peer_node.selected_events(), 1, "automatic Iroh peer")
+            .await;
+        assert_eq!(
+            node.contact_activity_snapshot().launched,
+            1,
+            "capacity contention must not require a second durable generation"
+        );
+
+        let (node_receipt, peer_receipt) = tokio::join!(node.shutdown(), peer_node.shutdown());
+        assert!(
+            node_receipt.is_ok(),
+            "automatic Iroh shutdown: {node_receipt:?}"
+        );
+        assert!(
+            peer_receipt.is_ok(),
+            "automatic Iroh peer shutdown: {peer_receipt:?}"
+        );
         fs::remove_dir_all(test_root).expect("automatic Iroh cleanup");
     }
 
