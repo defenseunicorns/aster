@@ -52,6 +52,28 @@ pub enum TokenReloadPolicy {
     ReloadFrom(PathBuf),
 }
 
+#[derive(Default)]
+struct TokenReloadObserver {
+    #[cfg(feature = "sdk-test-support")]
+    handled: Option<mpsc::UnboundedSender<()>>,
+}
+
+impl TokenReloadObserver {
+    #[cfg(feature = "sdk-test-support")]
+    fn for_test(handled: mpsc::UnboundedSender<()>) -> Self {
+        Self {
+            handled: Some(handled),
+        }
+    }
+
+    fn handled(&self) {
+        #[cfg(feature = "sdk-test-support")]
+        if let Some(handled) = &self.handled {
+            let _ = handled.send(());
+        }
+    }
+}
+
 impl fmt::Debug for TokenReloadPolicy {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -134,6 +156,7 @@ where
         signals,
         TokenReloadPolicy::ReloadFrom(token_path),
         btle,
+        TokenReloadObserver::default(),
     )
     .await
 }
@@ -155,6 +178,33 @@ where
         signals,
         reload,
         BtleRuntimeStartup::disabled(),
+        TokenReloadObserver::default(),
+    )
+    .await
+}
+
+/// Runs the credential-ready customer agent and acknowledges handled reloads.
+#[cfg(feature = "sdk-test-support")]
+#[doc(hidden)]
+pub async fn run_customer_agent_with_credentials_and_reload_observer<L>(
+    config: ValidatedRuntimeConfig,
+    credentials: StartupCredentials,
+    loader: &mut L,
+    signals: mpsc::Receiver<AgentSignal>,
+    reload: TokenReloadPolicy,
+    reload_handled: mpsc::UnboundedSender<()>,
+) -> Result<AgentExit, AgentRuntimeError>
+where
+    L: ProvisioningSecretLoader + ?Sized,
+{
+    run_customer_agent_with_credentials_and_btle_inner(
+        config,
+        credentials,
+        loader,
+        signals,
+        reload,
+        BtleRuntimeStartup::disabled(),
+        TokenReloadObserver::for_test(reload_handled),
     )
     .await
 }
@@ -177,6 +227,7 @@ async fn run_customer_agent_with_credentials_and_btle_inner<L>(
     mut signals: mpsc::Receiver<AgentSignal>,
     reload: TokenReloadPolicy,
     btle: BtleRuntimeStartup,
+    reload_observer: TokenReloadObserver,
 ) -> Result<AgentExit, AgentRuntimeError>
 where
     L: ProvisioningSecretLoader + ?Sized,
@@ -334,6 +385,7 @@ where
                         retryable,
                         response_code,
                     );
+                    reload_observer.handled();
                 }
                 Some(AgentSignal::Terminate) => break RunningTransition::Drain,
                 None => break RunningTransition::Fatal { health_completed: false },

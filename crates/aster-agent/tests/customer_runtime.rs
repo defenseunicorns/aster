@@ -20,6 +20,7 @@ use std::{fs::OpenOptions, time::Instant};
 #[cfg(feature = "sdk-test-support")]
 use aster_agent::runtime::{
     BtleRuntimeOwner, BtleRuntimeOwnerError, BtleRuntimeStartup, run_customer_agent_with_btle,
+    run_customer_agent_with_credentials_and_reload_observer,
 };
 use aster_agent::{
     ClientToken,
@@ -666,6 +667,7 @@ async fn customer_operation_limits_process_preserves_over_limit_reopen() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sdk-test-support")]
 async fn failed_hangup_keeps_the_old_token_and_readiness() {
     // Break caught: destructive or non-atomic reload revokes the working token
     // or drops readiness when the replacement file is invalid.
@@ -673,7 +675,11 @@ async fn failed_hangup_keeps_the_old_token_and_readiness() {
         return;
     }
     let fixture = CustomerFixture::new();
-    let running = RunningFixture::start(&fixture).await;
+    let (running, mut reloads) = RunningFixture::start_with_reload_observer(
+        &fixture,
+        TokenReloadPolicy::ReloadFrom(fixture.token.clone()),
+    )
+    .await;
 
     fixture.write_token(b"invalid");
     running
@@ -681,7 +687,7 @@ async fn failed_hangup_keeps_the_old_token_and_readiness() {
         .send(AgentSignal::Hangup)
         .await
         .expect("request failed reload");
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    reloads.recv().await.expect("failed reload was handled");
     assert_eq!(
         application_status(fixture.application(), fixture.token_bytes()).await,
         200
@@ -719,6 +725,7 @@ async fn successful_hangup_reloads_only_the_client_token_atomically() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "sdk-test-support")]
 async fn disabled_hangup_retains_the_current_token() {
     // Break caught: the Compose runtime must not reopen or replace a bind-
     // mounted token on SIGHUP, but must remain ready with the original token.
@@ -727,30 +734,17 @@ async fn disabled_hangup_retains_the_current_token() {
     }
     let fixture = CustomerFixture::new();
     let old_token = fixture.token_bytes().to_vec();
-    let config = load_and_validate_config(fixture.config_path()).expect("validated config");
-    let (runtime, paths) = config.into_parts();
-    let credentials = load_startup_credentials(&paths).expect("startup credentials");
-    let (signals, receiver) = tokio::sync::mpsc::channel(4);
-    let task = tokio::spawn(async move {
-        let mut loader = RecordingLoader::new();
-        run_customer_agent_with_credentials(
-            runtime,
-            credentials,
-            &mut loader,
-            receiver,
-            TokenReloadPolicy::Disabled,
-        )
-        .await
-    });
-    wait_until_ready(&fixture).await;
+    let (running, mut reloads) =
+        RunningFixture::start_with_reload_observer(&fixture, TokenReloadPolicy::Disabled).await;
 
     let replacement = b"replacement-client-token-00000002";
     fixture.write_token(replacement);
-    signals
+    running
+        .signals
         .send(AgentSignal::Hangup)
         .await
         .expect("send hangup");
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    reloads.recv().await.expect("disabled reload was handled");
     assert_eq!(
         application_status(fixture.application(), &old_token).await,
         200
@@ -760,11 +754,7 @@ async fn disabled_hangup_retains_the_current_token() {
         401
     );
     assert_eq!(health_status(fixture.health(), "/readyz").await, 200);
-    signals
-        .send(AgentSignal::Terminate)
-        .await
-        .expect("stop runtime");
-    assert_eq!(finish_runtime(task).await, AgentExit::Clean);
+    running.stop_clean().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2792,6 +2782,33 @@ impl RunningFixture {
         });
         wait_until_ready(fixture).await;
         Self { signals, task }
+    }
+
+    #[cfg(feature = "sdk-test-support")]
+    async fn start_with_reload_observer(
+        fixture: &CustomerFixture,
+        reload: TokenReloadPolicy,
+    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let config = load_and_validate_config(fixture.config_path()).expect("validated config");
+        let credentials =
+            load_startup_credentials(config.credential_paths()).expect("startup credentials");
+        let (runtime, _) = config.into_parts();
+        let (signals, receiver) = tokio::sync::mpsc::channel(4);
+        let (reload_send, reload_receive) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let mut loader = RecordingLoader::new();
+            run_customer_agent_with_credentials_and_reload_observer(
+                runtime,
+                credentials,
+                &mut loader,
+                receiver,
+                reload,
+                reload_send,
+            )
+            .await
+        });
+        wait_until_ready(fixture).await;
+        (Self { signals, task }, reload_receive)
     }
 
     async fn stop_clean(self) {
