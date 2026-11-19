@@ -2,8 +2,7 @@
 
 > Historical scope: the subsequent retirement of `aster-lab`, `aster-host`,
 > and the native/Gate H controllers supersedes their retention and execution
-> instructions below. The Iroh 1.5.0 upgrade also supersedes the netlink-patch
-> retention instruction. Recorded results remain bound to their original revisions.
+> instructions below. Recorded results remain bound to their original revisions.
 
 - Status: accepted — bounded test and dependency maintenance
 - Date: 2026-10-14

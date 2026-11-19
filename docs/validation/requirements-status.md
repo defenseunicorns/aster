@@ -4262,8 +4262,6 @@ review evidence.
 
 ## Dependency-admission gate
 
-The dependency-policy scope gate rejects `paste` in the root and fuzz graphs.
-
 Decision 0028 records the exact-package deviations, and `deny.toml` encodes
 them narrowly: `webpki-roots` 1.0.10 and `webpki-root-certs` 1.0.10 under
 `CDLA-Permissive-2.0`, plus the browser-WASM-only
