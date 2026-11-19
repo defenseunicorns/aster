@@ -25,6 +25,8 @@ btle_next_directory=
 btle_initial_encrypted=
 btle_next_encrypted=
 btle_status_log=
+btle_authorized_status_log=
+btle_denied_status_log=
 cleanup() {
     if [[ -n $lock_holder_pid ]]; then
         kill "$lock_holder_pid" 2>/dev/null || true
@@ -71,6 +73,14 @@ cleanup() {
     if [[ -n $btle_status_log ]]; then
         rm -f -- "$btle_status_log"
         btle_status_log=
+    fi
+    if [[ -n $btle_authorized_status_log ]]; then
+        rm -f -- "$btle_authorized_status_log"
+        btle_authorized_status_log=
+    fi
+    if [[ -n $btle_denied_status_log ]]; then
+        rm -f -- "$btle_denied_status_log"
+        btle_denied_status_log=
     fi
     systemctl stop aster-agent.service || true
 }
@@ -561,6 +571,35 @@ if [[ $btle_status_observed != true ]]; then
     sed -n '1,20p' "$btle_status_log" >&2
     exit 1
 fi
+btle_authorized_status_log=$(mktemp)
+btle_denied_status_log=$(mktemp)
+runuser -u nobody -g nogroup -G systemd-journal -- \
+    journalctl --unit=aster-agent.service --since="$btle_status_since" \
+        --output=cat --no-pager >"$btle_authorized_status_log"
+runuser -u nobody -g nogroup -- \
+    journalctl --unit=aster-agent.service --since="$btle_status_since" \
+        --output=cat --no-pager >"$btle_denied_status_log" 2>/dev/null || true
+python3 - "$btle_authorized_status_log" "$btle_denied_status_log" <<'PY'
+import json, sys
+from pathlib import Path
+
+def statuses(path):
+    records = []
+    for line in Path(path).read_text().splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("operation") == "btle_status":
+            records.append(record)
+    return records
+
+assert statuses(sys.argv[1])
+assert not statuses(sys.argv[2])
+PY
+rm -- "$btle_authorized_status_log" "$btle_denied_status_log"
+btle_authorized_status_log=
+btle_denied_status_log=
 rm -- "$btle_status_log"
 btle_status_log=
 python3 - /var/lib/aster-agent/discovery-checkpoint <<'PY'

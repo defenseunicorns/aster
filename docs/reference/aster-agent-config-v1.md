@@ -176,6 +176,21 @@ aster-agent.service`; `systemctl reload` reloads only the application bearer
 token. A replacement roster generation is validated and durably checkpointed
 before the new adapter lease is exposed.
 
+The packaged service writes its current sanitized BTLE status to the system
+journal. A host operator authorized by the Linux journal ACLs can read the
+latest record without granting an Aster application token:
+
+```console
+journalctl --unit=aster-agent.service --boot --output=cat --no-pager \
+  | grep '"operation":"btle_status"' | tail -1
+```
+
+The record contains only timestamp, operation, adapter kind, availability,
+closed reason, and support tag. Service readiness remains independent of BTLE
+availability. Journal authorization is owned by the host (normally root or an
+explicit journal-reader group); do not grant journal access to expose BTLE
+status to an application.
+
 The server also retains compiled, non-configurable bounds: 1 MiB encoded
 request/message, 4 MiB protobuf element memory, 2 MiB encoded protobuf
 response, RPC deadlines of 10 ms through 15 minutes (10-second default), 32

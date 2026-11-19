@@ -35,7 +35,7 @@ use std::os::unix::{
     fs::{DirBuilderExt as _, FileTypeExt as _, MetadataExt as _, PermissionsExt as _},
 };
 #[cfg(test)]
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 use aster_contact::{ContactError, ContactErrorKind, OrderedContact};
 use aster_iroh::{
@@ -4758,6 +4758,9 @@ struct ContactActivitySnapshot {
     completed: u64,
     failed: u64,
     transport_blocked: u64,
+    automatic_event_attempts_parked: u64,
+    automatic_event_admission_entries: u64,
+    event_admission_waits: u64,
 }
 
 #[cfg(test)]
@@ -4768,6 +4771,10 @@ struct ContactActivityProbe {
     completed: AtomicU64,
     failed: AtomicU64,
     transport_blocked: AtomicU64,
+    automatic_event_attempts_parked: AtomicU64,
+    automatic_event_admission_entries: AtomicU64,
+    event_admission_waits: AtomicU64,
+    automatic_event_admission_gate: OnceLock<Arc<Semaphore>>,
 }
 
 #[cfg(test)]
@@ -4789,6 +4796,29 @@ impl ContactActivityProbe {
         self.transport_blocked.fetch_add(1, Ordering::Release);
     }
 
+    fn automatic_event_admission_gate(&self) -> Arc<Semaphore> {
+        self.automatic_event_admission_gate
+            .get_or_init(|| Arc::new(Semaphore::new(1)))
+            .clone()
+    }
+
+    fn automatic_event_attempt_parked(&self) {
+        self.automatic_event_attempts_parked
+            .fetch_add(1, Ordering::Release);
+    }
+
+    async fn wait_at_automatic_event_admission(&self) {
+        self.automatic_event_admission_entries
+            .fetch_add(1, Ordering::Release);
+        let permit = self
+            .automatic_event_admission_gate()
+            .acquire_owned()
+            .await
+            .expect("test admission gate remains open");
+        self.event_admission_waits.fetch_add(1, Ordering::Release);
+        drop(permit);
+    }
+
     fn snapshot(&self) -> ContactActivitySnapshot {
         let active = self.active.load(Ordering::Acquire);
         ContactActivitySnapshot {
@@ -4797,6 +4827,13 @@ impl ContactActivityProbe {
             completed: self.completed.load(Ordering::Acquire),
             failed: self.failed.load(Ordering::Acquire),
             transport_blocked: self.transport_blocked.load(Ordering::Acquire),
+            automatic_event_attempts_parked: self
+                .automatic_event_attempts_parked
+                .load(Ordering::Acquire),
+            automatic_event_admission_entries: self
+                .automatic_event_admission_entries
+                .load(Ordering::Acquire),
+            event_admission_waits: self.event_admission_waits.load(Ordering::Acquire),
         }
     }
 }
@@ -19565,6 +19602,8 @@ async fn run_node_actor_inner(
                             continue;
                         };
                         pending_automatic_iroh_attempt = Some(attempt);
+                        #[cfg(test)]
+                        contact_activity.automatic_event_attempt_parked();
                         event_contact_wake.arm_event([peer.carrier]);
                         application_tick_pending = true;
                     }
@@ -20325,6 +20364,8 @@ async fn run_node_actor_inner(
                     let task_event_inserted = event_inserted.clone();
                     let cancellation = NativeIrohCancellation::default();
                     let task_cancellation = cancellation.clone();
+                    #[cfg(test)]
+                    let task_contact_activity = contact_activity.clone();
                     let task = outbound.spawn(inherit_node_output(CONTACT_EVENT_INSERTED.scope(
                         task_event_inserted,
                         async move {
@@ -20382,6 +20423,8 @@ async fn run_node_actor_inner(
                                         attempt,
                                         event_sessions,
                                         task_cancellation,
+                                        #[cfg(test)]
+                                        task_contact_activity,
                                     )
                                     .await
                                 }
@@ -21497,6 +21540,7 @@ async fn sync_automatic_iroh_with_forwarding(
     attempt: EventOutboundAttempt,
     event_sessions: OrderedEventContactHandle,
     cancellation: NativeIrohCancellation,
+    #[cfg(test)] contact_activity: Arc<ContactActivityProbe>,
 ) -> Result<CompletedPeerContact, NodeError> {
     let authenticated = Arc::new(AtomicBool::new(false));
     let mut attempt = NativeIrohAttemptGuard {
@@ -21530,6 +21574,8 @@ async fn sync_automatic_iroh_with_forwarding(
 
     let mut close_on_cancel = IrohConnectionCloseGuard(Some(connection.clone()));
     let _session_permit = {
+        #[cfg(test)]
+        contact_activity.wait_at_automatic_event_admission().await;
         let reservation = event_sessions.reserve_event_session();
         tokio::pin!(reservation);
         tokio::select! {
@@ -45676,7 +45722,13 @@ mod tests {
                 DEFAULT_IROH_EVENT_PRIORITY + 1,
             ))
             .expect("register unavailable BTLE adapter");
+        let held_automatic_admission = node
+            .contact_activity
+            .automatic_event_admission_gate()
+            .try_acquire_owned()
+            .expect("hold automatic Iroh before shared Event admission");
         assert!(node.open_transport_admission());
+        automatic.note_durable_work();
         assert_eq!(
             automatic.replace_eligibility(vec![
                 EventPeerEligibility::provisioned_exact_peer(
@@ -45700,38 +45752,68 @@ mod tests {
             ]),
             Some(AutomaticEventRosterStatus::Scheduled)
         );
+        timeout(Duration::from_secs(2), async {
+            while node
+                .contact_activity_snapshot()
+                .automatic_event_attempts_parked
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("automatic Iroh Event attempt reaches the node actor");
+        assert!(peer_node.open_transport_admission());
+        timeout(Duration::from_secs(5), async {
+            while node
+                .contact_activity_snapshot()
+                .automatic_event_admission_entries
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("automatic Iroh attempt opens its carrier");
         let held_event_session = node
             .ordered_event_contacts
             .session_permit
             .clone()
             .try_acquire_owned()
             .expect("hold shared Event session permit");
-        assert!(peer_node.open_transport_admission());
+        drop(held_automatic_admission);
         timeout(Duration::from_secs(2), async {
-            while peer_node.contact_activity_snapshot().launched == 0 {
+            while node.contact_activity_snapshot().event_admission_waits == 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("automatic Iroh carrier-open deadline");
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(100),
-                wait_for_authenticated_contacts(&peer_node.selected_events(), 1, "held admission"),
-            )
-            .await
-            .is_err(),
+        .expect("automatic Iroh attempt reaches Event admission");
+        assert_eq!(
+            peer_node
+                .selected_events()
+                .status()
+                .await
+                .expect("peer contact status")
+                .authenticated_contacts,
+            0,
             "an opened automatic Iroh carrier cannot authenticate before shared Event admission"
         );
 
         drop(held_event_session);
+        let later = node
+            .ordered_event_contacts
+            .try_reserve_native_iroh()
+            .expect_err("the queued automatic reservation owns released Event capacity");
+        assert_eq!(later.reason(), ContactReason::AdmissionBusy);
         wait_for_authenticated_contacts(&node.selected_events(), 1, "automatic Iroh local").await;
         wait_for_authenticated_contacts(&peer_node.selected_events(), 1, "automatic Iroh peer")
             .await;
         assert_eq!(
-            node.contact_activity_snapshot().launched,
+            node.contact_activity_snapshot()
+                .automatic_event_admission_entries,
             1,
-            "capacity contention must not require a second durable generation"
+            "capacity contention must retain one automatic Event attempt"
         );
 
         let (node_receipt, peer_receipt) = tokio::join!(node.shutdown(), peer_node.shutdown());

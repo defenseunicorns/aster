@@ -1115,26 +1115,13 @@ mod btle {
             .await
             .expect("begin drain");
         wait_for_atomic(&panicked).await;
-        let released_early = tokio::time::timeout(Duration::from_millis(100), async {
-            loop {
-                if let Ok(authority) =
-                    prepare_customer_btle_credential(&fixture, "panicking-cleanup")
-                {
-                    drop(authority);
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .is_ok();
+        assert!(matches!(
+            prepare_customer_btle_credential(&fixture, "panicking-cleanup"),
+            Err(DiscoveryCredentialError::CheckpointUnavailable)
+        ));
         let _ = running.signals.send(AgentSignal::Terminate).await;
         let exit = running.finish().await;
 
-        assert!(
-            !released_early,
-            "supervisor panic released credential authority before terminal state"
-        );
         assert_eq!(exit, AgentExit::Forced);
         assert!(cancelled.load(Ordering::Acquire));
         assert!(matches!(

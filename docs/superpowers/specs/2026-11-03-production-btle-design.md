@@ -115,7 +115,7 @@ evidence; absence of evidence means the lower status applies.
 | **BT-B0** | Blob Profile-5 DATA/CONTROL over BTLE | Exact canonical records, bounded channel association, interruption, record-level durable resume, and control-liveness/resource exits pass | **Designed** |
 | **BT-P0** | Additional Linux hardware and desktop/mobile foreground drivers | Each exact platform/hardware row passes the Linux-reference interoperability and lifecycle profile without changing application semantics | **Designed**; Pixel/Linux Event evidence is evaluation-only |
 | **BT-P1** | Background mobile profiles | Explicit OS background constraints, permission lifecycle, packaging, energy, and availability semantics pass separately per platform | **Designed**; scheduled only after foreground platform qualification |
-| **BT-O0** | Sanitized operability and support evidence | Readiness is separate from adapter availability; bounded status/reason/support fields obey the metadata budget and never expose locators, roster, PSM, peer, or credential data | **Source**; authoritative current status crosses the process boundary, while an authenticated query surface remains open |
+| **BT-O0** | Sanitized operability and support evidence | Readiness is separate from adapter availability; bounded status/reason/support fields obey the metadata budget and never expose locators, roster, PSM, peer, or credential data | **Source**; authoritative current status crosses the process boundary through the OS-authorized service journal, while installed-package reader and denial evidence remains open |
 | **BT-Q0** | Production qualification and authorization | Supported artifact, SBOM/license admission, dependency gates, hostile-peer/resource evidence, independent architecture/security review, reproducible package evidence, and signed release authorization pass | **Designed**; every release gate remains open |
 
 ### First production release boundary: Linux Event
@@ -834,6 +834,10 @@ failure at no more than four attempts per second, lets newer state replace a
 failed record, and interrupts retry on close. Sink failure never changes
 readiness, adapter availability, selection, or durable custody. Detailed
 lifecycle edge events remain internal and do not become customer fields.
+The packaged unit explicitly routes standard output to the system journal.
+Linux account, group, and journal ACL authorization is the operator boundary;
+the Aster application API is unchanged. Qualification proves one authorized
+reader can obtain the current record and an ordinary local account cannot.
 
 Compatibility observations are process-memory-only and replaced on inventory
 epochs as one bounded current snapshot per examined controller, not an
