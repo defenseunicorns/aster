@@ -464,6 +464,19 @@ mod tests {
         )
     }
 
+    async fn wait_until_operation_active(contact: &BleL2capContact) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !contact
+                .operation_active
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("contact operation did not start");
+    }
+
     async fn write_raw(stream: &mut DuplexStream, tag: u8, declared: u32, body: &[u8]) {
         stream.write_all(&[tag]).await.unwrap();
         stream.write_all(&declared.to_be_bytes()).await.unwrap();
@@ -665,7 +678,7 @@ mod tests {
                     .await
             }
         });
-        tokio::task::yield_now().await;
+        wait_until_operation_active(&contact).await;
         contact.close();
         assert_eq!(
             operation.await.unwrap().unwrap_err().kind(),
@@ -727,12 +740,12 @@ mod tests {
                     .await
             }
         });
-        tokio::task::yield_now().await;
+        wait_until_operation_active(&contact).await;
         let error = contact
             .request_with_total_limit(b"overlap", 64)
             .await
             .unwrap_err();
-        assert_eq!(error.kind(), ContactErrorKind::Unavailable);
+        assert_eq!(error.kind(), ContactErrorKind::Invariant);
         contact.close();
         let _ = first.await.unwrap();
     }

@@ -42969,21 +42969,14 @@ mod tests {
         let peer = issue_missions(1).remove(0);
         let contact = Arc::new(StalledOrderedContact::default());
 
-        let mut waiting = tokio::spawn({
-            let contact = contact.clone();
-            async move {
-                handle
-                    .run(
-                        OrderedEventContactRole::Initiator,
-                        contact.clone(),
-                        MissionPeerExpectation::new(contact.peer_evidence(), peer.identity),
-                    )
-                    .await
-            }
-        });
-        tokio::task::yield_now().await;
+        let mut waiting = Box::pin(handle.run(
+            OrderedEventContactRole::Initiator,
+            contact.clone(),
+            MissionPeerExpectation::new(contact.peer_evidence(), peer.identity),
+        ));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(
-            !waiting.is_finished(),
+            std::future::Future::poll(waiting.as_mut(), &mut context).is_pending(),
             "an established contact queues fairly"
         );
         assert_eq!(contact.operations(), 0);
@@ -42993,7 +42986,6 @@ mod tests {
         let error = timeout(Duration::from_secs(1), &mut waiting)
             .await
             .expect("released admission wakes the ordered contact")
-            .expect("ordered contact task")
             .expect_err("stopped actor rejects the admitted contact");
 
         assert_eq!(error.stage(), ContactStage::Candidate);
@@ -44562,15 +44554,18 @@ mod tests {
             admission: admission.clone(),
             session_permit: session_permit.clone(),
         };
-        let waiter = tokio::spawn(async move { handle.reserve_event_session().await });
-        tokio::task::yield_now().await;
+        let mut waiter = Box::pin(handle.reserve_event_session());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            std::future::Future::poll(waiter.as_mut(), &mut context).is_pending(),
+            "the collision waiter reaches the capacity boundary"
+        );
 
         admission.close();
 
         let outcome = timeout(Duration::from_secs(1), waiter)
             .await
             .expect("terminal admission wakes the collision waiter")
-            .expect("collision waiter task")
             .expect_err("terminal admission cannot grant the shared permit");
         assert_eq!(outcome.reason(), ContactReason::AdmissionClosed);
         assert_eq!(session_permit.available_permits(), 0);
@@ -46589,17 +46584,16 @@ mod tests {
         .expect("first ordered contact becomes active");
 
         let waiting = Arc::new(StalledOrderedContact::default());
-        let waiting_task = tokio::spawn({
-            let handle = handle.clone();
-            let waiting = waiting.clone();
-            async move {
-                handle
-                    .run(OrderedEventContactRole::Responder, waiting, expectation)
-                    .await
-            }
-        });
-        tokio::task::yield_now().await;
-        assert!(!waiting_task.is_finished(), "the overlap queues fairly");
+        let mut waiting_task = Box::pin(handle.run(
+            OrderedEventContactRole::Responder,
+            waiting.clone(),
+            expectation,
+        ));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            std::future::Future::poll(waiting_task.as_mut(), &mut context).is_pending(),
+            "the overlap queues fairly"
+        );
         assert_eq!(waiting.operations(), 0);
         assert_eq!(waiting.closes(), 0);
 
@@ -46607,7 +46601,6 @@ mod tests {
         assert!(active_task.await.expect("active ordered caller").is_err());
         let error = waiting_task
             .await
-            .expect("waiting ordered caller")
             .expect_err("terminal admission rejects the queued overlap");
         assert_eq!(error.reason(), ContactReason::AdmissionClosed);
         assert!(!error.permits_reselection());

@@ -426,14 +426,17 @@ wait_ready() {
     python3 - <<'PY'
 import time, urllib.request
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-for _ in range(100):
+deadline = time.monotonic() + 10
+while (remaining := deadline - time.monotonic()) > 0:
     try:
-        with opener.open("http://127.0.0.1:8182/readyz", timeout=1) as response:
+        with opener.open(
+            "http://127.0.0.1:8182/readyz", timeout=min(0.5, remaining)
+        ) as response:
             if response.status == 200:
                 break
     except OSError:
         pass
-    time.sleep(0.1)
+    time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 else:
     raise SystemExit("readiness timeout")
 PY
@@ -537,14 +540,17 @@ config["btle"] = {
 }
 path.write_text(json.dumps(config, indent=2) + "\n")
 PY
-btle_status_since=$(date --iso-8601=seconds)
+journalctl --sync
+btle_status_cursor=$(journalctl --lines=0 --show-cursor --no-pager | \
+    sed -n 's/^-- cursor: //p')
+test -n "$btle_status_cursor"
 systemctl restart aster-agent.service
 wait_ready
 btle_status_log=$(mktemp)
 btle_status_observed=false
 for _ in {1..50}; do
     journalctl --sync
-    journalctl --unit=aster-agent.service --since="$btle_status_since" \
+    journalctl --unit=aster-agent.service --after-cursor="$btle_status_cursor" \
         --output=cat --no-pager >"$btle_status_log"
     if python3 - "$btle_status_log" 2>/dev/null <<'PY'
 import json, sys
@@ -574,10 +580,10 @@ fi
 btle_authorized_status_log=$(mktemp)
 btle_denied_status_log=$(mktemp)
 runuser -u nobody -g nogroup -G systemd-journal -- \
-    journalctl --unit=aster-agent.service --since="$btle_status_since" \
+    journalctl --unit=aster-agent.service --after-cursor="$btle_status_cursor" \
         --output=cat --no-pager >"$btle_authorized_status_log"
 runuser -u nobody -g nogroup -- \
-    journalctl --unit=aster-agent.service --since="$btle_status_since" \
+    journalctl --unit=aster-agent.service --after-cursor="$btle_status_cursor" \
         --output=cat --no-pager >"$btle_denied_status_log" 2>/dev/null || true
 python3 - "$btle_authorized_status_log" "$btle_denied_status_log" <<'PY'
 import json, sys

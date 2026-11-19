@@ -289,20 +289,48 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn retry_later_uses_bounded_deterministic_jitter() {
-        let expected = [6_194, 10_128, 22_346, 44_958, 59_223];
         let retry = Err(ContactOutcome::admission_busy());
         let mut failures = 0;
-        for expected_millis in expected {
-            assert_eq!(
-                next_delay(PEER, &mut failures, retry),
-                ScheduleAction::After(Duration::from_millis(expected_millis))
-            );
+        let mut delays = Vec::new();
+        for expected_failure in 1..=5 {
+            let ScheduleAction::After(delay) = next_delay(PEER, &mut failures, retry) else {
+                panic!("retry-later outcome must schedule a delay");
+            };
+            let shift = (expected_failure - 1).min(4);
+            let base = EVENT_RETRY_INITIAL
+                .checked_mul(1_u32 << shift)
+                .expect("bounded retry base")
+                .min(EVENT_RETRY_BASE_MAX);
+            assert!(delay >= base);
+            assert!(delay <= base + base / 4);
+            delays.push(delay);
         }
         assert_eq!(failures, 5);
-        let mut other_peer_failures = 0;
-        assert_eq!(
-            next_delay([0x33; 32], &mut other_peer_failures, retry),
-            ScheduleAction::After(Duration::from_millis(5_181))
+
+        let mut repeated_failures = 0;
+        let repeated = (0..5)
+            .map(|_| {
+                let ScheduleAction::After(delay) = next_delay(PEER, &mut repeated_failures, retry)
+                else {
+                    panic!("retry-later outcome must schedule a delay");
+                };
+                delay
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(repeated, delays, "jitter must be deterministic per peer");
+
+        let peer_delays = [[0x33; 32], [0x44; 32], [0x55; 32]].map(|peer| {
+            let mut failures = 0;
+            let ScheduleAction::After(delay) = next_delay(peer, &mut failures, retry) else {
+                panic!("retry-later outcome must schedule a delay");
+            };
+            assert!(delay >= EVENT_RETRY_INITIAL);
+            assert!(delay <= EVENT_RETRY_INITIAL + EVENT_RETRY_INITIAL / 4);
+            delay
+        });
+        assert!(
+            peer_delays.iter().any(|delay| *delay != delays[0]),
+            "peer identity must influence retry jitter"
         );
 
         let (schedule, mut requests) = controlled_schedule(PEER);
@@ -312,7 +340,7 @@ mod tests {
             .expect("first live retry attempt")
             .finish(retry)
             .await;
-        tokio::time::advance(Duration::from_millis(6_193)).await;
+        tokio::time::advance(delays[0] - Duration::from_millis(1)).await;
         assert!(requests.recv().now_or_never().is_none());
         tokio::time::advance(Duration::from_millis(1)).await;
         assert_eq!(

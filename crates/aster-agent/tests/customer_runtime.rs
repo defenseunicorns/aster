@@ -919,6 +919,13 @@ async fn closed_signal_task_propagates_only_a_bounded_failure_reason() {
 mod btle {
     use super::*;
 
+    fn require_socket_access() {
+        assert!(
+            socket_access_available(),
+            "BTLE customer runtime tests require loopback sockets"
+        );
+    }
+
     fn install_deterministic_local_initiator_pair(
         state: &Path,
     ) -> (aster_iroh::EndpointId, aster_iroh::SecretKey) {
@@ -940,9 +947,7 @@ mod btle {
     async fn automatic_startup_consumes_material_once_and_retains_authority() {
         // Break caught: splitting the prepared credential without retaining its
         // authority guard releases rollback custody while adapter material is live.
-        if !socket_access_available() {
-            return;
-        }
+        require_socket_access();
         let fixture = CustomerFixture::new();
         let (btle, _control, _automatic) = automatic_test_runtime(&fixture, "authority");
         let running = start_with_optional_btle(&fixture, btle).await;
@@ -962,9 +967,7 @@ mod btle {
     async fn unconfirmed_cleanup_retains_authority_until_actual_terminal_signal() {
         // Break caught: a bounded supervisor join can return while its detached
         // lifecycle still uses credential material, releasing rollback custody.
-        if !socket_access_available() {
-            return;
-        }
+        require_socket_access();
         struct UnconfirmedOwner {
             completion: tokio::sync::watch::Receiver<bool>,
             cancelled: Arc<AtomicBool>,
@@ -1044,9 +1047,7 @@ mod btle {
     async fn panicking_cleanup_retains_authority_until_actual_terminal_signal() {
         // Break caught: unwinding a supervisor join must not release credential
         // authority while its detached lifecycle remains nonterminal.
-        if !socket_access_available() {
-            return;
-        }
+        require_socket_access();
         struct PanickingOwner {
             completion: tokio::sync::watch::Receiver<bool>,
             cancelled: Arc<AtomicBool>,
@@ -1141,9 +1142,7 @@ mod btle {
     async fn automatic_startup_registers_epoch_zero_unavailable() {
         // Break caught: registering the production lane as initially available can
         // dispatch durable work before a compatible operational epoch exists.
-        if !socket_access_available() {
-            return;
-        }
+        require_socket_access();
         let fixture = CustomerFixture::new();
         let (btle, control, automatic) = automatic_test_runtime(&fixture, "initial-unavailable");
         let running = start_with_optional_btle(&fixture, btle).await;
@@ -1178,9 +1177,7 @@ mod btle {
         // Break caught: bypassing the startup-composition overlap check installs
         // only the unavailable BTLE entry, so durable work cannot select the
         // configured Iroh route for the same exact mission peer.
-        if !socket_access_available() {
-            return;
-        }
+        require_socket_access();
         let fixture = CustomerFixture::new();
         let (local_carrier, peer_secret) =
             install_deterministic_local_initiator_pair(fixture.state());
@@ -1251,9 +1248,7 @@ mod btle {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn higher_priority_btle_wins_the_production_overlap_selector() {
-        if !socket_access_available() {
-            return;
-        }
+        require_socket_access();
         let fixture = CustomerFixture::new();
         let (local_carrier, peer_secret) =
             install_deterministic_local_initiator_pair(fixture.state());
@@ -1311,9 +1306,7 @@ mod btle {
         // Break caught: the agent composition can retain a permanently unavailable
         // registration when its supervisor reports availability, or leave it
         // available after the supervisor withdraws that availability.
-        if !socket_access_available() {
-            return;
-        }
+        require_socket_access();
         let fixture = CustomerFixture::new();
         let (btle, control, automatic) = automatic_test_runtime(&fixture, "selection");
         let running = start_with_optional_btle(&fixture, btle).await;
@@ -1387,9 +1380,7 @@ mod btle {
         // Break caught: treating a nonterminal unavailable BTLE supervisor as a
         // composition failure prevents a transport-neutral node from reaching
         // Ready or publishing.
-        if !socket_access_available() {
-            return;
-        }
+        require_socket_access();
         let fixture = CustomerFixture::new();
         let (btle, _control, _automatic) = automatic_test_runtime(&fixture, "no-controller");
         let running = start_with_optional_btle(&fixture, btle).await;
@@ -1425,9 +1416,7 @@ mod btle {
     async fn runtime_shutdown_cancels_btle_before_node() {
         // Break caught: closing the node before cancelling and joining BTLE can
         // leave the platform owner using admission or contacts after teardown.
-        if !socket_access_available() {
-            return;
-        }
+        require_socket_access();
         let fixture = CustomerFixture::new();
         let (btle, control, _automatic) = automatic_test_runtime(&fixture, "shutdown-order");
         let shutdown_state = Arc::clone(&control.state);
@@ -1464,9 +1453,7 @@ mod btle {
     async fn receive_only_keeps_btle_unavailable_without_operational_activation() {
         // Break caught: composing the normal automatic supervisor under
         // ReceiveOnly can start discretionary scanning or advertising.
-        if !socket_access_available() {
-            return;
-        }
+        require_socket_access();
         let fixture = CustomerFixture::new();
         let policy = fixture.enable_receive_only_btle_policy();
         let prepared = prepare_customer_btle_credential(&fixture, "receive-only")
