@@ -4262,14 +4262,6 @@ review evidence.
 
 ## Dependency-admission gate
 
-The Iroh-first implementation removed the active unmaintained `paste` package
-instead of expanding the retained-pilot exception. The workspace path-patches
-exact `netlink-packet-core` 0.8.2 with byte-identical Rust sources so its
-dependency key resolves to maintained `pastey` 0.2.2. The root lock and active
-graphs contain no `paste`; CI fails if it reappears. Patch provenance and the
-upstream-removal condition are recorded in
-[`ASTER-PATCH.md`](../../third-party/netlink-packet-core-0.8.2-aster/ASTER-PATCH.md).
-
 Decision 0028 records the exact-package deviations, and `deny.toml` encodes
 them narrowly: `webpki-roots` 1.0.10 and `webpki-root-certs` 1.0.10 under
 `CDLA-Permissive-2.0`, plus the browser-WASM-only

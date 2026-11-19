@@ -7,8 +7,6 @@
 !crates/**
 !proto/
 !proto/**
-!third-party/
-!third-party/**
 !docker/
 !docker/debian.sources
 !docker/lan-mvp/

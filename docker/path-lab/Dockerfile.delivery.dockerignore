@@ -7,8 +7,6 @@
 !crates/**
 !proto/
 !proto/**
-!third-party/
-!third-party/**
 !tools/
 tools/**
 !tools/aster_path_delivery.py

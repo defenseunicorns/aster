@@ -21,10 +21,7 @@ members = [
   "crates/aster-provisioning-age",
   "crates/aster-systemd-credentials",
 ]
-exclude = [
-  "fuzz",
-  "third-party/netlink-packet-core-0.8.2-aster",
-]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0-alpha.1"
@@ -46,8 +43,8 @@ futures = "=0.3.34"
 getrandom = { version = "=0.4.3", default-features = false, features = ["sys_rng"] }
 hkdf = "=0.13.0"
 hmac = { version = "=0.13.0", default-features = false, features = ["zeroize"] }
-iroh = { version = "=1.4.1", default-features = false, features = ["tls-ring"] }
-iroh-relay = { version = "=1.4.1", default-features = false, features = ["tls-ring"] }
+iroh = { version = "=1.5.0", default-features = false, features = ["tls-ring"] }
+iroh-relay = { version = "=1.5.0", default-features = false, features = ["tls-ring"] }
 iroh-mdns-address-lookup = { version = "=0.6.1", default-features = false }
 http = "=1.5.0"
 http-body-util = "=0.1.5"
@@ -74,9 +71,6 @@ tokio = { version = "=1.54.1", default-features = false, features = ["io-util", 
 tower = { version = "=0.5.3", features = ["util"] }
 tower-service = "=0.3.3"
 zeroize = { version = "=1.9.1", features = ["derive", "std"] }
-
-[patch.crates-io]
-netlink-packet-core = { path = "third-party/netlink-packet-core-0.8.2-aster" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

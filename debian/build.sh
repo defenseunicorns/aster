@@ -13,7 +13,6 @@ metadata=target/deb-metadata
 rm -rf "$stage" "$metadata"
 mkdir -p "$stage/bin" "$metadata"
 sha256sum Cargo.lock > "$stage/Cargo.lock.sha256"
-python3 tools/check-netlink-packet-core-patch.py
 cargo build --frozen --release --target "$target" \
     -p aster-node -p aster-agent -p asterctl -p aster-systemd-credentials \
     --features aster-agent/systemd-provider \

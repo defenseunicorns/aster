@@ -7,8 +7,6 @@
 !crates/**
 !proto/
 !proto/**
-!third-party/
-!third-party/**
 !docker/
 !docker/hierarchy-mvp/
 !docker/hierarchy-mvp/demo-node-entrypoint.sh
