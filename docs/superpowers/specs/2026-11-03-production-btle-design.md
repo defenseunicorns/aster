@@ -98,14 +98,14 @@ can return the capability to Source or Review blocked. Every implementation PR
 updates affected rows in the same change and links each claimed status to its
 evidence; absence of evidence means the lower status applies.
 
-| ID | Capability and owner | First measurable exit | Current status (2026-11-18) |
+| ID | Capability and owner | First measurable exit | Current status (2026-11-19) |
 | --- | --- | --- | --- |
 | **BT-A0** | Transport-neutral application readiness and durable publication, owned by the node/store | With zero eligible transports, startup succeeds, publication is durable, and later adapter availability wakes work without republishing | **Verified** for the merged Event evaluation path; production profile remains unqualified |
 | **BT-A1** | Adapter-neutral bounded contact and mission authentication, owned by the node | BTLE supplies only transient carrier evidence; the exact mission peer authenticates before inventory or data; no Bluetooth value grants identity | **Physical** for bounded Event evaluation; not release-qualified |
 | **BT-A2** | Adapter registry, eligibility, ranking, and node-global admission, owned by the transport-neutral node | Current exact authority and sanitized availability select one bounded fresh attempt; no adapter lifecycle or class retry policy enters the core | **Source**; automatic multi-adapter selection is not physically qualified |
 | **BT-A3** | Closed attempt outcome and custody contract, shared at the node/adapter boundary | Typed authority, policy, adapter-epoch, transient, authenticated, cancellation, and shutdown outcomes preserve durable work, release custody, and authorize only the permitted retry/reselection action | **Source** with focused verification; physical and release qualification remain open |
 | **BT-L0** | Bounded Linux controller inventory, passive compatibility probe, and sticky selection, owned by `aster-ble-linux` | Zero/many controllers, hotplug, BlueZ restart, timeouts, churn, unsafe rules, and unknown compatible hardware satisfy the defined deterministic bounds | **Source** with focused verification; physical automatic-path evidence remains open |
-| **BT-L1** | Rostered Linux discovery and controller-epoch lifecycle, owned by `aster-ble-linux` | Listener, advertisement, scan, candidate, socket, credential, cancellation, and cleanup owners are bounded and joined; discovery remains locator-only | **Source**; fixed-controller physical evidence is scoped to BT-E0, while stock teardown-ingress and working-secret lifetime gates block this exit |
+| **BT-L1** | Rostered Linux discovery and controller-epoch lifecycle, owned by `aster-ble-linux` | Listener, advertisement, scan, candidate, socket, credential, cancellation, and cleanup owners are bounded and joined; discovery remains locator-only | **Source**; fixed-controller physical evidence is scoped to BT-E0, while the stock teardown-ingress gate still blocks this exit; the working-secret lifetime gate is closed in source |
 | **BT-L2** | Linux Event contact scheduling, owned by the BTLE runtime owner | The validated lower member schedules remote-only contact; success delays from completion, transient local failures back off, authenticated suppression parks only BTLE scheduling, and durable work survives adapter epochs | **Source** with focused verification; Linux owns cadence/backoff and the node owns generic custody and selection |
 | **BT-L3** | Emission-policy lifecycle, owned by the BTLE composition root | Configured startup `Normal` owns the rostered radio lifecycle; configured startup `ReceiveOnly` is radio-inert. For the first profile, unsupported live changes are rejected and a controlled restart rebuilds radio and credentials atomically; later live reload must provide the same stop/join/restart guarantee | **Source** with focused verification; live mutation is rejected before either policy state changes |
 | **BT-L4** | Linux production credential, package, and confinement profile | `aster-btle-roster`, rollback-safe renewal, non-root BlueZ/socket least privilege, denial tests, shutdown ordering, upgrade/rollback, and operator status pass as the packaged service identity | **Source**; package construction and payload checks pass, while installed-service execution, physical qualification, and release gates remain open |
@@ -311,11 +311,11 @@ The stock dependency graph deliberately carries no BTLE-local forks. Stock
 `bluer` does not by itself establish acknowledged, cancellation-safe
 advertisement/discovery teardown or a bounded first D-Bus ingress queue; Linux
 rostered discovery remains unqualified until the driver supplies and proves
-those properties through stock or upstream APIs. Stock `hmac` computes the
-required bytes but does not by itself establish erasure of constructor-derived
-key, IPAD, and OPAD temporaries. Production credential handling therefore
-remains gated on an implementation and review that prove those working-secret
-lifetimes without a local crate fork.
+those properties through stock or upstream APIs. Aster does not use stock
+`hmac` for discovery-secret operations: one narrow local HMAC-SHA-256 helper
+over the public `sha2` API owns key-derived pads, hash state, and intermediate
+digests in zeroize-on-drop storage. Frozen beacon and credential-fingerprint
+vectors preserve the existing bytes without a local dependency fork.
 
 `BleL2capV1` owns carrier framing, deadlines, limits, flow control,
 session/channel association, scheduling, and error classification. Platform

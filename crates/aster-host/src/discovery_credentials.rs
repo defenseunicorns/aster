@@ -1,4 +1,3 @@
-use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use std::{
     ffi::{OsStr, OsString},
@@ -10,6 +9,8 @@ use std::{
     time::Instant,
 };
 use zeroize::Zeroizing;
+
+use crate::zeroizing_hmac_sha256;
 
 const ARTIFACT_MAGIC: &[u8; 8] = b"ASTRBD02";
 const ONE_ENTRY_BYTES: usize = 109;
@@ -259,12 +260,10 @@ fn read_entry(bytes: &[u8], offset: usize) -> Result<CredentialEntry, DiscoveryC
 }
 
 fn fingerprint(entry: &CredentialEntry, scope: &[u8; 32]) -> [u8; 32] {
-    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(entry.secret.as_ref())
-        .expect("SHA-256 HMAC accepts every 32-byte key");
-    mac.update(BINDING_DOMAIN);
-    mac.update(scope);
-    mac.update(&entry.generation.to_be_bytes());
-    mac.finalize().into_bytes().into()
+    zeroizing_hmac_sha256(
+        &entry.secret,
+        &[BINDING_DOMAIN, scope, &entry.generation.to_be_bytes()],
+    )
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -1742,6 +1741,23 @@ mod tests {
     const OLD_SECRET: [u8; 32] = [0x11; 32];
     const NEW_SECRET: [u8; 32] = [0x22; 32];
     const ISSUED: u64 = 1_800_000_000;
+
+    #[test]
+    fn discovery_fingerprint_matches_frozen_independent_vector() {
+        let secret = std::array::from_fn(|index| u8::try_from(index).unwrap());
+        let entry = CredentialEntry {
+            generation: 7,
+            secret: Zeroizing::new(secret),
+        };
+        assert_eq!(
+            fingerprint(&entry, &[0xa5; 32]),
+            [
+                0x1a, 0xe7, 0x54, 0x32, 0xac, 0x70, 0xc2, 0xba, 0x58, 0x10, 0x8a, 0xea, 0x23, 0x7b,
+                0x2f, 0xb2, 0x6f, 0x14, 0x47, 0xec, 0x81, 0x0a, 0x6a, 0x1a, 0xa0, 0xb8, 0x16, 0x8c,
+                0xea, 0x62, 0xf4, 0x89,
+            ]
+        );
+    }
 
     fn open_test_anchor(path: &Path) -> File {
         OpenOptions::new()
