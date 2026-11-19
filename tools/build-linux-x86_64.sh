@@ -31,7 +31,6 @@ git archive "$revision" | tar -xf - -C "$stage/source"
 bundle="$stage/bundle"
 cd "$stage/source"
 sha256sum Cargo.lock > "$stage/Cargo.lock.sha256"
-python3 tools/check-netlink-packet-core-patch.py
 
 cargo build --frozen --release --target "$target" \
     -p aster-node -p aster-agent -p asterctl --bin aster --bin aster-agent --bin asterctl

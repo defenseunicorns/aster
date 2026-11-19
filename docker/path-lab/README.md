@@ -323,7 +323,7 @@ directories. Re-including a parent alone also re-includes descendants under
 Docker's matching rules: `tools/**`, `docker/**`, and
 `docker/path-lab/**` therefore re-exclude descendants immediately after each
 parent entry, before the exact required files are re-included. The complete
-`crates`, `proto`, and `third-party` trees intentionally remain admitted; this
+`crates` and `proto` trees intentionally remain admitted; this
 is not a credential filter within those required trees. There is no wildcard
 re-inclusion of other tools, scenarios, or `delivery-*.py` files. Docker
 still sends the selected Dockerfile and ignore file as build metadata even

@@ -105,6 +105,10 @@ the remediation below retires that advisory exception before the deadline.
 
 ## Advisory remediation — 2026-08-23
 
+Superseded by the Iroh 1.5.0 upgrade: active consumers use the upstream
+netlink release, and the local patch and its verification scripts are removed.
+The following records the original remediation.
+
 The selected Iroh graph reached the same unmaintained `paste` package through
 `netwatch`, so expanding the pilot-only exception would have violated this
 decision. Instead, Aster vendors the exact MIT-licensed

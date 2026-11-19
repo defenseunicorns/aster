@@ -65,8 +65,6 @@ run = [
   "python3 tools/test-selected-live-blob-subscription-receipt.py",
   "python3 tools/test-linux-event-mvp-qualification.py",
   "python3 tools/check-selected-node-dependency-boundary.py",
-  "python3 tools/check-netlink-packet-core-patch.py",
-  "sh tools/test-netlink-packet-core-patch.sh",
   "sh ./tools/check-dependency-exception-scope.sh",
   "sh ./tools/test-dependency-exception-scope.sh",
 ]
