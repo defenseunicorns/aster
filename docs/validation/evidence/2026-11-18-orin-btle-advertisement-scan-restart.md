@@ -218,3 +218,28 @@ software stack until the corrected receive path is installed and the complete
 bidirectional path is repeated. This does not invalidate the separate
 fixed-locator 65,536-byte Event transfer evidence. No fallback or wire-protocol
 change was introduced. The harness, fixtures, state, and logs were removed.
+
+### Current-head installed-service follow-up
+
+At signed source `7debe7357feb0846f7f9263062ebc213756e04fb`, checksum-pinned
+ARM64 agent and credential-admin binaries were temporarily installed on the
+Orin under the production systemd unit, service account, D-Bus policy, and
+encrypted roster binding. The loaded unit had no drop-ins, no capabilities,
+enabled `NoNewPrivileges` and `PrivateDevices`, and allowed `AF_BLUETOOTH` but
+not `AF_PACKET`. Roster sequence 1 reached readiness and reported BTLE
+`available` with support `unqualified`; clean stop released advertising and
+discovery, same-state restart succeeded, and sequence 2 was accepted into the
+durable discovery checkpoint. Representative BlueZ control calls were denied,
+and journal visibility plus the bounded status-field schema passed.
+
+This is installed-service evidence, not Debian-package, peer-transport,
+Event-transfer, production, release, composite-profile, or hardware-
+qualification evidence. Systemd also reported that the host credential key was
+on unencrypted media and TPM2 sealing failed, so this Orin image does not meet
+production credential-at-rest custody without an encrypted-media or working-
+TPM remedy. After the run, an independent readback confirmed the Aster unit,
+account, policy, configuration, credential bindings, and state were absent;
+BlueZ reported zero advertisements and discovery false. The approved host-wide
+systemd credential key remained on the unencrypted media, while every staged
+Aster artifact was removed. The BlueZ 5.72 receive-path limitation above
+continues to block automatic peer-discovery qualification on this image.
