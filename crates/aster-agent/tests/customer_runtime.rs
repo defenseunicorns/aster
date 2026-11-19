@@ -332,9 +332,7 @@ async fn rejected_protected_bootstrap_leaves_no_listener_or_state_side_effect() 
 async fn receive_only_starts_ready_and_accepts_local_publication() {
     // Break caught: parsing receive_only without wiring it through customer
     // startup can either fail readiness or accidentally disable the local API.
-    if !socket_access_available() {
-        return;
-    }
+    require_socket_access();
     let fixture = CustomerFixture::new();
     fixture.set_emission_policy("receive_only");
     let running = RunningFixture::start(&fixture).await;
@@ -671,9 +669,7 @@ async fn customer_operation_limits_process_preserves_over_limit_reopen() {
 async fn failed_hangup_keeps_the_old_token_and_readiness() {
     // Break caught: destructive or non-atomic reload revokes the working token
     // or drops readiness when the replacement file is invalid.
-    if !socket_access_available() {
-        return;
-    }
+    require_socket_access();
     let fixture = CustomerFixture::new();
     let (running, mut reloads) = RunningFixture::start_with_reload_observer(
         &fixture,
@@ -700,9 +696,7 @@ async fn failed_hangup_keeps_the_old_token_and_readiness() {
 async fn successful_hangup_reloads_only_the_client_token_atomically() {
     // Break caught: reload reopens mission material or exposes a window where
     // neither the old nor fully validated replacement token authorizes.
-    if !socket_access_available() {
-        return;
-    }
+    require_socket_access();
     let fixture = CustomerFixture::new();
     let old_token = fixture.token_bytes().to_vec();
     let running = RunningFixture::start(&fixture).await;
@@ -729,9 +723,7 @@ async fn successful_hangup_reloads_only_the_client_token_atomically() {
 async fn disabled_hangup_retains_the_current_token() {
     // Break caught: the Compose runtime must not reopen or replace a bind-
     // mounted token on SIGHUP, but must remain ready with the original token.
-    if !socket_access_available() {
-        return;
-    }
+    require_socket_access();
     let fixture = CustomerFixture::new();
     let old_token = fixture.token_bytes().to_vec();
     let (running, mut reloads) =
@@ -761,9 +753,7 @@ async fn disabled_hangup_retains_the_current_token() {
 async fn second_terminate_forces_a_blocked_graceful_drain() {
     // Break caught: ignoring the second termination signal can strand an
     // operator behind an in-flight connection until the whole grace expires.
-    if !socket_access_available() {
-        return;
-    }
+    require_socket_access();
     let fixture = CustomerFixture::with_shutdown_grace(5_000);
     let running = RunningFixture::start(&fixture).await;
     let stalled = fill_unauthenticated_admission(fixture.application()).await;
@@ -787,9 +777,7 @@ async fn second_terminate_forces_a_blocked_graceful_drain() {
 async fn grace_expiry_forces_a_blocked_graceful_drain() {
     // Break caught: waiting indefinitely for a stalled connection violates the
     // configured process shutdown bound.
-    if !socket_access_available() {
-        return;
-    }
+    require_socket_access();
     let fixture = CustomerFixture::with_shutdown_grace(50);
     let running = RunningFixture::start(&fixture).await;
     let stalled = fill_unauthenticated_admission(fixture.application()).await;
@@ -808,9 +796,7 @@ async fn admitted_publish_finishes_before_node_shutdown() {
     // Break caught: starting selected-node shutdown concurrently with HTTP
     // drain can reject a mutating unary request that already passed the
     // pre-body admission gate but has not finished decoding its body.
-    if !socket_access_available() {
-        return;
-    }
+    require_socket_access();
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     let fixture = CustomerFixture::with_shutdown_grace(2_000);
@@ -898,9 +884,7 @@ async fn admitted_publish_finishes_before_node_shutdown() {
 async fn closed_signal_task_propagates_only_a_bounded_failure_reason() {
     // Break caught: losing the signal task without a terminal transition can
     // leave the process serving forever or expose an internal channel error.
-    if !socket_access_available() {
-        return;
-    }
+    require_socket_access();
     let fixture = CustomerFixture::new();
     let running = RunningFixture::start(&fixture).await;
     let RunningFixture { signals, task } = running;
@@ -918,13 +902,6 @@ async fn closed_signal_task_propagates_only_a_bounded_failure_reason() {
 ))]
 mod btle {
     use super::*;
-
-    fn require_socket_access() {
-        assert!(
-            socket_access_available(),
-            "BTLE customer runtime tests require loopback sockets"
-        );
-    }
 
     fn install_deterministic_local_initiator_pair(
         state: &Path,
@@ -1039,7 +1016,7 @@ mod btle {
                 tokio::time::Instant::now() < release_deadline,
                 "actual terminal state did not release credential authority"
             );
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
         }
     }
 
@@ -1487,9 +1464,7 @@ mod btle {
 async fn radio_inert_btle_lane_stays_unselected_for_real_durable_work() {
     // Break caught: retaining an Unavailable BLE lane must never consume or
     // dispatch a real eligible durable attempt while the service remains ready.
-    if !socket_access_available() {
-        return;
-    }
+    require_socket_access();
     let fixture = CustomerFixture::new();
     let prepared_dropped = Arc::new(AtomicBool::new(false));
     let policy = fixture.enable_btle_policy();
@@ -1559,9 +1534,7 @@ async fn radio_inert_btle_lane_stays_unselected_for_real_durable_work() {
 async fn unavailable_btle_and_availability_changes_do_not_gate_readyz() {
     // Break caught: coupling adapter availability to service readiness makes a
     // missing controller or later hotplug take the durable application down.
-    if !socket_access_available() {
-        return;
-    }
+    require_socket_access();
     let fixture = CustomerFixture::new();
     let (btle, control, prepared_dropped) = injected_btle_runtime(&fixture, JoinBehavior::Complete);
     let running = start_with_optional_btle(&fixture, btle).await;
@@ -1592,9 +1565,7 @@ async fn unavailable_btle_and_availability_changes_do_not_gate_readyz() {
 async fn btle_cleanup_starts_after_node_attempt_admission_is_closed() {
     // Break caught: leaving automatic/contact admission open while cancelling
     // the adapter can delegate fresh work into an owner that is already draining.
-    if !socket_access_available() {
-        return;
-    }
+    require_socket_access();
     let fixture = CustomerFixture::new();
     let (btle, control, _) = injected_btle_runtime(&fixture, JoinBehavior::Complete);
     let running = start_with_optional_btle(&fixture, btle).await;
@@ -1644,9 +1615,7 @@ async fn dropped_btle_completion_sender_prevents_ready_startup() {
 async fn startup_deadline_aborts_blocked_btle_cleanup() {
     // Break caught: timing out an awaited JoinHandle detaches the task unless
     // the supervisor explicitly aborts and retires it.
-    if !socket_access_available() {
-        return;
-    }
+    require_socket_access();
     let fixture = CustomerFixture::with_shutdown_grace(100);
     let (btle, control, prepared_dropped) = injected_btle_runtime(&fixture, JoinBehavior::Block);
     control
@@ -1672,9 +1641,7 @@ async fn startup_deadline_aborts_blocked_btle_cleanup() {
 async fn btle_owner_construction_failure_closes_and_releases_node() {
     // Break caught: returning directly from failed owner construction could
     // leak startup-closed admission, listeners, or state custody.
-    if !socket_access_available() {
-        return;
-    }
+    require_socket_access();
     let fixture = CustomerFixture::new();
     let policy = fixture.enable_btle_policy();
     let prepared_dropped = Arc::new(AtomicBool::new(false));
@@ -1743,9 +1710,7 @@ async fn btle_owner_construction_failure_closes_and_releases_node() {
 async fn btle_cleanup_failure_returns_only_the_fixed_shutdown_category() {
     // Break caught: forwarding owner cleanup detail could disclose controller,
     // credential, or path data through the process result.
-    if !socket_access_available() {
-        return;
-    }
+    require_socket_access();
     let fixture = CustomerFixture::new();
     let (btle, control, _) = injected_btle_runtime(&fixture, JoinBehavior::Fail);
     let running = start_with_optional_btle(&fixture, btle).await;
@@ -1764,9 +1729,7 @@ async fn btle_cleanup_failure_returns_only_the_fixed_shutdown_category() {
 
 #[cfg(feature = "sdk-test-support")]
 async fn assert_pre_ready_btle_terminal(drop_sender: bool) {
-    if !socket_access_available() {
-        return;
-    }
+    require_socket_access();
     let fixture = CustomerFixture::new();
     let (btle, control, _) = injected_btle_runtime(&fixture, JoinBehavior::Complete);
     if drop_sender {
@@ -1825,9 +1788,7 @@ enum DrainForce {
 
 #[cfg(feature = "sdk-test-support")]
 async fn assert_forced_btle_cleanup(block_join: bool, force: DrainForce) {
-    if !socket_access_available() {
-        return;
-    }
+    require_socket_access();
     let grace = match force {
         DrainForce::SecondSignal => 5_000,
         DrainForce::GraceExpiry => 100,
@@ -2752,6 +2713,13 @@ fn socket_access_available() -> bool {
         }
         Err(error) => panic!("probe loopback socket access: {error}"),
     }
+}
+
+fn require_socket_access() {
+    assert!(
+        socket_access_available(),
+        "customer runtime tests require loopback sockets"
+    );
 }
 
 struct RunningFixture {

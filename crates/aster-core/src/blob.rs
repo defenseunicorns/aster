@@ -2362,6 +2362,7 @@ impl BlobTransferStore {
     /// Installs records only after the calling envelope layer authenticated the
     /// exact manifest bytes and the protected route descriptor. Repeating this
     /// after any crash is safe and completes any already-held carriers.
+    #[cfg(test)]
     pub(crate) fn install_authenticated_manifest(
         &mut self,
         bytes: &[u8],

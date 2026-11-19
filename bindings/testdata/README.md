@@ -10,7 +10,8 @@ owned by the Rust provisioning provider and is deliberately not part of the C
 ABI or either language binding. Regenerate it whenever that provider's format
 version changes; never replace it with operational credential material.
 
-This fixture exercises the unprotected plaintext-ingestion compatibility path;
+ABI v2 tests copy this fixture to an owner-only artifact and exercise the
+selected node's unprotected reference-file startup path;
 its presence and successful use are not evidence for the protected-provisioning
 boundary, encryption at rest, or persistent secret custody.
 
@@ -27,3 +28,9 @@ cargo run -p aster-ffi --example generate_test_fixture -- \
 
 Current SHA-256:
 `1a6caf5de104f31a5a13d3611b8ad122fcd2e609b35c74d47705f6f561c542fe`.
+
+`prepare_binding_test_state` independently generates a disposable three-head
+Record conflict (including a tombstone), a control-authority mission artifact,
+and signed public registry for real C/Python/Go guard and rekey tests. It accepts
+only a new directory named `testdata`; it reads no operational inputs. The
+binding test script builds and invokes it automatically.

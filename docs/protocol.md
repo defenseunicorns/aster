@@ -404,23 +404,19 @@ format-2 singletons is respectively 1,207,414 and 677,014 bytes. These are
 serialized-byte equations, not transport-throughput or independent-
 interoperability claims.
 
-The reference exposes an explicit `publish_batch` operation rather than hidden
-buffering. It atomically reserves contiguous publisher/Event ranges and commits
-the proof, all compact items, accepted ledgers and metadata, plus either the
-default retained format-2 singleton set or an explicit batch-only policy. Blob
-items use the same source-authenticated route-commitment checks, and Rust/C/Go/
-Python can atomically finalize 2–64 distinct Blob writers while keeping them
-retryable after rejection. Failure before commit exposes none of the set, and
-reopen reauthenticates the proof before proof-backed application reads.
-Selected semantic-v1 peers reject compact batch items. Independent
-interoperability, live-carrier, and 3 kbps acceptance remain separate gates.
+These encoding rules specify proof and compact-item representations, not an
+application batch-publication API. The `aster-node` runtime and C/Go/Python
+bindings publish individual operations; they do not expose atomic multi-item
+or multi-Blob publication. Semantic-v1 peers reject compact batch items.
+Independent interoperability, live-carrier, and 3 kbps acceptance remain
+separate gates.
 
 ## 7. Causality
 
 A version vector records the greatest represented counter for each publisher.
-Schema 12 does not maintain one transitive node-global publication clock. It
-maintains a direct-observation frontier for each exact `(topic, origin scope)`
-domain. Publishing captures that domain's frontier before advancing the
+The redb store maintains a direct-observation frontier for each exact
+`(topic, origin scope)` domain. Publishing captures that domain's frontier
+before advancing the
 publisher's node-global durable counter. Accepting an ordinary item or an
 authenticated bridged source advances only that item's own dot in its origin
 domain; the received item's asserted predecessor vector is not joined into the
@@ -428,16 +424,10 @@ frontier. This rule prevents an authenticated publisher from manufacturing
 local evidence merely by signing arbitrary predecessor claims, but it is not a
 complete transitive causality construction.
 
-Each effective domain is the pointwise maximum of its exact rows and the
-reserved legacy sentinel rows with `topic = ''` and `scope = ''`. Empty topic
-and scope names are invalid protocol values, so the sentinel is SQLite-only and
-cannot collide with an admitted item. Migration from schema 11 copies the old
-node-global frontier verbatim into this sentinel and fails closed if it already
-exceeds 4,096 publishers. Sentinel rows are never advanced by normal schema-12
-acceptance. The exact-plus-sentinel union for any one domain is capped at 4,096
-distinct publishers; adding a new publisher to a saturated domain rejects the
-whole transaction. The number of domains and aggregate frontier rows are not
-currently bounded.
+Each frontier contains only observations from its exact topic/scope domain.
+A domain is capped at 4,096 distinct publishers; adding a new publisher to a
+saturated domain rejects the transaction. The aggregate number of domains and
+frontier rows has no separate bound or retirement protocol.
 
 The accepted-dot equivocation ledger remains node-global. The accepted Event
 sequence ledger is keyed by publisher, topic, scope, and sequence. Both survive
@@ -488,23 +478,21 @@ are immutable.
 A Record is a revision DAG. Every concurrent maximal revision is retained and
 surfaced as a sibling in a conflict annotation. A later causally dominating
 revision may remove a sibling from the current projection, but the input remains
-recoverable until retention-driven garbage collection. Explicit resolution
-publishes a revision whose context covers the exact observed sibling set.
+recoverable. The runtime does not collect State or Record history by retention.
+Explicit resolution publishes a revision whose context covers the exact
+observed sibling set.
 
 Application policy is process-local and is not a replicated protocol object.
-The current reference can associate an application-supplied policy ID with a
-topic; `ApplicationNode::conflicts()` reports that ID while the registration
-remains live. Direct and forwarded replicated ingestion never execute the
-registered policy or publish an automatic resolution. Registration is not
-durable across restart. Applications may compute deterministic bytes from
+The runtime exposes concurrent heads and guarded explicit resolution. Direct
+and forwarded replicated ingestion never execute application policy or publish an
+automatic resolution. Applications may compute deterministic bytes from
 ascending full-ItemID-sorted sibling inputs and submit them through explicit
 resolution. Any such helper MUST return identical bytes for identical canonical
 inputs across every supported implementation and version; this is an
 application conformance obligation, not something replicated ingestion verifies.
 
 Consequently, sibling preservation, annotations, and explicit resolution are
-implemented, but automatic registered-policy merge required by requirements
-§5.3 is partial.
+implemented; automatic application-policy execution is not.
 
 Code received over the mesh is never executed.
 
@@ -580,22 +568,18 @@ segments and complete through an authenticated terminal EOF; profile 4 cannot
 represent them. Nonempty profile-5 packs have at most 8,192 native segments.
 The historical semantic-v7/v8/profile-4 compatibility path remains
 limited to nonempty 64-MiB/1,024-chunk publications.
-The composite per-contact inventory is capped at 100,000 ObjectIDs with source
-envelopes inserted before Blob carriers. A source-envelope selection that alone
-exceeds the cap is rejected rather than silently truncated. Content-authorized nodes retain both a
-quota-accounted carrier and canonical encrypted chunk; route-only relays retain
-the carrier only. Since a transfer digest is not invertible to its route/index,
-local enumeration may reconstruct candidate objects from the authenticated route
-tree.
+The runtime keeps Blob source selection separate from carrier-range transfer.
+It requires content-authorized peers; route-only Blob custody is not supported.
+Source and depot admission use their own configured limits.
 
 ### 8.5 Tombstones
 
 A deletion is a signed revision with a dot, causal context, and all known heads
 as parents. A dominating tombstone keeps ancestors deleted; a concurrent delete
-and edit is a visible conflict. Tombstones and causal fences have separately
-configured retention. The deployment baseline is offline tolerance plus margin
-(30 days + 15 days). Returning after the configured bound can resurrect data;
-bounded retention cannot prevent that indefinitely.
+and edit follows the class’s conflict rules. The runtime retains State and
+Record tombstones and causal history without retention-driven collection.
+Any future bounded collection policy must account for returning offline nodes:
+removing their deletion fences can allow old data to reappear.
 
 ## 9. Exact reconciliation and resumption
 
@@ -648,16 +632,12 @@ An unanswered root commitment may survive a local inventory refresh only as
 bounded metadata. It becomes active again only when a fresh authorized receive
 baseline causes the requester to reissue that exact root PROBE; retained
 unvalidated history by itself never authorizes an OFFER or creates durable work.
-For an admitted INTEREST, the reference passes the complete selector sets to one
-metadata-only inventory query rather than issuing one query for every
-topic-by-scope pair. SQLite applies a 100,001-row `LIMIT`, retains at most the
-first 100,000 metadata rows, and rejects the selection if the extra row exists;
-it never collects the remainder. The generic node facade independently rejects
-an over-limit vector returned by a non-SQLite `RecordStore`, so a bare node does
-not silently accept a backend that violates the contract. SQLite returns
-envelope identifiers, sealed lengths, and the bounded forwarding fields needed
-for policy; the sealed BLOB, publisher, causal context, logical key, and
-application payload metadata do not cross into the Rust inventory projection.
+The live runtime constructs class-specific inventories under the current
+control policy. State and Record each admit at most 4,096 retained network
+items and 16 MiB of exact retained bytes; startup authenticates those rows.
+Event capacity follows the configured store limits, with a separate bounded
+route-only cache. These local admission limits are not limits on the wire
+encoding of INTEREST.
 
 The canonical first WANT for a Blob carrier has unknown total length, no missing
 ranges, and `need_forwarding = false`. After the first DATA establishes total
@@ -673,9 +653,9 @@ created. Transient Store, I/O, and missing-chunk failures preserve progress.
 
 Equal roots end wire tree descent for a partition, but they do not eliminate the
 local inventory snapshot. Each endpoint first performs policy-filtered metadata
-selection and builds and hashes its sparse tree; that selection is capped at
-100,000 objects as described above. Local snapshot work is therefore bounded
-but proportional to selected inventory size, not to the set difference. After
+selection and builds and hashes its sparse tree. Local snapshot work depends
+on selected inventory size, not just the set difference. Runtime admission
+bounds are class-specific. After
 roots differ, `PROBE` / `NODE` descent confines wire comparison to unequal tree
 branches. A future optimization such as an IBLT or Bloom filter MAY be
 negotiated, but every ambiguity or overflow must fall back to the exact tree; no
@@ -789,18 +769,7 @@ session MUST emit, accept, reserve, and count zero Blob interest, Blob-class
 mutable, Blob range, and Blob carrier finish frames. State and Record retain
 their semantic-v4 behavior in v5 through v8.
 
-The core SQLite compatibility store advances schema 14 to 15 only to admit
-`origin_semantic_version = 5` in `transfer_identities`. The transactional
-migration copies every existing row unchanged, retains v1-v4 provenance, and
-then permits v5 provenance across restart; it does not create or migrate the
-selected redb Blob staging/depot tables.
-
-The subsequent schema-15-to-16 migration likewise rebuilds only
-`transfer_identities`, copies every existing row unchanged, retains v1-v5
-provenance, and permits v6 provenance across restart. It changes no stable
-source, carrier, bridge authorization, or bridge-route-wrapper bytes.
-
-The selected redb store separately performs an audit-first Blob lifecycle
+The redb store performs an audit-first Blob lifecycle
 migration. A complete predecessor schema is reconstructed before mutation,
 checked against lineage/replay/publication capacities and the paired depot, and
 then gains publication/operation lifecycle wrappers, permanent fences, typed
@@ -854,9 +823,8 @@ range tuple, but schedules carrier bytes only after semantic-v7/v8 profile-4
 negotiation, control activation, and an exact configured Blob receive selector.
 Semantic-v5/v6 carrier attempts fail before carrier IO. Profile 4 replaces the
 historical per-range Result/Ack and Finish/Finished dialogue below with the
-receipt-free multi-range stream in §9.4. Current validation coverage and its
-environment limits are tracked in the [requirements
-status](validation/requirements-status.md).
+receipt-free multi-range stream in §9.4. See the
+[Blob API guide](quickstart/selected-blob-api.md) for the current runtime boundary.
 
 For each receiver direction, the Blob source phase completes first through the
 class-separated mutable inventory/difference/Offer/Fetch/result/ack/finish
@@ -1575,10 +1543,9 @@ infer real age from a capture alone; provisioning epochs bound this case.
 Wire priorities are fixed: 0 ROUTINE, 1 PRIORITY, 2 IMMEDIATE, 3 FLASH. Doctrine
 profiles MAY change display names but not ordinals. The selected Event API signs
 the caller-supplied priority directly; it does not currently apply a
-topic/integrator default, cap, or override. The generic semantic `Engine` can be
-configured with a global publisher-priority cap, but that is a distinct API
-surface. A bridge may locally suppress or demote scheduling but never rewrite
-the source-signed priority, reset custody age, or extend TTL.
+topic/integrator default, cap, or override. A bridge may locally suppress or
+demote scheduling but never rewrite the source-signed priority, reset custody
+age, or extend TTL.
 
 When eligible work is queued, higher priority receives earlier initial
 transmission and earlier retry deadlines; due work is sent in priority/queue
@@ -1645,8 +1612,8 @@ three modes but not `PassiveOnly`. Physical emission measurement and the
 distinction between receive-only protocol responses and literal radio silence
 remain stakeholder-validation items.
 
-Implementation evidence and bounded environment limitations for these modes
-are tracked in the [requirements status](validation/requirements-status.md).
+See [Carriers and contacts](transports.md) for runtime emission behavior and
+its deployment boundaries.
 
 ## 12. Scopes, topics, relay, and bridge policy
 
@@ -1686,20 +1653,18 @@ epoch grant. Application ItemID/dot/Event semantics and one durable delivery
 ledger are shared across direct and bridged arrival, while wrapper routes,
 receipts, outboxes, and custody remain representation specific.
 
-The reference implements every dependency arrival order, crash-durable pending
-state, restart reauthentication, receipt-aware inventory/serving, deterministic
-active-path selection with verified fallback, monotonic custody, dynamic
-filter/revocation/epoch checks, and quota/reference-counted lifecycle. A bridge
-authorization is live only while its exact bytes have been reauthenticated in
+The bridge-object rules require dependency validation, restart
+reauthentication, and current authorization checks before use. The runtime
+supports static Event hierarchy configuration; see §9.3 for its narrower
+contact and lifecycle boundary. A bridge authorization is live only while its
+exact bytes have been reauthenticated in
 the current process, it is the applied enabled generation high-water, and its
 authority root, delegated control signer, and bridge identity are all
 unrevoked. The independently contiguous bridge-control chain remains keyed by
 stable `authority_id` across signer handoff; a revoked-signer pending suffix is
-rejected and must be reissued from the last applied head. The
-high-level Rust/C/Go/Python administration surface uses move-only enrollment and
-opaque durable 32-byte authorization/route handles; it does not expose sealed
-objects or keys. Cross-implementation, scale, physical-carrier, and independent
-cryptographic review remain release gates. Future summarization publishes a new
+rejected and must be reissued from the last applied head. Dynamic bridge
+administration is not an application API. Cross-implementation, scale,
+physical-carrier, and independent cryptographic review remain release gates. Future summarization publishes a new
 derived item with provenance.
 
 A wrapper adds no trusted tombstone-retention timestamp. The reference therefore
@@ -1794,12 +1759,6 @@ provisioner has no in-band override. Total history loss, intentional fork
 replacement, or recovery without an exact trusted head requires a separately
 specified root-signed control epoch/cutover plus an externally persisted
 high-water mark; neither mechanism is defined by this profile.
-
-Schema 11 is the first durable schema that attributes ordinary and bridge
-controls to their delegated signers. An empty schema-10 control state upgrades,
-but opening a schema-10 store containing any control row fails closed pending a
-future signed cutover/import procedure or creation of a fresh store. The
-implementation does not guess a signer for legacy rows.
 
 After receiving revocation, a node rejects new sessions and source attestations
 from that credential. ScopeEpoch format `0` remains a legacy activation of an
@@ -2292,7 +2251,7 @@ outbound, and replay limits:
 | completed transfer records | 1,024 entries | FIFO eviction; conflicting unauthenticated route/transfer-ID reuse is discarded within the per-pump failure budget |
 | DATA production per WANT | 16 messages of at most 64 KiB payload each | each backend batch is queued before expanding the next WANT; excess returns backpressure |
 | INTEREST selectors | 256 topics, 256 scopes, 4,096 topic-by-scope work units | rejected before inventory selection |
-| policy-filtered inventory snapshot | 100,000 metadata objects | SQLite reads at most cap plus one in one query; cap-plus-one and over-limit custom-store results reject the exchange rather than truncate |
+| live State/Record inventory | 4,096 items and 16 MiB per class | startup authenticates retained network-profile rows; admission rejects excess |
 
 The shared 16 MiB counter covers each retained retry's fixed `Message` value,
 every owned nested string/vector capacity, any duplicate variable prefix held in
@@ -2354,10 +2313,10 @@ forbidden. The closed fixed-binary magic, kind, and role registries are in
 - Encryption does not hide traffic analysis.
 - PQ handshakes/signatures remain large; caching/batching reduces frequency only.
 - Format 2 carries a full credential and two large signatures per singleton
-  source envelope. The semantic-v2/v3/v4/v5/v6/v7/v8 provider and atomic explicit batch
-  source/store/application path plus reference peer proof/compact runtime
-  amortize transferred verification bytes, but the required 3 kbps end-to-end
-  measurement and independent interoperability remain separate gates.
+  source envelope. Format-3 proof/compact representations amortize encoded
+  authentication bytes; they do not establish application batch support or
+  measured throughput. The required 3 kbps end-to-end measurement and
+  independent interoperability remain separate gates.
 - Link-, network-, rendezvous-, or discovery-layer identifiers observed before
   the first Aster handshake flight can still correlate contacts.
 - Recipient-excluding rekey is implemented in the core fixed profile, but its

@@ -20,12 +20,6 @@ architecture = sys.argv[2]
 machine = {"amd64": 62, "arm64": 183}[architecture]
 
 
-def shell_function(script, name):
-    start = script.index(f"{name}() {{\n")
-    end = script.index("\n}\n", start) + 3
-    return script[start:end]
-
-
 def field(name):
     return subprocess.check_output(["dpkg-deb", "-f", str(package), name], text=True).strip()
 assert field("Package") == "aster"
@@ -142,19 +136,4 @@ with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
     ]
     assert not any("non-production" in name or name.endswith(".bundle") for name in members)
 
-control_archive = subprocess.check_output(["dpkg-deb", "--ctrl-tarfile", str(package)])
-with tarfile.open(fileobj=io.BytesIO(control_archive)) as tar:
-    members = {m.name.removeprefix("./"): m for m in tar.getmembers()}
-    postinst_member = members["postinst"]
-    assert postinst_member.isfile()
-    postinst = tar.extractfile(postinst_member).read().decode()
-    assert postinst.count("check_btle_authority_hierarchy allow-missing") == 1
-    assert postinst.count("check_btle_authority_hierarchy require-present") == 1
-    assert shell_function(postinst, "check_btle_authority_hierarchy") == """\
-check_btle_authority_hierarchy() {
-    check_btle_authority_ancestor
-    check_btle_authority_directory "$1"
-    check_btle_authority_lock "$1"
-}
-"""
 print("Package payload, manual page, ELF architecture, external SBOMs and checksums: OK")

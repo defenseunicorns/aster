@@ -519,12 +519,16 @@ mod tests {
 
     struct BlockingFingerprintSource {
         calls: Arc<std::sync::atomic::AtomicUsize>,
+        entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
         release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     }
 
     impl FingerprintBatchSource for BlockingFingerprintSource {
         fn collect(&self, adapter_names: &[String]) -> Vec<ControllerFingerprint> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
             let (lock, changed) = &*self.release;
             let mut released = lock.lock().unwrap();
             while !*released {
@@ -631,19 +635,27 @@ mod tests {
     async fn collection_timeout_is_nonfatal_and_single_flight() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (entered_send, entered_receive) = tokio::sync::oneshot::channel();
         let collector = ProductionControllerFingerprintCollector::with_source_for_test(
             Arc::new(BlockingFingerprintSource {
                 calls: calls.clone(),
+                entered: std::sync::Mutex::new(Some(entered_send)),
                 release: release.clone(),
             }),
-            Duration::from_millis(25),
+            Duration::from_millis(250),
         );
         let adapters = vec!["hci0".to_owned(), "hci1".to_owned()];
 
-        let first = collector.collect(&adapters).await;
+        let first = collector.collect(&adapters);
+        tokio::pin!(first);
+        tokio::select! {
+            entered = entered_receive => entered.expect("collector worker entered"),
+            fingerprints = &mut first => panic!("collector returned before source entry: {fingerprints:?}"),
+        }
         let second = tokio::time::timeout(Duration::from_millis(10), collector.collect(&adapters))
             .await
             .expect("busy collection returns without starting another worker");
+        let first = first.await;
 
         assert_eq!(first.len(), 2);
         assert_eq!(second.len(), 2);
@@ -815,30 +827,38 @@ mod tests {
 
     #[test]
     fn version_command_is_killed_at_its_deadline() {
-        let script = version_script("sleep 2");
-        let started = std::time::Instant::now();
+        let marker = unique_temp_path("aster-btle-command-started");
+        let script = version_script(&format!("printf started > {}; sleep 2", marker.display()));
+        let command = script.0.clone();
+        let worker = std::thread::spawn(move || {
+            read_command_version(&command, std::time::Duration::from_millis(500))
+        });
 
-        assert_eq!(
-            read_command_version(&script.0, std::time::Duration::from_millis(25)),
-            None
-        );
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        wait_for_file(&marker);
+        let deadline_started = std::time::Instant::now();
+        assert_eq!(worker.join().expect("version command worker"), None);
+        assert!(deadline_started.elapsed() < std::time::Duration::from_secs(1));
+        std::fs::remove_file(marker).unwrap();
     }
 
     #[test]
     fn version_command_deadline_includes_inherited_stdout() {
         let descendant_pid = unique_temp_path("aster-btle-descendant");
+        let marker = unique_temp_path("aster-btle-descendant-started");
         let script = version_script(&format!(
-            "sleep 2 & descendant=$!; printf '%s\\n' \"$descendant\" > {}; printf '5.72\\n'",
-            descendant_pid.display()
+            "sleep 2 & descendant=$!; printf '%s\\n' \"$descendant\" > {}; printf started > {}; printf '5.72\\n'",
+            descendant_pid.display(),
+            marker.display()
         ));
-        let started = std::time::Instant::now();
+        let command = script.0.clone();
+        let worker = std::thread::spawn(move || {
+            read_command_version(&command, std::time::Duration::from_millis(500))
+        });
 
-        assert_eq!(
-            read_command_version(&script.0, std::time::Duration::from_millis(25)),
-            None
-        );
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        wait_for_file(&marker);
+        let deadline_started = std::time::Instant::now();
+        assert_eq!(worker.join().expect("version command worker"), None);
+        assert!(deadline_started.elapsed() < std::time::Duration::from_secs(1));
 
         let pid = std::fs::read_to_string(&descendant_pid)
             .unwrap()
@@ -852,6 +872,15 @@ mod tests {
         }
         assert!(!process.exists(), "command descendant survived cleanup");
         std::fs::remove_file(descendant_pid).unwrap();
+        std::fs::remove_file(marker).unwrap();
+    }
+
+    fn wait_for_file(path: &Path) {
+        let expires = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !path.exists() && std::time::Instant::now() < expires {
+            std::thread::yield_now();
+        }
+        assert!(path.exists(), "command did not publish its start marker");
     }
 
     fn version_script(body: &str) -> ScriptFixture {

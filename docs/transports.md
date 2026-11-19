@@ -1,9 +1,8 @@
 # Carriers and contacts
 
-This guide distinguishes the selected Iroh carrier/storage composition
-from the proven semantic implementation whose protocol and carrier behavior is
-being migrated onto it. Read [Core concepts](concepts.md) first if terms such as
-node, topic, or scope are new.
+This guide describes Iroh contacts, embedded bindings, and BTLE evaluation
+paths, with their transport and authorization boundaries. Read
+[Core concepts](concepts.md) first if node, topic, or scope are new to you.
 
 ## Choose your path
 
@@ -83,12 +82,7 @@ compatibility path for peer-neutral contiguous carrier ranges of at most 16 KiB;
 v7 is durable-only,
 while v8 also implements
 authenticated finite-TTL custody and bounded lower-priority pressure recovery
-internally. The broader
-semantic implementation remains the migration source for behavior that has not
-yet moved into this composition.
-
-The retired `aster-host` shared-runtime composition used semantic v8/profile 4.
-The selected `aster-node` composition owns semantic-v9/profile-5 streaming.
+internally. The `aster-node` runtime owns semantic-v9/profile-5 streaming.
 
 ## Capability boundary
 
@@ -98,15 +92,12 @@ The selected `aster-node` composition owns semantic-v9/profile-5 streaming.
 | Selected nearby Iroh discovery | Feature-gated Iroh mDNS lookup using an exact roster or mission-authenticated `--discover-lan`; each window is at most 30 seconds | Default off; upstream observations are not globally capped, so this is not a hostile-LAN or production discovery service |
 | Selected controlled Iroh relay | One operator-pinned HTTPS relay with explicit trust, alongside an initial direct locator or with IP disabled | No public/default relay selection; the relay is transport infrastructure rather than an Aster mission or payload-blind application relay |
 | Selected node and CLI | Networked Event, State, and Record reconciliation; semantic-v9/profile-5 checkpointed Blob streaming plus semantic-v7/v8 profile-4 compatibility; live and stopped Rust APIs; bounded application delivery; payload-blind Event relay; restart/idempotency; Unix zeroization | Reference provisioning; no physically qualified cross-transport failover, dynamic application-driven network interests, automatic Record merge, route-only Blob custody, finite State/Record TTL, public Blob lifecycle controls, generalized control administration, or production authorization |
-| Current semantic in-memory link | High-level host contact, authentication, reconciliation, resume, and failure behavior | Reference carrier; not wired to the selected composition |
 | Linux BlueZ Event evaluation | Fixed-locator Ring 1 uses one exact controller and provisioned peer per process, event-driven availability, deterministic Linux role, bounded retry, and one semantic-v9 ordered Event contact. A separate source-present rostered evaluator adds authenticated transient discovery, a dynamic listener PSM, bounded credential/candidate state, and the same one-peer Event boundary. The Linux `systemd-provider` composition additionally implements bounded automatic controller inventory, passive compatibility probing, sticky selection, and one operational rostered epoch for `Normal` policy. | [Bounded Ring-1 CM4 evidence](validation/evidence/2026-11-05-cm4-btle-ring1-event-validation.md) is evaluation-only. The process-restart failure was bound to CVE-2026-72333 on Linux 6.18.39 by the [clean-restart diagnostic](validation/evidence/2026-11-06-cm4-btle-clean-restart-diagnostic.md); the [fixed-kernel record](validation/evidence/2026-11-06-cm4-btle-clean-restart-validation.md) then observed zero-work restart on Linux 6.18.60 without a controller epoch change. The Debian source profile now presents an optional encrypted roster credential, admits Bluetooth sockets without raw/admin capabilities, and restricts the service user to the exact BlueZ methods used by the adapter. Discovery-secret HMAC pads, hash state, and intermediate digests use zeroize-on-drop storage with frozen byte vectors. Package construction and payload checks pass, and a [disposable Orin run](validation/evidence/2026-11-18-orin-btle-advertisement-scan-restart.md#current-head-installed-service-follow-up) exercises the current source under the installed service identity. Installed-package qualification remains open because stock `bluer` does not establish acknowledged cancellation-safe advertisement/discovery teardown or a bounded first D-Bus ingress queue. No physically validated cross-transport fallback, other data class, requirement credit, support claim, or production authorization is claimed. |
 | Current semantic BTLE | MTU-aware link, unicast plus an advertisement primitive, disconnect handling, platform `BleRadio` seam | Selected-node integration; a shipped Android, iOS, Linux, or controller-specific radio driver; complete one-to-many profile |
 | LoRa, serial, file | The requirements and semantic design do not preclude them | No selected adapters ship |
 
-Deployment evidence and open gates are tracked in
-[requirements status](validation/requirements-status.md) and
-[conformance](validation/conformance.md); code presence alone is not deployment
-credit.
+See [conformance](validation/conformance.md) and the platform-specific
+validation records linked above; code presence alone is not deployment credit.
 
 ## Selected direct-Iroh contact
 
@@ -235,11 +226,9 @@ or non-Unix platforms. Exact usage and the crash-resumption boundary are in the
 
 ## Current semantic/reference carrier composition
 
-The repository also retains the current semantic application and host surfaces:
+The embedded bindings use the selected runtime:
 
-- `ApplicationNode` is the offline application surface.
-- Shared core and binding batch, bridge, and merge APIs remain available.
-  The native laboratory host composition and Gate H have been retired.
+- C ABI v2, Go, and Python start a local `aster-node` actor without contacts.
 - `BleLink` implements the opaque-fragment contract.
 - The maintained [implementation-boundary table](../README.md#current-implementation-boundary)
   records which operations each Rust and language-binding surface exposes.
@@ -464,17 +453,17 @@ conflict resolution, or treat transport security as Aster authentication. The
 core owns fragmentation, handshake, replay defense, exact reconciliation,
 source verification, and reducers.
 
-Use the `Link` trait and retained BTLE adapters as semantic and test migration
-sources. The selected node now has an adapter-neutral stream registry and
+The `Link` trait describes the opaque-fragment carrier boundary. The live node
+uses an adapter-neutral stream registry and
 deterministic selector. The Linux `systemd-provider` composition may register
 `BLE_L2CAP_V1` when optional BTLE policy and credential preparation succeed,
-including under the Debian service profile. It starts `Unavailable`; `Normal` policy may
-make it selectable only after automatic compatibility probing and complete
-operational startup plus admission of a complete authenticated roster beacon in
-the same epoch. `ReceiveOnly` retains the unavailable registration without
-starting radio work. A complete BTLE policy block is active by default;
-`"enabled": false` is the explicit opt-out, while an absent block grants no
-BTLE authority. Controller presence never supplies missing policy or credential
+including under the Debian service profile. It starts `Unavailable`; `Normal`
+policy may make it selectable only after automatic compatibility probing,
+complete operational startup, and admission of a complete authenticated roster
+beacon in the same epoch. `ReceiveOnly` retains the unavailable registration
+without starting radio work. A complete BTLE policy block is active by default;
+`"enabled": false` is the explicit opt-out, while an absent block grants no BTLE
+authority. Controller presence never supplies missing policy or credential
 authority. Each adapter owns its connection state and attempt creation.
 Implementing another adapter, or using it as the sole contact-agreed adapter,
 does not require changing the Blob stream codec, pipeline, persistence, or
@@ -528,8 +517,7 @@ evidence, independent review, and release authorization are necessary parts of
 those gates. Local multi-registration tests are not evidence that competing
 adapters may be enabled in a production composition. When another adapter is
 implemented, it uses the same registry and must not create a second persistence,
-reconciliation, authentication, or scheduling authority. Use the
-[binding pattern](bindings/pattern.md) for a language API.
+reconciliation, authentication, or scheduling authority.
 
 ## Semantic protocol versions you may see
 
@@ -602,16 +590,16 @@ compatibility is not downgrade-resistance evidence.
 
 ## Before a real deployment
 
-- Complete the migration ledger in
-  [production requirements status](validation/requirements-status.md), and
-  do not interpret the direct-Iroh carrier handshake as mission authentication
-  or the reference mission session as source-item authorization.
+- Review the [security boundaries](security.md). Do not interpret the
+  direct-Iroh carrier handshake as mission authentication or the reference
+  mission session as source-item authorization.
 - Issue distinct operational bundles through an approved provisioning process,
   wrap them with an admitted protected-artifact provider, and do not fall back
   to the raw fixture/compatibility path.
 - Define persistent secret custody, unattended startup, backup/recovery, and
   destroy behavior separately from artifact encryption.
-- Set quotas, retention, priority caps, and sync interests for the device tier.
+- Set store/depot quotas and network interests for the device tier; choose
+  publication priority and supported TTL per operation.
 - Decide how the host obtains peer identities and endpoints.
 - Integrate nonblocking carrier readiness and wakeups without polling.
 - Capture every enabled physical carrier and compare it with the privacy

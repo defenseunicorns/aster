@@ -18,7 +18,7 @@ REQUIRED = {
     "docker/path-lab/delivery-network-init.py",
     "docker/path-lab/delivery-agent.py", "docker/path-lab/delivery-wan.py",
 }
-for tree in ("crates", "proto", "third-party"):
+for tree in ("crates", "proto"):
     REQUIRED.update({f"{tree}/sentinel.txt", f"{tree}/nested/deep/sentinel.txt"})
 DENIED = {
     ".env", ".git/config", "target/sentinel.txt", "unrelated/sentinel.txt",

@@ -1,99 +1,52 @@
 # Go binding
 
-Use this module when a Go application needs Aster's offline publish, query,
-subscription, conflict, batch, Blob, bridge, or rekey operations. Start with the
-[commented ten-minute quickstart](../../docs/quickstart/go.md); this page is the
-binding-specific build and lifecycle reference.
+Clean Room — Privileged.
 
-Build or install the native library first. The binding links with
-`-laster_ffi` and does not embed a repository-relative library path. Use the
-platform linker configuration, or set `CGO_LDFLAGS` to add the directory that
-contains the matching shared/static library. `Open` currently accepts the
-canonical unprotected inner provisioning bytes for compatibility and tests; it
-does not derive identity or scope access from an application password or seed,
-and no protected-provider binding is shipped. Raw open is not an operational
-custody solution. See the
-[protected-provisioning gate](../../docs/decisions/0013-protected-provisioning-boundary.md).
+This cgo package wraps the redb-backed `aster-node` runtime through C ABI v2.
+It requires the matching `aster_ffi` library. `-tags aster_workspace` adds the repository's
+`target/debug` library directory; downstream packages configure their link path.
 
-The core application flow is `Open` → `Subscribe`/`Query` → `Publish` → `Poll`
-→ `Acknowledge` → `Close`. Publish returns after a durable local commit and does
-not wait for a peer. Subscriptions are durable and at-least-once; acknowledge
-only after the application has committed its own result.
-
-`ProtocolVersion()` is retained as the legacy name for replication-wire version
-`1`; new code should use `ReplicationWireVersion()`. The default and highest
-implemented semantic version are reported separately by
-`DefaultSemanticVersion()` and `HighestSupportedSemanticVersion()` and are both
-`9` in this build; authenticated sessions retain semantic versions 8, 7, 6, 5, 4, 3, 2,
-and 1 for compatibility. These process-wide values do not report a particular
-session's negotiated result.
-
-Semantic-v7 transfer-profile selection and Event page controls are
-runtime-internal. This application binding exposes neither; State, Record, Blob,
-and EventBridge remain available through the negotiated `LegacyV6` profile.
-
-Queried and subscribed `Item` values expose `OriginScope` and `CurrentScope`.
-`Scope` remains an exact compatibility alias of `CurrentScope`.
-
-`Node` provides synchronous offline publish/query, durable subscriptions,
-conflict inspection/resolution, emission policy, peer/sync status, bridge
-filters, and zeroization. It deterministically closes
-native result and output allocations. Call `Close` (or `Zeroize`) even though a
-finalizer exists as a leak backstop.
-
-`PublishBatch` atomically commits 2-64 ordered, same-route items and returns
-ordered receipts plus aggregate eviction IDs. `RetainedDual` is the safe
-default/zero-value policy; `BatchOnly` explicitly omits unchanged format-2
-singleton representations used by semantic-v1 peers. Rejected batches consume
-no publisher counter or event sequence.
-
-The high-level cross-scope surface consists of `CreateBridgeEnrollment`,
-`EnableBridge`, `DisableBridge`, `BridgeItem`, `ExtendBridgeRoute`, exact status
-lookups, and bounded `BridgeAuthorizations` / `BridgeRoutes` pages. Enrollment
-is a process-local move-only capability: `EnableBridge` consumes it once native
-authority processing begins, including rejected authorization attempts. Call
-`Close` for an unused enrollment. Durable `BridgeAuthorizationID` and
-`BridgeRouteHandle` values are fixed 32-byte arrays and remain usable after a
-node reopen.
-
-`BridgeAuthorizationPolicy` and `BridgeNarrowingPolicy` use exact topic lists
-and an explicit nonzero `PriorityMask`; the authority additionally selects a
-1-8 hop bound. An empty narrowing topic list retains the authority-permitted
-topics. The binding never represents sealed controls/wrappers, credential
-bytes, keys, provider state, transports, or synchronization internals.
-
-Large immutable values use `NewBlobWriter` and `OpenBlobReader`. The writer
-implements `io.Writer`, the reader implements `io.Reader`, and `Finish` is
-idempotent across retries. Generic `Publish(Blob, ...)` is rejected so a Blob
-payload cannot accidentally be collected into one native allocation. Each Blob
-chunk is authenticated before `Read` returns it, but the whole-content digest is
-verified only at the read that reaches `io.EOF`; do not act on accumulated bytes
-before that boundary.
-`PublishBlobBatch` finalizes and atomically publishes 2-64 distinct writers;
-the writers remain retryable on failure, and `Finish` returns their matching
-batch receipts after success.
-
-Control-authority nodes use `RekeyScope` with opaque signed registry bytes, a
-caller-retained minimum generation, a newer epoch, and explicit
-`RouteOnlyRecipient` or `ReadTopicsRecipient` values. Nested native memory is
-borrowed only for the synchronous call. The binding exposes the durable receipt,
-never keys, provider state, grant plans, or sealed controls.
-
-Run the actual shared-library tests with:
-
-```sh
-cargo build -p aster-ffi
-env CGO_LDFLAGS="-L$(pwd)/target/debug" \
-  LD_LIBRARY_PATH="$(pwd)/target/debug" \
-  DYLD_LIBRARY_PATH="$(pwd)/target/debug" \
-  go -C bindings/go test ./...
+```go
+node, err := aster.Open("/absolute/state", "/absolute/owner-only-mission.bundle")
+if err != nil { return err }
+defer node.Close()
+_, err = node.Publish(aster.PublishRequest{
+    Class: aster.State, Topic: "position.current", Scope: "mission/team/alpha",
+    OperationKey: []byte("position/1"), LogicalKey: []byte("unit-7"),
+    Payload: []byte("position"),
+})
 ```
 
-Repository verification instead uses the `aster_workspace` build tag, which
-adds only the workspace-local debug library directory and runtime search path:
+State/Record require operation keys, exact-key queries, and no finite TTL.
+`Query` returns a `*Result`: close it explicitly, and retain it while calling
+`Resolve`. `Entries` preserves whole Record projections and sibling annotations;
+`Items` is a convenience flattening. Poll results expose `HasMore`; Event queries
+also expose `ScannedThrough`. A delivery is acknowledged as a complete `Delivery`
+with its returned token. `RestoreSubscription` restores a durable ID after reopen.
+
+Events use explicit `Client`, `Sequence`, `BeginRecovery`, `CompleteRecovery`,
+`AcknowledgePublication` and `AbandonPublication`. Persist intent and claim nonce
+before calls and reconcile outstanding results before completing recovery.
+The wrapper does not synthesize a durable application journal.
+
+`NewBlobWriter` requires an operation key and total length, exposes `Offset()`
+for checkpoint resume, and implements `io.Writer`. `Finish` is repeatable after
+success. `OpenBlobReader` implements `io.Reader`. Blob options/receipts include
+finite TTL; subscription deliveries distinguish content from retirement.
+Emission, authenticated peer status, local delivery status and scope rekey remain
+available. All wrapper methods serialize with node closure. Error capture pins
+the goroutine to the originating OS thread.
+
+Explicit `Close` is required for nodes/results/readers/writers; finalizers are
+only a leak backstop. Node closure invalidates its children and joins native
+work. `Zeroize` consumes the node, destroys its retained provisioning artifact,
+and terminalizes the state. Caller-owned Go copies survive. No transport or
+process signal handler is installed by the binding.
+
+See the [ABI contract](../c/README.md),
+[Go sample](../../examples/go_basic.go), and [quickstart](../../docs/quickstart/go.md).
+Run the real suite from the repository root:
 
 ```sh
-cargo build -p aster-ffi
-GOCACHE=/tmp/aster-mesh-go-cache \
-  go -C bindings/go test -tags aster_workspace ./...
+mise exec -- sh tools/with-test-resources.sh sh tools/test-ffi-bindings.sh
 ```

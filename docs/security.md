@@ -24,7 +24,7 @@ policy-selectable; neither profile reinterprets the other's bytes or evidence.
 
 ## Implemented profile boundary
 
-Two versioned profile implementations now exist, with deliberately different
+Two versioned profile implementations have different
 supported surfaces and integration maturity. Profile `0x0002` is a bounded
 Event/control evaluation slice, not a complete MVP/product profile:
 
@@ -193,9 +193,9 @@ This Rust-only provider is disabled by default and is not production admitted.
 review, exceptions, and exit gates.
 
 The profile is X25519 and ChaCha20-Poly1305 based. It provides no post-quantum
-artifact-confidentiality or FIPS 140-3 validation claim. The raw
-`ApplicationNode::open`, FFI, Go, and Python paths remain
-unprotected compatibility/test ingestion. The stock `aster node`,
+artifact-confidentiality or FIPS 140-3 validation claim. The C ABI v2, Go,
+and Python constructors use unprotected reference provisioning; they do not
+expose protected-provider callbacks. The stock `aster node`,
 `control-revoke`, and `control-rekey` CLI paths also still require an owner-only
 unprotected-reference bundle. A Rust embedding can instead construct a live
 `NodeConfig` from a protected file, protected bytes, or an exact opaque provider
@@ -217,7 +217,7 @@ origin labels `provider-protected-artifact` and `provider-secret-reference`.
 They do not expose a path, provider identity, operation ID, or opaque reference,
 and they are not provisioning, custody, or destruction receipts.
 
-Persistent custody now has a provider-neutral contract, not a production
+Persistent custody has a provider-neutral contract, not a production
 backend. A versioned, bounded `ProvisioningSecretRef` carries an opaque backend
 locator or capability; its debug output is redacted, but opacity does not make
 it public. Separate caller-chosen install, load, and destroy operation IDs bind
@@ -461,11 +461,6 @@ fork replacement, or recovery without a trusted head requires a separately
 specified root-signed control epoch and an externally retained chain high-water;
 those mechanisms and an operator recovery workflow remain production gates.
 
-Schema 11 adds signer attribution. Migration from schema 10 succeeds only when
-both legacy control tables are empty. If either contains rows, open fails closed
-with an explicit migration-required error pending a signed cutover/import design
-or a fresh store; the implementation will not infer a signer for old controls.
-
 ## Revocation meaning
 
 A root-credentialed, delegated-hybrid-signed monotonic control record propagates
@@ -499,21 +494,17 @@ the hybrid recipient package withholds the fresh epoch keys.
 
 ## Causal evidence and bounded state
 
-Schema 12 scopes publication frontiers to exact `(topic, origin scope)` domains.
+The redb store scopes publication frontiers to exact `(topic, origin scope)` domains.
 Only an accepted item's own dot advances the local frontier; its signed
 predecessor vector is not imported as local observation. This is a deliberate
 trust boundary: source authentication identifies the publisher of a causal
 claim but cannot prove that the publisher truthfully or completely observed the
 claimed predecessors.
 
-Each domain loads the pointwise maximum of its exact rows and the reserved
-SQLite-only legacy sentinel `('', '')`. Empty topic and scope names are invalid
-on the protocol, so admitted data cannot occupy that sentinel. Schema-11
-node-global observations migrate verbatim into the sentinel, which is then
-read-only under normal acceptance. The exact-plus-sentinel union is capped at
-4,096 distinct publishers per domain, and a new publisher at the boundary fails
-the same transaction that would accept the item. The aggregate number of
-domains and frontier rows is not bounded.
+Each domain contains only its exact topic/scope observations and is capped at
+4,096 distinct publishers. A new publisher at the boundary fails the same
+transaction that would accept the item. The aggregate number of domains and
+frontier rows has no separate bound or retirement protocol.
 
 This bounds cross-scope pollution but does not establish transitive causality.
 For example, after A publishes `A1`, B observes it and publishes `B1`, and C
@@ -756,8 +747,10 @@ conservative lower-bound age. Finite Blob TTL and bounded pressure recovery are
 selected under authenticated semantic-v8 custody on Linux. The selected Linux
 local-agent and `asterctl` path exposes bounded Blob publish/read operations
 with durable or finite TTL. Route-only custody, public GC controls, Blob
-subscription/status RPCs and CLI commands, and FFI lifecycle controls remain
-unimplemented.
+subscription/status RPCs and CLI commands remain unimplemented. C ABI v2 and
+its Go/Python wrappers expose finite Blob TTL, content/retirement deliveries,
+and receiver-local delivery status. That status does not report remote
+delivery or convergence.
 
 ### Selected semantic-v6 Event-bridge isolation
 
@@ -789,17 +782,13 @@ replacement, or finite-TTL bridge age.
 
 Inventory roots are constant size and exact tree descent is bounded. Control
 records, current epochs, and retained tombstone fences have reserved quota.
-Priority does not bypass authentication or bounds. An INTEREST is rejected
-before backend work if it exceeds 256 topics, 256 scopes, or 4,096
-topic-by-scope combinations. An admitted filter causes one metadata-only
-inventory query, not a Cartesian series of store queries, and does not
-materialize sealed payload or causal/application fields into the Rust
-projection. The policy-filtered source snapshot has a 100,000-object ceiling.
-SQLite stops at cap plus one and rejects the selection if that row exists; the
-generic node facade also rejects an over-limit result from a custom store. Equal
-Merkle roots prevent further wire descent but do not avoid this local selection
-and hashing step, so local reconciliation work is snapshot-size proportional,
-not difference proportional.
+Priority does not bypass authentication or bounds. The runtime uses
+class-specific inventories under the current control policy. Live State and
+Record each have a 4,096-item and 16-MiB retained network limit; startup
+authenticates those rows. Event capacity follows configured store limits,
+with separate route-only cache limits. Equal inventory roots avoid further
+wire descent, not local inventory construction and hashing. Local work is
+therefore not necessarily proportional to the difference between peers.
 
 For a selected root containing no more than both peers' OFFER limits (256 by
 default), the sender can return the complete canonical identifier set. The
@@ -885,9 +874,8 @@ found in captured Aster carrier bytes. They cannot establish resistance to
 correlation through carrier identifiers and do not hide timing, direction,
 size, RF energy, or protocol presence.
 
-The complete test matrix, credited evidence, and open production gates live in
-[requirements status](validation/requirements-status.md) and
-[conformance status](validation/conformance.md).
+See [conformance status](validation/conformance.md) for protocol validation
+coverage and its independent-interoperability limits.
 
 Report vulnerabilities through the private process in `.github/SECURITY.md`.
 Do not include mission data or credentials in a public issue.

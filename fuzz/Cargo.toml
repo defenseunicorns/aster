@@ -113,6 +113,3 @@ doc = false
 bench = false
 
 [workspace]
-
-[patch.crates-io]
-netlink-packet-core = { path = "../third-party/netlink-packet-core-0.8.2-aster" }

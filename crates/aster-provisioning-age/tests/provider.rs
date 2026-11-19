@@ -1,11 +1,11 @@
 use age::secrecy::ExposeSecret;
 use age_core::format::{FileKey, Stanza};
 use aster_mesh::{
-    ApplicationNode, ApplicationNodeOptions, EngineError, MAX_PROTECTED_PROVISIONING_BYTES,
-    MAX_UNPROTECTED_PROVISIONING_BYTES, ProtectedProvisioningError, ProvisioningAccess,
+    MAX_PROTECTED_PROVISIONING_BYTES, MAX_UNPROTECTED_PROVISIONING_BYTES, ProvisioningAccess,
     ProvisioningBundle, ProvisioningProtectionError, ProvisioningProtector,
     ProvisioningUnprotector, ReferenceProvisioner, Scope, Topic, UnprotectedProvisioning,
 };
+use aster_node::application::{ApplicationErrorKind, SelectedEventNode};
 use aster_provisioning_age::{
     AgeIdentity, AgeProviderConfigError, AgeRecipient, AgeX25519Protector, AgeX25519Unprotector,
     MAX_AGE_HEADER_BYTES, MAX_AGE_HEADER_LINES, MAX_AGE_IDENTITIES, MAX_AGE_RECIPIENTS,
@@ -523,34 +523,21 @@ fn real_bundle_roundtrips_and_opens_an_application_node() {
 
     let root = test_directory("application-open");
     fs::create_dir(&root).unwrap();
-    let rejected_path = root.join("wrong-identity.sqlite");
+    let rejected_path = root.join("wrong-identity");
     let mut wrong = unprotector_for(AgeIdentity::generate());
-    let error = ApplicationNode::open_protected(
-        &rejected_path,
-        &protected,
-        &mut wrong,
-        ApplicationNodeOptions::default(),
-    )
-    .err()
-    .unwrap_or_else(|| panic!("wrong identity unexpectedly opened an application node"));
-    assert!(matches!(
-        error,
-        EngineError::Provisioning(ProtectedProvisioningError::Protection(
-            ProvisioningProtectionError::Rejected
-        ))
-    ));
+    let error = SelectedEventNode::from_protected_bytes(&rejected_path, &protected, &mut wrong)
+        .err()
+        .unwrap_or_else(|| panic!("wrong identity unexpectedly opened an application node"));
+    assert_eq!(error.kind(), ApplicationErrorKind::Provisioning);
     assert!(!rejected_path.exists());
 
-    let database_path = root.join("node.sqlite");
+    let state_path = root.join("node");
     let mut node_unprotector = unprotector_for(identity);
-    let node = ApplicationNode::open_protected(
-        &database_path,
-        &protected,
-        &mut node_unprotector,
-        ApplicationNodeOptions::default(),
-    )
-    .unwrap();
+    let node =
+        SelectedEventNode::from_protected_bytes(&state_path, &protected, &mut node_unprotector)
+            .unwrap();
     assert_ne!(node.identity(), [0; 32]);
+    assert!(state_path.join("mesh.redb").is_file());
     drop(node);
     fs::remove_dir_all(root).unwrap();
 }
