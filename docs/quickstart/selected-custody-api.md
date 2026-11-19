@@ -276,4 +276,4 @@ radio silence or media sanitization, protected provisioning, representative NAT
 or Internet paths, controlled relays, BTLE, crash/power-loss recovery, scale,
 mixed implementations, or release authorization. Current implementation and
 validation boundaries are tracked in the
-[requirements status](../validation/requirements-status.md).
+[current implementation boundary](../../README.md#current-implementation-boundary).

@@ -20,7 +20,7 @@ Local Blob publication commits without waiting for a peer. Rust, the native-gRPC
 - Product-intent authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Security-profile applicability:
   [`security-profile-requirements-disposition.md`](security-profile-requirements-disposition.md)
-- Evidence authority: [`requirements-status.md`](requirements-status.md)
+- Remaining-work discussion and revalidation: [#203](https://github.com/defenseunicorns/aster/issues/203)
 - Atomic trace: [`requirements-implementation.csv`](requirements-implementation.csv)
 - Current release posture: **evaluation-stage; not production-authorized**
 

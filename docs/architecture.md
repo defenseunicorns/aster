@@ -12,10 +12,8 @@ the complete protocol and semantic reference implementation.
 | Blob | Semantic-v7/v8 profile-4 direct range stream; v7 durable-only, v8 authenticated finite custody | Cloneable live Rust handle, exclusive stopped Rust handle, and encrypted local depot |
 
 Read the diagrams from broadest to narrowest: application surfaces, runtime
-ownership, then the publication and contact flows for each mechanism. Exact
-evidence and remaining release gates live in
-[requirements status](validation/requirements-status.md), not in these
-diagrams.
+ownership, then the publication and contact flows for each mechanism. See the
+[current implementation boundary](../README.md#current-implementation-boundary) for capabilities and limitations beyond these diagrams.
 
 ## Components and trust boundaries
 
@@ -582,5 +580,4 @@ and non-Unix behavior are outside the proof.
 - [Protocol](protocol.md) defines the wire and semantic contract.
 - [Security model](security.md) describes security properties and production
   gates.
-- [Requirements status](validation/requirements-status.md) records retained
-  evidence, credited behavior, and open validation gaps.
+- [Current implementation boundary](../README.md#current-implementation-boundary) describes capabilities and limitations.

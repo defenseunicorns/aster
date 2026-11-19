@@ -603,7 +603,7 @@ and both insert flags true in 1.26 seconds; an exact 0.84-second rerun returned
 the same semantic ID and projection with both insert flags false.
 
 The exact Record source/dependency hashes are pinned in the
-[requirements evidence](requirements-status.md#prior-selected-record-stopped-slice-automated-evidence).
+[requirements evidence](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md#prior-selected-record-stopped-slice-automated-evidence).
 This is the earlier stopped/local automated evidence, not a Record contact,
 disconnected-process acceptance result, retained execution receipt, or release
 artifact. At this frozen slice Record had no live handle or reconciliation
@@ -689,7 +689,7 @@ an earlier sandboxed attempt was denied by the host before those socket tests
 could run and is not counted as a test failure or success.
 
 The exact Blob source identities are pinned in the
-[requirements evidence](requirements-status.md#prior-selected-blob-automated-evidence).
+[requirements evidence](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md#prior-selected-blob-automated-evidence).
 A disposable provisioned fixture then ran the compiled Blob example twice over
 18,783 input bytes. The 4.792-second first run returned one chunk,
 `inserted=true`, and Blob ID
@@ -730,7 +730,7 @@ continuous/lost age, route promotion, retirement/lease drain, retry/receipt
 settlement, sender/receiver visibility, crash-reopen cleanup, cardinality/audit
 corruption, and one-transaction bounded scheduling. Exact final counts, timings,
 and source hashes are recorded in the
-[prior semantic-v3 custody requirements evidence](requirements-status.md#prior-semantic-v3-selected-event-custody-automated-evidence).
+[prior semantic-v3 custody requirements evidence](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md#prior-semantic-v3-selected-event-custody-automated-evidence).
 
 This is current-code automated evidence, not a retained physical acceptance
 receipt. That retained finite-TTL boundary is Linux/Event/v3-format only,
@@ -748,7 +748,7 @@ v5 compatibility and current v7/v8 stream/lifecycle gates below do not relabel i
 
 The subsequent stopped protected-provisioning/control-administration Step 4
 gate is pinned separately in the
-[requirements evidence](requirements-status.md#prior-protected-provisioning-and-control-administration-automated-evidence).
+[requirements evidence](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md#prior-protected-provisioning-and-control-administration-automated-evidence).
 On fresh isolated targets, current Rust 1.97.1 and Rust 1.91.0 each passed 927
 executable workspace tests with zero failures and one deliberately ignored
 performance experiment; every-target/every-feature Clippy and all 17 Rustdoc
@@ -791,7 +791,7 @@ and lexical state-witness mutation. Focused core/mission tests additionally name
 `protected_state_witness_is_lexical_and_clone_local`.
 
 At the exact source identities recorded in the
-[requirements ledger](requirements-status.md#current-protected-live-startup-and-control-automated-evidence),
+[requirements ledger](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md#current-protected-live-startup-and-control-automated-evidence),
 the reported current-code gates passed: core library 380/380 in 45.21s; node library
 180/180 in 69.94s; protected-runtime integration 12/12 in 0.15s; node
 all-target/all-feature check in 12m04s; strict node all-target/all-feature
@@ -893,7 +893,7 @@ cargo check --locked --manifest-path fuzz/Cargo.toml --bin selected_frame_decode
 
 The final source manifest, exact two-toolchain matrix results, binding gates,
 and the disclosed pre-existing lab-oracle retry are pinned in the
-[prior State/Record requirements evidence](requirements-status.md#prior-selected-state-and-record-network-automated-evidence).
+[prior State/Record requirements evidence](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md#prior-selected-state-and-record-network-automated-evidence).
 That earlier network-mechanics matrix remains current-code automation only; it
 does not itself create a retained execution root. Event last-contact status is
 not State/Record convergence. The later live-application receipt below adds a
@@ -1267,7 +1267,7 @@ cargo check --locked --manifest-path fuzz/Cargo.toml --bin selected_frame_decode
 
 The exact three-node, cleanup, delayed-insert/abort, terminal multi-carrier,
 all-open-path audit, and predecessor-migration results plus the frozen source
-manifest are recorded in the [prior semantic-v5 Blob requirements evidence](requirements-status.md#prior-semantic-v5-direct-blob-network-automated-evidence).
+manifest are recorded in the [prior semantic-v5 Blob requirements evidence](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md#prior-semantic-v5-direct-blob-network-automated-evidence).
 Independent final audit found no remaining P0–P3. The repair retains the bounded
 non-public physical-lineage fence, serializes durable-source/cache transitions,
 keeps terminal failures cursor-neutral, and uses the lexicographic maximum for
@@ -1553,7 +1553,7 @@ exclusivity, a complete listener-wide pre-authentication cap, BTLE,
 independent implementation or clock, resource thresholds, a hermetic build,
 complete MVP, or release authorization. Exact identities, replay commands, and
 status movements are in the
-[requirements ledger](requirements-status.md#selected-iroh-nat-retained-receipt).
+[requirements ledger](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md#selected-iroh-nat-retained-receipt).
 
 The 57th test in that parent redb-store receipt is a Unix writable-open
 durability adversary. Every new or existing writer, including a terminal
@@ -1598,7 +1598,7 @@ A pass must finish with
 default N4, and N8 observed loopback results and their exact claim boundaries
 are recorded in
 the [mesh CLI quickstart](../quickstart/mesh-cli.md) and [requirements
-status](requirements-status.md). Unit-test or demo success does
+status](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md). Unit-test or demo success does
 not override dependency-policy failure and does not authorize a production
 release.
 
@@ -1666,7 +1666,7 @@ duplicate-contact or connection-loss lines from the final no-op despite the
 exact terminal convergence pass. All 228 passing no-op contacts reported all
 11 counters zero. The command, root, artifact digest, and claim boundary are
 recorded in the
-[requirements status](requirements-status.md).
+[requirements status](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md).
 
 A separate 2026-08-25 manual gate used an operator-attested Cargo release-
 profile binary run for the signed current-tree source at N=32 on one macOS
@@ -1682,7 +1682,7 @@ receipt is reviewable. This moves only `DM-9-21A` to `observed-bounded`. It is
 not the at-least-100-node target, a distributed/physical topology, NAT,
 controlled-relay, BTLE/cross-transport, mixed-implementation, resource-threshold,
 or release evidence. The exact receipt and replay command are in the
-[requirements status](requirements-status.md#selected-n32-retained-receipt).
+[requirements status](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md#selected-n32-retained-receipt).
 
 The node tests establish the existing `aster-core` four-flight hybrid session
 over real loopback Iroh and exercise it in the selected runtime before

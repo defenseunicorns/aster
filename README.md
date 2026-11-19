@@ -17,8 +17,7 @@ constrained, and disconnected operation.
 > production-authorized system. Event, State, Record, and Blob have live Rust
 > APIs; Event and Blob also have a local agent API. Review the
 > [current implementation boundary](#current-implementation-boundary),
-> [security gates](docs/security.md), [conformance status](docs/validation/conformance.md),
-> and [requirements status](docs/validation/requirements-status.md) before
+> [security gates](docs/security.md), and [conformance status](docs/validation/conformance.md) before
 > planning a deployment.
 
 The current public Blob capability boundary is machine checked:
@@ -208,8 +207,8 @@ local implementation detail: it adds no wire-visible batch size or receipt.
 The first supportable profile is deliberately narrower than the implemented
 surface. Use the [capability roadmap](docs/validation/capability-roadmap.md) for
 planning and PR review, and
-[requirements status](docs/validation/requirements-status.md) for exact
-credited behavior and open gates.
+[current implementation boundary](#current-implementation-boundary) for capabilities and limitations. Remaining-work migration is tracked in
+[#203](https://github.com/defenseunicorns/aster/issues/203).
 
 For the Linux Event MVP, [Decision
 0043](docs/decisions/0043-authorize-linux-event-mvp-validation.md) records the
@@ -261,7 +260,7 @@ conventional database or broker will usually be simpler.
 | Understand trust and component boundaries | [Selected architecture](docs/architecture.md) |
 | Connect nodes or evaluate carriers | [Carriers and contacts](docs/transports.md) |
 | Implement compatible protocol bytes | [Protocol](docs/protocol.md), [wire grammar](docs/wire.cddl), and [security objects](docs/envelope.md) |
-| Assess progress or readiness | [Capability roadmap](docs/validation/capability-roadmap.md), [requirements status](docs/validation/requirements-status.md), [conformance](docs/validation/conformance.md), and [security](docs/security.md) |
+| Assess progress or readiness | [Capability roadmap](docs/validation/capability-roadmap.md), [current implementation boundary](#current-implementation-boundary), [conformance](docs/validation/conformance.md), and [security](docs/security.md) |
 | Deploy the Compose container profile | [Compose operator procedure](docs/release/docker-compose.md) and [schema v2](docs/reference/aster-agent-config-v2.md) |
 | Install and operate a packaged node | [Human operator guide](docs/operator-guide.md) |
 | Browse current product documentation | [Documentation map](docs/README.md) |

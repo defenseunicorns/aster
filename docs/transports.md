@@ -106,8 +106,8 @@ The selected `aster-node` composition owns semantic-v9/profile-5 streaming.
 | Current semantic BTLE | MTU-aware link, unicast plus an advertisement primitive, disconnect handling, platform `BleRadio` seam | Selected-node integration; a shipped Android, iOS, Linux, or controller-specific radio driver; complete one-to-many profile |
 | LoRa, serial, file | The requirements and semantic design do not preclude them | No selected adapters ship |
 
-Deployment evidence and open gates are tracked in
-[requirements status](validation/requirements-status.md) and
+See capabilities, limitations, and conformance coverage in
+[current implementation boundary](../README.md#current-implementation-boundary) and
 [conformance](validation/conformance.md); code presence alone is not deployment
 credit.
 
@@ -469,9 +469,7 @@ compatibility is not downgrade-resistance evidence.
 
 ## Before a real deployment
 
-- Complete the migration ledger in
-  [production requirements status](validation/requirements-status.md), and
-  do not interpret the direct-Iroh carrier handshake as mission authentication
+- Review the [requirements migration](https://github.com/defenseunicorns/aster/issues/203). Do not interpret the direct-Iroh carrier handshake as mission authentication
   or the reference mission session as source-item authorization.
 - Issue distinct operational bundles through an approved provisioning process,
   wrap them with an admitted protected-artifact provider, and do not fall back

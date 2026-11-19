@@ -976,8 +976,8 @@ timing, direction, size, RF energy, or protocol presence. Local discovery sends
 fresh truncated token-derived proofs; these establish reachability at the
 apparent socket, not peer identity or resistance to an active real-time relay.
 
-The complete test matrix, credited evidence, and open production gates live in
-[requirements status](validation/requirements-status.md) and
+See capabilities, limitations, and conformance coverage in
+[current implementation boundary](../README.md#current-implementation-boundary) and
 [conformance status](validation/conformance.md).
 
 Report vulnerabilities through the private process in `.github/SECURITY.md`.

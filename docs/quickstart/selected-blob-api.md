@@ -703,5 +703,4 @@ with the [selected architecture](../architecture.md), the
 [selected Record API](selected-record-api.md), the
 [selected State API](selected-state-api.md), the
 [selected Event API](selected-event-api.md), and the
-[requirements status](../validation/requirements-status.md) for credited
-behavior and open validation gaps.
+[current implementation boundary](../../README.md#current-implementation-boundary) for capabilities and limitations.

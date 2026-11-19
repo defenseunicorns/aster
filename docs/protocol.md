@@ -853,9 +853,7 @@ range tuple, but schedules carrier bytes only after semantic-v7/v8 profile-4
 negotiation, control activation, and an exact configured Blob receive selector.
 Semantic-v5/v6 carrier attempts fail before carrier IO. Profile 4 replaces the
 historical per-range Result/Ack and Finish/Finished dialogue below with the
-receipt-free multi-range stream in §9.4. Current validation coverage and its
-environment limits are tracked in the [requirements
-status](validation/requirements-status.md).
+receipt-free multi-range stream in §9.4. See the [current implementation boundary](../README.md#current-implementation-boundary).
 
 For each receiver direction, the Blob source phase completes first through the
 class-separated mutable inventory/difference/Offer/Fetch/result/ack/finish
@@ -1644,8 +1642,7 @@ three modes but not `PassiveOnly`. Physical emission measurement and the
 distinction between receive-only protocol responses and literal radio silence
 remain stakeholder-validation items.
 
-Implementation evidence and bounded environment limitations for these modes
-are tracked in the [requirements status](validation/requirements-status.md).
+For capabilities and limitations, see the [current implementation boundary](../README.md#current-implementation-boundary).
 
 ## 12. Scopes, topics, relay, and bridge policy
 

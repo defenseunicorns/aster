@@ -505,8 +505,8 @@ overlapping `Consume` wins for local delivery.
 
 Continue with the [capability tour](capability-tour.md) for a fast visible mesh,
 the [selected architecture](../architecture.md) for the complete authority
-split, and the [requirements status](../validation/requirements-status.md)
-for exact credited and open obligations.
+split, and the [current implementation boundary](../../README.md#current-implementation-boundary)
+for capabilities and limitations.
 
 ## Observe bounded numbered publication lifecycle
 

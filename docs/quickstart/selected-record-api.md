@@ -448,5 +448,4 @@ The live actor and stopped State or Record facades cannot own the same store
 concurrently. Close every stopped facade before starting the actor. See the
 [selected architecture](../architecture.md) for the complete trust path, the
 [selected State API](selected-state-api.md) for latest-value semantics, and
-[requirements status](../validation/requirements-status.md) for validation
-coverage.
+[current implementation boundary](../../README.md#current-implementation-boundary) for capabilities and limitations.

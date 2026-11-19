@@ -8,7 +8,7 @@ executables `aster` (package `aster-node`) and `aster-agent` (package
 `aster-agent`, using the node library). It does not complete packaging,
 reproducible builds, provenance, signing, or release authorization. The
 [capability roadmap](../../validation/capability-roadmap.md) and
-[requirements status](../../validation/requirements-status.md) retain
+[current implementation boundary](../../../README.md#current-implementation-boundary) retain
 their existing claim boundaries.
 
 ## Automated build and artifact
