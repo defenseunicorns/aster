@@ -133,7 +133,6 @@ dependencies = [
  "bluer",
  "futures",
  "getrandom 0.4.3",
- "hmac",
  "rustix",
  "sha2",
  "subtle",
@@ -184,7 +183,6 @@ name = "aster-host"
 version = "0.1.0-alpha.1"
 dependencies = [
  "aster-core",
- "hmac",
  "libc",
  "rustix",
  "sha2",
