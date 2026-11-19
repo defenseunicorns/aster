@@ -370,22 +370,24 @@ impl AdapterAvailabilityPublisher {
         &self,
         availability: crate::BtleAvailability,
     ) -> Result<(), AvailabilityPublishError> {
-        let state =
-            if self.selector_can_originate && availability == crate::BtleAvailability::Available {
-                EventAdapterState::Available
-            } else {
-                EventAdapterState::Unavailable
-            };
-        self.publication.publish(availability, state)
+        self.publication.publish(availability)
+    }
+
+    fn publish_selector_available(&self) -> Result<(), AvailabilityPublishError> {
+        if self.selector_can_originate {
+            self.publication.publish_selector_available()
+        } else {
+            Ok(())
+        }
     }
 }
 
 impl UnavailableAvailabilityPublisher {
     fn publish(&self) -> Result<(), AvailabilityPublishError> {
-        self.publication.publish(
-            crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable),
-            EventAdapterState::Unavailable,
-        )
+        self.publication
+            .publish(crate::BtleAvailability::Unavailable(
+                crate::AvailabilityReason::BluezUnavailable,
+            ))
     }
 
     fn publish_terminal(&self, terminal: crate::controller::TerminalAvailability) {
@@ -397,7 +399,6 @@ impl AvailabilityPublication {
     fn publish(
         &self,
         availability: crate::BtleAvailability,
-        state: EventAdapterState,
     ) -> Result<(), AvailabilityPublishError> {
         let mut current_epoch = self
             .epoch
@@ -406,24 +407,45 @@ impl AvailabilityPublication {
         if *self.updates.borrow() == availability {
             return Ok(());
         }
-        if let Some(control) = &self.control {
-            let epoch = (*current_epoch)
-                .checked_add(1)
-                .ok_or(AvailabilityPublishError::EpochExhausted)?;
-            if !control.publish_availability(EventAdapterSnapshot::new(
-                EventTransportKind::BLE_L2CAP_V1,
-                epoch,
-                state,
-                true,
-                0,
-            )) {
-                return Err(AvailabilityPublishError::RegistrationRejected);
-            }
-            *current_epoch = epoch;
-        }
+        self.publish_selector_snapshot(&mut current_epoch, EventAdapterState::Unavailable)?;
         self.updates.send_replace(availability);
         self.output
             .emit(crate::controller::availability_event(availability));
+        Ok(())
+    }
+
+    fn publish_selector_available(&self) -> Result<(), AvailabilityPublishError> {
+        let mut current_epoch = self
+            .epoch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *self.updates.borrow() != crate::BtleAvailability::Available {
+            return Err(AvailabilityPublishError::RegistrationRejected);
+        }
+        self.publish_selector_snapshot(&mut current_epoch, EventAdapterState::Available)
+    }
+
+    fn publish_selector_snapshot(
+        &self,
+        current_epoch: &mut u64,
+        state: EventAdapterState,
+    ) -> Result<(), AvailabilityPublishError> {
+        let Some(control) = &self.control else {
+            return Ok(());
+        };
+        let epoch = (*current_epoch)
+            .checked_add(1)
+            .ok_or(AvailabilityPublishError::EpochExhausted)?;
+        if !control.publish_availability(EventAdapterSnapshot::new(
+            EventTransportKind::BLE_L2CAP_V1,
+            epoch,
+            state,
+            true,
+            0,
+        )) {
+            return Err(AvailabilityPublishError::RegistrationRejected);
+        }
+        *current_epoch = epoch;
         Ok(())
     }
 }
@@ -440,6 +462,11 @@ struct EpochSignals {
 
 #[derive(Default)]
 struct AvailabilityFence(Mutex<bool>);
+
+struct AvailabilityGuards<'a> {
+    _supervisor: Option<std::sync::MutexGuard<'a, bool>>,
+    _epoch: Option<std::sync::MutexGuard<'a, bool>>,
+}
 
 impl AvailabilityFence {
     fn quiesce(&self) {
@@ -482,34 +509,9 @@ impl EpochSignals {
     }
 
     fn publish(&self, availability: crate::BtleAvailability) -> Result<(), SupervisorError> {
-        let _supervisor_available_guard = if availability == crate::BtleAvailability::Available {
-            let guard = self.supervisor_availability_fence.as_ref().map(|fence| {
-                fence
-                    .0
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-            });
-            if guard.as_deref().is_some_and(|quiesced| *quiesced) {
-                return Err(SupervisorError::TaskStopped);
-            }
-            guard
-        } else {
-            None
-        };
-        let _epoch_available_guard = if availability == crate::BtleAvailability::Available {
-            let guard = self.availability_fence.as_ref().map(|fence| {
-                fence
-                    .0
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-            });
-            if guard.as_deref().is_some_and(|quiesced| *quiesced) {
-                return Err(SupervisorError::TaskStopped);
-            }
-            guard
-        } else {
-            None
-        };
+        let _guards = (availability == crate::BtleAvailability::Available)
+            .then(|| self.acquire_available_guards())
+            .transpose()?;
         let result = if let Some(publisher) = &self.publisher {
             publisher
                 .publish(availability)
@@ -531,6 +533,40 @@ impl EpochSignals {
             operational.send_replace(state);
         }
         result
+    }
+
+    fn publish_selector_available(&self) -> Result<(), SupervisorError> {
+        let _guards = self.acquire_available_guards()?;
+        self.publisher.as_ref().map_or(Ok(()), |publisher| {
+            publisher
+                .publish_selector_available()
+                .map_err(|_| SupervisorError::TaskStopped)
+        })
+    }
+
+    fn acquire_available_guards(&self) -> Result<AvailabilityGuards<'_>, SupervisorError> {
+        let supervisor = self.supervisor_availability_fence.as_ref().map(|fence| {
+            fence
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        if supervisor.as_deref().is_some_and(|quiesced| *quiesced) {
+            return Err(SupervisorError::TaskStopped);
+        }
+        let epoch = self.availability_fence.as_ref().map(|fence| {
+            fence
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        if epoch.as_deref().is_some_and(|quiesced| *quiesced) {
+            return Err(SupervisorError::TaskStopped);
+        }
+        Ok(AvailabilityGuards {
+            _supervisor: supervisor,
+            _epoch: epoch,
+        })
     }
 }
 
@@ -1917,6 +1953,7 @@ where
     let mut outbound_candidate_pending = false;
     let mut contact_backoff = CappedBackoff::new(INITIAL_EPOCH_RETRY, MAXIMUM_EPOCH_RETRY);
     let mut owner_loss_required = true;
+    let mut selector_ready = !mode.is_automatic();
     let mut result = if cancellation.is_cancelled() {
         Err(SupervisorError::Controller(DriverErrorKind::Cancelled))
     } else {
@@ -2022,6 +2059,17 @@ where
                     let now = lifecycle_now();
                     let outcome =
                         admit_platform_observation(&mut admission, &config, observation, now);
+                    if outcome == ObservationOutcome::Accepted && !selector_ready {
+                        if let Err(error) = config
+                            .controller()
+                            .ensure_current()
+                            .map_err(supervisor_error)
+                            .and_then(|()| signals.publish_selector_available())
+                        {
+                            break Err(error);
+                        }
+                        selector_ready = true;
+                    }
                     if matches!(outcome, ObservationOutcome::StopWindow(_)) {
                         if let Err(error) = stop_active_scan(&mut scan_phase, &mut admission).await
                         {
@@ -6571,7 +6619,7 @@ mod tests {
             snapshots[0].availability_epoch(),
             crate::AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH + 1
         );
-        assert_eq!(snapshots[0].state(), EventAdapterState::Available);
+        assert_eq!(snapshots[0].state(), EventAdapterState::Unavailable);
         assert_eq!(
             snapshots[1].availability_epoch(),
             crate::AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH + 2
@@ -6663,6 +6711,7 @@ mod tests {
         publisher
             .publish(crate::BtleAvailability::Available)
             .unwrap();
+        publisher.publish_selector_available().unwrap();
         publisher
             .publish(crate::BtleAvailability::Unavailable(
                 crate::AvailabilityReason::ControllerAbsent,
@@ -6670,15 +6719,20 @@ mod tests {
             .unwrap();
 
         let snapshots = control.snapshots.lock().unwrap();
-        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots.len(), 3);
         assert_eq!(snapshots[0].availability_epoch(), 1);
         assert_eq!(
             snapshots[0].state(),
-            aster_node::EventAdapterState::Available
+            aster_node::EventAdapterState::Unavailable
         );
         assert_eq!(snapshots[1].availability_epoch(), 2);
         assert_eq!(
             snapshots[1].state(),
+            aster_node::EventAdapterState::Available
+        );
+        assert_eq!(snapshots[2].availability_epoch(), 3);
+        assert_eq!(
+            snapshots[2].state(),
             aster_node::EventAdapterState::Unavailable
         );
     }
@@ -6778,6 +6832,7 @@ mod tests {
             publisher
                 .publish(crate::BtleAvailability::Available)
                 .unwrap();
+            publisher.publish_selector_available().unwrap();
             let platform_owner = Arc::new(PlatformOwner::default());
             platform_owner.replace(OrderedOwnerLoss {
                 events: events.clone(),
@@ -6804,7 +6859,7 @@ mod tests {
             );
             assert_eq!(
                 *events.lock().unwrap(),
-                ["available", "unavailable", "force"]
+                ["unavailable", "available", "unavailable", "force"]
             );
         }
 
@@ -6860,6 +6915,19 @@ mod tests {
             };
 
             discovery.scan_started.notified().await;
+            let locator = crate::CanonicalLocator::new(
+                Address::new([2, 0, 0, 0, 0, 0x5d]),
+                AddressType::LeRandom,
+            )
+            .unwrap();
+            send_observation_to_barrier(&discovery, &config(), locator).await;
+            for _ in 0..64 {
+                if control.snapshots.lock().unwrap().len() >= 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(control.snapshots.lock().unwrap().len(), 2);
             cancellation.cancel();
             tokio::task::yield_now().await;
             tokio::time::advance(OWNED_STOP_DEADLINE + Duration::from_millis(1)).await;
@@ -6881,7 +6949,11 @@ mod tests {
                     .iter()
                     .map(EventAdapterSnapshot::state)
                     .collect::<Vec<_>>(),
-                [EventAdapterState::Available, EventAdapterState::Unavailable]
+                [
+                    EventAdapterState::Unavailable,
+                    EventAdapterState::Available,
+                    EventAdapterState::Unavailable
+                ]
             );
         }
 
@@ -6977,6 +7049,150 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn authenticated_beacon_opens_private_selector_without_changing_local_availability() {
+            let discovery = Arc::new(FakeDiscovery {
+                events: Arc::new(Mutex::new(Vec::new())),
+                advertisements: Arc::new(Mutex::new(Vec::new())),
+                scan_started: Arc::new(Notify::new()),
+                observation_sender: Mutex::new(None),
+            });
+            let (control, publisher, mut availability, available_started) = publisher();
+            let (_attempt_sender, attempts) = coordinator_attempt_channel();
+            let cancellation = LifecycleCancellation::new();
+            let task = tokio::spawn(run_automatic_available_epoch(
+                Arc::new(config()),
+                Arc::new(FakeSockets {
+                    events: Arc::new(Mutex::new(Vec::new())),
+                }),
+                discovery.clone(),
+                Arc::new(FixedNonce([0x51; 16])),
+                recording_admission(),
+                attempts,
+                EpochSignals::with_publisher(publisher, available_started),
+                cancellation.clone(),
+            ));
+
+            discovery.scan_started.notified().await;
+            availability.changed().await.unwrap();
+            assert_eq!(*availability.borrow(), crate::BtleAvailability::Available);
+            assert_eq!(
+                control
+                    .snapshots
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(EventAdapterSnapshot::state)
+                    .collect::<Vec<_>>(),
+                [EventAdapterState::Unavailable]
+            );
+
+            let locator = crate::CanonicalLocator::new(
+                Address::new([2, 0, 0, 0, 0, 0x51]),
+                AddressType::LeRandom,
+            )
+            .unwrap();
+            send_observation(&discovery, &config(), locator).await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while control.snapshots.lock().unwrap().len() < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("authenticated beacon must release private selector gate");
+
+            assert_eq!(*availability.borrow(), crate::BtleAvailability::Available);
+            assert_eq!(
+                control
+                    .snapshots
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(EventAdapterSnapshot::state)
+                    .collect::<Vec<_>>(),
+                [EventAdapterState::Unavailable, EventAdapterState::Available]
+            );
+
+            cancellation.cancel();
+            task.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn invalid_beacon_never_opens_private_selector() {
+            let discovery = Arc::new(FakeDiscovery {
+                events: Arc::new(Mutex::new(Vec::new())),
+                advertisements: Arc::new(Mutex::new(Vec::new())),
+                scan_started: Arc::new(Notify::new()),
+                observation_sender: Mutex::new(None),
+            });
+            let (control, publisher, mut availability, available_started) = publisher();
+            let (_attempt_sender, attempts) = coordinator_attempt_channel();
+            let cancellation = LifecycleCancellation::new();
+            let task = tokio::spawn(run_automatic_available_epoch(
+                Arc::new(config()),
+                Arc::new(FakeSockets {
+                    events: Arc::new(Mutex::new(Vec::new())),
+                }),
+                discovery.clone(),
+                Arc::new(FixedNonce([0x52; 16])),
+                recording_admission(),
+                attempts,
+                EpochSignals::with_publisher(publisher, available_started),
+                cancellation,
+            ));
+
+            discovery.scan_started.notified().await;
+            availability.changed().await.unwrap();
+            let locator = crate::CanonicalLocator::new(
+                Address::new([2, 0, 0, 0, 0, 0x52]),
+                AddressType::LeRandom,
+            )
+            .unwrap();
+            let mut record = AsterRosterBeaconV1::encode(
+                0x0083,
+                [0x52; 16],
+                config().discovery_credentials(),
+                Instant::now(),
+            )
+            .unwrap();
+            let last = record.last_mut().unwrap();
+            *last ^= 1;
+            let sender = discovery
+                .observation_sender
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .clone();
+            sender
+                .send(
+                    DiscoveryObservation::new(locator.address(), locator.address_type(), &record)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            drop(sender);
+            discovery.close_observations();
+
+            assert_eq!(
+                task.await.unwrap(),
+                Err(SupervisorError::Controller(DriverErrorKind::Transport))
+            );
+            assert_eq!(
+                control
+                    .snapshots
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(EventAdapterSnapshot::state)
+                    .collect::<Vec<_>>(),
+                [
+                    EventAdapterState::Unavailable,
+                    EventAdapterState::Unavailable
+                ]
+            );
+        }
+
+        #[tokio::test]
         async fn scan_denial_stays_unavailable() {
             let events = Arc::new(Mutex::new(Vec::new()));
             assert_startup_denial_stays_unavailable(Arc::new(FailingScanDiscovery { events }))
@@ -7040,8 +7256,40 @@ mod tests {
             ));
         }
 
+        #[test]
+        fn quiesced_epoch_fences_private_selector_available() {
+            let (control, publisher, availability, _available_started) = publisher();
+            let (updates, _status) = watch::channel(OperationalEpochState::Starting);
+            let fence = Arc::new(AvailabilityFence::default());
+            let signals = EpochSignals::operational(
+                publisher,
+                updates,
+                fence.clone(),
+                Arc::new(AvailabilityFence::default()),
+            );
+
+            signals.publish(crate::BtleAvailability::Available).unwrap();
+            assert_eq!(*availability.borrow(), crate::BtleAvailability::Available);
+            fence.quiesce();
+
+            assert_eq!(
+                signals.publish_selector_available(),
+                Err(SupervisorError::TaskStopped)
+            );
+            assert_eq!(
+                control
+                    .snapshots
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(EventAdapterSnapshot::state)
+                    .collect::<Vec<_>>(),
+                [EventAdapterState::Unavailable]
+            );
+        }
+
         #[tokio::test]
-        async fn operational_event_path_publishes_available_once() {
+        async fn operational_owner_start_keeps_private_selector_unavailable() {
             let discovery = Arc::new(FakeDiscovery {
                 events: Arc::new(Mutex::new(Vec::new())),
                 advertisements: Arc::new(Mutex::new(Vec::new())),
@@ -7073,7 +7321,7 @@ mod tests {
                     .iter()
                     .filter(|snapshot| snapshot.state() == EventAdapterState::Available)
                     .count(),
-                1
+                0
             );
             cancellation.cancel();
             task.await.unwrap().unwrap();
@@ -7458,11 +7706,13 @@ mod tests {
         assert_eq!(counters.ambiguous_failures.load(Ordering::Acquire), 0);
         assert_eq!(counters.cancellations.load(Ordering::Acquire), 0);
         let snapshots = control.snapshots.lock().unwrap();
-        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots.len(), 3);
         assert_eq!(snapshots[0].availability_epoch(), 1);
-        assert_eq!(snapshots[0].state(), EventAdapterState::Available);
+        assert_eq!(snapshots[0].state(), EventAdapterState::Unavailable);
         assert_eq!(snapshots[1].availability_epoch(), 2);
-        assert_eq!(snapshots[1].state(), EventAdapterState::Unavailable);
+        assert_eq!(snapshots[1].state(), EventAdapterState::Available);
+        assert_eq!(snapshots[2].availability_epoch(), 3);
+        assert_eq!(snapshots[2].state(), EventAdapterState::Unavailable);
     }
 
     #[tokio::test(start_paused = true)]

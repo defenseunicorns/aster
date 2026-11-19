@@ -251,9 +251,10 @@ roster credential compose `BLE_L2CAP_V1` at epoch zero as `Unavailable`.
 `Normal` policy then inventories BlueZ controllers, performs a bounded passive
 LE CoC compatibility probe, keeps a healthy choice sticky, and starts at most
 one rostered Event epoch. The selector does not see `Available` until the
-role-required listener, advertisement, and scan owners are ready. BlueZ,
-controller, or transport absence leaves the node ready and local publication
-durable.
+role-required listener, advertisement, and scan owners are ready and that
+operational epoch admits a complete authenticated roster beacon. Public carrier
+availability still reflects local owner readiness only. BlueZ, controller, or
+transport absence leaves the node ready and local publication durable.
 
 For the one-exact-peer Event profile, only the validated lower mission member
 runs the automatic outbound schedule. It submits one contact request to the
@@ -430,7 +431,8 @@ deterministic selector. The Linux `systemd-provider` composition may register
 `BLE_L2CAP_V1` when optional BTLE policy and credential preparation succeed,
 including under the Debian service profile. It starts `Unavailable`; `Normal` policy may
 make it selectable only after automatic compatibility probing and complete
-operational startup. `ReceiveOnly` retains the unavailable registration without
+operational startup plus admission of a complete authenticated roster beacon in
+the same epoch. `ReceiveOnly` retains the unavailable registration without
 starting radio work. A complete BTLE policy block is active by default;
 `"enabled": false` is the explicit opt-out, while an absent block grants no
 BTLE authority. Controller presence never supplies missing policy or credential

@@ -206,6 +206,11 @@ are distinct. Controller absence is nonfatal `unavailable` state. Lifecycle
 observation is event-driven; removal cancels and drains affected work before a
 new epoch. Controller discovery and selection stay inside the BTLE adapter; the
 host selector chooses a transport adapter, not a Bluetooth controller.
+Carrier availability reports only local ownership and health. In automatic
+mode the adapter separately keeps its private selector snapshot unavailable
+until it accepts one complete authenticated roster beacon in that operational
+epoch. That gate permits an outbound attempt; it is not peer reachability,
+peer eligibility, or a support claim.
 
 ## Deployment, availability, and selection
 
@@ -602,8 +607,10 @@ probing cannot violate `ReceiveOnly` or `PassiveOnly` policy.
 
 A candidate that passes every required preflight gate is `compatible` and may
 attempt operational activation whether or not it already has a support-matrix
-row. The host still sees BTLE as unavailable until every policy-permitted,
+row. The host sees the BTLE carrier as available after every policy-permitted,
 role-required listener, advertisement, or scan owner has started successfully.
+Automatic selection remains privately unavailable until discovery admission
+accepts one complete authenticated roster beacon in the same operational epoch.
 A compatible candidate is tagged `qualified` when its exact fingerprint has
 retained release evidence, otherwise `unqualified`; this tag informs selection
 and operator status but is not an activation gate. A deployment may opt into a
@@ -691,21 +698,28 @@ closes when its owner becomes stale. The existing exact configured controller
 tuple is retained only for evaluation and explicit diagnostic narrowing;
 production automatic activation obtains it from the resolver owner.
 
-State is represented on three independent axes. `ProbeDisposition` is
+State is represented on four independent axes. `ProbeDisposition` is
 `Compatible`, `Incompatible(reason)`, `Blocked(reason)`, or
 `Indeterminate(reason)`; probing itself is transient lifecycle, not a result.
 `SupportTag` is `Qualified` or `Unqualified` and applies only to compatible
-candidates. `RuntimeAvailability` is a private two-state model: `Unavailable`
-or `Available`. `Available` is published only after the selected controller's
-listener, advertisement, and scan owners are running and adapter availability
-has been accepted. Initial, probing, policy-rejected, operational-starting,
-loss, retry, and failure states remain `Unavailable`. Unsupported address
+candidates. `RuntimeAvailability` is the local carrier's two-state model:
+`Unavailable` or `Available`. `Available` is published only after the selected
+controller's listener, advertisement, and scan owners are running and adapter
+availability has been accepted. `SelectorReadiness` is a separate private
+two-state snapshot. In automatic mode it starts `Unavailable` and becomes `Available`
+only after admission of a complete authenticated roster beacon. The gate is
+scoped to the owned operational epoch and resets on owner loss or restart;
+reset during the current advertisement rotation is an initial implementation
+detail, not protocol behavior. Initial, probing, policy-rejected,
+operational-starting, loss, retry, and failure states remain `Unavailable`.
+Unsupported address
 family, protocol, or LE CoC maps to `Incompatible`. BlueZ loss, hotplug, power,
 permission, resource exhaustion, deadline, cancellation, or unknown platform
 error maps to `Indeterminate` and runtime `Unavailable` with capped retry.
 Package safety rules and explicit local policy map to `Blocked`. Mapping uses
 typed platform errors and never parses error messages. The selector receives
-only `Available` or `Unavailable`; no protocol or wire representation changes.
+only its private `Available` or `Unavailable` snapshot; no protocol or wire
+representation changes.
 Controller lifecycle remains private to the Linux adapter.
 
 The serialized probe has explicit per-operation, per-candidate, and whole-sweep
@@ -754,6 +768,8 @@ Status, logs, and metrics share one metadata budget: adapter kind, coarse
 available/unavailable reason, bounded counters, and current selected kind. They
 omit peer/controller addresses, PSMs, role/roster membership,
 discovery material, transfer identifiers/counts, retry detail, and secrets.
+The private selector transition caused by roster discovery is not emitted as
+operator status, a log, or a metric.
 BTLE output passes through an allowlisting, coalescing process writer before it
 reaches standard output. The agent publishes one current record containing only
 timestamp, operation, adapter kind, availability, closed reason, and support
