@@ -519,13 +519,12 @@ promotion. The 8-GiB ceiling permits 8,192 native segments. Local upload and
 peer transfer resume from durable pack checkpoints without whole-Blob RAM
 growth.
 
-The selected node's legacy application profile fixes canonical chunks at 64 KiB. A
-stopped `SelectedBlobNode` retains synchronous streaming, while
-`RunningNode::selected_blobs()` returns a cloneable live handle. Live publish
-takes ownership of a nonempty regular file positioned at byte zero and admits
-at most 64 MiB/1,024 chunks; live read returns one freshly authenticated,
-zeroize-on-drop page of `1..=64 KiB`. These application chunk/page bounds are
-separate from the historical semantic-v5 carrier range bound of 16 KiB in §9.2.
+A stopped `SelectedBlobNode` supports synchronous reader publication of nonempty
+input through 8 GiB. The live regular-file publisher accepts a nonempty file
+positioned at byte zero through 64 MiB. Both paths use profile-5 native 1-MiB
+segments. Live reads return authenticated, zeroize-on-drop pages of at most
+512 KiB; an empty Blob has an empty terminal page. These application limits
+are separate from the historical semantic-v5 carrier range bound in §9.2.
 Neither surface treats a redb projection as authorization: it freshly verifies
 the selected source and current policy/lineage and requires the exact
 authenticated `BlobDepotCompletion` capability before opening that depot
@@ -1045,7 +1044,7 @@ remain canonical digest input but are not selected.
 
 Blob profile registry: semantic v7/v8 select profile 4; semantic v9 selects profile 5.
 Profile 4 limits: 67,108,864 object bytes; 1,024 canonical chunks; 1,048,576 authenticated-source bytes.
-Profile 5 limits: 8,589,934,592 plaintext bytes; 8,192 native segments; 16,777,216 authenticated-source bytes.
+Profile 5 limits: 8,589,934,592 plaintext bytes; 8,192 native segments; 401,902 canonical authenticated SOURCE bytes. The redb source container has a separate 16,777,216-byte ceiling; it does not enlarge the canonical SOURCE or wire limit.
 Profile 5 size classes: 1,048,576 plaintext segment bytes; 1,048,706 encoded ASTRBS02 record bytes; 1,048,710 length-prefixed DATA-body bytes; 134,217,728 checkpoint bytes; 2,097,152 Iroh frame bytes.
 `StreamOpenV1.total_len` is the native pack wire length, not the plaintext
 object length. Its exact maximum for the profile-5 maximum shape is
@@ -2276,9 +2275,9 @@ outbound, and replay limits:
 | selected mutable class | 4,096 rows and 16 MiB encoded source bytes, independently for State and Record | an otherwise valid new object receives `DeferredCapacity`; no existing mutable row is pruned |
 | mutable fairness cursor | 256 configured mission peers, 4 peer/class/local-mode rows each, 1,024 rows total | startup rejects an overbound configured set and prunes rows for peers no longer configured; ordinary data quota cannot consume the reserve |
 | live application command lane | 32 commands shared by Event, State, Record, and Blob; one queued command for the joined Blob worker | a full Blob worker queue returns explicit `ResourceLimit`; shutdown and zeroization close both admissions and join the worker |
-| live Blob publication | one owned nonempty regular file at byte-zero cursor, at most 64 MiB and 1,024 fixed 64-KiB chunks | invalid shape is rejected; overbound input returns `ResourceLimit`; a source changed across the two passes returns conflict and cannot silently rebind the operation |
+| live Blob publication | one owned nonempty regular file at byte-zero cursor, at most 64 MiB, published through the profile-5 native 1-MiB segment pipeline | invalid shape is rejected; overbound input returns `ResourceLimit`; length changes return conflict, and exact retries verify previously committed source bytes before resuming |
 | streamed Blob publication | zero through 8 GiB and at most 8,192 native 1-MiB `ASTRBS02` segments | one bounded map/reorder/sink pipeline writes the same authenticated pack records later carried by DATA; provisional bytes remain charged until atomic lifecycle promotion; exact operation retry recovers durable local progress |
-| live Blob plaintext page | `1..=64 KiB`, spanning at most two canonical chunks | zero or overbound requests are rejected; the returned allocation zeroizes on drop; durable/cache/depot coherence loss is actor-fatal |
+| live Blob plaintext page | at most 512 KiB; an empty Blob has an empty terminal page | zero or overbound requests are rejected; the returned allocation zeroizes on drop; durable/cache/depot coherence loss is actor-fatal |
 | logical sends per pump | 128 | remaining due work keeps its monotonic deadline |
 | UDP datagrams examined per adapter poll | 64 | yields `None`; a later poll may continue queued input |
 | discardable unauthenticated carrier failures per runtime pump | 64 | yields with the contact intact; subsequent valid input can progress |

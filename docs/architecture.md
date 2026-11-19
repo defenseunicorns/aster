@@ -70,6 +70,16 @@ flowchart LR
     Carrier <--> Peer["Peer aster-node"]
 ```
 
+`aster-profile` supplies the complete reconciliation key and canonical inventory
+ordering; it does not establish source identity or authorization.
+`aster-negentropy` maps those keys to timestamp zero, so set difference does not
+depend on wall clocks or insertion order. Control transfer IDs are SHA-256
+identities of exact sealed control envelopes. Event, State, Record, and Blob
+source transfer IDs likewise identify exact sealed representations, not their
+source-authenticated semantic identities. Reconciliation and Fetch/Offer retain
+these class-specific transfer identities; redb keeps separate semantic indexes
+while sharing publisher-dot and causal-frontier authority across data classes.
+
 `aster-node` is the sole composition root. `aster-iroh` authenticates only the
 carrier endpoint and provides bounded direct exchange or exchange through one
 operator-pinned controlled relay. That relay is connectivity infrastructure,

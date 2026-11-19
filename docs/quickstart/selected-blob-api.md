@@ -24,7 +24,7 @@ application may publish a durable or finite-TTL owned regular file while the
 node has no peers, read one freshly authenticated plaintext page at a time,
 and consume tagged at-least-once content or retirement notifications for exact
 source-authenticated Blob publications.
-Each live page is at most 64 KiB and zeroizes its owned plaintext allocation on
+Each live page is at most 512 KiB and zeroizes its owned plaintext allocation on
 drop; each delivery is metadata only and carries no Blob plaintext.
 
 The live surface deliberately keeps application delivery separate from network
@@ -108,11 +108,12 @@ loop {
 }
 ```
 
-The legacy live-file publisher accepts a nonempty regular file of at most 64 MiB,
-with its cursor at exactly zero, and fixes the selected chunk size at 64 KiB. The file is
-moved into a bounded, joined worker rather than cloned into the actor command.
-That 64-MiB ceiling belongs to the legacy profile-4 facade, not the resumable
-application streaming protocol described below.
+The live-file publisher accepts a nonempty regular file of at most 64 MiB,
+with its cursor at exactly zero. The file is moved into a bounded, joined
+worker rather than cloned into the actor command. Publication uses the
+profile-5 native 1-MiB segment pipeline. The 64-MiB limit belongs to this
+regular-file facade; the resumable application stream API accepts zero
+through 8 GiB.
 The returned publication is operation-key idempotent and echoes its original
 signed TTL (`None` means durable), never a remaining lifetime or deletion
 timestamp. `BlobPublishOptions::finite_ttl_ms(0)` returns `InvalidRequest` before
@@ -121,7 +122,8 @@ source I/O, and a host without a supported finite custody clock returns
 wrapper. Retrying the exact operation with the same source, identity metadata,
 and lifetime recovers the original publisher counter and acceptance marker;
 changing content, metadata, or lifetime under that key fails closed as a
-conflict.
+conflict. Finite publication samples custody before staging and again before
+commit; staging time counts against the original TTL.
 
 Cancellation before enqueue cannot publish. Cancellation after enqueue has an
 indeterminate result because the worker may have committed; retry the exact

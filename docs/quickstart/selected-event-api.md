@@ -190,8 +190,9 @@ remain open.
 You supply the protection or SecretStore implementation. The repository has no
 production backend, hardware/platform key policy, backup/recovery procedure, or
 physical-erasure claim. The age pilot is isolated and non-production, and the
-SecretStore fixture tests only the provider contract. The live runtime, CLI,
-and C/Go/Python bindings still use the unprotected compatibility path.
+SecretStore fixture tests only the provider contract. The stock CLI and
+C/Go/Python bindings still use the unprotected compatibility path; Rust
+embeddings can use the protected live configuration described above.
 
 ## Prove offline publish and later synchronization
 
@@ -392,6 +393,12 @@ and live policy refresh, or return a sanitized administration error. An
 authenticated pending predecessor gap yields `PolicyUnsettled` for a fresh
 publication without terminating the actor; an exact already-committed retry can
 still recover its historical receipt while policy is deferred.
+
+`ScopeRekeyRequest::new` requires a nonempty signed public registry of at most
+16 MiB, an independently retained nonzero registry-generation floor, a nonzero
+scope epoch, 1–128 unique recipients, and at most 256 aggregate topic grants.
+Input bounds are checked before provider, RNG, or store work; registry and
+canonical recipient credentials authenticate before key generation.
 
 The control queue holds one command and the actor yields after at most four
 control commands so Event/status and network work can progress. Once enqueue
