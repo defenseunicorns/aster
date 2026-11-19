@@ -4125,56 +4125,7 @@ scale, or release evidence.
 
 
 
-## Mission-authenticated runtime validation
-
-The current verification lanes include:
-
-```sh
-cargo test --locked --offline -p aster-core --all-features
-cargo test --locked --offline -p aster-redb-store
-cargo test --locked --offline -p aster-node --all-features
-```
-
-On 2026-08-24 the parent PR-A/pre-subscription frozen tree passed 336 `aster-core` tests, 57 redb-store tests,
-48 node-library tests, six node-binary tests, ten node integration tests
-(including the default four-node Ping/Pong, explicit four-node control, live
-zeroization, abrupt-marker recovery, and dirty-process recovery cells), and doc
-tests. Current-toolchain formatting, Clippy with warnings denied, and the full
-workspace check passed; every target and feature also checked on Rust 1.91.
-Five fuzz campaigns completed 10,000 iterations each (50,000 total) over wire,
-fragment, envelope, selected-frame, and selected-Negentropy decode paths with no
-finding. Those counts and retained roots are historical parent evidence, not
-current PR-B, PR-C, or selected State execution receipts.
-
-The signed PR-B code baseline above passed the same current and exact
-Rust 1.91.0 matrix with 336 `aster-core` tests, 73 redb-store tests, 62
-node-library tests, six node-binary tests, and 11 real-process integration tests
-(488 total per toolchain). Both strict Clippy gates and formatting passed. After
-the directional Event-frame update, all five fuzz campaigns again completed
-10,000 iterations each (50,000 total) with no crash. The documented two-node
-capability tour passed, and the selected Event example demonstrated publish,
-fresh query, durable subscribe/poll/ack, and an exact idempotent second run.
-These are current code/test execution checks, not protected-provisioning,
-physical-carrier, mixed-implementation, scale, or release evidence.
-
-The runtime suite covers mission authentication before inventory, independent
-carrier/mission binding, protected mechanics, exact negotiated Fetch/Offer
-sets, source-authenticated control chains, control-before-Event admission,
-pending control gaps, atomic commit-before-activate, control restart replay,
-Event source/content verification, peer scope-route filtering, route-only relay
-behavior, durable operation replay, and fail-closed stale-epoch and revoked-peer
-cells. It also retains the negative cells for wrong carrier, wrong mission,
-cross-mission credentials, tamper, plaintext mechanics, replay, and unauthorized
-Fetch/Offer. The zeroization cells add live drain, terminal store lockout,
-retained-inode destruction, restored-credential refusal, idempotent replay,
-abrupt-marker resumption, fail-closed artifact/path adversaries, and an injected
-Unix parent-directory synchronization failure before any writable store or
-terminal cleanup handle becomes usable. This does not replace physical-network,
-packet-capture, physical sanitization or power-loss acceptance, database
-rollback resistance, non-Unix, independent interoperability, or cryptographic
-review evidence.
-
-## Dependency-admission gate
+## ## Dependency-admission gate
 
 The Iroh-first implementation removed the active unmaintained `paste` package
 instead of expanding the retained-pilot exception. The workspace path-patches
