@@ -18,6 +18,12 @@ pub const RING1_MAXIMUM_EXCHANGE_BYTES: usize = 64 * 1024 * 1024;
 pub const RING1_MAXIMUM_DEADLINE: Duration = Duration::from_secs(30);
 /// Initial unavailable epoch used when registering the automatic BTLE adapter.
 pub const AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH: u64 = 0;
+/// Smallest kernel-reported MTU accepted in either direction for an Event contact.
+///
+/// LE Credit-Based L2CAP implementations must support 23-byte MTUs. Aster's
+/// ordered-contact stream fragments larger records, so this baseline rejects
+/// invalid links without imposing a larger hardware-specific policy.
+pub const BTLE_EVENT_MINIMUM_DIRECTIONAL_MTU_BYTES: usize = 23;
 
 const SUPERVISOR_MAXIMUM_CONTACT_CADENCE: Duration = Duration::from_secs(24 * 60 * 60);
 

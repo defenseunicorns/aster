@@ -19,13 +19,13 @@ mod rostered_lifecycle;
 mod stream;
 
 pub use config::{
-    AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH, AutomaticRosteredSupervisorConfig, ContactLimits,
-    ControllerConfig, DriverConfig, FixedRole, LinkConfig, OpenRequest, RING1_MAXIMUM_DEADLINE,
-    RING1_MAXIMUM_EXCHANGE_BYTES, RING1_MAXIMUM_FRAME_BYTES, RosteredAdapterConfig,
-    RosteredDiscoveryConfig, RosteredSupervisorConfig, SupervisorConfig,
-    ValidatedAutomaticRosteredSupervisorConfig, ValidatedConfig, ValidatedContactLimits,
-    ValidatedControllerConfig, ValidatedLinkConfig, ValidatedRosteredDiscoveryConfig,
-    ValidatedRosteredSupervisorConfig, ValidatedSupervisorConfig,
+    AUTOMATIC_BTLE_INITIAL_AVAILABILITY_EPOCH, AutomaticRosteredSupervisorConfig,
+    BTLE_EVENT_MINIMUM_DIRECTIONAL_MTU_BYTES, ContactLimits, ControllerConfig, DriverConfig,
+    FixedRole, LinkConfig, OpenRequest, RING1_MAXIMUM_DEADLINE, RING1_MAXIMUM_EXCHANGE_BYTES,
+    RING1_MAXIMUM_FRAME_BYTES, RosteredAdapterConfig, RosteredDiscoveryConfig,
+    RosteredSupervisorConfig, SupervisorConfig, ValidatedAutomaticRosteredSupervisorConfig,
+    ValidatedConfig, ValidatedContactLimits, ValidatedControllerConfig, ValidatedLinkConfig,
+    ValidatedRosteredDiscoveryConfig, ValidatedRosteredSupervisorConfig, ValidatedSupervisorConfig,
 };
 pub use controller::{
     AvailabilityReason, BTLE_OPERATOR_OUTPUT_CAPACITY, BtleAvailability, BtleCurrentStatus,
@@ -88,7 +88,7 @@ pub enum DriverErrorKind {
     Cancelled,
     /// An unexpected transport or BlueZ failure occurred.
     Transport,
-    /// A listener rejected a connection from a non-provisioned locator.
+    /// An unauthenticated connection failed local peer or link admission.
     PeerRejected,
 }
 

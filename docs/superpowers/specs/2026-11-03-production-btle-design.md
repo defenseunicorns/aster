@@ -328,6 +328,18 @@ cancellation, close, controller/permission lifecycle observation, current
 packet/MTU bounds, and sanitized health/role reporting. Cancellation must
 release owned platform work within a declared bound.
 
+The initial Linux Event profile declares a 23-byte minimum negotiated L2CAP MTU
+in each direction. That is the LE Credit-Based L2CAP interoperability baseline,
+not a throughput guess: Aster's ordered-contact stream fragments larger records
+and therefore has no reason to reject a standards-compliant 23-byte link. The
+adapter first applies locator and roster admission, then bounds readiness for
+that accepted socket and rejects a missing or smaller directional MTU before
+constructing the unauthenticated mission contact. A remote-low send direction
+closes only that candidate and re-arms the listener; a missing or locally low
+receive direction is a platform failure. This is a local Linux admission rule
+and changes no semantic-v9 or discovery bytes. The value is
+grounded in the public [Bluetooth Core L2CAP specification](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core_v7.0/out/en/host/logicallinkcontrol-andadaptationprotocol-l2cap--specification.html).
+
 Startup must tolerate missing hardware, a stopped BlueZ service, denied optional
 permissions, and later hotplug. Those conditions make BTLE unavailable; they do
 not make the node or durable publication unavailable. Platform drivers probe

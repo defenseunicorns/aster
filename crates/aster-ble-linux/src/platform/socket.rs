@@ -1,7 +1,8 @@
 use super::{map_bluer_error, map_io_error};
 use crate::{
-    CanonicalLocator, DriverError, DriverErrorKind, OpenCancellation, OpenRequest, ValidatedConfig,
-    ValidatedControllerConfig, ValidatedRosteredSupervisorConfig,
+    BTLE_EVENT_MINIMUM_DIRECTIONAL_MTU_BYTES, CanonicalLocator, DriverError, DriverErrorKind,
+    OpenCancellation, OpenRequest, ValidatedConfig, ValidatedControllerConfig,
+    ValidatedRosteredSupervisorConfig,
     config::ControllerOperationBinding,
     configuration,
     controller_probe::ControllerProbeError,
@@ -31,8 +32,44 @@ pub trait SocketFactory: Send + Sync {
 
 pub(crate) type RosteredBindFuture<'a, L> =
     Pin<Box<dyn Future<Output = Result<BoundRosteredListener<L>, DriverError>> + Send + 'a>>;
-pub(crate) type RosteredAcceptFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<(SocketOpen, CanonicalLocator), DriverError>> + Send + 'a>>;
+pub(crate) type RosteredAcceptFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<(AcceptedSocket, CanonicalLocator), DriverError>> + Send + 'a>,
+>;
+
+pub(crate) struct AcceptedSocket {
+    readiness: OpenFuture<'static>,
+}
+
+impl AcceptedSocket {
+    fn from_bluez(stream: Stream) -> Self {
+        Self {
+            readiness: Box::pin(async move {
+                wait_for_l2cap_readiness(|| stream.as_ref().send_mtu()).await?;
+                Ok(SocketOpen::from_bluez(stream))
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ready(socket: SocketOpen) -> Self {
+        Self {
+            readiness: Box::pin(async move { Ok(socket) }),
+        }
+    }
+
+    pub(crate) async fn finish(
+        self,
+        readiness_timeout: Duration,
+    ) -> Result<SocketOpen, DriverError> {
+        match timeout(readiness_timeout, self.readiness).await {
+            Ok(result) => result,
+            Err(_) => Err(DriverError::new(
+                DriverErrorKind::PeerRejected,
+                "accepted LE L2CAP socket did not become ready within its admission bound",
+            )),
+        }
+    }
+}
 
 pub(crate) trait RosteredSocketFactory: Send + Sync {
     type Listener: Send + Sync + 'static;
@@ -162,7 +199,7 @@ impl RosteredSocketFactory for BluezRosteredSocketFactory {
                     "accepted rostered peer locator is invalid",
                 )
             })?;
-            Ok((SocketOpen::from_bluez(stream), locator))
+            Ok((AcceptedSocket::from_bluez(stream), locator))
         })
     }
 }
@@ -398,6 +435,24 @@ fn opened_contact(
     operation_timeout: Duration,
 ) -> Result<OpenedContact, DriverError> {
     let SocketOpen { stream, mtu } = opened_socket;
+    let negotiated_mtu = mtu.observation().ok_or_else(|| {
+        DriverError::new(
+            DriverErrorKind::Transport,
+            "negotiated LE L2CAP MTU was unavailable after socket readiness",
+        )
+    })?;
+    if negotiated_mtu.send_bytes() < BTLE_EVENT_MINIMUM_DIRECTIONAL_MTU_BYTES {
+        return Err(DriverError::new(
+            DriverErrorKind::PeerRejected,
+            "peer receive MTU is below the Event contact minimum",
+        ));
+    }
+    if negotiated_mtu.receive_bytes() < BTLE_EVENT_MINIMUM_DIRECTIONAL_MTU_BYTES {
+        return Err(DriverError::new(
+            DriverErrorKind::Transport,
+            "local receive MTU is below the Event contact minimum",
+        ));
+    }
     let stream = Box::new(MtuBoundedStream {
         stream,
         mtu: mtu.clone(),
@@ -474,6 +529,7 @@ async fn open_bluez(request: OpenRequest) -> Result<SocketOpen, DriverError> {
                     "listener rejected a non-provisioned Bluetooth peer",
                 ));
             }
+            wait_for_l2cap_readiness(|| stream.as_ref().send_mtu()).await?;
             Ok(SocketOpen::from_bluez(stream))
         }
     }
@@ -784,6 +840,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rostered_contact_accepts_the_le_coc_directional_mtu_floor() {
+        let config = rostered_config();
+        let locator =
+            CanonicalLocator::new(address("02:00:00:00:00:09"), AddressType::LeRandom).unwrap();
+        let (stream, _peer) = tokio::io::duplex(4096);
+        let socket = SocketOpen::with_observed_mtu(Box::new(stream), 23, 23).unwrap();
+
+        let opened = opened_rostered_contact(&config, locator, socket).unwrap();
+
+        assert_eq!(opened.negotiated_mtu().unwrap().send_bytes(), 23);
+        assert_eq!(opened.negotiated_mtu().unwrap().receive_bytes(), 23);
+    }
+
+    #[test]
+    fn rostered_contact_rejects_either_direction_below_the_le_coc_mtu_floor() {
+        let config = rostered_config();
+        let locator =
+            CanonicalLocator::new(address("02:00:00:00:00:09"), AddressType::LeRandom).unwrap();
+
+        for (send_bytes, receive_bytes, expected) in [
+            (22, 23, DriverErrorKind::PeerRejected),
+            (23, 22, DriverErrorKind::Transport),
+        ] {
+            let (stream, _peer) = tokio::io::duplex(4096);
+            let socket =
+                SocketOpen::with_observed_mtu(Box::new(stream), send_bytes, receive_bytes).unwrap();
+
+            let error = opened_rostered_contact(&config, locator, socket).unwrap_err();
+
+            assert_eq!(error.kind(), expected);
+        }
+    }
+
     struct ResultFactory {
         request: Mutex<Option<OpenRequest>>,
         result: Mutex<Option<Result<SocketOpen, DriverError>>>,
@@ -840,6 +930,39 @@ mod tests {
         .unwrap();
 
         assert_eq!(attempts.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accepted_socket_readiness_is_bounded_as_a_peer_rejection() {
+        let accepted = AcceptedSocket {
+            readiness: Box::pin(std::future::pending()),
+        };
+
+        let error = match accepted.finish(Duration::from_secs(5)).await {
+            Ok(_) => panic!("pending accepted socket must not become ready"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), DriverErrorKind::PeerRejected);
+    }
+
+    #[tokio::test]
+    async fn accepted_socket_preserves_typed_readiness_failure() {
+        let accepted = AcceptedSocket {
+            readiness: Box::pin(async {
+                Err(DriverError::new(
+                    DriverErrorKind::Unavailable,
+                    "test readiness failure",
+                ))
+            }),
+        };
+
+        let error = match accepted.finish(Duration::from_secs(5)).await {
+            Ok(_) => panic!("failed accepted socket must not become ready"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), DriverErrorKind::Unavailable);
     }
 
     #[test]

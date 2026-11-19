@@ -15,7 +15,7 @@ use crate::{
             PlatformFuture, RosterAdvertisement, ScanTermination, TerminationFuture,
         },
         socket::{
-            BluezRosteredSocketFactory, OpenedContact, RosteredSocketFactory,
+            AcceptedSocket, BluezRosteredSocketFactory, OpenedContact, RosteredSocketFactory,
             opened_rostered_contact,
         },
     },
@@ -74,7 +74,8 @@ enum EpochEvent {
     Observation(Option<DiscoveryObservation>),
     ScanDeadline,
     ScanIdleDeadline,
-    InboundAccepted(Result<(crate::SocketOpen, crate::CanonicalLocator), DriverError>),
+    InboundAccepted(Result<(AcceptedSocket, crate::CanonicalLocator), DriverError>),
+    InboundReady(Result<(crate::SocketOpen, crate::CanonicalLocator), DriverError>),
     InboundAcceptReady,
     OutboundRetry,
     CoordinatorAttempt(CoordinatorAttemptEvent),
@@ -85,6 +86,9 @@ enum EpochEvent {
 type ContactWorkFuture = Pin<Box<dyn Future<Output = ContactAttemptOutcome> + Send>>;
 type SharedContactAdmission = Arc<dyn ContactAdmission>;
 type InboundAcceptFuture = Pin<
+    Box<dyn Future<Output = Result<(AcceptedSocket, crate::CanonicalLocator), DriverError>> + Send>,
+>;
+type InboundReadinessFuture = Pin<
     Box<
         dyn Future<Output = Result<(crate::SocketOpen, crate::CanonicalLocator), DriverError>>
             + Send,
@@ -635,6 +639,7 @@ struct ContactOpenFailure {
 
 enum ContactPhase {
     Accepting(InboundAcceptFuture),
+    AdmittingInbound(InboundReadinessFuture),
     Paused(tokio::time::Instant),
     Active {
         cancellation: LifecycleCancellation,
@@ -734,6 +739,19 @@ impl ContactPhase {
         }
     }
 
+    fn admitting_inbound(
+        accepted: AcceptedSocket,
+        locator: crate::CanonicalLocator,
+        readiness_timeout: Duration,
+    ) -> Self {
+        Self::AdmittingInbound(Box::pin(async move {
+            accepted
+                .finish(readiness_timeout)
+                .await
+                .map(|socket| (socket, locator))
+        }))
+    }
+
     fn paused_until(deadline: Instant) -> Self {
         Self::Paused(tokio::time::Instant::from_std(deadline))
     }
@@ -775,6 +793,7 @@ impl ContactPhase {
     async fn next(&mut self) -> EpochEvent {
         match self {
             Self::Accepting(accept) => EpochEvent::InboundAccepted(accept.await),
+            Self::AdmittingInbound(readiness) => EpochEvent::InboundReady(readiness.await),
             Self::Paused(deadline) => {
                 tokio::time::sleep_until(*deadline).await;
                 EpochEvent::InboundAcceptReady
@@ -2109,7 +2128,7 @@ where
                     }
                 }
                 EpochEvent::InboundAccepted(accepted) => {
-                    let (opened_socket, locator) = match accepted {
+                    let (accepted_socket, locator) = match accepted {
                         Ok(accepted) => accepted,
                         Err(error) if error.kind() == DriverErrorKind::PeerRejected => {
                             contact_phase =
@@ -2122,21 +2141,43 @@ where
                     match admit_inbound_contact(&config, &mut admission, locator, now, mode) {
                         InboundContactAdmission::Admitted => {}
                         InboundContactAdmission::Rejected => {
-                            drop(opened_socket);
+                            drop(accepted_socket);
                             contact_phase =
                                 ContactPhase::accepting(sockets.clone(), listener.clone());
                             continue;
                         }
                         InboundContactAdmission::BackoffUntil(deadline) => {
-                            drop(opened_socket);
+                            drop(accepted_socket);
                             contact_phase = ContactPhase::paused_until(deadline);
                             continue;
                         }
                     }
-                    let opened = match opened_rostered_contact(&config, locator, opened_socket) {
-                        Ok(opened) => opened,
+                    contact_phase = ContactPhase::admitting_inbound(
+                        accepted_socket,
+                        locator,
+                        config.open_timeout(),
+                    );
+                }
+                EpochEvent::InboundReady(ready) => {
+                    let (opened_socket, locator) = match ready {
+                        Ok(ready) => ready,
+                        Err(error) if error.kind() == DriverErrorKind::PeerRejected => {
+                            contact_phase =
+                                ContactPhase::accepting(sockets.clone(), listener.clone());
+                            continue;
+                        }
                         Err(error) => break Err(supervisor_error(error)),
                     };
+                    let opened = match opened_rostered_contact(&config, locator, opened_socket) {
+                        Ok(opened) => opened,
+                        Err(error) if error.kind() == DriverErrorKind::PeerRejected => {
+                            contact_phase =
+                                ContactPhase::accepting(sockets.clone(), listener.clone());
+                            continue;
+                        }
+                        Err(error) => break Err(supervisor_error(error)),
+                    };
+                    let now = lifecycle_now();
                     if let Err(error) = stop_active_scan(&mut scan_phase, &mut admission).await {
                         break Err(error);
                     }
@@ -2997,10 +3038,10 @@ mod tests {
         admitted: Notify,
     }
 
-    type AcceptedContact = Result<(SocketOpen, crate::CanonicalLocator), DriverError>;
+    type AcceptedContact = Result<(AcceptedSocket, crate::CanonicalLocator), DriverError>;
 
     struct InboundSockets {
-        accepted: tokio::sync::Mutex<Option<oneshot::Receiver<AcceptedContact>>>,
+        accepted: tokio::sync::Mutex<mpsc::Receiver<AcceptedContact>>,
         connected: AtomicU8,
     }
 
@@ -3091,9 +3132,8 @@ mod tests {
             _listener: &'a Self::Listener,
         ) -> crate::platform::socket::RosteredAcceptFuture<'a> {
             Box::pin(async move {
-                let accepted = self.accepted.lock().await.take();
-                match accepted {
-                    Some(accepted) => accepted.await.expect("test accept sender remains live"),
+                match self.accepted.lock().await.recv().await {
+                    Some(accepted) => accepted,
                     None => pending().await,
                 }
             })
@@ -5016,7 +5056,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recent_authenticated_inbound_is_admitted_as_responder_for_the_exact_mission_peer() {
+    async fn below_floor_inbound_is_rejected_then_exact_mission_peer_is_admitted() {
         let config = config_with_ids([0x22; 32], [0x11; 32]);
         let locator =
             crate::CanonicalLocator::new(Address::new([2, 0, 0, 0, 0, 9]), AddressType::LeRandom)
@@ -5028,9 +5068,9 @@ mod tests {
             Instant::now(),
         )
         .unwrap();
-        let (accept_sender, accept_receiver) = oneshot::channel();
+        let (accept_sender, accept_receiver) = mpsc::channel(2);
         let sockets = Arc::new(InboundSockets {
-            accepted: tokio::sync::Mutex::new(Some(accept_receiver)),
+            accepted: tokio::sync::Mutex::new(accept_receiver),
             connected: AtomicU8::new(0),
         });
         let scan_started = Arc::new(Notify::new());
@@ -5077,15 +5117,22 @@ mod tests {
             )
             .await
             .unwrap();
+        let (below_floor, _peer) = tokio::io::duplex(4096);
+        accept_sender
+            .send(
+                SocketOpen::with_observed_mtu(Box::new(below_floor), 22, 23)
+                    .map(|opened| (AcceptedSocket::ready(opened), locator)),
+            )
+            .await
+            .unwrap();
         let (stream, _peer) = tokio::io::duplex(4096);
-        assert!(
-            accept_sender
-                .send(
-                    SocketOpen::with_observed_mtu(Box::new(stream), 128, 96)
-                        .map(|opened| (opened, locator)),
-                )
-                .is_ok()
-        );
+        accept_sender
+            .send(
+                SocketOpen::with_observed_mtu(Box::new(stream), 128, 96)
+                    .map(|opened| (AcceptedSocket::ready(opened), locator)),
+            )
+            .await
+            .unwrap();
 
         contacts.admitted.notified().await;
         cancellation.cancel();
@@ -6254,9 +6301,9 @@ mod tests {
             AddressType::LeRandom,
         )
         .unwrap();
-        let (accept_sender, accept_receiver) = oneshot::channel();
+        let (accept_sender, accept_receiver) = mpsc::channel(2);
         let sockets = Arc::new(InboundSockets {
-            accepted: tokio::sync::Mutex::new(Some(accept_receiver)),
+            accepted: tokio::sync::Mutex::new(accept_receiver),
             connected: AtomicU8::new(0),
         });
         let discovery = Arc::new(FakeDiscovery {
@@ -6287,14 +6334,13 @@ mod tests {
         let config = config_with_ids([0x11; 32], [0x22; 32]);
         send_observation(&discovery, &config, locator).await;
         let (stream, _peer) = tokio::io::duplex(4096);
-        assert!(
-            accept_sender
-                .send(
-                    SocketOpen::with_observed_mtu(Box::new(stream), 128, 96)
-                        .map(|opened| (opened, locator)),
-                )
-                .is_ok()
-        );
+        accept_sender
+            .send(
+                SocketOpen::with_observed_mtu(Box::new(stream), 128, 96)
+                    .map(|opened| (AcceptedSocket::ready(opened), locator)),
+            )
+            .await
+            .unwrap();
 
         contacts.admitted.notified().await;
         assert_eq!(
@@ -7530,9 +7576,9 @@ mod tests {
             AddressType::LeRandom,
         )
         .unwrap();
-        let (accept_sender, accept_receiver) = oneshot::channel();
+        let (accept_sender, accept_receiver) = mpsc::channel(2);
         let sockets = Arc::new(InboundSockets {
-            accepted: tokio::sync::Mutex::new(Some(accept_receiver)),
+            accepted: tokio::sync::Mutex::new(accept_receiver),
             connected: AtomicU8::new(0),
         });
         let discovery = Arc::new(FakeDiscovery {
@@ -7581,14 +7627,13 @@ mod tests {
         );
         send_observation(&discovery, &listener_config, locator).await;
         let (stream, _peer) = tokio::io::duplex(4096);
-        assert!(
-            accept_sender
-                .send(
-                    SocketOpen::with_observed_mtu(Box::new(stream), 128, 96)
-                        .map(|opened| (opened, locator)),
-                )
-                .is_ok()
-        );
+        accept_sender
+            .send(
+                SocketOpen::with_observed_mtu(Box::new(stream), 128, 96)
+                    .map(|opened| (AcceptedSocket::ready(opened), locator)),
+            )
+            .await
+            .unwrap();
         contacts.admitted.notified().await;
 
         assert_eq!(sockets.connected.load(Ordering::Acquire), 0);

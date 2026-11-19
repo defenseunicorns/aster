@@ -308,6 +308,17 @@ load the replacement `aster-btle-roster` credential and reconstruct the whole
 immutable epoch. This is process lifecycle behavior; semantic-v9 and transport
 selection bytes do not change.
 
+Linux Event contacts require a kernel-reported LE L2CAP MTU of at least 23 bytes
+in both directions after socket readiness. Twenty-three bytes is the Bluetooth
+LE Credit-Based L2CAP minimum, while the existing ordered-contact byte stream
+already fragments larger frames. The adapter therefore admits the smallest
+standards-compliant link and closes a missing or smaller negotiated link before
+mission authentication; it does not impose a controller-specific throughput
+threshold. Inbound socket readiness is bounded only after locator and roster
+admission, so an unadmitted or stalled connection cannot own the listener
+indefinitely. A remote-low direction is rejected without restarting the adapter;
+a missing or locally low receive direction remains a platform failure.
+
 This composition changes no semantic-v9 bytes and adds no new third-party
 package to the workspace lock graph. It advances no requirement credit.
 Installed-service execution, supported-hardware rows, physical qualification,
