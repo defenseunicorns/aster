@@ -462,6 +462,21 @@ expiry BTLE becomes unavailable while the node stays ready. Linux may implement
 renewal through an authenticated service reload or a controlled service restart;
 it must never park permanently merely because the startup lease expired.
 
+The initial Linux implementation uses controlled restart. At lease expiry the
+automatic adapter first fences availability, joins its resolver and platform
+owners, and releases credential custody. It then terminates the BTLE owner; the
+agent exits unsuccessfully and the packaged systemd `Restart=on-failure` policy
+starts a fresh process that receives the replacement credential and rebuilds
+the complete adapter epoch. The node remains ready during bounded expiry
+cleanup; terminal completion then deliberately transitions the agent to a
+failed exit so the service manager can restart it. Durable state and
+publications survive that process restart.
+Live credential reload remains a future implementation option, not a protocol
+capability.
+The unit's bounded start-rate policy prevents an absent or rejected replacement
+from becoming an unbounded restart loop; that condition requires operator or
+provider repair rather than keeping expired radio authority alive.
+
 The implemented rostered slice remains one Linux controller, one exact mission
 peer, one dynamic PSM, and one active Event contact. Lower complete mission
 `NodeId` initiates; higher listens. The BTLE adapter never substitutes GATT or a

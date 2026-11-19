@@ -56,6 +56,8 @@ pub enum BtleRuntimeOwnerError {
     Startup,
     /// The active owner could not confirm bounded cleanup.
     Cleanup,
+    /// The immutable credential epoch ended cleanly and requires process restart.
+    RestartRequired,
 }
 
 impl fmt::Display for BtleRuntimeOwnerError {
@@ -1027,9 +1029,12 @@ impl AuthorityBtleRuntimeOwner {
                     () = wait_for_runtime_completion(&mut supervisor_completion) => {
                         let supervisor = task_supervisor.take();
                         supervisor.cancel();
-                        let _ = join_runtime_owner(supervisor).await;
+                        let result = join_runtime_owner(supervisor).await;
                         drop((policy, authority));
-                        return Err(BtleRuntimeOwnerError::Cleanup);
+                        return match result {
+                            Err(BtleRuntimeOwnerError::RestartRequired) => result,
+                            Ok(()) | Err(_) => Err(BtleRuntimeOwnerError::Cleanup),
+                        };
                     }
                     () = tokio::time::sleep(interval) => {
                         if authority.resample_clock().is_ok() {
@@ -1148,10 +1153,7 @@ async fn join_runtime_owner(
     if !matches!(result, Ok(Ok(()))) {
         wait_for_runtime_completion(&mut completion).await;
     }
-    match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) | Err(_) => Err(BtleRuntimeOwnerError::Cleanup),
-    }
+    result.unwrap_or(Err(BtleRuntimeOwnerError::Cleanup))
 }
 
 #[cfg(feature = "systemd-provider")]
@@ -1279,10 +1281,13 @@ impl BtleRuntimeOwner for LinuxSupervisorRuntimeOwner {
                 status_stop,
                 status_task,
             } = *self;
-            let supervisor_result = supervisor
-                .shutdown()
-                .await
-                .map_err(|_| BtleRuntimeOwnerError::Cleanup);
+            let supervisor_result = match supervisor.shutdown().await {
+                Ok(()) => Ok(()),
+                Err(aster_ble_linux::SupervisorError::CredentialExpired) => {
+                    Err(BtleRuntimeOwnerError::RestartRequired)
+                }
+                Err(_) => Err(BtleRuntimeOwnerError::Cleanup),
+            };
             let _ = status_stop.send(());
             let mut status_task = status_task;
             let status_result =
@@ -1586,6 +1591,7 @@ mod tests {
         dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
         _completion_guard: tokio::sync::watch::Sender<bool>,
         completion: tokio::sync::watch::Receiver<bool>,
+        join_result: Result<(), BtleRuntimeOwnerError>,
     }
 
     #[cfg(feature = "systemd-provider")]
@@ -1621,8 +1627,9 @@ mod tests {
 
         fn join(self: Box<Self>) -> BoxFuture<'static, Result<(), BtleRuntimeOwnerError>> {
             Box::pin(async move {
+                let result = self.join_result;
                 drop(self);
-                Ok(())
+                result
             })
         }
     }
@@ -1644,6 +1651,7 @@ mod tests {
             dropped: supervisor_dropped.clone(),
             _completion_guard: completion_guard,
             completion,
+            join_result: Ok(()),
         };
         let owner = AuthorityBtleRuntimeOwner::start_with_interval(
             Box::new(supervisor),
@@ -1678,6 +1686,56 @@ mod tests {
             .expect("parked authority shutdown");
         assert!(authority_dropped.load(std::sync::atomic::Ordering::Acquire));
         assert!(*owner_completion.borrow_and_update());
+    }
+
+    #[cfg(feature = "systemd-provider")]
+    #[tokio::test]
+    async fn terminal_supervisor_completion_reaches_process_owner_after_cleanup() {
+        let resampled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let authority_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let authority_parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let supervisor_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (completion_guard, completion) = tokio::sync::watch::channel(false);
+        let terminal = completion_guard.clone();
+        let supervisor = ImmediateRuntimeOwner {
+            parked,
+            authority_parked,
+            cancelled: cancelled.clone(),
+            dropped: supervisor_dropped.clone(),
+            _completion_guard: completion_guard,
+            completion,
+            join_result: Err(BtleRuntimeOwnerError::RestartRequired),
+        };
+        let owner = AuthorityBtleRuntimeOwner::start_with_interval(
+            Box::new(supervisor),
+            (),
+            Box::new(FailingContinuity {
+                resampled: resampled.clone(),
+                dropped: authority_dropped.clone(),
+            }),
+            BTLE_CLOCK_CONTINUITY_INTERVAL,
+        );
+        let mut owner_completion = owner.completion();
+
+        terminal.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !*owner_completion.borrow_and_update() {
+                owner_completion.changed().await.expect("owner completion");
+            }
+        })
+        .await
+        .expect("terminal supervisor reaches process owner");
+
+        assert!(!resampled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(supervisor_dropped.load(std::sync::atomic::Ordering::Acquire));
+        assert!(authority_dropped.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            Box::new(owner).join().await,
+            Err(BtleRuntimeOwnerError::RestartRequired)
+        );
     }
 
     #[cfg(feature = "systemd-provider")]

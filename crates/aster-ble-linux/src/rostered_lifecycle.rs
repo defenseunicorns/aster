@@ -1239,6 +1239,7 @@ fn finish_operational_epoch_result(
             | SupervisorError::ActorUnavailable
             | SupervisorError::ActorStopped
             | SupervisorError::ContactTerminal(_)
+            | SupervisorError::CredentialExpired
             | SupervisorError::TaskStopped,
         ) => Some(DriverError::new(
             DriverErrorKind::Transport,
@@ -1290,17 +1291,25 @@ impl OperationalControllerEpoch for RosteredOperationalEpoch {
     fn quiesce(&mut self) -> OperationalEpochFuture<'_, Result<(), DriverError>> {
         self.availability_fence.quiesce();
         Box::pin(async move {
-            let (acknowledged, acknowledgement) = oneshot::channel();
-            self.quiesce.send(acknowledged).await.map_err(|_| {
-                self.publish_unavailable_after_failure(
-                    "automatic rostered Event epoch quiesce channel closed",
-                )
-            })?;
-            acknowledgement.await.map_err(|_| {
-                self.publish_unavailable_after_failure(
-                    "automatic rostered Event epoch quiesce was not acknowledged",
-                )
-            })?
+            timeout(OWNER_LOSS_AFTER, async {
+                let (acknowledged, acknowledgement) = oneshot::channel();
+                self.quiesce.send(acknowledged).await.map_err(|_| {
+                    self.publish_unavailable_after_failure(
+                        "automatic rostered Event epoch quiesce channel closed",
+                    )
+                })?;
+                acknowledgement.await.map_err(|_| {
+                    self.publish_unavailable_after_failure(
+                        "automatic rostered Event epoch quiesce was not acknowledged",
+                    )
+                })?
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(self.publish_unavailable_after_failure(
+                    "automatic rostered Event epoch quiesce exceeded its deadline",
+                ))
+            })
         })
     }
 
@@ -1311,32 +1320,13 @@ impl OperationalControllerEpoch for RosteredOperationalEpoch {
     fn join(mut self: Box<Self>) -> OperationalEpochFuture<'static, OperationalEpochOutcome> {
         Box::pin(async move {
             self.availability_fence.quiesce();
-            let task_result = self
-                .task
-                .as_mut()
-                .expect("operational epoch task retained")
-                .await;
-            let _ = self.task.take();
-            match task_result {
-                Ok(OperationalEpochOutcome::Retryable) => OperationalEpochOutcome::Retryable,
-                Ok(OperationalEpochOutcome::Suppressed) => {
-                    self.platform_owner.clear();
-                    OperationalEpochOutcome::Suppressed
-                }
-                Ok(OperationalEpochOutcome::Terminal(error)) => {
-                    let _ = self.unavailable.publish();
-                    self.platform_owner.force_loss();
-                    OperationalEpochOutcome::Terminal(error)
-                }
-                Err(_) => {
-                    let _ = self.unavailable.publish();
-                    self.platform_owner.force_loss();
-                    OperationalEpochOutcome::Terminal(DriverError::new(
-                        DriverErrorKind::Transport,
-                        "automatic rostered Event epoch cleanup was not confirmed",
-                    ))
-                }
-            }
+            self.cancellation.cancel();
+            finish_operational_epoch_task(
+                self.task.take().expect("operational epoch task retained"),
+                self.platform_owner.clone(),
+                self.unavailable.clone(),
+            )
+            .await
         })
     }
 }
@@ -1357,9 +1347,10 @@ impl Drop for RosteredOperationalEpoch {
         let _ = self.unavailable.publish();
         self.cancellation.cancel();
         let platform_owner = self.platform_owner.clone();
+        let unavailable = self.unavailable.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                contain_operational_epoch_task(task, platform_owner).await;
+                let _ = finish_operational_epoch_task(task, platform_owner, unavailable).await;
             });
         } else {
             platform_owner.force_loss();
@@ -1368,22 +1359,45 @@ impl Drop for RosteredOperationalEpoch {
     }
 }
 
-async fn contain_operational_epoch_task(
+async fn finish_operational_epoch_task(
     mut task: JoinHandle<OperationalEpochOutcome>,
     platform_owner: Arc<PlatformOwner>,
-) {
-    match timeout(OWNER_LOSS_AFTER, &mut task).await {
-        Ok(Ok(OperationalEpochOutcome::Retryable | OperationalEpochOutcome::Suppressed)) => return,
-        Ok(Ok(OperationalEpochOutcome::Terminal(_)) | Err(_)) => {
+    unavailable: UnavailableAvailabilityPublisher,
+) -> OperationalEpochOutcome {
+    let task_result = match timeout(OWNER_LOSS_AFTER, &mut task).await {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = unavailable.publish();
             platform_owner.force_loss();
-            return;
+            if timeout(OWNER_LOSS_JOIN_DEADLINE, &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+            return OperationalEpochOutcome::Terminal(DriverError::new(
+                DriverErrorKind::Transport,
+                "automatic rostered Event epoch cleanup exceeded its deadline",
+            ));
         }
-        Err(_) => {}
-    }
-    platform_owner.force_loss();
-    if timeout(OWNER_LOSS_JOIN_DEADLINE, &mut task).await.is_err() {
-        task.abort();
-        let _ = task.await;
+    };
+    match task_result {
+        Ok(OperationalEpochOutcome::Retryable) => OperationalEpochOutcome::Retryable,
+        Ok(OperationalEpochOutcome::Suppressed) => {
+            platform_owner.clear();
+            OperationalEpochOutcome::Suppressed
+        }
+        Ok(OperationalEpochOutcome::Terminal(error)) => {
+            let _ = unavailable.publish();
+            platform_owner.force_loss();
+            OperationalEpochOutcome::Terminal(error)
+        }
+        Err(_) => {
+            let _ = unavailable.publish();
+            platform_owner.force_loss();
+            OperationalEpochOutcome::Terminal(DriverError::new(
+                DriverErrorKind::Transport,
+                "automatic rostered Event epoch cleanup was not confirmed",
+            ))
+        }
     }
 }
 
@@ -1513,16 +1527,9 @@ where
     } else {
         None
     };
-    let shutdown_result = if matches!(wake, Wake::Expired) {
-        timeout(OWNER_LOSS_AFTER, shutdown)
-            .await
-            .map_err(|_| SupervisorError::PlatformCleanupUnconfirmed)
-            .and_then(|result| result.map_err(|_| SupervisorError::PlatformCleanupUnconfirmed))
-    } else {
-        shutdown
-            .await
-            .map_err(|_| SupervisorError::PlatformCleanupUnconfirmed)
-    };
+    let shutdown_result = shutdown
+        .await
+        .map_err(|_| SupervisorError::PlatformCleanupUnconfirmed);
     if let Err(error) = shutdown_result {
         unavailable.publish_terminal(crate::controller::TerminalAvailability::CleanupUnconfirmed);
         return Err(error);
@@ -1531,9 +1538,12 @@ where
         return Err(error);
     }
     if matches!(wake, Wake::Expired) {
-        cancellation.cancelled().await;
+        // Terminate only after fencing and cleanup so the process owner can
+        // rebuild this immutable credential epoch through controlled restart.
+        Err(SupervisorError::CredentialExpired)
+    } else {
+        Ok(())
     }
-    Ok(())
 }
 
 fn spawn_rostered_btle_event_supervisor(
@@ -1661,6 +1671,7 @@ async fn run_rostered_supervisor(
                 | SupervisorError::ActorStopped
                 | SupervisorError::ContactSuppressed(_)
                 | SupervisorError::ContactTerminal(_)
+                | SupervisorError::CredentialExpired
                 | SupervisorError::TaskStopped
                 | SupervisorError::PlatformCleanupUnconfirmed),
             ) => return Err(error),
@@ -3855,7 +3866,8 @@ mod tests {
             ))
         });
 
-        contain_operational_epoch_task(task, platform_owner).await;
+        let _ =
+            finish_operational_epoch_task(task, platform_owner, test_unavailable_publisher()).await;
 
         assert_eq!(force_count.load(Ordering::Acquire), 1);
     }
@@ -3872,7 +3884,8 @@ mod tests {
             panic!("test operational epoch panic");
         });
 
-        contain_operational_epoch_task(task, platform_owner).await;
+        let _ =
+            finish_operational_epoch_task(task, platform_owner, test_unavailable_publisher()).await;
 
         assert_eq!(force_count.load(Ordering::Acquire), 1);
     }
@@ -4027,7 +4040,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn automatic_expiry_publishes_unavailable_releases_config_and_parks() {
+    async fn automatic_expiry_publishes_unavailable_releases_config_and_terminates() {
         let cancellation = LifecycleCancellation::new();
         let task_cancellation = cancellation.clone();
         let (_status_updates, status) = watch::channel(OperationalEpochState::Starting);
@@ -4081,13 +4094,11 @@ mod tests {
             config_weak.upgrade().is_none(),
             "expired automatic configuration must release credential custody"
         );
-        assert!(
-            !task.is_finished(),
-            "expired supervisor remains nonterminal"
-        );
-
-        cancellation.cancel();
-        assert_eq!(task.await.unwrap(), Ok(()));
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("credential expiry must terminate the owner for controlled restart")
+            .expect("credential expiry owner task");
+        assert_eq!(result, Err(SupervisorError::CredentialExpired));
     }
 
     #[tokio::test(start_paused = true)]
@@ -4133,40 +4144,48 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn expiry_bounds_hung_resolver_cleanup_and_releases_custody() {
+    async fn operational_join_bounds_hung_task_and_releases_credential_custody() {
+        let force_count = Arc::new(AtomicU8::new(0));
+        let platform_owner = Arc::new(PlatformOwner::default());
+        platform_owner.replace(RecordingOwnerLoss {
+            force_count: force_count.clone(),
+            release: None,
+        });
         let cancellation = LifecycleCancellation::new();
+        let cancellation_observer = cancellation.observer();
         let (_status_updates, status) = watch::channel(OperationalEpochState::Starting);
+        let (quiesce, _requests) = mpsc::channel(1);
         let secret_drops = Arc::new(AtomicU8::new(0));
         let secret_owner = RecordDrop(secret_drops.clone());
-        let shutdown_started = Arc::new(AtomicU8::new(0));
-        let task_shutdown_started = shutdown_started.clone();
-        let task = tokio::spawn(run_automatic_resolver_owner(
+        let epoch = RosteredOperationalEpoch {
             status,
             cancellation,
-            Instant::now() + Duration::from_secs(5),
-            Arc::new(AvailabilityFence::default()),
-            test_unavailable_publisher(),
-            async move {
+            quiesce,
+            availability_fence: Arc::new(AvailabilityFence::default()),
+            task: Some(tokio::spawn(async move {
                 let _secret_owner = secret_owner;
-                task_shutdown_started.store(1, Ordering::Release);
-                pending::<Result<(), DriverError>>().await
-            },
-        ));
+                pending::<OperationalEpochOutcome>().await
+            })),
+            platform_owner,
+            unavailable: test_unavailable_publisher(),
+        };
+        tokio::task::yield_now().await;
+        let join = tokio::spawn(Box::new(epoch).join());
         tokio::task::yield_now().await;
 
-        tokio::time::advance(Duration::from_secs(5) + Duration::from_millis(1)).await;
-        while shutdown_started.load(Ordering::Acquire) == 0 {
-            tokio::task::yield_now().await;
-        }
         tokio::time::advance(OWNER_LOSS_AFTER + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(cancellation_observer.is_cancelled());
+        assert_eq!(force_count.load(Ordering::Acquire), 1);
+        assert_eq!(secret_drops.load(Ordering::Acquire), 0);
 
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), task)
-                .await
-                .expect("expiry bounds resolver cleanup custody")
-                .unwrap(),
-            Err(SupervisorError::PlatformCleanupUnconfirmed)
-        );
+        tokio::time::advance(OWNER_LOSS_JOIN_DEADLINE + Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+
+        assert!(matches!(
+            join.await.unwrap(),
+            OperationalEpochOutcome::Terminal(_)
+        ));
         assert_eq!(secret_drops.load(Ordering::Acquire), 1);
     }
 
@@ -4214,8 +4233,7 @@ mod tests {
             *availability.borrow_and_update(),
             crate::BtleAvailability::Unavailable(crate::AvailabilityReason::BluezUnavailable)
         );
-        cancellation.cancel();
-        assert_eq!(task.await.unwrap(), Ok(()));
+        assert_eq!(task.await.unwrap(), Err(SupervisorError::CredentialExpired));
     }
 
     #[test]

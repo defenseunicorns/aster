@@ -300,6 +300,14 @@ changes. The operator must change validated configuration and restart the
 agent, rebuilding the policy, credential, radio, registry, and admission state
 together.
 
+The packaged Linux profile also treats roster-credential expiry as a controlled
+restart boundary. The adapter publishes `credential_expired`, fences new radio
+work, completes bounded platform cleanup, and only then terminates its owner.
+The agent exits nonzero so the unit's existing `Restart=on-failure` policy can
+load the replacement `aster-btle-roster` credential and reconstruct the whole
+immutable epoch. This is process lifecycle behavior; semantic-v9 and transport
+selection bytes do not change.
+
 This composition changes no semantic-v9 bytes and adds no new third-party
 package to the workspace lock graph. It advances no requirement credit.
 Installed-service execution, supported-hardware rows, physical qualification,
