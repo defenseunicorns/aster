@@ -199,21 +199,22 @@ contact attempt as `AdapterEpochEnded`: no candidate completed during an
 advertisement epoch. This is an operator-attested source-composition
 observation; no reproducible package identity is retained.
 
-Peer-observation controls showed radio contact alongside the negative result:
-the Orin observed both legacy and extended UUID advertisements and an extended
-advertisement carrying one byte of service data. During continuous unfiltered
-scanning it observed eight bytes of service data, but not 16 bytes or the
-production 40-byte roster beacon; placing the same 40 bytes in scan response
-data did not change the result.
+Peer-observation controls showed radio contact alongside the negative result.
+A boundary sweep then exposed 128-bit UUID ServiceData with 13 payload bytes,
+but not 14, 16, or the production 40 bytes. This exactly matches a BlueZ
+receive-side defect: `btd_device` creates its discovered-device `bt_ad` cache
+with the [legacy 31-byte default](https://github.com/bluez/bluez/blob/770ad5614e7e8074133e6f563495ce4822f63fe4/src/shared/ad.c#L46-L59),
+and [`bt_ad_add_service_data`](https://github.com/bluez/bluez/blob/770ad5614e7e8074133e6f563495ce4822f63fe4/src/shared/ad.c#L967-L978)
+rejects payloads larger than
+`31 - 2 - 16 = 13` bytes. The [caller](https://github.com/bluez/bluez/blob/770ad5614e7e8074133e6f563495ce4822f63fe4/src/device.c#L2207-L2225)
+then omits that entry and its property update.
+This is the behavior of the evaluated BlueZ 5.72 stack, not an Orin radio
+limit. Upstream fixed the default cache capacity in
+[`f40c5857`](https://github.com/bluez/bluez/commit/f40c5857d70a91e417e22da9da20f4193414b8a3),
+first released in BlueZ 5.76.
 
-The production roster beacon is exactly 40 bytes, so the evaluated Orin stack
-is not qualified for automatic rostered discovery. This does not invalidate the
-separate fixed-locator 65,536-byte Event transfer evidence. No fallback or wire
-protocol change was introduced: qualification requires peer observation of the
-complete production beacon. The current empty, open-support package does not
-block this fingerprint, so it may still attempt activation and report local
-availability; this observation grants it no support or release credit.
-Deployments requiring qualified hardware must select `qualified-only`, while
-exact known-unsafe rows remain the responsibility of the future signed
-qualification package. The harness, temporary diagnostics, build-only changes,
-fixtures, state, and logs were removed after the run.
+Automatic rostered discovery therefore remains blocked on the evaluated Orin
+software stack until the corrected receive path is installed and the complete
+bidirectional path is repeated. This does not invalidate the separate
+fixed-locator 65,536-byte Event transfer evidence. No fallback or wire-protocol
+change was introduced. The harness, fixtures, state, and logs were removed.
