@@ -4,7 +4,7 @@
 - Status: superseded — stopped before formal Phase 0; no arm selected
 - Date: 2026-08-23
 - Proposal: [Shared-node rust-libp2p retest](0004-shared-node-libp2p-retest.md)
-- Disposition: [Decision 0029](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0029-close-proposal-0004-libp2p-pilot.md)
+- Disposition: [Decision 0029](../decisions/0029-close-proposal-0004-libp2p-pilot.md)
 - Requirements baseline:
   [`data-mesh-requirements.md`](../../data-mesh-requirements.md), SHA-256
   `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
@@ -20,7 +20,7 @@ default, deployment, release, or production lanes.
 This is a portfolio and completion disposition. It is not a claim that
 rust-libp2p failed gates that were never run. The publish-disabled provider and
 its opt-in lab feature remain only as a bounded test oracle under
-[Decision 0027](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0027-libp2p-pilot-dependency-policy.md). They grant
+[Decision 0027](../decisions/0027-libp2p-pilot-dependency-policy.md). They grant
 no requirement, conformance, compatibility, dependency-admission, capability,
 or production credit and must be removed or explicitly reauthorized by that
 decision's deadline.

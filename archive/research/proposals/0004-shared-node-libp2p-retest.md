@@ -18,17 +18,17 @@
   receipt
 - Execution cap: 30 engineer-days; this is a stop limit, not an estimate
 - Governing decision:
-  [Decision 0024](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0024-refactor-durable-node-ownership-before-ip-provider-selection.md)
+  [Decision 0024](../decisions/0024-refactor-durable-node-ownership-before-ip-provider-selection.md)
 - Closure decision:
-  [Decision 0029](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0029-close-proposal-0004-libp2p-pilot.md)
+  [Decision 0029](../decisions/0029-close-proposal-0004-libp2p-pilot.md)
 - Preserves: Decisions
-  [0002](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0002-dependency-admission.md),
+  [0002](../decisions/0002-dependency-admission.md),
   0014 (“Build versus buy is governed by total assurance cost”; privileged local
   record, not part of this repository artifact),
   0015 (“Delete custom mechanism behind narrow library-backed seams”; privileged
   local record, not part of this repository artifact),
-  [0022](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0022-ip-mesh-experiment-no-selection.md), and
-  [0023](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0023-mesh-host-contract-no-libp2p-selection.md)
+  [0022](../decisions/0022-ip-mesh-experiment-no-selection.md), and
+  [0023](../decisions/0023-mesh-host-contract-no-libp2p-selection.md)
 
 ## Question
 
@@ -407,7 +407,7 @@ the authorization-race witness invalid.
 Ordinary receive-only keeps advertisements, discovery, inventory, and item data
 silent while permitting only mandatory link, authentication, and
 acknowledgement traffic needed to ingest, as specified by
-[Decision 0004](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0004-radio-silence-semantics.md). The signed Flash
+[Decision 0004](../decisions/0004-radio-silence-semantics.md). The signed Flash
 control advances the shared authorization generation; a frame already queued
 for the named stale contact must remain at zero emitted bytes, that contact must
 fail closed, and a freshly authorized contact must progress.
@@ -974,7 +974,7 @@ assertion are unchanged. This is a deadlock bound, not throughput credit.
 
 It is retained only as a
 publish-disabled, opt-in test oracle under
-[Decision 0027](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0027-libp2p-pilot-dependency-policy.md). It grants
+[Decision 0027](../decisions/0027-libp2p-pilot-dependency-policy.md). It grants
 no requirement, conformance, compatibility, dependency-admission, capability,
 or production credit and must be removed or explicitly reauthorized by that
 decision's deadline.
@@ -985,4 +985,4 @@ from the continuing selected-stack implementation, default, deployment, and
 production lanes. This is a portfolio disposition, not a claim that
 rust-libp2p failed gates that were never run. See the
 [separate result](0004-shared-node-libp2p-retest-results.md) and
-[Decision 0029](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0029-close-proposal-0004-libp2p-pilot.md).
+[Decision 0029](../decisions/0029-close-proposal-0004-libp2p-pilot.md).
