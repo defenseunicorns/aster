@@ -50,6 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Replaced Iroh 1.4.1 with 1.5.0 and removed the vendored netlink patch.
+- Replaced the SQLite-backed application runtime and C, Go, and Python bindings
+  with the `aster-node` runtime and redb; removed atomic publication batches,
+  Blob batches, and dynamic bridge administration.
+
 - Removed outdated `aster-ip` and `aster-relay`, replaced by Iroh.
 - Hardened publication journals against parent-directory renames and replacement.
 - Removed `MeshService` and updated tests.

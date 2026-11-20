@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import hashlib
 import importlib.util
 import json
 import os
@@ -31,17 +30,6 @@ LIB = '/usr/local/libexec/aster/'
 # Image-resident delivery entrypoints are instead bound by the immutable image ID.
 HELPER_FILES = ('aster_path_diagnostic.py', 'aster_mesh_playground.py',
                 'aster_lan_mvp.py', 'aster_path_delivery.py')
-
-
-def source_identity(root):
-    return {
-        'source_head': _run_command(['git', '-C', str(root), 'rev-parse', 'HEAD'], 5).decode().strip(),
-        'source_diff_sha256': hashlib.sha256(_run_command(
-            ['git', '-C', str(root), 'diff', 'HEAD', '--binary'], 5)).hexdigest(),
-        'helper_files_sha256': {name: hashlib.sha256((root / 'tools' / name).read_bytes()).hexdigest()
-                                for name in HELPER_FILES},
-    }
-
 
 
 def verify_events(accepted, actual, *, deadline=None, exact=False):
@@ -453,11 +441,7 @@ def run_profile(config, profile, report):
                   rejected={}, deliveries={}, qdiscs=[], ownership_directory=str(directory))
     start = time.monotonic()
 
-    validate = getattr(config, 'validate_provenance', lambda: None)
-
     def phase(name):
-        if name != 'cleanup':
-            validate()
         report['phases'].append({'phase': name, 'elapsed': time.monotonic() - start})
         (config.output / (profile + '.json')).write_text(json.dumps(report) + '\n')
         print(json.dumps({'profile': profile, **report['phases'][-1]}), flush=True)
@@ -469,9 +453,8 @@ def run_profile(config, profile, report):
         return command('exec', cid, *args, timeout=timeout)
 
     def create(role, options, argv, caps=()):
-        validate()
         cid = owned.create(role, options, argv, caps)
-        if hasattr(config, 'validate_provenance'):
+        if hasattr(config, 'image'):
             actual = command('inspect', '--format', '{{.Image}}', cid).decode().strip()
             report.setdefault('all_container_image_ids', {})[role] = actual
             if actual != config.image:
@@ -541,7 +524,6 @@ def run_profile(config, profile, report):
         return event['id']
 
     def sample_all():
-        validate()
         report['samples'].append({role: worker.call('status') for role, worker in workers.items()})
         (config.output / (profile + '.json')).write_text(json.dumps(report) + '\n')
         print(json.dumps({'profile': profile, 'elapsed': time.monotonic() - start,
@@ -735,8 +717,7 @@ def run_profile(config, profile, report):
             actual = worker.call('query', maximum=count * 2 + 2, timeout=180)
             report['peerless'][role] = {'restart': restart, 'exact_events': verify_events(expected, actual, exact=True)}
         sample_all()
-        validate()
-        report['status'] = 'verified' if hasattr(config, 'validate_provenance') else 'pass'
+        report['status'] = 'pass'
     except (Exception, KeyboardInterrupt) as error:
         report['status'] = 'fail'
         report['error'] = str(error) or 'interrupted'
@@ -809,10 +790,6 @@ def run_profile(config, profile, report):
         report['elapsed_seconds'] = time.monotonic() - start
         if cleanup_errors:
             report['status'] = 'fail'
-        try:
-            validate()
-        except Exception as error:
-            report.update(status='fail', provenance_error=str(error))
         (config.output / (profile + '.json')).write_text(json.dumps(report) + '\n')
     return report
 
@@ -859,10 +836,6 @@ def main():
     run = _pinned_docker(_run_command)
     root = Path(__file__).resolve().parent.parent
     try:
-        identity = source_identity(root)
-        report.update(identity)
-        report['helper_sha256'] = identity['helper_files_sha256']['aster_path_diagnostic.py']
-        report['publisher_helper_sha256'] = identity['helper_files_sha256']['aster_mesh_playground.py']
         report['image_id'] = run(['docker', 'image', 'inspect', '--format', '{{.Id}}', config.image], 5).decode().strip()
         if re.fullmatch(r'sha256:[0-9a-f]{64}', report['image_id']) is None:
             raise ExecutionError('invalid immutable image ID')
@@ -872,32 +845,12 @@ def main():
             for name in HELPER_FILES:
                 destination = config.helper_directory / name
                 destination.write_bytes((root / 'tools' / name).read_bytes())
-                destination.chmod(0o444)
-
-            def validate_provenance():
-                if source_identity(root) != identity:
-                    raise ExecutionError('source/helper drift during diagnostic')
-                for name, digest in identity['helper_files_sha256'].items():
-                    if hashlib.sha256((config.helper_directory / name).read_bytes()).hexdigest() != digest:
-                        raise ExecutionError('frozen helper drift during diagnostic')
-
-            config.validate_provenance = validate_provenance
-            validate_provenance()
             for profile in config.profiles:
-                validate_provenance()
                 row = {}
                 report['profiles'].append(row)
                 run_profile(config, profile, row)
-                validate_provenance()
                 (config.output / 'receipt.json').write_text(json.dumps(report, indent=2) + '\n')
-            # No profile publishes PASS until the whole campaign's final identity
-            # check. Failed campaigns retain individually verified (not PASS) rows.
-            validate_provenance()
-            report['status'] = 'pass' if all(row['status'] == 'verified' for row in report['profiles']) else 'fail'
-            if report['status'] == 'pass':
-                for row in report['profiles']:
-                    row['status'] = 'pass'
-                    (config.output / (row['profile'] + '.json')).write_text(json.dumps(row) + '\n')
+            report['status'] = 'pass' if all(row['status'] == 'pass' for row in report['profiles']) else 'fail'
     except Exception as error:
         report.update(status='fail', error=str(error))
     finally:

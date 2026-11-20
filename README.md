@@ -126,8 +126,8 @@ does not require a hosted Buf Schema Registry.
 | **Rust selected node** | [Selected Event API](docs/quickstart/selected-event-api.md) | Live Event publish, query, durable delivery, gaps, and status |
 | **State or Record in Rust** | [State](docs/quickstart/selected-state-api.md) and [Record](docs/quickstart/selected-record-api.md) | Cloneable live handles and exclusive stopped facades; reconciliation over direct Iroh or one operator-pinned controlled Iroh connectivity relay; State latest-value and Record conflict-preserving delivery |
 | **Blob in Rust** | [Blob](docs/quickstart/selected-blob-api.md) | Cloneable `RunningNode::selected_blobs()` handle for durable or finite-TTL file publication, bounded pages, tagged content/retirement delivery, and local durable transfer progress, plus an exclusive stopped facade; semantic v9/profile 5 provides bounded checkpointed large-object streaming, while v7/v8 profile 4 remains the compatibility path |
-| **Rust semantic API** | [Rust quickstart](docs/quickstart/rust.md) | Broader proven semantic surface used as the migration source |
-| **Python, Go, or C** | [Language quickstarts](docs/quickstart/README.md) | Offline semantic API through the current C ABI, not the selected live node |
+| **Embedded Rust runtime** | [Rust quickstart](docs/quickstart/rust.md) | Class-specific handles over the `aster-node` actor and redb store |
+| **Python, Go, or C** | [Language quickstarts](docs/quickstart/README.md) | Local Event, State, Record, and Blob operations through C ABI v2 over `aster-node`; no network contacts |
 
 ### Download and run the Compose images
 
@@ -149,7 +149,7 @@ verification, import, credential-generation, activation, and Event-validation
 commands.
 
 The [application recipes](docs/application-recipes.md) show all four data
-classes, queries, subscriptions, batches, deletion, conflicts, and emission
+classes, queries, subscriptions, deletion, conflicts, and emission
 policy. Kubernetes, Zarf, and UDS integrations should treat the ConnectRPC
 agent as the application boundary; deployment packaging and protected
 provisioning remain open work.
@@ -159,12 +159,20 @@ provisioning remain open work.
 | Surface | Implemented | Still open |
 |---|---|---|
 | **Event** | Source-authenticated reconciliation over direct Iroh or one operator-pinned controlled Iroh connectivity relay; semantic-v7 receipt-free ordered pages with full-page receiver validation, receiver-local batched commits for consecutive content-capable durable/finite/mixed entries, and receipt-free route-only and blind ReceiveOnly Event traffic; semantic-v6 compatibility fallback; live Rust and local ConnectRPC APIs; client-owned durable consume/carry selectors and at-least-once delivery fenced by recovered sessions; numbered-only crash-safe publication with durable application journals and sparse result compaction; explicit partial Rust SDK/CLI journal-loss reconstruction, permanent offline client retirement with a permanently charged retry fence (client IDs/slots are not reusable by design) and persistent admission tuning | Physical performance/resource validation of v7 pages and receiver batching, physical lifecycle acceptance, atomic subscription replacement, hosted discovery, public relay selection, and broader physical-network acceptance |
-| **State** | Live or stopped publication/query, causal latest-value projection, reconciliation over direct Iroh or one operator-pinned controlled Iroh connectivity relay under explicit interests, durable positive-current-version delivery (no synthetic disappearance notifications under the current subscription contract), and local delivery-ledger status | Peer/contact/convergence status, dynamic network interests, selected-node bindings, finite TTL, broader relay and recovery validation, expiry, and garbage collection |
-| **Record** | Live or stopped conflict-preserving publication/query, exact-sibling guarded resolution, reconciliation over direct Iroh or one operator-pinned controlled Iroh connectivity relay, durable whole-key active-head delivery, and local delivery-ledger status | Peer/contact/convergence status, selected-node bindings, automatic merge execution, finite TTL, broader relay and recovery validation, expiry, and garbage collection |
-| **Blob** | Live or stopped durable/finite immutable publication, bounded authenticated reads, tagged content/retirement delivery, node durable transfer progress, agent streaming Blob publish/read APIs and `asterctl` publish/read through 8 GiB (`asterctl` uses native gRPC over HTTP/2; gRPC-Web Blob publication is unsupported), semantic-v9/profile-5 bounded checkpointed streaming with lifecycle-owned provisional state and a native pack checkpoint journal, semantic-v7/v8 profile-4 compatibility, authenticated finite-TTL custody, automatic garbage collection and bounded pressure recovery with local status, crash-resumable reclamation, and bounded maintenance | Network-wide visibility, route-only relay/custody, cross-transport failover, public application/agent GC administration, and Blob lifetime fields in the FFI surface |
+| **State** | Live or stopped publication/query, causal latest-value projection, reconciliation over direct Iroh or one operator-pinned controlled Iroh connectivity relay under explicit interests, durable positive-current-version delivery (no synthetic disappearance notifications under the current subscription contract), and local delivery-ledger status | Peer/contact/convergence status, dynamic network interests, networked bindings, finite TTL, broader relay and recovery validation, expiry, and garbage collection |
+| **Record** | Live or stopped conflict-preserving publication/query, exact-sibling guarded resolution, reconciliation over direct Iroh or one operator-pinned controlled Iroh connectivity relay, durable whole-key active-head delivery, and local delivery-ledger status | Peer/contact/convergence status, networked bindings, automatic merge execution, finite TTL, broader relay and recovery validation, expiry, and garbage collection |
+| **Blob** | Live or stopped durable/finite immutable publication, bounded authenticated reads, tagged content/retirement delivery, node durable transfer progress, agent streaming Blob publish/read APIs and `asterctl` publish/read through 8 GiB (`asterctl` uses native gRPC over HTTP/2; gRPC-Web Blob publication is unsupported), semantic-v9/profile-5 bounded checkpointed streaming with lifecycle-owned provisional state and a native pack checkpoint journal, semantic-v7/v8 profile-4 compatibility, authenticated finite-TTL custody, automatic garbage collection and bounded pressure recovery with local status, crash-resumable reclamation, and bounded maintenance | Network-wide visibility, route-only relay/custody, cross-transport failover, public application/agent GC administration, and networked FFI configuration |
 | **Static Event hierarchy** | Profile-`0x0001` authenticated directed edges, topic/priority narrowing, route-only nested wrappers, durable candidates, and semantic-v6 runtime integration; process-local cursors can replay a batch after restart, protected by durable idempotency | Supported bridge administration, live join/leave, complete quotas, dynamic policy, revocation/rekey lifecycle, and cross-class bridge custody |
 | **Security profiles** | Stock hybrid-PQ profile `0x0001`; additive P-256 Event/control profile `0x0002` with an exporter-bound two-node Iroh path | Stock runtime/CLI selection for `0x0002`, general negotiation, complete classical data/lifecycle coverage, and rollback policy |
 | **Operations** | Manually admitted direct addresses, one operator-pinned controlled relay, opt-in/default-off rosterless automatic LAN mDNS with mission authentication/admission and candidate, worker, and discovery-window bounds, reference provisioning, and owner-only same-UID Unix software-zeroization IPC (no general administrative RPCs) | Protected operational provisioning, hostile-LAN discovery, public/default relay selection, BTLE integration, and physical sanitization |
+
+C ABI v2 and its Python/Go wrappers embed `aster-node` inside the caller’s
+process for local Event, State, Record, and Blob operations. They use redb for
+durable state and expose numbered Event recovery, guarded Record resolution,
+subscriptions, finite Blob TTL, and scope rekey. Closing a node waits for its
+actor and workers. The bindings open no transport or administration socket.
+Reference-file provisioning is unprotected. See the
+[ABI contract](bindings/c/README.md) for ownership and supported operations.
 
 Blob has one canonical publication authority. Provisional local uploads,
 lifecycle-owned provisional network sources, and completed native packs share
@@ -204,11 +212,10 @@ local implementation detail: it adds no wire-visible batch size or receipt.
 
 ## Product readiness
 
-The first supportable profile is deliberately narrower than the implemented
-surface. Use the [capability roadmap](docs/validation/capability-roadmap.md) for
-planning and PR review, and
-[current implementation boundary](#current-implementation-boundary) for capabilities and limitations. Remaining-work migration is tracked in
-[#203](https://github.com/defenseunicorns/aster/issues/203).
+Implemented APIs do not establish deployment readiness. Review the
+[security boundaries](docs/security.md) and
+[conformance status](docs/validation/conformance.md) alongside the
+platform-specific validation records below.
 
 For the Linux Event MVP, [Decision
 0043](docs/decisions/0043-authorize-linux-event-mvp-validation.md) records the
@@ -260,7 +267,7 @@ conventional database or broker will usually be simpler.
 | Understand trust and component boundaries | [Selected architecture](docs/architecture.md) |
 | Connect nodes or evaluate carriers | [Carriers and contacts](docs/transports.md) |
 | Implement compatible protocol bytes | [Protocol](docs/protocol.md), [wire grammar](docs/wire.cddl), and [security objects](docs/envelope.md) |
-| Assess progress or readiness | [Capability roadmap](docs/validation/capability-roadmap.md), [current implementation boundary](#current-implementation-boundary), [conformance](docs/validation/conformance.md), and [security](docs/security.md) |
+| Assess progress or readiness | [Implementation boundary](#current-implementation-boundary), [conformance](docs/validation/conformance.md), and [security](docs/security.md) |
 | Deploy the Compose container profile | [Compose operator procedure](docs/release/docker-compose.md) and [schema v2](docs/reference/aster-agent-config-v2.md) |
 | Install and operate a packaged node | [Human operator guide](docs/operator-guide.md) |
 | Browse current product documentation | [Documentation map](docs/README.md) |
@@ -273,8 +280,8 @@ conventional database or broker will usually be simpler.
 | [`bindings`](bindings) | C ABI plus Go and Python wrappers |
 | [`docs`](docs) | Current product guides, concepts, specifications, and decisions |
 | [`docs/mvp`](docs/mvp) | MVP operating procedures |
-| [`docs/validation`](docs/validation) | Capability planning, requirements trace, conformance status, and retained evidence |
-| [`lab`](lab) | Controlled network and impairment experiments |
+| [`docs/validation`](docs/validation) | Conformance status, validation runbooks, and retained evidence |
+| [`docker/path-lab`](docker/path-lab) | Controlled network and impairment experiments |
 | [`fuzz`](fuzz) | Parser and protocol robustness targets |
 
 ## Build and verify

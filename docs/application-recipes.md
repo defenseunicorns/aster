@@ -10,16 +10,16 @@ across several documents.
 |---|---|
 | Embed the selected runtime in Rust | The live and stopped [Event](quickstart/selected-event-api.md), [State](quickstart/selected-state-api.md), [Record](quickstart/selected-record-api.md), and [Blob](quickstart/selected-blob-api.md) APIs |
 | Call a running local service | The authenticated Event and Blob [ConnectRPC/gRPC agent](quickstart/connect-agent.md) |
-| Use the broader language bindings | The [Rust, C, Go, and Python quickstarts](quickstart/README.md) |
+| Embed the C, Go, or Python bindings | The [Rust, C, Go, and Python quickstarts](quickstart/README.md) |
 | Configure the local agent | The [agent configuration reference](reference/aster-agent-config-v1.md) |
 
 The selected Rust handles are actor-owned and bounded. Cloning a handle does
 not open a second store authority. A retained handle returns a sanitized
 `StateUnavailable` result after its node closes.
 
-The broader language bindings and the selected Rust runtime are related but
-not identical surfaces. Check the operation table below instead of assuming
-that a Rust-only operation exists in every binding.
+The language bindings use the selected Rust runtime inside the caller process,
+without network contacts. Their operation names and recovery requirements are
+documented in the binding references linked below.
 
 ## Choose a data class
 
@@ -38,7 +38,8 @@ guide.
 A successful publish confirms a local durable commit. It does not confirm that
 a peer received the item or that all reachable nodes converged.
 
-Use a stable operation key for an exact retry. Repeating the same operation
+Use a stable operation key for State, Record, and Blob retries. Events use a
+recovered client session and numbered sequence. Repeating the same operation
 recovers the committed result; reusing the key with different content or
 identity metadata fails as a conflict. Topic, scope, logical key, priority, and
 TTL are separate application choices.
@@ -53,9 +54,9 @@ Selected runnable examples:
 ## Query local data
 
 A query is a bounded snapshot of the local store. It does not contact peers.
-Select the exact class, topic, scope, and logical key whenever possible. Read a
-scope subtree or recoverable history only when the application explicitly
-needs that broader result.
+State and Record queries require an exact topic, scope, and logical key;
+request recovery history when needed. Event queries support bounded pages and
+scope selection. Blob queries require an exact content ID.
 
 Peer/contact status is not proof that a particular item converged. Use the
 class-specific query or delivery result for application decisions.
@@ -83,7 +84,7 @@ delivery guides.
 
 ## Stream Blob content safely
 
-The broad bindings use `blob_writer`/`BlobWriter`-style streaming. The legacy
+The language bindings use `blob_writer`/`BlobWriter`-style streaming. The legacy
 selected Rust live-file facade publishes an owned regular file, reads
 authenticated pages of at most 64 KiB, and retains its 64-MiB ceiling. The
 Linux local agent and `asterctl` use resumable 512-KiB application frames over
@@ -127,18 +128,17 @@ projection, compute a deterministic merged payload, and resolve using the fresh
 exact head-set guard. If another revision arrives first, the stale guard fails
 instead of discarding it.
 
-Replicated ingestion never executes application merge code. Rust can register
-a process-local merge-policy identifier for annotations, but the application
-still computes and submits the resolution. Registration does not survive a
-process restart.
+Replicated ingestion never executes application merge code. The application
+computes and submits the resolution.
 
-## Use tombstones, batches, and emission policy
+## Use tombstones and emission policy
 
-- A tombstone is a replicated update, not immediate physical deletion. Older
-  data can reappear after the configured retention boundary if a long-absent
-  node returns.
-- An atomic batch contains 2–64 ordered items with the same publisher, class,
-  topic, scope, and active epoch. Either every member commits or none does.
+- A State or Record tombstone is a replicated update, not immediate physical
+  deletion. The runtime retains these tombstones and does not provide
+  retention-driven collection. A concurrent update can still remain visible
+  under the class’s conflict rules.
+- Each publication commits independently; multiple calls do not form an
+  all-or-nothing transaction.
 - Emission policy changes what a node may send; it does not rewrite priority,
   delete queued data, or broaden authorization.
 - `ReceiveOnly` suppresses Aster contact initiation and data disclosure while
@@ -149,24 +149,16 @@ process restart.
 
 ## Operation names across bindings
 
-An em dash means that the operation is not exposed by that language binding.
+Use the class-specific Rust guides above and the current binding references:
 
-| Purpose | Rust | Python | Go | C ABI |
-|---|---|---|---|---|
-| Open node | `ApplicationNode::open` | `Node(...)` | `Open` | `aster_node_open` |
-| Publish | `publish` | `publish` | `Publish` | `aster_node_publish` |
-| Query | `query` | `query` | `Query` | `aster_node_query` |
-| Subscribe | `subscribe` | `subscribe` | `Subscribe` | `aster_node_subscribe` |
-| Poll / acknowledge | `poll` / `acknowledge` | `poll` / `acknowledge` | `Poll` / `Acknowledge` | `aster_node_poll` / `aster_node_acknowledge` |
-| Atomic batch | `publish_batch` | `publish_batch` | `PublishBatch` | `aster_node_publish_batch` |
-| Stream Blob | `open_blob_service` | `blob_writer` | `NewBlobWriter` | `aster_node_blob_writer_open` |
-| Inspect conflicts | `conflicts` | `conflicts` | `Conflicts` | `aster_node_conflicts` |
-| Resolve conflict | `resolve` | `resolve` | `Resolve` | `aster_node_resolve` |
-| Inspect Event gaps | `event_gaps` | — | — | — |
-| Register merge-policy ID | `register_merge_policy` | — | — | — |
-| Run garbage collection | `collect_garbage` | — | — | — |
-| Emission policy | `set_emission_policy` | `emission_threshold` | `SetEmissionThreshold` | `aster_node_set_emission` |
-| Zeroize | `zeroize` | `zeroize` | `Zeroize` | `aster_node_zeroize` |
+- [C ABI v2](../bindings/c/README.md)
+- [Python](../bindings/python/README.md)
+- [Go](../bindings/go/README.md)
+
+State and Record publication use stable operation keys. Event publication uses
+numbered client sessions with explicit recovery. Blob publication uses a
+streaming writer. Record conflict inspection returns a query projection with
+an opaque resolution guard. ABI v1 calls are not compatible with ABI v2.
 
 For protocol semantics use the [protocol specification](protocol.md). For
 networking and synchronization use [Carriers and contacts](transports.md). For

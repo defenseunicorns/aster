@@ -1,75 +1,45 @@
+// Offline exact-key State publication through the selected-node C ABI.
 package main
 
-// Offline publish/subscribe with Aster's Go application binding.
-
 import (
+	aster "defenseunicorns.com/aster/mesh"
 	"fmt"
 	"log"
 	"os"
-
-	aster "defenseunicorns.com/aster/mesh"
+	"path/filepath"
 )
 
-func main() {
+func run() error {
 	if len(os.Args) != 3 {
-		log.Fatalf("usage: %s PROVISIONING_BUNDLE DATABASE", os.Args[0])
+		return fmt.Errorf("usage: %s PROVISIONING_FILE STATE_DIRECTORY", os.Args[0])
 	}
-
-	// The authority-issued bundle gives this node its identity and permitted
-	// scopes/topics. Applications pass it through as opaque bytes.
-	bundle, err := os.ReadFile(os.Args[1])
+	mission, err := filepath.Abs(os.Args[1])
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-
-	// The database holds publications, causal state, and subscription progress.
-	// Close the native node even though the Go wrapper has a finalizer backstop.
-	node, err := aster.Open(os.Args[2], bundle)
+	state, err := filepath.Abs(os.Args[2])
 	if err != nil {
-		log.Fatal(err)
+		return err
+	}
+	node, err := aster.Open(state, mission)
+	if err != nil {
+		return err
 	}
 	defer node.Close()
-
-	// Subscribe before publishing so the local commit uses the same durable,
-	// at-least-once delivery path as an item received from another node.
-	subscription, err := node.Subscribe(
-		"position.current", "mission/team/alpha", nil, false,
-	)
+	_, err = node.Publish(aster.PublishRequest{Class: aster.State, Topic: "position.current", Scope: "mission/team/alpha", OperationKey: []byte("example/position/1"), LogicalKey: []byte("unit-7"), Payload: []byte(`{"lat":38.9,"lon":-77.0}`), Priority: aster.Immediate})
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-
-	// Publish works with no peer or network. State uses LogicalKey to identify
-	// the entity whose current value is being replaced.
-	ttlMillis := uint64(60_000)
-	receipt, err := node.Publish(
-		aster.State,
-		"position.current",
-		"mission/team/alpha",
-		[]byte(`{"lat":38.9,"lon":-77.0}`),
-		aster.PublishOptions{
-			LogicalKey: []byte("unit-7"),
-			Priority:   aster.Immediate,
-			TTLMillis:  &ttlMillis, // Expiry is independent of priority.
-		},
-	)
+	result, err := node.Query(aster.Query{Class: aster.State, Topic: "position.current", Scope: "mission/team/alpha", LogicalKey: []byte("unit-7")})
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-
-	deliveries, err := subscription.Poll(1)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if len(deliveries) == 0 {
-		log.Fatal("the local publication was not delivered")
-	}
-
-	fmt.Printf("item=%x payload=%s\n", receipt.ItemID, deliveries[0].Item.Payload)
-
-	// Acknowledge only after application processing succeeds. Until then Aster
-	// may redeliver the item after a restart.
-	if err := subscription.Acknowledge(deliveries[0].Item.ItemID); err != nil {
+	defer result.Close()
+	fmt.Println(string(result.Items[0].Payload))
+	return nil
+}
+func main() {
+	if err := run(); err != nil {
 		log.Fatal(err)
 	}
 }

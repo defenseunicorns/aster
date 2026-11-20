@@ -41,7 +41,6 @@ android {
 val buildRust = tasks.register<Exec>("buildRust") {
     val output = layout.buildDirectory.dir("generated/jniLibs")
     inputs.dir(rootProject.file("../../crates"))
-    inputs.dir(rootProject.file("../../third-party"))
     inputs.files(
         rootProject.file("../../Cargo.toml"),
         rootProject.file("../../Cargo.lock"),

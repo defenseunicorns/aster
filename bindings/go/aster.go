@@ -1,4 +1,6 @@
-// Package aster provides the first-class Go binding for the stable Aster C ABI.
+// Package aster embeds the selected redb-backed local node through ABI v2.
+// Callers own durable Event client/session/sequence recovery. State and Record
+// queries select exact keys; a Result owns any opaque Record resolution guard.
 package aster
 
 /*
@@ -10,1715 +12,710 @@ package aster
 import "C"
 
 import (
-	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
-	"reflect"
 	"runtime"
-	"sort"
 	"sync"
 	"unsafe"
 )
 
-// ProtocolVersion is the legacy name for the stable replication-wire version.
-// It does not report the semantic version selected by an authenticated session.
-func ProtocolVersion() uint16 {
-	return uint16(C.aster_protocol_version())
-}
-
-// ReplicationWireVersion reports the stable wire/profile version.
-func ReplicationWireVersion() uint16 {
-	return uint16(C.aster_replication_wire_version())
-}
-
-// DefaultSemanticVersion reports the semantic version offered first by default.
-func DefaultSemanticVersion() uint16 {
-	return uint16(C.aster_default_semantic_version())
-}
-
-// HighestSupportedSemanticVersion reports this build's highest semantic version.
-func HighestSupportedSemanticVersion() uint16 {
-	return uint16(C.aster_highest_supported_semantic_version())
-}
-
 type DataClass uint32
 
 const (
-	State  DataClass = C.ASTER_STATE
-	Event  DataClass = C.ASTER_EVENT
-	Record DataClass = C.ASTER_RECORD
-	Blob   DataClass = C.ASTER_BLOB
+	State DataClass = iota
+	Event
+	Record
+	Blob
 )
 
 type Priority uint32
 
 const (
-	Routine     Priority = C.ASTER_ROUTINE
-	PriorityMsg Priority = C.ASTER_PRIORITY
-	Immediate   Priority = C.ASTER_IMMEDIATE
-	Flash       Priority = C.ASTER_FLASH
+	Routine Priority = iota
+	PriorityMsg
+	Immediate
+	Flash
 )
 
 type EmissionThreshold uint32
 
 const (
-	EmitRoutine   EmissionThreshold = C.ASTER_ROUTINE
-	EmitPriority  EmissionThreshold = C.ASTER_PRIORITY
-	EmitImmediate EmissionThreshold = C.ASTER_IMMEDIATE
-	EmitFlash     EmissionThreshold = C.ASTER_FLASH
-	ReceiveOnly   EmissionThreshold = C.ASTER_RECEIVE_ONLY
+	EmitRoutine EmissionThreshold = iota
+	EmitPriority
+	EmitImmediate
+	EmitFlash
+	ReceiveOnly
 )
+
+func ABIVersion() uint32             { return uint32(C.aster_abi_version()) }
+func ProtocolVersion() uint16        { return uint16(C.aster_protocol_version()) }
+func ReplicationWireVersion() uint16 { return uint16(C.aster_replication_wire_version()) }
+func DefaultSemanticVersion() uint16 { return uint16(C.aster_default_semantic_version()) }
+func HighestSupportedSemanticVersion() uint16 {
+	return uint16(C.aster_highest_supported_semantic_version())
+}
 
 type Error struct {
-	Status uint32
-	Detail string
+	Status  uint32
+	Message string
 }
 
-func (e *Error) Error() string {
-	if e.Detail != "" {
-		return e.Detail
+func (e *Error) Error() string { return fmt.Sprintf("aster (%d): %s", e.Status, e.Message) }
+
+// Error text is thread-local: the operation and error retrieval must execute on
+// the same OS thread even if the goroutine would otherwise migrate.
+func call(f func() C.uint32_t) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	status := f()
+	if status == 0 {
+		return nil
 	}
-	return fmt.Sprintf("Aster native status %d", e.Status)
+	b := C.AsterOwnedBuffer{abi_version: 2, struct_size: C.sizeof_AsterOwnedBuffer}
+	message := "Aster operation failed"
+	if C.aster_last_error(&b) == 0 {
+		message = string(copyBuffer(b))
+		C.aster_buffer_free(&b)
+	}
+	return &Error{uint32(status), message}
+}
+func isClosed(err error) bool { var e *Error; return errors.As(err, &e) && e.Status == 5 }
+
+// All borrowed inputs live in C storage. This also makes nested recipient arrays
+// legal under cgo's pointer rules. Every operation releases them before returning.
+type inputs []unsafe.Pointer
+
+func (a *inputs) bytes(b []byte) C.AsterBytes {
+	if len(b) == 0 {
+		return C.AsterBytes{}
+	}
+	p := C.CBytes(b)
+	*a = append(*a, p)
+	return C.AsterBytes{data: (*C.uint8_t)(p), len: C.size_t(len(b))}
+}
+func (a *inputs) text(s string) C.AsterBytes { return a.bytes([]byte(s)) }
+func (a inputs) free() {
+	for _, p := range a {
+		C.free(p)
+	}
+}
+func copyBuffer(b C.AsterOwnedBuffer) []byte {
+	if b.len == 0 {
+		return nil
+	}
+	return append([]byte(nil), unsafe.Slice((*byte)(unsafe.Pointer(b.data)), int(b.len))...)
+}
+func id(v [32]C.uint8_t) (out [32]byte) {
+	for i := range out {
+		out[i] = byte(v[i])
+	}
+	return
+}
+func cid(v [32]byte) (out [32]C.uint8_t) {
+	for i := range out {
+		out[i] = C.uint8_t(v[i])
+	}
+	return
+}
+func flag(v bool) C.uint8_t {
+	if v {
+		return 1
+	}
+	return 0
 }
 
-type PublishOptions struct {
-	LogicalKey []byte
-	Priority   Priority
-	TTLMillis  *uint64
-	Tombstone  bool
+type Client struct {
+	ID      []byte
+	Session uint64
 }
 
-type PublishReceipt struct {
-	ItemID            [32]byte
-	Publisher         [32]byte
-	CausalCounter     uint64
-	EventSequence     *uint64
-	EffectivePriority Priority
+func (c Client) native(a *inputs) C.AsterClient {
+	return C.AsterClient{client_id: a.bytes(c.ID), session: C.uint64_t(c.Session)}
 }
 
-// BatchPublicationPolicy selects whether compact retained items also keep a
-// semantic-v1 singleton. The zero value is the offline-safe RetainedDual mode.
-type BatchPublicationPolicy uint32
-
-const (
-	RetainedDual BatchPublicationPolicy = C.ASTER_BATCH_RETAINED_DUAL
-	BatchOnly    BatchPublicationPolicy = C.ASTER_BATCH_ONLY
-)
-
-// BatchPublishItem is one member of a bounded, ordered atomic publication.
-// Every member must use the same class, topic, and scope.
-type BatchPublishItem struct {
-	Class   DataClass
-	Topic   string
-	Scope   string
-	Payload []byte
-	Options PublishOptions
+type Receipt struct {
+	ItemID, BlobID, Publisher                              [32]byte
+	PublisherCounter, Sequence, AcceptanceMarker, TotalLen uint64
+	TTLMS                                                  uint64
+	HasTTL, Inserted, ContentRetired                       bool
 }
 
-// BatchPublishResult preserves request order and reports the aggregate victims
-// of the batch's single post-insert quota pass.
-type BatchPublishResult struct {
-	Items   []PublishReceipt
-	Evicted [][32]byte
-}
-
-type BlobID [32]byte
-
-type BlobOptions struct {
-	Priority  Priority
-	TTLMillis *uint64
-	ChunkSize uint32
-	MediaType string
-	SchemaID  []byte
-}
-
-type BlobFinish struct {
-	BlobID  BlobID
-	Receipt PublishReceipt
-}
-
-type Query struct {
-	Topic              string
-	Scope              string
-	LogicalKey         []byte
-	Class              *DataClass
-	IncludeDescendants bool
-	IncludeRecoverable bool
-	IncludeTombstones  bool
-	Limit              uint64
+func receipt(r C.AsterPublishReceipt) Receipt {
+	return Receipt{id(r.item_id), id(r.blob_id), id(r.publisher), uint64(r.publisher_counter), uint64(r.sequence), uint64(r.acceptance_marker), uint64(r.total_len), uint64(r.ttl_ms), r.has_ttl != 0, r.inserted != 0, r.content_retired != 0}
 }
 
 type Item struct {
-	ItemID        [32]byte
-	Publisher     [32]byte
-	Class         DataClass
-	Priority      Priority
-	CausalCounter uint64
-	EventSequence *uint64
-	Topic         string
-	Scope         string // Compatibility alias for CurrentScope.
-	OriginScope   string
-	CurrentScope  string
-	LogicalKey    []byte
-	Payload       []byte
-	Tombstone     bool
+	ID, BlobID, Publisher                            [32]byte
+	PublisherCounter                                 uint64
+	Class                                            DataClass
+	Priority                                         Priority
+	Disposition                                      uint32
+	EventSequence, AcceptanceMarker, TotalLen, TTLMS uint64
+	HasTTL, Tombstone                                bool
+	Topic, Scope                                     string
+	LogicalKey, Payload                              []byte
+	MediaType                                        string
+	SchemaID                                         []byte
 }
 
-type Conflict struct {
-	LogicalKey  []byte
-	SiblingIDs  [][32]byte
-	MergePolicy *string
-}
-
-type BridgeFilter struct {
-	FromScope       string
-	ToScope         string
-	Topic           string
-	MinimumPriority Priority
-}
-
-// PriorityMask is the explicit set of source-authenticated priorities an
-// authority or local narrowing policy permits.
-type PriorityMask uint8
-
-const (
-	AllowRoutine   PriorityMask = C.ASTER_PRIORITY_MASK_ROUTINE
-	AllowPriority  PriorityMask = C.ASTER_PRIORITY_MASK_PRIORITY
-	AllowImmediate PriorityMask = C.ASTER_PRIORITY_MASK_IMMEDIATE
-	AllowFlash     PriorityMask = C.ASTER_PRIORITY_MASK_FLASH
-	AllowAll       PriorityMask = C.ASTER_PRIORITY_MASK_ALL
-)
-
-type BridgeAuthorizationID [32]byte
-type BridgeRouteHandle [32]byte
-
-type BridgeAuthorizationPolicy struct {
-	Topics            []string
-	AllowedPriorities PriorityMask
-	MaxTotalHops      uint8
-}
-
-type BridgeNarrowingPolicy struct {
-	// Empty Topics retains every topic allowed by the signed authorization.
-	Topics            []string
-	AllowedPriorities PriorityMask
-}
-
-type BridgeAuthorizationResult struct {
-	ID              BridgeAuthorizationID
-	Generation      uint64
-	ControlSequence uint64
-	Enabled         bool
-}
-
-type BridgeCommitStatus uint32
-
-const (
-	BridgeActive            BridgeCommitStatus = C.ASTER_BRIDGE_ACTIVE
-	BridgeRetainedAlternate BridgeCommitStatus = C.ASTER_BRIDGE_RETAINED_ALTERNATE
-	BridgeDuplicateActive   BridgeCommitStatus = C.ASTER_BRIDGE_DUPLICATE_ACTIVE
-	BridgeDuplicateInactive BridgeCommitStatus = C.ASTER_BRIDGE_DUPLICATE_INACTIVE
-)
-
-type BridgeRouteResult struct {
-	Handle            BridgeRouteHandle
-	SourceItem        [32]byte
-	CurrentScope      string
-	CurrentRouteEpoch uint64
-	HopCount          uint8
-	Status            BridgeCommitStatus
-}
-
-type BridgeAuthorizationStatus struct {
-	ID                BridgeAuthorizationID
-	Authority         [32]byte
-	BridgeNode        [32]byte
-	SourceScope       string
-	TargetScope       string
-	Generation        uint64
-	ControlSequence   uint64
-	Applied           bool
-	Current           bool
-	Enabled           bool
-	Usable            bool
-	SourceRouteEpoch  *uint64
-	TargetRouteEpoch  *uint64
-	Topics            []string
-	AllowedPriorities PriorityMask
-	MaxTotalHops      *uint8
-}
-
-type BridgeRouteStatus struct {
-	Handle            BridgeRouteHandle
-	SourceItem        [32]byte
-	OriginScope       string
-	OriginRouteEpoch  uint64
-	CurrentScope      string
-	CurrentRouteEpoch uint64
-	Topic             string
-	Priority          Priority
-	HopCount          uint8
-	Active            bool
-	Live              bool
-}
-
-// RekeyAccess is an explicit fresh-epoch recipient mode. Zero is invalid.
-type RekeyAccess uint32
-
-const (
-	RekeyRouteOnly  RekeyAccess = C.ASTER_REKEY_ROUTE_ONLY
-	RekeyReadTopics RekeyAccess = C.ASTER_REKEY_READ_TOPICS
-)
-
-// RekeyRecipient contains only a node identity and high-level access choice.
-// It never contains keys, provider state, or serialized control objects.
-type RekeyRecipient struct {
-	NodeID [32]byte
-	Access RekeyAccess
-	Topics []string
-}
-
-func RouteOnlyRecipient(nodeID [32]byte) RekeyRecipient {
-	return RekeyRecipient{NodeID: nodeID, Access: RekeyRouteOnly}
-}
-
-func ReadTopicsRecipient(nodeID [32]byte, topics ...string) RekeyRecipient {
-	return RekeyRecipient{NodeID: nodeID, Access: RekeyReadTopics, Topics: append([]string(nil), topics...)}
-}
-
-type ScopeRekeyReceipt struct {
-	Epoch              uint64
-	RegistryGeneration uint64
-	RecipientCount     uint64
-	ControlSequence    uint64
-}
-
-type PeerState uint32
-type SyncState uint32
-
-const (
-	PeerOffline        PeerState = C.ASTER_PEER_OFFLINE
-	PeerAuthenticating PeerState = C.ASTER_PEER_AUTHENTICATING
-	PeerReady          PeerState = C.ASTER_PEER_READY
-	PeerRejected       PeerState = C.ASTER_PEER_REJECTED
-	PeerRevoked        PeerState = C.ASTER_PEER_REVOKED
-	SyncIdle           SyncState = C.ASTER_SYNC_IDLE
-	SyncReconciling    SyncState = C.ASTER_SYNC_RECONCILING
-	SyncTransferring   SyncState = C.ASTER_SYNC_TRANSFERRING
-	SyncConverged      SyncState = C.ASTER_SYNC_CONVERGED
-	SyncSuspended      SyncState = C.ASTER_SYNC_SUSPENDED
-)
-
-type PeerSnapshot struct {
-	Peer             [32]byte
-	PeerState        PeerState
-	SyncState        SyncState
-	LastChangeMillis *uint64
-	Detail           *string
+func item(r C.AsterItem) Item {
+	return Item{id(r.id), id(r.blob_id), id(r.publisher), uint64(r.publisher_counter), DataClass(r.data_class), Priority(r.priority), uint32(r.disposition), uint64(r.event_sequence), uint64(r.acceptance_marker), uint64(r.total_len), uint64(r.ttl_ms), r.has_ttl != 0, r.tombstone != 0, string(copyBuffer(r.topic)), string(copyBuffer(r.scope)), copyBuffer(r.logical_key), copyBuffer(r.payload), string(copyBuffer(r.media_type)), copyBuffer(r.schema_id)}
 }
 
 type Delivery struct {
-	Subscription uint64
-	Attempt      uint64
-	Item         Item
+	Items                []Item
+	ID                   [32]byte
+	Attempt              uint64
+	Token                []byte
+	Siblings             [][32]byte
+	Topic, Scope         string
+	LogicalKey           []byte
+	HasGuard, Retirement bool
+	RetirementReason     uint32
+	RetirementGeneration uint64
+}
+type Node struct {
+	mu     sync.Mutex
+	handle C.uint64_t
+}
+type Options struct {
+	MaxItems, MaxBytes, MaxBlobBytes, MaxBlobChunks, MaxBlobVariants uint64
+	Emission                                                         EmissionThreshold
+}
+
+func Open(statePath, provisioningPath string) (*Node, error) {
+	return OpenWithOptions(statePath, provisioningPath, Options{})
+}
+func OpenWithOptions(statePath, provisioningPath string, o Options) (*Node, error) {
+	if ABIVersion() != 2 {
+		return nil, errors.New("Aster ABI v2 required")
+	}
+	var a inputs
+	defer func() { a.free() }()
+	var r C.AsterNodeOptions
+	if err := call(func() C.uint32_t { return C.aster_node_options_init(&r) }); err != nil {
+		return nil, err
+	}
+	r.state_path = a.text(statePath)
+	r.provisioning_path = a.text(provisioningPath)
+	if o.MaxItems != 0 {
+		r.max_items = C.uint64_t(o.MaxItems)
+	}
+	if o.MaxBytes != 0 {
+		r.max_bytes = C.uint64_t(o.MaxBytes)
+	}
+	if o.MaxBlobBytes != 0 {
+		r.max_blob_bytes = C.uint64_t(o.MaxBlobBytes)
+	}
+	if o.MaxBlobChunks != 0 {
+		r.max_blob_chunks = C.uint64_t(o.MaxBlobChunks)
+	}
+	if o.MaxBlobVariants != 0 {
+		r.max_blob_variants = C.uint64_t(o.MaxBlobVariants)
+	}
+	r.emission_threshold = C.uint32_t(o.Emission)
+	n := &Node{}
+	if err := call(func() C.uint32_t { return C.aster_node_open(&r, &n.handle) }); err != nil {
+		return nil, err
+	}
+	runtime.SetFinalizer(n, func(n *Node) { _ = n.Close() })
+	return n, nil
+}
+func (n *Node) Close() error {
+	runtime.SetFinalizer(n, nil)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return call(func() C.uint32_t { return C.aster_node_close(&n.handle) })
+}
+
+// Zeroize terminalizes this state and destroys its selected provisioning artifact.
+func (n *Node) Zeroize() error {
+	runtime.SetFinalizer(n, nil)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return call(func() C.uint32_t { return C.aster_node_zeroize(&n.handle) })
+}
+
+type Recovery struct {
+	Client                             Client
+	AllocatedThrough, SnapshotRevision uint64
+	Outstanding                        []Receipt
+}
+
+func (n *Node) BeginRecovery(clientID []byte, expectedSession uint64, claimNonce []byte) (Recovery, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var a inputs
+	defer func() { a.free() }()
+	r := C.AsterRecoveryRequest{abi_version: 2, struct_size: C.sizeof_AsterRecoveryRequest, client: Client{clientID, expectedSession}.native(&a), claim_nonce: a.bytes(claimNonce)}
+	out := C.AsterRecovery{abi_version: 2, struct_size: C.sizeof_AsterRecovery}
+	if err := call(func() C.uint32_t { return C.aster_node_begin_recovery(n.handle, &r, &out) }); err != nil {
+		return Recovery{}, err
+	}
+	defer C.aster_result_close(n.handle, &out.results)
+	result := Recovery{Client: Client{append([]byte(nil), clientID...), uint64(out.session)}, AllocatedThrough: uint64(out.allocated_through), SnapshotRevision: uint64(out.snapshot_revision)}
+	info := C.AsterResultInfo{abi_version: 2, struct_size: C.sizeof_AsterResultInfo}
+	if err := call(func() C.uint32_t { return C.aster_result_info(n.handle, out.results, &info) }); err != nil {
+		return Recovery{}, err
+	}
+	for i := C.uint64_t(0); i < info.len; i++ {
+		r := C.AsterPublishReceipt{abi_version: 2, struct_size: C.sizeof_AsterPublishReceipt}
+		if err := call(func() C.uint32_t { return C.aster_result_receipt(n.handle, out.results, i, &r) }); err != nil {
+			return Recovery{}, err
+		}
+		result.Outstanding = append(result.Outstanding, receipt(r))
+	}
+	return result, nil
+}
+func (n *Node) CompleteRecovery(c Client, revision uint64) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var a inputs
+	defer func() { a.free() }()
+	r := C.AsterCompleteRecoveryRequest{abi_version: 2, struct_size: C.sizeof_AsterCompleteRecoveryRequest, client: c.native(&a), snapshot_revision: C.uint64_t(revision)}
+	return call(func() C.uint32_t { return C.aster_node_complete_recovery(n.handle, &r) })
+}
+func (n *Node) eventResult(c Client, seq uint64, abandon bool) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var a inputs
+	defer func() { a.free() }()
+	r := C.AsterEventResultRequest{abi_version: 2, struct_size: C.sizeof_AsterEventResultRequest, client: c.native(&a), sequence: C.uint64_t(seq)}
+	return call(func() C.uint32_t {
+		if abandon {
+			return C.aster_node_abandon_publication(n.handle, &r)
+		}
+		return C.aster_node_acknowledge_publication(n.handle, &r)
+	})
+}
+func (n *Node) AcknowledgePublication(c Client, seq uint64) error {
+	return n.eventResult(c, seq, false)
+}
+func (n *Node) AbandonPublication(c Client, seq uint64) error { return n.eventResult(c, seq, true) }
+
+type PublishRequest struct {
+	Class               DataClass
+	Priority            Priority
+	OperationKey        []byte
+	Client              Client
+	Sequence            uint64
+	Topic, Scope        string
+	LogicalKey, Payload []byte
+	Predecessor         *[32]byte
+	TTLMS               *uint64
+	Tombstone           bool
+}
+
+func (n *Node) Publish(p PublishRequest) (Receipt, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var a inputs
+	defer func() { a.free() }()
+	r := C.AsterPublishRequest{abi_version: 2, struct_size: C.sizeof_AsterPublishRequest, data_class: C.uint32_t(p.Class), priority: C.uint32_t(p.Priority), operation_key: a.bytes(p.OperationKey), client: p.Client.native(&a), sequence: C.uint64_t(p.Sequence), topic: a.text(p.Topic), scope: a.text(p.Scope), logical_key: a.bytes(p.LogicalKey), payload: a.bytes(p.Payload), tombstone: flag(p.Tombstone)}
+	if p.TTLMS != nil {
+		r.has_ttl = 1
+		r.ttl_ms = C.uint64_t(*p.TTLMS)
+	}
+	if p.Predecessor != nil {
+		r.has_predecessor = 1
+		r.predecessor = cid(*p.Predecessor)
+	}
+	out := C.AsterPublishReceipt{abi_version: 2, struct_size: C.sizeof_AsterPublishReceipt}
+	err := call(func() C.uint32_t { return C.aster_node_publish(n.handle, &r, &out) })
+	return receipt(out), err
+}
+
+type Query struct {
+	Class                                  DataClass
+	Topic, Scope                           string
+	LogicalKey                             []byte
+	IncludeDescendants, IncludeRecoverable bool
+	After, Before, Limit                   uint64
+}
+type Result struct {
+	node           *Node
+	handle         C.uint64_t
+	Entries        []Delivery
+	Items          []Item
+	ScannedThrough uint64
+	HasMore        bool
+}
+
+// loadResult runs while the owning node lock is held. It frees every temporary
+// native buffer, including partial reads, before returning caller-owned copies.
+func (n *Node) loadResult(h C.uint64_t) (_ *Result, err error) {
+	result := &Result{node: n, handle: h}
+	defer func() {
+		if err != nil {
+			C.aster_result_close(n.handle, &result.handle)
+		}
+	}()
+	info := C.AsterResultInfo{abi_version: 2, struct_size: C.sizeof_AsterResultInfo}
+	if err = call(func() C.uint32_t { return C.aster_result_info(n.handle, h, &info) }); err != nil {
+		return nil, err
+	}
+	result.ScannedThrough = uint64(info.scanned_through)
+	result.HasMore = info.has_more != 0
+	for i := C.uint64_t(0); i < info.len; i++ {
+		e := C.AsterEntry{abi_version: 2, struct_size: C.sizeof_AsterEntry}
+		if err = call(func() C.uint32_t { return C.aster_result_entry(n.handle, h, i, &e) }); err != nil {
+			return nil, err
+		}
+		d := Delivery{ID: id(e.id), Attempt: uint64(e.attempt), Token: copyBuffer(e.token), Topic: string(copyBuffer(e.topic)), Scope: string(copyBuffer(e.scope)), LogicalKey: copyBuffer(e.logical_key), HasGuard: e.has_guard != 0, Retirement: e.kind != 0, RetirementReason: uint32(e.retirement_reason), RetirementGeneration: uint64(e.retirement_generation)}
+		siblings := copyBuffer(e.sibling_ids)
+		for j := 0; j < len(siblings); j += 32 {
+			var v [32]byte
+			copy(v[:], siblings[j:j+32])
+			d.Siblings = append(d.Siblings, v)
+		}
+		count := e.item_count
+		C.aster_entry_free(&e)
+		for j := C.uint64_t(0); j < count; j++ {
+			v := C.AsterItem{abi_version: 2, struct_size: C.sizeof_AsterItem}
+			if err = call(func() C.uint32_t { return C.aster_result_item(n.handle, h, i, j, &v) }); err != nil {
+				return nil, err
+			}
+			copied := item(v)
+			C.aster_item_free(&v)
+			d.Items = append(d.Items, copied)
+			result.Items = append(result.Items, copied)
+		}
+		result.Entries = append(result.Entries, d)
+	}
+	runtime.SetFinalizer(result, func(r *Result) { _ = r.Close() })
+	return result, nil
+}
+func (r *Result) Close() error {
+	runtime.SetFinalizer(r, nil)
+	r.node.mu.Lock()
+	defer r.node.mu.Unlock()
+	err := call(func() C.uint32_t { return C.aster_result_close(r.node.handle, &r.handle) })
+	if isClosed(err) {
+		return nil
+	}
+	return err
+}
+func (n *Node) Query(q Query) (*Result, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var a inputs
+	defer func() { a.free() }()
+	limit := q.Limit
+	if q.Class == Event && limit == 0 {
+		limit = 128
+	}
+	r := C.AsterQueryRequest{abi_version: 2, struct_size: C.sizeof_AsterQueryRequest, data_class: C.uint32_t(q.Class), topic: a.text(q.Topic), scope: a.text(q.Scope), logical_key: a.bytes(q.LogicalKey), include_descendant_scopes: flag(q.IncludeDescendants), include_recoverable_versions: flag(q.IncludeRecoverable), after_acceptance_marker: C.uint64_t(q.After), before_acceptance_marker: C.uint64_t(q.Before), limit: C.uint64_t(limit)}
+	var h C.uint64_t
+	if err := call(func() C.uint32_t { return C.aster_node_query(n.handle, &r, &h) }); err != nil {
+		return nil, err
+	}
+	return n.loadResult(h)
+}
+func (n *Node) Conflicts(q Query) (*Result, error) { q.Class = Record; return n.Query(q) }
+func (n *Node) Resolve(guard *Result, entry uint64, operationKey, payload []byte, priority Priority, tombstone bool) (Receipt, error) {
+	defer runtime.KeepAlive(guard)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if guard == nil || guard.node != n {
+		return Receipt{}, errors.New("foreign resolution guard")
+	}
+	var a inputs
+	defer func() { a.free() }()
+	r := C.AsterResolveRequest{abi_version: 2, struct_size: C.sizeof_AsterResolveRequest, guard: guard.handle, entry: C.uint64_t(entry), operation_key: a.bytes(operationKey), payload: a.bytes(payload), priority: C.uint32_t(priority), tombstone: flag(tombstone)}
+	out := C.AsterPublishReceipt{abi_version: 2, struct_size: C.sizeof_AsterPublishReceipt}
+	err := call(func() C.uint32_t { return C.aster_node_resolve(n.handle, &r, &out) })
+	return receipt(out), err
 }
 
 type Subscription struct {
-	node *Node
-	ID   uint64
+	node   *Node
+	ID     [32]byte
+	Class  DataClass
+	Client Client
 }
 
-type Node struct {
-	mu     sync.Mutex
-	handle C.aster_node_t
+func (s *Subscription) native() C.AsterSubscription {
+	return C.AsterSubscription{id: cid(s.ID), data_class: C.uint32_t(s.Class)}
+}
+func (n *Node) Subscribe(class DataClass, topic, scope string, operationKey []byte, client Client, descendants bool) (*Subscription, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var a inputs
+	defer func() { a.free() }()
+	r := C.AsterSubscribeRequest{abi_version: 2, struct_size: C.sizeof_AsterSubscribeRequest, data_class: C.uint32_t(class), topic: a.text(topic), scope: a.text(scope), operation_key: a.bytes(operationKey), client: client.native(&a), include_descendant_scopes: flag(descendants)}
+	var out C.AsterSubscription
+	if err := call(func() C.uint32_t { return C.aster_node_subscribe(n.handle, &r, &out) }); err != nil {
+		return nil, err
+	}
+	return n.RestoreSubscription(class, id(out.id), client), nil
+}
+func (n *Node) RestoreSubscription(class DataClass, id [32]byte, c Client) *Subscription {
+	c.ID = append([]byte(nil), c.ID...)
+	return &Subscription{n, id, class, c}
+}
+func (s *Subscription) Poll(deliveryLimit, scanLimit uint64) (*Result, error) {
+	n := s.node
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var a inputs
+	defer func() { a.free() }()
+	r := C.AsterPollRequest{abi_version: 2, struct_size: C.sizeof_AsterPollRequest, subscription: s.native(), client: s.Client.native(&a), delivery_limit: C.uint64_t(deliveryLimit), scan_limit: C.uint64_t(scanLimit)}
+	var h C.uint64_t
+	if err := call(func() C.uint32_t { return C.aster_node_poll(n.handle, &r, &h) }); err != nil {
+		return nil, err
+	}
+	return n.loadResult(h)
+}
+func (s *Subscription) Acknowledge(d Delivery) error {
+	n := s.node
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var a inputs
+	defer func() { a.free() }()
+	r := C.AsterAckRequest{abi_version: 2, struct_size: C.sizeof_AsterAckRequest, subscription: s.native(), client: s.Client.native(&a), id: cid(d.ID), token: a.bytes(d.Token)}
+	return call(func() C.uint32_t { return C.aster_node_acknowledge(n.handle, &r) })
+}
+func (s *Subscription) Unsubscribe() error {
+	n := s.node
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var a inputs
+	defer func() { a.free() }()
+	r := C.AsterUnsubscribeRequest{abi_version: 2, struct_size: C.sizeof_AsterUnsubscribeRequest, subscription: s.native(), client: s.Client.native(&a)}
+	return call(func() C.uint32_t { return C.aster_node_unsubscribe(n.handle, &r) })
+}
+func (n *Node) SetEmission(v EmissionThreshold) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return call(func() C.uint32_t { return C.aster_node_set_emission(n.handle, C.uint32_t(v)) })
+}
+func (n *Node) Emission() (EmissionThreshold, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var out C.uint32_t
+	err := call(func() C.uint32_t { return C.aster_node_get_emission(n.handle, &out) })
+	return EmissionThreshold(out), err
 }
 
-// BridgeEnrollment is a process-local move-only capability. EnableBridge
-// consumes it once native authority processing starts, including error paths.
-type BridgeEnrollment struct {
-	mu     sync.Mutex
-	handle C.aster_bridge_enrollment_t
+type DeliveryStatus struct{ Subscriptions, PendingDeliveries, AcknowledgedDeliveries, DeliveryCursors, SelectorGeneration uint64 }
+
+func (n *Node) DeliveryStatus(class DataClass) (DeliveryStatus, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	out := C.AsterDeliveryStatus{abi_version: 2, struct_size: C.sizeof_AsterDeliveryStatus}
+	err := call(func() C.uint32_t { return C.aster_node_delivery_status(n.handle, C.uint32_t(class), &out) })
+	return DeliveryStatus{uint64(out.subscriptions), uint64(out.pending_deliveries), uint64(out.acknowledged_deliveries), uint64(out.delivery_cursors), uint64(out.selector_generation)}, err
 }
 
-// BlobWriter is a bounded, two-pass streaming writer. Finish durably finalizes
-// encrypted chunks and idempotently publishes their authenticated manifest.
+type Peer struct {
+	ID                         [32]byte
+	Contacts                   uint64
+	Authorization, LastContact uint32
+}
+
+func peer(p C.AsterPeerSnapshot) Peer {
+	return Peer{id(p.peer), uint64(p.contacts), uint32(p.authorization), uint32(p.last_contact)}
+}
+func (n *Node) Peers() ([]Peer, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var h C.uint64_t
+	if err := call(func() C.uint32_t { return C.aster_node_peers(n.handle, &h) }); err != nil {
+		return nil, err
+	}
+	defer C.aster_result_close(n.handle, &h)
+	info := C.AsterResultInfo{abi_version: 2, struct_size: C.sizeof_AsterResultInfo}
+	if err := call(func() C.uint32_t { return C.aster_result_info(n.handle, h, &info) }); err != nil {
+		return nil, err
+	}
+	var peers []Peer
+	for i := C.uint64_t(0); i < info.len; i++ {
+		out := C.AsterPeerSnapshot{abi_version: 2, struct_size: C.sizeof_AsterPeerSnapshot}
+		if err := call(func() C.uint32_t { return C.aster_result_peer(n.handle, h, i, &out) }); err != nil {
+			return nil, err
+		}
+		peers = append(peers, peer(out))
+	}
+	return peers, nil
+}
+func (n *Node) PeerStatus(id [32]byte) (Peer, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	r := C.AsterPeerRequest{abi_version: 2, struct_size: C.sizeof_AsterPeerRequest, peer: cid(id)}
+	out := C.AsterPeerSnapshot{abi_version: 2, struct_size: C.sizeof_AsterPeerSnapshot}
+	err := call(func() C.uint32_t { return C.aster_node_peer_status(n.handle, &r, &out) })
+	return peer(out), err
+}
+
+type RekeyRecipient struct {
+	NodeID [32]byte
+	Topics []string
+}
+type ControlReceipt struct {
+	TransferID          [32]byte
+	Sequence, Activated uint64
+	Emitted             bool
+}
+
+func (n *Node) RekeyScope(registry []byte, generation uint64, scope string, epoch uint64, recipients []RekeyRecipient) (ControlReceipt, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var a inputs
+	defer func() { a.free() }()
+	if len(recipients) > 128 {
+		return ControlReceipt{}, errors.New("too many rekey recipients")
+	}
+	p := C.calloc(C.size_t(len(recipients)), C.sizeof_AsterRekeyRecipient)
+	if p == nil && len(recipients) > 0 {
+		return ControlReceipt{}, errors.New("allocation failed")
+	}
+	a = append(a, p)
+	native := unsafe.Slice((*C.AsterRekeyRecipient)(p), len(recipients))
+	for i, r := range recipients {
+		if len(r.Topics) > 256 {
+			return ControlReceipt{}, errors.New("too many rekey topics")
+		}
+		topics := C.calloc(C.size_t(len(r.Topics)), C.sizeof_AsterBytes)
+		if topics == nil && len(r.Topics) > 0 {
+			return ControlReceipt{}, errors.New("allocation failed")
+		}
+		a = append(a, topics)
+		values := unsafe.Slice((*C.AsterBytes)(topics), len(r.Topics))
+		for j, t := range r.Topics {
+			values[j] = a.text(t)
+		}
+		native[i] = C.AsterRekeyRecipient{node_id: cid(r.NodeID), topics: (*C.AsterBytes)(topics), topic_count: C.size_t(len(r.Topics))}
+	}
+	r := C.AsterRekeyRequest{abi_version: 2, struct_size: C.sizeof_AsterRekeyRequest, signed_public_registry: a.bytes(registry), minimum_registry_generation: C.uint64_t(generation), scope: a.text(scope), epoch: C.uint64_t(epoch), recipients: (*C.AsterRekeyRecipient)(p), recipient_count: C.size_t(len(recipients))}
+	out := C.AsterControlReceipt{abi_version: 2, struct_size: C.sizeof_AsterControlReceipt}
+	err := call(func() C.uint32_t { return C.aster_node_rekey_scope(n.handle, &r, &out) })
+	return ControlReceipt{id(out.transfer_id), uint64(out.sequence), uint64(out.activated), out.emitted != 0}, err
+}
+
+type BlobOptions struct {
+	OperationKey []byte
+	TotalLen     uint64
+	Priority     Priority
+	TTLMS        *uint64
+	MediaType    string
+	SchemaID     []byte
+}
 type BlobWriter struct {
-	mu     sync.Mutex
 	node   *Node
-	handle C.aster_blob_writer_t
+	handle C.uint64_t
+	offset uint64
 }
 
-// BlobReader incrementally authenticates and returns Blob plaintext.
-type BlobReader struct {
-	mu     sync.Mutex
-	node   *Node
-	handle C.aster_blob_reader_t
-}
-
-func nativeBytes(value []byte) (C.aster_bytes_t, unsafe.Pointer) {
-	if len(value) == 0 {
-		return C.aster_bytes_t{}, nil
+func (n *Node) NewBlobWriter(topic, scope string, o BlobOptions) (*BlobWriter, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	var a inputs
+	defer func() { a.free() }()
+	r := C.AsterBlobPublishOptions{abi_version: 2, struct_size: C.sizeof_AsterBlobPublishOptions, operation_key: a.bytes(o.OperationKey), topic: a.text(topic), scope: a.text(scope), media_type: a.text(o.MediaType), schema_id: a.bytes(o.SchemaID), priority: C.uint32_t(o.Priority), total_len: C.uint64_t(o.TotalLen)}
+	if o.TTLMS != nil {
+		r.has_ttl = 1
+		r.ttl_ms = C.uint64_t(*o.TTLMS)
 	}
-	pointer := C.CBytes(value)
-	return C.aster_bytes_t{data: (*C.uint8_t)(pointer), len: C.size_t(len(value))}, pointer
-}
-
-func nativeString(value string) (C.aster_bytes_t, unsafe.Pointer) {
-	return nativeBytes([]byte(value))
-}
-
-func freePointers(values ...unsafe.Pointer) {
-	for _, value := range values {
-		if value != nil {
-			C.free(value)
-		}
-	}
-}
-
-func ownedBytes(value C.aster_owned_buffer_t) []byte {
-	if value.len == 0 {
-		return []byte{}
-	}
-	return C.GoBytes(unsafe.Pointer(value.data), C.int(value.len))
-}
-
-func lastError() string {
-	output := C.aster_owned_buffer_t{
-		abi_version: C.ASTER_ABI_VERSION,
-		struct_size: C.uint32_t(C.sizeof_aster_owned_buffer_t),
-	}
-	if C.aster_last_error(&output) != C.ASTER_OK {
-		return "native error (diagnostic unavailable)"
-	}
-	detail := string(ownedBytes(output))
-	C.aster_buffer_free(&output)
-	return detail
-}
-
-func check(status C.aster_status_t) error {
-	if status == C.ASTER_OK {
-		return nil
-	}
-	return &Error{Status: uint32(status), Detail: lastError()}
-}
-
-func Open(storePath string, provisioningBundle []byte) (*Node, error) {
-	var options C.aster_node_options_t
-	if err := check(C.aster_node_options_init(&options)); err != nil {
+	out := C.AsterBlobWriterInfo{abi_version: 2, struct_size: C.sizeof_AsterBlobWriterInfo}
+	if err := call(func() C.uint32_t { return C.aster_node_blob_writer_open(n.handle, &r, &out) }); err != nil {
 		return nil, err
 	}
-	path, pathPointer := nativeString(storePath)
-	bundle, bundlePointer := nativeBytes(provisioningBundle)
-	defer freePointers(pathPointer, bundlePointer)
-	options.store_path = path
-	options.provisioning_bundle = bundle
-	node := &Node{}
-	if err := check(C.aster_node_open(&options, &node.handle)); err != nil {
-		return nil, err
-	}
-	runtime.SetFinalizer(node, func(value *Node) { _ = value.Close() })
-	return node, nil
-}
-
-func (n *Node) active() error {
-	if n.handle.value == 0 {
-		return &Error{Status: C.ASTER_CLOSED, Detail: "node is closed"}
-	}
-	return nil
-}
-
-func (n *Node) Close() error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if n.handle.value == 0 {
-		return nil
-	}
-	runtime.SetFinalizer(n, nil)
-	return check(C.aster_node_close(&n.handle))
-}
-
-func (n *Node) Zeroize() error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return err
-	}
-	runtime.SetFinalizer(n, nil)
-	return check(C.aster_node_zeroize(&n.handle))
-}
-
-func receipt(value C.aster_publish_receipt_t) PublishReceipt {
-	result := PublishReceipt{
-		CausalCounter:     uint64(value.causal_counter),
-		EffectivePriority: Priority(value.effective_priority),
-	}
-	for index := range 32 {
-		result.ItemID[index] = byte(value.item_id[index])
-		result.Publisher[index] = byte(value.publisher[index])
-	}
-	if value.has_event_sequence != 0 {
-		sequence := uint64(value.event_sequence)
-		result.EventSequence = &sequence
-	}
-	return result
-}
-
-func (n *Node) Publish(class DataClass, topic, scope string, payload []byte, options PublishOptions) (PublishReceipt, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return PublishReceipt{}, err
-	}
-	topicValue, topicPointer := nativeString(topic)
-	scopeValue, scopePointer := nativeString(scope)
-	keyValue, keyPointer := nativeBytes(options.LogicalKey)
-	payloadValue, payloadPointer := nativeBytes(payload)
-	defer freePointers(topicPointer, scopePointer, keyPointer, payloadPointer)
-	request := C.aster_publish_request_t{
-		abi_version: C.ASTER_ABI_VERSION,
-		struct_size: C.uint32_t(C.sizeof_aster_publish_request_t),
-		data_class:  C.aster_data_class_t(class),
-		priority:    C.aster_priority_t(options.Priority),
-		topic:       topicValue, scope: scopeValue, logical_key: keyValue, payload: payloadValue,
-	}
-	if options.TTLMillis != nil {
-		request.has_ttl = 1
-		request.ttl_ms = C.uint64_t(*options.TTLMillis)
-	}
-	if options.Tombstone {
-		request.tombstone = 1
-	}
-	output := C.aster_publish_receipt_t{
-		abi_version: C.ASTER_ABI_VERSION,
-		struct_size: C.uint32_t(C.sizeof_aster_publish_receipt_t),
-	}
-	if err := check(C.aster_node_publish(n.handle, &request, &output)); err != nil {
-		return PublishReceipt{}, err
-	}
-	return receipt(output), nil
-}
-
-// PublishBatch atomically commits 2-64 ordered non-Blob items. A rejected call
-// commits no member and consumes no publisher counter or event sequence.
-func (n *Node) PublishBatch(items []BatchPublishItem, policy BatchPublicationPolicy) (BatchPublishResult, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return BatchPublishResult{}, err
-	}
-	if len(items) < 2 || len(items) > 64 {
-		return BatchPublishResult{}, fmt.Errorf("batch must contain between 2 and 64 items")
-	}
-	if policy != RetainedDual && policy != BatchOnly {
-		return BatchPublishResult{}, fmt.Errorf("unknown batch publication policy %d", policy)
-	}
-
-	memory := C.calloc(C.size_t(len(items)), C.size_t(C.sizeof_aster_publish_request_t))
-	if memory == nil {
-		return BatchPublishResult{}, fmt.Errorf("allocate native batch items")
-	}
-	defer C.free(memory)
-	nativeItems := unsafe.Slice((*C.aster_publish_request_t)(memory), len(items))
-	allocations := make([]unsafe.Pointer, 0, len(items)*4)
-	defer func() { freePointers(allocations...) }()
-	for index, item := range items {
-		topic, topicAllocation := nativeString(item.Topic)
-		scope, scopeAllocation := nativeString(item.Scope)
-		key, keyAllocation := nativeBytes(item.Options.LogicalKey)
-		payload, payloadAllocation := nativeBytes(item.Payload)
-		allocations = append(allocations, topicAllocation, scopeAllocation, keyAllocation, payloadAllocation)
-		native := &nativeItems[index]
-		native.abi_version = C.ASTER_ABI_VERSION
-		native.struct_size = C.uint32_t(C.sizeof_aster_publish_request_t)
-		native.data_class = C.aster_data_class_t(item.Class)
-		native.priority = C.aster_priority_t(item.Options.Priority)
-		native.topic = topic
-		native.scope = scope
-		native.logical_key = key
-		native.payload = payload
-		if item.Options.TTLMillis != nil {
-			native.has_ttl = 1
-			native.ttl_ms = C.uint64_t(*item.Options.TTLMillis)
-		}
-		if item.Options.Tombstone {
-			native.tombstone = 1
-		}
-	}
-
-	request := C.aster_publish_batch_request_t{
-		abi_version: C.ASTER_ABI_VERSION,
-		struct_size: C.uint32_t(C.sizeof_aster_publish_batch_request_t),
-		items:       (*C.aster_publish_request_t)(memory),
-		item_count:  C.size_t(len(items)),
-		policy:      C.aster_batch_policy_t(policy),
-	}
-	var nativeResult C.aster_batch_result_t
-	if err := check(C.aster_node_publish_batch(n.handle, &request, &nativeResult)); err != nil {
-		return BatchPublishResult{}, err
-	}
-	return readBatchResult(nativeResult)
-}
-
-func readBatchResult(nativeResult C.aster_batch_result_t) (BatchPublishResult, error) {
-	defer C.aster_batch_result_close(&nativeResult)
-
-	var itemCount C.size_t
-	if err := check(C.aster_batch_result_len(nativeResult, &itemCount)); err != nil {
-		return BatchPublishResult{}, err
-	}
-	result := BatchPublishResult{Items: make([]PublishReceipt, 0, int(itemCount))}
-	for index := C.size_t(0); index < itemCount; index++ {
-		output := C.aster_publish_receipt_t{
-			abi_version: C.ASTER_ABI_VERSION,
-			struct_size: C.uint32_t(C.sizeof_aster_publish_receipt_t),
-		}
-		if err := check(C.aster_batch_result_get(nativeResult, index, &output)); err != nil {
-			return BatchPublishResult{}, err
-		}
-		result.Items = append(result.Items, receipt(output))
-	}
-
-	var evictionCount C.size_t
-	if err := check(C.aster_batch_result_evicted_len(nativeResult, &evictionCount)); err != nil {
-		return BatchPublishResult{}, err
-	}
-	result.Evicted = make([][32]byte, 0, int(evictionCount))
-	for index := C.size_t(0); index < evictionCount; index++ {
-		output := C.aster_item_id_t{
-			abi_version: C.ASTER_ABI_VERSION,
-			struct_size: C.uint32_t(C.sizeof_aster_item_id_t),
-		}
-		if err := check(C.aster_batch_result_evicted_get(nativeResult, index, &output)); err != nil {
-			return BatchPublishResult{}, err
-		}
-		var itemID [32]byte
-		for byteIndex := range itemID {
-			itemID[byteIndex] = byte(output.bytes[byteIndex])
-		}
-		result.Evicted = append(result.Evicted, itemID)
-	}
-	return result, nil
-}
-
-// RekeyScope durably publishes a fresh authority-managed scope epoch. Registry
-// and nested topic memory are copied into C-owned call buffers and released as
-// soon as the synchronous native call returns.
-func (n *Node) RekeyScope(signedPublicRegistry []byte, minimumRegistryGeneration uint64,
-	scope string, newEpoch uint64, recipients []RekeyRecipient) (ScopeRekeyReceipt, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return ScopeRekeyReceipt{}, err
-	}
-	if len(signedPublicRegistry) == 0 || len(signedPublicRegistry) > 16*1024*1024 {
-		return ScopeRekeyReceipt{}, fmt.Errorf("signed public registry must be between 1 byte and 16 MiB")
-	}
-	if len(scope) == 0 || len([]byte(scope)) > 128 {
-		return ScopeRekeyReceipt{}, fmt.Errorf("scope must be between 1 and 128 UTF-8 bytes")
-	}
-	if newEpoch == 0 {
-		return ScopeRekeyReceipt{}, fmt.Errorf("new epoch must be nonzero")
-	}
-	if len(recipients) == 0 || len(recipients) > 128 {
-		return ScopeRekeyReceipt{}, fmt.Errorf("rekey recipients must contain between 1 and 128 entries")
-	}
-
-	recipientMemory := C.calloc(C.size_t(len(recipients)), C.size_t(C.sizeof_aster_rekey_recipient_t))
-	if recipientMemory == nil {
-		return ScopeRekeyReceipt{}, fmt.Errorf("allocate native rekey recipients")
-	}
-	defer C.free(recipientMemory)
-	nativeRecipients := unsafe.Slice((*C.aster_rekey_recipient_t)(recipientMemory), len(recipients))
-	var nestedAllocations []unsafe.Pointer
-	defer func() { freePointers(nestedAllocations...) }()
-
-	for recipientIndex, recipient := range recipients {
-		if recipient.Access == RekeyRouteOnly && len(recipient.Topics) != 0 {
-			return ScopeRekeyReceipt{}, fmt.Errorf("recipients[%d] route-only access must not include topics", recipientIndex)
-		}
-		if recipient.Access == RekeyReadTopics && (len(recipient.Topics) == 0 || len(recipient.Topics) > 128) {
-			return ScopeRekeyReceipt{}, fmt.Errorf("recipients[%d] read-topics access requires 1 to 128 topics", recipientIndex)
-		}
-		if recipient.Access != RekeyRouteOnly && recipient.Access != RekeyReadTopics {
-			return ScopeRekeyReceipt{}, fmt.Errorf("recipients[%d] has an unknown access mode", recipientIndex)
-		}
-
-		native := &nativeRecipients[recipientIndex]
-		native.abi_version = C.ASTER_ABI_VERSION
-		native.struct_size = C.uint32_t(C.sizeof_aster_rekey_recipient_t)
-		native.access = C.aster_rekey_access_t(recipient.Access)
-		for index := range 32 {
-			native.node_id[index] = C.uint8_t(recipient.NodeID[index])
-		}
-		if len(recipient.Topics) == 0 {
-			continue
-		}
-		topicMemory := C.calloc(C.size_t(len(recipient.Topics)), C.size_t(C.sizeof_aster_bytes_t))
-		if topicMemory == nil {
-			return ScopeRekeyReceipt{}, fmt.Errorf("allocate native topics for recipients[%d]", recipientIndex)
-		}
-		nestedAllocations = append(nestedAllocations, topicMemory)
-		nativeTopics := unsafe.Slice((*C.aster_bytes_t)(topicMemory), len(recipient.Topics))
-		for topicIndex, topic := range recipient.Topics {
-			if len(topic) == 0 || len([]byte(topic)) > 128 {
-				return ScopeRekeyReceipt{}, fmt.Errorf("recipients[%d].topics[%d] must be between 1 and 128 UTF-8 bytes", recipientIndex, topicIndex)
-			}
-			value, allocation := nativeString(topic)
-			nativeTopics[topicIndex] = value
-			nestedAllocations = append(nestedAllocations, allocation)
-		}
-		native.topics = (*C.aster_bytes_t)(topicMemory)
-		native.topic_count = C.size_t(len(recipient.Topics))
-	}
-
-	registry, registryAllocation := nativeBytes(signedPublicRegistry)
-	scopeValue, scopeAllocation := nativeString(scope)
-	defer freePointers(registryAllocation, scopeAllocation)
-	request := C.aster_rekey_request_t{
-		abi_version:                 C.ASTER_ABI_VERSION,
-		struct_size:                 C.uint32_t(C.sizeof_aster_rekey_request_t),
-		signed_public_registry:      registry,
-		scope:                       scopeValue,
-		minimum_registry_generation: C.uint64_t(minimumRegistryGeneration),
-		new_epoch:                   C.uint64_t(newEpoch),
-		recipients:                  (*C.aster_rekey_recipient_t)(recipientMemory),
-		recipient_count:             C.size_t(len(recipients)),
-	}
-	output := C.aster_rekey_receipt_t{
-		abi_version: C.ASTER_ABI_VERSION,
-		struct_size: C.uint32_t(C.sizeof_aster_rekey_receipt_t),
-	}
-	if err := check(C.aster_node_rekey_scope(n.handle, &request, &output)); err != nil {
-		return ScopeRekeyReceipt{}, err
-	}
-	return ScopeRekeyReceipt{
-		Epoch:              uint64(output.epoch),
-		RegistryGeneration: uint64(output.registry_generation),
-		RecipientCount:     uint64(output.recipient_count),
-		ControlSequence:    uint64(output.control_sequence),
-	}, nil
-}
-
-func (n *Node) NewBlobWriter(topic, scope string, options BlobOptions) (*BlobWriter, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return nil, err
-	}
-	var native C.aster_blob_publish_options_t
-	if err := check(C.aster_blob_publish_options_init(&native)); err != nil {
-		return nil, err
-	}
-	topicValue, a := nativeString(topic)
-	scopeValue, b := nativeString(scope)
-	mediaValue, c := nativeString(options.MediaType)
-	schemaValue, d := nativeBytes(options.SchemaID)
-	defer freePointers(a, b, c, d)
-	native.topic = topicValue
-	native.scope = scopeValue
-	native.media_type = mediaValue
-	native.schema_id = schemaValue
-	native.priority = C.aster_priority_t(options.Priority)
-	if options.ChunkSize != 0 {
-		native.chunk_size = C.uint32_t(options.ChunkSize)
-	}
-	if options.TTLMillis != nil {
-		native.has_ttl = 1
-		native.ttl_ms = C.uint64_t(*options.TTLMillis)
-	}
-	writer := &BlobWriter{node: n}
-	if err := check(C.aster_node_blob_writer_open(n.handle, &native, &writer.handle)); err != nil {
-		return nil, err
-	}
-	runtime.SetFinalizer(writer, func(value *BlobWriter) { _ = value.Close() })
+	writer := &BlobWriter{n, out.writer, uint64(out.durable_offset)}
+	runtime.SetFinalizer(writer, func(w *BlobWriter) { _ = w.Close() })
 	return writer, nil
 }
-
-// PublishBlobBatch finalizes and atomically publishes 2-64 distinct writers.
-// On success each writer remains open and Finish returns its matching receipt;
-// on failure every writer remains retryable.
-func (n *Node) PublishBlobBatch(writers []*BlobWriter, policy BatchPublicationPolicy) (BatchPublishResult, error) {
-	if len(writers) < 2 || len(writers) > 64 {
-		return BatchPublishResult{}, fmt.Errorf("Blob batch must contain between 2 and 64 writers")
-	}
-	if policy != RetainedDual && policy != BatchOnly {
-		return BatchPublishResult{}, fmt.Errorf("unknown batch publication policy %d", policy)
-	}
-	ordered := append([]*BlobWriter(nil), writers...)
-	seenWriters := make(map[*BlobWriter]struct{}, len(ordered))
-	for index, writer := range ordered {
-		if writer == nil {
-			return BatchPublishResult{}, fmt.Errorf("Blob batch writers[%d] is nil", index)
-		}
-		if _, exists := seenWriters[writer]; exists {
-			return BatchPublishResult{}, fmt.Errorf("Blob batch contains a duplicate writer")
-		}
-		seenWriters[writer] = struct{}{}
-	}
-	sort.Slice(ordered, func(first, second int) bool {
-		return reflect.ValueOf(ordered[first]).Pointer() < reflect.ValueOf(ordered[second]).Pointer()
-	})
-	for _, writer := range ordered {
-		writer.mu.Lock()
-	}
-	defer func() {
-		for index := len(ordered) - 1; index >= 0; index-- {
-			ordered[index].mu.Unlock()
-		}
-	}()
-
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return BatchPublishResult{}, err
-	}
-	nativeMemory := C.calloc(C.size_t(len(writers)), C.size_t(C.sizeof_aster_blob_writer_t))
-	if nativeMemory == nil {
-		return BatchPublishResult{}, fmt.Errorf("allocate native Blob batch writers")
-	}
-	defer C.free(nativeMemory)
-	nativeHandles := unsafe.Slice((*C.aster_blob_writer_t)(nativeMemory), len(writers))
-	seenHandles := make(map[uint64]struct{}, len(writers))
-	for index, writer := range writers {
-		if writer.node != n {
-			return BatchPublishResult{}, fmt.Errorf("Blob batch writers[%d] belongs to another node", index)
-		}
-		if writer.handle.value == 0 {
-			return BatchPublishResult{}, &Error{Status: C.ASTER_CLOSED, Detail: fmt.Sprintf("Blob batch writers[%d] is closed", index)}
-		}
-		handle := uint64(writer.handle.value)
-		if _, exists := seenHandles[handle]; exists {
-			return BatchPublishResult{}, fmt.Errorf("Blob batch contains a duplicate native writer handle")
-		}
-		seenHandles[handle] = struct{}{}
-		nativeHandles[index] = writer.handle
-	}
-	request := C.aster_blob_publish_batch_request_t{
-		abi_version:  C.ASTER_ABI_VERSION,
-		struct_size:  C.uint32_t(C.sizeof_aster_blob_publish_batch_request_t),
-		writers:      (*C.aster_blob_writer_t)(nativeMemory),
-		writer_count: C.size_t(len(nativeHandles)),
-		policy:       C.aster_batch_policy_t(policy),
-	}
-	var nativeResult C.aster_batch_result_t
-	if err := check(C.aster_node_publish_blob_batch(n.handle, &request, &nativeResult)); err != nil {
-		return BatchPublishResult{}, err
-	}
-	return readBatchResult(nativeResult)
-}
-
-func (w *BlobWriter) Write(value []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.handle.value == 0 {
-		return 0, &Error{Status: C.ASTER_CLOSED, Detail: "Blob writer is closed"}
-	}
+func (w *BlobWriter) Offset() uint64 { w.node.mu.Lock(); defer w.node.mu.Unlock(); return w.offset }
+func (w *BlobWriter) Write(data []byte) (int, error) {
+	defer runtime.KeepAlive(w)
 	w.node.mu.Lock()
 	defer w.node.mu.Unlock()
-	if err := w.node.active(); err != nil {
-		return 0, err
+	if w.handle == 0 || w.node.handle == 0 {
+		return 0, &Error{5, "writer closed"}
 	}
-	native, pointer := nativeBytes(value)
-	defer freePointers(pointer)
-	if err := check(C.aster_blob_writer_write(w.handle, native)); err != nil {
-		return 0, err
+	written := 0
+	for len(data) > 0 {
+		size := min(len(data), C.ASTER_BLOB_SEGMENT_BYTES-int(w.offset%C.ASTER_BLOB_SEGMENT_BYTES))
+		var a inputs
+		b := a.bytes(data[:size])
+		err := call(func() C.uint32_t { return C.aster_blob_writer_write(w.node.handle, w.handle, C.uint64_t(w.offset), b) })
+		a.free()
+		if err != nil {
+			return written, err
+		}
+		w.offset += uint64(size)
+		written += size
+		data = data[size:]
 	}
-	return len(value), nil
+	return written, nil
 }
-
-func (w *BlobWriter) Finish() (BlobFinish, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.handle.value == 0 {
-		return BlobFinish{}, &Error{Status: C.ASTER_CLOSED, Detail: "Blob writer is closed"}
-	}
+func (w *BlobWriter) Finish() (Receipt, error) {
+	defer runtime.KeepAlive(w)
 	w.node.mu.Lock()
 	defer w.node.mu.Unlock()
-	if err := w.node.active(); err != nil {
-		return BlobFinish{}, err
-	}
-	output := C.aster_blob_finish_t{
-		abi_version: C.ASTER_ABI_VERSION,
-		struct_size: C.uint32_t(C.sizeof_aster_blob_finish_t),
-	}
-	if err := check(C.aster_blob_writer_finish(w.handle, &output)); err != nil {
-		return BlobFinish{}, err
-	}
-	result := BlobFinish{Receipt: receipt(output.receipt)}
-	for index := range 32 {
-		result.BlobID[index] = byte(output.blob_id[index])
-	}
-	return result, nil
+	out := C.AsterPublishReceipt{abi_version: 2, struct_size: C.sizeof_AsterPublishReceipt}
+	err := call(func() C.uint32_t { return C.aster_blob_writer_finish(w.node.handle, w.handle, &out) })
+	return receipt(out), err
 }
-
 func (w *BlobWriter) Close() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.handle.value == 0 {
+	runtime.SetFinalizer(w, nil)
+	w.node.mu.Lock()
+	defer w.node.mu.Unlock()
+	err := call(func() C.uint32_t { return C.aster_blob_writer_close(w.node.handle, &w.handle) })
+	if isClosed(err) {
 		return nil
 	}
-	runtime.SetFinalizer(w, nil)
-	return check(C.aster_blob_writer_close(&w.handle))
+	return err
 }
 
-func (n *Node) OpenBlobReader(topic, scope string, id BlobID) (*BlobReader, error) {
+type BlobReader struct {
+	node   *Node
+	handle C.uint64_t
+}
+
+func (n *Node) OpenBlobReader(topic, scope string, blob [32]byte) (*BlobReader, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
+	var a inputs
+	defer func() { a.free() }()
+	r := C.AsterBlobReadRequest{abi_version: 2, struct_size: C.sizeof_AsterBlobReadRequest, topic: a.text(topic), scope: a.text(scope), blob_id: cid(blob)}
+	out := &BlobReader{node: n}
+	if err := call(func() C.uint32_t { return C.aster_node_blob_reader_open(n.handle, &r, &out.handle) }); err != nil {
 		return nil, err
 	}
-	topicValue, a := nativeString(topic)
-	scopeValue, b := nativeString(scope)
-	defer freePointers(a, b)
-	request := C.aster_blob_read_request_t{
-		abi_version: C.ASTER_ABI_VERSION,
-		struct_size: C.uint32_t(C.sizeof_aster_blob_read_request_t),
-		topic:       topicValue,
-		scope:       scopeValue,
-	}
-	for index := range 32 {
-		request.blob_id[index] = C.uint8_t(id[index])
-	}
-	reader := &BlobReader{node: n}
-	if err := check(C.aster_node_blob_reader_open(n.handle, &request, &reader.handle)); err != nil {
-		return nil, err
-	}
-	runtime.SetFinalizer(reader, func(value *BlobReader) { _ = value.Close() })
-	return reader, nil
+	runtime.SetFinalizer(out, func(r *BlobReader) { _ = r.Close() })
+	return out, nil
 }
-
-func (r *BlobReader) Read(output []byte) (int, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.handle.value == 0 {
-		return 0, &Error{Status: C.ASTER_CLOSED, Detail: "Blob reader is closed"}
-	}
-	if len(output) == 0 {
-		return 0, nil
-	}
+func (r *BlobReader) Read(p []byte) (int, error) {
+	defer runtime.KeepAlive(r)
 	r.node.mu.Lock()
 	defer r.node.mu.Unlock()
-	if err := r.node.active(); err != nil {
+	if r.handle == 0 || r.node.handle == 0 {
+		return 0, &Error{5, "reader closed"}
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	out := C.AsterOwnedBuffer{abi_version: 2, struct_size: C.sizeof_AsterOwnedBuffer}
+	if err := call(func() C.uint32_t {
+		return C.aster_blob_reader_read(r.node.handle, r.handle, C.uint64_t(min(len(p), C.ASTER_BLOB_READ_PAGE_BYTES)), &out)
+	}); err != nil {
 		return 0, err
 	}
-	var count C.size_t
-	if err := check(C.aster_blob_reader_read(
-		r.handle,
-		(*C.uint8_t)(unsafe.Pointer(&output[0])),
-		C.size_t(len(output)),
-		&count,
-	)); err != nil {
-		return 0, err
-	}
-	if count == 0 {
+	defer C.aster_buffer_free(&out)
+	n := copy(p, copyBuffer(out))
+	if n == 0 {
 		return 0, io.EOF
 	}
-	return int(count), nil
+	return n, nil
 }
-
 func (r *BlobReader) Close() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.handle.value == 0 {
-		return nil
-	}
 	runtime.SetFinalizer(r, nil)
-	return check(C.aster_blob_reader_close(&r.handle))
-}
-
-func queryRequest(query Query) (C.aster_query_request_t, []unsafe.Pointer) {
-	topic, topicPointer := nativeString(query.Topic)
-	scope, scopePointer := nativeString(query.Scope)
-	key, keyPointer := nativeBytes(query.LogicalKey)
-	value := C.aster_query_request_t{
-		abi_version: C.ASTER_ABI_VERSION,
-		struct_size: C.uint32_t(C.sizeof_aster_query_request_t),
-		topic:       topic, scope: scope, logical_key: key,
-		data_class: C.ASTER_DATA_CLASS_ANY,
-		limit:      C.uint64_t(query.Limit),
-	}
-	if query.Class != nil {
-		value.data_class = C.aster_data_class_t(*query.Class)
-	}
-	if query.IncludeDescendants {
-		value.include_descendant_scopes = 1
-	}
-	if query.IncludeRecoverable {
-		value.include_recoverable_versions = 1
-	}
-	if query.IncludeTombstones {
-		value.include_tombstones = 1
-	}
-	return value, []unsafe.Pointer{topicPointer, scopePointer, keyPointer}
-}
-
-func (n *Node) Query(query Query) ([]Item, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return nil, err
-	}
-	request, pointers := queryRequest(query)
-	defer freePointers(pointers...)
-	var result C.aster_query_t
-	if err := check(C.aster_node_query(n.handle, &request, &result)); err != nil {
-		return nil, err
-	}
-	defer C.aster_query_close(&result)
-	var count C.size_t
-	if err := check(C.aster_query_len(result, &count)); err != nil {
-		return nil, err
-	}
-	items := make([]Item, 0, int(count))
-	for index := C.size_t(0); index < count; index++ {
-		item, err := queryItem(result, index)
-		if err != nil {
-			return nil, err
-		}
-		items = append(items, item)
-	}
-	return items, nil
-}
-
-func queryItem(result C.aster_query_t, index C.size_t) (Item, error) {
-	raw := C.aster_item_t{abi_version: C.ASTER_ABI_VERSION, struct_size: C.uint32_t(C.sizeof_aster_item_t)}
-	if err := check(C.aster_query_get(result, index, &raw)); err != nil {
-		return Item{}, err
-	}
-	defer C.aster_item_free(&raw)
-	return rawItem(raw), nil
-}
-
-func rawItem(raw C.aster_item_t) Item {
-	item := Item{
-		Class: DataClass(raw.data_class), Priority: Priority(raw.priority),
-		CausalCounter: uint64(raw.causal_counter), Topic: string(ownedBytes(raw.topic)),
-		Scope: string(ownedBytes(raw.scope)), OriginScope: string(ownedBytes(raw.origin_scope)),
-		CurrentScope: string(ownedBytes(raw.current_scope)), LogicalKey: ownedBytes(raw.logical_key),
-		Payload: ownedBytes(raw.payload), Tombstone: raw.tombstone != 0,
-	}
-	for i := range 32 {
-		item.ItemID[i] = byte(raw.item_id[i])
-		item.Publisher[i] = byte(raw.publisher[i])
-	}
-	if raw.has_event_sequence != 0 {
-		value := uint64(raw.event_sequence)
-		item.EventSequence = &value
-	}
-	return item
-}
-
-func (n *Node) Subscribe(topic, scope string, class *DataClass, includeDescendants bool) (*Subscription, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return nil, err
-	}
-	topicValue, topicPointer := nativeString(topic)
-	scopeValue, scopePointer := nativeString(scope)
-	defer freePointers(topicPointer, scopePointer)
-	request := C.aster_subscribe_request_t{
-		abi_version: C.ASTER_ABI_VERSION,
-		struct_size: C.uint32_t(C.sizeof_aster_subscribe_request_t),
-		topic:       topicValue, scope: scopeValue, data_class: C.ASTER_DATA_CLASS_ANY,
-	}
-	if class != nil {
-		request.data_class = C.aster_data_class_t(*class)
-	}
-	if includeDescendants {
-		request.include_descendant_scopes = 1
-	}
-	var identifier C.uint64_t
-	if err := check(C.aster_node_subscribe(n.handle, &request, &identifier)); err != nil {
-		return nil, err
-	}
-	return &Subscription{node: n, ID: uint64(identifier)}, nil
-}
-
-func (s *Subscription) Poll(limit uint64) ([]Delivery, error) {
-	n := s.node
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return nil, err
-	}
-	request := C.aster_poll_request_t{
-		abi_version:  C.ASTER_ABI_VERSION,
-		struct_size:  C.uint32_t(C.sizeof_aster_poll_request_t),
-		subscription: C.uint64_t(s.ID), limit: C.uint64_t(limit),
-	}
-	var result C.aster_deliveries_t
-	if err := check(C.aster_node_poll(n.handle, &request, &result)); err != nil {
-		return nil, err
-	}
-	defer C.aster_deliveries_close(&result)
-	var count C.size_t
-	if err := check(C.aster_deliveries_len(result, &count)); err != nil {
-		return nil, err
-	}
-	values := make([]Delivery, 0, int(count))
-	for index := C.size_t(0); index < count; index++ {
-		raw := C.aster_delivery_t{abi_version: C.ASTER_ABI_VERSION, struct_size: C.uint32_t(C.sizeof_aster_delivery_t)}
-		if err := check(C.aster_deliveries_get(result, index, &raw)); err != nil {
-			return nil, err
-		}
-		values = append(values, Delivery{Subscription: uint64(raw.subscription), Attempt: uint64(raw.attempt), Item: rawItem(raw.item)})
-		C.aster_delivery_free(&raw)
-	}
-	return values, nil
-}
-
-func (s *Subscription) Acknowledge(itemID [32]byte) error {
-	n := s.node
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return err
-	}
-	request := C.aster_ack_request_t{
-		abi_version:  C.ASTER_ABI_VERSION,
-		struct_size:  C.uint32_t(C.sizeof_aster_ack_request_t),
-		subscription: C.uint64_t(s.ID),
-	}
-	for index := range 32 {
-		request.item_id[index] = C.uint8_t(itemID[index])
-	}
-	return check(C.aster_node_acknowledge(n.handle, &request))
-}
-
-func (n *Node) Conflicts(query Query) ([]Conflict, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return nil, err
-	}
-	request, pointers := queryRequest(query)
-	defer freePointers(pointers...)
-	var result C.aster_conflicts_t
-	if err := check(C.aster_node_conflicts(n.handle, &request, &result)); err != nil {
-		return nil, err
-	}
-	defer C.aster_conflicts_close(&result)
-	var count C.size_t
-	if err := check(C.aster_conflicts_len(result, &count)); err != nil {
-		return nil, err
-	}
-	values := make([]Conflict, 0, int(count))
-	for index := C.size_t(0); index < count; index++ {
-		raw := C.aster_conflict_t{abi_version: C.ASTER_ABI_VERSION, struct_size: C.uint32_t(C.sizeof_aster_conflict_t)}
-		if err := check(C.aster_conflicts_get(result, index, &raw)); err != nil {
-			return nil, err
-		}
-		ids := ownedBytes(raw.sibling_ids)
-		value := Conflict{LogicalKey: ownedBytes(raw.logical_key)}
-		for offset := 0; offset < len(ids); offset += 32 {
-			var id [32]byte
-			copy(id[:], ids[offset:offset+32])
-			value.SiblingIDs = append(value.SiblingIDs, id)
-		}
-		if raw.has_merge_policy != 0 {
-			policy := string(ownedBytes(raw.merge_policy))
-			value.MergePolicy = &policy
-		}
-		C.aster_conflict_free(&raw)
-		values = append(values, value)
-	}
-	return values, nil
-}
-
-func (n *Node) Resolve(topic, scope string, conflict Conflict, payload []byte, options PublishOptions) (PublishReceipt, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return PublishReceipt{}, err
-	}
-	ids := make([]byte, 0, len(conflict.SiblingIDs)*32)
-	for _, id := range conflict.SiblingIDs {
-		ids = append(ids, id[:]...)
-	}
-	topicValue, a := nativeString(topic)
-	scopeValue, b := nativeString(scope)
-	keyValue, c := nativeBytes(conflict.LogicalKey)
-	idsValue, d := nativeBytes(ids)
-	payloadValue, e := nativeBytes(payload)
-	defer freePointers(a, b, c, d, e)
-	request := C.aster_resolve_request_t{
-		abi_version: C.ASTER_ABI_VERSION, struct_size: C.uint32_t(C.sizeof_aster_resolve_request_t),
-		topic: topicValue, scope: scopeValue, logical_key: keyValue,
-		expected_sibling_ids: idsValue, payload: payloadValue, priority: C.aster_priority_t(options.Priority),
-	}
-	if options.TTLMillis != nil {
-		request.has_ttl = 1
-		request.ttl_ms = C.uint64_t(*options.TTLMillis)
-	}
-	output := C.aster_publish_receipt_t{abi_version: C.ASTER_ABI_VERSION, struct_size: C.uint32_t(C.sizeof_aster_publish_receipt_t)}
-	if err := check(C.aster_node_resolve(n.handle, &request, &output)); err != nil {
-		return PublishReceipt{}, err
-	}
-	return receipt(output), nil
-}
-
-func (n *Node) SetEmissionThreshold(value EmissionThreshold) error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return err
-	}
-	return check(C.aster_node_set_emission(n.handle, C.aster_priority_t(value)))
-}
-
-func (n *Node) EmissionThreshold() (EmissionThreshold, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return 0, err
-	}
-	var value C.aster_priority_t
-	if err := check(C.aster_node_get_emission(n.handle, &value)); err != nil {
-		return 0, err
-	}
-	return EmissionThreshold(value), nil
-}
-
-func rawPeer(raw C.aster_peer_snapshot_t) PeerSnapshot {
-	value := PeerSnapshot{PeerState: PeerState(raw.peer_state), SyncState: SyncState(raw.sync_state)}
-	for index := range 32 {
-		value.Peer[index] = byte(raw.peer[index])
-	}
-	if raw.has_last_change != 0 {
-		changed := uint64(raw.last_change_ms)
-		value.LastChangeMillis = &changed
-	}
-	if raw.has_detail != 0 {
-		detail := string(ownedBytes(raw.detail))
-		value.Detail = &detail
-	}
-	return value
-}
-
-func (n *Node) PeerStatus(peer [32]byte) (PeerSnapshot, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return PeerSnapshot{}, err
-	}
-	request := C.aster_peer_request_t{abi_version: C.ASTER_ABI_VERSION, struct_size: C.uint32_t(C.sizeof_aster_peer_request_t)}
-	for index := range 32 {
-		request.peer[index] = C.uint8_t(peer[index])
-	}
-	raw := C.aster_peer_snapshot_t{abi_version: C.ASTER_ABI_VERSION, struct_size: C.uint32_t(C.sizeof_aster_peer_snapshot_t)}
-	if err := check(C.aster_node_peer_status(n.handle, &request, &raw)); err != nil {
-		return PeerSnapshot{}, err
-	}
-	defer C.aster_peer_snapshot_free(&raw)
-	return rawPeer(raw), nil
-}
-
-func (n *Node) Peers() ([]PeerSnapshot, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return nil, err
-	}
-	var result C.aster_peers_t
-	if err := check(C.aster_node_peers(n.handle, &result)); err != nil {
-		return nil, err
-	}
-	defer C.aster_peers_close(&result)
-	var count C.size_t
-	if err := check(C.aster_peers_len(result, &count)); err != nil {
-		return nil, err
-	}
-	values := make([]PeerSnapshot, 0, int(count))
-	for index := C.size_t(0); index < count; index++ {
-		raw := C.aster_peer_snapshot_t{abi_version: C.ASTER_ABI_VERSION, struct_size: C.uint32_t(C.sizeof_aster_peer_snapshot_t)}
-		if err := check(C.aster_peers_get(result, index, &raw)); err != nil {
-			return nil, err
-		}
-		values = append(values, rawPeer(raw))
-		C.aster_peer_snapshot_free(&raw)
-	}
-	return values, nil
-}
-
-func validateBridgePriorityMask(value PriorityMask) error {
-	if value == 0 || value&^AllowAll != 0 {
-		return fmt.Errorf("bridge priority mask must explicitly select bits 0 through 3")
-	}
-	return nil
-}
-
-func nativeBridgeTopics(topics []string, required bool) (*C.aster_bytes_t, C.size_t, func(), error) {
-	if required && len(topics) == 0 {
-		return nil, 0, func() {}, fmt.Errorf("bridge policy requires at least one topic")
-	}
-	if len(topics) > 128 {
-		return nil, 0, func() {}, fmt.Errorf("bridge policy topics exceed 128 entries")
-	}
-	if len(topics) == 0 {
-		return nil, 0, func() {}, nil
-	}
-	memory := C.calloc(C.size_t(len(topics)), C.size_t(C.sizeof_aster_bytes_t))
-	if memory == nil {
-		return nil, 0, func() {}, fmt.Errorf("allocate native bridge topics")
-	}
-	allocations := []unsafe.Pointer{memory}
-	cleanup := func() { freePointers(allocations...) }
-	native := unsafe.Slice((*C.aster_bytes_t)(memory), len(topics))
-	for index, topic := range topics {
-		if length := len([]byte(topic)); length == 0 || length > 128 {
-			cleanup()
-			return nil, 0, func() {}, fmt.Errorf("bridge topics[%d] must be between 1 and 128 UTF-8 bytes", index)
-		}
-		value, allocation := nativeString(topic)
-		native[index] = value
-		allocations = append(allocations, allocation)
-	}
-	return (*C.aster_bytes_t)(memory), C.size_t(len(topics)), cleanup, nil
-}
-
-// CreateBridgeEnrollment creates an opaque enrollment for one exact directed
-// edge. It contains no application-readable credential or key bytes.
-func (n *Node) CreateBridgeEnrollment(sourceScope string, sourceRouteEpoch uint64,
-	targetScope string, targetRouteEpoch uint64) (*BridgeEnrollment, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return nil, err
-	}
-	source, a := nativeString(sourceScope)
-	target, b := nativeString(targetScope)
-	defer freePointers(a, b)
-	request := C.aster_bridge_enrollment_request_t{
-		abi_version:  C.ASTER_ABI_VERSION,
-		struct_size:  C.uint32_t(C.sizeof_aster_bridge_enrollment_request_t),
-		source_scope: source, target_scope: target,
-		source_route_epoch: C.uint64_t(sourceRouteEpoch),
-		target_route_epoch: C.uint64_t(targetRouteEpoch),
-	}
-	value := &BridgeEnrollment{}
-	if err := check(C.aster_node_bridge_enrollment_create(n.handle, &request, &value.handle)); err != nil {
-		return nil, err
-	}
-	runtime.SetFinalizer(value, func(enrollment *BridgeEnrollment) { _ = enrollment.Close() })
-	return value, nil
-}
-
-func (e *BridgeEnrollment) Close() error {
-	if e == nil {
+	r.node.mu.Lock()
+	defer r.node.mu.Unlock()
+	err := call(func() C.uint32_t { return C.aster_blob_reader_close(r.node.handle, &r.handle) })
+	if isClosed(err) {
 		return nil
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.handle.value == 0 {
-		return nil
-	}
-	runtime.SetFinalizer(e, nil)
-	return check(C.aster_bridge_enrollment_close(&e.handle))
-}
-
-func bridgeAuthorizationResult(raw C.aster_bridge_authorization_result_t) BridgeAuthorizationResult {
-	value := BridgeAuthorizationResult{
-		Generation: uint64(raw.generation), ControlSequence: uint64(raw.control_sequence),
-		Enabled: raw.enabled != 0,
-	}
-	for index := range 32 {
-		value.ID[index] = byte(raw.id[index])
-	}
-	return value
-}
-
-// EnableBridge is an authority operation. A well-formed native call consumes
-// enrollment even when authority verification rejects it.
-func (n *Node) EnableBridge(enrollment *BridgeEnrollment,
-	policy BridgeAuthorizationPolicy) (BridgeAuthorizationResult, error) {
-	if enrollment == nil {
-		return BridgeAuthorizationResult{}, fmt.Errorf("bridge enrollment must not be nil")
-	}
-	if err := validateBridgePriorityMask(policy.AllowedPriorities); err != nil {
-		return BridgeAuthorizationResult{}, err
-	}
-	if policy.MaxTotalHops == 0 || policy.MaxTotalHops > 8 {
-		return BridgeAuthorizationResult{}, fmt.Errorf("bridge maximum total hops must be between 1 and 8")
-	}
-	topics, topicCount, cleanup, err := nativeBridgeTopics(policy.Topics, true)
-	if err != nil {
-		return BridgeAuthorizationResult{}, err
-	}
-	defer cleanup()
-	enrollment.mu.Lock()
-	defer enrollment.mu.Unlock()
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err = n.active(); err != nil {
-		return BridgeAuthorizationResult{}, err
-	}
-	if enrollment.handle.value == 0 {
-		return BridgeAuthorizationResult{}, &Error{Status: C.ASTER_CLOSED, Detail: "bridge enrollment is closed or consumed"}
-	}
-	native := C.aster_bridge_enable_policy_t{
-		abi_version: C.ASTER_ABI_VERSION,
-		struct_size: C.uint32_t(C.sizeof_aster_bridge_enable_policy_t),
-		topics:      topics, topic_count: topicCount,
-		allowed_priority_mask: C.aster_priority_mask_t(policy.AllowedPriorities),
-		max_total_hops:        C.uint8_t(policy.MaxTotalHops),
-	}
-	output := C.aster_bridge_authorization_result_t{
-		abi_version: C.ASTER_ABI_VERSION,
-		struct_size: C.uint32_t(C.sizeof_aster_bridge_authorization_result_t),
-	}
-	status := C.aster_node_bridge_enable(n.handle, &enrollment.handle, &native, &output)
-	if enrollment.handle.value == 0 {
-		runtime.SetFinalizer(enrollment, nil)
-	}
-	if err = check(status); err != nil {
-		return BridgeAuthorizationResult{}, err
-	}
-	return bridgeAuthorizationResult(output), nil
-}
-
-func (n *Node) DisableBridge(bridgeNode [32]byte, sourceScope,
-	targetScope string) (BridgeAuthorizationResult, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return BridgeAuthorizationResult{}, err
-	}
-	source, a := nativeString(sourceScope)
-	target, b := nativeString(targetScope)
-	defer freePointers(a, b)
-	request := C.aster_bridge_disable_request_t{
-		abi_version:  C.ASTER_ABI_VERSION,
-		struct_size:  C.uint32_t(C.sizeof_aster_bridge_disable_request_t),
-		source_scope: source, target_scope: target,
-	}
-	for index := range 32 {
-		request.bridge_node[index] = C.uint8_t(bridgeNode[index])
-	}
-	output := C.aster_bridge_authorization_result_t{
-		abi_version: C.ASTER_ABI_VERSION,
-		struct_size: C.uint32_t(C.sizeof_aster_bridge_authorization_result_t),
-	}
-	if err := check(C.aster_node_bridge_disable(n.handle, &request, &output)); err != nil {
-		return BridgeAuthorizationResult{}, err
-	}
-	return bridgeAuthorizationResult(output), nil
-}
-
-func bridgeRouteResult(raw *C.aster_bridge_route_result_t) BridgeRouteResult {
-	value := BridgeRouteResult{
-		CurrentScope:      string(ownedBytes(raw.current_scope)),
-		CurrentRouteEpoch: uint64(raw.current_route_epoch),
-		HopCount:          uint8(raw.hop_count), Status: BridgeCommitStatus(raw.commit_status),
-	}
-	for index := range 32 {
-		value.Handle[index] = byte(raw.handle[index])
-		value.SourceItem[index] = byte(raw.source_item[index])
-	}
-	return value
-}
-
-func (n *Node) BridgeItem(sourceItem [32]byte, authorization BridgeAuthorizationID,
-	policy BridgeNarrowingPolicy) (BridgeRouteResult, error) {
-	if err := validateBridgePriorityMask(policy.AllowedPriorities); err != nil {
-		return BridgeRouteResult{}, err
-	}
-	topics, topicCount, cleanup, err := nativeBridgeTopics(policy.Topics, false)
-	if err != nil {
-		return BridgeRouteResult{}, err
-	}
-	defer cleanup()
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err = n.active(); err != nil {
-		return BridgeRouteResult{}, err
-	}
-	request := C.aster_bridge_item_request_t{
-		abi_version: C.ASTER_ABI_VERSION,
-		struct_size: C.uint32_t(C.sizeof_aster_bridge_item_request_t),
-		topics:      topics, topic_count: topicCount,
-		allowed_priority_mask: C.aster_priority_mask_t(policy.AllowedPriorities),
-	}
-	for index := range 32 {
-		request.source_item[index] = C.uint8_t(sourceItem[index])
-		request.authorization_id[index] = C.uint8_t(authorization[index])
-	}
-	output := C.aster_bridge_route_result_t{
-		abi_version: C.ASTER_ABI_VERSION,
-		struct_size: C.uint32_t(C.sizeof_aster_bridge_route_result_t),
-	}
-	if err = check(C.aster_node_bridge_item(n.handle, &request, &output)); err != nil {
-		return BridgeRouteResult{}, err
-	}
-	defer C.aster_bridge_route_result_free(&output)
-	return bridgeRouteResult(&output), nil
-}
-
-func (n *Node) ExtendBridgeRoute(route BridgeRouteHandle, authorization BridgeAuthorizationID,
-	policy BridgeNarrowingPolicy) (BridgeRouteResult, error) {
-	if err := validateBridgePriorityMask(policy.AllowedPriorities); err != nil {
-		return BridgeRouteResult{}, err
-	}
-	topics, topicCount, cleanup, err := nativeBridgeTopics(policy.Topics, false)
-	if err != nil {
-		return BridgeRouteResult{}, err
-	}
-	defer cleanup()
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err = n.active(); err != nil {
-		return BridgeRouteResult{}, err
-	}
-	request := C.aster_bridge_extend_request_t{
-		abi_version: C.ASTER_ABI_VERSION,
-		struct_size: C.uint32_t(C.sizeof_aster_bridge_extend_request_t),
-		topics:      topics, topic_count: topicCount,
-		allowed_priority_mask: C.aster_priority_mask_t(policy.AllowedPriorities),
-	}
-	for index := range 32 {
-		request.route_handle[index] = C.uint8_t(route[index])
-		request.authorization_id[index] = C.uint8_t(authorization[index])
-	}
-	output := C.aster_bridge_route_result_t{
-		abi_version: C.ASTER_ABI_VERSION,
-		struct_size: C.uint32_t(C.sizeof_aster_bridge_route_result_t),
-	}
-	if err = check(C.aster_node_bridge_extend(n.handle, &request, &output)); err != nil {
-		return BridgeRouteResult{}, err
-	}
-	defer C.aster_bridge_route_result_free(&output)
-	return bridgeRouteResult(&output), nil
-}
-
-func bridgeStatusRequest(id [32]byte) C.aster_bridge_status_request_t {
-	request := C.aster_bridge_status_request_t{
-		abi_version: C.ASTER_ABI_VERSION,
-		struct_size: C.uint32_t(C.sizeof_aster_bridge_status_request_t),
-	}
-	for index := range 32 {
-		request.id[index] = C.uint8_t(id[index])
-	}
-	return request
-}
-
-func decodeBridgeTopics(raw C.aster_owned_buffer_t, count uint64) ([]string, error) {
-	if count > 128 {
-		return nil, fmt.Errorf("native bridge topic count exceeds 128")
-	}
-	encoded := ownedBytes(raw)
-	values := make([]string, 0, int(count))
-	for range count {
-		if len(encoded) < 2 {
-			return nil, fmt.Errorf("native bridge topic list is truncated")
-		}
-		length := int(binary.BigEndian.Uint16(encoded[:2]))
-		encoded = encoded[2:]
-		if length == 0 || length > len(encoded) {
-			return nil, fmt.Errorf("native bridge topic length is invalid")
-		}
-		values = append(values, string(encoded[:length]))
-		encoded = encoded[length:]
-	}
-	if len(encoded) != 0 {
-		return nil, fmt.Errorf("native bridge topic list has trailing bytes")
-	}
-	return values, nil
-}
-
-func rawBridgeAuthorizationStatus(raw *C.aster_bridge_authorization_status_t) (BridgeAuthorizationStatus, error) {
-	topics, err := decodeBridgeTopics(raw.topics, uint64(raw.topic_count))
-	if err != nil {
-		return BridgeAuthorizationStatus{}, err
-	}
-	value := BridgeAuthorizationStatus{
-		SourceScope: string(ownedBytes(raw.source_scope)), TargetScope: string(ownedBytes(raw.target_scope)),
-		Generation: uint64(raw.generation), ControlSequence: uint64(raw.control_sequence),
-		Applied: raw.applied != 0, Current: raw.current != 0, Enabled: raw.enabled != 0,
-		Usable: raw.usable != 0, Topics: topics,
-		AllowedPriorities: PriorityMask(raw.allowed_priority_mask),
-	}
-	for index := range 32 {
-		value.ID[index] = byte(raw.id[index])
-		value.Authority[index] = byte(raw.authority[index])
-		value.BridgeNode[index] = byte(raw.bridge_node[index])
-	}
-	if raw.has_source_route_epoch != 0 {
-		epoch := uint64(raw.source_route_epoch)
-		value.SourceRouteEpoch = &epoch
-	}
-	if raw.has_target_route_epoch != 0 {
-		epoch := uint64(raw.target_route_epoch)
-		value.TargetRouteEpoch = &epoch
-	}
-	if raw.has_max_total_hops != 0 {
-		hops := uint8(raw.max_total_hops)
-		value.MaxTotalHops = &hops
-	}
-	return value, nil
-}
-
-func (n *Node) BridgeAuthorizationStatus(id BridgeAuthorizationID) (BridgeAuthorizationStatus, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return BridgeAuthorizationStatus{}, err
-	}
-	request := bridgeStatusRequest([32]byte(id))
-	raw := C.aster_bridge_authorization_status_t{
-		abi_version: C.ASTER_ABI_VERSION,
-		struct_size: C.uint32_t(C.sizeof_aster_bridge_authorization_status_t),
-	}
-	if err := check(C.aster_node_bridge_authorization_status(n.handle, &request, &raw)); err != nil {
-		return BridgeAuthorizationStatus{}, err
-	}
-	defer C.aster_bridge_authorization_status_free(&raw)
-	return rawBridgeAuthorizationStatus(&raw)
-}
-
-func bridgePageRequest(after *[32]byte, limit uint64) C.aster_bridge_page_request_t {
-	request := C.aster_bridge_page_request_t{
-		abi_version: C.ASTER_ABI_VERSION,
-		struct_size: C.uint32_t(C.sizeof_aster_bridge_page_request_t),
-		limit:       C.uint64_t(limit),
-	}
-	if after != nil {
-		request.has_after = 1
-		for index := range 32 {
-			request.after[index] = C.uint8_t(after[index])
-		}
-	}
-	return request
-}
-
-func (n *Node) BridgeAuthorizations(after *BridgeAuthorizationID, limit uint64) ([]BridgeAuthorizationStatus, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return nil, err
-	}
-	var cursor *[32]byte
-	if after != nil {
-		value := [32]byte(*after)
-		cursor = &value
-	}
-	request := bridgePageRequest(cursor, limit)
-	var page C.aster_bridge_authorizations_t
-	if err := check(C.aster_node_bridge_authorizations(n.handle, &request, &page)); err != nil {
-		return nil, err
-	}
-	defer C.aster_bridge_authorizations_close(&page)
-	var count C.size_t
-	if err := check(C.aster_bridge_authorizations_len(page, &count)); err != nil {
-		return nil, err
-	}
-	values := make([]BridgeAuthorizationStatus, 0, int(count))
-	for index := C.size_t(0); index < count; index++ {
-		raw := C.aster_bridge_authorization_status_t{
-			abi_version: C.ASTER_ABI_VERSION,
-			struct_size: C.uint32_t(C.sizeof_aster_bridge_authorization_status_t),
-		}
-		if err := check(C.aster_bridge_authorizations_get(page, index, &raw)); err != nil {
-			return nil, err
-		}
-		value, conversionError := rawBridgeAuthorizationStatus(&raw)
-		C.aster_bridge_authorization_status_free(&raw)
-		if conversionError != nil {
-			return nil, conversionError
-		}
-		values = append(values, value)
-	}
-	return values, nil
-}
-
-func rawBridgeRouteStatus(raw *C.aster_bridge_route_status_t) BridgeRouteStatus {
-	value := BridgeRouteStatus{
-		OriginScope: string(ownedBytes(raw.origin_scope)), OriginRouteEpoch: uint64(raw.origin_route_epoch),
-		CurrentScope: string(ownedBytes(raw.current_scope)), CurrentRouteEpoch: uint64(raw.current_route_epoch),
-		Topic: string(ownedBytes(raw.topic)), Priority: Priority(raw.priority), HopCount: uint8(raw.hop_count),
-		Active: raw.active != 0, Live: raw.live != 0,
-	}
-	for index := range 32 {
-		value.Handle[index] = byte(raw.handle[index])
-		value.SourceItem[index] = byte(raw.source_item[index])
-	}
-	return value
-}
-
-func (n *Node) BridgeRouteStatus(handle BridgeRouteHandle) (BridgeRouteStatus, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return BridgeRouteStatus{}, err
-	}
-	request := bridgeStatusRequest([32]byte(handle))
-	raw := C.aster_bridge_route_status_t{
-		abi_version: C.ASTER_ABI_VERSION,
-		struct_size: C.uint32_t(C.sizeof_aster_bridge_route_status_t),
-	}
-	if err := check(C.aster_node_bridge_route_status(n.handle, &request, &raw)); err != nil {
-		return BridgeRouteStatus{}, err
-	}
-	defer C.aster_bridge_route_status_free(&raw)
-	return rawBridgeRouteStatus(&raw), nil
-}
-
-func (n *Node) BridgeRoutes(after *BridgeRouteHandle, limit uint64) ([]BridgeRouteStatus, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return nil, err
-	}
-	var cursor *[32]byte
-	if after != nil {
-		value := [32]byte(*after)
-		cursor = &value
-	}
-	request := bridgePageRequest(cursor, limit)
-	var page C.aster_bridge_routes_t
-	if err := check(C.aster_node_bridge_routes(n.handle, &request, &page)); err != nil {
-		return nil, err
-	}
-	defer C.aster_bridge_routes_close(&page)
-	var count C.size_t
-	if err := check(C.aster_bridge_routes_len(page, &count)); err != nil {
-		return nil, err
-	}
-	values := make([]BridgeRouteStatus, 0, int(count))
-	for index := C.size_t(0); index < count; index++ {
-		raw := C.aster_bridge_route_status_t{
-			abi_version: C.ASTER_ABI_VERSION,
-			struct_size: C.uint32_t(C.sizeof_aster_bridge_route_status_t),
-		}
-		if err := check(C.aster_bridge_routes_get(page, index, &raw)); err != nil {
-			return nil, err
-		}
-		values = append(values, rawBridgeRouteStatus(&raw))
-		C.aster_bridge_route_status_free(&raw)
-	}
-	return values, nil
-}
-
-func (n *Node) SetBridgeFilters(filters []BridgeFilter) error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err := n.active(); err != nil {
-		return err
-	}
-	if len(filters) == 0 {
-		return check(C.aster_node_set_bridge_filters(n.handle, nil, 0))
-	}
-	native := make([]C.aster_bridge_filter_t, len(filters))
-	pointers := make([]unsafe.Pointer, 0, len(filters)*3)
-	defer func() { freePointers(pointers...) }()
-	for index, filter := range filters {
-		from, a := nativeString(filter.FromScope)
-		to, b := nativeString(filter.ToScope)
-		topic, c := nativeString(filter.Topic)
-		pointers = append(pointers, a, b, c)
-		native[index] = C.aster_bridge_filter_t{
-			abi_version: C.ASTER_ABI_VERSION, struct_size: C.uint32_t(C.sizeof_aster_bridge_filter_t),
-			from_scope: from, to_scope: to, topic: topic, minimum_priority: C.aster_priority_t(filter.MinimumPriority),
-		}
-	}
-	return check(C.aster_node_set_bridge_filters(n.handle, &native[0], C.size_t(len(native))))
+	return err
 }

@@ -31,20 +31,15 @@ pub use profile::{
 
 #[cfg(feature = "fuzzing")]
 pub use reference::fuzz_reference_v9_session_pair;
-pub(crate) use reference::{
-    PendingBatchItem, VerifiedBatchItem, VerifiedBatchProof, VerifiedBridgeAuthorization,
-    VerifiedBridgeSourceRoute, VerifiedBridgeWrapper,
-};
 pub use reference::{
     ProvisioningAccess, ProvisioningBundle, REFERENCE_SESSION_FRAME_OVERHEAD_BYTES,
     ReferenceAuthenticatedSession, ReferenceEnvelopeSealer, ReferenceProvisioner,
     ReferenceSessionAwaitingFinished, ReferenceSessionInitiator, ReferenceSessionResponder,
     ReferenceSessionResponderPending, ScopeRekeyPlan, ScopeRekeyRecipient,
 };
-#[cfg(feature = "sqlite-store")]
-pub use reference::{ReferenceNode, open_reference_node};
-#[cfg(test)]
-pub(crate) use reference::{SessionPrivacyCanaries, session_privacy_canaries};
+pub(crate) use reference::{
+    VerifiedBridgeAuthorization, VerifiedBridgeSourceRoute, VerifiedBridgeWrapper,
+};
 
 use aes_gcm::{
     Aes256Gcm,

@@ -42,7 +42,7 @@ mandatory-access-control profile. The manual operator procedure is
 | Check | Runner | Purpose |
 | --- | --- | --- |
 | `Cargo lockfiles` | `ubuntu-24.04` | Checks every committed Cargo graph with `cargo fetch --locked` before Cargo builds start, and tests rejection of stale or missing lockfiles offline. |
-| `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, the selected-node dependency boundary, the vendored netlink dependency source-equivalence/compatibility gate, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
+| `quality` | `ubuntu-24.04` | Runs the exact-source Python process contract, Rust and Go formatting, Apache-2.0-only project-license and package checks, the selected-node dependency boundary, selected live-Event, live-mutable, live-State-subscription, live-Record-subscription, live-Blob, and live-Blob-subscription receipt checker tests, real-process smokes, C ABI build and C/C++ header checks, Rust/Python conformance, Python/Go binding tests, and lab-controller tests. |
 | `Rust Clippy` | `ubuntu-24.04` | Runs locked Clippy for every workspace target and feature, with warnings denied. |
 | `Rust tests (1/2)` and `Rust tests (2/2)` | `ubuntu-24.04` | Run two disjoint nextest partitions covering the complete locked, all-feature Rust workspace suite. Partition 1 also runs all workspace doctests with Cargo. Both start independently of Clippy and use the existing resource wrapper. |
 | `macOS compatibility` | `macos-15` | Compiles and links every all-feature Rust workspace test target, then runs focused macOS/non-Linux custody-clock, finite-TTL, Blob staging/read, and credential-provider contracts. |
@@ -1722,15 +1722,7 @@ change exact package checksums, permit online execution after the acquisition
 step, or authorize the provider for production. Decision 0018 records the
 upstream `basic-toml` replacement, release gap, and removal gate.
 
-The former `RUSTSEC-2024-0436` exception is retired. A path-patched exact
-`netlink-packet-core` 0.8.2 preserves its API while resolving the dependency
-key `paste` to maintained `pastey` 0.2.2. [Decision 0027](../decisions/0027-libp2p-pilot-dependency-policy.md)
-and the vendored [`ASTER-PATCH.md`](../../third-party/netlink-packet-core-0.8.2-aster/ASTER-PATCH.md)
-record the provenance and removal gate. CI now requires `paste` to be absent
-from the lock, workspace, and fuzz graphs. It also verifies every retained
-upstream file hash, reconstructs and checks the two exact manifest-only deltas,
-rejects extra vendored files, and reruns all 13 upstream library unit tests from
-a disposable dependency-minimized copy. The decision continues to admit
+[Decision 0027](../decisions/0027-libp2p-pilot-dependency-policy.md) admits
 `BSD-2-Clause`, `ISC`, and `Zlib` for the reviewed external dependency graph;
 first-party packages and distributed project files remain subject to the
 separate byte-identical Apache-2.0 gate.
@@ -1760,8 +1752,8 @@ The provider removal also removes the optional Hickory 0.25.2 lock entries.
 The root audit no longer ignores `RUSTSEC-2026-0118` or `RUSTSEC-2026-0119`.
 The dependency-exception scope gate now requires only the retained fixed
 `hickory-proto` 0.26.2 lock entry and still rejects vulnerable active Hickory.
-The unrelated age advisory disposition, exact license exceptions, and netlink
-patch remain unchanged.
+The unrelated age advisory disposition and exact license exceptions remain
+unchanged.
 
 Current-stack regressions in `aster-node::runtime::tests` separate default
 serialization coverage from scale qualification. The default

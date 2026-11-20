@@ -9,7 +9,6 @@ WORKDIR /work
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY proto ./proto
-COPY third-party ./third-party
 RUN cargo build --locked --release \
     -p aster-node \
     --bin aster-hierarchy-demo-node \
