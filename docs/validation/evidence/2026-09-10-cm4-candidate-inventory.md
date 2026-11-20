@@ -121,7 +121,7 @@ identity, or raw command log is retained here.
 
 ## Frozen boundary and limitations
 
-[Decision 0043](../../decisions/0043-authorize-linux-event-mvp-validation.md)
+[Decision 0043](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0043-authorize-linux-event-mvp-validation.md)
 accepts this sanitized two-node inventory and the non-participating spare for
 the bounded MVP increment. No additional approval is required. Run-specific
 artifact, peer, network, state-path, and result facts remain evidence rather

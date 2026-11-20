@@ -162,10 +162,8 @@ candidate, admission, and concurrent-worker boundaries apply.
 Both modes are default-off and are not hostile-LAN or production discovery
 services. Mission proof is scoped to the same contact; this implementation does
 not bind it to a TLS exporter or prove common ownership of the carrier and
-mission keys. [ADR 0036](decisions/0036-mission-authenticated-lan-discovery-mvp.md)
-defines the selected boundary, and the
-[three-host LAN Event quickstart](quickstart/lan-mvp.md) gives the operator
-procedure.
+mission keys. The [LAN Event quickstart](quickstart/lan-mvp.md) describes
+operation and validation limits.
 
 The live selected Event, State, Record, and Blob handles compose high-level
 operations with this path through the running actor's shared bounded command

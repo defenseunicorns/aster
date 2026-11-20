@@ -42,7 +42,8 @@ For binary SDK client IDs, use `--client-id-hex HEX` instead of `--client-id`.
 Choose the actual observed session, not the example value. A competing takeover
 invalidates this CAS. Retirement keeps Events and their mesh lifecycle, removes
 owned delivery/publication bookkeeping, and retains a permanently charged fence.
-The ID can never be reused and its client slot is not reclaimed.
+The ID can never be reused and its client slot is not reclaimed. Safe
+reclamation remains deferred.
 
 To narrow admission limits while writers are stopped:
 
@@ -57,5 +58,19 @@ additionally constrained by the runtime's existing operation limits. Lowering
 limits below usage blocks growth without eviction; recovery and cleanup remain
 usable. Capacity inspection is read-only and does not represent total disk use.
 Commands require access to the existing local mission-bound store and never
-provision a new node. See [the decision](../decisions/0046-numbered-event-client-lifecycle.md)
-for format, privilege and evidence boundaries.
+provision a new node.
+
+## Format, privilege and validation boundaries
+
+Reconstructed Rust journals use version 2 so older SDKs reject result-only
+entries rather than mistake them for original intents. Current SDKs can still
+open ordinary version-1 journals. Retirement adds a storage record tag that
+older binaries cannot read; downgrading a store after retirement is unsupported.
+
+Retirement requires local filesystem authority and exclusive store access.
+The shared mission bearer token grants no retirement RPC.
+
+Local tests cover ownership fencing, partial journal-loss recovery and
+retirement. They do not establish physical acceptance of these operations.
+Historical Event publication measurements do not qualify the numbered-client
+lifecycle; that requires separate physical validation.

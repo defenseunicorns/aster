@@ -20,10 +20,10 @@
 - Follow-on experiment:
   [Proposal 0004](0004-shared-node-libp2p-retest.md)
 - Decision:
-  [0024 — Refactor durable node ownership before selecting an IP provider](../decisions/0024-refactor-durable-node-ownership-before-ip-provider-selection.md)
+  [0024 — Refactor durable node ownership before selecting an IP provider](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0024-refactor-durable-node-ownership-before-ip-provider-selection.md)
   — preserve Decisions
-  [0022](../decisions/0022-ip-mesh-experiment-no-selection.md) and
-  [0023](../decisions/0023-mesh-host-contract-no-libp2p-selection.md); select
+  [0022](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0022-ip-mesh-experiment-no-selection.md) and
+  [0023](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0023-mesh-host-contract-no-libp2p-selection.md); select
   **none**
 
 ## Outcome
@@ -380,7 +380,7 @@ remedy for the observed shared-state defect, while fresh authentication on every
 path/address transition is a conservative acceptance rule for preserving
 authenticated authority. Their direct-versus-derived mapping and the
 requirements that remain open are recorded in Decision 0024's
-[requirements traceability](../decisions/0024-refactor-durable-node-ownership-before-ip-provider-selection.md#requirements-traceability).
+[requirements traceability](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0024-refactor-durable-node-ownership-before-ip-provider-selection.md#requirements-traceability).
 
 After that refactor, keep native as the semantic and resource control and carry
 libp2p forward as the first connectivity candidate. A fair libp2p retry must

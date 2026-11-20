@@ -3,7 +3,7 @@
 # Linux Event MVP Evaluation Profile v0.1
 
 - Profile ID: `aster-linux-event-mvp-evaluation-v0.1`
-- Status: Accepted by Decision 0042 on 2026-09-08
+- Status: Accepted on 2026-09-08 ([historical Decision 0042](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0042-adopt-linux-event-mvp-evaluation-profile-v0-1.md))
 - Profile version: `0.1`
 - Approved design date: 2026-09-06
 - Candidate decision checkpoint: 2026-09-13
@@ -39,7 +39,7 @@ evidence. Current builds remove `PublishEvent` and `PublishEvents`; they expose
 a durable journal, fenced recovery, sequence-based exact replay, and explicit
 result acknowledgement. Use the
 [current application guide](../quickstart/connect-agent.md#use-crash-safe-numbered-publication)
-and [Decision 0044's numbered amendment](../decisions/0044-pipeline-durable-event-publication.md#numbered-publication-amendment--2026-10-08)
+and [client lifecycle guide](../quickstart/event-client-lifecycle.md)
 for current API behavior.
 
 This profile and its historical receipts do not qualify the current publication
@@ -50,6 +50,13 @@ The original operation-key limits must not be translated into numbered-client
 or result limits without that review. This notice preserves the accepted
 profile's other constraints and historical evidence boundaries; it grants no
 new approval or requirement credit.
+
+The [2026-09-15 internal validation authorization](evidence/2026-09-15-cm4-ci-package-mvp-validation.md#historical-validation-authorization)
+accepted a narrower engineering increment on the frozen two-CM4 inventory,
+using direct checks of the CI package and explicit deferrals. It did not grant
+full-profile qualification or production approval. Those historical results do
+not establish physical acceptance of numbered-client takeover, journal loss,
+or retirement.
 
 ## Summary
 

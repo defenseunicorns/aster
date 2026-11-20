@@ -14,7 +14,18 @@ evidence-bounded Linux Event evaluation procedure.
 The 2026-09-15 through 2026-09-16 two-node activity is recorded in the
 [direct CI-package record](../validation/evidence/2026-09-15-cm4-ci-package-mvp-validation.md).
 Use that record for the exact pass, failure, and unavailable-check boundary;
-do not infer additional device results from this runbook.
+do not infer additional device results from this runbook. Its
+[2026-09-15 authorization](../validation/evidence/2026-09-15-cm4-ci-package-mvp-validation.md#historical-validation-authorization)
+covered only that internal two-CM4 increment, with the recorded deferrals.
+
+The operation-key retry and capacity instructions below describe the historical
+v0.1 contract. Current builds use numbered publication; follow the
+[current application guide](../quickstart/connect-agent.md#use-crash-safe-numbered-publication)
+and [client lifecycle guide](../quickstart/event-client-lifecycle.md).
+A qualification claim for those builds requires a
+[reviewed profile amendment and new build-bound evidence](../validation/linux-event-mvp-evaluation-profile-v0.1.md#current-api-and-historical-qualification-boundary).
+The historical CM4 results do not establish physical acceptance of numbered-client
+takeover, journal loss, or retirement.
 
 ## Know the boundary
 
@@ -206,11 +217,11 @@ for its engineering lifecycle boundary. These command shapes are not yet a
 qualified customer package procedure. The final package must define stopping
 and termination confirmation, protected input descriptors, reference handoff,
 output custody, backup acceptance, readiness checks, and recovery/escalation.
-Decision 0043 accepts E01's team-internal approval for this bounded MVP
-increment; no additional approval is required. E09 packaged lifecycle
-qualification remains open. Every semantic operation uses a fresh retained
-operation ID; an uncertain result is retried with the identical ID and
-identical input.
+The [2026-09-15 authorization](../validation/evidence/2026-09-15-cm4-ci-package-mvp-validation.md#historical-validation-authorization)
+accepted E01's team-internal approval for that bounded increment without further
+approval. It did not close E09 packaged lifecycle qualification. Every semantic
+operation uses a fresh retained operation ID; retry an uncertain result with
+the identical ID and input.
 
 ## Validate a completed candidate bundle
 
