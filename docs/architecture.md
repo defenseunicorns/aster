@@ -12,10 +12,7 @@ the complete protocol and semantic reference implementation.
 | Blob | Semantic-v7/v8 profile-4 direct range stream; v7 durable-only, v8 authenticated finite custody | Cloneable live Rust handle, exclusive stopped Rust handle, and encrypted local depot |
 
 Read the diagrams from broadest to narrowest: application surfaces, runtime
-ownership, then the publication and contact flows for each mechanism. Exact
-evidence and remaining release gates live in
-[requirements status](validation/requirements-status.md), not in these
-diagrams.
+ownership, then the publication and contact flows for each mechanism.
 
 ## Components and trust boundaries
 
@@ -69,6 +66,16 @@ flowchart LR
     Session --> Carrier["Iroh carrier<br/>direct or operator-pinned relay"]
     Carrier <--> Peer["Peer aster-node"]
 ```
+
+`aster-profile` supplies the complete reconciliation key and canonical inventory
+ordering; it does not establish source identity or authorization.
+`aster-negentropy` maps those keys to timestamp zero, so set difference does not
+depend on wall clocks or insertion order. Control transfer IDs are SHA-256
+identities of exact sealed control envelopes. Event, State, Record, and Blob
+source transfer IDs likewise identify exact sealed representations, not their
+source-authenticated semantic identities. Reconciliation and Fetch/Offer retain
+these class-specific transfer identities; redb keeps separate semantic indexes
+while sharing publisher-dot and causal-frontier authority across data classes.
 
 `aster-node` is the sole composition root. `aster-iroh` authenticates only the
 carrier endpoint and provides bounded direct exchange or exchange through one
@@ -572,5 +579,3 @@ and non-Unix behavior are outside the proof.
 - [Protocol](protocol.md) defines the wire and semantic contract.
 - [Security model](security.md) describes security properties and production
   gates.
-- [Requirements status](validation/requirements-status.md) records retained
-  evidence, credited behavior, and open validation gaps.

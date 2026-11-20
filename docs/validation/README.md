@@ -9,8 +9,7 @@ itself authorize a production release.
 ## Product progress
 
 - [Capability roadmap](capability-roadmap.md) — planning and PR-review view.
-- [Requirements status](requirements-status.md) — evidence authority and
-  current implementation boundary by requirement.
+- [Requirements migration #203](https://github.com/defenseunicorns/aster/issues/203) — discussion and revalidation of remaining work.
 - [Requirements matrix notes](requirements-matrix-notes.md) — immutable
   requirements atomization rules and final-stack flags.
 - [Conformance](conformance.md), [security-profile disposition](security-profile-requirements-disposition.md),
