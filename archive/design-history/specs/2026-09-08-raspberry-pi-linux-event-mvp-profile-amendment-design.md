@@ -5,7 +5,7 @@
 - Status: Approved for profile revision
 - Approved: 2026-09-08
 - Profile: `aster-linux-event-mvp-evaluation-v0.1`
-- Decision: [Decision 0042](../../decisions/0042-adopt-linux-event-mvp-evaluation-profile-v0-1.md)
+- Decision: [Decision 0042](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0042-adopt-linux-event-mvp-evaluation-profile-v0-1.md)
 - Original design: [Linux Event MVP Evaluation Profile design](2026-09-06-linux-event-mvp-evaluation-profile-design.md)
 - Roadmap action: `P0-1 — define the claim boundary`
 

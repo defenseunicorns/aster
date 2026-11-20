@@ -50,6 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Consolidated useful design decisions into current documentation and removed
+  obsolete decision records, retaining links to their history.
 - Replaced Iroh 1.4.1 with 1.5.0 and removed the vendored netlink patch.
 - Replaced the SQLite-backed application runtime and C, Go, and Python bindings
   with the `aster-node` runtime and redb; removed atomic publication batches,
