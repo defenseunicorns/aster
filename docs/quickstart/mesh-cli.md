@@ -440,7 +440,3 @@ reconciliation. Do not use `put` for source-authenticated mesh data.
 | `aster-iroh` | Direct and operator-pinned controlled-relay endpoint lifecycle, carrier identity, and bounded exchange |
 | `aster-node` | Composition, mission-before-inventory and control-before-data ordering, peer route/interest filtering, exact control/Event/State/Record transfer, semantic-v7/v8 profile-4 Blob source/range automation with v7 durable-only and v8 authenticated finite custody, live Event/State/Record/Blob handles, durable application delivery, authority commands, sample applications, bounded same-UID Unix local zeroization lifecycle, and CLI |
 | `aster-core` | Existing spec-verified hybrid mission session, control envelope, recipient-filtered rekey, and typed source-envelope Event/State/Record/Blob semantics, used rather than rewritten |
-
-See the current capabilities and limitations in
-[current implementation boundary](../../README.md#current-implementation-boundary) and
-[conformance](../validation/conformance.md).
