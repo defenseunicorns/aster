@@ -8,7 +8,7 @@
 - Signed experiment checkpoint: `05250eb201cbb57b606ef50d8eb94785db5aae67`
 - Requirements SHA-256:
   `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
-- Decision: [0023 — Retain the mesh-host contract without selecting rust-libp2p](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0023-mesh-host-contract-no-libp2p-selection.md)
+- Decision: [0023 — Retain the mesh-host contract without selecting rust-libp2p](../decisions/0023-mesh-host-contract-no-libp2p-selection.md)
 
 ## Outcome
 
