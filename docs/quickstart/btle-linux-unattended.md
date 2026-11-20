@@ -16,6 +16,12 @@ for current policy and package status and the
 [design](../superpowers/specs/2026-11-03-production-btle-design.md#platform-qualification-and-support)
 for detailed resolver mechanics.
 
+For the exact packaged-service, rostered-discovery setup selected for the
+initial two-node evaluation, use the
+[two-node Linux BTLE procedure](btle-linux-two-node.md). This evaluator remains
+the lower-level fixed-controller and rostered diagnostic path; passing it does
+not substitute for the packaged two-node procedure.
+
 The Debian source profile can compose BTLE when complete policy and the optional
 encrypted roster credential are present; it remains unqualified. This runbook
 does not execute the package service identity or close the package-confinement,
