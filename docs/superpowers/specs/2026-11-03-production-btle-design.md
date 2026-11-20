@@ -1,9 +1,18 @@
 # Production BTLE carrier design after semantic v9
 
+Clean Room — Privileged
+
 **Status:** maintained architecture authority; no production authorization
 
 **Capability track:** P1-4 reachability and carrier portability, followed by
 all-class and cross-platform qualification.
+
+**Selected Linux activation policy (2026-11-16):** runtime compatibility is
+established by bounded, non-destructive probing. A previously unknown controller
+that passes the required probe may activate automatically. “Officially
+supported” remains a separate, evidence-backed release designation; absence from
+the support matrix is not a runtime block. Exact known-unsafe combinations and
+explicit deployment policy may still narrow the usable set.
 
 This document defines future BTLE architecture and release gates. Current
 evaluation claims are owned by
@@ -56,6 +65,110 @@ compatible with v9. Live-contact migration, transfer of attempt/session state,
 cross-carrier continuation not already owned by a durable class authority, and
 intra-record resume require a later semantic design; v9 does not infer them.
 
+## Delivery model and capability ledger
+
+This document is the single architecture and delivery authority for BTLE. The
+selected delivery model keeps the architecture, current status, increment
+boundaries, and release gates together here. A separate implementation roadmap
+was rejected because it would duplicate status and drift from the architecture;
+review-finding-driven implementation was rejected because local fixes do not
+define the product boundary.
+
+The first production-qualified data type is **Event** in the systemd-managed
+Linux agent. State, Record, Blob, other Linux hardware, macOS, Android, and iOS
+remain designed parts of this same architecture and advance only through their
+named capability exits. “Production-ready BTLE” without a qualifier means the
+complete ledger; “Linux Event production profile” means only the first release
+boundary defined below.
+
+Status has the following fixed meaning:
+
+- **Designed:** architecture and exit are defined, with no implementation claim.
+- **Source:** production code exists but has not passed the complete exit.
+- **Review blocked:** source exists, but an identified correctness, security, or
+  architecture issue prevents verification credit.
+- **Verified:** deterministic source verification for the capability passes.
+- **Physical:** retained target-device evidence passes, but release gates may
+  remain.
+- **Qualified:** the exact release profile has passed every applicable package,
+  security, support, evidence, and authorization gate.
+
+Status is monotonic only for an immutable artifact and profile. A later change
+can return the capability to Source or Review blocked. Every implementation PR
+updates affected rows in the same change and links each claimed status to its
+evidence; absence of evidence means the lower status applies.
+
+| ID | Capability and owner | First measurable exit | Current status (2026-11-19) |
+| --- | --- | --- | --- |
+| **BT-A0** | Transport-neutral application readiness and durable publication, owned by the node/store | With zero eligible transports, startup succeeds, publication is durable, and later adapter availability wakes work without republishing | **Verified** for the merged Event evaluation path; production profile remains unqualified |
+| **BT-A1** | Adapter-neutral bounded contact and mission authentication, owned by the node | BTLE supplies only transient carrier evidence; the exact mission peer authenticates before inventory or data; no Bluetooth value grants identity | **Physical** for bounded Event evaluation; not release-qualified |
+| **BT-A2** | Adapter registry, eligibility, ranking, and node-global admission, owned by the transport-neutral node | Current exact authority and sanitized availability select one bounded fresh attempt; no adapter lifecycle or class retry policy enters the core | **Source**; the Linux Event composition installs one common exact-peer Iroh/BTLE roster and shared admission, while physical multi-adapter qualification remains open |
+| **BT-A3** | Closed attempt outcome and custody contract, shared at the node/adapter boundary | Typed authority, policy, adapter-epoch, transient, authenticated, cancellation, and shutdown outcomes preserve durable work, release custody, and authorize only the permitted retry/reselection action | **Source** with focused verification; physical and release qualification remain open |
+| **BT-L0** | Bounded Linux controller inventory, passive compatibility probe, and sticky selection, owned by `aster-ble-linux` | Zero/many controllers, hotplug, BlueZ restart, timeouts, churn, unsafe rules, and unknown compatible hardware satisfy the defined deterministic bounds | **Source** with focused verification; physical automatic-path evidence remains open |
+| **BT-L1** | Rostered Linux discovery and controller-epoch lifecycle, owned by `aster-ble-linux` | Listener, advertisement, scan, candidate, socket, credential, cancellation, and cleanup owners are bounded and joined; discovery remains locator-only | **Source**; fixed-controller physical evidence is scoped to BT-E0, while the stock teardown-ingress gate still blocks this exit; the working-secret lifetime gate is closed in source |
+| **BT-L2** | Linux Event contact scheduling, owned by the BTLE runtime owner | The validated lower member schedules remote-only contact; success delays from completion, transient local failures back off, authenticated suppression parks only BTLE scheduling, and durable work survives adapter epochs | **Source** with focused verification; Linux owns cadence/backoff and the node owns generic custody and selection |
+| **BT-L3** | Emission-policy lifecycle, owned by the BTLE composition root | Configured startup `Normal` owns the rostered radio lifecycle; configured startup `ReceiveOnly` is radio-inert. For the first profile, unsupported live changes are rejected and a controlled restart rebuilds radio and credentials atomically; later live reload must provide the same stop/join/restart guarantee | **Source** with focused verification; live mutation is rejected before either policy state changes |
+| **BT-L4** | Linux production credential, package, and confinement profile | `aster-btle-roster`, rollback-safe renewal, non-root BlueZ/socket least privilege, denial tests, shutdown ordering, upgrade/rollback, and operator status pass as the packaged service identity | **Source**; package construction, payload checks, and disposable current-source execution under the installed service identity pass, while installed-package execution and qualification, physical qualification, and release gates remain open |
+| **BT-E0** | Fixed-controller semantic-v9 Event vertical slice | Two Linux nodes exchange and durably consume a protected Event larger than the minimum MTU through disconnect and restart | **Physical** evaluation only |
+| **BT-E1** | Automatic Linux Event production profile | BT-A0–A3, BT-L0–L4, BT-O0, and BT-Q0 are Qualified for one exact peer and the declared supported hardware rows | **Source**; supporting production code exists, but this first release boundary has not passed its composite exit |
+| **BT-SR0** | State and Record over the qualified class-neutral contact | Convergence, interruption, restart, withdrawal/tombstone behavior, priority, and resource bounds pass without BTLE-specific semantic records | **Designed** |
+| **BT-B0** | Blob Profile-5 DATA/CONTROL over BTLE | Exact canonical records, bounded channel association, interruption, record-level durable resume, and control-liveness/resource exits pass | **Designed** |
+| **BT-P0** | Additional Linux hardware and desktop/mobile foreground drivers | Each exact platform/hardware row passes the Linux-reference interoperability and lifecycle profile without changing application semantics | **Designed**; Pixel/Linux Event evidence is evaluation-only |
+| **BT-P1** | Background mobile profiles | Explicit OS background constraints, permission lifecycle, packaging, energy, and availability semantics pass separately per platform | **Designed**; scheduled only after foreground platform qualification |
+| **BT-O0** | Sanitized operability and support evidence | Readiness is separate from adapter availability; bounded status/reason/support fields obey the metadata budget and never expose locators, roster, PSM, peer, or credential data | **Source**; authoritative current status crosses the process boundary through the OS-authorized service journal, while installed-package reader and denial evidence remains open |
+| **BT-Q0** | Production qualification and authorization | Supported artifact, SBOM/license admission, dependency gates, hostile-peer/resource evidence, independent architecture/security review, reproducible package evidence, and signed release authorization pass | **Designed**; every release gate remains open |
+
+### First production release boundary: Linux Event
+
+The first production release is one exact-peer, Event-only,
+systemd-managed Linux profile. It requires BT-A0 through BT-A3, BT-L0 through
+BT-L4, BT-O0, and BT-Q0 to be Qualified for each named support row. It includes
+automatic compatible-controller discovery and selection, zero-controller
+readiness, hotplug/restart recovery, exact-peer authentication, durable Event
+delivery, bounded retry and cleanup, correct configured startup behavior for
+`Normal` and `ReceiveOnly`, explicit rejection of unsupported live policy
+mutation, protected credential renewal or controlled restart, least-privilege
+packaging, and actionable sanitized status.
+
+It does not claim State, Record, Blob, multiple peers, live contact migration,
+live emission-policy reload, background mobile operation, an unlisted support
+row, or production authorization for source builds. Those exclusions narrow the
+first release profile; they do not remove the corresponding capabilities from
+the architecture.
+
+### Aligned increments
+
+| Increment | Capability IDs | Exit before the next increment |
+| --- | --- | --- |
+| **E0 — Event carrier baseline** | BT-A0, BT-A1, BT-E0 | Merged non-IP adapter path and retained Linux/Android evaluation evidence; no production claim |
+| **E1 — automatic Linux hardware owner** | BT-A2, BT-L0, BT-L1 | Bounded probe/selection/activation source path is statically clean, deterministically verified, and its remaining physical/package gaps are explicit |
+| **E2 — attempt and Event scheduling contract** | BT-A3, BT-L2, BT-L3 | Durable work survives every typed local lifecycle transition; suppression affects only its authorized scope; pending and active custody drain; generic node owns no BTLE cadence; unsupported live policy changes fail explicitly |
+| **E3 — production Linux service profile** | BT-L4, BT-O0 | Credential renewal/restart, confinement, denial tests, status, upgrade/rollback, and signed package inputs pass as the service identity |
+| **E4 — Event qualification and authorization** | BT-E1, BT-Q0 | Named hardware rows pass physical, interoperability, hostile, restart, resource, dependency, independent-review, and release gates |
+| **SR1 — State/Record qualification** | BT-SR0 | Qualified Event contact carries State and Record convergence scenarios without carrier-specific semantics |
+| **B1 — Blob qualification** | BT-B0 | Profile-5 channel, checkpoint, interruption, and resource exits pass |
+| **P1 — platform expansion** | BT-P0, then BT-P1 | Exact additional platform rows pass foreground, then separately background, qualification |
+
+E1 and E2 may share a PR only if the combined diff remains independently
+reviewable and both exits pass; otherwise E1 closes first. No later increment
+may be used to waive an earlier exit. A reviewer finding changes an increment
+only when it maps to one of these capability invariants; otherwise it is either
+deferred to its named capability or rejected as unrelated scope.
+
+### Observable execution rules
+
+Every implementation increment must expose, in its PR description:
+
+1. capability IDs advanced and the exact old/new status;
+2. production invariants exercised and explicit non-goals;
+3. production-code and behavior-test delta, with no source-text/name tests;
+4. static architecture, security, and quality review disposition;
+5. focused verification, followed by one coordinated full check only when the
+   PR candidate is otherwise publishable;
+6. physical evidence required now versus deferred to qualification;
+7. OPI provenance screening and dependency/source changes; and
+8. signed commits and the exact upstream base.
+
 ## Architecture
 
 ```text
@@ -93,6 +206,11 @@ are distinct. Controller absence is nonfatal `unavailable` state. Lifecycle
 observation is event-driven; removal cancels and drains affected work before a
 new epoch. Controller discovery and selection stay inside the BTLE adapter; the
 host selector chooses a transport adapter, not a Bluetooth controller.
+Carrier availability reports only local ownership and health. In automatic
+mode the adapter separately keeps its private selector snapshot unavailable
+until it accepts one complete authenticated roster beacon in that operational
+epoch. That gate permits an outbound attempt; it is not peer reachability,
+peer eligibility, or a support claim.
 
 ## Deployment, availability, and selection
 
@@ -103,6 +221,26 @@ smaller platform-appropriate set, but application code and durable semantics do
 not vary with detected hardware. It is the same node process whether the host
 has an IP interface, a Bluetooth controller, both, or neither; there is no
 companion BTLE daemon.
+
+For the initial Linux Event implementation under semantic v9, a BTLE policy may
+name the same mission peer as one configured Iroh route. The composition root
+then registers that Iroh route in the automatic selector, installs Iroh and
+BTLE entries in one complete eligibility replacement, and removes forced Event
+wakes for that route from the legacy scheduler. The Iroh-specific periodic
+maintenance cadence remains so State, Record, Blob, and receive-side work are
+not stranded when Event selection prefers BTLE. Both selector-issued and
+periodic coordinated Iroh contacts share the same capacity-one Event-session
+admission with BTLE and require semantic v9; Iroh retains its existing ALPN,
+native unidirectional Event turns, and post-Event lanes. Because that periodic
+contact is the existing indivisible all-class semantic session, it may also
+reconcile Event; BTLE priority governs selector-issued automatic Event attempts,
+not suppression of native Iroh cadence. Making maintenance post-Event-only
+would require a separately designed protocol capability and is not part of this
+v9 implementation. Other Iroh peers retain their existing lifecycle.
+Semantic-v8 Iroh remains supported only when that route is not coordinated with
+BTLE; an overlapping configuration requires the peer to negotiate semantic v9.
+This does not generalize transport lifecycle or change protocol bytes; it is
+replaceable composition policy.
 
 Each adapter owns its platform lifecycle and independently reports a bounded,
 sanitized availability snapshot to the host registry. A snapshot includes the
@@ -133,15 +271,20 @@ For every fresh outbound pending-work cohort, the selector:
 3. admits one bounded attempt through the adapter-neutral contact port.
 
 The initial automatic composition admits one establishing or active outbound
-contact per node; already durable local application work is unaffected. The
-coordinator schedules peer/class cohorts with bounded fair rotation so an
-Event-only adapter cannot indefinitely strand State, Record, or Blob work. The
-exact ranking, fairness weights, and admission bound are replaceable local
-implementation details, not wire behavior. Normal configuration expresses
-policy—allow/deny, emission constraints, and optional priority/cost
-preferences—not controller addresses, interface names, or detected hardware.
-Applications publish and observe durable results; they cannot select a
-transport.
+Event contact per node; already durable local application work is unaffected.
+The Event coordinator ranks only Event-capable adapters. The Iroh adapter keeps
+its bounded periodic all-class maintenance cadence and enters the same shared
+contact admission, so preferring an Event-only adapter cannot indefinitely
+strand Iroh's State, Record, or Blob lanes. This existing all-class session may
+also reconcile Event; configured priority ranks only selector-issued automatic
+Event attempts. Future adapters that carry other classes must provide their own
+bounded class scheduling rather than extending the Event selector into a
+generic transport lifecycle. Exact ranking, cadence, and admission bounds are
+replaceable local implementation details, not wire behavior. Normal
+configuration expresses policy—allow/deny, emission constraints, and optional
+priority/cost preferences—not controller addresses, interface names, or
+detected hardware. Applications publish and observe durable results; they
+cannot select a transport.
 
 All eligible adapters may listen concurrently. Each adapter first enforces its
 own pre-contact connection, carrier-cryptography, socket, byte, task, and rate
@@ -149,9 +292,12 @@ budgets. Every resulting contact then enters node-global admission before the
 Aster mission handshake. The initial composition admits one mission
 handshake/contact across inbound and outbound automatic paths; excess candidates
 are closed without unbounded queues. `ReceiveOnly` admits bounded inbound work
-but originates none; `PassiveOnly` admits no session contact. Later concurrency
-requires measured global/per-adapter bounds and authenticated duplicate
-arbitration first.
+but originates none; `PassiveOnly` admits no session contact. That is the target
+profile behavior. The current source-level Linux agent keeps BTLE unavailable
+and radio-inert for `ReceiveOnly`, because its automatic rostered supervisor
+requires advertisement and scan, and the agent exposes no `PassiveOnly` option.
+Later concurrency requires measured global/per-adapter bounds and authenticated
+duplicate arbitration first.
 
 When no adapter is eligible or available, the node remains application-ready,
 accepts durable publication, reports sanitized unavailability, and waits for an
@@ -160,15 +306,19 @@ Hotplug, permission, driver, and link changes wake selection through adapter
 events. A new adapter or controller epoch never inherits a prior contact's
 mission keys, replay state, or provisional authorization.
 
-The composition root owns order: open the durable node, start adapters, then
-open contact admission; on shutdown, close admission, cancel and join adapters,
-then close the node. An embedded host supplies equivalent adapter and credential
-providers. The Linux service and later mobile applications are composition
-profiles of this contract, not separate transport authorities. The first
-BTLE-qualified production profile is the systemd-managed Linux agent. Container
-builds exclude BTLE until an equally protected credential provider, BlueZ/device
-access model, reload/rollback authority, and confinement profile are separately
-qualified.
+The composition root owns order: open the durable node with transport admission
+closed, start adapters, install the complete exact-peer roster, open contact
+admission, then start outbound scheduling. On shutdown it revokes selector
+tickets before publishing terminal admission, cancels and joins adapters, then
+closes the node. Collision arbitration is local cancellation, never transport
+failure evidence for reselection, and a waiter must recheck terminal admission
+after acquiring shared capacity. An embedded host supplies equivalent adapter
+and credential providers. The Linux service and later mobile applications are
+composition profiles of this contract, not separate transport authorities. The
+first BTLE-qualified production profile is the systemd-managed Linux agent.
+Container builds exclude BTLE until an equally protected credential provider,
+BlueZ/device access model, reload/rollback authority, and confinement profile
+are separately qualified.
 
 ## Platform boundary
 
@@ -178,23 +328,35 @@ cancellation, close, controller/permission lifecycle observation, current
 packet/MTU bounds, and sanitized health/role reporting. Cancellation must
 release owned platform work within a declared bound.
 
+The initial Linux Event profile declares a 23-byte minimum negotiated L2CAP MTU
+in each direction. That is the LE Credit-Based L2CAP interoperability baseline,
+not a throughput guess: Aster's ordered-contact stream fragments larger records
+and therefore has no reason to reject a standards-compliant 23-byte link. The
+adapter first applies locator and roster admission, then bounds readiness for
+that accepted socket and rejects a missing or smaller directional MTU before
+constructing the unauthenticated mission contact. A remote-low send direction
+closes only that candidate and re-arms the listener; a missing or locally low
+receive direction is a platform failure. This is a local Linux admission rule
+and changes no semantic-v9 or discovery bytes. The value is
+grounded in the public [Bluetooth Core L2CAP specification](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core_v7.0/out/en/host/logicallinkcontrol-andadaptationprotocol-l2cap--specification.html).
+
 Startup must tolerate missing hardware, a stopped BlueZ service, denied optional
 permissions, and later hotplug. Those conditions make BTLE unavailable; they do
 not make the node or durable publication unavailable. Platform drivers probe
-hardware automatically and select only controllers admitted by the qualified
-support matrix. An explicit controller override may exist as a diagnostic or
-deployment policy control, but is not required for normal operation and cannot
-turn unqualified hardware into supported hardware.
+hardware automatically and select a controller that passes the required
+compatibility probe. An explicit controller override may exist as a diagnostic
+or deployment policy control, but is not required for normal operation and
+cannot turn unqualified hardware into officially supported hardware.
 
 The stock dependency graph deliberately carries no BTLE-local forks. Stock
 `bluer` does not by itself establish acknowledged, cancellation-safe
 advertisement/discovery teardown or a bounded first D-Bus ingress queue; Linux
 rostered discovery remains unqualified until the driver supplies and proves
-those properties through stock or upstream APIs. Stock `hmac` computes the
-required bytes but does not by itself establish erasure of constructor-derived
-key, IPAD, and OPAD temporaries. Production credential handling therefore
-remains gated on an implementation and review that prove those working-secret
-lifetimes without a local crate fork.
+those properties through stock or upstream APIs. Aster does not use stock
+`hmac` for discovery-secret operations: one narrow local HMAC-SHA-256 helper
+over the public `sha2` API owns key-derived pads, hash state, and intermediate
+digests in zeroize-on-drop storage. Frozen beacon and credential-fingerprint
+vectors preserve the existing bytes without a local dependency fork.
 
 `BleL2capV1` owns carrier framing, deadlines, limits, flow control,
 session/channel association, scheduling, and error classification. Platform
@@ -214,11 +376,33 @@ replay state, pre-authentication slots, handshakes, retries, negative caches,
 windows, and retained bytes are bounded. Discovery exposes no `NodeId`, mission
 identifier, topic, scope, priority, inventory, data class, or payload.
 
-The current provisional `ReceiveOnly` behavior originates no discretionary
-scan, advertisement, contact, inventory, reconciliation, administration, or
+The target `ReceiveOnly` behavior originates no discretionary scan,
+advertisement, contact, inventory, reconciliation, administration, or
 application payload, while allowing protocol-required responses on an admitted
-inbound contact. `PassiveOnly` emits no framework bytes and cannot run an
-ordinary L2CAP session. Final names and doctrine remain a profile decision.
+inbound contact. The current Linux agent does not yet have that non-originating
+BTLE discovery/listener path: it registers the lane unavailable and starts no
+automatic radio owner for `ReceiveOnly`. `PassiveOnly` emits no framework bytes
+and cannot run an ordinary L2CAP session, but is not a current agent
+configuration option. Final names and doctrine remain a profile decision.
+
+The first Linux Event production profile accepts exactly `Normal` and
+`ReceiveOnly` as restart-only configured startup states. `Normal` may acquire
+the roster credential, probe and select a controller, start the role-required
+radio owners, and let the lower mission member originate automatic Event
+contacts. `ReceiveOnly` leaves BTLE unavailable and radio-inert in this first
+profile; it may still receive through another eligible adapter, and all local
+publication remains durable. It does not claim BTLE inbound reception until a
+separately designed non-originating listener path exists. `PassiveOnly` and
+threshold policies are outside this profile.
+
+While BTLE is composed, a live emission-policy mutation is rejected before
+either the node policy or BTLE owner changes. The operator changes validated
+configuration and performs a controlled service restart; startup then builds
+the new policy, credential, radio, registry, and admission state as one
+composition. Credential renewal may use the same controlled restart without a
+policy change. A later live-reload increment must replace this rejection with
+one serialized revision-coupled stop, join, credential swap, rebuild, and
+publish transition; independent policy and transport-gate writes are forbidden.
 
 ### `AsterRosterBeaconV1`
 
@@ -290,14 +474,31 @@ expiry BTLE becomes unavailable while the node stays ready. Linux may implement
 renewal through an authenticated service reload or a controlled service restart;
 it must never park permanently merely because the startup lease expired.
 
+The initial Linux implementation uses controlled restart. At lease expiry the
+automatic adapter first fences availability, joins its resolver and platform
+owners, and releases credential custody. It then terminates the BTLE owner; the
+agent exits unsuccessfully and the packaged systemd `Restart=on-failure` policy
+starts a fresh process that receives the replacement credential and rebuilds
+the complete adapter epoch. The node remains ready during bounded expiry
+cleanup; terminal completion then deliberately transitions the agent to a
+failed exit so the service manager can restart it. Durable state and
+publications survive that process restart.
+Live credential reload remains a future implementation option, not a protocol
+capability.
+The unit's bounded start-rate policy prevents an absent or rejected replacement
+from becoming an unbounded restart loop; that condition requires operator or
+provider repair rather than keeping expired radio authority alive.
+
 The implemented rostered slice remains one Linux controller, one exact mission
 peer, one dynamic PSM, and one active Event contact. Lower complete mission
 `NodeId` initiates; higher listens. The BTLE adapter never substitutes GATT or a
 fixed locator when rostered discovery fails. The future host composition defined
 here may schedule a fresh attempt on another independently eligible transport
 after a safely scoped transport failure; the current evaluation binary cannot.
-Multiple peers, duplicate arbitration, automatic BTLE controller selection,
-other classes, packaging, and production approval remain open.
+Source-level automatic Linux controller resolution/composition is now
+implemented and tested separately from that explicit-controller evaluator.
+Multiple peers, duplicate arbitration, other classes, packaged activation,
+physical automatic-path qualification, and production approval remain open.
 
 ## Contacts, channels, and data classes
 
@@ -393,17 +594,41 @@ and a sanitized reason. Mappings are owned as follows:
 - only locally proven adapter unavailability, link loss, or transport deadline
   permits reselection. Cancellation remains cancellation.
 
+A successfully settled contact returns a separate bounded completion containing
+the settled durable generation and completion time; success is not a failure
+disposition. The first profile's failure-disposition vocabulary is closed and
+local to the implementation, not a wire allocation:
+
+| Disposition | Transport-neutral custody and selection effect | Initiating owner effect |
+| --- | --- | --- |
+| `RetryLater` | Release attempt-local custody, retain durable work, and do not wake another adapter solely because of the failure | The BTLE owner may submit a later independent request after its bounded jittered backoff |
+| `Reselect` | After validating local adapter/attempt provenance, release custody and wake ordinary fresh selection; no session or attempt state transfers | End the affected BTLE attempt or epoch and wait for registry selection |
+| `Suppress` | Record only the authenticated expected-peer, mission, or policy scope against its authority generation; retain durable work | For the first Linux Event profile, park only the affected BTLE schedule until controlled restart; the adapter and node remain alive. A later administrative retry or generation-triggered wake is an implementation extension, not a wire change |
+| `Cancelled` | Release custody without changing eligibility, suppression, delivery, or retry state | End only an explicitly caller-cancelled operation or coordinated shutdown operation; lifecycle, authority, and policy changes must use their typed outcome instead |
+| `Terminal` | Release custody and retain undelivered durable work; authorize no automatic retry | End that operation. Only an independently proven node-local invariant may enter node-fatal handling; no peer or adapter outcome may terminate the transport-neutral service |
+
+The transport-neutral coordinator validates the tuple, owns custody release,
+authority-generation suppression, and a reselection wake. It owns no BTLE timer,
+success cadence, jitter, or retry count. The Linux BTLE runtime owner consumes
+completion, `RetryLater`, and the parked/unparked state to implement its local
+Event schedule. A pending ticket observes authority, policy, adapter epoch, and
+shutdown changes until it is issued or closed; late observers attach to the one
+shared completion object rather than creating a second scheduling mode.
+
 Locally proven adapter unavailability before a mission handshake may still wake
 ordinary selection because it identifies no remote peer. A remote or ambiguous
 pre-authentication failure ends that scheduled operation and enters bounded
 locator backoff; a later operation is independently selected rather than being
-failure-driven fallback. Expected-peer, mission, and policy suppressions last
-until their authenticated authority generation changes or an explicit
-administrative retry; transient transport state uses bounded backoff. The
-selector never parses error text.
-This outcome contract must replace the current coarse error collapse before a
-second production adapter is enabled, preventing both cross-carrier probing and
-attacker-selected peer suppression.
+failure-driven fallback. Expected-peer, mission, and policy suppressions retain
+their authority generation in the coordinator. The first Linux Event schedule
+stays parked until controlled restart; a later generation-triggered wake or
+administrative retry can be added locally without changing the wire protocol.
+Transient transport state uses bounded backoff. The selector never parses error
+text.
+
+This outcome contract replaces coarse error collapse before a second production
+adapter is enabled, preventing both cross-carrier probing and attacker-selected
+peer suppression.
 
 Process restart reconstructs availability from platform state and protocol
 progress only from mission-bound durable authorities. Platform callback queues,
@@ -420,28 +645,172 @@ firmware, driver build, role, lifecycle mode, MTU/rate/resource bounds,
 conformance scenario, artifact identity, and known exclusion. One successful
 controller does not qualify neighboring hardware.
 
-Runtime discovery is broader than the support claim: an unknown controller may
-be observed, but it remains unavailable unless its OS/driver/controller row is
-admitted. The package must not silently treat successful probing as production
-qualification. Operator status reports adapter type and sanitized reason codes,
-never raw transient Bluetooth addresses, PSMs, discovery proofs, or credentials.
+Runtime compatibility and official support are separate decisions. The Linux
+driver enumerates available BlueZ controllers and runs a bounded,
+non-destructive probe against each candidate. The required startup probe checks
+that the service identity can open a BlueZ session, read the controller's
+powered/address/type inventory, create and LE-address-bind a socket, validate its
+dynamic PSM, listen, and close within bounds. Those typed public operations—not
+metadata heuristics—establish inventory visibility, passive local CoC behavior,
+and the permissions required for that preflight. This is local compatibility
+preflight only; it does not prove radio operation, peer interoperability,
+negotiated MTU, restart behavior, or safe advertisement and scan teardown. It
+does not reset or power a controller, pair or bond a device, remove a device,
+disconnect another owner's peer, mutate host-wide configuration, or emit RF
+activity. Advertisement and scan capability and permission are established only
+by actual operational registration when the emission policy permits it; passive
+probing cannot violate `ReceiveOnly` or `PassiveOnly` policy.
 
-The release carries a signed, package-bound support matrix. A driver probes the
-OS, architecture, kernel/framework, controller vendor/product and revision,
-firmware, and driver identity and requires one exact non-revoked row. Missing,
-ambiguous, or conflicting fields yield `unqualified`. Among multiple qualified
-controllers the BTLE adapter chooses by row priority then stable platform ID; an
-operator override may only narrow that set. One controller is active in the
-initial profile. Replacement creates a new epoch and drains the prior owner.
+A candidate that passes every required preflight gate is `compatible` and may
+attempt operational activation whether or not it already has a support-matrix
+row. The host sees the BTLE carrier as available after every policy-permitted,
+role-required listener, advertisement, or scan owner has started successfully.
+Automatic selection remains privately unavailable until discovery admission
+accepts one complete authenticated roster beacon in the same operational epoch.
+A compatible candidate is tagged `qualified` when its exact fingerprint has
+retained release evidence, otherwise `unqualified`; this tag informs selection
+and operator status but is not an activation gate. A deployment may opt into a
+`qualified-only` hardening policy. Package composition can construct this
+policy and its exact support and unsafe rows through the driver API; the agent's
+current packaged configuration uses the default open-support policy. An exact
+package-bound known-unsafe or revoked rule blocks activation, but a missing
+support row does not. Missing or ambiguous fields that could overlap a
+known-unsafe rule fail closed as `blocked` rather than silently bypassing the
+rule. Successful probing never creates an official support claim.
 
-The Linux service remains the existing non-root `aster-agent`. BTLE packaging
-adds only the least privileges needed by the qualified BlueZ path, including
-`AF_BLUETOOTH` where socket-family confinement is used; it grants no controller
-reset, host pairing, or root authority. Roster-discovery credentials are
-systemd-managed encrypted credentials in production, not environment variables,
-CLI arguments, or ordinary configuration files. Configuration validation checks
-policy and credential references without requiring present hardware. Service
-readiness and health distinguish node readiness from per-adapter availability.
+The initial implementation examines at most eight controllers per probe sweep,
+probes at most one concurrently, activates at most one, and accepts canonical
+adapter names of at most 64 UTF-8 bytes. Eight and 64 are implementation
+resource bounds—not protocol or support limits—chosen to cover ordinary
+multi-controller Linux hosts and adapter names while bounding downstream
+retained candidates and socket, probe, retry, snapshot, and log work and
+rejecting pathological identifiers after BlueZ returns its fully materialized
+inventory. They do not bound that initial BlueZ or system D-Bus ingress
+allocation, which remains part of the trusted platform and confinement
+boundary. Names are
+canonicalized, validated, deduplicated, and ordered; the healthy selected
+controller and an explicit diagnostic override are retained before filling
+remaining slots. Extra entries are ignored deterministically without retained
+overflow state or per-entry logs. Either constant may change without
+compatibility impact.
+
+Selection is private to the adapter and does not inspect mission authority.
+Candidates are filtered by required compatibility, emission policy,
+known-unsafe rules, and local policy, then ranked by explicit local narrowing,
+an existing healthy selection, current health, qualification as a tie-breaker,
+and an epoch-local canonical key. The outer adapter owner separately gates
+activation and contact admission on policy, credentials, and peer authority.
+An unrelated controller addition must not disrupt a healthy selected
+controller. The driver coalesces harmless state changes behind a fixed 250 ms
+minimum before the next full observation and allows one probe sweep at a time.
+A selected-controller removal or relevant property change publishes
+`Unavailable` and drains its owner immediately; replacement observation still
+waits for the fixed coalescing boundary. It re-probes after BlueZ owner loss,
+relevant selected-controller change, inventory change, or package/policy
+generation change, and drains the current owner only when that controller is
+lost, blocked, explicitly replaced, or has a relevant identity or capability
+change. In the first increment, package and policy generation changes are
+observed only on process restart; live authenticated reload is future work.
+
+The compatibility fingerprint contains only the OS and architecture,
+kernel/BlueZ version, controller vendor/product/revision, and firmware or driver
+identity when the platform exposes them. Every field is typed, canonically
+parsed, and length- and cardinality-bounded before comparison or reporting. It
+excludes Bluetooth addresses, USB serial numbers, transient device paths,
+allocated PSMs, peer identifiers, and credentials. The epoch-local canonical
+adapter name or index may break selection ties but is never persisted or
+exported and need not remain stable across restart. Missing optional fingerprint
+fields make the support tag unqualified unless they create ambiguous overlap
+with a safety rule; they do not otherwise fail successful compatibility
+preflight.
+
+The initial Linux implementation obtains the kernel release from its fixed proc
+entry, the BlueZ version from a fixed absolute `bluetoothd` path with no shell or
+`PATH` lookup, and physical controller identity from each retained candidate's
+bounded sysfs device entries. The direct command and its inherited output pipe
+share a private 250 ms deadline. One single-flight collection batch has a 500 ms
+deadline: half is reserved for that command and half for the bounded proc/sysfs
+work across the at-most-eight retained candidates, leaving half of the default
+one-second resolver operation bound for BlueZ inventory and identity
+revalidation. Accepted identity atoms are at most 64 bytes; transient sysfs link
+reads are capped at 512 bytes before only their bounded basename is retained.
+The collector pins one device, driver, and module generation while reading and
+then revalidates those objects plus the BlueZ snapshot before admission.
+Missing, changed, malformed, oversized, or unavailable values remain absent and
+therefore cannot create a qualified support row. A timeout returns incomplete
+fingerprints while retaining at most one underlying blocking worker, so
+collection failure is non-fatal to compatibility probing and transport-neutral
+readiness.
+
+Static validated policy contains no detected controller identity and remains
+valid without present hardware. The resolver issues one ephemeral, non-cloneable
+`ControllerEpochOwner` containing the adapter name, address and type needed for
+local socket operations, inventory generation, and bounded fingerprint. It
+retains the lease while platform startup calls borrow a redacted, immutable
+snapshot. Exact name/address/type is rechecked immediately before each platform
+operation. Listener, advertisement, scan, and socket child owners do not clone
+or retain the lease; each observes the epoch-generation cancellation signal and
+closes when its owner becomes stale. The existing exact configured controller
+tuple is retained only for evaluation and explicit diagnostic narrowing;
+production automatic activation obtains it from the resolver owner.
+
+State is represented on four independent axes. `ProbeDisposition` is
+`Compatible`, `Incompatible(reason)`, `Blocked(reason)`, or
+`Indeterminate(reason)`; probing itself is transient lifecycle, not a result.
+`SupportTag` is `Qualified` or `Unqualified` and applies only to compatible
+candidates. `RuntimeAvailability` is the local carrier's two-state model:
+`Unavailable` or `Available`. `Available` is published only after the selected
+controller's listener, advertisement, and scan owners are running and adapter
+availability has been accepted. `SelectorReadiness` is a separate private
+two-state snapshot. In automatic mode it starts `Unavailable` and becomes `Available`
+only after admission of a complete authenticated roster beacon. The gate is
+scoped to the owned operational epoch and resets on owner loss or restart;
+reset during the current advertisement rotation is an initial implementation
+detail, not protocol behavior. Initial, probing, policy-rejected,
+operational-starting, loss, retry, and failure states remain `Unavailable`.
+Unsupported address
+family, protocol, or LE CoC maps to `Incompatible`. BlueZ loss, hotplug, power,
+permission, resource exhaustion, deadline, cancellation, or unknown platform
+error maps to `Indeterminate` and runtime `Unavailable` with capped retry.
+Package safety rules and explicit local policy map to `Blocked`. Mapping uses
+typed platform errors and never parses error messages. The selector receives
+only its private `Available` or `Unavailable` snapshot; no protocol or wire
+representation changes.
+Controller lifecycle remains private to the Linux adapter.
+
+The serialized probe has explicit per-operation, per-candidate, and whole-sweep
+deadlines. Cancellation, deadline, cleanup failure, or an incomplete sweep never
+asserts incompatibility. Every acquired socket or platform owner is closed and
+joined within its declared bound before the candidate may be retried. The
+whole-sweep budget gives every admitted candidate one bounded attempt; if that
+cannot be maintained, a retained rotating cursor makes unfinished candidates
+lead the next sweep. State changes collapse into one pending sweep. Harmless
+inventory or property churn permits at most four full observations per second;
+transient failures remain subject to capped retry/backoff.
+
+The current source composition uses immutable empty support and
+known-unsafe tables; the future signed qualified package compiles generated
+rows into those bounded tables. A separately updateable signed artifact is
+future work. Lab evidence
+promotes an exact fingerprint to `qualified` and records its tested roles,
+bounds, scenarios, artifact identity, and known issues. Safety rules use only
+reliably obtainable bounded fields and may define explicit bounded ranges;
+ambiguous overlap fails closed. Among probe-passing controllers, a qualified
+row is preferable but not required under the default policy. Target operator
+status reports adapter type, qualification tag, and sanitized closed reason
+codes, never raw transient Bluetooth addresses, PSMs, discovery proofs, or
+credentials.
+
+The Linux service remains the existing non-root `aster-agent`. Its Debian unit
+presents the optional systemd-encrypted `aster-btle-roster` credential and
+admits `AF_BLUETOOTH` without raw/admin capabilities. A user-specific D-Bus
+policy first denies BlueZ method calls, then allows only inventory/property
+reads, filtered discovery start/stop, and advertisement registration cleanup.
+It grants no controller power/reset, pairing, bonding, device connect/remove,
+or root authority; no additional Polkit grant is installed. Without complete
+BTLE configuration and a valid credential the radio path remains inert, and
+without compatible hardware the node remains ready. Configuration validation
+checks policy and credential references without requiring present hardware.
 
 Linux qualification freezes the exact BlueZ D-Bus interfaces and methods used
 for property reads, discovery filtering/windows, and advertisement registration.
@@ -452,10 +821,58 @@ enforce it, that composition is not qualified. Socket and D-Bus denial tests run
 as the actual service identity.
 
 Status, logs, and metrics share one metadata budget: adapter kind, coarse
-available/degraded/unavailable reason, bounded counters, and current selected
-kind. They omit peer/controller addresses, PSMs, role/roster membership,
+available/unavailable reason, bounded counters, and current selected kind. They
+omit peer/controller addresses, PSMs, role/roster membership,
 discovery material, transfer identifiers/counts, retry detail, and secrets.
-BTLE output uses the node's redaction sink rather than direct process logging.
+The private selector transition caused by roster discovery is not emitted as
+operator status, a log, or a metric.
+BTLE output passes through an allowlisting, coalescing process writer before it
+reaches standard output. The agent publishes one current record containing only
+timestamp, operation, adapter kind, availability, closed reason, and support
+tag. The writer retains at most the latest record, retries spawn or write
+failure at no more than four attempts per second, lets newer state replace a
+failed record, and interrupts retry on close. Sink failure never changes
+readiness, adapter availability, selection, or durable custody. Detailed
+lifecycle edge events remain internal and do not become customer fields.
+The packaged unit explicitly routes standard output to the system journal.
+Linux account, group, and journal ACL authorization is the operator boundary;
+the Aster application API is unchanged. Qualification proves one authorized
+reader can obtain the current record and an ordinary local account cannot.
+
+Compatibility observations are process-memory-only and replaced on inventory
+epochs as one bounded current snapshot per examined controller, not an
+unbounded history. Persistence requires a separate privacy and retention design.
+No compatibility-report command, export, customer-status field, or log field
+exists today. A future explicitly authorized manual evidence workflow may use
+only a bounded non-identifying tuple—OS and architecture, kernel and BlueZ,
+controller vendor/product/revision, and firmware/driver when exposed—plus
+closed probe outcomes, support tag, and software artifact identity. Even that
+tuple is potentially linkable operational metadata. The workflow must exclude
+hostname, machine ID, the epoch-local key, and all fields prohibited above;
+its output is evidence input, not authority to alter runtime policy or the
+support matrix.
+
+## Clean-room provenance guardrail
+
+All design, implementation, review, and evidence work follows the current OPI
+clean-room guardrail and exclusion list. Inputs are limited to clean Aster
+source, public standards and public BlueZ/Linux APIs, public pinned dependency
+sources, and clean hardware or ZeroTier lab observations. External components
+used in the implementation or evidence record their name, version, and public
+source in the resource log. Blocked repositories, packages, credentials,
+excluded-person input, and proprietary implementation material are not accessed
+or used.
+
+Before commit, the staged diff, dependency graph, and newly introduced source
+URLs are screened for excluded provenance. The retained receipt records only
+that screening completed and any public sources admitted; it never copies
+protected content. Each increment refreshes the shared guardrail and exclusion
+list before screening. Its sanitized receipt records the policy revision,
+applicable rule ID or `unknown`, match kind, affected file hash and location,
+screening method/version, and scope. A lexical or delegated-review flag is a
+candidate for contextual classification, not proof of exposure. Suspected
+excluded provenance pauses the affected work and is quarantined and escalated
+under the guardrail rather than silently removed.
 
 ## Required evidence and governance
 
@@ -470,6 +887,23 @@ floor, dynamic lifecycle, duplicate-contact vectors, packet and resource
 evidence, approved emission semantics, support rows, signed semantic minimum,
 durable per-identity high-water, authenticated rollback, dependency/SBOM
 admission, independent review, and release authorization.
+
+Linux automatic-probe evidence covers zero controllers, one and multiple
+controllers, malformed and duplicate inventories, eight-versus-nine selection,
+a huge fake inventory proving downstream work remains bounded, missing and
+ambiguous optional fingerprint fields, every closed disposition/error mapping,
+deterministic ranking and selected-controller stickiness, non-disruptive
+controller addition, hotplug and BlueZ restart re-probe, deadline/cancellation
+and cleanup at every probe step, an early hung candidate followed by a compatible
+candidate, sustained inventory-change storms, safety-rule ambiguity, and proof
+that passive probing emits no RF activity. It covers an unknown compatible
+controller attempting activation under the default policy, host availability
+only after all required operational owners start, the same controller rejected
+by `qualified-only` policy, and exact known-unsafe blocking. Fake platform tests
+provide deterministic failure injection; physical evidence covers the actual
+packaged service identity, controller coexistence without mutation, process and
+controller restart, CM4 cold/warm/hotplug behavior, and Pixel-to-Linux Event
+transfer. No requirement evidence advances from mechanism tests alone.
 
 Automatic-selection evidence adds two eligible physical adapters, zero-adapter
 startup and hotplug, fair Event-only/all-class pending work, inbound/outbound

@@ -264,6 +264,7 @@ dependencies = [
 name = "aster-agent"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "aster-ble-linux",
  "aster-core",
  "aster-host",
  "aster-iroh",
@@ -282,7 +283,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
- "memchr",
  "redb",
  "rustix",
  "serde",
@@ -336,7 +336,7 @@ dependencies = [
  "bluer",
  "futures",
  "getrandom 0.4.3",
- "hmac 0.13.0",
+ "rustix",
  "sha2 0.11.1",
  "subtle",
  "tokio",
@@ -405,7 +405,6 @@ dependencies = [
 name = "aster-host"
 version = "0.1.0-alpha.1"
 dependencies = [
- "hmac 0.13.0",
  "libc",
  "rustix",
  "sha2 0.11.1",

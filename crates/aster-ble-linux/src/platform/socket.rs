@@ -1,7 +1,11 @@
 use super::{map_bluer_error, map_io_error};
 use crate::{
-    CanonicalLocator, DriverError, DriverErrorKind, OpenCancellation, OpenRequest, ValidatedConfig,
-    ValidatedControllerConfig, ValidatedRosteredSupervisorConfig, configuration,
+    BTLE_EVENT_MINIMUM_DIRECTIONAL_MTU_BYTES, CanonicalLocator, DriverError, DriverErrorKind,
+    OpenCancellation, OpenRequest, ValidatedConfig, ValidatedControllerConfig,
+    ValidatedRosteredSupervisorConfig,
+    config::ControllerOperationBinding,
+    configuration,
+    controller_probe::ControllerProbeError,
     stream::{MtuBoundedStream, MtuProbe, NegotiatedMtu, SocketOpen},
 };
 use aster_ble_l2cap::BleL2capContact;
@@ -28,8 +32,44 @@ pub trait SocketFactory: Send + Sync {
 
 pub(crate) type RosteredBindFuture<'a, L> =
     Pin<Box<dyn Future<Output = Result<BoundRosteredListener<L>, DriverError>> + Send + 'a>>;
-pub(crate) type RosteredAcceptFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<(SocketOpen, CanonicalLocator), DriverError>> + Send + 'a>>;
+pub(crate) type RosteredAcceptFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<(AcceptedSocket, CanonicalLocator), DriverError>> + Send + 'a>,
+>;
+
+pub(crate) struct AcceptedSocket {
+    readiness: OpenFuture<'static>,
+}
+
+impl AcceptedSocket {
+    fn from_bluez(stream: Stream) -> Self {
+        Self {
+            readiness: Box::pin(async move {
+                wait_for_l2cap_readiness(|| stream.as_ref().send_mtu()).await?;
+                Ok(SocketOpen::from_bluez(stream))
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ready(socket: SocketOpen) -> Self {
+        Self {
+            readiness: Box::pin(async move { Ok(socket) }),
+        }
+    }
+
+    pub(crate) async fn finish(
+        self,
+        readiness_timeout: Duration,
+    ) -> Result<SocketOpen, DriverError> {
+        match timeout(readiness_timeout, self.readiness).await {
+            Ok(result) => result,
+            Err(_) => Err(DriverError::new(
+                DriverErrorKind::PeerRejected,
+                "accepted LE L2CAP socket did not become ready within its admission bound",
+            )),
+        }
+    }
+}
 
 pub(crate) trait RosteredSocketFactory: Send + Sync {
     type Listener: Send + Sync + 'static;
@@ -53,21 +93,46 @@ pub(crate) trait RosteredSocketFactory: Send + Sync {
 pub(crate) struct BluezRosteredSocketFactory;
 
 impl RosteredSocketFactory for BluezRosteredSocketFactory {
-    type Listener = StreamListener;
+    type Listener = BluezRosteredListener;
 
     fn bind_dynamic_listener<'a>(
         &'a self,
         controller: &'a ValidatedControllerConfig,
     ) -> RosteredBindFuture<'a, Self::Listener> {
         Box::pin(async move {
+            controller.ensure_current()?;
+            let binding = controller.operation_binding();
             let session = bluer::Session::new().await.map_err(map_bluer_error)?;
             let local = rostered_local_address(controller);
-            verify_adapter(&session, controller.adapter_name(), local).await?;
             let socket = Socket::<Stream>::new_stream().map_err(map_io_error)?;
-            socket.bind(local).map_err(map_io_error)?;
+            final_controller_io(
+                &binding,
+                || async {
+                    verify_adapter(&session, binding.adapter_name(), local)
+                        .await
+                        .map(|_| ())
+                },
+                || async { socket.bind(local).map_err(map_io_error) },
+            )
+            .await?;
             let allocated_psm = socket.local_addr().map_err(map_io_error)?.psm;
-            let listener = socket.listen(1).map_err(map_io_error)?;
-            BoundRosteredListener::new(listener, allocated_psm)
+            let listener = final_controller_io(
+                &binding,
+                || async {
+                    verify_adapter(&session, binding.adapter_name(), local)
+                        .await
+                        .map(|_| ())
+                },
+                || async { socket.listen(1).map_err(map_io_error) },
+            )
+            .await?;
+            BoundRosteredListener::new(
+                BluezRosteredListener {
+                    listener,
+                    controller: controller.operation_binding(),
+                },
+                allocated_psm,
+            )
         })
     }
 
@@ -83,12 +148,31 @@ impl RosteredSocketFactory for BluezRosteredSocketFactory {
                     "advertised LE PSM is outside the dynamic range",
                 ));
             }
+            controller.ensure_current()?;
+            let binding = controller.operation_binding();
             let session = bluer::Session::new().await.map_err(map_bluer_error)?;
             let (local, peer) = rostered_socket_addresses(controller, locator, advertised_psm);
-            verify_adapter(&session, controller.adapter_name(), local).await?;
             let socket = Socket::<Stream>::new_stream().map_err(map_io_error)?;
-            socket.bind(local).map_err(map_io_error)?;
-            let stream = socket.connect(peer).await.map_err(map_io_error)?;
+            final_controller_io(
+                &binding,
+                || async {
+                    verify_adapter(&session, binding.adapter_name(), local)
+                        .await
+                        .map(|_| ())
+                },
+                || async { socket.bind(local).map_err(map_io_error) },
+            )
+            .await?;
+            let stream = final_controller_io(
+                &binding,
+                || async {
+                    verify_adapter(&session, binding.adapter_name(), local)
+                        .await
+                        .map(|_| ())
+                },
+                || async { socket.connect(peer).await.map_err(map_io_error) },
+            )
+            .await?;
             wait_for_l2cap_readiness(|| stream.as_ref().send_mtu()).await?;
             Ok(SocketOpen::from_bluez(stream))
         })
@@ -96,16 +180,50 @@ impl RosteredSocketFactory for BluezRosteredSocketFactory {
 
     fn accept<'a>(&'a self, listener: &'a Self::Listener) -> RosteredAcceptFuture<'a> {
         Box::pin(async move {
-            let (stream, peer) = listener.accept().await.map_err(map_io_error)?;
+            listener.controller.ensure_current()?;
+            let session = bluer::Session::new().await.map_err(map_bluer_error)?;
+            let local = rostered_binding_address(&listener.controller);
+            let (stream, peer) = final_controller_io(
+                &listener.controller,
+                || async {
+                    verify_adapter(&session, listener.controller.adapter_name(), local)
+                        .await
+                        .map(|_| ())
+                },
+                || async { listener.listener.accept().await.map_err(map_io_error) },
+            )
+            .await?;
             let locator = CanonicalLocator::new(peer.addr, peer.addr_type).map_err(|_| {
                 DriverError::new(
                     DriverErrorKind::Transport,
                     "accepted rostered peer locator is invalid",
                 )
             })?;
-            Ok((SocketOpen::from_bluez(stream), locator))
+            Ok((AcceptedSocket::from_bluez(stream), locator))
         })
     }
+}
+
+async fn final_controller_io<T, Verify, VerifyFuture, Operation, OperationFuture>(
+    controller: &ControllerOperationBinding,
+    verify: Verify,
+    operation: Operation,
+) -> Result<T, DriverError>
+where
+    Verify: FnOnce() -> VerifyFuture,
+    VerifyFuture: Future<Output = Result<(), DriverError>>,
+    Operation: FnOnce() -> OperationFuture,
+    OperationFuture: Future<Output = Result<T, DriverError>>,
+{
+    controller.ensure_current()?;
+    verify().await?;
+    controller.ensure_current()?;
+    operation().await
+}
+
+pub(crate) struct BluezRosteredListener {
+    listener: StreamListener,
+    controller: ControllerOperationBinding,
 }
 
 fn rostered_socket_addresses(
@@ -127,6 +245,14 @@ fn rostered_local_address(controller: &ValidatedControllerConfig) -> SocketAddr 
     )
 }
 
+fn rostered_binding_address(controller: &ControllerOperationBinding) -> SocketAddr {
+    SocketAddr::new(
+        controller.local_address(),
+        controller.local_address_type(),
+        0,
+    )
+}
+
 pub(crate) struct BoundRosteredListener<L> {
     listener: L,
     allocated_psm: u16,
@@ -134,7 +260,7 @@ pub(crate) struct BoundRosteredListener<L> {
 
 impl<L> BoundRosteredListener<L> {
     pub(crate) fn new(listener: L, allocated_psm: u16) -> Result<Self, DriverError> {
-        if !(PSM_LE_DYN_START..=PSM_LE_MAX).contains(&allocated_psm) {
+        if validate_dynamic_le_psm(allocated_psm).is_err() {
             return Err(configuration(
                 "kernel allocated LE PSM is outside the dynamic range",
             ));
@@ -151,6 +277,60 @@ impl<L> BoundRosteredListener<L> {
 
     pub(crate) fn into_listener(self) -> L {
         self.listener
+    }
+}
+
+/// Validates the unprivileged dynamically allocated LE PSM range.
+pub(crate) fn validate_dynamic_le_psm(psm: u16) -> Result<(), ()> {
+    if (PSM_LE_DYN_START..=PSM_LE_MAX).contains(&psm) {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// Maps a kernel error into the closed passive controller-probe boundary.
+pub(crate) fn map_probe_io_error(error: io::Error) -> ControllerProbeError {
+    match error.kind() {
+        io::ErrorKind::PermissionDenied => ControllerProbeError::PermissionDenied,
+        io::ErrorKind::TimedOut => ControllerProbeError::DeadlineExceeded,
+        io::ErrorKind::AddrInUse | io::ErrorKind::WouldBlock => {
+            ControllerProbeError::ResourceExhausted
+        }
+        io::ErrorKind::Unsupported => ControllerProbeError::UnsupportedLeCoc,
+        io::ErrorKind::AddrNotAvailable
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::HostUnreachable
+        | io::ErrorKind::NetworkUnreachable
+        | io::ErrorKind::NotConnected
+        | io::ErrorKind::NotFound => ControllerProbeError::Removed,
+        _ => ControllerProbeError::UnknownPlatformError,
+    }
+}
+
+/// Maps a BlueZ error into the closed passive controller-probe boundary.
+pub(crate) fn map_probe_bluer_error(error: bluer::Error) -> ControllerProbeError {
+    use bluer::{ErrorKind, InternalErrorKind};
+
+    match error.kind {
+        ErrorKind::DoesNotExist | ErrorKind::NotFound | ErrorKind::NotReady => {
+            ControllerProbeError::Removed
+        }
+        ErrorKind::NotAvailable => ControllerProbeError::BluezUnavailable,
+        ErrorKind::NotAuthorized | ErrorKind::NotPermitted => {
+            ControllerProbeError::PermissionDenied
+        }
+        ErrorKind::AuthenticationTimeout => ControllerProbeError::DeadlineExceeded,
+        ErrorKind::NotSupported => ControllerProbeError::UnsupportedProtocol,
+        ErrorKind::Internal(InternalErrorKind::DBusConnectionLost) => {
+            ControllerProbeError::BluezUnavailable
+        }
+        ErrorKind::Internal(InternalErrorKind::Io(kind)) => {
+            map_probe_io_error(io::Error::from(kind))
+        }
+        _ => ControllerProbeError::UnknownPlatformError,
     }
 }
 
@@ -255,6 +435,24 @@ fn opened_contact(
     operation_timeout: Duration,
 ) -> Result<OpenedContact, DriverError> {
     let SocketOpen { stream, mtu } = opened_socket;
+    let negotiated_mtu = mtu.observation().ok_or_else(|| {
+        DriverError::new(
+            DriverErrorKind::Transport,
+            "negotiated LE L2CAP MTU was unavailable after socket readiness",
+        )
+    })?;
+    if negotiated_mtu.send_bytes() < BTLE_EVENT_MINIMUM_DIRECTIONAL_MTU_BYTES {
+        return Err(DriverError::new(
+            DriverErrorKind::PeerRejected,
+            "peer receive MTU is below the Event contact minimum",
+        ));
+    }
+    if negotiated_mtu.receive_bytes() < BTLE_EVENT_MINIMUM_DIRECTIONAL_MTU_BYTES {
+        return Err(DriverError::new(
+            DriverErrorKind::Transport,
+            "local receive MTU is below the Event contact minimum",
+        ));
+    }
     let stream = Box::new(MtuBoundedStream {
         stream,
         mtu: mtu.clone(),
@@ -331,6 +529,7 @@ async fn open_bluez(request: OpenRequest) -> Result<SocketOpen, DriverError> {
                     "listener rejected a non-provisioned Bluetooth peer",
                 ));
             }
+            wait_for_l2cap_readiness(|| stream.as_ref().send_mtu()).await?;
             Ok(SocketOpen::from_bluez(stream))
         }
     }
@@ -418,6 +617,19 @@ mod tests {
         time::Instant,
     };
     use tokio::sync::Notify;
+
+    fn automatic_controller(
+        cancellation: &crate::LifecycleCancellation,
+    ) -> ValidatedControllerConfig {
+        ValidatedControllerConfig::for_epoch(
+            "hci7".to_owned(),
+            address("02:00:00:00:00:01"),
+            AddressType::LeRandom,
+            1,
+            cancellation.observer(),
+        )
+        .unwrap()
+    }
 
     fn address(value: &str) -> Address {
         Address::from_str(value).expect("test Bluetooth address")
@@ -549,6 +761,54 @@ mod tests {
         assert_eq!(peer.psm, 0x0081);
     }
 
+    #[tokio::test]
+    async fn cancelled_between_exact_verification_and_socket_io_blocks_platform_call() {
+        let cancellation = crate::LifecycleCancellation::new();
+        let binding = automatic_controller(&cancellation).operation_binding();
+        let calls = AtomicUsize::new(0);
+
+        let result = final_controller_io(
+            &binding,
+            || async {
+                cancellation.cancel();
+                Ok(())
+            },
+            || async {
+                calls.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().kind(), DriverErrorKind::Cancelled);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn exact_identity_change_before_socket_io_blocks_platform_call() {
+        let cancellation = crate::LifecycleCancellation::new();
+        let binding = automatic_controller(&cancellation).operation_binding();
+        let calls = AtomicUsize::new(0);
+
+        let result = final_controller_io(
+            &binding,
+            || async {
+                Err(DriverError::new(
+                    DriverErrorKind::Unavailable,
+                    "test controller identity changed",
+                ))
+            },
+            || async {
+                calls.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().kind(), DriverErrorKind::Unavailable);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+
     #[test]
     fn rostered_socket_builds_a_bounded_contact_with_transient_locator_evidence() {
         use aster_contact::{CarrierPeerEvidence, OrderedContact};
@@ -578,6 +838,40 @@ mod tests {
                 .unwrap(),
             }
         );
+    }
+
+    #[test]
+    fn rostered_contact_accepts_the_le_coc_directional_mtu_floor() {
+        let config = rostered_config();
+        let locator =
+            CanonicalLocator::new(address("02:00:00:00:00:09"), AddressType::LeRandom).unwrap();
+        let (stream, _peer) = tokio::io::duplex(4096);
+        let socket = SocketOpen::with_observed_mtu(Box::new(stream), 23, 23).unwrap();
+
+        let opened = opened_rostered_contact(&config, locator, socket).unwrap();
+
+        assert_eq!(opened.negotiated_mtu().unwrap().send_bytes(), 23);
+        assert_eq!(opened.negotiated_mtu().unwrap().receive_bytes(), 23);
+    }
+
+    #[test]
+    fn rostered_contact_rejects_either_direction_below_the_le_coc_mtu_floor() {
+        let config = rostered_config();
+        let locator =
+            CanonicalLocator::new(address("02:00:00:00:00:09"), AddressType::LeRandom).unwrap();
+
+        for (send_bytes, receive_bytes, expected) in [
+            (22, 23, DriverErrorKind::PeerRejected),
+            (23, 22, DriverErrorKind::Transport),
+        ] {
+            let (stream, _peer) = tokio::io::duplex(4096);
+            let socket =
+                SocketOpen::with_observed_mtu(Box::new(stream), send_bytes, receive_bytes).unwrap();
+
+            let error = opened_rostered_contact(&config, locator, socket).unwrap_err();
+
+            assert_eq!(error.kind(), expected);
+        }
     }
 
     struct ResultFactory {
@@ -636,6 +930,39 @@ mod tests {
         .unwrap();
 
         assert_eq!(attempts.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accepted_socket_readiness_is_bounded_as_a_peer_rejection() {
+        let accepted = AcceptedSocket {
+            readiness: Box::pin(std::future::pending()),
+        };
+
+        let error = match accepted.finish(Duration::from_secs(5)).await {
+            Ok(_) => panic!("pending accepted socket must not become ready"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), DriverErrorKind::PeerRejected);
+    }
+
+    #[tokio::test]
+    async fn accepted_socket_preserves_typed_readiness_failure() {
+        let accepted = AcceptedSocket {
+            readiness: Box::pin(async {
+                Err(DriverError::new(
+                    DriverErrorKind::Unavailable,
+                    "test readiness failure",
+                ))
+            }),
+        };
+
+        let error = match accepted.finish(Duration::from_secs(5)).await {
+            Ok(_) => panic!("failed accepted socket must not become ready"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), DriverErrorKind::Unavailable);
     }
 
     #[test]
@@ -700,6 +1027,75 @@ mod tests {
             }),
             DriverError::new(DriverErrorKind::Configuration, "BlueZ operation failed")
         );
+    }
+
+    #[test]
+    fn passive_probe_maps_socket_and_bluez_failures_to_closed_errors() {
+        for (kind, expected) in [
+            (
+                io::ErrorKind::PermissionDenied,
+                ControllerProbeError::PermissionDenied,
+            ),
+            (
+                io::ErrorKind::TimedOut,
+                ControllerProbeError::DeadlineExceeded,
+            ),
+            (
+                io::ErrorKind::AddrInUse,
+                ControllerProbeError::ResourceExhausted,
+            ),
+            (
+                io::ErrorKind::Unsupported,
+                ControllerProbeError::UnsupportedLeCoc,
+            ),
+            (io::ErrorKind::NotFound, ControllerProbeError::Removed),
+            (
+                io::ErrorKind::Other,
+                ControllerProbeError::UnknownPlatformError,
+            ),
+        ] {
+            assert_eq!(map_probe_io_error(io::Error::from(kind)), expected);
+        }
+
+        for (kind, expected) in [
+            (bluer::ErrorKind::NotFound, ControllerProbeError::Removed),
+            (
+                bluer::ErrorKind::NotAvailable,
+                ControllerProbeError::BluezUnavailable,
+            ),
+            (
+                bluer::ErrorKind::NotAuthorized,
+                ControllerProbeError::PermissionDenied,
+            ),
+            (
+                bluer::ErrorKind::AuthenticationTimeout,
+                ControllerProbeError::DeadlineExceeded,
+            ),
+            (
+                bluer::ErrorKind::NotSupported,
+                ControllerProbeError::UnsupportedProtocol,
+            ),
+            (
+                bluer::ErrorKind::Internal(bluer::InternalErrorKind::DBusConnectionLost),
+                ControllerProbeError::BluezUnavailable,
+            ),
+            (
+                bluer::ErrorKind::Internal(bluer::InternalErrorKind::Io(io::ErrorKind::AddrInUse)),
+                ControllerProbeError::ResourceExhausted,
+            ),
+            (
+                bluer::ErrorKind::InvalidArguments,
+                ControllerProbeError::UnknownPlatformError,
+            ),
+        ] {
+            assert_eq!(
+                map_probe_bluer_error(bluer::Error {
+                    kind,
+                    message: "sensitive platform detail".to_owned(),
+                }),
+                expected
+            );
+        }
     }
 
     #[test]

@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod discovery_credentials;
+mod zeroizing_hmac;
 
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
@@ -21,3 +22,4 @@ pub use discovery_credentials::{
 pub use discovery_credentials::{
     UnprotectedReferenceAuthorityGuard, load_unprotected_reference_discovery_credentials,
 };
+pub use zeroizing_hmac::zeroizing_hmac_sha256;

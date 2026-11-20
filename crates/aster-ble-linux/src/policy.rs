@@ -6,12 +6,18 @@ pub(crate) struct LifecycleCancellation {
     cancelled: Arc<watch::Sender<bool>>,
 }
 
-impl LifecycleCancellation {
-    pub(crate) fn new() -> Self {
+impl Default for LifecycleCancellation {
+    fn default() -> Self {
         let (cancelled, _) = watch::channel(false);
         Self {
             cancelled: Arc::new(cancelled),
         }
+    }
+}
+
+impl LifecycleCancellation {
+    pub(crate) fn new() -> Self {
+        Self::default()
     }
 
     pub(crate) fn cancel(&self) {
@@ -29,8 +35,35 @@ impl LifecycleCancellation {
         *self.cancelled.borrow()
     }
 
+    pub(crate) fn observer(&self) -> LifecycleCancellationObserver {
+        LifecycleCancellationObserver {
+            cancelled: self.cancelled.subscribe(),
+        }
+    }
+
     pub(crate) async fn cancelled(&self) {
         let mut cancelled = self.cancelled.subscribe();
+        while !*cancelled.borrow_and_update() {
+            if cancelled.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Non-authoritative observation of one lifecycle cancellation generation.
+#[derive(Clone, Debug)]
+pub(crate) struct LifecycleCancellationObserver {
+    cancelled: watch::Receiver<bool>,
+}
+
+impl LifecycleCancellationObserver {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        *self.cancelled.borrow()
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        let mut cancelled = self.cancelled.clone();
         while !*cancelled.borrow_and_update() {
             if cancelled.changed().await.is_err() {
                 return;
@@ -98,5 +131,10 @@ mod tests {
 
         observer.cancelled().await;
         assert!(observer.is_cancelled());
+    }
+
+    #[test]
+    fn lifecycle_cancellation_default_starts_active() {
+        assert!(!LifecycleCancellation::default().is_cancelled());
     }
 }

@@ -2,6 +2,7 @@ use super::map_bluer_error;
 use crate::{
     ASTER_ROSTER_BEACON_V1_BYTES, ASTER_ROSTER_SERVICE_UUID, CanonicalLocator,
     CanonicalLocatorError, DriverError, DriverErrorKind, ValidatedControllerConfig,
+    config::ControllerOperationBinding,
 };
 use bluer::{Address, AddressType, Uuid, adv};
 use futures::{Stream, StreamExt, stream, stream::SelectAll};
@@ -130,19 +131,18 @@ fn bluez_advertisement(roster: RosterAdvertisement) -> adv::Advertisement {
     }
 }
 
-fn validate_advertising_support(
-    supported_instances: u8,
-    active_instances: u8,
-    secondary_channels: &BTreeSet<adv::SecondaryChannel>,
-    capabilities: &adv::Capabilities,
-) -> Result<(), DriverError> {
-    if supported_instances <= active_instances
-        || !secondary_channels.contains(&adv::SecondaryChannel::OneM)
-        || capabilities.max_advertisement_length < 79
-    {
-        return Err(advertising_unsupported());
+fn map_advertisement_registration_error(error: bluer::Error) -> DriverError {
+    if matches!(
+        &error.kind,
+        bluer::ErrorKind::InvalidArguments | bluer::ErrorKind::InvalidLength
+    ) {
+        DriverError::new(
+            DriverErrorKind::Unavailable,
+            "BlueZ advertisement registration rejected",
+        )
+    } else {
+        map_bluer_error(error)
     }
-    Ok(())
 }
 
 fn bluez_discovery_filter() -> bluer::DiscoveryFilter {
@@ -520,6 +520,23 @@ fn scan_owner_lost() -> DriverError {
 type AdapterEventStream = Pin<Box<dyn Stream<Item = bluer::AdapterEvent> + Send>>;
 type DeviceEventStream = Pin<Box<dyn Stream<Item = WatchedDeviceEvent> + Send>>;
 
+async fn final_discovery_io<Adapter, T, Verify, VerifyFuture, Operation, OperationFuture>(
+    controller: &ControllerOperationBinding,
+    verify: Verify,
+    operation: Operation,
+) -> Result<T, DriverError>
+where
+    Verify: FnOnce() -> VerifyFuture,
+    VerifyFuture: Future<Output = Result<Adapter, DriverError>>,
+    Operation: FnOnce(Adapter) -> OperationFuture,
+    OperationFuture: Future<Output = Result<T, DriverError>>,
+{
+    controller.ensure_current()?;
+    let adapter = verify().await?;
+    controller.ensure_current()?;
+    operation(adapter).await
+}
+
 enum WatchedDeviceEvent {
     Property(CanonicalLocator, bluer::DeviceEvent),
     Ended(Address),
@@ -531,7 +548,7 @@ enum AddDeviceError {
 }
 
 struct BluezScanBackend {
-    adapter: bluer::Adapter,
+    guard: BluezControllerGuard,
     adapter_events: Option<AdapterEventStream>,
     device_events: SelectAll<DeviceEventStream>,
     watched: BTreeSet<Address>,
@@ -541,14 +558,26 @@ struct BluezScanBackend {
 
 impl BluezScanBackend {
     async fn start(
-        adapter: bluer::Adapter,
+        guard: BluezControllerGuard,
         owner_loss: watch::Receiver<bool>,
     ) -> Result<Self, DriverError> {
-        adapter
-            .set_discovery_filter(bluez_discovery_filter())
-            .await
-            .map_err(map_bluer_error)?;
-        let mut addresses = adapter.device_addresses().await.map_err(map_bluer_error)?;
+        final_discovery_io(
+            &guard.controller,
+            || guard.adapter(),
+            |adapter| async move {
+                adapter
+                    .set_discovery_filter(bluez_discovery_filter())
+                    .await
+                    .map_err(map_bluer_error)
+            },
+        )
+        .await?;
+        let mut addresses = final_discovery_io(
+            &guard.controller,
+            || guard.adapter(),
+            |adapter| async move { adapter.device_addresses().await.map_err(map_bluer_error) },
+        )
+        .await?;
         addresses.sort_unstable();
         let mut initial_capacity_exceeded =
             addresses.len() > DISCOVERY_INITIAL_DEVICE_INSPECTION_CAPACITY;
@@ -556,8 +585,19 @@ impl BluezScanBackend {
         let mut device_events = SelectAll::new();
         let mut watched = BTreeSet::new();
         for address in addresses {
-            let device = adapter.device(address).map_err(map_bluer_error)?;
-            let service_data = device.service_data().await.map_err(map_bluer_error)?;
+            let service_data = final_discovery_io(
+                &guard.controller,
+                || guard.adapter(),
+                |adapter| async move {
+                    adapter
+                        .device(address)
+                        .map_err(map_bluer_error)?
+                        .service_data()
+                        .await
+                        .map_err(map_bluer_error)
+                },
+            )
+            .await?;
             if !service_data.is_some_and(|data| {
                 data.contains_key(&bluer::Uuid::from_bytes(ASTER_ROSTER_SERVICE_UUID))
             }) {
@@ -567,14 +607,21 @@ impl BluezScanBackend {
                 initial_capacity_exceeded = true;
                 break;
             }
-            if let Some(events) = subscribe_device(&adapter, address).await? {
+            if let Some(events) = subscribe_device(&guard, address).await? {
                 watched.insert(address);
                 device_events.push(events);
             }
         }
-        let adapter_events = Box::pin(adapter.discover_devices().await.map_err(map_bluer_error)?);
+        let adapter_events = Box::pin(
+            final_discovery_io(
+                &guard.controller,
+                || guard.adapter(),
+                |adapter| async move { adapter.discover_devices().await.map_err(map_bluer_error) },
+            )
+            .await?,
+        );
         Ok(Self {
-            adapter,
+            guard,
             adapter_events: Some(adapter_events),
             device_events,
             watched,
@@ -590,7 +637,7 @@ impl BluezScanBackend {
         if self.watched.len() >= DISCOVERY_DEVICE_WATCHER_CAPACITY {
             return Err(AddDeviceError::Capacity);
         }
-        if let Some(events) = subscribe_device(&self.adapter, address)
+        if let Some(events) = subscribe_device(&self.guard, address)
             .await
             .map_err(|_| AddDeviceError::Platform)?
         {
@@ -673,12 +720,35 @@ impl ScanBackend for BluezScanBackend {
 }
 
 async fn subscribe_device(
-    adapter: &bluer::Adapter,
+    guard: &BluezControllerGuard,
     address: Address,
 ) -> Result<Option<DeviceEventStream>, DriverError> {
-    let device = adapter.device(address).map_err(map_bluer_error)?;
-    let events = device.events().await.map_err(map_bluer_error)?;
-    let address_type = device.address_type().await.map_err(map_bluer_error)?;
+    let events = final_discovery_io(
+        &guard.controller,
+        || guard.adapter(),
+        |adapter| async move {
+            adapter
+                .device(address)
+                .map_err(map_bluer_error)?
+                .events()
+                .await
+                .map_err(map_bluer_error)
+        },
+    )
+    .await?;
+    let address_type = final_discovery_io(
+        &guard.controller,
+        || guard.adapter(),
+        |adapter| async move {
+            adapter
+                .device(address)
+                .map_err(map_bluer_error)?
+                .address_type()
+                .await
+                .map_err(map_bluer_error)
+        },
+    )
+    .await?;
     let Ok(locator) = CanonicalLocator::new(address, address_type) else {
         return Ok(None);
     };
@@ -693,6 +763,47 @@ async fn subscribe_device(
 pub(crate) struct BluezDiscoveryPlatform {
     session: bluer::Session,
     owner_loss: BluezOwnerLoss,
+}
+
+struct BluezControllerGuard {
+    session: bluer::Session,
+    controller: ControllerOperationBinding,
+}
+
+impl BluezControllerGuard {
+    async fn adapter(&self) -> Result<bluer::Adapter, DriverError> {
+        self.controller.ensure_current()?;
+        let names = self
+            .session
+            .adapter_names()
+            .await
+            .map_err(map_bluer_error)?;
+        if !names
+            .iter()
+            .any(|name| name == self.controller.adapter_name())
+        {
+            return Err(controller_unavailable());
+        }
+        self.controller.ensure_current()?;
+        let adapter = self
+            .session
+            .adapter(self.controller.adapter_name())
+            .map_err(map_bluer_error)?;
+        self.controller.ensure_current()?;
+        let powered = adapter.is_powered().await.map_err(map_bluer_error)?;
+        self.controller.ensure_current()?;
+        let address = adapter.address().await.map_err(map_bluer_error)?;
+        self.controller.ensure_current()?;
+        let address_type = adapter.address_type().await.map_err(map_bluer_error)?;
+        self.controller.ensure_current()?;
+        if !powered
+            || address != self.controller.local_address()
+            || address_type != self.controller.local_address_type()
+        {
+            return Err(controller_unavailable());
+        }
+        Ok(adapter)
+    }
 }
 
 #[derive(Clone)]
@@ -737,32 +848,11 @@ impl BluezDiscoveryPlatform {
         self.owner_loss.clone()
     }
 
-    async fn adapter(
-        &self,
-        controller: &ValidatedControllerConfig,
-    ) -> Result<bluer::Adapter, DriverError> {
-        let names = self
-            .session
-            .adapter_names()
-            .await
-            .map_err(map_bluer_error)?;
-        if !names.iter().any(|name| name == controller.adapter_name()) {
-            return Err(controller_unavailable());
+    fn guard(&self, controller: &ValidatedControllerConfig) -> BluezControllerGuard {
+        BluezControllerGuard {
+            session: self.session.clone(),
+            controller: controller.operation_binding(),
         }
-        let adapter = self
-            .session
-            .adapter(controller.adapter_name())
-            .map_err(map_bluer_error)?;
-        let powered = adapter.is_powered().await.map_err(map_bluer_error)?;
-        let address = adapter.address().await.map_err(map_bluer_error)?;
-        let address_type = adapter.address_type().await.map_err(map_bluer_error)?;
-        if !powered
-            || address != controller.local_address()
-            || address_type != controller.local_address_type()
-        {
-            return Err(controller_unavailable());
-        }
-        Ok(adapter)
     }
 }
 
@@ -773,30 +863,21 @@ impl DiscoveryPlatform for BluezDiscoveryPlatform {
         advertisement: RosterAdvertisement,
     ) -> PlatformFuture<'a, Box<dyn OwnedAdvertisement>> {
         Box::pin(async move {
-            let adapter = self.adapter(controller).await?;
-            let supported = adapter
-                .supported_advertising_instances()
-                .await
-                .map_err(map_bluer_error)?;
-            let active = adapter
-                .active_advertising_instances()
-                .await
-                .map_err(map_bluer_error)?;
-            let channels = adapter
-                .supported_advertising_secondary_channels()
-                .await
-                .map_err(map_bluer_error)?
-                .ok_or_else(advertising_unsupported)?;
-            let capabilities = adapter
-                .supported_advertising_capabilities()
-                .await
-                .map_err(map_bluer_error)?
-                .ok_or_else(advertising_unsupported)?;
-            validate_advertising_support(supported, active, &channels, &capabilities)?;
-            let handle = adapter
-                .advertise(bluez_advertisement(advertisement))
-                .await
-                .map_err(map_bluer_error)?;
+            let guard = self.guard(controller);
+            // Passive controller compatibility is established by controller_probe.
+            // Exact registration is the operational advertisement capability
+            // and permission check for this policy-authorized radio epoch.
+            let handle = final_discovery_io(
+                &guard.controller,
+                || guard.adapter(),
+                |adapter| async move {
+                    adapter
+                        .advertise(bluez_advertisement(advertisement))
+                        .await
+                        .map_err(map_advertisement_registration_error)
+                },
+            )
+            .await?;
             Ok(
                 Box::new(spawn_advertisement_owner(BluezAdvertisementBackend::new(
                     handle,
@@ -811,8 +892,7 @@ impl DiscoveryPlatform for BluezDiscoveryPlatform {
         controller: &'a ValidatedControllerConfig,
     ) -> PlatformFuture<'a, StartedScan> {
         Box::pin(async move {
-            let adapter = self.adapter(controller).await?;
-            BluezScanBackend::start(adapter, self.owner_loss.subscribe())
+            BluezScanBackend::start(self.guard(controller), self.owner_loss.subscribe())
                 .await
                 .map(spawn_scan_owner)
         })
@@ -827,13 +907,6 @@ fn controller_unavailable() -> DriverError {
     DriverError::new(
         DriverErrorKind::Unavailable,
         "configured Bluetooth controller is unavailable",
-    )
-}
-
-fn advertising_unsupported() -> DriverError {
-    DriverError::new(
-        DriverErrorKind::Unavailable,
-        "configured controller lacks rostered advertising support",
     )
 }
 
@@ -923,6 +996,19 @@ mod tests {
         }))
         .validate()
         .unwrap()
+        .unwrap()
+    }
+
+    fn automatic_controller(
+        cancellation: &crate::LifecycleCancellation,
+    ) -> ValidatedControllerConfig {
+        ValidatedControllerConfig::for_epoch(
+            "hci7".to_owned(),
+            Address::new([2, 0, 0, 0, 0, 1]),
+            AddressType::LeRandom,
+            1,
+            cancellation.observer(),
+        )
         .unwrap()
     }
 
@@ -1036,6 +1122,54 @@ mod tests {
         assert!(oversized.record().is_empty());
     }
 
+    #[tokio::test]
+    async fn cancellation_after_exact_verification_blocks_final_rf_call() {
+        let cancellation = crate::LifecycleCancellation::new();
+        let binding = automatic_controller(&cancellation).operation_binding();
+        let calls = AtomicUsize::new(0);
+
+        let result = final_discovery_io(
+            &binding,
+            || async {
+                cancellation.cancel();
+                Ok(())
+            },
+            |_| async {
+                calls.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().kind(), DriverErrorKind::Cancelled);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn exact_identity_change_blocks_final_rf_call() {
+        let cancellation = crate::LifecycleCancellation::new();
+        let binding = automatic_controller(&cancellation).operation_binding();
+        let calls = AtomicUsize::new(0);
+
+        let result = final_discovery_io(
+            &binding,
+            || async {
+                Err::<(), _>(DriverError::new(
+                    DriverErrorKind::Unavailable,
+                    "test controller identity changed",
+                ))
+            },
+            |_| async {
+                calls.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().kind(), DriverErrorKind::Unavailable);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+
     #[test]
     fn production_advertisement_uses_the_frozen_extended_tuple() {
         let record = [0x55; ASTER_ROSTER_BEACON_V1_BYTES];
@@ -1073,18 +1207,33 @@ mod tests {
     }
 
     #[test]
-    fn advertising_eligibility_requires_capacity_instance_and_one_m_phy() {
-        let channels = [bluer::adv::SecondaryChannel::OneM].into_iter().collect();
-        let mut capabilities = bluer::adv::Capabilities::default();
-        capabilities.max_advertisement_length = 79;
+    fn advertisement_registration_errors_preserve_operational_categories() {
+        for kind in [
+            bluer::ErrorKind::InvalidArguments,
+            bluer::ErrorKind::InvalidLength,
+        ] {
+            let error = map_advertisement_registration_error(bluer::Error {
+                kind,
+                message: "sensitive BlueZ detail".to_owned(),
+            });
 
-        assert!(validate_advertising_support(2, 1, &channels, &capabilities).is_ok());
-        assert!(validate_advertising_support(1, 1, &channels, &capabilities).is_err());
+            assert_eq!(
+                error,
+                DriverError::new(
+                    DriverErrorKind::Unavailable,
+                    "BlueZ advertisement registration rejected",
+                )
+            );
+        }
 
-        let mut short = bluer::adv::Capabilities::default();
-        short.max_advertisement_length = 78;
-        assert!(validate_advertising_support(2, 1, &channels, &short).is_err());
-        assert!(validate_advertising_support(2, 1, &Default::default(), &capabilities).is_err());
+        let timeout = map_advertisement_registration_error(bluer::Error {
+            kind: bluer::ErrorKind::AuthenticationTimeout,
+            message: "sensitive BlueZ detail".to_owned(),
+        });
+        assert_eq!(
+            timeout,
+            DriverError::new(DriverErrorKind::Timeout, "BlueZ operation failed")
+        );
     }
 
     #[test]

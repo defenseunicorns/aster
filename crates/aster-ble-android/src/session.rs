@@ -764,7 +764,8 @@ fn internal_subscription_error() -> ValidatorError {
 fn map_contact_error(error: aster_contact::ContactError) -> ValidatorError {
     let category = match error.kind() {
         ContactErrorKind::Configuration => ValidatorErrorCategory::Configuration,
-        ContactErrorKind::Bounds => ValidatorErrorCategory::Bounds,
+        ContactErrorKind::Invariant => ValidatorErrorCategory::Internal,
+        ContactErrorKind::Bounds | ContactErrorKind::RemoteBounds => ValidatorErrorCategory::Bounds,
         ContactErrorKind::Unavailable | ContactErrorKind::Transport => {
             ValidatorErrorCategory::Unavailable
         }
@@ -792,6 +793,7 @@ fn map_node_error(error: NodeError) -> ValidatorError {
         NodeError::Reconciliation(_)
         | NodeError::Protocol(_)
         | NodeError::EmissionPolicyChanged
+        | NodeError::EmissionPolicyRestartRequired
         | NodeError::CustodySendSkipped => ValidatorErrorCategory::Protocol,
         NodeError::Identity(_) | NodeError::Demo(_) => ValidatorErrorCategory::Internal,
     };
@@ -799,30 +801,39 @@ fn map_node_error(error: NodeError) -> ValidatorError {
 }
 
 fn map_ordered_contact_error(outcome: ContactOutcome) -> ValidatorError {
-    let category = match outcome.reason() {
+    ValidatorError::new(
+        ordered_contact_error_category(outcome.reason()),
+        "validator ordered Event contact failed",
+    )
+}
+
+fn ordered_contact_error_category(reason: ContactReason) -> ValidatorErrorCategory {
+    match reason {
         ContactReason::AdmissionClosed
         | ContactReason::AdmissionBusy
         | ContactReason::ActorUnavailable
         | ContactReason::ActorStopped
         | ContactReason::CallerCancelled
+        | ContactReason::AdapterEpochEnded
+        | ContactReason::Shutdown
         | ContactReason::CarrierUnavailable
         | ContactReason::TransportInterrupted
         | ContactReason::TransportTimeout => ValidatorErrorCategory::Unavailable,
-        ContactReason::IdentityMismatch | ContactReason::AuthenticationFailed => {
-            ValidatorErrorCategory::Authentication
-        }
-        ContactReason::PolicyRejected | ContactReason::ProtocolViolation => {
-            ValidatorErrorCategory::Protocol
-        }
+        ContactReason::IdentityMismatch
+        | ContactReason::AuthenticationFailed
+        | ContactReason::AuthorityChanged => ValidatorErrorCategory::Authentication,
+        ContactReason::PolicyRejected
+        | ContactReason::PolicySuspended
+        | ContactReason::ProtocolViolation => ValidatorErrorCategory::Protocol,
         ContactReason::LocalInvariant => ValidatorErrorCategory::Internal,
-    };
-    ValidatorError::new(category, "validator ordered Event contact failed")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{ValidatorConfig, ValidatorError, ValidatorErrorCategory};
+    use aster_contact::ContactError;
     use aster_mesh::{ProvisioningAccess, ReferenceProvisioner, Scope, Topic};
     use aster_node::{application::EventQuery, mission::UnprotectedReferenceMission};
     use std::{
@@ -836,6 +847,17 @@ mod tests {
     use tokio::io::AsyncReadExt as _;
 
     static NEXT_PATH: AtomicUsize = AtomicUsize::new(1);
+
+    #[test]
+    fn emission_policy_restart_requirement_is_sanitized_as_protocol_failure() {
+        let error = map_node_error(NodeError::EmissionPolicyRestartRequired);
+
+        assert_eq!(error.category(), ValidatorErrorCategory::Protocol);
+        assert_eq!(
+            error.to_string(),
+            "validator protected Event session failed"
+        );
+    }
 
     struct RecordingSink {
         events: Mutex<Vec<SessionEvent>>,
@@ -1257,18 +1279,108 @@ mod tests {
     }
 
     #[test]
-    fn ordered_contact_error_maps_to_validator_categories() {
-        for error in [
-            ContactOutcome::admission_closed(),
-            ContactOutcome::admission_busy(),
-            ContactOutcome::actor_unavailable(),
-            ContactOutcome::actor_stopped(),
-        ] {
-            assert_eq!(
-                map_ordered_contact_error(error).category(),
-                ValidatorErrorCategory::Unavailable
-            );
+    fn ordered_contact_reason_maps_to_validator_categories() {
+        let cases: &[(ValidatorErrorCategory, &[ContactReason])] = &[
+            (
+                ValidatorErrorCategory::Unavailable,
+                &[
+                    ContactReason::AdmissionClosed,
+                    ContactReason::AdmissionBusy,
+                    ContactReason::ActorUnavailable,
+                    ContactReason::ActorStopped,
+                    ContactReason::CallerCancelled,
+                    ContactReason::CarrierUnavailable,
+                    ContactReason::TransportInterrupted,
+                    ContactReason::TransportTimeout,
+                    ContactReason::AdapterEpochEnded,
+                    ContactReason::Shutdown,
+                ],
+            ),
+            (
+                ValidatorErrorCategory::Authentication,
+                &[
+                    ContactReason::IdentityMismatch,
+                    ContactReason::AuthenticationFailed,
+                    ContactReason::AuthorityChanged,
+                ],
+            ),
+            (
+                ValidatorErrorCategory::Protocol,
+                &[
+                    ContactReason::PolicyRejected,
+                    ContactReason::PolicySuspended,
+                    ContactReason::ProtocolViolation,
+                ],
+            ),
+            (
+                ValidatorErrorCategory::Internal,
+                &[ContactReason::LocalInvariant],
+            ),
+        ];
+        for &(expected, reasons) in cases {
+            for &reason in reasons {
+                assert_eq!(
+                    ordered_contact_error_category(reason),
+                    expected,
+                    "unexpected category for {reason:?}"
+                );
+            }
         }
+        assert_eq!(
+            map_ordered_contact_error(ContactOutcome::admission_busy()).to_string(),
+            "validator ordered Event contact failed"
+        );
+    }
+
+    #[test]
+    fn contact_error_maps_to_validator_categories() {
+        let cases: &[(ValidatorErrorCategory, &[ContactErrorKind])] = &[
+            (
+                ValidatorErrorCategory::Configuration,
+                &[ContactErrorKind::Configuration],
+            ),
+            (
+                ValidatorErrorCategory::Internal,
+                &[ContactErrorKind::Invariant],
+            ),
+            (
+                ValidatorErrorCategory::Unavailable,
+                &[ContactErrorKind::Unavailable, ContactErrorKind::Transport],
+            ),
+            (
+                ValidatorErrorCategory::Timeout,
+                &[ContactErrorKind::Timeout],
+            ),
+            (
+                ValidatorErrorCategory::Bounds,
+                &[ContactErrorKind::Bounds, ContactErrorKind::RemoteBounds],
+            ),
+            (
+                ValidatorErrorCategory::Authentication,
+                &[ContactErrorKind::Unauthorized],
+            ),
+            (
+                ValidatorErrorCategory::Protocol,
+                &[ContactErrorKind::Protocol, ContactErrorKind::Unsupported],
+            ),
+        ];
+        for &(expected, kinds) in cases {
+            for &kind in kinds {
+                assert_eq!(
+                    map_contact_error(ContactError::new(kind, "test")).category(),
+                    expected,
+                    "unexpected category for {kind:?}"
+                );
+            }
+        }
+        assert_eq!(
+            map_contact_error(ContactError::new(
+                ContactErrorKind::Protocol,
+                "peer-controlled detail"
+            ))
+            .to_string(),
+            "validator contact failed"
+        );
     }
 
     #[test]

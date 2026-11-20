@@ -4,7 +4,12 @@ use crate::{
 };
 use bluer::{AdapterEvent, AdapterProperty, Address, AddressType, SessionEvent};
 use futures::{Stream, StreamExt, stream};
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::sync::{mpsc, watch};
 
 const INITIAL_SESSION_RETRY: Duration = Duration::from_millis(250);
@@ -19,9 +24,40 @@ pub enum BtleAvailability {
     Available,
 }
 
-/// Sanitized reason why the configured Linux BTLE controller is unavailable.
+/// Release-evidence classification for the selected Linux BTLE controller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BtleSupport {
+    /// No compatible controller has been evaluated for the current state.
+    NotEvaluated,
+    /// The exact controller fingerprint has retained release evidence.
+    Qualified,
+    /// The compatible controller has no exact retained release evidence.
+    Unqualified,
+}
+
+/// Authoritative current status for the automatic Linux BTLE Event adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BtleCurrentStatus {
+    /// The adapter is operational for its configured Event role.
+    Available { support: BtleSupport },
+    /// The adapter cannot currently accept selected Event work.
+    Unavailable {
+        reason: AvailabilityReason,
+        support: BtleSupport,
+    },
+}
+
+/// Closed, sanitized reason why a Linux BTLE adapter is unavailable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AvailabilityReason {
+    /// A compatible controller is starting its operational owners.
+    Activating,
+    /// The controller address family cannot carry LE contacts.
+    UnsupportedAddressFamily,
+    /// The required Bluetooth protocol is unavailable.
+    UnsupportedProtocol,
+    /// LE L2CAP connection-oriented channels are unavailable.
+    UnsupportedLeCoc,
     /// The BlueZ service or its D-Bus session cannot be observed.
     BluezUnavailable,
     /// The configured controller name is not present.
@@ -32,6 +68,28 @@ pub enum AvailabilityReason {
     ControllerUnauthorized,
     /// The named controller does not have the provisioned address and address type.
     ControllerIdentityMismatch,
+    /// A bounded platform resource was exhausted.
+    ResourceExhausted,
+    /// A bounded platform operation exceeded its deadline.
+    DeadlineExceeded,
+    /// The current attempt was cancelled.
+    Cancelled,
+    /// The platform returned an unclassified typed failure.
+    PlatformFailure,
+    /// Local policy requires an exact qualified support row.
+    QualifiedOnly,
+    /// The controller matched an exact known-unsafe rule.
+    KnownUnsafe,
+    /// Missing fingerprint fields could overlap a known-unsafe rule.
+    AmbiguousUnsafeOverlap,
+    /// The discovery credential lease expired.
+    CredentialExpired,
+    /// The discovery authority can no longer be trusted.
+    CredentialUnavailable,
+    /// Platform cleanup could not be confirmed within its hard bound.
+    CleanupUnconfirmed,
+    /// Local emission policy keeps the adapter radio-inert.
+    ReceiveOnlyPolicy,
 }
 
 /// Closed, sanitized events emitted by Linux BTLE lifecycle owners.
@@ -56,6 +114,45 @@ pub const BTLE_OPERATOR_OUTPUT_CAPACITY: usize = 32;
 #[derive(Clone, Debug, Default)]
 pub struct BtleOperatorOutput {
     events: Option<mpsc::Sender<BtleOperatorEvent>>,
+    status: Option<Arc<CurrentStatusOutput>>,
+}
+
+#[derive(Debug)]
+struct CurrentStatusOutput {
+    updates: watch::Sender<BtleCurrentStatus>,
+    state: Mutex<CurrentStatusState>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CurrentStatusState {
+    current: BtleCurrentStatus,
+    terminal: Option<TerminalAvailability>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalAvailability {
+    PlatformFailure,
+    CredentialExpired,
+    CredentialUnavailable,
+    CleanupUnconfirmed,
+}
+
+impl TerminalAvailability {
+    const fn reason(self) -> AvailabilityReason {
+        match self {
+            Self::PlatformFailure => AvailabilityReason::PlatformFailure,
+            Self::CredentialExpired => AvailabilityReason::CredentialExpired,
+            Self::CredentialUnavailable => AvailabilityReason::CredentialUnavailable,
+            Self::CleanupUnconfirmed => AvailabilityReason::CleanupUnconfirmed,
+        }
+    }
+
+    const fn priority(self) -> u8 {
+        match self {
+            Self::CleanupUnconfirmed => 2,
+            Self::PlatformFailure | Self::CredentialExpired | Self::CredentialUnavailable => 1,
+        }
+    }
 }
 
 impl BtleOperatorOutput {
@@ -65,6 +162,27 @@ impl BtleOperatorOutput {
         (
             Self {
                 events: Some(events),
+                status: None,
+            },
+            receiver,
+        )
+    }
+
+    /// Creates an authoritative latest-status output and its consumer.
+    pub fn current_status(
+        initial: BtleCurrentStatus,
+    ) -> (Self, watch::Receiver<BtleCurrentStatus>) {
+        let (updates, receiver) = watch::channel(initial);
+        (
+            Self {
+                events: None,
+                status: Some(Arc::new(CurrentStatusOutput {
+                    updates,
+                    state: Mutex::new(CurrentStatusState {
+                        current: initial,
+                        terminal: None,
+                    }),
+                })),
             },
             receiver,
         )
@@ -72,12 +190,54 @@ impl BtleOperatorOutput {
 
     /// Creates an output that intentionally discards every event.
     pub const fn discard() -> Self {
-        Self { events: None }
+        Self {
+            events: None,
+            status: None,
+        }
     }
 
     pub(crate) fn emit(&self, event: BtleOperatorEvent) {
         if let Some(events) = &self.events {
             let _ = events.try_send(event);
+        }
+    }
+
+    pub(crate) fn publish_status(&self, next: BtleCurrentStatus) {
+        if let Some(status) = &self.status {
+            let mut state = status
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.terminal.is_none() && state.current != next {
+                state.current = next;
+                status.updates.send_replace(next);
+            }
+        }
+    }
+
+    pub(crate) fn publish_terminal(&self, terminal: TerminalAvailability) {
+        if let Some(status) = &self.status {
+            let mut state = status
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state
+                .terminal
+                .is_some_and(|current| current.priority() >= terminal.priority())
+            {
+                return;
+            }
+            let support = match state.current {
+                BtleCurrentStatus::Available { support }
+                | BtleCurrentStatus::Unavailable { support, .. } => support,
+            };
+            let next = BtleCurrentStatus::Unavailable {
+                reason: terminal.reason(),
+                support,
+            };
+            state.current = next;
+            state.terminal = Some(terminal);
+            status.updates.send_replace(next);
         }
     }
 }
@@ -91,12 +251,13 @@ pub(crate) const fn availability_event(availability: BtleAvailability) -> BtleOp
 
 pub(crate) type MonitorFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), DriverError>> + Send + 'a>>;
-type BluezFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, BluezFailure>> + Send + 'a>>;
-type SessionStream = Pin<Box<dyn Stream<Item = SessionSignal> + Send>>;
-type AdapterStream = Pin<Box<dyn Stream<Item = AdapterSignal> + Send>>;
+pub(crate) type BluezFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, BluezFailure>> + Send + 'a>>;
+pub(crate) type SessionStream = Pin<Box<dyn Stream<Item = SessionSignal> + Send>>;
+pub(crate) type AdapterStream = Pin<Box<dyn Stream<Item = AdapterSignal> + Send>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BluezFailure {
+pub(crate) enum BluezFailure {
     BluezUnavailable,
     ControllerAbsent,
     ControllerUnauthorized,
@@ -114,35 +275,35 @@ impl BluezFailure {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum SessionSignal {
+pub(crate) enum SessionSignal {
     AdapterAdded(String),
     AdapterRemoved(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AdapterSignal {
+pub(crate) enum AdapterSignal {
     PropertiesChanged,
     Unrelated,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct AdapterSnapshot {
-    powered: bool,
-    address: Address,
-    address_type: AddressType,
+pub(crate) struct AdapterSnapshot {
+    pub(crate) powered: bool,
+    pub(crate) address: Address,
+    pub(crate) address_type: AddressType,
 }
 
-trait BluezBackend: Send + Sync {
+pub(crate) trait BluezBackend: Send + Sync {
     fn open_session(&self) -> BluezFuture<'_, Box<dyn BluezSession>>;
 }
 
-trait BluezSession: Send + Sync {
+pub(crate) trait BluezSession: Send + Sync {
     fn subscribe(&self) -> BluezFuture<'_, SessionStream>;
     fn adapter_names(&self) -> BluezFuture<'_, Vec<String>>;
     fn adapter<'a>(&'a self, name: &'a str) -> BluezFuture<'a, Box<dyn BluezAdapter>>;
 }
 
-trait BluezAdapter: Send + Sync {
+pub(crate) trait BluezAdapter: Send + Sync {
     fn subscribe(&self) -> BluezFuture<'_, AdapterStream>;
     fn snapshot(&self) -> BluezFuture<'_, AdapterSnapshot>;
 }
@@ -532,7 +693,7 @@ fn publish(
     }
 }
 
-struct ProductionBluez;
+pub(crate) struct ProductionBluez;
 
 impl BluezBackend for ProductionBluez {
     fn open_session(&self) -> BluezFuture<'_, Box<dyn BluezSession>> {
@@ -649,6 +810,37 @@ mod tests {
         time::Duration,
     };
     use tokio::sync::{Notify, mpsc, watch};
+
+    fn bluez_error(kind: bluer::ErrorKind) -> bluer::Error {
+        bluer::Error {
+            kind,
+            message: "sensitive BlueZ detail".to_owned(),
+        }
+    }
+
+    #[test]
+    fn production_bluez_boundaries_map_to_closed_failures() {
+        assert_eq!(
+            session_failure(bluez_error(bluer::ErrorKind::NotAuthorized)),
+            BluezFailure::ControllerUnauthorized
+        );
+        assert_eq!(
+            session_failure(bluez_error(bluer::ErrorKind::NotFound)),
+            BluezFailure::BluezUnavailable
+        );
+        assert_eq!(
+            adapter_failure(bluez_error(bluer::ErrorKind::NotPermitted)),
+            BluezFailure::ControllerUnauthorized
+        );
+        assert_eq!(
+            adapter_failure(bluez_error(bluer::ErrorKind::DoesNotExist)),
+            BluezFailure::ControllerAbsent
+        );
+        assert_eq!(
+            adapter_failure(bluez_error(bluer::ErrorKind::NotAvailable)),
+            BluezFailure::BluezUnavailable
+        );
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Call {
@@ -827,6 +1019,65 @@ mod tests {
         assert!(events.try_recv().is_err(), "overflow must be dropped");
 
         BtleOperatorOutput::discard().emit(BtleOperatorEvent::Stopped);
+    }
+
+    #[test]
+    fn current_status_coalesces_to_the_latest_value_without_a_queue() {
+        // Break caught: using the bounded lifecycle-event queue as current
+        // state loses the final transition when its consumer is paused.
+        let initial = BtleCurrentStatus::Unavailable {
+            reason: AvailabilityReason::BluezUnavailable,
+            support: BtleSupport::NotEvaluated,
+        };
+        let (output, mut status) = BtleOperatorOutput::current_status(initial);
+
+        for index in 0..=BTLE_OPERATOR_OUTPUT_CAPACITY {
+            let next = if index == BTLE_OPERATOR_OUTPUT_CAPACITY {
+                BtleCurrentStatus::Available {
+                    support: BtleSupport::Qualified,
+                }
+            } else if index % 2 == 0 {
+                BtleCurrentStatus::Unavailable {
+                    reason: AvailabilityReason::DeadlineExceeded,
+                    support: BtleSupport::Unqualified,
+                }
+            } else {
+                BtleCurrentStatus::Unavailable {
+                    reason: AvailabilityReason::BluezUnavailable,
+                    support: BtleSupport::NotEvaluated,
+                }
+            };
+            output.publish_status(next);
+        }
+
+        assert!(status.has_changed().unwrap());
+        assert_eq!(
+            *status.borrow_and_update(),
+            BtleCurrentStatus::Available {
+                support: BtleSupport::Qualified,
+            }
+        );
+        assert!(!status.has_changed().unwrap());
+    }
+
+    #[test]
+    fn terminal_status_rejects_late_available_and_retains_support() {
+        let (output, status) = BtleOperatorOutput::current_status(BtleCurrentStatus::Available {
+            support: BtleSupport::Qualified,
+        });
+
+        output.publish_terminal(TerminalAvailability::CredentialExpired);
+        output.publish_status(BtleCurrentStatus::Available {
+            support: BtleSupport::Unqualified,
+        });
+
+        assert_eq!(
+            *status.borrow(),
+            BtleCurrentStatus::Unavailable {
+                reason: AvailabilityReason::CredentialExpired,
+                support: BtleSupport::Qualified,
+            }
+        );
     }
 
     fn address(value: &str) -> Address {

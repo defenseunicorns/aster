@@ -11,6 +11,9 @@ operations. The five `aster-credential-admin` command forms and statically
 composed runtime loader are exact and executable. A 2026-09-09 engineering
 spike exercised the code-level integration on the selected physical hardware.
 The original Raspberry Pi packaged qualification remains open. The
+[two-node BTLE Event procedure](../quickstart/btle-linux-two-node.md#install-and-hand-off-the-protected-mission-reference)
+supplies the concrete Debian 13 arm64 first-install reference handoff for that
+bounded evaluation; physical execution and qualification remain open. The
 [Ubuntu 24.04 amd64 candidate annex](#ubuntu-2404-amd64-package-annex) below
 supplies concrete package paths, service identity, reference handoff and
 supervisor commands for that separate evaluation target.
@@ -50,10 +53,11 @@ handoff file. After a successful INSTALL or ROTATE, the deployment procedure mus
 parse the exact complete `reference=HEX` success field, decode that canonical
 hex to the serialized `ProvisioningSecretRef` bytes expected by the agent, and
 atomically replace the handoff file. The file must be owned exactly by the
-final service UID with mode `0600`. The Ubuntu candidate annex specifies its
-path and manual handoff; the original Raspberry Pi package annex remains open. The
-agent's `mission_secret_ref_file` must name that handoff file, and its
-configured `mission_load_id` must equal the load-operation ID used for the
+final service UID with mode `0600`. The two-node BTLE Event procedure specifies
+the initial Debian 13 arm64 path and manual handoff; its physical qualification
+remains open. The Ubuntu candidate annex specifies the separate Ubuntu path and
+handoff. The agent's `mission_secret_ref_file` must name that handoff file, and
+its configured `mission_load_id` must equal the load-operation ID used for the
 Active generation.
 
 The runtime presentation must satisfy either the original service-owned

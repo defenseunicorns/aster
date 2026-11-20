@@ -18,6 +18,7 @@ on using the current product surface.
 | Measure the 8/32/64-publisher hierarchy diagnostic | `mise run hierarchy-scale-compose -- --publishers-per-leaf N` | [Hierarchy scale](hierarchy-scale.md) |
 | Attempt one foreground Android-to-Linux non-IP Event validation | Android app + `aster-btle-ring1` | [Android BTLE Ring-1](btle-android-ring1.md) |
 | Evaluate unattended Event recovery between two provisioned Linux nodes | `aster-btle-event` | [Unattended Linux BTLE Event evaluation](btle-linux-unattended.md) |
+| Evaluate packaged automatic BTLE on the initial exact two-node Linux profile | `aster-agent.service` | [Two-node Linux BTLE Event evaluation](btle-linux-two-node.md) |
 | Rehearse a built Debian package with two static peers | `mise run deb-compose -- --deb /path/to/aster.deb` | [Package Compose smoke](../../docker/deb-test/README.md) |
 | Operate the bounded Linux Event evaluation slice | Operator procedures | [Linux Event MVP runbook](../mvp/linux-event-mvp-runbook.md) |
 

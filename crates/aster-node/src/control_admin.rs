@@ -163,6 +163,7 @@ pub(crate) fn admin_error(operation: &'static str, error: NodeError) -> ControlA
         | NodeError::Carrier(_)
         | NodeError::FatalBlobCoherence(_)
         | NodeError::EmissionPolicyChanged
+        | NodeError::EmissionPolicyRestartRequired
         | NodeError::CustodySendSkipped
         | NodeError::Io(_)
         | NodeError::Demo(_) => ControlAdminErrorKind::StateUnavailable,
@@ -666,6 +667,22 @@ mod tests {
         ProvisioningSecretStoreError, ReferenceEnvelopeSealer, ReferenceProvisioner, Topic,
         UnprotectedProvisioning,
     };
+
+    #[test]
+    fn emission_policy_restart_requirement_is_closed_as_state_unavailable() {
+        let error = admin_error(
+            "publish revocation",
+            NodeError::EmissionPolicyRestartRequired,
+        );
+
+        assert_eq!(error.kind(), ControlAdminErrorKind::StateUnavailable);
+        assert_eq!(error.operation(), "publish revocation");
+        assert_eq!(
+            error.to_string(),
+            "control administration publish revocation: selected state unavailable"
+        );
+        assert!(std::error::Error::source(&error).is_none());
+    }
 
     struct OneShotUnprotector {
         calls: usize,

@@ -110,14 +110,18 @@ impl CarrierPeerEvidence {
 pub enum ContactErrorKind {
     /// Invalid local configuration or caller input.
     Configuration,
+    /// The local adapter violated its own lifecycle or sequencing invariant.
+    Invariant,
     /// The adapter or controller is currently unavailable.
     Unavailable,
     /// The operation exceeded its deadline.
     Timeout,
     /// The carrier operation failed without a more specific safe classification.
     Transport,
-    /// A caller or remote value exceeded a declared bound.
+    /// A local caller value exceeded a declared bound.
     Bounds,
+    /// A peer-supplied value exceeded a local receive bound.
+    RemoteBounds,
     /// The carrier rejected an unauthenticated or unauthorized peer.
     Unauthorized,
     /// The peer or higher layer contradicted the contact protocol.

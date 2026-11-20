@@ -1,9 +1,9 @@
 use bluer::l2cap::{PSM_LE_DYN_START, PSM_LE_MAX};
-use hmac::{Hmac, KeyInit, Mac};
-use sha2::Sha256;
 use std::{fmt, num::NonZeroU32, time::Instant};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
+
+use aster_host::zeroizing_hmac_sha256;
 
 /// Canonical private UUID bytes for the rostered LE L2CAP carrier.
 pub const ASTER_ROSTER_SERVICE_UUID: [u8; 16] = [
@@ -326,23 +326,13 @@ fn validate_psm(listener_psm: u16) -> Result<(), DiscoveryRecordError> {
 }
 
 fn proof_tag(secret: &DiscoverySecret, header: &[u8]) -> [u8; PROOF_BYTES] {
-    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(secret.as_bytes())
-        .expect("SHA-256 HMAC accepts every 32-byte key");
-    mac.update(PROOF_DOMAIN);
-    mac.update(&ASTER_ROSTER_SERVICE_UUID);
-    mac.update(header);
-    let output = mac.finalize().into_bytes();
+    let output = Zeroizing::new(zeroizing_hmac_sha256(
+        secret.as_bytes(),
+        &[PROOF_DOMAIN, &ASTER_ROSTER_SERVICE_UUID, header],
+    ));
     let mut tag = [0_u8; PROOF_BYTES];
     tag.copy_from_slice(&output[..PROOF_BYTES]);
     tag
-}
-
-#[cfg(test)]
-fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    let mut mac =
-        <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts keys of every length");
-    mac.update(message);
-    mac.finalize().into_bytes().into()
 }
 
 #[cfg(test)]
@@ -382,19 +372,6 @@ mod tests {
                 .unwrap(),
             now,
         )
-    }
-
-    #[test]
-    fn discovery_record_rfc_4231_hmac_sanity_vector() {
-        let key = [0x0b; 20];
-        assert_eq!(
-            hmac_sha256(&key, b"Hi There"),
-            [
-                0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53, 0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b,
-                0xf1, 0x2b, 0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7, 0x26, 0xe9, 0x37, 0x6c,
-                0x2e, 0x32, 0xcf, 0xf7,
-            ]
-        );
     }
 
     #[test]

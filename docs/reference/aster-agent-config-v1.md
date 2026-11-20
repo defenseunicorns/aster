@@ -137,8 +137,15 @@ Unsigned integer fields use their JSON integer representation.
 | `mesh.emission_policy` | string enum | none | `normal` or `receive_only`. The selection is applied at startup and changes require restart. Receive-only accepts authenticated inbound work but initiates no contacts and discloses no local Event/control inventory or objects; it is not physical radio silence. |
 | `mesh.sync_interval_ms` | integer | none | `1..=60000`. |
 | `mesh.blob_interests` | array of strings | `[]` | `0..=256` unique canonical exact selectors, each encoded as one `TOPIC@SCOPE`. Topic and scope use the normal canonical Aster name rules. Empty or omitted means receive no Blob network work. Descendant-scope and wildcard intent are not supported. Changing this restart-only field requires process restart. |
-| `mesh.peers` | array of strings | none | `0..=256` exact manual peers. Each is `CARRIER_ID@IP:PORT=MISSION_NODE_ID_HEX64`. Carrier identities must be unique and mission identities must be unique; distinct peers may share a socket address. |
+| `mesh.peers` | array of strings | none | Exact manual Iroh peers. At most 256 distinct mission identities may appear across this array and an active `btle.peer`; the array may contain 256 entries when BTLE names one of them, otherwise an additional BTLE identity limits it to 255. Each peer is `CARRIER_ID@IP:PORT=MISSION_NODE_ID_HEX64`. Carrier identities must be unique and mission identities within this array must be unique; distinct peers may share a socket address. |
 | `mesh.relay` | object or `null` | omitted/`null` | At most one controlled relay. See Relay below. |
+| `btle.enabled` | boolean | `true` within object | An absent object grants no BTLE authority. `{ "enabled": false }` is the only disabled form; no other BTLE field may accompany it. |
+| `btle.peer` | string | none | Exact 64-hex mission `NodeId` for the one rostered peer. It may name the same mission peer as one `mesh.peers` entry so automatic selection can choose Iroh or BTLE for that peer; the shared distinct-identity cap remains 256. |
+| `btle.deployment_scope_id` | string | none | Exactly 64 hexadecimal characters decoding to a nonzero 32-byte discovery scope. It is not a peer identity. |
+| `btle.policy` | string enum | none | Exactly `rostered`. Discovery supplies a transient locator only; normal mission authentication still admits the peer. |
+| `btle.emission_policy` | string enum | none | `normal` or `receive_only`, selected only at startup. It cannot be `normal` when `mesh.emission_policy` is `receive_only`. The first `receive_only` profile keeps BTLE radio-inert. |
+| `btle.priority` | integer | none | Nonzero `u16` local adapter-selection priority. It does not enter the wire protocol. |
+| `btle.credential` | string | none | Exactly `aster-btle-roster`. The Debian service obtains this optional encrypted credential from the systemd credential store. |
 | `credentials.client_token_file` | string path | none | Absolute path to the owner-only bearer-token file. |
 | `credentials.mission_secret_ref_file` | string path | none | Absolute path to one owner-only canonical serialized `ProvisioningSecretRef`; JSON never carries its bytes. |
 | `credentials.mission_load_id` | string | none | Exactly 64 hexadecimal characters (case-insensitive), decoded as the provider load-operation ID. |
@@ -159,6 +166,30 @@ Unsigned integer fields use their JSON integer representation.
 | `limits.first_authentication_timeout_ms` | integer | `5000` | `1..=5000` from connection admission to the first authenticated request. |
 | `limits.max_in_flight_requests` | integer | `64` | `1..=64` business responses/streams in flight across the node. |
 | `limits.shutdown_grace_ms` | integer | `30000` | `1..=30000` for application drain and selected-node shutdown together. A second termination signal or expiry forces exit code `2`; clean shutdown is `0` and a terminal failure is `1`. |
+
+BTLE controller inventory and selection are automatic; controller identity is
+not configuration. Complete policy plus a current encrypted roster credential
+authorizes composition, while missing BlueZ or compatible hardware leaves the
+adapter unavailable without blocking node readiness or durable publication.
+Credential replacement and BTLE policy changes require `systemctl restart
+aster-agent.service`; `systemctl reload` reloads only the application bearer
+token. A replacement roster generation is validated and durably checkpointed
+before the new adapter lease is exposed.
+
+The packaged service writes its current sanitized BTLE status to the system
+journal. A host operator authorized by the Linux journal ACLs can read the
+latest record without granting an Aster application token:
+
+```console
+journalctl --unit=aster-agent.service --boot --output=cat --no-pager \
+  | grep '"operation":"btle_status"' | tail -1
+```
+
+The record contains only timestamp, operation, adapter kind, availability,
+closed reason, and support tag. Service readiness remains independent of BTLE
+availability. Journal authorization is owned by the host (normally root or an
+explicit journal-reader group); do not grant journal access to expose BTLE
+status to an application.
 
 The server also retains compiled, non-configurable bounds: 1 MiB encoded
 request/message, 4 MiB protobuf element memory, 2 MiB encoded protobuf
