@@ -8,7 +8,7 @@
 - Candidate implementation checkpoint: `117770259680d89e5fbd1ff1f6c3df9f3e646e6c`
 - Requirements SHA-256:
   `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
-- Decision: [0022 — Do not select an IP mesh substrate from Proposal 0001](../decisions/0022-ip-mesh-experiment-no-selection.md)
+- Decision: [0022 — Do not select an IP mesh substrate from Proposal 0001](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0022-ip-mesh-experiment-no-selection.md)
 
 ## Outcome
 

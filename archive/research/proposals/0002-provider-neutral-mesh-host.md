@@ -7,7 +7,7 @@
 - Starting commit: `6d199d8176091360012dd8d5bcca1fd638248f7b`
 - Requirements baseline SHA-256:
   `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
-- Decision target: amend or preserve [Decision 0022](../decisions/0022-ip-mesh-experiment-no-selection.md)
+- Decision target: amend or preserve [Decision 0022](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0022-ip-mesh-experiment-no-selection.md)
 - Related experiment: [Proposal 0001](0001-ip-mesh-vertical-slice.md)
 
 ## Question
@@ -142,4 +142,4 @@ fixtures. The focused rust-libp2p profile failed clean trial 14 after 13 passes,
 exceeded the idle-CPU gate, did not implement NAT/relay lanes, and produced no
 net custom-mechanism reduction. No provider or dependency was admitted. See the
 [full result](0002-provider-neutral-mesh-host-results.md) and
-[Decision 0023](../decisions/0023-mesh-host-contract-no-libp2p-selection.md).
+[Decision 0023](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0023-mesh-host-contract-no-libp2p-selection.md).

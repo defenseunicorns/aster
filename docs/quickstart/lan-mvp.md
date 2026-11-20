@@ -339,6 +339,5 @@ This flow uses unprotected reference provisioning and local bearer tokens. It
 does not establish protected provisioning, physical-network evidence,
 independent interoperability, NAT/WAN discovery or traversal, global
 convergence, resource/soak qualification, or release authorization. See
-[Carriers and contacts](../transports.md) and
-[ADR 0036](../decisions/0036-mission-authenticated-lan-discovery-mvp.md) for the
-design boundary.
+[Carriers and contacts](../transports.md) for the discovery and authorization
+boundaries.

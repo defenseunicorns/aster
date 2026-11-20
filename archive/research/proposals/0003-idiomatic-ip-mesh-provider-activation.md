@@ -411,7 +411,7 @@ scale phases.
 
 The complete measurements, stopped cells, rollback proof, and recommendation
 are in the [Proposal 0003 result](0003-idiomatic-ip-mesh-provider-results.md).
-[Decision 0024](../decisions/0024-refactor-durable-node-ownership-before-ip-provider-selection.md)
+[Decision 0024](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0024-refactor-durable-node-ownership-before-ip-provider-selection.md)
 selects no provider and requires a single process-owned durable authority before
 another comparison. The experimental Iroh and libp2p Rust adapter modules,
 Cargo features, and dependency graphs were removed from the continuing branch;

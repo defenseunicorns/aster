@@ -100,8 +100,7 @@ An open QUIC connection can still exchange transport keepalives or
 acknowledgements; closing discovery does not close an authenticated connection.
 An idle open connection is not a promise of zero radio or battery cost.
 
-See the [nearby discovery decision](../decisions/0034-short-lived-iroh-nearby-discovery.md)
-for the alternatives, measured caveats, and physical qualification plan.
+See [Carriers and contacts](../transports.md) for discovery modes and limits.
 
 ## Exact claim boundary
 

@@ -13,12 +13,12 @@
   `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
 - Execution cap: 36 engineer-days; this is a stop limit, not an estimate
 - Result: [Proposal 0003 result](0003-idiomatic-ip-mesh-provider-results.md)
-- Decision: [Decision 0024](../decisions/0024-refactor-durable-node-ownership-before-ip-provider-selection.md)
-- Preserves: [Decision 0002](../decisions/0002-dependency-admission.md),
+- Decision: [Decision 0024](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0024-refactor-durable-node-ownership-before-ip-provider-selection.md)
+- Preserves: [Decision 0002](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0002-dependency-admission.md),
   Decision 0014 (“Build versus buy is governed by total assurance cost”;
   Decision 0015 (“Delete custom mechanism behind narrow library-backed seams”;
-  [Decision 0022](../decisions/0022-ip-mesh-experiment-no-selection.md), and
-  [Decision 0023](../decisions/0023-mesh-host-contract-no-libp2p-selection.md)
+  [Decision 0022](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0022-ip-mesh-experiment-no-selection.md), and
+  [Decision 0023](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0023-mesh-host-contract-no-libp2p-selection.md)
 - Prior results: [Proposal 0001](0001-ip-mesh-vertical-slice-results.md) and
   [Proposal 0002](0002-provider-neutral-mesh-host-results.md)
 

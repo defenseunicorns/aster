@@ -11,8 +11,8 @@
 - Requirements exercised, not closed: §5.6–§5.8; §6 transport boundary; §7
   sync/peer status; §8 dependency/interoperability constraints; §9 resource
   targets; §12 relay, NAT, and capture scenarios
-- Related decisions: [0002](../decisions/0002-dependency-admission.md),
-  [0007](../decisions/0007-ip-and-btle-links.md),
+- Related decisions: [0002](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0002-dependency-admission.md),
+  [0007](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0007-ip-and-btle-links.md),
   0014 (“Build versus buy is governed by total assurance cost”;  not part of this repository artifact),
   0015 (“Delete custom mechanism behind narrow library-backed seams”; not part of this repository artifact), and
   0016 (“Tokio owns relay host I/O and scheduling”; not
@@ -774,7 +774,7 @@ pass. No arm was eligible for Phase C and no dependency was selected.
 The complete measurements, failed-run ledger, evidence identities, gate matrix,
 supply-chain results, and next boundary are in the
 [result report](0001-ip-mesh-vertical-slice-results.md). Decision
-[0022](../decisions/0022-ip-mesh-experiment-no-selection.md) records the
+[0022](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0022-ip-mesh-experiment-no-selection.md) records the
 no-selection disposition.
 
 ## Progress log
