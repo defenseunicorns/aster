@@ -503,10 +503,9 @@ the receiver's interest with current route authority. `Carry` can retain exact
 protected bytes without exposing plaintext or creating application delivery;
 overlapping `Consume` wins for local delivery.
 
-Continue with the [capability tour](capability-tour.md) for a fast visible mesh,
+Continue with the [capability tour](capability-tour.md) for a fast visible mesh and
 the [selected architecture](../architecture.md) for the complete authority
-split, and the [current implementation boundary](../../README.md#current-implementation-boundary)
-for capabilities and limitations.
+split.
 
 ## Observe bounded numbered publication lifecycle
 

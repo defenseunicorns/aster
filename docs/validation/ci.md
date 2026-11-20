@@ -585,32 +585,8 @@ ID directions, shared causal ledgers with disjoint class indexes, collision,
 quota, schema/reopen, and terminal-state invariants. No test invokes a
 registered application merge policy during ingest.
 
-The final frozen-tree matrix passed 539 of 539 on each toolchain. The current
-run comprised core 349/349 (44.44s), node library 81/81 (5.19s), node binary
-6/6 (0.00s), `mesh_cli` 13/13 (135.87s), and selected store 90/90 (8.75s).
-The separate Rust 1.91.0 run comprised the same counts in 45.77, 5.42, 0.01,
-135.76, and 8.61 seconds respectively. Each run also had five zero-test targets;
-their test-harness sums were 194.25 and 195.57 seconds. The executions and
-timings are not pooled.
-
-Strict all-target/all-feature Clippy with warnings denied passed on the current
-and Rust 1.91 toolchains in 10.32 and 10.30 seconds. Formatting passed on both
-in 0.73 and 0.85 seconds, and `git diff --check` passed in 0.03 seconds. The
-complete dual-toolchain validation used 463.76 seconds wall time. After a
-27.21-second disposable two-node fixture, the compiled Record example returned
-`moving`, counter 3, one superseded revision, no concurrent head, no conflict,
-and both insert flags true in 1.26 seconds; an exact 0.84-second rerun returned
-the same semantic ID and projection with both insert flags false.
-
-The exact Record source/dependency hashes are pinned in the
-[requirements evidence](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md#prior-selected-record-stopped-slice-automated-evidence).
-This is the earlier stopped/local automated evidence, not a Record contact,
-disconnected-process acceptance result, retained execution receipt, or release
-artifact. At this frozen slice Record had no live handle or reconciliation
-frames; the later semantic-v4 gate below adds frames but no live application
-handle. Automatic registered-policy
-merge, finite TTL design (the selected form is rejected), expiry/garbage
-collection, selected-node bindings, physical
+Automatic registered-policy merge, finite TTL design (the selected form is
+rejected), expiry/garbage collection, selected-node bindings, physical
 systems, mixed implementations, and scale remain open.
 
 The subsequent stopped/local Blob gate adds a typed source-manifest capability,
@@ -668,39 +644,6 @@ The owner-token/binding migration is all-or-none and admits missing fields only
 for canonical empty Blob rows/counters with no fixed depot root; partial
 fields, any logical Blob state, or any fixed depot root fail without repair.
 
-On the final frozen bytes, focused current-toolchain runs passed the six typed
-source-Blob tests, the dedicated core reader retry-state adversary, all 28
-selected-store Blob tests, and all seven selected-node Blob tests. The current
-tracked-Cargo-target matrix passed 576 of 576 tests: core library 351/351
-(44.68s), node library 88/88 (11.29s), node binary 6/6 (0.00s), `mesh_cli`
-13/13 (153.69s), and selected store 118/118 (12.33s). The separate exact Rust
-1.91.0 matrix passed the same 576 tests in 45.57, 28.63, 0.01, 153.99, and
-12.44 seconds respectively. The core basic example and five node examples had
-no tests. These totals count only the listed tracked Cargo targets; no
-auxiliary non-workspace scratch harness is counted.
-
-Strict workspace all-target Clippy with warnings denied passed on the current
-and Rust 1.91 toolchains in 28.36 and 34.71 seconds. Current-toolchain Rustdoc
-with warnings denied, `cargo fmt --all -- --check`, and `git diff --check`
-also passed. A loopback-enabled current-toolchain `cargo test --workspace`
-passed every runnable workspace suite; one performance experiment remained
-explicitly ignored. The process-heavy node cells required loopback permission;
-an earlier sandboxed attempt was denied by the host before those socket tests
-could run and is not counted as a test failure or success.
-
-The exact Blob source identities are pinned in the
-[requirements evidence](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md#prior-selected-blob-automated-evidence).
-A disposable provisioned fixture then ran the compiled Blob example twice over
-18,783 input bytes. The 4.792-second first run returned one chunk,
-`inserted=true`, and Blob ID
-`85c3f98504cc9e671212256c994698ce2d8c1e947aa5b3841d61a943d3660fde`;
-the 0.714-second exact rerun returned the same ID with `inserted=false`. Both
-outputs matched the input byte-for-byte at SHA-256
-`f3d9ba32b0825abfec157aadf8c16581608220f48dd2a8f0a3a39bef29bdd966`.
-The fixture is not retained, and this is local executable evidence rather than
-a Blob contact, remote-resume result, physical-storage measurement, or release
-receipt.
-
 The subsequent selected Event custody gate originally added semantic-v3
 authenticated cumulative age; current semantic v4 inherits that format. The
 gate also adds Linux finite Event TTL, priority-sensitive scheduling/retry, bounded
@@ -728,9 +671,7 @@ and final query/poll expiry withholding. Store tests cover exact-scope quota
 configuration, aggregate quota enforcement/rejection, authority reserve,
 continuous/lost age, route promotion, retirement/lease drain, retry/receipt
 settlement, sender/receiver visibility, crash-reopen cleanup, cardinality/audit
-corruption, and one-transaction bounded scheduling. Exact final counts, timings,
-and source hashes are recorded in the
-[prior semantic-v3 custody requirements evidence](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md#prior-semantic-v3-selected-event-custody-automated-evidence).
+corruption, and one-transaction bounded scheduling.
 
 This is current-code automated evidence, not a retained physical acceptance
 receipt. That retained finite-TTL boundary is Linux/Event/v3-format only,
@@ -746,19 +687,9 @@ separate current-code gate below.
 Networked Blob was outside that Event-custody receipt; the separate historical
 v5 compatibility and current v7/v8 stream/lifecycle gates below do not relabel it.
 
-The subsequent stopped protected-provisioning/control-administration Step 4
-gate is pinned separately in the
-[requirements evidence](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md#prior-protected-provisioning-and-control-administration-automated-evidence).
-On fresh isolated targets, current Rust 1.97.1 and Rust 1.91.0 each passed 927
-executable workspace tests with zero failures and one deliberately ignored
-performance experiment; every-target/every-feature Clippy and all 17 Rustdoc
-crate-targets passed with warnings denied on both toolchains. The current and
-Rust 1.91 real-process `mesh_cli` targets passed 13/13 in 144.36s and 139.03s,
-respectively. The ordinary ready deadline is raised to 40 seconds; the cold offline
+The ordinary ready deadline is raised to 40 seconds; the cold offline
 cell uses separate 90-second startup, 120-second contact, and 150-second
-completion bounds. This historical freeze is stopped Rust automation, not a
-protected live CLI/binding, production SecretStore, operational recovery or
-destroy workflow, physical receipt, or release authorization.
+completion bounds.
 
 The later frozen source slice adds caller-provided protected live bootstrap and
 actor-owned live control administration. Its focused reproduction commands are:
@@ -789,35 +720,6 @@ and lexical state-witness mutation. Focused core/mission tests additionally name
 `secret_reference_is_bounded_canonical_versioned_and_redacted`,
 `provisioning_origins_have_stable_nonidentifying_receipt_labels`, and
 `protected_state_witness_is_lexical_and_clone_local`.
-
-At the exact source identities recorded in the
-[requirements ledger](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md#current-protected-live-startup-and-control-automated-evidence),
-the reported current-code gates passed: core library 380/380 in 45.21s; node library
-180/180 in 69.94s; protected-runtime integration 12/12 in 0.15s; node
-all-target/all-feature check in 12m04s; strict node all-target/all-feature
-Clippy with warnings denied in 25.84s; fresh-target workspace all-feature
-no-dependency Rustdoc with warnings denied in 17.97s; and formatting plus diff
-checks.
-
-The final serialized gate over those source identities and the preceding frozen
-documentation bytes ran outside the sandbox for real-Iroh loopback:
-
-```sh
-CARGO_TARGET_DIR=/private/tmp/aster-protected-admin-full-check CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=1 mise run check
-# exit 0
-```
-
-The all-feature workspace tests and strict Clippy passed. Major test results
-were core 388/388, node library 180/180, node main 12/12, `mesh_cli` 20/20,
-`protected_runtime` 12/12, redb 166/166, `aster-iroh` 13/13, host 74/74, IP
-50/50, lab 32/32, and FFI 13/13; all doctests also passed. C/C++ syntax,
-conformance and Python wire checks, Python bindings 12/12, lab Python 162/162,
-Go, license, dependency, and requirements gates were green. The requirements
-gate remained 348 IDs, 119 mappings, and 78/37/233 statuses. This is a
-non-retained current-code CI receipt: it creates no execution root, observed
-credit, or status movement. The source freeze is signed commit
-`164ccc1dbafd7fa954c06eb7cf555671ff597ba1`; no signed documentation commit is
-claimed here.
 
 The live-control cells cover capacity-one pressure with a four-command yield
 budget, policy refresh before response, nonfatal pending-policy deferral, exact
@@ -891,11 +793,7 @@ cargo test --locked -p aster-node same_epoch_rekey_restart
 cargo check --locked --manifest-path fuzz/Cargo.toml --bin selected_frame_decode
 ```
 
-The final source manifest, exact two-toolchain matrix results, binding gates,
-and the disclosed pre-existing lab-oracle retry are pinned in the
-[prior State/Record requirements evidence](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md#prior-selected-state-and-record-network-automated-evidence).
-That earlier network-mechanics matrix remains current-code automation only; it
-does not itself create a retained execution root. Event last-contact status is
+Event last-contact status is
 not State/Record convergence. The later live-application receipt below adds a
 bounded two-participant result, not a scale result. Physical links, State/Record
 relay, NAT, BTLE, resource brackets, mixed implementations, and release gates
@@ -1265,16 +1163,10 @@ cargo test --locked -p aster-node runtime::tests::authenticated_peer_without_sco
 cargo check --locked --manifest-path fuzz/Cargo.toml --bin selected_frame_decode
 ```
 
-The exact three-node, cleanup, delayed-insert/abort, terminal multi-carrier,
-all-open-path audit, and predecessor-migration results plus the frozen source
-manifest are recorded in the [prior semantic-v5 Blob requirements evidence](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md#prior-semantic-v5-direct-blob-network-automated-evidence).
-Independent final audit found no remaining P0–P3. The repair retains the bounded
+The repair retains the bounded
 non-public physical-lineage fence, serializes durable-source/cache transitions,
 keeps terminal failures cursor-neutral, and uses the lexicographic maximum for
-authorized terminal source rotation. Exactly six
-requirements moved to `implemented-uncredited`; this current-code automation
-creates no retained Blob receipt or `observed-bounded` credit and does not
-relabel historical Event/control evidence.
+authorized terminal source rotation.
 Strict workspace Rustdoc and a fresh isolated `aster-node` plus `aster-iroh`
 documentation build are also part of the frozen gate; stale Cargo rmeta is not a
 source change or an accepted substitute for the clean isolated build.
@@ -1551,9 +1443,7 @@ does not claim discovery or punching, temporal direct-first fallback,
 representative or physical NAT, public Internet/relay operation, lab-network
 exclusivity, a complete listener-wide pre-authentication cap, BTLE,
 independent implementation or clock, resource thresholds, a hermetic build,
-complete MVP, or release authorization. Exact identities, replay commands, and
-status movements are in the
-[requirements ledger](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md#selected-iroh-nat-retained-receipt).
+complete MVP, or release authorization.
 
 The 57th test in that parent redb-store receipt is a Unix writable-open
 durability adversary. Every new or existing writer, including a terminal
@@ -1594,11 +1484,7 @@ A pass must finish with
 `emitted_by=running-node-processes`, `restarts=pass`, `atomic_reaction=pass`,
 `equal_inventory_noop=pass`, `transfers_each=2`,
 `semantics=source-authenticated-event`, `payload_blind_relays=pass`, and
-`ttl=durable-none`. The retained parent PR-A/pre-subscription 2026-08-24 N3,
-default N4, and N8 observed loopback results and their exact claim boundaries
-are recorded in
-the [mesh CLI quickstart](../quickstart/mesh-cli.md) and [requirements
-status](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md). Unit-test or demo success does
+`ttl=durable-none`. Unit-test or demo success does
 not override dependency-policy failure and does not authorize a production
 release.
 
@@ -1657,32 +1543,6 @@ deterministic remote observation of mid-flight stream teardown, physical or
 copy-on-write sanitization, snapshot/swap/backup destruction, redb
 rollback/replacement resistance, non-Unix support, remote triggering, or
 independent platform assurance.
-
-A separate retained parent PR-A/pre-subscription probe exercised the
-Event/mission boundary across eight loopback nodes and 38 child processes in 17
-causal cohorts. It is a manual
-receipt, not a CI lane; seven nonempty stderr files preserve ten transient
-duplicate-contact or connection-loss lines from the final no-op despite the
-exact terminal convergence pass. All 228 passing no-op contacts reported all
-11 counters zero. The command, root, artifact digest, and claim boundary are
-recorded in the
-[requirements status](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md).
-
-A separate 2026-08-25 manual gate used an operator-attested Cargo release-
-profile binary run for the signed current-tree source at N=32 on one macOS
-arm64 host over direct loopback. The no-dependency validator accepted 65/65
-exact cohorts, 158/158 exact-named executions with distinct READY PIDs, 32 distinct
-mission identities and stores, 30 payload-blind intermediates, and a final
-zero-difference no-op with 32 distinct log-observed READY PIDs; all 158 child
-stderr files were empty. No overlap timing or OS sampler proves simultaneity.
-The 62 data-motion edge cohorts remained serial two-process
-contacts. The raw retained root contains unprotected mission and carrier
-identity material and is not a source artifact; only the sanitized checked-in
-receipt is reviewable. This moves only `DM-9-21A` to `observed-bounded`. It is
-not the at-least-100-node target, a distributed/physical topology, NAT,
-controlled-relay, BTLE/cross-transport, mixed-implementation, resource-threshold,
-or release evidence. The exact receipt and replay command are in the
-[requirements status](https://github.com/defenseunicorns/aster/blob/0a2fb28088ae67bd8cb9e746ce8a499af6b0bbc1/docs/validation/requirements-status.md#selected-n32-retained-receipt).
 
 The node tests establish the existing `aster-core` four-flight hybrid session
 over real loopback Iroh and exercise it in the selected runtime before

@@ -7,9 +7,8 @@ artifacts**. It documents the evaluated workflow for the unpackaged Linux
 executables `aster` (package `aster-node`) and `aster-agent` (package
 `aster-agent`, using the node library). It does not complete packaging,
 reproducible builds, provenance, signing, or release authorization. The
-[capability roadmap](../../validation/capability-roadmap.md) and
-[current implementation boundary](../../../README.md#current-implementation-boundary) retain
-their existing claim boundaries.
+[capability roadmap](../../validation/capability-roadmap.md) retains
+its existing claim boundaries.
 
 ## Automated build and artifact
 

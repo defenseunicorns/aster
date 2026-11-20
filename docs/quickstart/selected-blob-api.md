@@ -701,6 +701,5 @@ every other stopped facade before opening `SelectedBlobNode`; use
 `RunningNode::selected_blobs()` instead while the actor is running. Continue
 with the [selected architecture](../architecture.md), the
 [selected Record API](selected-record-api.md), the
-[selected State API](selected-state-api.md), the
-[selected Event API](selected-event-api.md), and the
-[current implementation boundary](../../README.md#current-implementation-boundary) for capabilities and limitations.
+[selected State API](selected-state-api.md), and the
+[selected Event API](selected-event-api.md).

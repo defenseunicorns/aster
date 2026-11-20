@@ -446,6 +446,5 @@ plans are structural inputs, not authorization capabilities.
 
 The live actor and stopped State or Record facades cannot own the same store
 concurrently. Close every stopped facade before starting the actor. See the
-[selected architecture](../architecture.md) for the complete trust path, the
-[selected State API](selected-state-api.md) for latest-value semantics, and
-[current implementation boundary](../../README.md#current-implementation-boundary) for capabilities and limitations.
+[selected architecture](../architecture.md) for the complete trust path and the
+[selected State API](selected-state-api.md) for latest-value semantics.
