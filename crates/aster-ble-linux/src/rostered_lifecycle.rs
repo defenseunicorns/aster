@@ -1965,10 +1965,8 @@ where
     let (scan, observations) = started_scan.into_parts();
     let mut admission = DiscoveryAdmission::new();
     let started_at = lifecycle_now();
-    debug_assert_eq!(
-        admission.start_scan(started_at),
-        crate::ScanStartOutcome::Started
-    );
+    let scan_start = admission.start_scan(started_at);
+    debug_assert_eq!(scan_start, crate::ScanStartOutcome::Started);
     let mut scan_phase = ScanPhase::Active {
         scan: ActiveScan {
             owner: scan,
@@ -2323,7 +2321,8 @@ where
                     }
                     let (owner, observations) = started_scan.into_parts();
                     let now = lifecycle_now();
-                    debug_assert_eq!(admission.start_scan(now), crate::ScanStartOutcome::Started);
+                    let scan_start = admission.start_scan(now);
+                    debug_assert_eq!(scan_start, crate::ScanStartOutcome::Started);
                     scan_phase = ScanPhase::Active {
                         scan: ActiveScan {
                             owner,
@@ -5043,7 +5042,9 @@ mod tests {
             .await
             .unwrap();
 
-        contacts.admitted.notified().await;
+        timeout(Duration::from_secs(2), contacts.admitted.notified())
+            .await
+            .expect("authenticated discovery candidate must reach contact admission");
         cancellation.cancel();
         task.await.unwrap().unwrap();
 
@@ -7465,7 +7466,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn remote_pre_auth_ticket_completion_never_self_selects_an_alternate() {
+    async fn restarted_scan_admits_a_new_candidate_only_for_a_new_ticket() {
         let locator = crate::CanonicalLocator::new(
             Address::new([2, 0, 0, 0, 0, 0x74]),
             AddressType::LeRandom,
@@ -7515,6 +7516,53 @@ mod tests {
         assert_eq!(counters.runs.load(Ordering::Acquire), 1);
         assert_eq!(counters.completed.load(Ordering::Acquire), 1);
         assert_eq!(sockets.connected.lock().unwrap().len(), 1);
+
+        let replacement = TestAttemptCounters::default();
+        let replacement_locator = crate::CanonicalLocator::new(
+            Address::new([2, 0, 0, 0, 0, 0x75]),
+            AddressType::LeRandom,
+        )
+        .unwrap();
+        let replacement_record = AsterRosterBeaconV1::encode(
+            0x0083,
+            [0x75; 16],
+            config().discovery_credentials(),
+            Instant::now(),
+        )
+        .unwrap();
+        let sender = discovery
+            .observation_sender
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone();
+        sender
+            .send(
+                DiscoveryObservation::new(
+                    replacement_locator.address(),
+                    replacement_locator.address_type(),
+                    &replacement_record,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Reserving the fake's capacity-one queue is an explicit barrier: the
+        // permit becomes available only after the epoch consumes the candidate.
+        drop(sender.reserve().await.unwrap());
+        attempt_sender
+            .send(instrumented_attempt([0x11; 32], [0x22; 32], &replacement))
+            .await
+            .unwrap();
+        replacement.wait_for_completion().await;
+
+        assert_eq!(replacement.runs.load(Ordering::Acquire), 1);
+        assert_eq!(replacement.completed.load(Ordering::Acquire), 1);
+        assert_eq!(
+            *sockets.connected.lock().unwrap(),
+            [(locator, 0x0083), (replacement_locator, 0x0083)]
+        );
         cancellation.cancel();
         task.await.unwrap().unwrap();
     }

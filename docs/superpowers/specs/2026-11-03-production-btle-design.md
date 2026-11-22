@@ -376,6 +376,17 @@ replay state, pre-authentication slots, handshakes, retries, negative caches,
 windows, and retained bytes are bounded. Discovery exposes no `NodeId`, mission
 identifier, topic, scope, priority, inventory, data class, or payload.
 
+The initial Linux driver arms the raw BlueZ adapter event stream before it
+enumerates cached devices or starts discovery. Every retained baseline LE
+device is watched within the local stream limit, but cached state is never
+admitted as an observation. The separate discovery stream owns the scan window;
+its synthetic known-device events are not evidence. A raw live device addition
+has an existing pre-armed watcher or is subscribed before one bounded snapshot
+is read synchronously. The address type is rechecked after the snapshot,
+removals invalidate generation-tagged watchers, and an actual property stream
+remains charged until it ends. Watcher limits are replaceable local resource
+bounds, not protocol values.
+
 The target `ReceiveOnly` behavior originates no discretionary scan,
 advertisement, contact, inventory, reconciliation, administration, or
 application payload, while allowing protocol-required responses on an admitted
