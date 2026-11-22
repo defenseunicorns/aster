@@ -31,9 +31,12 @@ use aster_node::{
 };
 use std::{
     fmt,
-    future::Future,
+    future::{Future, poll_fn},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
     time::Instant,
 };
 use tokio::{
@@ -1790,6 +1793,54 @@ where
     }
 }
 
+async fn await_owned_discovery_start<D, T, F, Cleanup, CleanupFuture>(
+    discovery: &D,
+    expires_at: Instant,
+    open_timeout: Duration,
+    cancellation: &LifecycleCancellationObserver,
+    operation: F,
+    cleanup: Cleanup,
+) -> Result<T, SupervisorError>
+where
+    D: DiscoveryPlatform + ?Sized,
+    F: Future<Output = Result<T, DriverError>>,
+    Cleanup: FnOnce(T) -> CleanupFuture,
+    CleanupFuture: Future<Output = Result<(), DriverError>>,
+{
+    let local_deadline = tokio::time::Instant::now() + open_timeout;
+    let credential_deadline = tokio::time::Instant::from_std(expires_at);
+    let deadline = local_deadline.min(credential_deadline);
+    tokio::pin!(operation);
+    let operation_polled = AtomicBool::new(false);
+    let interrupted = {
+        let tracked_operation = poll_fn(|context| {
+            operation_polled.store(true, AtomicOrdering::Relaxed);
+            operation.as_mut().poll(context)
+        });
+        tokio::pin!(tracked_operation);
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                SupervisorError::Controller(DriverErrorKind::Cancelled)
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                SupervisorError::Controller(DriverErrorKind::Unavailable)
+            }
+            result = &mut tracked_operation => return result.map_err(supervisor_error),
+        }
+    };
+    if !operation_polled.load(AtomicOrdering::Relaxed) {
+        return Err(interrupted);
+    }
+    discovery.force_owner_loss();
+    match timeout(OWNED_STOP_DEADLINE, &mut operation).await {
+        Ok(Ok(owner)) => cleanup(owner).await.map_err(owned_cleanup_unconfirmed)?,
+        Ok(Err(_)) => {}
+        Err(_) => return Err(SupervisorError::PlatformCleanupUnconfirmed),
+    }
+    Err(interrupted)
+}
+
 fn publish_availability(
     updates: &watch::Sender<crate::BtleAvailability>,
     availability: crate::BtleAvailability,
@@ -1893,11 +1944,13 @@ where
     let record =
         encode_advertisement(&config, listener_psm, nonces.as_ref()).map_err(supervisor_error)?;
     let mut advertisement = Some(
-        match await_startup_platform(
+        match await_owned_discovery_start(
+            discovery.as_ref(),
             expires_at,
             config.open_timeout(),
             &cancellation,
             discovery.start_advertisement(config.controller(), record),
+            |mut owner| async move { release_advertisement(owner.as_mut()).await },
         )
         .await
         {
@@ -1923,11 +1976,16 @@ where
         cleanup.map_err(owned_cleanup_unconfirmed)?;
         return Err(SupervisorError::Controller(DriverErrorKind::Unavailable));
     }
-    let started_scan = match await_startup_platform(
+    let started_scan = match await_owned_discovery_start(
+        discovery.as_ref(),
         expires_at,
         config.open_timeout(),
         &cancellation,
         discovery.start_scan(config.controller()),
+        |started| async move {
+            let (mut owner, _) = started.into_parts();
+            stop_scan(owner.as_mut()).await
+        },
     )
     .await
     {
@@ -2301,11 +2359,16 @@ where
                     }
                 }
                 EpochEvent::ScanIdleDeadline => {
-                    let started_scan = match await_startup_platform(
+                    let started_scan = match await_owned_discovery_start(
+                        discovery.as_ref(),
                         expires_at,
                         config.open_timeout(),
                         &cancellation,
                         discovery.start_scan(config.controller()),
+                        |started| async move {
+                            let (mut owner, _) = started.into_parts();
+                            stop_scan(owner.as_mut()).await
+                        },
                     )
                     .await
                     {
@@ -4648,7 +4711,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn local_open_timeout_bounds_hung_advertisement() {
+    async fn hung_advertisement_start_fences_retry_as_unconfirmed_cleanup() {
         let started = Arc::new(Notify::new());
         let owner_loss_forced = Arc::new(AtomicU8::new(0));
         let task = tokio::spawn(run_available_epoch(
@@ -4668,20 +4731,88 @@ mod tests {
         started.notified().await;
 
         tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        assert_eq!(owner_loss_forced.load(Ordering::Acquire), 1);
+        tokio::time::advance(OWNED_STOP_DEADLINE).await;
 
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), task)
                 .await
-                .expect("local deadline ends hung advertisement startup")
+                .expect("cleanup deadline ends hung advertisement startup")
                 .unwrap()
                 .unwrap_err(),
-            SupervisorError::Controller(DriverErrorKind::Unavailable)
+            SupervisorError::PlatformCleanupUnconfirmed
         );
-        assert_eq!(owner_loss_forced.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn local_open_timeout_bounds_hung_initial_scan() {
+    async fn pre_cancelled_owned_start_is_never_polled() {
+        let polls = AtomicU8::new(0);
+        let cancellation = LifecycleCancellation::new();
+        cancellation.cancel();
+        let observer = cancellation.observer();
+        let owner_loss_forced = Arc::new(AtomicU8::new(0));
+        let discovery = PendingAdvertisementDiscovery {
+            started: Arc::new(Notify::new()),
+            owner_loss_forced: owner_loss_forced.clone(),
+        };
+
+        let result = await_owned_discovery_start(
+            &discovery,
+            Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(5),
+            &observer,
+            async {
+                polls.fetch_add(1, Ordering::AcqRel);
+                pending::<Result<(), DriverError>>().await
+            },
+            |()| async { Ok(()) },
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Err(SupervisorError::Controller(DriverErrorKind::Cancelled))
+        );
+        assert_eq!(polls.load(Ordering::Acquire), 0);
+        assert_eq!(owner_loss_forced.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_owned_start_is_never_polled() {
+        let polls = AtomicU8::new(0);
+        let cancellation = LifecycleCancellation::new();
+        let observer = cancellation.observer();
+        let owner_loss_forced = Arc::new(AtomicU8::new(0));
+        let discovery = PendingAdvertisementDiscovery {
+            started: Arc::new(Notify::new()),
+            owner_loss_forced: owner_loss_forced.clone(),
+        };
+
+        let result = await_owned_discovery_start(
+            &discovery,
+            Instant::now() - Duration::from_secs(1),
+            Duration::from_secs(5),
+            &observer,
+            async {
+                polls.fetch_add(1, Ordering::AcqRel);
+                pending::<Result<(), DriverError>>().await
+            },
+            |()| async { Ok(()) },
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Err(SupervisorError::Controller(DriverErrorKind::Unavailable))
+        );
+        assert_eq!(polls.load(Ordering::Acquire), 0);
+        assert_eq!(owner_loss_forced.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hung_initial_scan_start_fences_retry_as_unconfirmed_cleanup() {
         let scan_started = Arc::new(Notify::new());
         let owner_loss_forced = Arc::new(AtomicU8::new(0));
         let task = tokio::spawn(run_available_epoch(
@@ -4702,20 +4833,23 @@ mod tests {
         scan_started.notified().await;
 
         tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        assert_eq!(owner_loss_forced.load(Ordering::Acquire), 1);
+        tokio::time::advance(OWNED_STOP_DEADLINE).await;
 
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), task)
                 .await
-                .expect("local deadline ends hung initial scan")
+                .expect("cleanup deadline ends hung initial scan")
                 .unwrap()
                 .unwrap_err(),
-            SupervisorError::Controller(DriverErrorKind::Unavailable)
+            SupervisorError::PlatformCleanupUnconfirmed
         );
-        assert_eq!(owner_loss_forced.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn local_open_timeout_bounds_hung_scan_restart() {
+    async fn hung_scan_restart_fences_retry_as_unconfirmed_cleanup() {
         let restart_started = Arc::new(Notify::new());
         let owner_loss_forced = Arc::new(AtomicU8::new(0));
         let discovery = Arc::new(OneScanThenPendingDiscovery {
@@ -4749,21 +4883,25 @@ mod tests {
         );
 
         tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        assert_eq!(owner_loss_forced.load(Ordering::Acquire), 1);
+        tokio::time::advance(OWNED_STOP_DEADLINE).await;
 
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), task)
                 .await
-                .expect("local deadline ends a hung scan restart")
+                .expect("cleanup deadline ends a hung scan restart")
                 .unwrap()
                 .unwrap_err(),
-            SupervisorError::Controller(DriverErrorKind::Unavailable)
+            SupervisorError::PlatformCleanupUnconfirmed
         );
-        assert_eq!(owner_loss_forced.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn credential_expiry_bounds_initial_platform_registration() {
+    async fn credential_expiry_fences_hung_registration_as_unconfirmed_cleanup() {
         let owner_loss_forced = Arc::new(AtomicU8::new(0));
+        let registration_started = Arc::new(Notify::new());
         let (available_started, available_started_at) = oneshot::channel();
         let task = tokio::spawn(run_available_epoch(
             Arc::new(config_with_ids_and_lease(
@@ -4775,7 +4913,7 @@ mod tests {
                 events: Arc::new(Mutex::new(Vec::new())),
             }),
             Arc::new(PendingAdvertisementDiscovery {
-                started: Arc::new(Notify::new()),
+                started: registration_started.clone(),
                 owner_loss_forced: owner_loss_forced.clone(),
             }),
             Arc::new(FixedNonce([0x33; 16])),
@@ -4786,17 +4924,70 @@ mod tests {
             },
             LifecycleCancellation::new(),
         ));
+        registration_started.notified().await;
 
-        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        assert_eq!(owner_loss_forced.load(Ordering::Acquire), 1);
+        tokio::time::advance(OWNED_STOP_DEADLINE).await;
 
         assert_eq!(
             task.await.unwrap().unwrap_err(),
-            SupervisorError::Controller(DriverErrorKind::Unavailable)
+            SupervisorError::PlatformCleanupUnconfirmed
         );
-        assert_eq!(owner_loss_forced.load(Ordering::Acquire), 1);
         assert!(
             available_started_at.await.is_err(),
             "failed startup must not count toward stable Available time"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_late_scan_owner_cleanup() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let scan_entered = Arc::new(Notify::new());
+        let allow_scan = Arc::new(Notify::new());
+        let cancellation = LifecycleCancellation::new();
+        let task = tokio::spawn(run_available_epoch(
+            Arc::new(config()),
+            Arc::new(FakeSockets {
+                events: events.clone(),
+            }),
+            Arc::new(GatedScanDiscovery {
+                events: events.clone(),
+                scan_entered: scan_entered.clone(),
+                allow_scan: allow_scan.clone(),
+                observation_sender: Mutex::new(None),
+            }),
+            Arc::new(FixedNonce([0x33; 16])),
+            recording_admission(),
+            EpochSignals::default(),
+            cancellation.clone(),
+        ));
+        scan_entered.notified().await;
+
+        cancellation.cancel();
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        allow_scan.notify_one();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("late scan owner is stopped before cancellation completes")
+                .unwrap()
+                .unwrap_err(),
+            SupervisorError::Controller(DriverErrorKind::Cancelled)
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "bind",
+                "advertise",
+                "scan-starting",
+                "scan-stop",
+                "advertisement-release"
+            ]
         );
     }
 
