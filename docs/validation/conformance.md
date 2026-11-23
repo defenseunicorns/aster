@@ -273,20 +273,6 @@ the separate at-least-100-node target, any resource or hardware gate, physical
 or distributed topology, NAT/relay/BTLE/cross-transport behavior, independent
 interoperability, or release acceptance.
 
-A separate [9,573-byte selected live-Event receipt](evidence/selected-live-event-c464129.json)
-(SHA-256
-`4d71d04e4ebcc9f63c0e84e7f11e83bf1f3d1ad2ca8608486cdcc875b6dfeef0`,
-signed source `c464129`) is also a bounded reference-implementation observation,
-not a new `A-*` scenario. It records four peerless Events, threshold transfer of
-alpha sequences 1 and 3 with authenticated gap `[2,3)`, forced receiver-child
-termination after a flushed unacknowledged poll, fresh-process attempt-2
-redelivery with ack/re-ack, and Normal transfer of alpha 2 closing the gap. The
-authorized beta Event stays withheld; a temporary beta subscription observes
-`PolicyChangedSinceContact` and is removed without a later contact or beta
-delivery. Awaiting status has zero failed attempts. The run is one-host,
-same-implementation, direct loopback only and supplies no physical, NAT/relay,
-BTLE, mixed/independent, scale/resource, other-class, or release acceptance.
-
 ## Implemented reliability and resource subgates
 
 The authenticated in-memory runtime has a deterministic monotonic retry loop,
@@ -389,56 +375,6 @@ claim no retained delivery evidence. The queue's local ledger counts are not
 peer/convergence status. None of this evidence claims route-only Blob
 relay/custody, the 100+ MiB or RSS target, physical-media behavior, mixed
 implementation, or release acceptance.
-
-The delivery queue separately has a dated
-[`V-BLOB-DELIVERY` retained receipt](evidence/selected-live-blob-subscription-26e0a09.json).
-Its 10,269 canonical bytes have SHA-256
-`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`
-and bind Good-signed source `26e0a09`. One participant executes three
-processes and four actor lifetimes on one peerless host. Two exact publications
-share one `BlobId`; after the attempt-one child flushes an unacknowledged token
-and receives `SIGKILL`, a fresh process receives attempt 2 and acknowledges it
-with the persisted attempt-one token, rejects a cross-publication token, and
-settles both publications. The final parent reopen replays one selector and
-polls an empty ledger. This is not a network conformance result and claims no
-contact, synchronization, transfer, peer/convergence status,
-selector/network-interest separation, power-loss/filesystem-crash recovery,
-TTL/GC, physical or mixed implementation, resource/soak, reproducible build,
-or release acceptance.
-
-A separate dated
-[`V-BLOB-LIVE` retained receipt](evidence/selected-live-blob-044d90f.json)
-supersedes the earlier v1 observation and records the bounded live-application
-resume composition at good-signature source commit
-`044d90ff07c8e754b3d490cb810d42de3c915e3d`. Its 10,728 canonical bytes have
-SHA-256
-`4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`.
-Three participant identities under disjoint credentials and one mission
-authority execute seven phases with at most two live actors. After peerless
-publication and direct seeding, a receiver retains a non-public 16,384-byte
-prefix from the publisher across graceful shutdown and reopen. One contact
-with the different eligible replica advances that exact prefix to 32,768 bytes
-without refetching the source; the replica then supplies the remaining 65,870
-bytes. Exact runtime and typed Store accounting reconstructs 98,638 carrier
-bytes before promotion, authenticated two-page reads, and a final peerless
-graceful reopen. Eleven retained handles fail closed and three direct bind
-addresses are reacquired. The 45-test independent-oracle checker suite covers
-the canonical projection, exact transcript/runtime and prefix relations,
-private-artifact metadata-only inventory, privacy exclusion, and fail-closed
-replay.
-
-This advances only the bounded same-implementation, three-party, one-host
-direct-Iroh graceful interruption/reopen and different-peer continuation
-observation. It is not an independent black-box conformance result and does not
-satisfy a separately deployed SUT requirement. It does not prove process-crash
-or power-loss recovery, long-offline recovery, arbitrary-peer or route-only
-resume, physical-media sanitization, distinct physical hosts, NAT or Internet
-paths, controlled/public relay, BTLE, mixed implementations, scale beyond
-three participants, resource thresholds or long-duration soak, Blob
-subscription/status/TTL/garbage collection, complete MVP acceptance, release
-evidence, Event/State/Record live-application acceptance, or production
-authorization. Intermediate Store inspection and transcript timing remain
-producer-attested.
 
 Focused inventory-selection regressions exercise the same bound at small test
 sizes: the SQLite helper returns exactly the configured cap, requests only cap

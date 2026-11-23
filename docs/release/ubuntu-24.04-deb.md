@@ -65,9 +65,6 @@ checks passed. On 2026-09-14, native ARM64 package builds, protected systemd
 startup, Event delivery/acknowledgement, restart, removal/purge preservation,
 and same-runtime package upgrade/downgrade checks also passed. The package
 configuration example now includes the required `storage.operations` limits.
-See the [current validation record](2026-09-14-deb-observation.md) for artifact
-hashes, retained evidence, test-helper failures and qualification limits.
-Historical observations remain in [the earlier record](2026-09-10-deb-observation.md).
 
 The separate [two-node package Compose smoke](../../docker/deb-test/README.md)
 passed on amd64 and native ARM64, including offline backlog delivery and

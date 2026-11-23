@@ -820,65 +820,7 @@ cargo test --locked -p aster-node runtime::tests::run_for_preempts_a_saturated_a
 python3 tools/test-selected-live-mutable-receipt.py
 ```
 
-The separate v2
-[`selected-live-mutable-6cabb4c.json`](evidence/selected-live-mutable-6cabb4c.json)
-canonical receipt is 7,752 bytes with SHA-256
-`054945ecf94e8bfba1b130f6a5f47e9b1e0e17ad69f3b1472085a1d10f05eeaa`
-and binds the run to good-signature source commit `6cabb4c`. Its two distinct
-participants and mission identities execute six actor lifetimes with at most
-two concurrent. They publish State and Record while peerless, then eight direct
-`CONTACT` records account exactly for 7/7/7 selected items
-offered/fetched/inserted, zero remaining work, and zero Event/control/Blob
-counters. State first selects the maximum of two heads as `Current` and retains
-the other as `Concurrent`. A node-a successor observes and supersedes both;
-after node-b observes that successor, its authenticated empty tombstone observes
-and supersedes all three predecessors. Both actors select the tombstone as
-current, and one immediate peerless restart reproduces the exact four-version
-projection. Record retains two conflict siblings, rejects an ordinary publish
-without changing them, resolves only under the exact guard, supersedes both
-originals, retries without another insert, converges, and reproduces the result
-after restart. Six graceful shutdowns complete, and four retained State/Record
-handles fail closed.
-
-The receipt records an operator-attested source/binary/execution link, not a
-cryptographic or reproducible-build proof, and validates participant secret
-artifacts by metadata only without opening, reading, or hashing their contents.
-State causal observation and publication order are producer-attested. This is
-one-host same-implementation loopback evidence, and the restart is one
-immediate peerless reopen—not indefinite tombstone retention, compaction,
-garbage collection, or delete-wins. It supplies no physical, NAT/Internet,
-controlled/public-relay, BTLE, independent-implementation, scale beyond two,
-resource-threshold, long-duration, Event/Blob-live, or release acceptance from
-that State/Record receipt.
-The separate retained State- and Record-subscription gates below add bounded
-durable positive-current-version and whole-key active-head delivery. The Record
-receipt moves only `DM-5.1-08`; selected-node bindings, finite TTL/GC, automatic
-registered-policy Record merge, broader carriers/partitions, and release gates
-remain open.
-Its zero Blob counters
-do not evidence the newer live Blob mechanism.
-
 ## Selected live State subscription retained gate
-
-The v1
-[`selected-live-state-subscription-8912fc3.json`](evidence/selected-live-state-subscription-8912fc3.json)
-canonical receipt is 9,656 bytes with SHA-256
-`7d0b568dd4d57c3f2967da55953896829261877513c59c51a0b274eeda69485f`
-and binds the run to good-signature source commit `8912fc3`. Two participants
-and three processes execute ten actor lifetimes across seven phases with at
-most two concurrent actors. Nine lifetimes stop gracefully; the parent sends
-one receiver child `SIGKILL` after its attempt-one durable poll is flushed and
-before acknowledgement. Both participant binds are reacquired at the end.
-
-Six durable State publications produce five network inserts, deterministic
-concurrent-origin reduction, a causal successor, and an explicit current
-tombstone. One exact-key application subscription is inserted once and replayed
-seven times. Four deliveries include the local current origin, the successor at
-attempt one, the same successor at attempt two in a fresh process, and the
-current tombstone. Two acknowledgements, two idempotent reacknowledgements,
-eight token-binding checks, and four empty polls cover superseded-pending
-retirement, durable redelivery, token rotation, malformed and cross-binding
-rejection, ancestor suppression, and final peerless reopen.
 
 The gate separately proves that application delivery does not mutate network
 receive policy: one configured-network-interest State remains durably retained
@@ -907,67 +849,12 @@ install -d -m 700 /private/tmp/aster-live-state-subscription-projection
   --output /private/tmp/aster-live-state-subscription-projection/selected-live-state-subscription-receipt.json
 ```
 
-The checked-in receipt can be replayed byte-for-byte only with the installed
-pinned Python runtime, the externally retained raw root, and a separate clean
-checkout detached at the exact source. Pass both the source-bound checker and
-the checked-in receipt by absolute path because the receipt postdates the
-signed source freeze:
-
-```sh
-ASTER_SOURCE=/path/to/aster-source-detached-at-8912fc33571449d1beb4a4cb0f204b5dcd44e8c2
-ASTER_RECEIPT=/absolute/path/to/current-aster-checkout/docs/validation/evidence/selected-live-state-subscription-8912fc3.json
-cd /private/tmp
-ASTER_PYTHON="$(mise where python@3.13.7)/bin/python3"
-"$ASTER_PYTHON" "$ASTER_SOURCE/tools/check-selected-live-state-subscription-receipt.py" \
-  --raw-root /path/to/retained/selected-live-state-subscription-raw-root \
-  --source "$ASTER_SOURCE" \
-  "$ASTER_RECEIPT"
-cd "$ASTER_SOURCE"
-"$ASTER_PYTHON" tools/test-selected-live-state-subscription-receipt.py
-```
-
-The source/binary/execution link is operator-attested, not cryptographic or a
-reproducible build. The six participant mission, identity, and store artifacts
-are validated by metadata only and are never opened, read, or hashed by the
-checker. State causal observation and publication order are producer-attested.
-This is one-host, same-implementation, direct-loopback evidence only. It claims
-no physical host or carrier, NAT/Internet, relay, BTLE, mixed implementation,
-scale/resource/soak, Event/Record/Blob live acceptance, or release result.
-
 The delivery contract is positive-current-only. Its explicit current tombstone
 is a State version, not a synthetic withdrawal; there is no materialized view,
 transition feed, Current-to-None event, or dynamic `NodeConfig` interest
-mutation. The older mutable v2 receipt remains primary for its broader State
-causal convergence observation.
+mutation.
 
 ## Selected live Record subscription retained gate
-
-The v1
-[`selected-live-record-subscription-0c11344.json`](evidence/selected-live-record-subscription-0c11344.json)
-canonical receipt is 10,357 bytes with SHA-256
-`ba0e2bf47291f7e87000b85fa280cc957f3710ac800def82a51fb9b4657a1b48`
-and binds the run to Good-signed source commit
-`0c1134411953f4bb52133b50aff9989cd4ce3930`. Two participants and three OS
-processes execute seven actor lifetimes with at most two concurrent; six stop
-gracefully, while the parent sends one receiver child `SIGKILL` after its
-attempt-one conflict poll is durably flushed and before acknowledgement.
-
-One subscription is inserted once and replayed five times. Seven polls produce
-four deliveries and three empty results. The retained run first emits a
-peerless Current tombstone, then emits one complete two-head edit/tombstone
-conflict at `delivery_limit=1` and `scan_limit=16`. A fresh child replays the
-same projection at attempt two with a distinct 89-byte token. Exact
-acknowledgement/reacknowledgement succeeds, while malformed,
-wrong-subscription, wrong-projection, and retired-singleton tokens fail closed.
-A fresh exact query supplies the guard omitted from delivery, resolution inserts
-once with an exact noninserting retry, and its successor uses a new projection;
-both originals remain query-only Superseded history.
-
-The gate separately proves that application delivery does not mutate network
-receive policy: configured network-interested application-unmatched beta is
-retained but undelivered, while application-matched network-uninterested gamma
-is withheld. Final peerless reopen preserves that separation, the subscription,
-the resolved Current successor, both query-only originals, and an empty queue.
 
 Create a fresh owner-restricted raw root only from a clean Good-signed checkout
 using the pinned runtimes, then project its canonical receipt:
@@ -987,59 +874,7 @@ install -d -m 700 /private/tmp/aster-live-record-subscription-projection
   --output /private/tmp/aster-live-record-subscription-projection/selected-live-record-subscription-receipt.json
 ```
 
-Byte-for-byte replay requires the retained raw root and a separate clean
-checkout detached at the exact signed source:
-
-```sh
-ASTER_SOURCE=/path/to/aster-source-detached-at-0c1134411953f4bb52133b50aff9989cd4ce3930
-ASTER_RECEIPT=/absolute/path/to/current-aster-checkout/docs/validation/evidence/selected-live-record-subscription-0c11344.json
-cd /private/tmp
-ASTER_PYTHON="$(mise where python@3.13.7)/bin/python3"
-"$ASTER_PYTHON" "$ASTER_SOURCE/tools/check-selected-live-record-subscription-receipt.py" \
-  --raw-root /path/to/retained/selected-live-record-subscription-raw-root \
-  --source "$ASTER_SOURCE" \
-  "$ASTER_RECEIPT"
-cd "$ASTER_SOURCE"
-"$ASTER_PYTHON" tools/test-selected-live-record-subscription-receipt.py
-```
-
-The source/binary/execution link is operator-attested, not cryptographic or a
-reproducible build; admitted source is not a complete build closure. Secret
-artifacts are metadata-only evidence and Record causal order is producer-
-attested. This one-host same-implementation direct-loopback gate is not
-power-loss recovery, long retention/TTL/GC, physical/NAT/relay/BTLE,
-mixed-implementation, scale/resource/soak, binding, automatic-merge, or release
-evidence. It moves only `DM-5.1-08`; `DM-7-11`, `DM-7-14`, `DM-7-15`, and
-`DM-7-18` remain `implemented-uncredited`, and `DM-7-20` is unchanged.
-
 ## Selected live Event retained gate
-
-The v1
-[`selected-live-event-c464129.json`](evidence/selected-live-event-c464129.json)
-canonical receipt is 9,573 bytes with SHA-256
-`4d71d04e4ebcc9f63c0e84e7f11e83bf1f3d1ad2ca8608486cdcc875b6dfeef0`
-and binds the run to signed source commit
-`c464129d58c250dea2ecbf5f51d7ece0e5aab6d0`. Two distinct carrier and mission
-identities execute seven actor lifetimes with at most two concurrent actors on
-one same-implementation loopback host.
-
-The publisher creates four durable Events while peerless: alpha sequences 1,
-2, and 3 plus one authorized beta Event. One priority-threshold direct contact
-delivers alpha 1 and 3 as attempt 1 and exposes authenticated half-open gap
-`[2,3)`; routine alpha 2 and unsubscribed beta remain withheld. The parent then
-forcibly terminates the receiver child after its two-item poll was flushed
-without acknowledgement. A fresh receiver process reopens the durable
-subscription, receives the same IDs as attempt 2, acknowledges and idempotently
-re-acknowledges both, and reaches an empty poll. A normal direct contact later
-delivers alpha 2 as attempt 1, closes the gap, and completes its ack/re-ack.
-
-The beta query remains empty while unsubscribed. Creating a temporary beta
-subscription advances the selector snapshot and observes
-`PolicyChangedSinceContact`; exact removal and idempotent removal follow. The
-run performs no fresh post-change contact and observes no beta delivery. Its two
-`AwaitingAuthenticatedContact` observations have zero failed attempts, so this
-receipt does not establish positive failed-contact propagation. Control,
-State/Record, and Blob activity remain zero.
 
 The raw root is owner-only evidence containing participant mission bundles,
 identity keys, and stores. Keep it outside source control. The runner/checker
@@ -1062,28 +897,8 @@ Current native Event and Linux custody captures use v2 receipts with an explicit
 `numbered-v1` publication model and one private publication journal. The journal
 is included in the exact inventory and inspected only by metadata. V2 also
 classifies the exact bounded publication diagnostics retained from pipelining;
-unknown stderr and inconsistent outcome or writer accounting fail validation. The v1
-receipts retained below describe their original execution; use
-`--historical-v1` to invoke the frozen verifier without relabeling them. No new
+unknown stderr and inconsistent outcome or writer accounting fail validation. No new
 physical or performance qualification follows from this producer migration.
-
-Replaying the checked-in projection requires the externally retained raw root
-and a clean checkout detached at its exact signed source:
-
-```sh
-python3 tools/check-selected-live-event-receipt.py --historical-v1 \
-  --raw-root /path/to/retained/selected-live-event-raw-root \
-  --source /path/to/aster-source-detached-at-c464129d58c250dea2ecbf5f51d7ece0e5aab6d0 \
-  docs/validation/evidence/selected-live-event-c464129.json
-python3 tools/test-selected-live-event-receipt.py
-```
-
-The source/binary/execution link remains operator-attested, not cryptographic
-or reproducible-build proof. This gate claims no distinct physical hosts;
-NAT/Internet, controlled/public relay, or BTLE path; mixed or independent
-implementation; scale/resource/soak result; State, Record, or Blob acceptance;
-post-policy fresh completion or beta delivery; indefinite retention/GC; release
-artifact; or production authorization.
 
 The historical semantic-v5 direct Blob gate is retained as codec and
 durable-storage compatibility evidence; Result/Ack/Finish is not current
@@ -1139,11 +954,7 @@ publication. Normal and AtLeast must run the lane because AtLeast is Event-only;
 ReceiveOnly must perform zero Blob work. The separate live Blob gate covers an
 actor-owned handle, peerless publication, later direct synchronization,
 authenticated bounded page reads, restart, and closure, but remains current-code
-same-implementation loopback automation. A separate retained peerless
-Blob-delivery gate is described below; neither network gate supplies Blob
-peer/convergence status, route-only Blob relay,
-a 100+ MiB/RSS or resource test, physical-system or mixed-implementation
-evidence, or release acceptance.
+same-implementation loopback automation.
 
 Representative focused commands include:
 
@@ -1173,39 +984,6 @@ source change or an accepted substitute for the clean isolated build.
 
 ## Selected live Blob retained gate
 
-The dated 2026-08-27 v2 retained gate supersedes the earlier v1 live-Blob
-observation and only the statements above that no retained direct-Iroh Blob
-resume receipt existed. The canonical
-[`selected-live-blob-044d90f.json`](evidence/selected-live-blob-044d90f.json)
-receipt is 10,728 bytes with SHA-256
-`4fea2ffbd16608862a67167fb1b8fcb6d5d8b4b82c576aa9a6b7e25ee9c55909`
-and binds the run to good-signature source commit
-`044d90ff07c8e754b3d490cb810d42de3c915e3d`.
-
-Three distinct participants execute 11 actor lifetimes in seven exact phases
-with at most two concurrent actors. A live publisher creates one 98,304-byte
-Blob while peerless, proves exact noninserting retry and changed-payload
-conflict behavior, and reads its two bounded pages. A replica first receives
-the complete Blob directly over Iroh. A receiver then takes exactly one contact
-from the publisher, retains a non-public 16,384-byte carrier prefix across a
-graceful actor/store/provider reopen, and takes exactly one contact from the
-different eligible replica. That continuation preserves the first prefix,
-advances it to 32,768 bytes without refetching the source, and remains
-non-public until the replica supplies the exact remaining 65,870 bytes. The
-three phases therefore reconstruct exactly 98,638 carrier bytes, equal to the
-seeded transfer, before whole-Blob promotion and authenticated reads. A final
-peerless graceful receiver reopen reproduces the same two-page read.
-
-Thirty-two positive direct `CONTACT` records cross-bind per-contact and
-terminal runtime accounting. Eleven graceful shutdowns and closed retained
-handles, three bind reacquisitions, typed intermediate Store inspections, and
-the final three-participant metadata-only inventory pass. Each participant
-retains one two-chunk finalized variant with 98,642 committed ciphertext-file
-bytes. Pending prefixes never enter ordinary visibility; exact authenticated
-reads, durable rows, prefix persistence and advancement, transfer accounting,
-and completed depot shape—not `blob_remaining` alone—provide the bounded
-observation.
-
 The raw root is owner-only evidence and contains mission and identity material,
 databases, depot metadata, and ciphertext. It must remain outside source
 control. The checker inventories those private artifacts by metadata only and
@@ -1223,54 +1001,7 @@ python3 tools/check-selected-live-blob-receipt.py - \
   --output /private/tmp/aster-live-blob-projection/selected-live-blob-receipt.json
 ```
 
-Replaying the checked-in receipt requires the externally retained raw root and
-a separate clean checkout detached at the exact signed source commit:
-
-```sh
-python3 tools/check-selected-live-blob-receipt.py \
-  --raw-root /path/to/retained/selected-live-blob-raw-root \
-  --source /path/to/aster-source-detached-at-044d90ff07c8e754b3d490cb810d42de3c915e3d \
-  docs/validation/evidence/selected-live-blob-044d90f.json
-python3 tools/test-selected-live-blob-receipt.py
-```
-
-The raw-root projection reproduced the checked-in receipt byte-for-byte, and
-the independent-oracle fail-closed suite passed 45/45. The source-to-binary-to-
-execution link remains operator-attested rather than cryptographically proven,
-and the admitted source list is not a complete reproducible build closure. The
-interruption and reopens are graceful same-process actor/store/provider events,
-not process-crash or power-loss recovery. Intermediate Store inspection,
-transcript timing, and source-removal order are producer-attested; unlink plus
-parent sync is not physical-media sanitization. The receipt does not claim
-distinct physical hosts; NAT, Internet, controlled/public relay, or BTLE paths;
-an independent implementation; scale beyond three participants; resource
-thresholds or long-duration soak; long-offline recovery; arbitrary-peer or
-route-only Blob resume; Blob subscription, status, TTL, or garbage collection;
-Event, State, or Record live-application acceptance; complete MVP acceptance;
-a release artifact; or production authorization.
-
 ## Selected live Blob delivery retained gate
-
-The dated 2026-08-27 v1 retained delivery gate supersedes only present-tense
-statements that the metadata-only Blob queue had no retained acceptance. The
-canonical
-[`selected-live-blob-subscription-26e0a09.json`](evidence/selected-live-blob-subscription-26e0a09.json)
-receipt is 10,269 bytes with SHA-256
-`3d0c0b2da629282c56de5ae9dacc8920c9960defba083c6bff856e2c0612a675`
-and binds Good-signed source commit
-`26e0a090b9a6f644d96b38cfaa23f4e2139ad8b1`.
-
-One participant executes three processes and four actor lifetimes on one
-peerless host. Two exact publications share one `BlobId`. The attempt-one child
-flushes an owner-only, fsynced unacknowledged token and is sent `SIGKILL`
-without a graceful `STOP`; a fresh process receives the same publication as
-attempt 2 and acknowledges it with the persisted attempt-one token. The run
-also rejects a malformed token and a token bound to the other exact
-publication, acknowledges and re-acknowledges both publications, then reopens
-in the parent with one replayed subscription, zero pending, two acknowledged,
-two cursors, and an empty poll. Store inspection binds two publications and
-operations to one `BlobId`, one finalized variant, one chunk, and 207 committed
-ciphertext bytes.
 
 A fresh capture requires a clean Good-signed checkout and a new exclusive raw
 root:
@@ -1284,17 +1015,6 @@ python3 tools/check-selected-live-blob-subscription-receipt.py - \
   --raw-root /private/tmp/aster-selected-live-blob-subscription-new \
   --source /path/to/clean-good-signed-aster-source \
   --output /private/tmp/aster-live-blob-subscription-projection/selected-live-blob-subscription-receipt.json
-```
-
-Replaying the checked-in receipt requires its externally retained raw root and
-a clean checkout detached at the exact signed source commit:
-
-```sh
-python3 tools/check-selected-live-blob-subscription-receipt.py \
-  --raw-root /path/to/retained/selected-live-blob-subscription-raw-root \
-  --source /path/to/aster-source-detached-at-26e0a090b9a6f644d96b38cfaa23f4e2139ad8b1 \
-  docs/validation/evidence/selected-live-blob-subscription-26e0a09.json
-python3 tools/test-selected-live-blob-subscription-receipt.py
 ```
 
 The raw root contains private mission, identity, database, depot-marker, and
@@ -1392,58 +1112,6 @@ grants no physical or representative-NAT, BTLE/cross-transport,
 mixed-implementation, N=32, resource-bracket,
 State/Record/Blob-over-controlled-relay, route-only Blob custody, release, or
 `observed-bounded` credit.
-
-## Selected Iroh namespace-NAT retained gate
-
-The separate retained gate is bound to signed commit
-`15f4e0b8e9f817508c14fcbb4b307d6949add557` and exact tree
-`09d2f5bb037d694367e24ec50747aba8cac83b96`. On one Darwin arm64 host,
-Docker 29.4.0 and OrbStack 2.2.3 ran two cells, each with two selected endpoints
-behind distinct Docker Linux LAN/NAT-router namespaces. The cone cell disabled
-relays and observed Direct plus 978 cross-NAT UDP packet observations. The
-restrictive cell recorded three direct-drop packets, zero direct WAN
-observations, Relay at both endpoints, two accepted allowlisted sessions, and
-2,052 controlled-relay
-HTTPS packet observations. Each cell delivered and acknowledged one exact
-32-byte Event and repeated as an exact no-op.
-
-The canonical checked-in receipt is
-[`selected-iroh-nat-15f4e0b.json`](evidence/selected-iroh-nat-15f4e0b.json):
-48,302 bytes, SHA-256
-`55dc67ac606e92c44c2e36d959b23bc52880b483bdab21a7c2ec47487eee0393`.
-The raw root contains external-restricted packet captures, mission bundles,
-credentials, and encrypted state and must remain outside source control. Its
-canary result covers exactly 26 enumerated finalized targets, not the complete
-raw root or host. Runtime cleanup removed the cell containers, networks, and
-namespaces; it does not claim deletion of the selected local image, global or
-physical sanitization, or sanitization of retained encrypted state.
-
-The namespace-NAT controller has been retired. The following command records
-the historical workflow and requires its original source checkout:
-
-```sh
-python3 lab/orchestrate.py selected-iroh-nat-run \
-  --execute --allow-build-network --profile all
-```
-
-Review of the frozen run requires access to its external-restricted raw root.
-The validator binds the public receipt to the immutable signed Git objects and
-all curated raw artifacts:
-
-```sh
-python3 tools/historical/check-selected-iroh-nat-receipt.py \
-  --raw-root /private/tmp/aster-selected-iroh-nat.zFpaqB/20260826T143559Z-selected-iroh-nat-50726015670670e9 \
-  --source . \
-  docs/validation/evidence/selected-iroh-nat-15f4e0b.json
-```
-
-The raw-root projector independently reproduced the public receipt
-byte-for-byte, and the synthetic fail-closed suite passed 38/38. The receipt
-does not claim discovery or punching, temporal direct-first fallback,
-representative or physical NAT, public Internet/relay operation, lab-network
-exclusivity, a complete listener-wide pre-authentication cap, BTLE,
-independent implementation or clock, resource thresholds, a hermetic build,
-complete MVP, or release authorization.
 
 The 57th test in that parent redb-store receipt is a Unix writable-open
 durability adversary. Every new or existing writer, including a terminal

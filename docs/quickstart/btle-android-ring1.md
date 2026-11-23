@@ -217,9 +217,6 @@ adb shell rm /sdcard/Download/aster-android-ring1.bundle
 rm -r -- "$ASTER_BTLE_LAB"
 ```
 
-The retained
-[Android/Linux physical summary](../validation/evidence/2026-11-09-android-linux-btle-text-event-validation.md)
-records the exact warm-state Pixel/Linux result and cold-controller limitation.
 This run does not establish background operation, discovery, pairing authority,
 reconnection policy, controller hot-plug, State/Record/Blob transfer, automatic
 selection/fallback, packaging, performance, scale, broad interoperability, or

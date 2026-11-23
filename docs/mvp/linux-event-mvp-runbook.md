@@ -11,11 +11,6 @@ and Blob walkthrough written for operators rather than developers, start with
 the [human operator guide](../operator-guide.md). This runbook remains the
 evidence-bounded Linux Event evaluation procedure.
 
-The 2026-09-15 through 2026-09-16 two-node activity is recorded in the
-[direct CI-package record](../validation/evidence/2026-09-15-cm4-ci-package-mvp-validation.md).
-Use that record for the exact pass, failure, and unavailable-check boundary;
-do not infer additional device results from this runbook.
-
 ## Know the boundary
 
 The repository currently provides the Event application service and its
