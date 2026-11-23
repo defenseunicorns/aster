@@ -6207,7 +6207,7 @@ impl Store {
 
     fn require_store_compatible(
         path: impl AsRef<Path>,
-        check: fn(&redb::ReadTransaction) -> Result<(), StoreError>,
+        check: impl Fn(&redb::ReadTransaction) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
         let path = path.as_ref();
         match std::fs::symlink_metadata(path) {
@@ -6395,7 +6395,21 @@ impl Store {
         numbered_publication_only: bool,
     ) -> Result<Self, StoreError> {
         let path = std::path::absolute(path).map_err(StoreError::StorePath)?;
-        Self::require_store_compatible(&path, reject_legacy_subscriptions_read)?;
+        // Reject a different mission before even a writable redb open can change
+        // allocator metadata. The exact writer still repeats this check below.
+        Self::require_store_compatible(&path, |read| {
+            reject_legacy_subscriptions_read(read)?;
+            if let Some(expected) = expected_mission_authority
+                && let Some(bound) = inspect_mission_binding_read(read)?
+                && bound != expected
+            {
+                return Err(StoreError::MissionAuthorityMismatch {
+                    bound,
+                    received: expected,
+                });
+            }
+            Ok(())
+        })?;
         if path.exists() {
             match reject_terminal_normal_open(&path) {
                 Ok(()) => match inspect_control_state_read_only(&path) {
@@ -17593,7 +17607,12 @@ fn bind_security_profile_policy_write(
 
 fn inspect_mission_binding_read_only(path: &Path) -> Result<Option<NodeId>, StoreError> {
     let database = redb::Builder::new().open_read_only(path)?;
-    let read = database.begin_read()?;
+    inspect_mission_binding_read(&database.begin_read()?)
+}
+
+fn inspect_mission_binding_read(
+    read: &redb::ReadTransaction,
+) -> Result<Option<NodeId>, StoreError> {
     let table_names = read
         .list_tables()?
         .map(|table| table.name().to_owned())
@@ -27333,6 +27352,42 @@ mod tests {
     }
 
     #[test]
+    fn numbered_wrong_mission_reopen_preserves_database_bytes() {
+        let file = TestFile::new("numbered-wrong-mission");
+        let open = |authority| {
+            Store::open_numbered_for_mission(
+                &file.0,
+                StoreLimits::default(),
+                BlobDepotLimits::default(),
+                EventOperationLimits::DEFAULT,
+                authority,
+            )
+        };
+        let authority = [0x31; 32];
+        let retained = item(0x42);
+        let payload = b"retained across rejected numbered open";
+        let store = open(authority).expect("create numbered store");
+        store.apply(retained, payload).expect("retain item");
+        drop(store);
+
+        let before = std::fs::read(&file.0).expect("snapshot store");
+        assert!(matches!(
+            open([0x32; 32]),
+            Err(StoreError::MissionAuthorityMismatch { bound, received })
+                if bound == authority && received == [0x32; 32]
+        ));
+        assert!(
+            std::fs::read(&file.0).expect("read rejected store") == before,
+            "wrong-mission open changed database bytes"
+        );
+        let reopened = open(authority).expect("reopen original mission");
+        assert_eq!(
+            reopened.get(retained).expect("read item"),
+            Some(payload.to_vec())
+        );
+    }
+
+    #[test]
     fn security_profile_policy_binding_is_additive_to_legacy_store_bytes() {
         let file = TestFile::new("security-profile-policy-additive");
         let authority = [0xa1; 32];
@@ -36401,30 +36456,31 @@ mod tests {
         let original = event_services(0xd4);
         let wrong = event_services(0xd5);
         assert_ne!(original.authority, wrong.authority);
+        let before = std::fs::read(&file.0).expect("snapshot unclean store");
         assert!(matches!(
             Store::open_for_mission(&file.0, wrong.authority),
             Err(StoreError::MissionAuthorityMismatch { bound, received })
                 if bound == original.authority && received == wrong.authority
         ));
 
-        let database = redb::Builder::new()
-            .open_read_only(&file.0)
-            .expect("writer recovery completed before mismatch");
-        let read = database.begin_read().expect("read rejected store");
         assert!(
-            read.open_table(METADATA)
-                .expect("metadata remains present")
-                .get(TOTAL_PAYLOAD_BYTES)
-                .expect("read payload accounting")
-                .is_none(),
-            "wrong-authority rejection must not reconstruct missing accounting"
+            std::fs::read(&file.0).expect("read rejected store") == before,
+            "wrong-authority rejection must not repair the original store"
         );
-        drop(read);
-        drop(database);
-        assert_eq!(
-            inspect_mission_binding_read_only(&file.0).expect("original binding"),
-            Some(original.authority)
-        );
+        Store::require_store_compatible(&file.0, |read| {
+            assert!(
+                read.open_table(METADATA)?
+                    .get(TOTAL_PAYLOAD_BYTES)?
+                    .is_none(),
+                "wrong-authority rejection must not reconstruct missing accounting"
+            );
+            assert_eq!(
+                inspect_mission_binding_read(read)?,
+                Some(original.authority)
+            );
+            Ok(())
+        })
+        .expect("inspect recovered disposable copy");
 
         let store = Store::open_for_mission(&file.0, original.authority)
             .expect("correct authority may perform normal reconstruction");
