@@ -8,9 +8,7 @@
   the preserved [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Derived row mapping:
   [security-profile requirements disposition](../validation/security-profile-requirements-disposition.md)
-- Related: [Decision 0001](0001-standards-and-provider-boundaries.md),
-  [Decision 0003](0003-fips-production-gate.md),
-  [Decision 0012](0012-content-committing-pq-batches.md), and
+- Related: [Decision 0012](0012-content-committing-pq-batches.md) and
   [Decision 0028](0028-selected-stack-implementation-boundary.md)
 
 ## Context

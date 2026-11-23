@@ -36,7 +36,7 @@ part of the normal reading path.
 | Validation | [Validation and readiness map](validation/README.md) for capability planning, requirements trace, conformance, the Linux Event MVP profile, and retained evidence; [Blob streaming engineering runbook](validation/blob-streaming-engineering-runbook.md) for large-object development validation |
 | Customer feedback | [Customer feedback index](customer-feedback/README.md) for advisory input and separate product recommendation reviews; feedback is not requirements or evidence |
 | Decisions | [`docs/decisions/`](decisions/) records the rationale for boundaries that still constrain the product; specifications and current references remain authoritative for behavior |
-| Container delivery | [Compose operator procedure](release/docker-compose.md), [schema v2](reference/aster-agent-config-v2.md), and [Decision 0044](decisions/0044-compose-file-secret-provider.md) |
+| Container delivery | [Compose operator procedure](release/docker-compose.md) and [schema v2](reference/aster-agent-config-v2.md) |
 
 ## Document authority
 

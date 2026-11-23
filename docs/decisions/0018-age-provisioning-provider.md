@@ -5,8 +5,7 @@
 
 ## Context
 
-The protected-provisioning boundary in [Decision
-0013](0013-protected-provisioning-boundary.md) deliberately separated artifact
+The protected-provisioning boundary deliberately separated artifact
 protection from Aster's mission data model and wire cryptography. Leaving that
 boundary backed only by behavioral test doubles would continue to put the
 correctness of an encrypted-file construction on this project if an operational
