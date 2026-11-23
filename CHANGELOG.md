@@ -91,6 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed unused-field warnings in `aster-node` builds.
 
 ### Security
+- Fixed RUSTSEC-2026-0592 by updating url to 2.5.9 in the workspace and fuzz lockfiles; replaced yanked chacha20 and wnaf releases with 0.10.2 and 0.14.1.
 - Fixed RUSTSEC-2026-0459 by updating rusqlite to 0.41.1 and libsqlite3-sys to 0.39.1.
 - Bounded abandoned received Profile-5 uploads with a receiver-local 30-day
   idle-retention lease refreshed by durable checkpoint progress, reclaimed
