@@ -1711,8 +1711,9 @@ zeroization assurance, admitted release cryptography, independent review, or
 physical-network acceptance.
 
 Dependency checks use the advisory dispositions and exact-package license
-exceptions in [`deny.toml`](../../deny.toml). The [dependency policy](../dependency-policy.md)
-explains their scope and review requirements. The age-provider exceptions do
+exceptions in [`deny.toml`](../../deny.toml).
+[Third-party notices](../../THIRD_PARTY_NOTICES.md) contains the corresponding
+package notices and license texts. The age-provider exceptions do
 not authorize production use or suppress unrelated advisories. External
 license allowances do not change the first-party Apache-2.0 requirements.
 

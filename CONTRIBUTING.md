@@ -35,14 +35,6 @@ or their input limits:
 mise run fuzz-smoke
 ```
 
-## Documentation
-
-Keep current usage, architecture, and maintenance guidance in `docs/` or the
-relevant component README. Describe implemented behavior and link to its
-contract instead of repeating it. Put proposed work and implementation plans
-in issues. Preserve useful history in the Wiki or link to the original commit;
-do not keep completed checklists alongside current instructions.
-
 ## Reporting issues
 
 Check existing issues before opening a new one. For bug reports, explain how

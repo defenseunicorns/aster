@@ -248,8 +248,8 @@ complete process-memory erasure. This residual is separate from successful
 ciphertext authentication and is another production-review gate.
 
 This Rust-only provider is disabled by default and is not production admitted.
-The [dependency policy](dependency-policy.md#age-provisioning-pilot) records its
-review, exceptions, and exit gates.
+Its build-time advisory exceptions are listed in [deny.toml](../deny.toml).
+They do not establish production readiness.
 
 The profile is X25519 and ChaCha20-Poly1305 based. It provides no post-quantum
 artifact-confidentiality or FIPS 140-3 validation claim. The C ABI v2, Go,
