@@ -5000,31 +5000,36 @@ async fn await_application_policy_lease(
         .await
 }
 
-struct RoutedApplicationPolicyLease {
+struct RoutedApplicationPolicyLease<'a> {
+    pending: &'a mut Option<ApplicationPolicyLeaseFuture>,
     priority: Option<ApplicationPolicyLeaseFuture>,
     ordinary: Option<ApplicationPolicyLeaseFuture>,
 }
 
-impl RoutedApplicationPolicyLease {
-    fn route(pending: &mut Option<ApplicationPolicyLeaseFuture>, priority: bool) -> Self {
+impl<'a> RoutedApplicationPolicyLease<'a> {
+    fn route(pending: &'a mut Option<ApplicationPolicyLeaseFuture>, priority: bool) -> Self {
         let routed = pending.take();
         if priority {
             Self {
+                pending,
                 priority: routed,
                 ordinary: None,
             }
         } else {
             Self {
+                pending,
                 priority: None,
                 ordinary: routed,
             }
         }
     }
+}
 
-    fn restore(self, pending: &mut Option<ApplicationPolicyLeaseFuture>) {
-        debug_assert!(pending.is_none());
+impl Drop for RoutedApplicationPolicyLease<'_> {
+    fn drop(&mut self) {
+        debug_assert!(self.pending.is_none());
         debug_assert!(self.priority.is_none() || self.ordinary.is_none());
-        *pending = self.priority.or(self.ordinary);
+        *self.pending = self.priority.take().or_else(|| self.ordinary.take());
     }
 }
 
@@ -20764,7 +20769,7 @@ async fn run_node_actor_inner(
                 application_tick_yield_required = false;
             }
             }
-            routed_application_lease.restore(&mut pending_application_lease);
+            drop(routed_application_lease);
         }
     }
 
@@ -54159,7 +54164,11 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn assert_application_policy_lease_retains_fifo_position(write: bool) {
+    async fn assert_application_policy_lease_retains_fifo_position(
+        write: bool,
+        exercise_nonterminal_exit: bool,
+        shutdown_while_blocked: bool,
+    ) {
         use std::num::NonZeroU64;
 
         use crate::{
@@ -54170,7 +54179,11 @@ mod tests {
             control_admin::RevocationRequest,
         };
 
-        let state = root(if write {
+        let state = root(if shutdown_while_blocked {
+            "application-policy-lease-blocked-shutdown"
+        } else if exercise_nonterminal_exit {
+            "application-policy-lease-nonterminal-exit"
+        } else if write {
             "application-write-policy-lease-fifo"
         } else {
             "application-read-policy-lease-fifo"
@@ -54185,6 +54198,8 @@ mod tests {
             mpsc::channel(APPLICATION_COMMAND_CAPACITY);
         let application_admission = Arc::new(AtomicBool::new(true));
         let (control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
+        let (ordered_event_contact_sender, ordered_event_contact_receiver) =
+            mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY);
         let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
         let (ready_sender, ready_receiver) = oneshot::channel();
         let (before_loop_ready, before_loop_reached) = oneshot::channel();
@@ -54214,7 +54229,7 @@ mod tests {
                 application_admission,
                 transport_admission: Arc::new(TransportAdmission::open()),
                 control_receiver,
-                ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
+                ordered_event_contact_receiver,
                 shutdown_receiver,
                 ready: ready_sender,
                 contact_activity: Arc::new(ContactActivityProbe::default()),
@@ -54255,6 +54270,7 @@ mod tests {
             .expect("policy-lease loop gate deadline")
             .expect("policy-lease loop gate");
 
+        let mut blocked_status_response = None;
         let command = if write {
             let (response, _received) = oneshot::channel();
             SelectedApplicationCommand::Event(SelectedEventCommand::Subscribe {
@@ -54272,7 +54288,8 @@ mod tests {
                 response,
             })
         } else {
-            let (response, _received) = oneshot::channel();
+            let (response, received) = oneshot::channel();
+            blocked_status_response = Some(received);
             SelectedApplicationCommand::Event(SelectedEventCommand::Status { response })
         };
         application_sender
@@ -54284,6 +54301,67 @@ mod tests {
             .await
             .expect("application lease poll deadline")
             .expect("application lease polled");
+
+        if exercise_nonterminal_exit {
+            let contact = Arc::new(StalledOrderedContact::default());
+            let (response, closed_response) = oneshot::channel();
+            drop(closed_response);
+            ordered_event_contact_sender
+                .send(OrderedEventContactCommand {
+                    role: OrderedEventContactRole::Responder,
+                    contact: contact.clone(),
+                    peer: MissionPeerExpectation::new(
+                        contact.peer_evidence(),
+                        services.other.identity(),
+                    ),
+                    response,
+                    _session_permit: Arc::new(Semaphore::new(1))
+                        .try_acquire_owned()
+                        .expect("reserve ordered contact session"),
+                })
+                .await
+                .expect("queue cancelled ordered contact");
+            timeout(Duration::from_secs(10), async {
+                while contact.closes() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelled ordered contact closes");
+            assert!(
+                timeout(Duration::from_secs(1), application_poll_observer.recv())
+                    .await
+                    .is_err(),
+                "a nonterminal scheduler exit must not recreate the application lease future"
+            );
+        }
+
+        if shutdown_while_blocked {
+            use crate::application::ApplicationErrorKind;
+
+            shutdown_sender.send(()).await.expect("request shutdown");
+            let error = timeout(
+                Duration::from_secs(10),
+                blocked_status_response
+                    .take()
+                    .expect("blocked shutdown uses a read command"),
+            )
+            .await
+            .expect("blocked application rejection deadline")
+            .expect("blocked application response")
+            .expect_err("blocked application command must be rejected");
+            assert_eq!(error.kind(), ApplicationErrorKind::StateUnavailable);
+            timeout(Duration::from_secs(10), actor)
+                .await
+                .expect("blocked policy-lease actor shutdown deadline")
+                .expect("join blocked policy-lease actor")
+                .expect("blocked policy-lease actor result");
+            drop(blocking_lease);
+            drop(application_sender);
+            drop(control_sender);
+            fs::remove_dir_all(state).expect("blocked policy-lease cleanup");
+            return;
+        }
 
         let (control_response, _control_received) = oneshot::channel();
         control_sender
@@ -54328,13 +54406,25 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn application_read_policy_lease_retains_fifo_position() {
-        assert_application_policy_lease_retains_fifo_position(false).await;
+        assert_application_policy_lease_retains_fifo_position(false, false, false).await;
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn application_write_policy_lease_retains_fifo_position() {
-        assert_application_policy_lease_retains_fifo_position(true).await;
+        assert_application_policy_lease_retains_fifo_position(true, false, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn application_policy_lease_survives_nonterminal_scheduler_exit() {
+        assert_application_policy_lease_retains_fifo_position(false, true, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn application_policy_lease_shutdown_drops_blocked_waiter() {
+        assert_application_policy_lease_retains_fifo_position(false, false, true).await;
     }
 
     #[tokio::test]
@@ -54356,7 +54446,7 @@ mod tests {
             }
             _ = tokio::task::yield_now() => {}
         }
-        routed.restore(&mut pending);
+        drop(routed);
 
         let mut routed = RoutedApplicationPolicyLease::route(&mut pending, true);
         tokio::select! {
@@ -54366,7 +54456,7 @@ mod tests {
             }
             _ = tokio::task::yield_now() => {}
         }
-        routed.restore(&mut pending);
+        drop(routed);
 
         let mut later_control = Box::pin(policy_lock.clone().write_owned());
         tokio::select! {
@@ -54391,7 +54481,7 @@ mod tests {
         timeout(Duration::from_secs(1), later_control)
             .await
             .expect("later control lease proceeds after application completion");
-        routed.restore(&mut pending);
+        drop(routed);
         assert!(pending.is_none());
     }
 
