@@ -1342,7 +1342,8 @@ mod tests {
     #[test]
     fn btle_current_status_record_has_one_bounded_allowlisted_shape() {
         // Break caught: forwarding driver text or controller identity through
-        // the agent output boundary expands operator metadata beyond BT-O0.
+        // the agent output boundary expands operator metadata beyond the
+        // bounded allowlisted status policy.
         let records = [
             btle_status_record(aster_ble_linux::BtleCurrentStatus::Available {
                 support: aster_ble_linux::BtleSupport::Qualified,

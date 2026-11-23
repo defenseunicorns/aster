@@ -12,9 +12,7 @@ epoch; the selector does not see `Available` until its listener,
 advertisement, and scan owners are ready. No controller or transport is
 required for node readiness or durable publication. See the
 [carrier guide](../transports.md#automatic-linux-btle-event-composition)
-for current policy and package status and the
-[design](../superpowers/specs/2026-11-03-production-btle-design.md#platform-qualification-and-support)
-for detailed resolver mechanics.
+for current policy, resolver behavior, and package status.
 
 For the exact packaged-service, rostered-discovery setup selected for the
 initial two-node evaluation, use the
@@ -265,10 +263,9 @@ ID, addresses, adapter names or indexes, serials, transient paths, allocated
 PSMs, mission or peer IDs, credentials, and payloads out of shared records.
 
 There is no current compatibility-report command, export, or customer-status
-surface. The privacy schema in the
-[design](../superpowers/specs/2026-11-03-production-btle-design.md#platform-qualification-and-support)
-is guidance for a future explicitly authorized manual evidence workflow only;
-it is not runtime authority and cannot create a support row.
+surface. The field guidance above is for a future explicitly authorized manual
+evidence workflow only; it is not runtime authority and cannot create a support
+row.
 
 See the concise [Ring-1 Event](../validation/evidence/2026-11-05-cm4-btle-ring1-event-validation.md),
 [affected-kernel diagnostic](../validation/evidence/2026-11-06-cm4-btle-clean-restart-diagnostic.md),

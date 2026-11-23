@@ -70,9 +70,7 @@ and the separate private selector gate that remains `Unavailable` until a
 complete authenticated roster beacon is admitted. Node readiness and durable
 publication require neither a controller nor a transport. See the
 [carrier guide](../transports.md#automatic-linux-btle-event-composition)
-for current behavior and the
-[design](../superpowers/specs/2026-11-03-production-btle-design.md#platform-qualification-and-support)
-for detailed policy and resource bounds.
+for current behavior, policy, and resource bounds.
 
 The Debian source profile now presents the optional encrypted roster credential,
 admits Bluetooth sockets without raw/admin capabilities, and restricts the
@@ -82,14 +80,11 @@ service identity pass; installed-package execution and qualification,
 support-matrix population, and physical qualification remain open. This source
 mechanism advances no support or requirement credit.
 
-## Current Linux BTLE Event E1/E2 boundary
+## Current Linux BTLE Event source boundary
 
-The authoritative capability status, increment boundary, exclusions, and
-release gates are maintained in the
-[production BTLE design](../superpowers/specs/2026-11-03-production-btle-design.md#delivery-model-and-capability-ledger).
-This roadmap does not duplicate that ledger. The current candidate remains an
-exact-peer, Event-only Linux source path until the BT-E1 focused verification,
-exact-device evidence, package, and qualification exits pass. It makes no
+The current candidate remains an exact-peer, Event-only Linux source path until
+the production gates in the carrier guide pass, including focused automatic-path
+verification, exact-device evidence, packaging, and qualification. It makes no
 hardware-support, other data type, requirement-credit, or release-authorization
 claim.
 

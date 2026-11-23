@@ -291,11 +291,13 @@ together.
 
 The packaged Linux profile also treats roster-credential expiry as a controlled
 restart boundary. The adapter publishes `credential_expired`, fences new radio
-work, completes bounded platform cleanup, and only then terminates its owner.
-The agent exits nonzero so the unit's existing `Restart=on-failure` policy can
-load the replacement `aster-btle-roster` credential and reconstruct the whole
-immutable epoch. This is process lifecycle behavior; semantic-v9 and transport
-selection bytes do not change.
+work, attempts bounded local owner cleanup, and then terminates its owner.
+Cleanup uncertainty is terminal; process and D-Bus connection exit fence the
+replacement. This does not claim BlueZ acknowledged teardown or that RF activity
+already ceased. The agent exits nonzero so the unit's existing
+`Restart=on-failure` policy can load the replacement `aster-btle-roster`
+credential and reconstruct the whole immutable epoch. This is process lifecycle
+behavior; semantic-v9 and transport selection bytes do not change.
 
 Linux Event contacts require a kernel-reported LE L2CAP MTU of at least 23 bytes
 in both directions after socket readiness. Twenty-three bytes is the Bluetooth
@@ -510,13 +512,17 @@ Cross-carrier reselection is permitted only after locally proven adapter
 unavailability, link loss, or a transport deadline. A remote or ambiguous
 pre-authentication failure neither suppresses the expected peer nor triggers
 reselection. Common source-level composition must not be presented as supported
-or release-qualified until the full [BTLE evidence and governance gates](superpowers/specs/2026-11-03-production-btle-design.md#required-evidence-and-governance)
-are satisfied. The closed `ContactOutcome` mappings, peer-indexed eligibility,
-node-global admission and duplicate arbitration, operational and physical
-evidence, independent review, and release authorization are necessary parts of
-those gates. Local multi-registration tests are not evidence that competing
-adapters may be enabled in a production composition. When another adapter is
-implemented, it uses the same registry and must not create a second persistence,
+or release-qualified until the BTLE evidence and governance gates are satisfied.
+Those gates require closed `ContactOutcome` mappings, peer-indexed eligibility,
+node-global admission and duplicate arbitration; a production decision for the
+teardown and bounded-ingress gap tracked in
+[issue #224](https://github.com/defenseunicorns/aster/issues/224); package
+confinement and operator-metadata privacy; exact supported-hardware rows;
+hostile, resource, and physical evidence; independent review; and release
+authorization. Local
+multi-registration tests are not evidence that competing adapters may be
+enabled in a production composition. When another adapter is implemented, it
+uses the same registry and must not create a second persistence,
 reconciliation, authentication, or scheduling authority.
 
 ## Semantic protocol versions you may see
