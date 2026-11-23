@@ -217,13 +217,6 @@ Implemented APIs do not establish deployment readiness. Review the
 [conformance status](docs/validation/conformance.md) alongside the
 platform-specific validation records below.
 
-For the Linux Event MVP, [Decision
-0043](docs/decisions/0043-authorize-linux-event-mvp-validation.md) records the
-team-internal approvals and frozen two-CM4 boundary. Protected mission
-rotation/revoke/rekey/destruction still requires externally issued authorized
-replacement material, and Decision 0043 defers the soak, true-partition,
-signing/reproduction, independent-review, and production-authorization work.
-
 ## When Aster fits
 
 Aster is a strong fit when:

@@ -16,22 +16,3 @@ itself authorize a production release.
   and [CI](ci.md) — verification boundaries and remaining gates.
 - [Blob streaming engineering runbook](blob-streaming-engineering-runbook.md)
   — large-object application, selected-contact, CM4, and diagnostic examples.
-
-## Linux Event MVP qualification
-
-The accepted profile is hash-bound and remains the exact authority. Its
-original design links resolve through compatibility pointers: superseded
-designs live in the archive, while active approval inputs live in this
-validation package.
-
-- [Coordination guide](linux-event-mvp-coordination-guide.md) — human-oriented
-  sequence, ownership, blockers, and definition of done.
-- [Evaluation profile](linux-event-mvp-evaluation-profile-v0.1.md) — exact
-  claim boundary.
-- [Decision register](linux-event-mvp-evaluation-profile-v0.1-register.md) and
-  [candidate annex](linux-event-mvp-evaluation-profile-v0.1-annex-template.md)
-  — gate status and candidate evidence shape.
-- [Qualification receipt validator](linux-event-mvp-qualification-receipt-validator-spec.md)
-  — receipt contract.
-- [Immutable inputs](inputs/) and [retained evidence](evidence/) — exact
-  approval records and bounded observations.

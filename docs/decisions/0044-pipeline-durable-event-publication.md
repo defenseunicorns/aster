@@ -6,8 +6,7 @@
 - Authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Related: [Decision 0009](0009-public-api-boundary.md),
   [Decision 0012](0012-content-committing-pq-batches.md),
-  [Decision 0030](0030-event-first-local-connect-agent.md), and
-  [Decision 0042](0042-adopt-linux-event-mvp-evaluation-profile-v0-1.md)
+  [Decision 0030](0030-event-first-local-connect-agent.md)
 
 ## Numbered publication amendment — 2026-10-08
 

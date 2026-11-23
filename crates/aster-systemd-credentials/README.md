@@ -56,12 +56,6 @@ All failures use Aster's fixed `ProvisioningSecretStoreError` categories. The
 provider does not log or retain the credential path, reference, operation ID,
 envelope, parser detail, or plaintext.
 
-The systemd 257 ACL/tmpfs boundary is defined by the
-[profile amendment](../../docs/validation/inputs/systemd-257-credential-presentation-amendment.md).
-It does not claim systemd's `secure` label, generic `tmpfs` safety, generic
-Debian support, or production qualification. Security and Deployment approval
-of the immutable amendment remains required at candidate gate E01.
-
 ## Current implementation boundary
 
 The administration lane now supplies the complete code-level
@@ -116,22 +110,15 @@ this does not qualify the original Raspberry Pi target. The provider's
 a separate mode-`0600`, final-service-UID-owned reference handoff from
 successful INSTALL/ROTATE output. Agent configuration checks and runtime must
 run as that final service UID, while the administration CLI remains root-only.
-E01, packaged E09 qualification, the exact handoff path and ownership setup,
+The exact handoff path and ownership setup,
 service UID, hardened unit/control values, readiness check, native package
-integration, G3/G4, protected authority issuance, cross-host recovery,
+integration, protected authority issuance, cross-host recovery,
 snapshot rollback, physical erasure, production, and general-platform support
 remain open. There is no age, plaintext-file, TPM2, or alternate-provider
 fallback.
-
-The [approved v2 design](../../docs/validation/inputs/raspberry-pi-systemd-credential-provider-v2-design.md)
-on `main` defines this exact evaluation profile. Persistent v1 state is
-deliberately rejected rather than migrated; the historical v1 design does not
-qualify this v2 provider.
 
 Run the focused provider checks with:
 
 ```text
 CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=1 cargo test -p aster-systemd-credentials
 ```
-
-The exact design is the approved v2 design on `main` linked above.

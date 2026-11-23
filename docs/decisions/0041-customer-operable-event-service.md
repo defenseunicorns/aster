@@ -101,10 +101,8 @@ forwarding, Event bridges, and dynamic bridge administration.
 
     The mode-`0400`/`ramfs` description remains the original accepted
     presentation. The exact systemd 257 profile additionally uses the narrowly
-    pinned root-owned ACL/read-only-`tmpfs`/`noswap` presentation defined in
-    the [2026-09-09 credential-presentation amendment](../validation/inputs/systemd-257-credential-presentation-amendment.md).
-    That amendment requires separate Security and Deployment approval at E01
-    and creates no generic Debian, `tmpfs`, or production support claim.
+    pinned root-owned ACL/read-only-`tmpfs`/`noswap` presentation.
+    This creates no generic Debian, `tmpfs`, or production support claim.
 
 ### Direct dependency admission for pre-body serving
 
@@ -188,9 +186,9 @@ provider candidate. The provider-internal Active reference remains root-only;
 the future package must atomically hand successful INSTALL/ROTATE output to a
 separate mode-`0600`, final-service-UID-owned reference file. Configuration
 checking and runtime validation run as that final service UID, while provider
-administration remains root-only. E01, packaged E09 qualification, the exact
+administration remains root-only. The exact
 handoff path and ownership setup, service UID, hardened unit/control values,
-readiness check, native package integration, G3/G4, protected authority
+readiness check, native package integration, protected authority
 issuance, cross-host recovery, snapshot rollback, physical erasure,
 production, and general-platform support remain open. Persistent v1 provider
 state is deliberately rejected rather than migrated.

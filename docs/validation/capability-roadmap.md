@@ -103,10 +103,6 @@ sequence-based exact replay. The ordinary `PublishEvent`/`PublishEvents` RPCs
 and their SDK helpers have been removed. Use the
 [current application guide](../quickstart/connect-agent.md#use-crash-safe-numbered-publication)
 and [Decision 0044's numbered amendment](../decisions/0044-pipeline-durable-event-publication.md#numbered-publication-amendment--2026-10-08).
-The approved [Linux Event v0.1 profile](linux-event-mvp-evaluation-profile-v0.1.md#current-api-and-historical-qualification-boundary)
-preserves its earlier publication contract and evidence; those do not qualify
-the current API. A reviewed profile amendment and evidence for the exact
-numbered build remain necessary before extending that qualification claim.
 
 ## Maturity vocabulary
 

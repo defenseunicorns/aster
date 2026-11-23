@@ -101,8 +101,6 @@ sensor, or automated-detection claim.
 
 References:
 
-- `docs/validation/linux-event-mvp-evaluation-profile-v0.1.md`, "Capacity and
-  workload matrix"
 - `docs/validation/evidence/2026-09-15-cm4-ci-package-mvp-validation.md`, "Not
   run in this session"
 
