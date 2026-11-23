@@ -2,14 +2,13 @@
 
 - Version: 0.1.0
 - Status: reference design; production security and integration gates unsatisfied
-- Profile policy: [Decision 0033](decisions/0033-policy-selected-security-profiles.md)
-  and its [requirements disposition](validation/security-profile-requirements-disposition.md)
+- [Security-profile requirements disposition](validation/security-profile-requirements-disposition.md)
 
 This document primarily describes suite/profile `0x0001` and the stock selected
 runtime. The additive, evaluation-only profile `0x0002` boundary is documented
 separately in [Classical P-256 / Iroh-QUIC security profile](classical-iroh-security-profile.md).
-Decision 0033 makes metadata exposure and classical versus hybrid-PQ use
-policy-selectable; neither profile reinterprets the other's bytes or evidence.
+Metadata exposure and classical versus hybrid-PQ use are policy-selectable;
+neither profile reinterprets the other's bytes or evidence.
 
 ## Find a section
 
@@ -211,8 +210,6 @@ complete process-memory erasure. This residual is separate from successful
 ciphertext authentication and is another production-review gate.
 
 This Rust-only provider is disabled by default and is not production admitted.
-[Decision 0018](decisions/0018-age-provisioning-provider.md) owns its dependency
-review, exceptions, and exit gates.
 
 The profile is X25519 and ChaCha20-Poly1305 based. It provides no post-quantum
 artifact-confidentiality or FIPS 140-3 validation claim. The C ABI v2, Go,

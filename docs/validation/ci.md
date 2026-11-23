@@ -1247,16 +1247,15 @@ patched release for either package; current Rust separately emits
 future-incompatibility `E0365` for `proc-macro-error2`. The ignores permit only
 those exact informational findings. They do not suppress other advisories,
 change exact package checksums, permit online execution after the acquisition
-step, or authorize the provider for production. Decision 0018 records the
-upstream `basic-toml` replacement, release gap, and removal gate.
+step, or authorize the provider for production.
 
 The companion scope gate fails if either ignored package's reverse graph
 drifts, if either appears in the separately excluded fuzz graph, or if any
 `paste` version reappears. Any change to a package chain or advisory
 disposition requires a recorded pilot review.
 
-The selected Iroh graph carries five exact-coordinate license exceptions
-recorded by Decision 0028: `webpki-root-certs` and `webpki-roots` 1.0.10 use
+The selected Iroh graph carries five exact-coordinate license exceptions:
+`webpki-root-certs` and `webpki-roots` 1.0.10 use
 `CDLA-Permissive-2.0`, while all-target browser-WASM
 packages `async_io_stream` 0.3.3, `pharos` 0.5.3, and `ws_stream_wasm` 0.7.5 use
 the OSI-approved `Unlicense`. Neither license is globally allowed. Package or

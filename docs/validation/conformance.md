@@ -483,8 +483,7 @@ commitment canaries. Full A-09 still requires captures covering source,
 custody, protected replication, and each physical carrier claimed by the
 release profile. For the current security construction using suite `0x0001`,
 all named protected metadata canaries remain required absent. A future profile
-instead must declare its exact exposure budget under
-[Decision 0033](../decisions/0033-policy-selected-security-profiles.md), and its
+instead must declare its exact exposure budget, and its
 captures must reveal no payload plaintext or metadata beyond that budget. A-09
 excludes correlation already available from link/network/rendezvous
 identifiers before the first Aster flight unless a named profile mechanism

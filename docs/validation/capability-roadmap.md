@@ -101,8 +101,7 @@ Current Event publication is numbered-only: `PublishNumberedEvent` and
 `PublishNumberedEvents` use durable client journals, fenced recovery, and
 sequence-based exact replay. The ordinary `PublishEvent`/`PublishEvents` RPCs
 and their SDK helpers have been removed. Use the
-[current application guide](../quickstart/connect-agent.md#use-crash-safe-numbered-publication)
-and [Decision 0044's numbered amendment](../decisions/0044-pipeline-durable-event-publication.md#numbered-publication-amendment--2026-10-08).
+[current application guide](../quickstart/connect-agent.md#use-crash-safe-numbered-publication).
 
 ## Maturity vocabulary
 
@@ -162,8 +161,7 @@ defined.
 
 ## Adopted security-profile direction
 
-[Decision 0033](../decisions/0033-policy-selected-security-profiles.md) and its
-[requirements disposition](security-profile-requirements-disposition.md) make
+The [requirements disposition](security-profile-requirements-disposition.md) makes
 metadata exposure and post-quantum use explicit profile policy:
 
 - source payload encryption/authentication, payload-blind forwarding, Aster

@@ -35,7 +35,6 @@ part of the normal reading path.
 | MVP operation | [Human operator guide](operator-guide.md), [evaluation runbook](mvp/linux-event-mvp-runbook.md), [systemd credential-provider operations](mvp/raspberry-pi-provider-v2-operations.md), and [Compose container delivery](release/docker-compose.md) |
 | Validation | [Validation and readiness map](validation/README.md) for capability planning, requirements trace, conformance, the Linux Event MVP profile, and retained evidence; [Blob streaming engineering runbook](validation/blob-streaming-engineering-runbook.md) for large-object development validation |
 | Customer feedback | [Customer feedback index](customer-feedback/README.md) for advisory input and separate product recommendation reviews; feedback is not requirements or evidence |
-| Decisions | [`docs/decisions/`](decisions/) records the rationale for boundaries that still constrain the product; specifications and current references remain authoritative for behavior |
 | Container delivery | [Compose operator procedure](release/docker-compose.md) and [schema v2](reference/aster-agent-config-v2.md) |
 
 ## Document authority

@@ -380,9 +380,6 @@ link, authentication, acknowledgement, and response traffic can still be
 emitted. Do not describe this mode as physical radio silence or literal zero
 transfer. Changing this mode neither rotates nor reloads provider material.
 
-Final naming and literal-RF-silence behavior remain the external stakeholder
-procedure recorded in [Decision 0004](../decisions/0004-radio-silence-semantics.md).
-
 ## 7. Logically destroy a provider reference
 
 Retain the exact Active reference from the successful INSTALL or ROTATE output.

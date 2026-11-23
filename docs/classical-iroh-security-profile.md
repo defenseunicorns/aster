@@ -9,7 +9,6 @@
 - Interoperability status: complete normative byte grammar and independent
   vectors remain open; this document bounds the reference implementation but
   is not sufficient by itself to build an independent conformant peer
-- Policy authority: [Decision 0033](decisions/0033-policy-selected-security-profiles.md)
 
 This document records the bounded reference implementation of Aster's first
 carrier-protected classical profile. It is an additive path beside the

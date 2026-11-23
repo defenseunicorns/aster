@@ -2222,8 +2222,7 @@ and fixture writers do not provide an ordinary application publishing lane.
 This local API addition allocates no semantic version, source-envelope format,
 reconciliation frame, or stable mesh registry value. Reference window,
 fairness, and session-rotation values are implementation bounds rather than
-protocol data-rate limits or supported-target performance claims. The exact
-reference decision is [Decision 0044](decisions/0044-pipeline-durable-event-publication.md).
+protocol data-rate limits or supported-target performance claims.
 
 The reference adapter and authenticated adjacency enforce these work,
 outbound, and replay limits:
