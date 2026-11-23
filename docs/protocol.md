@@ -285,6 +285,12 @@ the 32-byte Merkle root, so it is `143 + topic_bytes + scope_bytes` bytes.
 `BatchID = H_batch-id(exact_manifest)`, and the source's batch hybrid signature
 signs `H_batch-signature(exact_manifest)`.
 
+A post-quantum signature over only a delegated ECDSA key and counter range
+would let an attacker who breaks ECDSA forge new item contents without forging
+any post-quantum signature. Instead, the ML-DSA signature commits to the exact
+item contents through the manifest's Merkle root, preventing such forgeries
+as long as SHA-256 and ML-DSA remain secure.
+
 A hybrid signature is exactly `u16(64) || p256_signature[64] || u32(3309) ||
 ml_dsa_65_signature[3309]`, for 3,379 bytes. Verification is AND. A credential
 with `g` route groups has an exact body length `B(g) = 3264 + 32g`, where
