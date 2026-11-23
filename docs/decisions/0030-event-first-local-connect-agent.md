@@ -6,7 +6,6 @@
 - Date: 2026-08-25
 - Authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Related: [Decision 0002](0002-dependency-admission.md),
-  [Decision 0008](0008-local-agent-phasing.md),
   [Decision 0009](0009-public-api-boundary.md), and
   [Decision 0028](0028-selected-stack-implementation-boundary.md)
 
@@ -14,9 +13,7 @@
 
 Requirements section 7 marks a gRPC-or-similar local agent as an MVP Should,
 requires the same high-level application boundary as the library, and gives a
-short integration target. Decision 0008 correctly rejected a thin
-unauthenticated daemon and deferred work until local authentication, service
-lifecycle, versioning, and bounded backpressure could be addressed.
+short integration target.
 
 The selected node now has a cloneable live `SelectedEventHandle` into its sole
 actor and durable-store authority. It can support an out-of-process Event API
@@ -62,9 +59,6 @@ choice while allowing standard Connect, gRPC, and gRPC-Web clients.
    effect and acknowledge separately for explicit at-least-once semantics.
 7. Share graceful shutdown state with active delivery streams so they stop
    before the transport drain completes.
-
-This supersedes only Decision 0008's scheduling deferral. Its security and
-lifecycle concerns remain requirements and gates.
 
 ## Exact dependency admission
 

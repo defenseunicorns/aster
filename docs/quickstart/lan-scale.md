@@ -126,6 +126,3 @@ running it does not move a requirement status and does not create retained
 evidence automatically. In particular it does not satisfy the provisional
 100-node-per-scope or 1,000-node-across-bridges targets, any hierarchical bridge
 row, Tier-2 resource brackets, hostile-LAN qualification, or release acceptance.
-
-The rationale and exact boundary are recorded in
-[Decision 0037](../decisions/0037-bound-concurrent-lan-scale-baseline.md).

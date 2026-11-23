@@ -6,7 +6,6 @@
 - Date: 2026-08-23
 - Authority: [`data-mesh-requirements.md`](../../data-mesh-requirements.md)
 - Related: [Decision 0002](0002-dependency-admission.md),
-  [Decision 0025](0025-requirements-first-foss-architecture-evaluation.md),
   [Proposal 0006](../../archive/research/proposals/0006-selected-foss-reference-stack.md), and
   [Proposal 0006 result](../../archive/research/evaluations/0006/README.md)
 
@@ -113,9 +112,7 @@ Begin the selected-stack implementation as an isolated migration lane:
    redb cutover must replace, not duplicate, the corresponding SQLite owner.
 6. Treat the current SQLite/custom-sync/IP path as the proven semantic and test
    source during migration, without running a second selected persistence or
-   reconciliation authority beside it. The libp2p path remains only the bounded
-   retained oracle described by Decision 0029. This decision removes neither;
-   each displaced mechanism stays until its replacement passes equivalent tests.
+   reconciliation authority beside it.
 
 The evaluation profile-v0 wire corpus is seed material, not a product format.
 No product encoder or decoder may copy its undeclared extension behavior.

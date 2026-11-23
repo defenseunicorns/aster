@@ -1250,11 +1250,6 @@ change exact package checksums, permit online execution after the acquisition
 step, or authorize the provider for production. Decision 0018 records the
 upstream `basic-toml` replacement, release gap, and removal gate.
 
-[Decision 0027](../decisions/0027-libp2p-pilot-dependency-policy.md) admits
-`BSD-2-Clause`, `ISC`, and `Zlib` for the reviewed external dependency graph;
-first-party packages and distributed project files remain subject to the
-separate byte-identical Apache-2.0 gate.
-
 The companion scope gate fails if either ignored package's reverse graph
 drifts, if either appears in the separately excluded fuzz graph, or if any
 `paste` version reappears. Any change to a package chain or advisory
@@ -1271,10 +1266,6 @@ is a visible stakeholder deviation from the frozen OSI-only requirement, not a
 claim of outside-counsel review or requirements credit. Passing this gate does
 not by itself authorize a release, extend the earlier 1.0.9 evaluation
 approval to the replacement coordinates, or declare browser-WASM supported.
-
-[Decision 0045](../decisions/0045-remove-libp2p-test-oracle.md) supersedes
-Decision 0029's retention policy. The experimental provider and only its lab
-integration are removed; the rest of `aster-lab` remains.
 
 The provider removal also removes the optional Hickory 0.25.2 lock entries.
 The root audit no longer ignores `RUSTSEC-2026-0118` or `RUSTSEC-2026-0119`.

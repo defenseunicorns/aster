@@ -5,7 +5,6 @@
 - Date: 2026-08-31
 - Authority: [data-mesh-requirements.md](../../data-mesh-requirements.md)
 - Related: [Decision 0036](0036-mission-authenticated-lan-discovery-mvp.md),
-  [Decision 0037](0037-bound-concurrent-lan-scale-baseline.md),
   [Decision 0038](0038-select-an-event-bridge-foundation.md), and roadmap
   action `P2-1`
 
