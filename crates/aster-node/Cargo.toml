@@ -9,6 +9,8 @@ publish = false
 
 [features]
 fuzzing = ["aster-mesh/fuzzing"]
+# Internal deterministic clock controls; absent from default/customer builds.
+test-utils = []
 nearby-discovery = ["aster-iroh/nearby-discovery"]
 device-validation = ["aster-mesh/test-utils"]
 

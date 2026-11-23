@@ -1038,7 +1038,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lazy_read_reauthenticates_expiry_between_pages() {
         const TEST_PAGE_BYTES: usize = 4;
-        let ttl = std::time::Duration::from_secs(2);
+        const TTL_MS: u64 = 2_000;
+        let clock = aster_node::TestCustodyClock::new([0xb8; 16], 0);
         let fixture = StagingTestRoot::new();
         let state_root = fixture.0.join("state");
         fs::create_dir(&state_root).unwrap();
@@ -1058,18 +1059,19 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let node = start_node(NodeConfig {
-            state: state_root.clone(),
-            bind: "127.0.0.1:0".parse().unwrap(),
-            mission,
-            peers: Vec::new(),
-            mutable_interests: MutableSourceInterests::default(),
-            sync_interval: std::time::Duration::from_millis(50),
-            run_for: None,
-            application: NodeApplication::Relay,
-        })
-        .await
-        .unwrap();
+        let node = clock
+            .start_node(NodeConfig {
+                state: state_root.clone(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                mission,
+                peers: Vec::new(),
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: std::time::Duration::from_millis(50),
+                run_for: None,
+                application: NodeApplication::Relay,
+            })
+            .await
+            .unwrap();
         let blobs = node.selected_blobs();
         let source_path = fixture.0.join("source.bin");
         fs::write(&source_path, vec![0x5c; TEST_PAGE_BYTES + 1]).unwrap();
@@ -1083,10 +1085,7 @@ mod tests {
                     media_type: None,
                     schema_id: Vec::new(),
                 },
-                BlobPublishOptions::finite_ttl_ms(
-                    u64::try_from(ttl.as_millis()).expect("test TTL fits u64"),
-                )
-                .unwrap(),
+                BlobPublishOptions::finite_ttl_ms(TTL_MS).unwrap(),
                 fs::File::open(source_path).unwrap(),
             )
             .await
@@ -1110,7 +1109,9 @@ mod tests {
         assert_eq!(first.chunk.len(), TEST_PAGE_BYTES);
         assert!(!first.complete);
 
-        tokio::time::sleep(ttl + std::time::Duration::from_millis(100)).await;
+        // Custody uses CLOCK_BOOTTIME, not Tokio time. Keep it frozen through
+        // publication and the first page, then expire before polling the next.
+        clock.set_tick_ms(TTL_MS + 100).unwrap();
         let expired = stream.next().await.unwrap().unwrap_err();
         assert_eq!(expired.code, ErrorCode::NotFound);
         assert_eq!(
