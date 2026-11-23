@@ -70,7 +70,7 @@ swarm-discovery = { version = "=0.6.6", default-features = false }
 tokio = { version = "=1.54.1", default-features = false, features = ["io-util", "net", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 tower = { version = "=0.5.3", features = ["util"] }
 tower-service = "=0.3.3"
-zeroize = { version = "=1.9.1", features = ["derive", "std"] }
+zeroize = { version = "=1.9.2", features = ["derive", "std"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
