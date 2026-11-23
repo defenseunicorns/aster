@@ -1727,7 +1727,7 @@ mod stream_frame_codec {
     #[test]
     fn profile5_data_body_is_one_complete_native_pack_record() {
         let bytes = include_bytes!(
-            "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-valid.bin"
+            "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-valid-v2.bin"
         );
         let (_, record) = split_composite_data_record(bytes).expect("ASD1 seed");
         let header = inspect_native_pack_record(record).expect("native pack record");
@@ -2039,7 +2039,7 @@ mod stream_frame_codec {
     #[test]
     fn composite_data_record_matches_the_independent_wire_corpus() {
         for line in
-            include_str!("../../../conformance/vectors/profile5-composite-data-record-v1.tsv")
+            include_str!("../../../conformance/vectors/profile5-composite-data-record-v2.tsv")
                 .lines()
                 .filter(|line| !line.starts_with('#'))
         {
@@ -2066,11 +2066,11 @@ mod stream_frame_codec {
         assert_eq!(MAX_COMPOSITE_STREAM_DATA_BYTES, 1_050_766);
         for bytes in [
             include_bytes!(
-                "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-valid.bin"
+                "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-valid-v2.bin"
             )
             .as_slice(),
             include_bytes!(
-                "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-maximum.bin"
+                "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-maximum-v2.bin"
             )
             .as_slice(),
         ] {
@@ -2087,7 +2087,7 @@ mod stream_frame_codec {
     #[test]
     fn production_composite_valid_seed_opens_and_segment_authenticates() {
         let bytes = include_bytes!(
-            "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-valid.bin"
+            "../../../fuzz/corpus/stream_transfer_decode/profile5-composite-valid-v2.bin"
         );
         let data = crate::runtime::blob_stream::fuzz_open_profile5_data_extent(bytes)
             .expect("production MissionBlobRecordCodec opens seed");

@@ -4,20 +4,18 @@ The selected runtime applies source-authenticated priority and finite TTL to
 Event and route-only Event custody. It also exposes aggregate logical-store
 limits, exact-scope custody quotas, a minimum emitted priority, and receive-only
 operation. State and Record remain outside Event custody, priority, and TTL
-pressure. Blob has an independent semantic-v8 authenticated finite-custody and
-storage-pressure policy; semantic v7 Blob work is durable-only. The independent
-State/Record v4-v8 and Blob v7/v8 lanes still run during `Normal` and
+pressure. Blob has an independent semantic-v9 authenticated finite-custody and
+storage-pressure policy. The independent State/Record and Blob lanes run during `Normal` and
 `AtLeast` contacts; `AtLeast` is an Event threshold only. `ReceiveOnly`
 initiates or discloses none of those lanes. See the selected State, Record, and
 Blob API guides for their application surfaces and limits.
 
-Semantic v7/v8 does not weaken this custody contract. When both peers negotiate
-`EventPagesV1`, durable Events, tombstones, and finite-TTL non-tombstones use
+The semantic-v9 hybrid session requires `EventPagesV1`. Durable Events,
+tombstones, and finite-TTL non-tombstones use
 receipt-free Event pages. Every finite entry carries session-authenticated
 cumulative custody age and is checked for continuity, policy, and expiry before
 send and during atomic receiver admission; it creates no peer lease, apply
-result, suppression, or retry settlement. A v1-v6 peer retains the complete
-`LegacyV6` custody path. ReceiveOnly discloses no local Event difference, but it
+result, suppression, or retry settlement. ReceiveOnly discloses no local Event difference, but it
 can accept bounded blind pages whose entries independently satisfy its interest,
 route grant, local policy, and custody checks.
 
@@ -232,7 +230,7 @@ store class always evicts the globally lowest priority first.
 
 ## Understand emission modes
 
-| Policy | Contact initiation | Event/control object emission | State/Record v4-v8 and Blob v7/v8 profile 4 | Authenticated inbound work |
+| Policy | Contact initiation | Event/control object emission | State/Record LegacyV6 and Blob profile 5 in v9 | Authenticated inbound work |
 |---|---|---|---|---|
 | `Normal` | yes | every eligible priority | full interested mutable lanes plus eligible v7/v8 Blob work | accepted within policy and quota |
 | `AtLeast(p)` | yes | only Events at or above `p`; required contact/control work continues | full interested mutable lanes plus eligible v7/v8 Blob work; `p` is Event-only | accepted within policy and quota |
@@ -254,19 +252,12 @@ change, not Carry/Consume mode or unrelated inventory.
 
 ## Compatibility and claim boundary
 
-Finite Event custody requires semantic version 3 through 8. Explicit version-1 and
-version-2 sessions remain compatible with durable Event transfer only. The
-protected lane-defer exchange, receiver-relative apply disposition, and
-generation-scoped suppression-receipt accounting are v3-format mechanisms
-inherited by v4 through v8; no
-equivalent deterministic whole-contact partial claim is made for v1/v2.
+Finite Event custody travels in semantic-v9 Event pages with authenticated
+cumulative age. State and Record use `LegacyV6` mechanics inside v9 sessions
+and do not support finite TTL. Blob uses its separate profile-5 custody,
+expiry and bounded maintenance policy. Normal and `AtLeast` run these lanes;
+`AtLeast` filters Event only.
 
-The selected implementation covers Event and RouteEvent custody only. It does
-not add State/Record custody; their cloneable live handles and separate
-semantic v4-v8 mutable reconciliation run outside this custody policy in `Normal`
-and `AtLeast`, as do the live Blob application surface and semantic-v7/v8
-profile-4 Blob work. This guide adds no finite State/Record TTL and does not
-define Blob's separate semantic-v8 custody, TTL, or bounded GC policy.
 See the selected [State](selected-state-api.md),
 [Record](selected-record-api.md), and [Blob](selected-blob-api.md) API guides for
 those independent application boundaries.

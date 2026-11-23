@@ -2795,27 +2795,17 @@ fn initialize_custody_schema(
                 .checked_add(record.accounted_bytes)
                 .ok_or(CustodyStoreError::CounterOverflow)
         })?;
-    let operation_metadata = write.open_table(METADATA)?;
-    let tombstone_operation_items = operation_metadata
-        .get(EVENT_TOMBSTONE_OPERATION_COUNT)?
-        .map_or(0, |value| value.value());
-    let tombstone_operation_bytes = operation_metadata
-        .get(EVENT_TOMBSTONE_OPERATION_TOTAL_BYTES)?
-        .map_or(0, |value| value.value());
-    drop(operation_metadata);
     let tombstone_usage = CustodyUsage {
         items: item_count
             .checked_sub(ordinary_item_count)
-            .and_then(|items| items.checked_add(tombstone_operation_items))
             .ok_or(CustodyStoreError::Invariant(
                 "ordinary items exceed total custody items during migration",
             ))?,
-        bytes: total_bytes
-            .checked_sub(ordinary_total_bytes)
-            .and_then(|bytes| bytes.checked_add(tombstone_operation_bytes))
-            .ok_or(CustodyStoreError::Invariant(
+        bytes: total_bytes.checked_sub(ordinary_total_bytes).ok_or(
+            CustodyStoreError::Invariant(
                 "ordinary bytes exceed total custody bytes during migration",
-            ))?,
+            ),
+        )?,
     };
     let (tombstone_max_items, tombstone_max_bytes) = custody_tombstone_allowance(limits);
     require_quota_capacity(
@@ -3808,98 +3798,22 @@ pub(crate) fn selected_tombstone_payload_usage_read(
     })
 }
 
-fn selected_tombstone_usage_write(
-    write: &redb::WriteTransaction,
-) -> Result<CustodyUsage, StoreError> {
-    let payload = selected_tombstone_payload_usage_write(write)?;
-    let metadata = write.open_table(METADATA)?;
-    let operation_items = metadata
-        .get(EVENT_TOMBSTONE_OPERATION_COUNT)?
-        .map_or(0, |value| value.value());
-    let operation_bytes = metadata
-        .get(EVENT_TOMBSTONE_OPERATION_TOTAL_BYTES)?
-        .map_or(0, |value| value.value());
-    Ok(CustodyUsage {
-        items: payload
-            .items
-            .checked_add(operation_items)
-            .ok_or(CustodyStoreError::Invariant(
-                "selected tombstone item accounting is invalid",
-            ))?,
-        bytes: payload
-            .bytes
-            .checked_add(operation_bytes)
-            .ok_or(CustodyStoreError::Invariant(
-                "selected tombstone byte accounting is invalid",
-            ))?,
-    })
-}
-
 fn selected_tombstone_usage_read(
-    read: &redb::ReadTransaction,
+    _read: &redb::ReadTransaction,
     item_count: u64,
     total_bytes: u64,
     ordinary_item_count: u64,
     ordinary_total_bytes: u64,
 ) -> Result<CustodyUsage, StoreError> {
-    let metadata = read.open_table(METADATA)?;
-    let operation_items = metadata
-        .get(EVENT_TOMBSTONE_OPERATION_COUNT)?
-        .map(|value| value.value());
-    let operation_bytes = metadata
-        .get(EVENT_TOMBSTONE_OPERATION_TOTAL_BYTES)?
-        .map(|value| value.value());
-    let (operation_items, operation_bytes) = match (operation_items, operation_bytes) {
-        (Some(items), Some(bytes)) => (items, bytes),
-        (None, None) => {
-            let events = read.open_table(EVENTS)?;
-            let mut items = 0u64;
-            let mut bytes = 0u64;
-            for row in read.open_table(EVENT_OPERATIONS)?.iter()? {
-                let (key, value) = row?;
-                let operation = decode_operation_record(value.value())?;
-                let event = events
-                    .get(operation.transfer_id.as_bytes().as_slice())?
-                    .map(|value| decode_event_metadata(value.value()))
-                    .transpose()?
-                    .ok_or(CustodyStoreError::Invariant(
-                        "Event operation points to missing tombstone metadata",
-                    ))?;
-                if event.header.tombstone {
-                    items = next_counter(items)?;
-                    bytes = bytes
-                        .checked_add(
-                            key.value()
-                                .len()
-                                .checked_add(value.value().len())
-                                .and_then(|length| u64::try_from(length).ok())
-                                .ok_or(CustodyStoreError::CounterOverflow)?,
-                        )
-                        .ok_or(CustodyStoreError::CounterOverflow)?;
-                }
-            }
-            (items, bytes)
-        }
-        _ => {
-            return Err(CustodyStoreError::Invariant(
-                "Event tombstone-operation accounting metadata is incomplete",
-            )
-            .into());
-        }
-    };
     Ok(CustodyUsage {
         items: item_count
             .checked_sub(ordinary_item_count)
-            .and_then(|items| items.checked_add(operation_items))
             .ok_or(CustodyStoreError::Invariant(
                 "selected tombstone item accounting is invalid",
             ))?,
-        bytes: total_bytes
-            .checked_sub(ordinary_total_bytes)
-            .and_then(|bytes| bytes.checked_add(operation_bytes))
-            .ok_or(CustodyStoreError::Invariant(
-                "selected tombstone byte accounting is invalid",
-            ))?,
+        bytes: total_bytes.checked_sub(ordinary_total_bytes).ok_or(
+            CustodyStoreError::Invariant("selected tombstone byte accounting is invalid"),
+        )?,
     })
 }
 
@@ -3913,7 +3827,7 @@ fn check_admission_capacity(
     if admission.tombstone {
         let (max_items, max_bytes) = custody_tombstone_allowance(limits);
         return require_quota_capacity(
-            selected_tombstone_usage_write(write)?,
+            selected_tombstone_payload_usage_write(write)?,
             &CustodyQuota {
                 scope: None,
                 max_items,
@@ -5126,19 +5040,6 @@ pub(crate) fn cleanup_retirement_dependencies_write(
         budget.record_removed_pair()?;
     }
     if key.class == CustodyObjectClass::Event {
-        match crate::event_operation::cleanup_retired_event_operations_write(
-            write,
-            EventTransferId::new(key.transfer_id),
-            cleanup.reason,
-            budget,
-        )
-        .map_err(crate::event_operation::classify_retirement_invariant)?
-        {
-            RetirementCleanupProgress::Pending => {
-                return Ok(RetirementCleanupProgress::Pending);
-            }
-            RetirementCleanupProgress::Complete => {}
-        }
         match crate::numbered_event_operation::cleanup_numbered_results_write(
             write,
             EventTransferId::new(key.transfer_id),
@@ -9786,28 +9687,15 @@ pub(crate) fn audit_custody_tables_write(
         0,
         0,
     )?;
-    let operation_metadata = write.open_table(METADATA)?;
-    let tombstone_operation_items = operation_metadata
-        .get(EVENT_TOMBSTONE_OPERATION_COUNT)?
-        .map_or(0, |value| value.value());
-    let tombstone_operation_bytes = operation_metadata
-        .get(EVENT_TOMBSTONE_OPERATION_TOTAL_BYTES)?
-        .map_or(0, |value| value.value());
-    drop(operation_metadata);
-    let tombstone_usage = CustodyUsage {
-        items: item_count
-            .checked_sub(ordinary_item_count)
-            .and_then(|items| items.checked_add(tombstone_operation_items))
-            .ok_or(CustodyStoreError::Invariant(
-                "ordinary items exceed total custody items",
-            ))?,
-        bytes: total_bytes
-            .checked_sub(ordinary_total_bytes)
-            .and_then(|bytes| bytes.checked_add(tombstone_operation_bytes))
-            .ok_or(CustodyStoreError::Invariant(
-                "ordinary bytes exceed total custody bytes",
-            ))?,
-    };
+    let tombstone_usage =
+        CustodyUsage {
+            items: item_count.checked_sub(ordinary_item_count).ok_or(
+                CustodyStoreError::Invariant("ordinary items exceed total custody items"),
+            )?,
+            bytes: total_bytes.checked_sub(ordinary_total_bytes).ok_or(
+                CustodyStoreError::Invariant("ordinary bytes exceed total custody bytes"),
+            )?,
+        };
     let (tombstone_max_items, tombstone_max_bytes) = custody_tombstone_allowance(limits);
     require_quota_capacity(
         tombstone_usage,
@@ -10557,27 +10445,6 @@ pub(crate) fn retired_event_write(
         .transpose()
 }
 
-pub(crate) fn retired_event_receipt_write(
-    write: &redb::WriteTransaction,
-    transfer_id: EventTransferId,
-) -> Result<Option<(EventSemanticId, u64, CustodyRetirementReason)>, StoreError> {
-    if !preflight_custody_schema_write(write)? {
-        return Ok(None);
-    }
-    write
-        .open_table(CUSTODY_RETIREMENTS)?
-        .get(CustodyObjectKey::event(transfer_id).encoded().as_slice())?
-        .map(|value| {
-            let record = decode_retirement(value.value())?;
-            Ok((
-                EventSemanticId::new(record.semantic_id),
-                record.acceptance_order,
-                record.reason,
-            ))
-        })
-        .transpose()
-}
-
 pub(crate) fn retired_event_read(
     read: &redb::ReadTransaction,
     transfer_id: EventTransferId,
@@ -10621,26 +10488,6 @@ pub(crate) fn retired_route_semantic_write(
         .open_table(CUSTODY_RETIRED_SEMANTICS)?
         .get(semantic_id.as_slice())?
         .map(|value| CustodyObjectKey::decode(value.value()).map_err(StoreError::from))
-        .transpose()
-}
-
-pub(crate) fn retired_event_receipt_read(
-    read: &redb::ReadTransaction,
-    transfer_id: EventTransferId,
-) -> Result<Option<(EventSemanticId, u64, CustodyRetirementReason)>, StoreError> {
-    if !custody_schema_present_read(read)? {
-        return Ok(None);
-    }
-    read.open_table(CUSTODY_RETIREMENTS)?
-        .get(CustodyObjectKey::event(transfer_id).encoded().as_slice())?
-        .map(|value| {
-            let record = decode_retirement(value.value())?;
-            Ok((
-                EventSemanticId::new(record.semantic_id),
-                record.acceptance_order,
-                record.reason,
-            ))
-        })
         .transpose()
 }
 

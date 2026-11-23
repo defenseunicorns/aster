@@ -23,7 +23,6 @@ use aster_node::{
     NodeBootstrapError, NodeBootstrapErrorKind, NodeConfig, NodeConfigOptions, NodeError,
     SourceInterestSelector, start_node,
 };
-use aster_profile::ItemId;
 use aster_redb_store::{Store, ZeroizationIntent};
 
 static ROOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -610,11 +609,13 @@ fn rejected_secret_loader_precedes_repair_required_store_recovery() {
         let store = Store::open_for_mission(store_path, mission.mission_authority_id())
             .expect("open repair-child store");
         store
-            .apply(
-                ItemId::new([0x91; 32]),
+            .begin_event_publication_session(
+                &aster_redb_store::EventClientId::new(b"repair-child".to_vec())
+                    .expect("repair-child client"),
+                0,
                 b"committed before abrupt protected bootstrap",
             )
-            .expect("commit repair-child row");
+            .expect("commit repair-child session");
         std::process::exit(86);
     }
 

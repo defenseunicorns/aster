@@ -36,6 +36,8 @@ AUTHENTICATED_NATIVE_RECORD = bytes.fromhex(
 PROTECTED_HEADER_SHA256 = {
     'profile5-protected-data-header.bin': '8b9401d11aa038741805715586df5cbf438fbba74746a9b290c31e62d6854c88',
     'profile5-protected-data-header-maximum.bin': '10bc837c1182113a5970baeb20d178b98e0c35d83ab06eef08c94672e909829d',
+    'profile5-protected-data-header-v2.bin': 'f905ff436d6abc430565f262b23d527bd6c7b2accc5c830a75b3bd7b31ca1609',
+    'profile5-protected-data-header-maximum-v2.bin': '0bbbf720caea2cdd28abaca0605883979b5c75eefa341d308b6d3f5f473c8835',
 }
 
 
@@ -324,9 +326,10 @@ def profile5_stream_corpus():
         f'{status}\t{name}\t{wire.hex()}\n' for status, name, wire in rows)
 
 
-def profile5_composite_corpus():
+def profile5_composite_corpus(version=1):
     extent = native_record()
-    data_header = protected_header('profile5-protected-data-header.bin')
+    suffix = '-v2' if version == 2 else ''
+    data_header = protected_header(f'profile5-protected-data-header{suffix}.bin')
     rows = [
         ('ACCEPT', 'native-pack-data', b'ASD1' + struct.pack('>I', len(data_header)) + data_header + extent),
         ('REJECT', 'wrong-magic', b'ASD2' + struct.pack('>I', 2) + b'\xa1\xa2\xb1'),
@@ -335,7 +338,7 @@ def profile5_composite_corpus():
         ('REJECT', 'truncated-length', b'ASD1\0\0\0'),
         ('REJECT', 'truncated-header', b'ASD1' + struct.pack('>I', 3) + b'\xa1\xa2'),
     ]
-    return '# aster-profile5-composite-data-record/v1\toracle=python-stdlib\n' + ''.join(
+    return f'# aster-profile5-composite-data-record/v{version}\toracle=python-stdlib\n' + ''.join(
         '\t'.join((status, name, wire.hex())) + '\n'
         for status, name, wire in rows
     )
@@ -413,6 +416,7 @@ def main():
         'blob-stream-records-v1.tsv': corpus(),
         'profile5-stream-records-v1.tsv': profile5_stream_corpus(),
         'profile5-composite-data-record-v1.tsv': profile5_composite_corpus(),
+        'profile5-composite-data-record-v2.tsv': profile5_composite_corpus(2),
         'profile5-transcripts-v1.tsv': profile5_transcript_corpus(),
     }
     for name, text in outputs.items():
@@ -474,13 +478,19 @@ def main():
             path.write_bytes(payload)
         else:
             assert path.read_bytes() == payload, f'{path}: differs from oracle'
-    if '--write' in sys.argv:
-        for existing in stream_seed_root.iterdir():
-            if existing.name not in expected_names:
-                existing.unlink()
-    else:
-        assert {path.name for path in stream_seed_root.iterdir()} == expected_names
-    print('Blob stream oracle: profile-4 compatibility and profile-5 corpora/seeds match independent Python construction')
+    for suffix in ('valid', 'maximum'):
+        header_suffix = '' if suffix == 'valid' else '-maximum'
+        header = protected_header(f'profile5-protected-data-header{header_suffix}-v2.bin')
+        record = extent if suffix == 'valid' else maximum
+        payload = b'ASD1' + struct.pack('>I', len(header)) + header + record
+        path = stream_seed_root / f'profile5-composite-{suffix}-v2.bin'
+        expected_names.add(path.name)
+        if '--write' in sys.argv:
+            path.write_bytes(payload)
+        else:
+            assert path.read_bytes() == payload, f'{path}: differs from oracle'
+    assert {path.name for path in stream_seed_root.iterdir()} == expected_names
+    print('Blob stream oracle: historical profile-4 and original/current profile-5 corpora/seeds match independent Python construction')
 
 
 if __name__ == '__main__':

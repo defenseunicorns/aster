@@ -830,13 +830,13 @@ provider destruction is added. The post-enqueue cancellation cell is Unix-only.
 
 ## Semantic-v7 Event page current-code gate
 
-`V-EVENT-PAGES-V7` is an additive current-code gate. It checks semantic
-`[8,7,6,5,4,3,2,1]` selection, v8/v7 page inheritance, and v7/v6 fallback,
+`V-EVENT-PAGES-V7` retains its original vector identity. Current hybrid tests
+require semantic `[9]`, reject older peers and require EventPagesV1. They check
 canonical per-lane profile
 negotiation, contextual record AAD, bounded ordered uni turns, receipt-free
 durable, finite-TTL, mixed, route-only, and blind ReceiveOnly Event convergence,
 finite custody-age admission without per-peer receipt/lease/retry state,
-v7/v6 compatibility fallback, interruption with prefix preservation and
+interruption with prefix preservation and
 remainder-only reconnect, strict
 priority/equal-tier rotation, and later-lane reserves. Receiver rejection limits
 come only from exact serialization and protected-carrier bounds. Sender page
@@ -848,21 +848,11 @@ rows and 6 representative malformed REJECT rows; the `aster-node` vector tests
 regenerate it from the reference codecs and route every REJECT row through its
 corresponding decoder.
 
-The semantic-v4 State/Record gate is inherited unchanged through v8 and
-is additive to those frozen slices. The frozen v6 gate used default/highest 6
-with `[6, 5, 4, 3, 2, 1]`; the current default/highest is 8 with
-`[8, 7, 6, 5, 4, 3, 2, 1]`. Semantic v6 preserves the historical v5 ordinary
-frame allocation and adds only the mutually enabled Event-bridge mechanics
-lane; selected Blob carrier IO now requires v7/v8 profile 4. Selected mutable
-frames are absent in v1-v3 and selected bridge frames are absent in v1-v5.
-Focused validation
-must cover the complete State/Record class and direction grammar, including all
-20 structured mutable tags in `selected_frame_decode`; exact offer
-`MutableApplyResult`, fetch `MutableFetchResult` plus required exact
-`MutableFetchResultAck`, and Finish/Finished remaining matching; missing,
-duplicate, changed, cross-class, cross-direction, and out-of-order rejection;
-and v1-v3 plus ReceiveOnly mutable absence. Normal and every AtLeast threshold
-must still run mutable lanes because AtLeast is Event-only.
+State and Record retain their `LegacyV6` class- and direction-separated
+mechanics inside semantic v9, as does the static EventBridge lane. Focused
+validation covers their structured tags, exact result/acknowledgement and
+Finish/Finished matching, and missing, duplicate, cross-class and cross-direction
+rejection. Normal and `AtLeast` run mutable lanes; ReceiveOnly does not.
 
 Store/runtime cells must additionally exercise the fatal 1 MiB structural
 object limit and, for otherwise-valid authenticated objects, typed effective
@@ -1187,9 +1177,12 @@ implementation; scale/resource/soak result; State, Record, or Blob acceptance;
 post-policy fresh completion or beta delivery; indefinite retention/GC; release
 artifact; or production authorization.
 
-The historical semantic-v5 direct Blob gate is retained as codec and
-durable-storage compatibility evidence; Result/Ack/Finish is not current
-carrier behavior. The current network gate requires semantic-v7/v8 profile 4,
+The following frozen semantic-v5/v7/v8 Blob gate describes historical codec,
+storage and runtime evidence. Its commands require the recorded source revision;
+it is not a current-runtime gate. Current Blob validation uses semantic v9/profile 5
+and the [streaming runbook](blob-streaming-engineering-runbook.md).
+
+The historical profile-4 gate required
 the stdlib-only same-team construction oracle plus shared ABRS/ABRD/ABRE record vectors,
 malformed schedule/hash/index/count/terminal
 rejection, and v5/v6 pre-carrier failure. Provider

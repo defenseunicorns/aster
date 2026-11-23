@@ -1149,8 +1149,6 @@ fn validate_peerless_receipt(receipt: &NodeReceipt) -> Result<(), DynError> {
             && receipt.blob_carrier_prefixes == 0
             && receipt.blob_carrier_fetch_cursors == 0
             && receipt.blob_network_staging_bytes == 0
-            && receipt.items == 0
-            && receipt.acceptance_markers == 0
             && receipt.events == 0
             && receipt.event_acceptance_markers == 0
             && receipt.route_cached_events == 0
@@ -1195,8 +1193,7 @@ fn validate_inspection(inspection: &StoreInspection) -> Result<(), DynError> {
 }
 
 fn other_namespaces_empty(inspection: &StoreInspection) -> bool {
-    inspection.stats == Default::default()
-        && inspection.event_stats == Default::default()
+    inspection.event_stats == Default::default()
         && inspection.state_stats == Default::default()
         && inspection.record_stats == Default::default()
         && inspection.event_subscription_stats == Default::default()
@@ -1397,7 +1394,6 @@ fn prefixed_receipt_fields(receipt: &NodeReceipt) -> Vec<(&'static str, String)>
             "shutdown_blob_network_staging_bytes",
             receipt.blob_network_staging_bytes.to_string(),
         ),
-        ("shutdown_items", receipt.items.to_string()),
         ("shutdown_events", receipt.events.to_string()),
         ("shutdown_controls", receipt.controls.to_string()),
     ]
@@ -1534,7 +1530,6 @@ fn peerless_child_receipt_fields_match(fields: &ChildFields) -> Result<bool, Dyn
         "shutdown_pending_blobs",
         "shutdown_blob_carrier_prefixes",
         "shutdown_blob_network_staging_bytes",
-        "shutdown_items",
         "shutdown_events",
         "shutdown_controls",
     ] {
@@ -2154,7 +2149,6 @@ fn receipt_fields(receipt: &NodeReceipt) -> Vec<(&'static str, String)> {
             "blob_network_staging_bytes",
             receipt.blob_network_staging_bytes.to_string(),
         ),
-        ("items", receipt.items.to_string()),
         ("events", receipt.events.to_string()),
         ("controls", receipt.controls.to_string()),
     ]
@@ -2225,7 +2219,6 @@ fn emit_child_receipt(
             "blob_network_staging_bytes",
             "shutdown_blob_network_staging_bytes",
         ),
-        ("items", "shutdown_items"),
         ("events", "shutdown_events"),
         ("controls", "shutdown_controls"),
     ];

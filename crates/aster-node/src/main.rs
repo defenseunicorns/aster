@@ -20,14 +20,12 @@ use aster_node::{
     DemoScenario, MissionExpectedPeer, MutableSourceInterests, NodeApplication, NodeConfig,
     NodeIdentity, RegistryGenerationWitness, RevocationRequest, ScopeRekeyRequest,
     SelectedControlAdmin, SelectedForwardingConfig, SourceInterestSelector,
-    audit_store_event_operations, ensure_state_accepts_normal_operation,
-    format_control_transfer_id, format_path_field, format_receipt_field, inspect_store,
-    mission::UnprotectedReferenceMission, parse_item_id, parse_node_id, put_opaque,
+    ensure_state_accepts_normal_operation, format_control_transfer_id, format_path_field,
+    format_receipt_field, inspect_store, mission::UnprotectedReferenceMission, parse_node_id,
     run_demo_scenario, run_node_with_forwarding, zeroize_node,
 };
 use zeroize::Zeroize as _;
 
-const MAX_PUT_BYTES: u64 = 1024 * 1024;
 const MAX_REKEY_REGISTRY_BYTES: u64 = 16 * 1024 * 1024;
 const PLAYGROUND_MIN_NODES: usize = 2;
 const PLAYGROUND_MAX_NODES: usize = 32;
@@ -99,41 +97,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 format_path_field(identity.path())
             );
         }
-        "put" => {
-            let state = arguments.required_path("--state")?;
-            let id = parse_item_id(&arguments.required("--id")?)?;
-            let file = arguments.required_path("--file")?;
-            arguments.finish()?;
-            ensure_state_accepts_normal_operation(&state)?;
-            let bytes = read_put_source(&file)?;
-            let inserted = put_opaque(&state, id, &bytes)?;
-            println!(
-                "PUT status=pass state={} id={} inserted={} source={} semantics=opaque",
-                format_path_field(&state),
-                aster_node::format_item_id(id),
-                inserted,
-                format_path_field(&file)
-            );
-        }
         "inspect" => {
             let state = arguments.required_path("--state")?;
-            let audit_operations = arguments.switch("--audit-event-operations")?;
             arguments.finish()?;
-            if audit_operations {
-                let audit = audit_store_event_operations(&state)?;
-                println!(
-                    "EVENT_OPERATION_AUDIT status=pass state=complete scanned={} total={} units=ledger-and-reverse-rows",
-                    audit.scanned, audit.total
-                );
-            }
             let receipt = inspect_store(&state)?;
             println!(
-                "INSPECT status=pass state={} zeroization={} opaque_items={} opaque_acceptance_markers={} opaque_bytes={} events={} event_acceptance_markers={} event_sealed_bytes={} route_cached_events={} route_cached_bytes={} controls={} applied_controls={} pending_controls={} control_highwater={}",
+                "INSPECT status=pass state={} zeroization={} events={} event_acceptance_markers={} event_sealed_bytes={} route_cached_events={} route_cached_bytes={} controls={} applied_controls={} pending_controls={} control_highwater={}",
                 format_path_field(&state),
                 receipt.zeroization.as_str(),
-                receipt.items,
-                receipt.acceptance_markers,
-                receipt.payload_bytes,
                 receipt.events,
                 receipt.event_acceptance_markers,
                 receipt.event_sealed_bytes,
@@ -144,9 +115,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 receipt.pending_controls,
                 receipt.control_highwater,
             );
-            for id in receipt.ids {
-                println!("ITEM id={}", aster_node::format_item_id(id));
-            }
         }
         "event-client-capacity" | "event-client-limits" | "event-client-retire" => {
             let state = arguments.required_path("--state")?;
@@ -390,7 +358,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             arguments.finish()?;
             let receipt = zeroize_node(&state, &mission_bundle, wait).await?;
             println!(
-                "ZEROIZE status=pass mode={} state={} mission_destroyed={} carrier_identity_destroyed={} mission_pathname={} carrier_identity_pathname={} data_rows_preserved=true opaque_items={} events={} route_cached_events={} controls={} assurance=bounded-software physical_sanitization=not-claimed local_authority=same-uid-operator state_root={}",
+                "ZEROIZE status=pass mode={} state={} mission_destroyed={} carrier_identity_destroyed={} mission_pathname={} carrier_identity_pathname={} data_rows_preserved=true events={} route_cached_events={} controls={} assurance=bounded-software physical_sanitization=not-claimed local_authority=same-uid-operator state_root={}",
                 if receipt.live_request {
                     "live"
                 } else {
@@ -401,7 +369,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 receipt.identity_destroyed,
                 receipt.mission_pathname.as_str(),
                 receipt.identity_pathname.as_str(),
-                receipt.preserved.items,
                 receipt.preserved.events,
                 receipt.preserved.route_cached_events,
                 receipt.preserved.controls,
@@ -536,10 +503,6 @@ fn create_owner_only_directory(path: &Path) -> io::Result<()> {
     }
 }
 
-fn read_put_source(path: &Path) -> io::Result<Vec<u8>> {
-    read_regular_bounded(path, MAX_PUT_BYTES, "put source")
-}
-
 fn read_registry_source(path: &Path) -> io::Result<Vec<u8>> {
     read_regular_bounded(
         path,
@@ -590,11 +553,6 @@ fn read_regular_bounded(path: &Path, limit: u64, label: &str) -> io::Result<Vec<
     read_bounded_limit(file, metadata.len(), limit, label)
 }
 
-#[cfg(test)]
-fn read_bounded(reader: impl Read, length_hint: u64) -> io::Result<Vec<u8>> {
-    read_bounded_limit(reader, length_hint, MAX_PUT_BYTES, "put source")
-}
-
 fn read_bounded_limit(
     reader: impl Read,
     length_hint: u64,
@@ -602,7 +560,7 @@ fn read_bounded_limit(
     label: &str,
 ) -> io::Result<Vec<u8>> {
     let capacity =
-        usize::try_from(length_hint.min(limit)).expect("the one-MiB put limit fits in usize");
+        usize::try_from(length_hint.min(limit)).expect("bounded source limit fits in usize");
     let mut bytes = Vec::with_capacity(capacity);
     reader
         .take(limit.saturating_add(1))
@@ -787,11 +745,10 @@ fn apply_nearby_cli(
 const HELP: &str = "Aster selected-stack mesh CLI\n\n\
          Commands:\n\
            aster init --state DIR\n\
-           aster put --state DIR --id HEX64 --file PATH  # maximum 1,048,576 bytes\n\
            aster event-client-capacity --state DIR\n\
            aster event-client-limits --state DIR --max-clients N --max-outstanding N --max-records N --max-bytes N\n\
            aster event-client-retire --state DIR (--client-id ID | --client-id-hex HEX) --expected-session N --irreversible\n\
-           aster inspect --state DIR [--audit-event-operations]\n\
+           aster inspect --state DIR\n\
            aster playground-init --nodes N --root DIR\n\
            aster zeroize --state DIR \\
              --mission-bundle-unprotected-reference FILE [--wait-seconds SEC]\n\
@@ -852,8 +809,7 @@ const HELP: &str = "Aster selected-stack mesh CLI\n\n\
          must use disjoint explicit --base-port blocks; automatic selection is a single-demo\n\
          convenience. Semantic admission\n\
          and application reaction require successful content authentication; payload-blind relays\n\
-         retain only bounded route-verified bytes. The put command remains an isolated opaque\n\
-         compatibility lane and is never advertised by Event reconciliation. Semantic v3 binds\n\
+         retain only bounded route-verified bytes. Semantic v3 binds\n\
          finite-TTL dissemination to authenticated cumulative custody age, exact source claims,\n\
          quotas, and final send checks; production finite-TTL clocks are currently Linux-only.\n\
          Zeroize is an irreversible same-UID local operator hook. It durably locks the exact\n\
@@ -1159,16 +1115,32 @@ mod tests {
     }
 
     #[test]
-    fn exact_put_limit_is_accepted() {
+    fn stream_without_eof_is_stopped_at_one_byte_over_limit() {
+        let error = read_bounded_limit(io::repeat(0xa5), 0, 64, "registry source")
+            .expect_err("reject endless stream");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn stale_small_metadata_hint_cannot_bypass_the_read_limit() {
+        let input = vec![0x33; 65];
+        let error = read_bounded_limit(io::Cursor::new(input), 1, 64, "registry source")
+            .expect_err("reject grown input");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn exact_read_limit_is_accepted() {
         let source = TestFile::new("exact-limit");
         fs::write(
             source.path(),
-            vec![0x5a; usize::try_from(MAX_PUT_BYTES).expect("limit")],
+            vec![0x5a; usize::try_from(64_u64).expect("limit")],
         )
         .expect("write source");
 
-        let bytes = read_put_source(source.path()).expect("read exact-limit source");
-        assert_eq!(bytes.len(), usize::try_from(MAX_PUT_BYTES).expect("limit"));
+        let bytes = read_regular_bounded(source.path(), 64, "registry source")
+            .expect("read exact-limit source");
+        assert_eq!(bytes.len(), usize::try_from(64_u64).expect("limit"));
         assert!(bytes.iter().all(|byte| *byte == 0x5a));
     }
 
@@ -1180,37 +1152,39 @@ mod tests {
             .create_new(true)
             .open(source.path())
             .expect("create source");
-        file.set_len(MAX_PUT_BYTES + 1).expect("set sparse length");
+        file.set_len(64_u64 + 1).expect("set sparse length");
 
-        let error = read_put_source(source.path()).expect_err("reject oversized source");
+        let error = read_regular_bounded(source.path(), 64, "registry source")
+            .expect_err("reject oversized source");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("1048576-byte limit"));
+        assert!(error.to_string().contains("64-byte limit"));
     }
 
     #[test]
-    fn stream_without_eof_is_stopped_at_one_byte_over_limit() {
-        let error = read_bounded(io::repeat(0xa5), 0).expect_err("reject endless stream");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("1048576-byte limit"));
-    }
-
-    #[test]
-    fn stale_small_metadata_hint_cannot_bypass_the_read_limit() {
-        let input = vec![0x33; usize::try_from(MAX_PUT_BYTES + 1).expect("limit plus one")];
-        let error = read_bounded(io::Cursor::new(input), 1).expect_err("reject grown input");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn non_regular_put_source_is_rejected() {
+    fn non_regular_registry_source_is_rejected() {
         let source = TestFile::new("directory");
         fs::create_dir(source.path()).expect("create source directory");
-        let error = read_put_source(source.path()).expect_err("reject directory source");
+        let error = read_regular_bounded(source.path(), 64, "registry source")
+            .expect_err("reject directory source");
         assert!(matches!(
             error.kind(),
             io::ErrorKind::InvalidData | io::ErrorKind::IsADirectory
         ));
         fs::remove_dir(source.path()).expect("remove source directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symbolic_link_registry_source_is_rejected_before_open() {
+        use std::os::unix::fs::symlink;
+
+        let target = TestFile::new("symlink-target");
+        let source = TestFile::new("symlink-source");
+        fs::write(target.path(), b"payload").expect("write target");
+        symlink(target.path(), source.path()).expect("create source symlink");
+        let error = read_regular_bounded(source.path(), 64, "registry source")
+            .expect_err("reject symlink source");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -1325,19 +1299,6 @@ mod tests {
             .finish_redacted()
             .expect_err("unexpected node argument must be redacted");
         assert!(!error.to_string().contains("do-not-log"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symbolic_link_put_source_is_rejected_before_open() {
-        use std::os::unix::fs::symlink;
-
-        let target = TestFile::new("symlink-target");
-        let source = TestFile::new("symlink-source");
-        fs::write(target.path(), b"payload").expect("write target");
-        symlink(target.path(), source.path()).expect("create source symlink");
-        let error = read_put_source(source.path()).expect_err("reject symlink source");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }
 

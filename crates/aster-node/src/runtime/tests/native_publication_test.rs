@@ -87,7 +87,6 @@ fn native_publication_recovers_committed_unapplied_intent_without_republishing()
             store.committed_numbered_event_publication_count().unwrap(),
             1
         );
-        assert_eq!(store.event_operation_stats().unwrap().records_total, 0);
     }
     assert_eq!(
         tracker

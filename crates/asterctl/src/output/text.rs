@@ -88,9 +88,17 @@ pub(super) fn status(s: &api::GetStatusResponse) -> String {
             "Size",
             format!("{} / {}", size(s.bytes), size(s.byte_hard_limit)),
         );
-        field(&mut text, "Active rows", count(s.active_rows));
-        field(&mut text, "Retired rows", count(s.retired_rows));
-        field(&mut text, "Reverse index rows", count(s.reverse_rows));
+        field(&mut text, "Numbered clients", count(s.numbered_clients));
+        field(
+            &mut text,
+            "Outstanding results",
+            count(s.numbered_outstanding_results),
+        );
+        field(
+            &mut text,
+            "Numbered reverse index rows",
+            count(s.numbered_reverse_rows),
+        );
         field(&mut text, "Profile boundary", count(s.profile_boundary));
         field(&mut text, "Profile remaining", count(s.profile_remaining));
         field(&mut text, "Profile warning", yes_no(s.profile_warning));
@@ -112,18 +120,6 @@ pub(super) fn status(s: &api::GetStatusResponse) -> String {
             "Estimated exhaustion",
             duration(s.estimated_seconds_to_exhaustion),
         );
-        if let Some(audit) = s.audit.as_option() {
-            field(
-                &mut text,
-                "Audit",
-                format!(
-                    "{} ({} / {} rows scanned)",
-                    state(audit.state, "OPERATION_LEDGER_AUDIT_"),
-                    count(audit.scanned),
-                    count(audit.total)
-                ),
-            );
-        }
     }
     if let Some(s) = s.delivery_capacity.as_option() {
         text.push_str("\nDELIVERY:\n");

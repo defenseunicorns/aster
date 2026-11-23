@@ -894,7 +894,6 @@ fn emit_receipt(
                 "deferred_mutable_lanes",
                 evidence.receipt.deferred_mutable_lanes.to_string(),
             ),
-            ("items", evidence.receipt.items.to_string()),
             ("events", evidence.receipt.events.to_string()),
             ("blobs", evidence.receipt.blobs.to_string()),
         ],
@@ -1227,7 +1226,6 @@ fn emit_child_receipt(
                 "deferred_mutable_lanes",
                 child_field(fields, "shutdown_deferred_mutable_lanes")?.to_owned(),
             ),
-            ("items", child_field(fields, "shutdown_items")?.to_owned()),
             ("events", child_field(fields, "shutdown_events")?.to_owned()),
             ("blobs", child_field(fields, "shutdown_blobs")?.to_owned()),
         ],
@@ -3510,7 +3508,6 @@ fn peerless_child_receipt_fields_are_zero(fields: &ChildFields) -> Result<bool, 
         "shutdown_direct_contacts",
         "shutdown_relay_contacts",
         "shutdown_unknown_path_contacts",
-        "shutdown_items",
         "shutdown_events",
         "shutdown_blobs",
         "shutdown_data_offered",
@@ -3537,9 +3534,7 @@ fn is_sha256(value: &str) -> bool {
 
 fn validate_excluded_receipt(receipt: &NodeReceipt) -> Result<(), DynError> {
     require(
-        receipt.items == 0
-            && receipt.acceptance_markers == 0
-            && receipt.events == 0
+        receipt.events == 0
             && receipt.event_acceptance_markers == 0
             && receipt.route_cached_events == 0
             && receipt.controls == 0
@@ -3651,8 +3646,7 @@ fn validate_inspections(
 }
 
 fn other_namespaces_empty(inspection: &StoreInspection) -> bool {
-    inspection.stats == Default::default()
-        && inspection.event_stats == Default::default()
+    inspection.event_stats == Default::default()
         && inspection.state_stats == Default::default()
         && inspection.blob_stats == Default::default()
         && inspection.event_subscription_stats == Default::default()
@@ -3705,7 +3699,6 @@ fn prefixed_receipt_fields(receipt: &NodeReceipt) -> Vec<(&'static str, String)>
             "shutdown_unknown_path_contacts",
             receipt.unknown_path_contacts.to_string(),
         ),
-        ("shutdown_items", receipt.items.to_string()),
         ("shutdown_events", receipt.events.to_string()),
         ("shutdown_blobs", receipt.blobs.to_string()),
         ("shutdown_data_offered", receipt.data_offered.to_string()),

@@ -225,55 +225,6 @@ func (EmissionMode) EnumDescriptor() ([]byte, []int) {
 	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{2}
 }
 
-type PublishOperationLedgerMode int32
-
-const (
-	PublishOperationLedgerMode_PUBLISH_OPERATION_LEDGER_MODE_UNSPECIFIED PublishOperationLedgerMode = 0
-	PublishOperationLedgerMode_PUBLISH_OPERATION_LEDGER_MODE_LEGACY      PublishOperationLedgerMode = 1
-	PublishOperationLedgerMode_PUBLISH_OPERATION_LEDGER_MODE_NUMBERED    PublishOperationLedgerMode = 2
-)
-
-// Enum value maps for PublishOperationLedgerMode.
-var (
-	PublishOperationLedgerMode_name = map[int32]string{
-		0: "PUBLISH_OPERATION_LEDGER_MODE_UNSPECIFIED",
-		1: "PUBLISH_OPERATION_LEDGER_MODE_LEGACY",
-		2: "PUBLISH_OPERATION_LEDGER_MODE_NUMBERED",
-	}
-	PublishOperationLedgerMode_value = map[string]int32{
-		"PUBLISH_OPERATION_LEDGER_MODE_UNSPECIFIED": 0,
-		"PUBLISH_OPERATION_LEDGER_MODE_LEGACY":      1,
-		"PUBLISH_OPERATION_LEDGER_MODE_NUMBERED":    2,
-	}
-)
-
-func (x PublishOperationLedgerMode) Enum() *PublishOperationLedgerMode {
-	p := new(PublishOperationLedgerMode)
-	*p = x
-	return p
-}
-
-func (x PublishOperationLedgerMode) String() string {
-	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
-}
-
-func (PublishOperationLedgerMode) Descriptor() protoreflect.EnumDescriptor {
-	return file_aster_application_v1alpha1_aster_proto_enumTypes[3].Descriptor()
-}
-
-func (PublishOperationLedgerMode) Type() protoreflect.EnumType {
-	return &file_aster_application_v1alpha1_aster_proto_enumTypes[3]
-}
-
-func (x PublishOperationLedgerMode) Number() protoreflect.EnumNumber {
-	return protoreflect.EnumNumber(x)
-}
-
-// Deprecated: Use PublishOperationLedgerMode.Descriptor instead.
-func (PublishOperationLedgerMode) EnumDescriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{3}
-}
-
 type OperationCapacityWarning int32
 
 const (
@@ -313,11 +264,11 @@ func (x OperationCapacityWarning) String() string {
 }
 
 func (OperationCapacityWarning) Descriptor() protoreflect.EnumDescriptor {
-	return file_aster_application_v1alpha1_aster_proto_enumTypes[4].Descriptor()
+	return file_aster_application_v1alpha1_aster_proto_enumTypes[3].Descriptor()
 }
 
 func (OperationCapacityWarning) Type() protoreflect.EnumType {
-	return &file_aster_application_v1alpha1_aster_proto_enumTypes[4]
+	return &file_aster_application_v1alpha1_aster_proto_enumTypes[3]
 }
 
 func (x OperationCapacityWarning) Number() protoreflect.EnumNumber {
@@ -326,62 +277,7 @@ func (x OperationCapacityWarning) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use OperationCapacityWarning.Descriptor instead.
 func (OperationCapacityWarning) EnumDescriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{4}
-}
-
-type OperationLedgerAudit int32
-
-const (
-	OperationLedgerAudit_OPERATION_LEDGER_AUDIT_UNSPECIFIED OperationLedgerAudit = 0
-	OperationLedgerAudit_OPERATION_LEDGER_AUDIT_PENDING     OperationLedgerAudit = 1
-	OperationLedgerAudit_OPERATION_LEDGER_AUDIT_RUNNING     OperationLedgerAudit = 2
-	OperationLedgerAudit_OPERATION_LEDGER_AUDIT_COMPLETE    OperationLedgerAudit = 3
-	OperationLedgerAudit_OPERATION_LEDGER_AUDIT_FAILED      OperationLedgerAudit = 4
-)
-
-// Enum value maps for OperationLedgerAudit.
-var (
-	OperationLedgerAudit_name = map[int32]string{
-		0: "OPERATION_LEDGER_AUDIT_UNSPECIFIED",
-		1: "OPERATION_LEDGER_AUDIT_PENDING",
-		2: "OPERATION_LEDGER_AUDIT_RUNNING",
-		3: "OPERATION_LEDGER_AUDIT_COMPLETE",
-		4: "OPERATION_LEDGER_AUDIT_FAILED",
-	}
-	OperationLedgerAudit_value = map[string]int32{
-		"OPERATION_LEDGER_AUDIT_UNSPECIFIED": 0,
-		"OPERATION_LEDGER_AUDIT_PENDING":     1,
-		"OPERATION_LEDGER_AUDIT_RUNNING":     2,
-		"OPERATION_LEDGER_AUDIT_COMPLETE":    3,
-		"OPERATION_LEDGER_AUDIT_FAILED":      4,
-	}
-)
-
-func (x OperationLedgerAudit) Enum() *OperationLedgerAudit {
-	p := new(OperationLedgerAudit)
-	*p = x
-	return p
-}
-
-func (x OperationLedgerAudit) String() string {
-	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
-}
-
-func (OperationLedgerAudit) Descriptor() protoreflect.EnumDescriptor {
-	return file_aster_application_v1alpha1_aster_proto_enumTypes[5].Descriptor()
-}
-
-func (OperationLedgerAudit) Type() protoreflect.EnumType {
-	return &file_aster_application_v1alpha1_aster_proto_enumTypes[5]
-}
-
-func (x OperationLedgerAudit) Number() protoreflect.EnumNumber {
-	return protoreflect.EnumNumber(x)
-}
-
-// Deprecated: Use OperationLedgerAudit.Descriptor instead.
-func (OperationLedgerAudit) EnumDescriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{5}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{3}
 }
 
 type Priority int32
@@ -423,11 +319,11 @@ func (x Priority) String() string {
 }
 
 func (Priority) Descriptor() protoreflect.EnumDescriptor {
-	return file_aster_application_v1alpha1_aster_proto_enumTypes[6].Descriptor()
+	return file_aster_application_v1alpha1_aster_proto_enumTypes[4].Descriptor()
 }
 
 func (Priority) Type() protoreflect.EnumType {
-	return &file_aster_application_v1alpha1_aster_proto_enumTypes[6]
+	return &file_aster_application_v1alpha1_aster_proto_enumTypes[4]
 }
 
 func (x Priority) Number() protoreflect.EnumNumber {
@@ -436,7 +332,7 @@ func (x Priority) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Priority.Descriptor instead.
 func (Priority) EnumDescriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{6}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{4}
 }
 
 type SyncStatus int32
@@ -484,11 +380,11 @@ func (x SyncStatus) String() string {
 }
 
 func (SyncStatus) Descriptor() protoreflect.EnumDescriptor {
-	return file_aster_application_v1alpha1_aster_proto_enumTypes[7].Descriptor()
+	return file_aster_application_v1alpha1_aster_proto_enumTypes[5].Descriptor()
 }
 
 func (SyncStatus) Type() protoreflect.EnumType {
-	return &file_aster_application_v1alpha1_aster_proto_enumTypes[7]
+	return &file_aster_application_v1alpha1_aster_proto_enumTypes[5]
 }
 
 func (x SyncStatus) Number() protoreflect.EnumNumber {
@@ -497,7 +393,7 @@ func (x SyncStatus) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SyncStatus.Descriptor instead.
 func (SyncStatus) EnumDescriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{7}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{5}
 }
 
 type PeerAuthorization int32
@@ -533,11 +429,11 @@ func (x PeerAuthorization) String() string {
 }
 
 func (PeerAuthorization) Descriptor() protoreflect.EnumDescriptor {
-	return file_aster_application_v1alpha1_aster_proto_enumTypes[8].Descriptor()
+	return file_aster_application_v1alpha1_aster_proto_enumTypes[6].Descriptor()
 }
 
 func (PeerAuthorization) Type() protoreflect.EnumType {
-	return &file_aster_application_v1alpha1_aster_proto_enumTypes[8]
+	return &file_aster_application_v1alpha1_aster_proto_enumTypes[6]
 }
 
 func (x PeerAuthorization) Number() protoreflect.EnumNumber {
@@ -546,7 +442,7 @@ func (x PeerAuthorization) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use PeerAuthorization.Descriptor instead.
 func (PeerAuthorization) EnumDescriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{8}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{6}
 }
 
 type ContactStatus int32
@@ -585,11 +481,11 @@ func (x ContactStatus) String() string {
 }
 
 func (ContactStatus) Descriptor() protoreflect.EnumDescriptor {
-	return file_aster_application_v1alpha1_aster_proto_enumTypes[9].Descriptor()
+	return file_aster_application_v1alpha1_aster_proto_enumTypes[7].Descriptor()
 }
 
 func (ContactStatus) Type() protoreflect.EnumType {
-	return &file_aster_application_v1alpha1_aster_proto_enumTypes[9]
+	return &file_aster_application_v1alpha1_aster_proto_enumTypes[7]
 }
 
 func (x ContactStatus) Number() protoreflect.EnumNumber {
@@ -598,7 +494,7 @@ func (x ContactStatus) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use ContactStatus.Descriptor instead.
 func (ContactStatus) EnumDescriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{9}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{7}
 }
 
 type CommittedContentStatus int32
@@ -634,11 +530,11 @@ func (x CommittedContentStatus) String() string {
 }
 
 func (CommittedContentStatus) Descriptor() protoreflect.EnumDescriptor {
-	return file_aster_application_v1alpha1_aster_proto_enumTypes[10].Descriptor()
+	return file_aster_application_v1alpha1_aster_proto_enumTypes[8].Descriptor()
 }
 
 func (CommittedContentStatus) Type() protoreflect.EnumType {
-	return &file_aster_application_v1alpha1_aster_proto_enumTypes[10]
+	return &file_aster_application_v1alpha1_aster_proto_enumTypes[8]
 }
 
 func (x CommittedContentStatus) Number() protoreflect.EnumNumber {
@@ -647,7 +543,7 @@ func (x CommittedContentStatus) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use CommittedContentStatus.Descriptor instead.
 func (CommittedContentStatus) EnumDescriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{10}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{8}
 }
 
 type RetirementReason int32
@@ -683,11 +579,11 @@ func (x RetirementReason) String() string {
 }
 
 func (RetirementReason) Descriptor() protoreflect.EnumDescriptor {
-	return file_aster_application_v1alpha1_aster_proto_enumTypes[11].Descriptor()
+	return file_aster_application_v1alpha1_aster_proto_enumTypes[9].Descriptor()
 }
 
 func (RetirementReason) Type() protoreflect.EnumType {
-	return &file_aster_application_v1alpha1_aster_proto_enumTypes[11]
+	return &file_aster_application_v1alpha1_aster_proto_enumTypes[9]
 }
 
 func (x RetirementReason) Number() protoreflect.EnumNumber {
@@ -696,7 +592,7 @@ func (x RetirementReason) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use RetirementReason.Descriptor instead.
 func (RetirementReason) EnumDescriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{11}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{9}
 }
 
 type BlobPublicationPhase int32
@@ -744,11 +640,11 @@ func (x BlobPublicationPhase) String() string {
 }
 
 func (BlobPublicationPhase) Descriptor() protoreflect.EnumDescriptor {
-	return file_aster_application_v1alpha1_aster_proto_enumTypes[12].Descriptor()
+	return file_aster_application_v1alpha1_aster_proto_enumTypes[10].Descriptor()
 }
 
 func (BlobPublicationPhase) Type() protoreflect.EnumType {
-	return &file_aster_application_v1alpha1_aster_proto_enumTypes[12]
+	return &file_aster_application_v1alpha1_aster_proto_enumTypes[10]
 }
 
 func (x BlobPublicationPhase) Number() protoreflect.EnumNumber {
@@ -757,7 +653,7 @@ func (x BlobPublicationPhase) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use BlobPublicationPhase.Descriptor instead.
 func (BlobPublicationPhase) EnumDescriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{12}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{10}
 }
 
 type PublicErrorDetail struct {
@@ -2270,28 +2166,23 @@ func (x *StoreCapacityStatus) GetPayloadByteLimit() uint64 {
 }
 
 type PublishOperationCapacityStatus struct {
-	state                        protoimpl.MessageState      `protogen:"open.v1"`
-	Rows                         uint64                      `protobuf:"varint,1,opt,name=rows,proto3" json:"rows,omitempty"`
-	Bytes                        uint64                      `protobuf:"varint,2,opt,name=bytes,proto3" json:"bytes,omitempty"`
-	RowHardLimit                 uint64                      `protobuf:"varint,3,opt,name=row_hard_limit,json=rowHardLimit,proto3" json:"row_hard_limit,omitempty"`
-	ByteHardLimit                uint64                      `protobuf:"varint,4,opt,name=byte_hard_limit,json=byteHardLimit,proto3" json:"byte_hard_limit,omitempty"`
-	ProfileBoundary              uint64                      `protobuf:"varint,5,opt,name=profile_boundary,json=profileBoundary,proto3" json:"profile_boundary,omitempty"`
-	ProfileRemaining             uint64                      `protobuf:"varint,6,opt,name=profile_remaining,json=profileRemaining,proto3" json:"profile_remaining,omitempty"`
-	ProfileWarning               bool                        `protobuf:"varint,7,opt,name=profile_warning,json=profileWarning,proto3" json:"profile_warning,omitempty"`
-	ProfileExhausted             bool                        `protobuf:"varint,8,opt,name=profile_exhausted,json=profileExhausted,proto3" json:"profile_exhausted,omitempty"`
-	ActiveRows                   uint64                      `protobuf:"varint,9,opt,name=active_rows,json=activeRows,proto3" json:"active_rows,omitempty"`
-	RetiredRows                  uint64                      `protobuf:"varint,10,opt,name=retired_rows,json=retiredRows,proto3" json:"retired_rows,omitempty"`
-	ReverseRows                  uint64                      `protobuf:"varint,11,opt,name=reverse_rows,json=reverseRows,proto3" json:"reverse_rows,omitempty"`
-	OrdinaryRemaining            uint64                      `protobuf:"varint,12,opt,name=ordinary_remaining,json=ordinaryRemaining,proto3" json:"ordinary_remaining,omitempty"`
-	EmergencyRemaining           uint64                      `protobuf:"varint,13,opt,name=emergency_remaining,json=emergencyRemaining,proto3" json:"emergency_remaining,omitempty"`
-	RollingAcceptRate            float64                     `protobuf:"fixed64,14,opt,name=rolling_accept_rate,json=rollingAcceptRate,proto3" json:"rolling_accept_rate,omitempty"`
-	EstimatedSecondsToExhaustion uint64                      `protobuf:"varint,15,opt,name=estimated_seconds_to_exhaustion,json=estimatedSecondsToExhaustion,proto3" json:"estimated_seconds_to_exhaustion,omitempty"`
-	WarningState                 OperationCapacityWarning    `protobuf:"varint,16,opt,name=warning_state,json=warningState,proto3,enum=aster.application.v1alpha1.OperationCapacityWarning" json:"warning_state,omitempty"`
-	Audit                        *OperationLedgerAuditStatus `protobuf:"bytes,17,opt,name=audit,proto3" json:"audit,omitempty"`
-	LedgerMode                   PublishOperationLedgerMode  `protobuf:"varint,18,opt,name=ledger_mode,json=ledgerMode,proto3,enum=aster.application.v1alpha1.PublishOperationLedgerMode" json:"ledger_mode,omitempty"`
-	NumberedClients              uint64                      `protobuf:"varint,19,opt,name=numbered_clients,json=numberedClients,proto3" json:"numbered_clients,omitempty"`
-	NumberedOutstandingResults   uint64                      `protobuf:"varint,20,opt,name=numbered_outstanding_results,json=numberedOutstandingResults,proto3" json:"numbered_outstanding_results,omitempty"`
-	NumberedReverseRows          uint64                      `protobuf:"varint,21,opt,name=numbered_reverse_rows,json=numberedReverseRows,proto3" json:"numbered_reverse_rows,omitempty"`
+	state                        protoimpl.MessageState   `protogen:"open.v1"`
+	Rows                         uint64                   `protobuf:"varint,1,opt,name=rows,proto3" json:"rows,omitempty"`
+	Bytes                        uint64                   `protobuf:"varint,2,opt,name=bytes,proto3" json:"bytes,omitempty"`
+	RowHardLimit                 uint64                   `protobuf:"varint,3,opt,name=row_hard_limit,json=rowHardLimit,proto3" json:"row_hard_limit,omitempty"`
+	ByteHardLimit                uint64                   `protobuf:"varint,4,opt,name=byte_hard_limit,json=byteHardLimit,proto3" json:"byte_hard_limit,omitempty"`
+	ProfileBoundary              uint64                   `protobuf:"varint,5,opt,name=profile_boundary,json=profileBoundary,proto3" json:"profile_boundary,omitempty"`
+	ProfileRemaining             uint64                   `protobuf:"varint,6,opt,name=profile_remaining,json=profileRemaining,proto3" json:"profile_remaining,omitempty"`
+	ProfileWarning               bool                     `protobuf:"varint,7,opt,name=profile_warning,json=profileWarning,proto3" json:"profile_warning,omitempty"`
+	ProfileExhausted             bool                     `protobuf:"varint,8,opt,name=profile_exhausted,json=profileExhausted,proto3" json:"profile_exhausted,omitempty"`
+	OrdinaryRemaining            uint64                   `protobuf:"varint,12,opt,name=ordinary_remaining,json=ordinaryRemaining,proto3" json:"ordinary_remaining,omitempty"`
+	EmergencyRemaining           uint64                   `protobuf:"varint,13,opt,name=emergency_remaining,json=emergencyRemaining,proto3" json:"emergency_remaining,omitempty"`
+	RollingAcceptRate            float64                  `protobuf:"fixed64,14,opt,name=rolling_accept_rate,json=rollingAcceptRate,proto3" json:"rolling_accept_rate,omitempty"`
+	EstimatedSecondsToExhaustion uint64                   `protobuf:"varint,15,opt,name=estimated_seconds_to_exhaustion,json=estimatedSecondsToExhaustion,proto3" json:"estimated_seconds_to_exhaustion,omitempty"`
+	WarningState                 OperationCapacityWarning `protobuf:"varint,16,opt,name=warning_state,json=warningState,proto3,enum=aster.application.v1alpha1.OperationCapacityWarning" json:"warning_state,omitempty"`
+	NumberedClients              uint64                   `protobuf:"varint,19,opt,name=numbered_clients,json=numberedClients,proto3" json:"numbered_clients,omitempty"`
+	NumberedOutstandingResults   uint64                   `protobuf:"varint,20,opt,name=numbered_outstanding_results,json=numberedOutstandingResults,proto3" json:"numbered_outstanding_results,omitempty"`
+	NumberedReverseRows          uint64                   `protobuf:"varint,21,opt,name=numbered_reverse_rows,json=numberedReverseRows,proto3" json:"numbered_reverse_rows,omitempty"`
 	unknownFields                protoimpl.UnknownFields
 	sizeCache                    protoimpl.SizeCache
 }
@@ -2382,27 +2273,6 @@ func (x *PublishOperationCapacityStatus) GetProfileExhausted() bool {
 	return false
 }
 
-func (x *PublishOperationCapacityStatus) GetActiveRows() uint64 {
-	if x != nil {
-		return x.ActiveRows
-	}
-	return 0
-}
-
-func (x *PublishOperationCapacityStatus) GetRetiredRows() uint64 {
-	if x != nil {
-		return x.RetiredRows
-	}
-	return 0
-}
-
-func (x *PublishOperationCapacityStatus) GetReverseRows() uint64 {
-	if x != nil {
-		return x.ReverseRows
-	}
-	return 0
-}
-
 func (x *PublishOperationCapacityStatus) GetOrdinaryRemaining() uint64 {
 	if x != nil {
 		return x.OrdinaryRemaining
@@ -2438,20 +2308,6 @@ func (x *PublishOperationCapacityStatus) GetWarningState() OperationCapacityWarn
 	return OperationCapacityWarning_OPERATION_CAPACITY_WARNING_UNSPECIFIED
 }
 
-func (x *PublishOperationCapacityStatus) GetAudit() *OperationLedgerAuditStatus {
-	if x != nil {
-		return x.Audit
-	}
-	return nil
-}
-
-func (x *PublishOperationCapacityStatus) GetLedgerMode() PublishOperationLedgerMode {
-	if x != nil {
-		return x.LedgerMode
-	}
-	return PublishOperationLedgerMode_PUBLISH_OPERATION_LEDGER_MODE_UNSPECIFIED
-}
-
 func (x *PublishOperationCapacityStatus) GetNumberedClients() uint64 {
 	if x != nil {
 		return x.NumberedClients
@@ -2473,66 +2329,6 @@ func (x *PublishOperationCapacityStatus) GetNumberedReverseRows() uint64 {
 	return 0
 }
 
-type OperationLedgerAuditStatus struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	State         OperationLedgerAudit   `protobuf:"varint,1,opt,name=state,proto3,enum=aster.application.v1alpha1.OperationLedgerAudit" json:"state,omitempty"`
-	Scanned       uint64                 `protobuf:"varint,2,opt,name=scanned,proto3" json:"scanned,omitempty"`
-	Total         uint64                 `protobuf:"varint,3,opt,name=total,proto3" json:"total,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *OperationLedgerAuditStatus) Reset() {
-	*x = OperationLedgerAuditStatus{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[21]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *OperationLedgerAuditStatus) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*OperationLedgerAuditStatus) ProtoMessage() {}
-
-func (x *OperationLedgerAuditStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[21]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use OperationLedgerAuditStatus.ProtoReflect.Descriptor instead.
-func (*OperationLedgerAuditStatus) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{21}
-}
-
-func (x *OperationLedgerAuditStatus) GetState() OperationLedgerAudit {
-	if x != nil {
-		return x.State
-	}
-	return OperationLedgerAudit_OPERATION_LEDGER_AUDIT_UNSPECIFIED
-}
-
-func (x *OperationLedgerAuditStatus) GetScanned() uint64 {
-	if x != nil {
-		return x.Scanned
-	}
-	return 0
-}
-
-func (x *OperationLedgerAuditStatus) GetTotal() uint64 {
-	if x != nil {
-		return x.Total
-	}
-	return 0
-}
-
 type DeliveryCapacityStatus struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	Pending          uint64                 `protobuf:"varint,1,opt,name=pending,proto3" json:"pending,omitempty"`
@@ -2545,7 +2341,7 @@ type DeliveryCapacityStatus struct {
 
 func (x *DeliveryCapacityStatus) Reset() {
 	*x = DeliveryCapacityStatus{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[22]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2557,7 +2353,7 @@ func (x *DeliveryCapacityStatus) String() string {
 func (*DeliveryCapacityStatus) ProtoMessage() {}
 
 func (x *DeliveryCapacityStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[22]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2570,7 +2366,7 @@ func (x *DeliveryCapacityStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeliveryCapacityStatus.ProtoReflect.Descriptor instead.
 func (*DeliveryCapacityStatus) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{22}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *DeliveryCapacityStatus) GetPending() uint64 {
@@ -2613,7 +2409,7 @@ type PeerStatus struct {
 
 func (x *PeerStatus) Reset() {
 	*x = PeerStatus{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[23]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2625,7 +2421,7 @@ func (x *PeerStatus) String() string {
 func (*PeerStatus) ProtoMessage() {}
 
 func (x *PeerStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[23]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2638,7 +2434,7 @@ func (x *PeerStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeerStatus.ProtoReflect.Descriptor instead.
 func (*PeerStatus) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{23}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *PeerStatus) GetPeer() []byte {
@@ -2678,7 +2474,7 @@ type PublishNumberedEventsRequest struct {
 
 func (x *PublishNumberedEventsRequest) Reset() {
 	*x = PublishNumberedEventsRequest{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[24]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2690,7 +2486,7 @@ func (x *PublishNumberedEventsRequest) String() string {
 func (*PublishNumberedEventsRequest) ProtoMessage() {}
 
 func (x *PublishNumberedEventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[24]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2703,7 +2499,7 @@ func (x *PublishNumberedEventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PublishNumberedEventsRequest.ProtoReflect.Descriptor instead.
 func (*PublishNumberedEventsRequest) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{24}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *PublishNumberedEventsRequest) GetPublication() *PublishNumberedEventRequest {
@@ -2726,7 +2522,7 @@ type PublishNumberedEventsResponse struct {
 
 func (x *PublishNumberedEventsResponse) Reset() {
 	*x = PublishNumberedEventsResponse{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[25]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2738,7 +2534,7 @@ func (x *PublishNumberedEventsResponse) String() string {
 func (*PublishNumberedEventsResponse) ProtoMessage() {}
 
 func (x *PublishNumberedEventsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[25]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2751,7 +2547,7 @@ func (x *PublishNumberedEventsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PublishNumberedEventsResponse.ProtoReflect.Descriptor instead.
 func (*PublishNumberedEventsResponse) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{25}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *PublishNumberedEventsResponse) GetOutcome() isPublishNumberedEventsResponse_Outcome {
@@ -2806,7 +2602,7 @@ type BeginEventPublicationSessionRequest struct {
 
 func (x *BeginEventPublicationSessionRequest) Reset() {
 	*x = BeginEventPublicationSessionRequest{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[26]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2818,7 +2614,7 @@ func (x *BeginEventPublicationSessionRequest) String() string {
 func (*BeginEventPublicationSessionRequest) ProtoMessage() {}
 
 func (x *BeginEventPublicationSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[26]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2831,7 +2627,7 @@ func (x *BeginEventPublicationSessionRequest) ProtoReflect() protoreflect.Messag
 
 // Deprecated: Use BeginEventPublicationSessionRequest.ProtoReflect.Descriptor instead.
 func (*BeginEventPublicationSessionRequest) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{26}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *BeginEventPublicationSessionRequest) GetClientId() []byte {
@@ -2867,7 +2663,7 @@ type BeginEventPublicationSessionResponse struct {
 
 func (x *BeginEventPublicationSessionResponse) Reset() {
 	*x = BeginEventPublicationSessionResponse{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[27]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2879,7 +2675,7 @@ func (x *BeginEventPublicationSessionResponse) String() string {
 func (*BeginEventPublicationSessionResponse) ProtoMessage() {}
 
 func (x *BeginEventPublicationSessionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[27]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2892,7 +2688,7 @@ func (x *BeginEventPublicationSessionResponse) ProtoReflect() protoreflect.Messa
 
 // Deprecated: Use BeginEventPublicationSessionResponse.ProtoReflect.Descriptor instead.
 func (*BeginEventPublicationSessionResponse) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{27}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *BeginEventPublicationSessionResponse) GetSession() uint64 {
@@ -2934,7 +2730,7 @@ type CompleteEventPublicationRecoveryRequest struct {
 
 func (x *CompleteEventPublicationRecoveryRequest) Reset() {
 	*x = CompleteEventPublicationRecoveryRequest{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[28]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2946,7 +2742,7 @@ func (x *CompleteEventPublicationRecoveryRequest) String() string {
 func (*CompleteEventPublicationRecoveryRequest) ProtoMessage() {}
 
 func (x *CompleteEventPublicationRecoveryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[28]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2959,7 +2755,7 @@ func (x *CompleteEventPublicationRecoveryRequest) ProtoReflect() protoreflect.Me
 
 // Deprecated: Use CompleteEventPublicationRecoveryRequest.ProtoReflect.Descriptor instead.
 func (*CompleteEventPublicationRecoveryRequest) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{28}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *CompleteEventPublicationRecoveryRequest) GetClientId() []byte {
@@ -2991,7 +2787,7 @@ type CompleteEventPublicationRecoveryResponse struct {
 
 func (x *CompleteEventPublicationRecoveryResponse) Reset() {
 	*x = CompleteEventPublicationRecoveryResponse{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[29]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3003,7 +2799,7 @@ func (x *CompleteEventPublicationRecoveryResponse) String() string {
 func (*CompleteEventPublicationRecoveryResponse) ProtoMessage() {}
 
 func (x *CompleteEventPublicationRecoveryResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[29]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3016,7 +2812,7 @@ func (x *CompleteEventPublicationRecoveryResponse) ProtoReflect() protoreflect.M
 
 // Deprecated: Use CompleteEventPublicationRecoveryResponse.ProtoReflect.Descriptor instead.
 func (*CompleteEventPublicationRecoveryResponse) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{29}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{28}
 }
 
 type PublishNumberedEventRequest struct {
@@ -3038,7 +2834,7 @@ type PublishNumberedEventRequest struct {
 
 func (x *PublishNumberedEventRequest) Reset() {
 	*x = PublishNumberedEventRequest{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[30]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3050,7 +2846,7 @@ func (x *PublishNumberedEventRequest) String() string {
 func (*PublishNumberedEventRequest) ProtoMessage() {}
 
 func (x *PublishNumberedEventRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[30]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3063,7 +2859,7 @@ func (x *PublishNumberedEventRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PublishNumberedEventRequest.ProtoReflect.Descriptor instead.
 func (*PublishNumberedEventRequest) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{30}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *PublishNumberedEventRequest) GetClientId() []byte {
@@ -3153,7 +2949,7 @@ type PublishNumberedEventResponse struct {
 
 func (x *PublishNumberedEventResponse) Reset() {
 	*x = PublishNumberedEventResponse{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[31]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3165,7 +2961,7 @@ func (x *PublishNumberedEventResponse) String() string {
 func (*PublishNumberedEventResponse) ProtoMessage() {}
 
 func (x *PublishNumberedEventResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[31]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3178,7 +2974,7 @@ func (x *PublishNumberedEventResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PublishNumberedEventResponse.ProtoReflect.Descriptor instead.
 func (*PublishNumberedEventResponse) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{31}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *PublishNumberedEventResponse) GetResult() *CommittedPublicationResult {
@@ -3206,7 +3002,7 @@ type AbandonEventPublicationRequest struct {
 
 func (x *AbandonEventPublicationRequest) Reset() {
 	*x = AbandonEventPublicationRequest{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[32]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3218,7 +3014,7 @@ func (x *AbandonEventPublicationRequest) String() string {
 func (*AbandonEventPublicationRequest) ProtoMessage() {}
 
 func (x *AbandonEventPublicationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[32]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3231,7 +3027,7 @@ func (x *AbandonEventPublicationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AbandonEventPublicationRequest.ProtoReflect.Descriptor instead.
 func (*AbandonEventPublicationRequest) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{32}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *AbandonEventPublicationRequest) GetClientId() []byte {
@@ -3264,7 +3060,7 @@ type AbandonEventPublicationResponse struct {
 
 func (x *AbandonEventPublicationResponse) Reset() {
 	*x = AbandonEventPublicationResponse{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[33]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3276,7 +3072,7 @@ func (x *AbandonEventPublicationResponse) String() string {
 func (*AbandonEventPublicationResponse) ProtoMessage() {}
 
 func (x *AbandonEventPublicationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[33]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3289,7 +3085,7 @@ func (x *AbandonEventPublicationResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AbandonEventPublicationResponse.ProtoReflect.Descriptor instead.
 func (*AbandonEventPublicationResponse) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{33}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *AbandonEventPublicationResponse) GetAlreadyAbandoned() bool {
@@ -3310,7 +3106,7 @@ type AcknowledgeEventPublicationResultRequest struct {
 
 func (x *AcknowledgeEventPublicationResultRequest) Reset() {
 	*x = AcknowledgeEventPublicationResultRequest{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[34]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3322,7 +3118,7 @@ func (x *AcknowledgeEventPublicationResultRequest) String() string {
 func (*AcknowledgeEventPublicationResultRequest) ProtoMessage() {}
 
 func (x *AcknowledgeEventPublicationResultRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[34]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3335,7 +3131,7 @@ func (x *AcknowledgeEventPublicationResultRequest) ProtoReflect() protoreflect.M
 
 // Deprecated: Use AcknowledgeEventPublicationResultRequest.ProtoReflect.Descriptor instead.
 func (*AcknowledgeEventPublicationResultRequest) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{34}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *AcknowledgeEventPublicationResultRequest) GetClientId() []byte {
@@ -3368,7 +3164,7 @@ type AcknowledgeEventPublicationResultResponse struct {
 
 func (x *AcknowledgeEventPublicationResultResponse) Reset() {
 	*x = AcknowledgeEventPublicationResultResponse{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[35]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3380,7 +3176,7 @@ func (x *AcknowledgeEventPublicationResultResponse) String() string {
 func (*AcknowledgeEventPublicationResultResponse) ProtoMessage() {}
 
 func (x *AcknowledgeEventPublicationResultResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[35]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3393,7 +3189,7 @@ func (x *AcknowledgeEventPublicationResultResponse) ProtoReflect() protoreflect.
 
 // Deprecated: Use AcknowledgeEventPublicationResultResponse.ProtoReflect.Descriptor instead.
 func (*AcknowledgeEventPublicationResultResponse) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{35}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *AcknowledgeEventPublicationResultResponse) GetAlreadyAcknowledged() bool {
@@ -3415,7 +3211,7 @@ type CommittedPublicationResult struct {
 
 func (x *CommittedPublicationResult) Reset() {
 	*x = CommittedPublicationResult{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[36]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3427,7 +3223,7 @@ func (x *CommittedPublicationResult) String() string {
 func (*CommittedPublicationResult) ProtoMessage() {}
 
 func (x *CommittedPublicationResult) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[36]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3440,7 +3236,7 @@ func (x *CommittedPublicationResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommittedPublicationResult.ProtoReflect.Descriptor instead.
 func (*CommittedPublicationResult) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{36}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *CommittedPublicationResult) GetOperationSequence() uint64 {
@@ -3482,7 +3278,7 @@ type CommittedEventReceipt struct {
 
 func (x *CommittedEventReceipt) Reset() {
 	*x = CommittedEventReceipt{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[37]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3494,7 +3290,7 @@ func (x *CommittedEventReceipt) String() string {
 func (*CommittedEventReceipt) ProtoMessage() {}
 
 func (x *CommittedEventReceipt) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[37]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3507,7 +3303,7 @@ func (x *CommittedEventReceipt) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommittedEventReceipt.ProtoReflect.Descriptor instead.
 func (*CommittedEventReceipt) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{37}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *CommittedEventReceipt) GetTransferId() []byte {
@@ -3548,7 +3344,7 @@ type QueryEventsRequest struct {
 
 func (x *QueryEventsRequest) Reset() {
 	*x = QueryEventsRequest{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[38]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3560,7 +3356,7 @@ func (x *QueryEventsRequest) String() string {
 func (*QueryEventsRequest) ProtoMessage() {}
 
 func (x *QueryEventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[38]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3573,7 +3369,7 @@ func (x *QueryEventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use QueryEventsRequest.ProtoReflect.Descriptor instead.
 func (*QueryEventsRequest) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{38}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *QueryEventsRequest) GetPublisher() []byte {
@@ -3643,7 +3439,7 @@ type QueryEventsResponse struct {
 
 func (x *QueryEventsResponse) Reset() {
 	*x = QueryEventsResponse{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[39]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3655,7 +3451,7 @@ func (x *QueryEventsResponse) String() string {
 func (*QueryEventsResponse) ProtoMessage() {}
 
 func (x *QueryEventsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[39]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3668,7 +3464,7 @@ func (x *QueryEventsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use QueryEventsResponse.ProtoReflect.Descriptor instead.
 func (*QueryEventsResponse) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{39}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *QueryEventsResponse) GetEvents() []*Event {
@@ -3713,7 +3509,7 @@ type Event struct {
 
 func (x *Event) Reset() {
 	*x = Event{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[40]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3725,7 +3521,7 @@ func (x *Event) String() string {
 func (*Event) ProtoMessage() {}
 
 func (x *Event) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[40]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3738,7 +3534,7 @@ func (x *Event) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Event.ProtoReflect.Descriptor instead.
 func (*Event) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{40}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *Event) GetId() []byte {
@@ -3838,7 +3634,7 @@ type CreateEventSubscriptionRequest struct {
 
 func (x *CreateEventSubscriptionRequest) Reset() {
 	*x = CreateEventSubscriptionRequest{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[41]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3850,7 +3646,7 @@ func (x *CreateEventSubscriptionRequest) String() string {
 func (*CreateEventSubscriptionRequest) ProtoMessage() {}
 
 func (x *CreateEventSubscriptionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[41]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3863,7 +3659,7 @@ func (x *CreateEventSubscriptionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateEventSubscriptionRequest.ProtoReflect.Descriptor instead.
 func (*CreateEventSubscriptionRequest) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{41}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *CreateEventSubscriptionRequest) GetClient() *EventClientContext {
@@ -3911,7 +3707,7 @@ type CreateEventSubscriptionResponse struct {
 
 func (x *CreateEventSubscriptionResponse) Reset() {
 	*x = CreateEventSubscriptionResponse{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[42]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3923,7 +3719,7 @@ func (x *CreateEventSubscriptionResponse) String() string {
 func (*CreateEventSubscriptionResponse) ProtoMessage() {}
 
 func (x *CreateEventSubscriptionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[42]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3936,7 +3732,7 @@ func (x *CreateEventSubscriptionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateEventSubscriptionResponse.ProtoReflect.Descriptor instead.
 func (*CreateEventSubscriptionResponse) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{42}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *CreateEventSubscriptionResponse) GetSubscriptionId() []byte {
@@ -3965,7 +3761,7 @@ type PollEventsRequest struct {
 
 func (x *PollEventsRequest) Reset() {
 	*x = PollEventsRequest{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[43]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3977,7 +3773,7 @@ func (x *PollEventsRequest) String() string {
 func (*PollEventsRequest) ProtoMessage() {}
 
 func (x *PollEventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[43]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3990,7 +3786,7 @@ func (x *PollEventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PollEventsRequest.ProtoReflect.Descriptor instead.
 func (*PollEventsRequest) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{43}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *PollEventsRequest) GetClient() *EventClientContext {
@@ -4031,7 +3827,7 @@ type PollEventsResponse struct {
 
 func (x *PollEventsResponse) Reset() {
 	*x = PollEventsResponse{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[44]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4043,7 +3839,7 @@ func (x *PollEventsResponse) String() string {
 func (*PollEventsResponse) ProtoMessage() {}
 
 func (x *PollEventsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[44]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4056,7 +3852,7 @@ func (x *PollEventsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PollEventsResponse.ProtoReflect.Descriptor instead.
 func (*PollEventsResponse) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{44}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *PollEventsResponse) GetDeliveries() []*EventDelivery {
@@ -4087,7 +3883,7 @@ type StreamEventsRequest struct {
 
 func (x *StreamEventsRequest) Reset() {
 	*x = StreamEventsRequest{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[45]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4099,7 +3895,7 @@ func (x *StreamEventsRequest) String() string {
 func (*StreamEventsRequest) ProtoMessage() {}
 
 func (x *StreamEventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[45]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4112,7 +3908,7 @@ func (x *StreamEventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamEventsRequest.ProtoReflect.Descriptor instead.
 func (*StreamEventsRequest) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{45}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *StreamEventsRequest) GetClient() *EventClientContext {
@@ -4160,7 +3956,7 @@ type StreamEventsResponse struct {
 
 func (x *StreamEventsResponse) Reset() {
 	*x = StreamEventsResponse{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[46]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4172,7 +3968,7 @@ func (x *StreamEventsResponse) String() string {
 func (*StreamEventsResponse) ProtoMessage() {}
 
 func (x *StreamEventsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[46]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4185,7 +3981,7 @@ func (x *StreamEventsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamEventsResponse.ProtoReflect.Descriptor instead.
 func (*StreamEventsResponse) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{46}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *StreamEventsResponse) GetEvent() *Event {
@@ -4212,7 +4008,7 @@ type EventDelivery struct {
 
 func (x *EventDelivery) Reset() {
 	*x = EventDelivery{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[47]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4224,7 +4020,7 @@ func (x *EventDelivery) String() string {
 func (*EventDelivery) ProtoMessage() {}
 
 func (x *EventDelivery) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[47]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4237,7 +4033,7 @@ func (x *EventDelivery) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EventDelivery.ProtoReflect.Descriptor instead.
 func (*EventDelivery) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{47}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *EventDelivery) GetEvent() *Event {
@@ -4265,7 +4061,7 @@ type AcknowledgeEventRequest struct {
 
 func (x *AcknowledgeEventRequest) Reset() {
 	*x = AcknowledgeEventRequest{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[48]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4277,7 +4073,7 @@ func (x *AcknowledgeEventRequest) String() string {
 func (*AcknowledgeEventRequest) ProtoMessage() {}
 
 func (x *AcknowledgeEventRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[48]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4290,7 +4086,7 @@ func (x *AcknowledgeEventRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AcknowledgeEventRequest.ProtoReflect.Descriptor instead.
 func (*AcknowledgeEventRequest) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{48}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *AcknowledgeEventRequest) GetClient() *EventClientContext {
@@ -4323,7 +4119,7 @@ type AcknowledgeEventResponse struct {
 
 func (x *AcknowledgeEventResponse) Reset() {
 	*x = AcknowledgeEventResponse{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[49]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4335,7 +4131,7 @@ func (x *AcknowledgeEventResponse) String() string {
 func (*AcknowledgeEventResponse) ProtoMessage() {}
 
 func (x *AcknowledgeEventResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[49]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4348,7 +4144,7 @@ func (x *AcknowledgeEventResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AcknowledgeEventResponse.ProtoReflect.Descriptor instead.
 func (*AcknowledgeEventResponse) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{49}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *AcknowledgeEventResponse) GetAlreadyAcknowledged() bool {
@@ -4368,7 +4164,7 @@ type DeleteEventSubscriptionRequest struct {
 
 func (x *DeleteEventSubscriptionRequest) Reset() {
 	*x = DeleteEventSubscriptionRequest{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[50]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4380,7 +4176,7 @@ func (x *DeleteEventSubscriptionRequest) String() string {
 func (*DeleteEventSubscriptionRequest) ProtoMessage() {}
 
 func (x *DeleteEventSubscriptionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[50]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4393,7 +4189,7 @@ func (x *DeleteEventSubscriptionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteEventSubscriptionRequest.ProtoReflect.Descriptor instead.
 func (*DeleteEventSubscriptionRequest) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{50}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *DeleteEventSubscriptionRequest) GetClient() *EventClientContext {
@@ -4419,7 +4215,7 @@ type DeleteEventSubscriptionResponse struct {
 
 func (x *DeleteEventSubscriptionResponse) Reset() {
 	*x = DeleteEventSubscriptionResponse{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[51]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4431,7 +4227,7 @@ func (x *DeleteEventSubscriptionResponse) String() string {
 func (*DeleteEventSubscriptionResponse) ProtoMessage() {}
 
 func (x *DeleteEventSubscriptionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[51]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4444,7 +4240,7 @@ func (x *DeleteEventSubscriptionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteEventSubscriptionResponse.ProtoReflect.Descriptor instead.
 func (*DeleteEventSubscriptionResponse) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{51}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{50}
 }
 
 func (x *DeleteEventSubscriptionResponse) GetAlreadyAbsent() bool {
@@ -4467,7 +4263,7 @@ type QueryEventGapsRequest struct {
 
 func (x *QueryEventGapsRequest) Reset() {
 	*x = QueryEventGapsRequest{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[52]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4479,7 +4275,7 @@ func (x *QueryEventGapsRequest) String() string {
 func (*QueryEventGapsRequest) ProtoMessage() {}
 
 func (x *QueryEventGapsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[52]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4492,7 +4288,7 @@ func (x *QueryEventGapsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use QueryEventGapsRequest.ProtoReflect.Descriptor instead.
 func (*QueryEventGapsRequest) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{52}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{51}
 }
 
 func (x *QueryEventGapsRequest) GetPublisher() []byte {
@@ -4541,7 +4337,7 @@ type QueryEventGapsResponse struct {
 
 func (x *QueryEventGapsResponse) Reset() {
 	*x = QueryEventGapsResponse{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[53]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4553,7 +4349,7 @@ func (x *QueryEventGapsResponse) String() string {
 func (*QueryEventGapsResponse) ProtoMessage() {}
 
 func (x *QueryEventGapsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[53]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4566,7 +4362,7 @@ func (x *QueryEventGapsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use QueryEventGapsResponse.ProtoReflect.Descriptor instead.
 func (*QueryEventGapsResponse) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{53}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{52}
 }
 
 func (x *QueryEventGapsResponse) GetGaps() []*EventGap {
@@ -4603,7 +4399,7 @@ type EventGap struct {
 
 func (x *EventGap) Reset() {
 	*x = EventGap{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[54]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[53]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4615,7 +4411,7 @@ func (x *EventGap) String() string {
 func (*EventGap) ProtoMessage() {}
 
 func (x *EventGap) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[54]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[53]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4628,7 +4424,7 @@ func (x *EventGap) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EventGap.ProtoReflect.Descriptor instead.
 func (*EventGap) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{54}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{53}
 }
 
 func (x *EventGap) GetPublisher() []byte {
@@ -4677,7 +4473,7 @@ type InspectBlobPublicationRequest struct {
 
 func (x *InspectBlobPublicationRequest) Reset() {
 	*x = InspectBlobPublicationRequest{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[55]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[54]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4689,7 +4485,7 @@ func (x *InspectBlobPublicationRequest) String() string {
 func (*InspectBlobPublicationRequest) ProtoMessage() {}
 
 func (x *InspectBlobPublicationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[55]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[54]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4702,7 +4498,7 @@ func (x *InspectBlobPublicationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InspectBlobPublicationRequest.ProtoReflect.Descriptor instead.
 func (*InspectBlobPublicationRequest) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{55}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{54}
 }
 
 func (x *InspectBlobPublicationRequest) GetPublicationId() []byte {
@@ -4743,7 +4539,7 @@ type InspectBlobPublicationResponse struct {
 
 func (x *InspectBlobPublicationResponse) Reset() {
 	*x = InspectBlobPublicationResponse{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[56]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[55]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4755,7 +4551,7 @@ func (x *InspectBlobPublicationResponse) String() string {
 func (*InspectBlobPublicationResponse) ProtoMessage() {}
 
 func (x *InspectBlobPublicationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[56]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[55]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4768,7 +4564,7 @@ func (x *InspectBlobPublicationResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InspectBlobPublicationResponse.ProtoReflect.Descriptor instead.
 func (*InspectBlobPublicationResponse) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{56}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{55}
 }
 
 func (x *InspectBlobPublicationResponse) GetPublicationId() []byte {
@@ -4853,7 +4649,7 @@ type BlobCapacityStatus struct {
 
 func (x *BlobCapacityStatus) Reset() {
 	*x = BlobCapacityStatus{}
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[57]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[56]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4865,7 +4661,7 @@ func (x *BlobCapacityStatus) String() string {
 func (*BlobCapacityStatus) ProtoMessage() {}
 
 func (x *BlobCapacityStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[57]
+	mi := &file_aster_application_v1alpha1_aster_proto_msgTypes[56]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4878,7 +4674,7 @@ func (x *BlobCapacityStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BlobCapacityStatus.ProtoReflect.Descriptor instead.
 func (*BlobCapacityStatus) Descriptor() ([]byte, []int) {
-	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{57}
+	return file_aster_application_v1alpha1_aster_proto_rawDescGZIP(), []int{56}
 }
 
 func (x *BlobCapacityStatus) GetReservedBytes() uint64 {
@@ -5090,7 +4886,7 @@ const file_aster_application_v1alpha1_aster_proto_rawDesc = "" +
 	"\n" +
 	"item_limit\x18\x02 \x01(\x04R\titemLimit\x12#\n" +
 	"\rpayload_bytes\x18\x03 \x01(\x04R\fpayloadBytes\x12,\n" +
-	"\x12payload_byte_limit\x18\x04 \x01(\x04R\x10payloadByteLimit\"\xa7\b\n" +
+	"\x12payload_byte_limit\x18\x04 \x01(\x04R\x10payloadByteLimit\"\xf4\x06\n" +
 	"\x1ePublishOperationCapacityStatus\x12\x12\n" +
 	"\x04rows\x18\x01 \x01(\x04R\x04rows\x12\x14\n" +
 	"\x05bytes\x18\x02 \x01(\x04R\x05bytes\x12$\n" +
@@ -5099,27 +4895,17 @@ const file_aster_application_v1alpha1_aster_proto_rawDesc = "" +
 	"\x10profile_boundary\x18\x05 \x01(\x04R\x0fprofileBoundary\x12+\n" +
 	"\x11profile_remaining\x18\x06 \x01(\x04R\x10profileRemaining\x12'\n" +
 	"\x0fprofile_warning\x18\a \x01(\bR\x0eprofileWarning\x12+\n" +
-	"\x11profile_exhausted\x18\b \x01(\bR\x10profileExhausted\x12\x1f\n" +
-	"\vactive_rows\x18\t \x01(\x04R\n" +
-	"activeRows\x12!\n" +
-	"\fretired_rows\x18\n" +
-	" \x01(\x04R\vretiredRows\x12!\n" +
-	"\freverse_rows\x18\v \x01(\x04R\vreverseRows\x12-\n" +
+	"\x11profile_exhausted\x18\b \x01(\bR\x10profileExhausted\x12-\n" +
 	"\x12ordinary_remaining\x18\f \x01(\x04R\x11ordinaryRemaining\x12/\n" +
 	"\x13emergency_remaining\x18\r \x01(\x04R\x12emergencyRemaining\x12.\n" +
 	"\x13rolling_accept_rate\x18\x0e \x01(\x01R\x11rollingAcceptRate\x12E\n" +
 	"\x1festimated_seconds_to_exhaustion\x18\x0f \x01(\x04R\x1cestimatedSecondsToExhaustion\x12Y\n" +
-	"\rwarning_state\x18\x10 \x01(\x0e24.aster.application.v1alpha1.OperationCapacityWarningR\fwarningState\x12L\n" +
-	"\x05audit\x18\x11 \x01(\v26.aster.application.v1alpha1.OperationLedgerAuditStatusR\x05audit\x12W\n" +
-	"\vledger_mode\x18\x12 \x01(\x0e26.aster.application.v1alpha1.PublishOperationLedgerModeR\n" +
-	"ledgerMode\x12)\n" +
+	"\rwarning_state\x18\x10 \x01(\x0e24.aster.application.v1alpha1.OperationCapacityWarningR\fwarningState\x12)\n" +
 	"\x10numbered_clients\x18\x13 \x01(\x04R\x0fnumberedClients\x12@\n" +
 	"\x1cnumbered_outstanding_results\x18\x14 \x01(\x04R\x1anumberedOutstandingResults\x122\n" +
-	"\x15numbered_reverse_rows\x18\x15 \x01(\x04R\x13numberedReverseRows\"\x94\x01\n" +
-	"\x1aOperationLedgerAuditStatus\x12F\n" +
-	"\x05state\x18\x01 \x01(\x0e20.aster.application.v1alpha1.OperationLedgerAuditR\x05state\x12\x18\n" +
-	"\ascanned\x18\x02 \x01(\x04R\ascanned\x12\x14\n" +
-	"\x05total\x18\x03 \x01(\x04R\x05total\"\xa9\x01\n" +
+	"\x15numbered_reverse_rows\x18\x15 \x01(\x04R\x13numberedReverseRowsJ\x04\b\t\x10\n" +
+	"J\x04\b\n" +
+	"\x10\vJ\x04\b\v\x10\fJ\x04\b\x11\x10\x12J\x04\b\x12\x10\x13R\vactive_rowsR\fretired_rowsR\freverse_rowsR\x05auditR\vledger_mode\"\xa9\x01\n" +
 	"\x16DeliveryCapacityStatus\x12\x18\n" +
 	"\apending\x18\x01 \x01(\x04R\apending\x12)\n" +
 	"\x10profile_boundary\x18\x02 \x01(\x04R\x0fprofileBoundary\x12+\n" +
@@ -5355,23 +5141,13 @@ const file_aster_application_v1alpha1_aster_proto_rawDesc = "" +
 	"\fEmissionMode\x12\x1d\n" +
 	"\x19EMISSION_MODE_UNSPECIFIED\x10\x00\x12\x18\n" +
 	"\x14EMISSION_MODE_NORMAL\x10\x01\x12\x1e\n" +
-	"\x1aEMISSION_MODE_RECEIVE_ONLY\x10\x02*\xa1\x01\n" +
-	"\x1aPublishOperationLedgerMode\x12-\n" +
-	")PUBLISH_OPERATION_LEDGER_MODE_UNSPECIFIED\x10\x00\x12(\n" +
-	"$PUBLISH_OPERATION_LEDGER_MODE_LEGACY\x10\x01\x12*\n" +
-	"&PUBLISH_OPERATION_LEDGER_MODE_NUMBERED\x10\x02*\xe4\x01\n" +
+	"\x1aEMISSION_MODE_RECEIVE_ONLY\x10\x02*\xe4\x01\n" +
 	"\x18OperationCapacityWarning\x12*\n" +
 	"&OPERATION_CAPACITY_WARNING_UNSPECIFIED\x10\x00\x12!\n" +
 	"\x1dOPERATION_CAPACITY_WARNING_OK\x10\x01\x12&\n" +
 	"\"OPERATION_CAPACITY_WARNING_WARNING\x10\x02\x12'\n" +
 	"#OPERATION_CAPACITY_WARNING_CRITICAL\x10\x03\x12(\n" +
-	"$OPERATION_CAPACITY_WARNING_EXHAUSTED\x10\x04*\xce\x01\n" +
-	"\x14OperationLedgerAudit\x12&\n" +
-	"\"OPERATION_LEDGER_AUDIT_UNSPECIFIED\x10\x00\x12\"\n" +
-	"\x1eOPERATION_LEDGER_AUDIT_PENDING\x10\x01\x12\"\n" +
-	"\x1eOPERATION_LEDGER_AUDIT_RUNNING\x10\x02\x12#\n" +
-	"\x1fOPERATION_LEDGER_AUDIT_COMPLETE\x10\x03\x12!\n" +
-	"\x1dOPERATION_LEDGER_AUDIT_FAILED\x10\x04*}\n" +
+	"$OPERATION_CAPACITY_WARNING_EXHAUSTED\x10\x04*}\n" +
 	"\bPriority\x12\x18\n" +
 	"\x14PRIORITY_UNSPECIFIED\x10\x00\x12\x14\n" +
 	"\x10PRIORITY_ROUTINE\x10\x01\x12\x15\n" +
@@ -5448,172 +5224,166 @@ func file_aster_application_v1alpha1_aster_proto_rawDescGZIP() []byte {
 	return file_aster_application_v1alpha1_aster_proto_rawDescData
 }
 
-var file_aster_application_v1alpha1_aster_proto_enumTypes = make([]protoimpl.EnumInfo, 13)
-var file_aster_application_v1alpha1_aster_proto_msgTypes = make([]protoimpl.MessageInfo, 58)
+var file_aster_application_v1alpha1_aster_proto_enumTypes = make([]protoimpl.EnumInfo, 11)
+var file_aster_application_v1alpha1_aster_proto_msgTypes = make([]protoimpl.MessageInfo, 57)
 var file_aster_application_v1alpha1_aster_proto_goTypes = []any{
 	(PublicErrorReason)(0),                            // 0: aster.application.v1alpha1.PublicErrorReason
 	(EventClientDisposition)(0),                       // 1: aster.application.v1alpha1.EventClientDisposition
 	(EmissionMode)(0),                                 // 2: aster.application.v1alpha1.EmissionMode
-	(PublishOperationLedgerMode)(0),                   // 3: aster.application.v1alpha1.PublishOperationLedgerMode
-	(OperationCapacityWarning)(0),                     // 4: aster.application.v1alpha1.OperationCapacityWarning
-	(OperationLedgerAudit)(0),                         // 5: aster.application.v1alpha1.OperationLedgerAudit
-	(Priority)(0),                                     // 6: aster.application.v1alpha1.Priority
-	(SyncStatus)(0),                                   // 7: aster.application.v1alpha1.SyncStatus
-	(PeerAuthorization)(0),                            // 8: aster.application.v1alpha1.PeerAuthorization
-	(ContactStatus)(0),                                // 9: aster.application.v1alpha1.ContactStatus
-	(CommittedContentStatus)(0),                       // 10: aster.application.v1alpha1.CommittedContentStatus
-	(RetirementReason)(0),                             // 11: aster.application.v1alpha1.RetirementReason
-	(BlobPublicationPhase)(0),                         // 12: aster.application.v1alpha1.BlobPublicationPhase
-	(*PublicErrorDetail)(nil),                         // 13: aster.application.v1alpha1.PublicErrorDetail
-	(*PublishBlobMetadata)(nil),                       // 14: aster.application.v1alpha1.PublishBlobMetadata
-	(*PublishBlobRequest)(nil),                        // 15: aster.application.v1alpha1.PublishBlobRequest
-	(*PublishBlobData)(nil),                           // 16: aster.application.v1alpha1.PublishBlobData
-	(*PublishBlobFinish)(nil),                         // 17: aster.application.v1alpha1.PublishBlobFinish
-	(*PublishBlobAccepted)(nil),                       // 18: aster.application.v1alpha1.PublishBlobAccepted
-	(*PublishBlobCheckpoint)(nil),                     // 19: aster.application.v1alpha1.PublishBlobCheckpoint
-	(*PublishBlobReceipt)(nil),                        // 20: aster.application.v1alpha1.PublishBlobReceipt
-	(*PublishBlobResponse)(nil),                       // 21: aster.application.v1alpha1.PublishBlobResponse
-	(*ReadBlobRequest)(nil),                           // 22: aster.application.v1alpha1.ReadBlobRequest
-	(*ReadBlobResponse)(nil),                          // 23: aster.application.v1alpha1.ReadBlobResponse
-	(*EventClientContext)(nil),                        // 24: aster.application.v1alpha1.EventClientContext
-	(*GetEventClientStatusRequest)(nil),               // 25: aster.application.v1alpha1.GetEventClientStatusRequest
-	(*GetEventClientStatusResponse)(nil),              // 26: aster.application.v1alpha1.GetEventClientStatusResponse
-	(*ListEventSubscriptionsRequest)(nil),             // 27: aster.application.v1alpha1.ListEventSubscriptionsRequest
-	(*ListEventSubscriptionsResponse)(nil),            // 28: aster.application.v1alpha1.ListEventSubscriptionsResponse
-	(*EventSubscription)(nil),                         // 29: aster.application.v1alpha1.EventSubscription
-	(*GetStatusRequest)(nil),                          // 30: aster.application.v1alpha1.GetStatusRequest
-	(*GetStatusResponse)(nil),                         // 31: aster.application.v1alpha1.GetStatusResponse
-	(*StoreCapacityStatus)(nil),                       // 32: aster.application.v1alpha1.StoreCapacityStatus
-	(*PublishOperationCapacityStatus)(nil),            // 33: aster.application.v1alpha1.PublishOperationCapacityStatus
-	(*OperationLedgerAuditStatus)(nil),                // 34: aster.application.v1alpha1.OperationLedgerAuditStatus
-	(*DeliveryCapacityStatus)(nil),                    // 35: aster.application.v1alpha1.DeliveryCapacityStatus
-	(*PeerStatus)(nil),                                // 36: aster.application.v1alpha1.PeerStatus
-	(*PublishNumberedEventsRequest)(nil),              // 37: aster.application.v1alpha1.PublishNumberedEventsRequest
-	(*PublishNumberedEventsResponse)(nil),             // 38: aster.application.v1alpha1.PublishNumberedEventsResponse
-	(*BeginEventPublicationSessionRequest)(nil),       // 39: aster.application.v1alpha1.BeginEventPublicationSessionRequest
-	(*BeginEventPublicationSessionResponse)(nil),      // 40: aster.application.v1alpha1.BeginEventPublicationSessionResponse
-	(*CompleteEventPublicationRecoveryRequest)(nil),   // 41: aster.application.v1alpha1.CompleteEventPublicationRecoveryRequest
-	(*CompleteEventPublicationRecoveryResponse)(nil),  // 42: aster.application.v1alpha1.CompleteEventPublicationRecoveryResponse
-	(*PublishNumberedEventRequest)(nil),               // 43: aster.application.v1alpha1.PublishNumberedEventRequest
-	(*PublishNumberedEventResponse)(nil),              // 44: aster.application.v1alpha1.PublishNumberedEventResponse
-	(*AbandonEventPublicationRequest)(nil),            // 45: aster.application.v1alpha1.AbandonEventPublicationRequest
-	(*AbandonEventPublicationResponse)(nil),           // 46: aster.application.v1alpha1.AbandonEventPublicationResponse
-	(*AcknowledgeEventPublicationResultRequest)(nil),  // 47: aster.application.v1alpha1.AcknowledgeEventPublicationResultRequest
-	(*AcknowledgeEventPublicationResultResponse)(nil), // 48: aster.application.v1alpha1.AcknowledgeEventPublicationResultResponse
-	(*CommittedPublicationResult)(nil),                // 49: aster.application.v1alpha1.CommittedPublicationResult
-	(*CommittedEventReceipt)(nil),                     // 50: aster.application.v1alpha1.CommittedEventReceipt
-	(*QueryEventsRequest)(nil),                        // 51: aster.application.v1alpha1.QueryEventsRequest
-	(*QueryEventsResponse)(nil),                       // 52: aster.application.v1alpha1.QueryEventsResponse
-	(*Event)(nil),                                     // 53: aster.application.v1alpha1.Event
-	(*CreateEventSubscriptionRequest)(nil),            // 54: aster.application.v1alpha1.CreateEventSubscriptionRequest
-	(*CreateEventSubscriptionResponse)(nil),           // 55: aster.application.v1alpha1.CreateEventSubscriptionResponse
-	(*PollEventsRequest)(nil),                         // 56: aster.application.v1alpha1.PollEventsRequest
-	(*PollEventsResponse)(nil),                        // 57: aster.application.v1alpha1.PollEventsResponse
-	(*StreamEventsRequest)(nil),                       // 58: aster.application.v1alpha1.StreamEventsRequest
-	(*StreamEventsResponse)(nil),                      // 59: aster.application.v1alpha1.StreamEventsResponse
-	(*EventDelivery)(nil),                             // 60: aster.application.v1alpha1.EventDelivery
-	(*AcknowledgeEventRequest)(nil),                   // 61: aster.application.v1alpha1.AcknowledgeEventRequest
-	(*AcknowledgeEventResponse)(nil),                  // 62: aster.application.v1alpha1.AcknowledgeEventResponse
-	(*DeleteEventSubscriptionRequest)(nil),            // 63: aster.application.v1alpha1.DeleteEventSubscriptionRequest
-	(*DeleteEventSubscriptionResponse)(nil),           // 64: aster.application.v1alpha1.DeleteEventSubscriptionResponse
-	(*QueryEventGapsRequest)(nil),                     // 65: aster.application.v1alpha1.QueryEventGapsRequest
-	(*QueryEventGapsResponse)(nil),                    // 66: aster.application.v1alpha1.QueryEventGapsResponse
-	(*EventGap)(nil),                                  // 67: aster.application.v1alpha1.EventGap
-	(*InspectBlobPublicationRequest)(nil),             // 68: aster.application.v1alpha1.InspectBlobPublicationRequest
-	(*InspectBlobPublicationResponse)(nil),            // 69: aster.application.v1alpha1.InspectBlobPublicationResponse
-	(*BlobCapacityStatus)(nil),                        // 70: aster.application.v1alpha1.BlobCapacityStatus
+	(OperationCapacityWarning)(0),                     // 3: aster.application.v1alpha1.OperationCapacityWarning
+	(Priority)(0),                                     // 4: aster.application.v1alpha1.Priority
+	(SyncStatus)(0),                                   // 5: aster.application.v1alpha1.SyncStatus
+	(PeerAuthorization)(0),                            // 6: aster.application.v1alpha1.PeerAuthorization
+	(ContactStatus)(0),                                // 7: aster.application.v1alpha1.ContactStatus
+	(CommittedContentStatus)(0),                       // 8: aster.application.v1alpha1.CommittedContentStatus
+	(RetirementReason)(0),                             // 9: aster.application.v1alpha1.RetirementReason
+	(BlobPublicationPhase)(0),                         // 10: aster.application.v1alpha1.BlobPublicationPhase
+	(*PublicErrorDetail)(nil),                         // 11: aster.application.v1alpha1.PublicErrorDetail
+	(*PublishBlobMetadata)(nil),                       // 12: aster.application.v1alpha1.PublishBlobMetadata
+	(*PublishBlobRequest)(nil),                        // 13: aster.application.v1alpha1.PublishBlobRequest
+	(*PublishBlobData)(nil),                           // 14: aster.application.v1alpha1.PublishBlobData
+	(*PublishBlobFinish)(nil),                         // 15: aster.application.v1alpha1.PublishBlobFinish
+	(*PublishBlobAccepted)(nil),                       // 16: aster.application.v1alpha1.PublishBlobAccepted
+	(*PublishBlobCheckpoint)(nil),                     // 17: aster.application.v1alpha1.PublishBlobCheckpoint
+	(*PublishBlobReceipt)(nil),                        // 18: aster.application.v1alpha1.PublishBlobReceipt
+	(*PublishBlobResponse)(nil),                       // 19: aster.application.v1alpha1.PublishBlobResponse
+	(*ReadBlobRequest)(nil),                           // 20: aster.application.v1alpha1.ReadBlobRequest
+	(*ReadBlobResponse)(nil),                          // 21: aster.application.v1alpha1.ReadBlobResponse
+	(*EventClientContext)(nil),                        // 22: aster.application.v1alpha1.EventClientContext
+	(*GetEventClientStatusRequest)(nil),               // 23: aster.application.v1alpha1.GetEventClientStatusRequest
+	(*GetEventClientStatusResponse)(nil),              // 24: aster.application.v1alpha1.GetEventClientStatusResponse
+	(*ListEventSubscriptionsRequest)(nil),             // 25: aster.application.v1alpha1.ListEventSubscriptionsRequest
+	(*ListEventSubscriptionsResponse)(nil),            // 26: aster.application.v1alpha1.ListEventSubscriptionsResponse
+	(*EventSubscription)(nil),                         // 27: aster.application.v1alpha1.EventSubscription
+	(*GetStatusRequest)(nil),                          // 28: aster.application.v1alpha1.GetStatusRequest
+	(*GetStatusResponse)(nil),                         // 29: aster.application.v1alpha1.GetStatusResponse
+	(*StoreCapacityStatus)(nil),                       // 30: aster.application.v1alpha1.StoreCapacityStatus
+	(*PublishOperationCapacityStatus)(nil),            // 31: aster.application.v1alpha1.PublishOperationCapacityStatus
+	(*DeliveryCapacityStatus)(nil),                    // 32: aster.application.v1alpha1.DeliveryCapacityStatus
+	(*PeerStatus)(nil),                                // 33: aster.application.v1alpha1.PeerStatus
+	(*PublishNumberedEventsRequest)(nil),              // 34: aster.application.v1alpha1.PublishNumberedEventsRequest
+	(*PublishNumberedEventsResponse)(nil),             // 35: aster.application.v1alpha1.PublishNumberedEventsResponse
+	(*BeginEventPublicationSessionRequest)(nil),       // 36: aster.application.v1alpha1.BeginEventPublicationSessionRequest
+	(*BeginEventPublicationSessionResponse)(nil),      // 37: aster.application.v1alpha1.BeginEventPublicationSessionResponse
+	(*CompleteEventPublicationRecoveryRequest)(nil),   // 38: aster.application.v1alpha1.CompleteEventPublicationRecoveryRequest
+	(*CompleteEventPublicationRecoveryResponse)(nil),  // 39: aster.application.v1alpha1.CompleteEventPublicationRecoveryResponse
+	(*PublishNumberedEventRequest)(nil),               // 40: aster.application.v1alpha1.PublishNumberedEventRequest
+	(*PublishNumberedEventResponse)(nil),              // 41: aster.application.v1alpha1.PublishNumberedEventResponse
+	(*AbandonEventPublicationRequest)(nil),            // 42: aster.application.v1alpha1.AbandonEventPublicationRequest
+	(*AbandonEventPublicationResponse)(nil),           // 43: aster.application.v1alpha1.AbandonEventPublicationResponse
+	(*AcknowledgeEventPublicationResultRequest)(nil),  // 44: aster.application.v1alpha1.AcknowledgeEventPublicationResultRequest
+	(*AcknowledgeEventPublicationResultResponse)(nil), // 45: aster.application.v1alpha1.AcknowledgeEventPublicationResultResponse
+	(*CommittedPublicationResult)(nil),                // 46: aster.application.v1alpha1.CommittedPublicationResult
+	(*CommittedEventReceipt)(nil),                     // 47: aster.application.v1alpha1.CommittedEventReceipt
+	(*QueryEventsRequest)(nil),                        // 48: aster.application.v1alpha1.QueryEventsRequest
+	(*QueryEventsResponse)(nil),                       // 49: aster.application.v1alpha1.QueryEventsResponse
+	(*Event)(nil),                                     // 50: aster.application.v1alpha1.Event
+	(*CreateEventSubscriptionRequest)(nil),            // 51: aster.application.v1alpha1.CreateEventSubscriptionRequest
+	(*CreateEventSubscriptionResponse)(nil),           // 52: aster.application.v1alpha1.CreateEventSubscriptionResponse
+	(*PollEventsRequest)(nil),                         // 53: aster.application.v1alpha1.PollEventsRequest
+	(*PollEventsResponse)(nil),                        // 54: aster.application.v1alpha1.PollEventsResponse
+	(*StreamEventsRequest)(nil),                       // 55: aster.application.v1alpha1.StreamEventsRequest
+	(*StreamEventsResponse)(nil),                      // 56: aster.application.v1alpha1.StreamEventsResponse
+	(*EventDelivery)(nil),                             // 57: aster.application.v1alpha1.EventDelivery
+	(*AcknowledgeEventRequest)(nil),                   // 58: aster.application.v1alpha1.AcknowledgeEventRequest
+	(*AcknowledgeEventResponse)(nil),                  // 59: aster.application.v1alpha1.AcknowledgeEventResponse
+	(*DeleteEventSubscriptionRequest)(nil),            // 60: aster.application.v1alpha1.DeleteEventSubscriptionRequest
+	(*DeleteEventSubscriptionResponse)(nil),           // 61: aster.application.v1alpha1.DeleteEventSubscriptionResponse
+	(*QueryEventGapsRequest)(nil),                     // 62: aster.application.v1alpha1.QueryEventGapsRequest
+	(*QueryEventGapsResponse)(nil),                    // 63: aster.application.v1alpha1.QueryEventGapsResponse
+	(*EventGap)(nil),                                  // 64: aster.application.v1alpha1.EventGap
+	(*InspectBlobPublicationRequest)(nil),             // 65: aster.application.v1alpha1.InspectBlobPublicationRequest
+	(*InspectBlobPublicationResponse)(nil),            // 66: aster.application.v1alpha1.InspectBlobPublicationResponse
+	(*BlobCapacityStatus)(nil),                        // 67: aster.application.v1alpha1.BlobCapacityStatus
 }
 var file_aster_application_v1alpha1_aster_proto_depIdxs = []int32{
 	0,  // 0: aster.application.v1alpha1.PublicErrorDetail.reason:type_name -> aster.application.v1alpha1.PublicErrorReason
-	6,  // 1: aster.application.v1alpha1.PublishBlobMetadata.priority:type_name -> aster.application.v1alpha1.Priority
-	14, // 2: aster.application.v1alpha1.PublishBlobRequest.metadata:type_name -> aster.application.v1alpha1.PublishBlobMetadata
-	16, // 3: aster.application.v1alpha1.PublishBlobRequest.data:type_name -> aster.application.v1alpha1.PublishBlobData
-	17, // 4: aster.application.v1alpha1.PublishBlobRequest.finish:type_name -> aster.application.v1alpha1.PublishBlobFinish
-	6,  // 5: aster.application.v1alpha1.PublishBlobReceipt.priority:type_name -> aster.application.v1alpha1.Priority
-	18, // 6: aster.application.v1alpha1.PublishBlobResponse.accepted:type_name -> aster.application.v1alpha1.PublishBlobAccepted
-	19, // 7: aster.application.v1alpha1.PublishBlobResponse.checkpoint:type_name -> aster.application.v1alpha1.PublishBlobCheckpoint
-	20, // 8: aster.application.v1alpha1.PublishBlobResponse.complete:type_name -> aster.application.v1alpha1.PublishBlobReceipt
-	6,  // 9: aster.application.v1alpha1.ReadBlobResponse.priority:type_name -> aster.application.v1alpha1.Priority
+	4,  // 1: aster.application.v1alpha1.PublishBlobMetadata.priority:type_name -> aster.application.v1alpha1.Priority
+	12, // 2: aster.application.v1alpha1.PublishBlobRequest.metadata:type_name -> aster.application.v1alpha1.PublishBlobMetadata
+	14, // 3: aster.application.v1alpha1.PublishBlobRequest.data:type_name -> aster.application.v1alpha1.PublishBlobData
+	15, // 4: aster.application.v1alpha1.PublishBlobRequest.finish:type_name -> aster.application.v1alpha1.PublishBlobFinish
+	4,  // 5: aster.application.v1alpha1.PublishBlobReceipt.priority:type_name -> aster.application.v1alpha1.Priority
+	16, // 6: aster.application.v1alpha1.PublishBlobResponse.accepted:type_name -> aster.application.v1alpha1.PublishBlobAccepted
+	17, // 7: aster.application.v1alpha1.PublishBlobResponse.checkpoint:type_name -> aster.application.v1alpha1.PublishBlobCheckpoint
+	18, // 8: aster.application.v1alpha1.PublishBlobResponse.complete:type_name -> aster.application.v1alpha1.PublishBlobReceipt
+	4,  // 9: aster.application.v1alpha1.ReadBlobResponse.priority:type_name -> aster.application.v1alpha1.Priority
 	1,  // 10: aster.application.v1alpha1.GetEventClientStatusResponse.disposition:type_name -> aster.application.v1alpha1.EventClientDisposition
-	29, // 11: aster.application.v1alpha1.ListEventSubscriptionsResponse.subscriptions:type_name -> aster.application.v1alpha1.EventSubscription
-	7,  // 12: aster.application.v1alpha1.GetStatusResponse.sync:type_name -> aster.application.v1alpha1.SyncStatus
-	36, // 13: aster.application.v1alpha1.GetStatusResponse.peers:type_name -> aster.application.v1alpha1.PeerStatus
+	27, // 11: aster.application.v1alpha1.ListEventSubscriptionsResponse.subscriptions:type_name -> aster.application.v1alpha1.EventSubscription
+	5,  // 12: aster.application.v1alpha1.GetStatusResponse.sync:type_name -> aster.application.v1alpha1.SyncStatus
+	33, // 13: aster.application.v1alpha1.GetStatusResponse.peers:type_name -> aster.application.v1alpha1.PeerStatus
 	2,  // 14: aster.application.v1alpha1.GetStatusResponse.configured_emission_mode:type_name -> aster.application.v1alpha1.EmissionMode
 	2,  // 15: aster.application.v1alpha1.GetStatusResponse.effective_emission_mode:type_name -> aster.application.v1alpha1.EmissionMode
-	32, // 16: aster.application.v1alpha1.GetStatusResponse.store_capacity:type_name -> aster.application.v1alpha1.StoreCapacityStatus
-	33, // 17: aster.application.v1alpha1.GetStatusResponse.publish_operation_capacity:type_name -> aster.application.v1alpha1.PublishOperationCapacityStatus
-	35, // 18: aster.application.v1alpha1.GetStatusResponse.delivery_capacity:type_name -> aster.application.v1alpha1.DeliveryCapacityStatus
-	70, // 19: aster.application.v1alpha1.GetStatusResponse.blob_capacity:type_name -> aster.application.v1alpha1.BlobCapacityStatus
-	4,  // 20: aster.application.v1alpha1.PublishOperationCapacityStatus.warning_state:type_name -> aster.application.v1alpha1.OperationCapacityWarning
-	34, // 21: aster.application.v1alpha1.PublishOperationCapacityStatus.audit:type_name -> aster.application.v1alpha1.OperationLedgerAuditStatus
-	3,  // 22: aster.application.v1alpha1.PublishOperationCapacityStatus.ledger_mode:type_name -> aster.application.v1alpha1.PublishOperationLedgerMode
-	5,  // 23: aster.application.v1alpha1.OperationLedgerAuditStatus.state:type_name -> aster.application.v1alpha1.OperationLedgerAudit
-	8,  // 24: aster.application.v1alpha1.PeerStatus.authorization:type_name -> aster.application.v1alpha1.PeerAuthorization
-	9,  // 25: aster.application.v1alpha1.PeerStatus.last_contact:type_name -> aster.application.v1alpha1.ContactStatus
-	43, // 26: aster.application.v1alpha1.PublishNumberedEventsRequest.publication:type_name -> aster.application.v1alpha1.PublishNumberedEventRequest
-	44, // 27: aster.application.v1alpha1.PublishNumberedEventsResponse.published:type_name -> aster.application.v1alpha1.PublishNumberedEventResponse
-	13, // 28: aster.application.v1alpha1.PublishNumberedEventsResponse.failure:type_name -> aster.application.v1alpha1.PublicErrorDetail
-	49, // 29: aster.application.v1alpha1.BeginEventPublicationSessionResponse.outstanding:type_name -> aster.application.v1alpha1.CommittedPublicationResult
-	6,  // 30: aster.application.v1alpha1.PublishNumberedEventRequest.priority:type_name -> aster.application.v1alpha1.Priority
-	49, // 31: aster.application.v1alpha1.PublishNumberedEventResponse.result:type_name -> aster.application.v1alpha1.CommittedPublicationResult
-	50, // 32: aster.application.v1alpha1.CommittedPublicationResult.receipt:type_name -> aster.application.v1alpha1.CommittedEventReceipt
-	10, // 33: aster.application.v1alpha1.CommittedPublicationResult.content:type_name -> aster.application.v1alpha1.CommittedContentStatus
-	11, // 34: aster.application.v1alpha1.CommittedPublicationResult.retirement_reason:type_name -> aster.application.v1alpha1.RetirementReason
-	53, // 35: aster.application.v1alpha1.QueryEventsResponse.events:type_name -> aster.application.v1alpha1.Event
-	6,  // 36: aster.application.v1alpha1.Event.priority:type_name -> aster.application.v1alpha1.Priority
-	24, // 37: aster.application.v1alpha1.CreateEventSubscriptionRequest.client:type_name -> aster.application.v1alpha1.EventClientContext
-	24, // 38: aster.application.v1alpha1.PollEventsRequest.client:type_name -> aster.application.v1alpha1.EventClientContext
-	60, // 39: aster.application.v1alpha1.PollEventsResponse.deliveries:type_name -> aster.application.v1alpha1.EventDelivery
-	24, // 40: aster.application.v1alpha1.StreamEventsRequest.client:type_name -> aster.application.v1alpha1.EventClientContext
-	53, // 41: aster.application.v1alpha1.StreamEventsResponse.event:type_name -> aster.application.v1alpha1.Event
-	53, // 42: aster.application.v1alpha1.EventDelivery.event:type_name -> aster.application.v1alpha1.Event
-	24, // 43: aster.application.v1alpha1.AcknowledgeEventRequest.client:type_name -> aster.application.v1alpha1.EventClientContext
-	24, // 44: aster.application.v1alpha1.DeleteEventSubscriptionRequest.client:type_name -> aster.application.v1alpha1.EventClientContext
-	67, // 45: aster.application.v1alpha1.QueryEventGapsResponse.gaps:type_name -> aster.application.v1alpha1.EventGap
-	12, // 46: aster.application.v1alpha1.InspectBlobPublicationResponse.phase:type_name -> aster.application.v1alpha1.BlobPublicationPhase
-	30, // 47: aster.application.v1alpha1.AsterApplicationService.GetStatus:input_type -> aster.application.v1alpha1.GetStatusRequest
-	68, // 48: aster.application.v1alpha1.AsterApplicationService.InspectBlobPublication:input_type -> aster.application.v1alpha1.InspectBlobPublicationRequest
-	39, // 49: aster.application.v1alpha1.AsterApplicationService.BeginEventPublicationSession:input_type -> aster.application.v1alpha1.BeginEventPublicationSessionRequest
-	41, // 50: aster.application.v1alpha1.AsterApplicationService.CompleteEventPublicationRecovery:input_type -> aster.application.v1alpha1.CompleteEventPublicationRecoveryRequest
-	43, // 51: aster.application.v1alpha1.AsterApplicationService.PublishNumberedEvent:input_type -> aster.application.v1alpha1.PublishNumberedEventRequest
-	37, // 52: aster.application.v1alpha1.AsterApplicationService.PublishNumberedEvents:input_type -> aster.application.v1alpha1.PublishNumberedEventsRequest
-	45, // 53: aster.application.v1alpha1.AsterApplicationService.AbandonEventPublication:input_type -> aster.application.v1alpha1.AbandonEventPublicationRequest
-	47, // 54: aster.application.v1alpha1.AsterApplicationService.AcknowledgeEventPublicationResult:input_type -> aster.application.v1alpha1.AcknowledgeEventPublicationResultRequest
-	51, // 55: aster.application.v1alpha1.AsterApplicationService.QueryEvents:input_type -> aster.application.v1alpha1.QueryEventsRequest
-	54, // 56: aster.application.v1alpha1.AsterApplicationService.CreateEventSubscription:input_type -> aster.application.v1alpha1.CreateEventSubscriptionRequest
-	25, // 57: aster.application.v1alpha1.AsterApplicationService.GetEventClientStatus:input_type -> aster.application.v1alpha1.GetEventClientStatusRequest
-	27, // 58: aster.application.v1alpha1.AsterApplicationService.ListEventSubscriptions:input_type -> aster.application.v1alpha1.ListEventSubscriptionsRequest
-	56, // 59: aster.application.v1alpha1.AsterApplicationService.PollEvents:input_type -> aster.application.v1alpha1.PollEventsRequest
-	58, // 60: aster.application.v1alpha1.AsterApplicationService.StreamEvents:input_type -> aster.application.v1alpha1.StreamEventsRequest
-	61, // 61: aster.application.v1alpha1.AsterApplicationService.AcknowledgeEvent:input_type -> aster.application.v1alpha1.AcknowledgeEventRequest
-	63, // 62: aster.application.v1alpha1.AsterApplicationService.DeleteEventSubscription:input_type -> aster.application.v1alpha1.DeleteEventSubscriptionRequest
-	65, // 63: aster.application.v1alpha1.AsterApplicationService.QueryEventGaps:input_type -> aster.application.v1alpha1.QueryEventGapsRequest
-	15, // 64: aster.application.v1alpha1.AsterApplicationService.PublishBlob:input_type -> aster.application.v1alpha1.PublishBlobRequest
-	22, // 65: aster.application.v1alpha1.AsterApplicationService.ReadBlob:input_type -> aster.application.v1alpha1.ReadBlobRequest
-	31, // 66: aster.application.v1alpha1.AsterApplicationService.GetStatus:output_type -> aster.application.v1alpha1.GetStatusResponse
-	69, // 67: aster.application.v1alpha1.AsterApplicationService.InspectBlobPublication:output_type -> aster.application.v1alpha1.InspectBlobPublicationResponse
-	40, // 68: aster.application.v1alpha1.AsterApplicationService.BeginEventPublicationSession:output_type -> aster.application.v1alpha1.BeginEventPublicationSessionResponse
-	42, // 69: aster.application.v1alpha1.AsterApplicationService.CompleteEventPublicationRecovery:output_type -> aster.application.v1alpha1.CompleteEventPublicationRecoveryResponse
-	44, // 70: aster.application.v1alpha1.AsterApplicationService.PublishNumberedEvent:output_type -> aster.application.v1alpha1.PublishNumberedEventResponse
-	38, // 71: aster.application.v1alpha1.AsterApplicationService.PublishNumberedEvents:output_type -> aster.application.v1alpha1.PublishNumberedEventsResponse
-	46, // 72: aster.application.v1alpha1.AsterApplicationService.AbandonEventPublication:output_type -> aster.application.v1alpha1.AbandonEventPublicationResponse
-	48, // 73: aster.application.v1alpha1.AsterApplicationService.AcknowledgeEventPublicationResult:output_type -> aster.application.v1alpha1.AcknowledgeEventPublicationResultResponse
-	52, // 74: aster.application.v1alpha1.AsterApplicationService.QueryEvents:output_type -> aster.application.v1alpha1.QueryEventsResponse
-	55, // 75: aster.application.v1alpha1.AsterApplicationService.CreateEventSubscription:output_type -> aster.application.v1alpha1.CreateEventSubscriptionResponse
-	26, // 76: aster.application.v1alpha1.AsterApplicationService.GetEventClientStatus:output_type -> aster.application.v1alpha1.GetEventClientStatusResponse
-	28, // 77: aster.application.v1alpha1.AsterApplicationService.ListEventSubscriptions:output_type -> aster.application.v1alpha1.ListEventSubscriptionsResponse
-	57, // 78: aster.application.v1alpha1.AsterApplicationService.PollEvents:output_type -> aster.application.v1alpha1.PollEventsResponse
-	59, // 79: aster.application.v1alpha1.AsterApplicationService.StreamEvents:output_type -> aster.application.v1alpha1.StreamEventsResponse
-	62, // 80: aster.application.v1alpha1.AsterApplicationService.AcknowledgeEvent:output_type -> aster.application.v1alpha1.AcknowledgeEventResponse
-	64, // 81: aster.application.v1alpha1.AsterApplicationService.DeleteEventSubscription:output_type -> aster.application.v1alpha1.DeleteEventSubscriptionResponse
-	66, // 82: aster.application.v1alpha1.AsterApplicationService.QueryEventGaps:output_type -> aster.application.v1alpha1.QueryEventGapsResponse
-	21, // 83: aster.application.v1alpha1.AsterApplicationService.PublishBlob:output_type -> aster.application.v1alpha1.PublishBlobResponse
-	23, // 84: aster.application.v1alpha1.AsterApplicationService.ReadBlob:output_type -> aster.application.v1alpha1.ReadBlobResponse
-	66, // [66:85] is the sub-list for method output_type
-	47, // [47:66] is the sub-list for method input_type
-	47, // [47:47] is the sub-list for extension type_name
-	47, // [47:47] is the sub-list for extension extendee
-	0,  // [0:47] is the sub-list for field type_name
+	30, // 16: aster.application.v1alpha1.GetStatusResponse.store_capacity:type_name -> aster.application.v1alpha1.StoreCapacityStatus
+	31, // 17: aster.application.v1alpha1.GetStatusResponse.publish_operation_capacity:type_name -> aster.application.v1alpha1.PublishOperationCapacityStatus
+	32, // 18: aster.application.v1alpha1.GetStatusResponse.delivery_capacity:type_name -> aster.application.v1alpha1.DeliveryCapacityStatus
+	67, // 19: aster.application.v1alpha1.GetStatusResponse.blob_capacity:type_name -> aster.application.v1alpha1.BlobCapacityStatus
+	3,  // 20: aster.application.v1alpha1.PublishOperationCapacityStatus.warning_state:type_name -> aster.application.v1alpha1.OperationCapacityWarning
+	6,  // 21: aster.application.v1alpha1.PeerStatus.authorization:type_name -> aster.application.v1alpha1.PeerAuthorization
+	7,  // 22: aster.application.v1alpha1.PeerStatus.last_contact:type_name -> aster.application.v1alpha1.ContactStatus
+	40, // 23: aster.application.v1alpha1.PublishNumberedEventsRequest.publication:type_name -> aster.application.v1alpha1.PublishNumberedEventRequest
+	41, // 24: aster.application.v1alpha1.PublishNumberedEventsResponse.published:type_name -> aster.application.v1alpha1.PublishNumberedEventResponse
+	11, // 25: aster.application.v1alpha1.PublishNumberedEventsResponse.failure:type_name -> aster.application.v1alpha1.PublicErrorDetail
+	46, // 26: aster.application.v1alpha1.BeginEventPublicationSessionResponse.outstanding:type_name -> aster.application.v1alpha1.CommittedPublicationResult
+	4,  // 27: aster.application.v1alpha1.PublishNumberedEventRequest.priority:type_name -> aster.application.v1alpha1.Priority
+	46, // 28: aster.application.v1alpha1.PublishNumberedEventResponse.result:type_name -> aster.application.v1alpha1.CommittedPublicationResult
+	47, // 29: aster.application.v1alpha1.CommittedPublicationResult.receipt:type_name -> aster.application.v1alpha1.CommittedEventReceipt
+	8,  // 30: aster.application.v1alpha1.CommittedPublicationResult.content:type_name -> aster.application.v1alpha1.CommittedContentStatus
+	9,  // 31: aster.application.v1alpha1.CommittedPublicationResult.retirement_reason:type_name -> aster.application.v1alpha1.RetirementReason
+	50, // 32: aster.application.v1alpha1.QueryEventsResponse.events:type_name -> aster.application.v1alpha1.Event
+	4,  // 33: aster.application.v1alpha1.Event.priority:type_name -> aster.application.v1alpha1.Priority
+	22, // 34: aster.application.v1alpha1.CreateEventSubscriptionRequest.client:type_name -> aster.application.v1alpha1.EventClientContext
+	22, // 35: aster.application.v1alpha1.PollEventsRequest.client:type_name -> aster.application.v1alpha1.EventClientContext
+	57, // 36: aster.application.v1alpha1.PollEventsResponse.deliveries:type_name -> aster.application.v1alpha1.EventDelivery
+	22, // 37: aster.application.v1alpha1.StreamEventsRequest.client:type_name -> aster.application.v1alpha1.EventClientContext
+	50, // 38: aster.application.v1alpha1.StreamEventsResponse.event:type_name -> aster.application.v1alpha1.Event
+	50, // 39: aster.application.v1alpha1.EventDelivery.event:type_name -> aster.application.v1alpha1.Event
+	22, // 40: aster.application.v1alpha1.AcknowledgeEventRequest.client:type_name -> aster.application.v1alpha1.EventClientContext
+	22, // 41: aster.application.v1alpha1.DeleteEventSubscriptionRequest.client:type_name -> aster.application.v1alpha1.EventClientContext
+	64, // 42: aster.application.v1alpha1.QueryEventGapsResponse.gaps:type_name -> aster.application.v1alpha1.EventGap
+	10, // 43: aster.application.v1alpha1.InspectBlobPublicationResponse.phase:type_name -> aster.application.v1alpha1.BlobPublicationPhase
+	28, // 44: aster.application.v1alpha1.AsterApplicationService.GetStatus:input_type -> aster.application.v1alpha1.GetStatusRequest
+	65, // 45: aster.application.v1alpha1.AsterApplicationService.InspectBlobPublication:input_type -> aster.application.v1alpha1.InspectBlobPublicationRequest
+	36, // 46: aster.application.v1alpha1.AsterApplicationService.BeginEventPublicationSession:input_type -> aster.application.v1alpha1.BeginEventPublicationSessionRequest
+	38, // 47: aster.application.v1alpha1.AsterApplicationService.CompleteEventPublicationRecovery:input_type -> aster.application.v1alpha1.CompleteEventPublicationRecoveryRequest
+	40, // 48: aster.application.v1alpha1.AsterApplicationService.PublishNumberedEvent:input_type -> aster.application.v1alpha1.PublishNumberedEventRequest
+	34, // 49: aster.application.v1alpha1.AsterApplicationService.PublishNumberedEvents:input_type -> aster.application.v1alpha1.PublishNumberedEventsRequest
+	42, // 50: aster.application.v1alpha1.AsterApplicationService.AbandonEventPublication:input_type -> aster.application.v1alpha1.AbandonEventPublicationRequest
+	44, // 51: aster.application.v1alpha1.AsterApplicationService.AcknowledgeEventPublicationResult:input_type -> aster.application.v1alpha1.AcknowledgeEventPublicationResultRequest
+	48, // 52: aster.application.v1alpha1.AsterApplicationService.QueryEvents:input_type -> aster.application.v1alpha1.QueryEventsRequest
+	51, // 53: aster.application.v1alpha1.AsterApplicationService.CreateEventSubscription:input_type -> aster.application.v1alpha1.CreateEventSubscriptionRequest
+	23, // 54: aster.application.v1alpha1.AsterApplicationService.GetEventClientStatus:input_type -> aster.application.v1alpha1.GetEventClientStatusRequest
+	25, // 55: aster.application.v1alpha1.AsterApplicationService.ListEventSubscriptions:input_type -> aster.application.v1alpha1.ListEventSubscriptionsRequest
+	53, // 56: aster.application.v1alpha1.AsterApplicationService.PollEvents:input_type -> aster.application.v1alpha1.PollEventsRequest
+	55, // 57: aster.application.v1alpha1.AsterApplicationService.StreamEvents:input_type -> aster.application.v1alpha1.StreamEventsRequest
+	58, // 58: aster.application.v1alpha1.AsterApplicationService.AcknowledgeEvent:input_type -> aster.application.v1alpha1.AcknowledgeEventRequest
+	60, // 59: aster.application.v1alpha1.AsterApplicationService.DeleteEventSubscription:input_type -> aster.application.v1alpha1.DeleteEventSubscriptionRequest
+	62, // 60: aster.application.v1alpha1.AsterApplicationService.QueryEventGaps:input_type -> aster.application.v1alpha1.QueryEventGapsRequest
+	13, // 61: aster.application.v1alpha1.AsterApplicationService.PublishBlob:input_type -> aster.application.v1alpha1.PublishBlobRequest
+	20, // 62: aster.application.v1alpha1.AsterApplicationService.ReadBlob:input_type -> aster.application.v1alpha1.ReadBlobRequest
+	29, // 63: aster.application.v1alpha1.AsterApplicationService.GetStatus:output_type -> aster.application.v1alpha1.GetStatusResponse
+	66, // 64: aster.application.v1alpha1.AsterApplicationService.InspectBlobPublication:output_type -> aster.application.v1alpha1.InspectBlobPublicationResponse
+	37, // 65: aster.application.v1alpha1.AsterApplicationService.BeginEventPublicationSession:output_type -> aster.application.v1alpha1.BeginEventPublicationSessionResponse
+	39, // 66: aster.application.v1alpha1.AsterApplicationService.CompleteEventPublicationRecovery:output_type -> aster.application.v1alpha1.CompleteEventPublicationRecoveryResponse
+	41, // 67: aster.application.v1alpha1.AsterApplicationService.PublishNumberedEvent:output_type -> aster.application.v1alpha1.PublishNumberedEventResponse
+	35, // 68: aster.application.v1alpha1.AsterApplicationService.PublishNumberedEvents:output_type -> aster.application.v1alpha1.PublishNumberedEventsResponse
+	43, // 69: aster.application.v1alpha1.AsterApplicationService.AbandonEventPublication:output_type -> aster.application.v1alpha1.AbandonEventPublicationResponse
+	45, // 70: aster.application.v1alpha1.AsterApplicationService.AcknowledgeEventPublicationResult:output_type -> aster.application.v1alpha1.AcknowledgeEventPublicationResultResponse
+	49, // 71: aster.application.v1alpha1.AsterApplicationService.QueryEvents:output_type -> aster.application.v1alpha1.QueryEventsResponse
+	52, // 72: aster.application.v1alpha1.AsterApplicationService.CreateEventSubscription:output_type -> aster.application.v1alpha1.CreateEventSubscriptionResponse
+	24, // 73: aster.application.v1alpha1.AsterApplicationService.GetEventClientStatus:output_type -> aster.application.v1alpha1.GetEventClientStatusResponse
+	26, // 74: aster.application.v1alpha1.AsterApplicationService.ListEventSubscriptions:output_type -> aster.application.v1alpha1.ListEventSubscriptionsResponse
+	54, // 75: aster.application.v1alpha1.AsterApplicationService.PollEvents:output_type -> aster.application.v1alpha1.PollEventsResponse
+	56, // 76: aster.application.v1alpha1.AsterApplicationService.StreamEvents:output_type -> aster.application.v1alpha1.StreamEventsResponse
+	59, // 77: aster.application.v1alpha1.AsterApplicationService.AcknowledgeEvent:output_type -> aster.application.v1alpha1.AcknowledgeEventResponse
+	61, // 78: aster.application.v1alpha1.AsterApplicationService.DeleteEventSubscription:output_type -> aster.application.v1alpha1.DeleteEventSubscriptionResponse
+	63, // 79: aster.application.v1alpha1.AsterApplicationService.QueryEventGaps:output_type -> aster.application.v1alpha1.QueryEventGapsResponse
+	19, // 80: aster.application.v1alpha1.AsterApplicationService.PublishBlob:output_type -> aster.application.v1alpha1.PublishBlobResponse
+	21, // 81: aster.application.v1alpha1.AsterApplicationService.ReadBlob:output_type -> aster.application.v1alpha1.ReadBlobResponse
+	63, // [63:82] is the sub-list for method output_type
+	44, // [44:63] is the sub-list for method input_type
+	44, // [44:44] is the sub-list for extension type_name
+	44, // [44:44] is the sub-list for extension extendee
+	0,  // [0:44] is the sub-list for field type_name
 }
 
 func init() { file_aster_application_v1alpha1_aster_proto_init() }
@@ -5637,22 +5407,22 @@ func file_aster_application_v1alpha1_aster_proto_init() {
 	file_aster_application_v1alpha1_aster_proto_msgTypes[10].OneofWrappers = []any{}
 	file_aster_application_v1alpha1_aster_proto_msgTypes[12].OneofWrappers = []any{}
 	file_aster_application_v1alpha1_aster_proto_msgTypes[13].OneofWrappers = []any{}
-	file_aster_application_v1alpha1_aster_proto_msgTypes[25].OneofWrappers = []any{
+	file_aster_application_v1alpha1_aster_proto_msgTypes[24].OneofWrappers = []any{
 		(*PublishNumberedEventsResponse_Published)(nil),
 		(*PublishNumberedEventsResponse_Failure)(nil),
 	}
-	file_aster_application_v1alpha1_aster_proto_msgTypes[30].OneofWrappers = []any{}
-	file_aster_application_v1alpha1_aster_proto_msgTypes[36].OneofWrappers = []any{}
-	file_aster_application_v1alpha1_aster_proto_msgTypes[38].OneofWrappers = []any{}
-	file_aster_application_v1alpha1_aster_proto_msgTypes[40].OneofWrappers = []any{}
-	file_aster_application_v1alpha1_aster_proto_msgTypes[56].OneofWrappers = []any{}
+	file_aster_application_v1alpha1_aster_proto_msgTypes[29].OneofWrappers = []any{}
+	file_aster_application_v1alpha1_aster_proto_msgTypes[35].OneofWrappers = []any{}
+	file_aster_application_v1alpha1_aster_proto_msgTypes[37].OneofWrappers = []any{}
+	file_aster_application_v1alpha1_aster_proto_msgTypes[39].OneofWrappers = []any{}
+	file_aster_application_v1alpha1_aster_proto_msgTypes[55].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_aster_application_v1alpha1_aster_proto_rawDesc), len(file_aster_application_v1alpha1_aster_proto_rawDesc)),
-			NumEnums:      13,
-			NumMessages:   58,
+			NumEnums:      11,
+			NumMessages:   57,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

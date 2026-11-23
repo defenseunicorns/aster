@@ -1,6 +1,6 @@
 # Aster Mesh Protocol Specification
 
-- Specification version: 0.1.0-draft.3
+- Specification version: 0.1.0-draft.4
 - Wire major/minor: 1.0
 - Status: reference draft; not production-authorized
 - Date: 2026-08-25
@@ -669,14 +669,10 @@ protocol receipt state.
 
 ### 9.1 Selected semantic-v4 State and Record reconciliation
 
-The selected mechanics profile adds State and Record when the authenticated
-mission session selects semantic version `4`, `5`, `6`, `7`, `8`, or `9`. Semantic
-versions `1`, `2`, and `3` retain their Event compatibility behavior and MUST
-NOT send, accept, reserve, or count mutable frames. The current default semantic
-offer is `[9, 8, 7, 6, 5, 4, 3, 2, 1]`; stable replication-wire/profile, handshake
-framing, source envelopes, and suite remain version `1`. Semantic v5 inherits
-these State/Record mechanics unchanged and adds the separate Blob mechanics in
-§9.2; semantic v6, v7, v8, and v9 inherit both ordinary lanes unchanged.
+State and Record use the `LegacyV6` profile in the current semantic-v9
+session. Their class- and direction-separated mechanics originated in v4;
+stable replication-wire/profile, handshake framing, source envelopes and suite
+remain version 1. Historical versions do not provide runtime fallback.
 
 State and Record are independent classes (`State = 1`, `Record = 2`). Each has
 two receiver-directed lanes, so every contact has four independent reconciliation
@@ -747,9 +743,9 @@ receiving selected Event work.
 ### 9.2 Historical semantic-v5 direct Blob transfer
 
 This section retains the original versioned byte definitions and source/storage
-invariants. Protocol draft.3 no longer implements the legacy carrier dialogue;
-selected Blob carrier transfer requires profile 4 in §9.4 and
-[Blob range streaming](blob-ranges-stream.md). The historical Result/Ack and
+invariants. Protocol draft.4 requires semantic v9/profile 5 for current Blob
+transfer, as defined in §9.4. The [Blob range specification](blob-ranges-stream.md)
+also describes a historical allocation. The historical Result/Ack and
 Finish/Finished records are not an available runtime fallback.
 
 Semantic version `5` inherits the exact Event behavior of versions `1` through
@@ -757,8 +753,7 @@ Semantic version `5` inherits the exact Event behavior of versions `1` through
 one selected Blob source class (`MutableClass = 3`) and one Blob carrier lane.
 Semantic versions `6`, `7`, and `8` inherit that complete v5 ordinary-lane
 behavior; semantic version `9` retains it outside the versioned Blob profile.
-The current default descending
-offer is `[9, 8, 7, 6, 5, 4, 3, 2, 1]`.
+The current hybrid offer is `[9]`.
 For the historical semantic-v7/v8 Profile-4 path, stable replication-wire and
 ABI version `1`, handshake framing,
 `ASTRENV2`/`ASTRENV3` source formats, `ASTRBT01` carriers, typed ObjectIDs, and
@@ -1002,17 +997,15 @@ initiator sends and the responder returns one protected canonical
 `4` Blob, and `5` EventBridge. Known profile IDs are `1` `LegacyV6`, `2`
 `EventPagesV1`, `3` reserved for `BlobCustodyV1` (not implemented), `4`
 `BlobRangesStreamV1`, and `5` `BlobStreamV1`. Lanes and profiles are strictly
-descending and unique. Event, State, Record, and EventBridge MUST offer
-`LegacyV6`. Blob offers MUST contain `LegacyV6`, `BlobRangesStreamV1`, or
-`BlobStreamV1`;
-semantic v7/v8 offers only `BlobRangesStreamV1`, while semantic v9 offers only
-`BlobStreamV1`. Only Event may offer `EventPagesV1`, and only Blob may offer
-`BlobRangesStreamV1` or `BlobStreamV1`. Unknown
-IDs with bit `0x8000` set are critical and fail the contact; other unknown IDs
-remain canonical digest input but are not selected.
+descending and unique. In the current hybrid runtime, Event MUST offer
+`EventPagesV1`, Blob MUST offer `BlobStreamV1`, and State, Record, and
+EventBridge MUST offer `LegacyV6`. Unknown IDs with bit `0x8000` set are
+critical and fail the contact; other unknown IDs remain canonical digest
+input but are not selected.
 
-Blob profile registry: semantic v7/v8 select profile 4; semantic v9 selects profile 5.
-Profile 4 limits: 67,108,864 object bytes; 1,024 canonical chunks; 1,048,576 authenticated-source bytes.
+Profile 4 is a historical semantic-v7/v8 allocation. Its codecs and original
+vectors remain readable, but it is not a runtime offer or transfer path.
+
 Profile 5 limits: 8,589,934,592 plaintext bytes; 8,192 native segments; 16,777,216 authenticated-source bytes.
 Profile 5 size classes: 1,048,576 plaintext segment bytes; 1,048,706 encoded ASTRBS02 record bytes; 1,048,710 length-prefixed DATA-body bytes; 134,217,728 checkpoint bytes; 2,097,152 Iroh frame bytes.
 `StreamOpenV1.total_len` is the native pack wire length, not the plaintext
@@ -1022,24 +1015,14 @@ stream-open fields.
 
 Both peers compute the same highest common profile independently for each lane
 and bind the complete canonical offers plus intersections into
-`transfer_profile_digest`. The current offer selects `EventPagesV1` for Event
-when both peers support it, `BlobRangesStreamV1` for Blob at semantic v7/v8,
-`BlobStreamV1` for Blob at semantic v9, and `LegacyV6` for State, Record, and
-EventBridge. Blob has no legacy or cross-profile fallback: an authenticated peer
-without the profile required by the selected semantic version fails profile
-intersection, and semantic-v5/v6 Blob carrier attempts are rejected before
-carrier IO. This is the selected-runtime compatibility break, not a
-reinterpretation of old frame bytes. Historical codecs/vectors remain readable
-but do not enable legacy Blob transfer. No other data class changes its profile
-or grammar. Semantic v7 uses profile 4 with durable-only policy; semantic v8
-uses profile 4 with authenticated finite-TTL custody; semantic v9 uses the
-native completed-pack pipeline defined by profile 5. See
-[receipt-free Blob ranges](blob-ranges-stream.md) for the retained v7/v8
-profile-4 contract. A missing required profile, empty
-intersection, digest mismatch, semantic/profile substitution, or profile-5
-selection before v9 fails closed. A v9/v8 or v9/v7 peer pair first negotiates
-the lower semantic version and then uses that version's exact profile-4 offer;
-an active profile-5 attempt is never downgraded into profile 4.
+`transfer_profile_digest`. The hybrid runtime requires semantic v9,
+`EventPagesV1` for Event and `BlobStreamV1` for Blob. State, Record and
+EventBridge retain `LegacyV6`. Missing required profiles, an empty intersection,
+a digest mismatch, or semantic/profile substitution fails closed. Neither
+Event nor Blob has a legacy fallback.
+
+The [historical Blob range specification](blob-ranges-stream.md) preserves the
+v7/v8 profile-4 format; it does not authorize current contacts.
 
 Profile 5 order: PLAN -> OPEN -> SOURCE -> ACCEPT -> ASTRBS02 pack DATA -> CHECKPOINT -> FINISH -> RESULT -> ACK.
 Profile 5 exact empty transfer: OPEN -> SOURCE -> ACCEPT -> FINISH(final_offset=0) -> RESULT -> ACK, with no DATA or CHECKPOINT.
@@ -1178,6 +1161,7 @@ copying every large record through two independent
 record layers while retaining mission authorization for the attempt metadata
 and end-to-end source authentication for the content.
 
+The following profile-4 grammar is historical and has no runtime handler.
 For each admitted Blob direction, profile 4 sends one protected `ABRS || 0x01`
 schedule containing at most 64 canonical `BlobRangeFetchV5` tuples and receives
 the exact domain-separated schedule hash as acceptance. The role-ordered
@@ -1710,25 +1694,16 @@ The key schedule uses exact concatenation of the 32-byte P-256 ECDH result and
 32-byte ML-KEM result, with the public transcript as HKDF salt and seven distinct
 direction/protection/confirmation labels. The stable handshake framing,
 credential/envelope encoding, cryptographic profile, and replication wire
-profile remain version `1`. Inside that framing, a default initiator offers
-semantic versions `[9, 8, 7, 6, 5, 4, 3, 2, 1]`; an honest current responder selects
-the highest common value, so current peers select `9`, a v8-only peer selects
-`8`, a v7-only peer selects `7`, a v6-only peer selects
-`6`, a v5-only peer selects `5`, a v4-only peer selects `4`, a v3-only peer
-selects `3`, a v2-only peer selects `2`, and a v1-only peer selects `1`. The
-selected semantic version is bound into the public transcript, key schedule,
-key confirmations, and hybrid handshake authentication.
+profile remain version `1`. Inside that framing, the hybrid initiator offers
+semantic version `[9]`; both roles reject older versions. The selected version
+is bound into the public transcript, key schedule, key confirmations, and
+hybrid handshake authentication.
 
-That binding provides on-path transcript downgrade resistance: an attacker who
-cannot authenticate as either endpoint cannot strip or reorder the ClientHello
-offer or rewrite an honest ServerHello selection. It does not authenticate the
-responder's complete capability set. A valid older, modified, or rolled-back
-responder using an accepted credential can select `1`, and the initiator cannot
-distinguish authorized compatibility from rollback. No production downgrade
-claim is permitted until an authority-signed mission minimum semantic version
-and durable per-identity high-water state with explicit rollback authorization
-are implemented and independently tested. Stateless cookies, resumption,
-export keys, and general handshake extensions also remain separate release work.
+That binding prevents an unauthenticated on-path attacker from rewriting the
+offer or selection. It does not authenticate a peer's complete capability set
+or provide durable rollback protection. Authority-signed mission minima,
+per-identity high-water state, and explicit rollback authorization remain
+separate production work. The classical profile has its own version policy.
 
 ## 14. Revocation, rekey, and zeroization
 
@@ -2086,15 +2061,16 @@ A transport addition changes none of them. `PROTOCOL_VERSION` and the legacy C
 `aster_protocol_version()` report stable replication-wire/profile version `1`;
 the unambiguous replication-wire surfaces also report `1`, while the default and
 highest-supported semantic-version surfaces report `9`.
-The default semantic offer is `[9, 8, 7, 6, 5, 4, 3, 2, 1]`.
+The default hybrid semantic offer is `[9]`.
 
-The current handshake negotiates semantic versions `9`, `8`, `7`, `6`, `5`,
-`4`, `3`, `2`, and `1` and the complete suite `0x0001`. Offers are nonempty, nonzero,
+The current hybrid handshake negotiates semantic version `9` and complete suite
+`0x0001`. Offers are nonempty, nonzero,
 duplicate-free canonical descending lists of at most 16 values. The responder selects the highest common semantic
 version and its locally preferred complete common suite; the initiator requires
 both selections to have been offered and to be locally supported.
 
-The semantic-version inheritance registry is normative:
+The semantic-version registry preserves historical allocations. Versions 1–8
+are not supported hybrid network sessions:
 
 | Semantic version | Inherits | Additional mechanics |
 | --- | --- | --- |
@@ -2143,23 +2119,11 @@ authentication. Semantics 2 through 8 permit both the unchanged format-2
 singleton and the §6.1 format-3 batch representation; negotiated semantics
 never rewrite stored stable bytes.
 
-Durable ranged-transfer progress records the immutable semantic version under
-which the object was first admitted. A source object first admitted under v1 is
-stored as compatible with every supported version; a source first admitted
-under v2 through v8 is stored as compatible only with v2 through v8. Recognized
-stable Blob carrier records preserve their supported origin-version provenance,
-while extended kinds `3..5` preserve v2-through-v8 provenance. These stored
-compatibility facts do not authorize network carrier I/O. Migrated progress
-without trustworthy origin-version provenance is suppressed rather than
-guessed. Selected mutable State/Record transfer remains v4/v5/v6/v7/v8-only.
-Actual selected Blob source and carrier resume requires semantic v7 or v8
-profile 4: durable exact prefixes are peer-neutral and may resume across v7/v8,
-while a finite pending source resumes only under v8 custody mode with compatible
-authenticated provenance.
-Selected Event-bridge mechanics remain v6/v7/v8-only regardless of the stable
-source object's earlier compatibility provenance.
-Eligibility filtering occurs before page limits so incompatible early rows
-cannot starve later compatible work.
+Current Event contacts use receipt-free pages. Current Blob contacts use the
+native-pack checkpoint state defined in §9.4. State, Record and EventBridge
+retain their `LegacyV6` mechanics inside semantic v9. Stored historical
+provenance does not authorize an older network session. Unsupported stores fail
+without mutation, migration, or reset.
 
 Deterministic-CBOR map keys `64` and above are ignorable extensions, while
 unknown keys `0..63` fail. Fixed-binary registries are closed. The current
@@ -2167,7 +2131,7 @@ source-envelope decoder rejects unknown data classes, so opaque forwarding of a
 future class is aspirational rather than implemented behavior. New semantics,
 formats, or registry entries MUST allocate new values rather than changing
 stable version-1 bytes in place. The authenticated mission floor and peer
-high-water gate in §13 is required before negotiated v1 fallback is authorized
+high-water gate in §13 remains required for rollback-sensitive authorization
 for downgrade-sensitive production use.
 
 Before 1.0, the project MUST publish minimum support windows, authority rollback
@@ -2210,9 +2174,8 @@ The actor groups compatible adjacent non-Flash publications already admitted
 in its bounded lane. It does not wait for future input or skip intervening
 work. Exceptional cohort failure falls back in order; Flash remains singleton.
 Grouping retains the individual source representations and is distinct from
-§6.1's explicit cryptographic batch. Normal startup refuses nonempty legacy
-Event operation ledgers before migration or maintenance. Historical inspection
-and fixture writers do not provide an ordinary application publishing lane.
+§6.1's explicit cryptographic batch. Store opens refuse unsupported historical
+Event operation ledgers without mutation, migration, or maintenance.
 
 This local API addition allocates no semantic version, source-envelope format,
 reconciliation frame, or stable mesh registry value. Reference window,

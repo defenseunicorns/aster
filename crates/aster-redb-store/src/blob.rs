@@ -15172,25 +15172,7 @@ fn require_blob_apply_capacity_read(
             )
             .ok_or(StoreError::PayloadByteAccountingOverflow)?,
     };
-    let tombstone_payload = custody::selected_tombstone_payload_usage_read(read)?;
-    let tombstone = CustodyUsage {
-        items: tombstone_payload
-            .items
-            .checked_add(
-                aggregate
-                    .get(EVENT_TOMBSTONE_OPERATION_COUNT)?
-                    .map_or(0, |value| value.value()),
-            )
-            .ok_or(StoreError::ItemCountAccountingOverflow)?,
-        bytes: tombstone_payload
-            .bytes
-            .checked_add(
-                aggregate
-                    .get(EVENT_TOMBSTONE_OPERATION_TOTAL_BYTES)?
-                    .map_or(0, |value| value.value()),
-            )
-            .ok_or(StoreError::PayloadByteAccountingOverflow)?,
-    };
+    let tombstone = custody::selected_tombstone_payload_usage_read(read)?;
     let ordinary = CustodyUsage {
         items: total
             .items

@@ -327,10 +327,8 @@ func TestStatusEvidenceRequiresProfileCapacityContract(t *testing.T) {
 		PublishOperationCapacity: &applicationv1alpha1.PublishOperationCapacityStatus{
 			Rows: 0, Bytes: 0, RowHardLimit: 1_000_000, ByteHardLimit: 201_326_592,
 			ProfileBoundary: 1_024, ProfileRemaining: 1_024,
-			OrdinaryRemaining: 990_000, EmergencyRemaining: 10_000,
+			OrdinaryRemaining: 683_926, EmergencyRemaining: 5_548,
 			WarningState: applicationv1alpha1.OperationCapacityWarning_OPERATION_CAPACITY_WARNING_OK,
-			LedgerMode:   applicationv1alpha1.PublishOperationLedgerMode_PUBLISH_OPERATION_LEDGER_MODE_LEGACY,
-			Audit:        &applicationv1alpha1.OperationLedgerAuditStatus{State: applicationv1alpha1.OperationLedgerAudit_OPERATION_LEDGER_AUDIT_PENDING},
 		},
 		DeliveryCapacity: &applicationv1alpha1.DeliveryCapacityStatus{
 			Pending: 0, ProfileBoundary: 256, HardLimit: 262_144,
@@ -346,11 +344,8 @@ func TestStatusEvidenceRequiresProfileCapacityContract(t *testing.T) {
 	if receipt["configured_emission_mode"] != "normal" || receipt["effective_emission_mode"] != "receive_only" {
 		t.Fatalf("emission modes not retained in receipt: %#v", receipt)
 	}
-	if receipt["operation_ledger_mode"] != "legacy" {
-		t.Fatalf("operation ledger mode missing from receipt: %#v", receipt)
-	}
-	if receipt["operation_ordinary_remaining"] != uint64(990_000) || receipt["operation_audit_state"] != "pending" {
-		t.Fatalf("ledger health missing from receipt: %#v", receipt)
+	if receipt["operation_ordinary_remaining"] != uint64(683_926) {
+		t.Fatalf("operation health missing from receipt: %#v", receipt)
 	}
 
 	for name, mutate := range map[string]func(*applicationv1alpha1.GetStatusResponse){
@@ -362,15 +357,18 @@ func TestStatusEvidenceRequiresProfileCapacityContract(t *testing.T) {
 		"wrong-delivery-hard-limit": func(status *applicationv1alpha1.GetStatusResponse) {
 			status.DeliveryCapacity.HardLimit = 1
 		},
-		"missing-audit":      func(status *applicationv1alpha1.GetStatusResponse) { status.PublishOperationCapacity.Audit = nil },
-		"wrong-active-count": func(status *applicationv1alpha1.GetStatusResponse) { status.PublishOperationCapacity.ActiveRows = 1 },
+		"wrong-client-count": func(status *applicationv1alpha1.GetStatusResponse) {
+			status.PublishOperationCapacity.NumberedClients = 1
+		},
+		"wrong-reverse-count": func(status *applicationv1alpha1.GetStatusResponse) {
+			status.PublishOperationCapacity.NumberedReverseRows = 1
+		},
 		"wrong-headroom": func(status *applicationv1alpha1.GetStatusResponse) {
 			status.PublishOperationCapacity.OrdinaryRemaining++
 		},
 		"wrong-warning": func(status *applicationv1alpha1.GetStatusResponse) {
 			status.PublishOperationCapacity.WarningState = applicationv1alpha1.OperationCapacityWarning_OPERATION_CAPACITY_WARNING_CRITICAL
 		},
-		"unknown-audit": func(status *applicationv1alpha1.GetStatusResponse) { status.PublishOperationCapacity.Audit.State = 99 },
 		"negative-rate": func(status *applicationv1alpha1.GetStatusResponse) {
 			status.PublishOperationCapacity.RollingAcceptRate = -1
 		},
@@ -386,29 +384,23 @@ func TestStatusEvidenceRequiresProfileCapacityContract(t *testing.T) {
 			}
 		})
 	}
-	for _, state := range []applicationv1alpha1.OperationLedgerAudit{
-		applicationv1alpha1.OperationLedgerAudit_OPERATION_LEDGER_AUDIT_RUNNING,
-		applicationv1alpha1.OperationLedgerAudit_OPERATION_LEDGER_AUDIT_COMPLETE,
-		applicationv1alpha1.OperationLedgerAudit_OPERATION_LEDGER_AUDIT_FAILED,
-	} {
-		changed := proto.Clone(valid).(*applicationv1alpha1.GetStatusResponse)
-		operations := changed.PublishOperationCapacity
-		operations.Rows, operations.ActiveRows, operations.RetiredRows, operations.ReverseRows = 1_024, 24, 1_000, 24
-		operations.Bytes, operations.OrdinaryRemaining = 70_888, 988_976
-		operations.ProfileRemaining, operations.ProfileWarning, operations.ProfileExhausted = 0, true, true
-		operations.RollingAcceptRate, operations.EstimatedSecondsToExhaustion = 2, 494_488
-		operations.Audit = &applicationv1alpha1.OperationLedgerAuditStatus{State: state, Scanned: 1_048, Total: 1_048}
-		receipt, err := statusEvidence(changed)
-		if err != nil {
-			t.Fatalf("mixed ledger/audit state %v rejected: %v", state, err)
-		}
-		if receipt["operation_active_rows"] != uint64(24) || receipt["operation_retired_rows"] != uint64(1_000) || receipt["operation_rolling_accept_rate"] != float64(2) || receipt["operation_estimated_seconds_to_exhaustion"] != uint64(494_488) {
-			t.Fatalf("ledger observation lost: %#v", receipt)
-		}
+	changed := proto.Clone(valid).(*applicationv1alpha1.GetStatusResponse)
+	operations := changed.PublishOperationCapacity
+	operations.Rows, operations.NumberedClients = 1_024, 24
+	operations.NumberedOutstandingResults, operations.NumberedReverseRows = 1_000, 1_000
+	operations.Bytes, operations.OrdinaryRemaining = 299_008, 682_902
+	operations.ProfileRemaining, operations.ProfileWarning, operations.ProfileExhausted = 0, true, true
+	operations.RollingAcceptRate, operations.EstimatedSecondsToExhaustion = 2, 341_451
+	receipt, err = statusEvidence(changed)
+	if err != nil {
+		t.Fatalf("numbered capacity rejected: %v", err)
+	}
+	if receipt["operation_numbered_clients"] != uint64(24) || receipt["operation_numbered_outstanding_results"] != uint64(1_000) || receipt["operation_rolling_accept_rate"] != float64(2) || receipt["operation_estimated_seconds_to_exhaustion"] != uint64(341_451) {
+		t.Fatalf("operation observation lost: %#v", receipt)
 	}
 }
 
-func TestOperationHealthRequiresCoherentRateEstimate(t *testing.T) {
+func TestOperationEstimateRequiresCoherentRateEstimate(t *testing.T) {
 	for _, test := range []struct {
 		name     string
 		rows     uint64
@@ -442,20 +434,9 @@ func TestOperationHealthRequiresCoherentRateEstimate(t *testing.T) {
 		{"zero-headroom-estimate", 990_000, 2, 1, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			operations := &applicationv1alpha1.PublishOperationCapacityStatus{
-				Rows: test.rows, ActiveRows: 24, RetiredRows: test.rows - 24, ReverseRows: 24,
-				Bytes:             3_888 + (test.rows-24)*67,
-				OrdinaryRemaining: 990_000 - test.rows, EmergencyRemaining: 10_000,
-				RollingAcceptRate: test.rate, EstimatedSecondsToExhaustion: test.estimate,
-				WarningState: applicationv1alpha1.OperationCapacityWarning_OPERATION_CAPACITY_WARNING_OK,
-				Audit:        &applicationv1alpha1.OperationLedgerAuditStatus{State: applicationv1alpha1.OperationLedgerAudit_OPERATION_LEDGER_AUDIT_PENDING},
-			}
-			if test.rows == 990_000 {
-				operations.WarningState = applicationv1alpha1.OperationCapacityWarning_OPERATION_CAPACITY_WARNING_EXHAUSTED
-			}
-			_, _, err := operationHealth(operations)
-			if (err == nil) != test.valid {
-				t.Fatalf("estimate accepted=%v; want %v", err == nil, test.valid)
+			estimate, valid := operationEstimate(990_000-test.rows, test.rate)
+			if (valid && estimate == test.estimate) != test.valid {
+				t.Fatalf("estimate=%d valid=%v; want estimate=%d accepted=%v", estimate, valid, test.estimate, test.valid)
 			}
 		})
 	}
@@ -466,20 +447,16 @@ func TestOperationHealthAcceptsCoherentNumberedCapacity(t *testing.T) {
 		Rows: 2, Bytes: 300,
 		OrdinaryRemaining: 683_925, EmergencyRemaining: 5_548,
 		WarningState:               applicationv1alpha1.OperationCapacityWarning_OPERATION_CAPACITY_WARNING_OK,
-		LedgerMode:                 applicationv1alpha1.PublishOperationLedgerMode_PUBLISH_OPERATION_LEDGER_MODE_NUMBERED,
 		NumberedClients:            1,
 		NumberedOutstandingResults: 1,
 		NumberedReverseRows:        1,
-		Audit: &applicationv1alpha1.OperationLedgerAuditStatus{
-			State: applicationv1alpha1.OperationLedgerAudit_OPERATION_LEDGER_AUDIT_PENDING,
-		},
 	}
 
-	if _, _, err := operationHealth(operations); err != nil {
+	if _, err := operationHealth(operations); err != nil {
 		t.Fatalf("coherent numbered capacity rejected: %v", err)
 	}
 	operations.EmergencyRemaining = 0
-	if _, _, err := operationHealth(operations); err == nil {
+	if _, err := operationHealth(operations); err == nil {
 		t.Fatal("missing numbered emergency headroom accepted")
 	}
 }

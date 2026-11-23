@@ -210,6 +210,55 @@ fn persist_zeroization_bundle(path: &std::path::Path, seed: u8) -> Vec<u8> {
     bytes
 }
 
+#[cfg(unix)]
+fn publish_zeroization_event(
+    state: &std::path::Path,
+    mission_path: &std::path::Path,
+    payload: &[u8],
+) -> aster_redb_store::EventStoreStats {
+    use aster_node::{
+        application::SelectedEventNode,
+        publication_journal::{Intent, Journal},
+    };
+
+    {
+        let mut node = SelectedEventNode::open_unprotected_reference(state, mission_path)
+            .expect("open zeroization publisher");
+        let journal_path = state.join("publication.redb");
+        Journal::initialize(&journal_path, b"zeroization-publisher").expect("initialize journal");
+        let mut journal =
+            Journal::open(&journal_path, b"zeroization-publisher").expect("open journal");
+        journal
+            .recover_stopped(&mut node)
+            .expect("recover publisher");
+        journal
+            .publish_metadata_stopped(
+                &mut node,
+                Intent {
+                    predecessor: None,
+                    topic: "zeroization-event".to_owned(),
+                    scope: "test/process-zeroization".to_owned(),
+                    priority: Priority::Routine as u8,
+                    logical_key: b"preserved-event".to_vec(),
+                    payload: payload.to_vec(),
+                    tombstone: false,
+                    ttl_ms: None,
+                },
+            )
+            .expect("publish authenticated preserved Event");
+        journal
+            .acknowledge_stopped(&mut node)
+            .expect("acknowledge publication");
+    }
+    let stats = Store::inspect_existing(state.join("mesh.redb"))
+        .expect("inspect published Event")
+        .event_stats;
+    assert_eq!(stats.events, 1);
+    assert_eq!(stats.acceptance_markers, 1);
+    assert!(stats.total_sealed_bytes > payload.len() as u64);
+    stats
+}
+
 fn bytes_hex(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -2063,26 +2112,10 @@ fn live_zeroization_drains_node_blocks_restored_credentials_and_preserves_rows()
     let root = fresh_root("live-zeroization");
     let state = root.join("state");
     let mission_path = root.join("mission.bundle");
-    let payload_path = root.join("payload.bin");
     std::fs::create_dir_all(&root).expect("root");
     let mission_bytes = persist_zeroization_bundle(&mission_path, 0xd1);
-    std::fs::write(&payload_path, b"preserved-through-zeroization").expect("payload");
-    let put = Command::new(env!("CARGO_BIN_EXE_aster"))
-        .args(["put", "--state"])
-        .arg(&state)
-        .args([
-            "--id",
-            "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
-            "--file",
-        ])
-        .arg(&payload_path)
-        .output()
-        .expect("put preserved row");
-    assert!(
-        put.status.success(),
-        "put failed: {}",
-        String::from_utf8_lossy(&put.stderr)
-    );
+    let preserved_stats =
+        publish_zeroization_event(&state, &mission_path, b"preserved-through-zeroization");
 
     let mut node = Command::new(env!("CARGO_BIN_EXE_aster"))
         .args(["node", "--state"])
@@ -2128,7 +2161,7 @@ fn live_zeroization_drains_node_blocks_restored_credentials_and_preserves_rows()
         "live zeroization failed: stdout={zeroize_stdout} stderr={zeroize_stderr}"
     );
     assert!(zeroize_stdout.contains("ZEROIZE status=pass mode=live state=complete"));
-    assert!(zeroize_stdout.contains("data_rows_preserved=true opaque_items=1"));
+    assert!(zeroize_stdout.contains("data_rows_preserved=true events=1"));
     assert!(zeroize_stdout.contains(
         "mission_pathname=retained-zero-length carrier_identity_pathname=retained-zero-length"
     ));
@@ -2169,7 +2202,13 @@ fn live_zeroization_drains_node_blocks_restored_credentials_and_preserves_rows()
         "inspect failed: {}",
         String::from_utf8_lossy(&inspect.stderr)
     );
-    assert!(inspect_stdout.contains("zeroization=complete opaque_items=1"));
+    assert!(inspect_stdout.contains("zeroization=complete events=1"));
+    assert_eq!(
+        Store::inspect_existing(state.join("mesh.redb"))
+            .expect("inspect zeroized Event rows and bytes")
+            .event_stats,
+        preserved_stats
+    );
 
     // Rewriting the retained tombstones preserves their inode identities.
     // Terminal state still blocks every normal reopen, and idempotent cleanup
@@ -2833,15 +2872,180 @@ fn zeroization_marker_child_process() {
 
 #[cfg(unix)]
 #[test]
+fn normal_operation_preflight_preserves_incompatible_store_bytes() {
+    const CHILD_STATE: &str = "ASTER_NORMAL_PREFLIGHT_CHILD_STATE";
+    const CHILD_KIND: &str = "ASTER_NORMAL_PREFLIGHT_CHILD_KIND";
+    const CHILD_DIRTY: &str = "ASTER_NORMAL_PREFLIGHT_CHILD_DIRTY";
+    if let Some(state) = std::env::var_os(CHILD_STATE) {
+        let path = PathBuf::from(state).join("mesh.redb");
+        let database = redb::Database::open(path).expect("open preflight fixture");
+        let write = database.begin_write().unwrap();
+        let kind = std::env::var(CHILD_KIND).unwrap();
+        let table: redb::TableDefinition<&[u8], &[u8]> =
+            redb::TableDefinition::new(match kind.as_str() {
+                "opaque" => "aster.items.v1",
+                "event" => "aster.event-operation-ledger.v3",
+                _ => "preflight-compatible-fixture",
+            });
+        write
+            .open_table(table)
+            .unwrap()
+            .insert(b"old-key".as_slice(), b"old-value".as_slice())
+            .unwrap();
+        write.commit().unwrap();
+        if std::env::var_os(CHILD_DIRTY).is_some() {
+            std::process::exit(86); // Skip redb's clean-close allocator receipt.
+        }
+        return;
+    }
+    let _process_test = serialize_process_test();
+    for dirty in [true, false] {
+        for (kind, terminal) in [
+            ("opaque", false),
+            ("event", false),
+            ("compatible", false),
+            ("opaque", true),
+            ("event", true),
+            ("compatible", true),
+        ] {
+            let root = fresh_root("normal-preflight");
+            let state = root.join("state");
+            std::fs::create_dir_all(&state).unwrap();
+            let mission_path = root.join("mission.bundle");
+            let mission_bytes = persist_zeroization_bundle(&mission_path, 0xd3);
+            let mission = UnprotectedReferenceMission::load(&mission_path).unwrap();
+            let store_path = state.join("mesh.redb");
+            let mut store =
+                Store::open_for_mission(&store_path, mission.mission_authority_id()).unwrap();
+            let identity_bytes = if terminal {
+                let identity = NodeIdentity::load_or_create(&state).unwrap();
+                let prepared_mission = mission.prepare_software_erasure().unwrap();
+                let prepared_identity = identity.prepare_software_erasure().unwrap();
+                let intent = ZeroizationIntent::new(
+                    prepared_mission.target().to_bytes(),
+                    prepared_identity.target().to_bytes(),
+                )
+                .unwrap();
+                store.begin_zeroization(&intent).unwrap();
+                Some(std::fs::read(state.join("identity.key")).unwrap())
+            } else {
+                None
+            };
+            drop(store);
+            drop(mission);
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "normal_operation_preflight_preserves_incompatible_store_bytes",
+                    "--nocapture",
+                ])
+                .env(CHILD_STATE, &state)
+                .env(CHILD_KIND, kind);
+            if dirty {
+                child.env(CHILD_DIRTY, "1");
+            }
+            let seeded = child.output().unwrap();
+            assert_eq!(
+                seeded.status.code(),
+                Some(if dirty { 86 } else { 0 }),
+                "{}",
+                String::from_utf8_lossy(&seeded.stderr)
+            );
+            assert_eq!(
+                Store::inspect_zeroization_state(&store_path)
+                    .is_err_and(|error| error.is_read_only_repair_required()),
+                dirty
+            );
+            let before = std::fs::read(&store_path).unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+                .args(["node", "--state"])
+                .arg(&state)
+                .args([
+                    "--bind",
+                    "127.0.0.1:0",
+                    "--mission-bundle-unprotected-reference",
+                ])
+                .arg(&mission_path)
+                .args(["--run-for", "1"])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if kind == "compatible" && !terminal {
+                assert!(
+                    output.status.success(),
+                    "compatible dirty={dirty}: {stderr}"
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("READY selected=true"));
+                assert!(
+                    !Store::inspect_zeroization_state(&store_path)
+                        .unwrap()
+                        .state()
+                        .is_terminal()
+                );
+            } else {
+                assert!(!output.status.success());
+                assert!(
+                    std::fs::read(&store_path).unwrap() == before,
+                    "rejected {kind} dirty={dirty} store bytes changed"
+                );
+                assert!(
+                    stderr.contains(if terminal {
+                        "terminally%20locked%20out"
+                    } else {
+                        "fresh%20store"
+                    }),
+                    "{stderr}"
+                );
+                assert!(!String::from_utf8_lossy(&output.stdout).contains("READY selected=true"));
+                if let Some(identity_bytes) = identity_bytes {
+                    assert_eq!(
+                        std::fs::read(state.join("identity.key")).unwrap(),
+                        identity_bytes
+                    );
+                } else {
+                    assert!(!state.join("identity.key").exists());
+                }
+                assert_eq!(std::fs::read(&mission_path).unwrap(), mission_bytes);
+                if terminal {
+                    assert!(
+                        Store::recover_zeroization_state(&store_path)
+                            .unwrap()
+                            .state()
+                            .is_terminal()
+                    );
+                    drop(Store::open_for_zeroization(&store_path).unwrap());
+                }
+                if terminal && kind == "compatible" {
+                    let cleanup = Command::new(env!("CARGO_BIN_EXE_aster"))
+                        .args(["zeroize", "--state"])
+                        .arg(&state)
+                        .arg("--mission-bundle-unprotected-reference")
+                        .arg(&mission_path)
+                        .output()
+                        .unwrap();
+                    assert!(
+                        cleanup.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&cleanup.stderr)
+                    );
+                    assert!(String::from_utf8_lossy(&cleanup.stdout).contains("state=complete"));
+                }
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn interrupted_terminal_marker_resumes_without_losing_data_rows() {
     let _process_test = serialize_process_test();
     let root = fresh_root("interrupted-zeroization");
     let state = root.join("state");
     let mission_path = root.join("mission.bundle");
-    let payload_path = root.join("payload.bin");
     std::fs::create_dir_all(&root).expect("root");
     let mission_bytes = persist_zeroization_bundle(&mission_path, 0xd2);
-    std::fs::write(&payload_path, b"survives-interrupted-cleanup").expect("payload");
     let init = Command::new(env!("CARGO_BIN_EXE_aster"))
         .args(["init", "--state"])
         .arg(&state)
@@ -2854,22 +3058,8 @@ fn interrupted_terminal_marker_resumes_without_losing_data_rows() {
     );
     let identity_path = state.join("identity.key");
     let identity_bytes = std::fs::read(&identity_path).expect("identity bytes");
-    let put = Command::new(env!("CARGO_BIN_EXE_aster"))
-        .args(["put", "--state"])
-        .arg(&state)
-        .args([
-            "--id",
-            "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
-            "--file",
-        ])
-        .arg(&payload_path)
-        .output()
-        .expect("put row");
-    assert!(
-        put.status.success(),
-        "put failed: {}",
-        String::from_utf8_lossy(&put.stderr)
-    );
+    let preserved_stats =
+        publish_zeroization_event(&state, &mission_path, b"survives-interrupted-cleanup");
 
     let interrupted = Command::new(std::env::current_exe().expect("integration test executable"))
         .args(["--exact", "zeroization_marker_child_process", "--nocapture"])
@@ -2930,7 +3120,7 @@ fn interrupted_terminal_marker_resumes_without_losing_data_rows() {
         String::from_utf8_lossy(&resumed.stderr)
     );
     assert!(resumed_stdout.contains("state=complete"));
-    assert!(resumed_stdout.contains("data_rows_preserved=true opaque_items=1"));
+    assert!(resumed_stdout.contains("data_rows_preserved=true events=1"));
     assert!(resumed_stdout.contains(
         "mission_pathname=retained-zero-length carrier_identity_pathname=retained-zero-length"
     ));
@@ -2960,7 +3150,13 @@ fn interrupted_terminal_marker_resumes_without_losing_data_rows() {
     assert!(
         String::from_utf8(inspect.stdout)
             .expect("inspect stdout")
-            .contains("zeroization=complete opaque_items=1")
+            .contains("zeroization=complete events=1")
+    );
+    assert_eq!(
+        Store::inspect_existing(state.join("mesh.redb"))
+            .expect("inspect resumed Event rows and bytes")
+            .event_stats,
+        preserved_stats
     );
     std::fs::remove_dir_all(root).expect("cleanup interrupted zeroization root");
 }

@@ -1382,7 +1382,6 @@ fn validate_attempt_two(
             && child_field(fields, "shutdown_direct_contacts")? == "0"
             && child_field(fields, "shutdown_relay_contacts")? == "0"
             && child_field(fields, "shutdown_unknown_path_contacts")? == "0"
-            && child_field(fields, "shutdown_items")? == "0"
             && child_field(fields, "shutdown_events")? == "0"
             && child_field(fields, "shutdown_blobs")? == "0"
             && child_field(fields, "closed_kind")? == "state_unavailable"
@@ -2192,9 +2191,7 @@ async fn validate_closed_handle(
 
 fn validate_excluded_receipt(receipt: &NodeReceipt) -> Result<(), DynError> {
     require(
-        receipt.items == 0
-            && receipt.acceptance_markers == 0
-            && receipt.events == 0
+        receipt.events == 0
             && receipt.event_acceptance_markers == 0
             && receipt.route_cached_events == 0
             && receipt.controls == 0
@@ -2299,8 +2296,7 @@ fn validate_inspections(
     )?;
     for inspection in [publisher, receiver] {
         require(
-            inspection.stats == Default::default()
-                && inspection.event_stats == Default::default()
+            inspection.event_stats == Default::default()
                 && inspection.record_stats == Default::default()
                 && inspection.blob_stats == Default::default()
                 && inspection.event_subscription_stats == Default::default()
@@ -2337,7 +2333,6 @@ fn prefixed_receipt_fields(receipt: &NodeReceipt) -> Vec<(&'static str, String)>
             "shutdown_unknown_path_contacts",
             receipt.unknown_path_contacts.to_string(),
         ),
-        ("shutdown_items", receipt.items.to_string()),
         ("shutdown_events", receipt.events.to_string()),
         ("shutdown_blobs", receipt.blobs.to_string()),
         ("shutdown_data_offered", receipt.data_offered.to_string()),

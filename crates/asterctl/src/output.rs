@@ -345,22 +345,19 @@ fn status_fields(s: &api::GetStatusResponse) -> Fields {
         })));
     }
     if let Some(s) = s.publish_operation_capacity.as_option() {
-        let mut capacity = fields! {
+        let capacity = fields! {
             "rows": s.rows.to_string(), "bytes": s.bytes.to_string(),
             "rowHardLimit": s.row_hard_limit.to_string(), "byteHardLimit": s.byte_hard_limit.to_string(),
             "profileBoundary": s.profile_boundary.to_string(), "profileRemaining": s.profile_remaining.to_string(),
             "profileWarning": s.profile_warning, "profileExhausted": s.profile_exhausted,
-            "activeRows": s.active_rows.to_string(), "retiredRows": s.retired_rows.to_string(),
-            "reverseRows": s.reverse_rows.to_string(), "ordinaryRemaining": s.ordinary_remaining.to_string(),
+            "numberedClients": s.numbered_clients.to_string(),
+            "numberedOutstandingResults": s.numbered_outstanding_results.to_string(),
+            "numberedReverseRows": s.numbered_reverse_rows.to_string(),
+            "ordinaryRemaining": s.ordinary_remaining.to_string(),
             "emergencyRemaining": s.emergency_remaining.to_string(), "rollingAcceptRate": Double(s.rolling_accept_rate),
             "estimatedSecondsToExhaustion": s.estimated_seconds_to_exhaustion.to_string(),
             "warningState": s.warning_state,
         };
-        if let Some(audit) = s.audit.as_option() {
-            capacity.push(("audit", Output::Object(fields! {
-                "state": audit.state, "scanned": audit.scanned.to_string(), "total": audit.total.to_string(),
-            })));
-        }
         value.push(("publishOperationCapacity", Output::Object(capacity)));
     }
     if let Some(s) = s.delivery_capacity.as_option() {
@@ -415,10 +412,9 @@ mod tests {
             "publishOperationCapacity": {
                 "rows": "2", "bytes": "48", "rowHardLimit": "10000", "byteHardLimit": "65536",
                 "profileBoundary": "1000", "profileRemaining": "998", "profileWarning": false,
-                "profileExhausted": false, "activeRows": "2", "retiredRows": "0", "reverseRows": "0",
+                "profileExhausted": false, "numberedClients": "1", "numberedOutstandingResults": "1", "numberedReverseRows": "1",
                 "ordinaryRemaining": "9998", "emergencyRemaining": "100", "rollingAcceptRate": 1.25,
-                "estimatedSecondsToExhaustion": "0", "warningState": "OPERATION_CAPACITY_WARNING_OK",
-                "audit": {"state": "OPERATION_LEDGER_AUDIT_COMPLETE", "scanned": "2", "total": "2"}
+                "estimatedSecondsToExhaustion": "0", "warningState": "OPERATION_CAPACITY_WARNING_OK"
             },
             "deliveryCapacity": {"pending": "0", "profileBoundary": "1000", "profileSaturated": false, "hardLimit": "10000"}
         })
@@ -673,7 +669,7 @@ mod tests {
     #[test]
     fn empty_present_messages_keep_defaults_and_unknown_enums_keep_numbers() {
         let response: api::GetStatusResponse = serde_json::from_value(json!({
-            "sync": 123, "storeCapacity": {}, "publishOperationCapacity": {"audit": {}},
+            "sync": 123, "storeCapacity": {}, "publishOperationCapacity": {},
             "deliveryCapacity": {}, "peers": [{"authorization": 99}]
         }))
         .unwrap();
@@ -683,9 +679,14 @@ mod tests {
         assert_eq!(value["peers"][0]["authorization"], 99);
         assert_eq!(value["peers"][0]["authenticatedContacts"], "0");
         assert_eq!(value["publishOperationCapacity"]["rollingAcceptRate"], 0.0);
+        assert_eq!(value["publishOperationCapacity"]["numberedClients"], "0");
         assert_eq!(
-            value["publishOperationCapacity"]["audit"]["state"],
-            "OPERATION_LEDGER_AUDIT_UNSPECIFIED"
+            value["publishOperationCapacity"]["numberedOutstandingResults"],
+            "0"
+        );
+        assert_eq!(
+            value["publishOperationCapacity"]["numberedReverseRows"],
+            "0"
         );
         assert_eq!(value["deliveryCapacity"]["profileSaturated"], false);
         let text = status(&response, false).unwrap();
@@ -693,10 +694,9 @@ mod tests {
         assert_eq!(text_value(&text, "Authorization"), "Unknown (99)");
         assert_eq!(text_value(&text, "Payload"), "0 B / 0 B");
         assert_eq!(text_value(&text, "Profile warning"), "No");
-        assert_eq!(
-            text_value(&text, "Audit"),
-            "Unspecified (0 / 0 rows scanned)"
-        );
+        assert_eq!(text_value(&text, "Numbered clients"), "0");
+        assert_eq!(text_value(&text, "Outstanding results"), "0");
+        assert_eq!(text_value(&text, "Numbered reverse index rows"), "0");
     }
 
     #[test]

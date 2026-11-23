@@ -20,13 +20,13 @@ typed `SelectedControlHandle`; those bounded Rust-only seams are documented
 below. Linux semantic-v3-format finite Event TTL is documented in the
 [selected custody quickstart](selected-custody-api.md).
 
-With semantic v7, exact durable, finite-TTL, tombstone, route-only, mixed, and
+With semantic v9, exact durable, finite-TTL, tombstone, route-only, mixed, and
 bounded blind ReceiveOnly Event traffic synchronizes as receipt-free pages after
 per-lane profile negotiation. Finite entries retain authenticated cumulative
 age without per-peer receipt, lease, suppression, or retry state. Publish still
 completes at the local durable commit and never waits for this synchronization.
-Only peers that do not share `EventPagesV1` use the complete legacy Event
-mechanics. Contact/page counters describe attempts and durable local application,
+Peers must share `EventPagesV1`; incompatible offers fail negotiation.
+Contact/page counters describe attempts and durable local application,
 not proof that a remote application consumed data.
 
 ## Run the live example

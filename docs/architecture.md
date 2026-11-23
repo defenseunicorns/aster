@@ -40,7 +40,7 @@ flowchart LR
     Record --> Exclusive
     Blob --> Depot["Encrypted local depot"]
     Actor --> Depot
-    Actor --> Network["Event · State · Record · v7/v8 Blob reconciliation"]
+    Actor --> Network["Event · State · Record · Blob reconciliation"]
 ```
 
 The running actor and stopped handles never own the store at the same time.
@@ -49,9 +49,8 @@ the running actor, or use their stopped facades after the actor exits. Objects
 published through either mode reconcile under the same authority. Blob
 applications likewise publish through the live handle or stopped facade; the
 live handle returns only bounded pages, while the stopped facade supports
-caller-owned streaming. Semantic v7/v8 profile 4 separately transfers Blob
-sources and bounded carrier prefixes directly between content-capable peers;
-v7 is durable-only and v8 additionally admits authenticated finite custody.
+caller-owned streaming. Semantic v9/profile 5 transfers native Blob packs
+between content-capable peers with durable checkpoints and finite custody.
 
 ### Runtime trust path
 
@@ -120,10 +119,10 @@ or key-bearing state is released, so retained clones return sanitized
 `StateUnavailable`. A stopped facade can acquire the writer only after the live
 actor has exited and must close before a new actor starts.
 
-For a semantic-v7 contact, the first protected exchange negotiates a transfer
-profile independently for Event, State, Record, Blob, and EventBridge. Every
-non-Blob lane offers `LegacyV6`; Event may additionally select
-`EventPagesV1`. Blob requires `BlobRangesStreamV1`, with no legacy fallback. Exact Event differences and bounded blind traffic into a
+For a semantic-v9 contact, the first protected exchange negotiates a transfer
+profile independently for Event, State, Record, Blob, and EventBridge. State,
+Record, and EventBridge use `LegacyV6`. Event requires `EventPagesV1` and Blob
+requires `BlobStreamV1`, with no legacy fallback. Exact Event differences and bounded blind traffic into a
 ReceiveOnly peer can then move in one ordered bounded unidirectional turn.
 Finite entries carry session-authenticated cumulative age, while durable and
 tombstone entries carry no age wrapper. The receiver commits each complete page
@@ -382,25 +381,16 @@ a publication reference while installing replay/publication/causal authority and
 removing pending rows; abort atomically removes only the pending source and its
 reference. The lineage fence and depot import remain after abort.
 
-Opening a predecessor store reconstructs and audits the complete lifecycle
-image, checks all configured lifecycle capacities and the paired physical depot,
-and then commits wrappers, fences, references, counters, and maintenance cursors
-together.
-Any audit or injected failure leaves the predecessor untouched. Read-only
-inspection reconstructs predecessor state only in memory. Once current, every
-open strictly checks exact bidirectional correspondence among base rows,
-lifecycle rows, typed references, permanent fences, accounting, and cursor
-shape; it does not repair a partial or contradictory current schema.
+An incompatible predecessor store fails open without mutation or migration.
+Current-store opens validate lifecycle rows, typed references, permanent fences,
+accounting, and cursor shape; they do not repair contradictory state.
 
-Under semantic v7/v8 profile 4, a content-capable receiver reconciles exact Blob
-source IDs before requesting only missing, peer-neutral 16-KiB carrier prefixes.
-V7 selects durable work only; v8 also selects finite work with exact
-authenticated custody provenance. Every
-source and range send requires the authenticated peer's current exact content
-proof plus route and nonrevocation authority. Pending bytes remain outside
-ordinary publication until the exact depot, full-content, and current-lineage
-proofs agree atomically. This path implements bounded direct transfer, not
-route-only Blob relay or custody.
+Under semantic v9/profile 5, content-capable peers transfer native `ASTRBS02`
+records. Current route/content authorization, revocation, and lineage checks
+gate transfer and promotion. Provisional source state and the native pack
+checkpoint journal authorize resume. The receiver verifies the complete content
+and atomically promotes it before RESULT. This path does not provide route-only
+Blob relay or custody.
 
 `BlobDepotLimits` reserve canonical ciphertext-file bytes for every durable
 expected chunk record and bound durable per-chunk metadata rows and

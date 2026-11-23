@@ -22,18 +22,17 @@ use aster_iroh::{
     Connection, EndpointId, SecretKey,
 };
 use aster_mesh::{
-    ApplicationProtection, AuthenticatedBlobCustodySendContextV1,
-    AuthenticatedBlobCustodySendContextV2, AuthenticatedChannelBinding, BlobCustodyClaimV1,
+    ApplicationProtection, AuthenticatedBlobCustodySendContextV2, AuthenticatedChannelBinding,
     BlobCustodyClaimV2, BlobCustodyDirectionV1, ClassicalAuthenticatedSession,
     ClassicalProvisioningBundle, ClassicalSessionInitiator, ClassicalSessionResponder,
     CustodyClaims, CustodyExpectation, MAX_PROTECTED_PROVISIONING_BYTES,
-    MAX_UNPROTECTED_PROVISIONING_BYTES, NodeId, OpenedBlobSourceFrameV1, ProvisioningBundle,
-    ProvisioningLoadId, ProvisioningProtectionError, ProvisioningSecretLoader,
-    ProvisioningSecretRef, ProvisioningSecretStoreError, ProvisioningUnprotector,
-    ReferenceAuthenticatedSession, ReferenceEnvelopeSealer, ReferenceSessionAwaitingFinished,
-    ReferenceSessionInitiator, ReferenceSessionResponder, ReferenceSessionResponderPending,
-    SecurityProfileId, UnprotectedProvisioning, VerifiedCustodyClaims, VerifiedSecurityProfile,
-    engine::EnvelopeError, load_provisioning_secret, unprotect_provisioning_artifact,
+    MAX_UNPROTECTED_PROVISIONING_BYTES, NodeId, ProvisioningBundle, ProvisioningLoadId,
+    ProvisioningProtectionError, ProvisioningSecretLoader, ProvisioningSecretRef,
+    ProvisioningSecretStoreError, ProvisioningUnprotector, ReferenceAuthenticatedSession,
+    ReferenceEnvelopeSealer, ReferenceSessionAwaitingFinished, ReferenceSessionInitiator,
+    ReferenceSessionResponder, ReferenceSessionResponderPending, SecurityProfileId,
+    UnprotectedProvisioning, VerifiedCustodyClaims, VerifiedSecurityProfile, engine::EnvelopeError,
+    load_provisioning_secret, unprotect_provisioning_artifact,
 };
 use std::{
     error::Error,
@@ -61,9 +60,7 @@ const MAX_SOFTWARE_ERASURE_PATH_BYTES: usize =
     MAX_SOFTWARE_ERASURE_DESCRIPTOR_BYTES - SOFTWARE_ERASURE_DESCRIPTOR_HEADER_BYTES;
 const ERASE_BUFFER_BYTES: usize = 8 * 1024;
 const CLASSICAL_CHANNEL_BINDING_CONTEXT_MAGIC: &[u8; 8] = b"ASTRCB01";
-// The selected contact runtime below implements the legacy fixed lanes and the
-// v7/v8 BlobRangesStreamV1 lane. The separate profile-5 Blob DAG must not be
-// advertised here until it is dispatched by this contact owner.
+// The selected contact runtime dispatches profile-5 Blob DAG transfers.
 const SELECTED_CONTACT_SEMANTIC_CEILING: u16 = 9;
 const MISSION_HANDSHAKE_EXCHANGE_LIMIT: usize = 2 * 1024 * 1024;
 /// Exact bytes in a canonical carrier-bound classical mission context.
@@ -2841,18 +2838,6 @@ impl HybridMissionSession {
         self.inner.session_id()
     }
 
-    /// Mints one exact non-clone outbound Blob custody context.
-    pub(crate) fn mint_blob_custody_send_context(
-        &self,
-        direction: BlobCustodyDirectionV1,
-        exchange_id: u64,
-        finalization_charge_ms: u64,
-    ) -> Result<AuthenticatedBlobCustodySendContextV1, MissionSessionError> {
-        self.inner
-            .mint_blob_custody_send_context(direction, exchange_id, finalization_charge_ms)
-            .map_err(Into::into)
-    }
-
     pub(crate) fn mint_blob_custody_send_context_v2(
         &self,
         direction: crate::frame::EventDirection,
@@ -2890,30 +2875,6 @@ impl HybridMissionSession {
     /// Authenticates, decrypts, and replay-checks one application frame.
     pub fn open_application_frame(&mut self, frame: &[u8]) -> Result<Vec<u8>, MissionSessionError> {
         self.inner.open_frame(frame).map_err(Into::into)
-    }
-
-    /// Protects one complete v8 Blob source-bearing frame in profile 4.
-    pub(crate) fn seal_blob_source_frame(
-        &mut self,
-        direction: BlobCustodyDirectionV1,
-        claim: Option<&BlobCustodyClaimV1>,
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, MissionSessionError> {
-        self.inner
-            .seal_blob_source_frame(direction, claim, plaintext)
-            .map_err(Into::into)
-    }
-
-    /// Opens one complete v8 Blob source-bearing frame and returns its exact
-    /// finite-contact authority when a claim is present.
-    pub(crate) fn open_blob_source_frame(
-        &mut self,
-        direction: BlobCustodyDirectionV1,
-        frame: &[u8],
-    ) -> Result<OpenedBlobSourceFrameV1, MissionSessionError> {
-        self.inner
-            .open_blob_source_frame(direction, frame)
-            .map_err(Into::into)
     }
 
     /// Protects and records this endpoint's one canonical transfer-profile offer.
@@ -4478,44 +4439,44 @@ mod tests {
     }
 
     #[test]
-    fn semantic_v8_lane_records_bind_the_v8_domain_and_reject_v7_substitution() {
+    fn semantic_v9_lane_records_bind_the_v9_domain_and_reject_v7_substitution() {
         let mut provisioner = ReferenceProvisioner::from_seed([0x44; 32]).expect("provisioner");
         let initiator = issue(&mut provisioner, 1);
         let responder = issue(&mut provisioner, 2);
         let (mut sender, mut receiver) = establish_with_semantic_version(
             &initiator,
             &responder,
-            crate::event_pages::SEMANTIC_PROTOCOL_V8,
+            crate::event_pages::SEMANTIC_PROTOCOL_V9,
         )
-        .expect("establish semantic-v8 session");
+        .expect("establish semantic-v9 session");
         assert_eq!(
             sender.semantic_version(),
-            crate::event_pages::SEMANTIC_PROTOCOL_V8
+            crate::event_pages::SEMANTIC_PROTOCOL_V9
         );
 
         let offer = crate::event_pages::TransferProfileOfferV1::for_semantic_version(
-            crate::event_pages::SEMANTIC_PROTOCOL_V8,
+            crate::event_pages::SEMANTIC_PROTOCOL_V9,
         )
-        .expect("v8 transfer profiles");
+        .expect("v9 transfer profiles");
         let negotiated = crate::event_pages::negotiate_transfer_profiles(&offer, &offer)
-            .expect("negotiate v8 profiles");
+            .expect("negotiate v9 profiles");
         let digest = crate::event_pages::transfer_profile_digest(&offer, &offer, &negotiated);
         let lane = crate::event_pages::LaneId::Blob;
-        let profile = crate::event_pages::TransferProfileId::BlobRangesStreamV1;
+        let profile = crate::event_pages::TransferProfileId::BlobStreamV1;
         let direction = EventDirection::ToSessionResponder;
 
-        let v8 = sender
-            .seal_profiled_application_frame(digest, lane, profile, direction, b"v8")
-            .expect("seal v8 lane record");
+        let v9 = sender
+            .seal_profiled_application_frame(digest, lane, profile, direction, b"v9")
+            .expect("seal v9 lane record");
         assert_eq!(
             receiver
-                .open_profiled_application_frame(digest, lane, profile, direction, &v8)
-                .expect("open v8 lane record"),
-            b"v8"
+                .open_profiled_application_frame(digest, lane, profile, direction, &v9)
+                .expect("open v9 lane record"),
+            b"v9"
         );
 
         let mut v7_context = b"ASTER/v7-lane-record/v1\0".to_vec();
-        v7_context.extend_from_slice(&crate::event_pages::SEMANTIC_PROTOCOL_V8.to_be_bytes());
+        v7_context.extend_from_slice(&crate::event_pages::SEMANTIC_PROTOCOL_V9.to_be_bytes());
         v7_context.extend_from_slice(&digest);
         v7_context.extend_from_slice(&(lane as u16).to_be_bytes());
         v7_context.extend_from_slice(&(profile as u16).to_be_bytes());
@@ -4529,7 +4490,7 @@ mod tests {
             receiver
                 .open_profiled_application_frame(digest, lane, profile, direction, &substituted)
                 .is_err(),
-            "semantic-v8 lane record protection must reject the v7 AAD domain"
+            "semantic-v9 lane record protection must reject the v7 AAD domain"
         );
     }
 

@@ -38,9 +38,8 @@ python3 tools/blob_benchmark.py \
   --output /durable/new-scale-results --state /scratch/new-scale-state
 ```
 
-Semantic v9/profile 5 admits up to 8 GiB. Semantic v7/v8 compatibility profile
-4 remains limited to 64 MiB; profile 5 never downgrades an active attempt into
-profile 4.
+The hybrid network requires semantic v9/profile 5 and admits up to 8 GiB.
+Older peers fail negotiation.
 
 Run the explicit 1-GiB profile-5 campaign only on a prepared engineering host:
 

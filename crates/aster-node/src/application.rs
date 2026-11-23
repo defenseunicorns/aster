@@ -35,11 +35,10 @@ use aster_redb_store::{
 };
 pub use aster_redb_store::{
     CommittedEventContent, CommittedEventReceipt, EventClientContext, EventClientDisposition,
-    EventClientId, EventClientStatus, EventOperationAbandonment, EventOperationAuditState,
-    EventOperationAuditStatus, EventOperationLimits, EventOperationSequence, EventOperationStats,
-    EventPublicationSession, EventRecoverySnapshot, EventResultAcknowledgement,
-    NumberedEventOperationError, NumberedEventOperationStats, NumberedEventPublishOutcome,
-    NumberedEventResult,
+    EventClientId, EventClientStatus, EventOperationAbandonment, EventOperationLimits,
+    EventOperationSequence, EventPublicationSession, EventRecoverySnapshot,
+    EventResultAcknowledgement, NumberedEventOperationError, NumberedEventOperationStats,
+    NumberedEventPublishOutcome, NumberedEventResult,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -58,14 +57,6 @@ use crate::{
         verify_content_stored_claim, verify_stored_claim,
     },
 };
-
-#[cfg(test)]
-use crate::runtime::{
-    SelectedEventPublish, publish_selected_event_group_once, publish_selected_event_once,
-    publish_selected_event_once_observed,
-};
-#[cfg(test)]
-use aster_redb_store::EventOperationKey;
 
 mod blob;
 #[cfg(all(test, unix))]
@@ -705,18 +696,10 @@ pub enum EventOperationCapacityWarning {
     Exhausted,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EventOperationLedgerMode {
-    Legacy,
-    Numbered,
-}
-
-/// Candidate ledger headroom, independent of the approved evaluation profile.
+/// Numbered publication ledger headroom.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EventOperationCapacity {
-    pub stats: EventOperationStats,
     pub numbered_stats: NumberedEventOperationStats,
-    pub mode: EventOperationLedgerMode,
     pub limits: EventOperationLimits,
     pub rows: u64,
     pub logical_bytes: u64,
@@ -726,81 +709,25 @@ pub struct EventOperationCapacity {
 }
 
 impl EventOperationCapacity {
-    /// Capacity of an explicitly inspected historical opaque-key ledger.
-    /// Normal node status uses `for_ledgers`, including an empty numbered store.
-    pub fn from_legacy_inspection(
-        stats: EventOperationStats,
-        limits: EventOperationLimits,
-    ) -> Self {
-        Self::calculate(
-            stats,
-            NumberedEventOperationStats::default(),
-            limits,
-            EventOperationLedgerMode::Legacy,
-        )
-    }
-
     pub fn for_ledgers(
-        stats: EventOperationStats,
         numbered_stats: NumberedEventOperationStats,
         limits: EventOperationLimits,
     ) -> Self {
-        #[cfg(test)]
-        if stats != EventOperationStats::default() {
-            return Self::from_legacy_inspection(stats, limits);
-        }
-        Self::calculate(
-            stats,
-            numbered_stats,
-            limits,
-            EventOperationLedgerMode::Numbered,
-        )
-    }
-
-    fn calculate(
-        stats: EventOperationStats,
-        numbered_stats: NumberedEventOperationStats,
-        limits: EventOperationLimits,
-        mode: EventOperationLedgerMode,
-    ) -> Self {
-        const LEGACY_ACTIVE_BYTES: u64 = 162;
         const NUMBERED_RESULT_BYTES: u64 = 292;
-        // EventOperationLimits construction checked both reserve arithmetic
-        // and subtraction. Retained usage may exceed a lower reopened limit.
-        let rows = match mode {
-            EventOperationLedgerMode::Legacy => stats.records_total,
-            EventOperationLedgerMode::Numbered => numbered_stats
-                .clients
-                .saturating_add(numbered_stats.outstanding_results),
-        };
-        let logical_bytes = match mode {
-            EventOperationLedgerMode::Legacy => stats.logical_bytes,
-            EventOperationLedgerMode::Numbered => numbered_stats.logical_bytes,
-        };
+        let rows = numbered_stats
+            .clients
+            .saturating_add(numbered_stats.outstanding_results);
+        let logical_bytes = numbered_stats.logical_bytes;
         let ordinary_records = limits.ordinary_record_limit();
         let ordinary_bytes = limits.max_logical_bytes() - limits.emergency_byte_reserve();
-        let ordinary_remaining = ordinary_records.saturating_sub(rows).min(
-            ordinary_bytes.saturating_sub(logical_bytes)
-                / match mode {
-                    EventOperationLedgerMode::Legacy => LEGACY_ACTIVE_BYTES,
-                    EventOperationLedgerMode::Numbered => NUMBERED_RESULT_BYTES,
-                },
-        );
-        let emergency_remaining = match mode {
-            EventOperationLedgerMode::Legacy => {
-                let total_remaining = limits.max_records().saturating_sub(rows).min(
-                    limits.max_logical_bytes().saturating_sub(logical_bytes) / LEGACY_ACTIVE_BYTES,
-                );
-                total_remaining.saturating_sub(ordinary_remaining)
-            }
-            EventOperationLedgerMode::Numbered => {
-                let total_remaining = limits.max_records().saturating_sub(rows).min(
-                    limits.max_logical_bytes().saturating_sub(logical_bytes)
-                        / NUMBERED_RESULT_BYTES,
-                );
-                total_remaining.saturating_sub(ordinary_remaining)
-            }
-        };
+        let ordinary_remaining = ordinary_records
+            .saturating_sub(rows)
+            .min(ordinary_bytes.saturating_sub(logical_bytes) / NUMBERED_RESULT_BYTES);
+        let total_remaining = limits
+            .max_records()
+            .saturating_sub(rows)
+            .min(limits.max_logical_bytes().saturating_sub(logical_bytes) / NUMBERED_RESULT_BYTES);
+        let emergency_remaining = total_remaining.saturating_sub(ordinary_remaining);
         let at_percent = |percent: u128| {
             u128::from(rows) * 100 >= u128::from(ordinary_records) * percent
                 || u128::from(logical_bytes) * 100 >= u128::from(ordinary_bytes) * percent
@@ -815,9 +742,7 @@ impl EventOperationCapacity {
             EventOperationCapacityWarning::Ok
         };
         Self {
-            stats,
             numbered_stats,
-            mode,
             limits,
             rows,
             logical_bytes,
@@ -828,14 +753,9 @@ impl EventOperationCapacity {
     }
 }
 
-/// Sanitized live selected-Event status snapshot. When the operation audit is
-/// `Failed`, store usage, operation counts/bytes, and pending deliveries are
-/// the last successfully read figures, not current or trusted capacity. Peer,
-/// synchronization, emission, and audit observations remain actor-current.
+/// Sanitized live selected-Event status snapshot.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SelectedEventStatus {
-    /// Legacy-ledger background audit; it does not claim numbered-ledger coverage.
-    pub event_operation_audit: EventOperationAuditStatus,
     pub sync: EventSyncStatus,
     pub authenticated_contacts: u64,
     pub failed_contact_attempts: u64,
@@ -1363,7 +1283,6 @@ pub struct SelectedEventNode {
     verifier_head: Option<(u64, ControlTransferId)>,
     custody_clock: NodeCustodyClock,
     event_route_cache: Arc<AuthenticatedEventRouteCache>,
-    operation_retirement_quarantined: bool,
 }
 
 impl SelectedEventNode {
@@ -1522,7 +1441,6 @@ impl SelectedEventNode {
             verifier_head,
             custody_clock,
             event_route_cache,
-            operation_retirement_quarantined: false,
         };
         selected.current_policy("open")?;
         Ok(selected)
@@ -1543,22 +1461,14 @@ impl SelectedEventNode {
             verifier_head,
             custody_clock,
             event_route_cache,
-            operation_retirement_quarantined: false,
         }
-    }
-
-    pub(crate) fn quarantine_operation_retirement(&mut self) {
-        self.operation_retirement_quarantined = true;
     }
 
     pub(crate) fn maintain_runtime_custody(
         &self,
         scope_quotas: &[CustodyQuota],
     ) -> Result<(), NodeError> {
-        operation_audit_maintenance_result(
-            self.operation_retirement_quarantined,
-            drive_custody_maintenance(&self.store, &self.custody_clock, scope_quotas),
-        )
+        drive_custody_maintenance(&self.store, &self.custody_clock, scope_quotas)
     }
 
     pub(crate) fn refresh_runtime_policy(
@@ -1892,7 +1802,35 @@ impl SelectedEventNode {
         })
     }
 
-    /// Durably publishes one arbitrary selected Event exactly once per operation key.
+    // Historical fixture labels identify independent numbered clients. These
+    // test-only adapters exercise the production numbered ledger, including retries.
+    #[cfg(test)]
+    fn numbered_fixture_request(
+        &self,
+        request: EventPublishRequest,
+    ) -> Result<NumberedEventPublishRequest, ApplicationError> {
+        let client_id = EventClientId::new(request.operation_key)
+            .map_err(|error| application_error("publish", StoreError::from(error).into()))?;
+        let snapshot = self.begin_publication_session(&client_id, 0, b"fixture-claim")?;
+        self.complete_publication_recovery(
+            &client_id,
+            snapshot.session,
+            snapshot.snapshot_revision,
+        )?;
+        Ok(NumberedEventPublishRequest {
+            client_id,
+            session: snapshot.session,
+            sequence: EventOperationSequence::new(1).expect("first fixture sequence"),
+            predecessor: request.predecessor,
+            topic: request.topic,
+            scope: request.scope,
+            priority: request.priority,
+            logical_key: request.logical_key,
+            payload: request.payload,
+            tombstone: request.tombstone,
+        })
+    }
+
     #[cfg(test)]
     pub fn publish(
         &mut self,
@@ -1901,81 +1839,15 @@ impl SelectedEventNode {
         self.publish_with_options(request, EventPublishOptions::durable())
     }
 
-    /// Durably publishes with an explicit finite or durable custody lifetime.
     #[cfg(test)]
     pub fn publish_with_options(
         &mut self,
         request: EventPublishRequest,
         options: EventPublishOptions,
     ) -> Result<EventPublishResult, ApplicationError> {
-        self.maintain_custody_for("publish")?;
-        self.publish_after_maintenance(request, options)
-    }
-
-    #[cfg(test)]
-    fn publish_after_maintenance(
-        &mut self,
-        request: EventPublishRequest,
-        options: EventPublishOptions,
-    ) -> Result<EventPublishResult, ApplicationError> {
-        if options.ttl_ms().is_some()
-            && !request.tombstone
-            && !self.custody_clock.supports_finite_ttl()
-        {
-            return Err(ApplicationError::new(
-                ApplicationErrorKind::RequestRejected,
-                "publish",
-            ));
-        }
-        let custody_sample = Some(
-            self.custody_clock
-                .sample()
-                .map_err(|error| application_error("publish", error))?,
-        );
-        let EventPublishRequest {
-            operation_key,
-            predecessor,
-            topic,
-            scope,
-            priority,
-            logical_key,
-            payload,
-            tombstone,
-        } = request;
-        let operation = EventOperationKey::new(operation_key)
-            .map_err(|error| application_error("publish", error.into()))?;
-        let predecessor = predecessor.map(EventId::into_store);
-        let policy = self.current_policy("publish")?;
-        let (stored, inserted) = publish_selected_event_once(
-            &self.store,
-            &policy,
-            &mut self.verifier,
-            SelectedEventPublish {
-                operation: &operation,
-                predecessor,
-                topic: &topic,
-                scope: &scope,
-                priority,
-                ttl_ms: options.ttl_ms(),
-                custody_sample,
-                logical_key: &logical_key,
-                payload: &payload,
-                tombstone,
-            },
-        )
-        .map_err(|error| application_error("publish", error))?;
-        cache_accepted_stored_event(&self.event_route_cache, &mut self.verifier, &stored)
-            .map_err(|error| application_error("publish", error))?;
-        Ok(EventPublishResult {
-            id: EventId::from_store(stored.semantic_id),
-            publisher: stored.header.stamp.dot.publisher,
-            publisher_counter: stored.header.stamp.dot.counter,
-            event_sequence: event_sequence(&stored, "publish")?,
-            priority: stored.header.priority,
-            ttl_ms: stored.header.ttl_ms,
-            acceptance_marker: stored.acceptance_marker,
-            inserted,
-        })
+        let request = self.numbered_fixture_request(request)?;
+        let outcome = self.publish_numbered(request, options)?;
+        self.finish_fixture_publication(outcome)
     }
 
     #[cfg(test)]
@@ -1983,147 +1855,43 @@ impl SelectedEventNode {
         &mut self,
         publications: Vec<(EventPublishRequest, EventPublishOptions)>,
     ) -> EventPublicationGroupResult {
-        let mut diagnostic = EventPublicationGroupDiagnostic {
-            collected: u64::try_from(publications.len()).unwrap_or(u64::MAX),
-            ..EventPublicationGroupDiagnostic::default()
-        };
-        if publications.is_empty() {
-            return EventPublicationGroupResult {
-                results: Vec::new(),
-                diagnostic,
-            };
-        }
-        let maintenance = drive_custody_maintenance_observed(&self.store, &self.custody_clock, &[]);
-        diagnostic.custody_writer_commits = maintenance.writer_commits;
-        if let Err(error) = maintenance.result {
-            let error = application_error("publish", error);
-            let results = publications
-                .into_iter()
-                .map(|_| Err(error))
-                .collect::<Vec<_>>();
-            diagnostic.failures = diagnostic.collected;
-            return EventPublicationGroupResult {
-                results,
-                diagnostic,
-            };
-        }
-
-        let mut results = Vec::with_capacity(publications.len());
-        let mut start = 0usize;
-        while start < publications.len() {
-            let first = &publications[start];
-            let ordinary = first.0.priority != Priority::Flash;
-            let finite = first.1.ttl_ms().is_some();
-            let mut end = start + 1;
-            if ordinary {
-                while end < publications.len()
-                    && publications[end].0.priority != Priority::Flash
-                    && publications[end].0.topic == first.0.topic
-                    && publications[end].0.scope == first.0.scope
-                    && publications[end].1.ttl_ms().is_some() == finite
-                {
-                    end += 1;
-                }
-            }
-            let cohort = &publications[start..end];
-            diagnostic.cohorts = diagnostic.cohorts.saturating_add(1);
-            diagnostic.max_cohort_size = diagnostic
-                .max_cohort_size
-                .max(u64::try_from(cohort.len()).unwrap_or(u64::MAX));
-            if cohort.len() > 1
-                && (!finite
-                    || self.custody_clock.supports_finite_ttl()
-                    || cohort.iter().all(|(request, _)| request.tombstone))
-            {
-                let operations = cohort
-                    .iter()
-                    .map(|(request, _)| EventOperationKey::new(request.operation_key.clone()))
-                    .collect::<Result<Vec<_>, _>>();
-                let predecessors = cohort
-                    .iter()
-                    .map(|(request, _)| request.predecessor.map(EventId::into_store))
-                    .collect::<Vec<_>>();
-                let custody_sample = if finite {
-                    self.custody_clock.sample().ok()
-                } else {
-                    None
+        let collected = publications.len() as u64;
+        let requests = publications
+            .into_iter()
+            .map(|(request, options)| {
+                self.numbered_fixture_request(request)
+                    .map(|request| (request, options))
+            })
+            .collect::<Result<Vec<_>, _>>();
+        let requests = match requests {
+            Ok(requests) => requests,
+            Err(error) => {
+                return EventPublicationGroupResult {
+                    results: (0..collected).map(|_| Err(error)).collect(),
+                    diagnostic: EventPublicationGroupDiagnostic {
+                        collected,
+                        failures: collected,
+                        ..Default::default()
+                    },
                 };
-                let policy = self.current_policy("publish");
-                if let (Ok(operations), Ok(policy)) = (operations, policy) {
-                    let selected = cohort
-                        .iter()
-                        .zip(&operations)
-                        .zip(&predecessors)
-                        .map(|(((request, options), operation), predecessor)| {
-                            SelectedEventPublish {
-                                operation,
-                                predecessor: *predecessor,
-                                topic: &request.topic,
-                                scope: &request.scope,
-                                priority: request.priority,
-                                ttl_ms: options.ttl_ms(),
-                                custody_sample,
-                                logical_key: &request.logical_key,
-                                payload: &request.payload,
-                                tombstone: request.tombstone,
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    let group = publish_selected_event_group_once(
-                        &self.store,
-                        &policy,
-                        &mut self.verifier,
-                        &selected,
-                    );
-                    diagnostic.event_writer_commits = diagnostic
-                        .event_writer_commits
-                        .checked_add(group.writer_commits)
-                        .expect("bounded publication group writer count");
-                    if let Ok(outcomes) = group.result {
-                        for outcome in outcomes {
-                            let result = outcome
-                                .map_err(|error| application_error("publish", error))
-                                .and_then(|(stored, inserted)| {
-                                    self.finish_published_event(stored, inserted)
-                                });
-                            if result.as_ref().is_ok_and(|result| result.inserted) {
-                                diagnostic.accepted_new = diagnostic.accepted_new.saturating_add(1);
-                            } else if result.is_ok() {
-                                diagnostic.exact_retries =
-                                    diagnostic.exact_retries.saturating_add(1);
-                            } else {
-                                diagnostic.failures = diagnostic.failures.saturating_add(1);
-                            }
-                            results.push(result);
-                        }
-                        start = end;
-                        continue;
-                    }
-                }
             }
-
-            diagnostic.singleton_fallbacks = diagnostic
-                .singleton_fallbacks
-                .saturating_add(u64::try_from(cohort.len()).unwrap_or(u64::MAX));
-            for (request, options) in cohort.iter().cloned() {
-                let (result, writer_commits) =
-                    self.publish_singleton_after_maintenance_observed(request, options);
-                diagnostic.event_writer_commits = diagnostic
-                    .event_writer_commits
-                    .checked_add(writer_commits)
-                    .expect("bounded publication group writer count");
-                match &result {
-                    Ok(result) if result.inserted => {
-                        diagnostic.accepted_new = diagnostic.accepted_new.saturating_add(1);
-                    }
-                    Ok(_) => {
-                        diagnostic.exact_retries = diagnostic.exact_retries.saturating_add(1);
-                    }
-                    Err(_) => diagnostic.failures = diagnostic.failures.saturating_add(1),
-                }
-                results.push(result);
+        };
+        let group = self.publish_numbered_group_with_options(requests);
+        let results = group
+            .results
+            .into_iter()
+            .map(|result| result.and_then(|outcome| self.finish_fixture_publication(outcome)))
+            .collect::<Vec<_>>();
+        let mut diagnostic = group.diagnostic;
+        diagnostic.accepted_new = 0;
+        diagnostic.exact_retries = 0;
+        diagnostic.failures = 0;
+        for result in &results {
+            match result {
+                Ok(result) if result.inserted => diagnostic.accepted_new += 1,
+                Ok(_) => diagnostic.exact_retries += 1,
+                Err(_) => diagnostic.failures += 1,
             }
-            start = end;
         }
         EventPublicationGroupResult {
             results,
@@ -2132,69 +1900,17 @@ impl SelectedEventNode {
     }
 
     #[cfg(test)]
-    fn publish_singleton_after_maintenance_observed(
+    fn finish_fixture_publication(
         &mut self,
-        request: EventPublishRequest,
-        options: EventPublishOptions,
-    ) -> (Result<EventPublishResult, ApplicationError>, u64) {
-        if options.ttl_ms().is_some()
-            && !request.tombstone
-            && !self.custody_clock.supports_finite_ttl()
-        {
-            return (
-                Err(ApplicationError::new(
-                    ApplicationErrorKind::RequestRejected,
-                    "publish",
-                )),
-                0,
-            );
-        }
-        let operation = match EventOperationKey::new(request.operation_key.clone()) {
-            Ok(operation) => operation,
-            Err(error) => return (Err(application_error("publish", error.into())), 0),
-        };
-        let custody_sample = match self.custody_clock.sample() {
-            Ok(sample) => Some(sample),
-            Err(error) => return (Err(application_error("publish", error)), 0),
-        };
-        let predecessor = request.predecessor.map(EventId::into_store);
-        let policy = match self.current_policy("publish") {
-            Ok(policy) => policy,
-            Err(error) => return (Err(error), 0),
-        };
-        let selected = SelectedEventPublish {
-            operation: &operation,
-            predecessor,
-            topic: &request.topic,
-            scope: &request.scope,
-            priority: request.priority,
-            ttl_ms: options.ttl_ms(),
-            custody_sample,
-            logical_key: &request.logical_key,
-            payload: &request.payload,
-            tombstone: request.tombstone,
-        };
-        let attempt = publish_selected_event_once_observed(
-            &self.store,
-            &policy,
-            &mut self.verifier,
-            selected,
-        );
-        let result = match attempt.result {
-            Ok((stored, inserted)) => self.finish_published_event(stored, inserted),
-            Err(error) => Err(application_error("publish", error)),
-        };
-        (result, attempt.writer_commits)
-    }
-
-    #[cfg(test)]
-    fn finish_published_event(
-        &mut self,
-        stored: StoredEvent,
-        inserted: bool,
+        outcome: NumberedEventPublishOutcome,
     ) -> Result<EventPublishResult, ApplicationError> {
-        cache_accepted_stored_event(&self.event_route_cache, &mut self.verifier, &stored)
-            .map_err(|error| application_error("publish", error))?;
+        let stored = self
+            .store
+            .get_event(outcome.result.receipt.transfer_id)
+            .map_err(|error| application_error("publish", error.into()))?
+            .ok_or_else(|| {
+                ApplicationError::new(ApplicationErrorKind::ExpiredOrRetired, "publish")
+            })?;
         Ok(EventPublishResult {
             id: EventId::from_store(stored.semantic_id),
             publisher: stored.header.stamp.dot.publisher,
@@ -2203,7 +1919,7 @@ impl SelectedEventNode {
             priority: stored.header.priority,
             ttl_ms: stored.header.ttl_ms,
             acceptance_marker: stored.acceptance_marker,
-            inserted,
+            inserted: outcome.inserted,
         })
     }
 
@@ -2289,7 +2005,7 @@ impl SelectedEventNode {
             diagnostic.cohorts += 1;
             diagnostic.max_cohort_size = diagnostic.max_cohort_size.max(cohort.len() as u64);
             let policy = self.current_policy("publish_numbered");
-            let sample = if finite {
+            let sample = if finite && self.custody_clock.supports_finite_ttl() {
                 self.custody_clock.sample().ok()
             } else {
                 None
@@ -2808,21 +2524,6 @@ fn event_sequence(stored: &StoredEvent, operation: &'static str) -> Result<u64, 
         .ok_or_else(|| ApplicationError::new(ApplicationErrorKind::Integrity, operation))
 }
 
-fn operation_audit_maintenance_result(
-    quarantined: bool,
-    result: Result<(), NodeError>,
-) -> Result<(), NodeError> {
-    match result {
-        Err(NodeError::Store(StoreError::EventOperationRetirementInvariant(_))) if quarantined => {
-            // The compaction transaction aborted. Retain the untrusted rows,
-            // without repair; reads still enforce custody TTL/authorization.
-            // Unrelated storage/security errors propagate unchanged.
-            Ok(())
-        }
-        result => result,
-    }
-}
-
 fn application_error(operation: &'static str, error: NodeError) -> ApplicationError {
     let kind = match error {
         NodeError::Configuration(_) => ApplicationErrorKind::InvalidRequest,
@@ -2891,13 +2592,11 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
             | NumberedEventOperationError::SessionExhausted
             | NumberedEventOperationError::RevisionExhausted
             | NumberedEventOperationError::Invariant(_) => ApplicationErrorKind::StateUnavailable,
-            NumberedEventOperationError::LegacyStoreRequiresFreshState
-            | NumberedEventOperationError::LegacyOperationDisabled => {
+            NumberedEventOperationError::LegacyStoreRequiresFreshState => {
                 ApplicationErrorKind::LegacyState
             }
             _ => ApplicationErrorKind::StateUnavailable,
         },
-        StoreError::EventOperationAuditCancelled => ApplicationErrorKind::StateUnavailable,
         StoreError::Blob(error) => blob_store_error_kind(error),
         // The bridge foundation has no selected application surface yet. Any
         // bridge-store error reaching this classifier is therefore an internal
@@ -2905,8 +2604,7 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         StoreError::Bridge(_) => ApplicationErrorKind::Integrity,
         StoreError::Custody(error) => custody_store_error_kind(error),
         StoreError::BlobDeliveryNotFound => ApplicationErrorKind::NotFound,
-        StoreError::InvalidEventOperationKey { .. }
-        | StoreError::InvalidStateOperationKey { .. }
+        StoreError::InvalidStateOperationKey { .. }
         | StoreError::InvalidRecordOperationKey { .. }
         | StoreError::InvalidEventSubscriptionKey { .. }
         | StoreError::InvalidStateSubscriptionKey { .. }
@@ -2982,8 +2680,7 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::SecurityPolicyGenerationAdvanceRequired { .. } => {
             ApplicationErrorKind::PolicyUnsettled
         }
-        StoreError::IdentityConflict { .. }
-        | StoreError::SemanticRepresentationConflict { .. }
+        StoreError::SemanticRepresentationConflict { .. }
         | StoreError::StateRepresentationConflict { .. }
         | StoreError::RecordRepresentationConflict { .. }
         | StoreError::CausalEquivocation { .. }
@@ -3000,12 +2697,6 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::StateSubscriptionConflict
         | StoreError::RecordSubscriptionConflict
         | StoreError::BlobSubscriptionConflict => ApplicationErrorKind::Conflict,
-        StoreError::EventOperationLimitExceeded { .. }
-        | StoreError::EventOperationByteLimitExceeded { .. }
-        | StoreError::EventOperationMigrationAliasOverflow
-        | StoreError::EventOperationMigrationDestinationCapacity => {
-            ApplicationErrorKind::OperationCapacity
-        }
         StoreError::ItemLimitExceeded { .. }
         | StoreError::StateProjectionLimitExceeded { .. }
         | StoreError::StateCausalFrontierLimitExceeded { .. }
@@ -3058,18 +2749,12 @@ fn store_error_kind(error: &StoreError) -> ApplicationErrorKind {
         | StoreError::StoreInUse
         | StoreError::StoreZeroized(_) => ApplicationErrorKind::StateUnavailable,
         StoreError::SemanticVerification(_)
-        | StoreError::EventOperationMigrationMissingMissionBinding
-        | StoreError::EventOperationMigrationMissingAuthenticatedIntent
-        | StoreError::EventOperationMigrationFingerprintCollision
         | StoreError::StateVerification(_)
         | StoreError::RecordVerification(_)
-        | StoreError::MissingAcceptanceMarker { .. }
-        | StoreError::OrphanedAcceptanceMarker { .. }
         | StoreError::InvalidStoredIdLength { .. }
         | StoreError::AccountingMismatch { .. }
         | StoreError::MissingAccountingMetadata { .. }
         | StoreError::SemanticInvariant(_)
-        | StoreError::EventOperationRetirementInvariant(_)
         | StoreError::StateInvariant(_)
         | StoreError::RecordInvariant(_)
         | StoreError::BlobInvariant(_)
@@ -3324,24 +3009,14 @@ mod tests {
     #[test]
     fn event_operation_capacity_has_a_distinct_application_kind() {
         for error in [
-            StoreError::EventOperationLimitExceeded {
-                current: 64,
-                limit: 64,
-            },
-            StoreError::EventOperationMigrationAliasOverflow,
-            StoreError::EventOperationMigrationDestinationCapacity,
-            StoreError::EventOperationLimitExceeded {
-                current: 4_096,
-                limit: 4_096,
-            },
-            StoreError::EventOperationByteLimitExceeded {
-                current: 524_200,
-                incoming: 100,
-                limit: 524_288,
-            },
+            NumberedEventOperationError::ClientLimitExceeded,
+            NumberedEventOperationError::OutstandingLimitExceeded,
+            NumberedEventOperationError::GlobalRecordLimitExceeded,
+            NumberedEventOperationError::GlobalByteLimitExceeded,
+            NumberedEventOperationError::RecoverySnapshotTooLarge,
         ] {
             assert_eq!(
-                store_error_kind(&error),
+                store_error_kind(&StoreError::NumberedEventOperation(error)),
                 ApplicationErrorKind::OperationCapacity
             );
         }
@@ -3352,41 +3027,6 @@ mod tests {
             }),
             ApplicationErrorKind::ResourceLimit
         );
-        for error in [
-            StoreError::EventOperationMigrationMissingMissionBinding,
-            StoreError::EventOperationMigrationMissingAuthenticatedIntent,
-            StoreError::EventOperationMigrationFingerprintCollision,
-        ] {
-            assert_eq!(store_error_kind(&error), ApplicationErrorKind::Integrity);
-        }
-    }
-
-    #[test]
-    fn operation_audit_maintenance_quarantine_is_narrow_and_requires_failure() {
-        for quarantined in [false, true] {
-            let ledger_error = StoreError::EventOperationRetirementInvariant(Box::new(
-                StoreError::SemanticInvariant("ledger retirement"),
-            ));
-            assert_eq!(
-                operation_audit_maintenance_result(quarantined, Err(ledger_error.into())).is_ok(),
-                quarantined
-            );
-            for error in [
-                StoreError::Backend(redb::Error::Io(std::io::Error::other("storage"))),
-                StoreError::Custody(CustodyStoreError::Invariant("custody")),
-                StoreError::ControlPolicyUnsettled { pending: 1 },
-                StoreError::SemanticInvariant("outside ledger retirement"),
-                StoreError::AccountingMismatch {
-                    field: "outside ledger retirement",
-                    durable: 1,
-                    reconstructed: 0,
-                },
-            ] {
-                assert!(
-                    operation_audit_maintenance_result(quarantined, Err(error.into())).is_err()
-                );
-            }
-        }
     }
 
     struct TestRoot(PathBuf);
@@ -3616,32 +3256,74 @@ mod tests {
     #[test]
     fn event_operation_quota_is_terminal_and_exact_retry_survives_exhaustion() {
         use aster_redb_store::{BlobDepotLimits, EventOperationLimits, StoreLimits};
-        for (records, bytes) in [(2, 1_000), (10, 324)] {
+        for byte_limited in [false, true] {
             let root = TestRoot::new("operation-capacity-classification");
             let mut node = selected_node(&root);
+            node.store = Arc::new(
+                Store::open_for_mission(
+                    root.path().join("limited.redb"),
+                    node.mission.mission_authority_id(),
+                )
+                .unwrap(),
+            );
+            let client = EventClientId::new(b"quota-client".to_vec()).unwrap();
+            let snapshot = node
+                .begin_publication_session(&client, 0, b"quota-claim")
+                .unwrap();
+            node.complete_publication_recovery(
+                &client,
+                snapshot.session,
+                snapshot.snapshot_revision,
+            )
+            .unwrap();
+            let first_request = numbered_request(&client, snapshot.session, 1, b"ready");
+            let first = node
+                .publish_numbered(first_request.clone(), EventPublishOptions::durable())
+                .expect("first ordinary slot");
+            let stats = node.store.numbered_event_operation_stats().unwrap();
+            let authority = node.mission.mission_authority_id();
+            // Reopen at exactly the retained ordinary row or byte usage. The
+            // emergency reserve remains unavailable to the next Routine result.
+            let limits = EventOperationLimits::new(
+                if byte_limited {
+                    100
+                } else {
+                    stats.clients + stats.outstanding_results + 1
+                },
+                if byte_limited {
+                    stats.logical_bytes + 162
+                } else {
+                    100_000
+                },
+                1,
+            )
+            .unwrap();
+            let placeholder =
+                Arc::new(Store::open_for_mission(root.path().join(STORE_FILE), authority).unwrap());
+            drop(std::mem::replace(&mut node.store, placeholder));
             node.store = Arc::new(
                 Store::open_with_limits_and_operation_limits_for_mission(
                     root.path().join("limited.redb"),
                     StoreLimits::default(),
                     BlobDepotLimits::DEFAULT,
-                    EventOperationLimits::new(records, bytes, 1).expect("limits"),
-                    node.mission.mission_authority_id(),
+                    limits,
+                    authority,
                 )
-                .expect("limited store"),
+                .unwrap(),
             );
-            let first_request = request(b"first", "ops.alpha", b"asset", b"ready");
-            let first = node
-                .publish(first_request.clone())
-                .expect("first ordinary slot");
             let error = node
-                .publish(request(b"second", "ops.alpha", b"asset", b"ready"))
-                .expect_err("new key at operation capacity");
+                .publish_numbered(
+                    numbered_request(&client, snapshot.session, 2, b"next"),
+                    EventPublishOptions::durable(),
+                )
+                .expect_err("new sequence at operation capacity");
             assert_eq!(error.kind(), ApplicationErrorKind::OperationCapacity);
             let retry = node
-                .publish(first_request)
+                .publish_numbered(first_request, EventPublishOptions::durable())
                 .expect("exact retry at capacity");
-            assert_eq!(retry.id, first.id);
+            assert_eq!(retry.result.receipt, first.result.receipt);
             assert!(!retry.inserted);
+            assert_eq!(node.store.numbered_event_operation_stats().unwrap(), stats);
         }
     }
 
@@ -4259,48 +3941,57 @@ mod tests {
     fn numbered_profile_refuses_legacy_ledger_without_modifying_it() {
         let root = TestRoot::new("numbered-refuses-legacy");
         let mut node = selected_node(&root);
-        let legacy = node
-            .publish(request(
-                b"legacy-operation",
-                "ops.alpha",
-                b"legacy-asset",
-                b"preserve-me",
-            ))
-            .expect("legacy publication");
-        let client = EventClientId::new(b"new-profile-client".to_vec()).expect("client");
-        let error = node
-            .begin_publication_session(&client, 0, b"cannot-migrate")
-            .expect_err("legacy state requires a fresh boundary");
+        let published = node
+            .publish(request(b"retained", "ops.alpha", b"asset", b"preserve-me"))
+            .expect("numbered publication");
+        drop(node);
+        let path = root.path().join(STORE_FILE);
+        let legacy: redb::TableDefinition<&[u8], &[u8]> =
+            redb::TableDefinition::new("aster.event-operations.v1");
+        let database = redb::Database::open(&path).expect("open fixture");
+        let write = database.begin_write().expect("writer");
+        write
+            .open_table(legacy)
+            .expect("legacy table")
+            .insert(
+                b"legacy-operation".as_slice(),
+                b"preserve-legacy".as_slice(),
+            )
+            .expect("seed historical row");
+        write.commit().expect("commit fixture");
+        drop(database);
+        let before = fs::read(&path).expect("snapshot");
+        let mission_path = root.path().join("mission.unprotected-reference.bundle");
+        let error = SelectedEventNode::open_unprotected_reference(root.path(), &mission_path)
+            .err()
+            .expect("legacy state requires a fresh boundary");
         assert_eq!(error.kind(), ApplicationErrorKind::LegacyState);
-        let retained = node.query(EventQuery::default()).expect("legacy query");
-        assert_eq!(retained.items.len(), 1);
-        assert_eq!(retained.items[0].id, legacy.id);
-        assert_eq!(retained.items[0].payload, b"preserve-me");
+        assert_eq!(fs::read(&path).expect("retained bytes"), before);
 
-        let numbered_root = TestRoot::new("legacy-refuses-numbered");
-        let mut numbered_node = selected_node(&numbered_root);
-        let recovery = numbered_node
-            .begin_publication_session(&client, 0, b"numbered-only")
-            .expect("initialize numbered profile");
-        numbered_node
-            .complete_publication_recovery(&client, recovery.session, recovery.snapshot_revision)
-            .expect("complete recovery");
-        let legacy_error = numbered_node
-            .publish(request(
-                b"legacy-after-numbered",
-                "ops.alpha",
-                b"legacy-asset",
-                b"must-not-commit",
-            ))
-            .expect_err("numbered state disables the legacy ledger");
-        assert_eq!(legacy_error.kind(), ApplicationErrorKind::LegacyState);
-        assert!(
-            numbered_node
-                .query(EventQuery::default())
-                .expect("query numbered store")
-                .items
-                .is_empty()
+        // Remove only the injected historical row to verify the independently
+        // published Event remains readable after the rejected application open.
+        let database = redb::Database::open(&path).expect("open fixture");
+        let write = database.begin_write().expect("writer");
+        assert_eq!(
+            write
+                .open_table(legacy)
+                .expect("legacy table")
+                .remove(b"legacy-operation".as_slice())
+                .expect("remove fixture row")
+                .expect("retained legacy row")
+                .value(),
+            b"preserve-legacy"
         );
+        write.commit().expect("commit fixture cleanup");
+        drop(database);
+        let mut node = SelectedEventNode::open_unprotected_reference(root.path(), &mission_path)
+            .expect("reopen numbered state");
+        let retained = node
+            .query(EventQuery::default())
+            .expect("query retained Event");
+        assert_eq!(retained.items.len(), 1);
+        assert_eq!(retained.items[0].id, published.id);
+        assert_eq!(retained.items[0].payload, b"preserve-me");
     }
 
     #[test]

@@ -102,11 +102,6 @@ description = "Run the ignored generated 100 MiB Blob pipeline qualification"
 tools = { "cargo:cargo-nextest" = "0.9.145" }
 run = "sh tools/with-test-resources.sh cargo nextest run --locked -p aster-core --all-features --run-ignored ignored-only -E 'test(=blob::tests::qualify_generated_100mb_blob_pipeline)'"
 
-[tasks.qualify-local-blob-above-network-limit]
-description = "Run the ignored local Blob-above-network-limit qualification"
-tools = { "cargo:cargo-nextest" = "0.9.145" }
-run = "sh tools/with-test-resources.sh cargo nextest run --locked -p aster-node --all-features --lib --run-ignored ignored-only --test-threads 1 -E 'test(=runtime::tests::qualify_valid_local_blob_above_network_limit)'"
-
 [tasks.qualify-near-two-mib-events]
 description = "Run the ignored near-2-MiB bidirectional Event qualification"
 tools = { "cargo:cargo-nextest" = "0.9.145" }

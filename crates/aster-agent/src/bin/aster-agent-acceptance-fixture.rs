@@ -556,14 +556,6 @@ fn status_evidence(response: &api::GetStatusResponse) -> Result<serde_json::Valu
         .publish_operation_capacity
         .as_option()
         .ok_or(FixtureError::Local)?;
-    let operation_ledger_mode = if operations.ledger_mode == api::PublishOperationLedgerMode::Legacy
-    {
-        "legacy"
-    } else if operations.ledger_mode == api::PublishOperationLedgerMode::Numbered {
-        "numbered"
-    } else {
-        return Err(FixtureError::Local);
-    };
     let deliveries = response
         .delivery_capacity
         .as_option()
@@ -589,7 +581,7 @@ fn status_evidence(response: &api::GetStatusResponse) -> Result<serde_json::Valu
     {
         return Err(FixtureError::Local);
     }
-    let (warning, audit) = operation_health(operations)?;
+    let warning = operation_health(operations)?;
     if deliveries.profile_boundary != EVENT_DELIVERY_PROFILE_ROWS
         || deliveries.hard_limit != EVENT_DELIVERY_HARD_ROWS
         || deliveries.profile_saturated != (deliveries.pending >= EVENT_DELIVERY_PROFILE_ROWS)
@@ -619,10 +611,6 @@ fn status_evidence(response: &api::GetStatusResponse) -> Result<serde_json::Valu
         "operation_profile_remaining": operations.profile_remaining,
         "operation_profile_warning": operations.profile_warning,
         "operation_profile_exhausted": operations.profile_exhausted,
-        "operation_ledger_mode": operation_ledger_mode,
-        "operation_active_rows": operations.active_rows,
-        "operation_retired_rows": operations.retired_rows,
-        "operation_reverse_rows": operations.reverse_rows,
         "operation_numbered_clients": operations.numbered_clients,
         "operation_numbered_outstanding_results": operations.numbered_outstanding_results,
         "operation_numbered_reverse_rows": operations.numbered_reverse_rows,
@@ -631,9 +619,6 @@ fn status_evidence(response: &api::GetStatusResponse) -> Result<serde_json::Valu
         "operation_rolling_accept_rate": operations.rolling_accept_rate,
         "operation_estimated_seconds_to_exhaustion": operations.estimated_seconds_to_exhaustion,
         "operation_warning_state": warning,
-        "operation_audit_state": audit,
-        "operation_audit_scanned": operations.audit.as_option().ok_or(FixtureError::Local)?.scanned,
-        "operation_audit_total": operations.audit.as_option().ok_or(FixtureError::Local)?.total,
         "pending_deliveries": deliveries.pending,
         "delivery_profile_saturated": deliveries.profile_saturated,
         "blob_reserved_bytes": blobs.reserved_bytes,
@@ -669,60 +654,26 @@ fn lower_hex(bytes: &[u8]) -> String {
 
 fn operation_health(
     operations: &api::PublishOperationCapacityStatus,
-) -> Result<(&'static str, &'static str), FixtureError> {
+) -> Result<&'static str, FixtureError> {
     use aster_node::application::{EventOperationCapacity, EventOperationCapacityWarning};
-    use aster_redb_store::{
-        EventOperationLimits, EventOperationStats, NumberedEventOperationStats,
-    };
-    let capacity = if operations.ledger_mode == api::PublishOperationLedgerMode::Unspecified
-        || operations.ledger_mode == api::PublishOperationLedgerMode::Legacy
+    use aster_redb_store::{EventOperationLimits, NumberedEventOperationStats};
+    if operations
+        .numbered_clients
+        .checked_add(operations.numbered_outstanding_results)
+        != Some(operations.rows)
+        || operations.numbered_reverse_rows != operations.numbered_outstanding_results
     {
-        if operations.active_rows.checked_add(operations.retired_rows) != Some(operations.rows)
-            || operations.reverse_rows != operations.active_rows
-            || u128::from(operations.bytes)
-                != u128::from(operations.active_rows) * 162
-                    + u128::from(operations.retired_rows) * 67
-            || operations.numbered_clients != 0
-            || operations.numbered_outstanding_results != 0
-            || operations.numbered_reverse_rows != 0
-        {
-            return Err(FixtureError::Local);
-        }
-        EventOperationCapacity::from_legacy_inspection(
-            EventOperationStats {
-                records_total: operations.rows,
-                records_active: operations.active_rows,
-                records_retired: operations.retired_rows,
-                reverse_rows: operations.reverse_rows,
-                logical_bytes: operations.bytes,
-            },
-            EventOperationLimits::DEFAULT,
-        )
-    } else if operations.ledger_mode == api::PublishOperationLedgerMode::Numbered {
-        if operations.active_rows != 0
-            || operations.retired_rows != 0
-            || operations.reverse_rows != 0
-            || operations
-                .numbered_clients
-                .checked_add(operations.numbered_outstanding_results)
-                != Some(operations.rows)
-            || operations.numbered_reverse_rows != operations.numbered_outstanding_results
-        {
-            return Err(FixtureError::Local);
-        }
-        EventOperationCapacity::for_ledgers(
-            EventOperationStats::default(),
-            NumberedEventOperationStats {
-                clients: operations.numbered_clients,
-                outstanding_results: operations.numbered_outstanding_results,
-                reverse_edges: operations.numbered_reverse_rows,
-                logical_bytes: operations.bytes,
-            },
-            EventOperationLimits::DEFAULT,
-        )
-    } else {
         return Err(FixtureError::Local);
-    };
+    }
+    let capacity = EventOperationCapacity::for_ledgers(
+        NumberedEventOperationStats {
+            clients: operations.numbered_clients,
+            outstanding_results: operations.numbered_outstanding_results,
+            reverse_edges: operations.numbered_reverse_rows,
+            logical_bytes: operations.bytes,
+        },
+        EventOperationLimits::DEFAULT,
+    );
     let (expected_warning, warning) = match capacity.warning {
         EventOperationCapacityWarning::Ok => (api::OperationCapacityWarning::Ok, "ok"),
         EventOperationCapacityWarning::Warning => {
@@ -743,18 +694,7 @@ fn operation_health(
     {
         return Err(FixtureError::Local);
     }
-    let audit = operations.audit.as_option().ok_or(FixtureError::Local)?;
-    if audit.scanned > audit.total {
-        return Err(FixtureError::Local);
-    }
-    let audit_name = match audit.state.as_known() {
-        Some(api::OperationLedgerAudit::Pending) if audit.scanned == 0 => "pending",
-        Some(api::OperationLedgerAudit::Running) => "running",
-        Some(api::OperationLedgerAudit::Complete) if audit.scanned == audit.total => "complete",
-        Some(api::OperationLedgerAudit::Failed) => "failed",
-        _ => return Err(FixtureError::Local),
-    };
-    Ok((warning, audit_name))
+    Ok(warning)
 }
 
 fn operation_estimate(remaining: u64, rate: f64) -> Option<u64> {
@@ -1369,9 +1309,7 @@ mod tests {
         let evidence = status_evidence(&valid).expect("valid profile status");
         assert_eq!(evidence["configured_emission_mode"], "normal");
         assert_eq!(evidence["effective_emission_mode"], "receive_only");
-        assert_eq!(evidence["operation_ledger_mode"], "legacy");
-        assert_eq!(evidence["operation_ordinary_remaining"], 990_000);
-        assert_eq!(evidence["operation_audit_state"], "pending");
+        assert_eq!(evidence["operation_ordinary_remaining"], 683926);
 
         let mut invalid = valid;
         invalid
@@ -1419,15 +1357,9 @@ mod tests {
                 byte_hard_limit: 201_326_592,
                 profile_boundary: 1_024,
                 profile_remaining: 1_024,
-                ordinary_remaining: 990_000,
-                emergency_remaining: 10_000,
+                ordinary_remaining: 683926,
+                emergency_remaining: 5548,
                 warning_state: api::OperationCapacityWarning::Ok.into(),
-                ledger_mode: api::PublishOperationLedgerMode::Legacy.into(),
-                audit: api::OperationLedgerAuditStatus {
-                    state: api::OperationLedgerAudit::Pending.into(),
-                    ..Default::default()
-                }
-                .into(),
                 ..Default::default()
             }
             .into(),
@@ -1449,7 +1381,7 @@ mod tests {
     }
 
     #[test]
-    fn operation_health_requires_coherent_rate_estimate() {
+    fn operation_estimate_requires_coherent_rate_estimate() {
         for (name, rows, rate, estimate, valid) in [
             ("exact", 1_024, 2.0, 494_488, true),
             ("positive-rate-zero", 1_024, 2.0, 0, false),
@@ -1506,30 +1438,11 @@ mod tests {
             ("zero-headroom", 990_000, 2.0, 0, true),
             ("zero-headroom-estimate", 990_000, 2.0, 1, false),
         ] {
-            let operations = api::PublishOperationCapacityStatus {
-                rows,
-                active_rows: 24,
-                retired_rows: rows - 24,
-                reverse_rows: 24,
-                bytes: 3_888 + (rows - 24) * 67,
-                ordinary_remaining: 990_000 - rows,
-                emergency_remaining: 10_000,
-                rolling_accept_rate: rate,
-                estimated_seconds_to_exhaustion: estimate,
-                warning_state: if rows == 990_000 {
-                    api::OperationCapacityWarning::Exhausted
-                } else {
-                    api::OperationCapacityWarning::Ok
-                }
-                .into(),
-                audit: api::OperationLedgerAuditStatus {
-                    state: api::OperationLedgerAudit::Pending.into(),
-                    ..Default::default()
-                }
-                .into(),
-                ..Default::default()
-            };
-            assert_eq!(operation_health(&operations).is_ok(), valid, "{name}");
+            assert_eq!(
+                operation_estimate(990_000 - rows, rate) == Some(estimate),
+                valid,
+                "{name}",
+            );
         }
     }
 
@@ -1541,15 +1454,9 @@ mod tests {
             ordinary_remaining: 683_925,
             emergency_remaining: 5_548,
             warning_state: api::OperationCapacityWarning::Ok.into(),
-            ledger_mode: api::PublishOperationLedgerMode::Numbered.into(),
             numbered_clients: 1,
             numbered_outstanding_results: 1,
             numbered_reverse_rows: 1,
-            audit: api::OperationLedgerAuditStatus {
-                state: api::OperationLedgerAudit::Pending.into(),
-                ..Default::default()
-            }
-            .into(),
             ..Default::default()
         };
 
