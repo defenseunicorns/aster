@@ -1995,11 +1995,11 @@ pub(crate) struct NodeCustodyClock {
     finite_ttl_supported: bool,
     #[cfg(not(unix))]
     origin: Arc<Instant>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     injected: Option<Arc<InjectedCustodyClock>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 #[derive(Debug)]
 struct InjectedCustodyClock {
     next_tick_ms: AtomicU64,
@@ -2016,12 +2016,12 @@ impl NodeCustodyClock {
     /// validated kernel boot identity.
     pub(crate) fn supports_finite_ttl(&self) -> bool {
         self.finite_ttl_supported
-            || cfg!(test) && {
-                #[cfg(test)]
+            || cfg!(any(test, feature = "test-utils")) && {
+                #[cfg(any(test, feature = "test-utils"))]
                 {
                     self.injected.is_some()
                 }
-                #[cfg(not(test))]
+                #[cfg(not(any(test, feature = "test-utils")))]
                 {
                     false
                 }
@@ -2100,12 +2100,12 @@ impl NodeCustodyClock {
             finite_ttl_supported,
             #[cfg(not(unix))]
             origin: Arc::new(Instant::now()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-utils"))]
             injected: None,
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn injected(clock_id: [u8; 16], first_tick_ms: u64, step_ms: u64) -> Self {
         Self {
             clock_id,
@@ -2143,7 +2143,7 @@ impl NodeCustodyClock {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn set_injected_tick(&self, tick_ms: u64) -> Result<(), NodeError> {
         let injected = self.injected.as_ref().ok_or_else(|| {
             NodeError::Protocol("custody test hook requires an injected clock".into())
@@ -2153,7 +2153,7 @@ impl NodeCustodyClock {
     }
 
     pub(crate) fn sample(&self) -> Result<CustodySample, NodeError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-utils"))]
         if let Some(injected) = &self.injected {
             let sample_index = injected.samples.fetch_add(1, Ordering::SeqCst);
             let tick_ms = injected
@@ -2188,6 +2188,40 @@ impl NodeCustodyClock {
             clock_id: self.clock_id,
             tick_ms,
         })
+    }
+}
+
+/// Manually controlled custody time for cross-crate integration tests.
+///
+/// Clones share one clock. Real I/O and Tokio scheduling do not advance it.
+#[cfg(feature = "test-utils")]
+#[derive(Clone, Debug)]
+pub struct TestCustodyClock(NodeCustodyClock);
+
+#[cfg(feature = "test-utils")]
+impl TestCustodyClock {
+    /// Creates a frozen clock in an explicit test continuity domain.
+    pub fn new(clock_id: [u8; 16], tick_ms: u64) -> Self {
+        Self(NodeCustodyClock::injected(clock_id, tick_ms, 0))
+    }
+
+    /// Sets the shared custody tick; callers must not move time backwards.
+    pub fn set_tick_ms(&self, tick_ms: u64) -> Result<(), NodeError> {
+        self.0.set_injected_tick(tick_ms)
+    }
+
+    /// Starts a real node using this clock for all custody operations.
+    pub async fn start_node(&self, config: NodeConfig) -> Result<RunningNode, NodeError> {
+        start_node_with_shutdown_ownership(
+            config,
+            SelectedForwardingConfig::default(),
+            NodeOperatorOutput::process(NodeOperatorOutputPolicy::default()),
+            true,
+            true,
+            InitialTransportAdmission::Open,
+            Some(self.0.clone()),
+        )
+        .await
     }
 }
 
@@ -17214,6 +17248,8 @@ pub async fn start_transport_neutral_node(
         false,
         true,
         InitialTransportAdmission::Open,
+        #[cfg(feature = "test-utils")]
+        None,
     )
     .await
 }
@@ -17249,6 +17285,8 @@ pub async fn start_externally_supervised_local_node(
         false,
         false,
         InitialTransportAdmission::Embedded,
+        #[cfg(feature = "test-utils")]
+        None,
     )
     .await
 }
@@ -17264,6 +17302,8 @@ async fn start_externally_supervised_transport_neutral_node_with_output(
         false,
         false,
         InitialTransportAdmission::Open,
+        #[cfg(feature = "test-utils")]
+        None,
     )
     .await
 }
@@ -17307,6 +17347,8 @@ async fn start_node_with_forwarding_output(
         true,
         true,
         InitialTransportAdmission::Open,
+        #[cfg(feature = "test-utils")]
+        None,
     )
     .await
 }
@@ -17330,6 +17372,8 @@ pub async fn start_supervised_node_with_forwarding_and_output_policy(
         true,
         false,
         InitialTransportAdmission::SupervisedClosed,
+        #[cfg(feature = "test-utils")]
+        None,
     )
     .await
 }
@@ -17348,6 +17392,7 @@ async fn start_node_with_shutdown_ownership(
     iroh_transport_enabled: bool,
     handle_sigint: bool,
     initial_transport_admission: InitialTransportAdmission,
+    #[cfg(feature = "test-utils")] custody_clock: Option<NodeCustodyClock>,
 ) -> Result<RunningNode, NodeError> {
     let identity = config.mission.identity();
     let mission_authority = config.mission.mission_authority_id();
@@ -17420,6 +17465,10 @@ async fn start_node_with_shutdown_ownership(
     } else {
         None
     };
+    #[cfg(feature = "test-utils")]
+    {
+        channels.custody_clock = custody_clock;
+    }
     channels.handle_sigint = handle_sigint;
     channels.iroh_transport_enabled = iroh_transport_enabled;
     channels.automatic_event_transports = Some(automatic_event_transports.clone());
@@ -17815,6 +17864,8 @@ struct EventOperationAuditTestControl {
 }
 
 struct NodeActorChannels {
+    #[cfg(feature = "test-utils")]
+    custody_clock: Option<NodeCustodyClock>,
     #[cfg(unix)]
     embedded_zeroization: Option<(EmbeddedZeroizationSender, EmbeddedZeroizationReceiver)>,
     handle_sigint: bool,
@@ -18132,6 +18183,8 @@ impl NodeActorChannels {
         ready: oneshot::Sender<NodeReady>,
     ) -> Self {
         Self {
+            #[cfg(feature = "test-utils")]
+            custody_clock: None,
             application_receiver,
             handle_sigint: true,
             iroh_transport_enabled: true,
@@ -18221,6 +18274,8 @@ async fn run_node_actor_inner(
     channels: NodeActorChannels,
 ) -> Result<NodeReceipt, NodeError> {
     let NodeActorChannels {
+        #[cfg(feature = "test-utils")]
+        custody_clock,
         #[cfg(unix)]
         embedded_zeroization,
         handle_sigint,
@@ -18337,7 +18392,13 @@ async fn run_node_actor_inner(
     }
     // Mission identity is available before any runtime maintenance. Reuse this
     // one clock domain for Blob deletion age and later custody maintenance.
+    #[cfg(not(feature = "test-utils"))]
     let custody_clock = NodeCustodyClock::open(config.mission.identity())?;
+    #[cfg(feature = "test-utils")]
+    let custody_clock = match custody_clock {
+        Some(clock) => clock,
+        None => NodeCustodyClock::open(config.mission.identity())?,
+    };
     #[cfg(all(test, unix))]
     let custody_clock = test_control
         .as_ref()
@@ -36012,6 +36073,8 @@ mod tests {
             SelectedForwardingConfig::default(),
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             NodeActorChannels {
+                #[cfg(feature = "test-utils")]
+                custody_clock: None,
                 handle_sigint: false,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
@@ -36261,6 +36324,8 @@ mod tests {
             SelectedForwardingConfig::default(),
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             NodeActorChannels {
+                #[cfg(feature = "test-utils")]
+                custody_clock: None,
                 handle_sigint: false,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
@@ -36360,6 +36425,8 @@ mod tests {
             SelectedForwardingConfig::default(),
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             NodeActorChannels {
+                #[cfg(feature = "test-utils")]
+                custody_clock: None,
                 handle_sigint: false,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
@@ -40666,6 +40733,8 @@ mod tests {
             forwarding,
             emission_policy,
             NodeActorChannels {
+                #[cfg(feature = "test-utils")]
+                custody_clock: None,
                 handle_sigint: false,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
@@ -40913,6 +40982,8 @@ mod tests {
             forwarding,
             emission_policy.clone(),
             NodeActorChannels {
+                #[cfg(feature = "test-utils")]
+                custody_clock: None,
                 handle_sigint: false,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
@@ -47394,6 +47465,8 @@ mod tests {
             SelectedForwardingConfig::default(),
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             NodeActorChannels {
+                #[cfg(feature = "test-utils")]
+                custody_clock: None,
                 handle_sigint: true,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
@@ -47544,6 +47617,8 @@ mod tests {
             SelectedForwardingConfig::default(),
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             NodeActorChannels {
+                #[cfg(feature = "test-utils")]
+                custody_clock: None,
                 handle_sigint: true,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
@@ -48113,6 +48188,8 @@ mod tests {
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             output,
             NodeActorChannels {
+                #[cfg(feature = "test-utils")]
+                custody_clock: None,
                 handle_sigint: false,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
@@ -48278,6 +48355,8 @@ mod tests {
             SelectedForwardingConfig::default(),
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             NodeActorChannels {
+                #[cfg(feature = "test-utils")]
+                custody_clock: None,
                 handle_sigint: false,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
@@ -48445,6 +48524,8 @@ mod tests {
             SelectedForwardingConfig::default(),
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             NodeActorChannels {
+                #[cfg(feature = "test-utils")]
+                custody_clock: None,
                 handle_sigint: false,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
@@ -49920,6 +50001,8 @@ mod tests {
             SelectedForwardingConfig::default(),
             Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
             NodeActorChannels {
+                #[cfg(feature = "test-utils")]
+                custody_clock: None,
                 handle_sigint: false,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,
@@ -54224,6 +54307,8 @@ mod tests {
             forwarding,
             emission_policy,
             NodeActorChannels {
+                #[cfg(feature = "test-utils")]
+                custody_clock: None,
                 handle_sigint: true,
                 iroh_transport_enabled: true,
                 automatic_event_transports: None,

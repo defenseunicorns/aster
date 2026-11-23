@@ -60,6 +60,7 @@ rustix.workspace = true
 connectrpc-build.workspace = true
 
 [dev-dependencies]
+aster-node = { path = "../aster-node", features = ["test-utils"] }
 aster-host = { path = "../aster-host", features = ["test-support"] }
 aster-profile = { path = "../aster-profile" }
 memchr.workspace = true

@@ -65,6 +65,8 @@ pub mod journal_directory;
 pub mod mission;
 pub mod publication_journal;
 mod runtime;
+#[cfg(feature = "test-utils")]
+pub use runtime::TestCustodyClock;
 pub mod stream_pipeline;
 #[allow(dead_code)] // Includes validation-only profile-5 codec and state helpers.
 mod stream_transfer;
