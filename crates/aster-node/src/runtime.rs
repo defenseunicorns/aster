@@ -4935,6 +4935,24 @@ enum ApplicationPolicyLease {
 type ControlPolicyLeaseFuture =
     Pin<Box<dyn Future<Output = OwnedRwLockWriteGuard<()>> + Send + 'static>>;
 
+type ApplicationPolicyLeaseFuture =
+    Pin<Box<dyn Future<Output = ApplicationPolicyLease> + Send + 'static>>;
+
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PolicyLeaseObservation {
+    ControlQueued,
+    Application,
+    Control,
+}
+
+#[cfg(all(test, unix))]
+struct PolicyLeaseTestControl {
+    lock: Arc<RwLock<()>>,
+    application_polled: mpsc::UnboundedSender<()>,
+    observations: mpsc::UnboundedSender<PolicyLeaseObservation>,
+}
+
 async fn await_control_policy_lease(
     pending: &mut Option<ControlPolicyLeaseFuture>,
 ) -> OwnedRwLockWriteGuard<()> {
@@ -4956,6 +4974,57 @@ async fn acquire_application_policy_lease(
         ApplicationPolicyLease::Read {
             _guard: policy_lock.read_owned().await,
         }
+    }
+}
+
+fn application_policy_lease_future(
+    policy_lock: Arc<RwLock<()>>,
+    write: bool,
+    #[cfg(all(test, unix))] first_poll: Option<mpsc::UnboundedSender<()>>,
+) -> ApplicationPolicyLeaseFuture {
+    Box::pin(async move {
+        #[cfg(all(test, unix))]
+        if let Some(first_poll) = first_poll {
+            let _ = first_poll.send(());
+        }
+        acquire_application_policy_lease(policy_lock, write).await
+    })
+}
+
+async fn await_application_policy_lease(
+    pending: &mut Option<ApplicationPolicyLeaseFuture>,
+) -> ApplicationPolicyLease {
+    pending
+        .as_mut()
+        .expect("pending application command requires one policy-lease future")
+        .await
+}
+
+struct RoutedApplicationPolicyLease {
+    priority: Option<ApplicationPolicyLeaseFuture>,
+    ordinary: Option<ApplicationPolicyLeaseFuture>,
+}
+
+impl RoutedApplicationPolicyLease {
+    fn route(pending: &mut Option<ApplicationPolicyLeaseFuture>, priority: bool) -> Self {
+        let routed = pending.take();
+        if priority {
+            Self {
+                priority: routed,
+                ordinary: None,
+            }
+        } else {
+            Self {
+                priority: None,
+                ordinary: routed,
+            }
+        }
+    }
+
+    fn restore(self, pending: &mut Option<ApplicationPolicyLeaseFuture>) {
+        debug_assert!(pending.is_none());
+        debug_assert!(self.priority.is_none() || self.ordinary.is_none());
+        *pending = self.priority.or(self.ordinary);
     }
 }
 
@@ -17597,6 +17666,7 @@ impl BlobMaintenanceTestGate {
 #[cfg(all(test, unix))]
 struct RunNodeActorTestControl {
     allow_legacy_publication_fixture: bool,
+    policy_lease: Option<PolicyLeaseTestControl>,
     event_operation_audit: Option<EventOperationAuditTestControl>,
     before_loop_ready: oneshot::Sender<()>,
     before_loop_release: oneshot::Receiver<()>,
@@ -18390,6 +18460,13 @@ async fn run_node_actor_inner(
             emit_bridge_delivery("recovered", delivery);
         }
     }
+    #[cfg(all(test, unix))]
+    let policy_lock = test_control
+        .as_ref()
+        .and_then(|control| control.policy_lease.as_ref())
+        .map(|control| control.lock.clone())
+        .unwrap_or_else(|| Arc::new(RwLock::new(())));
+    #[cfg(not(all(test, unix)))]
     let policy_lock = Arc::new(RwLock::new(()));
     // Prove every retained Event/route source across both the pre-control and
     // final replayed key views before quota replacement or
@@ -18774,6 +18851,7 @@ async fn run_node_actor_inner(
         initial_peer_contact_activity,
         mut event_group_execution_gate,
         mut event_operation_audit_control,
+        policy_lease_test_control,
     ) = match test_control.take() {
         Some(control) => (
             Some(control.before_loop_ready),
@@ -18787,6 +18865,7 @@ async fn run_node_actor_inner(
             control.initial_peer_contact_activity,
             control.event_group_execution_gate,
             control.event_operation_audit,
+            control.policy_lease,
         ),
         None => (
             None,
@@ -18800,8 +18879,17 @@ async fn run_node_actor_inner(
             Vec::new(),
             None,
             None,
+            None,
         ),
     };
+    #[cfg(all(test, unix))]
+    let application_policy_lease_polled = policy_lease_test_control
+        .as_ref()
+        .map(|control| control.application_polled.clone());
+    #[cfg(all(test, unix))]
+    let policy_lease_observations = policy_lease_test_control
+        .as_ref()
+        .map(|control| control.observations.clone());
     #[cfg(not(all(test, unix)))]
     let blob_worker_fatal_on_shutdown = false;
     #[cfg(all(test, unix))]
@@ -18906,6 +18994,7 @@ async fn run_node_actor_inner(
         .set(Some(initial_status_metrics));
     let mut application_commands_open = true;
     let mut pending_application_command = None::<SelectedApplicationCommand>;
+    let mut pending_application_lease = None::<ApplicationPolicyLeaseFuture>;
     let mut control_commands_open = true;
     let mut pending_control_command = None::<SelectedControlCommand>;
     let mut pending_control_lease = None::<ControlPolicyLeaseFuture>;
@@ -19088,6 +19177,20 @@ async fn run_node_actor_inner(
                     }
                 }
             }
+            if pending_application_command.is_some() && pending_application_lease.is_none() {
+                pending_application_lease = Some(application_policy_lease_future(
+                    policy_lock.clone(),
+                    pending_application_command
+                        .as_ref()
+                        .is_some_and(SelectedApplicationCommand::mutates_selectors),
+                    #[cfg(all(test, unix))]
+                    application_policy_lease_polled.clone(),
+                ));
+            }
+            debug_assert_eq!(
+                pending_application_command.is_some(),
+                pending_application_lease.is_some()
+            );
             if blob_retirement_deadline_retry_pending
                 && !application_tick_pending
                 && pending_application_command.is_none()
@@ -19108,6 +19211,10 @@ async fn run_node_actor_inner(
                 && !emission_policy_yield_required
                 && !(application_tick_pending && application_tick_yield_required)
                 && network_events_since_application < NETWORK_EVENT_BUDGET;
+            let mut routed_application_lease = RoutedApplicationPolicyLease::route(
+                &mut pending_application_lease,
+                network_events_since_application >= NETWORK_EVENT_BUDGET,
+            );
             tokio::select! {
             biased;
             zeroization = zeroization_receiver.recv() => {
@@ -19650,6 +19757,10 @@ async fn run_node_actor_inner(
                         pending_control_command = Some(command);
                         pending_control_lease =
                             Some(Box::pin(policy_lock.clone().write_owned()));
+                        #[cfg(all(test, unix))]
+                        if let Some(observer) = policy_lease_observations.as_ref() {
+                            let _ = observer.send(PolicyLeaseObservation::ControlQueued);
+                        }
                     }
                     None => control_commands_open = false,
                 }
@@ -19658,6 +19769,10 @@ async fn run_node_actor_inner(
                 if pending_control_command.is_some() && !control_yield_required => {
                 discovery_yield_required = false;
                 let _lease = lease;
+                #[cfg(all(test, unix))]
+                if let Some(observer) = policy_lease_observations.as_ref() {
+                    let _ = observer.send(PolicyLeaseObservation::Control);
+                }
                 pending_control_lease.take();
                 let command = pending_control_command
                     .take()
@@ -20004,16 +20119,17 @@ async fn run_node_actor_inner(
                     contact_activity.launched();
                 }
             }
-            lease = acquire_application_policy_lease(
-                policy_lock.clone(),
-                pending_application_command
-                    .as_ref()
-                    .is_some_and(SelectedApplicationCommand::mutates_selectors),
-            ), if pending_application_command.is_some()
+            lease = await_application_policy_lease(&mut routed_application_lease.priority),
+                if pending_application_command.is_some()
                 && network_events_since_application >= NETWORK_EVENT_BUDGET => {
                 control_yield_required = false;
                 discovery_yield_required = false;
                 let _lease = lease;
+                routed_application_lease.priority.take();
+                #[cfg(all(test, unix))]
+                if let Some(observer) = policy_lease_observations.as_ref() {
+                    let _ = observer.send(PolicyLeaseObservation::Application);
+                }
                 let command = pending_application_command
                     .take()
                     .expect("application policy lease requires a pending command");
@@ -20580,16 +20696,17 @@ async fn run_node_actor_inner(
                     None => application_commands_open = false,
                 }
             }
-            lease = acquire_application_policy_lease(
-                policy_lock.clone(),
-                pending_application_command
-                    .as_ref()
-                    .is_some_and(SelectedApplicationCommand::mutates_selectors),
-            ), if pending_application_command.is_some()
+            lease = await_application_policy_lease(&mut routed_application_lease.ordinary),
+                if pending_application_command.is_some()
                 && network_events_since_application < NETWORK_EVENT_BUDGET => {
                 control_yield_required = false;
                 discovery_yield_required = false;
                 let _lease = lease;
+                routed_application_lease.ordinary.take();
+                #[cfg(all(test, unix))]
+                if let Some(observer) = policy_lease_observations.as_ref() {
+                    let _ = observer.send(PolicyLeaseObservation::Application);
+                }
                 let command = pending_application_command
                     .take()
                     .expect("application policy lease requires a pending command");
@@ -20647,6 +20764,7 @@ async fn run_node_actor_inner(
                 application_tick_yield_required = false;
             }
             }
+            routed_application_lease.restore(&mut pending_application_lease);
         }
     }
 
@@ -20658,6 +20776,7 @@ async fn run_node_actor_inner(
     control_receiver.close();
     ordered_event_contact_receiver.close();
     pending_control_lease.take();
+    pending_application_lease.take();
     if let Some(command) = pending_application_command.take() {
         command.reject();
     }
@@ -36027,6 +36146,7 @@ mod tests {
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
                     allow_legacy_publication_fixture: false,
+                    policy_lease: None,
                     event_operation_audit: Some(EventOperationAuditTestControl {
                         page_size: 1_024,
                         on_progress: Box::new(|_| {}),
@@ -36276,6 +36396,7 @@ mod tests {
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
                     allow_legacy_publication_fixture: false,
+                    policy_lease: None,
                     event_operation_audit: None,
                     before_loop_ready,
                     before_loop_release: release_loop,
@@ -36375,6 +36496,7 @@ mod tests {
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
                     allow_legacy_publication_fixture: false,
+                    policy_lease: None,
                     event_operation_audit: None,
                     before_loop_ready,
                     before_loop_release: release_loop,
@@ -40681,6 +40803,7 @@ mod tests {
                 contact_activity,
                 test_control: Some(RunNodeActorTestControl {
                     allow_legacy_publication_fixture: false,
+                    policy_lease: None,
                     event_operation_audit: None,
                     before_loop_ready,
                     before_loop_release: release_loop,
@@ -40928,6 +41051,7 @@ mod tests {
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
                     allow_legacy_publication_fixture: false,
+                    policy_lease: None,
                     event_operation_audit: None,
                     before_loop_ready,
                     before_loop_release: release_loop,
@@ -47409,6 +47533,7 @@ mod tests {
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
                     allow_legacy_publication_fixture: false,
+                    policy_lease: None,
                     before_loop_ready: before_loop_ready_sender,
                     before_loop_release: before_loop_release_receiver,
                     zeroization_queued: zeroization_queued_sender,
@@ -47559,6 +47684,7 @@ mod tests {
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
                     allow_legacy_publication_fixture: false,
+                    policy_lease: None,
                     before_loop_ready,
                     before_loop_release: release_loop,
                     zeroization_queued,
@@ -48128,6 +48254,7 @@ mod tests {
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
                     allow_legacy_publication_fixture: false,
+                    policy_lease: None,
                     event_operation_audit: None,
                     before_loop_ready,
                     before_loop_release: release_loop,
@@ -48293,6 +48420,7 @@ mod tests {
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
                     allow_legacy_publication_fixture: false,
+                    policy_lease: None,
                     event_operation_audit: None,
                     before_loop_ready,
                     before_loop_release: release_loop,
@@ -48460,6 +48588,7 @@ mod tests {
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
                     allow_legacy_publication_fixture: false,
+                    policy_lease: None,
                     event_operation_audit: None,
                     before_loop_ready,
                     before_loop_release: release_loop,
@@ -49935,6 +50064,7 @@ mod tests {
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
                     allow_legacy_publication_fixture: true,
+                    policy_lease: None,
                     before_loop_ready,
                     before_loop_release,
                     zeroization_queued,
@@ -54028,6 +54158,243 @@ mod tests {
         fs::remove_dir_all(state).expect("cleanup pending live-control state");
     }
 
+    #[cfg(unix)]
+    async fn assert_application_policy_lease_retains_fifo_position(write: bool) {
+        use std::num::NonZeroU64;
+
+        use crate::{
+            application::{
+                EventClientContext, EventClientId, EventPublicationSession,
+                EventSubscriptionRequest,
+            },
+            control_admin::RevocationRequest,
+        };
+
+        let state = root(if write {
+            "application-write-policy-lease-fifo"
+        } else {
+            "application-read-policy-lease-fifo"
+        });
+        fs::create_dir_all(&state).expect("policy-lease state");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700))
+            .expect("owner-only policy-lease state");
+        let services = control_test_services(if write { [0xd1; 32] } else { [0xd2; 32] });
+        let policy_lock = Arc::new(RwLock::new(()));
+        let blocking_lease = policy_lock.clone().write_owned().await;
+        let (application_sender, application_receiver) =
+            mpsc::channel(APPLICATION_COMMAND_CAPACITY);
+        let application_admission = Arc::new(AtomicBool::new(true));
+        let (control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
+        let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let (before_loop_ready, before_loop_reached) = oneshot::channel();
+        let (before_loop_release, release_loop) = oneshot::channel();
+        let (zeroization_queued, _zeroization_observer) = oneshot::channel();
+        let (application_polled, mut application_poll_observer) = mpsc::unbounded_channel();
+        let (lease_observations, mut lease_observer) = mpsc::unbounded_channel();
+        let mut actor = tokio::spawn(run_node_actor_inner(
+            NodeConfig {
+                state: state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: services.authority.clone(),
+                peers: Vec::new(),
+                mutable_interests: Default::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            SelectedForwardingConfig::default(),
+            Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+            NodeActorChannels {
+                handle_sigint: false,
+                iroh_transport_enabled: false,
+                automatic_event_transports: None,
+                embedded_zeroization: None,
+                application_receiver,
+                application_admission,
+                transport_admission: Arc::new(TransportAdmission::open()),
+                control_receiver,
+                ordered_event_contact_receiver: mpsc::channel(ORDERED_EVENT_CONTACT_CAPACITY).1,
+                shutdown_receiver,
+                ready: ready_sender,
+                contact_activity: Arc::new(ContactActivityProbe::default()),
+                test_control: Some(RunNodeActorTestControl {
+                    allow_legacy_publication_fixture: false,
+                    policy_lease: Some(PolicyLeaseTestControl {
+                        lock: policy_lock,
+                        application_polled,
+                        observations: lease_observations,
+                    }),
+                    event_operation_audit: None,
+                    before_loop_ready,
+                    before_loop_release: release_loop,
+                    zeroization_queued,
+                    blob_worker_fatal_on_shutdown: false,
+                    blob_maintenance_gate: None,
+                    blob_final_read_gate: None,
+                    event_group_execution_gate: None,
+                    outbound_contact: None,
+                    contact_lifecycle: None,
+                    initial_peer_contact_activity: Vec::new(),
+                }),
+            },
+        ));
+        match timeout(Duration::from_secs(10), ready_receiver).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => panic!(
+                "policy-lease actor readiness channel failed ({error}); actor={:?}",
+                (&mut actor).await
+            ),
+            Err(error) => panic!(
+                "policy-lease actor readiness timed out ({error}); actor={:?}",
+                (&mut actor).await
+            ),
+        }
+        timeout(Duration::from_secs(10), before_loop_reached)
+            .await
+            .expect("policy-lease loop gate deadline")
+            .expect("policy-lease loop gate");
+
+        let command = if write {
+            let (response, _received) = oneshot::channel();
+            SelectedApplicationCommand::Event(SelectedEventCommand::Subscribe {
+                request: EventSubscriptionRequest {
+                    client: EventClientContext {
+                        client_id: EventClientId::new(b"policy-lease-test".to_vec())
+                            .expect("bounded client id"),
+                        session: EventPublicationSession::new(1).expect("nonzero session"),
+                    },
+                    operation_key: b"policy-lease-test".to_vec(),
+                    topic: services.topic.clone(),
+                    scope: services.scope.clone(),
+                    include_descendant_scopes: false,
+                },
+                response,
+            })
+        } else {
+            let (response, _received) = oneshot::channel();
+            SelectedApplicationCommand::Event(SelectedEventCommand::Status { response })
+        };
+        application_sender
+            .send(command)
+            .await
+            .expect("queue application command");
+        before_loop_release.send(()).expect("release actor loop");
+        timeout(Duration::from_secs(10), application_poll_observer.recv())
+            .await
+            .expect("application lease poll deadline")
+            .expect("application lease polled");
+
+        let (control_response, _control_received) = oneshot::channel();
+        control_sender
+            .send(SelectedControlCommand::PublishRevocation {
+                request: RevocationRequest::new(
+                    services.other.identity(),
+                    NonZeroU64::new(1).expect("nonzero revocation epoch"),
+                ),
+                response: control_response,
+            })
+            .await
+            .expect("queue later control command");
+        assert_eq!(
+            timeout(Duration::from_secs(10), lease_observer.recv())
+                .await
+                .expect("control queue observation deadline")
+                .expect("control queue observation"),
+            PolicyLeaseObservation::ControlQueued
+        );
+
+        drop(blocking_lease);
+        assert_eq!(
+            timeout(Duration::from_secs(10), lease_observer.recv())
+                .await
+                .expect("first policy lease deadline")
+                .expect("first policy lease observation"),
+            PolicyLeaseObservation::Application,
+            "the earlier application lease must remain ahead of later control work"
+        );
+
+        shutdown_sender.send(()).await.expect("request shutdown");
+        timeout(Duration::from_secs(10), actor)
+            .await
+            .expect("policy-lease actor shutdown deadline")
+            .expect("join policy-lease actor")
+            .expect("policy-lease actor result");
+        drop(application_sender);
+        drop(control_sender);
+        fs::remove_dir_all(state).expect("policy-lease cleanup");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn application_read_policy_lease_retains_fifo_position() {
+        assert_application_policy_lease_retains_fifo_position(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn application_write_policy_lease_retains_fifo_position() {
+        assert_application_policy_lease_retains_fifo_position(true).await;
+    }
+
+    #[tokio::test]
+    async fn application_policy_lease_route_preserves_fifo_position_across_priority_change() {
+        let policy_lock = Arc::new(RwLock::new(()));
+        let blocking_lease = policy_lock.clone().write_owned().await;
+        let mut pending = Some(application_policy_lease_future(
+            policy_lock.clone(),
+            false,
+            #[cfg(all(test, unix))]
+            None,
+        ));
+
+        let mut routed = RoutedApplicationPolicyLease::route(&mut pending, false);
+        tokio::select! {
+            biased;
+            _ = await_application_policy_lease(&mut routed.ordinary) => {
+                panic!("application lease acquired while the blocking lease was held");
+            }
+            _ = tokio::task::yield_now() => {}
+        }
+        routed.restore(&mut pending);
+
+        let mut routed = RoutedApplicationPolicyLease::route(&mut pending, true);
+        tokio::select! {
+            biased;
+            _ = await_application_policy_lease(&mut routed.priority) => {
+                panic!("application lease acquired while the blocking lease was held");
+            }
+            _ = tokio::task::yield_now() => {}
+        }
+        routed.restore(&mut pending);
+
+        let mut later_control = Box::pin(policy_lock.clone().write_owned());
+        tokio::select! {
+            biased;
+            _ = &mut later_control => {
+                panic!("later control lease acquired while the blocking lease was held");
+            }
+            _ = tokio::task::yield_now() => {}
+        }
+        drop(blocking_lease);
+
+        let mut routed = RoutedApplicationPolicyLease::route(&mut pending, true);
+        let application_lease = await_application_policy_lease(&mut routed.priority).await;
+        assert!(
+            timeout(Duration::from_millis(25), &mut later_control)
+                .await
+                .is_err(),
+            "later control work must remain blocked by the earlier application lease"
+        );
+        routed.priority.take();
+        drop(application_lease);
+        timeout(Duration::from_secs(1), later_control)
+            .await
+            .expect("later control lease proceeds after application completion");
+        routed.restore(&mut pending);
+        assert!(pending.is_none());
+    }
+
     #[tokio::test]
     async fn saturated_cloned_live_control_retries_do_not_starve_event_status_or_publish() {
         use std::{
@@ -54239,6 +54606,7 @@ mod tests {
                 contact_activity: Arc::new(ContactActivityProbe::default()),
                 test_control: Some(RunNodeActorTestControl {
                     allow_legacy_publication_fixture: false,
+                    policy_lease: None,
                     before_loop_ready,
                     before_loop_release: release_received,
                     zeroization_queued,
