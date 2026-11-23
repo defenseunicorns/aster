@@ -15,7 +15,7 @@ The 2026-09-15 through 2026-09-16 two-node activity is recorded in the
 [direct CI-package record](../validation/evidence/2026-09-15-cm4-ci-package-mvp-validation.md).
 Use that record for the exact pass, failure, and unavailable-check boundary;
 do not infer additional device results from this runbook. Its
-[2026-09-15 authorization](../validation/evidence/2026-09-15-cm4-ci-package-mvp-validation.md#historical-validation-authorization)
+[2026-09-15 authorization](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0043-authorize-linux-event-mvp-validation.md)
 covered only that internal two-CM4 increment, with the recorded deferrals.
 
 The operation-key retry and capacity instructions below describe the historical
@@ -217,7 +217,7 @@ for its engineering lifecycle boundary. These command shapes are not yet a
 qualified customer package procedure. The final package must define stopping
 and termination confirmation, protected input descriptors, reference handoff,
 output custody, backup acceptance, readiness checks, and recovery/escalation.
-The [2026-09-15 authorization](../validation/evidence/2026-09-15-cm4-ci-package-mvp-validation.md#historical-validation-authorization)
+The [2026-09-15 authorization](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0043-authorize-linux-event-mvp-validation.md)
 accepted E01's team-internal approval for that bounded increment without further
 approval. It did not close E09 packaged lifecycle qualification. Every semantic
 operation uses a fresh retained operation ID; retry an uncertain result with

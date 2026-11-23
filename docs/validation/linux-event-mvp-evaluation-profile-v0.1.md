@@ -51,7 +51,7 @@ or result limits without that review. This notice preserves the accepted
 profile's other constraints and historical evidence boundaries; it grants no
 new approval or requirement credit.
 
-The [2026-09-15 internal validation authorization](evidence/2026-09-15-cm4-ci-package-mvp-validation.md#historical-validation-authorization)
+The [2026-09-15 internal validation authorization](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0043-authorize-linux-event-mvp-validation.md)
 accepted a narrower engineering increment on the frozen two-CM4 inventory,
 using direct checks of the CI package and explicit deferrals. It did not grant
 full-profile qualification or production approval. Those historical results do

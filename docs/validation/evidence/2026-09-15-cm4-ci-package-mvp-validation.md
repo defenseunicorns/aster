@@ -23,28 +23,12 @@ revocation, rekey, Previous-generation destruction, and Active-reference
 destruction were not run because the repository does not issue the required
 authorized replacement mission bundles, roster, signed registry, or stopped
 authority state. Inventing those inputs or destroying the only live generation
-would not be valid evidence. The 24-hour soak and true network partition were
-[deferred for this increment](#explicit-post-mvp-exclusions).
+would not be valid evidence. The 24-hour soak and true network partition remain
+explicitly deferred by Decision 0043.
 
-## Historical validation authorization
-
-On 2026-09-15, [Decision 0043](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0043-authorize-linux-event-mvp-validation.md)
-accepted all team-internal approvals needed for this bounded, non-production
-validation increment, with no additional stakeholder or external approval.
-It froze the v0.1 annex boundary and two-node CM4 inventory. Run-specific
-configuration and observations did not reopen that inventory or its approval.
-
-The authorization accepted direct functional observations from the actual
-CI-produced `arm64` Debian package without a separate device-validation harness
-or synthetic receipt framework. It accepted the package name `aster` for the
-MVP and deferred renaming. The [deferrals below](#explicit-post-mvp-exclusions)
-applied only to this increment; they did not turn unrun checks into passes.
-Completed, failed, unavailable, and incompletely measured checks remain distinct.
-
-This authorization did not broaden platform support, change atomic requirement
-status, or authorize production use. The results bind the package below, not
-current builds or the numbered publication API. A numbered-API qualification
-claim needs the [reviewed amendment and build-bound evidence](../linux-event-mvp-evaluation-profile-v0.1.md#current-api-and-historical-qualification-boundary).
+Decision 0043's internal approvals, frozen inventory, accepted package name,
+and post-MVP deferrals remain valid. No additional approval is required for
+this bounded engineering result.
 
 ## Artifact binding
 
@@ -236,15 +220,14 @@ idle-threshold result.
 
 ## Explicit post-MVP exclusions
 
-Under the [2026-09-15 authorization](#historical-validation-authorization), this
-increment did not run or claim:
+Per Decision 0043, this increment does not run or claim:
 
 - a 24-hour soak or true network partition;
 - package/archive signing or independent reproducibility replay;
 - package renaming;
 - independent implementation, external review, FIPS, or production
   authorization; or
-- additional validation automation beyond focused CI and direct device checks.
+- additional qualification automation.
 
 ## Access path, retained evidence, and final device state
 
@@ -274,6 +257,6 @@ above.
 
 Do not reinterpret this as complete v0.1 release qualification. The protected
 mission rotation/revoke/rekey/destruction chain still requires externally
-issued authorized replacement material. The [historical authorization](#historical-validation-authorization)
-deferred the work listed under [post-MVP exclusions](#explicit-post-mvp-exclusions);
-it did not approve that work as an implementation backlog.
+issued authorized replacement material, and Decision 0043 explicitly defers
+the soak, true-partition, signing/reproduction, independent-review, and
+production-authorization work.
