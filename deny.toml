@@ -5,13 +5,12 @@ exclude-dev = false
 [advisories]
 ignore = [
   # Non-production age-provider pilot only. This is an unmaintained build-time
-  # localization proc macro, not a reported vulnerability. ADR 0018 records
-  # the exact graph, future-compiler warning, removal gate, and prohibition on
-  # treating this exception as production admission.
+  # localization proc macro, not a reported vulnerability. This exception
+  # does not authorize production use.
   "RUSTSEC-2026-0173",
   # The same pilot's compile-time localization configuration parser is also
   # unmaintained. The scope checker enforces its exact version, registry source,
-  # checksum, and reverse dependency graph; ADR 0018 records migration and exit.
+  # checksum, and reverse dependency graph.
   "RUSTSEC-2026-0374",
   # chrono is unmaintained; Windows netwatch/wmi dependencies require it.
   # Review by 2026-12-17; remove when netwatch/wmi drops chrono.
@@ -33,7 +32,7 @@ allow = [
   "Zlib",
 ]
 
-# Stakeholder-approved exact-package deviations recorded by Decision 0028.
+# Stakeholder-approved exact-package deviations.
 # CDLA-Permissive-2.0 applies to Mozilla trust-root data, and Unlicense is
 # OSI-approved but remains outside the general allowlist. Version drift fails
 # closed instead of extending either exception to another package or release.

@@ -2,7 +2,6 @@
 
 # Raspberry Pi systemd credential provider v2 operations
 
-- Profile: `aster-linux-event-mvp-evaluation-v0.1`
 - Provider: `aster-systemd-credential-store/v2`
 - Status: code-level integration manually validated; packaged qualification blocked
 
@@ -55,12 +54,6 @@ path and manual handoff; the original Raspberry Pi package annex remains open. T
 agent's `mission_secret_ref_file` must name that handoff file, and its
 configured `mission_load_id` must equal the load-operation ID used for the
 Active generation.
-
-The runtime presentation must satisfy either the original service-owned
-mode-`0400` `ramfs` form or every predicate of the exact
-[systemd 257 credential-presentation amendment](../validation/inputs/systemd-257-credential-presentation-amendment.md).
-The latter is not a generic `tmpfs` fallback and remains subject to Security
-and Deployment approval at E01.
 
 Run the root administration CLI only as root. Run `aster-agent --check-config`
 and the agent runtime as the final service UID, not root: agent credential-file
@@ -252,9 +245,7 @@ The repository does not issue that mission material.
    `DESTROY disposition=destroyed`; an exact retry is
    `DESTROY disposition=already-destroyed`.
 6. Start again and require readiness. This final restart proves operationally
-   that the ready generation is independent of the removed Previous slot. It
-   is not G4 qualification until run on the frozen package and both mandatory
-   physical nodes.
+   that the ready generation is independent of the removed Previous slot.
 
 ## 5. Back up and recover the exact current generation
 
@@ -376,8 +367,7 @@ The coordinated operation is:
 The authority mechanisms and provider CLI pieces are executable with
 authorized inputs. Their end-to-end Event-agent composition remains blocked on
 the package handoff, identity, service-control, readiness, and protected-
-issuance gaps above. Physical-node execution and the exact rejection receipt
-remain E09/G4 work.
+issuance gaps above.
 
 ## Adjacent Event-agent ReceiveOnly behavior
 
@@ -389,9 +379,6 @@ inventory or objects, while accepting authenticated inbound work. Mandatory
 link, authentication, acknowledgement, and response traffic can still be
 emitted. Do not describe this mode as physical radio silence or literal zero
 transfer. Changing this mode neither rotates nor reloads provider material.
-
-Final naming and literal-RF-silence behavior remain the external stakeholder
-procedure recorded in [Decision 0004](../decisions/0004-radio-silence-semantics.md).
 
 ## 7. Logically destroy a provider reference
 
@@ -464,25 +451,15 @@ The five provider CLI commands are executable at source level. The complete
 seven-operation Event-agent composition is not yet executable end to end and
 does not qualify a candidate. All of the following remain open:
 
-- Security and Deployment approval at E01;
-- packaged lifecycle qualification at E09;
 - a hardened systemd unit and native package integration, including the exact
   service UID, service-readable reference handoff path/ownership setup, unit
   and control values, and readiness check;
-- G3 package, executable, unit, source, SBOM, notice, and provenance freeze;
-- G4 lifecycle and negative acceptance on both mandatory physical CM4 nodes;
 - protected mission/registry issuance and operator authorization;
 - cross-host recovery, complete host loss, and host-key recovery;
 - snapshot rollback resistance and rollback recovery;
 - physical erasure or sanitization;
 - root, PID 1, kernel, running-process, and copied-media compromise; and
 - production authorization or general-platform support.
-
-Component tests and successful local commands are implementation evidence, not
-E01/E09/G3/G4 or physical-target receipts. The exact candidate must still bind
-and qualify the package, hardened unit, provider executable, runtime loader,
-administration binary, platform, filesystem, and complete procedure unchanged.
-
 
 ## Ubuntu 24.04 amd64 package annex
 

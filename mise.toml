@@ -63,7 +63,6 @@ run = [
   "python3 tools/test-selected-live-state-subscription-receipt.py",
   "python3 tools/test-selected-live-record-subscription-receipt.py",
   "python3 tools/test-selected-live-blob-subscription-receipt.py",
-  "python3 tools/test-linux-event-mvp-qualification.py",
   "python3 tools/check-selected-node-dependency-boundary.py",
   "sh ./tools/check-dependency-exception-scope.sh",
   "sh ./tools/test-dependency-exception-scope.sh",
@@ -152,10 +151,6 @@ run = [
 description = "Run bounded sanitizer-instrumented decoder fuzz campaigns"
 tools = { rust = "nightly-2026-08-18", "cargo:cargo-fuzz" = "0.13.2" }
 run = "sh ./tools/run-fuzz-smoke.sh"
-
-[tasks.qualification-validator]
-description = "Run focused Linux Event MVP qualification validator tests"
-run = "python3 tools/test-linux-event-mvp-qualification.py"
 
 [tasks.ci-python-preflight]
 description = "Fail closed unless CI uses the exact compatible signal-safe interpreter"

@@ -57,5 +57,4 @@ additionally constrained by the runtime's existing operation limits. Lowering
 limits below usage blocks growth without eviction; recovery and cleanup remain
 usable. Capacity inspection is read-only and does not represent total disk use.
 Commands require access to the existing local mission-bound store and never
-provision a new node. See [the decision](../decisions/0046-numbered-event-client-lifecycle.md)
-for format, privilege and evidence boundaries.
+provision a new node.

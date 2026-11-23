@@ -13,7 +13,7 @@ and `arm64` from the same reviewed source revision and Cargo.lock. Each
 architecture needs its own build, SBOM, package dependency calculation,
 checksums, and clean-system installation/runtime receipt. The first exit is
 installation, protected service startup, local Event smoke, restart, and
-removal on both targets. This does not close all of P0-3: reproducibility,
+removal on both targets. Reproducibility,
 upgrade/rollback, release signatures and release-container work follow.
 
 The architectures have [separate manual CI workflows](../validation/ci.md#manual-ubuntu-debian-packages):
@@ -65,9 +65,6 @@ checks passed. On 2026-09-14, native ARM64 package builds, protected systemd
 startup, Event delivery/acknowledgement, restart, removal/purge preservation,
 and same-runtime package upgrade/downgrade checks also passed. The package
 configuration example now includes the required `storage.operations` limits.
-See the [current validation record](2026-09-14-deb-observation.md) for artifact
-hashes, retained evidence, test-helper failures and qualification limits.
-Historical observations remain in [the earlier record](2026-09-10-deb-observation.md).
 
 The separate [two-node package Compose smoke](../../docker/deb-test/README.md)
 passed on amd64 and native ARM64, including offline backlog delivery and

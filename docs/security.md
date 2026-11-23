@@ -2,14 +2,13 @@
 
 - Version: 0.1.0
 - Status: reference design; production security and integration gates unsatisfied
-- Profile policy: [Decision 0033](decisions/0033-policy-selected-security-profiles.md)
-  and its [requirements disposition](validation/security-profile-requirements-disposition.md)
+- [Security-profile requirements disposition](validation/security-profile-requirements-disposition.md)
 
 This document primarily describes suite/profile `0x0001` and the stock selected
 runtime. The additive, evaluation-only profile `0x0002` boundary is documented
 separately in [Classical P-256 / Iroh-QUIC security profile](classical-iroh-security-profile.md).
-Decision 0033 makes metadata exposure and classical versus hybrid-PQ use
-policy-selectable; neither profile reinterprets the other's bytes or evidence.
+Metadata exposure and classical versus hybrid-PQ use are policy-selectable;
+neither profile reinterprets the other's bytes or evidence.
 
 ## Find a section
 
@@ -23,6 +22,28 @@ policy-selectable; neither profile reinterprets the other's bytes or evidence.
 | What blocks production authorization? | [Mesh cryptographic provider status](#mesh-cryptographic-provider-status) and [production authorization boundary](#production-authorization-boundary) |
 
 ## Implemented profile boundary
+
+A security profile binds a cryptographic suite to mission authorization,
+source-object forms, carrier protection, metadata exposure, and compatibility
+rules; a suite identifier alone does not define that policy. Mission policy
+chooses permitted classical or hybrid-PQ profiles and the required minimum.
+The policy requires authenticated profile selection and failure before inventory
+when no permitted profile meets that minimum, never a weaker retry or silent
+fallback when PQ support is missing. Hybrid-PQ is recommended for long-lived
+secrets or harvest-now-decrypt-later exposure. General runtime profile selection
+and negotiation remain unimplemented; the stock runtime uses profile `0x0001`.
+
+Across profiles, source encryption and authentication, mission authorization,
+payload-blind forwarding, plaintext minimization, and versioned algorithm agility
+remain required. Changing carrier protection must not weaken persistent source
+or forwarding objects or silently convert them to another suite.
+
+Each profile declares a best-effort metadata exposure budget. Ephemeral contact
+metadata may use an authenticated encrypted carrier, an Aster protection layer,
+or exposure explicitly permitted by mission policy; this choice does not grant
+semantic authority or remove persistent object protection. Local indexes and
+operational metadata are minimized and protected through storage, key custody,
+and platform controls where practical, not assumed universally encrypted at rest.
 
 Two versioned profile implementations have different
 supported surfaces and integration maturity. Profile `0x0002` is a bounded
@@ -189,8 +210,6 @@ complete process-memory erasure. This residual is separate from successful
 ciphertext authentication and is another production-review gate.
 
 This Rust-only provider is disabled by default and is not production admitted.
-[Decision 0018](decisions/0018-age-provisioning-provider.md) owns its dependency
-review, exceptions, and exit gates.
 
 The profile is X25519 and ChaCha20-Poly1305 based. It provides no post-quantum
 artifact-confidentiality or FIPS 140-3 validation claim. The C ABI v2, Go,

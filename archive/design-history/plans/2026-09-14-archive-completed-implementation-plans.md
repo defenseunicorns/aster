@@ -17,7 +17,7 @@
 - Archived material is non-normative and is not linked from normal product-documentation navigation.
 - Preserve `data-mesh-requirements.md`, all 348 requirement IDs, the hash-bound baseline, and required historical evidence.
 - Do not move any specification in this batch. Two systemd specifications are exact current hash-bound inputs, and the remaining specifications require separate durable-constraint review.
-- Open qualification, role-review, and external gates remain in current profiles, registers, roadmap, and requirements status; an open gate does not make its completed implementation plan current product documentation.
+- Open qualification, role-review, and external gates remain in current profiles, registers, and requirements status; an open gate does not make its completed implementation plan current product documentation.
 - Move archived files byte-for-byte with `git mv`; do not rewrite historical plan content or add redirects.
 - Do not add an archive manifest, checker, test, permanent inventory, archive-specific task, or Markdown parser.
 - Do not run `mise run check`, builds, Cargo/Rust/Go commands, or test suites locally. Draft PR #24 CI provides the full-suite execution path after push.

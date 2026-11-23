@@ -16,7 +16,7 @@ Customer feedback is **advisory input**. A feedback record or recommendation:
   those actions or their evidence; and
 - becomes authoritative only through the normal reviewed artifact for the
   decision being made, such as a requirements disposition, decision record,
-  evaluation or production profile, capability-roadmap change, or approved
+  evaluation or production profile, or approved
   implementation increment.
 
 If a recommendation is adopted, link the authoritative follow-up artifact from
@@ -84,6 +84,6 @@ permit identification.
   priority, or scope materially.
 - Update recommendation status only after the responsible reviewers make that
   disposition.
-- Update exact requirement IDs or the capability roadmap only when their own
+- Update exact requirement IDs only when their own
   implementation, evidence, applicability, or planning boundary genuinely
   changes.

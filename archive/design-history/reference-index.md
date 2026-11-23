@@ -44,7 +44,6 @@ For a shorter path based on what you are trying to accomplish, start at the
 
 ## Validation and evidence
 
-- [Capability roadmap and merge-review model](implementation/capability-roadmap.md)
 - [Production implementation requirements status](implementation/requirements-status.md)
 - [Conformance and acceptance](conformance.md)
 - [CI and local validation](ci.md)

@@ -3,18 +3,12 @@
 > ****
 
 This is the shortest operator path through the currently implemented portions
-of the Linux Event evaluation profile. It is for engineering evaluation; open
-qualification gates still prevent a profile or release claim.
+of the Linux Event service. It is for engineering evaluation.
 
 For a task-oriented packaged installation, authentication, `asterctl`, Event,
 and Blob walkthrough written for operators rather than developers, start with
 the [human operator guide](../operator-guide.md). This runbook remains the
 evidence-bounded Linux Event evaluation procedure.
-
-The 2026-09-15 through 2026-09-16 two-node activity is recorded in the
-[direct CI-package record](../validation/evidence/2026-09-15-cm4-ci-package-mvp-validation.md).
-Use that record for the exact pass, failure, and unavailable-check boundary;
-do not infer additional device results from this runbook.
 
 ## Know the boundary
 
@@ -29,7 +23,7 @@ For a first Ubuntu 24.04 amd64 package installation, use the
 [provider operations package annex](raspberry-pi-provider-v2-operations.md#ubuntu-2404-amd64-package-annex).
 It defines the candidate's service, paths and credential handoff. Native ARM64
 and final device qualification remain separate deliverables. Source integration
-does not close Security/Deployment approval or packaged acceptance. The local
+does not establish packaged acceptance. The local
 development path below remains available for API evaluation. Use the documented
 candidate procedure; do not invent service names, installed paths, or credential
 handoff steps.
@@ -131,9 +125,7 @@ required.
 
 The 1,024-key boundary counts distinct accepted publish-operation keys over the
 entire state-directory lifetime, including restarts. It is an operator/harness
-stop, not an enforced store admission limit. The
-[accepted containment contract](../validation/linux-event-mvp-evaluation-profile-v0.1.md#durable-publish-operation-containment)
-selects a separate permanent ledger quota:
+stop, not an enforced store admission limit. The separate permanent ledger quota is:
 
 - `storage.operations.max_records = 1_000_000` records;
 - `storage.operations.max_logical_bytes = 201_326_592` logical ledger and
@@ -145,8 +137,7 @@ Confirm these configured ceilings and ordinary/emergency headroom in
 authenticated `GetStatus`, separately from profile headroom and warning state.
 The aggregate Event/control store quota is separate and can stop admission
 earlier. These are logical quotas, not physical database-size limits or
-qualification of a workload above 1,024 operations. The
-[register records the selected capacity boundary](../validation/linux-event-mvp-evaluation-profile-v0.1-register.md#selected-operation-ledger-capacity-boundary).
+qualification of a workload above 1,024 operations.
 
 Configured-ledger exhaustion returns Connect `ResourceExhausted` with
 `OPERATION_CAPACITY_EXHAUSTED`, `retryable = false`, and no retry delay. Do not
@@ -175,8 +166,7 @@ aster inspect --state DIR --audit-event-operations
 
 Require a successful command and retain its `EVENT_OPERATION_AUDIT` receipt
 with `state=complete` and equal `scanned`/`total` counts. Counts include both
-ledger and active reverse-index rows. This complete audit is also required for
-release qualification; startup readiness and a background audit still in
+ledger and active reverse-index rows. Startup readiness and a background audit still in
 progress do not replace it. The inspection command does not repair or migrate
 the store. On failure, keep publication stopped and escalate with the sanitized
 receipt.
@@ -206,36 +196,9 @@ for its engineering lifecycle boundary. These command shapes are not yet a
 qualified customer package procedure. The final package must define stopping
 and termination confirmation, protected input descriptors, reference handoff,
 output custody, backup acceptance, readiness checks, and recovery/escalation.
-Decision 0043 accepts E01's team-internal approval for this bounded MVP
-increment; no additional approval is required. E09 packaged lifecycle
-qualification remains open. Every semantic operation uses a fresh retained
+Every semantic operation uses a fresh retained
 operation ID; an uncertain result is retried with the identical ID and
 identical input.
-
-## Validate a completed candidate bundle
-
-After the owners assemble a canonical candidate body, receipt index, detached
-role approvals, and one release decision, validate only those local immutable
-bytes:
-
-```sh
-python3 tools/check-linux-event-mvp-qualification.py \
-  --bundle-root /controlled/candidate-bundle \
-  --artifact-root /controlled/candidate-artifacts \
-  --body candidate-body.json \
-  --index receipt-index.json \
-  --approval approvals/profile-product.json \
-  --approval approvals/security.json \
-  --decision release-decision.json
-```
-
-Supply every detached candidate approval with another `--approval`. Omit
-`--artifact-root` only when the receipt index has no artifact-root entry. The
-validator reads no devices or credentials, makes no network calls, and emits
-one sanitized canonical JSON report. Exit 0 means the supplied bundle is
-structurally conformant only; it is not a qualification or signature-
-verification result. Exit 2 means nonconformant, exit 3 means required local
-bytes are unavailable, and exit 70 means the validator itself failed.
 
 ## Stop and escalate
 
@@ -251,7 +214,4 @@ occurs:
 - a capacity stop that cannot be relieved without changing the profile.
 
 For API details, error handling, and shutdown semantics, use the
-[Event agent quickstart](../quickstart/connect-agent.md). For the exact evaluation boundary
-and acceptance gates, use the
-[Linux Event MVP profile](../validation/linux-event-mvp-evaluation-profile-v0.1.md)
-and its [candidate annex](../validation/linux-event-mvp-evaluation-profile-v0.1-annex-template.md).
+[Event agent quickstart](../quickstart/connect-agent.md).

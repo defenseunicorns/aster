@@ -59,9 +59,7 @@ The matrix follows these rules:
 Atomization is a traceability technique, not a work-breakdown structure. An
 atom can be a repeated phase statement, provisional value, future candidate,
 assumption, evidence outcome, deliverable, or open decision. Counts must not be
-used as backlog size, completion percentage, estimate, or release score. The
-[capability roadmap](../../validation/capability-roadmap.md) is the planning
-and PR-review view.
+used as backlog size, completion percentage, estimate, or release score.
 
 ## Column conventions
 

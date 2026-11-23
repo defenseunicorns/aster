@@ -342,8 +342,7 @@ now require the same stable client owner and recovered session as publication.
 Populated stores with unowned subscription records are also refused without
 modifying the original bytes.
 Increment 3 adds explicit partial Rust SDK/CLI journal-loss
-reconstruction, permanent offline retirement and admission tuning. See
-[the lifecycle procedure](../decisions/0046-numbered-event-client-lifecycle.md).
+reconstruction, permanent offline retirement and admission tuning.
 Neither reconstruction nor retirement recovers lost application effects or
 permits client-ID reuse.
 

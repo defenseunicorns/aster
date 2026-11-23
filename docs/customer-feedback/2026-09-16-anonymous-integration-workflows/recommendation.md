@@ -12,7 +12,7 @@
 ## Executive recommendation
 
 Treat this feedback as validation of existing Blob, store-and-forward, adopter-
-surface, status, and protected-provisioning roadmap work rather than as a
+surface, status, and protected-provisioning work rather than as a
 commitment to customer-specific connectors.
 
 First define a narrow Event-and-Blob integration profile and its transfer-state
@@ -24,24 +24,23 @@ confirmed.
 
 ## Assessment
 
-The feedback maps primarily to existing capability actions:
+The feedback concerns these capabilities:
 
-- **P0-1:** define the adopter workflow, included data classes, target systems,
+- define the adopter workflow, included data classes, target systems,
   delivery meanings, security boundary, and acceptance thresholds;
-- **P1-1:** close applicable Blob retention, staging cleanup, expiry, pressure,
+- close applicable Blob retention, staging cleanup, expiry, pressure,
   and crash-recovery behavior;
-- **P1-3:** preserve protected identity provisioning and administration rather
+- preserve protected identity provisioning and administration rather
   than treating bulk addition as unauthenticated discovery;
-- **P2-1:** use existing scoped, payload-blind store-and-forward behavior where
+- use existing scoped, payload-blind store-and-forward behavior where
   indirect delivery is required;
-- **P2-2:** qualify interruption, resume, resource use, and difference work for
+- qualify interruption, resume, resource use, and difference work for
   the selected artifact workflow; and
-- **P2-3:** expose stable transfer and node status and provide a usable,
+- expose stable transfer and node status and provide a usable,
   technology-neutral adopter surface.
 
-No new top-level capability action is warranted. The potentially new product
-decisions are narrower: whether artifact groups need atomic readiness, whether
-granular delivery control belongs in Aster's propagation model, and which
+The potentially new product decisions are narrower: whether artifact groups
+need atomic readiness, whether granular delivery control belongs in Aster's propagation model, and which
 administrative operations are meant by bulk onboarding.
 
 ## Completeness and sanitization boundary
@@ -62,7 +61,7 @@ technology relationships.
 
 Scores are relative from 1 to 5:
 
-- **Value** combines adopter relevance, roadmap leverage, and reduction of
+- **Value** combines adopter relevance, capability leverage, and reduction of
   integration or qualification risk.
 - **Remaining effort** combines engineering, review, qualification, security,
   dependency, and operational complexity. It is not a calendar estimate.
@@ -71,13 +70,13 @@ Scores are relative from 1 to 5:
 
 ## Value/effort ranking
 
-| Rank | Candidate action | Value | Remaining effort | Balance | Roadmap fit |
-| ---: | --- | ---: | ---: | ---: | --- |
-| **1** | **Define and expose selected Event-and-Blob transfer status and lifecycle records** | 5 | 3 | **1.7** | P0-1, P2-3; P1-1/P2-2 dependencies |
-| **2** | **Qualify lossless artifact delivery with associated metadata** | 5 | 3 | **1.7** | P1-1, P2-2, P2-3 |
-| **3** | **Publish a technology-neutral local integration adapter pattern and sample** | 5 | 4 | **1.3** | P2-3 |
-| **4** | **Decide protected granular-delivery semantics** | 4 | 4 | **1.0** | P0-1, P2-1; security-policy dependency |
-| **5** | **Define and implement protected bulk onboarding** | 3 | 5 | **0.6** | P1-3; P2-1/P2-3 dependencies |
+| Rank | Candidate action | Value | Remaining effort | Balance |
+| ---: | --- | ---: | ---: | ---: |
+| **1** | **Define and expose selected Event-and-Blob transfer status and lifecycle records** | 5 | 3 | **1.7** |
+| **2** | **Qualify lossless artifact delivery with associated metadata** | 5 | 3 | **1.7** |
+| **3** | **Publish a technology-neutral local integration adapter pattern and sample** | 5 | 4 | **1.3** |
+| **4** | **Decide protected granular-delivery semantics** (security-policy dependency) | 4 | 4 | **1.0** |
+| **5** | **Define and implement protected bulk onboarding** | 3 | 5 | **0.6** |
 
 The first two actions have the same numeric balance. Status comes first because
 it defines the observations needed to qualify the artifact workflow and gives
@@ -110,7 +109,7 @@ status with lifecycle records without exposing payloads, protected routing
 metadata, or unauthorized node information. Do not label sender completion as
 receiver or application completion.
 
-This is a P2-3 adopter-surface increment with P1-1 lifecycle and P2-2 recovery
+This is an adopter-surface increment with lifecycle and recovery
 dependencies. It does not establish all-class status or production
 observability.
 
@@ -161,18 +160,18 @@ idempotent retry, rollback behavior, and an audit record.
 This work follows the selected provisioning backend and operator-lifecycle
 decisions. Ease of use must not weaken identity or authorization controls.
 
-## Recommended roadmap sequencing
+## Recommended sequencing
 
-1. Use P0-1 to select the initial Event-and-Blob workflow and define exact
+1. Select the initial Event-and-Blob workflow and define exact
    transfer, health, and completion meanings.
-2. Add the selected status and lifecycle surface under P2-3 while closing its
-   P1-1 and P2-2 dependencies.
+2. Add the selected status and lifecycle surface while closing its
+   lifecycle and recovery dependencies.
 3. Run the lossless artifact-and-metadata qualification scenario.
 4. Publish the neutral adapter pattern against the stabilized surface.
 5. Pull granular-delivery or bulk-onboarding implementation forward only after
    their policy and ownership questions are resolved.
 
-This sequence reuses the current roadmap and avoids making customer-specific
+This sequence avoids making customer-specific
 integration work a prerequisite for unrelated capability progress.
 
 ## Recommendations not adopted

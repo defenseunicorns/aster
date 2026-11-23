@@ -11,8 +11,7 @@
 
 ## Executive recommendation
 
-The feedback reinforces Aster's current roadmap rather than requiring a product
-pivot. Finite Event TTL is now a merged foundation. Capture its reported test-
+Finite Event TTL is now a merged foundation. Capture its reported test-
 device observation in a reviewable record, then use the capability in a narrow,
 instrumented 24-hour Event workflow before extending into measured growth
 behavior and policy-driven, higher-capacity custody.
@@ -23,17 +22,17 @@ provisional offline-tolerance value.
 
 ## Assessment
 
-The feedback maps primarily to existing capability actions:
+The feedback concerns these capabilities:
 
-- **P0-1:** define the exact workload, platforms, retention policy, operating
+- define the exact workload, platforms, retention policy, operating
   bounds, and acceptance claim;
-- **P1-1:** close the applicable Event lifecycle and bounded-retention subset;
-- **P2-2:** measure long-offline recovery, synchronization work, storage,
+- close the applicable Event lifecycle and bounded-retention subset;
+- measure long-offline recovery, synchronization work, storage,
   bandwidth, memory, and target-resource behavior; and
-- **P2-1:** introduce a supported custody or forwarding profile only after its
+- introduce a supported custody or forwarding profile only after its
   lifecycle, policy, and administration dependencies are stable.
 
-No new top-level capability action is needed. The first client-shaped profile
+The first client-shaped profile
 should remain single-scope and Event-only unless confirmed workloads require
 another data class.
 
@@ -60,7 +59,7 @@ do not describe the device result as retained qualification evidence.
 
 Scores are relative from 1 to 5:
 
-- **Value** combines client relevance, roadmap leverage, and reduction of
+- **Value** combines client relevance, capability leverage, and reduction of
   product or qualification risk.
 - **Remaining effort** combines engineering, review, qualification, dependency,
   and operational complexity. It is not a calendar estimate.
@@ -69,14 +68,14 @@ Scores are relative from 1 to 5:
 
 ## Value/effort ranking
 
-| Rank | Candidate action | Value | Remaining effort | Balance | Roadmap fit |
-| ---: | --- | ---: | ---: | ---: | --- |
-| **1** | **Instrumented 24-hour selected-Event retention and reconnect qualification** | 5 | 2 | **2.5** | P0-1, P2-2 |
-| **2** | **Dataset-growth synchronization benchmark and Event-path remediation** | 5 | 3 | **1.7** | P2-2; `DM-5.2-18` |
-| **3** | **Higher-capacity same-scope custody-node profile** | 4 | 3 | **1.3** | P2-1, P2-2 |
-| **4** | **Few-kilobytes-per-second stress profile** | 2 | 2 | **1.0** | P1-4, P2-2 |
-| **5** | **Cross-segment onward synchronization through the custody node** | 4 | 4 | **1.0** | P2-1, P1-3 |
-| **6** | **Seven-day retention profile** | 3 | 5 | **0.6** | P1-1, P2-2 |
+| Rank | Candidate action | Value | Remaining effort | Balance |
+| ---: | --- | ---: | ---: | ---: |
+| **1** | **Instrumented 24-hour selected-Event retention and reconnect qualification** | 5 | 2 | **2.5** |
+| **2** | **Dataset-growth synchronization benchmark and Event-path remediation** (`DM-5.2-18`) | 5 | 3 | **1.7** |
+| **3** | **Higher-capacity same-scope custody-node profile** | 4 | 3 | **1.3** |
+| **4** | **Few-kilobytes-per-second stress profile** | 2 | 2 | **1.0** |
+| **5** | **Cross-segment onward synchronization through the custody node** | 4 | 4 | **1.0** |
+| **6** | **Seven-day retention profile** | 3 | 5 | **0.6** |
 
 Finite Event TTL is excluded from this ranking because it is delivered
 foundation rather than remaining feature scope. Capturing its device result is
@@ -101,8 +100,6 @@ sensor, or automated-detection claim.
 
 References:
 
-- `docs/validation/linux-event-mvp-evaluation-profile-v0.1.md`, "Capacity and
-  workload matrix"
 - `docs/validation/evidence/2026-09-15-cm4-ci-package-mvp-validation.md`, "Not
   run in this session"
 
@@ -113,9 +110,8 @@ record transmitted bytes and frames, inventory rows examined, convergence
 duration, CPU, peak RSS, durable progress-state growth, and zero-difference
 repeat-contact cost.
 
-Start with the Event-only profile. The current roadmap already records that
-difference-proportional local work is not demonstrated and that total-snapshot
-inventory behavior can starve Blob carrier IDs at the 100,000-item ceiling.
+Start with the Event-only profile. Difference-proportional local work is not
+demonstrated, and total-snapshot inventory behavior can starve Blob carrier IDs at the 100,000-item ceiling.
 Remediate measured Event-path bottlenecks before expanding this acceptance
 matrix across all classes.
 
@@ -152,19 +148,18 @@ the separate operation ledger has a larger allowance. A credible seven-day
 profile requires confirmed rates, payloads, selection policy, storage sizing,
 garbage collection, recovery evidence, and a delivery objective.
 
-## Recommended roadmap sequencing
+## Recommended sequencing
 
 1. Capture and review a sanitized test-device record for the merged TTL
    capability without broadening its claim boundary.
-2. Define a successor client-shaped evaluation profile under P0-1 that uses
+2. Define a successor client-shaped evaluation profile that uses
    the merged TTL capability where applicable.
-3. Run the instrumented 24-hour and fixed-difference growth scenarios under
-   P2-2.
-4. Add the same-scope custody profile under P2-1/P2-2.
+3. Run the instrumented 24-hour and fixed-difference growth scenarios.
+4. Add the same-scope custody profile.
 5. Pull cross-segment, mixed-class, or seven-day work forward only when
    confirmed customer facts justify it.
 
-This preserves the roadmap's single-scope, Event-only first-customer boundary.
+This preserves the single-scope, Event-only first-customer boundary.
 It does not make the ordered bridge lane a global prerequisite for customer
 readiness.
 

@@ -2,18 +2,15 @@
 
 **Status:** maintained architecture authority; no production authorization
 
-**Capability track:** P1-4 reachability and carrier portability, followed by
+**Capability track:** reachability and carrier portability, followed by
 all-class and cross-platform qualification.
 
 This document defines future BTLE architecture and release gates. Current
 evaluation claims are owned by
 [`btle-ring1-evaluation-profile.md`](../../validation/btle-ring1-evaluation-profile.md);
 operator procedures and dated physical observations do not broaden this design.
-Approval of this maintained design is the reviewed decision that extends the
-narrow selected-node amendment in
-[`Decision 0007`](../../decisions/0007-ip-and-btle-links.md); it does not create
-a second BTLE design or amend semantic-v9 wire behavior. Implementation must reconcile
-the older single-production-adapter wording in the carrier guide, roadmap, and
+This design does not amend semantic-v9 wire behavior. Implementation must reconcile
+the older single-production-adapter wording in the carrier guide and
 conformance documents in the same change that enables a second adapter.
 
 ## Intent and authority

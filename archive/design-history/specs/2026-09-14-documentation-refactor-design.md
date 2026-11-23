@@ -118,7 +118,7 @@ IDs, the hash-bound baseline, and historical evidence required by repository
 policy. Documentation location alone does not change a requirement's status or
 expand an implementation claim.
 
-The current requirements status and capability roadmap belong under
+The current requirements status belongs under
 `docs/validation/` because they describe qualification and traceability rather
 than implementation design. Any relocation updates exact path consumers and
 recorded hashes in the same focused change. Exact requirement IDs are updated

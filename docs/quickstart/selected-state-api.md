@@ -356,6 +356,5 @@ inputs, not authorization capabilities.
 The live actor and stopped facade cannot own the same store concurrently. Stop
 the actor before opening `SelectedStateNode`, and close that facade before
 starting the actor. See the [selected architecture](../architecture.md) for the
-complete trust path, the [selected Event API](selected-event-api.md) for the
-live runtime, and [requirements status](../validation/requirements-status.md)
-for validation coverage.
+complete trust path and the [selected Event API](selected-event-api.md) for the
+live runtime.

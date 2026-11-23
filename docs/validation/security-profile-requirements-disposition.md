@@ -3,8 +3,6 @@
 
 - Status: accepted applicability overlay; initial classical evaluation implementation present; release gates open
 - Date: 2026-08-28
-- Decision authority:
-  [Decision 0033](../decisions/0033-policy-selected-security-profiles.md)
 - Preserved requirements SHA-256:
   `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
 - Preserved atomic-matrix SHA-256:
@@ -14,7 +12,7 @@
 
 The hash-bound requirements and atomic matrix remain unchanged as provenance
 and historical product intent. The source was a draft, and atomization was not
-stakeholder ratification. The capability roadmap permits a reviewed decision
+stakeholder ratification. A reviewed decision may choose
 to affirm, revise, defer, or reject a row without rewriting that baseline.
 
 This record supplies that reviewed applicability for metadata protection and

@@ -274,6 +274,4 @@ those independent application boundaries.
 This guide also makes no claim about cross-class priority eviction, physical
 radio silence or media sanitization, protected provisioning, representative NAT
 or Internet paths, controlled relays, BTLE, crash/power-loss recovery, scale,
-mixed implementations, or release authorization. Current implementation and
-validation boundaries are tracked in the
-[requirements status](../validation/requirements-status.md).
+mixed implementations, or release authorization.

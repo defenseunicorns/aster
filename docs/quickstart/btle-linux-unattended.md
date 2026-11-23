@@ -218,9 +218,6 @@ availability/contact/recovery/shutdown timestamps; application receipt; and
 sanitized cleanup/resource observations. Keep addresses, mission IDs, paths,
 credentials, and payloads out of shared records.
 
-See the concise [Ring-1 Event](../validation/evidence/2026-11-05-cm4-btle-ring1-event-validation.md),
-[affected-kernel diagnostic](../validation/evidence/2026-11-06-cm4-btle-clean-restart-diagnostic.md),
-and [fixed-kernel restart](../validation/evidence/2026-11-06-cm4-btle-clean-restart-validation.md)
-summaries. One hardware stack does not qualify another, and this procedure does
+One hardware stack does not qualify another, and this procedure does
 not establish discovery support, multi-peer/controller operation, other data
 classes, packaging, performance thresholds, or production readiness.

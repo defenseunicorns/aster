@@ -48,10 +48,7 @@ preparation/contact operation is active at a time under the 30-second deadline;
 the dedicated native preparation worker has an 8 MiB stack. These are
 evaluation implementation bounds, not protocol or support guarantees.
 
-The retained
-[Android/Linux summary](evidence/2026-11-09-android-linux-btle-text-event-validation.md)
-records warm-state bidirectional text/large-Event success on a Pixel 9 Pro XL
-and a Realtek/Linux host. The same host's cold-controller path is unqualified:
+The Realtek/Linux cold-controller path is unqualified:
 inbound ACL data could precede HCI Connection Complete and be discarded by the
 evaluated kernel. A mouse warm-up, controller reset, protocol fallback, or
 kernel-version heuristic is not an Aster remedy. Reproduce the path with the
@@ -70,18 +67,6 @@ fallback for the other. Retry from 250 ms to 30 seconds and the default
 60-second successful-contact cadence are local policy. Local publication stays
 durable with no transport; the standalone evaluator exposes no application
 endpoint.
-
-The retained Linux evidence is deliberately split by claim:
-
-- [Ring-1 Event summary](evidence/2026-11-05-cm4-btle-ring1-event-validation.md):
-  protected 65,536-byte Event delivery, application receipt, deduplication, and
-  controller-epoch recovery on two CM4 devices.
-- [Affected-kernel diagnostic](evidence/2026-11-06-cm4-btle-clean-restart-diagnostic.md):
-  restart failure on Linux 6.18.39 bound to CVE-2026-72333 L2CAP signaling-ID
-  exhaustion, not Aster state.
-- [Fixed-kernel restart](evidence/2026-11-06-cm4-btle-clean-restart-validation.md):
-  zero-work process restart on Linux 6.18.60 without controller mutation; Event
-  delivery was not repeated.
 
 Clean-restart qualification requires a distribution kernel containing the fix
 (6.18.40 is the first fixed 6.18 release) and a physical post-stop contact

@@ -8,31 +8,10 @@ itself authorize a production release.
 
 ## Product progress
 
-- [Capability roadmap](capability-roadmap.md) — planning and PR-review view.
-- [Requirements status](requirements-status.md) — evidence authority and
-  current implementation boundary by requirement.
+- [Requirements migration #203](https://github.com/defenseunicorns/aster/issues/203) — discussion and revalidation of remaining work.
 - [Requirements matrix notes](requirements-matrix-notes.md) — immutable
   requirements atomization rules and final-stack flags.
 - [Conformance](conformance.md), [security-profile disposition](security-profile-requirements-disposition.md),
   and [CI](ci.md) — verification boundaries and remaining gates.
 - [Blob streaming engineering runbook](blob-streaming-engineering-runbook.md)
   — large-object application, selected-contact, CM4, and diagnostic examples.
-
-## Linux Event MVP qualification
-
-The accepted profile is hash-bound and remains the exact authority. Its
-original design links resolve through compatibility pointers: superseded
-designs live in the archive, while active approval inputs live in this
-validation package.
-
-- [Coordination guide](linux-event-mvp-coordination-guide.md) — human-oriented
-  sequence, ownership, blockers, and definition of done.
-- [Evaluation profile](linux-event-mvp-evaluation-profile-v0.1.md) — exact
-  claim boundary.
-- [Decision register](linux-event-mvp-evaluation-profile-v0.1-register.md) and
-  [candidate annex](linux-event-mvp-evaluation-profile-v0.1-annex-template.md)
-  — gate status and candidate evidence shape.
-- [Qualification receipt validator](linux-event-mvp-qualification-receipt-validator-spec.md)
-  — receipt contract.
-- [Immutable inputs](inputs/) and [retained evidence](evidence/) — exact
-  approval records and bounded observations.

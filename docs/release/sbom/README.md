@@ -2,14 +2,10 @@
 
 
 
-This is the bounded SBOM increment of P0-3, **Produce reproducible deployable
-artifacts**. It documents the evaluated workflow for the unpackaged Linux
+This documents the evaluated SBOM workflow for the unpackaged Linux
 executables `aster` (package `aster-node`) and `aster-agent` (package
 `aster-agent`, using the node library). It does not complete packaging,
-reproducible builds, provenance, signing, or release authorization. The
-[capability roadmap](../../validation/capability-roadmap.md) and
-[requirements status](../../validation/requirements-status.md) retain
-their existing claim boundaries.
+reproducible builds, provenance, signing, or release authorization.
 
 ## Automated build and artifact
 
@@ -85,7 +81,7 @@ The evaluation target is Ubuntu 24.04 amd64, using Rust/Cargo 1.97.1 and
 platform-support claim. The historical evaluation ran in an Ubuntu 24.04
 chroot on an Ubuntu 26.04 host and used cargo-auditable for its binaries. The stable plain-build commands
 below describe the workflow; they do not change the identities of
-those historical artifacts. See the [dated observation](2026-09-08-observation.md).
+those historical artifacts.
 
 | Tool | Evaluated version | Role |
 |---|---|---|
@@ -203,9 +199,7 @@ build's checksums or SBOM as belonging to a fresh build.
 
 License fields normally contain package-manifest declarations. A full release
 notice bundle and review of native/toolchain licenses remain separate release
-work. Use the [historical observation](2026-09-08-observation.md) only
-for its dated results, including its optional binary-audit experiment; it is
-not a current vulnerability scan.
+work.
 
 ## Remaining release work
 
