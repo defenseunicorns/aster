@@ -121,7 +121,7 @@ sampled container CPU, memory, and PID peaks include that diagnostic overhead.
 
 ## Evidence boundary
 
-This runner is development tooling aligned with roadmap action `P2-2`. Adding or
+This runner is development tooling. Adding or
 running it does not move a requirement status and does not create retained
 evidence automatically. In particular it does not satisfy the provisional
 100-node-per-scope or 1,000-node-across-bridges targets, any hierarchical bridge

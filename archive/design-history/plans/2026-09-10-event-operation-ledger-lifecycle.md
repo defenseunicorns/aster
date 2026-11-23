@@ -60,7 +60,7 @@ Implement this as three dependent reviewable pull requests:
 2. **Operational surface:** Tasks 6 through 8; background audit, configuration,
    status, generated clients, and operator documentation.
 3. **Qualification evidence:** Task 9; load tool, CM4 measurements, retained
-   receipt, and evidence-bound profile/roadmap updates.
+   receipt, and evidence-bound profile updates.
 
 Do not merge a later pull request before its predecessor. Each pull request is
 one coherent outcome and must use `.github/pull_request_template.md`.
@@ -489,7 +489,6 @@ the larger of record and logical-byte occupancy against their ordinary limits.
 - Modify: `docs/quickstart/linux-event-mvp-runbook.md`
 - Modify: `docs/implementation/linux-event-mvp-evaluation-profile-v0.1.md`
 - Modify: `docs/implementation/linux-event-mvp-evaluation-profile-v0.1-annex-template.md`
-- Modify: `docs/implementation/capability-roadmap.md`
 - Modify: `docs/implementation/requirements-status.md` only where the retained
   evidence changes an exact requirement boundary
 
@@ -528,7 +527,7 @@ end-to-end retention evidence.
   and release owners review the implemented boundary and evidence. Record role
   and disposition; do not infer approval from green CI.
 - [ ] Only after evidence and reviews, add Decision 0043 and update the profile,
-  annex, roadmap, and exact requirement rows. Keep Event retention and the
+  annex, and exact requirement rows. Keep Event retention and the
   other causal-ledger lifecycles explicit blockers.
 - [ ] Run `python3 tools/check-implementation-requirements.py` because
   traceability changed.

@@ -13,7 +13,7 @@ and `arm64` from the same reviewed source revision and Cargo.lock. Each
 architecture needs its own build, SBOM, package dependency calculation,
 checksums, and clean-system installation/runtime receipt. The first exit is
 installation, protected service startup, local Event smoke, restart, and
-removal on both targets. This does not close all of P0-3: reproducibility,
+removal on both targets. Reproducibility,
 upgrade/rollback, release signatures and release-container work follow.
 
 The architectures have [separate manual CI workflows](../validation/ci.md#manual-ubuntu-debian-packages):

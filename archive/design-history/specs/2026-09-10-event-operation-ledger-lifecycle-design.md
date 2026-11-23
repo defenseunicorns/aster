@@ -3,7 +3,7 @@
 - Status: product design approved; implementation and role review pending
 - Date: 2026-09-10
 - Profile: Linux Event MVP evaluation profile
-- Capability: P1-1 causal correctness and bounded data lifecycle, supporting
+- Capability: causal correctness and bounded data lifecycle, supporting
   the P0 customer-operable Event service
 
 ## Purpose

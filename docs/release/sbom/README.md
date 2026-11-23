@@ -2,13 +2,10 @@
 
 
 
-This is the bounded SBOM increment of P0-3, **Produce reproducible deployable
-artifacts**. It documents the evaluated workflow for the unpackaged Linux
+This documents the evaluated SBOM workflow for the unpackaged Linux
 executables `aster` (package `aster-node`) and `aster-agent` (package
 `aster-agent`, using the node library). It does not complete packaging,
-reproducible builds, provenance, signing, or release authorization. The
-[capability roadmap](../../validation/capability-roadmap.md) retains
-its existing claim boundaries.
+reproducible builds, provenance, signing, or release authorization.
 
 ## Automated build and artifact
 

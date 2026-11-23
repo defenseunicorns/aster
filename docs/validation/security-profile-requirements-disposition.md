@@ -12,7 +12,7 @@
 
 The hash-bound requirements and atomic matrix remain unchanged as provenance
 and historical product intent. The source was a draft, and atomization was not
-stakeholder ratification. The capability roadmap permits a reviewed decision
+stakeholder ratification. A reviewed decision may choose
 to affirm, revise, defer, or reject a row without rewriting that baseline.
 
 This record supplies that reviewed applicability for metadata protection and

@@ -607,7 +607,7 @@ requirement status and is not acceptance evidence.
 
 Completion of this work establishes the runtime portion of a customer-operable
 Event service within its isolated-loopback, single-scope, Event-only boundary.
-It does not by itself close the roadmap's complete customer-readiness row.
+
 Protected-provider delivery, qualified isolated deployment, service-manager
 artifacts, representative acceptance, packaging, physical and mixed-network
 evidence, and release authorization remain separate gates.

@@ -43,8 +43,6 @@ part of the normal reading path.
   interoperable behavior.
 - The [classical Iroh profile](classical-iroh-security-profile.md) defines the
   additive evaluation-only profile `0x0002` boundary.
-- The [capability roadmap](validation/capability-roadmap.md)
-  is the planning and PR-review view.
 - The Linux Event MVP profile and register define a bounded, non-production
   evaluation. They do not authorize a release.
 - Code and tests are authoritative for implemented behavior when a guide
