@@ -24,6 +24,28 @@ policy-selectable; neither profile reinterprets the other's bytes or evidence.
 
 ## Implemented profile boundary
 
+A security profile binds a cryptographic suite to mission authorization,
+source-object forms, carrier protection, metadata exposure, and compatibility
+rules; a suite identifier alone does not define that policy. Mission policy
+chooses permitted classical or hybrid-PQ profiles and the required minimum.
+The policy requires authenticated profile selection and failure before inventory
+when no permitted profile meets that minimum, never a weaker retry or silent
+fallback when PQ support is missing. Hybrid-PQ is recommended for long-lived
+secrets or harvest-now-decrypt-later exposure. General runtime profile selection
+and negotiation remain unimplemented; the stock runtime uses profile `0x0001`.
+
+Across profiles, source encryption and authentication, mission authorization,
+payload-blind forwarding, plaintext minimization, and versioned algorithm agility
+remain required. Changing carrier protection must not weaken persistent source
+or forwarding objects or silently convert them to another suite.
+
+Each profile declares a best-effort metadata exposure budget. Ephemeral contact
+metadata may use an authenticated encrypted carrier, an Aster protection layer,
+or exposure explicitly permitted by mission policy; this choice does not grant
+semantic authority or remove persistent object protection. Local indexes and
+operational metadata are minimized and protected through storage, key custody,
+and platform controls where practical, not assumed universally encrypted at rest.
+
 Two versioned profile implementations have different
 supported surfaces and integration maturity. Profile `0x0002` is a bounded
 Event/control evaluation slice, not a complete MVP/product profile:
