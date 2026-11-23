@@ -172,7 +172,7 @@ separate source, evidence, or gate dimensions.
 ## Adopted security-profile applicability
 
 The hash-bound requirements baseline remains unchanged. On 2026-08-28,
-[Security applicability amendment](../security.md#security-applicability-amendment) and the
+[Decision 0033](../decisions/0033-policy-selected-security-profiles.md) and the
 [security-profile requirements disposition](security-profile-requirements-disposition.md)
 refined its universal metadata and post-quantum wording for current planning and
 release review:

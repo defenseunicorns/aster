@@ -11,7 +11,7 @@ evaluation claims are owned by
 operator procedures and dated physical observations do not broaden this design.
 Approval of this maintained design is the reviewed decision that extends the
 narrow selected-node amendment in
-[`Decision 0007`](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0007-ip-and-btle-links.md); it does not create
+[`Decision 0007`](../../decisions/0007-ip-and-btle-links.md); it does not create
 a second BTLE design or amend semantic-v9 wire behavior. Implementation must reconcile
 the older single-production-adapter wording in the carrier guide, roadmap, and
 conformance documents in the same change that enables a second adapter.

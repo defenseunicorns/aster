@@ -130,7 +130,7 @@ fail, or a typed reason the work was not run.
 
 ## Current decision state
 
-[Decision 0043](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0043-authorize-linux-event-mvp-validation.md)
+[Decision 0043](../decisions/0043-authorize-linux-event-mvp-validation.md)
 records all approvals for the bounded MVP increment as team-internal and
 accepted, freezes the annex/two-CM4 inventory boundary, and defers the 24-hour
 soak. Current direct CI-package passes, failures, and unavailable checks are in
@@ -218,4 +218,4 @@ candidate.
 | [Evaluation profile](linux-event-mvp-evaluation-profile-v0.1.md) | Exact supported behavior, limits, exclusions, and acceptance contract |
 | [Decision and gate register](linux-event-mvp-evaluation-profile-v0.1-register.md) | Current owner, date, status, blocker, and exit artifact for each decision or gate |
 | [Candidate-annex schema](linux-event-mvp-evaluation-profile-v0.1-annex-template.md) | Shared handoff record for one exact candidate |
-| [Decision 0042](https://github.com/defenseunicorns/aster/blob/a4c934b09b3e190f9bbdadaed1130e4cc18a6a2e/docs/decisions/0042-adopt-linux-event-mvp-evaluation-profile-v0-1.md) | Ratification authority and the distinction between defining and issuing the profile |
+| [Decision 0042](../decisions/0042-adopt-linux-event-mvp-evaluation-profile-v0-1.md) | Ratification authority and the distinction between defining and issuing the profile |

@@ -103,7 +103,7 @@ Current Event publication is numbered-only: `PublishNumberedEvent` and
 sequence-based exact replay. The ordinary `PublishEvent`/`PublishEvents` RPCs
 and their SDK helpers have been removed. Use the
 [current application guide](../quickstart/connect-agent.md#use-crash-safe-numbered-publication)
-and [client lifecycle guide](../quickstart/event-client-lifecycle.md).
+and [Decision 0044's numbered amendment](../decisions/0044-pipeline-durable-event-publication.md#numbered-publication-amendment--2026-10-08).
 The approved [Linux Event v0.1 profile](linux-event-mvp-evaluation-profile-v0.1.md#current-api-and-historical-qualification-boundary)
 preserves its earlier publication contract and evidence; those do not qualify
 the current API. A reviewed profile amendment and evidence for the exact
@@ -167,7 +167,7 @@ defined.
 
 ## Adopted security-profile direction
 
-[Security applicability amendment](../security.md#security-applicability-amendment) and its
+[Decision 0033](../decisions/0033-policy-selected-security-profiles.md) and its
 [requirements disposition](security-profile-requirements-disposition.md) make
 metadata exposure and post-quantum use explicit profile policy:
 

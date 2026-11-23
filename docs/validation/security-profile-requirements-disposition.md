@@ -4,7 +4,7 @@
 - Status: accepted applicability overlay; initial classical evaluation implementation present; release gates open
 - Date: 2026-08-28
 - Decision authority:
-  [Security applicability amendment](../security.md#security-applicability-amendment)
+  [Decision 0033](../decisions/0033-policy-selected-security-profiles.md)
 - Preserved requirements SHA-256:
   `e88bcc6c717a5175a460205fdc084aaa2e1f020a142a84087f9881677da02987`
 - Preserved atomic-matrix SHA-256:

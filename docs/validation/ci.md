@@ -1710,16 +1710,50 @@ administration, non-Linux/cross-class finite-TTL custody, protected provisioning
 zeroization assurance, admitted release cryptography, independent review, or
 physical-network acceptance.
 
-Dependency checks use the advisory dispositions and exact-package license
-exceptions in [`deny.toml`](../../deny.toml).
-[Third-party notices](../../THIRD_PARTY_NOTICES.md) contains the corresponding
-package notices and license texts. The age-provider exceptions do
-not authorize production use or suppress unrelated advisories. External
-license allowances do not change the first-party Apache-2.0 requirements.
+Two explicit `cargo deny` advisory ignores cover one bounded active pilot
+graph. `RUSTSEC-2026-0173` covers unmaintained build-time
+`proc-macro-error2` 2.0.1, and `RUSTSEC-2026-0374` covers unmaintained
+compile-time configuration parser `basic-toml` 0.1.10, both in the
+non-production age-provider pilot. RustSec reports no vulnerability and no
+patched release for either package; current Rust separately emits
+future-incompatibility `E0365` for `proc-macro-error2`. The ignores permit only
+those exact informational findings. They do not suppress other advisories,
+change exact package checksums, permit online execution after the acquisition
+step, or authorize the provider for production. Decision 0018 records the
+upstream `basic-toml` replacement, release gap, and removal gate.
 
-The libp2p pilot and its Hickory advisory exceptions are retired. Current
-regression coverage uses the selected Iroh stack; it does not require keeping
-an experimental provider or restoring its dependency gates.
+[Decision 0027](../decisions/0027-libp2p-pilot-dependency-policy.md) admits
+`BSD-2-Clause`, `ISC`, and `Zlib` for the reviewed external dependency graph;
+first-party packages and distributed project files remain subject to the
+separate byte-identical Apache-2.0 gate.
+
+The companion scope gate fails if either ignored package's reverse graph
+drifts, if either appears in the separately excluded fuzz graph, or if any
+`paste` version reappears. Any change to a package chain or advisory
+disposition requires a recorded pilot review.
+
+The selected Iroh graph carries five exact-coordinate license exceptions
+recorded by Decision 0028: `webpki-root-certs` and `webpki-roots` 1.0.10 use
+`CDLA-Permissive-2.0`, while all-target browser-WASM
+packages `async_io_stream` 0.3.3, `pharos` 0.5.3, and `ws_stream_wasm` 0.7.5 use
+the OSI-approved `Unlicense`. Neither license is globally allowed. Package or
+version drift fails closed, and the project-license gate hash-pins the complete
+distribution notices and requires them in the lab image. The CDLA disposition
+is a visible stakeholder deviation from the frozen OSI-only requirement, not a
+claim of outside-counsel review or requirements credit. Passing this gate does
+not by itself authorize a release, extend the earlier 1.0.9 evaluation
+approval to the replacement coordinates, or declare browser-WASM supported.
+
+[Decision 0045](../decisions/0045-remove-libp2p-test-oracle.md) supersedes
+Decision 0029's retention policy. The experimental provider and only its lab
+integration are removed; the rest of `aster-lab` remains.
+
+The provider removal also removes the optional Hickory 0.25.2 lock entries.
+The root audit no longer ignores `RUSTSEC-2026-0118` or `RUSTSEC-2026-0119`.
+The dependency-exception scope gate now requires only the retained fixed
+`hickory-proto` 0.26.2 lock entry and still rejects vulnerable active Hickory.
+The unrelated age advisory disposition and exact license exceptions remain
+unchanged.
 
 Current-stack regressions in `aster-node::runtime::tests` separate default
 serialization coverage from scale qualification. The default
