@@ -45750,7 +45750,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_iroh_waits_for_shared_event_session_after_carrier_open() {
+    async fn published_event_wakes_coordinated_iroh_before_periodic_tick() {
         let test_root = root("automatic-iroh-event-peer");
         let local_state = test_root.join("local");
         let peer_state = test_root.join("peer");
@@ -45813,7 +45813,7 @@ mod tests {
                     mission: peer.identity,
                 }],
                 mutable_interests: MutableSourceInterests::default(),
-                sync_interval: Duration::from_millis(20),
+                sync_interval: Duration::from_secs(60),
                 run_for: None,
                 application: NodeApplication::Relay,
             },
@@ -45852,8 +45852,6 @@ mod tests {
             .automatic_event_admission_gate()
             .try_acquire_owned()
             .expect("hold automatic Iroh before shared Event admission");
-        assert!(node.open_transport_admission());
-        automatic.note_durable_work();
         assert_eq!(
             automatic.replace_eligibility(vec![
                 EventPeerEligibility::provisioned_exact_peer(
@@ -45877,6 +45875,35 @@ mod tests {
             ]),
             Some(AutomaticEventRosterStatus::Scheduled)
         );
+        let events = node.selected_events();
+        let client = subscription_fixture_client(&events).await;
+        assert!(node.open_transport_admission());
+        tokio::task::yield_now().await;
+        assert_eq!(
+            node.contact_activity_snapshot()
+                .automatic_event_attempts_parked,
+            0,
+            "transport admission without durable Event work must not select Iroh"
+        );
+
+        events
+            .publish_numbered(
+                NumberedEventPublishRequest {
+                    client_id: client.client_id,
+                    session: client.session,
+                    sequence: aster_redb_store::EventOperationSequence::new(1).unwrap(),
+                    predecessor: None,
+                    topic: Topic::new("opaque").expect("automatic Iroh Event topic"),
+                    scope: Scope::new("test/runtime-contact").expect("automatic Iroh Event scope"),
+                    priority: Priority::Priority,
+                    logical_key: b"automatic-iroh-publish-wake".to_vec(),
+                    payload: b"wake coordinated Iroh before the periodic tick".to_vec(),
+                    tombstone: false,
+                },
+                EventPublishOptions::durable(),
+            )
+            .await
+            .expect("publish durable Event for coordinated Iroh");
         timeout(Duration::from_secs(2), async {
             while node
                 .contact_activity_snapshot()
@@ -45887,7 +45914,7 @@ mod tests {
             }
         })
         .await
-        .expect("automatic Iroh Event attempt reaches the node actor");
+        .expect("published Event must select Iroh before the 60-second periodic tick");
         assert!(peer_node.open_transport_admission());
         timeout(Duration::from_secs(5), async {
             while node
